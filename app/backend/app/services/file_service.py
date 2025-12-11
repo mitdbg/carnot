@@ -15,7 +15,7 @@ from fastapi import HTTPException, UploadFile
 from app.env import BASE_DIR, DATA_DIR
 from app.models.schemas import FileItem
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('uvicorn.error')
 
 # predefined set of archive extensions
 ARCHIVE_EXTENSIONS = (
