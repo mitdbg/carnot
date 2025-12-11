@@ -43,7 +43,6 @@ function DataManagementPage() {
     try {
       setUploading(true)
       setError(null)
-      console.log('UPLOADED FILE:', file.filename)
       await filesApi.upload(file)
       setSuccess('File uploaded successfully!')
       setTimeout(() => setSuccess(null), 3000)
