@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,6 +9,8 @@ from app.database import get_db
 from app.env import BASE_DIR, IS_LOCAL_ENV
 from app.models.schemas import FileItem
 from app.services.file_service import LocalFileService, S3FileService
+
+logger = logging.getLogger('uvicorn.error')
 
 router = APIRouter()
 file_service = LocalFileService() if IS_LOCAL_ENV else S3FileService()
@@ -58,7 +62,11 @@ async def browse_directory(path: str | None = None):
     try:
         # return the root level (i.e. "data/") if no path is provided
         if path is None or path == "":
-            return file_service.list_directory(BASE_DIR)
+            file_items = file_service.list_directory(BASE_DIR)
+            logger.info(
+                f"browse directory | Path: {path} | BASE_DIR: {BASE_DIR} | Returning: {file_items}"
+            )
+            return file_items
 
         # ✨ FIX: Normalize the incoming path from the frontend
         normalized_path = normalize_path(path)
@@ -74,6 +82,10 @@ async def browse_directory(path: str | None = None):
         items = file_service.list_directory(normalized_path)
         items.sort(key=lambda file: (not file.is_directory, file.path.lower()))
 
+        logger.info(
+            f"browse directory | Path: {path} | normalized_path: {normalized_path} | Returning: {items}"
+        )
+
         return items
 
     except HTTPException:
@@ -87,17 +99,17 @@ async def upload_file(file: UploadFile = File(...), db: AsyncSession = Depends(g
     """
     Upload a file to the server.
     """
-    # try:
-    # save file to file system
-    file_paths = file_service.save_uploaded_file(file)
+    try:
+        # save file to file system
+        file_paths = file_service.save_uploaded_file(file)
 
-    # store file metadata in database
-    uploaded_files = [FileRecord(file_path=file_path) for file_path in file_paths]
-    db.add_all(uploaded_files)
-    await db.commit()
+        # store file metadata in database
+        uploaded_files = [FileRecord(file_path=file_path) for file_path in file_paths]
+        db.add_all(uploaded_files)
+        await db.commit()
 
-    # except Exception as e:
-    #     raise HTTPException(status_code=500, detail=f"Error uploading file: {str(e)}") from e
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error uploading file: {str(e)}") from e
 
 
 @router.get("/upload")

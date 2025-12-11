@@ -21,14 +21,16 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
   const [directorySelectionState, setDirectorySelectionState] = useState(new Map())
 
   useEffect(() => {
-    // 1. Fetch config first to know the base path (only once)
+    // fetch config once to know the base path
     const fetchConfig = async () => {
         try {
             const configRes = await configApi.getConfig();
             const fullPath = configRes.data.base_dir;
             setBasePathFull(fullPath);
             setBaseDirName(fullPath.split('/').filter(Boolean).pop());
-            loadDirectory(''); 
+            loadDirectory('');
+            console.log("basePathFull set to:", basePathFull);
+            console.log("baseDirName set to:", baseDirName);
         } catch (err) {
             setError('Failed to load config: ' + err.message)
         }
