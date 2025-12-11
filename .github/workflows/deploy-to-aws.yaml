@@ -6,6 +6,7 @@ on:
     - main
     - wl-prod
     - wm-prod
+    - fix-routes
 
 permissions:
   id-token: write
