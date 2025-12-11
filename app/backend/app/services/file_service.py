@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import tarfile
@@ -13,6 +14,8 @@ from fastapi import HTTPException, UploadFile
 
 from app.env import BASE_DIR, DATA_DIR
 from app.models.schemas import FileItem
+
+logger = logging.getLogger(__name__)
 
 # predefined set of archive extensions
 ARCHIVE_EXTENSIONS = (
@@ -297,4 +300,9 @@ class S3FileService(BaseFileService):
 
     def _write_file_to_path(self, file_bytes_stream: IO[bytes], path: str) -> None:
         """Save an uploaded file to the given s3 path"""
-        self.s3.upload_fileobj(file_bytes_stream, self.s3_bucket, self._get_s3_key_from_path(path))
+        s3_key = self._get_s3_key_from_path(path)
+        logger.info(
+            f"Starting S3 upload | Path: {path} | Bucket: {self.s3_bucket} | Key: {s3_key}"
+        )
+        self.s3.upload_fileobj(file_bytes_stream, self.s3_bucket, s3_key)
+        logger.info(f"Completed S3 upload | Path: {path}")
