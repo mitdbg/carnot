@@ -2,13 +2,17 @@ import logging
 import os
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 import carnot
+from app.auth import get_user_hash
+from app.database import get_db
 from app.env import DATA_DIR, IS_LOCAL_ENV
 from app.models.schemas import SearchQuery, SearchResult
 from app.services.file_service import LocalFileService, S3FileService
+from app.services.llm import get_user_llm_config
 from carnot.core.data.iter_dataset import IterDataset
 
 router = APIRouter()
@@ -50,11 +54,12 @@ class RecursiveTextFileDataset(IterDataset):
         }
 
 
-def run_semantic_search(query_text: str, search_paths: list[str] | None) -> list[SearchResult]:
+def run_semantic_search(query_text: str, search_paths: list[str] | None, user_config: dict) -> list[SearchResult]:
     ds = RecursiveTextFileDataset(id="search", paths=search_paths)
     ds = ds.sem_filter(f"The file matches the query: {query_text}")
     config = carnot.QueryProcessorConfig(
         policy=carnot.MaxQuality(),
+        llm_config=user_config,
         progress=False,
     )
 
@@ -77,10 +82,23 @@ def run_semantic_search(query_text: str, search_paths: list[str] | None) -> list
 
 
 @router.post("/", response_model=list[SearchResult])
-async def search_files(query: SearchQuery):
+async def search_files(
+    query: SearchQuery,
+    auth_data: tuple = Depends(get_user_hash),
+    db: Session = Depends(get_db)
+):
     try:
+        # retrieve user LLM config
+        user_hash, _ = auth_data
+        user_config = await get_user_llm_config(db, user_hash)
+        if not user_config:
+            raise HTTPException(
+                status_code=400, 
+                detail="No LLM API keys found for this user. Please configure them in Settings."
+            )
+
         search_paths = query.paths or None
-        results: list[SearchResult] = run_semantic_search(query.query, search_paths)
+        results: list[SearchResult] = run_semantic_search(query.query, search_paths, user_config)
 
         unique: list[SearchResult] = []
         seen_paths = set()
@@ -91,6 +109,8 @@ async def search_files(query: SearchQuery):
 
         return unique
 
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Search failed")
         raise HTTPException(status_code=500, detail=f"Error searching files: {exc}") from exc

@@ -9,12 +9,14 @@ services:
         VITE_AUTH0_CLIENT_ID: ${VITE_AUTH0_CLIENT_ID}
         VITE_AUTH0_ORGANIZATION_ID: ${VITE_AUTH0_ORGANIZATION_ID}
         VITE_API_BASE_URL: ${VITE_API_BASE_URL}
-        VITE_BASE_URL: ${VITE_BASE_URL}
 
   web-backend:
+    environment:
+      AUTH0_DOMAIN: ${VITE_AUTH0_DOMAIN}
+      AUTH0_AUDIENCE: ${VITE_AUTH0_AUDIENCE}
     volumes:
       # maps the host directory created in start_local.sh to the container's /carnot/data
-      - ${LOCAL_DATA_DIR}:/carnot/data
+      - ${LOCAL_BASE_DIR}:/carnot
 
   db:
     volumes:

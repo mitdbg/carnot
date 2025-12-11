@@ -143,6 +143,7 @@ class Context(Dataset, ABC):
             schema: type[BaseModel] | None = None,
             sources: list[Context] | Context | None = None,
             materialized: bool = False,
+            llm_config: dict | None = None,
         ) -> None:
         """
         Constructor for the `Context` class.
@@ -156,6 +157,11 @@ class Context(Dataset, ABC):
                 the operator used to compute this `Context`.
             materialized (`bool`): True if the `Context` has been computed, False otherwise
         """
+        # if there are any API keys specified in the llm_config, set them in the config
+        if llm_config is not None and len(llm_config.keys()) > 0:
+            for key, value in llm_config.items():
+                os.environ[key] = value
+
         # set the description
         self._description = description
 
@@ -237,7 +243,7 @@ class Context(Dataset, ABC):
         return Context(id=new_id, description=new_description, operator=operator, sources=[self], materialized=False)
 
 class TextFileContext(Context):
-    def __init__(self, path: str, id: str, description: str) -> None:
+    def __init__(self, path: str, id: str, description: str, **kwargs) -> None:
         """
         Constructor for the `TextFileContext` class.
 
@@ -270,7 +276,9 @@ class TextFileContext(Context):
             operator=ContextScan(context=self, output_schema=schema),
             schema=schema,
             materialized=True,
+            **kwargs,
         )
+
     def _check_filter_answer_text(self, answer_text: str) -> dict | None:
         """
         Return {"passed_operator": True} if and only if "true" is in the answer text.

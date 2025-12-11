@@ -67,7 +67,8 @@ class ProgressLogger:
     def _open_stream(self):
         """Open the stream using fsspec in append mode ('a')."""
         try:
-            self.file_handle = fsspec.open(self.log_file_path, mode='a', encoding='utf-8')
+            fs = fsspec.filesystem("s3" if self.log_file_path.startswith("s3://") else "file")
+            self.file_handle = fs.open(self.log_file_path, mode='a', encoding='utf-8')
             self.file_stream = self.file_handle.__enter__()
 
         except Exception:
@@ -82,7 +83,7 @@ class ProgressLogger:
             self.file_stream.write(event.to_json() + '\n')
             self.file_stream.flush()
 
-        except Exception as e:
+        except Exception:
             pass
 
     def close(self):

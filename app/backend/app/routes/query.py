@@ -9,24 +9,28 @@ from uuid import uuid4
 
 import fsspec
 import pandas as pd
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 import carnot
+from app.auth import get_user_hash
 from app.database import (
     AsyncSessionLocal,
     Conversation,
     Dataset,
     DatasetFile,
     Message,
+    get_db,
 )
 from app.database import (
     File as FileRecord,
 )
-from app.env import BACKEND_ROOT, BASE_DIR, IS_LOCAL_ENV
+from app.env import BACKEND_ROOT, BASE_DIR, FILESYSTEM, IS_LOCAL_ENV
 from app.services.file_service import LocalFileService, S3FileService
+from app.services.llm import get_user_llm_config
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -50,7 +54,8 @@ class OutputCapture:
         try:
             # open the stream in append mode ('a') since stdout/stderr writes are sequential
             # and may be interleaved. 'w' would overwrite the previous stream's output.
-            self.file_handle = fsspec.open(self.filepath, mode='a', encoding='utf-8')
+            fs = fsspec.filesystem(FILESYSTEM)
+            self.file_handle = fs.open(self.filepath, mode='a', encoding='utf-8')
             self.file_stream = self.file_handle.__enter__()
         except Exception as e:
             self.original_stream.write(f"Error opening output stream for {self.filepath}: {e}\n")
@@ -109,7 +114,7 @@ def extract_plan_from_output(output) -> str | None:
 class QueryRequest(BaseModel):
     query: str
     dataset_ids: list[int]
-    session_id: str | None = None
+    session_id: str
 
 
 def cleanup_old_sessions() -> None:
@@ -176,7 +181,7 @@ async def save_message(
 
 
 async def stream_query_execution(
-    query: str, dataset_ids: list[int], session_id: str | None = None
+    query: str, dataset_ids: list[int], session_id: str, user_config: dict,
 ):
     try:
         cleanup_old_sessions()
@@ -266,20 +271,22 @@ async def stream_query_execution(
                 path=str(session_dir),
                 id=context_id,
                 description=f"Query on {len(datasets)} dataset(s)",
+                llm_config=user_config,
             )
 
         yield f"data: {json.dumps({'type': 'status', 'message': f'Executing query: {query}'})}\n\n"
         await asyncio.sleep(0.1)
 
         # setup progress logging and clear old progress log if it exists
-        progress_log = fsspec.join(str(session_dir), "progress.jsonl")
-        fs = fsspec.utils.get_fs(progress_log)
+        fs = fsspec.filesystem(FILESYSTEM)
+        progress_log = str(Path(session_dir, "progress.jsonl"))
         if fs.exists(progress_log):
             fs.rm(progress_log, recursive=False)
 
         compute_ctx = ctx.compute(query)
         config = carnot.QueryProcessorConfig(
             policy=carnot.MaxQuality(),
+            llm_config=user_config,
             progress=True,  # Enable console progress
             session_id=session_id,  # Add session ID for tracking
             progress_log_file=progress_log,  # Add progress log file path
@@ -288,8 +295,7 @@ async def stream_query_execution(
         yield f"data: {json.dumps({'type': 'status', 'message': 'Running Carnot query processor...'})}\n\n"
         await asyncio.sleep(0.1)
 
-        output_log = fsspec.join(str(session_dir), "output.txt")
-        fs = fsspec.utils.get_fs(output_log)
+        output_log = str(Path(session_dir, "output.txt"))
         if fs.exists(output_log):
             fs.rm(output_log, recursive=False)
 
@@ -413,19 +419,35 @@ async def stream_query_execution(
         yield f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n"
 
 @router.post("/execute")
-async def execute_query(request: QueryRequest):
+async def execute_query(
+    request: QueryRequest,
+    auth_data: tuple = Depends(get_user_hash), 
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
     """
     Execute a Carnot query on selected datasets with streaming progress.
     Supports multi-turn conversations via session_id.
     """
     if not request.dataset_ids:
         raise HTTPException(status_code=400, detail="At least one dataset must be selected")
-    
+
     if not request.query.strip():
         raise HTTPException(status_code=400, detail="Query cannot be empty")
-    
+
+    # retrieve user LLM config
+    user_hash, _ = auth_data
+    user_config = await get_user_llm_config(db, user_hash)
+    if not user_config:
+        raise HTTPException(
+            status_code=400, 
+            detail={
+                "type": "API_KEY_MISSING",
+                "message": "No LLM API keys found for this user. Please configure them in Settings.",
+            }
+        )
+
     return StreamingResponse(
-        stream_query_execution(request.query, request.dataset_ids, request.session_id),
+        stream_query_execution(request.query, request.dataset_ids, request.session_id, user_config),
         media_type="text/event-stream"
     )
 
@@ -435,15 +457,14 @@ async def get_progress(session_id: str, since_timestamp: str | None = None):
     Get progress events for a session, optionally filtering by timestamp
     """
     try:
-        session_dir = fsspec.join(BASE_DIR, "sessions", session_id)
-        progress_log = fsspec.join(session_dir, "progress.jsonl")
-
-        fs = fsspec.utils.get_fs(progress_log)
+        fs = fsspec.filesystem(FILESYSTEM)
+        session_dir = str(Path(BASE_DIR, "sessions", session_id))
+        progress_log = str(Path(session_dir, "progress.jsonl"))
         if not fs.exists(progress_log):
             return {"events": []}
 
         events = []
-        with fsspec.open(progress_log, 'r', encoding='utf-8') as f:
+        with fs.open(progress_log, 'r', encoding='utf-8') as f:
             for line in f:
                 if line.strip():
                     try:
@@ -466,14 +487,13 @@ async def get_output(session_id: str, last_line: int = 0):
     Get terminal output for a session, returns lines after last_line
     """
     try:
-        session_dir = fsspec.join(BASE_DIR, "sessions", session_id)
-        output_file = fsspec.join(session_dir, "output.txt")
-
-        fs = fsspec.utils.get_fs(output_file)
+        fs = fsspec.filesystem(FILESYSTEM)
+        session_dir = str(Path(BASE_DIR, "sessions", session_id))
+        output_file = str(Path(session_dir, "output.txt"))
         if not fs.exists(output_file):
             return {"lines": [], "total_lines": 0}
-        
-        with fsspec.open(output_file, 'r', encoding='utf-8') as f:
+
+        with fs.open(output_file, 'r', encoding='utf-8') as f:
             all_lines = f.readlines()
             new_lines = all_lines[last_line:]
             return {"lines": new_lines, "total_lines": len(all_lines)}
@@ -496,9 +516,8 @@ async def download_query_results(filename: str):
         raise HTTPException(status_code=400, detail="Invalid filename")
 
     # Get the backend directory path
-    file_path = fsspec.join(BACKEND_ROOT, filename)
-
-    fs = fsspec.utils.get_fs(file_path)
+    fs = fsspec.filesystem(FILESYSTEM)
+    file_path = str(Path(BASE_DIR, "results", filename))
     if not fs.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
 

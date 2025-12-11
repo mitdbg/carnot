@@ -2,7 +2,7 @@
 
 # --- Configuration ---
 PROJECT_NAME="carnot"
-LOCAL_DATA_DIR="$HOME/.$PROJECT_NAME/carnot/data"
+LOCAL_BASE_DIR="$HOME/.$PROJECT_NAME/carnot"
 SECRETS_DIR="compose/secrets"
 PG_DATA_DIR="/tmp/pg-data/data"
 COMPOSE_FILE="docker-compose.yaml"
@@ -10,14 +10,22 @@ OVERRIDE_FILE="docker-compose.local.yaml"
 COMPOSE_DIR="compose"
 
 # --- Default Environment Variables ---
+export CARNOT_USER_SALT="default_local_salt"
 export ENV_NAME="dev"
 export LOCAL_ENV="true"
-export LOCAL_DATA_DIR="$LOCAL_DATA_DIR"
+export LOCAL_BASE_DIR="$LOCAL_BASE_DIR"
 export DOCKERHUB_USERNAME="carnotlocal"
+export SETTINGS_ENCRYPTION_KEY="12u1STDIIImTyKtTfkqwPDRCK4dCe65xHfXrPjrTeIU="
 
 # Frontend Build Arguments (Vite variables)
+# NOTE: if you want Auth0 to work locally, you will need to set the following variables:
+#  - VITE_AUTH0_DOMAIN
+#  - VITE_AUTH0_AUDIENCE
+#  - VITE_AUTH0_CLIENT_ID
+#  - VITE_AUTH0_ORGANIZATION_ID
+#  - AUTH0_CLAIMS_NAMESPACE
+# mdrusso has the local Auth0 setup for Carnot, ask him for details.
 export VITE_API_BASE_URL="http://localhost:8000/api"
-export VITE_BASE_URL="http://localhost:8000"
 
 # Backend Runtime Environment
 export BASE_ORIGINS="http://localhost"
@@ -28,8 +36,8 @@ DB_USER_DEFAULT="carnotuser"
 DB_NAME_DEFAULT="carnotdb"
 
 # --- Create Directories ---
-echo "Creating local data directory: $LOCAL_DATA_DIR"
-mkdir -p "$LOCAL_DATA_DIR"
+echo "Creating local data directory: $LOCAL_BASE_DIR"
+mkdir -p "$LOCAL_BASE_DIR"
 
 echo "Creating secrets directory: $SECRETS_DIR"
 mkdir -p "$SECRETS_DIR"
@@ -78,7 +86,7 @@ if [ $EXIT_CODE -eq 0 ]; then
     echo "Frontend available at: http://localhost"
     echo "Backend available at: http://localhost:8000"
     echo "PostgreSQL available on port 5432 (data in /tmp/pg-data/data on host)"
-    echo "Local data mounted to: $LOCAL_DATA_DIR"
+    echo "Local data mounted to: $LOCAL_BASE_DIR"
     echo "---"
     # Run PS here while we are still in the correct directory
     docker compose -f $COMPOSE_FILE -f $OVERRIDE_FILE ps

@@ -8,6 +8,11 @@ from app.database import AsyncSessionLocal, Conversation, Message
 
 router = APIRouter()
 
+# TODO: break update_conversation into smaller pieces, e.g.:
+# - update title
+# - add message
+# - delete message
+
 class ConversationCreate(BaseModel):
     session_id: str
     title: str | None = None
@@ -211,7 +216,7 @@ async def delete_conversation(conversation_id: int):
 
         return {"message": "Conversation deleted successfully"}
 
-@router.post("/messages", response_model=MessageResponse)
+@router.post("/message", response_model=MessageResponse)
 async def create_message(message: MessageCreate):
     """Add a message to a conversation"""
     async with AsyncSessionLocal() as db:

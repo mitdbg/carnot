@@ -14,6 +14,28 @@ export const configApi = {
   getConfig: () => api.get('/config/'),
 }
 
+// Settings API
+export const settingsApi = {
+  getSettings: (token) =>
+    api.get('/settings/', {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  updateApiKeys: (keys, token) =>
+    api.post('/settings/keys', keys, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  uploadEnvFile: (file, token) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return api.post('/settings/env', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+        Authorization: `Bearer ${token}`,
+      },
+    });
+  },
+}
+
 // Files API
 export const filesApi = {
   browse: (path = '') => api.get('/files/browse', { params: { path } }),
@@ -38,7 +60,11 @@ export const datasetsApi = {
 
 // Search API
 export const searchApi = {
-  search: (query, paths = null) => api.post('/search', { query, paths }),
+  search: (query, paths = null, token) => 
+    api.post('/search',
+      { query, paths },
+      {headers: { Authorization: `Bearer ${token}` }}
+    ),
 }
 
 export default api

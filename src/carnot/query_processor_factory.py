@@ -1,4 +1,5 @@
 import logging
+import os
 from enum import Enum
 
 from carnot.config import QueryProcessorConfig
@@ -115,6 +116,11 @@ class QueryProcessorFactory:
 
         # apply any additional keyword arguments to the config and validate its contents
         config = cls._config_validation_and_normalization(config)
+
+        # if there are any API keys specified in the llm_config, set them in the config
+        if len(config.llm_config.keys()) > 0:
+            for key, value in config.llm_config.items():
+                os.environ[key] = value
 
         # update the dataset's types if we're not enforcing types
         if not config.enforce_types:

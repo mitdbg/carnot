@@ -189,12 +189,11 @@ jobs:
           cd deploy/compose
 
           # set environment variables for build arguments;
-          # NOTE: VITE_API_BASE_URL and VITE_BASE_URL point to internal docker compose service names
           export DOCKERHUB_USERNAME=${{ vars.DOCKERHUB_USERNAME }}
           export ENV_NAME=${ENV_NAME}
+          export VITE_AUTH0_AUDIENCE=${{ secrets.AUTH0_AUDIENCE }}
           export VITE_AUTH0_DOMAIN=${{ secrets.AUTH0_CUSTOM_DOMAIN }}
           export VITE_API_BASE_URL="https://${SUBDOMAIN}.carnot-research.org/api"
-          export VITE_BASE_URL="https://${SUBDOMAIN}.carnot-research.org"
           if [[ "${GITHUB_REF_NAME}" == "wl-prod" ]]; then
             export VITE_AUTH0_CLIENT_ID=${{ secrets.WL_PROD_AUTH0_CLIENT_ID }}
             export VITE_AUTH0_ORGANIZATION_ID=${{ secrets.WL_PROD_AUTH0_ORGANIZATION_ID }}
@@ -245,7 +244,12 @@ jobs:
             export DOCKERHUB_USERNAME=${{ vars.DOCKERHUB_USERNAME }}
             export ENV_NAME=${ENV_NAME}
             export LOCAL_ENV="false"
+            export SETTINGS_ENCRYPTION_KEY="${{ secrets.SETTINGS_ENCRYPTION_KEY }}"
+            export AUTH0_DOMAIN="${{ secrets.AUTH0_CUSTOM_DOMAIN }}"
+            export AUTH0_AUDIENCE="${{ secrets.AUTH0_AUDIENCE }}"
+            export AUTH0_CLAIMS_NAMESPACE="${{ secrets.AUTH0_CLAIMS_NAMESPACE }}"
             export BASE_ORIGINS="http://${SUBDOMAIN}.carnot-research.org,https://${SUBDOMAIN}.carnot-research.org,http://web-backend,https://web-backend"
+            export CARNOT_USER_SALT="${{ secrets.CARNOT_USER_SALT }}"
             docker login -u '${{ vars.DOCKERHUB_USERNAME }}' -p '${{ secrets.DOCKERHUB_TOKEN }}'
             docker compose pull
             docker compose up -d

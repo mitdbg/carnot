@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router-dom'
-import { Database, MessageSquare, LogOut } from 'lucide-react'
+import { Database, MessageSquare, LogOut, Settings } from 'lucide-react'
 import { useAuth0 } from '@auth0/auth0-react'
 
 function Layout({ children }) {
@@ -9,6 +9,7 @@ function Layout({ children }) {
   const tabs = [
     { name: 'Data Management', path: '/', icon: Database },
     { name: 'User Chat', path: '/chat', icon: MessageSquare },
+    { name: 'Settings', path: '/settings', icon: Settings },
   ]
 
   return (

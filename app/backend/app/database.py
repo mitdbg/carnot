@@ -4,6 +4,7 @@ from sqlalchemy import Column, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import declarative_base
+from sqlalchemy.sql import func
 
 
 # read secrets
@@ -32,6 +33,22 @@ AsyncSessionLocal = async_sessionmaker(
 Base = declarative_base()
 
 # Database models
+class UserSettings(Base):
+    __tablename__ = "user_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_hash = Column(String, unique=True, index=True, nullable=False)
+    email = Column(String, nullable=True) 
+
+    # API Keys
+    openai_api_key = Column(String, nullable=True)
+    anthropic_api_key = Column(String, nullable=True)
+    gemini_api_key = Column(String, nullable=True)
+    together_api_key = Column(String, nullable=True)
+
+    updated_at = Column(TIMESTAMP(timezone=True), onupdate=func.now())
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+
 class Dataset(Base):
     __tablename__ = "datasets"
     

@@ -14,15 +14,14 @@ from carnot.operators.logical import (
     BaseScan,
     ComputeOperator,
     ContextScan,
-    SearchOperator,
     FilteredScan,
+    SearchOperator,
 )
 from carnot.operators.physical import PhysicalOperator
 from carnot.operators.scan import ContextScanOp, MarshalAndScanDataOp
 from carnot.operators.search import (
     SmolAgentsSearch,  # SmolAgentsCustomManagedSearch,  # SmolAgentsManagedSearch
 )
-from carnot.operators.filter import SmolAgentsFilter
 from carnot.optimizer.primitives import Expression, Group, LogicalExpression, PhysicalExpression
 from carnot.prompts import CONTEXT_SEARCH_PROMPT
 
@@ -353,7 +352,7 @@ class BasicSubstitutionRule(ImplementationRule):
         # ComputeOperator: SmolAgentsCompute,
         SearchOperator: SmolAgentsSearch, # SmolAgentsManagedSearch, # SmolAgentsCustomManagedSearch
         ContextScan: ContextScanOp,
-        FilteredScan: SmolAgentsFilter,
+        FilteredScan: SmolAgentsSearch,
     }
 
     @classmethod

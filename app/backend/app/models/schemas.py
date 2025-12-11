@@ -7,6 +7,10 @@ from pydantic import BaseModel
 class AppConfig(BaseModel):
     base_dir: str
 
+# Settings schemas
+class AppSettings(BaseModel):
+    env_filepath: str | None = None
+
 # File schemas
 class FileItem(BaseModel):
     path: str

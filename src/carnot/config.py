@@ -50,6 +50,9 @@ class QueryProcessorConfig(BaseModel):
     exp_name: str | None = Field(default=None)
     priors: dict | None = Field(default=None)
 
+    # llm config
+    llm_config: dict = Field(default_factory=dict)
+
     def to_dict(self) -> dict:
         """Convert the config to a dict representation."""
         return self.model_dump()
