@@ -1,13 +1,10 @@
 """Progress event logging for web session tracking."""
-from dataclasses import dataclass
-from datetime import datetime
-from enum import Enum
 import json
-from pathlib import Path
-from typing import Literal
-import fcntl
 import logging
+from dataclasses import dataclass
+from enum import Enum
 
+import fsspec
 
 logger = logging.getLogger(__name__)
 
@@ -59,25 +56,63 @@ class ProgressEvent:
         return json.dumps(self.to_dict())
 
 
-class ProgressLogger:    
+class ProgressLogger:
     def __init__(self, log_file_path: str | None):
-        self.log_file_path = Path(log_file_path) if log_file_path else None
+        self.log_file_path = log_file_path
+        self.file_handle = None
+        self.file_stream = None
         if self.log_file_path:
-            # Ensure parent directory exists
-            self.log_file_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    def log_event(self, event: ProgressEvent):
-        if not self.log_file_path:
-            return
-        
-        try:
-            with open(self.log_file_path, 'a') as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-                try:
-                    f.write(event.to_json() + '\n')
-                    f.flush()
-                finally:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-        except Exception as e:
-            logger.warning(f"Failed to write progress event: {e}")
+            self._open_stream()
 
+    def _open_stream(self):
+        """Open the stream using fsspec in append mode ('a')."""
+        try:
+            fs = fsspec.filesystem("s3" if self.log_file_path.startswith("s3://") else "file")
+            self.file_handle = fs.open(self.log_file_path, mode='a', encoding='utf-8')
+            self.file_stream = self.file_handle.__enter__()
+
+        except Exception:
+            raise
+
+    def log_event(self, event: ProgressEvent):
+        if not self.file_stream:
+            return
+
+        try:
+            # write and flush the new event data
+            self.file_stream.write(event.to_json() + '\n')
+            self.file_stream.flush()
+
+        except Exception:
+            pass
+
+    def close(self):
+        """Close the file stream, committing the final data chunk to S3 if applicable."""
+        if self.file_handle:
+            self.file_handle.__exit__(None, None, None)
+            self.file_handle = None
+            self.file_stream = None
+
+
+# NOTE: keeping old class definition w/locking around in case we need it later
+# class ProgressLogger:
+#     def __init__(self, log_file_path: str | None):
+#         self.log_file_path = Path(log_file_path) if log_file_path else None
+#         if self.log_file_path:
+#             # Ensure parent directory exists
+#             self.log_file_path.parent.mkdir(parents=True, exist_ok=True)
+
+#     def log_event(self, event: ProgressEvent):
+#         if not self.log_file_path:
+#             return
+
+#         try:
+#             with open(self.log_file_path, 'a') as f:
+#                 fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+#                 try:
+#                     f.write(event.to_json() + '\n')
+#                     f.flush()
+#                 finally:
+#                     fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+#         except Exception as e:
+#             logger.warning(f"Failed to write progress event: {e}")

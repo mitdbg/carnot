@@ -3,6 +3,11 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
+  resolve: {
+    alias: {
+      'path': 'path-browserify',
+    },
+  },
   server: {
     port: 5173,
     proxy: {

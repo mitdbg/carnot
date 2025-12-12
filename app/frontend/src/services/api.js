@@ -1,6 +1,6 @@
 import axios from 'axios'
 
-const API_BASE_URL = process.env.API_BASE_URL || import.meta.env.VITE_API_URL || 'http://localhost:8000/api'
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api'
 
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -8,6 +8,33 @@ const api = axios.create({
     'Content-Type': 'application/json',
   },
 })
+
+// Config API
+export const configApi = {
+  getConfig: () => api.get('/config/'),
+}
+
+// Settings API
+export const settingsApi = {
+  getSettings: (token) =>
+    api.get('/settings/', {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  updateApiKeys: (keys, token) =>
+    api.post('/settings/keys', keys, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  uploadEnvFile: (file, token) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return api.post('/settings/env', formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+        Authorization: `Bearer ${token}`,
+      },
+    });
+  },
+}
 
 // Files API
 export const filesApi = {
@@ -19,13 +46,13 @@ export const filesApi = {
       headers: { 'Content-Type': 'multipart/form-data' },
     })
   },
-  listUploaded: () => api.get('/files/uploaded'),
+  listUploaded: () => api.get('/files/upload'),
 }
 
 // Datasets API
 export const datasetsApi = {
-  list: () => api.get('/datasets'),
-  create: (data) => api.post('/datasets', data),
+  list: () => api.get('/datasets/'),
+  create: (data) => api.post('/datasets/', data),
   get: (id) => api.get(`/datasets/${id}`),
   update: (id, data) => api.put(`/datasets/${id}`, data),
   delete: (id) => api.delete(`/datasets/${id}`),
@@ -33,7 +60,11 @@ export const datasetsApi = {
 
 // Search API
 export const searchApi = {
-  search: (query, path = null) => api.post('/search', { query, path }),
+  search: (query, paths = null, token) => 
+    api.post('/search',
+      { query, paths },
+      {headers: { Authorization: `Bearer ${token}` }}
+    ),
 }
 
 export default api

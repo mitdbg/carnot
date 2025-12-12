@@ -1,8 +1,10 @@
 import { useState } from 'react'
+import { useAuth0 } from '@auth0/auth0-react';
 import { Send, Loader2, Bot, User, CheckCircle } from 'lucide-react'
 import { searchApi } from '../../services/api'
 
 function SearchChatbot({ onSelectFiles }) {
+  const { getAccessTokenSilently } = useAuth0();
   const [messages, setMessages] = useState([
     {
       role: 'assistant',
@@ -19,18 +21,21 @@ function SearchChatbot({ onSelectFiles }) {
 
     const userMessage = input.trim()
     setInput('')
-    
+
     // Add user message
     setMessages((prev) => [...prev, { role: 'user', content: userMessage }])
     setLoading(true)
 
     try {
-      // Search for files
-      const response = await searchApi.search(userMessage)
+      // fetch access token
+      const token = await getAccessTokenSilently();
+
+      // search for files
+      const response = await searchApi.search(userMessage, null, token);
       const results = response.data
       setLastResults(results)
 
-      // Add assistant response
+      // add assistant response
       if (results.length > 0) {
         setMessages((prev) => [
           ...prev,
@@ -96,7 +101,7 @@ function SearchChatbot({ onSelectFiles }) {
                 <Bot className="w-5 h-5 text-primary-600" />
               </div>
             )}
-            
+
             <div
               className={`max-w-[80%] rounded-lg px-4 py-2 ${
                 message.role === 'user'
@@ -105,7 +110,7 @@ function SearchChatbot({ onSelectFiles }) {
               }`}
             >
               <p className="text-sm whitespace-pre-wrap">{message.content}</p>
-              
+
               {/* Display search results */}
               {message.results && message.results.length > 0 && (
                 <div className="mt-3 space-y-2">
@@ -125,7 +130,7 @@ function SearchChatbot({ onSelectFiles }) {
                       </div>
                     ))}
                   </div>
-                  
+
                   <button
                     onClick={() => handleAddToSelection(message.results)}
                     className="w-full mt-2 flex items-center justify-center gap-2 px-3 py-2 bg-primary-600 text-white text-sm rounded hover:bg-primary-700 transition-colors"

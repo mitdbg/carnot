@@ -1,7 +1,7 @@
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 
 from rich.console import Console
 from rich.progress import (
@@ -203,7 +203,7 @@ class PZProgressManager(ProgressManager):
         # Log started event
         if self.progress_logger and self.session_id:
             event = ProgressEvent(
-                timestamp=datetime.utcnow().isoformat() + 'Z',
+                timestamp=datetime.now(timezone.utc).isoformat() + 'Z',
                 session_id=self.session_id,
                 level=self.level,
                 operator_id=unique_full_op_id,
@@ -271,7 +271,7 @@ class PZProgressManager(ProgressManager):
             percentage = (current / total * 100) if total > 0 else 0
             
             event = ProgressEvent(
-                timestamp=datetime.utcnow().isoformat() + 'Z',
+                timestamp=datetime.now(timezone.utc).isoformat() + 'Z',
                 session_id=self.session_id,
                 level=self.level,
                 operator_id=unique_full_op_id,
@@ -291,7 +291,7 @@ class PZProgressManager(ProgressManager):
             for unique_full_op_id, task_id in self.unique_full_op_id_to_task.items():
                 task_obj = self.progress._tasks[task_id]
                 event = ProgressEvent(
-                    timestamp=datetime.utcnow().isoformat() + 'Z',
+                    timestamp=datetime.now(timezone.utc).isoformat() + 'Z',
                     session_id=self.session_id,
                     level=self.level,
                     operator_id=unique_full_op_id,
@@ -306,6 +306,8 @@ class PZProgressManager(ProgressManager):
                 self.progress_logger.log_event(event)
         
         self.progress.stop()
+        if self.progress_logger:
+            self.progress_logger.close()
 
         # compute total cost, success, and failure
         total_cost = sum(stats.total_cost for stats in self.unique_full_op_id_to_stats.values())

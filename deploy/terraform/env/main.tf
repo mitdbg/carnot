@@ -102,7 +102,13 @@ resource "aws_iam_role_policy" "s3_access" {
 
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
+    Statement = [
+      {
+      Effect = "Allow"
+      Action = ["s3:ListBucket"]
+      Resource = ["arn:aws:s3:::carnot-research"]
+    },
+    {
       Effect   = "Allow"
       Action   = ["s3:*"]
       Resource = [

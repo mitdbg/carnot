@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import os
 import re
-from abc import ABC
+from abc import ABC, abstractmethod
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
+import boto3
+import pandas as pd
+from cloudpathlib import S3Path
 from pydantic import BaseModel
 from smolagents import CodeAgent, LiteLLMModel
 
@@ -14,6 +18,14 @@ from carnot.core.data.dataset import Dataset
 from carnot.core.lib.schemas import create_schema_from_fields, union_schemas
 from carnot.operators.logical import ComputeOperator, ContextScan, LogicalOperator, SearchOperator
 from carnot.utils.hash_helpers import hash_for_id
+
+IS_LOCAL_ENV = os.getenv("LOCAL_ENV").lower() == "true"
+FILESYSTEM = "file" if IS_LOCAL_ENV else "s3"
+COMPANY_ENV = os.getenv("COMPANY_ENV", "dev")
+BACKEND_ROOT = "/code/backend/"
+BASE_DIR = f"s3://carnot-research/{COMPANY_ENV}/"
+DATA_DIR = f"s3://carnot-research/{COMPANY_ENV}/data/"
+SKIP_SUFFIXES = {".pdf", ".jpg", ".jpeg", ".png", ".gif", ".zip", ".exe", ".bin"}
 
 PZ_INSTRUCTION = """\n\nYou are a CodeAgent who is a specialist at writing declarative AI programs with the Palimpzest (PZ) library.
 
@@ -48,11 +60,11 @@ validator = pz.Validator()
 config = pz.QueryProcessorConfig(
     policy=pz.MaxQuality(),
     execution_strategy="parallel",
-    available_models=[pz.Model.GPT_4o, pz.Model.GPT_4o_MINI],
+    available_models=[pz.Model.GPT_5, pz.Model.GPT_5_MINI],
     max_workers=20,
     progress=True,
 )
-output = ds.optimize_and_run(config=config, validator=validator)
+output = ds.run(config=config, validator=validator)
 
 # write the execution stats to json
 output.execution_stats.to_json("pz_program_stats.json")
@@ -99,11 +111,11 @@ validator = pz.Validator()
 config = pz.QueryProcessorConfig(
     policy=pz.MaxQuality(),
     execution_strategy="parallel",
-    available_models=[pz.Model.GPT_4o, pz.Model.GPT_4o_MINI],
+    available_models=[pz.Model.GPT_5, pz.Model.GPT_5_MINI],
     max_workers=20,
     progress=True,
 )
-output = ds.optimize_and_run(config=config, validator=validator)
+output = ds.run(config=config, validator=validator)
 
 # write the execution stats to json
 output.execution_stats.to_json("pz_program_stats.json")
@@ -115,10 +127,95 @@ print(f"Results at: {output_filepath}")
 ```
 
 Be sure to always:
-- execute your program using the `.optimize_and_run()` format shown above
+- execute your program using the `.run()` format shown above
 - call `output.execution_stats.to_json("pz_program_stats.json")` to write execution statistics to disk
 - write your output to CSV and print where you wrote it!
 """
+
+class BaseFileService(ABC):
+    """Abstract base class for file services"""
+
+    @abstractmethod
+    def exists(self, path: str) -> bool:
+        pass
+
+    @abstractmethod
+    def is_dir(self, path: str) -> bool:
+        pass
+
+    @abstractmethod
+    def list_all_subfiles(self, path: str) -> list[str]:
+        pass
+
+    @abstractmethod
+    def read_file(self, path: str) -> str:
+        pass
+
+class LocalFileService(BaseFileService):
+    """File service for local filesystem"""
+    def exists(self, path: str) -> bool:
+        return os.path.exists(path)
+
+    def is_dir(self, path: str) -> bool:
+        return os.path.isdir(path)
+
+    def list_all_subfiles(self, path: str) -> list[str]:
+        """
+        NOTE: this method assumes path is an absolute path; without this assumption file_paths
+        will not have correct absolute paths.
+        """
+        file_paths = []
+        for root, _, files in os.walk(path):
+            for file in files:
+                file_paths.append(os.path.join(root, file))
+        return file_paths
+
+    def read_file(self, path: str) -> str:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+class S3FileService(BaseFileService):
+    """File service for AWS S3"""
+    def __init__(self):
+        self.s3_bucket = DATA_DIR.replace("s3://", "").split("/")[0]
+
+    def _get_s3_key_from_path(self, path: str) -> str:
+        return "/".join(path.replace("s3://", "").split("/")[1:])
+
+    def exists(self, path: str) -> bool:
+        """Check if a file or directory exists"""
+        s3 = boto3.client('s3')
+        s3_prefix = self._get_s3_key_from_path(path)
+        response = s3.list_objects_v2(Bucket=self.s3_bucket, Prefix=s3_prefix, MaxKeys=1)
+        return 'Contents' in response
+
+    def is_dir(self, path: str) -> bool:
+        """Check if a path is a directory; S3 prefixes are always treated as directories"""
+        return True
+
+    def list_all_subfiles(self, path: str) -> list[str]:
+        """List all files under the given s3 prefix"""
+        s3 = boto3.client('s3')
+
+        file_paths = []
+        prefix = self._get_s3_key_from_path(path)
+        paginator = s3.get_paginator('list_objects_v2')
+        result_iterator = paginator.paginate(Bucket=self.s3_bucket, Prefix=prefix)
+
+        for page in result_iterator:
+            for obj in page.get('Contents', []):
+                file_paths.append(f"s3://{self.s3_bucket}/{obj['Key']}")
+
+        return file_paths
+
+    def read_file(self, path: str) -> str:
+        """Read the contents of a file from s3"""
+        s3 = boto3.client('s3')
+        s3_key = self._get_s3_key_from_path(path)
+        response = s3.get_object(Bucket=self.s3_bucket, Key=s3_key)
+        content = response['Body'].read().decode('utf-8')
+        return content
+
 
 class Context(Dataset, ABC):
     """
@@ -143,6 +240,7 @@ class Context(Dataset, ABC):
             schema: type[BaseModel] | None = None,
             sources: list[Context] | Context | None = None,
             materialized: bool = False,
+            llm_config: dict | None = None,
         ) -> None:
         """
         Constructor for the `Context` class.
@@ -156,6 +254,11 @@ class Context(Dataset, ABC):
                 the operator used to compute this `Context`.
             materialized (`bool`): True if the `Context` has been computed, False otherwise
         """
+        # if there are any API keys specified in the llm_config, set them in the config
+        if llm_config is not None and len(llm_config.keys()) > 0:
+            for key, value in llm_config.items():
+                os.environ[key] = value
+
         # set the description
         self._description = description
 
@@ -237,30 +340,26 @@ class Context(Dataset, ABC):
         return Context(id=new_id, description=new_description, operator=operator, sources=[self], materialized=False)
 
 class TextFileContext(Context):
-    def __init__(self, path: str, id: str, description: str) -> None:
+    def __init__(self, paths: str | list[str], id: str, description: str, **kwargs) -> None:
         """
         Constructor for the `TextFileContext` class.
 
         Args:
-            path (str): The path to the file
+            paths (str | list[str]): (list of) path(s) to text files / directories to include in the `Context`
             id (str): a string identifier for the `Context`
-            description (str): The description of the data contained within the `Context`
-            kwargs (dict): Keyword arguments containing the `Context's` id and description.
+            description (str): the description of the data contained within the `Context`
+            kwargs (dict): keyword arguments containing the `Context's` id and description.
         """
-        # check that path is a valid file or directory
-        assert os.path.isfile(path) or os.path.isdir(path), f"Path {path} is not a file nor a directory"
+        if isinstance(paths, str):
+            paths = [paths]
 
-        # get list of filepaths
-        self.filepaths = []
-        if os.path.isfile(path):
-            self.filepaths = [path]
-        else:
-            self.filepaths = []
-            for root, _, files in os.walk(path):
-                for file in files:
-                    fp = os.path.join(root, file)
-                    self.filepaths.append(fp)
-            self.filepaths = sorted(self.filepaths)
+        self.file_service = S3FileService() if FILESYSTEM == "s3" else LocalFileService()
+        self.filepaths = [
+            fp 
+            for path in paths
+            for fp in self.file_service.list_all_subfiles(path)
+            if not any(fp.lower().endswith(suffix) for suffix in SKIP_SUFFIXES)
+        ]
 
         # call parent constructor to set id, operator, and schema
         schema = create_schema_from_fields([{"name": "context", "desc": "The context", "type": str | Any}])
@@ -270,7 +369,9 @@ class TextFileContext(Context):
             operator=ContextScan(context=self, output_schema=schema),
             schema=schema,
             materialized=True,
+            **kwargs,
         )
+
     def _check_filter_answer_text(self, answer_text: str) -> dict | None:
         """
         Return {"passed_operator": True} if and only if "true" is in the answer text.
@@ -380,9 +481,29 @@ class TextFileContext(Context):
             """
             return self.filepaths
 
+        @tool
+        def tool_read_filepath(path: str) -> str:
+            """
+            This tool takes a filepath (`path`) as input and returns the content of the file as a string.
+            It handles both CSV files and html / regular text files as well as files in S3. It does not
+            handle images.
+
+            Args:
+                path (str): The path to the file to read.
+
+            Returns:
+                str: The content of the file as a string.
+            """
+            if path.endswith(".csv"):
+                return pd.read_csv(path, encoding="ISO-8859-1").to_string(index=False)
+            
+            file_service = S3FileService() if FILESYSTEM == "s3" else LocalFileService()
+
+            return file_service.read_file(path)
+
         agent = CodeAgent(
             model=LiteLLMModel(model_id="openai/o1", api_key=os.getenv("OPENAI_API_KEY")),
-            tools=[tool_list_filepaths],
+            tools=[tool_list_filepaths, tool_read_filepath],
             max_steps=20,
             planning_interval=4,
             add_base_tools=False,
