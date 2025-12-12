@@ -91,21 +91,26 @@ active_sessions: dict[str, dict] = {}
 async def heartbeat_sender(stream_response_generator):
     """
     Sends an SSE comment line every HEARTBEAT_INTERVAL seconds to keep the connection alive.
-    The stream_response_generator must be the main generator function object,
-    so we can send it the data directly using .send().
+    The stream_response_generator must be the main async generator object.
     """
     try:
+        # Wait for the generator to be initialized (i.e., the first yield to happen)
+        # This is often necessary for async generators before sending them data.
+        await stream_response_generator.__anext__()
+        
         while True:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
-            # Send an SSE comment line. It must end with two newlines (\n\n).
-            # The browser's EventSource client ignores lines starting with ':'
-            await stream_response_generator.send(":keep-alive\n\n")
+            # Send an SSE comment line using the special 'asend()' method 
+            # for asynchronous generators.
+            await stream_response_generator.asend(":keep-alive\n\n")
     except asyncio.CancelledError:
-        # This is expected when the task is cancelled (i.e., when the query completes)
+        # This is expected when the task is cancelled
         pass
     except Exception as e:
+        # If the stream closes or breaks, asend() might raise StopAsyncIteration
+        if isinstance(e, StopAsyncIteration):
+            return
         logger.error(f"Heartbeat sender failed: {e}")
-
 
 def extract_plan_from_output(output) -> str | None:
     """Extract the CodeAgent planning steps from the DataRecordCollection."""
@@ -207,17 +212,13 @@ async def save_message(
         await db.commit()
 
 
-async def stream_query_execution(
-    query: str, dataset_ids: list[int], session_id: str, user_config: dict,
+async def stream_query_generator(
+    query: str, dataset_ids: list[int], session_id: str, user_config: dict, heartbeat_task: asyncio.Task,
 ):
+    """
+    The main generator logic, now accepting the heartbeat_task for cleanup in its finally block.
+    """
     try:
-        # Get a reference to the generator object instance itself.
-        # This allows the heartbeat task to "inject" data into the stream.
-        stream_generator_ref = sys.exc_info()[2].gi_frame.f_locals['self']
-
-        # Start the heartbeat task
-        heartbeat_task = asyncio.create_task(heartbeat_sender(stream_generator_ref))
-
         cleanup_old_sessions()
 
         session_id = session_id or str(uuid4())
@@ -476,14 +477,37 @@ async def stream_query_execution(
                 logger.exception("Failed to save error message")
         yield f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n"
     finally:
-            # cancel the heartbeat task to clean up resources
-            if heartbeat_task:
-                heartbeat_task.cancel()
-                try:  # noqa: SIM105
-                    # Wait for the task to finish cancelling to avoid resource leakage
-                    await heartbeat_task
-                except asyncio.CancelledError:
-                    pass
+        # The heartbeat task cleanup is now performed here in the generator's cleanup
+        if heartbeat_task:
+            heartbeat_task.cancel()
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+
+def stream_query_execution(
+    query: str, dataset_ids: list[int], session_id: str, user_config: dict,
+):
+    """
+    The outer generator function required by StreamingResponse.
+    It manages the heartbeat task and yields from the main generator.
+    """
+    # 1. Create the generator object
+    generator_obj = stream_query_generator(
+        query, dataset_ids, session_id, user_config, heartbeat_task=None
+    )
+    
+    # 2. Start the heartbeat task, passing it the generator object
+    heartbeat_task = asyncio.create_task(heartbeat_sender(generator_obj))
+    
+    # 3. Update the generator object's internal state with the task reference
+    # This is the new, safe way to pass the heartbeat task reference *into* the generator
+    # It must be done right after the task is created, before yielding any content.
+    generator_obj.ag_frame.f_locals['heartbeat_task'] = heartbeat_task
+    
+    # 4. Yield all results from the inner generator
+    # The 'await' is necessary because the inner generator is an async generator
+    return generator_obj
 
 @router.post("/execute")
 async def execute_query(
