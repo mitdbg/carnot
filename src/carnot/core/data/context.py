@@ -479,7 +479,7 @@ class TextFileContext(Context):
             return self.filepaths
 
         @tool
-        def tool_read_filepath(self, path: str) -> str:
+        def tool_read_filepath(path: str) -> str:
             """
             This tool takes a filepath (`path`) as input and returns the content of the file as a string.
             It handles both CSV files and html / regular text files as well as files in S3. It does not
