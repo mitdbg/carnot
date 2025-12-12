@@ -491,20 +491,20 @@ async def get_output(session_id: str, last_line: int = 0):
     """
     Get terminal output for a session, returns lines after last_line
     """
-    try:
-        fs = fsspec.filesystem(FILESYSTEM)
-        session_dir = str(Path(BASE_DIR, "sessions", session_id) if IS_LOCAL_ENV else S3Path(BASE_DIR, "sessions", session_id))
-        output_file = str(Path(session_dir, "output.txt") if IS_LOCAL_ENV else S3Path(session_dir, "output.txt"))
-        if not fs.exists(output_file):
-            return {"lines": [], "total_lines": 0}
-
-        with fs.open(output_file, 'r', encoding='utf-8') as f:
-            all_lines = f.readlines()
-            new_lines = all_lines[last_line:]
-            return {"lines": new_lines, "total_lines": len(all_lines)}
-    except Exception as e:
-        logger.error(f"Error reading output log: {e}")
+    # try:
+    fs = fsspec.filesystem(FILESYSTEM)
+    session_dir = str(Path(BASE_DIR, "sessions", session_id) if IS_LOCAL_ENV else S3Path(BASE_DIR, "sessions", session_id))
+    output_file = str(Path(session_dir, "output.txt") if IS_LOCAL_ENV else S3Path(session_dir, "output.txt"))
+    if not fs.exists(output_file):
         return {"lines": [], "total_lines": 0}
+
+    with fs.open(output_file, 'r', encoding='utf-8') as f:
+        all_lines = f.readlines()
+        new_lines = all_lines[last_line:]
+        return {"lines": new_lines, "total_lines": len(all_lines)}
+    # except Exception as e:
+    #     logger.error(f"Error reading output log: {e}")
+    #     return {"lines": [], "total_lines": 0}
 
 
 @router.get("/download/{filename}")
