@@ -148,8 +148,18 @@ class ParallelExecutionStrategy(ExecutionStrategy):
         input_queues = self._create_input_queues(plan)
         future_queues = {f"{topo_idx}-{op.get_full_op_id()}": [] for topo_idx, op in enumerate(plan)}
 
+        # Get session info from config if available
+        session_id = getattr(self, 'session_id', None)
+        progress_log_file = getattr(self, 'progress_log_file', None)
+        
         # initialize and start the progress manager
-        self.progress_manager = create_progress_manager(plan, num_samples=self.num_samples, progress=self.progress)
+        self.progress_manager = create_progress_manager(
+            plan, 
+            num_samples=self.num_samples, 
+            progress=self.progress,
+            session_id=session_id,
+            progress_log_file=progress_log_file,
+        )
         self.progress_manager.start()
 
         # NOTE: we must handle progress manager outside of _execute_plan to ensure that it is shut down correctly;

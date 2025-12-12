@@ -1,10 +1,13 @@
 import { useState, useEffect, useRef } from 'react'
+import { useAuth0 } from '@auth0/auth0-react';
 import { Send, Database, CheckSquare, Square, AlertCircle, Loader2, XCircle, RotateCcw, MessageSquare, Trash2, ChevronLeft, ChevronRight, Search } from 'lucide-react'
 import axios from 'axios'
+import ProgressDisplay from '../components/ProgressDisplay'
 
-const BASE_URL = process.env.BASE_URL || "http://localhost:8000"
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api"
 
 function UserChatPage() {
+  const { getAccessTokenSilently } = useAuth0();
   const [datasets, setDatasets] = useState([])
   const [selectedDatasets, setSelectedDatasets] = useState(new Set())
   const [messages, setMessages] = useState([])
@@ -17,7 +20,7 @@ function UserChatPage() {
   const [datasetSearchQuery, setDatasetSearchQuery] = useState('')
   const messagesEndRef = useRef(null)
   const abortControllerRef = useRef(null)
-  
+
   // Generate session ID on component mount
   useEffect(() => {
     generateNewSession()
@@ -38,7 +41,7 @@ function UserChatPage() {
   
   const loadConversations = async () => {
     try {
-      const response = await axios.get(`${BASE_URL}/api/conversations/`)
+      const response = await axios.get(`${API_BASE_URL}/conversations/`)
       setConversations(response.data)
     } catch (error) {
       console.error('Error loading conversations:', error)
@@ -47,7 +50,7 @@ function UserChatPage() {
 
   const loadConversation = async (conversationId) => {
     try {
-      const response = await axios.get(`${BASE_URL}/api/conversations/${conversationId}`)
+      const response = await axios.get(`${API_BASE_URL}/conversations/${conversationId}`)
       const conversation = response.data
       
       // Set session ID and messages
@@ -80,7 +83,7 @@ function UserChatPage() {
     }
     
     try {
-      await axios.delete(`${BASE_URL}/api/conversations/${conversationId}`)
+      await axios.delete(`${API_BASE_URL}/conversations/${conversationId}`)
       
       // If we deleted the current conversation, create a new session
       if (conversationId === currentConversationId) {
@@ -104,7 +107,7 @@ function UserChatPage() {
 
   const loadDatasets = async () => {
     try {
-      const response = await axios.get(`${BASE_URL}/api/datasets/`)
+      const response = await axios.get(`${API_BASE_URL}/datasets/`)
       setDatasets(response.data)
     } catch (error) {
       console.error('Error loading datasets:', error)
@@ -160,6 +163,14 @@ function UserChatPage() {
       return
     }
 
+    // if sessionId is null (due to initial state/race condition), generate a new one immediately.
+    let currentSessionId = sessionId;
+    if (!currentSessionId) {
+      const newSessionId = crypto.randomUUID();
+      setSessionId(newSessionId); 
+      currentSessionId = newSessionId;
+    }
+
     // Add user message
     const userMessage = {
       type: 'user',
@@ -170,13 +181,17 @@ function UserChatPage() {
     setIsLoading(true)
 
     try {
+      // fetch access token
+      const token = await getAccessTokenSilently();
+
       // Create abort controller for this request
       abortControllerRef.current = new AbortController()
 
-      const response = await fetch(`${BASE_URL}/api/query/execute`, {
+      const response = await fetch(`${API_BASE_URL}/query/execute`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
         },
         body: JSON.stringify({
           query: userMessage.content,
@@ -185,6 +200,21 @@ function UserChatPage() {
         }),
         signal: abortControllerRef.current.signal
       })
+
+      // handle non-streaming errors (e.g., 400 No API Keys)
+      if (!response.ok) {
+        let errorData;
+        try {
+          // response body is the FastAPI JSON error structure
+          errorData = await response.json();
+        } catch (e) {
+          throw new Error(`Server responded with ${response.status}: ${response.statusText}`);
+        }
+        
+        // Pass the detail object so we can inspect its 'type' in the catch block
+        // If errorData.detail is the structured dictionary, we throw it. Otherwise, fall back to the generic error string.
+        throw errorData.detail || new Error(errorData.message || 'An unknown server error occurred.');
+      }
 
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
@@ -236,8 +266,19 @@ function UserChatPage() {
         }
       }
     } catch (error) {
-      if (error.name !== 'AbortError') {
+      if (error && error.type === 'API_KEY_MISSING') {
+        console.warn('API Key missing:', error.message)
+        setMessages(prev => [...prev, {
+          type: 'error',
+          // Use the specific message from the server response
+          content: `${error.message} Please go to the Settings page to configure your keys.`
+        }])
+      }
+      else if (error.name !== 'AbortError') {
         console.error('Error executing query:', error)
+        console.log('Error Name:', error.name)
+        console.log('Error Message:', error.message)
+        console.log('Error Keys:', Object.keys(error))
         setMessages(prev => [...prev, {
           type: 'error',
           content: 'Failed to execute query. Please try again.'
@@ -298,7 +339,7 @@ function UserChatPage() {
               </pre>
               {message.csv_file && (
                 <a
-                  href={`${BASE_URL}/api/query/download/${message.csv_file}`}
+                  href={`${API_BASE_URL}/query/download/${message.csv_file}`}
                   download={message.csv_file}
                   className="inline-flex items-center gap-2 bg-primary-500 hover:bg-primary-600 text-white px-4 py-2 rounded-lg transition-colors"
                 >
@@ -424,6 +465,11 @@ function UserChatPage() {
           )}
           
           {messages.map((message, index) => renderMessage(message, index))}
+          
+          {/* Show progress display when loading - after messages */}
+          {isLoading && sessionId && (
+            <ProgressDisplay sessionId={sessionId} isActive={isLoading} />
+          )}
           
           <div ref={messagesEndRef} />
         </div>

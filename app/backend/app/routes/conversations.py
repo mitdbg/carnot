@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -7,6 +7,11 @@ from sqlalchemy import desc, func, select
 from app.database import AsyncSessionLocal, Conversation, Message
 
 router = APIRouter()
+
+# TODO: break update_conversation into smaller pieces, e.g.:
+# - update title
+# - add message
+# - delete message
 
 class ConversationCreate(BaseModel):
     session_id: str
@@ -72,7 +77,7 @@ async def list_conversations():
             .group_by(Conversation.id)
             .order_by(desc(Conversation.updated_at))
         )
-        
+
         conversations = []
         for conversation, message_count in result:
             conversations.append(ConversationResponse(
@@ -84,7 +89,7 @@ async def list_conversations():
                 created_at=conversation.created_at,
                 updated_at=conversation.updated_at
             ))
-        
+
         return conversations
 
 @router.get("/{conversation_id}", response_model=ConversationDetailResponse)
@@ -96,10 +101,10 @@ async def get_conversation(conversation_id: int):
             select(Conversation).where(Conversation.id == conversation_id)
         )
         conversation = result.scalar_one_or_none()
-        
+
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
-        
+
         # Get messages
         messages_result = await db.execute(
             select(Message)
@@ -107,7 +112,7 @@ async def get_conversation(conversation_id: int):
             .order_by(Message.created_at)
         )
         messages = messages_result.scalars().all()
-        
+
         return ConversationDetailResponse(
             id=conversation.id,
             session_id=conversation.session_id,
@@ -115,7 +120,7 @@ async def get_conversation(conversation_id: int):
             dataset_ids=conversation.dataset_ids,
             created_at=conversation.created_at,
             updated_at=conversation.updated_at,
-            messages=[MessageResponse.from_orm(msg) for msg in messages]
+            messages=[MessageResponse.model_validate(msg) for msg in messages]
         )
 
 @router.post("/", response_model=ConversationResponse)
@@ -127,7 +132,7 @@ async def create_conversation(conversation: ConversationCreate):
             select(Conversation).where(Conversation.session_id == conversation.session_id)
         )
         existing = result.scalar_one_or_none()
-        
+
         if existing:
             return ConversationResponse(
                 id=existing.id,
@@ -138,7 +143,7 @@ async def create_conversation(conversation: ConversationCreate):
                 created_at=existing.created_at,
                 updated_at=existing.updated_at
             )
-        
+
         # Create new conversation
         new_conversation = Conversation(
             session_id=conversation.session_id,
@@ -148,7 +153,7 @@ async def create_conversation(conversation: ConversationCreate):
         db.add(new_conversation)
         await db.commit()
         await db.refresh(new_conversation)
-        
+
         return ConversationResponse(
             id=new_conversation.id,
             session_id=new_conversation.session_id,
@@ -167,23 +172,23 @@ async def update_conversation(conversation_id: int, update: ConversationUpdate):
             select(Conversation).where(Conversation.id == conversation_id)
         )
         conversation = result.scalar_one_or_none()
-        
+
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
-        
+
         if update.title is not None:
             conversation.title = update.title
-        
-        conversation.updated_at = datetime.utcnow()
+
+        conversation.updated_at = datetime.now(timezone.utc)
         await db.commit()
         await db.refresh(conversation)
-        
+
         # Get message count
         count_result = await db.execute(
             select(func.count(Message.id)).where(Message.conversation_id == conversation_id)
         )
         message_count = count_result.scalar()
-        
+
         return ConversationResponse(
             id=conversation.id,
             session_id=conversation.session_id,
@@ -202,16 +207,16 @@ async def delete_conversation(conversation_id: int):
             select(Conversation).where(Conversation.id == conversation_id)
         )
         conversation = result.scalar_one_or_none()
-        
+
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
-        
+
         await db.delete(conversation)
         await db.commit()
-        
+
         return {"message": "Conversation deleted successfully"}
 
-@router.post("/messages", response_model=MessageResponse)
+@router.post("/message", response_model=MessageResponse)
 async def create_message(message: MessageCreate):
     """Add a message to a conversation"""
     async with AsyncSessionLocal() as db:
@@ -220,10 +225,10 @@ async def create_message(message: MessageCreate):
             select(Conversation).where(Conversation.id == message.conversation_id)
         )
         conversation = result.scalar_one_or_none()
-        
+
         if not conversation:
             raise HTTPException(status_code=404, detail="Conversation not found")
-        
+
         # Create message
         new_message = Message(
             conversation_id=message.conversation_id,
@@ -233,12 +238,11 @@ async def create_message(message: MessageCreate):
             row_count=message.row_count
         )
         db.add(new_message)
-        
+
         # Update conversation timestamp
-        conversation.updated_at = datetime.utcnow()
-        
+        conversation.updated_at = datetime.now(timezone.utc)
+
         await db.commit()
         await db.refresh(new_message)
-        
-        return MessageResponse.from_orm(new_message)
 
+        return MessageResponse.model_validate(new_message)

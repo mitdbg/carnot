@@ -5,6 +5,7 @@ import Layout from './components/Layout'
 import DataManagementPage from './pages/DataManagementPage'
 import DatasetCreatorPage from './pages/DatasetCreatorPage'
 import UserChatPage from './pages/UserChatPage'
+import Settings from './pages/Settings'
 
 
 function App() {
@@ -32,6 +33,7 @@ function App() {
         <Route path="/" element={<DataManagementPage />} />
         <Route path="/datasets/create" element={<DatasetCreatorPage />} />
         <Route path="/chat" element={<UserChatPage />} />
+        <Route path="/settings" element={<Settings />} />
       </Routes>
     </Layout>
   )

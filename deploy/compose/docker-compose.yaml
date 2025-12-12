@@ -1,0 +1,74 @@
+services:
+  web-frontend:
+    image: ${DOCKERHUB_USERNAME}/carnot:frontend-${ENV_NAME}
+    build:
+      context: .
+      dockerfile: Dockerfile-frontend
+      args:
+        VITE_AUTH0_AUDIENCE: ${VITE_AUTH0_AUDIENCE}
+        VITE_AUTH0_DOMAIN: ${VITE_AUTH0_DOMAIN}
+        VITE_AUTH0_CLIENT_ID: ${VITE_AUTH0_CLIENT_ID}
+        VITE_AUTH0_ORGANIZATION_ID: ${VITE_AUTH0_ORGANIZATION_ID}
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL}
+    ports:
+      - "80:80"
+    depends_on:
+      - web-backend
+
+  web-backend:
+    image: ${DOCKERHUB_USERNAME}/carnot:backend-${ENV_NAME}
+    build:
+      context: .
+      dockerfile: Dockerfile-backend
+    environment:
+      AUTH0_DOMAIN: ${AUTH0_DOMAIN}
+      AUTH0_AUDIENCE: ${AUTH0_AUDIENCE}
+      AUTH0_CLAIMS_NAMESPACE: ${AUTH0_CLAIMS_NAMESPACE}
+      BASE_ORIGINS: ${BASE_ORIGINS}
+      CARNOT_USER_SALT: ${CARNOT_USER_SALT}
+      COMPANY_ENV: ${ENV_NAME}
+      LOCAL_ENV: ${LOCAL_ENV}
+      SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY}
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      POSTGRES_USER_FILE: /run/secrets/db_user
+      POSTGRES_DB_FILE: /run/secrets/db_name
+    ports:
+      - "8000:8000"
+    command: >
+      sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    secrets:
+      - db_password
+      - db_user
+      - db_name
+    depends_on:
+      db:
+        condition: service_healthy
+
+  db:
+    image: postgres:13-alpine
+    restart: always
+    environment:
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      POSTGRES_USER_FILE: /run/secrets/db_user
+      POSTGRES_DB_FILE: /run/secrets/db_name
+    ports:
+      - "5432:5432"
+    volumes:
+      - /mnt/pg-data/data:/var/lib/postgresql/data
+    secrets:
+      - db_password
+      - db_user
+      - db_name
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+secrets:
+  db_password:
+    file: secrets/db_password.txt
+  db_user:
+    file: secrets/db_user.txt
+  db_name:
+    file: secrets/db_name.txt

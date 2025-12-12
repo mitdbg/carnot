@@ -215,3 +215,4 @@ venv_web/
 *.log
 backend.log
 frontend.log
+secrets/

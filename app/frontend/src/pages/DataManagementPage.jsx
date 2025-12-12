@@ -1,3 +1,4 @@
+import path from 'path';
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Plus, Upload, Loader2, Database, Calendar, FileText, Trash2, X, Eye } from 'lucide-react'
@@ -177,7 +178,7 @@ function DataManagementPage() {
                   className="flex items-center gap-2 text-sm text-gray-600 bg-gray-50 px-3 py-2 rounded"
                 >
                   <FileText className="w-4 h-4" />
-                  <span className="flex-1">{file.file_name}</span>
+                  <span className="flex-1">{path.basename(file.file_path)}</span>
                   <span className="text-xs text-gray-400">
                     {formatDate(file.upload_date)}
                   </span>
@@ -292,7 +293,7 @@ function DataManagementPage() {
                       <FileText className="w-5 h-5 text-gray-400 flex-shrink-0" />
                       <div className="flex-1 min-w-0">
                         <p className="text-sm font-medium text-gray-900 truncate">
-                          {file.file_name}
+                          {path.basename(file.file_path)}
                         </p>
                         <p className="text-xs text-gray-500 truncate">
                           {file.file_path}

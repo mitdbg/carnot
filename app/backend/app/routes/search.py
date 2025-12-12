@@ -1,39 +1,104 @@
 import logging
 import os
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 import carnot
+from app.auth import get_user_hash
+from app.database import get_db
+from app.env import DATA_DIR, IS_LOCAL_ENV
 from app.models.schemas import SearchQuery, SearchResult
+from app.services.file_service import LocalFileService, S3FileService
+from app.services.llm import get_user_llm_config
+from carnot.core.data.iter_dataset import IterDataset
 
 router = APIRouter()
+file_service = LocalFileService() if IS_LOCAL_ENV else S3FileService()
 logger = logging.getLogger(__name__)
 
 SKIP_SUFFIXES = {".pdf", ".jpg", ".jpeg", ".png", ".gif", ".zip", ".exe", ".bin"}
-IS_REMOTE_ENV = os.getenv("REMOTE_ENV", "false").lower() == "true"
-if IS_REMOTE_ENV:
-    COMPANY_ENV = os.getenv("COMPANY_ENV", "dev")
-    DATA_ROOT = Path(f"s3://carnot-research/{COMPANY_ENV}/data")
-    UPLOAD_ROOT = Path(f"s3://carnot-research/{COMPANY_ENV}/uploaded_files")
-else:
-    PROJECT_ROOT = Path(__file__).resolve().parents[4]
-    DATA_ROOT = os.path.join(PROJECT_ROOT, "data")
-    UPLOAD_ROOT = os.path.join(Path.cwd(), "uploaded_files")
-    os.makedirs(DATA_ROOT, exist_ok=True)
-    os.makedirs(UPLOAD_ROOT, exist_ok=True)
+
+class TextFileWithPath(BaseModel):
+    file_path: str
+    file_name: str
+    contents: str
+
+
+class RecursiveTextFileDataset(IterDataset):
+    def __init__(self, id: str, paths: list[str] | None) -> None:
+        paths = paths or [DATA_DIR]
+        super().__init__(id=id, schema=TextFileWithPath)
+        self.filepaths = [
+            fp 
+            for path in paths
+            for fp in file_service.list_all_subfiles(path)
+            if Path(fp).suffix.lower() not in SKIP_SUFFIXES
+        ]
+
+    def __getitem__(self, idx: int) -> dict:
+        filepath = self.filepaths[idx]
+        filename = os.path.basename(filepath)
+
+        try:
+            contents = file_service.read_file(filepath)
+        except Exception:
+            contents = ""
+
+        return {
+            "file_path": filepath,
+            "file_name": filename,
+            "contents": contents,
+        }
+
+
+def run_semantic_search(query_text: str, search_paths: list[str] | None, user_config: dict) -> list[SearchResult]:
+    ds = RecursiveTextFileDataset(id="search", paths=search_paths)
+    ds = ds.sem_filter(f"The file matches the query: {query_text}")
+    config = carnot.QueryProcessorConfig(
+        policy=carnot.MaxQuality(),
+        llm_config=user_config,
+        progress=False,
+    )
+
+    output_ds = ds.run(config=config)
+
+    results = []
+    for item in output_ds:
+        content = getattr(item, "contents", "")
+        snippet = content[:200] + "..." if len(content) > 200 else content
+        results.append(
+            SearchResult(
+                file_path=getattr(item, "file_path", ""),
+                file_name=getattr(item, "file_name", ""),
+                relevance_score=1.0,
+                snippet=snippet,
+            )
+        )
+
+    return results
 
 
 @router.post("/", response_model=list[SearchResult])
-async def search_files(query: SearchQuery):
+async def search_files(
+    query: SearchQuery,
+    auth_data: tuple = Depends(get_user_hash),
+    db: Session = Depends(get_db)
+):
     try:
-        search_path = query.path or ""
-        search_dirs = determine_search_dirs(search_path)
+        # retrieve user LLM config
+        user_hash, _ = auth_data
+        user_config = await get_user_llm_config(db, user_hash)
+        if not user_config:
+            raise HTTPException(
+                status_code=400, 
+                detail="No LLM API keys found for this user. Please configure them in Settings."
+            )
 
-        results: list[SearchResult] = []
-        for search_dir, label in search_dirs:
-            results.extend(run_semantic_search(query.query, search_dir, label))
+        search_paths = query.paths or None
+        results: list[SearchResult] = run_semantic_search(query.query, search_paths, user_config)
 
         unique: list[SearchResult] = []
         seen_paths = set()
@@ -42,118 +107,10 @@ async def search_files(query: SearchQuery):
                 seen_paths.add(result.file_path)
                 unique.append(result)
 
-        unique.sort(key=lambda x: x.relevance_score or 0, reverse=True)
-        return unique[:50]
+        return unique
+
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Search failed")
         raise HTTPException(status_code=500, detail=f"Error searching files: {exc}") from exc
-
-
-def determine_search_dirs(search_path: str) -> list[tuple[Path, str]]:
-    search_dirs: list[tuple[Path, str]] = []
-
-    if search_path.startswith("data"):
-        path = DATA_ROOT / search_path.replace("data/", "").strip("/")
-        if path.exists() and path.is_dir():
-            search_dirs.append((path, "data"))
-    elif search_path.startswith("uploaded_files"):
-        path = UPLOAD_ROOT / search_path.replace("uploaded_files/", "").strip("/")
-        if path.exists() and path.is_dir():
-            search_dirs.append((path, "uploaded_files"))
-    else:
-        if DATA_ROOT.exists():
-            search_dirs.append((DATA_ROOT, "data"))
-        if UPLOAD_ROOT.exists():
-            search_dirs.append((UPLOAD_ROOT, "uploaded_files"))
-
-    return search_dirs
-
-
-def run_semantic_search(query_text: str, search_dir: Path, label: str) -> list[SearchResult]:
-    text_results = semantic_search_with_context(query_text, search_dir, label)
-    return text_results
-
-
-def semantic_search_with_context(query_text: str, search_dir: Path, label: str) -> list[SearchResult]:
-    results: list[SearchResult] = []
-
-    with TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
-        text_files = copy_text_files(search_dir, temp_path)
-        if text_files == 0:
-            return results
-
-        context_id = f"search_{label}_{abs(hash(search_dir)) % 10000}"
-        ctx = carnot.TextFileContext(
-            path=str(temp_path),
-            id=context_id,
-            description=f"Text files from {label} directory",
-        )
-
-        search_ctx = ctx.search(query_text)
-        config = carnot.QueryProcessorConfig(
-            policy=carnot.MaxQuality(),
-            progress=False,
-        )
-
-        search_results = search_ctx.run(config=config)
-        if not hasattr(search_results, "records") or not search_results.records:
-            return results
-
-        for record in search_results.records:
-            state = getattr(record, "record_state", None)
-            if not state:
-                continue
-
-            temp_file_path = state.get("filepath")
-            if not temp_file_path:
-                continue
-
-            temp_file = Path(temp_file_path)
-            if not temp_file.exists():
-                continue
-
-            rel_path = temp_file.relative_to(temp_path)
-            original_file = search_dir / rel_path
-            if not original_file.exists():
-                continue
-
-            snippet = read_snippet(original_file)
-            results.append(
-                SearchResult(
-                    file_path=str(Path(label) / rel_path),
-                    file_name=original_file.name,
-                    relevance_score=1.0,
-                    snippet=snippet,
-                )
-            )
-
-    return results
-
-
-def copy_text_files(source_root: Path, destination_root: Path) -> int:
-    copied = 0
-    for root, _, files in os.walk(source_root):
-        root_path = Path(root)
-        for filename in files:
-            if Path(filename).suffix.lower() in SKIP_SUFFIXES:
-                continue
-            source = root_path / filename
-            rel_path = source.relative_to(source_root)
-            destination = destination_root / rel_path
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                destination.write_bytes(source.read_bytes())
-                copied += 1
-            except OSError as exc:
-                logger.debug("Failed to copy %s: %s", source, exc)
-    return copied
-
-
-def read_snippet(path: Path, length: int = 200) -> str | None:
-    try:
-        content = path.read_text(encoding="utf-8", errors="ignore")
-        return content[:length] + ("..." if len(content) > length else "")
-    except OSError:
-        return None
-

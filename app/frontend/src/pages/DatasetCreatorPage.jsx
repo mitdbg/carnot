@@ -14,19 +14,18 @@ function DatasetCreatorPage() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
 
-  const handleFileToggle = (filePath, fileName, newSet = null) => {
+  const handleFileToggle = (filePath, newSet = null) => {
     if (newSet !== null) {
       // Allow passing a new set directly (for bulk operations)
       setSelectedFiles(newSet)
       return
     }
     
-    const key = `${filePath}||${fileName}`
     const newSelected = new Set(selectedFiles)
-    if (newSelected.has(key)) {
-      newSelected.delete(key)
+    if (newSelected.has(filePath)) {
+      newSelected.delete(filePath)
     } else {
-      newSelected.add(key)
+      newSelected.add(filePath)
     }
     setSelectedFiles(newSelected)
   }
@@ -34,8 +33,7 @@ function DatasetCreatorPage() {
   const handleChatbotSelect = (files) => {
     const newSelected = new Set(selectedFiles)
     files.forEach((file) => {
-      const key = `${file.file_path}||${file.file_name}`
-      newSelected.add(key)
+      newSelected.add(file.file_path)
     })
     setSelectedFiles(newSelected)
   }
@@ -59,16 +57,12 @@ function DatasetCreatorPage() {
       setLoading(true)
       setError(null)
 
-      // Convert selected files to API format
-      const files = Array.from(selectedFiles).map((key) => {
-        const [file_path, file_name] = key.split('||')
-        return { file_path, file_name }
-      })
-
+      // Convert selected files to Array
+      const files = Array.from(selectedFiles)
       await datasetsApi.create({
         name: datasetName,
-        annotation,
-        files,
+        annotation: annotation,
+        files: files,
       })
 
       // Navigate back to data management page

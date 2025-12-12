@@ -66,6 +66,13 @@ jobs:
           role-to-assume: arn:aws:iam::422297141788:role/CarnotGithubRole
           aws-region: us-east-1
 
+      - name: Write Deployer Key to Files
+        env:
+          CARNOT_DEPLOY_KEY: ${{ secrets.CARNOT_DEPLOY_KEY }}
+        run: |
+          echo "$CARNOT_DEPLOY_KEY" > deployer_key.pem
+          chmod 400 deployer_key.pem
+
       ######################################################################
       # STEP 1 — DEPLOY GLOBAL TERRAFORM
       ######################################################################
@@ -90,7 +97,34 @@ jobs:
       - name: Terraform Apply (Global)
         working-directory: deploy/terraform/global
         id: apply-global
-        run: terraform apply -var-file="global-vars.tfvars" -auto-approve
+        run: |
+          terraform apply -var-file="global-vars.tfvars" -auto-approve
+      
+      - name: Get Homepage EC2 Public IP
+        working-directory: deploy/terraform/global
+        id: homepage-ip
+        run: |
+          homepage_public_ip=$(terraform output -raw homepage_public_ip)
+          echo "HOMEPAGE_PUBLIC_IP=$homepage_public_ip" >> $GITHUB_ENV
+
+      - name: Start NGINX on Homepage EC2
+        env:
+          CARNOT_DEPLOY_KEY: ${{ secrets.CARNOT_DEPLOY_KEY }}
+        run: |
+          echo "Copying homepage files to $HOMEPAGE_PUBLIC_IP"
+          
+          # copy index.html to EC2; sleep first to wait for it to be ready to accept SSH connections
+          sleep 5
+          scp -o StrictHostKeyChecking=no -i deployer_key.pem app/index.html ubuntu@$HOMEPAGE_PUBLIC_IP:~/
+
+          # Copy index.html to the NGINX default location inside the container's volume mount and (re)start container
+          ssh -o StrictHostKeyChecking=no -i deployer_key.pem ubuntu@$HOMEPAGE_PUBLIC_IP "
+            sudo docker start carnot-homepage-nginx
+            sleep 3
+            sudo docker cp index.html carnot-homepage-nginx:/usr/share/nginx/html/index.html
+            rm index.html
+            sudo docker restart carnot-homepage-nginx
+          "
 
       ######################################################################
       # STEP 2 — DEPLOY ENVIRONMENT TERRAFORM
@@ -133,6 +167,7 @@ jobs:
         run: |
           ec2_public_ip=$(terraform output -raw ec2_public_ip)
           echo "EC2_PUBLIC_IP=$ec2_public_ip" >> $GITHUB_ENV
+
       ######################################################################
       # STEP 3 — BUILD & DEPLOY APPLICATION
       ######################################################################
@@ -145,7 +180,7 @@ jobs:
 
       - name: Build & Push Docker Images to Docker Hub
         run: |
-          # Copy relevant source files to build context
+          # copy relevant source files to build context
           cp -r app/frontend deploy/compose/frontend
           cp -r app/backend deploy/compose/backend
           cp -r src deploy/compose/src
@@ -155,33 +190,28 @@ jobs:
           # navigate to build context
           cd deploy/compose
 
-          # Build frontend image
+          # set environment variables for build arguments;
+          export DOCKERHUB_USERNAME=${{ vars.DOCKERHUB_USERNAME }}
+          export ENV_NAME=${ENV_NAME}
+          export VITE_AUTH0_AUDIENCE=${{ secrets.AUTH0_AUDIENCE }}
+          export VITE_AUTH0_DOMAIN=${{ secrets.AUTH0_CUSTOM_DOMAIN }}
+          export VITE_API_BASE_URL="https://${SUBDOMAIN}.carnot-research.org/api"
           if [[ "${GITHUB_REF_NAME}" == "wl-prod" ]]; then
-            docker build -f Dockerfile-frontend \
-              --build-arg VITE_AUTH0_DOMAIN=${{ secrets.AUTH0_CUSTOM_DOMAIN }} \
-              --build-arg VITE_AUTH0_CLIENT_ID=${{ secrets.WL_PROD_AUTH0_CLIENT_ID }} \
-              --build-arg VITE_AUTH0_ORGANIZATION_ID=${{ secrets.WL_PROD_AUTH0_ORGANIZATION_ID }} \
-              -t ${{ vars.DOCKERHUB_USERNAME }}/carnot:frontend .
+            export VITE_AUTH0_CLIENT_ID=${{ secrets.WL_PROD_AUTH0_CLIENT_ID }}
+            export VITE_AUTH0_ORGANIZATION_ID=${{ secrets.WL_PROD_AUTH0_ORGANIZATION_ID }}
           elif [[ "${GITHUB_REF_NAME}" == "wm-prod" ]]; then
-            docker build -f Dockerfile-frontend \
-              --build-arg VITE_AUTH0_DOMAIN=${{ secrets.AUTH0_CUSTOM_DOMAIN }} \
-              --build-arg VITE_AUTH0_CLIENT_ID=${{ secrets.WM_PROD_AUTH0_CLIENT_ID }} \
-              --build-arg VITE_AUTH0_ORGANIZATION_ID=${{ secrets.WM_PROD_AUTH0_ORGANIZATION_ID }} \
-              -t ${{ vars.DOCKERHUB_USERNAME }}/carnot:frontend .
+            export VITE_AUTH0_CLIENT_ID=${{ secrets.WM_PROD_AUTH0_CLIENT_ID }}
+            export VITE_AUTH0_ORGANIZATION_ID=${{ secrets.WM_PROD_AUTH0_ORGANIZATION_ID }}
           else
-            docker build -f Dockerfile-frontend \
-              --build-arg VITE_AUTH0_DOMAIN=${{ secrets.AUTH0_CUSTOM_DOMAIN }} \
-              --build-arg VITE_AUTH0_CLIENT_ID=${{ secrets.DEV_AUTH0_CLIENT_ID }} \
-              --build-arg VITE_AUTH0_ORGANIZATION_ID=${{ secrets.DEV_AUTH0_ORGANIZATION_ID }} \
-              -t ${{ vars.DOCKERHUB_USERNAME }}/carnot:frontend .
+            export VITE_AUTH0_CLIENT_ID=${{ secrets.DEV_AUTH0_CLIENT_ID }}
+            export VITE_AUTH0_ORGANIZATION_ID=${{ secrets.DEV_AUTH0_ORGANIZATION_ID }}
           fi
 
-          # Build backend image
-          docker build -f Dockerfile-backend -t ${{ vars.DOCKERHUB_USERNAME }}/carnot:backend .
+          # build images using docker compose
+          docker compose build
 
-          # Push both images
-          docker push ${{ vars.DOCKERHUB_USERNAME }}/carnot:frontend
-          docker push ${{ vars.DOCKERHUB_USERNAME }}/carnot:backend
+          # push images to docker hub
+          docker compose push
 
       - name: Deploy Application to EC2 Instance
         env:
@@ -199,13 +229,22 @@ jobs:
           echo "$CARNOT_DB_NAME" > deploy/compose/secrets/db_name.txt
           chmod 600 deploy/compose/secrets/db_*.txt
 
+          # Prepare deploy environment variables
+          echo "DOCKERHUB_USERNAME=${{ vars.DOCKERHUB_USERNAME }}" >> deploy/compose/.env
+          echo "ENV_NAME=${ENV_NAME}" >> deploy/compose/.env
+          echo "LOCAL_ENV=false" >> deploy/compose/.env
+          echo "SETTINGS_ENCRYPTION_KEY=${{ secrets.SETTINGS_ENCRYPTION_KEY }}" >> deploy/compose/.env
+          echo "AUTH0_DOMAIN=${{ secrets.AUTH0_CUSTOM_DOMAIN }}" >> deploy/compose/.env
+          echo "AUTH0_AUDIENCE=${{ secrets.AUTH0_AUDIENCE }}" >> deploy/compose/.env
+          echo "AUTH0_CLAIMS_NAMESPACE=${{ secrets.AUTH0_CLAIMS_NAMESPACE }}" >> deploy/compose/.env
+          echo "BASE_ORIGINS=http://${SUBDOMAIN}.carnot-research.org,https://${SUBDOMAIN}.carnot-research.org,http://web-backend,https://web-backend" >> deploy/compose/.env
+          echo "CARNOT_USER_SALT=${{ secrets.CARNOT_USER_SALT }}" >> deploy/compose/.env
+
           # Copy compose bundle to EC2
-          echo "$CARNOT_DEPLOY_KEY" > deploy/terraform/deployer_key.pem
-          chmod 400 deploy/terraform/deployer_key.pem
-          scp -r -o StrictHostKeyChecking=no -i deploy/terraform/deployer_key.pem deploy/compose ubuntu@$EC2_PUBLIC_IP:~/
+          scp -r -o StrictHostKeyChecking=no -i deployer_key.pem deploy/compose ubuntu@$EC2_PUBLIC_IP:~/
 
           # Shutdown current docker containers
-          ssh -o StrictHostKeyChecking=no -i deploy/terraform/deployer_key.pem ubuntu@$EC2_PUBLIC_IP "
+          ssh -o StrictHostKeyChecking=no -i deployer_key.pem ubuntu@$EC2_PUBLIC_IP "
             cd compose
             docker compose down
             docker rmi -f $(docker images -aq)
@@ -213,12 +252,8 @@ jobs:
           "
 
           # Login & deploy using pulled images
-          ssh -o StrictHostKeyChecking=no -i deploy/terraform/deployer_key.pem ubuntu@$EC2_PUBLIC_IP "
+          ssh -o StrictHostKeyChecking=no -i deployer_key.pem ubuntu@$EC2_PUBLIC_IP "
             cd compose
-            export SUBDOMAIN=${SUBDOMAIN}
-            export API_BASE_URL="http://$SUBDOMAIN.carnot-research.org:8000/api"
-            export BASE_URL="http://$SUBDOMAIN.carnot-research.org:8000"
-            export BASE_ORIGINS="http://$SUBDOMAIN.carnot-research.org,https://$SUBDOMAIN.carnot-research.org"
             docker login -u '${{ vars.DOCKERHUB_USERNAME }}' -p '${{ secrets.DOCKERHUB_TOKEN }}'
             docker compose pull
             docker compose up -d

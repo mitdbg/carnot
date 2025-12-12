@@ -16,6 +16,8 @@ class BaseExecutionStrategy:
                  num_samples: int | None = None,
                  verbose: bool = False,
                  progress: bool = True,
+                 session_id: str | None = None,
+                 progress_log_file: str | None = None,
                  *args,
                  **kwargs):
         self.scan_start_idx = scan_start_idx
@@ -24,6 +26,8 @@ class BaseExecutionStrategy:
         self.num_samples = num_samples
         self.verbose = verbose
         self.progress = progress
+        self.session_id = session_id
+        self.progress_log_file = progress_log_file
 
 
 class ExecutionStrategy(BaseExecutionStrategy, ABC):

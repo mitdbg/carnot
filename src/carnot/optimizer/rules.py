@@ -14,6 +14,7 @@ from carnot.operators.logical import (
     BaseScan,
     ComputeOperator,
     ContextScan,
+    FilteredScan,
     SearchOperator,
 )
 from carnot.operators.physical import PhysicalOperator
@@ -351,6 +352,7 @@ class BasicSubstitutionRule(ImplementationRule):
         # ComputeOperator: SmolAgentsCompute,
         SearchOperator: SmolAgentsSearch, # SmolAgentsManagedSearch, # SmolAgentsCustomManagedSearch
         ContextScan: ContextScanOp,
+        FilteredScan: SmolAgentsSearch,
     }
 
     @classmethod

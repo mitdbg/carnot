@@ -21,3 +21,7 @@ output "https_listener_arn" {
 output "http_listener_arn" {
   value = aws_lb_listener.http_redirect.arn
 }
+
+output "homepage_public_ip" {
+  value       = aws_instance.homepage_ec2.public_ip
+}

@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Carnot | Deep Research Engine</title>
+    <style>
+        /* 
+         * MIT VISUAL IDENTITY COMPLIANCE NOTES:
+         * Colors: 
+         * - Primary: MIT Red (#A31F34), Black (#000000), White (#FFFFFF)
+         * - Secondary: Silver Gray (#8A8B8C)
+         * Typography:
+         * - Primary Stack: Neue Haas Grotesk (Licensed), falling back to Helvetica Neue/Helvetica/Arial.
+         */
+
+        :root {
+            --mit-red: #A31F34;
+            --mit-dark-red: #781626;
+            --mit-gray: #8A8B8C;
+            --mit-light-gray: #F2F2F2;
+            --mit-black: #000000;
+            --text-color: #333333;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: "Neue Haas Grotesk Display", "Helvetica Neue", Helvetica, Arial, sans-serif;
+            background-color: #FFFFFF;
+            color: var(--text-color);
+            line-height: 1.6;
+            -webkit-font-smoothing: antialiased;
+            display: flex;
+            flex-direction: column;
+            min-height: 100vh;
+        }
+
+        /* MAIN CONTENT */
+        /* Flexbox centers the content vertically since the header is gone */
+        main {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 60px 20px;
+            max-width: 800px;
+            margin: 0 auto;
+            text-align: center;
+        }
+
+        /* LOGO CONTAINER */
+        .logo-container {
+            width: 100%;
+            max-width: 500px;
+            margin-bottom: 40px;
+        }
+
+        /* TYPOGRAPHY */
+        h1 {
+            font-size: 2.5rem;
+            font-weight: 300;
+            margin-bottom: 20px;
+            color: var(--mit-black);
+            letter-spacing: -0.5px;
+        }
+
+        p.lead {
+            font-size: 1.25rem;
+            color: var(--mit-gray);
+            font-weight: 300;
+            max-width: 700px; /* Slightly wider to accommodate new text */
+            margin: 0 auto 40px auto;
+        }
+
+        .cta-button {
+            display: inline-block;
+            background-color: var(--mit-red);
+            color: white;
+            padding: 14px 32px;
+            font-size: 14px;
+            font-weight: 700;
+            text-transform: uppercase;
+            text-decoration: none;
+            letter-spacing: 1px;
+            border-radius: 2px;
+            transition: background-color 0.2s ease;
+        }
+
+        .cta-button:hover {
+            background-color: var(--mit-dark-red);
+        }
+
+        /* FOOTER */
+        footer {
+            background-color: var(--mit-light-gray);
+            padding: 40px;
+            text-align: center;
+            font-size: 12px;
+            color: var(--mit-gray);
+            border-top: 1px solid #E5E5E5;
+        }
+
+        footer a {
+            color: var(--mit-red);
+            text-decoration: none;
+        }
+
+        /* ANIMATION FADE IN */
+        .fade-in {
+            animation: fadeIn 1.2s ease-out forwards;
+            opacity: 0;
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        /* SVG RESPONSIVENESS */
+        svg {
+            width: 100%;
+            height: auto;
+        }
+    </style>
+</head>
+<body>
+
+    <main class="fade-in">
+        <div class="logo-container">
+            <!-- EMBEDDED SVG LOGO -->
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 120">
+                <defs>
+                  <linearGradient id="mitRedGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+                    <stop offset="0%" style="stop-color:#A31F34;stop-opacity:1" />
+                    <stop offset="100%" style="stop-color:#781626;stop-opacity:1" />
+                  </linearGradient>
+                  
+                  <linearGradient id="mitGrayGrad" x1="0%" y1="100%" x2="100%" y2="0%">
+                    <stop offset="0%" style="stop-color:#000000;stop-opacity:1" />
+                    <stop offset="100%" style="stop-color:#8A8B8C;stop-opacity:1" />
+                  </linearGradient>
+                </defs>
+              
+                <g transform="translate(20, 10)">
+                  <!-- Upper Arc -->
+                  <path d="M20,50 C20,20 45,10 75,10 C90,10 100,15 105,20" 
+                        fill="none" 
+                        stroke="url(#mitRedGrad)" 
+                        stroke-width="12" 
+                        stroke-linecap="round" />
+              
+                  <!-- Lower Arc -->
+                  <path d="M95,80 C85,90 60,95 40,90 C15,85 10,60 10,50" 
+                        fill="none" 
+                        stroke="url(#mitGrayGrad)" 
+                        stroke-width="12" 
+                        stroke-linecap="round" />
+                  
+                  <!-- Adiabatic Connection -->
+                  <path d="M105,20 L95,80" 
+                        fill="none" 
+                        stroke="#C2C0BF" 
+                        stroke-width="3" 
+                        stroke-dasharray="3,3" />
+              
+                  <!-- Node -->
+                  <rect x="45" y="45" width="12" height="12" transform="rotate(45 51 51)" fill="#A31F34" />
+                </g>
+              
+                <g transform="translate(140, 72)">
+                  <text font-family="'Neue Haas Grotesk Display', 'Helvetica Neue', Helvetica, Arial, sans-serif" 
+                        font-weight="700" 
+                        font-size="52" 
+                        fill="#000000" 
+                        letter-spacing="1">
+                    CARNOT
+                  </text>
+                  <text x="2" y="22" 
+                        font-family="'Neue Haas Grotesk Text', 'Helvetica Neue', Helvetica, Arial, sans-serif" 
+                        font-weight="400" 
+                        font-size="12" 
+                        fill="#8A8B8C" 
+                        letter-spacing="1.5"
+                        style="text-transform: uppercase;">
+                    Deep Research Engine
+                  </text>
+                </g>
+              </svg>
+        </div>
+
+        <h1>Cost-Based Optimization for Deep Research.</h1>
+        
+        <p class="lead">
+            Pushing the boundaries of Deep Research with optimized execution. 
+            Carnot aims to improve the quality, cost, and latency of queries executed over private data warehouses.
+        </p>
+
+        <a href="mailto:mdrusso@mit.edu" class="cta-button">Request Access</a>
+
+    </main>
+
+    <footer>
+        <p>&copy; 2025 Carnot Project. MIT Data Systems Group.<br>
+        <br>
+        This project is a research initiative and is not commercially available.</p>
+    </footer>
+
+</body>
+</html>

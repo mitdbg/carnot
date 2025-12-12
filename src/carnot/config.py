@@ -21,6 +21,8 @@ class QueryProcessorConfig(BaseModel):
     num_samples: int = Field(default=None)
     verbose: bool = Field(default=False)
     progress: bool = Field(default=True)
+    session_id: str | None = Field(default=None)
+    progress_log_file: str | None = Field(default=None)
     available_models: list[Model] | None = Field(default=None)
     remove_models: list[Model] | None = Field(default=None)
     max_workers: int | None = Field(default=64)
@@ -47,6 +49,9 @@ class QueryProcessorConfig(BaseModel):
     seed: int = Field(default=42)
     exp_name: str | None = Field(default=None)
     priors: dict | None = Field(default=None)
+
+    # llm config
+    llm_config: dict = Field(default_factory=dict)
 
     def to_dict(self) -> dict:
         """Convert the config to a dict representation."""

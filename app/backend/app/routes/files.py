@@ -1,10 +1,4 @@
-import os
-import re
-import shutil
-import tarfile
-import zipfile
-from datetime import datetime
-from pathlib import Path
+import logging
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import select
@@ -12,267 +6,142 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import File as FileRecord
 from app.database import get_db
-from app.models.schemas import DirectoryContents, FileItem, UploadResponse
+from app.env import BASE_DIR, IS_LOCAL_ENV
+from app.models.schemas import FileItem
+from app.services.file_service import LocalFileService, S3FileService
+
+logger = logging.getLogger('uvicorn.error')
 
 router = APIRouter()
+file_service = LocalFileService() if IS_LOCAL_ENV else S3FileService()
 
-# Base upload directory
-IS_REMOTE_ENV = os.getenv("REMOTE_ENV", "false").lower() == "true"
-if IS_REMOTE_ENV:
-    COMPANY_ENV = os.getenv("COMPANY_ENV", "dev")
-    DATA_DIR = Path(f"s3://carnot-research/{COMPANY_ENV}/data/")
-    UPLOAD_DIR = Path(f"s3://carnot-research/{COMPANY_ENV}/uploaded_files/")
-    UPLOAD_DIR_PATH = Path(UPLOAD_DIR) # TODO: we can probably delete one of UPLOAD_DIR or UPLOAD_DIR_PATH
-else:
-    PROJECT_ROOT = Path(__file__).resolve().parents[4]
-    DATA_DIR = os.path.join(PROJECT_ROOT, "data")
-    UPLOAD_DIR = os.getenv("UPLOAD_DIR", os.path.join(os.getcwd(), "uploaded_files"))
-    UPLOAD_DIR_PATH = Path(UPLOAD_DIR)
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(UPLOAD_DIR, exist_ok=True)
+# def normalize_path(path: str) -> str:
+#     """
+#     Normalizes a path, preserving protocol (like s3://) and ensuring consistent
+#     single slashes and no trailing slash (unless the path is just the root protocol).
+#     """
+#     if not path:
+#         return ""
 
-ARCHIVE_EXTENSIONS = (
-    ".zip",
-    ".tar",
-    ".tar.gz",
-    ".tgz",
-    ".tar.bz2",
-    ".tbz",
-    ".tar.xz",
-    ".txz",
-)
+#     # separate protocol (e.g., s3://bucket, file://) from the path segment
+#     protocol = ""
+#     path_segment = path
 
+#     # check for protocol or local absolute path starting with "/"
+#     if "://" in path:
+#         parts = path.split("://", 1)
+#         protocol = parts[0] + "://"
+#         path_segment = parts[1]
+#     elif path.startswith("/"):
+#         # for local paths, treat the initial '/' as a special character to preserve
+#         path_segment = path.lstrip("/")
 
-def _sanitize_directory_name(name: str) -> str:
-    sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
-    return sanitized or "archive"
+#     # normalize the path segment: remove multiple slashes and trailing slash
+#     # This also handles the case where the protocol part might have had extra slashes
+#     path_segment = path_segment.replace("//", "/")
+#     path_segment = path_segment.rstrip("/")
 
+#     # recombine
+#     if protocol:
+#         # for protocols, the combination looks like: s3://bucket/key/
+#         return protocol + path_segment
+#     elif path.startswith("/") and path_segment:
+#         # for absolute local paths: /carnot/data
+#         return "/" + path_segment
+#     elif path.startswith("/") and not path_segment:
+#         # If path was just "/", return "/"
+#         return "/"
 
-def _archive_base_name(filename: str) -> str:
-    lower = filename.lower()
-    if lower.endswith(".tar.gz") or lower.endswith(".tar.bz2") or lower.endswith(".tar.xz"):
-        base = Path(filename).stem  # remove .gz/.bz2/.xz
-        base = Path(base).stem  # remove .tar
-    elif lower.endswith(".tgz") or lower.endswith(".tbz") or lower.endswith(".txz"):
-        base = Path(filename).stem  # remove gz variant
-        base = Path(base).stem
-    else:
-        base = Path(filename).stem
-    return _sanitize_directory_name(base)
+#     return path_segment
+def normalize_path(path: str) -> str:
+    """
+    Normalizes a path, preserving protocol (like s3://) and ensuring consistent single slashes.
+    """
+    if not path:
+        return ""
 
+    # separate protocol (e.g., s3://bucket, file://) from the path segment
+    protocol = ""
+    path_segment = path
 
-def _ensure_unique_directory(base_dir: Path, base_name: str) -> Path:
-    candidate = base_dir / base_name
-    counter = 1
-    while candidate.exists():
-        candidate = base_dir / f"{base_name}_{counter}"
-        counter += 1
-    candidate.mkdir(parents=True, exist_ok=False)
-    return candidate
+    # check for protocol or local absolute path starting with "/"
+    if "://" in path:
+        parts = path.split("://", 1)
+        protocol = parts[0] + "://"
+        path_segment = parts[1]
+    elif path.startswith("/"):
+        # for local paths, treat the initial '/' as a special character to preserve
+        path_segment = path.lstrip("/")
 
+    # normalize the path segment: remove multiple slashes and trailing slash
+    # This also handles the case where the protocol part might have had extra slashes
+    path_segment = path_segment.replace("//", "/")
 
-def _safe_join(base: Path, target: Path) -> Path:
-    resolved_base = base.resolve()
-    resolved_target = target.resolve()
-    try:
-        resolved_target.relative_to(resolved_base)
-    except ValueError as err:
-        raise HTTPException(status_code=400, detail="Archive contains unsafe paths") from err
-    return resolved_target
+    # recombine
+    if protocol:
+        # for protocols, the combination looks like: s3://bucket/key/
+        return protocol + path_segment
+    elif path.startswith("/") and path_segment:
+        # for absolute local paths: /carnot/data/
+        return "/" + path_segment
+    elif path.startswith("/") and not path_segment:
+        # If path was just "/", return "/"
+        return "/"
 
-
-def _extract_zip(archive_path: Path, destination: Path) -> None:
-    try:
-        with zipfile.ZipFile(archive_path) as zip_ref:
-            for member in zip_ref.infolist():
-                member_path = destination / member.filename
-                _safe_join(destination, member_path)
-            zip_ref.extractall(destination)
-    except zipfile.BadZipFile as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid ZIP archive: {exc}") from exc
-
-
-def _extract_tar(archive_path: Path, destination: Path) -> None:
-    try:
-        with tarfile.open(archive_path, "r:*") as tar_ref:
-            members = tar_ref.getmembers()
-            for member in members:
-                member_path = destination / member.name
-                _safe_join(destination, member_path)
-            tar_ref.extractall(destination, members)
-    except tarfile.TarError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid TAR archive: {exc}") from exc
+    return path_segment
 
 
-def _extract_archive(archive_path: Path) -> tuple[str | None, list[str] | None]:
-    filename = archive_path.name
-    lower = filename.lower()
-    if not any(lower.endswith(ext) for ext in ARCHIVE_EXTENSIONS):
-        return None, None
-
-    base_name = _archive_base_name(filename)
-    extraction_dir = _ensure_unique_directory(UPLOAD_DIR_PATH, base_name)
-
-    if lower.endswith(".zip"):
-        _extract_zip(archive_path, extraction_dir)
-    else:
-        _extract_tar(archive_path, extraction_dir)
-
-    extracted_files: list[str] = []
-    for path in extraction_dir.rglob("*"):
-        if path.is_file():
-            relative_path = Path("uploaded_files") / path.relative_to(UPLOAD_DIR_PATH)
-            extracted_files.append(str(relative_path).replace(os.sep, "/"))
-
-    extracted_to = str(Path("uploaded_files") / extraction_dir.relative_to(UPLOAD_DIR_PATH)).replace(os.sep, "/")
-    return extracted_to, extracted_files
-
-@router.get("/browse", response_model=DirectoryContents)
+@router.get("/browse", response_model=list[FileItem])
 async def browse_directory(path: str | None = None):
     """
     Browse directory contents (uploaded files and user's data directory)
     """
     try:
+        # return the root level (i.e. "data/") if no path is provided
         if path is None or path == "":
-            # Return root level: show uploaded_files and data directory
-            items = []
+            return file_service.list_directory(BASE_DIR)
 
-            # Add uploaded files and data directories
-            upload_path = UPLOAD_DIR if IS_REMOTE_ENV else "uploaded_files"
-            data_path = DATA_DIR if IS_REMOTE_ENV else "data"
-            items.append(FileItem(
-                name="uploaded_files",
-                path=upload_path,
-                is_directory=True
-            ))
-            items.append(FileItem(
-                name="data",
-                path=data_path,
-                is_directory=True
-            ))
-            return DirectoryContents(
-                current_path="",
-                items=items,
-                parent_path=None
-            )
+        # normalize the incoming path from the frontend
+        normalized_path = normalize_path(path)
 
-        # Resolve actual path
-        if path.startswith("uploaded_files"):
-            actual_path = os.path.join(UPLOAD_DIR, path.replace("uploaded_files/", "").replace("uploaded_files", ""))
-        elif path.startswith("data"):
-            actual_path = os.path.join(DATA_DIR, path.replace("data/", "").replace("data", ""))
-        else:
-            raise HTTPException(status_code=400, detail="Invalid path")
+        # confirm that path exists and is a directory / s3 prefix
+        if not file_service.exists(normalized_path):
+            raise HTTPException(status_code=404, detail=f"Path {normalized_path} not found")
         
-        if not os.path.exists(actual_path):
-            raise HTTPException(status_code=404, detail="Directory not found")
-        
-        if not os.path.isdir(actual_path):
-            raise HTTPException(status_code=400, detail="Path is not a directory")
-        
-        # List directory contents
-        items = []
-        for entry in os.listdir(actual_path):
-            entry_path = os.path.join(actual_path, entry)
-            is_dir = os.path.isdir(entry_path)
-            
-            # Build relative path
-            if path.startswith("uploaded_files") or path.startswith("data"):
-                relative_path = os.path.join(path, entry)
-            else:
-                relative_path = entry
-            
-            stat = os.stat(entry_path)
-            
-            items.append(FileItem(
-                name=entry,
-                path=relative_path,
-                is_directory=is_dir,
-                size=stat.st_size if not is_dir else None,
-                modified=datetime.fromtimestamp(stat.st_mtime)
-            ))
-        
-        # Sort: directories first, then files
-        items.sort(key=lambda x: (not x.is_directory, x.name.lower()))
-        
-        # Calculate parent path
-        parent_path = None
-        if "/" in path:
-            parent_path = "/".join(path.split("/")[:-1])
-        elif path in ["uploaded_files", "data"]:
-            parent_path = ""
-        
-        return DirectoryContents(
-            current_path=path,
-            items=items,
-            parent_path=parent_path
-        )
-    
+        if not file_service.is_dir(normalized_path):
+            raise HTTPException(status_code=400, detail=f"Path {normalized_path} is not a directory or s3 prefix")
+
+        # get list of directory contents and then sort them so that directories come first
+        items = file_service.list_directory(normalized_path)
+        items.sort(key=lambda file: (not file.is_directory, file.path.lower()))
+
+        return items
+
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error browsing directory: {str(e)}") from e
 
-@router.post("/upload", response_model=UploadResponse)
-async def upload_file(
-    file: UploadFile = File(...),
-    db: AsyncSession = Depends(get_db)
-):
+
+@router.post("/upload")
+async def upload_file(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
     """
-    Upload a file to the server
+    Upload a file to the server.
     """
     try:
-        # Create upload directory if it doesn't exist
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
-        
-        # Generate unique filename if needed
-        file_path = os.path.join(UPLOAD_DIR, file.filename)
-        counter = 1
-        original_filename = file.filename
-        name, ext = os.path.splitext(original_filename)
-        
-        while os.path.exists(file_path):
-            new_filename = f"{name}_{counter}{ext}"
-            file_path = os.path.join(UPLOAD_DIR, new_filename)
-            counter += 1
-        
-        # Save file
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        # Store in database
-        uploaded_file = FileRecord(
-            file_path=file_path,
-            file_name=original_filename
-        )
-        db.add(uploaded_file)
+        # save file to file system
+        file_paths = file_service.save_uploaded_file(file)
+
+        # store file metadata in database
+        uploaded_files = [FileRecord(file_path=file_path) for file_path in file_paths]
+        db.add_all(uploaded_files)
         await db.commit()
 
-        extracted_to = None
-        extracted_files = None
-        try:
-            extracted_to, extracted_files = _extract_archive(Path(file_path))
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"Failed to extract archive: {exc}") from exc
-
-        message = "File uploaded successfully"
-        if extracted_to:
-            message = f"Archive extracted to {extracted_to}"
-
-        return UploadResponse(
-            file_path=file_path,
-            original_name=original_filename,
-            message=message,
-            extracted_to=extracted_to,
-            extracted_files=extracted_files
-        )
-    
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error uploading file: {str(e)}") from e
 
-@router.get("/uploaded")
+
+@router.get("/upload")
 async def list_uploaded_files(db: AsyncSession = Depends(get_db)):
     """
     List all uploaded files
@@ -284,11 +153,9 @@ async def list_uploaded_files(db: AsyncSession = Depends(get_db)):
             {
                 "id": f.id,
                 "file_path": f.file_path,
-                "file_name": f.file_name,
                 "upload_date": f.upload_date
             }
             for f in files
         ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing files: {str(e)}") from e
-
