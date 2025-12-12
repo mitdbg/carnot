@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -46,6 +47,7 @@ class OutputCapture:
     def __init__(self, filepath: str, original_stream):
         self.filepath = filepath
         self.original_stream = original_stream
+        self.temp_filepath = Path(tempfile.gettempdir()) / f"output_temp_{uuid4()}.txt"
         self.file_handle = None
         self.file_stream = None
         self._open_stream()
@@ -55,8 +57,10 @@ class OutputCapture:
         # try:
         # open the stream in append mode ('a') since stdout/stderr writes are sequential
         # and may be interleaved. 'w' would overwrite the previous stream's output.
-        fs = fsspec.filesystem(FILESYSTEM)
-        self.file_handle = fs.open(self.filepath, mode='a', encoding='utf-8')
+        # fs = fsspec.filesystem(FILESYSTEM)
+        fs = fsspec.filesystem("file")
+        fp = self.filepath if IS_LOCAL_ENV else str(self.temp_filepath)
+        self.file_handle = fs.open(fp, mode='a', encoding='utf-8')
         self.file_stream = self.file_handle.__enter__()
         # except Exception as e:
         #     self.original_stream.write(f"Error opening output stream for {self.filepath}: {e}\n")
@@ -307,6 +311,7 @@ async def stream_query_execution(
     original_stdout = sys.stdout
     original_stderr = sys.stderr
     def run_query_with_capture():
+        local_output_path = None
         stdout_capture = OutputCapture(output_log, original_stdout)
         stderr_capture = OutputCapture(output_log, original_stderr)
         try:
@@ -318,6 +323,18 @@ async def stream_query_execution(
             sys.stderr = original_stderr
             stdout_capture.close()
             stderr_capture.close()
+
+            # Note: We only need to upload one file since both stdout and stderr write to the same file in OutputCapture
+            local_output_path = stdout_capture.temp_filepath
+            if not IS_LOCAL_ENV and local_output_path and Path(local_output_path).exists():
+                s3_fs = fsspec.filesystem("s3")
+                try:
+                    s3_fs.put(str(local_output_path), output_log)
+                except Exception as e:
+                    original_stderr.write(f"Error uploading output.txt to S3: {e}\n")
+                finally:
+                    # clean up the local temp file
+                    Path(local_output_path).unlink(missing_ok=True)
 
     loop = asyncio.get_event_loop()
     output = await loop.run_in_executor(None, run_query_with_capture)
@@ -343,11 +360,13 @@ async def stream_query_execution(
     results_dir = Path(BASE_DIR, "results") if IS_LOCAL_ENV else S3Path(BASE_DIR, "results")
     file_service.create_dir(str(results_dir))
     csv_path = results_dir / csv_filename
+    fs = fsspec.filesystem(FILESYSTEM)
 
     try:
         # First, save to our timestamp-based file
         df = output.to_df()
-        df.to_csv(csv_path, index=False)
+        with fs.open(str(csv_path), 'w', encoding='utf-8') as f:
+            df.to_csv(f, index=False)
 
         # Try to extract the actual filename from Carnot's output
         csv_filename_from_output = None
