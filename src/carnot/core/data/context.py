@@ -140,15 +140,7 @@ class BaseFileService(ABC):
         pass
 
     @abstractmethod
-    def create_dir(self, path: str) -> None:
-        pass
-
-    @abstractmethod
     def is_dir(self, path: str) -> bool:
-        pass
-
-    @abstractmethod
-    def list_directory(self, path: str) -> list[str]:
         pass
 
     @abstractmethod
@@ -163,9 +155,6 @@ class LocalFileService(BaseFileService):
     """File service for local filesystem"""
     def exists(self, path: str) -> bool:
         return os.path.exists(path)
-
-    def create_dir(self, path: str) -> None:
-        os.makedirs(path, exist_ok=True)
 
     def is_dir(self, path: str) -> bool:
         return os.path.isdir(path)
