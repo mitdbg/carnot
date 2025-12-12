@@ -237,12 +237,18 @@ class QueryExecutionStreamer:
             stdout_capture = OutputCapture(output_log, original_stdout)
             stderr_capture = OutputCapture(output_log, original_stderr)
 
+            current_local_output_path = (
+                output_log
+                if IS_LOCAL_ENV
+                else str(stdout_capture.temp_filepath)
+            )
+
             active_sessions[session_id] = {
                 "context": None,
                 "last_access": datetime.now(),
                 "dataset_ids": self.dataset_ids,
                 "session_dir": str(session_dir),
-                "local_output_path": str(stdout_capture.temp_filepath),
+                "local_output_path": current_local_output_path,
             }
 
             def run_query_with_capture():
