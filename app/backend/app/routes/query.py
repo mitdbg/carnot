@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
 import tempfile
@@ -16,6 +17,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from starlette.background import BackgroundTask
 
 import carnot
 from app.auth import get_user_hash
@@ -586,9 +588,6 @@ async def get_output(session_id: str, last_line: int = 0):
 
 @router.get("/download/{filename}")
 async def download_query_results(filename: str):
-    """
-    Download a query results CSV file
-    """
     # Security: only allow downloading CSV files from backend directory
     if not filename.endswith(".csv"):
         raise HTTPException(status_code=400, detail="Invalid filename - must be a CSV file")
@@ -597,14 +596,38 @@ async def download_query_results(filename: str):
     if "/" in filename or ".." in filename:
         raise HTTPException(status_code=400, detail="Invalid filename")
 
-    # Get the backend directory path
+    # Get the file path (S3 or local)
     fs = fsspec.filesystem(FILESYSTEM)
     file_path = str(Path(BASE_DIR, "results", filename) if IS_LOCAL_ENV else S3Path(BASE_DIR, "results", filename))
+    
     if not fs.exists(file_path):
         raise HTTPException(status_code=404, detail="File not found")
 
+    local_path = file_path # Default to the existing path if IS_LOCAL_ENV is true
+    should_cleanup = False
+    
+    # 1. If running remotely (S3), download the file to a local temporary path
+    if not IS_LOCAL_ENV:
+        try:
+            # Create a unique temporary file path on the server
+            temp_dir = tempfile.gettempdir()
+            local_path = os.path.join(temp_dir, filename)
+            
+            # Use fsspec to download the S3 file to the local temp path
+            s3_fs = fsspec.filesystem("s3")
+            s3_fs.get(file_path, local_path)
+            
+            should_cleanup = True
+        except Exception as e:
+            logger.error(f"Failed to download S3 file {file_path} to local temp: {e}")
+            raise HTTPException(status_code=500, detail="Failed to stage file for download.") from e
+
+    # 2. Return the local path using FileResponse
+    # Starlette's FileResponse will now be able to resolve and serve the file.
     return FileResponse(
-        path=file_path,
+        path=local_path,
         filename=filename,
-        media_type="text/csv"
+        media_type="text/csv",
+        # 3. Add cleanup handler for the temporary file
+        background=BackgroundTask(lambda: os.remove(local_path)) if should_cleanup else None
     )
