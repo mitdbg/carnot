@@ -19,3 +19,4 @@ retrieval:
 
 decomposition:
   top_k: 100
+  llm_model: gpt-4o-mini

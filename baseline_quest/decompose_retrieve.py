@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 # Import from lib
 from lib.decomposition_generator import generate_strategies
 from lib.decomposition_executor import execute_all_strategies
-from lib.analyze_retrieval_results import analyze_results
+from lib.retrieval_analyzer import analyze_results
 
 CONFIG_PATH = "config.yaml"
 
@@ -51,9 +51,9 @@ def main():
     subset_name = os.path.splitext(os.path.basename(queries_path))[0]
     target_k = config['decomposition'].get('top_k', 100)
     
-    strategies_dir = f"decomposition_strategies/{subset_name}_k{target_k}"
-    pred_output_path = f"decomposition/pred_set_ops_{subset_name}.jsonl"
-    report_output_path = f"decomposition/results/recall_report_{subset_name}.txt"
+    strategies_dir = f"results/decomposition/{subset_name}_k{target_k}"
+    pred_output_path = f"results/decomposition/pred_set_ops_{subset_name}.jsonl"
+    report_output_path = f"results/decomposition/results/recall_report_{subset_name}.txt"
 
     # MODE: GENERATE
     if args.mode in ["generate", "auto"]:
@@ -96,7 +96,7 @@ def main():
                 gold_path=queries_path,
                 pred_path=pred_output_path,
                 output_report_path=report_output_path
-            ) #
+            )
         else:
             logger.error(f"Prediction file not found at {pred_output_path}. Cannot analyze.")
 

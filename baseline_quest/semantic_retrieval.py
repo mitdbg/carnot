@@ -5,21 +5,19 @@ import logging
 import yaml
 import argparse
 
-# SQLite compatibility
 try:
     __import__('pysqlite3')
     sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
 except ImportError:
     pass
 
-# Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Import from lib
 from lib.chroma_utils import get_db_collection, read_jsonl
 from lib.retriever import retrieve_batch
-from lib.analyze_retrieval_results import calculate_recall_stats, write_analysis_report
+from baseline_quest.lib.retrieval_analyzer import analyze_results
 
 CONFIG_PATH = "config.yaml"
 
@@ -47,19 +45,11 @@ def main():
 
     # 2. Initialize Collection
     logger.info("Initializing ChromaDB collection...")
-    try:
-        collection = get_db_collection(config) #
-    except Exception as e:
-        logger.error(f"Failed to load collection: {e}")
-        return
+    collection = get_db_collection(config)
 
     # 3. Load Queries
     logger.info(f"Reading queries from {queries_path}...")
-    try:
-        queries_data = list(read_jsonl(queries_path))
-    except FileNotFoundError:
-        logger.error(f"Query file not found: {queries_path}")
-        return
+    queries_data = list(read_jsonl(queries_path))
 
     query_texts = [item['query'] for item in queries_data]
     logger.info(f"Found {len(query_texts)} queries. Starting retrieval (k={top_k}, chunks={include_chunks})...")
@@ -92,19 +82,8 @@ def main():
 
     # 6. Analyze Results
     logger.info("Calculating recall statistics...")
-    try:
-        stats = calculate_recall_stats(queries_path, output_pred_path) #
-        
-        # 7. Write Report
-        logger.info(f"Writing analysis report to {output_report_path}...")
-        write_analysis_report(stats, output_report_path) #
-        
-    except Exception as e:
-        logger.error(f"Error during analysis: {e}")
-        import traceback
-        traceback.print_exc()
-
-    logger.info("Semantic retrieval completed successfully.")
+    analyze_results(queries_path, output_pred_path, output_report_path)
+    logger.info(f'Semantic retrieval completed successfully. Results saved to{output_report_path}')
 
 if __name__ == "__main__":
     main()
