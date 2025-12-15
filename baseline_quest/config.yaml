@@ -13,8 +13,9 @@ data:
   document_path: /orcd/home/002/joycequ/quest_data/documents.jsonl
   queries_file: data/train_subset1.jsonl
 
-decomposition:
-  top_k: 100
-
 retrieval:
+  top_k: 100
+  include_chunks: True
+
+decomposition:
   top_k: 100
