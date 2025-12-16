@@ -137,8 +137,11 @@ async def delete_files(data: FileBatchDelete, db: AsyncSession = Depends(get_db)
 
     for file_path in data.files:
         try:
+            # NOTE: if there is an error in the SQL execution after this point, the file service
+            #       and database will be inconsistent; we should update file_service.delete_file(file_path)
+            #       to be idempotent; such that future deletions of the same path do not error out.
             # delete from file storage
-            await file_service.delete_file(file_path)
+            file_service.delete_file(file_path)
             
             # delete the file record from the database; ensure the path matches the record exactly
             stmt = select(FileRecord).where(FileRecord.file_path == file_path)
