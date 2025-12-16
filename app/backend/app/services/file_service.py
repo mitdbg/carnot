@@ -148,6 +148,10 @@ class BaseFileService(ABC):
         pass
 
     @abstractmethod
+    def delete_file(self, path: str) -> None:
+        pass
+
+    @abstractmethod
     def read_file(self, path: str) -> str:
         pass
 
@@ -212,6 +216,9 @@ class LocalFileService(BaseFileService):
             for file in files:
                 file_paths.append(os.path.join(root, file))
         return file_paths
+
+    def delete_file(self, path: str) -> None:
+        os.remove(path)
 
     def read_file(self, path: str) -> str:
         with open(path, encoding="utf-8") as f:
@@ -292,6 +299,11 @@ class S3FileService(BaseFileService):
                 file_paths.append(f"s3://{self.s3_bucket}/{obj['Key']}")
 
         return file_paths
+
+    def delete_file(self, path: str) -> None:
+        """Delete a file from s3"""
+        s3_key = self._get_s3_key_from_path(path)
+        self.s3.delete_object(Bucket=self.s3_bucket, Key=s3_key)
 
     def read_file(self, path: str) -> str:
         """Read the contents of a file from s3"""

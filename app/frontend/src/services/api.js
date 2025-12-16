@@ -47,6 +47,7 @@ export const filesApi = {
     })
   },
   listUploaded: () => api.get('/files/upload'),
+  delete: (filePaths) => api.post('/files/delete', { files: filePaths }),
 }
 
 // Datasets API

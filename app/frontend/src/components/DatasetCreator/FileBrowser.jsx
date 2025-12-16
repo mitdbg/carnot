@@ -120,6 +120,39 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedFiles, items])
 
+  // state to manage Select/Delete button visibility
+  const hasSelectedFiles = selectedFiles.size > 0;
+
+  // handle the deletion of selected files and browser refresh
+  const handleDeleteSelected = async () => {
+    if (!window.confirm(`Are you sure you want to permanently delete ${selectedFiles.size} selected file(s)? This action cannot be undone.`)) {
+      return
+    }
+
+    try {
+      setLoading(true)
+      setError(null)
+
+      const filesToDelete = Array.from(selectedFiles)
+
+      // perform all deletions in parallel
+      await filesApi.delete(filesToDelete)
+
+      // clear the selection in the parent component; we use onFileToggle with null and an empty Set
+      // to trigger the bulk update logic defined in DatasetCreatorPage's handleFileToggle.
+      onFileToggle(null, new Set())
+
+      // refresh the file list by navigating to the root; this state change (currentPath = '') will
+      // automatically trigger the useEffect to call loadDirectory('')
+      navigateToRoot()
+
+    } catch (err) {
+      setError('Failed to delete files: ' + (err.response?.data?.detail || err.message))
+    } finally {
+      setLoading(false)
+    }
+  }
+
   const getAllFilesInDirectory = async (dirPath) => {
     const allFiles = []
 
@@ -311,8 +344,23 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
           <Folder className="w-5 h-5" />
           File Browser
         </h2>
-        {items.length > 0 && (
-          <button
+        {/* ACTION BUTTONS CONTAINER */}
+        <div className="flex gap-2"> 
+          {/* Delete Button */}
+          {hasSelectedFiles && (
+            <button
+              onClick={handleDeleteSelected}
+              disabled={loading}
+              className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-red-600 hover:bg-red-50 rounded-lg transition-colors border border-red-200"
+            >
+              <Trash2 className="w-4 h-4" />
+              Delete {selectedFiles.size} File(s)
+            </button>
+          )}
+
+          {/* Select All Button (Existing) */}
+          {items.length > 0 && (
+            <button
             onClick={handleSelectAll}
             className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-primary-600 hover:bg-primary-50 rounded-lg transition-colors border border-primary-200"
           >
@@ -334,7 +382,8 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
               </>
             )}
           </button>
-        )}
+          )}
+        </div>
       </div>
 
       {/* Breadcrumb Navigation */}

@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import File as FileRecord
 from app.database import get_db
 from app.env import BASE_DIR, IS_LOCAL_ENV
-from app.models.schemas import FileItem
+from app.models.schemas import FileBatchDelete, FileItem
 from app.services.file_service import LocalFileService, S3FileService
 
 logger = logging.getLogger('uvicorn.error')
@@ -15,44 +15,7 @@ logger = logging.getLogger('uvicorn.error')
 router = APIRouter()
 file_service = LocalFileService() if IS_LOCAL_ENV else S3FileService()
 
-# def normalize_path(path: str) -> str:
-#     """
-#     Normalizes a path, preserving protocol (like s3://) and ensuring consistent
-#     single slashes and no trailing slash (unless the path is just the root protocol).
-#     """
-#     if not path:
-#         return ""
 
-#     # separate protocol (e.g., s3://bucket, file://) from the path segment
-#     protocol = ""
-#     path_segment = path
-
-#     # check for protocol or local absolute path starting with "/"
-#     if "://" in path:
-#         parts = path.split("://", 1)
-#         protocol = parts[0] + "://"
-#         path_segment = parts[1]
-#     elif path.startswith("/"):
-#         # for local paths, treat the initial '/' as a special character to preserve
-#         path_segment = path.lstrip("/")
-
-#     # normalize the path segment: remove multiple slashes and trailing slash
-#     # This also handles the case where the protocol part might have had extra slashes
-#     path_segment = path_segment.replace("//", "/")
-#     path_segment = path_segment.rstrip("/")
-
-#     # recombine
-#     if protocol:
-#         # for protocols, the combination looks like: s3://bucket/key/
-#         return protocol + path_segment
-#     elif path.startswith("/") and path_segment:
-#         # for absolute local paths: /carnot/data
-#         return "/" + path_segment
-#     elif path.startswith("/") and not path_segment:
-#         # If path was just "/", return "/"
-#         return "/"
-
-#     return path_segment
 def normalize_path(path: str) -> str:
     """
     Normalizes a path, preserving protocol (like s3://) and ensuring consistent single slashes.
@@ -159,3 +122,49 @@ async def list_uploaded_files(db: AsyncSession = Depends(get_db)):
         ]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing files: {str(e)}") from e
+
+
+@router.post("/delete-batch")
+async def delete_files_batch(data: FileBatchDelete, db: AsyncSession = Depends(get_db)):
+    """
+    Delete a batch of files from storage and the database.
+    """
+    if not data.files:
+        raise HTTPException(status_code=400, detail="No file paths provided for deletion.")
+
+    deleted_count = 0
+    errors = []
+
+    for file_path in data.files:
+        try:
+            # delete from file storage
+            await file_service.delete_file(file_path)
+            
+            # delete the file record from the database; ensure the path matches the record exactly
+            stmt = select(FileRecord).where(FileRecord.file_path == file_path)
+            result = await db.execute(stmt)
+            file_record = result.scalars().first()
+
+            if file_record:
+                await db.delete(file_record)
+                deleted_count += 1
+            else:
+                # log if the record doesn't exist but continue trying others
+                logger.warning(f"Database record not found for file path: {file_path}")
+
+        except Exception as e:
+            # collect errors and continue processing the rest of the batch
+            errors.append({"file_path": file_path, "error": str(e)})
+            logger.error(f"Failed to delete file {file_path}: {str(e)}")
+
+    await db.commit()
+    
+    if errors:
+        # if there are errors, return a partial success/failure response
+        raise HTTPException(
+            status_code=400,
+            detail=f"Successfully deleted {deleted_count} file(s) but failed for {len(errors)} file(s).",
+            headers={"X-Deletion-Errors": str(errors)}
+        )
+        
+    return {"message": f"Successfully deleted {deleted_count} file(s)."}
