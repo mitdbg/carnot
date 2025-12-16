@@ -1,0 +1,32 @@
+dataset_name: quest
+
+# Chroma basics
+chroma_persist_dir: "./chroma_quest"       
+chroma_collection_name: "quest_documents"   
+embedding_model_name: "BAAI/bge-small-en-v1.5"
+clear_chroma_collection: false
+
+# Data path (optional, used by manual loading scripts)
+quest_documents_path: "quest_data.jsonl"
+
+# Chunking
+index_first_512: True       
+chunk_size: 512
+overlap: 80
+tokenizer_model: "BAAI/bge-small-en-v1.5"
+
+# Batching
+batch_size: 512             
+
+# Concept generation (optional defaults)
+concept_generation_mode: "two_stage"
+concept_cluster_count: 50
+concept_embedding_model: "all-MiniLM-L6-v2"
+
+# Search / System constraints
+
+# Retrieval configurations
+top_k: 10
+where: null
+include: ["documents", "metadatas", "distances"]
+
