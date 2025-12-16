@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { ChevronRight, ChevronDown, Folder, File, Loader2, Home, CheckSquare, Square } from 'lucide-react'
+import { ChevronRight, ChevronDown, Folder, File, Loader2, Home, CheckSquare, Square, Trash2 } from 'lucide-react'
 import { configApi, filesApi } from '../../services/api'
 
 function formatFileSize(bytes) {
