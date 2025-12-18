@@ -1,0 +1,77 @@
+[
+  {
+    "name": "amphibian:location:habitat",
+    "type": "List[str]",
+    "desc": "Types of habitats where the amphibian is found (e.g., wetlands, forests, ponds). If the document does not mention any habitats, set this field to None."
+  },
+  {
+    "name": "amphibian:location:region",
+    "type": "List[str]",
+    "desc": "Named geographic regions or areas where the amphibian occurs (e.g., Amazon basin, Pacific Northwest). If the document does not mention any regions, set this field to None."
+  },
+  {
+    "name": "amphibian:location:country",
+    "type": "List[str]",
+    "desc": "Countries where the amphibian is found. If the document does not mention any countries, set this field to None."
+  },
+  {
+    "name": "amphibian:location:continent",
+    "type": "List[str]",
+    "desc": "Continents where the amphibian is found. If the document does not mention any continents, set this field to None."
+  },
+  {
+    "name": "film:classification:rating",
+    "type": "str",
+    "desc": "Content rating assigned to the film (e.g., G, PG, PG-13, R, NC-17). If the document does not mention a film rating, set this field to None."
+  },
+  {
+    "name": "film:classification:genre",
+    "type": "List[str]",
+    "desc": "Genres assigned to the film (e.g., comedy, drama, horror). If the document does not mention any film genres, set this field to None."
+  },
+  {
+    "name": "fish:classification:species",
+    "type": "List[str]",
+    "desc": "Species-level classification of fish mentioned in the document. If the document does not mention any fish species, set this field to None."
+  },
+  {
+    "name": "fish:classification:genus",
+    "type": "List[str]",
+    "desc": "Genus-level classification of fish mentioned in the document. If the document does not mention any fish genera, set this field to None."
+  },
+  {
+    "name": "fish:classification:family",
+    "type": "List[str]",
+    "desc": "Family-level classification of fish mentioned in the document. If the document does not mention any fish families, set this field to None."
+  },
+  {
+    "name": "fish:classification:order",
+    "type": "List[str]",
+    "desc": "Order-level classification of fish mentioned in the document. If the document does not mention any fish orders, set this field to None."
+  },
+  {
+    "name": "fish:classification:class",
+    "type": "List[str]",
+    "desc": "Class-level classification of fish mentioned in the document. If the document does not mention any fish classes, set this field to None."
+  },
+  {
+    "name": "fish:classification:phylum",
+    "type": "List[str]",
+    "desc": "Phylum-level classification of fish mentioned in the document. If the document does not mention any fish phyla, set this field to None."
+  },
+  {
+    "name": "fish:classification:kingdom",
+    "type": "List[str]",
+    "desc": "Kingdom-level classification of fish mentioned in the document. If the document does not mention any fish kingdoms, set this field to None."
+  },
+  {
+    "name": "book:region",
+    "type": "List[str]",
+    "desc": "Geographical regions associated with the book (e.g., where it is set, published, or thematically focused). If the document does not mention any book regions, set this field to None."
+  },
+  {
+    "name": "crime:film:theme",
+    "type": "List[str]",
+    "desc": "Themes present in a crime film, such as motifs, central ideas, or recurring narrative elements. If the document does not mention any crime film themes, set this field to None."
+  }
+]

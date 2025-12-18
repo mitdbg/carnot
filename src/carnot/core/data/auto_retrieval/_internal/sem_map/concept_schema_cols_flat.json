@@ -1,0 +1,27 @@
+[
+  {
+    "name": "amphibian:location",
+    "type": "List[str]",
+    "desc": "Distinct amphibian locations mentioned. If the document does not mention any amphibian locations, set this field to None."
+  },
+  {
+    "name": "film:classification",
+    "type": "List[str]",
+    "desc": "Distinct film classifications mentioned. If the document does not mention any film classifications, set this field to None."
+  },
+  {
+    "name": "fish:classification",
+    "type": "List[str]",
+    "desc": "Distinct fish classification terms mentioned. If the document does not mention any fish classification, set this field to None."
+  },
+  {
+    "name": "book:region",
+    "type": "List[str]",
+    "desc": "Distinct book regions mentioned. If the document does not mention any book regions, set this field to None."
+  },
+  {
+    "name": "crime:film:theme",
+    "type": "List[str]",
+    "desc": "Distinct crime film themes mentioned. If the document does not mention any crime film themes, set this field to None."
+  }
+]
