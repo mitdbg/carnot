@@ -13,9 +13,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_TOKENIZER_MODEL = "BAAI/bge-small-en-v1.5"
 
-
 # -----------------------------
-# Helpers copied from QUEST script
+# QUEST Data Preparation Helpers
 # -----------------------------
 
 def normalize_title_slug(s: str) -> str:
@@ -29,16 +28,14 @@ def normalize_title_slug(s: str) -> str:
     t = re.sub(r"[^A-Za-z0-9 _\-.]", "", t).strip().replace(" ", "_")
     return t or "untitled"
 
-
 def stable_entity_id(title: str, text: str) -> str:
     slug = normalize_title_slug(title)
     h = hashlib.sha1((title + "\n" + (text or "")).encode("utf-8")).hexdigest()[:8]
     return f"{slug}-{h}"
 
-
 def read_jsonl(path: str) -> Iterable[Dict[str, Any]]:
     if not os.path.exists(path):
-        logger.warning(f"File not found: {path}")
+        logger.warning(f"⚠️ File not found: {path}")
         return []
 
     with open(path, "r", encoding="utf-8") as f:
@@ -49,14 +46,12 @@ def read_jsonl(path: str) -> Iterable[Dict[str, Any]]:
             try:
                 yield json.loads(line)
             except json.JSONDecodeError as e:
-                logger.warning(f"Skipping malformed JSON on line {idx}: {e}")
-
+                logger.warning(f"⚠️ Skipping malformed JSON on line {idx}: {e}")
 
 def build_tokenizer(model_name: str = DEFAULT_TOKENIZER_MODEL):
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, model_max_length=100000)
     return tokenizer
-
 
 def chunk_by_tokens(
     text: str,
@@ -86,11 +81,6 @@ def chunk_by_tokens(
 
     return chunks
 
-
-# -----------------------------
-# QUEST document preparation
-# -----------------------------
-
 def prepare_quest_documents(
     jsonl_path: str,
     tokenizer_model: str = DEFAULT_TOKENIZER_MODEL,
@@ -107,10 +97,10 @@ def prepare_quest_documents(
           * index_first_512=False: full token-based chunking with overlap
       - Yield dicts with:
           {
-            "id": <chunk_id>,         # entity_id or entity_id__0000, etc.
             "text": <chunk_text>,     # chunk body
             "metadata": {
                 "entity_id": ...,
+                "chunk_id": ..., # only present if index_first_512=False
                 "title": ...,
                 "chunk_index": ...,
                 "n_chunks": ...,
@@ -119,11 +109,8 @@ def prepare_quest_documents(
           }
     """
     tokenizer = build_tokenizer(tokenizer_model)
-
     filename = os.path.basename(jsonl_path)
-
     logger.info(f"indexing first 512 tokens: {index_first_512}.")
-    
 
     for idx, raw in enumerate(read_jsonl(jsonl_path)):
         if idx % 1000 == 0:
@@ -150,13 +137,10 @@ def prepare_quest_documents(
             }
 
             yield {
-                "id": entity_id,   
                 "text": chunk_text_str,
                 "metadata": metadata,
             }
-
         else:
-            # --- VERBOSE MODE: full token-based chunking with overlap ---
             chunks = chunk_by_tokens(text, tokenizer, chunk_size, overlap)
             if not chunks:
                 chunks = [title]
@@ -165,9 +149,9 @@ def prepare_quest_documents(
 
             for idx, ch in enumerate(chunks):
                 cid = f"{entity_id}__{idx:04d}"
-
                 metadata = {
                     "entity_id": entity_id,
+                    "chunk_id": cid,
                     "title": title,
                     "chunk_index": idx,
                     "n_chunks": n_chunks,
@@ -175,12 +159,12 @@ def prepare_quest_documents(
                 }
 
                 yield {
-                    "id": cid,
                     "text": ch,
                     "metadata": metadata,
                 }
+
 # -----------------------------
-# QUEST query representation
+# QUEST Query Preparation
 # -----------------------------
 
 @dataclass
@@ -192,19 +176,13 @@ class QuestQuery:
     scores: Optional[List[float]] = None
     metadata: Optional[Dict[str, Any]] = None
 
-
-QUEST_TRAINING_SET_URL = "https://storage.googleapis.com/gresearch/quest/train.jsonl"
-
-
 def _iter_jsonl_from_source(source: str):
     if source.startswith("http://") or source.startswith("https://"):
         import requests
-
         logger.info(f"Downloading QUEST queries from URL: {source}")
-        resp = requests.get(source)
+        resp = requests.get(source, stream=True)
         resp.raise_for_status()
-        content = resp.content.decode("utf-8")
-        for line_num, line in enumerate(content.splitlines(), 1):
+        for line_num, line in enumerate(resp.iter_lines(decode_unicode=True), 1):
             line = line.strip()
             if not line:
                 continue
@@ -212,13 +190,14 @@ def _iter_jsonl_from_source(source: str):
                 yield json.loads(line)
             except json.JSONDecodeError as e:
                 logger.warning(
-                    f"JSON parsing error on line {line_num} from URL {source}: {e}"
+                    f"⚠️ JSON parsing error on line {line_num} from URL {source}: {e}"
                 )
                 logger.debug(f"Offending line (first 100 chars): {line[:100]}")
     else:
         if not os.path.exists(source):
-            logger.warning(f"QUEST query file not found: {source}")
+            logger.warning(f"⚠️ QUEST query file not found: {source}")
             return
+        
         logger.info(f"Loading QUEST queries from file: {source}")
         with open(source, "r", encoding="utf-8") as f:
             for line_num, line in enumerate(f, 1):
@@ -233,16 +212,12 @@ def _iter_jsonl_from_source(source: str):
                     )
                     logger.debug(f"Offending line (first 100 chars): {line[:100]}")
 
-
-# -----------------------------
-# Public API: prepare QUEST queries
-# -----------------------------
-
 def prepare_quest_queries(
-    source: str = QUEST_TRAINING_SET_URL,
+    source: str,
 ) -> List[QuestQuery]:
+    if not source:
+        raise ValueError("⚠️ No source provided for QUEST queries.")
     queries: List[QuestQuery] = []
-
     for data in _iter_jsonl_from_source(source):
         q = QuestQuery(
             query=data.get("query", ""),
@@ -252,6 +227,6 @@ def prepare_quest_queries(
             metadata=data.get("metadata"),
         )
         queries.append(q)
-
     logger.info(f"Loaded {len(queries)} QUEST queries from {source}")
     return queries
+
