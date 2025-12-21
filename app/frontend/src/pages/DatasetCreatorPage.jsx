@@ -5,8 +5,10 @@ import FileBrowser from '../components/DatasetCreator/FileBrowser'
 import SearchChatbot from '../components/DatasetCreator/SearchChatbot'
 import DatasetAnnotation from '../components/DatasetCreator/DatasetAnnotation'
 import { datasetsApi } from '../services/api'
+import { useApiToken } from '../hooks/useApiToken';
 
 function DatasetCreatorPage() {
+  const getValidToken = useApiToken();
   const navigate = useNavigate()
   const [selectedFiles, setSelectedFiles] = useState(new Set())
   const [datasetName, setDatasetName] = useState('')
@@ -56,14 +58,16 @@ function DatasetCreatorPage() {
     try {
       setLoading(true)
       setError(null)
+      const token = await getValidToken();
 
       // Convert selected files to Array
       const files = Array.from(selectedFiles)
       await datasetsApi.create({
         name: datasetName,
+        shared: false, // TODO: allow shared datasets
         annotation: annotation,
         files: files,
-      })
+      }, token)
 
       // Navigate back to data management page
       navigate('/')

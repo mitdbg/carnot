@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from starlette.background import BackgroundTask
 
 import carnot
-from app.auth import get_user_hash
+from app.auth import get_current_user
 from app.database import (
     AsyncSessionLocal,
     Conversation,
@@ -501,7 +501,7 @@ async def save_message(
 @router.post("/execute")
 async def execute_query(
     request: QueryRequest,
-    auth_data: tuple = Depends(get_user_hash),
+    user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
     """
@@ -515,8 +515,7 @@ async def execute_query(
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
     # retrieve user LLM config
-    user_hash, _ = auth_data
-    user_config = await get_user_llm_config(db, user_hash)
+    user_config = await get_user_llm_config(db, user_id)
     if not user_config:
         raise HTTPException(
             status_code=400,

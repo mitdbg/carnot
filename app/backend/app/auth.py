@@ -26,7 +26,7 @@ def get_jwks():
             raise HTTPException(status_code=500, detail="Could not verify authentication keys") from e
     return jwks_cache
 
-def get_user_hash(authorization: str | None = Header(None)) -> tuple[str, str]:
+def get_current_user(authorization: str | None = Header(None)) -> tuple[str, str]:
     """
     Validates the Bearer token signature using Auth0 JWKS and returns (user_hash, email).
     """
@@ -69,17 +69,12 @@ def get_user_hash(authorization: str | None = Header(None)) -> tuple[str, str]:
             issuer=AUTH0_ISSUER,
         )
 
-        # extract email and compute salted user hash
-        email = payload.get(f"{CLAIMS_NAMESPACE}/email")
-        if not email:
-            # fallback: Sometimes standard 'email' claim exists if configured differently
-            email = payload.get("email")
-        if not email:
-            raise HTTPException(status_code=400, detail="Token missing email claim")
-        hash_input = f"{email}{SALT}"
-        user_hash = hashlib.sha256(hash_input.encode('utf-8')).hexdigest()
+        # extract user_id
+        user_id = payload.get("sub")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Token missing 'sub' claim")
 
-        return user_hash, email
+        return user_id
 
     except jwt.ExpiredSignatureError as e:
         raise HTTPException(status_code=401, detail="Token is expired") from e

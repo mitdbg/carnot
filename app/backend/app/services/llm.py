@@ -5,9 +5,9 @@ from app.database import UserSettings
 from app.security import decrypt_value
 
 
-async def get_user_llm_config(db: AsyncSession, user_hash: str) -> dict:
+async def get_user_llm_config(db: AsyncSession, user_id: str) -> dict:
     """Retrieves and decrypts the user's LLM API keys from the database."""
-    result = await db.execute(select(UserSettings).where(UserSettings.user_hash == user_hash))
+    result = await db.execute(select(UserSettings).where(UserSettings.user_id == user_id))
     settings = result.scalar_one_or_none()
 
     config = {}

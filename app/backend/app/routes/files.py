@@ -1,9 +1,10 @@
 import logging
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import get_current_user
 from app.database import File as FileRecord
 from app.database import get_db
 from app.env import BASE_DIR, IS_LOCAL_ENV
@@ -87,7 +88,7 @@ async def browse_directory(path: str | None = None):
 
 
 @router.post("/upload")
-async def upload_file(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
+async def upload_file(file: UploadFile = File(...), user_id: str = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """
     Upload a file to the server.
     """
@@ -96,7 +97,7 @@ async def upload_file(file: UploadFile = File(...), db: AsyncSession = Depends(g
         file_paths = file_service.save_uploaded_file(file)
 
         # store file metadata in database
-        uploaded_files = [FileRecord(file_path=file_path) for file_path in file_paths]
+        uploaded_files = [FileRecord(user_id=user_id, file_path=file_path) for file_path in file_paths]
         db.add_all(uploaded_files)
         await db.commit()
 
@@ -105,23 +106,23 @@ async def upload_file(file: UploadFile = File(...), db: AsyncSession = Depends(g
 
 
 @router.get("/upload")
-async def list_uploaded_files(db: AsyncSession = Depends(get_db)):
+async def list_uploaded_files(user_id: str = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """
     List all uploaded files
     """
-    try:
-        result = await db.execute(select(FileRecord).order_by(FileRecord.upload_date.desc()))
-        files = result.scalars().all()
-        return [
-            {
-                "id": f.id,
-                "file_path": f.file_path,
-                "upload_date": f.upload_date
-            }
-            for f in files
-        ]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing files: {str(e)}") from e
+    # try:
+    result = await db.execute(select(FileRecord).where(FileRecord.user_id == user_id).order_by(FileRecord.upload_date.desc()))
+    files = result.scalars().all()
+    return [
+        {
+            "id": f.id,
+            "file_path": f.file_path,
+            "upload_date": f.upload_date
+        }
+        for f in files
+    ]
+    # except Exception as e:
+    #     raise HTTPException(status_code=500, detail=f"Error listing files: {str(e)}") from e
 
 
 @router.post("/delete")

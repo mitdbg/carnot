@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 import carnot
-from app.auth import get_user_hash
+from app.auth import get_current_user
 from app.database import get_db
 from app.env import DATA_DIR, IS_LOCAL_ENV
 from app.models.schemas import SearchQuery, SearchResult
@@ -84,13 +84,12 @@ def run_semantic_search(query_text: str, search_paths: list[str] | None, user_co
 @router.post("/", response_model=list[SearchResult])
 async def search_files(
     query: SearchQuery,
-    auth_data: tuple = Depends(get_user_hash),
+    user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     try:
         # retrieve user LLM config
-        user_hash, _ = auth_data
-        user_config = await get_user_llm_config(db, user_hash)
+        user_config = await get_user_llm_config(db, user_id)
         if not user_config:
             raise HTTPException(
                 status_code=400, 

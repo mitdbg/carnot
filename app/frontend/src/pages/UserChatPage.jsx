@@ -1,13 +1,13 @@
 import { useState, useEffect, useRef } from 'react'
-import { useAuth0 } from '@auth0/auth0-react';
 import { Send, Database, CheckSquare, Square, AlertCircle, Loader2, XCircle, RotateCcw, MessageSquare, Trash2, ChevronLeft, ChevronRight, Search } from 'lucide-react'
+import { useApiToken } from '../hooks/useApiToken';
 import axios from 'axios'
 import ProgressDisplay from '../components/ProgressDisplay'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api"
 
 function UserChatPage() {
-  const { getAccessTokenSilently } = useAuth0();
+  const getValidToken = useApiToken();
   const [datasets, setDatasets] = useState([])
   const [selectedDatasets, setSelectedDatasets] = useState(new Set())
   const [messages, setMessages] = useState([])
@@ -38,10 +38,17 @@ function UserChatPage() {
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }
-  
+
   const loadConversations = async () => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/conversations/`)
+      // get the raw JWT Access Token
+      const token = await getValidToken();
+
+      const response = await axios.get(`${API_BASE_URL}/conversations/`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
       setConversations(response.data)
     } catch (error) {
       console.error('Error loading conversations:', error)
@@ -182,7 +189,7 @@ function UserChatPage() {
 
     try {
       // fetch access token
-      const token = await getAccessTokenSilently();
+      const token = await getValidToken();
 
       // Create abort controller for this request
       abortControllerRef.current = new AbortController()

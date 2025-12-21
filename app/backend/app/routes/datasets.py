@@ -1,9 +1,10 @@
 import os
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import get_current_user
 from app.database import Dataset, DatasetFile, get_db
 from app.database import File as FileRecord
 from app.models.schemas import (
@@ -16,40 +17,42 @@ from app.models.schemas import (
 router = APIRouter()
 
 @router.get("/", response_model=list[DatasetResponse])
-async def list_datasets(db: AsyncSession = Depends(get_db)):
+async def list_datasets(user_id: str = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """
     List all datasets with file count
     """
-    try:
-        # Query datasets with file count
-        result = await db.execute(
-            select(
-                Dataset,
-                func.count(DatasetFile.file_id).label("file_count")
-            )
-            .outerjoin(DatasetFile, Dataset.id == DatasetFile.dataset_id)
-            .group_by(Dataset.id)
-            .order_by(Dataset.created_at.desc())
+    # try:
+    # Query datasets with file count
+    result = await db.execute(
+        select(
+            Dataset,
+            func.count(DatasetFile.file_id).label("file_count")
         )
+        .where(or_(Dataset.user_id == user_id, Dataset.shared))
+        .outerjoin(DatasetFile, Dataset.id == DatasetFile.dataset_id)
+        .group_by(Dataset.id)
+        .order_by(Dataset.created_at.desc())
+    )
 
-        datasets = []
-        for dataset, file_count in result:
-            datasets.append(DatasetResponse(
-                id=dataset.id,
-                name=dataset.name,
-                annotation=dataset.annotation,
-                created_at=dataset.created_at,
-                updated_at=dataset.updated_at,
-                file_count=file_count or 0
-            ))
+    datasets = []
+    for dataset, file_count in result:
+        datasets.append(DatasetResponse(
+            id=dataset.id,
+            name=dataset.name,
+            annotation=dataset.annotation,
+            created_at=dataset.created_at,
+            updated_at=dataset.updated_at,
+            file_count=file_count or 0
+        ))
 
-        return datasets
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing datasets: {str(e)}") from e
+    return datasets
+    # except Exception as e:
+    #     raise HTTPException(status_code=500, detail=f"Error listing datasets: {str(e)}") from e
 
 @router.post("/", response_model=DatasetDetailResponse)
 async def create_dataset(
     dataset: DatasetCreate,
+    user_id: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -58,7 +61,10 @@ async def create_dataset(
     try:
         # Check if dataset name already exists
         result = await db.execute(
-            select(Dataset).where(Dataset.name == dataset.name)
+            select(Dataset).where(
+                Dataset.name == dataset.name,
+                or_(Dataset.user_id == user_id, Dataset.shared)
+            )
         )
         existing = result.scalar_one_or_none()
 
@@ -68,6 +74,8 @@ async def create_dataset(
         # Create dataset and write to DB to get db_dataset.id
         db_dataset = Dataset(
             name=dataset.name,
+            user_id=user_id,
+            shared=dataset.shared,
             annotation=dataset.annotation
         )
         db.add(db_dataset)
@@ -83,7 +91,7 @@ async def create_dataset(
             db_file_record = file_result.scalar_one_or_none()
 
             if not db_file_record:
-                db_file_record = FileRecord(file_path=filepath)
+                db_file_record = FileRecord(file_path=filepath, user_id=user_id)
                 db.add(db_file_record)
                 await db.flush()
 
@@ -132,14 +140,21 @@ async def create_dataset(
         raise HTTPException(status_code=500, detail=f"Error creating dataset: {str(e)}") from e
 
 @router.get("/{dataset_id}", response_model=DatasetDetailResponse)
-async def get_dataset(dataset_id: int, db: AsyncSession = Depends(get_db)):
+async def get_dataset(
+    dataset_id: int,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """
     Get dataset details with files
     """
     try:
         # Get dataset
         result = await db.execute(
-            select(Dataset).where(Dataset.id == dataset_id)
+            select(Dataset).where(
+                Dataset.id == dataset_id,
+                or_(Dataset.user_id == user_id, Dataset.shared)
+            )
         )
         dataset = result.scalar_one_or_none()
 
@@ -178,6 +193,7 @@ async def get_dataset(dataset_id: int, db: AsyncSession = Depends(get_db)):
 async def update_dataset(
     dataset_id: int,
     dataset_update: DatasetUpdate,
+    user_id: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -186,7 +202,10 @@ async def update_dataset(
     try:
         # Get dataset
         result = await db.execute(
-            select(Dataset).where(Dataset.id == dataset_id)
+            select(Dataset).where(
+                Dataset.id == dataset_id,
+                or_(Dataset.user_id == user_id, Dataset.shared)
+            )
         )
         dataset = result.scalar_one_or_none()
 
@@ -199,6 +218,7 @@ async def update_dataset(
             result = await db.execute(
                 select(Dataset).where(
                     Dataset.name == dataset_update.name,
+                    or_(Dataset.user_id == user_id, Dataset.shared),
                     Dataset.id != dataset_id
                 )
             )
@@ -269,14 +289,20 @@ async def update_dataset(
         raise HTTPException(status_code=500, detail=f"Error updating dataset: {str(e)}") from e
 
 @router.delete("/{dataset_id}")
-async def delete_dataset(dataset_id: int, db: AsyncSession = Depends(get_db)):
+async def delete_dataset(
+    dataset_id: int,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """
     Delete dataset
     """
     try:
         # Get dataset
         result = await db.execute(
-            select(Dataset).where(Dataset.id == dataset_id)
+            select(Dataset).where(
+                Dataset.id == dataset_id,
+                or_(Dataset.user_id == user_id, Dataset.shared))
         )
         dataset = result.scalar_one_or_none()
 

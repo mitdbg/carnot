@@ -6,7 +6,6 @@ on:
     - main
     - wl-prod
     - wm-prod
-    - add-delete-files
 
 permissions:
   id-token: write
