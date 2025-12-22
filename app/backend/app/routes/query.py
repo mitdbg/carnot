@@ -20,7 +20,7 @@ from sqlalchemy.orm import Session
 from starlette.background import BackgroundTask
 
 import carnot
-from app.auth import get_user_hash
+from app.auth import get_current_user
 from app.database import (
     AsyncSessionLocal,
     Conversation,
@@ -87,9 +87,10 @@ class QueryExecutionStreamer:
     Encapsulates the query execution and concurrent heartbeat task for SSE streaming.
     Uses an asyncio.Queue to safely merge output from the query task and the heartbeat task.
     """
-    def __init__(self, query: str, dataset_ids: list[int], session_id: str, user_config: dict):
+    def __init__(self, query: str, dataset_ids: list[int], user_id: str, session_id: str, user_config: dict):
         self.query = query
         self.dataset_ids = dataset_ids
+        self.user_id = user_id
         self.session_id = session_id
         self.user_config = user_config
         self.queue = asyncio.Queue()
@@ -118,7 +119,7 @@ class QueryExecutionStreamer:
 
             session_id = self.session_id or str(uuid4())
             conversation_id = await get_or_create_conversation(
-                session_id, self.query, self.dataset_ids
+                self.user_id, session_id, self.query, self.dataset_ids
             )
             await save_message(conversation_id, "user", self.query)
 
@@ -171,19 +172,13 @@ class QueryExecutionStreamer:
             await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Preparing data context...'})}\n\n")
             await asyncio.sleep(0.1)
 
-            # NOTE: this copies files to a session-specific directory; we should not be making copies of large datasets
+            # TODO: remove this and place file check into Carnot context
             if not session_exists:
                 text_file_count = 0
                 for file_path in all_files:
-                    if file_path.suffix.lower() in {".pdf", ".jpg", ".jpeg", ".png", ".gif", ".zip", ".exe", ".bin"}:
+                    if file_path.suffix.lower() in {".jpg", ".jpeg", ".png", ".gif", ".zip", ".exe", ".bin"}:
                         continue
-
-                    destination = session_dir / file_path.name
-                    try:
-                        destination.write_bytes(file_path.read_bytes())
-                        text_file_count += 1
-                    except OSError as exc:
-                        logger.debug("Skipping file %s: %s", file_path, exc)
+                    text_file_count += 1
 
                 if text_file_count == 0:
                     await self.queue.put(f"data: {json.dumps({'type': 'error', 'message': 'No text files found in selected datasets'})}\n\n")
@@ -200,7 +195,7 @@ class QueryExecutionStreamer:
             else:
                 context_id = f"session_{session_id[:8]}"
                 ctx = carnot.TextFileContext(
-                    paths=[str(session_dir)],
+                    paths=[str(fp) for fp in all_files],
                     id=context_id,
                     description=f"Query on {len(datasets)} dataset(s)",
                     llm_config=self.user_config,
@@ -447,11 +442,14 @@ def cleanup_old_sessions() -> None:
 
 
 async def get_or_create_conversation(
-    session_id: str, query: str, dataset_ids: list[int]
+    user_id: str, session_id: str, query: str, dataset_ids: list[int]
 ) -> int:
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            select(Conversation).where(Conversation.session_id == session_id)
+            select(Conversation).where(
+                Conversation.session_id == session_id,
+                Conversation.user_id == user_id,
+            )
         )
         conversation = result.scalar_one_or_none()
         if conversation:
@@ -461,6 +459,7 @@ async def get_or_create_conversation(
         dataset_ids_str = ",".join(map(str, dataset_ids))
 
         conversation = Conversation(
+            user_id=user_id,
             session_id=session_id,
             title=title,
             dataset_ids=dataset_ids_str,
@@ -501,7 +500,7 @@ async def save_message(
 @router.post("/execute")
 async def execute_query(
     request: QueryRequest,
-    auth_data: tuple = Depends(get_user_hash),
+    user_id: str = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> StreamingResponse:
     """
@@ -515,8 +514,7 @@ async def execute_query(
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
     # retrieve user LLM config
-    user_hash, _ = auth_data
-    user_config = await get_user_llm_config(db, user_hash)
+    user_config = await get_user_llm_config(db, user_id)
     if not user_config:
         raise HTTPException(
             status_code=400,
@@ -528,7 +526,7 @@ async def execute_query(
 
     # Instantiate the streamer class
     streamer = QueryExecutionStreamer(
-        request.query, request.dataset_ids, request.session_id, user_config
+        request.query, request.dataset_ids, user_id, request.session_id, user_config
     )
 
     return StreamingResponse(

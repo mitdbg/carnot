@@ -1,13 +1,14 @@
 import { useState, useEffect, useRef } from 'react'
-import { useAuth0 } from '@auth0/auth0-react';
 import { Send, Database, CheckSquare, Square, AlertCircle, Loader2, XCircle, RotateCcw, MessageSquare, Trash2, ChevronLeft, ChevronRight, Search } from 'lucide-react'
+import { useApiToken } from '../hooks/useApiToken'
 import axios from 'axios'
 import ProgressDisplay from '../components/ProgressDisplay'
+import { conversationsApi, datasetsApi } from '../services/api'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api"
 
 function UserChatPage() {
-  const { getAccessTokenSilently } = useAuth0();
+  const getValidToken = useApiToken();
   const [datasets, setDatasets] = useState([])
   const [selectedDatasets, setSelectedDatasets] = useState(new Set())
   const [messages, setMessages] = useState([])
@@ -38,10 +39,13 @@ function UserChatPage() {
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }
-  
+
   const loadConversations = async () => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/conversations/`)
+      const token = await getValidToken();
+      if (!token) return;
+
+      const response = await conversationsApi.list(token)
       setConversations(response.data)
     } catch (error) {
       console.error('Error loading conversations:', error)
@@ -50,7 +54,10 @@ function UserChatPage() {
 
   const loadConversation = async (conversationId) => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/conversations/${conversationId}`)
+      const token = await getValidToken();
+      if (!token) return;
+
+      const response = await conversationsApi.get(conversationId, token)
       const conversation = response.data
       
       // Set session ID and messages
@@ -83,7 +90,10 @@ function UserChatPage() {
     }
     
     try {
-      await axios.delete(`${API_BASE_URL}/conversations/${conversationId}`)
+      const token = await getValidToken();
+      if (!token) return;
+
+      await conversationsApi.delete(conversationId, token)
       
       // If we deleted the current conversation, create a new session
       if (conversationId === currentConversationId) {
@@ -107,7 +117,10 @@ function UserChatPage() {
 
   const loadDatasets = async () => {
     try {
-      const response = await axios.get(`${API_BASE_URL}/datasets/`)
+      const token = await getValidToken();
+      if (!token) return;
+
+      const response = await datasetsApi.list(token)
       setDatasets(response.data)
     } catch (error) {
       console.error('Error loading datasets:', error)
@@ -182,7 +195,8 @@ function UserChatPage() {
 
     try {
       // fetch access token
-      const token = await getAccessTokenSilently();
+      const token = await getValidToken();
+      if (!token) return;
 
       // Create abort controller for this request
       abortControllerRef.current = new AbortController()

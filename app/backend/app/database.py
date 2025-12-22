@@ -1,7 +1,7 @@
 import os
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import declarative_base
@@ -37,45 +37,45 @@ Base = declarative_base()
 class UserSettings(Base):
     __tablename__ = "user_settings"
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_hash = Column(String, unique=True, index=True, nullable=False)
-    email = Column(String, nullable=True) 
-
-    # API Keys
+    user_id = Column(String, primary_key=True, unique=True, index=True, nullable=False)
     openai_api_key = Column(String, nullable=True)
     anthropic_api_key = Column(String, nullable=True)
     gemini_api_key = Column(String, nullable=True)
     together_api_key = Column(String, nullable=True)
-
     updated_at = Column(TIMESTAMP(timezone=True), onupdate=func.now())
     created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
 
 class Dataset(Base):
     __tablename__ = "datasets"
-    
+
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, index=True, nullable=False)
     name = Column(String, unique=True, nullable=False, index=True)
+    shared = Column(Boolean, default=False)
     annotation = Column(Text, nullable=False)
     created_at = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 class File(Base):
     __tablename__ = "files"
-    
+
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, index=True, nullable=False)
     file_path = Column(String, unique=True, nullable=False)
+    shared = Column(Boolean, default=False)
     upload_date = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 class DatasetFile(Base):
     __tablename__ = "dataset_files"
-    
+
     dataset_id = Column(Integer, ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False, primary_key=True)
     file_id = Column(Integer, ForeignKey("files.id", ondelete="CASCADE"), nullable=False, primary_key=True)
 
 class Conversation(Base):
     __tablename__ = "conversations"
-    
+
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, index=True, nullable=False)
     session_id = Column(String, unique=True, nullable=False, index=True)
     title = Column(String, nullable=True)  # Auto-generated from first query
     dataset_ids = Column(String, nullable=True)  # Comma-separated dataset IDs
@@ -84,7 +84,7 @@ class Conversation(Base):
 
 class Message(Base):
     __tablename__ = "messages"
-    
+
     id = Column(Integer, primary_key=True, index=True)
     conversation_id = Column(Integer, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
     role = Column(String, nullable=False)  # 'user', 'assistant', 'status', 'error', 'result'

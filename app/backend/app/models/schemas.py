@@ -19,9 +19,13 @@ class FileItem(BaseModel):
     size: int | None = None
     modified: datetime | None = None
 
+class FileBatchDelete(BaseModel):
+    files: list[str]
+
 # Dataset schemas
 class DatasetCreate(BaseModel):
     name: str
+    shared: bool
     annotation: str
     files: list[str]
 

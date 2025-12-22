@@ -1,10 +1,9 @@
-import React, { useState, useEffect } from 'react';
-import { useAuth0 } from '@auth0/auth0-react';
+import { useState, useEffect } from 'react';
 import { settingsApi } from '../services/api';
+import { useApiToken } from '../hooks/useApiToken';
 
 const Settings = () => {
-  // Auth0 hook
-  const { user, getAccessTokenSilently } = useAuth0();
+  const getValidToken = useApiToken();
 
   // state
   const [keys, setKeys] = useState({
@@ -21,8 +20,11 @@ const Settings = () => {
   useEffect(() => {
     const fetchSettings = async () => {
       try {
-        // use the token to authenticate and retrieve user-specific settings from the backend
-        const token = await getAccessTokenSilently();
+        // use the token to authenticate
+        const token = await getValidToken();
+        if (!token) return;
+
+        // retrieve user-specific settings from the backend
         const response = await settingsApi.getSettings(token); 
         if(response.data) setKeys(prev => ({ ...prev, ...response.data }));
       } catch (error) {
@@ -30,8 +32,8 @@ const Settings = () => {
       }
     };
 
-    if (user) fetchSettings();
-  }, [user, getAccessTokenSilently]);
+    fetchSettings();
+  }, []);
 
   // Handle manual input changes
   const handleInputChange = (e) => {
@@ -56,9 +58,10 @@ const Settings = () => {
     setMessage({ type: '', text: '' });
 
     try {
-      const token = await getAccessTokenSilently();
+      const token = await getValidToken();
+      if (!token) return;
       await settingsApi.updateApiKeys(keys, token);
-      setMessage({ type: 'success', text: 'API Keys saved successfully for ' + user.email });
+      setMessage({ type: 'success', text: 'API Keys saved successfully!' });
       setKeys({
         OPENAI_API_KEY: '',
         ANTHROPIC_API_KEY: '',
@@ -85,7 +88,8 @@ const Settings = () => {
     setMessage({ type: '', text: '' });
 
     try {
-      const token = await getAccessTokenSilently();
+      const token = await getValidToken();
+      if (!token) return;
       await settingsApi.uploadEnvFile(selectedFile, token);
       setMessage({ type: 'success', text: '.env file uploaded and parsed successfully.' });
       setSelectedFile(null);
@@ -102,13 +106,6 @@ const Settings = () => {
   return (
     <div className="container mx-auto p-6">
       <h1 className="text-2xl font-bold mb-6">Settings</h1>
-
-      {/* Display User Email for confirmation */}
-      {user && (
-        <p className="text-sm text-gray-500 mb-6">
-          Managing settings for: <span className="font-semibold text-gray-700">{user.email}</span>
-        </p>
-      )}
 
       {/* Feedback Message */}
       {message.text && (

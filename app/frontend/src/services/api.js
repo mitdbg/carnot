@@ -36,26 +36,63 @@ export const settingsApi = {
   },
 }
 
+// Conversations API
+export const conversationsApi = {
+  list: (token) =>
+    api.get('/conversations/', {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  get: (id, token) =>
+    api.get(`/conversations/${id}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  delete: (id, token) =>
+    api.delete(`/conversations/${id}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+}
+
 // Files API
 export const filesApi = {
   browse: (path = '') => api.get('/files/browse', { params: { path } }),
-  upload: (file) => {
+  upload: (file, token) => {
     const formData = new FormData()
     formData.append('file', file)
     return api.post('/files/upload', formData, {
-      headers: { 'Content-Type': 'multipart/form-data' },
+      headers: {
+        'Content-Type': 'multipart/form-data',
+        Authorization: `Bearer ${token}`,
+      },
     })
   },
-  listUploaded: () => api.get('/files/upload'),
+  listUploaded: (token) => api.get('/files/upload', {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  delete: (filePaths) => api.post('/files/delete', { files: filePaths }),
 }
 
 // Datasets API
 export const datasetsApi = {
-  list: () => api.get('/datasets/'),
-  create: (data) => api.post('/datasets/', data),
-  get: (id) => api.get(`/datasets/${id}`),
-  update: (id, data) => api.put(`/datasets/${id}`, data),
-  delete: (id) => api.delete(`/datasets/${id}`),
+  list: (token) =>
+    api.get('/datasets/', {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  create: (data, token) =>
+    api.post('/datasets/', data, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  get: (id, token) =>
+    api.get(`/datasets/${id}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  update: (id, data, token) =>
+    api.put(`/datasets/${id}`, data, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  delete: (id, token) =>
+    api.delete(`/datasets/${id}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
 }
 
 // Search API

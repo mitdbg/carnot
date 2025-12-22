@@ -49,6 +49,11 @@ mkdir -p "$PG_DATA_DIR"
 echo "Copying source files to Docker build context..."
 
 # copy relevant source files to build context
+rm -rf $COMPOSE_DIR/frontend
+rm -rf $COMPOSE_DIR/backend
+rm -rf $COMPOSE_DIR/src
+rm $COMPOSE_DIR/pyproject.toml
+rm $COMPOSE_DIR/README.md
 cp -r ../app/frontend $COMPOSE_DIR/frontend
 cp -r ../app/backend $COMPOSE_DIR/backend
 cp -r ../src $COMPOSE_DIR/src

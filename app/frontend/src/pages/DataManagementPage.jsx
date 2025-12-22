@@ -3,8 +3,10 @@ import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Plus, Upload, Loader2, Database, Calendar, FileText, Trash2, X, Eye } from 'lucide-react'
 import { datasetsApi, filesApi } from '../services/api'
+import { useApiToken } from '../hooks/useApiToken';
 
 function DataManagementPage() {
+  const getValidToken = useApiToken();
   const navigate = useNavigate()
   const [datasets, setDatasets] = useState([])
   const [uploadedFiles, setUploadedFiles] = useState([])
@@ -23,9 +25,11 @@ function DataManagementPage() {
     try {
       setLoading(true)
       setError(null)
+      const token = await getValidToken();
+      if (!token) return;
       const [datasetsRes, filesRes] = await Promise.all([
-        datasetsApi.list(),
-        filesApi.listUploaded(),
+        datasetsApi.list(token),
+        filesApi.listUploaded(token),
       ])
       setDatasets(datasetsRes.data)
       setUploadedFiles(filesRes.data)
@@ -43,7 +47,9 @@ function DataManagementPage() {
     try {
       setUploading(true)
       setError(null)
-      await filesApi.upload(file)
+      const token = await getValidToken();
+      if (!token) return;
+      await filesApi.upload(file, token)
       setSuccess('File uploaded successfully!')
       setTimeout(() => setSuccess(null), 3000)
       loadData()
@@ -61,7 +67,9 @@ function DataManagementPage() {
 
     try {
       setError(null)
-      await datasetsApi.delete(id)
+      const token = await getValidToken();
+      if (!token) return;
+      await datasetsApi.delete(id, token)
       setSuccess('Dataset deleted successfully!')
       setTimeout(() => setSuccess(null), 3000)
       loadData()
@@ -81,7 +89,9 @@ function DataManagementPage() {
   const handleViewDataset = async (datasetId) => {
     try {
       setError(null)
-      const response = await datasetsApi.get(datasetId)
+      const token = await getValidToken();
+      if (!token) return;
+      const response = await datasetsApi.get(datasetId, token)
       setSelectedDataset(response.data)
       setViewingDataset(true)
     } catch (err) {

@@ -1,10 +1,10 @@
 import { useState } from 'react'
-import { useAuth0 } from '@auth0/auth0-react';
 import { Send, Loader2, Bot, User, CheckCircle } from 'lucide-react'
 import { searchApi } from '../../services/api'
+import { useApiToken } from '../../hooks/useApiToken';
 
 function SearchChatbot({ onSelectFiles }) {
-  const { getAccessTokenSilently } = useAuth0();
+  const getValidToken = useApiToken();
   const [messages, setMessages] = useState([
     {
       role: 'assistant',
@@ -28,7 +28,8 @@ function SearchChatbot({ onSelectFiles }) {
 
     try {
       // fetch access token
-      const token = await getAccessTokenSilently();
+      const token = await getValidToken();
+      if (!token) return;
 
       // search for files
       const response = await searchApi.search(userMessage, null, token);

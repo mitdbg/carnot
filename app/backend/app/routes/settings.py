@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import get_user_hash
+from app.auth import get_current_user
 from app.database import UserSettings, get_db
 from app.security import decrypt_value, encrypt_value
 
@@ -16,11 +16,11 @@ class ApiKeysRequest(BaseModel):
     GEMINI_API_KEY: str = ""
     TOGETHER_API_KEY: str = ""
 
-async def upsert_settings(db: AsyncSession, user_hash: str, email: str, updates: dict):
-    result = await db.execute(select(UserSettings).where(UserSettings.user_hash == user_hash))
+async def upsert_settings(db: AsyncSession, user_id: str, updates: dict):
+    result = await db.execute(select(UserSettings).where(UserSettings.user_id == user_id))
     user_settings = result.scalar_one_or_none()
     if not user_settings:
-        user_settings = UserSettings(user_hash=user_hash, email=email)
+        user_settings = UserSettings(user_id=user_id)
         db.add(user_settings)
 
     # encrypt values before setting attributes
@@ -35,11 +35,10 @@ async def upsert_settings(db: AsyncSession, user_hash: str, email: str, updates:
 
 @router.get("/")
 async def get_settings(
-    auth_data: tuple = Depends(get_user_hash),
+    user_id: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    user_hash, _ = auth_data
-    result = await db.execute(select(UserSettings).where(UserSettings.user_hash == user_hash))
+    result = await db.execute(select(UserSettings).where(UserSettings.user_id == user_id))
     user_settings = result.scalar_one_or_none()
 
     if not user_settings:
@@ -69,11 +68,9 @@ async def get_settings(
 @router.post("/keys")
 async def update_keys(
     keys: ApiKeysRequest,
-    auth_data: tuple = Depends(get_user_hash),
+    user_id: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    user_hash, email = auth_data
-
     updates = {
         "openai_api_key": keys.OPENAI_API_KEY,
         "anthropic_api_key": keys.ANTHROPIC_API_KEY,
@@ -81,17 +78,15 @@ async def update_keys(
         "together_api_key": keys.TOGETHER_API_KEY
     }
 
-    await upsert_settings(db, user_hash, email, updates)
+    await upsert_settings(db, user_id, updates)
     return {"status": "success"}
 
 @router.post("/env")
 async def upload_env(
     file: UploadFile = File(...),
-    auth_data: tuple = Depends(get_user_hash),
+    user_id: str = Depends(get_current_user),
     db: AsyncSession = Depends(get_db)
 ):
-    user_hash, email = auth_data
-
     # Read file content
     content = await file.read()
     content_str = content.decode("utf-8")
@@ -115,5 +110,5 @@ async def upload_env(
     if not updates:
         raise HTTPException(status_code=400, detail="No valid API keys found in .env file")
 
-    await upsert_settings(db, user_hash, email, updates)
+    await upsert_settings(db, user_id, updates)
     return {"status": "success", "updated": list(updates.keys())}
