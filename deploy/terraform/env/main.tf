@@ -23,6 +23,17 @@ locals {
 }
 
 # -------------------------------
+# S3 Bucket for application data
+# -------------------------------
+resource "aws_s3_bucket" "app_data_bucket" {
+  bucket = "carnot-research-${local.env_name}"
+
+  tags = {
+    Name = "carnot-research-${local.env_name}"
+  }
+}
+
+# -------------------------------
 # AMI Used for EC2 Instances
 # -------------------------------
 data "aws_ami" "ubuntu" {
@@ -106,14 +117,14 @@ resource "aws_iam_role_policy" "s3_access" {
       {
       Effect = "Allow"
       Action = ["s3:ListBucket"]
-      Resource = ["arn:aws:s3:::carnot-research"]
+      Resource = ["arn:aws:s3:::carnot-research-${local.env_name}"]
     },
     {
       Effect   = "Allow"
       Action   = ["s3:*"]
       Resource = [
-        "arn:aws:s3:::carnot-research/${local.env_name}",
-        "arn:aws:s3:::carnot-research/${local.env_name}/*"
+        "arn:aws:s3:::carnot-research-${local.env_name}",
+        "arn:aws:s3:::carnot-research-${local.env_name}/*"
       ]
     }]
   })

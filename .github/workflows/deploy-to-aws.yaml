@@ -6,6 +6,7 @@ on:
     - main
     - wl-prod
     - wm-prod
+    - harden-envs
 
 permissions:
   id-token: write
