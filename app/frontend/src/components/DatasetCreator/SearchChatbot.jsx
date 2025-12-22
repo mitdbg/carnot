@@ -29,6 +29,7 @@ function SearchChatbot({ onSelectFiles }) {
     try {
       // fetch access token
       const token = await getValidToken();
+      if (!token) return;
 
       // search for files
       const response = await searchApi.search(userMessage, null, token);

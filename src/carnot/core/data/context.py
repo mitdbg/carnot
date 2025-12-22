@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import re
 from abc import ABC, abstractmethod
@@ -11,6 +12,7 @@ import boto3
 import pandas as pd
 from cloudpathlib import S3Path
 from pydantic import BaseModel
+from pypdf import PdfReader
 from smolagents import CodeAgent, LiteLLMModel
 
 from carnot.core.data import context_manager
@@ -25,7 +27,15 @@ COMPANY_ENV = os.getenv("COMPANY_ENV", "dev")
 BACKEND_ROOT = "/code/backend/"
 BASE_DIR = f"s3://carnot-research/{COMPANY_ENV}/"
 DATA_DIR = f"s3://carnot-research/{COMPANY_ENV}/data/"
-SKIP_SUFFIXES = {".pdf", ".jpg", ".jpeg", ".png", ".gif", ".zip", ".exe", ".bin"}
+SKIP_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".zip", ".exe", ".bin"}
+
+def get_text_from_pdf(pdf_bytes):
+    pdf = PdfReader(io.BytesIO(pdf_bytes))
+    all_text = ""
+    for page in pdf.pages:
+        all_text += page.extract_text() + "\n"
+    return all_text
+
 
 PZ_INSTRUCTION = """\n\nYou are a CodeAgent who is a specialist at writing declarative AI programs with the Palimpzest (PZ) library.
 
@@ -148,7 +158,7 @@ class BaseFileService(ABC):
         pass
 
     @abstractmethod
-    def read_file(self, path: str) -> str:
+    def read_file(self, path: str, bytes: bool = False) -> str:
         pass
 
 class LocalFileService(BaseFileService):
@@ -170,9 +180,11 @@ class LocalFileService(BaseFileService):
                 file_paths.append(os.path.join(root, file))
         return file_paths
 
-    def read_file(self, path: str) -> str:
-        with open(path, encoding="utf-8") as f:
-            return f.read()
+    def read_file(self, path: str, bytes: bool = False) -> str:
+        read_kwargs = {"mode": "rb"} if bytes else {"encoding": "utf-8"}
+        with open(path, **read_kwargs) as file:
+            content = file.read()
+        return content
 
 class S3FileService(BaseFileService):
     """File service for AWS S3"""
@@ -208,13 +220,13 @@ class S3FileService(BaseFileService):
 
         return file_paths
 
-    def read_file(self, path: str) -> str:
+    def read_file(self, path: str, bytes: bool = False) -> str:
         """Read the contents of a file from s3"""
         s3 = boto3.client('s3')
         s3_key = self._get_s3_key_from_path(path)
         response = s3.get_object(Bucket=self.s3_bucket, Key=s3_key)
-        content = response['Body'].read().decode('utf-8')
-        return content
+        content = response['Body'].read()
+        return content if bytes else content.decode('utf-8')
 
 
 class Context(Dataset, ABC):
@@ -499,6 +511,10 @@ class TextFileContext(Context):
             
             file_service = S3FileService() if FILESYSTEM == "s3" else LocalFileService()
 
+            if path.endswith(".pdf"):
+                pdf_bytes = file_service.read_file(path, bytes=True)
+                return get_text_from_pdf(pdf_bytes)
+
             return file_service.read_file(path)
 
         agent = CodeAgent(
@@ -508,7 +524,7 @@ class TextFileContext(Context):
             planning_interval=4,
             add_base_tools=False,
             return_full_result=True,
-            additional_authorized_imports=["dotenv", "json", "palimpzest", "pandas"],
+            additional_authorized_imports=["dotenv", "json", "palimpzest", "io", "os", "re", "pandas"],
             instructions=PZ_INSTRUCTION,
         )
         result = agent.run(instruction)

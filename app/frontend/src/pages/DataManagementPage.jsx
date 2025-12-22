@@ -48,6 +48,7 @@ function DataManagementPage() {
       setUploading(true)
       setError(null)
       const token = await getValidToken();
+      if (!token) return;
       await filesApi.upload(file, token)
       setSuccess('File uploaded successfully!')
       setTimeout(() => setSuccess(null), 3000)
@@ -67,6 +68,7 @@ function DataManagementPage() {
     try {
       setError(null)
       const token = await getValidToken();
+      if (!token) return;
       await datasetsApi.delete(id, token)
       setSuccess('Dataset deleted successfully!')
       setTimeout(() => setSuccess(null), 3000)
@@ -88,6 +90,7 @@ function DataManagementPage() {
     try {
       setError(null)
       const token = await getValidToken();
+      if (!token) return;
       const response = await datasetsApi.get(datasetId, token)
       setSelectedDataset(response.data)
       setViewingDataset(true)

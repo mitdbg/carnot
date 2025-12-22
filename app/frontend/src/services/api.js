@@ -36,6 +36,22 @@ export const settingsApi = {
   },
 }
 
+// Conversations API
+export const conversationsApi = {
+  list: (token) =>
+    api.get('/conversations/', {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  get: (id, token) =>
+    api.get(`/conversations/${id}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  delete: (id, token) =>
+    api.delete(`/conversations/${id}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+}
+
 // Files API
 export const filesApi = {
   browse: (path = '') => api.get('/files/browse', { params: { path } }),

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import { settingsApi } from '../services/api';
 import { useApiToken } from '../hooks/useApiToken';
 
@@ -20,8 +20,11 @@ const Settings = () => {
   useEffect(() => {
     const fetchSettings = async () => {
       try {
-        // use the token to authenticate and retrieve user-specific settings from the backend
+        // use the token to authenticate
         const token = await getValidToken();
+        if (!token) return;
+
+        // retrieve user-specific settings from the backend
         const response = await settingsApi.getSettings(token); 
         if(response.data) setKeys(prev => ({ ...prev, ...response.data }));
       } catch (error) {
@@ -29,8 +32,8 @@ const Settings = () => {
       }
     };
 
-    if (user) fetchSettings();
-  }, [user, getValidToken]);
+    fetchSettings();
+  }, []);
 
   // Handle manual input changes
   const handleInputChange = (e) => {
@@ -56,6 +59,7 @@ const Settings = () => {
 
     try {
       const token = await getValidToken();
+      if (!token) return;
       await settingsApi.updateApiKeys(keys, token);
       setMessage({ type: 'success', text: 'API Keys saved successfully!' });
       setKeys({
@@ -85,6 +89,7 @@ const Settings = () => {
 
     try {
       const token = await getValidToken();
+      if (!token) return;
       await settingsApi.uploadEnvFile(selectedFile, token);
       setMessage({ type: 'success', text: '.env file uploaded and parsed successfully.' });
       setSelectedFile(null);

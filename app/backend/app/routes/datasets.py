@@ -21,33 +21,33 @@ async def list_datasets(user_id: str = Depends(get_current_user), db: AsyncSessi
     """
     List all datasets with file count
     """
-    # try:
-    # Query datasets with file count
-    result = await db.execute(
-        select(
-            Dataset,
-            func.count(DatasetFile.file_id).label("file_count")
+    try:
+        # Query datasets with file count
+        result = await db.execute(
+            select(
+                Dataset,
+                func.count(DatasetFile.file_id).label("file_count")
+            )
+            .where(or_(Dataset.user_id == user_id, Dataset.shared))
+            .outerjoin(DatasetFile, Dataset.id == DatasetFile.dataset_id)
+            .group_by(Dataset.id)
+            .order_by(Dataset.created_at.desc())
         )
-        .where(or_(Dataset.user_id == user_id, Dataset.shared))
-        .outerjoin(DatasetFile, Dataset.id == DatasetFile.dataset_id)
-        .group_by(Dataset.id)
-        .order_by(Dataset.created_at.desc())
-    )
 
-    datasets = []
-    for dataset, file_count in result:
-        datasets.append(DatasetResponse(
-            id=dataset.id,
-            name=dataset.name,
-            annotation=dataset.annotation,
-            created_at=dataset.created_at,
-            updated_at=dataset.updated_at,
-            file_count=file_count or 0
-        ))
+        datasets = []
+        for dataset, file_count in result:
+            datasets.append(DatasetResponse(
+                id=dataset.id,
+                name=dataset.name,
+                annotation=dataset.annotation,
+                created_at=dataset.created_at,
+                updated_at=dataset.updated_at,
+                file_count=file_count or 0
+            ))
 
-    return datasets
-    # except Exception as e:
-    #     raise HTTPException(status_code=500, detail=f"Error listing datasets: {str(e)}") from e
+        return datasets
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing datasets: {str(e)}") from e
 
 @router.post("/", response_model=DatasetDetailResponse)
 async def create_dataset(

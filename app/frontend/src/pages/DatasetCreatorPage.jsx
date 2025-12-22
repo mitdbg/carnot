@@ -59,6 +59,7 @@ function DatasetCreatorPage() {
       setLoading(true)
       setError(null)
       const token = await getValidToken();
+      if (!token) return;
 
       // Convert selected files to Array
       const files = Array.from(selectedFiles)

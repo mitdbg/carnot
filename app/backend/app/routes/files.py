@@ -110,19 +110,19 @@ async def list_uploaded_files(user_id: str = Depends(get_current_user), db: Asyn
     """
     List all uploaded files
     """
-    # try:
-    result = await db.execute(select(FileRecord).where(FileRecord.user_id == user_id).order_by(FileRecord.upload_date.desc()))
-    files = result.scalars().all()
-    return [
-        {
-            "id": f.id,
-            "file_path": f.file_path,
-            "upload_date": f.upload_date
-        }
-        for f in files
-    ]
-    # except Exception as e:
-    #     raise HTTPException(status_code=500, detail=f"Error listing files: {str(e)}") from e
+    try:
+        result = await db.execute(select(FileRecord).where(FileRecord.user_id == user_id).order_by(FileRecord.upload_date.desc()))
+        files = result.scalars().all()
+        return [
+            {
+                "id": f.id,
+                "file_path": f.file_path,
+                "upload_date": f.upload_date
+            }
+            for f in files
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error listing files: {str(e)}") from e
 
 
 @router.post("/delete")

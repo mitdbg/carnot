@@ -25,7 +25,6 @@ class FileBatchDelete(BaseModel):
 # Dataset schemas
 class DatasetCreate(BaseModel):
     name: str
-    user_id: str
     shared: bool
     annotation: str
     files: list[str]
