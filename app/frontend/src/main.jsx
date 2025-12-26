@@ -14,7 +14,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(
         redirect_uri: window.location.origin,
         organization: import.meta.env.VITE_AUTH0_ORGANIZATION_ID,
         audience: import.meta.env.VITE_AUTH0_AUDIENCE,
-        scope: 'openid profile email',
+        scope: 'openid profile offline_access',
       }}
       cacheLocation="localstorage"
       useRefreshTokens={true}

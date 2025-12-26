@@ -6,6 +6,8 @@ from pydantic import BaseModel
 # Config schemas
 class AppConfig(BaseModel):
     base_dir: str
+    data_dir: str
+    shared_data_dir: str
 
 # Settings schemas
 class AppSettings(BaseModel):
@@ -16,11 +18,16 @@ class FileItem(BaseModel):
     path: str
     display_name: str
     is_directory: bool
+    is_hidden: bool = False
     size: int | None = None
     modified: datetime | None = None
 
 class FileBatchDelete(BaseModel):
     files: list[str]
+
+class DirectoryCreate(BaseModel):
+    path: str
+    name: str
 
 # Dataset schemas
 class DatasetCreate(BaseModel):
@@ -72,5 +79,6 @@ class SearchQuery(BaseModel):
 class SearchResult(BaseModel):
     file_path: str
     file_name: str
+    virtual_path: str
     relevance_score: float | None = None
     snippet: str | None = None

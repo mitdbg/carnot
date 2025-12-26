@@ -238,7 +238,6 @@ jobs:
           echo "AUTH0_AUDIENCE=${{ secrets.AUTH0_AUDIENCE }}" >> deploy/compose/.env
           echo "AUTH0_CLAIMS_NAMESPACE=${{ secrets.AUTH0_CLAIMS_NAMESPACE }}" >> deploy/compose/.env
           echo "BASE_ORIGINS=http://${SUBDOMAIN}.carnot-research.org,https://${SUBDOMAIN}.carnot-research.org,http://web-backend,https://web-backend" >> deploy/compose/.env
-          echo "CARNOT_USER_SALT=${{ secrets.CARNOT_USER_SALT }}" >> deploy/compose/.env
 
           # Copy compose bundle to EC2
           scp -r -o StrictHostKeyChecking=no -i deployer_key.pem deploy/compose ubuntu@$EC2_PUBLIC_IP:~/

@@ -1,15 +1,16 @@
 import logging
+import os
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from sqlalchemy import or_, select
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
 from app.database import File as FileRecord
 from app.database import get_db
-from app.env import BASE_DIR, IS_LOCAL_ENV
-from app.models.schemas import FileBatchDelete, FileItem
-from app.services.file_service import LocalFileService, S3FileService
+from app.env import BASE_DIR, DATA_DIR, IS_LOCAL_ENV, SHARED_DATA_DIR
+from app.models.schemas import DirectoryCreate, FileBatchDelete, FileItem
+from app.services.file_service import LocalFileService, S3FileService, normalize_path
 
 logger = logging.getLogger('uvicorn.error')
 
@@ -17,56 +18,23 @@ router = APIRouter()
 file_service = LocalFileService() if IS_LOCAL_ENV else S3FileService()
 
 
-def normalize_path(path: str) -> str:
-    """
-    Normalizes a path, preserving protocol (like s3://) and ensuring consistent single slashes.
-    """
-    if not path:
-        return ""
-
-    # separate protocol (e.g., s3://bucket, file://) from the path segment
-    protocol = ""
-    path_segment = path
-
-    # check for protocol or local absolute path starting with "/"
-    if "://" in path:
-        parts = path.split("://", 1)
-        protocol = parts[0] + "://"
-        path_segment = parts[1]
-    elif path.startswith("/"):
-        # for local paths, treat the initial '/' as a special character to preserve
-        path_segment = path.lstrip("/")
-
-    # normalize the path segment: remove multiple slashes and trailing slash
-    # This also handles the case where the protocol part might have had extra slashes
-    path_segment = path_segment.replace("//", "/")
-
-    # recombine
-    if protocol:
-        # for protocols, the combination looks like: s3://bucket/key/
-        return protocol + path_segment
-    elif path.startswith("/") and path_segment:
-        # for absolute local paths: /carnot/data/
-        return "/" + path_segment
-    elif path.startswith("/") and not path_segment:
-        # If path was just "/", return "/"
-        return "/"
-
-    return path_segment
-
-
 @router.get("/browse", response_model=list[FileItem])
-async def browse_directory(path: str | None = None):
+async def browse_directory(path: str | None = None, user_id: str = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """
     Browse directory contents (uploaded files and user's data directory)
     """
     try:
         # return the root level (i.e. "data/") if no path is provided
         if path is None or path == "":
-            return file_service.list_directory(BASE_DIR)
+            filepaths = file_service.list_directory(BASE_DIR)
+            return [fp for fp in filepaths if not fp.is_hidden]
 
         # normalize the incoming path from the frontend
         normalized_path = normalize_path(path)
+
+        # if this path is {DATA_DIR}, return the results under the user's data directory
+        if normalized_path.rstrip("/") == normalize_path(DATA_DIR).rstrip("/"):
+            normalized_path = os.path.join(DATA_DIR, user_id)
 
         # confirm that path exists and is a directory / s3 prefix
         if not file_service.exists(normalized_path):
@@ -77,6 +45,7 @@ async def browse_directory(path: str | None = None):
 
         # get list of directory contents and then sort them so that directories come first
         items = file_service.list_directory(normalized_path)
+        items = [item for item in items if not item.is_hidden]
         items.sort(key=lambda file: (not file.is_directory, file.path.lower()))
 
         return items
@@ -88,41 +57,41 @@ async def browse_directory(path: str | None = None):
 
 
 @router.post("/upload")
-async def upload_file(file: UploadFile = File(...), user_id: str = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+async def upload_file(file: UploadFile = File(...), path: str = Form(""), user_id: str = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
     """
     Upload a file to the server.
     """
     try:
+        # normalize the incoming path from the frontend
+        normalized_path = normalize_path(path)
+
+        # if this path is {DATA_DIR}, then upload the file under the user's data directory
+        if normalized_path.rstrip("/") == normalize_path(DATA_DIR).rstrip("/"):
+            normalized_path = os.path.join(DATA_DIR, user_id)
+
+        # do not upload files within the BASE_DIR directly
+        if normalized_path.rstrip("/") == normalize_path(BASE_DIR).rstrip("/"):
+            raise HTTPException(status_code=400, detail="Cannot upload files directly to the base directory.")
+
         # save file to file system
-        file_paths = file_service.save_uploaded_file(file)
+        file_paths = file_service.save_uploaded_file(file, normalized_path)
+
+        # determine if the file is shared based on the provided path
+        shared = (
+            normalized_path.rstrip("/") == normalize_path(SHARED_DATA_DIR).rstrip("/")
+            or normalized_path.startswith(SHARED_DATA_DIR)
+        )
 
         # store file metadata in database
-        uploaded_files = [FileRecord(user_id=user_id, file_path=file_path) for file_path in file_paths]
+        uploaded_files = [
+            FileRecord(user_id=user_id, file_path=file_path, shared=shared)
+            for file_path in file_paths
+        ]
         db.add_all(uploaded_files)
         await db.commit()
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error uploading file: {str(e)}") from e
-
-
-@router.get("/upload")
-async def list_uploaded_files(user_id: str = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
-    """
-    List all uploaded files
-    """
-    try:
-        result = await db.execute(select(FileRecord).where(FileRecord.user_id == user_id).order_by(FileRecord.upload_date.desc()))
-        files = result.scalars().all()
-        return [
-            {
-                "id": f.id,
-                "file_path": f.file_path,
-                "upload_date": f.upload_date
-            }
-            for f in files
-        ]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error listing files: {str(e)}") from e
 
 
 @router.post("/delete")
@@ -133,24 +102,31 @@ async def delete_files(data: FileBatchDelete, db: AsyncSession = Depends(get_db)
     if not data.files:
         raise HTTPException(status_code=400, detail="No file paths provided for deletion.")
 
+    # Separate items into files and directories
+    files_to_delete, dirs_to_delete = [], []    
+    for file_path in data.files:
+        if file_service.is_dir(file_path):
+            dirs_to_delete.append(file_path)
+        else:
+            files_to_delete.append(file_path)
+
     deleted_count = 0
     errors = []
 
-    for file_path in data.files:
+    # delete individual files and their DB records first
+    for file_path in files_to_delete:
         try:
             # NOTE: if there is an error in the SQL execution after this point, the file service
             #       and database will be inconsistent; we should update file_service.delete_file(file_path)
             #       to be idempotent; such that future deletions of the same path do not error out.
-            # delete from file storage
             file_service.delete_file(file_path)
-            
+
             # delete the file record from the database; ensure the path matches the record exactly
             stmt = select(FileRecord).where(FileRecord.file_path == file_path)
             result = await db.execute(stmt)
-            file_record = result.scalars().first()
-
-            if file_record:
-                await db.delete(file_record)
+            record = result.scalars().first()
+            if record:
+                await db.delete(record)
                 deleted_count += 1
             else:
                 # log if the record doesn't exist but continue trying others
@@ -161,7 +137,16 @@ async def delete_files(data: FileBatchDelete, db: AsyncSession = Depends(get_db)
             errors.append({"file_path": file_path, "error": str(e)})
             logger.error(f"Failed to delete file {file_path}: {str(e)}")
 
+    # commit deletions of individual files
     await db.commit()
+
+    # remove the directory structures
+    for dir_path in dirs_to_delete:
+        try:
+            file_service.delete_directory(dir_path)
+        except Exception as e:
+            errors.append({"directory_path": dir_path, "error": str(e)})
+            logger.error(f"Failed to delete directory {dir_path}: {e}")
     
     if errors:
         # if there are errors, return a partial success/failure response
@@ -170,5 +155,31 @@ async def delete_files(data: FileBatchDelete, db: AsyncSession = Depends(get_db)
             detail=f"Successfully deleted {deleted_count} file(s) but failed for {len(errors)} file(s).",
             headers={"X-Deletion-Errors": str(errors)}
         )
-        
+
     return {"message": f"Successfully deleted {deleted_count} file(s)."}
+
+
+@router.post("/create-directory")
+async def create_directory(data: DirectoryCreate, user_id: str = Depends(get_current_user)):
+    """
+    Create a new directory for the user.
+    """
+    try:
+        # normalize the incoming path from the frontend
+        normalized_path = normalize_path(data.path)
+
+        # do not create directories within the BASE_DIR directly
+        if normalized_path.rstrip("/") == normalize_path(BASE_DIR).rstrip("/"):
+            raise HTTPException(status_code=400, detail="Cannot create directory immediately under the base directory.")
+
+        # inject user_id if we are at the top level of DATA_DIR
+        if normalized_path.rstrip("/") == normalize_path(DATA_DIR).rstrip("/"):
+            normalized_path = os.path.join(normalized_path, user_id)
+
+        # construct the final path by joining only the new directory name
+        full_path = os.path.join(normalized_path, data.name)
+        file_service.create_dir(full_path)
+
+        return {"message": "Success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating directory: {str(e)}") from e

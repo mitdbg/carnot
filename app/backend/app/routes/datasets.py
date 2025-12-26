@@ -13,6 +13,7 @@ from app.models.schemas import (
     DatasetResponse,
     DatasetUpdate,
 )
+from app.services.file_service import virtualize_filepath
 
 router = APIRouter()
 
@@ -126,8 +127,8 @@ async def create_dataset(
             files=[
                 {
                     "id": file.id,
-                    "file_path": file.file_path,
                     "file_name": os.path.basename(file.file_path),
+                    "file_path": virtualize_filepath(file.file_path),
                 }
                 for _, file in file_rows
             ]
@@ -178,7 +179,8 @@ async def get_dataset(
             files=[
                 {
                     "id": file.id,
-                    "file_path": file.file_path,
+                    "file_name": os.path.basename(file.file_path),
+                    "file_path": virtualize_filepath(file.file_path),
                 }
                 for _, file in file_rows
             ]
@@ -276,7 +278,8 @@ async def update_dataset(
             files=[
                 {
                     "id": file.id,
-                    "file_path": file.file_path,
+                    "file_name": os.path.basename(file.file_path),
+                    "file_path": virtualize_filepath(file.file_path),
                 }
                 for _, file in file_rows
             ]
