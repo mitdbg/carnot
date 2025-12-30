@@ -71,6 +71,7 @@ def get_current_user(authorization: str | None = Header(None)) -> tuple[str, str
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Token missing 'sub' claim")
+        user_id = user_id.replace("|", "-")
 
         return user_id
 

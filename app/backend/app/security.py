@@ -30,6 +30,7 @@ def decrypt_value(token: str) -> str:
 ### for remote environments ###
 def get_user_secret_id(user_id: str) -> str:
     """standardize secret naming convention."""
+    # NOTE: this replace should be superfluous now that we do it in auth.py, but keeping for safety
     user_id = user_id.replace("|", "-")
     return f"carnot/{COMPANY_ENV}/{user_id}"
 

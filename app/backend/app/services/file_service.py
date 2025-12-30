@@ -353,7 +353,7 @@ class S3FileService(BaseFileService):
     def list_directory(self, path: str) -> list[FileItem]:
         """List contents of an s3 prefix"""
         items = []
-        prefix = self._get_s3_key_from_path(path)
+        prefix = self._get_s3_key_from_path(path).rstrip("/") + "/"
         paginator = self.s3.get_paginator('list_objects_v2')
         result_iterator = paginator.paginate(Bucket=self.s3_bucket, Prefix=prefix, Delimiter='/')
 
@@ -366,7 +366,7 @@ class S3FileService(BaseFileService):
                 display_name = path.rstrip("/").split("/")[-1]
                 items.append(FileItem(
                     path=path,
-                    display_name=display_name + "/",
+                    display_name=display_name.rstrip("/") + "/",
                     is_directory=True,
                     is_hidden=display_name.startswith("."),
                 ))
