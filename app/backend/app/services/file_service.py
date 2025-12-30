@@ -348,7 +348,7 @@ class S3FileService(BaseFileService):
 
     def is_dir(self, path: str) -> bool:
         """Check if a path is a directory; S3 prefixes are always treated as directories"""
-        return True
+        return path.endswith("/")
 
     def list_directory(self, path: str) -> list[FileItem]:
         """List contents of an s3 prefix"""
