@@ -360,10 +360,8 @@ class S3FileService(BaseFileService):
 
         for page in result_iterator:
             # CommonPrefixes contains "directories"
-            for prefix in page.get('CommonPrefixes', []):
-                path = f"s3://{self.s3_bucket}/{prefix['Prefix']}"
-                # base_dir = os.path.join(DATA_DIR, user_id) if user_id else BASE_DIR
-                # display_name = path.split(base_dir)[-1].lstrip("/")
+            for cp in page.get('CommonPrefixes', []):
+                path = f"s3://{self.s3_bucket}/{cp['Prefix']}"
                 display_name = path.rstrip("/").split("/")[-1]
                 items.append(FileItem(
                     path=path,
@@ -377,8 +375,6 @@ class S3FileService(BaseFileService):
                 if obj['Key'] == prefix:
                     continue
                 path = f"s3://{self.s3_bucket}/{obj['Key']}"
-                # base_dir = os.path.join(DATA_DIR, user_id) if user_id else BASE_DIR
-                # display_name = path.split(base_dir)[-1].lstrip("/")
                 display_name = path.rstrip("/").split("/")[-1]
                 items.append(FileItem(
                     path=path,
@@ -393,7 +389,7 @@ class S3FileService(BaseFileService):
 
     def delete_directory(self, path: str) -> None:
         """Delete a directory (prefix) from s3"""
-        prefix = self._get_s3_key_from_path(path)
+        prefix = self._get_s3_key_from_path(path).rstrip("/") + "/"
         paginator = self.s3.get_paginator('list_objects_v2')
         result_iterator = paginator.paginate(Bucket=self.s3_bucket, Prefix=prefix)
 
