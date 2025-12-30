@@ -35,6 +35,7 @@ async def browse_directory(path: str | None = None, user_id: str = Depends(get_c
         # if this path is {DATA_DIR}, return the results under the user's data directory
         if normalized_path.rstrip("/") == normalize_path(DATA_DIR).rstrip("/"):
             normalized_path = os.path.join(DATA_DIR, user_id)
+            file_service.create_dir(normalized_path)
 
         # confirm that path exists and is a directory / s3 prefix
         if not file_service.exists(normalized_path):
