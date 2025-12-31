@@ -337,9 +337,27 @@ class Context(Dataset, ABC):
         return Context(id=new_id, description=new_description, operator=operator, sources=[self], materialized=False)
 
     def search(self, search_query: str) -> Context:
+        # [NEW] Use flat index routing if available (for TextFileContext)
+        routed_files = None
+        if hasattr(self, 'flat_index') and self.flat_index is not None:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"Routing search query with flat index: {search_query}")
+            
+            try:
+                # Route to top-k files (default 50)
+                routed_files = self.flat_index.route(search_query, top_k=50)
+                logger.info(f"Routed to {len(routed_files)} files")
+            except Exception as e:
+                logger.error(f"Routing failed: {e}, falling back to full scan")
+                routed_files = None
+        
         # construct new description and output schema
         new_id = hash_for_id(search_query)
         new_description = f"Parent Context ID: {self.id}\n\nThis Context is the result of searching the parent context for information related to the following query.\n\nSEARCH QUERY: {search_query}\n\n"
+        
+        if routed_files:
+            new_description += f"\nROUTED TO {len(routed_files)} FILES\n"
 
         # construct logical operator
         operator = SearchOperator(
@@ -348,11 +366,18 @@ class Context(Dataset, ABC):
             context_id=new_id,
             search_query=search_query,
         )
+        
+        # Create new context
+        new_context = Context(id=new_id, description=new_description, operator=operator, sources=[self], materialized=False)
+        
+        # [NEW] Store routed files in the new context if routing was used
+        if routed_files:
+            new_context.routed_files = routed_files
 
-        return Context(id=new_id, description=new_description, operator=operator, sources=[self], materialized=False)
+        return new_context
 
 class TextFileContext(Context):
-    def __init__(self, paths: str | list[str], id: str, description: str, **kwargs) -> None:
+    def __init__(self, paths: str | list[str], id: str, description: str, use_routing: bool = True, **kwargs) -> None:
         """
         Constructor for the `TextFileContext` class.
 
@@ -360,6 +385,7 @@ class TextFileContext(Context):
             paths (str | list[str]): (list of) path(s) to text files / directories to include in the `Context`
             id (str): a string identifier for the `Context`
             description (str): the description of the data contained within the `Context`
+            use_routing (bool): whether to use LLM-based file routing for search operations
             kwargs (dict): keyword arguments containing the `Context's` id and description.
         """
         if isinstance(paths, str):
@@ -372,6 +398,12 @@ class TextFileContext(Context):
             for fp in self.file_service.list_all_subfiles(path)
             if not any(fp.lower().endswith(suffix) for suffix in SKIP_SUFFIXES)
         ]
+        
+        # Initialize routing components
+        self.use_routing = use_routing
+        self._flat_index = None  # Lazy initialization
+        self._file_summaries_cache = {}  # Cache file summaries
+        self.routed_files = None  # Set by search() if routing enabled
 
         # call parent constructor to set id, operator, and schema
         schema = create_schema_from_fields([{"name": "context", "desc": "The context", "type": str | Any}])
@@ -383,6 +415,75 @@ class TextFileContext(Context):
             materialized=True,
             **kwargs,
         )
+
+    def _build_flat_index(self):
+        """
+        Build flat file index with file summaries for LLM-based routing.
+        This is called lazily on first search() if routing is enabled.
+        """
+        import logging
+        from carnot.core.data.smv_generator import SMVGenerator
+        from carnot.core.data.flat_index import FlatFileIndex
+        
+        logger = logging.getLogger(__name__)
+        logger.info(f"Building flat file index for {len(self.filepaths)} files...")
+        
+        # Generate file summaries
+        smv_gen = SMVGenerator()
+        file_summaries = []
+        
+        for i, filepath in enumerate(self.filepaths):
+            if i % 10 == 0:
+                logger.info(f"Generating summaries: {i}/{len(self.filepaths)}")
+            
+            try:
+                # Read file content
+                content = self.file_service.read_file(filepath, bytes=False)
+                
+                # Generate file summary
+                file_id = filepath  # Use filepath as ID
+                summary = smv_gen.generate_file_summary(
+                    file_id=file_id,
+                    text_content=content,
+                    file_path=filepath
+                )
+                
+                file_summaries.append(summary)
+                self._file_summaries_cache[file_id] = summary
+                
+            except Exception as e:
+                logger.warning(f"Failed to generate summary for {filepath}: {e}")
+                continue
+        
+        logger.info(f"Generated {len(file_summaries)} file summaries")
+        
+        # Build flat index
+        self._flat_index = FlatFileIndex(file_summaries)
+        logger.info("Flat file index built successfully")
+        
+        return self._flat_index
+    
+    @property
+    def flat_index(self):
+        """Lazy-load the flat index."""
+        if self._flat_index is None and self.use_routing:
+            self._build_flat_index()
+        return self._flat_index
+    
+    def get_files_to_scan(self) -> list[str]:
+        """
+        Get the list of files to scan, respecting routing if available.
+        
+        Returns:
+            List of file paths to scan. If routing is active and routed_files
+            is set, returns only the routed files. Otherwise returns all files.
+        """
+        if self.routed_files is not None:
+            # Only scan routed files
+            return [fp for fp in self.filepaths if fp in self.routed_files]
+        else:
+            # Scan all files
+            return self.filepaths
 
     def _check_filter_answer_text(self, answer_text: str) -> dict | None:
         """
