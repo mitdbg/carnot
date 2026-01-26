@@ -21,7 +21,7 @@ from carnot.core.lib.schemas import create_schema_from_fields, union_schemas
 from carnot.operators.logical import ComputeOperator, ContextScan, LogicalOperator, SearchOperator
 from carnot.utils.hash_helpers import hash_for_id
 
-IS_LOCAL_ENV = os.getenv("LOCAL_ENV").lower() == "true"
+IS_LOCAL_ENV = os.getenv("LOCAL_ENV", "").lower() == "true"
 FILESYSTEM = "file" if IS_LOCAL_ENV else "s3"
 COMPANY_ENV = os.getenv("COMPANY_ENV", "dev")
 BACKEND_ROOT = "/code/backend/"

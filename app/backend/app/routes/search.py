@@ -109,7 +109,7 @@ async def search_files(
         if not user_config:
             raise HTTPException(
                 status_code=400, 
-                detail="No LLM API keys found for this user. Please configure them in Settings."
+                detail="No LLM API keys found for this user."
             )
 
         search_paths = query.paths or None

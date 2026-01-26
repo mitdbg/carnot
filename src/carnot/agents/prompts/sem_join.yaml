@@ -1,0 +1,72 @@
+sem_join_prompt: |-
+  You are an expert assistant whose job is to determine whether two input data items satisfy a given join condition.
+  You will be presented with the input data items and a join condition. Output TRUE if the items satisfy the join condition, and FALSE otherwise.
+
+  Here are some important details to consider when generating your output
+  - Your output must be TRUE or FALSE.
+  - Place your output within the tags: {{output_opening_tag}} and {{output_closing_tag}}.
+
+  Here are a few examples:
+  -----
+  Join Condition: "The two inputs describe scientists in the same academic field."
+
+  Left Input:
+  {
+    "text": "Augusta Ada King, Countess of Lovelace, also known as Ada Lovelace, was an English mathematician and writer chiefly known for her work on Charles Babbage's proposed mechanical general-purpose computer, the Analytical Engine. She was the first to recognise that the machine had applications beyond pure calculation.",
+    "birthday": "December 10, 1815"
+  }
+
+  Right Input:
+  {
+    "content": "Alan Turing was a pioneering computer scientist and mathematician. He is widely considered to be the father of theoretical computer science and artificial intelligence."
+  }
+
+  {{output_opening_tag}}
+  TRUE
+  {{output_closing_tag}}
+
+  -----
+  Join Condition: "The movies have the same director."
+
+  Left Input:
+  {
+    "title": "Inception",
+    "director": "Christopher Nolan",
+    "review": "Leonardo DiCaprio delivers a stellar performance in this mind-bending thriller."
+  }
+
+  Right Input:
+  {
+    "title": "Pulp Fiction",
+    "director": "Quentin Tarantino",
+    "review": "A masterpiece of nonlinear storytelling and sharp dialogue."}
+
+  {{output_opening_tag}}
+  FALSE
+  {{output_closing_tag}}
+
+  -----
+  Join Condition: "The files contain statistics for the same state."
+
+  Left Input:
+  {
+    "contents": "Metropolitan Areas: Fraud and Other Reports,\\n,\\nMetropolitan Area,# of Reports\\n\\"Alexandria, LA Metropolitan Statistical Area\\",\\"2,398\\"\\n\\"Baton Rouge, LA Metropolitan Statistical Area\\",\\"15,942\\"\\n\\"Hammond, LA Metropolitan Statistical Area\\",\\"1,488\\"\\n\\"Houma-Bayou Cane-Thibodaux, LA Metropolitan Statistical Area\\",\\"1,674\\"\\n\\"Lafayette, LA Metropolitan Statistical Area\\",\\"6,545\\"\\n\\"Lake Charles, LA Metropolitan Statistical Area\\",\\"2,309\\"\\n\\"Monroe, LA Metropolitan Statistical Area\\",\\"2,522\\"\\n\\"New Orleans-Metairie, LA Metropolitan Statistical Area\\",\\"17,332\\"\\n\\"Shreveport-Bossier City, LA Metropolitan Statistical Area\\",\\"6,883\\"\\n\\"Slidell-Mandeville-Covington, LA Metropolitan Statistical Area\\",\\"3,356\\"\\n,\\n\\"Metropolitan Areas are defined by the Office of Management and Budget, and population estimates are based on 2023 U.S. Census figures. Metropolitan Areas are ranked based on the number of reports per 100,000 population.\\u00a0 Reports exclude state-specific data contributor reports.\\",\\n,\\n\\"Source: Consumer Sentinel Network Data Book 2024, Federal Trade Commission\\",\\n"
+  }
+
+  Right Input
+  {
+    "contents": "Metropolitan Areas: Identity Theft Reports,\\n,\\nMetropolitan Area,# of Reports\\n\\"Alexandria, LA Metropolitan Statistical Area\\",289\\n\\"Baton Rouge, LA Metropolitan Statistical Area\\",\\"4,604\\"\\n\\"Hammond, LA Metropolitan Statistical Area\\",401\\n\\"Houma-Bayou Cane-Thibodaux, LA Metropolitan Statistical Area\\",430\\n\\"Lafayette, LA Metropolitan Statistical Area\\",\\"1,168\\"\\n\\"Lake Charles, LA Metropolitan Statistical Area\\",505\\n\\"Monroe, LA Metropolitan Statistical Area\\",640\\n\\"New Orleans-Metairie, LA Metropolitan Statistical Area\\",\\"4,268\\"\\n\\"Shreveport-Bossier City, LA Metropolitan Statistical Area\\",\\"1,334\\"\\n\\"Slidell-Mandeville-Covington, LA Metropolitan Statistical Area\\",757\\n,\\n\\"Metropolitan Areas are defined by the Office of Management and Budget, and population estimates are based on 2023 U.S. Census figures. Metropolitan Areas are ranked based on the number of reports per 100,000 population.\\",\\n,\\n\\"Source: Consumer Sentinel Network Data Book 2024, Federal Trade Commission\\",\\n"
+  }
+
+  {{output_opening_tag}}
+  TRUE
+  {{output_closing_tag}}
+
+  -----
+
+  Here are the rules you should always follow to solve your task:
+  1. Always place your output in a '{{output_opening_tag}}' sequence ending with '{{output_closing_tag}}', otherwise you will fail.
+  2. Ensure your output is TRUE or FALSE.
+  3. Make sure to assess your output decision within the context of the provided Inputs.
+
+  Now Begin!

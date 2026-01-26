@@ -3,7 +3,6 @@ import logging
 from carnot.config import QueryProcessorConfig
 from carnot.constants import Cardinality, Model
 from carnot.core.data.context import Context, TextFileContext
-from carnot.core.data.dataset import Dataset
 from carnot.core.data.iter_dataset import (
     AudioFileDataset,
     HTMLFileDataset,
@@ -15,6 +14,9 @@ from carnot.core.data.iter_dataset import (
     XLSFileDataset,
 )
 from carnot.core.lib.schemas import AudioBase64, AudioFilepath, ImageBase64, ImageFilepath, ImageURL
+from carnot.data.dataset import Dataset
+from carnot.data.logical_dataset import LogicalDataset
+from carnot.execution.execution import Execution
 from carnot.policy import (
     MaxQuality,
     MaxQualityAtFixedCost,
@@ -37,7 +39,6 @@ __all__ = [
     # core
     "Context",
     "TextFileContext",
-    "Dataset",
     "IterDataset",
     "AudioFileDataset",
     "MemoryDataset",
@@ -46,6 +47,11 @@ __all__ = [
     "PDFFileDataset",
     "TextFileDataset",
     "XLSFileDataset",
+    # data
+    "Dataset",
+    "LogicalDataset",
+    # execution
+    "Execution",
     # schemas
     "AudioBase64",
     "AudioFilepath",

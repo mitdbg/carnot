@@ -5,8 +5,8 @@ from fastapi import Header, HTTPException
 from jose import jwt
 
 AUTH0_ISSUER = f"https://{os.getenv('AUTH0_DOMAIN')}/"
-AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE")
-CLAIMS_NAMESPACE = os.getenv("AUTH0_CLAIMS_NAMESPACE")
+AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE", "")
+CLAIMS_NAMESPACE = os.getenv("AUTH0_CLAIMS_NAMESPACE", "")  # NOTE: not used anymore; may be deprecated
 ALGORITHMS = ["RS256"]
 
 # Cache for JWKS keys to avoid hitting Auth0 on every request

@@ -8,6 +8,8 @@ from cryptography.fernet import Fernet
 from app.env import COMPANY_ENV
 
 ### for local environments ###
+# NOTE: only used in local dev/testing; remote uses AWS Secrets Manager
+#       perhaps we should update the check below not to throw a ValueError
 key = os.getenv("SETTINGS_ENCRYPTION_KEY")
 
 if not key:

@@ -209,6 +209,10 @@ __marimo__/
 # allow env/ within deploy/terraform/env/
 !deploy/terraform/env/
 
+# test data files
+tests/pytest/data/movie-reviews
+tests/pytest/data/quest/
+
 # Miscellaneous
 .github/workflows/github-trust-policy.json
 venv_web/

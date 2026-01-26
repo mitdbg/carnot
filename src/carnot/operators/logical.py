@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import textwrap
 from collections.abc import Callable
 
 from pydantic import BaseModel
@@ -51,6 +52,9 @@ class LogicalOperator:
         self.generated_fields = sorted(
             [field_name for field_name in self.output_schema.model_fields if field_name not in input_field_names]
         )
+
+    def desc(self) -> str:
+        raise NotImplementedError("Abstract method")
 
     def __str__(self) -> str:
         raise NotImplementedError("Abstract method")
@@ -162,6 +166,24 @@ class Aggregate(LogicalOperator):
         super().__init__(*args, **kwargs)
         self.agg_func = agg_func
 
+    @staticmethod
+    def desc() -> str:
+        return textwrap.dedent(
+            """
+            Aggregate Operator:
+                Description: Applies an aggregation function to the input set.
+                Syntax: ds.sem_aggregate(agg: str)
+                Example: ds.sem_aggregate(agg="The number of positive reviews in the dataset")
+            GroupBy Operator:
+                Description: Groups the input set by specified columns and applies an aggregation function to each group.
+                    Currently only supports single aggregation function per group.
+                    The supported `agg_funcs` are: "count" and "average".
+                    The `agg_fields` must exist in the dataset already, but the `gby_fields` can be new fields derived from existing fields.
+                Syntax: ds.sem_groupby(gby_fields: list[str], agg_fields: list[str], agg_funcs: list[str])
+                Example: ds.sem_groupby(gby_fields=["sentiment"], agg_fields=["review_text"], agg_funcs=["count"])
+            """
+        )
+
     def __str__(self):
         return f"{self.__class__.__name__}(function: {str(self.agg_func.value)})"
 
@@ -187,6 +209,11 @@ class BaseScan(LogicalOperator):
     def __init__(self, datasource: dataset.Dataset, output_schema: type[BaseModel], *args, **kwargs):
         super().__init__(*args, output_schema=output_schema, **kwargs)
         self.datasource = datasource
+
+    @staticmethod
+    def desc() -> str:
+        # TODO
+        return ""
 
     def __str__(self):
         return f"BaseScan({self.datasource},{self.output_schema})"
@@ -221,6 +248,11 @@ class ContextScan(LogicalOperator):
     def __init__(self, context: context.Context, output_schema: type[BaseModel], *args, **kwargs):
         super().__init__(*args, output_schema=output_schema, **kwargs)
         self.context = context
+
+    @staticmethod
+    def desc() -> str:
+        # TODO
+        return ""
 
     def __str__(self):
         return f"ContextScan({self.context},{self.output_schema})"
@@ -261,7 +293,22 @@ class ConvertScan(LogicalOperator):
         super().__init__(*args, **kwargs)
         self.cardinality = cardinality
         self.udf = udf
-        self.desc = desc
+        self._desc = desc
+
+    @staticmethod
+    def desc() -> str:
+        return textwrap.dedent(
+            """
+            Map Operator:
+                Description: Executes a semantic map operation by applying an LLM to each record in the input set to compute an output field.
+                Syntax: ds.sem_map(field: str, type: type, description: str)
+                Example: ds.sem_map(field="summary", type=str, description="A concise summary of the legal contract")
+            Flat Map Operator:
+                Description: Executes a semantic flat map operation by applying an LLM to each record in the input set to compute multiple output records per input record.
+                Syntax: ds.sem_flat_map(field: str, type: type, description: str)
+                Example: ds.sem_flat_map(field="key_points", type=str, description="Key points extracted from the legal contract")
+            """
+        )
 
     def __str__(self):
         return f"ConvertScan({self.input_schema} -> {str(self.output_schema)})"
@@ -271,7 +318,7 @@ class ConvertScan(LogicalOperator):
         logical_id_params = {
             "cardinality": self.cardinality,
             "udf": self.udf,
-            "desc": self.desc,
+            "desc": self._desc,
             **logical_id_params,
         }
 
@@ -282,7 +329,7 @@ class ConvertScan(LogicalOperator):
         logical_op_params = {
             "cardinality": self.cardinality,
             "udf": self.udf,
-            "desc": self.desc,
+            "desc": self._desc,
             **logical_op_params,
         }
 
@@ -303,6 +350,11 @@ class Distinct(LogicalOperator):
             if distinct_cols is None
             else sorted(distinct_cols)
         )
+
+    @staticmethod
+    def desc() -> str:
+        # TODO
+        return ""
 
     def __str__(self):
         return f"Distinct({self.distinct_cols})"
@@ -335,7 +387,18 @@ class FilteredScan(LogicalOperator):
     ):
         super().__init__(*args, **kwargs)
         self.filter = filter
-        self.desc = desc
+        self._desc = desc
+
+    @staticmethod
+    def desc() -> str:
+        return textwrap.dedent(
+            """
+            Filter Operator:
+                Description: Applies a semantic filter to the input set based on a provided natural language condition.
+                Syntax: ds.sem_filter(condition: str)
+                Example: ds.sem_filter("The image contains a sunset over the mountains")
+            """
+        )
 
     def __str__(self):
         return f"FilteredScan({str(self.output_schema)}, {str(self.filter)})"
@@ -344,7 +407,7 @@ class FilteredScan(LogicalOperator):
         logical_id_params = super().get_logical_id_params()
         logical_id_params = {
             "filter": self.filter,
-            "desc": self.desc,
+            "desc": self._desc,
             **logical_id_params,
         }
 
@@ -354,7 +417,7 @@ class FilteredScan(LogicalOperator):
         logical_op_params = super().get_logical_op_params()
         logical_op_params = {
             "filter": self.filter,
-            "desc": self.desc,
+            "desc": self._desc,
             **logical_op_params,
         }
 
@@ -365,14 +428,25 @@ class JoinOp(LogicalOperator):
     def __init__(self, condition: str, desc: str | None = None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.condition = condition
-        self.desc = desc
+        self._desc = desc
+
+    @staticmethod
+    def desc():
+        return textwrap.dedent(
+            """
+            Join Operator:
+                Description: Semantically joins two input sets based on a provided natural language condition.
+                Syntax: ds.sem_join(other_ds: LogicalDataset, condition: str)
+                Example: ds.sem_join(other_ds=orders_ds, condition="customer_id matches id in the order PDF")
+            """
+        )
 
     def __str__(self):
         return f"Join(condition={self.condition})"
 
     def get_logical_id_params(self) -> dict:
         logical_id_params = super().get_logical_id_params()
-        logical_id_params = {"condition": self.condition, "desc": self.desc, **logical_id_params}
+        logical_id_params = {"condition": self.condition, "desc": self._desc, **logical_id_params}
 
         return logical_id_params
 
@@ -380,7 +454,7 @@ class JoinOp(LogicalOperator):
         logical_op_params = super().get_logical_op_params()
         logical_op_params = {
             "condition": self.condition,
-            "desc": self.desc,
+            "desc": self._desc,
             **logical_op_params,
         }
 
@@ -391,6 +465,11 @@ class LimitScan(LogicalOperator):
     def __init__(self, limit: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.limit = limit
+
+    @staticmethod
+    def desc() -> str:
+        # TODO
+        return ""
 
     def __str__(self):
         return f"LimitScan({str(self.input_schema)}, {str(self.output_schema)})"
@@ -415,6 +494,11 @@ class Project(LogicalOperator):
     def __init__(self, project_cols: list[str], *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.project_cols = project_cols
+
+    @staticmethod
+    def desc() -> str:
+        # TODO
+        return ""
 
     def __str__(self):
         return f"Project({self.input_schema}, {self.project_cols})"
@@ -454,6 +538,11 @@ class RetrieveScan(LogicalOperator):
         self.search_attr = search_attr
         self.output_attrs = output_attrs
         self.k = k
+
+    @staticmethod
+    def desc() -> str:
+        # TODO
+        return ""
 
     def __str__(self):
         return f"RetrieveScan({self.input_schema} -> {str(self.output_schema)})"
@@ -497,6 +586,21 @@ class ComputeOperator(LogicalOperator):
         self.context_id = context_id
         self.instruction = instruction
 
+    @staticmethod
+    def desc() -> str:
+        return textwrap.dedent(
+            """
+            Code Operator:
+                Description: Executes a computation described in natural language on a given dataset.
+                Syntax: ds.code(instruction: str)
+                Example: ds.code("Compute the mean temperature from all temperature readings recorded in the dataset")
+            Reasoning Operator:
+                Description: Executes a reasoning task described in natural language on a given dataset.
+                Syntax: ds.reason(instruction: str)
+                Example: ds.reason("Determine if there is a correlation between sales and marketing spend in the dataset")
+            """
+        )
+
     def __str__(self):
         return f"ComputeOperator(id={self.context_id}, instr={self.instruction:20s})"
 
@@ -531,6 +635,11 @@ class SearchOperator(LogicalOperator):
         super().__init__(*args, **kwargs)
         self.context_id = context_id
         self.search_query = search_query
+
+    @staticmethod
+    def desc() -> str:
+        # TODO
+        return ""
 
     def __str__(self):
         return f"SearchOperator(id={self.context_id}, search_query={self.search_query:20s})"

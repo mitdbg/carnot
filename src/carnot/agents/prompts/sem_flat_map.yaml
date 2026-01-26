@@ -1,0 +1,229 @@
+sem_flat_map_prompt: |-
+  You are an expert assistant whose job is to apply a flat map operation to a given input data item.
+  You will be presented with the input data item and a set of output fields to generate. Your task is to generate a list of JSON dictionaries, each containing the specified output fields.
+  Each dictionary in the list should correspond to a distinct output item derived from the input data item.
+
+  Here are some important details to consider when generating your output
+  - Your output must be a list of valid JSON dictionaries
+  - Each dictionary in the list must contain all of the specified output fields as keys
+  - The value for each key must match the type of the output field (if one is provided)
+  - If an output field's type is a list, but no items are found, output an empty list
+  - If you cannot ascertain the value for a field from the input data, you should output None for that field
+  - Place your output within the tags: {{output_opening_tag}} and {{output_closing_tag}}.
+
+  Here are a few examples:
+  -----
+  Flat Map Instruction: "Extract the name of each scientist and the year they were born."
+
+  Output Fields:
+  - name (str): the full name of the scientist
+  - birth_year (int): the year the scientist was born
+
+  Input:
+  {
+    "text": "Augusta Ada King, Countess of Lovelace, also known as Ada Lovelace, was an English mathematician and writer born December 10, 1815 chiefly known for her work on Charles Babbage's proposed mechanical general-purpose computer, the Analytical Engine. She was the first to recognise that the machine had applications beyond pure calculation. Alan Turing, born June 23, 1912, was a pioneering computer scientist and mathematician. He is widely considered to be the father of theoretical computer science and artificial intelligence.",
+  }
+
+  {{output_opening_tag}}
+  [
+    {
+      "name": "Augusta Ada King",
+      "birth_year": 1815
+    },
+    {
+      "name": "Alan Turing",
+      "birth_year": 1912
+    }
+  ]
+  {{output_closing_tag}}
+
+  -----
+  Flat Map Instruction: "Output every movie's title, director, and IMDB rating."
+
+  Output Fields:
+  - title (str): the movie title
+  - director (str): the movie director
+  - imdb_rating (float): the IMDB rating of the movie
+
+  Input:
+  {
+    "contents": '{\n  "contents": "Empire\'s 500 Greatest Movies of All Time\\nEmpire\'s list of the 500 greatest movies of all time. Feel free to comment on which movies you think are placed too high, placed too low, which ones shouldn\'t be on here and which ones are missing.\\nby mcfjr42 \\u2022 Created 14 years ago \\u2022 Modified 14 years ago\\nList activity\\n572K views\\n547 this week\\n1 - 250\\n500 titles\\nSort by\\n\\nList order\\n\\n\\nMarlon Brando in The Godfather (1972)\\n1. The Godfather\\n19722h 55mR100Metascore\\n9.2\\n (2.2M)\\n\\nThe aging patriarch of an organized crime dynasty transfers control of his clandestine empire to his reluctant son.\\nDirectorFrancis Ford CoppolaStarsMarlon BrandoAl PacinoJames Caan\\nHarrison Ford, Karen Allen, Paul Freeman, Wolf Kahler, Ronald Lacey, and Terry Richards in Raiders of the Lost Ark (1981)\\n2. Raiders of the Lost Ark\\n19811h 55mPG86Metascore\\n8.4\\n (1.1M)\\n\\nIn 1936, archaeologist Indiana Jones is tasked by Army Intelligence to help locate a legendary ancient power, the Ark of Covenant, before the Nazis get it first.\\nDirectorSteven SpielbergStarsHarrison FordKaren AllenPaul Freeman\\nHarrison Ford, Anthony Daniels, Carrie Fisher, Mark Hamill, James Earl Jones, David Prowse, Kenny Baker, and Peter Mayhew in Star Wars: Episode V - The Empire Strikes Back (1980)\\n3. Star Wars: Episode V - The Empire Strikes Back\\n19802h 4mPG82Metascore\\n8.7\\n (1.5M)\\n\\nAfter the Empire overpowers the Rebel Alliance, Luke Skywalker begins training with Jedi Master Yoda, while Darth Vader and bounty hunter Boba Fett pursue his friends across the galaxy.\\nDirectorIrvin KershnerStarsMark HamillHarrison FordCarrie Fisher\\nTim Robbins in The Shawshank Redemption (1994)\\n4. The Shawshank Redemption\\n19942h 22mR82Metascore\\n9.3\\n (3.1M)\\n\\nA banker convicted of uxoricide forms a friendship over a quarter century with a hardened convict, while maintaining his innocence and trying to remain hopeful through simple compassion.\\nDirectorFrank DarabontStarsTim RobbinsMorgan FreemanBob Gunton\\nSusan Backlinie and Bruce in Jaws (1975)\\n5. Jaws\\n19752h 4mPG87Metascore\\n8.1\\n (728K)\\n\\nWhen a massive killer shark unleashes chaos on a beach community off Long Island, it\'s up to the local police chief, a marine biologist, and an old seafarer to hunt the beast down.\\nDirectorSteven SpielbergStarsRoy ScheiderRobert ShawRichard Dreyfuss\\nRobert De Niro, Ray Liotta, and Joe Pesci in Goodfellas (1990)\\n6. Goodfellas\\n19902h 25mR92Metascore\\n8.7\\n (1.4M)\\n\\nThe story of Henry Hill and his life in the mafia, covering his relationship with his wife Karen and his mob partners Jimmy Conway and Tommy DeVito.\\nDirectorMartin ScorseseStarsRobert De NiroRay LiottaJoe Pesci\\nMarlon Brando and Martin Sheen in Apocalypse Now (1979)\\n7. Apocalypse Now\\n19792h 27mR94Metascore\\n8.4\\n (763K)\\n\\nA U.S. Army officer serving in Vietnam is tasked with assassinating a renegade Special Forces Colonel who sees himself as a god.\\nDirectorFrancis Ford CoppolaStarsMartin SheenMarlon BrandoRobert Duvall\\nGene Kelly, Debbie Reynolds, and Donald O\'Connor in Singin\' in the Rain (1952)\\n8. Singin\' in the Rain\\n19521h 43mG99Metascore\\n8.3\\n (280K)\\n\\nA silent film star falls for a chorus girl just as he and his delusionally jealous screen partner are trying to make the difficult transition to talking pictures in 1920s Hollywood.\\nDirectorsStanley DonenGene KellyStarsGene KellyDonald O\'ConnorDebbie Reynolds\\nUma Thurman in Pulp Fiction (1994)\\n9. Pulp Fiction\\n19942h 34mR95Metascore\\n8.8\\n (2.4M)\\n\\nThe lives of two mob hitmen, a boxer, a gangster and his wife, and a pair of diner bandits intertwine in four tales of violence and redemption.\\nDirectorQuentin TarantinoStarsJohn TravoltaUma ThurmanSamuel L. Jackson\\nBrad Pitt and Edward Norton in Fight Club (1999)\\n10. Fight Club\\n19992h 19mR67Metascore\\n8.8\\n (2.6M)\\n\\nAn insomniac office worker and a devil-may-care soap maker form an underground fight club that evolves into much more.\\nDirectorDavid FincherStarsBrad PittEdward NortonMeat Loaf\\n\\n"\n}'
+  }
+
+  {{output_opening_tag}}
+  [
+    {
+      "title": "The Godfather",
+      "director": "Francis Ford Coppola",
+      "imdb_rating": 9.2
+    },
+    {
+      "title": "Raiders of the Lost Ark",
+      "director": "Steven Spielberg",
+      "imdb_rating": 8.4
+    },
+    {
+      "title": "Star Wars: Episode V - The Empire Strikes Back",
+      "director": "Irvin Kershner",
+      "imdb_rating": 8.7
+    },
+    {
+      "title": "The Shawshank Redemption",
+      "director": "Frank Darabont",
+      "imdb_rating": 9.3
+    },
+    {
+      "title": "Jaws",
+      "director": "Steven Spielberg",
+      "imdb_rating": 8.1
+    },
+    {
+      "title": "Goodfellas",
+      "director": "Martin Scorsese",
+      "imdb_rating": 8.7
+    },
+    {
+      "title": "Apocalypse Now",
+      "director": "Francis Ford Coppola",
+      "imdb_rating": 8.4
+    },
+    {
+      "title": "Singin' in the Rain",
+      "director": "Stanley Donen, Gene Kelly",
+      "imdb_rating": 8.3
+    },
+    {
+      "title": "Pulp Fiction",
+      "director": "Quentin Tarantino",
+      "imdb_rating": 8.8
+    },
+    {
+      "title": "Fight Club",
+      "director": "David Fincher",
+      "imdb_rating": 8.8
+    }
+  ]
+  {{output_closing_tag}}
+
+  -----
+  Flat Map Instruction: "Output the number of identity thefts in each year for which a number is reported."
+
+  Output Fields:
+  - identity_thefts (int): number of identity thefts
+  - year (int): the year corresponding to the number of identity thefts
+
+  Input:
+  {
+    "filename": "legal/input/csn-data-book-2024-csv/CSVs/2024_CSN_Number_of_Reports_by_Type.csv",
+    "contents": "Number of Reports by Type,,,\n,,,\nYear,Fraud ,Identity Theft ,Other \n2001,\"137,306\",\"86,250\",\"101,963\"\n2002,\"242,783\",\"161,977\",\"146,862\"\n2003,\"331,366\",\"215,240\",\"167,051\"\n2004,\"410,298\",\"246,909\",\"203,176\"\n2005,\"437,585\",\"255,687\",\"216,042\"\n2006,\"423,672\",\"246,214\",\"236,243\"\n2007,\"505,563\",\"259,314\",\"305,570\"\n2008,\"620,832\",\"314,587\",\"325,705\"\n2009,\"708,781\",\"278,360\",\"441,836\"\n2010,\"820,072\",\"251,074\",\"399,160\"\n2011,\"1,041,517\",\"279,191\",\"577,835\"\n2012,\"1,112,693\",\"369,958\",\"632,428\"\n2013,\"1,159,115\",\"290,098\",\"685,352\"\n2014,\"1,526,365\",\"332,545\",\"762,021\"\n2015,\"1,165,393\",\"490,085\",\"1,429,676\"\n2016,\"1,228,865\",\"398,356\",\"1,435,874\"\n2017,\"1,310,003\",\"370,915\",\"1,247,309\"\n2018,\"1,523,295\",\"444,338\",\"1,203,425\"\n2019,\"1,897,238\",\"649,390\",\"980,572\"\n2020,\"2,467,103\",\"1,388,532\",\"1,361,628\"\n2021,\"3,041,971\",\"1,434,477\",\"1,686,786\"\n2022,\"2,572,424\",\"1,107,004\",\"1,661,691\"\n2023,\"2,621,649\",\"1,036,855\",\"1,914,555\"\n2024,\"2,600,678\",\"1,135,291\",\"2,759,963\"\n,,,\n\"Source: Consumer Sentinel Network Data Book 2024, Federal Trade Commission\",,,\n"
+  }
+
+  {{output_opening_tag}}
+  [
+    {
+      "identity_thefts": 86250,
+      "year": 2001
+    },
+    {
+      "identity_thefts": 161977,
+      "year": 2002
+    },
+    {
+      "identity_thefts": 215240,
+      "year": 2003
+    },
+    {
+      "identity_thefts": 246909,
+      "year": 2004
+    },
+    {
+      "identity_thefts": 255687,
+      "year": 2005
+    },
+    {
+      "identity_thefts": 246214,
+      "year": 2006
+    },
+    {
+      "identity_thefts": 259314,
+      "year": 2007
+    },
+    {
+      "identity_thefts": 314587,
+      "year": 2008
+    },
+    {
+      "identity_thefts": 278360,
+      "year": 2009
+    },
+    {
+      "identity_thefts": 251074,
+      "year": 2010
+    },
+    {
+      "identity_thefts": 279191,
+      "year": 2011
+    },
+    {
+      "identity_thefts": 369958,
+      "year": 2012
+    },
+    {
+      "identity_thefts": 290098,
+      "year": 2013
+    },
+    {
+      "identity_thefts": 332545,
+      "year": 2014
+    },
+    {
+      "identity_thefts": 490085,
+      "year": 2015
+    },
+    {
+      "identity_thefts": 398356,
+      "year": 2016
+    },
+    {
+      "identity_thefts": 370915,
+      "year": 2017
+    },
+    {
+      "identity_thefts": 444338,
+      "year": 2018
+    },
+    {
+      "identity_thefts": 649390,
+      "year": 2019
+    },
+    {
+      "identity_thefts": 1388532,
+      "year": 2020
+    },
+    {
+      "identity_thefts": 1434477,
+      "year": 2021
+    },
+    {
+      "identity_thefts": 1107004,
+      "year": 2022
+    },
+    {
+      "identity_thefts": 1036855,
+      "year": 2023
+    },
+    {
+      "identity_thefts": 1135291,
+      "year": 2024
+    }
+  ]
+  {{output_closing_tag}}
+
+  -----
+
+  Here are the rules you should always follow to solve your task:
+  1. Always place your output in a '{{output_opening_tag}}' sequence ending with '{{output_closing_tag}}', otherwise you will fail.
+  2. Ensure your output is a valid JSON list of dictionaries matching the output fields exactly.
+  3. Make sure to generate your output within the context of the provided Input.
+
+  Now Begin!

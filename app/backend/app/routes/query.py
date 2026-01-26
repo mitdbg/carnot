@@ -13,10 +13,11 @@ import fsspec
 import pandas as pd
 from cloudpathlib import S3Path
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.background import BackgroundTask
 
 import carnot
@@ -35,6 +36,8 @@ from app.database import (
 from app.env import BACKEND_ROOT, BASE_DIR, FILESYSTEM, IS_LOCAL_ENV
 from app.services.file_service import LocalFileService, S3FileService
 from app.services.llm import get_user_llm_config
+from carnot.data.dataset import Dataset as CarnotDataset
+from carnot.data.item import DataItem
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -87,8 +90,9 @@ class QueryExecutionStreamer:
     Encapsulates the query execution and concurrent heartbeat task for SSE streaming.
     Uses an asyncio.Queue to safely merge output from the query task and the heartbeat task.
     """
-    def __init__(self, query: str, dataset_ids: list[int], user_id: str, session_id: str, user_config: dict):
+    def __init__(self, query: str, plan: dict, dataset_ids: list[int], user_id: str, session_id: str, user_config: dict):
         self.query = query
+        self.plan = plan # TODO: use the plan in execution
         self.dataset_ids = dataset_ids
         self.user_id = user_id
         self.session_id = session_id
@@ -428,6 +432,7 @@ class QueryRequest(BaseModel):
     query: str
     dataset_ids: list[int]
     session_id: str
+    plan: dict | None = None
 
 
 def cleanup_old_sessions() -> None:
@@ -496,12 +501,89 @@ async def save_message(
 
         await db.commit()
 
+@router.post("/plan")
+async def plan_query(
+    request: QueryRequest,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Generate a logical execution plan for a Carnot query on selected datasets.
+    Supports multi-turn conversations via session_id.
+    """
+    if not request.dataset_ids:
+        raise HTTPException(status_code=400, detail="At least one dataset must be selected")
+
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    # retrieve user LLM config
+    user_config = await get_user_llm_config(db, user_id)
+    if not user_config:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "type": "API_KEY_MISSING",
+                "message": "No LLM API keys found for this user.",
+            }
+        )
+
+    # load datasets
+    datasets = []
+    for dataset_id in request.dataset_ids:
+        dataset_result = await db.execute(
+            select(Dataset).where(Dataset.id == dataset_id)
+        )
+        dataset = dataset_result.scalar_one_or_none()
+        if not dataset:
+            raise HTTPException(status_code=404, detail=f"Dataset {dataset_id} not found")
+
+        files_result = await db.execute(
+            select(FileRecord)
+            .join(DatasetFile, FileRecord.id == DatasetFile.file_id)
+            .where(DatasetFile.dataset_id == dataset_id)
+        )
+        files = files_result.scalars().all()
+        carnot_dataset = CarnotDataset(
+            name=dataset.name,
+            annotation=dataset.annotation,
+            items=[DataItem(path=file.file_path) for file in files],
+        )
+        datasets.append(carnot_dataset)
+
+    # retrieve or create conversation to save the 'user' feedback/query
+    conversation_id = await get_or_create_conversation(
+        user_id, request.session_id, request.query, request.dataset_ids
+    )
+    await save_message(conversation_id, "user", request.query)
+
+    # create execution and generate plan
+    exec_instance = carnot.Execution(
+        query=request.query,
+        datasets=datasets,
+        conversation=None, # TODO: pass in conversation history
+        tools=[],
+        memory=None,
+        indices=[],
+        llm_config=user_config,
+    )
+
+    nl_plan, plan = await run_in_threadpool(exec_instance.plan)
+
+    # save the natural language plan as an 'assistant' role message
+    await save_message(conversation_id, "assistant", nl_plan)
+
+    return {
+        "natural_language_plan": nl_plan,
+        "plan": plan,
+        "session_id": request.session_id,
+    }
 
 @router.post("/execute")
 async def execute_query(
     request: QueryRequest,
     user_id: str = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
     """
     Execute a Carnot query on selected datasets with streaming progress.
@@ -520,13 +602,13 @@ async def execute_query(
             status_code=400,
             detail={
                 "type": "API_KEY_MISSING",
-                "message": "No LLM API keys found for this user. Please configure them in Settings.",
+                "message": "No LLM API keys found for this user.",
             }
         )
 
     # Instantiate the streamer class
     streamer = QueryExecutionStreamer(
-        request.query, request.dataset_ids, user_id, request.session_id, user_config
+        request.query, request.plan, request.dataset_ids, user_id, request.session_id, user_config,
     )
 
     return StreamingResponse(
