@@ -314,17 +314,12 @@ class QueryExecutionStreamer:
 
                     # If we found a filename, check if that file exists and use it
                     if csv_filename_from_output:
-                        actual_csv_path = os.path.join(BACKEND_ROOT, csv_filename_from_output)
-                        if os.path.exists(actual_csv_path) and actual_csv_path != csv_path:
+                        actual_csv_path = Path(BACKEND_ROOT) / csv_filename_from_output
+                        if actual_csv_path.exists() and actual_csv_path != csv_path:
                             # Use the file that Carnot created
                             csv_filename = csv_filename_from_output
                             csv_path = actual_csv_path
-                            df = pd.read_csv(csv_path)  # Re-read from the actual file
-                        else:
-                            # File doesn't exist, rename our file to match
-                            csv_path.rename(actual_csv_path)
-                            csv_path = actual_csv_path
-                            csv_filename = csv_filename_from_output
+                            df = pd.read_csv(str(csv_path))  # Re-read from the actual file
 
                 if df.empty:
                     message_text = "No results found for your query."
