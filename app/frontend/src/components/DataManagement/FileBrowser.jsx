@@ -382,6 +382,9 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
         if (parentPath === base || !parentPath) {
             setCurrentPath(''); 
         } else {
+            if (!parentPath.endsWith('/')) {
+                parentPath += '/';
+            }
             setCurrentPath(parentPath);
         }
     }

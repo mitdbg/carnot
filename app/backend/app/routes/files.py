@@ -32,12 +32,13 @@ async def browse_directory(path: str | None = None, user_id: str = Depends(get_c
         # normalize the incoming path from the frontend
         normalized_path = normalize_path(path)
 
+        # ensure that path ends with a slash for directory listing consistency
+        if not normalized_path.endswith("/") and path != "":
+             normalized_path += "/"
+
         # if this path is {DATA_DIR}, return the results under the user's data directory
         if normalized_path.rstrip("/") == normalize_path(DATA_DIR).rstrip("/"):
             normalized_path = os.path.join(DATA_DIR, user_id)
-            if not normalized_path.endswith("/"):
-                normalized_path += "/"
-
             if not file_service.exists(normalized_path):
                 file_service.create_dir(normalized_path)
 
