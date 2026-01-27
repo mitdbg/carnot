@@ -104,4 +104,3 @@ async def get_db():
 # database initialization is handled by Alembic migrations
 async def init_db():
     pass
-

@@ -13,7 +13,6 @@ function SearchChatbot({ onSelectFiles }) {
   ])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
-  const [lastResults, setLastResults] = useState([])
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -34,7 +33,6 @@ function SearchChatbot({ onSelectFiles }) {
       // search for files
       const response = await searchApi.search(userMessage, null, token);
       const results = response.data
-      setLastResults(results)
 
       // add assistant response
       if (results.length > 0) {
@@ -122,7 +120,7 @@ function SearchChatbot({ onSelectFiles }) {
                         className="bg-white border border-gray-200 rounded p-2 text-xs"
                       >
                         <div className="font-medium text-gray-800">{result.file_name}</div>
-                        <div className="text-gray-500 text-xs truncate">{result.file_path}</div>
+                        <div className="text-gray-500 text-xs truncate">{result.virtual_path}</div>
                         {result.snippet && (
                           <div className="text-gray-600 mt-1 text-xs line-clamp-2">
                             {result.snippet}

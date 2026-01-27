@@ -2,7 +2,6 @@ import { Routes, Route } from 'react-router-dom'
 import Layout from './components/Layout'
 import ProtectedRoute from './components/ProtectedRoute'
 import DataManagementPage from './pages/DataManagementPage'
-import DatasetCreatorPage from './pages/DatasetCreatorPage'
 import UserChatPage from './pages/UserChatPage'
 import Settings from './pages/Settings'
 
@@ -32,10 +31,6 @@ function App() {
         <Route 
           path="/"
           element={<ProtectedRoute component={DataManagementPage} />}
-        />
-        <Route
-          path="/datasets/create"
-          element={<ProtectedRoute component={DatasetCreatorPage} />}
         />
         <Route
           path="/chat"

@@ -25,8 +25,9 @@ IS_LOCAL_ENV = os.getenv("LOCAL_ENV").lower() == "true"
 FILESYSTEM = "file" if IS_LOCAL_ENV else "s3"
 COMPANY_ENV = os.getenv("COMPANY_ENV", "dev")
 BACKEND_ROOT = "/code/backend/"
-BASE_DIR = f"s3://carnot-research/{COMPANY_ENV}/"
-DATA_DIR = f"s3://carnot-research/{COMPANY_ENV}/data/"
+BASE_DIR = f"s3://carnot-research-{COMPANY_ENV}/"
+DATA_DIR = f"s3://carnot-research-{COMPANY_ENV}/data/"
+SHARED_DATA_DIR = f"s3://carnot-research-{COMPANY_ENV}/shared/"
 SKIP_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".zip", ".exe", ".bin"}
 
 def get_text_from_pdf(pdf_bytes):
@@ -366,12 +367,16 @@ class TextFileContext(Context):
             paths = [paths]
 
         self.file_service = S3FileService() if FILESYSTEM == "s3" else LocalFileService()
-        self.filepaths = [
-            fp 
-            for path in paths
-            for fp in self.file_service.list_all_subfiles(path)
-            if not any(fp.lower().endswith(suffix) for suffix in SKIP_SUFFIXES)
-        ]
+        self.filepaths = []
+        for path in paths:
+            if self.file_service.is_dir(path):
+                self.filepaths.extend([
+                    fp
+                    for fp in self.file_service.list_all_subfiles(path)
+                    if not any(fp.lower().endswith(suffix) for suffix in SKIP_SUFFIXES)
+                ])
+            else:
+                self.filepaths.append(path)
 
         # call parent constructor to set id, operator, and schema
         schema = create_schema_from_fields([{"name": "context", "desc": "The context", "type": str | Any}])

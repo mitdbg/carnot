@@ -290,9 +290,6 @@ function UserChatPage() {
       }
       else if (error.name !== 'AbortError') {
         console.error('Error executing query:', error)
-        console.log('Error Name:', error.name)
-        console.log('Error Message:', error.message)
-        console.log('Error Keys:', Object.keys(error))
         setMessages(prev => [...prev, {
           type: 'error',
           content: 'Failed to execute query. Please try again.'

@@ -1,35 +1,42 @@
+import io
 import logging
 import os
 from pathlib import Path
 
+import palimpzest as pz
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from pypdf import PdfReader
 from sqlalchemy.orm import Session
 
-import carnot
 from app.auth import get_current_user
 from app.database import get_db
-from app.env import DATA_DIR, IS_LOCAL_ENV
+from app.env import DATA_DIR, IS_LOCAL_ENV, SHARED_DATA_DIR
 from app.models.schemas import SearchQuery, SearchResult
-from app.services.file_service import LocalFileService, S3FileService
+from app.services.file_service import LocalFileService, S3FileService, virtualize_filepath
 from app.services.llm import get_user_llm_config
-from carnot.core.data.iter_dataset import IterDataset
 
 router = APIRouter()
 file_service = LocalFileService() if IS_LOCAL_ENV else S3FileService()
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('uvicorn.error')
 
-SKIP_SUFFIXES = {".pdf", ".jpg", ".jpeg", ".png", ".gif", ".zip", ".exe", ".bin"}
+SKIP_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".zip", ".exe", ".bin"}
 
 class TextFileWithPath(BaseModel):
     file_path: str
     file_name: str
     contents: str
 
+def get_text_from_pdf(pdf_bytes):
+    pdf = PdfReader(io.BytesIO(pdf_bytes))
+    all_text = ""
+    for page in pdf.pages:
+        all_text += page.extract_text() + "\n"
+    return all_text
 
-class RecursiveTextFileDataset(IterDataset):
-    def __init__(self, id: str, paths: list[str] | None) -> None:
-        paths = paths or [DATA_DIR]
+class RecursiveTextFileDataset(pz.IterDataset):
+    def __init__(self, id: str, paths: list[str] | None, user_id: str) -> None:
+        paths = paths or [os.path.join(DATA_DIR, user_id), SHARED_DATA_DIR]
         super().__init__(id=id, schema=TextFileWithPath)
         self.filepaths = [
             fp 
@@ -38,12 +45,19 @@ class RecursiveTextFileDataset(IterDataset):
             if Path(fp).suffix.lower() not in SKIP_SUFFIXES
         ]
 
+    def __len__(self) -> int:
+        return len(self.filepaths)
+
     def __getitem__(self, idx: int) -> dict:
         filepath = self.filepaths[idx]
         filename = os.path.basename(filepath)
 
         try:
-            contents = file_service.read_file(filepath)
+            if filepath.endswith(".pdf"):
+                pdf_contents = file_service.read_file(filepath, bytes=True)
+                contents = get_text_from_pdf(pdf_contents)
+            else:
+                contents = file_service.read_file(filepath)
         except Exception:
             contents = ""
 
@@ -54,11 +68,12 @@ class RecursiveTextFileDataset(IterDataset):
         }
 
 
-def run_semantic_search(query_text: str, search_paths: list[str] | None, user_config: dict) -> list[SearchResult]:
-    ds = RecursiveTextFileDataset(id="search", paths=search_paths)
+def run_semantic_search(query_text: str, search_paths: list[str] | None, user_id: str, user_config: dict) -> list[SearchResult]:
+    os.environ["OPENAI_API_KEY"] = user_config.get("OPENAI_API_KEY", "")
+    ds = RecursiveTextFileDataset(id="search", paths=search_paths, user_id=user_id)
     ds = ds.sem_filter(f"The file matches the query: {query_text}")
-    config = carnot.QueryProcessorConfig(
-        policy=carnot.MaxQuality(),
+    config = pz.QueryProcessorConfig(
+        policy=pz.MaxQuality(),
         llm_config=user_config,
         progress=False,
     )
@@ -69,15 +84,16 @@ def run_semantic_search(query_text: str, search_paths: list[str] | None, user_co
     for item in output_ds:
         content = getattr(item, "contents", "")
         snippet = content[:200] + "..." if len(content) > 200 else content
+        file_path = getattr(item, "file_path", "")
         results.append(
             SearchResult(
-                file_path=getattr(item, "file_path", ""),
+                file_path=file_path,
                 file_name=getattr(item, "file_name", ""),
+                virtual_path=virtualize_filepath(file_path),
                 relevance_score=1.0,
                 snippet=snippet,
             )
         )
-
     return results
 
 
@@ -97,7 +113,7 @@ async def search_files(
             )
 
         search_paths = query.paths or None
-        results: list[SearchResult] = run_semantic_search(query.query, search_paths, user_config)
+        results: list[SearchResult] = run_semantic_search(query.query, search_paths, user_id, user_config)
 
         unique: list[SearchResult] = []
         seen_paths = set()

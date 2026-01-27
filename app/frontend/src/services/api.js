@@ -54,10 +54,20 @@ export const conversationsApi = {
 
 // Files API
 export const filesApi = {
-  browse: (path = '') => api.get('/files/browse', { params: { path } }),
-  upload: (file, token) => {
+  browse: (token, path = '') =>
+    api.get('/files/browse', {
+      params: { path },
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  createDirectory: (path, name, token) => {
+    return api.post('/files/create-directory', { path, name }, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+  },
+  upload: (file, token, destinationPath = '') => {
     const formData = new FormData()
     formData.append('file', file)
+    formData.append('path', destinationPath);
     return api.post('/files/upload', formData, {
       headers: {
         'Content-Type': 'multipart/form-data',
@@ -65,9 +75,6 @@ export const filesApi = {
       },
     })
   },
-  listUploaded: (token) => api.get('/files/upload', {
-      headers: { Authorization: `Bearer ${token}` }
-    }),
   delete: (filePaths) => api.post('/files/delete', { files: filePaths }),
 }
 

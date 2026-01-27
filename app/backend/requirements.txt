@@ -8,6 +8,7 @@ fastapi>=0.115.0
 fsspec>=2025.12.0
 greenlet==3.0.1
 pydantic>=2.11.7
+pypdf>=5.1.0
 python-dotenv==1.0.0
 python-jose[cryptography]>=3.5.0
 python-multipart>=0.0.18

@@ -2,15 +2,21 @@
 FROM python:3.12-slim
 RUN mkdir -p /carnot/data
 WORKDIR /code
+
+# install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential
+
+# copy and install python dependencies
 COPY ./backend/requirements.txt requirements.txt
-COPY ./src ./src
 COPY ./pyproject.toml .
 COPY ./README.md .
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
- && pip install --no-cache-dir -r requirements.txt \
- && pip install --no-cache-dir . \
- && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir -r requirements.txt
+
+# install Carnot
+COPY ./src ./src
+RUN pip install --no-cache-dir .
+RUN rm -rf /var/lib/apt/lists/*
+
 EXPOSE 8000
 COPY ./backend .
 CMD ["uvicorn", "app.main:app", "--reload", "--port", "8000"]

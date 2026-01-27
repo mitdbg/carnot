@@ -10,7 +10,6 @@ OVERRIDE_FILE="docker-compose.local.yaml"
 COMPOSE_DIR="compose"
 
 # --- Default Environment Variables ---
-export CARNOT_USER_SALT="default_local_salt"
 export ENV_NAME="dev"
 export LOCAL_ENV="true"
 export LOCAL_BASE_DIR="$LOCAL_BASE_DIR"

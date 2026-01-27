@@ -1,4 +1,3 @@
-import hashlib
 import os
 
 import requests
@@ -9,7 +8,6 @@ AUTH0_ISSUER = f"https://{os.getenv('AUTH0_DOMAIN')}/"
 AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE")
 CLAIMS_NAMESPACE = os.getenv("AUTH0_CLAIMS_NAMESPACE")
 ALGORITHMS = ["RS256"]
-SALT = os.getenv("CARNOT_USER_SALT")
 
 # Cache for JWKS keys to avoid hitting Auth0 on every request
 jwks_cache = {}
@@ -73,6 +71,7 @@ def get_current_user(authorization: str | None = Header(None)) -> tuple[str, str
         user_id = payload.get("sub")
         if not user_id:
             raise HTTPException(status_code=401, detail="Token missing 'sub' claim")
+        user_id = user_id.replace("|", "-")
 
         return user_id
 

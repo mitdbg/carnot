@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 
-from app.env import BASE_DIR
+from app.env import BASE_DIR, DATA_DIR, SHARED_DATA_DIR
 from app.models.schemas import AppConfig
 
 router = APIRouter()
@@ -12,7 +12,7 @@ async def get_config(path: str | None = None):
     Return the config for the application.
     """
     try:
-        return AppConfig(base_dir=BASE_DIR)
+        return AppConfig(base_dir=BASE_DIR, data_dir=DATA_DIR, shared_data_dir=SHARED_DATA_DIR)
 
     except HTTPException:
         raise

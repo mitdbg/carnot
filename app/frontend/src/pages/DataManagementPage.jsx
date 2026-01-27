@@ -1,21 +1,25 @@
 import path from 'path';
 import { useState, useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { Plus, Upload, Loader2, Database, Calendar, FileText, Trash2, X, Eye } from 'lucide-react'
-import { datasetsApi, filesApi } from '../services/api'
+import { Plus, Loader2, Database, Calendar, FileText, Trash2, X, Eye, Save, ArrowLeft } from 'lucide-react'
+import FileBrowser from '../components/DataManagement/FileBrowser'
+import SearchChatbot from '../components/DataManagement/SearchChatbot'
+import DatasetAnnotation from '../components/DataManagement/DatasetAnnotation'
+import { datasetsApi } from '../services/api'
 import { useApiToken } from '../hooks/useApiToken';
 
 function DataManagementPage() {
   const getValidToken = useApiToken();
-  const navigate = useNavigate()
   const [datasets, setDatasets] = useState([])
-  const [uploadedFiles, setUploadedFiles] = useState([])
   const [loading, setLoading] = useState(true)
-  const [uploading, setUploading] = useState(false)
   const [error, setError] = useState(null)
   const [success, setSuccess] = useState(null)
   const [selectedDataset, setSelectedDataset] = useState(null)
   const [viewingDataset, setViewingDataset] = useState(false)
+  const [selectedFiles, setSelectedFiles] = useState(new Set())
+  const [isCreatingMode, setIsCreatingMode] = useState(false)
+  const [datasetName, setDatasetName] = useState('')
+  const [annotation, setAnnotation] = useState('')
+  const [saving, setSaving] = useState(false)
 
   useEffect(() => {
     loadData()
@@ -27,12 +31,8 @@ function DataManagementPage() {
       setError(null)
       const token = await getValidToken();
       if (!token) return;
-      const [datasetsRes, filesRes] = await Promise.all([
-        datasetsApi.list(token),
-        filesApi.listUploaded(token),
-      ])
+      const datasetsRes = await datasetsApi.list(token)
       setDatasets(datasetsRes.data)
-      setUploadedFiles(filesRes.data)
     } catch (err) {
       setError('Failed to load data: ' + err.message)
     } finally {
@@ -40,24 +40,61 @@ function DataManagementPage() {
     }
   }
 
-  const handleFileUpload = async (e) => {
-    const file = e.target.files[0]
-    if (!file) return
+  const handleFileToggle = (filePath, bulkSelection = null) => {
+    if (bulkSelection) {
+      // Handles 'Select All' and 'Directory Toggles'
+      setSelectedFiles(bulkSelection)
+    } else {
+      // Handles individual file selection
+      const newSelected = new Set(selectedFiles)
+      if (newSelected.has(filePath)) {
+        newSelected.delete(filePath)
+      } else {
+        newSelected.add(filePath)
+      }
+      setSelectedFiles(newSelected)
+    }
+  }
+
+  const handleChatbotSelect = (files) => {
+    const newSelected = new Set(selectedFiles)
+    files.forEach((file) => newSelected.add(file.file_path))
+    setSelectedFiles(newSelected)
+  }
+
+  const handleSaveDataset = async () => {
+    if (!datasetName.trim() || !annotation.trim() || selectedFiles.size === 0) {
+      setError('Please provide a name, description, and select at least one file.')
+      return
+    }
 
     try {
-      setUploading(true)
-      setError(null)
+      setSaving(true)
       const token = await getValidToken();
       if (!token) return;
-      await filesApi.upload(file, token)
-      setSuccess('File uploaded successfully!')
-      setTimeout(() => setSuccess(null), 3000)
+
+      await datasetsApi.create({
+        name: datasetName,
+        shared: false,
+        annotation: annotation,
+        files: Array.from(selectedFiles),
+      }, token)
+
+      setSuccess('Dataset created successfully!')
+      resetCreationState()
       loadData()
     } catch (err) {
-      setError('Failed to upload file: ' + err.message)
+      setError('Failed to create dataset: ' + err.message)
     } finally {
-      setUploading(false)
+      setSaving(false)
     }
+  }
+
+  const resetCreationState = () => {
+    setIsCreatingMode(false)
+    setDatasetName('')
+    setAnnotation('')
+    setSelectedFiles(new Set())
   }
 
   const handleDeleteDataset = async (id) => {
@@ -114,152 +151,167 @@ function DataManagementPage() {
 
   return (
     <div className="space-y-8">
-      {/* Header */}
+      {/* Dynamic Header */}
       <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-3xl font-bold text-gray-900">Data Management</h1>
-          <p className="mt-2 text-gray-600">
-            Manage your datasets and upload files
-          </p>
+        <div className="flex items-center gap-4">
+          {isCreatingMode && (
+            <button 
+              onClick={resetCreationState} 
+              className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
+              title="Go back"
+            >
+              <ArrowLeft className="w-6 h-6" />
+            </button>
+          )}
+          <div>
+            <h1 className="text-3xl font-bold text-gray-900">
+              {isCreatingMode ? 'Create New Dataset' : 'Data Management'}
+            </h1>
+            <p className="mt-1 text-gray-600">
+              {isCreatingMode ? 'Configure your dataset details' : 'Manage your datasets and browse files'}
+            </p>
+          </div>
         </div>
-        <button
-          onClick={() => navigate('/datasets/create')}
-          className="flex items-center gap-2 px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 transition-colors duration-200 shadow-md hover:shadow-lg"
-        >
-          <Plus className="w-5 h-5" />
-          Create Dataset
-        </button>
+        
+        <div className="flex items-center gap-3">
+          {!isCreatingMode ? (
+            <button
+              onClick={() => setIsCreatingMode(true)}
+              className="flex items-center gap-2 px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 shadow-md transition-all"
+            >
+              <Plus className="w-5 h-5" />
+              New Dataset
+            </button>
+          ) : (
+            <>
+              {/* NEW CANCEL BUTTON */}
+              <button
+                onClick={resetCreationState}
+                disabled={saving}
+                className="px-6 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors disabled:opacity-50"
+              >
+                Cancel
+              </button>
+
+              {/* SAVE BUTTON */}
+              <button
+                onClick={handleSaveDataset}
+                disabled={saving}
+                className="flex items-center gap-2 px-6 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 shadow-md transition-all disabled:opacity-50"
+              >
+                {saving ? (
+                  <>
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                    Saving...
+                  </>
+                ) : (
+                  <>
+                    <Save className="w-5 h-5" />
+                    Save Dataset
+                  </>
+                )}
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
       {/* Notifications */}
-      {error && (
-        <div className="bg-red-50 border border-red-200 text-red-800 px-4 py-3 rounded-lg">
-          {error}
-        </div>
-      )}
-      {success && (
-        <div className="bg-green-50 border border-green-200 text-green-800 px-4 py-3 rounded-lg">
-          {success}
+      {error && <div className="bg-red-50 border border-red-200 text-red-800 px-4 py-3 rounded-lg">{error}</div>}
+      {success && <div className="bg-green-50 border border-green-200 text-green-800 px-4 py-3 rounded-lg">{success}</div>}
+
+      {/* Creation HUD */}
+      {isCreatingMode && (
+        <div className="bg-primary-50 border border-primary-200 px-4 py-3 rounded-lg flex justify-between items-center">
+          <p className="text-primary-800 font-medium">
+            Select files below and add annotations. 
+            <span className="ml-4 bg-primary-200 px-2 py-1 rounded text-sm">{selectedFiles.size} files selected</span>
+          </p>
         </div>
       )}
 
-      {/* File Upload Section */}
-      <div className="bg-white rounded-lg shadow-md p-6">
-        <h2 className="text-xl font-semibold text-gray-800 mb-4 flex items-center gap-2">
-          <Upload className="w-5 h-5" />
-          Upload Files
-        </h2>
-        <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:border-primary-400 transition-colors">
-          <input
-            type="file"
-            id="file-upload"
-            className="hidden"
-            onChange={handleFileUpload}
-            disabled={uploading}
-          />
-          <label
-            htmlFor="file-upload"
-            className="cursor-pointer flex flex-col items-center"
-          >
-            {uploading ? (
-              <Loader2 className="w-12 h-12 text-gray-400 animate-spin mb-3" />
-            ) : (
-              <Upload className="w-12 h-12 text-gray-400 mb-3" />
-            )}
-            <span className="text-lg font-medium text-gray-700">
-              {uploading ? 'Uploading...' : 'Click to upload a file'}
-            </span>
-            <span className="text-sm text-gray-500 mt-1">
-              or drag and drop
-            </span>
-          </label>
+      {/* Main Grid: File Browser + Optional Chatbot */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        <div className={isCreatingMode ? "lg:col-span-2" : "lg:col-span-3"}>
+          <FileBrowser selectedFiles={selectedFiles} onFileToggle={handleFileToggle} />
         </div>
+        {isCreatingMode && (
+          <div>
+            <SearchChatbot onSelectFiles={handleChatbotSelect} />
+          </div>
+        )}
+      </div>
 
-        {/* Uploaded Files List */}
-        {uploadedFiles.length > 0 && (
-          <div className="mt-6">
-            <h3 className="text-sm font-medium text-gray-700 mb-3">
-              Recently Uploaded ({uploadedFiles.length})
-            </h3>
-            <div className="space-y-2 max-h-40 overflow-y-auto">
-              {uploadedFiles.slice(0, 10).map((file) => (
+      {/* Creation Form or Dataset List */}
+      {isCreatingMode ? (
+        <DatasetAnnotation
+          datasetName={datasetName}
+          annotation={annotation}
+          onNameChange={setDatasetName}
+          onAnnotationChange={setAnnotation}
+        />
+      ) : (
+        <div className="bg-white rounded-lg shadow-md p-6">
+          <h2 className="text-xl font-semibold text-gray-800 mb-4 flex items-center gap-2">
+            <Database className="w-5 h-5" />
+            Datasets ({datasets.length})
+          </h2>
+            
+          {datasets.length === 0 ? (
+            <div className="text-center py-12 text-gray-500">
+              <Database className="w-16 h-16 mx-auto mb-4 text-gray-300" />
+              <p className="text-lg">No datasets yet</p>
+              <p className="text-sm mt-2">Create your first dataset to get started</p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {datasets.map((dataset) => (
                 <div
-                  key={file.id}
-                  className="flex items-center gap-2 text-sm text-gray-600 bg-gray-50 px-3 py-2 rounded"
+                  key={dataset.id}
+                  className="border border-gray-200 rounded-lg p-4 hover:shadow-lg transition-shadow duration-200 cursor-pointer"
+                  onClick={() => handleViewDataset(dataset.id)}
                 >
-                  <FileText className="w-4 h-4" />
-                  <span className="flex-1">{path.basename(file.file_path)}</span>
-                  <span className="text-xs text-gray-400">
-                    {formatDate(file.upload_date)}
-                  </span>
+                  <div className="flex items-start justify-between mb-3">
+                    <h3 className="text-lg font-semibold text-gray-800 flex-1">
+                      {dataset.name}
+                    </h3>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        handleDeleteDataset(dataset.id)
+                      }}
+                      className="text-red-500 hover:text-red-700 p-1"
+                      title="Delete dataset"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
+                  
+                  <p className="text-sm text-gray-600 mb-4 line-clamp-2">
+                    {dataset.annotation}
+                  </p>
+                  
+                  <div className="flex items-center justify-between text-sm text-gray-500">
+                    <div className="flex items-center gap-1">
+                      <FileText className="w-4 h-4" />
+                      <span>{dataset.file_count} files</span>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <Calendar className="w-4 h-4" />
+                      <span>{formatDate(dataset.created_at)}</span>
+                    </div>
+                  </div>
+                  
+                  <div className="mt-3 pt-3 border-t border-gray-200 text-xs text-gray-500 flex items-center gap-1">
+                    <Eye className="w-3 h-3" />
+                    <span>Click to view files</span>
+                  </div>
                 </div>
               ))}
             </div>
-          </div>
-        )}
-      </div>
-
-      {/* Datasets List */}
-      <div className="bg-white rounded-lg shadow-md p-6">
-        <h2 className="text-xl font-semibold text-gray-800 mb-4 flex items-center gap-2">
-          <Database className="w-5 h-5" />
-          Datasets ({datasets.length})
-        </h2>
-        
-        {datasets.length === 0 ? (
-          <div className="text-center py-12 text-gray-500">
-            <Database className="w-16 h-16 mx-auto mb-4 text-gray-300" />
-            <p className="text-lg">No datasets yet</p>
-            <p className="text-sm mt-2">Create your first dataset to get started</p>
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {datasets.map((dataset) => (
-              <div
-                key={dataset.id}
-                className="border border-gray-200 rounded-lg p-4 hover:shadow-lg transition-shadow duration-200 cursor-pointer"
-                onClick={() => handleViewDataset(dataset.id)}
-              >
-                <div className="flex items-start justify-between mb-3">
-                  <h3 className="text-lg font-semibold text-gray-800 flex-1">
-                    {dataset.name}
-                  </h3>
-                  <button
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      handleDeleteDataset(dataset.id)
-                    }}
-                    className="text-red-500 hover:text-red-700 p-1"
-                    title="Delete dataset"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                </div>
-                
-                <p className="text-sm text-gray-600 mb-4 line-clamp-2">
-                  {dataset.annotation}
-                </p>
-                
-                <div className="flex items-center justify-between text-sm text-gray-500">
-                  <div className="flex items-center gap-1">
-                    <FileText className="w-4 h-4" />
-                    <span>{dataset.file_count} files</span>
-                  </div>
-                  <div className="flex items-center gap-1">
-                    <Calendar className="w-4 h-4" />
-                    <span>{formatDate(dataset.created_at)}</span>
-                  </div>
-                </div>
-                
-                <div className="mt-3 pt-3 border-t border-gray-200 text-xs text-gray-500 flex items-center gap-1">
-                  <Eye className="w-3 h-3" />
-                  <span>Click to view files</span>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
+          )}
+        </div>
+      )}
 
       {/* Dataset Details Modal */}
       {viewingDataset && selectedDataset && (
@@ -332,4 +384,3 @@ function DataManagementPage() {
 }
 
 export default DataManagementPage
-
