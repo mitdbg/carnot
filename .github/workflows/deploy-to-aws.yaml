@@ -118,19 +118,32 @@ jobs:
       - name: Start NGINX on Homepage EC2
         env:
           CARNOT_DEPLOY_KEY: ${{ secrets.CARNOT_DEPLOY_KEY }}
+          MS_APP_ID: ${{ secrets.MICROSOFT_APPLICATION_ID }}
         run: |
+          echo "Preparing Entra ID association file..."
+          mkdir -p .well-known
+          echo "{\"associatedApplications\":[{\"applicationId\": \"$MS_APP_ID\"}]}" > .well-known/microsoft-identity-association.json
+
+          # sleep to ensure that the instance is ready to accept SSH connections
           echo "Copying homepage files to $HOMEPAGE_PUBLIC_IP"
-          
-          # copy index.html to EC2; sleep first to wait for it to be ready to accept SSH connections
           sleep 5
-          scp -o StrictHostKeyChecking=no -i deployer_key.pem app/index.html ubuntu@$HOMEPAGE_PUBLIC_IP:~/
+
+          # copy index.html to EC2
+          scp -r -o StrictHostKeyChecking=no -i deployer_key.pem app/index.html .well-known ubuntu@$HOMEPAGE_PUBLIC_IP:~/
 
           # Copy index.html to the NGINX default location inside the container's volume mount and (re)start container
           ssh -o StrictHostKeyChecking=no -i deployer_key.pem ubuntu@$HOMEPAGE_PUBLIC_IP "
             sudo docker start carnot-homepage-nginx
             sleep 3
+
+            # Ensure the directory exists in the container and copy files
+            sudo docker exec carnot-homepage-nginx mkdir -p /usr/share/nginx/html/.well-known
             sudo docker cp index.html carnot-homepage-nginx:/usr/share/nginx/html/index.html
-            rm index.html
+            sudo docker cp .well-known/microsoft-identity-association.json carnot-homepage-nginx:/usr/share/nginx/html/.well-known/microsoft-identity-association.json
+
+            # Clean up home directory
+            rm -rf index.html .well-known
+
             sudo docker restart carnot-homepage-nginx
           "
 
