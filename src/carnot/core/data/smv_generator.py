@@ -121,7 +121,7 @@ File: {file_path or file_id}
 Content:
 {text_content}
 
-Generate a 2-3 sentence summary that:
+Generate a 5 sentence summary that:
 1. Identifies the main topics/themes in the file
 2. Highlights key entities, dates, or events mentioned
 3. Uses specific terms that would match relevant queries

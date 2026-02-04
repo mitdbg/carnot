@@ -346,7 +346,7 @@ class Context(Dataset, ABC):
             
             try:
                 # Route to top-k files (default 50)
-                routed_files = self.flat_index.route(search_query, top_k=50)
+                routed_files = self.flat_index.route(search_query, top_k=100)
                 logger.info(f"Routed to {len(routed_files)} files")
             except Exception as e:
                 logger.error(f"Routing failed: {e}, falling back to full scan")
@@ -377,7 +377,7 @@ class Context(Dataset, ABC):
         return new_context
 
 class TextFileContext(Context):
-    def __init__(self, paths: str | list[str], id: str, description: str, use_routing: bool = True, **kwargs) -> None:
+    def __init__(self, paths: str | list[str], id: str, description: str, use_routing: bool = False, **kwargs) -> None:
         """
         Constructor for the `TextFileContext` class.
 
@@ -416,10 +416,74 @@ class TextFileContext(Context):
             **kwargs,
         )
 
+    def _get_file_hash(self, filepath: str) -> str:
+        """Get a hash of file content to detect changes."""
+        import hashlib
+        try:
+            content = self.file_service.read_file(filepath, bytes=True)
+            if isinstance(content, str):
+                content = content.encode('utf-8')
+            return hashlib.md5(content).hexdigest()
+        except Exception:
+            return None
+    
+    def _load_summary_from_cache(self, filepath: str, file_hash: str):
+        """Load file summary from disk cache if available and up-to-date."""
+        import pickle
+        import logging
+        from carnot.constants import PZ_DIR
+        
+        logger = logging.getLogger(__name__)
+        
+        # Create summary cache directory
+        summary_dir = os.path.join(PZ_DIR, "file_summaries")
+        os.makedirs(summary_dir, exist_ok=True)
+        
+        # Use file hash as cache key
+        cache_file = os.path.join(summary_dir, f"{file_hash}.pkl")
+        
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, 'rb') as f:
+                    cached_data = pickle.load(f)
+                # Verify it's for the same file
+                if cached_data.get('filepath') == filepath:
+                    logger.debug(f"Loaded cached summary for {filepath}")
+                    return cached_data['summary']
+            except Exception as e:
+                logger.warning(f"Failed to load cached summary: {e}")
+        
+        return None
+    
+    def _save_summary_to_cache(self, filepath: str, file_hash: str, summary):
+        """Save file summary to disk cache."""
+        import pickle
+        import logging
+        from carnot.constants import PZ_DIR
+        
+        logger = logging.getLogger(__name__)
+        
+        summary_dir = os.path.join(PZ_DIR, "file_summaries")
+        os.makedirs(summary_dir, exist_ok=True)
+        
+        cache_file = os.path.join(summary_dir, f"{file_hash}.pkl")
+        
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump({
+                    'filepath': filepath,
+                    'file_hash': file_hash,
+                    'summary': summary
+                }, f)
+            logger.debug(f"Cached summary for {filepath}")
+        except Exception as e:
+            logger.warning(f"Failed to cache summary: {e}")
+    
     def _build_flat_index(self):
         """
         Build flat file index with file summaries for LLM-based routing.
         This is called lazily on first search() if routing is enabled.
+        Summaries are cached to disk and reused across runs.
         """
         import logging
         from carnot.core.data.smv_generator import SMVGenerator
@@ -428,34 +492,52 @@ class TextFileContext(Context):
         logger = logging.getLogger(__name__)
         logger.info(f"Building flat file index for {len(self.filepaths)} files...")
         
-        # Generate file summaries
+        # Generate file summaries (with caching)
         smv_gen = SMVGenerator()
         file_summaries = []
+        cache_hits = 0
+        cache_misses = 0
         
         for i, filepath in enumerate(self.filepaths):
             if i % 10 == 0:
-                logger.info(f"Generating summaries: {i}/{len(self.filepaths)}")
+                logger.info(f"Processing summaries: {i}/{len(self.filepaths)} (cache hits: {cache_hits}, misses: {cache_misses})")
             
             try:
-                # Read file content
-                content = self.file_service.read_file(filepath, bytes=False)
+                # Get file hash to check cache
+                file_hash = self._get_file_hash(filepath)
+                if not file_hash:
+                    logger.warning(f"Could not hash file {filepath}, skipping")
+                    continue
                 
-                # Generate file summary
-                file_id = filepath  # Use filepath as ID
-                summary = smv_gen.generate_file_summary(
-                    file_id=file_id,
-                    text_content=content,
-                    file_path=filepath
-                )
+                # Try to load from cache first
+                summary = self._load_summary_from_cache(filepath, file_hash)
+                
+                if summary is not None:
+                    # Cache hit!
+                    cache_hits += 1
+                else:
+                    # Cache miss - generate summary
+                    cache_misses += 1
+                    content = self.file_service.read_file(filepath, bytes=False)
+                    
+                    file_id = filepath  # Use filepath as ID
+                    summary = smv_gen.generate_file_summary(
+                        file_id=file_id,
+                        text_content=content,
+                        file_path=filepath
+                    )
+                    
+                    # Save to cache
+                    self._save_summary_to_cache(filepath, file_hash, summary)
                 
                 file_summaries.append(summary)
-                self._file_summaries_cache[file_id] = summary
+                self._file_summaries_cache[filepath] = summary
                 
             except Exception as e:
-                logger.warning(f"Failed to generate summary for {filepath}: {e}")
+                logger.warning(f"Failed to process summary for {filepath}: {e}")
                 continue
         
-        logger.info(f"Generated {len(file_summaries)} file summaries")
+        logger.info(f"Generated/loaded {len(file_summaries)} file summaries (cache hits: {cache_hits}, misses: {cache_misses})")
         
         # Build flat index
         self._flat_index = FlatFileIndex(file_summaries)
@@ -480,6 +562,7 @@ class TextFileContext(Context):
         """
         if self.routed_files is not None:
             # Only scan routed files
+            logger.info("ONLY SCANNING ROUTED FILES")
             return [fp for fp in self.filepaths if fp in self.routed_files]
         else:
             # Scan all files
@@ -592,7 +675,7 @@ class TextFileContext(Context):
             Returns:
                 list[str]: A list of file paths for all files in the `Context`.
             """
-            return self.filepaths
+            return self.get_files_to_scan()
 
         @tool
         def tool_read_filepath(path: str) -> str:
