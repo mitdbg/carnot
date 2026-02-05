@@ -307,9 +307,10 @@ function UserChatPage() {
       setMessages(prev => [...prev, {
         type: 'assistant',
         content: response.data.natural_language_plan,
-        isPlanConfirmation: true // Flag to show "Execute" buttons
+        isPlanConfirmation: true, // Flag to show "Execute" buttons
+        attachedPlan: response.data.plan
       }]);
-      setCurrentPlan(response.data.plan);
+      setCurrentPlan(response.data.plan); // TODO: maybe redundant now that we use attachedPlan?
     } catch (error) {
       const errorData = error.response?.data?.detail;
       if (errorData?.type === 'API_KEY_MISSING') {
@@ -329,7 +330,8 @@ function UserChatPage() {
     }
   };
 
-  const handleExecutePlan = async () => {
+  const handleExecutePlan = async (planToUse) => {
+    const plan = planToUse || currentPlan;
     setIsLoading(true);
     setIsExecuting(true);
 
@@ -372,7 +374,7 @@ function UserChatPage() {
           query: lastQuery,
           dataset_ids: datasetIds,
           session_id: currentSessionId,
-          plan: currentPlan
+          plan: plan
         }),
         signal: abortControllerRef.current.signal
       })
@@ -487,7 +489,7 @@ function UserChatPage() {
               {message.isPlanConfirmation && isLastMessage && !isLoading && (
                 <div className="mt-4 flex gap-3 border-t pt-4">
                   <button
-                    onClick={handleExecutePlan}
+                    onClick={handleExecutePlan(message.attachedPlan)}
                     className="flex items-center gap-2 bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-md text-sm font-medium transition-colors"
                   >
                     <Play className="w-4 h-4" /> Execute Plan
@@ -751,16 +753,23 @@ function UserChatPage() {
               {filteredDatasets.map(dataset => (
                 <li
                   key={dataset.id}
-                  className="flex items-center justify-between p-3 bg-gray-50 rounded-lg border border-gray-200"
+                  className="flex items-start justify-between p-3 bg-gray-50 rounded-lg border border-gray-200"
                 >
-                  <div className="flex-1">
-                    <p className="font-semibold text-gray-800">{dataset.name}</p>
-                    <p className="text-sm text-gray-600">{dataset.annotation}</p>
+                  <div className="flex-1 min-w-0">
+                    <p className="font-semibold text-gray-800 truncate" title={dataset.name}>
+                      {dataset.name}
+                    </p>
+                    {/* The line-clamp-3 class limits text to exactly 3 lines before adding '...' */}
+                    <p 
+                      className="text-sm text-gray-600 mt-1 line-clamp-3 leading-relaxed" 
+                      title={dataset.annotation}
+                    >
+                      {dataset.annotation}
+                    </p>
                   </div>
                   <button
                     onClick={() => toggleDataset(dataset.id)}
-                    className="p-2 rounded-full text-gray-500 hover:bg-gray-200 transition-colors"
-                    title={selectedDatasets.has(dataset.id) ? 'Deselect dataset' : 'Select dataset'}
+                    className="p-2 ml-2 rounded-full text-gray-500 hover:bg-gray-200 transition-colors flex-shrink-0"
                   >
                     {selectedDatasets.has(dataset.id) ? (
                       <CheckSquare className="w-5 h-5 text-primary-500" />
