@@ -4,8 +4,9 @@ on:
   push:
     branches:
     - main
+    - at-prod
+    - lm-prod
     - wl-prod
-    - wm-prod
     - dev
 
 permissions:
@@ -30,8 +31,10 @@ jobs:
         run: |
           if [[ "${GITHUB_REF_NAME}" == "wl-prod" ]]; then
             echo "SUBDOMAIN=${{ secrets.WL_PROD }}" >> $GITHUB_ENV
-          elif [[ "${GITHUB_REF_NAME}" == "wm-prod" ]]; then
-            echo "SUBDOMAIN=${{ secrets.WM_PROD }}" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF_NAME}" == "lm-prod" ]]; then
+            echo "SUBDOMAIN=${{ secrets.LM_PROD }}" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF_NAME}" == "at-prod" ]]; then
+            echo "SUBDOMAIN=${{ secrets.AT_PROD }}" >> $GITHUB_ENV
           else
             echo "SUBDOMAIN=dev" >> $GITHUB_ENV
           fi
@@ -41,8 +44,10 @@ jobs:
         run: |
           if [[ "${GITHUB_REF_NAME}" == "wl-prod" ]]; then
             echo "PRIORITY_OFFSET=100" >> $GITHUB_ENV
-          elif [[ "${GITHUB_REF_NAME}" == "wm-prod" ]]; then
+          elif [[ "${GITHUB_REF_NAME}" == "lm-prod" ]]; then
             echo "PRIORITY_OFFSET=200" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF_NAME}" == "at-prod" ]]; then
+            echo "PRIORITY_OFFSET=300" >> $GITHUB_ENV
           else
             echo "PRIORITY_OFFSET=0" >> $GITHUB_ENV
           fi
@@ -52,8 +57,10 @@ jobs:
         run: |
           if [[ "${GITHUB_REF_NAME}" == "wl-prod" ]]; then
             echo "ENV_NAME=wl-prod" >> $GITHUB_ENV
-          elif [[ "${GITHUB_REF_NAME}" == "wm-prod" ]]; then
-            echo "ENV_NAME=wm-prod" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF_NAME}" == "lm-prod" ]]; then
+            echo "ENV_NAME=lm-prod" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF_NAME}" == "at-prod" ]]; then
+            echo "ENV_NAME=at-prod" >> $GITHUB_ENV
           else
             echo "ENV_NAME=dev" >> $GITHUB_ENV
           fi
@@ -111,19 +118,34 @@ jobs:
       - name: Start NGINX on Homepage EC2
         env:
           CARNOT_DEPLOY_KEY: ${{ secrets.CARNOT_DEPLOY_KEY }}
+          MS_APP_ID: ${{ secrets.MICROSOFT_APPLICATION_ID }}
         run: |
+          echo "Preparing Entra ID association file..."
+          mkdir -p .well-known
+          echo "{\"associatedApplications\":[{\"applicationId\": \"$MS_APP_ID\"}]}" > .well-known/microsoft-identity-association.json
+
+          # sleep to ensure that the instance is ready to accept SSH connections
           echo "Copying homepage files to $HOMEPAGE_PUBLIC_IP"
-          
-          # copy index.html to EC2; sleep first to wait for it to be ready to accept SSH connections
           sleep 5
-          scp -o StrictHostKeyChecking=no -i deployer_key.pem app/index.html ubuntu@$HOMEPAGE_PUBLIC_IP:~/
+
+          # copy files to EC2
+          scp -r -o StrictHostKeyChecking=no -i deployer_key.pem app/index.html app/terms-of-service.md app/privacy-statement.md .well-known ubuntu@$HOMEPAGE_PUBLIC_IP:~/
 
           # Copy index.html to the NGINX default location inside the container's volume mount and (re)start container
           ssh -o StrictHostKeyChecking=no -i deployer_key.pem ubuntu@$HOMEPAGE_PUBLIC_IP "
             sudo docker start carnot-homepage-nginx
             sleep 3
+
+            # Ensure the directory exists in the container and copy files
+            sudo docker exec carnot-homepage-nginx mkdir -p /usr/share/nginx/html/.well-known
             sudo docker cp index.html carnot-homepage-nginx:/usr/share/nginx/html/index.html
-            rm index.html
+            sudo docker cp terms-of-service.md carnot-homepage-nginx:/usr/share/nginx/html/terms-of-service.md
+            sudo docker cp privacy-statement.md carnot-homepage-nginx:/usr/share/nginx/html/privacy-statement.md
+            sudo docker cp .well-known/microsoft-identity-association.json carnot-homepage-nginx:/usr/share/nginx/html/.well-known/microsoft-identity-association.json
+
+            # Clean up home directory
+            rm -rf index.html terms-of-service.md privacy-statement.md .well-known
+
             sudo docker restart carnot-homepage-nginx
           "
 
@@ -200,9 +222,12 @@ jobs:
           if [[ "${GITHUB_REF_NAME}" == "wl-prod" ]]; then
             export VITE_AUTH0_CLIENT_ID=${{ secrets.WL_PROD_AUTH0_CLIENT_ID }}
             export VITE_AUTH0_ORGANIZATION_ID=${{ secrets.WL_PROD_AUTH0_ORGANIZATION_ID }}
-          elif [[ "${GITHUB_REF_NAME}" == "wm-prod" ]]; then
-            export VITE_AUTH0_CLIENT_ID=${{ secrets.WM_PROD_AUTH0_CLIENT_ID }}
-            export VITE_AUTH0_ORGANIZATION_ID=${{ secrets.WM_PROD_AUTH0_ORGANIZATION_ID }}
+          elif [[ "${GITHUB_REF_NAME}" == "lm-prod" ]]; then
+            export VITE_AUTH0_CLIENT_ID=${{ secrets.LM_PROD_AUTH0_CLIENT_ID }}
+            export VITE_AUTH0_ORGANIZATION_ID=${{ secrets.LM_PROD_AUTH0_ORGANIZATION_ID }}
+          elif [[ "${GITHUB_REF_NAME}" == "at-prod" ]]; then
+            export VITE_AUTH0_CLIENT_ID=${{ secrets.AT_PROD_AUTH0_CLIENT_ID }}
+            export VITE_AUTH0_ORGANIZATION_ID=${{ secrets.AT_PROD_AUTH0_ORGANIZATION_ID }}
           else
             export VITE_AUTH0_CLIENT_ID=${{ secrets.DEV_AUTH0_CLIENT_ID }}
             export VITE_AUTH0_ORGANIZATION_ID=${{ secrets.DEV_AUTH0_ORGANIZATION_ID }}

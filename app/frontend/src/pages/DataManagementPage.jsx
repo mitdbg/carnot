@@ -384,4 +384,3 @@ function DataManagementPage() {
 }
 
 export default DataManagementPage
-

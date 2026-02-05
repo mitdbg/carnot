@@ -38,6 +38,10 @@ async def browse_directory(path: str | None = None, user_id: str = Depends(get_c
             if not file_service.exists(normalized_path):
                 file_service.create_dir(normalized_path)
 
+        # ensure that path ends with a slash for directory listing consistency
+        if not normalized_path.endswith("/") and normalized_path != "":
+             normalized_path += "/"
+
         # confirm that path exists and is a directory / s3 prefix
         if not file_service.exists(normalized_path):
             raise HTTPException(status_code=404, detail=f"Path {normalized_path} not found")
