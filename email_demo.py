@@ -23,8 +23,9 @@ def clear_cache():
 
 def run_carnot():
     ds = carnot.TextFileContext("data/enron-eval-medium", "enron-data", "250 emails from Enron employees")
-    ds = ds.compute(
-        "Compute the sender, subject, and summary of every email which refers to the Raptor, Deathstar, Chewco, and/or Fat Boy investments, and is not quoting text from an article or source outside of Enron"
+    ds = ds.search(
+        "Find emails that refer to the Raptor, Deathstar, Chewco, and/or Fat Boy investments, "
+        "excluding emails that quote text from external articles or sources outside of Enron"
     )
     config = carnot.QueryProcessorConfig(
         policy=carnot.MaxQuality(),
@@ -34,6 +35,9 @@ def run_carnot():
 
 
 if __name__ == "__main__":
+    clear_cache()
+    print("Cache cleared")
+
     start_time = time.time()
 
     # execute script
