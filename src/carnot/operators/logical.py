@@ -2,14 +2,10 @@ from __future__ import annotations
 
 import json
 import textwrap
-from collections.abc import Callable
 
 from pydantic import BaseModel
 
-from carnot.constants import AggFunc, Cardinality
-from carnot.core.data import context, dataset
-from carnot.core.elements.filters import Filter
-from carnot.core.lib.schemas import Average, Count
+from carnot.data.dataset import Dataset
 from carnot.utils.hash_helpers import hash_for_id
 
 
@@ -151,18 +147,10 @@ class Aggregate(LogicalOperator):
 
     def __init__(
         self,
-        agg_func: AggFunc,
+        agg_func: str,
         *args,
         **kwargs,
     ):
-        if kwargs.get("output_schema") is None:
-            if agg_func == AggFunc.COUNT:
-                kwargs["output_schema"] = Count
-            elif agg_func == AggFunc.AVERAGE:
-                kwargs["output_schema"] = Average
-            else:
-                raise ValueError(f"Unsupported aggregation function: {agg_func}")
-
         super().__init__(*args, **kwargs)
         self.agg_func = agg_func
 
@@ -248,7 +236,7 @@ class Aggregate(LogicalOperator):
 class BaseScan(LogicalOperator):
     """A BaseScan is a logical operator that represents a scan of a particular root Dataset."""
 
-    def __init__(self, datasource: dataset.Dataset, output_schema: type[BaseModel], *args, **kwargs):
+    def __init__(self, datasource: Dataset, output_schema: type[BaseModel], *args, **kwargs):
         super().__init__(*args, output_schema=output_schema, **kwargs)
         self.datasource = datasource
 
@@ -317,57 +305,16 @@ class Code(LogicalOperator):
 
         return logical_op_params
 
-class ContextScan(LogicalOperator):
-    """A ContextScan is a logical operator that loads the context for a particular root Dataset."""
-
-    def __init__(self, context: context.Context, output_schema: type[BaseModel], *args, **kwargs):
-        super().__init__(*args, output_schema=output_schema, **kwargs)
-        self.context = context
-
-    @staticmethod
-    def desc() -> str:
-        # TODO
-        return ""
-
-    def __str__(self):
-        return f"ContextScan({self.context},{self.output_schema})"
-
-    def __eq__(self, other) -> bool:
-        return (
-            isinstance(other, ContextScan)
-            and self.context.id == other.context.id
-        )
-
-    def get_logical_id_params(self) -> dict:
-        logical_id_params = super().get_logical_id_params()
-        logical_id_params = {
-            "id": self.context.id,
-            **logical_id_params,
-        }
-
-        return logical_id_params
-
-    def get_logical_op_params(self) -> dict:
-        logical_op_params = super().get_logical_op_params()
-        logical_op_params = {"context": self.context, **logical_op_params}
-
-        return logical_op_params
-
-
 class MapScan(LogicalOperator):
     """A MapScan is a logical operator that represents a scan of a particular input Dataset, with a map operation applied."""
 
     def __init__(
         self,
-        cardinality: Cardinality = Cardinality.ONE_TO_ONE,
-        udf: Callable | None = None,
         desc: str | None = None,
         *args,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.cardinality = cardinality
-        self.udf = udf
         self._desc = desc
 
     @staticmethod
@@ -392,8 +339,6 @@ class MapScan(LogicalOperator):
     def get_logical_id_params(self) -> dict:
         logical_id_params = super().get_logical_id_params()
         logical_id_params = {
-            "cardinality": self.cardinality,
-            "udf": self.udf,
             "desc": self._desc,
             **logical_id_params,
         }
@@ -403,8 +348,6 @@ class MapScan(LogicalOperator):
     def get_logical_op_params(self) -> dict:
         logical_op_params = super().get_logical_op_params()
         logical_op_params = {
-            "cardinality": self.cardinality,
-            "udf": self.udf,
             "desc": self._desc,
             **logical_op_params,
         }
@@ -456,7 +399,7 @@ class FilteredScan(LogicalOperator):
 
     def __init__(
         self,
-        filter: Filter,
+        filter: str,
         desc: str | None = None,
         *args,
         **kwargs,
@@ -651,96 +594,6 @@ class TopK(LogicalOperator):
             "search_attr": self.search_attr,
             "output_attrs": self.output_attrs,
             "k": self.k,
-            **logical_op_params,
-        }
-
-        return logical_op_params
-
-
-class ComputeOperator(LogicalOperator):
-    """
-    A ComputeOperator is a logical operator that performs a computation described in natural language
-    on a given Context.
-    """
-
-    def __init__(self, context_id: str, instruction: str, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.context_id = context_id
-        self.instruction = instruction
-
-    @staticmethod
-    def desc() -> str:
-        return textwrap.dedent(
-            """
-            Code Operator:
-                Description: Executes a computation described in natural language on a given dataset.
-                Syntax: ds.code(instruction: str)
-                Example: ds.code("Compute the mean temperature from all temperature readings recorded in the dataset")
-            Reasoning Operator:
-                Description: Executes a reasoning task described in natural language on a given dataset.
-                Syntax: ds.reason(instruction: str)
-                Example: ds.reason("Determine if there is a correlation between sales and marketing spend in the dataset")
-            """
-        )
-
-    def __str__(self):
-        return f"ComputeOperator(id={self.context_id}, instr={self.instruction:20s})"
-
-    def get_logical_id_params(self) -> dict:
-        logical_id_params = super().get_logical_id_params()
-        logical_id_params = {
-            "context_id": self.context_id,
-            "instruction": self.instruction,
-            **logical_id_params,
-        }
-
-        return logical_id_params
-
-    def get_logical_op_params(self) -> dict:
-        logical_op_params = super().get_logical_op_params()
-        logical_op_params = {
-            "context_id": self.context_id,
-            "instruction": self.instruction,
-            **logical_op_params,
-        }
-
-        return logical_op_params
-
-
-class SearchOperator(LogicalOperator):
-    """
-    A SearchOperator is a logical operator that executes a search described in natural language
-    on a given Context.
-    """
-
-    def __init__(self, context_id: str, search_query: str, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.context_id = context_id
-        self.search_query = search_query
-
-    @staticmethod
-    def desc() -> str:
-        # TODO
-        return ""
-
-    def __str__(self):
-        return f"SearchOperator(id={self.context_id}, search_query={self.search_query:20s})"
-
-    def get_logical_id_params(self) -> dict:
-        logical_id_params = super().get_logical_id_params()
-        logical_id_params = {
-            "context_id": self.context_id,
-            "search_query": self.search_query,
-            **logical_id_params,
-        }
-
-        return logical_id_params
-
-    def get_logical_op_params(self) -> dict:
-        logical_op_params = super().get_logical_op_params()
-        logical_op_params = {
-            "context_id": self.context_id,
-            "search_query": self.search_query,
             **logical_op_params,
         }
 
