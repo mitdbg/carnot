@@ -1,7 +1,10 @@
+import os
+
 from carnot.data.dataset import Dataset
 from carnot.operators.sem_agg import SemAggOperator
 
 TEST_MODEL_ID = "openai/gpt-5-mini"
+LLM_CONFIG = {"OPENAI_API_KEY": os.getenv("OPENAI_API_KEY")}
 
 def test_sem_agg_operator_basic():
     # construct dataset of various animals
@@ -21,18 +24,18 @@ def test_sem_agg_operator_basic():
     input_datasets = {animal_dataset.name: animal_dataset}
 
     # execute the operator
-    sem_agg_operator = SemAggOperator(task, output_fields, TEST_MODEL_ID, max_workers=4)
+    sem_agg_operator = SemAggOperator(task, output_fields, "output-dataset-id", TEST_MODEL_ID, LLM_CONFIG, max_workers=4)
     output_datasets = sem_agg_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 2
-    assert "SemAggOperatorOutput" in output_datasets
-    output_dataset = output_datasets["SemAggOperatorOutput"]
+    assert "output-dataset-id" in output_datasets
+    output_dataset = output_datasets["output-dataset-id"]
     assert len(output_dataset.items) == 1
     assert {"largest_animal": "elephant"} in output_dataset.items
 
 
-def test_sem_map_operator_movie_reviews(movie_reviews_data):
+def test_sem_agg_operator_movie_reviews(movie_reviews_data):
     # load movie reviews data
     _, reviews_df = movie_reviews_data
 
@@ -52,11 +55,11 @@ def test_sem_map_operator_movie_reviews(movie_reviews_data):
     input_datasets = {"Reviews Dataset": reviews_dataset}
 
     # generate output
-    sem_agg_operator = SemAggOperator(task, output_fields, TEST_MODEL_ID, max_workers=4)
+    sem_agg_operator = SemAggOperator(task, output_fields, "output-dataset-id", TEST_MODEL_ID, LLM_CONFIG, max_workers=4)
     output_datasets = sem_agg_operator("Reviews Dataset", input_datasets)
 
     assert len(output_datasets) == 2
-    assert "SemAggOperatorOutput" in output_datasets
-    output_dataset = output_datasets["SemAggOperatorOutput"]
+    assert "output-dataset-id" in output_datasets
+    output_dataset = output_datasets["output-dataset-id"]
     assert len(output_dataset.items) == 1
     assert {"worst_movie": "inception"} in output_dataset.items

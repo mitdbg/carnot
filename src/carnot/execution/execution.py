@@ -71,13 +71,6 @@ class Execution:
 
         return nl_plan, plan
 
-    def compile(self): # plan: LogicalPlan -> PhysicalPlan
-        """
-        Compile a logical plan into a physical execution plan.
-        """
-        # return self.planner.compile_physical_plan(self._plan)
-        pass
-
     def _get_op_from_plan_dict(self, plan: dict) -> tuple[Operator | Dataset, list[str]]:
         """
         Return the physical operator associated with the given plan name.

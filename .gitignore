@@ -221,4 +221,4 @@ backend.log
 frontend.log
 secrets/
 how-tos/
-
+make_password.py

@@ -1,7 +1,10 @@
+import os
+
 from carnot.data.dataset import Dataset
 from carnot.operators.sem_flat_map import SemFlatMapOperator
 
 TEST_MODEL_ID = "openai/gpt-5-mini"
+LLM_CONFIG = {"OPENAI_API_KEY": os.getenv("OPENAI_API_KEY")}
 
 def test_sem_flat_map_operator_basic():
     # construct dataset of various fruits
@@ -23,13 +26,13 @@ def test_sem_flat_map_operator_basic():
     input_datasets = {fruit_dataset.name: fruit_dataset}
 
     # execute the operator
-    sem_flat_map_operator = SemFlatMapOperator(task, output_fields, TEST_MODEL_ID, max_workers=4)
+    sem_flat_map_operator = SemFlatMapOperator(task, output_fields, "output-dataset-id", TEST_MODEL_ID, LLM_CONFIG, max_workers=4)
     output_datasets = sem_flat_map_operator("Fruit Dataset", input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 2
-    assert "SemFlatMapOperatorOutput" in output_datasets
-    output_dataset = output_datasets["SemFlatMapOperatorOutput"]
+    assert "output-dataset-id" in output_datasets
+    output_dataset = output_datasets["output-dataset-id"]
     assert len(output_dataset.items) == 5
     for item in output_dataset.items:
         item["fruit"] = item["fruit"].lower()
@@ -62,10 +65,10 @@ def test_sem_flat_map_operator_movie_reviews(research_papers_data):
     input_datasets = {"Research Papers Dataset": papers_dataset}
 
     # generate output
-    sem_flat_map_operator = SemFlatMapOperator(task, output_fields, TEST_MODEL_ID, max_workers=4)
+    sem_flat_map_operator = SemFlatMapOperator(task, output_fields, "output-dataset-id", TEST_MODEL_ID, LLM_CONFIG, max_workers=4)
     output_datasets = sem_flat_map_operator("Research Papers Dataset", input_datasets)
 
     assert len(output_datasets) == 2
-    assert "SemFlatMapOperatorOutput" in output_datasets
-    output_dataset = output_datasets["SemFlatMapOperatorOutput"]
+    assert "output-dataset-id" in output_datasets
+    output_dataset = output_datasets["output-dataset-id"]
     assert len(output_dataset.items) == 2 + 15 + 10

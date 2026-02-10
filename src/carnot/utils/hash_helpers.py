@@ -1,10 +1,8 @@
 import hashlib
 import json
 
-from carnot.constants import MAX_ID_CHARS
 
-
-def hash_for_id(id_str: str, max_chars: int = MAX_ID_CHARS) -> str:
+def hash_for_id(id_str: str, max_chars: int = 16) -> str:
     return hashlib.sha256(id_str.encode("utf-8")).hexdigest()[:max_chars]
 
 

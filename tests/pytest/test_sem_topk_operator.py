@@ -1,7 +1,10 @@
+import os
+
 from carnot.data.dataset import Dataset
 from carnot.operators.sem_topk import SemTopKOperator
 
 TEST_MODEL_ID = "openai/text-embedding-3-small"
+LLM_CONFIG = {"OPENAI_API_KEY": os.getenv("OPENAI_API_KEY")}
 
 def test_sem_topk_operator_basic():
     # construct dataset of various animals
@@ -20,13 +23,13 @@ def test_sem_topk_operator_basic():
     input_datasets = {animal_dataset.name: animal_dataset}
 
     # execute the operator
-    sem_topk_operator = SemTopKOperator(task, k=2, model_id=TEST_MODEL_ID, max_workers=4)
+    sem_topk_operator = SemTopKOperator(task, k=2, output_dataset_id="output-dataset-id", model_id=TEST_MODEL_ID, llm_config=LLM_CONFIG, max_workers=4)
     output_datasets = sem_topk_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 2
-    assert "SemTopKOperatorOutput" in output_datasets
-    output_dataset = output_datasets["SemTopKOperatorOutput"]
+    assert "output-dataset-id" in output_datasets
+    output_dataset = output_datasets["output-dataset-id"]
     assert len(output_dataset.items) == 2
     assert {"animal": "giraffe"} in output_dataset.items
     assert {"animal": "elephant"} in output_dataset.items
@@ -51,12 +54,12 @@ def test_sem_topk_operator_movie_reviews(movie_reviews_data):
     input_datasets = {"Reviews Dataset": reviews_dataset}
 
     # generate output
-    sem_topk_operator = SemTopKOperator(task, k=5, model_id=TEST_MODEL_ID, max_workers=4)
+    sem_topk_operator = SemTopKOperator(task, k=5, output_dataset_id="output-dataset-id", model_id=TEST_MODEL_ID, llm_config=LLM_CONFIG, max_workers=4)
     output_datasets = sem_topk_operator("Reviews Dataset", input_datasets)
 
     assert len(output_datasets) == 2
-    assert "SemTopKOperatorOutput" in output_datasets
-    output_dataset = output_datasets["SemTopKOperatorOutput"]
+    assert "output-dataset-id" in output_datasets
+    output_dataset = output_datasets["output-dataset-id"]
     assert len(output_dataset.items) == 5
     total_correct, total = 0, 0
     for review in output_dataset.items:
