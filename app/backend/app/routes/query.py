@@ -38,8 +38,91 @@ from app.services.file_service import LocalFileService, S3FileService
 from app.services.llm import get_user_llm_config
 from carnot.data.dataset import Dataset as CarnotDataset
 from carnot.data.item import DataItem
+from carnot.index.hierarchical import FileRouter
+from carnot.index.index import HierarchicalCarnotIndex
 
 router = APIRouter()
+
+# Minimum files to trigger routing (below this, we process all files)
+ROUTING_MIN_FILES = 30
+# Max files to pass through after routing
+ROUTING_TOP_K = 150
+
+# Shared router instance for in-memory cache reuse across requests.
+# Persistent cache (disk) is used regardless; this avoids rebuilding when
+# the same path set is queried repeatedly in the same process.
+_shared_file_router = None
+
+
+def _get_file_router():
+    """Return the shared FileRouter, creating it lazily with persistence enabled."""
+    global _shared_file_router
+    if _shared_file_router is None:
+        _shared_file_router = FileRouter(use_persistence=True)
+    return _shared_file_router
+
+
+def _apply_file_routing(
+    query: str,
+    datasets: list[CarnotDataset],
+    user_config: dict,
+    top_k: int = ROUTING_TOP_K,
+) -> list[CarnotDataset]:
+    """
+    Route query to top-k relevant files across all datasets.
+    Returns new datasets with items filtered to the routed subset.
+    """
+    all_items = []
+    for ds in datasets:
+        all_items.extend(ds.items)
+
+    if len(all_items) < ROUTING_MIN_FILES:
+        return datasets
+
+    # Set API key for router (uses litellm/OpenAI)
+    api_key = user_config.get("OPENAI_API_KEY")
+    if api_key:
+        os.environ["OPENAI_API_KEY"] = api_key
+
+    try:
+        router_instance = _get_file_router()
+        routed_items, hierarchical_index = router_instance.route(
+            query=query,
+            items=all_items,
+            k=top_k,
+            min_files_to_route=ROUTING_MIN_FILES,
+        )
+        routed_paths = {item.path for item in routed_items}
+
+        # Filter each dataset to routed items only; attach hierarchical index when available
+        routed_datasets = []
+        for ds in datasets:
+            filtered = [item for item in ds.items if item.path in routed_paths]
+            index = None
+            if hierarchical_index is not None and filtered:
+                index = HierarchicalCarnotIndex(
+                    name=ds.name,
+                    items=filtered,
+                    hierarchical_index=hierarchical_index,
+                )
+            routed_datasets.append(
+                CarnotDataset(
+                    name=ds.name,
+                    annotation=ds.annotation,
+                    items=filtered,
+                    index=index,
+                )
+            )
+        logger.info(
+            "File routing: %d -> %d files across %d datasets",
+            len(all_items),
+            sum(len(d.items) for d in routed_datasets),
+            len(datasets),
+        )
+        return routed_datasets
+    except Exception as e:
+        logger.warning("File routing failed, using all files: %s", e)
+        return datasets
 # logger = logging.getLogger(__name__)
 logger = logging.getLogger('uvicorn.error')
 file_service = LocalFileService() if IS_LOCAL_ENV else S3FileService()
@@ -173,6 +256,25 @@ class QueryExecutionStreamer:
 
             await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': f'Processing {len(all_files)} files...'})}\n\n")
             await asyncio.sleep(0.1)
+
+            # Apply file routing when we have many files (runs in thread - LLM/embedding calls)
+            if len(all_files) >= ROUTING_MIN_FILES:
+                await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Routing to relevant files...'})}\n\n")
+                await asyncio.sleep(0.1)
+                datasets = await run_in_threadpool(
+                    _apply_file_routing,
+                    self.query,
+                    datasets,
+                    self.user_config,
+                    ROUTING_TOP_K,
+                )
+                all_files = [
+                    S3Path(item.path) if item.path.startswith("s3://") else Path(item.path)
+                    for dataset in datasets
+                    for item in dataset
+                ]
+                await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': f'Routed to {len(all_files)} files'})}\n\n")
+                await asyncio.sleep(0.1)
 
             session_exists = session_id in active_sessions
             if session_exists and set(active_sessions[session_id]["dataset_ids"]) != set(self.dataset_ids):

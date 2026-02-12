@@ -4,8 +4,12 @@ import json
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import chromadb
+
+if TYPE_CHECKING:
+    from carnot.index.hierarchical import HierarchicalFileIndex
 import faiss
 import litellm
 import numpy as np
@@ -48,6 +52,25 @@ class CarnotIndex(ABC):
     @abstractmethod
     def search(self, query: str, k: int) -> list:
         pass
+
+
+class HierarchicalCarnotIndex(CarnotIndex):
+    """CarnotIndex adapter for HierarchicalFileIndex. Maps paths to DataItems."""
+
+    def __init__(self, name: str, items: list, hierarchical_index: "HierarchicalFileIndex"):
+        super().__init__(name=name, items=items)
+        self._hierarchical = hierarchical_index
+        self._path_to_item = {item.path: item for item in items if item.path}
+
+    def _add_index_to_catalog(self):
+        pass
+
+    def _get_or_create_index(self):
+        pass
+
+    def search(self, query: str, k: int) -> list:
+        paths = self._hierarchical.search(query, k)
+        return [self._path_to_item[p] for p in paths if p in self._path_to_item][:k]
 
 
 class ChromaIndex(CarnotIndex):
