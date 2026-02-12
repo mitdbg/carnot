@@ -1,7 +1,7 @@
 import os
 
 ROOT_DIR = "data/enron-eval-medium"
-KEYWORDS = ["deathstar", "chewco", "raptor", "fat boy"]
+KEYWORDS = ["chewco"]
 
 matches = []
 
