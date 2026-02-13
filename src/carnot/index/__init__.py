@@ -1,4 +1,4 @@
-from carnot.index.hierarchical import FileRouter, HierarchicalFileIndex, HierarchicalIndexConfig
+from carnot.index.hierarchical import HierarchicalFileIndex, HierarchicalIndexConfig
 from carnot.index.index import (
     CarnotIndex,
     ChromaIndex,
@@ -14,7 +14,6 @@ __all__ = [
     "FaissIndex",
     "HierarchicalCarnotIndex",
     "SemanticIndex",
-    "FileRouter",
     "HierarchicalFileIndex",
     "HierarchicalIndexConfig",
     "FileSummaryCache",

@@ -1,9 +1,3 @@
-"""Hierarchical (B-tree-like) file index for semantic routing.
-
-Leaves are file summaries; internal nodes summarize their children.
-The top level is sized to fit within the router model's context limit.
-"""
-
 from __future__ import annotations
 
 import logging
@@ -64,6 +58,13 @@ class HierarchicalIndexConfig:
     llm_routing_max_nodes: int = 15  # max nodes to send to LLM at once (context limit)
 
 
+def _get_routing_storage_base() -> Path:
+    base = Path.home() / ".carnot"
+    if os.getenv("CARNOT_HOME"):
+        base = Path(os.getenv("CARNOT_HOME"))
+    return base / "routing"
+
+
 class HierarchicalFileIndex:
     """
     B-tree-like index over file summaries.
@@ -72,6 +73,8 @@ class HierarchicalFileIndex:
     - Internal nodes: LLM-generated summaries of children
     - Top level sized to fit router context
     - Search: top-down traversal by query embedding similarity
+
+    Use from_items() to build from raw DataItems (summarizes, embeds, caches).
     """
 
     def __init__(
@@ -81,6 +84,7 @@ class HierarchicalFileIndex:
         config: HierarchicalIndexConfig | None = None,
         api_key: str | None = None,
         build: bool = True,
+        **kwargs
     ):
         self.name = name
         self.file_summaries = file_summaries
@@ -97,6 +101,136 @@ class HierarchicalFileIndex:
 
         if build:
             self._build()
+
+    @classmethod
+    def from_items(
+        cls,
+        name: str,
+        items: list[DataItem],
+        config: HierarchicalIndexConfig | None = None,
+        api_key: str | None = None,
+        storage_dir: Path | None = None,
+        use_persistence: bool = True,
+        summary_generator=None,
+    ) -> "HierarchicalFileIndex | None":
+        """
+        Build index from DataItems. Summarizes files, caches, builds hierarchy.
+        Returns None if summaries cannot be generated.
+        """
+        if not items:
+            return None
+
+        from carnot.core.data.smv_generator import SMVGenerator
+        from carnot.index.persistence import FileSummaryCache, HierarchicalIndexCache
+
+        api_key = api_key or os.getenv("OPENAI_API_KEY")
+        config = config or HierarchicalIndexConfig()
+        summary_generator = summary_generator or SMVGenerator()
+
+        base = storage_dir or _get_routing_storage_base()
+        summary_cache = FileSummaryCache(base / "summaries") if use_persistence else None
+        index_cache = HierarchicalIndexCache(base / "indices") if use_persistence else None
+
+        paths = [i.path for i in items if i.path]
+        cache_key = hash_for_id("|".join(sorted(paths)))
+
+        if index_cache:
+            index = index_cache.load(paths, config=config, api_key=api_key)
+            if index is not None:
+                logger.debug("Loaded index from cache for %d files", len(paths))
+                return index
+
+        summaries = cls._get_or_build_summaries(
+            items, summary_generator, summary_cache
+        )
+        if not summaries:
+            logger.warning("No file summaries could be generated")
+            return None
+
+        index = cls(
+            name=cache_key,
+            file_summaries=summaries,
+            config=config,
+            api_key=api_key,
+        )
+        if index_cache:
+            try:
+                index_cache.save(index)
+            except Exception as e:
+                logger.warning("Failed to persist index: %s", e)
+        return index
+
+    @staticmethod
+    def _get_file_text(item: DataItem) -> str:
+        try:
+            d = item.to_dict()
+            return d.get("contents", "") or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _build_file_summaries(
+        items: list[DataItem],
+        summary_generator,
+        summary_cache: "FileSummaryCache | None",
+    ) -> list[FileSummaryEntry]:
+        skip_suffixes = {".jpg", ".jpeg", ".png", ".gif", ".zip", ".exe", ".bin"}
+        entries: list[FileSummaryEntry] = []
+
+        for item in items:
+            if not item.path:
+                continue
+            if Path(item.path).suffix.lower() in skip_suffixes:
+                continue
+            try:
+                text = HierarchicalFileIndex._get_file_text(item)
+                if not text.strip():
+                    continue
+                fs = summary_generator.generate_file_summary(
+                    file_id=item.path,
+                    text_content=text,
+                    file_path=item.path,
+                )
+                emb = fs.summary_embedding
+                if emb is None and summary_generator.emb_fn:
+                    emb = summary_generator.emb_fn([fs.global_summary])[0]
+                if emb is None:
+                    continue
+                entry = FileSummaryEntry(path=item.path, summary=fs.global_summary, embedding=emb)
+                entries.append(entry)
+                if summary_cache:
+                    try:
+                        summary_cache.save(entry)
+                    except Exception as e:
+                        logger.warning("Failed to persist summary for %s: %s", item.path, e)
+            except Exception as e:
+                logger.warning("Failed to summarize %s: %s", item.path, e)
+        return entries
+
+    @staticmethod
+    def _get_or_build_summaries(
+        items: list[DataItem],
+        summary_generator,
+        summary_cache: "FileSummaryCache | None",
+    ) -> list[FileSummaryEntry]:
+        skip_suffixes = {".jpg", ".jpeg", ".png", ".gif", ".zip", ".exe", ".bin"}
+        paths = [
+            i.path for i in items
+            if i.path and Path(i.path).suffix.lower() not in skip_suffixes
+        ]
+        if summary_cache:
+            loaded, missing_paths = summary_cache.load_many(paths)
+            items_to_compute = [i for i in items if i.path in missing_paths]
+        else:
+            loaded = {}
+            items_to_compute = [i for i in items if i.path and Path(i.path).suffix.lower() not in skip_suffixes]
+        if items_to_compute:
+            new_entries = HierarchicalFileIndex._build_file_summaries(
+                items_to_compute, summary_generator, summary_cache
+            )
+            for entry in new_entries:
+                loaded[entry.path] = entry
+        return list(loaded.values())
 
     def _max_root_nodes(self) -> int:
         """Max nodes at root level that fit in router context."""
@@ -461,189 +595,3 @@ Return only the comma-separated numbers, nothing else:"""
             self._collect_paths_from_node(
                 node.children[idx], query, query_emb, k, seen_paths, result_paths
             )
-
-
-class FileRouter:
-    """
-    High-level router that builds a hierarchical index from datasets and routes
-    queries to a subset of relevant files.
-
-    Uses persistent caches (per-file summaries, per-path-set index) so that
-    once a dataset's files are summarized, they are reused for all future queries.
-    """
-
-    def __init__(
-        self,
-        summary_generator=None,
-        config: HierarchicalIndexConfig | None = None,
-        api_key: str | None = None,
-        storage_dir: Path | None = None,
-        use_persistence: bool = True,
-    ):
-        from carnot.core.data.smv_generator import SMVGenerator
-
-        self.summary_generator = summary_generator or SMVGenerator()
-        self.config = config or HierarchicalIndexConfig()
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        self._index_cache: dict[str, HierarchicalFileIndex] = {}  # in-memory fallback
-        self.use_persistence = use_persistence
-        if use_persistence:
-            from carnot.index.persistence import FileSummaryCache, HierarchicalIndexCache
-
-            base = storage_dir or (Path.home() / ".carnot" / "routing")
-            if os.getenv("CARNOT_HOME"):
-                base = Path(os.getenv("CARNOT_HOME")) / "routing"
-            self._summary_cache = FileSummaryCache(base / "summaries")
-            self._index_cache_persistent = HierarchicalIndexCache(base / "indices")
-        else:
-            self._summary_cache = None
-            self._index_cache_persistent = None
-
-    def _get_file_text(self, item: DataItem) -> str:
-        """Extract text from a DataItem (file path)."""
-        try:
-            d = item.to_dict()
-            return d.get("contents", "") or ""
-        except Exception:
-            return ""
-
-    def _build_file_summaries(
-        self, items: list[DataItem], skip_suffixes: set[str] | None = None
-    ) -> list[FileSummaryEntry]:
-        """Generate summaries for each file."""
-        skip_suffixes = skip_suffixes or {".jpg", ".jpeg", ".png", ".gif", ".zip", ".exe", ".bin"}
-        entries: list[FileSummaryEntry] = []
-
-        for item in items:
-            if not item.path:
-                continue
-            suffix = Path(item.path).suffix.lower()
-            if suffix in skip_suffixes:
-                continue
-
-            try:
-                text = self._get_file_text(item)
-                if not text.strip():
-                    continue
-
-                fs = self.summary_generator.generate_file_summary(
-                    file_id=item.path,
-                    text_content=text,
-                    file_path=item.path,
-                )
-                emb = fs.summary_embedding
-                if emb is None and self.summary_generator.emb_fn:
-                    emb = self.summary_generator.emb_fn([fs.global_summary])[0]
-                if emb is None:
-                    continue  # skip files we can't embed
-
-                entry = FileSummaryEntry(
-                    path=item.path,
-                    summary=fs.global_summary,
-                    embedding=emb,
-                )
-                entries.append(entry)
-                # Save immediately so incremental progress is visible and cost is preserved
-                if self._summary_cache:
-                    try:
-                        self._summary_cache.save(entry)
-                    except Exception as e:
-                        logger.warning("Failed to persist summary for %s: %s", item.path, e)
-            except Exception as e:
-                logger.warning(f"Failed to summarize {item.path}: {e}")
-                continue
-
-        return entries
-
-    def _get_or_build_summaries(
-        self, items: list[DataItem], skip_suffixes: set[str] | None = None
-    ) -> list[FileSummaryEntry]:
-        """
-        Get file summaries, loading from persistent cache when available and
-        computing only for missing files.
-        """
-        skip_suffixes = skip_suffixes or {".jpg", ".jpeg", ".png", ".gif", ".zip", ".exe", ".bin"}
-        paths = [
-            i.path for i in items
-            if i.path and Path(i.path).suffix.lower() not in skip_suffixes
-        ]
-
-        if self._summary_cache:
-            loaded, missing_paths = self._summary_cache.load_many(paths)
-            items_to_compute = [i for i in items if i.path in missing_paths]
-        else:
-            loaded = {}
-            items_to_compute = [i for i in items if i.path and Path(i.path).suffix.lower() not in skip_suffixes]
-
-        # Compute summaries for missing files (saves incrementally inside _build_file_summaries)
-        if items_to_compute:
-            new_entries = self._build_file_summaries(items_to_compute, skip_suffixes)
-            for entry in new_entries:
-                loaded[entry.path] = entry
-
-        return list(loaded.values())
-
-    def route(
-        self,
-        query: str,
-        items: list[DataItem],
-        k: int = 100,
-        index_name: str | None = None,
-        min_files_to_route: int = 30,
-    ) -> tuple[list[DataItem], HierarchicalFileIndex | None]:
-        """
-        Route a query to the top-k most relevant files.
-
-        Returns (routed_items, index). routed_items are DataItems in relevance order.
-        index is the HierarchicalFileIndex used (or None if routing was skipped/failed).
-        If the index cannot be built (e.g. no embeddings), returns (all items, None).
-        Skips routing when item count is below min_files_to_route.
-        """
-        if not items:
-            return [], None
-        if len(items) < min_files_to_route:
-            return list(items), None
-
-        paths = [i.path for i in items if i.path]
-        cache_key = index_name or hash_for_id("|".join(sorted(paths)))
-
-        # Try in-memory cache first
-        if cache_key in self._index_cache:
-            index = self._index_cache[cache_key]
-        else:
-            index = None
-
-            # Try persistent index cache
-            if index is None and self._index_cache_persistent:
-                index = self._index_cache_persistent.load(
-                    paths, config=self.config, api_key=self.api_key
-                )
-                if index is not None:
-                    logger.debug("Loaded index from persistent cache for %d files", len(paths))
-
-            # Build index if not cached
-            if index is None:
-                summaries = self._get_or_build_summaries(items)
-                if not summaries:
-                    logger.warning("No file summaries could be generated, returning all items")
-                    return list(items), None
-
-                idx = HierarchicalFileIndex(
-                    name=cache_key,
-                    file_summaries=summaries,
-                    config=self.config,
-                    api_key=self.api_key,
-                )
-                # Save to persistent index cache
-                if self._index_cache_persistent:
-                    try:
-                        self._index_cache_persistent.save(idx)
-                    except Exception as e:
-                        logger.warning("Failed to persist index cache: %s", e)
-                self._index_cache[cache_key] = idx
-                index = idx
-
-        paths_result = index.search(query, k=k)
-        path_to_item = {item.path: item for item in items if item.path}
-        routed = [path_to_item[p] for p in paths_result if p in path_to_item]
-        return routed, index

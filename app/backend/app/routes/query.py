@@ -38,7 +38,7 @@ from app.services.file_service import LocalFileService, S3FileService
 from app.services.llm import get_user_llm_config
 from carnot.data.dataset import Dataset as CarnotDataset
 from carnot.data.item import DataItem
-from carnot.index.hierarchical import FileRouter
+from carnot.index.hierarchical import HierarchicalFileIndex
 from carnot.index.index import HierarchicalCarnotIndex
 
 router = APIRouter()
@@ -47,19 +47,6 @@ router = APIRouter()
 ROUTING_MIN_FILES = 30
 # Max files to pass through after routing
 ROUTING_TOP_K = 150
-
-# Shared router instance for in-memory cache reuse across requests.
-# Persistent cache (disk) is used regardless; this avoids rebuilding when
-# the same path set is queried repeatedly in the same process.
-_shared_file_router = None
-
-
-def _get_file_router():
-    """Return the shared FileRouter, creating it lazily with persistence enabled."""
-    global _shared_file_router
-    if _shared_file_router is None:
-        _shared_file_router = FileRouter(use_persistence=True)
-    return _shared_file_router
 
 
 def _apply_file_routing(
@@ -85,13 +72,17 @@ def _apply_file_routing(
         os.environ["OPENAI_API_KEY"] = api_key
 
     try:
-        router_instance = _get_file_router()
-        routed_items, hierarchical_index = router_instance.route(
-            query=query,
+        hierarchical_index = HierarchicalFileIndex.from_items(
+            name="routed",
             items=all_items,
-            k=top_k,
-            min_files_to_route=ROUTING_MIN_FILES,
+            use_persistence=True,
         )
+        if hierarchical_index is None:
+            logger.warning("File routing: could not build index, using all files")
+            return datasets
+        paths = hierarchical_index.search(query, k=top_k)
+        path_to_item = {item.path: item for item in all_items if item.path}
+        routed_items = [path_to_item[p] for p in paths if p in path_to_item]
         routed_paths = {item.path for item in routed_items}
 
         # Filter each dataset to routed items only; attach hierarchical index when available

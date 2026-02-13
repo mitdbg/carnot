@@ -4,12 +4,10 @@ import json
 import os
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import chromadb
 
-if TYPE_CHECKING:
-    from carnot.index.hierarchical import HierarchicalFileIndex
+from carnot.index.hierarchical import HierarchicalFileIndex
 import faiss
 import litellm
 import numpy as np
@@ -57,18 +55,70 @@ class CarnotIndex(ABC):
 class HierarchicalCarnotIndex(CarnotIndex):
     """CarnotIndex adapter for HierarchicalFileIndex. Maps paths to DataItems."""
 
-    def __init__(self, name: str, items: list, hierarchical_index: "HierarchicalFileIndex"):
+    def __init__(
+        self,
+        name: str,
+        items: list,
+        hierarchical_index: "HierarchicalFileIndex | None" = None,
+        config=None,
+        api_key: str | None = None,
+        use_persistence: bool = True,
+        **kwargs
+    ):
         super().__init__(name=name, items=items)
         self._hierarchical = hierarchical_index
-        self._path_to_item = {item.path: item for item in items if item.path}
+        self._config = config
+        self._api_key = api_key
+        self._use_persistence = use_persistence
+        self._path_to_item = {}
+        for item in items:
+            p = item.path if hasattr(item, "path") else (item.get("path") if isinstance(item, dict) else None)
+            if p:
+                self._path_to_item[p] = item
+        if self._hierarchical is None and self._path_to_item:
+            self._get_or_create_index()
 
     def _add_index_to_catalog(self):
         pass
 
-    def _get_or_create_index(self):
-        pass
+    def _get_or_create_index(self) -> HierarchicalFileIndex | None:
+        if self._hierarchical is not None:
+            return self._hierarchical
+        from carnot.data.item import DataItem
+
+        def to_data_item(i) -> DataItem | None:
+            if isinstance(i, DataItem) and i.path:
+                return i
+            if isinstance(i, dict) and i.get("path"):
+                di = DataItem(path=i["path"])
+                di._dict = i
+                return di
+            return None
+
+        data_items = [x for x in (to_data_item(i) for i in self.items) if x is not None]
+        if not data_items:
+            raise ValueError("HierarchicalCarnotIndex: no items with path to build index")
+        index = HierarchicalFileIndex.from_items(
+            name=self.name,
+            items=data_items,
+            config=self._config,
+            api_key=self._api_key,
+            use_persistence=self._use_persistence,
+        )
+        if index is None:
+            raise ValueError("Could not build hierarchical index from items")
+        self._hierarchical = index
+        path_to_item = {}
+        for item in self.items:
+            p = item.path if hasattr(item, "path") else (item.get("path") if isinstance(item, dict) else None)
+            if p:
+                path_to_item[p] = item
+        self._path_to_item = path_to_item
+        return self._hierarchical
 
     def search(self, query: str, k: int) -> list:
+        if self._hierarchical is None:
+            self._get_or_create_index()
         paths = self._hierarchical.search(query, k)
         return [self._path_to_item[p] for p in paths if p in self._path_to_item][:k]
 

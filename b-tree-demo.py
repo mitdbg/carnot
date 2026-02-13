@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 from carnot.data.dataset import Dataset as CarnotDataset
 from carnot.data.item import DataItem
-from carnot.index.hierarchical import FileRouter
 from carnot.index.index import HierarchicalCarnotIndex
 
 logging.basicConfig(
@@ -34,7 +33,6 @@ def main():
     items = [DataItem(path=str(f.absolute())) for f in files]
     logger.info("Loaded %d files from %s", len(items), data_dir)
 
-    router = FileRouter(use_persistence=True)
     if os.getenv("OPENAI_API_KEY"):
         os.environ["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
 
@@ -42,24 +40,21 @@ def main():
         "Find emails that refer to the Raptor, Deathstar, Chewco, and/or Fat Boy investments, "
         "excluding emails that quote text from external articles or sources outside of Enron"
     )
-    k = 50
 
-    logger.info("Routing with query: %s...", query[:60])
-    routed_items, hierarchical_index = router.route(
-        query=query,
+    carnot_index = HierarchicalCarnotIndex(
+        name="enron-emails",
         items=items,
-        k=k,
-        min_files_to_route=30,
+        use_persistence=True,
     )
+    if len(items) >= 30:
+        logger.info("Routing with query: %s...", query[:60])
+        routed_items = carnot_index.search(query, k=50)
+    else:
+        logger.info("Skipping routing (< 30 files), using all items")
+        routed_items = list(items)
 
     logger.info("Routed: %d items (of %d)", len(routed_items), len(items))
     logger.info("Routed file paths: %s", [r.path for r in routed_items])
-
-    if hierarchical_index is None:
-        logger.warning("No hierarchical index returned (routing skipped or failed)")
-        return
-
-    logger.info("Index returned: %s", type(hierarchical_index).__name__)
 
     dataset = CarnotDataset(
         name="enron-emails",
@@ -68,7 +63,7 @@ def main():
         index=HierarchicalCarnotIndex(
             name="enron-emails",
             items=routed_items,
-            hierarchical_index=hierarchical_index,
+            hierarchical_index=carnot_index._hierarchical,
         ),
     )
     logger.info("Generating plan and executing...")
