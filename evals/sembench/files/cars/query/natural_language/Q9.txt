@@ -1,0 +1,1 @@
+Find cars that are torn according to images and have bad ignition according to audio.

@@ -12,6 +12,7 @@ from carnot.memory.memory import Memory
 # from carnot.plan.logical import LogicalPlan
 # from carnot.plan.physical import PhysicalPlan
 from carnot.operators.code import CodeOperator
+from carnot.operators.limit import LimitOperator
 from carnot.operators.reasoning import ReasoningOperator
 from carnot.operators.sem_agg import SemAggOperator
 from carnot.operators.sem_filter import SemFilterOperator
@@ -49,7 +50,18 @@ class Execution:
         self.indices = indices or []
         self.llm_config = llm_config or {}
         self.progress_log_file = progress_log_file
-        self.planner = Planner(tools=self.tools, model=LiteLLMModel(model_id="openai/gpt-4o-mini", api_key=llm_config.get("OPENAI_API_KEY")))
+        self.planner_model_id = "openai/gpt-5-mini"
+        self.api_key_name = "OPENAI_API_KEY"
+        if "OPENAI_API_KEY" not in self.llm_config and "ANTHROPIC_API_KEY" in self.llm_config:
+            self.planner_model_id = "anthropic/claude-sonnet-4-5-20250929"
+            self.api_key_name = "ANTHROPIC_API_KEY"
+        elif "OPENAI_API_KEY" not in self.llm_config and "GEMINI_API_KEY" in self.llm_config:
+            self.planner_model_id = "google/gemini-2.5-flash"
+            self.api_key_name = "GEMINI_API_KEY"
+        elif "OPENAI_API_KEY" not in self.llm_config and "GOOGLE_API_KEY" in self.llm_config:
+            self.planner_model_id = "google/gemini-2.5-flash"
+            self.api_key_name = "GOOGLE_API_KEY"
+        self.planner = Planner(tools=self.tools, model=LiteLLMModel(model_id=self.planner_model_id, api_key=llm_config.get(self.api_key_name)))
 
     def plan(self) -> tuple[str, dict]:
         """
@@ -58,16 +70,25 @@ class Execution:
         # retrieve relevant context from memory
         memories = [] # self.memory.retrieve(self.query)
 
-        # synthesize relevant context from conversation
-        conversation_context = ""
-        # if self.conversation:
-        #     conversation_context = self.conversation.condense(self.query)
+        # perform preliminary data discovery to inform planning
+        data_discovery_report = self.planner.search_for_relevant_data(
+            self.query, self.datasets, self.indices, self.tools, memories,
+            conversation=self.conversation,
+        )
 
         # invoke the planner to create a logical plan in natural language
-        nl_plan = self.planner.generate_logical_plan(self.query, self.datasets, self.indices, self.tools, memories, conversation_context)
+        nl_plan = self.planner.generate_logical_plan(
+            self.query, self.datasets, self.indices, self.tools, memories,
+            data_discovery_report=data_discovery_report,
+            conversation=self.conversation,
+        )
 
         # convert the natural language plan to a LogicalPlan object
-        plan = self.planner.compile_logical_plan(self.query, self.datasets, nl_plan)
+        plan = self.planner.compile_logical_plan(
+            self.query, self.datasets, nl_plan,
+            data_discovery_report=data_discovery_report,
+            conversation=self.conversation,
+        )
 
         return nl_plan, plan
 
@@ -81,6 +102,9 @@ class Execution:
         op_name = op_params.get('operator', plan['name'])
         if op_name == "Code":
             operator = CodeOperator(task=op_params['task'], output_dataset_id=plan['output_dataset_id'], model_id="openai/gpt-5-mini", llm_config=self.llm_config)
+
+        elif op_name == "Limit":
+            operator = LimitOperator(n=op_params['n'], output_dataset_id=plan['output_dataset_id'])
 
         elif op_name == "SemanticAgg":
             operator = SemAggOperator(task=op_params['task'], agg_fields=op_params['agg_fields'], output_dataset_id=plan['output_dataset_id'], model_id="openai/gpt-5-mini", llm_config=self.llm_config, max_workers=4)

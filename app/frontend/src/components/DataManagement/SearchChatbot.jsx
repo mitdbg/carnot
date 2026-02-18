@@ -7,7 +7,7 @@ function SearchChatbot({ onSelectFiles }) {
   const getValidToken = useApiToken();
   const [messages, setMessages] = useState([
     {
-      role: 'assistant',
+      role: 'agent',
       content: 'Hi! I can help you find files. Try asking me something like "Find all email files" or "Search for files about investments".',
     },
   ])
@@ -34,12 +34,12 @@ function SearchChatbot({ onSelectFiles }) {
       const response = await searchApi.search(userMessage, null, token);
       const results = response.data
 
-      // add assistant response
+      // add agent response
       if (results.length > 0) {
         setMessages((prev) => [
           ...prev,
           {
-            role: 'assistant',
+            role: 'agent',
             content: `I found ${results.length} file(s) matching your query. Click "Add to Selection" to include them in your dataset.`,
             results: results,
           },
@@ -48,7 +48,7 @@ function SearchChatbot({ onSelectFiles }) {
         setMessages((prev) => [
           ...prev,
           {
-            role: 'assistant',
+            role: 'agent',
             content: "I couldn't find any files matching your query. Try rephrasing or using different keywords.",
           },
         ])
@@ -57,7 +57,7 @@ function SearchChatbot({ onSelectFiles }) {
       setMessages((prev) => [
         ...prev,
         {
-          role: 'assistant',
+          role: 'agent',
           content: 'Sorry, I encountered an error searching for files: ' + err.message,
         },
       ])
@@ -71,7 +71,7 @@ function SearchChatbot({ onSelectFiles }) {
     setMessages((prev) => [
       ...prev,
       {
-        role: 'assistant',
+        role: 'agent',
         content: `Added ${results.length} file(s) to your selection!`,
       },
     ])
@@ -95,7 +95,7 @@ function SearchChatbot({ onSelectFiles }) {
             key={index}
             className={`flex gap-3 ${message.role === 'user' ? 'justify-end' : 'justify-start'}`}
           >
-            {message.role === 'assistant' && (
+            {message.role === 'agent' && (
               <div className="flex-shrink-0 w-8 h-8 rounded-full bg-primary-100 flex items-center justify-center">
                 <Bot className="w-5 h-5 text-primary-600" />
               </div>

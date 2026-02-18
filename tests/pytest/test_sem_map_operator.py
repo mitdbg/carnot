@@ -1,12 +1,8 @@
-import os
-
 from carnot.data.dataset import Dataset
 from carnot.operators.sem_map import SemMapOperator
 
-TEST_MODEL_ID = "openai/gpt-5-mini"
-LLM_CONFIG = {"OPENAI_API_KEY": os.getenv("OPENAI_API_KEY")}
 
-def test_sem_map_operator_basic():
+def test_sem_map_operator_basic(test_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [
         {"animal": animal}
@@ -24,7 +20,7 @@ def test_sem_map_operator_basic():
     input_datasets = {animal_dataset.name: animal_dataset}
 
     # execute the operator
-    sem_map_operator = SemMapOperator(task, output_fields, "output-dataset-id", TEST_MODEL_ID, LLM_CONFIG, max_workers=4)
+    sem_map_operator = SemMapOperator(task, output_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
     output_datasets = sem_map_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
@@ -39,7 +35,7 @@ def test_sem_map_operator_basic():
     assert {"animal": "tucan", "animal_group": "bird"} in output_dataset.items
 
 
-def test_sem_map_operator_movie_reviews(movie_reviews_data):
+def test_sem_map_operator_movie_reviews(test_model_id, llm_config, movie_reviews_data):
     # load movie reviews data
     _, reviews_df = movie_reviews_data
 
@@ -59,7 +55,7 @@ def test_sem_map_operator_movie_reviews(movie_reviews_data):
     input_datasets = {"Reviews Dataset": reviews_dataset}
 
     # generate output
-    sem_map_operator = SemMapOperator(task, output_fields, "output-dataset-id", TEST_MODEL_ID, LLM_CONFIG, max_workers=4)
+    sem_map_operator = SemMapOperator(task, output_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
     output_datasets = sem_map_operator("Reviews Dataset", input_datasets)
 
     assert len(output_datasets) == 2

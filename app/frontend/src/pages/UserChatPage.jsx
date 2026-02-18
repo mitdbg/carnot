@@ -170,7 +170,10 @@ function UserChatPage() {
       setCurrentConversationId(conversation.id)
       
       // Convert database messages to frontend format
-      const formattedMessages = conversation.messages.map(msg => ({
+      // filter out logical-plan messages which are stored in the conversation history but not displayed to users
+      const formattedMessages = conversation.messages
+      .filter(msg => msg.type !== 'logical-plan')
+      .map(msg => ({
         type: msg.role,
         content: msg.content,
         csv_file: msg.csv_file,
@@ -305,7 +308,7 @@ function UserChatPage() {
       });
 
       setMessages(prev => [...prev, {
-        type: 'assistant',
+        type: 'agent',
         content: response.data.natural_language_plan,
         isPlanConfirmation: true, // Flag to show "Execute" buttons
         attachedPlan: response.data.plan
@@ -478,7 +481,7 @@ function UserChatPage() {
           </div>
         )
       
-      case 'assistant':
+      case 'agent':
         return (
           <div key={index} className="flex flex-col items-start mb-4">
             <div className="bg-white border border-gray-200 p-4 rounded-lg max-w-[85%] shadow-sm">

@@ -18,7 +18,21 @@ if TYPE_CHECKING:
     from carnot.agents.monitoring import AgentLogger
 
 
-__all__ = ["AgentMemory"]
+__all__ = [
+    "AgentMemory",
+    "ConversationUserStep",
+    "ConversationAgentStep",
+    "MemoryStep",
+    "ActionStep",
+    "PlanningStep",
+    "TaskStep",
+    "CompilerTaskStep",
+    "PlannerTaskStep",
+    "DataDiscoveryTaskStep",
+    "SystemPromptStep",
+    "FinalAnswerStep",
+    "ToolCall",
+]
 
 
 logger = getLogger(__name__)
@@ -179,6 +193,26 @@ class TaskStep(MemoryStep):
 
         return [ChatMessage(role=MessageRole.USER, content=content)]
 
+
+@dataclass
+class ConversationUserStep(MemoryStep):
+    """Represents a user message from conversation history."""
+    content: str
+
+    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
+        return [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": self.content}])]
+
+
+@dataclass
+class ConversationAgentStep(MemoryStep):
+    """Represents an agent message from conversation history."""
+    content: str
+    message_type: str | None = None  # e.g., "natural-language-plan", "logical-plan"
+
+    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
+        return [ChatMessage(role=MessageRole.ASSISTANT, content=[{"type": "text", "text": self.content}])]
+
+
 @dataclass
 class CompilerTaskStep(MemoryStep):
     task: str
@@ -198,6 +232,17 @@ class PlannerTaskStep(MemoryStep):
     def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
         dataset_list = "\n".join([f"- {dataset.name}: {dataset.annotation}" for dataset in self.datasets])
         content = f"Task: \"{self.task}\"\n\nDatasets:\n{dataset_list}"
+        return [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": content}])]
+
+
+@dataclass
+class DataDiscoveryTaskStep(MemoryStep):
+    task: str
+    datasets: list[Dataset]
+
+    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
+        dataset_list = "\n".join([f"- {dataset.name}: {dataset.annotation}" for dataset in self.datasets])
+        content = f"Query: \"{self.task}\"\n\nDatasets:\n{dataset_list}"
         return [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": content}])]
 
 

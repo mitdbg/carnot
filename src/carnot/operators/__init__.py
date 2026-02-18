@@ -3,6 +3,7 @@ from carnot.operators.logical import (
     Code,
     FilteredScan,
     JoinOp,
+    Limit,
     MapScan,
     TopK,
 )
@@ -12,6 +13,7 @@ LOGICAL_OPERATORS = [
     Code,
     FilteredScan,
     JoinOp,
+    Limit,
     MapScan,
     TopK,
 ]

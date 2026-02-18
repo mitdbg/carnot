@@ -87,8 +87,9 @@ class Message(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     conversation_id = Column(Integer, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
-    role = Column(String, nullable=False)  # 'user', 'assistant', 'status', 'error', 'result'
+    role = Column(String, nullable=False)  # 'user', 'agent', 'status', 'error', 'result'
     content = Column(Text, nullable=False)
+    type = Column(String, nullable=True)  # Message type: 'natural-language-plan', 'logical-plan', etc.
     csv_file = Column(String, nullable=True)  # For result messages
     row_count = Column(Integer, nullable=True)  # For result messages
     created_at = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))

@@ -1,0 +1,7 @@
+{
+    "nl_question": "Which airlines have destinations in Germany?",
+    "modalities": ["table"],
+    "ground_truth": [
+        "Discover Airlines"
+    ]
+}

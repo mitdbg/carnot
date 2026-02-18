@@ -53,6 +53,12 @@ tests = [
     "mock",
     "kagglehub",
 ]
+evals = [
+    "duckdb",
+    "cdlib",
+    "gdown",
+    "tomli",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

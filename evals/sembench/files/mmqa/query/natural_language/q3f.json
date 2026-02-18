@@ -1,0 +1,9 @@
+{
+    "nl_question": "Which movies are romantic comedies?",
+    "modalities": ["table"],
+    "ground_truth": [
+        "My Best Friend's Girl",
+        "Save the Date",
+        "The People We Hate at the Wedding"
+    ]
+}

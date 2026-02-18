@@ -1,0 +1,11 @@
+{
+    "nl_question": "Identify the images containing logos, if available, for each racetrack in which A.P. Warrior was a contender. What is the color of each logo?",
+    "modalities": ["table", "image"],
+    "ground_truth": [
+        [0, "117d500aaa630023c4038b8268b309c0.png", "blue"],
+        [5, "117d500aaa630023c4038b8268b309c0.png", "blue"],
+        [6, "117d500aaa630023c4038b8268b309c0.png", "blue"],
+        [9, "117d500aaa630023c4038b8268b309c0.png", "blue"],
+        [10, "117d500aaa630023c4038b8268b309c0.png", "blue"]
+    ]
+}
