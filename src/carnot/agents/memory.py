@@ -92,9 +92,7 @@ class ActionStep(MemoryStep):
             "model_output": self.model_output,
             "code_action": self.code_action,
             "observations": self.observations,
-            "observations_images": [image.tobytes() for image in self.observations_images]
-            if self.observations_images
-            else None,
+            "observations_images": [image.tobytes() for image in self.observations_images] if self.observations_images else None,
             "action_output": make_json_serializable(self.action_output),
             "token_usage": asdict(self.token_usage) if self.token_usage else None,
             "is_final_answer": self.is_final_answer,
@@ -210,7 +208,9 @@ class ConversationAgentStep(MemoryStep):
     message_type: str | None = None  # e.g., "natural-language-plan", "logical-plan"
 
     def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
-        return [ChatMessage(role=MessageRole.ASSISTANT, content=[{"type": "text", "text": self.content}])]
+        plan_type_str = "Logical Plan" if self.message_type == "logical-plan" else "Natural Language Plan"
+        content = f"Latest {plan_type_str} from conversation history:\n{self.content}"
+        return [ChatMessage(role=MessageRole.ASSISTANT, content=[{"type": "text", "text": content}])]
 
 
 @dataclass

@@ -311,7 +311,7 @@ class QueryExecutionStreamer:
 
                 if df.empty and (not answer or answer.strip() == ""):
                     message_text = "No results found for your query."
-                    await save_message(conversation_id, "result", message_text)
+                    await save_message(conversation_id, "agent", message_text, "result")
                     await self.queue.put(f"data: {json.dumps({'type': 'result', 'message': message_text, 'session_id': session_id})}\n\n")
                 elif df.empty:
                     message_text = (
@@ -319,7 +319,7 @@ class QueryExecutionStreamer:
                         f"Answer Text: {answer}\n\n"
                         "No tabular results found."
                     )
-                    await save_message(conversation_id, "result", message_text)
+                    await save_message(conversation_id, "agent", message_text, "result")
                     await self.queue.put(f"data: {json.dumps({'type': 'result', 'message': message_text, 'session_id': session_id})}\n\n")
                 elif not answer or answer.strip() == "":
                     body = str(df.head())
@@ -327,9 +327,7 @@ class QueryExecutionStreamer:
                         "Query completed successfully!\n\n"
                         f"Found {len(df)} result(s):\n\n{body}\n..."
                     )
-                    await save_message(
-                        conversation_id, "result", message_text, csv_filename, len(df),
-                    )
+                    await save_message(conversation_id, "agent", message_text, "result", csv_filename, len(df))
                     await self.queue.put(f"data: {json.dumps({'type': 'result', 'message': message_text, 'csv_file': csv_filename, 'row_count': len(df), 'session_id': session_id})}\n\n")
                 else:
                     body = str(df.head())
@@ -338,15 +336,13 @@ class QueryExecutionStreamer:
                         f"Answer Text: {answer}\n\n"
                         f"Found {len(df)} result(s):\n\n{body}\n..."
                     )
-                    await save_message(
-                        conversation_id, "result", message_text, csv_filename, len(df),
-                    )
+                    await save_message(conversation_id, "agent", message_text, "result", csv_filename, len(df))
                     await self.queue.put(f"data: {json.dumps({'type': 'result', 'message': message_text, 'csv_file': csv_filename, 'row_count': len(df), 'session_id': session_id})}\n\n")
 
             except Exception as exc:
                 logger.exception("Error processing query results")
                 error_msg = f"Error processing results: {exc}"
-                await save_message(conversation_id, "error", error_msg)
+                await save_message(conversation_id, "agent", error_msg, "error")
                 await self.queue.put(f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n")
 
             await self.queue.put(f"data: {json.dumps({'type': 'done', 'message': 'Query execution complete'})}\n\n")
@@ -356,7 +352,7 @@ class QueryExecutionStreamer:
             error_msg = f"Error executing query: {exc}"
             if conversation_id is not None:
                 try:
-                    await save_message(conversation_id, "error", error_msg)
+                    await save_message(conversation_id, "agent", error_msg, "error")
                 except Exception:
                     logger.exception("Failed to save error message")
             await self.queue.put(f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n")

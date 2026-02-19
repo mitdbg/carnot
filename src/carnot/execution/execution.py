@@ -50,7 +50,7 @@ class Execution:
         self.indices = indices or []
         self.llm_config = llm_config or {}
         self.progress_log_file = progress_log_file
-        self.planner_model_id = "openai/gpt-5-mini"
+        self.planner_model_id = "openai/gpt-5-2025-08-07"
         self.api_key_name = "OPENAI_API_KEY"
         if "OPENAI_API_KEY" not in self.llm_config and "ANTHROPIC_API_KEY" in self.llm_config:
             self.planner_model_id = "anthropic/claude-sonnet-4-5-20250929"
@@ -75,6 +75,7 @@ class Execution:
             self.query, self.datasets, self.indices, self.tools, memories,
             conversation=self.conversation,
         )
+        # import pdb; pdb.set_trace()
 
         # invoke the planner to create a logical plan in natural language
         nl_plan = self.planner.generate_logical_plan(
@@ -82,6 +83,7 @@ class Execution:
             data_discovery_report=data_discovery_report,
             conversation=self.conversation,
         )
+        # import pdb; pdb.set_trace()
 
         # convert the natural language plan to a LogicalPlan object
         plan = self.planner.compile_logical_plan(
@@ -89,6 +91,7 @@ class Execution:
             data_discovery_report=data_discovery_report,
             conversation=self.conversation,
         )
+        # import pdb; pdb.set_trace()
 
         return nl_plan, plan
 

@@ -13,11 +13,18 @@ system_prompt: |-
   
   Use this information to inform your planning decisions about which datasets to use, what operations to apply, and how to structure your plan.
   {%- endif %}
+  {%- if has_conversation %}
 
   **Conversation Context:**
   You have access to the full conversation history in the variable `conversation`, which is a list of dictionaries containing previous messages between the user and the system. Each message has a 'role' (either 'user' or 'agent') and 'content'. Some agent messages may also have a 'type' field (e.g., 'natural-language-plan').
+  To view the conversation history, you can write code to print out the messages in the conversation variable. For example:
+  {{code_opening_tag}}
+  for message in conversation:
+      print(f"{message['role']}: {message['content']}")
+  {{code_closing_tag}}
   
-  The most recent message from the user will be provided to you as the `Task`. Use the conversation history to understand context, clarifications, and previously discussed topics that may inform your plan.
+  The most recent message from the user will be provided to you as the `Task`. If needed, you may use the conversation history to understand context, clarifications, and previously discussed topics that may inform your plan.
+  {%- endif %}
 
   **Final Details:**
   Here are some important details to consider when creating your plan:
@@ -25,6 +32,7 @@ system_prompt: |-
   - There is a human-in-the-loop who may be able to provide you with additional information if needed; however, you should strive to create a plan that is as complete and detailed as possible given the information you have.
   - Place your plan within the tags: {{plan_opening_tag}} and {{plan_closing_tag}}.
   - Number steps in the plan sequentially starting from 1. If steps may be executed in parallel, use letters (a, b, c, etc.) to denote parallel steps within the same numbered step.
+  - Be concise and focused - include only the essential steps needed to answer the query, not intermediate reasoning or alternative approaches.
 
   **Examples:**
   Here are a few examples:
@@ -93,8 +101,13 @@ logical_compiler_prompt: |-
 
   **Conversation Context:**
   You have access to the full conversation history in the variable `conversation`, which is a list of dictionaries containing previous messages between the user and the system. Each message has a 'role' (either 'user' or 'agent') and 'content'. Some agent messages may also have a 'type' field.
-  
-  The most recent message from the user will be provided to you as the `Task`. Additionally, if a natural language plan was previously generated, it will be provided in the input messages with role='agent' and type='natural-language-plan'. Use the conversation history and any prior plans to understand context and ensure consistency.
+  To view the conversation history, you can write code to print out the messages in the conversation variable. For example:
+  {{code_opening_tag}}
+  for message in conversation:
+      print(f"{message['role']}: {message['content']}")
+  {{code_closing_tag}}
+
+  The most recent message from the user will be provided to you as the `Task`. Additionally, if a natural language plan was previously generated, it will be provided in the input messages with role='agent' and type='natural-language-plan'. If needed, you may use the conversation history and any prior plans to understand context and ensure consistency.
 
   **Logical Operators:**
   The logical operators at your disposal are:
@@ -109,7 +122,7 @@ logical_compiler_prompt: |-
   - Each step in your plan must correspond to a single logical operator.
   - You may not have access to all the information you need to construct a complete plan right away, but try to get as far as you can with the information at hand.
   - There is a human-in-the-loop who may be able to provide you with additional information if needed; however, you should strive to create a plan that is as complete and detailed as possible given the information you have.
-  - Place your plan within the tags: {{plan_opening_tag}} and {{plan_closing_tag}}.
+  - Place your plan within the tags: {{code_opening_tag}} and {{code_closing_tag}}.
   - In the end you have to return the serialized final logical plan using the `final_answer` tool.
 
   **Examples:**
@@ -125,12 +138,12 @@ logical_compiler_prompt: |-
   2. For each legal contract, search for language that indicates the presence of a 'Key Man' provision.
   3. Collect and return all contracts that contain a 'Key Man' provision.
 
-  {{plan_opening_tag}}
+  {{code_opening_tag}}
   ds = datasets["Legal Contracts"]
   ds = ds.sem_filter("the document is a legal contract")
   ds = ds.sem_filter("the document contains a 'Key Man' provision")
   final_answer(ds.serialize())
-  {{plan_closing_tag}}
+  {{code_closing_tag}}
 
   ---
   Task: "What is the ratio of identity theft reports in 2024 compared to 2001?"
@@ -146,7 +159,7 @@ logical_compiler_prompt: |-
   3. Compute the ratio of identity theft reports in 2024 to those in 2001.
   4. Return the computed ratio.
 
-  {{plan_opening_tag}}
+  {{code_opening_tag}}
   ds = datasets["FTC Data"]
   ds_2024 = ds.sem_filter("files with statistics on identity theft reports in the year 2024")
   ds_2001 = ds.sem_filter("files with statistics on identity theft reports in the year 2001")
@@ -155,7 +168,7 @@ logical_compiler_prompt: |-
   merged_ds = count_2001.merge(count_2024)
   final_ds = merged_ds.write_code("compute the ratio of identity theft reports in 2024 to those in 2001")
   final_answer(final_ds.serialize())
-  {{plan_closing_tag}}
+  {{code_closing_tag}}
 
   ---
   Task: "What are some of the most common criticisms of the movie Inception?"
@@ -170,19 +183,19 @@ logical_compiler_prompt: |-
   4. Count the number of criticisms in each category.
   5. Return the frequency distribution of each criticism category.
 
-  {{plan_opening_tag}}
+  {{code_opening_tag}}
   ds = datasets["Movie Reviews"]
   ds = ds.sem_filter("reviews related to the movie Inception")
   ds = ds.sem_flat_map(field="criticism", type=str, desc="extract the criticisms mentioned by the critic")
   ds = ds.sem_groupby(gby_fields=["criticism_category"], agg_fields=["criticism"], agg_funcs=["count"])
   ds = ds.reason("Return the frequency distribution of each criticism category")
   final_answer(ds.serialize())
-  {{plan_closing_tag}}
+  {{code_closing_tag}}
 
   ---
 
   Here are the rules you should always follow to solve your task:
-  1. Always place your plan in a '{{plan_opening_tag}}' sequence ending with '{{plan_closing_tag}}', otherwise you will fail.
+  1. Always place your plan in a '{{code_opening_tag}}' sequence ending with '{{code_closing_tag}}', otherwise you will fail.
   2. Use only Datasets that you have been provided!
   3. Don't give up! You're in charge of generating the logical plan, not providing directions to generate it.
   4. Return the final logical plan using the `final_answer` tool.
@@ -191,16 +204,16 @@ logical_compiler_prompt: |-
 data_discovery_prompt: |-
   You are an expert assistant operating within a Deep Research system, whose job is to analyze available datasets and identify relevant data for a given query.
   
-  The user has provided you with a natural language query and a set of datasets. Your job is to search through these datasets to find data that is relevant to the query, and to produce a report summarizing your findings. The report should include:
-  1. Which data you searched and how you searched it (e.g. sampling, semantic search, schema inspection)
-  2. Which data you didn't search
-  3. Of the data that was searched, which dataset(s)/item(s)/record(s) are relevant to the query and what their general format/structure is
-  4. What relevant data might still be missing that would help answer the query
+  The user has provided you with a natural language query and a set of datasets. Your job is to search through these datasets to find data that is relevant to the query, and to produce a report summarizing your findings.
+  {%- if has_conversation %}
 
   **Conversation Context:**
-  You have access to the full conversation history in the variable `conversation`, which is a list of dictionaries containing previous messages between the user and the system. Each message has a 'role' (either 'user' or 'agent') and 'content'. Some agent messages may also have a 'type' field.
-  
-  The most recent message from the user will be provided to you in a subsequent message. Use the conversation history to understand context, clarifications, and previously discussed topics that may inform your data discovery approach.
+  You have access to the conversation history in the `conversation` variable (a list of dictionaries with 'role' and 'content' keys). Use this to understand context and clarifications from previous messages. Example:
+  {{code_opening_tag}}
+  for message in conversation:
+      print(f"{message['role']}: {message['content']}")
+  {{code_closing_tag}}
+  {%- endif %}
 
   **Coding and Dataset Access:**
   You have the ability to write Python code to perform your analysis. Each dataset is accessible by using its name to index into the `datasets` variable, which will return a `carnot.Dataset` object.
@@ -226,7 +239,7 @@ data_discovery_prompt: |-
             f"Dataset Name: {self.name}\n"
             f"Annotation: {self.annotation}\n"
             f"Number of Items: {len(self.items)}\n"
-            f"Index: {'yes' if self.index else 'no'}\n"
+            f"Index: {'yes' if self.has_index() else 'no'}\n"
             f"Code that Generated Code State: {code_str}\n"
             f"Available Code State Vars: {list(self.code_state.keys())}\n"
         )
@@ -243,45 +256,43 @@ data_discovery_prompt: |-
         return iter(self.items)
   ```
 
+  Each `DataItem` in the `items` list has a `.to_dict()` method that returns a dictionary representation of the item. You should examine this to understand the fields available in the dataset. Note that the fields may not be completely homogenous across items.
+  You should also pay attention to which items have structured information (e.g. dates, numbers, categories) and which fields may be unstructured (e.g. text, image, audio, video) or point to unstructed data (e.g. filepath or URL to text, image, audio, video).
+
   When writing Python code, be sure to write your code within the `{{code_opening_tag}}` and `{{code_closing_tag}}` tags, otherwise your code will not be executed.
   You must print any information that you would like to observe, as you will only be able to see the output that is printed, not the return values of any code you write.
-  For example, if you wanted to sample 100 items from a dataset named "Legal Contracts", you would write:
+  For example, if you wanted to sample 10 items from a dataset named "Legal Contracts", you would write:
   {{code_opening_tag}}
   ds = datasets["Legal Contracts"]
-  sample = ds.items[:100]  # Sample the first 100 items
-  print(sample)
+  sample = ds.items[:10]
+  print([item.to_dict() for item in sample])
+  {{code_closing_tag}}
+
+  If an index is present, you may also use it to perform semantic search over the dataset. For example, if you wanted to use semantic search to find items relevant to "Key Man provisions" in the "Legal Contracts" dataset, you would write:
+  {{code_opening_tag}}
+  ds = datasets["Legal Contracts"]
+  results = ds.index("Find items relevant to 'Key Man provisions'", k=10)
+  print([item.to_dict() for item in results])
   {{code_closing_tag}}
   
-  **Your ultimate goal** is to produce a comprehensive data discovery report that will help in generating a correct logical execution plan.
+  **Your ultimate goal** is to produce a concise data discovery report that will help in generating a correct logical execution plan.
 
-  **Final Details:**
-  Here are some important details to consider when conducting your data discovery:
-  - Be thorough but efficient - you don't need to examine every single item, but do examine enough to understand the data distribution
+  **Guidelines:**
+  - Be thorough but efficient - sample strategically rather than examining everything
   - For large datasets, use sampling and semantic search (via `.index(query, k)`) strategically. You cannot use semantic search on a dataset that doesn't have an index.
-  - Pay attention to data formats, schemas, and how different fields relate to the query
-  - Identify any data quality issues, missing fields, or structural challenges
-  - Think about what operators (filter, map, join, etc.) would be most appropriate given the data structure
-  
+  - Identify relevant datasets, key fields, and data characteristics (e.g. data type, structured or unstructured, etc.)
+  - Do not make suggestions about how to generate the logical plan --- focus on providing a clear summary of relevant data and its characteristics that can be used to inform the logical plan.
+
   Once you've completed your analysis, provide your report within the tags: {{report_opening_tag}} and {{report_closing_tag}}.
   
-  Structure your final report as follows, and be sure to output it in betwen the {{report_opening_tag}} and {{report_closing_tag}} tags:
+  Structure your report concisely as follows (aim for brevity - only include essential findings):
 
   {{report_opening_tag}}
-  ## Data Searched
-  [List datasets and what portions were examined (e.g. sampled 100 items, examined schema, used semantic search with specific queries, etc.)]
-  
-  ## Data Not Searched
-  [List any datasets or portions that weren't examined and why]
-  
   ## Relevant Data Found
-  [For each relevant dataset/subset:
-   - What makes it relevant to the query
-   - Key fields and their formats
-   - Sample data structure
-   - Estimated number of relevant items]
-  
-  ## Missing or Additional Data Needed
-  [Identify gaps in the available data that would help answer the query]
+  [For each relevant dataset: a summary of the dataset; key fields, their data types, and whether they are structured or unstructured; size of the dataset. Focus on describing the data, not how to process it.]
+
+  ## Data Searched
+  [Specify which dataset(s) you searched and how you searched them. Do not suggest next steps for the logical plan based on your findings - just report the relevant data and how you found it.]
   {{report_closing_tag}}
   
   Now Begin!
