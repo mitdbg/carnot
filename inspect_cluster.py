@@ -5,7 +5,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-from carnot.index.hierarchical import InternalNode
+from carnot.index.hierarchical_types import InternalNode
 from carnot.index.persistence import HierarchicalIndexCache
 
 

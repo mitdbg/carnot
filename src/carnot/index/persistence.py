@@ -14,9 +14,8 @@ from pathlib import Path
 
 import numpy as np
 
-from carnot.index.hierarchical import (
+from carnot.index.hierarchical_types import (
     FileSummaryEntry,
-    HierarchicalFileIndex,
     HierarchicalIndexConfig,
     InternalNode,
 )
@@ -118,8 +117,9 @@ class HierarchicalIndexCache:
         paths: list[str],
         config: HierarchicalIndexConfig | None = None,
         api_key: str | None = None,
-    ) -> HierarchicalFileIndex | None:
+    ) -> "HierarchicalFileIndex | None":
         """Load a cached index for the given path set. Returns None if not found."""
+        from carnot.index.summary_indices import HierarchicalFileIndex
         key = self._path_set_to_key(paths)
         filepath = self.storage_dir / f"{key}.json"
         if not filepath.exists():
@@ -132,7 +132,7 @@ class HierarchicalIndexCache:
             logger.warning("Failed to load index cache %s: %s", key, e)
             return None
 
-    def save(self, index: HierarchicalFileIndex) -> None:
+    def save(self, index: "HierarchicalFileIndex") -> None:
         """Save an index to the cache (keyed by its path set)."""
         paths = [e.path for e in index.file_summaries]
         key = self._path_set_to_key(paths)
@@ -141,7 +141,7 @@ class HierarchicalIndexCache:
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=0)
 
-    def _serialize(self, index: HierarchicalFileIndex) -> dict:
+    def _serialize(self, index: "HierarchicalFileIndex") -> dict:
         """Serialize index to JSON-safe dict, including nested tree structure."""
         file_summaries = [
             {
@@ -203,8 +203,10 @@ class HierarchicalIndexCache:
         data: dict,
         config: HierarchicalIndexConfig | None = None,
         api_key: str | None = None,
-    ) -> HierarchicalFileIndex:
+    ) -> "HierarchicalFileIndex":
         """Deserialize index from dict."""
+        from carnot.index.summary_indices import HierarchicalFileIndex
+
         file_summaries = [
             FileSummaryEntry(
                 path=e["path"],

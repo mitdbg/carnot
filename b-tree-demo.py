@@ -60,11 +60,13 @@ def main():
         name="enron-emails",
         annotation="Routed Enron emails",
         items=routed_items,
-        index=HierarchicalCarnotIndex(
-            name="enron-emails",
-            items=routed_items,
-            hierarchical_index=carnot_index._hierarchical,
-        ),
+        indices={
+            "hierarchical": HierarchicalCarnotIndex(
+                name="enron-emails",
+                items=routed_items,
+                hierarchical_index=carnot_index._hierarchical,
+            ),
+        },
     )
     logger.info("Generating plan and executing...")
     exec_instance = carnot.Execution(

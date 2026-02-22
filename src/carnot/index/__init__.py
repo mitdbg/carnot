@@ -1,4 +1,3 @@
-from carnot.index.hierarchical import FlatFileIndex, HierarchicalFileIndex, HierarchicalIndexConfig
 from carnot.index.index import (
     CarnotIndex,
     ChromaIndex,
@@ -8,6 +7,7 @@ from carnot.index.index import (
     SemanticIndex,
 )
 from carnot.index.persistence import FileSummaryCache, HierarchicalIndexCache
+from carnot.index.summary_indices import FlatFileIndex, HierarchicalFileIndex, HierarchicalIndexConfig
 
 __all__ = [
     "CarnotIndex",

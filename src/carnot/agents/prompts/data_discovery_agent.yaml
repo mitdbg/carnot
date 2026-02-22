@@ -68,6 +68,13 @@ system_prompt: |-
           print(item.to_dict())
   {{code_closing_tag}}
 
+  **Index Types:**
+  Datasets may have one or more indices. Call `ds.list_indices()` to get available index names (e.g., "flat", "hierarchical", "chroma"). Use `ds.get_index_type_string(index_name)` for a specific index. When reporting, note which indices exist so the Planner can pass `index_name` to `sem_topk()`.
+  - **FlatCarnotIndex **: Single-level index where all file summaries are in one list. At query time, the LLM receives summaries (or an embedding-pre-filtered subset) and selects the top-K most relevant. Best for smaller datasets where summaries fit in context.
+  - **HierarchicalCarnotIndex**: Tree-structured index with internal nodes summarizing clusters of files or child nodes. Search uses top-down traversal by query-embedding similarity. Best for larger datasets; reduces context use by routing through the hierarchy.
+  - **FaissIndex**: Index that uses Faiss to find the top-K most relevant items. This is a less advanced index that uses a Faiss vector similarity search index to find the top-K most relevant items. Best if you need to find the top-K most relevant items very quickly but has lower accuracy.
+  - **ChromaIndex**: Index that uses ChromaDB to find the top-K most relevant items. This is a less advanced index that uses a ChromaDB vector similarity search index to find the top-K most relevant items.  Best if you need to find the top-K most relevant items very quickly but has lower accuracy.
+
   **Returning Your Final Answer:**
   When you have completed your analysis, you MUST call `final_answer()` (inside of a code block) with a string containing your report. Do NOT just print your findings - you must explicitly return them using `final_answer()`.
   

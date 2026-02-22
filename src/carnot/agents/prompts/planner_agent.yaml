@@ -45,8 +45,44 @@ system_prompt: |-
   {{ op_desc }}
   {% endfor %}
 
-  {%- if has_conversation %}
+  **Index-Aware Planning:**
+  Datasets may have semantic indices for efficient search. Use the data discovery agent to learn whether a dataset has an index. 
 
+  **Index Types:**
+  Datasets may use different index structures for semantic search. When reporting on indices, you can find the index type by calling `ds.get_index_type_string()`. The possible index types are:
+  - **FlatCarnotIndex**: Single-level index where all file summaries are in one list. At query time, the LLM receives summaries (or an embedding-pre-filtered subset) and selects the top-K most relevant. Best for smaller datasets where summaries fit in context.
+  - **HierarchicalCarnotIndex**: Tree-structured index with internal nodes summarizing clusters of files or child nodes. Search uses top-down traversal by query-embedding similarity. Best for larger datasets; reduces context use by routing through the hierarchy.
+  - **FaissIndex**: Index that uses Faiss to find the top-K most relevant items. This is a less advanced index that uses a Faiss vector similarity search index to find the top-K most relevant items. Best if you need to find the top-K most relevant items very quickly but has lower accuracy.
+  - **ChromaIndex**: Index that uses ChromaDB to find the top-K most relevant items. This is a less advanced index that uses a ChromaDB vector similarity search index to find the top-K most relevant items.  Best if you need to find the top-K most relevant items very quickly but has lower accuracy.
+  
+  **Example Index Workflow:**
+  Task: "Find all legal contracts which contain a 'Key Man' provision."
+
+  Datasets:
+  - Legal Contracts: A dataset containing various legal contracts in text format.
+
+  Thought: I need to understand the schema of the Legal Contracts dataset first, then filter for contracts with 'Key Man' provisions.
+  {{code_opening_tag}}
+  # Step 1: Understand the dataset structure
+  index_info = data_discovery("Does the Legal Contracts dataset have an index? Which index does it have?")
+  print(index_info)
+  {{code_closing_tag}}
+  Observation: The Legal Contracts dataset has an index of type "FlatCarnotIndex".
+
+  Thought: Now I can build the logical plan. I'll first use the index to retrieve the top-K most relevant documents for the query "Find all legal contracts which contain a 'Key Man' provision.", then filter for those containing 'Key Man' provisions.
+  {{code_opening_tag}}
+  # Step 2: Build logical plan
+  ds = datasets["Legal Contracts"]
+  ds = ds.sem_topk("Find all legal contracts which contain a 'Key Man' provision.", k=50, index_name="flat")
+  ds = ds.sem_filter("The document contains a 'Key Man' provision")
+  final_answer(ds.serialize())
+  {{code_closing_tag}}
+
+When a dataset has a semantic index: first use `sem_topk(search_str, k, index_name)` to retrieve candidate items via the index, then apply `sem_filter(condition)`. Use `index_name` (e.g., "flat", "hierarchical", "chroma", "faiss") when the dataset has multiple indices. Both steps are needed—sem_topk narrows the search space, sem_filter applies the query condition.
+When no index exists: use `sem_filter(condition)` only to scan and filter. Flat indices suit smaller collections, B-tree (hierarchical) indices scale better. Later, quality/time/cost estimates will allow choosing the optimal plan.  
+
+{%- if has_conversation %}
+  
   **Conversation Context:**
   You have access to the conversation history in the `conversation` variable (a list of dicts with 'role' and 'content'). Use it to understand context from previous messages:
   {{code_opening_tag}}

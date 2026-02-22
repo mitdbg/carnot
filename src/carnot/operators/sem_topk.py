@@ -15,6 +15,7 @@ class SemTopKOperator:
         self.model_id = model_id
         self.api_key = llm_config.get("OPENAI_API_KEY")
         # self.max_workers = max_workers
+        self.index_type = index_type
         index_map = {
             "chroma": ChromaIndex,
             "faiss": FaissIndex,
@@ -39,10 +40,10 @@ class SemTopKOperator:
         if not input_dataset.has_index():
             name = f"{hash_for_id(input_dataset.name)}_{hash_for_id(self.task)}"
             index = self.index_cls(name=name, items=input_dataset.items, model=self.model_id, api_key=self.api_key)
-            input_dataset._index = index
+            input_dataset._indices[self.index_type] = index
 
-        # invoke the index() method on the dataset to retrieve items
-        results = input_dataset.index(self.task, k=self.k)
+        # invoke the search() method on the index to retrieve items
+        results = input_dataset._indices[self.index_type].search(self.task, k=self.k)
 
         # TODO: we could construct "instance-optimized" indices by using a map operator to extract the relevant info
         #       from the input items, and then building an index on that extracted info

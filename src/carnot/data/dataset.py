@@ -14,24 +14,25 @@ class Dataset:
     This class serves dual purposes:
     1. Physical dataset: Contains actual data items and metadata
     2. Logical dataset: Supports building logical query plans through chained operations
+    
+    Supports multiple indices via the indices dict. Use index_name in sem_topk() to specify which index to use.
     """
     def __init__(
         self,
         name: str,
         annotation: str,
         items: list[DataItem] | None = None,
-        index: CarnotIndex | None = None,
+        indices: dict[str, CarnotIndex] | None = None,
         code: str | None = None,
         code_state: dict | None = None,
         parents: list[Dataset] | None = None,
         id_params: dict | None = None,
         **kwargs
     ):
-        # Physical dataset attributes
         self.name = name
         self.annotation = annotation
         self.items = items or []
-        self._index = index
+        self._indices = dict(indices) if indices else {}
         self.code = code
         self.code_state = code_state or {}
         self.parents = parents or []
@@ -62,22 +63,30 @@ class Dataset:
 
     def format_description(self, code_block_tags: list[str]) -> str:
         code_str = " None" if self.code is None else f"\n{code_block_tags[0]}\n{self.code}\n{code_block_tags[1]}"
+        index_info = "yes" if self.has_index() else "no"
+        if self._indices:
+            index_info += f" ({', '.join(self.list_indices())})"
         return textwrap.dedent(
             f"Dataset Name: {self.name}\n"
             f"Annotation: {self.annotation}\n"
             f"Number of Items: {len(self.items)}\n"
-            f"Index: {'yes' if self.has_index() else 'no'}\n"
+            f"Index: {index_info}\n"
             f"Code that Generated Code State: {code_str}\n"
             f"Available Code State Vars: {list(self.code_state.keys())}\n"
         )
 
     def has_index(self) -> bool:
-        return self._index is not None
+        """Return True if any index exists, or if the specified index exists."""
+        return bool(self._indices)
 
-    def index(self, query: str, k: int = 5) -> list[DataItem]:
-        if self._index is None:
-            raise NotImplementedError("Dataset does not have an index constructed.")
-        return self._index.search(query, k=k)
+    def list_indices(self) -> list[str]:
+        """Return names of available indices (e.g., 'flat', 'hierarchical', 'chroma')."""
+        return list(self._indices.keys())
+
+    def get_index_types_string(self) -> str:
+        """Return the index type string for the given or default index."""
+        return [index.get_index_type_string() for index in self._indices.values()]
+
 
     def __iter__(self) -> Iterator[DataItem]:
         return iter(self.items)
@@ -271,9 +280,11 @@ class Dataset:
             **params
         )
 
-    def sem_topk(self, search_str: str, k: int = 5) -> Dataset:
+    def sem_topk(self, search_str: str, k: int = 5, index_name: str | None = None) -> Dataset:
         """
         Apply a semantic top-k operation with the given search string and k value.
+        Use index_name to specify which index to use when the dataset has multiple indices
+        (e.g., 'flat', 'hierarchical', 'chroma'). If None, the first available index is used.
         """
         top_k_name = f"TopKOperation{self.id_params['sem_topk_id'] + 1}"
         self.id_params["sem_topk_id"] += 1
@@ -283,6 +294,8 @@ class Dataset:
             "search_str": search_str,
             "k": k,
         }
+        if index_name is not None:
+            params["index_name"] = index_name
         return Dataset(
             name=top_k_name,
             annotation=f"Top-{k} from ({self.annotation})",

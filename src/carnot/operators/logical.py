@@ -569,9 +569,10 @@ class TopK(LogicalOperator):
         return textwrap.dedent(
             """
             Top-K Operator:
-                Description: Searches for the top-k most semantically relevant items to a given search string.
-                Syntax: ds.sem_topk(search_str: str, k: int)
+                Description: Searches for the top-k most semantically relevant items to a given search string. Uses the dataset's index (flat, hierarchical, chroma, or faiss). When a dataset has multiple indices, specify which to use with index_name.
+                Syntax: ds.sem_topk(search_str: str, k: int, index_name: str | None = None)
                 Example: ds.sem_topk(search_str="order contains self-care products", k=5)
+                Example (with index): ds.sem_topk(search_str="legal contracts", k=10, index_name="flat")
             """
         )
 
