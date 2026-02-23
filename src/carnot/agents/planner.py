@@ -68,10 +68,21 @@ class Planner(BaseAgent):
         # Store datasets for use in planning
         self._datasets = datasets
         
-        # Load prompt templates
-        prompt_templates = yaml.safe_load(
-            resources.files("carnot.agents.prompts").joinpath("planner_agent.yaml").read_text()
+        # Load prompt templates (pre-render Jinja2 so YAML can parse; {% %} blocks need resolving first)
+        from jinja2 import Template
+        raw_yaml = resources.files("carnot.agents.prompts").joinpath("planner_agent.yaml").read_text()
+
+        def _indent_for_yaml(s: str, spaces: int = 2) -> str:
+            return "\n".join(" " * spaces + line for line in s.split("\n"))
+
+        rendered_yaml = Template(raw_yaml).render(
+            has_conversation=False,
+            managed_agents={},
+            logical_operators={
+                op: _indent_for_yaml(op.desc()) for op in LOGICAL_OPERATORS
+            },
         )
+        prompt_templates = yaml.safe_load(rendered_yaml)
         
         self.plan_tags = ["<begin_plan>", "<end_plan>"]
         # Use code block tags where closing tag is NOT contained in opening tag

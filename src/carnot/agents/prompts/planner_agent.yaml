@@ -78,8 +78,8 @@ system_prompt: |-
   final_answer(ds.serialize())
   {{code_closing_tag}}
 
-When a dataset has a semantic index: first use `sem_topk(search_str, k, index_name)` to retrieve candidate items via the index, then apply `sem_filter(condition)`. Use `index_name` (e.g., "flat", "hierarchical", "chroma", "faiss") when the dataset has multiple indices. Both steps are needed—sem_topk narrows the search space, sem_filter applies the query condition.
-When no index exists: use `sem_filter(condition)` only to scan and filter. Flat indices suit smaller collections, B-tree (hierarchical) indices scale better. Later, quality/time/cost estimates will allow choosing the optimal plan.  
+  When a dataset has a semantic index: first use `sem_topk(search_str, k, index_name)` to retrieve candidate items via the index, then apply `sem_filter(condition)`. Use `index_name` (e.g., "flat", "hierarchical", "chroma", "faiss") when the dataset has multiple indices. Both steps are needed—sem_topk narrows the search space, sem_filter applies the query condition.
+  When no index exists: use `sem_filter(condition)` only to scan and filter. Flat indices suit smaller collections, B-tree (hierarchical) indices scale better. Later, quality/time/cost estimates will allow choosing the optimal plan.  
 
 {%- if has_conversation %}
   

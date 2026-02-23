@@ -1,0 +1,827 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.12.11, pytest-8.4.1, pluggy-1.6.0 -- /Users/yashaga/Carnot/.venv312/bin/python3.12
+cachedir: .pytest_cache
+rootdir: /Users/yashaga/Carnot
+configfile: pyproject.toml
+plugins: anyio-4.12.1, mock-3.15.1
+collecting ... collected 1 item
+
+tests/pytest/test_e2e_sem_topk.py::test_e2e_agent_uses_sem_topk_for_indexed_dataset ╭──────────────────────────────────────── New run ────────────────────────────────────────╮
+│                                                                                         │
+│ Find emails about the Raptor investment or LJM partnerships                             │
+│                                                                                         │
+╰─ LiteLLMModel - openai/gpt-5-2025-08-07 ────────────────────────────────────────────────╯
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Step 1 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Error in parsing output:
+Your code snippet is invalid, because the regex pattern ```python(.*?)
+``` was not found in it.
+                Here is your code snippet:
+                Thought: I need to confirm whether the "Enron Emails Hierarchical" dataset 
+has a semantic index (likely hierarchical) and understand its schema (which fields contain 
+subject/body text). Then I will use the index to retrieve candidate emails related to 
+Raptor or LJM, and apply a precise semantic filter to include only Enron’s Raptor vehicles 
+and LJM partnerships (LJM, LJM1, LJM2), excluding unrelated “raptor” mentions.
+
+'index_info = data_discovery("For the 'Enron Emails Hierarchical' dataset: 1) Does it have 
+a semantic index? If so, list the index type(s) and available index name(s). 2) What is its
+schema? Which fields contain the email subject and body text?")
+print(index_info)'
+
+Thought: Using the hierarchical index, I will first retrieve the top-K most relevant emails
+for "Raptor investment or LJM partnerships", then filter to ensure they specifically 
+pertain to Enron’s Raptor vehicles (Raptor I–IV) or LJM partnerships (LJM, LJM1, LJM2), 
+excluding generic mentions of “raptor” (animals, sports). I’ll preview a small sample 
+before returning the full plan.
+
+'ds = datasets["Enron Emails Hierarchical"\]
+
+# Use the semantic index to pull candidate emails about Raptor/LJM
+ds = ds.sem_topk(
+    search_str="Find Enron emails about the Raptor investment vehicles (Raptor I–IV) or the
+LJM partnerships (LJM, LJM1, LJM2), hedges, structures, or related transactions.",
+    k=100,
+    index_name="hierarchical",
+)
+
+# Precisely filter for Enron-specific Raptor/LJM content and exclude unrelated 'raptor' 
+mentions
+ds = ds.sem_filter(
+    "The email (subject or body) is about Enron's off-balance-sheet entities known as 
+'Raptor' (Raptor I–IV) or the 'LJM' partnerships (LJM, LJM1, LJM2). "
+    "Include discussions of deals, hedges, structures, transactions, approvals, or 
+references to Fastow. "
+    "Exclude unrelated uses of 'raptor' (animals, sports teams, etc.)."
+)
+
+# Preview a few results of the plan before finalizing
+print(ds.limit(n=5).serialize())
+
+final_answer(ds.serialize())'
+```
+                It seems like you're trying to return the final answer, you can do it as 
+follows:
+                ```python
+                final_answer("YOUR FINAL ANSWER HERE")
+
+```
+Make sure to provide correct code blobs.
+[Step 1: Duration 37.26 seconds| Input tokens: 2,531 | Output tokens: 2,614]
+[Planner] Step 1 completed, 4 steps remaining (max=5)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Step 2 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ ─ Executing parsed code: ──────────────────────────────────────────────────────────────── 
+  index_info = data_discovery("For the 'Enron Emails Hierarchical' dataset: 1) Does it     
+  have any semantic indices? If so, list their types and index_name(s). 2) What is the     
+  schema? Which fields contain the email subject and body?")                               
+  print(index_info)                                                                        
+ ───────────────────────────────────────────────────────────────────────────────────────── 
+╭─────────────────────────────── New run - data_discovery ────────────────────────────────╮
+│                                                                                         │
+│ You're a helpful agent named 'data_discovery'.                                          │
+│ You have been submitted this task by your manager:                                      │
+│ ---                                                                                     │
+│ For the 'Enron Emails Hierarchical' dataset: 1) Does it have any semantic indices? If   │
+│ so, list their types and index_name(s). 2) What is the schema? Which fields contain the │
+│ email subject and body?                                                                 │
+│ ---                                                                                     │
+│ You're helping with data discovery and analysis. Provide accurate, detailed information │
+│ about datasets, their schemas, and their relevance to the query.                        │
+│                                                                                         │
+╰─ LiteLLMModel - openai/gpt-5-2025-08-07 ────────────────────────────────────────────────╯
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Step 1 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ ─ Executing parsed code: ──────────────────────────────────────────────────────────────── 
+  # Step 1: List all datasets and basic info                                               
+  for name, ds in datasets.items():                                                        
+      print(f"Dataset: {ds.name}")                                                         
+      print(f"Annotation: {ds.annotation}")                                                
+      print(f"Number of items: {len(ds.items)}")                                           
+      try:                                                                                 
+          print(f"Has index: {ds.has_index()}")                                            
+          if ds.has_index():                                                               
+              idx_names = ds.list_indices()                                                
+              print(f"Indices: {idx_names}")                                               
+              for idx in idx_names:                                                        
+                  print(f"  - {idx}: {ds.get_index_type_string(idx)}")                     
+      except Exception as e:                                                               
+          print(f"Index info unavailable: {str(e)}")                                       
+      # Show fields from first item for a quick schema peek                                
+      if ds.items:                                                                         
+          item_dict = ds.items[0].to_dict()                                                
+          print(f"Fields: {list(item_dict.keys())}")                                       
+      print("---")                                                                         
+                                                                                           
+  # Step 2: Inspect the specific dataset "Enron Emails Hierarchical"                       
+  ds_name = "Enron Emails Hierarchical"                                                    
+  if ds_name in datasets:                                                                  
+      ds = datasets[ds_name]                                                               
+      print(f"\nDataset: {ds.name}")                                                       
+      print(f"Annotation: {ds.annotation}")                                                
+      print(f"Number of items: {len(ds.items)}")                                           
+      print(f"Has index: {ds.has_index()}")                                                
+      if ds.has_index():                                                                   
+          idx_names = ds.list_indices()                                                    
+          print(f"Indices: {idx_names}")                                                   
+          for idx in idx_names:                                                            
+              print(f"  - index_name='{idx}', type='{ds.get_index_type_string(idx)}'")     
+      # Step 3: Sample a few items to understand schema and where subject/body live        
+      sample_size = min(5, len(ds.items))                                                  
+      for i, item in enumerate(ds.items[:sample_size], 1):                                 
+          d = item.to_dict()                                                               
+          print(f"\nSample item {i}:")                                                     
+          for k, v in d.items():                                                           
+              t = typename(v)                                                              
+              # Provide a small preview for string-like fields                             
+              preview = str(v)                                                             
+              if typename(v) == 'str' and len(preview) > 160:                              
+                  preview = preview[:160] + "..."                                          
+              print(f"  - {k} ({t}): {preview}")                                           
+  else:                                                                                    
+      print("Dataset 'Enron Emails Hierarchical' not found.")                              
+ ───────────────────────────────────────────────────────────────────────────────────────── 
+Execution logs:
+Dataset: Enron Emails Hierarchical
+Annotation: Full Enron email corpus for semantic search.
+Number of items: 250
+Has index: True
+Indices: ['hierarchical']
+Index info unavailable: Object <carnot.data.dataset.Dataset object at 0x169ad8bc0> has no 
+attribute get_index_type_string
+Fields: ['contents', 'path', 'metadata', 'embedding']
+---
+
+Dataset: Enron Emails Hierarchical
+Annotation: Full Enron email corpus for semantic search.
+Number of items: 250
+Has index: True
+Indices: ['hierarchical']
+
+Code execution failed at line 'if ds_name in datasets:
+    ds = datasets[ds_name\]
+    print(f"\nDataset: {ds.name}")
+    print(f"Annotation: {ds.annotation}")
+    print(f"Number of items: {len(ds.items)}")
+    print(f"Has index: {ds.has_index()}")
+    if ds.has_index():
+        idx_names = ds.list_indices()
+        print(f"Indices: {idx_names}")
+        for idx in idx_names:
+            print(f"  - index_name='{idx}', type='{ds.get_index_type_string(idx)}'")
+    # Step 3: Sample a few items to understand schema and where subject/body live
+    sample_size = min(5, len(ds.items))
+    for i, item in enumerate(ds.items[:sample_size\], 1):
+        d = item.to_dict()
+        print(f"\nSample item {i}:")
+        for k, v in d.items():
+            t = typename(v)
+            # Provide a small preview for string-like fields
+            preview = str(v)
+            if typename(v) == 'str' and len(preview) > 160:
+                preview = preview[:160\] + "..."
+            print(f"  - {k} ({t}): {preview}")
+else:
+    print("Dataset 'Enron Emails Hierarchical' not found.")' due to: InterpreterError: 
+Object <carnot.data.dataset.Dataset object at 0x169ad8bc0> has no attribute 
+get_index_type_string
+[Step 1: Duration 14.09 seconds| Input tokens: 1,923 | Output tokens: 1,110]
+[DataDiscoveryAgent] Step 1 completed, 9 steps remaining (max=10)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Step 2 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ ─ Executing parsed code: ──────────────────────────────────────────────────────────────── 
+  # Inspect the specific dataset safely without using unsupported methods                  
+  ds_name = "Enron Emails Hierarchical"                                                    
+  if ds_name in datasets:                                                                  
+      ds = datasets[ds_name]                                                               
+      print(f"Dataset: {ds.name}")                                                         
+      print(f"Annotation: {ds.annotation}")                                                
+      print(f"Number of items: {len(ds.items)}")                                           
+      has_idx = False                                                                      
+      try:                                                                                 
+          has_idx = ds.has_index()                                                         
+      except Exception as e:                                                               
+          print(f"has_index() not available: {str(e)}")                                    
+      print(f"Has index: {has_idx}")                                                       
+      if has_idx:                                                                          
+          try:                                                                             
+              idx_names = ds.list_indices()                                                
+              print(f"Indices: {idx_names}")                                               
+          except Exception as e:                                                           
+              print(f"list_indices() not available: {str(e)}")                             
+                                                                                           
+      # Examine schema from up to 3 items, and drill into metadata                         
+      sample_size = min(3, len(ds.items))                                                  
+      for i, item in enumerate(ds.items[:sample_size], 1):                                 
+          d = item.to_dict()                                                               
+          print(f"\nSample item {i} top-level fields and types:")                          
+          for k, v in d.items():                                                           
+              t = typename(v)                                                              
+              preview = ""                                                                 
+              if t == 'str':                                                               
+                  s = v                                                                    
+                  if len(s) > 200:                                                         
+                      s = s[:200] + "..."                                                  
+                  preview = f" preview='{s.replace(chr(10),' ')}'"                         
+              elif t == 'list':                                                            
+                  try:                                                                     
+                      l = len(v)                                                           
+                      et = typename(v[0]) if l > 0 else 'n/a'                              
+                      preview = f" len={l}, elem_type={et}"                                
+                  except Exception:                                                        
+                      preview = " (list)"                                                  
+              elif t == 'dict':                                                            
+                  preview = f" keys={list(v.keys())}"                                      
+              print(f"  - {k} ({t}){preview}")                                             
+                                                                                           
+          # Try to identify subject and body                                               
+          subj = None                                                                      
+          body_preview = None                                                              
+          if 'metadata' in d and typename(d['metadata']) == 'dict':                        
+              md = d['metadata']                                                           
+              # Common keys: 'subject', 'Subject', etc.                                    
+              for key in ['subject', 'Subject', 'SUBJECT', 'email_subject']:               
+                  if key in md and typename(md[key]) == 'str' and md[key].strip():         
+                      subj = md[key]                                                       
+                      break                                                                
+              print(f"  Subject candidate from metadata: {str(subj)[:160] + ('...' if      
+  subj and len(str(subj))>160 else '') if subj else 'None found'}")                        
+                                                                                           
+          if 'contents' in d and typename(d['contents']) == 'str':                         
+              body_preview = d['contents'][:300].replace("\n", " ")                        
+              print(f"  Body (contents) preview: {body_preview + ('...' if                 
+  len(d['contents'])>300 else '')}")                                                       
+  else:                                                                                    
+      print("Dataset 'Enron Emails Hierarchical' not found.")                              
+ ───────────────────────────────────────────────────────────────────────────────────────── 
+Execution logs:
+Dataset: Enron Emails Hierarchical
+Annotation: Full Enron email corpus for semantic search.
+Number of items: 250
+Has index: True
+Indices: ['hierarchical']
+
+Sample item 1 top-level fields and types:
+  - contents (str) preview='Message-ID: <8268911.1075858645425.JavaMail.evans@thyme> Date: 
+Mon, 29 Oct 2001 18:08:10 -0800 (PST) From: mondohed@gte.net To: pallen@ect.enron.com 
+Subject: Fw: Golfin' and Wedding!!! Mime-Versi...'
+  - path (str) 
+preview='/Users/yashaga/Carnot/tests/pytest/data/enron-eval-medium/allen-p-inbox-42.txt'
+  - metadata (dict) keys=[]
+  - embedding (NoneType)
+  Subject candidate from metadata: None found
+  Body (contents) preview: Message-ID: <8268911.1075858645425.JavaMail.evans@thyme> Date: 
+Mon, 29 Oct 2001 18:08:10 -0800 (PST) From: mondohed@gte.net To: pallen@ect.enron.com 
+Subject: Fw: Golfin' and Wedding!!! Mime-Version: 1.0 Content-Type: text/plain; 
+charset=us-ascii Content-Transfer-Encoding: 7bit X-From: "Arman...
+
+Sample item 2 top-level fields and types:
+  - contents (str) preview='Message-ID: <31239550.1075858645503.JavaMail.evans@thyme> Date:
+Mon, 29 Oct 2001 21:16:58 -0800 (PST) From: enron_update@concureworkplace.com To: 
+pallen@enron.com Subject: Expense Reports Awaiting...'
+  - path (str) 
+preview='/Users/yashaga/Carnot/tests/pytest/data/enron-eval-medium/allen-p-inbox-45.txt'
+  - metadata (dict) keys=[]
+  - embedding (NoneType)
+  Subject candidate from metadata: None found
+  Body (contents) preview: Message-ID: <31239550.1075858645503.JavaMail.evans@thyme> Date: 
+Mon, 29 Oct 2001 21:16:58 -0800 (PST) From: enron_update@concureworkplace.com To: 
+pallen@enron.com Subject: Expense Reports Awaiting Your Approval Mime-Version: 1.0 
+Content-Type: text/plain; charset=us-ascii Content-Transfer-Enco...
+
+Sample item 3 top-level fields and types:
+  - contents (str) preview='Message-ID: <16163432.1075862166007.JavaMail.evans@thyme> Date:
+Tue, 27 Nov 2001 11:22:36 -0800 (PST) From: gthorse@about-cis.com To: k..allen@enron.com 
+Subject:  Mime-Version: 1.0 Content-Type:...'
+  - path (str) 
+preview='/Users/yashaga/Carnot/tests/pytest/data/enron-eval-medium/allen-p-inbox-69.txt'
+  - metadata (dict) keys=[]
+  - embedding (NoneType)
+  Subject candidate from metadata: None found
+  Body (contents) preview: Message-ID: <16163432.1075862166007.JavaMail.evans@thyme> Date: 
+Tue, 27 Nov 2001 11:22:36 -0800 (PST) From: gthorse@about-cis.com To: k..allen@enron.com 
+Subject:  Mime-Version: 1.0 Content-Type: text/plain; charset=us-ascii 
+Content-Transfer-Encoding: 7bit X-From: "Greg Thorse" <gthorse@about...
+
+Out: Message-ID: <16163432.1075862166007.JavaMail.evans@thyme> Date: Tue, 27 Nov 2001 
+11:22:36 -0800 (PST) From: gthorse@about-cis.com To: k..allen@enron.com Subject:  
+Mime-Version: 1.0 Content-Type: text/plain; charset=us-ascii Content-Transfer-Encoding: 
+7bit X-From: "Greg Thorse" <gthorse@about
+[Step 2: Duration 32.53 seconds| Input tokens: 5,441 | Output tokens: 2,907]
+[DataDiscoveryAgent] Step 2 completed, 8 steps remaining (max=10)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Step 3 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ ─ Executing parsed code: ──────────────────────────────────────────────────────────────── 
+  final_answer("""                                                                         
+  Dataset: Enron Emails Hierarchical                                                       
+  Annotation: Full Enron email corpus for semantic search.                                 
+  Items: 250                                                                               
+                                                                                           
+  1) Semantic indices                                                                      
+  - Has semantic index: Yes                                                                
+  - Available index_name(s): ['hierarchical']                                              
+  - Index type(s): The index_name 'hierarchical' corresponds to a HierarchicalCarnotIndex  
+  (inferred from the naming convention in this system). Note: get_index_type_string() was  
+  not available on this Dataset object, but list_indices() returned ['hierarchical'].      
+                                                                                           
+  2) Schema and field types                                                                
+  Top-level fields observed (from DataItem.to_dict()):                                     
+  - contents (str): Unstructured — Raw RFC-822 style email text including headers and      
+  body in one string.                                                                      
+    - Contains email subject: Yes (as a "Subject: ..." header line within the text)        
+    - Contains email body: Yes (body appears after the header block, typically following   
+  a blank line)                                                                            
+    - Example snippet: "Subject: Fw: Golfin' and Wedding!!! ..."                           
+  - path (str): Structured — File path to the source email text file (e.g.,                
+  '/Users/.../allen-p-inbox-42.txt')                                                       
+  - metadata (dict): Structured — Dictionary present but empty in sampled items. No        
+  separate 'subject' key found in samples.                                                 
+  - embedding (NoneType): Structured (optional) — Placeholder for a vector embedding; not  
+  populated in sampled items. If present, would typically be a numeric vector (e.g.,       
+  list[float]).                                                                            
+                                                                                           
+  Which fields contain the email subject and body?                                         
+  - Subject: Embedded in the 'contents' field as a header line starting with "Subject:     
+  ...". There is no separate dedicated 'subject' field populated in 'metadata' based on    
+  sampled items.                                                                           
+  - Body: Embedded in the 'contents' field (after the headers).                            
+                                                                                           
+  Additional notes:                                                                        
+  - Use index_name='hierarchical' for semantic retrieval (e.g., with sem_topk() or         
+  dataset-specific search calls).                                                          
+  - The 'metadata' dict is currently empty in samples; if future items populate it, a      
+  structured 'subject' could appear there, but it is not present in the examined items.    
+  """)                                                                                     
+ ───────────────────────────────────────────────────────────────────────────────────────── 
+Final answer: 
+Dataset: Enron Emails Hierarchical
+Annotation: Full Enron email corpus for semantic search.
+Items: 250
+
+1) Semantic indices
+- Has semantic index: Yes
+- Available index_name(s): ['hierarchical']
+- Index type(s): The index_name 'hierarchical' corresponds to a HierarchicalCarnotIndex 
+(inferred from the naming convention in this system). Note: get_index_type_string() was not
+available on this Dataset object, but list_indices() returned ['hierarchical'].
+
+2) Schema and field types
+Top-level fields observed (from DataItem.to_dict()):
+- contents (str): Unstructured — Raw RFC-822 style email text including headers and body in
+one string.
+  - Contains email subject: Yes (as a "Subject: ..." header line within the text)
+  - Contains email body: Yes (body appears after the header block, typically following a 
+blank line)
+  - Example snippet: "Subject: Fw: Golfin' and Wedding!!! ..."
+- path (str): Structured — File path to the source email text file (e.g., 
+'/Users/.../allen-p-inbox-42.txt')
+- metadata (dict): Structured — Dictionary present but empty in sampled items. No separate 
+'subject' key found in samples.
+- embedding (NoneType): Structured (optional) — Placeholder for a vector embedding; not 
+populated in sampled items. If present, would typically be a numeric vector (e.g., 
+list[float]).
+
+Which fields contain the email subject and body?
+- Subject: Embedded in the 'contents' field as a header line starting with "Subject: ...". 
+There is no separate dedicated 'subject' field populated in 'metadata' based on sampled 
+items.
+- Body: Embedded in the 'contents' field (after the headers).
+
+Additional notes:
+- Use index_name='hierarchical' for semantic retrieval (e.g., with sem_topk() or 
+dataset-specific search calls).
+- The 'metadata' dict is currently empty in samples; if future items populate it, a 
+structured 'subject' could appear there, but it is not present in the examined items.
+
+[Step 3: Duration 31.45 seconds| Input tokens: 11,389 | Output tokens: 4,634]
+[DataDiscoveryAgent] Step 3 completed, 7 steps remaining (max=10)
+Execution logs:
+Here is the final answer from your data discovery agent 'data_discovery':
+
+Dataset: Enron Emails Hierarchical
+Annotation: Full Enron email corpus for semantic search.
+Items: 250
+
+1) Semantic indices
+- Has semantic index: Yes
+- Available index_name(s): ['hierarchical']
+- Index type(s): The index_name 'hierarchical' corresponds to a HierarchicalCarnotIndex 
+(inferred from the naming convention in this system). Note: get_index_type_string() was not
+available on this Dataset object, but list_indices() returned ['hierarchical'].
+
+2) Schema and field types
+Top-level fields observed (from DataItem.to_dict()):
+- contents (str): Unstructured — Raw RFC-822 style email text including headers and body in
+one string.
+  - Contains email subject: Yes (as a "Subject: ..." header line within the text)
+  - Contains email body: Yes (body appears after the header block, typically following a 
+blank line)
+  - Example snippet: "Subject: Fw: Golfin' and Wedding!!! ..."
+- path (str): Structured — File path to the source email text file (e.g., 
+'/Users/.../allen-p-inbox-42.txt')
+- metadata (dict): Structured — Dictionary present but empty in sampled items. No separate 
+'subject' key found in samples.
+- embedding (NoneType): Structured (optional) — Placeholder for a vector embedding; not 
+populated in sampled items. If present, would typically be a numeric vector (e.g., 
+list[float]).
+
+Which fields contain the email subject and body?
+- Subject: Embedded in the 'contents' field as a header line starting with "Subject: ...". 
+There is no separate dedicated 'subject' field populated in 'metadata' based on sampled 
+items.
+- Body: Embedded in the 'contents' field (after the headers).
+
+Additional notes:
+- Use index_name='hierarchical' for semantic retrieval (e.g., with sem_topk() or 
+dataset-specific search calls).
+- The 'metadata' dict is currently empty in samples; if future items populate it, a 
+structured 'subject' could appear there, but it is not present in the examined items.
+
+
+Out: None
+[Step 2: Duration 104.27 seconds| Input tokens: 6,167 | Output tokens: 4,939]
+[Planner] Step 2 completed, 3 steps remaining (max=5)
+[Planner] Added max_steps warning to observations
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Step 3 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ ─ Executing parsed code: ──────────────────────────────────────────────────────────────── 
+  # Build the logical plan                                                                 
+  ds = datasets["Enron Emails Hierarchical"]                                               
+                                                                                           
+  # 1) Use the hierarchical semantic index to retrieve candidate emails about Raptor/LJM   
+  ds = ds.sem_topk(                                                                        
+      search_str=(                                                                         
+          "Find Enron emails about the Raptor investment vehicles (Raptor I, Raptor II,    
+  Raptor III, Raptor IV) "                                                                 
+          "or the LJM partnerships (LJM, LJM1, LJM2). Include discussions of hedges,       
+  structures, transactions, "                                                              
+          "term sheets, approvals, accounting impact, or references to Andrew Fastow       
+  related to these entities."                                                              
+      ),                                                                                   
+      k=150,                                                                               
+      index_name="hierarchical",                                                           
+  )                                                                                        
+                                                                                           
+  # 2) Precisely filter for Enron-specific Raptor/LJM content and exclude unrelated        
+  'raptor' mentions                                                                        
+  ds = ds.sem_filter(                                                                      
+      "The email (subject or body) is specifically about Enron's Raptor special purpose    
+  entities (Raptor I, Raptor II, "                                                         
+      "Raptor III, Raptor IV) or the Enron LJM partnerships (LJM, LJM1, LJM2). Include     
+  content about hedges, "                                                                  
+      "structures, transactions, approvals, term sheets, valuations, reserves, or          
+  references to Fastow in the context "                                                    
+      "of these entities. Exclude unrelated uses of 'raptor' (e.g., animals, sports        
+  teams) or unrelated partnerships."                                                       
+  )                                                                                        
+                                                                                           
+  # Preview a few results before finalizing                                                
+  print(ds.limit(n=5).serialize())                                                         
+                                                                                           
+  # 3) Return the final logical plan                                                       
+  final_answer(ds.serialize())                                                             
+ ───────────────────────────────────────────────────────────────────────────────────────── 
+Execution logs:
+{'name': 'LimitOperation1', 'output_dataset_id': 'LimitOperation1', 'params': 
+{'output_dataset_id': 'LimitOperation1', 'operator': 'Limit', 'description': 'Limited 
+FilterOperation1 to first 5 records', 'n': 5}, 'parents': [{'name': 'FilterOperation1', 
+'output_dataset_id': 'FilterOperation1', 'params': {'output_dataset_id': 
+'FilterOperation1', 'operator': 'SemanticFilter', 'description': "Filtered TopKOperation1 
+by condition: The email (subject or body) is specifically about Enron's Raptor special 
+purpose entities (Raptor I, Raptor II, Raptor III, Raptor IV) or the Enron LJM partnerships
+(LJM, LJM1, LJM2). Include content about hedges, structures, transactions, approvals, term 
+sheets, valuations, reserves, or references to Fastow in the context of these entities. 
+Exclude unrelated uses of 'raptor' (e.g., animals, sports teams) or unrelated 
+partnerships.", 'condition': "The email (subject or body) is specifically about Enron's 
+Raptor special purpose entities (Raptor I, Raptor II, Raptor III, Raptor IV) or the Enron 
+LJM partnerships (LJM, LJM1, LJM2). Include content about hedges, structures, transactions,
+approvals, term sheets, valuations, reserves, or references to Fastow in the context of 
+these entities. Exclude unrelated uses of 'raptor' (e.g., animals, sports teams) or 
+unrelated partnerships."}, 'parents': [{'name': 'TopKOperation1', 'output_dataset_id': 
+'TopKOperation1', 'params': {'output_dataset_id': 'TopKOperation1', 'operator': 
+'SemanticTopK', 'description': 'Top-150 items from Enron Emails Hierarchical for search 
+string: Find Enron emails about the Raptor investment vehicles (Raptor I, Raptor II, Raptor
+III, Raptor IV) or the LJM partnerships (LJM, LJM1, LJM2). Include discussions of hedges, 
+structures, transactions, term sheets, approvals, accounting impact, or references to 
+Andrew Fastow related to these entities.', 'search_str': 'Find Enron emails about the 
+Raptor investment vehicles (Raptor I, Raptor II, Raptor III, Raptor IV) or the LJM 
+partnerships (LJM, LJM1, LJM2). Include discussions of hedges, structures, transactions, 
+term sheets, approvals, accounting impact, or references to Andrew Fastow related to these 
+entities.', 'k': 150, 'index_name': 'hierarchical'}, 'parents': [{'name': 'Enron Emails 
+Hierarchical', 'output_dataset_id': 'Enron Emails Hierarchical', 'params': {}, 'parents': 
+[]}]}]}]}
+
+Final answer: {'name': 'FilterOperation1', 'output_dataset_id': 'FilterOperation1', 
+'params': {'output_dataset_id': 'FilterOperation1', 'operator': 'SemanticFilter', 
+'description': "Filtered TopKOperation1 by condition: The email (subject or body) is 
+specifically about Enron's Raptor special purpose entities (Raptor I, Raptor II, Raptor 
+III, Raptor IV) or the Enron LJM partnerships (LJM, LJM1, LJM2). Include content about 
+hedges, structures, transactions, approvals, term sheets, valuations, reserves, or 
+references to Fastow in the context of these entities. Exclude unrelated uses of 'raptor' 
+(e.g., animals, sports teams) or unrelated partnerships.", 'condition': "The email (subject
+or body) is specifically about Enron's Raptor special purpose entities (Raptor I, Raptor 
+II, Raptor III, Raptor IV) or the Enron LJM partnerships (LJM, LJM1, LJM2). Include content
+about hedges, structures, transactions, approvals, term sheets, valuations, reserves, or 
+references to Fastow in the context of these entities. Exclude unrelated uses of 'raptor' 
+(e.g., animals, sports teams) or unrelated partnerships."}, 'parents': [{'name': 
+'TopKOperation1', 'output_dataset_id': 'TopKOperation1', 'params': {'output_dataset_id': 
+'TopKOperation1', 'operator': 'SemanticTopK', 'description': 'Top-150 items from Enron 
+Emails Hierarchical for search string: Find Enron emails about the Raptor investment 
+vehicles (Raptor I, Raptor II, Raptor III, Raptor IV) or the LJM partnerships (LJM, LJM1, 
+LJM2). Include discussions of hedges, structures, transactions, term sheets, approvals, 
+accounting impact, or references to Andrew Fastow related to these entities.', 
+'search_str': 'Find Enron emails about the Raptor investment vehicles (Raptor I, Raptor II,
+Raptor III, Raptor IV) or the LJM partnerships (LJM, LJM1, LJM2). Include discussions of 
+hedges, structures, transactions, term sheets, approvals, accounting impact, or references 
+to Andrew Fastow related to these entities.', 'k': 150, 'index_name': 'hierarchical'}, 
+'parents': [{'name': 'Enron Emails Hierarchical', 'output_dataset_id': 'Enron Emails 
+Hierarchical', 'params': {}, 'parents': []}]}]}
+[Step 3: Duration 29.40 seconds| Input tokens: 10,578 | Output tokens: 6,423]
+[Planner] Step 3 completed, 2 steps remaining (max=5)
+[Planner] Added max_steps warning to observations
+╭─────────────────────────────── New run - Plan Paraphrase ───────────────────────────────╮
+│                                                                                         │
+│ Find emails about the Raptor investment or LJM partnerships                             │
+│                                                                                         │
+╰─ LiteLLMModel - openai/gpt-5-2025-08-07 ────────────────────────────────────────────────╯
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Step 1 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Error in parsing output:
+Your code snippet is invalid, because the regex pattern ```python(.*?)
+``` was not found in it.
+            Here is your code snippet:
+            <NaturalLanguagePlan>
+1a. Search the Enron Emails Hierarchical dataset for emails whose content is about the 
+“Raptor investment” (using semantic relevance, not just exact keywords).
+1b. In parallel, search the same dataset for emails whose content is about “LJM 
+partnerships.”
+
+2. Combine the results from 1a and 1b so that emails matching either topic are included.
+
+3. Return the set of emails that discuss the Raptor investment or LJM partnerships.
+</NaturalLanguagePlan>
+```
+            Make sure to include code with the correct pattern, for instance:
+            Thoughts: Your thoughts
+            ```python
+            # Your python code here
+
+```
+Make sure to provide either code blobs or a final answer.
+[Step 4: Duration 10.45 seconds| Input tokens: 10,941 | Output tokens: 7,048]
+[Planner] Step 1 completed, 4 steps remaining (max=5)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Step 2 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Error in parsing output:
+Your code snippet is invalid, because the regex pattern ```python(.*?)
+``` was not found in it.
+            Here is your code snippet:
+            <NaturalLanguagePlan>
+1a. Search the Enron Emails Hierarchical dataset for emails whose subject or body content 
+discusses the “Raptor” investment (using semantic relevance, not just exact keyword 
+matches).
+1b. In parallel, search the same dataset for emails whose subject or body content discusses
+the “LJM” partnerships.
+
+2. Combine the results from steps 1a and 1b so that emails matching either topic are 
+included.
+
+3. Return the set of emails that discuss the Raptor investment or LJM partnerships.
+</NaturalLanguagePlan>
+```
+            Make sure to include code with the correct pattern, for instance:
+            Thoughts: Your thoughts
+            ```python
+            # Your python code here
+
+```
+Make sure to provide either code blobs or a final answer.
+[Step 5: Duration 12.90 seconds| Input tokens: 11,633 | Output tokens: 7,745]
+[Planner] Step 2 completed, 3 steps remaining (max=5)
+[Planner] Added max_steps warning to observations
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Step 3 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ ─ Executing parsed code: ──────────────────────────────────────────────────────────────── 
+  final_answer("""<NaturalLanguagePlan>                                                    
+  1a. Search the Enron Emails Hierarchical dataset for emails whose subject or body        
+  discusses the "Raptor" investment (using semantic relevance, not just exact keyword      
+  matches).                                                                                
+  1b. In parallel, search the same dataset for emails whose subject or body discusses the  
+  "LJM" partnerships.                                                                      
+  2. Combine the results from 1a and 1b so that emails matching either topic are           
+  included.                                                                                
+  3. Return the set of emails that discuss the Raptor investment or LJM partnerships.      
+  </NaturalLanguagePlan>""")                                                               
+ ───────────────────────────────────────────────────────────────────────────────────────── 
+Out: <NaturalLanguagePlan>
+1a. Search the Enron Emails Hierarchical dataset for emails whose subject or body discusses
+the "Raptor" investment (using semantic relevance, not just exact keyword matches).
+1b. In parallel, search the same dataset for emails whose subject or body discusses the 
+"LJM" partnerships.
+2. Combine the results from 1a and 1b so that emails matching either topic are included.
+3. Return the set of emails that discuss the Raptor investment or LJM partnerships.
+</NaturalLanguagePlan>
+[Step 6: Duration 20.73 seconds| Input tokens: 12,694 | Output tokens: 8,768]
+[Planner] Step 3 completed, 2 steps remaining (max=5)
+[Planner] Added max_steps warning to observations
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Step 4 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ ─ Executing parsed code: ──────────────────────────────────────────────────────────────── 
+  final_answer("""<NaturalLanguagePlan>                                                    
+  1a. Search the Enron Emails Hierarchical dataset for emails whose content discusses the  
+  "Raptor" investment (using semantic relevance, not just exact keyword matches).          
+  1b. In parallel, search the same dataset for emails whose content discusses the "LJM"    
+  partnerships.                                                                            
+  2. Combine the results from 1a and 1b so that emails matching either topic are           
+  included.                                                                                
+  3. Return the set of emails that discuss the Raptor investment or LJM partnerships.      
+  </NaturalLanguagePlan>""")                                                               
+ ───────────────────────────────────────────────────────────────────────────────────────── 
+Out: <NaturalLanguagePlan>
+1a. Search the Enron Emails Hierarchical dataset for emails whose content discusses the 
+"Raptor" investment (using semantic relevance, not just exact keyword matches).
+1b. In parallel, search the same dataset for emails whose content discusses the "LJM" 
+partnerships.
+2. Combine the results from 1a and 1b so that emails matching either topic are included.
+3. Return the set of emails that discuss the Raptor investment or LJM partnerships.
+</NaturalLanguagePlan>
+[Step 7: Duration 18.36 seconds| Input tokens: 14,180 | Output tokens: 9,723]
+[Planner] Step 4 completed, 1 steps remaining (max=5)
+[Planner] Added max_steps warning to observations
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Step 5 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ ─ Executing parsed code: ──────────────────────────────────────────────────────────────── 
+  final_answer("""<NaturalLanguagePlan>                                                    
+  1a. Search the Enron Emails Hierarchical dataset for emails whose content discusses the  
+  "Raptor" investment (using semantic relevance, not just exact keyword matches).          
+  1b. In parallel, search the same dataset for emails whose content discusses the "LJM"    
+  partnerships.                                                                            
+  2. Combine the results from steps 1a and 1b so that emails matching either topic are     
+  included.                                                                                
+  3. Return the set of emails that discuss the Raptor investment or LJM partnerships.      
+  </NaturalLanguagePlan>""")                                                               
+ ───────────────────────────────────────────────────────────────────────────────────────── 
+Out: <NaturalLanguagePlan>
+1a. Search the Enron Emails Hierarchical dataset for emails whose content discusses the 
+"Raptor" investment (using semantic relevance, not just exact keyword matches).
+1b. In parallel, search the same dataset for emails whose content discusses the "LJM" 
+partnerships.
+2. Combine the results from steps 1a and 1b so that emails matching either topic are 
+included.
+3. Return the set of emails that discuss the Raptor investment or LJM partnerships.
+</NaturalLanguagePlan>
+[Step 8: Duration 6.12 seconds| Input tokens: 16,079 | Output tokens: 10,167]
+[Planner] Step 5 completed, 0 steps remaining (max=5)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ Step 1 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[{'type': 'text', 'text': 'You are an expert assistant whose job is to reason about how to 
+solve a given task (and solve it).\nYou will be given a natural language task and a 
+dictionary of input dataset(s), your job is to reason and/or write code that processes the 
+input dataset(s) to solve the given task.\nYour final answer must be a dictionary with two 
+keys: "final_items" and "final_answer_str".\n- The value of "final_items" must be a list of
+dictionary objects representing the final output dataset that solves the given task (if 
+applicable, it can be an empty list if the task does not require computing a dataset).\n- 
+The value of "final_answer_str" must be a string that concisely explains the final answer 
+to the user based on the output dataset.\n\nHere are some important details to consider 
+when writing your code:\n- Each input dataset can be accessed by using its name to index 
+into the `input_datasets` dictionary.\n  - For example, if you have a dataset named 
+"Customer Data", you can access it using `input_datasets["Customer Data"]`.\n- Each dataset
+will have the following attributes:\n  - An annotation string that describes the dataset, 
+accessible using the `annotation` attribute.\n  - An iterable list of dictionary objects 
+that can be accessed using the `items` attribute.\n  - An `index(query: str, k: int)` 
+method which can be used to retrieve the top-k elements from the list of `items` which are 
+the most semantically similar to `query`.\n  - The state of any previously executed Code 
+Operator(s), which can be accessed using the `code_state` attribute (a dictionary mapping 
+variable names to Python objects).\n- You can access each attribute from the dataset 
+object. For example:\n  - To get the annotation of the "Customer Data" dataset, you can use
+`input_datasets["Customer Data"].annotation`.\n  - To access the items in the "Customer 
+Data" dataset, you can iterate over `input_datasets["Customer Data"].items`.\n  - To 
+perform a semantic search on the "Customer Data" dataset, you can call 
+`input_datasets["Customer Data"].index(query="some search string", k=5)`.\n  - To access 
+the code state of the "Customer Data" dataset, you can use `input_datasets["Customer 
+Data"].code_state["foo"]`.\n- You should reason about and/or write code that processes the 
+input dataset(s) to solve the given task.\n- You should only use the input datasets 
+provided to you; do not assume the existence of any other datasets.\n- You will be allowed 
+to iterate on your code, so you may write exploratory code before arriving at the final 
+code that solves the task.\n- Not every dataset will have an indexing method; only use it 
+if it is mentioned in the dataset description.\n- Place your code within the tags: 
+```python and ```.\n- In the end you have to return the output state you wish to expose to 
+downstream operators using the `final_answer` tool.\n- Remember to return a dictionary with
+two keys: "final_items" and "final_answer_str".\n- The value of "final_items" must be a 
+list of dictionary objects.\n- The value of "final_answer_str" must be a string.\n\nHere 
+are a few examples:\n-----\nTask: "Find every legal contract which mentions John 
+Doe."\n\nTools:\n```python\ndef final_answer(answer: any) -> any:\n  """Provides a final 
+answer to the given problem.\n\n  Args:\n      answer: The final answer to the problem\n  
+"""\n```\n\nInput Datasets:\n---\nDataset Name: Legal Contracts\nAnnotation: A dataset 
+containing various legal contracts in text format.\nNumber of Items: 1000\nIndex: no\nCode 
+that Generated Code State: None\nAvailable Code State Vars: []\n\nDataset Name: 
+FilterOperation1\nAnnotation: Sem filter operator output for task: "Find every legal 
+contract which mentions John Doe."\nNumber of Items: 7\nIndex: no\nCode that Generated Code
+State: None\nAvailable Code State Vars: []\n---\n\n```python\nfinal_answer({"final_items": 
+input_datasets["FilterOperation1"].items,\n              "final_answer_str": f"Found 
+{len(input_datasets[\'FilterOperation1\'].items)} legal contracts mentioning John 
+Doe."})\n```\n\n-----\nTask: "For each movie, find all reviews that mention the lead 
+actor."\n\nTools:\n```python\ndef final_answer(answer: any) -> any:\n  """Provides a final 
+answer to the given problem.\n\n  Args:\n      answer: The final answer to the problem\n  
+"""\n```\n\nInput Datasets:\n---\nDataset Name: Movies\nAnnotation: A dataset containing 
+information about various movies, including the director, actors, and plot summary.\nNumber
+of Items: 500\nIndex: no\nCode that Generated Code State: None\nAvailable Code State Vars: 
+[]\n\nDataset Name: Reviews\nAnnotation: A dataset containing movie reviews from various 
+critics.\nNumber of Items: 2000\nIndex: no\nCode that Generated Code State: None\nAvailable
+Code State Vars: []\n\nDataset Name: CodeOperation1\nAnnotation: Code operator output for 
+task: "For each movie, find all reviews that mention the lead actor."\nNumber of Items: 
+0\nIndex: no\nCode that Generated Code State:\n```python\nlead_actor_reviews = {}\nmovies =
+input_datasets["Movies"].items\nreviews = input_datasets["Reviews"].items\nfor movie in 
+movies:\n    lead_actor = movie[\'lead_actor\']\n    movie_title = movie[\'title\']\n    
+lead_actor_reviews = []\n    for review in reviews:\n        if lead_actor.lower() in 
+review[\'review_text\'].lower():\n            
+lead_actor_reviews.append(review)\nfinal_answer({"lead_actor_reviews": 
+lead_actor_reviews})\n```\nAvailable Code State Vars: 
+[\'lead_actor_reviews\']\n---\n\n```python\n# check the Code Operation output to see the 
+lead actor reviews dictionary\nlead_actor_reviews = 
+input_datasets["CodeOperation1"].code_state["lead_actor_reviews"]\nprint(lead_actor_reviews
+)\n```\n\nExecution logs (truncated output):\n{\'Inception\': [{\'id\': 101, 
+\'movie_title\': \'Inception\', \'review_text\': \'Leonardo DiCaprio delivers a stellar 
+performance in this mind-bending thriller.\'}, {\'id\': 123, \'movie_title\': 
+\'Inception\', \'review_text\': \'Inception was an amazing movie in which Leonardo DiCaprio
+shined.\'}], \'The Dark Knight\': [{\'id\': 102, \'movie_title\': \'The Dark Knight\', 
+\'review_text\': \'Christian Bale is outstanding as Batman in this dark and gripping 
+film.\'}], ...}\n\n```python\n# convert the lead_actor_reviews dictionary into a list of 
+dictionaries for final answer\nfinal_items = []\nfor movie_title, reviews in 
+lead_actor_reviews.items():\n    final_items.append({"movie_title": movie_title, "reviews":
+reviews})\nfinal_answer({"final_items": final_items,\n              "final_answer_str": 
+f"Found lead actor reviews for {len(final_items)} movies."})\n```\n\n-----\nTask: "Compute 
+the geometric mean of temperature readings from all sensors at Boston 
+beaches."\n\nTools:\n```python\ndef final_answer(answer: any) -> any:\n  """Provides a 
+final answer to the given problem.\n\n  Args:\n      answer: The final answer to the 
+problem\n  """\n\ndef geometric_mean(numbers: list) -> float:\n    """Computes the 
+geometric mean of a list of numbers.\n    \n    Args:\n        numbers: A list of float 
+numbers.\n    """\n\ndef get_beach_city(sensor_id: str) -> str:\n    """Returns the city of
+the beach where the sensor is located.\n    \n    Args:\n        sensor_id: The ID of the 
+sensor.\n    """\n```\n\nInput Datasets:\n---\nDataset Name: Temperature 
+Readings\nAnnotation: A dataset containing temperature readings from various sensors 
+located at beaches around the world.\nNumber of Items: 10000\nIndex: no\nCode that 
+Generated Code State: None\nAvailable Code State Vars: []\n\nDataset Name: 
+CodeOperation1\nAnnotation: Code operator output for task: "Clean the temperature readings 
+by removing invalid entries."\nNumber of Items: 0\nIndex: no\nCode that Generated Code 
+State:\n```python\nimport pandas as pd\n\ntemp_readings = input_datasets["Temperature 
+Readings"].items\ncleaned_readings = []\nfor reading in temp_readings:\n    clean_reading =
+{}\n    clean_reading[\'sensor_id\'] = reading[\'sensor_id\']\n    try:\n        
+clean_reading[\'temperature\'] = float(reading[\'temperature\'])\n    except (ValueError, 
+TypeError):\n        clean_reading[\'temperature\'] = None\n    if 
+clean_reading[\'temperature\'] is not None:\n        
+cleaned_readings.append(clean_reading)\n\ntemp_df = 
+pd.DataFrame(cleaned_readings)\nfinal_answer({"temp_df": temp_df})\n```\nAvailable Code 
+State Vars: [\'temp_df\']\n\nDataset Name: CodeOperation2\nAnnotation: Code operator output
+for task: "Compute the geometric mean of temperature readings from all sensors at Boston 
+beaches."\nNumber of Items: 0\nIndex: no\nCode that Generated Code 
+State:\n```python\ntemp_df = input_datasets["Cleaned Temperature 
+Readings"].code_state["temp_df"]\nboston_temps = []\nfor _, row in temp_df.iterrows():\n   
+sensor_id = row[\'sensor_id\']\n    city = get_beach_city(sensor_id)\n    if city.lower() 
+== "boston":\n        boston_temps.append(row[\'temperature\'])\ngeo_mean = 
+geometric_mean(boston_temps)\nfinal_answer({"geometric_mean_boston_temps": 
+geo_mean})\n```\n---\n\n```python\ngeo_mean = 
+input_datasets["CodeOperation2"].code_state["geometric_mean_boston_temps"]\nfinal_answer({"
+final_items": [],\n              "final_answer_str": f"The geometric mean of temperature 
+readings from all sensors at Boston beaches is {geo_mean}."})\n```\n\n-----\n\nHere are the
+rules you should always follow to solve your task:\n1. Always place your code in a 
+\'```python\' sequence ending with \'```\', otherwise you will fail.\n2. Only use the input
+datasets (and tools) that you are provided with below! (The ones above are for examples and
+may not be available to you.)\n3. Don\'t give up! You\'re in charge of writing the code to 
+implement the task, not providing directions to generate it.\n4. Return the final answer 
+using the `final_answer` tool as specified above.\n5. Remember to return a dictionary with 
+two keys: "final_items" and "final_answer_str".\n6. The value of "final_items" must be a 
+list of dictionary objects.\n7. The value of "final_answer_str" must be a string.\n\nNow 
+Begin!'}]
+[{'type': 'text', 'text': 'Task: "Find emails about the Raptor investment or LJM 
+partnerships"\n\nTools:\n```python\ndef final_answer(answer: any) -> any:\n    """Provides 
+a final answer to the given problem.\n\n    Args:\n        answer: The final answer to the 
+problem\n    """\n```\n\nInput Datasets:\n---\nDataset Name: Enron Emails 
+Hierarchical\nAnnotation: Full Enron email corpus for semantic search.\nNumber of Items: 
+250\nIndex: yes (hierarchical)\nCode that Generated Code State:  None\nAvailable Code State
+Vars: []\n\n\nDataset Name: TopKOperation1\nAnnotation: Sem Top-K operator output for task:
+Find Enron emails about the Raptor investment vehicles (Raptor I, Raptor II, Raptor III, 
+Raptor IV) or the LJM partnerships (LJM, LJM1, LJM2). Include discussions of hedges, 
+structures, transactions, term sheets, approvals, accounting impact, or references to 
+Andrew Fastow related to these entities.\nNumber of Items: 150\nIndex: no\nCode that 
+Generated Code State:  None\nAvailable Code State Vars: []\n\n\nDataset Name: 
+FilterOperation1\nAnnotation: Sem filter operator output for task: The email (subject or 
+body) is specifically about Enron\'s Raptor special purpose entities (Raptor I, Raptor II, 
+Raptor III, Raptor IV) or the Enron LJM partnerships (LJM, LJM1, LJM2). Include content 
+about hedges, structures, transactions, approvals, term sheets, valuations, reserves, or 
+references to Fastow in the context of these entities. Exclude unrelated uses of \'raptor\'
+(e.g., animals, sports teams) or unrelated partnerships.\nNumber of Items: 14\nIndex: 
+no\nCode that Generated Code State:  None\nAvailable Code State Vars: []'}]
+ ─ Executing parsed code: ──────────────────────────────────────────────────────────────── 
+  final_items = input_datasets["FilterOperation1"].items                                   
+                                                                                           
+  final_answer({                                                                           
+      "final_items": final_items,                                                          
+      "final_answer_str": f"Found {len(final_items)} emails specifically about the Raptor  
+  (Raptor I-IV) or LJM (LJM, LJM1, LJM2) entities, including discussions of hedges,        
+  structures, transactions, term sheets, approvals, accounting impact, or references to    
+  Andrew Fastow."                                                                          
+  })                                                                                       
+ ───────────────────────────────────────────────────────────────────────────────────────── 
+Final answer: {'final_items': [<carnot.data.item.DataItem object at 0x169d897c0>, 
+<carnot.data.item.DataItem object at 0x169d8b800>, <carnot.data.item.DataItem object at 
+0x169d89520>, <carnot.data.item.DataItem object at 0x169d8b860>, <carnot.data.item.DataItem
+object at 0x169d8b8c0>, <carnot.data.item.DataItem object at 0x169d8b920>, 
+<carnot.data.item.DataItem object at 0x169d8b980>, <carnot.data.item.DataItem object at 
+0x169d8b9e0>, <carnot.data.item.DataItem object at 0x169d8bda0>, <carnot.data.item.DataItem
+object at 0x169d87320>, <carnot.data.item.DataItem object at 0x169d895e0>, 
+<carnot.data.item.DataItem object at 0x169d89580>, <carnot.data.item.DataItem object at 
+0x169d8be60>, <carnot.data.item.DataItem object at 0x169d8bd40>], 'final_answer_str': 
+'Found 14 emails specifically about the Raptor (Raptor I-IV) or LJM (LJM, LJM1, LJM2) 
+entities, including discussions of hedges, structures, transactions, term sheets, 
+approvals, accounting impact, or references to Andrew Fastow.'}
+PASSED
+
+======================== 1 passed in 361.73s (0:06:01) =========================

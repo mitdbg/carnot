@@ -47,3 +47,70 @@ def enron_data_items():
     if not enron_dir.exists():
         pytest.skip(f"Enron data dir not found: {enron_dir}")
     return [DataItem(path=str(p.absolute())) for p in sorted(enron_dir.glob("*.txt"))]
+
+
+@pytest.fixture
+def enron_data_items_small(enron_data_items):
+    """Subset of 30 Enron files for faster index builds in E2E tests."""
+    return enron_data_items[:30]
+
+
+@pytest.fixture
+def small_enron_dataset_with_index(llm_config, enron_data_items_small):
+    """Dataset with pre-built Flat index for E2E index-aware planning tests."""
+    from carnot.data.dataset import Dataset
+    from carnot.index import FlatCarnotIndex
+
+    flat_index = FlatCarnotIndex(
+        name="enron-flat",
+        items=enron_data_items_small,
+        api_key=llm_config.get("OPENAI_API_KEY"),
+        use_persistence=True,
+    )
+    return Dataset(
+        name="Enron Emails",
+        annotation="Enron email corpus for semantic search.",
+        items=enron_data_items_small,
+        indices={"flat": flat_index},
+    )
+
+@pytest.fixture
+def enron_dataset_with_flat_index(llm_config, enron_data_items):
+    """Dataset with pre-built Flat index for E2E index-aware planning tests."""
+    from carnot.data.dataset import Dataset
+    from carnot.index import FlatCarnotIndex
+
+    flat_index = FlatCarnotIndex(
+        name="enron-flat-big",
+        items=enron_data_items,
+        api_key=llm_config.get("OPENAI_API_KEY"),
+        use_persistence=True,
+    )
+
+    return Dataset(
+        name="Enron Emails Big",
+        annotation="Full Enron email corpus for semantic search.",
+        items=enron_data_items,
+        indices={"flat": flat_index},
+    )
+
+@pytest.fixture
+def enron_dataset_with_hierarchical_index(llm_config, enron_data_items):
+    """Dataset with pre-built Flat index for E2E index-aware planning tests."""
+    from carnot.data.dataset import Dataset
+    from carnot.index import HierarchicalCarnotIndex
+
+    hierarchical_index = HierarchicalCarnotIndex(
+        name="enron-hierarchical",
+        items=enron_data_items,
+        api_key=llm_config.get("OPENAI_API_KEY"),
+        use_persistence=True,
+    )
+
+    return Dataset(
+        name="Enron Emails Hierarchical",
+        annotation="Full Enron email corpus for semantic search.",
+        items=enron_data_items,
+        indices={"hierarchical": hierarchical_index},
+    )
+    

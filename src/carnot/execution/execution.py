@@ -158,7 +158,9 @@ class Execution:
             operator = SemJoinOperator(task=op_params['condition'], output_dataset_id=plan['output_dataset_id'], model_id="openai/gpt-5-mini", llm_config=self.llm_config, max_workers=4)
 
         elif op_name == "SemanticTopK":
-            operator = SemTopKOperator(task=op_params['search_str'], k=op_params['k'], output_dataset_id=plan['output_dataset_id'], model_id="openai/text-embedding-3-small", llm_config=self.llm_config, max_workers=4, index_type=op_params.get('index_type'))
+            # Plan uses index_name; SemTopKOperator uses index_type (same semantic)
+            index_type = op_params.get('index_type') or op_params.get('index_name') or 'chroma'
+            operator = SemTopKOperator(task=op_params['search_str'], k=op_params['k'], output_dataset_id=plan['output_dataset_id'], model_id="openai/text-embedding-3-small", llm_config=self.llm_config, max_workers=4, index_type=index_type)
 
         else:
             for dataset in self.datasets:

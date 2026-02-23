@@ -65,8 +65,8 @@ class SemFilterOperator:
         """
         memory = AgentMemory("")
         memory.system_prompt = SystemPromptStep(system_prompt=system_prompt)
-        memory.steps.append(SemFilterOperatorStep(task=self.task, item=item))
-
+        item_dict = item.to_dict() if hasattr(item, "to_dict") else item
+        memory.steps.append(SemFilterOperatorStep(task=self.task, item=item_dict))
         passes_filter, step_number = None, 0
         while passes_filter is None and step_number < self.max_steps:
             memory_step = ActionStep(step_number=1, timing=Timing(start_time=time.time()))
