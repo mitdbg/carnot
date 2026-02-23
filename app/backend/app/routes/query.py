@@ -90,13 +90,14 @@ class QueryExecutionStreamer:
     Encapsulates the query execution and concurrent heartbeat task for SSE streaming.
     Uses an asyncio.Queue to safely merge output from the query task and the heartbeat task.
     """
-    def __init__(self, query: str, plan: dict, dataset_ids: list[int], user_id: str, session_id: str, user_config: dict):
+    def __init__(self, query: str, plan: dict, dataset_ids: list[int], user_id: str, session_id: str, user_config: dict, cost_budget: float | None = None):
         self.query = query
         self.plan = plan
         self.dataset_ids = dataset_ids
         self.user_id = user_id
         self.session_id = session_id
         self.user_config = user_config
+        self.cost_budget = cost_budget
         self.queue = asyncio.Queue()
         self.heartbeat_task = None
         self.query_task = None
@@ -214,6 +215,7 @@ class QueryExecutionStreamer:
             logger.info(f"Query: {self.query}")
             logger.info(f"Plan: {json.dumps(self.plan, indent=2)}")
             logger.info(f"Datasets: {[dataset.name for dataset in datasets]}")
+            logger.info(f"Cost budget: ${self.cost_budget}" if self.cost_budget else "Cost budget: None")
             
             # Load existing conversation history from database
             conversation = await load_conversation_from_db(self.user_id, self.session_id)
@@ -229,6 +231,7 @@ class QueryExecutionStreamer:
                 indices=[],
                 llm_config=self.user_config,
                 progress_log_file=progress_log,
+                cost_budget=self.cost_budget,
             )
 
             await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Running Carnot query processor...'})}\n\n")
@@ -417,6 +420,7 @@ class QueryRequest(BaseModel):
     dataset_ids: list[int]
     session_id: str
     plan: dict | None = None
+    cost_budget: float | None = None  # Maximum dollar amount user is willing to spend
 
 
 def cleanup_old_sessions() -> None:
@@ -466,6 +470,7 @@ async def save_message(
     message_type: str | None = None,
     csv_file: str | None = None,
     row_count: int | None = None,
+    cost_budget: float | None = None,
 ) -> None:
     async with AsyncSessionLocal() as db:
         message = Message(
@@ -475,6 +480,7 @@ async def save_message(
             type=message_type,
             csv_file=csv_file,
             row_count=row_count,
+            cost_budget=cost_budget,
         )
         db.add(message)
 
@@ -604,7 +610,7 @@ async def plan_query(
     conversation = await load_conversation_from_db(user_id, request.session_id)
     
     # Add the current user message to the conversation before planning
-    await save_message(conversation_id, "user", request.query)
+    await save_message(conversation_id, "user", request.query, cost_budget=request.cost_budget)
 
     # create execution and generate plan
     try:
@@ -616,6 +622,7 @@ async def plan_query(
             memory=None,
             indices=[],
             llm_config=user_config,
+            cost_budget=request.cost_budget,
         )
 
         nl_plan, plan = await run_in_threadpool(exec_instance.plan)
@@ -678,8 +685,9 @@ async def execute_query(
 
     # Instantiate the streamer class
     logger.info(f"Request.plan: {request.plan}")
+    logger.info(f"Request.cost_budget: {request.cost_budget}")
     streamer = QueryExecutionStreamer(
-        request.query, request.plan, request.dataset_ids, user_id, request.session_id, user_config,
+        request.query, request.plan, request.dataset_ids, user_id, request.session_id, user_config, request.cost_budget,
     )
 
     return StreamingResponse(

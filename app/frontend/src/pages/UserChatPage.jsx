@@ -1,11 +1,13 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { Send, Database, CheckSquare, Square, AlertCircle, Loader2, XCircle, MessageSquare, Trash2, ChevronLeft, ChevronRight, Search, Play, Plus, X } from 'lucide-react'
 import { useApiToken } from '../hooks/useApiToken'
 import axios from 'axios'
 import ProgressDisplay from '../components/ProgressDisplay'
+import CostBudgetPicker from '../components/CostBudgetPicker'
 import { conversationsApi, datasetsApi } from '../services/api'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api"
+const DEFAULT_COST_BUDGET = 5.00; // Default cost budget in dollars if user doesn't specify
 
 function PlanVisualizer({ plan }) {
   // Recursively flattens the tree into chronological steps
@@ -124,8 +126,23 @@ function UserChatPage() {
   const [datasetSearchQuery, setDatasetSearchQuery] = useState('')
   const [currentPlan, setCurrentPlan] = useState(null);
   const [lastQuery, setLastQuery] = useState('');
+  const [costBudget, setCostBudget] = useState(DEFAULT_COST_BUDGET);
   const messagesEndRef = useRef(null)
   const abortControllerRef = useRef(null)
+  const textareaRef = useRef(null)
+
+  // Auto-resize the textarea as the user types, up to ~6 lines (~1–1.5 paragraphs).
+  // Beyond that it scrolls internally.
+  const autoResizeTextarea = useCallback(() => {
+    const el = textareaRef.current
+    if (!el) return
+    el.style.height = 'auto'                  // shrink first so scrollHeight is accurate
+    el.style.height = `${el.scrollHeight}px`  // expand to fit content
+  }, [])
+
+  useEffect(() => {
+    autoResizeTextarea()
+  }, [inputQuery, autoResizeTextarea])
 
   // Generate session ID on component mount
   useEffect(() => {
@@ -302,7 +319,8 @@ function UserChatPage() {
         query: queryToPlan,
         dataset_ids: datasetIds,
         session_id: currentSessionId,
-        plan: currentPlan
+        plan: currentPlan,
+        cost_budget: costBudget
       }, {
         headers: { Authorization: `Bearer ${token}` }
       });
@@ -377,7 +395,8 @@ function UserChatPage() {
           query: lastQuery,
           dataset_ids: datasetIds,
           session_id: currentSessionId,
-          plan: plan
+          plan: plan,
+          cost_budget: costBudget
         }),
         signal: abortControllerRef.current.signal
       })
@@ -685,34 +704,46 @@ function UserChatPage() {
         {/* 3. Sticky Chat Input: Pins to the bottom of the parent flex-col */}
         <div className="w-full border-t border-gray-100 bg-white px-6 py-4">
           <div className="max-w-4xl mx-auto">
-            <form 
-              onSubmit={handleRequestPlan} 
-              className="relative flex items-end gap-2 bg-gray-50 border border-gray-300 rounded-2xl p-2 focus-within:ring-2 focus-within:ring-primary-500 transition-all shadow-sm"
-            >
-              <textarea
-                rows="1"
-                value={inputQuery}
-                onChange={(e) => setInputQuery(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleRequestPlan(); } }}
-                placeholder="Ask a question..."
-                className="flex-1 bg-transparent border-none focus:ring-0 resize-none py-3 px-4 text-gray-800"
+            <div className="flex items-end gap-2">
+              {/* Main chat form */}
+              <form 
+                onSubmit={handleRequestPlan} 
+                className="relative flex flex-1 items-end gap-2 bg-gray-50 border border-gray-300 rounded-2xl p-2 focus-within:ring-2 focus-within:ring-primary-500 transition-all shadow-sm"
+              >
+                <textarea
+                  ref={textareaRef}
+                  rows="1"
+                  value={inputQuery}
+                  onChange={(e) => setInputQuery(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleRequestPlan(); } }}
+                  placeholder="Ask a question..."
+                  className="flex-1 bg-transparent border-none focus:ring-0 resize-none py-3 px-4 text-gray-800 overflow-y-auto"
+                  style={{ maxHeight: '9rem' }}
+                  disabled={isLoading}
+                />
+                <div className="flex gap-1 pb-1 pr-1">
+                  {isLoading && (
+                    <button type="button" onClick={handleCancel} className="p-2 text-red-500 hover:bg-red-50 rounded-lg">
+                      <XCircle className="w-6 h-6" />
+                    </button>
+                  )}
+                  <button
+                    type="submit"
+                    className="bg-primary-600 hover:bg-primary-700 text-white p-2 rounded-xl disabled:bg-gray-300 transition-colors"
+                    disabled={isLoading || !inputQuery.trim()}
+                  >
+                    {isLoading ? <Loader2 className="w-6 h-6 animate-spin" /> : <Send className="w-6 h-6" />}
+                  </button>
+                </div>
+              </form>
+
+              {/* Cost budget picker — lives outside the chat form */}
+              <CostBudgetPicker
+                value={costBudget}
+                onChange={setCostBudget}
                 disabled={isLoading}
               />
-              <div className="flex gap-1 pb-1 pr-1">
-                {isLoading && (
-                  <button type="button" onClick={handleCancel} className="p-2 text-red-500 hover:bg-red-50 rounded-lg">
-                    <XCircle className="w-6 h-6" />
-                  </button>
-                )}
-                <button
-                  type="submit"
-                  className="bg-primary-600 hover:bg-primary-700 text-white p-2 rounded-xl disabled:bg-gray-300 transition-colors"
-                  disabled={isLoading || !inputQuery.trim()}
-                >
-                  {isLoading ? <Loader2 className="w-6 h-6 animate-spin" /> : <Send className="w-6 h-6" />}
-                </button>
-              </div>
-            </form>
+            </div>
             <p className="text-[10px] text-gray-400 text-center mt-3 uppercase tracking-widest">
               Carnot Research Engine • {sessionId ? `Session: ${sessionId.slice(0,8)}` : 'Ready'}
             </p>

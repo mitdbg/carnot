@@ -40,6 +40,7 @@ class Execution:
             indices: list[CarnotIndex] | None = None,
             llm_config: dict | None = None,
             progress_log_file: str | None = None,
+            cost_budget: float | None = None,
         ):
         self.query = query
         self.datasets = datasets
@@ -50,6 +51,7 @@ class Execution:
         self.indices = indices or []
         self.llm_config = llm_config or {}
         self.progress_log_file = progress_log_file
+        self.cost_budget = cost_budget
         self.planner_model_id = "openai/gpt-5-2025-08-07"
         self.api_key_name = "OPENAI_API_KEY"
         if "OPENAI_API_KEY" not in self.llm_config and "ANTHROPIC_API_KEY" in self.llm_config:
@@ -85,6 +87,7 @@ class Execution:
             self.query, 
             self.datasets, 
             conversation=self.conversation,
+            cost_budget=self.cost_budget,
         )
 
         # Phase 2: Translate the logical plan to natural language for the user
@@ -93,6 +96,7 @@ class Execution:
             logical_plan, 
             self.datasets,
             conversation=self.conversation,
+            cost_budget=self.cost_budget,
         )
 
         return nl_plan, logical_plan

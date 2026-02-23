@@ -689,7 +689,8 @@ class Planner(BaseAgent):
         self, 
         query: str, 
         datasets: list[Dataset], 
-        conversation: Conversation | None = None
+        conversation: Conversation | None = None,
+        cost_budget: float | None = None,
     ) -> dict:
         """
         Generate a logical execution plan as code.
@@ -703,10 +704,15 @@ class Planner(BaseAgent):
             query: The user's query to plan for.
             datasets: List of available datasets.
             conversation: Optional conversation context for multi-turn interactions.
+            cost_budget: Optional maximum dollar amount the user is willing to spend.
             
         Returns:
             A dict containing the logical plan structure.
         """
+        # TODO: Use cost_budget to inform query optimization decisions
+        # For now, we accept the parameter but do not use it
+        _ = cost_budget
+        
         # Update datasets if provided (also updates managed agent)
         if datasets:
             self._datasets = datasets
@@ -743,6 +749,7 @@ class Planner(BaseAgent):
         logical_plan: dict, 
         datasets: list[Dataset],
         conversation: Conversation | None = None,
+        cost_budget: float | None = None,
     ) -> str:
         """
         Translate a logical plan into a natural language description.
@@ -755,10 +762,15 @@ class Planner(BaseAgent):
             logical_plan: The logical plan dict to paraphrase.
             datasets: List of datasets referenced in the plan.
             conversation: Optional conversation context.
+            cost_budget: Optional maximum dollar amount the user is willing to spend.
             
         Returns:
             A natural language description of the logical plan.
         """
+        # TODO: Use cost_budget to inform paraphrase content (e.g., estimated costs)
+        # For now, we accept the parameter but do not use it
+        _ = cost_budget
+        
         # setup execution with phase-specific memory
         paraphrase_memory = self._setup_phase_execution(
             phase_type="paraphrase",
