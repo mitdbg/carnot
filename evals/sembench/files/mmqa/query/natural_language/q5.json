@@ -1,0 +1,5 @@
+{
+    "nl_question": "Who has played a role in all the following movies: 'Love Is the Drug', 'Crashing', 'Cloverfield', 'My Best Friend's Girl', 'Hot Tub Time Machine', 'The Last Rites of Ransom Pride', 'Save the Date', 'Bachelorette', '3, 2, 1... Frankie Go Boom', 'Queens of Country', 'Item 47', 'The Night Before', 'Now You See Me 2', 'Allied', 'Extinction', and 'Cobweb'?",
+    "modalities": ["text"],
+    "ground_truth": ["Lizzy Caplan"]
+}

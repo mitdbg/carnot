@@ -285,8 +285,8 @@ class Code(LogicalOperator):
             """
             Code Operator:
                 Description: Use a coding agent to perform computation over structured data based on a natural language task description.
-                Syntax: ds.code(task: str)
-                Example: ds.code(task="Compute the total revenue for each product category in the sales dataset.")
+                Syntax: ds.write_code(task: str)
+                Example: ds.write_code(task="Compute the total revenue for each product category in the sales dataset.")
             """
         )
 
@@ -455,7 +455,7 @@ class JoinOp(LogicalOperator):
             """
             Join Operator:
                 Description: Semantically joins two input sets based on a provided natural language condition.
-                Syntax: ds.sem_join(other_ds: LogicalDataset, condition: str)
+                Syntax: ds.sem_join(other_ds: Dataset, condition: str)
                 Example: ds.sem_join(other_ds=orders_ds, condition="customer_id matches id in the order PDF")
             """
         )
@@ -480,18 +480,24 @@ class JoinOp(LogicalOperator):
         return logical_op_params
 
 
-class LimitScan(LogicalOperator):
+class Limit(LogicalOperator):
     def __init__(self, limit: int, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.limit = limit
 
     @staticmethod
     def desc() -> str:
-        # TODO
-        return ""
+        return textwrap.dedent(
+            """
+            Limit Operator:
+                Description: return the first N records from the input set. Useful for limiting the number of records returned or for debugging.
+                Syntax: ds.limit(n: int)
+                Example: ds.limit(n=10)
+            """
+        )
 
     def __str__(self):
-        return f"LimitScan({str(self.input_schema)}, {str(self.output_schema)})"
+        return f"Limit({str(self.input_schema)}, {str(self.output_schema)})"
 
     def get_logical_id_params(self) -> dict:
         logical_id_params = super().get_logical_id_params()

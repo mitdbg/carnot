@@ -1,0 +1,18 @@
+[metadata]
+query_id = 1
+modalities = ["image", "tabular", "text", "audio", "video", "geospatial", "time-series"]
+required_operators = ["SEMANTIC_FILTER", "SEMANTIC_JOIN", "SEMANTIC_AGGREGATE", "SEMANTIC_RANKING", "SEMANTIC_MAP", "SEMANTIC_CLASSIFICATION", "WORLD_KNOWLEDGE"]
+description = ""
+
+
+[definition]
+# For systems that accept free-text queries
+natural_language = ""
+# Equivalent to the natural language query
+sql = ""
+
+# Traditional SQL query to compute the exact result on the non-omitted data.
+ground_truth = ""
+
+# Which accuracy metric to use for evaluation
+accuracy_metric = "f1-score"

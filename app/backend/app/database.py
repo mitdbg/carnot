@@ -1,7 +1,7 @@
 import os
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, Column, Float, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.dialects.postgresql import TIMESTAMP
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import declarative_base
@@ -70,6 +70,12 @@ class DatasetFile(Base):
 
     dataset_id = Column(Integer, ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False, primary_key=True)
     file_id = Column(Integer, ForeignKey("files.id", ondelete="CASCADE"), nullable=False, primary_key=True)
+    
+    # Add explicit indexes for faster COUNT queries and lookups
+    __table_args__ = (
+        Index('ix_dataset_files_dataset_id', 'dataset_id'),
+        Index('ix_dataset_files_file_id', 'file_id'),
+    )
 
 class Conversation(Base):
     __tablename__ = "conversations"
@@ -87,10 +93,12 @@ class Message(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     conversation_id = Column(Integer, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
-    role = Column(String, nullable=False)  # 'user', 'assistant', 'status', 'error', 'result'
+    role = Column(String, nullable=False)  # 'user', 'agent', 'status', 'error', 'result'
     content = Column(Text, nullable=False)
+    type = Column(String, nullable=True)  # Message type: 'natural-language-plan', 'logical-plan', etc.
     csv_file = Column(String, nullable=True)  # For result messages
     row_count = Column(Integer, nullable=True)  # For result messages
+    cost_budget = Column(Float, nullable=True)  # Maximum dollar amount user was willing to spend for this query
     created_at = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 # dependency to get database session

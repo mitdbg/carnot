@@ -192,6 +192,32 @@ jobs:
           echo "EC2_PUBLIC_IP=$ec2_public_ip" >> $GITHUB_ENV
 
       ######################################################################
+      # STEP 2.5 — SEED ORG-LEVEL DEFAULT API KEYS (if applicable)
+      ######################################################################
+
+      - name: Seed org-level default API keys
+        if: env.ENV_NAME == 'lm-prod' || env.ENV_NAME == 'at-prod'
+        run: |
+          SECRET_ID="carnot/${ENV_NAME}/__org_defaults__"
+
+          if [[ "${ENV_NAME}" == "lm-prod" ]]; then
+            OPENAI_API_KEY="${{ secrets.LM_PROD_OPENAI_API_KEY }}"
+          elif [[ "${ENV_NAME}" == "at-prod" ]]; then
+            OPENAI_API_KEY="${{ secrets.AT_PROD_OPENAI_API_KEY }}"
+          fi
+
+          SECRET_JSON=$(jq -n --arg key "$OPENAI_API_KEY" '{"openai_api_key": $key}')
+
+          aws secretsmanager create-secret \
+            --name "$SECRET_ID" \
+            --secret-string "$SECRET_JSON" \
+            --region us-east-1 2>/dev/null \
+          || aws secretsmanager put-secret-value \
+            --secret-id "$SECRET_ID" \
+            --secret-string "$SECRET_JSON" \
+            --region us-east-1
+
+      ######################################################################
       # STEP 3 — BUILD & DEPLOY APPLICATION
       ######################################################################
 

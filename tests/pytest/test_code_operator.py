@@ -1,14 +1,10 @@
-import os
-
 from carnot.data.dataset import Dataset
 from carnot.operators.code import CodeOperator
 
-TEST_MODEL_ID = "openai/gpt-5-mini"
-LLM_CONFIG = {"OPENAI_API_KEY": os.getenv("OPENAI_API_KEY")}
 
-def test_code_operator_no_inputs():
+def test_code_operator_no_inputs(test_model_id, llm_config):
     task = "what is 2 + 2?"
-    code_operator = CodeOperator(task, "output-dataset-id", TEST_MODEL_ID, LLM_CONFIG)
+    code_operator = CodeOperator(task, "output-dataset-id", test_model_id, llm_config)
     input_datasets = {}
     output_datasets = code_operator(input_datasets)
 
@@ -21,7 +17,7 @@ def test_code_operator_no_inputs():
     assert list(output_state.values())[0] == 4
 
 
-def test_code_operator_one_dataset(movie_reviews_data):
+def test_code_operator_one_dataset(test_model_id, llm_config, movie_reviews_data):
     movies_df, _ = movie_reviews_data
 
     # create movies dataset
@@ -36,7 +32,7 @@ def test_code_operator_one_dataset(movie_reviews_data):
     input_datasets = {"Movies Dataset": movies_dataset}
 
     # generate output
-    code_operator = CodeOperator(task, "output-dataset-id", TEST_MODEL_ID, LLM_CONFIG)
+    code_operator = CodeOperator(task, "output-dataset-id", test_model_id, llm_config)
     output_datasets = code_operator(input_datasets)
 
     assert len(output_datasets) == 2
@@ -47,7 +43,7 @@ def test_code_operator_one_dataset(movie_reviews_data):
     assert "mean girls" in output_movies
     assert "volver" not in output_movies
 
-def test_code_operator_two_datasets(movie_reviews_data):
+def test_code_operator_two_datasets(test_model_id, llm_config, movie_reviews_data):
     # load movie reviews data
     movies_df, reviews_df = movie_reviews_data
 
@@ -71,7 +67,7 @@ def test_code_operator_two_datasets(movie_reviews_data):
     input_datasets = {"Movies Dataset": movies_dataset, "Reviews Dataset": reviews_dataset}
 
     # generate output
-    code_operator = CodeOperator(task, "output-dataset-id", TEST_MODEL_ID, LLM_CONFIG)
+    code_operator = CodeOperator(task, "output-dataset-id", test_model_id, llm_config)
     output_datasets = code_operator(input_datasets)
 
     assert len(output_datasets) == 3

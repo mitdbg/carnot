@@ -1,0 +1,10 @@
+{
+    "nl_question": "Which movies are romances?",
+    "modalities": ["table"],
+    "ground_truth": [
+        "My Best Friend's Girl",
+        "Save the Date",
+        "Allied",
+        "The People We Hate at the Wedding"
+    ]
+}

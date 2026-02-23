@@ -1,0 +1,37 @@
+[metadata]
+query_id = 4
+modalities = ["image"]
+required_operators = ["SEMANTIC_MAP"]
+description = """
+Basic semantic map on image data.
+
+Simple query with a single semantic mapping operator that is relatively easy to evaluate.
+Used to test isolated performance of semantic map on image data.
+
+Pre-filter products for `baseColour IN ('Black', 'Blue', 'Red', 'White', 'Orange', 'Green')`
+to avoid overly specific color names, but do not instruct the model which colors are in
+the list of pre-filtered colors because this would be a semantic classification.
+"""
+
+
+[definition]
+# For systems that accept free-text queries
+natural_language = """
+For each product, extract the primary color of the depicted product.
+Return the product id and the primary color in a column titled 'category'.
+"""
+# Equivalent to the natural language query
+sql = """
+SELECT id, SEM_MAP('Extract the primary color of the product', image)
+FROM styles_details
+"""
+
+# Traditional SQL query to compute the exact result on the non-omitted data.
+ground_truth = """
+SELECT id, baseColour as category
+FROM read_parquet('styles_details.parquet')
+WHERE baseColour IN ('Black', 'Blue', 'Red', 'White', 'Orange', 'Green');
+"""
+
+# Which accuracy metric to use for evaluation
+accuracy_metric = "adjusted-rand-index"

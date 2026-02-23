@@ -1,0 +1,1 @@
+All Pairs of reviews that express the *opposite* sentiment (one is positive and the other is negative) for movie with id 'ant_man_and_the_wasp_quantumania'. Return id, reviewId from first review, reviewId from second review.

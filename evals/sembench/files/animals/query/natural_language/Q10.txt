@@ -1,0 +1,1 @@
+What is the city and station with most associated pictures showing zebras (ties are broken arbitrarily, only consider cities with at least one zebra picture)?

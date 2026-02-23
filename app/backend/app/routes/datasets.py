@@ -7,15 +7,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import get_current_user
 from app.database import Dataset, DatasetFile, get_db
 from app.database import File as FileRecord
+from app.env import IS_LOCAL_ENV
 from app.models.schemas import (
     DatasetCreate,
     DatasetDetailResponse,
     DatasetResponse,
     DatasetUpdate,
 )
-from app.services.file_service import virtualize_filepath
+from app.services.file_service import LocalFileService, S3FileService, virtualize_filepath
 
 router = APIRouter()
+file_service = LocalFileService() if IS_LOCAL_ENV else S3FileService()
 
 @router.get("/", response_model=list[DatasetResponse])
 async def list_datasets(user_id: str = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
@@ -82,9 +84,20 @@ async def create_dataset(
         db.add(db_dataset)
         await db.flush()
 
-        # Add files (expand directories if needed)
-        dataset_files = []
+        # Expand directories to individual files
+        expanded_files = set()
         for filepath in dataset.files:
+            if file_service.is_dir(filepath):
+                # Expand directory to all contained files
+                subfiles = file_service.list_all_subfiles(filepath)
+                expanded_files.update(subfiles)
+            elif file_service.exists(filepath):
+                expanded_files.add(filepath)
+            # Skip non-existent paths
+
+        # Add files to dataset
+        dataset_files = []
+        for filepath in expanded_files:
             # Get or create File record
             file_result = await db.execute(
                 select(FileRecord).where(FileRecord.file_path == filepath)

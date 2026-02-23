@@ -1,14 +1,15 @@
 import logging
 
-from carnot.data.dataset import Dataset
-from carnot.data.logical_dataset import LogicalDataset
+from carnot.conversation.conversation import Conversation
+from carnot.data.dataset import DataItem, Dataset
 from carnot.execution.execution import Execution
 
 # Initialize the root logger
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 __all__ = [
+    "Conversation",
     "Dataset",
-    "LogicalDataset",
+    "DataItem",
     "Execution",
 ]

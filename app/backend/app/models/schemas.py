@@ -22,6 +22,15 @@ class FileItem(BaseModel):
     size: int | None = None
     modified: datetime | None = None
 
+
+class PaginatedFileList(BaseModel):
+    """Paginated response for file browsing with large directories."""
+    items: list[FileItem]
+    next_token: str | None = None
+    total_count: int | None = None  # Only provided on first page if available
+    has_more: bool = False
+
+
 class FileBatchDelete(BaseModel):
     files: list[str]
 

@@ -1,12 +1,8 @@
-import os
-
 from carnot.data.dataset import Dataset
 from carnot.operators.sem_flat_map import SemFlatMapOperator
 
-TEST_MODEL_ID = "openai/gpt-5-mini"
-LLM_CONFIG = {"OPENAI_API_KEY": os.getenv("OPENAI_API_KEY")}
 
-def test_sem_flat_map_operator_basic():
+def test_sem_flat_map_operator_basic(test_model_id, llm_config):
     # construct dataset of various fruits
     fruit_data = [
         {"text": "Apple is a sweet red fruit. Banana is a long yellow fruit. Cherry is a small red fruit. Orange is a round orange fruit. Grape is a small purple fruit."},
@@ -26,7 +22,7 @@ def test_sem_flat_map_operator_basic():
     input_datasets = {fruit_dataset.name: fruit_dataset}
 
     # execute the operator
-    sem_flat_map_operator = SemFlatMapOperator(task, output_fields, "output-dataset-id", TEST_MODEL_ID, LLM_CONFIG, max_workers=4)
+    sem_flat_map_operator = SemFlatMapOperator(task, output_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
     output_datasets = sem_flat_map_operator("Fruit Dataset", input_datasets)
 
     # assert the output is as expected
@@ -44,7 +40,7 @@ def test_sem_flat_map_operator_basic():
     assert {"fruit": "grape", "color": "purple"} in output_dataset.items
 
 
-def test_sem_flat_map_operator_movie_reviews(research_papers_data):
+def test_sem_flat_map_operator_movie_reviews(test_model_id, llm_config, research_papers_data):
     # load movie reviews data
     papers = research_papers_data
 
@@ -65,7 +61,7 @@ def test_sem_flat_map_operator_movie_reviews(research_papers_data):
     input_datasets = {"Research Papers Dataset": papers_dataset}
 
     # generate output
-    sem_flat_map_operator = SemFlatMapOperator(task, output_fields, "output-dataset-id", TEST_MODEL_ID, LLM_CONFIG, max_workers=4)
+    sem_flat_map_operator = SemFlatMapOperator(task, output_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
     output_datasets = sem_flat_map_operator("Research Papers Dataset", input_datasets)
 
     assert len(output_datasets) == 2

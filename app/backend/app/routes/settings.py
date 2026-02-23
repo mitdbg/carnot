@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import get_current_user
 from app.database import UserSettings, get_db
 from app.env import IS_LOCAL_ENV
-from app.security import decrypt_value, encrypt_value, get_user_secrets, save_user_secrets
+from app.security import decrypt_value, encrypt_value, get_merged_secrets, get_user_secrets, save_user_secrets
 
 router = APIRouter()
 
@@ -67,19 +67,29 @@ async def get_settings(user_id: str = Depends(get_current_user), db: AsyncSessio
             "TOGETHER_API_KEY": decrypt_and_mask(user_settings.together_api_key),
         }
     else:
-        # fetch secrets from AWS Secrets Manager
-        secrets = await get_user_secrets(user_id)
+        # fetch org-level defaults and user-specific secrets (merged, user wins)
+        org_defaults, user_secrets, merged = await get_merged_secrets(user_id)
 
         def mask_key(plain_text):
             if not plain_text:
                 return ""
             return f"...{plain_text[-4:]}" if len(plain_text) > 4 else "******"
 
+        def source_for(key):
+            """Determine whether a key was set by the user or the organization."""
+            if key in user_secrets and user_secrets[key]:
+                return "user"
+            if key in org_defaults and org_defaults[key]:
+                return "organization"
+            return None
+
+        key_names = ["openai_api_key", "anthropic_api_key", "gemini_api_key", "together_api_key"]
+        display_names = ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "TOGETHER_API_KEY"]
+
         return {
-            "OPENAI_API_KEY": mask_key(secrets.get("openai_api_key")),
-            "ANTHROPIC_API_KEY": mask_key(secrets.get("anthropic_api_key")),
-            "GEMINI_API_KEY": mask_key(secrets.get("gemini_api_key")),
-            "TOGETHER_API_KEY": mask_key(secrets.get("together_api_key")),
+            **{dn: mask_key(merged.get(kn)) for kn, dn in zip(key_names, display_names, strict=True)},
+            "has_org_defaults": bool(org_defaults),
+            "key_sources": {dn: source_for(kn) for kn, dn in zip(key_names, display_names, strict=True)},
         }
 
 

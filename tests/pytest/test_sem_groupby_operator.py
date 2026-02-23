@@ -1,12 +1,8 @@
-import os
-
 from carnot.data.dataset import Dataset
 from carnot.operators.sem_groupby import SemGroupByOperator
 
-TEST_MODEL_ID = "openai/gpt-5-mini"
-LLM_CONFIG = {"OPENAI_API_KEY": os.getenv("OPENAI_API_KEY")}
 
-def test_sem_groupby_operator_sem_group_relational_agg():
+def test_sem_groupby_operator_sem_group_relational_agg(test_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [
         {"animal": animal}
@@ -25,7 +21,7 @@ def test_sem_groupby_operator_sem_group_relational_agg():
     input_datasets = {animal_dataset.name: animal_dataset}
 
     # execute the operator
-    sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, "output-dataset-id", TEST_MODEL_ID, LLM_CONFIG, max_workers=4)
+    sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
     output_datasets = sem_groupby_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
@@ -39,7 +35,7 @@ def test_sem_groupby_operator_sem_group_relational_agg():
     assert {"animal_group": "bird", "count": 1} in output_dataset.items
 
 
-def test_sem_groupby_operator_sem_group_sem_agg():
+def test_sem_groupby_operator_sem_group_sem_agg(test_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [
         {"animal": animal, "name": name, "weight": weight}
@@ -67,7 +63,7 @@ def test_sem_groupby_operator_sem_group_sem_agg():
     input_datasets = {animal_dataset.name: animal_dataset}
 
     # execute the operator
-    sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, "output-dataset-id", TEST_MODEL_ID, LLM_CONFIG, max_workers=4)
+    sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
     output_datasets = sem_groupby_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
@@ -81,7 +77,7 @@ def test_sem_groupby_operator_sem_group_sem_agg():
     assert {"animal_group": "bird", "count": 1, "heaviest_animal": "sam"} in output_dataset.items
 
 
-def test_sem_groupby_operator_relational_group_sem_agg():
+def test_sem_groupby_operator_relational_group_sem_agg(test_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [
         {"animal": animal, "name": name, "weight": weight}
@@ -108,7 +104,7 @@ def test_sem_groupby_operator_relational_group_sem_agg():
     input_datasets = {animal_dataset.name: animal_dataset}
 
     # execute the operator
-    sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, "output-dataset-id", TEST_MODEL_ID, LLM_CONFIG, max_workers=4)
+    sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
     output_datasets = sem_groupby_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
@@ -122,7 +118,7 @@ def test_sem_groupby_operator_relational_group_sem_agg():
     assert {"animal": "tucan", "heaviest_weight": 0.5} in output_dataset.items
 
 
-def test_sem_groupby_operator_relational_group_relational_agg():
+def test_sem_groupby_operator_relational_group_relational_agg(test_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [
         {"animal": animal, "name": name, "weight": weight}
@@ -149,7 +145,7 @@ def test_sem_groupby_operator_relational_group_relational_agg():
     input_datasets = {animal_dataset.name: animal_dataset}
 
     # execute the operator
-    sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, "output-dataset-id", TEST_MODEL_ID, LLM_CONFIG, max_workers=4)
+    sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
     output_datasets = sem_groupby_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
