@@ -130,6 +130,7 @@ class QueryExecutionStreamer:
             # await save_message(conversation_id, "user", self.query)
 
             await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Starting query execution...', 'session_id': session_id})}\n\n")
+            # TODO(Tianyu): why are we sleeping here (and everywhere else after an await)? This feels like bad code smell.
             await asyncio.sleep(0.1)
             await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Loading datasets...'})}\n\n")
             await asyncio.sleep(0.1)
@@ -288,14 +289,6 @@ class QueryExecutionStreamer:
             loop = asyncio.get_event_loop()
             items, answer = await loop.run_in_executor(None, run_query_with_capture)
 
-            # active_sessions[session_id]["context"] = compute_ctx
-
-            # plan_text = extract_plan_from_output(output)
-            # if plan_text:
-            #     await save_message(conversation_id, "plan", plan_text)
-            #     await self.queue.put(f"data: {json.dumps({'type': 'plan', 'message': plan_text, 'session_id': session_id})}\n\n")
-            #     await asyncio.sleep(0.1)
-
             await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Processing results...'})}\n\n")
             await asyncio.sleep(0.1)
 
@@ -382,37 +375,6 @@ class QueryExecutionStreamer:
             self.query_task.cancel()
             # Wait for tasks to finish cancelling to avoid resource leakage
             await asyncio.gather(self.heartbeat_task, self.query_task, return_exceptions=True)
-
-
-def extract_plan_from_output(output) -> str | None:
-    """Extract the CodeAgent planning steps from the DataRecordCollection."""
-    try:
-        data_records = getattr(output, "data_records", None)
-        if not data_records:
-            return None
-
-        seen: set[str] = set()
-        ordered_plans: list[str] = []
-
-        for record in data_records:
-            try:
-                context_obj = record["context"]
-            except Exception:
-                context_obj = None
-
-            plan_value = getattr(context_obj, "plan", None) if context_obj is not None else None
-            if isinstance(plan_value, str):
-                plan_str = plan_value.strip()
-                if plan_str and plan_str not in seen:
-                    ordered_plans.append(plan_str)
-                    seen.add(plan_str)
-
-        if ordered_plans:
-            return "\n\n".join(ordered_plans)
-    except Exception:
-        logger.debug("Failed to extract plan from output", exc_info=True)
-
-    return None
 
 
 class QueryRequest(BaseModel):

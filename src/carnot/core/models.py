@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
+# TODO(Tianyu): None of these seem used either?
 class GenerationStats(BaseModel):
     """
     Model for storing statistics about the execution of an operator on a single record.

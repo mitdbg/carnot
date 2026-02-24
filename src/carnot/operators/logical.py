@@ -139,6 +139,7 @@ class LogicalOperator:
         return int(self.logical_op_id, 16)
 
 
+# TODO(Tianyu): Nobody subclasses this?
 class Aggregate(LogicalOperator):
     """
     Aggregate is a logical operator that applies an aggregation to the input set and yields a single result.
@@ -233,45 +234,6 @@ class Aggregate(LogicalOperator):
         return logical_op_params
 
 
-class BaseScan(LogicalOperator):
-    """A BaseScan is a logical operator that represents a scan of a particular root Dataset."""
-
-    def __init__(self, datasource: Dataset, output_schema: type[BaseModel], *args, **kwargs):
-        super().__init__(*args, output_schema=output_schema, **kwargs)
-        self.datasource = datasource
-
-    @staticmethod
-    def desc() -> str:
-        # TODO
-        return ""
-
-    def __str__(self):
-        return f"BaseScan({self.datasource},{self.output_schema})"
-
-    def __eq__(self, other) -> bool:
-        return (
-            isinstance(other, BaseScan)
-            and self.input_schema == other.input_schema
-            and self.output_schema == other.output_schema
-            and self.datasource == other.datasource
-        )
-
-    def get_logical_id_params(self) -> dict:
-        logical_id_params = super().get_logical_id_params()
-        logical_id_params = {
-            "id": self.datasource.id,
-            **logical_id_params,
-        }
-
-        return logical_id_params
-
-    def get_logical_op_params(self) -> dict:
-        logical_op_params = super().get_logical_op_params()
-        logical_op_params = {"datasource": self.datasource, **logical_op_params}
-
-        return logical_op_params
-
-
 class Code(LogicalOperator):
     """A Code is a logical operator that represents a code operation on the input Dataset."""
 
@@ -349,45 +311,6 @@ class MapScan(LogicalOperator):
         logical_op_params = super().get_logical_op_params()
         logical_op_params = {
             "desc": self._desc,
-            **logical_op_params,
-        }
-
-        return logical_op_params
-
-
-class Distinct(LogicalOperator):
-    def __init__(self, distinct_cols: list[str] | None, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        # if distinct_cols is not None, check that all columns are in the input schema
-        if distinct_cols is not None:
-            for col in distinct_cols:
-                assert col in self.input_schema.model_fields, f"Column {col} not found in input schema {self.input_schema} for Distinct operator"
-
-        # store the list of distinct columns, sorted
-        self.distinct_cols = (
-            sorted([field_name for field_name in self.input_schema.model_fields])
-            if distinct_cols is None
-            else sorted(distinct_cols)
-        )
-
-    @staticmethod
-    def desc() -> str:
-        # TODO
-        return ""
-
-    def __str__(self):
-        return f"Distinct({self.distinct_cols})"
-
-    def get_logical_id_params(self) -> dict:
-        logical_id_params = super().get_logical_id_params()
-        logical_id_params = {"distinct_cols": self.distinct_cols, **logical_id_params}
-
-        return logical_id_params
-
-    def get_logical_op_params(self) -> dict:
-        logical_op_params = super().get_logical_op_params()
-        logical_op_params = {
-            "distinct_cols": self.distinct_cols,
             **logical_op_params,
         }
 
@@ -509,35 +432,6 @@ class Limit(LogicalOperator):
         logical_op_params = super().get_logical_op_params()
         logical_op_params = {
             "limit": self.limit,
-            **logical_op_params,
-        }
-
-        return logical_op_params
-
-
-class Project(LogicalOperator):
-    def __init__(self, project_cols: list[str], *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.project_cols = project_cols
-
-    @staticmethod
-    def desc() -> str:
-        # TODO
-        return ""
-
-    def __str__(self):
-        return f"Project({self.input_schema}, {self.project_cols})"
-
-    def get_logical_id_params(self) -> dict:
-        logical_id_params = super().get_logical_id_params()
-        logical_id_params = {"project_cols": self.project_cols, **logical_id_params}
-
-        return logical_id_params
-
-    def get_logical_op_params(self) -> dict:
-        logical_op_params = super().get_logical_op_params()
-        logical_op_params = {
-            "project_cols": self.project_cols,
             **logical_op_params,
         }
 
