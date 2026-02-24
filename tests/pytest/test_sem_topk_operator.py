@@ -81,7 +81,7 @@ def test_sem_topk_operator_with_index(test_embedding_model_id, llm_config, enron
         model_id=test_embedding_model_id,
         llm_config=llm_config,
         max_workers=4,
-        index_type="flat",
+        index_name="flat",
     )
     output_datasets = sem_topk_operator("Emails Dataset", input_datasets)
     assert len(output_datasets) == 2
