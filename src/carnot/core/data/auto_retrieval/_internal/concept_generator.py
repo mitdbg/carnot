@@ -1,10 +1,11 @@
 from __future__ import annotations
+
 import json
 import re
 import logging
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sentence_transformers import SentenceTransformer
 from sklearn.cluster import KMeans
@@ -15,250 +16,260 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_OUTPUT_DIR = Path("concept_generation_outputs")
 
-def _parse_concept_list(raw: str) -> List[str]:
-    """Parse a JSON array of strings; salvage common non-JSON formats."""
-    if not isinstance(raw, str):
-        return []
+ConceptTriple = Tuple[str, str, str]
 
-    raw = raw.strip()
-    if not raw:
-        return []
 
+# ── Text helpers ──────────────────────────────────────────────────────────────
+
+
+def _norm(text: str) -> str:
+    return " ".join(str(text).strip().split())
+
+
+def _canon(d: str, f: str, v: str) -> ConceptTriple:
+    return (_norm(d), _norm(f), _norm(v))
+
+
+def _key(t: ConceptTriple) -> ConceptTriple:
+    return (_norm(t[0]).lower(), _norm(t[1]).lower(), _norm(t[2]).lower())
+
+
+def _embed_text(t: ConceptTriple) -> str:
+    return " | ".join(_canon(*t))
+
+
+def _to_list(t: ConceptTriple) -> List[str]:
+    return list(_canon(*t))
+
+
+# ── Parsing helpers ───────────────────────────────────────────────────────────
+
+
+def _try_json(text: str) -> Any:
     try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
-            return parsed
+        return json.loads(text)
     except Exception:
-        pass
+        return None
 
+
+def _json_to_triples(parsed: Any) -> List[ConceptTriple]:
+    if not isinstance(parsed, list):
+        return []
+    triples: List[ConceptTriple] = []
+    for item in parsed:
+        if isinstance(item, list) and len(item) == 3:
+            triples.append(_canon(str(item[0]), str(item[1]), str(item[2])))
+        elif isinstance(item, dict):
+            lm = {str(k).strip().lower(): v for k, v in item.items()}
+            if {"domain", "facet", "value"} <= set(lm):
+                triples.append(
+                    _canon(str(lm["domain"]), str(lm["facet"]), str(lm["value"]))
+                )
+        elif isinstance(item, str):
+            triples.append(_canon("unknown", "unknown", item))
+    return triples
+
+
+def _parse_triples(raw: str) -> List[ConceptTriple]:
+    """Parse triples from strict JSON first, then salvage bullet/pipe formats."""
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    raw = raw.strip()
+
+    candidates = [raw]
     if "[" in raw and "]" in raw:
-        candidate = raw[raw.find("[") : raw.rfind("]") + 1]
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, list) and all(isinstance(x, str) for x in parsed):
-                return parsed
-        except Exception:
-            pass
+        candidates.append(raw[raw.find("[") : raw.rfind("]") + 1])
+    for c in candidates:
+        parsed = _try_json(c)
+        if parsed is not None:
+            result = _json_to_triples(parsed)
+            if result:
+                return result
 
-    numbered_pattern = r"\[\d+\]\s*[«\"]([^»\"]+)[»\"]"
-    matches = re.findall(numbered_pattern, raw)
-    if matches:
-        return [m.strip() for m in matches]
+    triples: List[ConceptTriple] = []
+    for line in raw.splitlines():
+        line = re.sub(r"^(?:[-*•]|\d+[.)])\s*", "", line.strip()).strip()
+        if "|" in line:
+            parts = [_norm(p) for p in line.split("|")]
+            if len(parts) == 3 and all(parts):
+                triples.append(_canon(*parts))
+    return triples or [_canon("unknown", "unknown", raw)]
 
-    return [raw]
 
+def _parse_batch(raw: str, queries: List[str]) -> Dict[str, List[ConceptTriple]]:
+    """Parse batched per-query output (JSON dict keyed by query, or aligned list)."""
+    result: Dict[str, List[ConceptTriple]] = {q: [] for q in queries}
+    if not isinstance(raw, str) or not raw.strip():
+        return result
 
-def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
-    """Case-insensitive dedupe preserving original order."""
-    seen = set()
-    result: List[str] = []
-    for item in items:
-        norm = item.strip().lower()
-        if not norm:
-            continue
-        if norm in seen:
-            continue
-        seen.add(norm)
-        result.append(item.strip())
+    parsed = _try_json(raw.strip())
+    if parsed is None:
+        for open_ch, close_ch in [("{", "}"), ("[", "]")]:
+            if open_ch in raw and close_ch in raw:
+                parsed = _try_json(raw[raw.find(open_ch) : raw.rfind(close_ch) + 1])
+                if parsed is not None:
+                    break
+    if parsed is None:
+        return result
+
+    if isinstance(parsed, dict):
+        for idx, q in enumerate(queries):
+            triples = _json_to_triples(parsed.get(q, []))
+            if not triples:
+                triples = _json_to_triples(parsed.get(str(idx), []))
+            result[q] = _dedupe(triples)
+    elif isinstance(parsed, list):
+        for idx, q in enumerate(queries):
+            if idx < len(parsed):
+                result[q] = _dedupe(_json_to_triples(parsed[idx]))
     return result
 
 
-class PerQueryConceptSignature(dspy.Signature):
+# ── Deduplication ─────────────────────────────────────────────────────────────
+
+
+def _dedupe(items: Iterable[ConceptTriple]) -> List[ConceptTriple]:
+    """Case-insensitive dedup preserving insertion order."""
+    seen: set = set()
+    out: List[ConceptTriple] = []
+    for t in items:
+        c = _canon(*t)
+        if not all(c):
+            continue
+        k = _key(c)
+        if k not in seen:
+            seen.add(k)
+            out.append(c)
+    return out
+
+
+def _dedupe_strings(items: Iterable[str]) -> List[str]:
+    seen: set = set()
+    out: List[str] = []
+    for s in items:
+        s = _norm(s)
+        if s and s.lower() not in seen:
+            seen.add(s.lower())
+            out.append(s)
+    return out
+
+
+# ── DSPy signatures & modules ────────────────────────────────────────────────
+
+
+class PerQueryConceptTripleSignature(dspy.Signature):
     """
     Generate mid-granularity concepts for a single query.
     """
     query = dspy.InputField(
         desc="Natural language search query."
     )
-    concepts = dspy.OutputField(
+    concept_triples = dspy.OutputField(
         desc=(
-            "Return ONLY a JSON array of strings (no prose before/after). "
-            "Each string is ONE self-contained, Boolean-friendly concept."
+            "Return ONLY a JSON array of triples: [domain, facet, value] (no prose before/after). "
+            "domain: entity type being searched (e.g., film, book, plant_taxon, biological_taxon, work). "
+            "facet: attribute dimension (e.g., genre, subject, location, language, time_period, taxonomy, audience, source). "
+            "value: short canonical noun phrase/entity for that facet."
         )
     )
 
 
-class PerQueryConceptModel(dspy.Module):
-    """
-    LLM wrapper that maps a single query → per-query concept list.
-    """
+class PerQueryConceptTripleModel(dspy.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self._predict = dspy.Predict(PerQueryConceptSignature)
+        self._predict = dspy.Predict(PerQueryConceptTripleSignature)
 
-        # Optional: built-in few-shot examples (generic, not dataset-specific).
         self._few_shot_examples = [
             dspy.Example(
-                query="Birds of Kolombangara or of the Western Province (Solomon Islands)",
-                concepts='['
-                         '"Birds of Kolombangara",'
-                         '"Birds on the New Georgia Islands group",'
-                         '"Birds of the Western Province (Solomon Islands)",'
-                         '"Birds of the Solomon Islands"'
-                         ']'
+                query="Non-fiction books about elections excluding Books about North America",
+                concept_triples='['
+                                '["book","genre","non-fiction"],'
+                                '["book","subject","elections"],'
+                                '["book","location","North America"]'
+                                ']'
             ).with_inputs("query"),
             dspy.Example(
-                query="Trees of South Africa that are also in the south-central Pacific",
-                concepts='['
-                         '"Trees of Africa",'
-                         '"Trees of South Africa",'
-                         '"Trees of the South-Central Pacific",'
-                         '"Trees in the Pacific",'
-                         '"Coastal trees"'
-                         ']'
+                query="Orchids of Myanmar but not Flora of India",
+                concept_triples='['
+                                '["plant_taxon","taxonomy","Orchidaceae"],'
+                                '["plant_taxon","location","Myanmar"],'
+                                '["work","source","Flora of India"]'
+                                ']'
             ).with_inputs("query"),
             dspy.Example(
-                query="2010s adventure films set in the Southwestern United States but not in California",
-                concepts='['
-                         '"Adventure films",'
-                         '"2010s films",'
-                         '"Films set in the Southwestern United States",'
-                         '"Films set in the United States",'
-                         '"Films set in California"'
-                         ']'
+                query="Canadian teen films that are not in the English language.",
+                concept_triples='['
+                                '["film","location","Canada"],'
+                                '["film","audience","teenagers"],'
+                                '["film","language","English"]'
+                                ']'
+            ).with_inputs("query"),
+            dspy.Example(
+                query="Prehistoric toothed whales not from the Miocene period",
+                concept_triples='['
+                                '["biological_taxon","taxonomy","Odontoceti"],'
+                                '["biological_taxon","time_period","prehistory"],'
+                                '["biological_taxon","time_period","Miocene"],'
+                                '["biological_taxon","subject","toothed whales"]'
+                                ']'
             ).with_inputs("query"),
         ]
 
-    def forward(self, query: str) -> List[str]:
-        """Run the LLM and return a parsed list of concepts."""
+    def forward(self, query: str) -> List[ConceptTriple]:
         result = self._predict(query=query, demos=self._few_shot_examples)
-        raw = getattr(result, "concepts", "") or ""
-        return _parse_concept_list(raw)
+        raw = getattr(result, "concept_triples", "") or ""
+        return _dedupe(_parse_triples(raw))
 
 
-class BatchFinalConceptSignature(dspy.Signature):
-    """
-    Directly generate final abstract concepts from a list of queries.
-    """
-    queries = dspy.InputField(
-        desc="A list of natural language queries."
+class BatchPerQueryConceptTripleSignature(dspy.Signature):
+    queries = dspy.InputField(desc="List of natural language queries.")
+    per_query_concepts = dspy.OutputField(
+        desc=(
+            "Return ONLY a JSON object keyed by the exact query string. "
+            "Each value must be a JSON array of triples [domain, facet, value]. "
+            "No prose before/after."
+        )
     )
-    final_concepts = dspy.OutputField(
-        desc="Return ONLY a JSON list of UNIQUE short noun phrases."
-    )
 
 
-class BatchFinalConceptModel(dspy.Module):
-    """
-    ONE-SHOT: list of queries → deduped list of final concepts.
-    """
+class BatchPerQueryConceptTripleModel(dspy.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self._predict = dspy.Predict(BatchFinalConceptSignature)
+        self._predict = dspy.Predict(BatchPerQueryConceptTripleSignature)
         self._few_shot_examples = [
             dspy.Example(
                 queries=[
-                    "Birds of Kolombangara or of the Western Province (Solomon Islands)",
-                    "Trees of South Africa that are also in the south-central Pacific",
-                    "2010s adventure films set in the Southwestern United States but not in California",
+                    "Non-fiction books about elections excluding Books about North America",
+                    "Orchids of Myanmar but not Flora of India",
+                    "Canadian teen films that are not in the English language.",
+                    "Prehistoric toothed whales not from the Miocene period",
                 ],
-                final_concepts=[
-                    "bird location",
-                    "plant location",
-                    "film genre",
-                    "film decade",
-                    "film location",
-                ],
+                per_query_concepts='{"Non-fiction books about elections excluding Books about North America":[["book","genre","non-fiction"],["book","subject","elections"],["book","location","North America"]],"Orchids of Myanmar but not Flora of India":[["plant_taxon","taxonomy","Orchidaceae"],["plant_taxon","location","Myanmar"],["work","source","Flora of India"]],"Canadian teen films that are not in the English language.":[["film","location","Canada"],["film","audience","teenagers"],["film","language","English"]],"Prehistoric toothed whales not from the Miocene period":[["biological_taxon","taxonomy","Odontoceti"],["biological_taxon","time_period","prehistory"],["biological_taxon","time_period","Miocene"],["biological_taxon","subject","toothed whales"]]}',
             ).with_inputs("queries"),
         ]
 
-    def forward(self, queries: List[str]) -> List[str]:
-        """Run the LLM and return a parsed, deduped list of final concepts."""
+    def forward(self, queries: List[str]) -> Dict[str, List[ConceptTriple]]:
         result = self._predict(queries=queries, demos=self._few_shot_examples)
-        raw = getattr(result, "final_concepts", "") or ""
-        parsed = _parse_concept_list(raw)
-        return _dedupe_preserve_order(parsed)
+        raw = getattr(result, "per_query_concepts", "") or ""
+        return _parse_batch(raw, queries)
 
 
-class ClusterCentroidSignature(dspy.Signature):
-    concepts = dspy.InputField(
-        desc="A list of mid-granularity concept strings that belong to ONE cluster."
-    )
-    centroid = dspy.OutputField(
-        desc=(
-            "Return EXACTLY ONE short noun phrase of the form '<subject> <facet>'. "
-            "The subject is a generic singular noun. "
-            "The facet is the dominant *attribute type* expressed by the cluster "
-            "(e.g., location, nationality, habitat, genre, tear). "
-            "Do NOT output specific entities/places/years. "
-            "Do NOT output a bare topic like 'fish' or 'criminal films'. "
-            "Do NOT combine facets (no 'and', no commas)."
-        )
-    )
-
-
-class ClusterCentroidModel(dspy.Module):
-    """
-    LLM wrapper: cluster of concepts → centroid label.
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._predict = dspy.Predict(ClusterCentroidSignature)
-        self._few_shot_examples = [
-            dspy.Example(
-                concepts=[
-                    "Birds of the Pacific Islands",
-                    "Birds of North America",
-                    "Birds found in Central Africa",
-                ],
-                centroid="bird location",
-            ).with_inputs("concepts"),
-            dspy.Example(
-                concepts=[
-                    "Horror films",
-                    "Historical films",
-                    "Films set in the future",
-                    "Black-and-white films",
-                ],
-                centroid="film genre",
-            ).with_inputs("concepts"),
-            dspy.Example(
-                concepts=[
-                    "1990s films",
-                    "Early 1960s films",
-                    "Late 1990s films",
-                ],
-                centroid="film decade",
-            ).with_inputs("concepts"),
-            dspy.Example(
-                concepts=[
-                    "2002 films",
-                    "films released in 2024",
-                    "films shot in 1999",
-                ],
-                centroid="film year",
-            ).with_inputs("concepts"),
-            dspy.Example(
-                concepts=[
-                    "Flowers of the Crozet Islands",
-                    "Trees of the Marshall Islands",
-                    "Trees of the Line Islands",
-                ],
-                centroid="plant location",
-            ).with_inputs("concepts"),
-        ]
-
-    def forward(self, concepts: List[str]) -> str:
-        """Run the LLM and return a centroid label."""
-        concepts_str = "\n".join(f"- {c}" for c in concepts)
-        result = self._predict(concepts=concepts_str, demos=self._few_shot_examples)
-        centroid = (getattr(result, "centroid", "") or "").strip()
-        return centroid
+# ── Generator ─────────────────────────────────────────────────────────────────
 
 
 class ConceptGenerationMode(Enum):
     TWO_STAGE = "two_stage"
-    DIRECT = "direct"
 
 
 class LLMConceptGenerator:
     """
-    Minimal concept-generation API with exactly two paths:
-    - DIRECT: queries -> final concepts
-    - TWO_STAGE: per-query concepts -> clustering -> centroid labels
+    Concept-generation pipeline:
+      1. LLM extracts per-query (domain, facet, value) triples.
+      2. Global dedup with query provenance tracking.
+      3. Group by *domain*, cluster within each group.
+      4. Final concepts = unique domain strings (+ optional refined centroids).
     """
 
     def __init__(self, config: Any) -> None:
@@ -270,182 +281,201 @@ class LLMConceptGenerator:
         except ValueError:
             self.mode = ConceptGenerationMode.TWO_STAGE
 
-        self.n_clusters = getattr(config, "concept_cluster_count", 50)
+        self.n_clusters = getattr(config, "concept_cluster_count", 3)
+        self.min_cluster_size = int(getattr(config, "concept_min_cluster_size", 3) or 3)
+        self.per_query_batch_size = int(getattr(config, "concept_per_query_batch_size", 16) or 16)
+        self.enable_refined_centroids = bool(getattr(config, "concept_enable_refined_centroids", False))
         self.embedding_model_name = getattr(config, "concept_embedding_model", "all-MiniLM-L6-v2")
 
-        self._per_query_model = PerQueryConceptModel()
-        self._batch_final_model = BatchFinalConceptModel()
-        self._centroid_model = ClusterCentroidModel()
-
+        self._per_query_model = PerQueryConceptTripleModel()
+        self._batch_model = BatchPerQueryConceptTripleModel()
         self._concept_vocabulary: List[str] = []
 
-    def fit(
-        self,
-        queries: Iterable[str],
-        *,
-        output_dir: Optional[str | Path] = None,
-    ) -> None:
+    # ── public API ──
+
+    def fit(self, queries: Iterable[str], *, output_dir: Optional[str | Path] = None) -> None:
         queries_list = list(queries)
-        logger.info(
-            f"LLMConceptGenerator: fitting on {len(queries_list)} queries (mode={self.mode})."
-        )
+        logger.info(f"Fitting on {len(queries_list)} queries (mode={self.mode}).")
 
         if not queries_list:
             self._concept_vocabulary = []
             return
 
-        if self.mode is ConceptGenerationMode.TWO_STAGE:
-            concepts, artifacts = self._fit_two_stage(queries_list)
-        else:
-            concepts, artifacts = self._fit_direct(queries_list)
-
+        concepts, file_map = self._fit_two_stage(queries_list)
         self._concept_vocabulary = concepts
-        logger.info(f"LLMConceptGenerator: learned {len(concepts)} concepts.")
+        logger.info(f"Learned {len(concepts)} concepts.")
 
-        if output_dir is None:
-            output_dir = (
-                getattr(self.config, "concept_generation_output_dir", None)
-                or getattr(self.config, "concept_output_dir", None)
-                or DEFAULT_OUTPUT_DIR
-            )
-        self._persist(output_dir=output_dir, artifacts=artifacts)
+        out = Path(
+            output_dir
+            or getattr(self.config, "concept_generation_output_dir", None)
+            or getattr(self.config, "concept_output_dir", None)
+            or DEFAULT_OUTPUT_DIR
+        )
+        self._save(out, file_map)
 
-    def _persist(self, *, output_dir: str | Path, artifacts: Mapping[str, Any]) -> None:
-        out_dir = Path(output_dir)
+    # ── persistence ──
+
+    def _save(self, out_dir: Path, file_map: Dict[str, Any]) -> None:
+        """Write each key in *file_map* as a separate ``<key>.json`` file."""
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / "concept_generation_artifacts.json"
-        try:
-            # Keep insertion order for readability (e.g., clusters in numeric order).
-            out_path.write_text(json.dumps(artifacts, indent=2, sort_keys=False))
-        except Exception as e:
-            logger.warning(f"Failed to write concept generation artifacts to {out_path}: {e}")
+        for name, data in file_map.items():
+            path = out_dir / f"{name}.json"
+            try:
+                path.write_text(json.dumps(data, indent=2, sort_keys=False))
+                logger.info(f"Wrote {path}")
+            except Exception as e:
+                logger.warning(f"Failed to write {path}: {e}")
+
+    # ── clustering ──
+
+    def _target_n_clusters(self, group_size: int) -> int:
+        if group_size < self.min_cluster_size:
+            return 1
+        target = max(1, group_size // max(1, self.min_cluster_size))
+        return max(1, min(int(self.n_clusters), target, group_size))
+
+    def _cluster_triples(
+        self,
+        triples: List[ConceptTriple],
+        embedding_model: Optional[SentenceTransformer],
+    ) -> Dict[str, Any]:
+        if not triples:
+            return {"members": [], "n_clusters": 0, "clusters": {}}
+
+        triples = sorted(triples, key=_key)
+        n = len(triples)
+        n_clusters = self._target_n_clusters(n)
+
+        if n_clusters <= 1 or embedding_model is None:
+            labels = [0] * n
+            n_clusters = 1
+            kmeans, embeddings = None, None
+        else:
+            texts = [_embed_text(t) for t in triples]
+            embeddings = embedding_model.encode(texts, show_progress_bar=False)
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            labels = [int(x) for x in kmeans.fit_predict(embeddings)]
+
+        buckets: Dict[int, List[int]] = {}
+        for idx, lbl in enumerate(labels):
+            buckets.setdefault(lbl, []).append(idx)
+
+        clusters: Dict[str, Any] = {}
+        for cid in sorted(buckets):
+            members = [triples[i] for i in buckets[cid]]
+            entry: Dict[str, Any] = {"members": [_to_list(t) for t in members]}
+            if self.enable_refined_centroids:
+                if kmeans is not None and embeddings is not None:
+                    center = kmeans.cluster_centers_[cid]
+                    best = min(
+                        buckets[cid],
+                        key=lambda i: float(((embeddings[i] - center) ** 2).sum()),
+                    )
+                    entry["centroid_value"] = _norm(triples[best][2])
+                else:
+                    entry["centroid_value"] = _norm(members[0][2])
+            clusters[str(cid)] = entry
+
+        return {
+            "members": [_to_list(t) for t in triples],
+            "n_clusters": n_clusters,
+            "clusters": clusters,
+        }
+
+    # ── two-stage pipeline ──
 
     def _fit_two_stage(self, queries: List[str]) -> tuple[List[str], Dict[str, Any]]:
-        """
-        TWO-STAGE STRATEGY:
-        1. LLM generates per-query intermediate concepts.
-        2. Concepts are embedded and clustered.
-        3. LLM generates a centroid (final concept) for each cluster.
-        """
-        artifacts: Dict[str, Any] = {
-            "mode": ConceptGenerationMode.TWO_STAGE.value,
-            "n_clusters": int(self.n_clusters),
-            "embedding_model_name": self.embedding_model_name,
+        # ── Stage 1: per-query extraction via LLM ──
+        per_query: Dict[str, List[ConceptTriple]] = {}
+        batch_size = max(1, self.per_query_batch_size)
+
+        for start in tqdm(range(0, len(queries), batch_size), desc="per-query triples"):
+            batch = queries[start : start + batch_size]
+            batch_result = self._batch_model(batch)
+            batch_ok = any(batch_result.get(q) for q in batch)
+            for q in batch:
+                triples = _dedupe(batch_result.get(q, []))
+                if not batch_ok and not triples:
+                    triples = _dedupe(self._per_query_model(q))
+                per_query[q] = triples
+
+        # ── Stage 2: global dedup + query provenance ──
+        key_to_triple: Dict[ConceptTriple, ConceptTriple] = {}
+        key_to_queries: Dict[ConceptTriple, List[str]] = {}
+
+        for q, triples in per_query.items():
+            for t in triples:
+                k = _key(t)
+                if k not in key_to_triple:
+                    key_to_triple[k] = _canon(*t)
+                    key_to_queries[k] = []
+                if q not in key_to_queries[k]:
+                    key_to_queries[k].append(q)
+
+        sorted_keys = sorted(key_to_triple)
+        unique_triples = [key_to_triple[k] for k in sorted_keys]
+        logger.info(f"Generated {len(unique_triples)} unique triples.")
+
+        num_unique = len(unique_triples)
+
+        facet_freq: Dict[str, int] = {}
+        for t in unique_triples:
+            pair = f"{_norm(t[0])}|{_norm(t[1])}"
+            facet_freq[pair] = facet_freq.get(pair, 0) + 1
+        facet_freq = dict(sorted(facet_freq.items(), key=lambda kv: (-kv[1], kv[0])))
+
+        per_query_json: Dict[str, Any] = {
+            "num_unique_triples": num_unique,
+            "facet_frequencies": facet_freq,
+            "queries": {q: [_to_list(t) for t in ts] for q, ts in per_query.items()},
         }
 
-        all_concepts: List[str] = []
-        per_query: Dict[str, List[str]] = {}
-        for query in tqdm(queries, desc="two_stage per-query"):
-            per_query_concepts = self._per_query_model(query)
-            per_query[query] = list(per_query_concepts)
-            all_concepts.extend(per_query_concepts)
+        if not unique_triples:
+            return [], {
+                "per_query_concepts": per_query_json,
+                "domain_clusters": {"total_clusters": 0, "domains": {}},
+            }
 
-        all_concepts = _dedupe_preserve_order(all_concepts)
-        logger.info(f"LLMConceptGenerator: generated {len(all_concepts)} intermediate concepts.")
-        if not all_concepts:
-            artifacts["per_query_concepts"] = per_query
-            artifacts["intermediate_concepts"] = []
-            artifacts["clusters"] = {}
-            artifacts["final_concepts"] = []
-            return [], artifacts
+        # ── Stage 3: group by domain, cluster within each group ──
+        domain_groups: Dict[str, List[ConceptTriple]] = {}
+        for t in unique_triples:
+            domain_groups.setdefault(_norm(t[0]), []).append(t)
 
-        model = SentenceTransformer(self.embedding_model_name)
-        embeddings = model.encode(all_concepts, show_progress_bar=False)
+        sorted_domains = sorted(domain_groups)
+        embedding_model: Optional[SentenceTransformer] = None
+        if any(len(ts) >= self.min_cluster_size for ts in domain_groups.values()):
+            embedding_model = SentenceTransformer(self.embedding_model_name)
 
-        n_clusters = min(self.n_clusters, len(all_concepts))
-        logger.info(f"LLMConceptGenerator: clustering into {n_clusters} clusters.")
-        if n_clusters <= 0:
-            artifacts["per_query_concepts"] = per_query
-            artifacts["intermediate_concepts"] = all_concepts
-            artifacts["clusters"] = {}
-            artifacts["final_concepts"] = []
-            return [], artifacts
+        domains_json: Dict[str, Any] = {}
+        total_clusters = 0
+        refined_concepts: List[str] = []
+        for domain in tqdm(sorted_domains, desc="domain clustering"):
+            cluster_result = self._cluster_triples(domain_groups[domain], embedding_model)
+            total_clusters += cluster_result["n_clusters"]
+            for cid, cdata in cluster_result["clusters"].items():
+                cdata["num_members"] = len(cdata["members"])
+                if self.enable_refined_centroids:
+                    cv = cdata.get("centroid_value")
+                    if cv:
+                        refined_concepts.append(f"{domain} | {cv}")
+            domains_json[domain] = cluster_result
 
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        labels = kmeans.fit_predict(embeddings)
+        base_concepts = list(sorted_domains)
+        final_concepts = _dedupe_strings(base_concepts + refined_concepts)
 
-        clusters: Mapping[int, List[str]] = {}
-        for concept, label in zip(all_concepts, labels):
-            clusters.setdefault(int(label), []).append(concept)  # type: ignore[attr-defined]
-
-        cluster_ids = sorted(clusters.keys())
-        cluster_centroids: Dict[str, str] = {}
-        centroids_in_cluster_order: List[str] = []
-        for cluster_id in tqdm(cluster_ids, desc="two_stage centroids"):
-            members = clusters[cluster_id]
-            if not members:
-                continue
-            centroid = self._centroid_model(members)
-            if centroid:
-                cluster_centroids[str(cluster_id)] = centroid
-                centroids_in_cluster_order.append(centroid)
-
-        final_concepts = _dedupe_preserve_order(centroids_in_cluster_order)
-
-        artifacts["per_query_concepts"] = per_query
-        artifacts["intermediate_concepts"] = all_concepts
-        # Preserve numeric ordering for cluster ids in the JSON file.
-        artifacts["clusters"] = {str(k): clusters[k] for k in cluster_ids}
-        artifacts["cluster_centroids"] = cluster_centroids
-        artifacts["final_concepts"] = final_concepts
-        return final_concepts, artifacts
-
-    def _fit_direct(self, queries: List[str]) -> tuple[List[str], Dict[str, Any]]:
-        """
-        DIRECT STRATEGY:
-        Generate final concepts in batches and globally dedupe.
-        """
-        batch_size = int(getattr(self.config, "concept_direct_batch_size", 100) or 0)
-
-        global_seen: set[str] = set()
-        global_concepts: List[str] = []
-        batch_results: List[Dict[str, Any]] = []
-
-        n = len(queries)
-        if batch_size <= 0:
-            batch_size = n
-        num_batches = (n + batch_size - 1) // batch_size if batch_size else 0
-
-        for batch_idx in tqdm(range(num_batches), desc="direct batches"):
-            start_idx = batch_idx * batch_size
-            end_idx = min(start_idx + batch_size, n)
-            batch_queries = queries[start_idx:end_idx]
-
-            tqdm.write(f"direct batch {batch_idx + 1}/{num_batches}: queries[{start_idx}:{end_idx}]")
-            batch_concepts = self._batch_final_model(batch_queries)
-
-            new_concepts: List[str] = []
-            for concept in batch_concepts:
-                norm = concept.strip().lower()
-                if not norm:
-                    continue
-                if norm in global_seen:
-                    continue
-                global_seen.add(norm)
-                kept = concept.strip()
-                global_concepts.append(kept)
-                new_concepts.append(kept)
-
-            batch_results.append(
-                {
-                    "batch_idx": batch_idx,
-                    "raw_concepts": batch_concepts,
-                    "new_concepts": new_concepts,
-                    "num_new_concepts": len(new_concepts),
-                }
-            )
-
-        artifacts: Dict[str, Any] = {
-            "mode": ConceptGenerationMode.DIRECT.value,
-            "batch_size": batch_size,
-            "num_batches": num_batches,
-            "batches": batch_results,
-            "final_concepts": global_concepts,
+        domain_clusters_json: Dict[str, Any] = {
+            "total_clusters": total_clusters,
+            "domains": domains_json,
         }
-        return global_concepts, artifacts
+
+        return final_concepts, {
+            "per_query_concepts": per_query_json,
+            "domain_clusters": domain_clusters_json,
+        }
 
 
-# Example usage:
+# ── Example usage ─────────────────────────────────────────────────────────────
+
 if __name__ == "__main__":
     import os
     import requests
@@ -455,31 +485,18 @@ if __name__ == "__main__":
     lines = requests.get(url).content.decode("utf-8").strip().split("\n")
     queries = [json.loads(line).get("query", "") for line in lines if line.strip()]
     queries = [q for q in queries if q]
-    print(f"✅ Queries downloaded, {len(queries)} queries found")
-    
+    print(f"Queries downloaded, {len(queries)} queries found")
+
     api_key = os.environ.get("OPENAI_API_KEY", "")
     lm = dspy.LM("openai/gpt-5.1", temperature=1.0, max_tokens=16000, api_key=api_key)
     dspy.configure(lm=lm)
 
     class _Cfg:
-        pass
-    
-    
-    cfg_direct = _Cfg()
-    cfg_direct.concept_generation_mode = ConceptGenerationMode.DIRECT.value
-    cfg_direct.concept_direct_batch_size = 100
+        concept_generation_mode = ConceptGenerationMode.TWO_STAGE.value
+        concept_cluster_count = 3
+        concept_per_query_batch_size = 20
+        concept_embedding_model = "all-MiniLM-L6-v2"
 
-    cfg_two_stage = _Cfg()
-    cfg_two_stage.concept_generation_mode = ConceptGenerationMode.TWO_STAGE.value
-    cfg_two_stage.concept_cluster_count = 50
-    cfg_two_stage.concept_embedding_model = "all-MiniLM-L6-v2"
-
-    # print("Fitting DIRECT model...")
-    # LLMConceptGenerator(cfg_direct).fit(queries, output_dir="results/quest_concepts/direct")
-    # print("✅ DIRECT model fitted")
-    
-    print("[DEFAULT] Fitting TWO_STAGE model...")
-    LLMConceptGenerator(cfg_two_stage).fit(queries, output_dir="results/quest_concepts/two_stage")
-    print("[DEFAULT] ✅ TWO_STAGE model fitted")
-    
-    print("[DEFAULT] Wrote TWO_STAGE artifacts to results/quest_concepts/two_stage/concept_generation_artifacts.json")
+    print("Fitting TWO_STAGE model...")
+    LLMConceptGenerator(_Cfg()).fit(queries, output_dir="results/quest_concepts/two_stage")
+    print("Done — wrote per_query_concepts.json, domain_clusters.json")
