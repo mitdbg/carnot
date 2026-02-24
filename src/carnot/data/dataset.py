@@ -293,7 +293,7 @@ class Dataset:
         """
         Apply a semantic top-k operation with the given search string and k value.
         Use index_name to specify which index to use when the dataset has multiple indices
-        (e.g., 'flat', 'hierarchical', 'chroma'). If None, the first available index is used.
+        (e.g., 'flat', 'hierarchical', 'chroma').
         """
         top_k_name = f"TopKOperation{self.id_params['sem_topk_id'] + 1}"
         self.id_params["sem_topk_id"] += 1
