@@ -1,7 +1,12 @@
 import os
+from pathlib import Path
 
 import pandas as pd
 import pytest
+
+from carnot.data.dataset import Dataset
+from carnot.data.item import DataItem
+from carnot.index import FlatCarnotIndex, HierarchicalCarnotIndex
 
 
 @pytest.fixture
@@ -31,6 +36,7 @@ def research_papers_data():
 
     return papers
 
+
 @pytest.fixture
 def enron_emails_data():
     emails = []
@@ -44,10 +50,6 @@ def enron_emails_data():
 @pytest.fixture
 def enron_data_items():
     """DataItems with paths to Enron email files (for Flat/Hierarchical indices)."""
-    from pathlib import Path
-
-    from carnot.data.item import DataItem
-
     enron_dir = Path(__file__).resolve().parent.parent / "data" / "emails"
     if not enron_dir.exists():
         pytest.skip(f"Enron data dir not found: {enron_dir}")
@@ -63,9 +65,6 @@ def enron_data_items_small(enron_data_items):
 @pytest.fixture
 def small_enron_dataset_with_index(llm_config, enron_data_items_small):
     """Dataset with pre-built Flat index for E2E index-aware planning tests."""
-    from carnot.data.dataset import Dataset
-    from carnot.index import FlatCarnotIndex
-
     flat_index = FlatCarnotIndex(
         name="enron-flat",
         items=enron_data_items_small,
@@ -102,9 +101,6 @@ def enron_dataset_with_flat_index(llm_config, enron_data_items):
 @pytest.fixture
 def enron_dataset_with_hierarchical_index(llm_config, enron_data_items):
     """Dataset with pre-built Flat index for E2E index-aware planning tests."""
-    from carnot.data.dataset import Dataset
-    from carnot.index import HierarchicalCarnotIndex
-
     hierarchical_index = HierarchicalCarnotIndex(
         name="enron-hierarchical",
         items=enron_data_items,
