@@ -32,7 +32,7 @@ class Dataset:
         self.name = name
         self.annotation = annotation
         self.items = items or []
-        self._indices = dict(indices) if indices else {}
+        self.indices = dict(indices) if indices else {}
         self.code = code
         self.code_state = code_state or {}
         self.parents = parents or []
@@ -64,7 +64,7 @@ class Dataset:
     def format_description(self, code_block_tags: list[str]) -> str:
         code_str = " None" if self.code is None else f"\n{code_block_tags[0]}\n{self.code}\n{code_block_tags[1]}"
         index_info = "yes" if self.has_index() else "no"
-        if self._indices:
+        if self.indices:
             index_info += f" ({', '.join(self.list_indices())})"
         return textwrap.dedent(
             f"Dataset Name: {self.name}\n"
@@ -77,16 +77,25 @@ class Dataset:
 
     def has_index(self) -> bool:
         """Return True if any index exists, or if the specified index exists."""
-        return bool(self._indices)
+        return bool(self.indices)
 
     def list_indices(self) -> list[str]:
         """Return names of available indices (e.g., 'flat', 'hierarchical', 'chroma')."""
-        return list(self._indices.keys())
+        return list(self.indices.keys())
 
-    def get_index_types_string(self) -> str:
-        """Return the index type string for the given or default index."""
-        return [index.get_index_type_string() for index in self._indices.values()]
+    def get_indices_info(self) -> list[dict]:
+        """Return info about available indices, including name, type, and the index class description."""
+        return [
+            {"index_name": name, "index_type": index.get_index_type_string(), "description": index.description}
+            for name, index in self.indices.items()
+        ]
 
+    def get_index_type_string(self, index_name: str) -> str:
+        """Return the type string for a given index name."""
+        index = self.indices.get(index_name)
+        if index is None:
+            raise ValueError(f"Index '{index_name}' not found in dataset '{self.name}'")
+        return index.get_index_type_string()
 
     def __iter__(self) -> Iterator[DataItem]:
         return iter(self.items)

@@ -34,6 +34,8 @@ INDEX_BATCH_SIZE = 1000
 
 
 class CarnotIndex(ABC):
+    description: str = "Base CarnotIndex class. Not meant to be used directly."
+
     def __init__(self, name: str, items: list):
         self.name = name
         self.items = items
@@ -48,16 +50,15 @@ class CarnotIndex(ABC):
         pass
 
     @abstractmethod
-    def get_index_type_string(self) -> str:
-        pass
-
-    @abstractmethod
     def _get_or_create_index(self):
         pass
 
     @abstractmethod
     def search(self, query: str, k: int) -> list:
         pass
+
+    def get_index_type_string(self) -> str:
+        return self.__class__.__name__
 
 
 class HierarchicalCarnotIndex(CarnotIndex):
@@ -99,9 +100,6 @@ class HierarchicalCarnotIndex(CarnotIndex):
         if self._hierarchical is None:
             self._get_or_create_index()
         return self._hierarchical
-
-    def get_index_type_string(self) -> str:
-        return "HierarchicalCarnotIndex"
 
     def _get_or_create_index(self) -> HierarchicalFileIndex | None:
         if self._hierarchical is not None:
@@ -159,7 +157,7 @@ class FlatCarnotIndex(CarnotIndex):
         self,
         name: str,
         items: list,
-        flat_index: "FlatFileIndex | None" = None,
+        flat_index: FlatFileIndex | None = None,
         config=None,
         api_key: str | None = None,
         use_persistence: bool = True,
@@ -185,9 +183,6 @@ class FlatCarnotIndex(CarnotIndex):
         if self._flat is None:
             self._get_or_create_index()
         return self._flat
-
-    def get_index_type_string(self) -> str:
-        return "FlatCarnotIndex"
 
     def _get_or_create_index(self) -> FlatFileIndex | None:
         if self._flat is not None:
@@ -248,9 +243,6 @@ class ChromaIndex(CarnotIndex):
         if self._chroma is None:
             self._get_or_create_index()
         return self._chroma
-
-    def get_index_type_string(self) -> str:
-        return "ChromaIndex"
 
     def _get_or_create_index(self):
         # retrieve the location of the chroma database
@@ -329,9 +321,6 @@ class FaissIndex(CarnotIndex):
             self._get_or_create_index()
         return self._faiss
 
-    def get_index_type_string(self) -> str:
-        return "FaissIndex"
-
     def _get_or_create_index(self):
         # retrieve the location of the vector database
         home_directory = Path.home() / ".carnot" if os.getenv("CARNOT_HOME") is None else Path(os.getenv("CARNOT_HOME"))
@@ -373,9 +362,6 @@ class FaissIndex(CarnotIndex):
 class SemanticIndex(CarnotIndex):
     def get_index(self) -> SemanticIndex:
         return self
-
-    def get_index_type_string(self) -> str:
-        return "SemanticIndex"
 
     def search(self, query: str, k: int) -> list:
         return self.items[:k]
