@@ -135,11 +135,11 @@ The summary should be rich enough to enable accurate routing when users search f
 Summary:"""
         
         # Choose model
-        model_id = "openai/gpt-4o-mini"
+        model_id = "openai/gpt-5-mini-2025-08-07"
         if os.getenv("ANTHROPIC_API_KEY"):
-            model_id = "anthropic/claude-3-5-sonnet-20241022"
+            model_id = "anthropic/claude-sonnet-4-5-20250929"
         elif os.getenv("GEMINI_API_KEY"):
-            model_id = "vertex_ai/gemini-2.0-flash-001"
+            model_id = "gemini/gemini-2.5-flash"
         
         try:
             response = litellm.completion(
