@@ -20,7 +20,7 @@ from carnot.agents.utils import (
     AgentParsingError,
     parse_boolean_output,
 )
-from carnot.data.dataset import Dataset
+from carnot.data.dataset import DataItem, Dataset
 
 
 class SemFilterOperator:
@@ -65,7 +65,7 @@ class SemFilterOperator:
         """
         memory = AgentMemory("")
         memory.system_prompt = SystemPromptStep(system_prompt=system_prompt)
-        item_dict = item.to_dict() if hasattr(item, "to_dict") else item
+        item_dict = item.to_dict() if isinstance(item, DataItem) else item
         memory.steps.append(SemFilterOperatorStep(task=self.task, item=item_dict))
         passes_filter, step_number = None, 0
         while passes_filter is None and step_number < self.max_steps:
