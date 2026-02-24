@@ -33,6 +33,7 @@ from carnot.agents.utils import (
 )
 from carnot.conversation.conversation import Conversation
 from carnot.data.dataset import Dataset
+from carnot.index import INDEX_TYPES
 from carnot.operators import LOGICAL_OPERATORS
 
 # Number of steps remaining at which to warn the agent to wrap up
@@ -67,12 +68,12 @@ class Planner(BaseAgent):
     ):
         # Store datasets for use in planning
         self._datasets = datasets
-        
+
         # Load prompt templates
         prompt_templates = yaml.safe_load(
             resources.files("carnot.agents.prompts").joinpath("planner_agent.yaml").read_text()
         )
-        
+
         self.plan_tags = ["<begin_plan>", "<end_plan>"]
         # Use code block tags where closing tag is NOT contained in opening tag
         # This allows us to use the closing tag as a stop sequence
@@ -135,6 +136,7 @@ class Planner(BaseAgent):
                 "logical_operators": {op: op.desc() for op in LOGICAL_OPERATORS},
                 "managed_agents": self.managed_agents,
                 "has_conversation": False,
+                "index_types": {cls.__name__: cls.description for cls in INDEX_TYPES},
             },
         )
         return system_prompt

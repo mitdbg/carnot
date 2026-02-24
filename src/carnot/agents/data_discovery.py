@@ -34,6 +34,7 @@ from carnot.agents.monitoring import LogLevel
 from carnot.agents.tools import Tool
 from carnot.agents.utils import AgentParsingError
 from carnot.data.dataset import Dataset
+from carnot.index import INDEX_TYPES
 
 MAX_PRINT_DATASETS = 20
 MAX_STEPS_WARNING_THRESHOLD = 3
@@ -214,6 +215,7 @@ class DataDiscoveryAgent(BaseAgent):
                 "custom_instructions": self.instructions,
                 "code_opening_tag": self.code_block_tags[0],
                 "code_closing_tag": self.code_block_tags[1],
+                "index_types": {cls.__name__: cls.description for cls in INDEX_TYPES},
             },
         )
         return system_prompt

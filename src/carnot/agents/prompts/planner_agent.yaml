@@ -46,7 +46,7 @@ system_prompt: |-
   {% endfor %}
 
   {%- if has_conversation %}
-
+  
   **Conversation Context:**
   You have access to the conversation history in the `conversation` variable (a list of dicts with 'role' and 'content'). Use it to understand context from previous messages:
   {{code_opening_tag}}
@@ -85,6 +85,36 @@ system_prompt: |-
   ds = ds.sem_filter("the document contains a 'Key Man' provision")
   final_answer(ds.serialize())
   {{code_closing_tag}}
+
+  **Index-Aware Planning:**
+  Datasets may have semantic indices for efficient search. Use the data discovery agent to learn whether a dataset has an index. 
+  
+  **Example Index Workflow:**
+  Task: "Find all legal contracts which contain a 'Key Man' provision."
+
+  Datasets:
+  - Legal Contracts: A dataset containing various legal contracts in text format.
+
+  Thought: I need to understand the schema of the Legal Contracts dataset first, then filter for contracts with 'Key Man' provisions.
+  {{code_opening_tag}}
+  # Step 1: Understand the dataset structure
+  index_info = data_discovery("Does the Legal Contracts dataset have an index? Which indices does it have?")
+  print(index_info)
+  {{code_closing_tag}}
+  Observation: The Legal Contracts dataset has the following indices: [{"index_name": "flat", "index_type": "FlatCarnotIndex", "description": "Index that uses ChromaDB to find the top-K most relevant items. Uses a ChromaDB vector similarity search index. Best if you need to find the top-K most relevant items very quickly but has lower accuracy."}].
+
+  Thought: Now I can build the logical plan. I'll first use the index to retrieve the top-K most relevant documents for the query "Find all legal contracts which contain a 'Key Man' provision.", then filter for those containing 'Key Man' provisions.
+  {{code_opening_tag}}
+  # Step 2: Build logical plan
+  ds = datasets["Legal Contracts"]
+  ds = ds.sem_topk(index_name="flat", search_str="Find all legal contracts which contain a 'Key Man' provision.", k=50)
+  ds = ds.sem_filter("The document contains a 'Key Man' provision")
+  final_answer(ds.serialize())
+  {{code_closing_tag}}
+
+  **Index Tips:**
+  When a dataset has a semantic index: first use `sem_topk(search_str, k, index_name)` to retrieve candidate items via the index, then apply `sem_filter(condition)`. Use `index_name` (e.g., "flat", "hierarchical", "chroma", "faiss") when the dataset has multiple indices. Both steps are needed—sem_topk narrows the search space, sem_filter applies the query condition.
+  When no index exists: use `sem_filter(condition)` only to scan and filter. Flat indices suit smaller collections, B-tree (hierarchical) indices scale better. Later, quality/time/cost estimates will allow choosing the optimal plan.
 
   Now Begin!
 paraphrase_prompt: |-

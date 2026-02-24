@@ -212,6 +212,8 @@ __marimo__/
 # test data files
 tests/pytest/data/movie-reviews
 tests/pytest/data/quest/
+tests/pytest/data/enron-eval-medium/
+tests/pytest/data/emails/
 
 # evals data / results files
 evals/sembench/files/movie/data/
@@ -250,6 +252,10 @@ frontend.log
 secrets/
 how-tos/
 make_password.py
+test_output.txt
+inspect_cluster.py
+agent-indices.py
+b-tree-demo.py
 
 # local envs
 .venv*/

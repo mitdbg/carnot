@@ -1,20 +1,29 @@
 from carnot.data.dataset import Dataset
+from carnot.index import FlatCarnotIndex, HierarchicalCarnotIndex
 from carnot.index.index import ChromaIndex, FaissIndex
-from carnot.utils.hash_helpers import hash_for_id
+
+# from carnot.utils.hash_helpers import hash_for_id
 
 
 class SemTopKOperator:
     """
     Represents a semantic top-k operator.
     """
-    def __init__(self, task: str, k: int, output_dataset_id: str, max_workers: int, model_id: str = "openai/text-embedding-3-small", llm_config: dict | None = None, index_type: str = "chroma"):
+    def __init__(self, task: str, k: int, output_dataset_id: str, max_workers: int, model_id: str = "openai/text-embedding-3-small", llm_config: dict | None = None, index_name: str = "chroma"):
         self.task = task
         self.output_dataset_id = output_dataset_id
         self.k = k
         self.model_id = model_id
         self.api_key = llm_config.get("OPENAI_API_KEY")
         # self.max_workers = max_workers
-        self.index_cls = ChromaIndex if index_type == "chroma" else FaissIndex
+        self.index_name = index_name
+        index_map = {
+            "chroma": ChromaIndex,
+            "faiss": FaissIndex,
+            "hierarchical": HierarchicalCarnotIndex,
+            "flat": FlatCarnotIndex,
+        }  
+        self.index_cls = index_map[index_name]
         # self.prompt_templates = yaml.safe_load(
         #     resources.files("carnot.agents.prompts").joinpath("sem_topk.yaml").read_text()
         # )
@@ -29,13 +38,13 @@ class SemTopKOperator:
         input_dataset = input_datasets[dataset_id]
 
         # check if the dataset has an index constructed and construct one on-the-fly if not
-        if not input_dataset.has_index():
-            name = f"{hash_for_id(input_dataset.name)}_{hash_for_id(self.task)}"
-            index = self.index_cls(name=name, items=input_dataset.items, model=self.model_id, api_key=self.api_key)
-            input_dataset._index = index
+        if self.index_name not in input_dataset.list_indices():
+            # name = f"{hash_for_id(input_dataset.name)}_{hash_for_id(self.task)}"
+            index = self.index_cls(name=self.index_name, items=input_dataset.items, model=self.model_id, api_key=self.api_key)
+            input_dataset.indices[self.index_name] = index
 
-        # invoke the index() method on the dataset to retrieve items
-        results = input_dataset.index(self.task, k=self.k)
+        # invoke the search() method on the index to retrieve items
+        results = input_dataset.indices[self.index_name].search(self.task, k=self.k)
 
         # TODO: we could construct "instance-optimized" indices by using a map operator to extract the relevant info
         #       from the input items, and then building an index on that extracted info

@@ -794,6 +794,7 @@ class TestConversationMemoryIntegration:
             "output_dataset_id": "TopKOperation1",
             "params": {
                 "operator": "SemanticTopK",
+                "index_name": "chroma",
                 "description": "Top-5 items from FilterOperation1 for search string: highest rated",
                 "search_str": "highest rated",
                 "k": 5

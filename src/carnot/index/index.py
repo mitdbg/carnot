@@ -10,6 +10,8 @@ import faiss
 import litellm
 import numpy as np
 
+from carnot.index.summary_indices import FlatFileIndex, HierarchicalFileIndex
+
 INDEX_BATCH_SIZE = 1000
 
 # class IndexCatalog:
@@ -32,6 +34,8 @@ INDEX_BATCH_SIZE = 1000
 
 
 class CarnotIndex(ABC):
+    description: str = "Base CarnotIndex class. Not meant to be used directly."
+
     def __init__(self, name: str, items: list):
         self.name = name
         self.items = items
@@ -42,6 +46,10 @@ class CarnotIndex(ABC):
         pass
 
     @abstractmethod
+    def get_index(self) -> HierarchicalFileIndex | FlatFileIndex | ChromaIndex | FaissIndex | SemanticIndex:
+        pass
+
+    @abstractmethod
     def _get_or_create_index(self):
         pass
 
@@ -49,8 +57,176 @@ class CarnotIndex(ABC):
     def search(self, query: str, k: int) -> list:
         pass
 
+    def get_index_type_string(self) -> str:
+        return self.__class__.__name__
+
+
+class HierarchicalCarnotIndex(CarnotIndex):
+    """CarnotIndex adapter for HierarchicalFileIndex. Maps paths to DataItems."""
+
+    description: str = (
+        "Tree-structured index with internal nodes summarizing clusters of files or child nodes. "
+        "Search uses top-down traversal by query-embedding similarity. "
+        "Best for larger datasets; reduces context use by routing through the hierarchy."
+    )
+
+    def __init__(
+        self,
+        name: str,
+        items: list,
+        hierarchical_index: HierarchicalFileIndex | None = None,
+        config=None,
+        api_key: str | None = None,
+        use_persistence: bool = True,
+        **kwargs
+    ):
+        super().__init__(name=name, items=items)
+        self._hierarchical = hierarchical_index
+        self._config = config
+        self._api_key = api_key
+        self._use_persistence = use_persistence
+        self._path_to_item = {}
+        for item in items:
+            p = item.path if hasattr(item, "path") else (item.get("path") if isinstance(item, dict) else None)
+            if p:
+                self._path_to_item[p] = item
+        if self._hierarchical is None and self._path_to_item:
+            self._get_or_create_index()
+
+    def _add_index_to_catalog(self):
+        pass
+
+    def get_index(self) -> HierarchicalFileIndex:
+        if self._hierarchical is None:
+            self._get_or_create_index()
+        return self._hierarchical
+
+    def _get_or_create_index(self) -> HierarchicalFileIndex | None:
+        if self._hierarchical is not None:
+            return self._hierarchical
+        from carnot.data.item import DataItem
+
+        def to_data_item(i) -> DataItem | None:
+            if isinstance(i, DataItem) and i.path:
+                return i
+            if isinstance(i, dict) and i.get("path"):
+                di = DataItem(path=i["path"])
+                di._dict = i
+                return di
+            return None
+
+        data_items = [x for x in (to_data_item(i) for i in self.items) if x is not None]
+        if not data_items:
+            raise ValueError("HierarchicalCarnotIndex: no items with path to build index")
+        index = HierarchicalFileIndex.from_items(
+            name=self.name,
+            items=data_items,
+            config=self._config,
+            api_key=self._api_key,
+            use_persistence=self._use_persistence,
+        )
+        if index is None:
+            raise ValueError("Could not build hierarchical index from items")
+        self._hierarchical = index
+        path_to_item = {}
+        for item in self.items:
+            p = item.path if hasattr(item, "path") else (item.get("path") if isinstance(item, dict) else None)
+            if p:
+                path_to_item[p] = item
+        self._path_to_item = path_to_item
+        return self._hierarchical
+
+    def search(self, query: str, k: int) -> list:
+        if self._hierarchical is None:
+            self._get_or_create_index()
+        paths = self._hierarchical.search(query, k)
+        return [self._path_to_item[p] for p in paths if p in self._path_to_item][:k]
+
+
+class FlatCarnotIndex(CarnotIndex):
+    """CarnotIndex adapter for FlatFileIndex. Single-level, LLM selects top-K."""
+
+    description: str = (
+        "Single-level index where all file summaries are in one list. "
+        "At query time, the LLM receives summaries (or an embedding-pre-filtered subset) "
+        "and selects the top-K most relevant. "
+        "Best for smaller datasets where summaries fit in context."
+    )
+
+    def __init__(
+        self,
+        name: str,
+        items: list,
+        flat_index: FlatFileIndex | None = None,
+        config=None,
+        api_key: str | None = None,
+        use_persistence: bool = True,
+        **kwargs
+    ):
+        super().__init__(name=name, items=items)
+        self._flat = flat_index
+        self._config = config
+        self._api_key = api_key
+        self._use_persistence = use_persistence
+        self._path_to_item = {}
+        for item in items:
+            p = item.path if hasattr(item, "path") else (item.get("path") if isinstance(item, dict) else None)
+            if p:
+                self._path_to_item[p] = item
+        if self._flat is None and self._path_to_item:
+            self._get_or_create_index()
+
+    def _add_index_to_catalog(self):
+        pass
+
+    def get_index(self) -> FlatFileIndex:
+        if self._flat is None:
+            self._get_or_create_index()
+        return self._flat
+
+    def _get_or_create_index(self) -> FlatFileIndex | None:
+        if self._flat is not None:
+            return self._flat
+        from carnot.data.item import DataItem
+
+        def to_data_item(i):
+            if isinstance(i, DataItem) and i.path:
+                return i
+            if isinstance(i, dict) and i.get("path"):
+                di = DataItem(path=i["path"])
+                di._dict = i
+                return di
+            return None
+
+        data_items = [x for x in (to_data_item(i) for i in self.items) if x is not None]
+        if not data_items:
+            raise ValueError("FlatCarnotIndex: no items with path to build index")
+        index = FlatFileIndex.from_items(
+            name=self.name,
+            items=data_items,
+            config=self._config,
+            api_key=self._api_key,
+            use_persistence=self._use_persistence,
+        )
+        if index is None:
+            raise ValueError("Could not build flat index from items")
+        self._flat = index
+        return self._flat
+
+    def search(self, query: str, k: int) -> list:
+        if self._flat is None:
+            self._get_or_create_index()
+        paths = self._flat.search(query, k)
+        return [self._path_to_item[p] for p in paths if p in self._path_to_item][:k]
+
 
 class ChromaIndex(CarnotIndex):
+    description: str = (
+        "Index that uses ChromaDB to find the top-K most relevant items. "
+        "Uses a ChromaDB vector similarity search index. "
+        "Best if you need to find the top-K most relevant items very quickly but has lower accuracy."
+    )
+
     def __init__(self, name: str, items: list, model: str = "openai/text-embedding-3-small", api_key: str = None):
         # construct the index
         super().__init__(name, items)
@@ -62,6 +238,11 @@ class ChromaIndex(CarnotIndex):
 
     def _add_index_to_catalog(self):
         pass
+
+    def get_index(self) -> ChromaIndex:
+        if self._chroma is None:
+            self._get_or_create_index()
+        return self._chroma
 
     def _get_or_create_index(self):
         # retrieve the location of the chroma database
@@ -117,6 +298,12 @@ class ChromaIndex(CarnotIndex):
 
 
 class FaissIndex(CarnotIndex):
+    description: str = (
+        "Index that uses Faiss to find the top-K most relevant items. "
+        "Uses a Faiss vector similarity search index. "
+        "Best if you need to find the top-K most relevant items very quickly but has lower accuracy."
+    )
+
     def __init__(self, name: str, items: list, model: str = "openai/text-embedding-3-small", api_key: str = None):
         # construct the index
         super().__init__(name, items)
@@ -128,6 +315,11 @@ class FaissIndex(CarnotIndex):
     
     def _add_index_to_catalog(self):
         pass
+
+    def get_index(self) -> FaissIndex:
+        if self._faiss is None:
+            self._get_or_create_index()
+        return self._faiss
 
     def _get_or_create_index(self):
         # retrieve the location of the vector database
@@ -168,5 +360,8 @@ class FaissIndex(CarnotIndex):
 
 
 class SemanticIndex(CarnotIndex):
+    def get_index(self) -> SemanticIndex:
+        return self
+
     def search(self, query: str, k: int) -> list:
         return self.items[:k]

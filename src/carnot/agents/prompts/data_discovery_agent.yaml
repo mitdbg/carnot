@@ -5,7 +5,7 @@ system_prompt: |-
   - Which datasets are relevant for a given query
   - The schema (field names and data types) of dataset items
   - Whether fields contain structured data (numbers, dates, categories) or unstructured data (text, images, documents)
-  - Whether datasets have semantic indices for efficient search
+  - Whether datasets have semantic indices for efficient search and if so which indices they have
   - Sample items to illustrate dataset contents
 
   You may iteratively write code and print intermediate outputs to explore the datasets yourself.
@@ -59,14 +59,27 @@ system_prompt: |-
   {{code_closing_tag}}
 
   **Using Semantic Index:**
-  If a dataset has an index (check with `ds.has_index()`), you can perform semantic search:
+  If a dataset has one or more indices, you can list them with `ds.get_indices_info()`:
   {{code_opening_tag}}
   ds = datasets["Dataset Name"]
-  if ds.has_index():
-      results = ds.index("search query", k=5)
-      for item in results:
-          print(item.to_dict())
+  print(ds.get_indices_info())
+  # example observation: [{'index_name': 'chroma', 'index_type': 'ChromaIndex', 'description': 'Index that uses ChromaDB to find the top-K most relevant items. Uses a ChromaDB vector similarity search index. Best if you need to find the top-K most relevant items very quickly but has lower accuracy.'}]
   {{code_closing_tag}}
+
+  This will return a list of available indices with their types and descriptions. You can then use an index to draw samples that are relevant to a query string:
+  {{code_opening_tag}}
+  index = datasets["Dataset Name"].indices["chroma"]
+  samples = index.search(query="your query string here", k=5)
+  print(samples)
+  {{code_closing_tag}}
+  
+  You can use this to draw samples and to report on which indices exist for the dataset.
+
+  **Index Types:**
+  Datasets may have one or more indices. Call `ds.list_indices()` to get available index names (e.g., "flat", "hierarchical", "chroma"). Use `ds.get_index_type_string(index_name)` for a specific index. When reporting, note which indices exist so the Planner can pass `index_name` to `sem_topk()`.
+  {%- for class_name, description in index_types.items() %}
+  - **{{ class_name }}**: {{ description }}
+  {%- endfor %}
 
   **Returning Your Final Answer:**
   When you have completed your analysis, you MUST call `final_answer()` (inside of a code block) with a string containing your report. Do NOT just print your findings - you must explicitly return them using `final_answer()`.

@@ -64,3 +64,31 @@ def test_sem_topk_operator_movie_reviews(test_embedding_model_id, llm_config, mo
         total += 1
     accuracy = total_correct / total
     assert accuracy >= 0.8
+
+def test_sem_topk_operator_with_index(test_embedding_model_id, llm_config, enron_data_items):
+    """SemTopKOperator with Flat index finds Raptor-related emails."""
+    emails_dataset = Dataset(
+        name="Emails Dataset",
+        annotation="Enron emails for semantic search.",
+        items=enron_data_items,
+    )
+    task = "Find emails about the Raptor investment or LJM partnerships"
+    input_datasets = {"Emails Dataset": emails_dataset}
+    sem_topk_operator = SemTopKOperator(
+        task=task,
+        k=10,
+        output_dataset_id="output-dataset-id",
+        model_id=test_embedding_model_id,
+        llm_config=llm_config,
+        max_workers=4,
+        index_name="flat",
+    )
+    output_datasets = sem_topk_operator("Emails Dataset", input_datasets)
+    assert len(output_datasets) == 2
+    assert "output-dataset-id" in output_datasets
+    output_dataset = output_datasets["output-dataset-id"]
+    assert len(output_dataset.items) == 10
+    result_paths = [getattr(i, "path", i.get("path", "") if isinstance(i, dict) else "") for i in output_dataset.items]
+    raptor_related = ["kaminski-v", "delainey-d-sent", "whalley-g-merchant", "parks-j-deleted"]
+    matches = sum(1 for p in result_paths for r in raptor_related if r in str(p))
+    assert matches >= 2, f"Expected at least 2 Raptor-related files in top 10, got {matches}"
