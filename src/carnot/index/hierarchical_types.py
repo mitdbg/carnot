@@ -31,7 +31,7 @@ class InternalNode:
     embedding: list[float]
     child_paths: list[str]  # file paths when is_leaf_cluster=True
     is_leaf_cluster: bool  # True if direct children are files, False if child InternalNodes
-    children: list["InternalNode"] | None = None  # child InternalNodes when is_leaf_cluster=False
+    children: list[InternalNode] | None = None  # child InternalNodes when is_leaf_cluster=False
 
 
 @dataclass
@@ -43,8 +43,8 @@ class HierarchicalIndexConfig:
     min_files_for_hierarchy: int = MIN_FILES_FOR_HIERARCHY
     max_children_per_node: int = MAX_CHILDREN_PER_NODE
     embedding_model: str = "openai/text-embedding-3-small"
-    summary_model: str = "openai/gpt-4o-mini"
+    summary_model: str = "openai/gpt-5-mini"
     tokens_per_summary_estimate: int = 80  # rough chars/4 for internal node summaries
     use_llm_routing: bool = True  # use LLM to select nodes when they fit in context
-    llm_routing_model: str = "openai/gpt-4o-mini"
+    llm_routing_model: str = "openai/gpt-5-mini"
     llm_routing_max_nodes: int = 15  # max nodes to send to LLM at once (context limit)
