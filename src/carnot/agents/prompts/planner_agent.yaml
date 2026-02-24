@@ -50,9 +50,9 @@ system_prompt: |-
 
   **Index Types:**
   Datasets may use different index structures for semantic search. When reporting on indices, you can find the index type by calling `ds.get_index_type_string()`. The possible index types are:
-  {%- for class_name, description in index_types.items() %}
+  {% raw %}{%- for class_name, description in index_types.items() %}
   - **{{ class_name }}**: {{ description }}
-  {%- endfor %}
+  {%- endfor %}{% endraw %}
   
   **Example Index Workflow:**
   Task: "Find all legal contracts which contain a 'Key Man' provision."
