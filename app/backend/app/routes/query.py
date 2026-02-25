@@ -130,10 +130,7 @@ class QueryExecutionStreamer:
             # await save_message(conversation_id, "user", self.query)
 
             await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Starting query execution...', 'session_id': session_id})}\n\n")
-            # TODO(Tianyu): why are we sleeping here (and everywhere else after an await)? This feels like bad code smell.
-            await asyncio.sleep(0.1)
             await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Loading datasets...'})}\n\n")
-            await asyncio.sleep(0.1)
 
             async with AsyncSessionLocal() as db:
                 datasets: list[CarnotDataset] = []
@@ -162,7 +159,6 @@ class QueryExecutionStreamer:
                     logger.info(f"Dataset: {dataset.name}, Annotation: {dataset.annotation}, Items: {[item.path for item in dataset.items]}")
 
             await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': f'Loaded {len(datasets)} dataset(s)'})}\n\n")
-            await asyncio.sleep(0.1)
 
             all_files = [
                 S3Path(item.path) if item.path.startswith("s3://") else Path(item.path)
@@ -174,7 +170,6 @@ class QueryExecutionStreamer:
                 return
 
             await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': f'Processing {len(all_files)} files...'})}\n\n")
-            await asyncio.sleep(0.1)
 
             session_exists = session_id in active_sessions
             if session_exists and set(active_sessions[session_id]["dataset_ids"]) != set(self.dataset_ids):
@@ -184,7 +179,6 @@ class QueryExecutionStreamer:
             file_service.create_dir(str(session_dir))
 
             await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Preparing data context...'})}\n\n")
-            await asyncio.sleep(0.1)
 
             # TODO: remove this and place file check into Carnot context
             if not session_exists:
@@ -199,13 +193,10 @@ class QueryExecutionStreamer:
                     return
 
                 await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': f'Processing {text_file_count} text files...'})}\n\n")
-                await asyncio.sleep(0.1)
             else:
                 await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Continuing conversation...'})}\n\n")
-                await asyncio.sleep(0.1)
 
             await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': f'Executing query: {self.query}'})}\n\n")
-            await asyncio.sleep(0.1)
 
             # setup progress logging and clear old progress log if it exists
             fs = fsspec.filesystem(FILESYSTEM)
@@ -236,7 +227,6 @@ class QueryExecutionStreamer:
             )
 
             await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Running Carnot query processor...'})}\n\n")
-            await asyncio.sleep(0.1)
 
             output_log = str(Path(session_dir, "output.txt") if IS_LOCAL_ENV else str(S3Path(session_dir, "output.txt")))
             if fs.exists(output_log):
@@ -290,7 +280,6 @@ class QueryExecutionStreamer:
             items, answer = await loop.run_in_executor(None, run_query_with_capture)
 
             await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Processing results...'})}\n\n")
-            await asyncio.sleep(0.1)
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             csv_filename = f"query_results_{timestamp}.csv"
