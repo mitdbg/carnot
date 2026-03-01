@@ -21,6 +21,7 @@ dependencies = [
     "onnxruntime>=1.23.2",
     "palimpzest>=1.2.0",
     "pandas>=2.3.1",
+    "pyyaml>=6.0",
     "pydantic>=2.11.7",
     "pypdf>=5.1.0",
     "regex>=2024.5.15",

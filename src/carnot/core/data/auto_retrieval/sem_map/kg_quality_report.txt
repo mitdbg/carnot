@@ -1,0 +1,527 @@
+================================================================================
+  WIKIDATA KG MATCHING QUALITY REPORT
+================================================================================
+  Raw values:             28,091
+  After canonicalize:     28,013
+  After propagation:      28,013
+  After materialization:   37,605
+  Alias collapse:             78
+  Materialization added:    9,592
+  Propagation added:           0
+  Active tags:            17,818
+
+================================================================================
+  1. CANONICALIZATION (Wikidata QID Resolution)
+================================================================================
+  Unique string values:      17,344
+  Resolved to QID:            3,657  (21.1%)
+  Unresolved (kept as text): 13,687  (78.9%)
+  Total value occurrences:   28,013
+
+--- Per concept key ---
+  animal:geographic:distribution      █████░░░░░░░░░░░░░░░ 27.7%  (718/2594 unique)
+  animal:geologic_period              ███░░░░░░░░░░░░░░░░░ 15.0%  (21/140 unique)
+  animal:taxonomic-group              ████████████░░░░░░░░ 61.0%  (577/946 unique)
+  bird:temporal:classification        ░░░░░░░░░░░░░░░░░░░░  0.0%  (0/113 unique)
+  book:nationality                    █████████░░░░░░░░░░░ 45.5%  (40/88 unique)
+  book:publication:period             ████████░░░░░░░░░░░░ 44.2%  (91/206 unique)
+  book:subject                        ░░░░░░░░░░░░░░░░░░░░  2.0%  (53/2607 unique)
+  book:time-period                    ██████░░░░░░░░░░░░░░ 33.8%  (158/467 unique)
+  film:genre                          ███████████░░░░░░░░░ 59.0%  (125/212 unique)
+  film:nationality                    ██████████░░░░░░░░░░ 51.7%  (31/60 unique)
+  film:setting                        ██████████░░░░░░░░░░ 54.3%  (453/834 unique)
+  film:thematic_category              ███░░░░░░░░░░░░░░░░░ 15.1%  (310/2057 unique)
+  film:time-period                    █░░░░░░░░░░░░░░░░░░░  5.7%  (17/301 unique)
+  novel:attribute                     ░░░░░░░░░░░░░░░░░░░░  3.6%  (34/931 unique)
+  novel:genre                         ██████████████░░░░░░ 74.8%  (92/123 unique)
+  plant:attribute                     ░░░░░░░░░░░░░░░░░░░░  3.3%  (128/3872 unique)
+  plant:location                      █████████░░░░░░░░░░░ 45.1%  (809/1793 unique)
+
+--- Unresolved value examples (kept as plain text) ---
+  animal:geographic:distribution:
+    - "1,270 meters above sea level"
+    - "10 metres depth"
+    - "165 m depth"
+    - "73 m depth"
+    - "a cave on tioman island"
+    - "a plateau near the western region of mafhaq"
+    - "aachen formation of moresnet"
+    - "abandoned aardvark holes"
+  animal:geologic_period:
+    - "16 million years ago"
+    - "1930"
+    - "19th century"
+    - "60-80 million years ago"
+    - "82 million years ago"
+    - "aalenian"
+    - "about 13 to 5 million years ago"
+    - "about 38 million years ago"
+  animal:taxonomic-group:
+    - "a. citrinellus"
+    - "acratocnidae"
+    - "algae"
+    - "alien"
+    - "amphibamiform temnospondyls"
+    - "annelid worms"
+    - "antelope"
+    - "anthropoids"
+  bird:temporal:classification:
+    - "1970s?"
+    - "53 to 50 million years ago"
+    - "58-61.6 ma"
+    - "62 to 1.8 million years ago"
+    - "altitudinal migration"
+    - "ancient australo-papuan radiation"
+    - "austral winter (may to august)"
+    - "breed much of year"
+  book:nationality:
+    - "afghan-american"
+    - "algerian"
+    - "american"
+    - "anglo-afghan"
+    - "asian-american"
+    - "assamese"
+    - "australian"
+    - "bantam books"
+  book:publication:period:
+    - "1684-1687"
+    - "1731-1743"
+    - "1731-1745"
+    - "1770s-1780"
+    - "1840s"
+    - "1849-1850"
+    - "1856-1857"
+    - "1857-1858"
+  book:subject:
+    - "15th-century france"
+    - "1632 series"
+    - "1925 film depiction"
+    - "2001 war in afghanistan"
+    - "2003 iraq war"
+    - "2016 indian banknote demonetisation"
+    - "2016 united states presidential election"
+    - "26/11 attacks"
+  book:time-period:
+    - "1140s"
+    - "12 years earlier"
+    - "12th-14th century"
+    - "1485"
+    - "1502"
+    - "1509"
+    - "1516"
+    - "1533"
+  film:genre:
+    - "3d"
+    - "3d animation"
+    - "3d computer animated"
+    - "3d computer-animated"
+    - "3d motion simulator"
+    - "american adventure film"
+    - "american drama film"
+    - "american horror film"
+  film:nationality:
+    - "american"
+    - "australian"
+    - "barbadian"
+    - "bbc"
+    - "belgian"
+    - "bollywood"
+    - "british"
+    - "canadian"
+  film:setting:
+    - "1730"
+    - "1782"
+    - "1885"
+    - "1930s"
+    - "1936 olympics"
+    - "1950s italy"
+    - "1955"
+    - "1960s new york city"
+  film:thematic_category:
+    - "3d filmmaking"
+    - "45th infantry division"
+    - "a cappella competition"
+    - "a million volunteers"
+    - "abduction"
+    - "abdulrahman ibrahim ibn sori"
+    - "abolition"
+    - "abolitionism"
+  film:time-period:
+    - "1194"
+    - "12th century"
+    - "1489"
+    - "150 years"
+    - "16th century"
+    - "1768-1813"
+    - "1769 to 1820"
+    - "1782"
+  novel:attribute:
+    - "1868"
+    - "1991 publication"
+    - "2-in-1 edition"
+    - "2013 publication"
+    - "22 chapters"
+    - "42nd book in series"
+    - "48 books and 365 chapters"
+    - "655,478 words in the original french"
+  novel:genre:
+    - "abridged novel"
+    - "allegorical satire"
+    - "amatory fiction"
+    - "assamese novel"
+    - "bengali novel"
+    - "contemporary novel"
+    - "crime and mystery"
+    - "debut novel"
+  plant:attribute:
+    - "0.5-1.5 cm broad leaves"
+    - "1 to 3 flowered inflorescence"
+    - "1-2 cm spine length"
+    - "1-3 m tall"
+    - "1-4 hard, woody, warty stones"
+    - "1-locular ovaries"
+    - "10 stamens"
+    - "10 stamens and 3 styles extend beyond throat"
+  plant:location:
+    - "1.0 km to 3.0 km altitude"
+    - "1000-2600 m above sea level"
+    - "2,500-3,300 meters elevation"
+    - "2800-2850 m elevation"
+    - "35° to 44° south latitude"
+    - "aachen formation of moresnet"
+    - "aberdare mountains"
+    - "acidic soils"
+
+================================================================================
+  2. MATERIALIZATION (Ancestor Expansion)
+================================================================================
+  Unique values before:  17,344
+  Unique values after:   17,344
+  Net added:                  0
+  Expansion ratio:         1.00x
+
+--- Per concept key ---
+  animal:geographic:distribution       2594 -> 2594  (+0, 1.00x)
+  animal:geologic_period                140 ->  140  (+0, 1.00x)
+  animal:taxonomic-group                946 ->  946  (+0, 1.00x)
+  bird:temporal:classification          113 ->  113  (+0, 1.00x)
+  book:nationality                       88 ->   88  (+0, 1.00x)
+  book:publication:period               206 ->  206  (+0, 1.00x)
+  book:subject                         2607 -> 2607  (+0, 1.00x)
+  book:time-period                      467 ->  467  (+0, 1.00x)
+  film:genre                            212 ->  212  (+0, 1.00x)
+  film:nationality                       60 ->   60  (+0, 1.00x)
+  film:setting                          834 ->  834  (+0, 1.00x)
+  film:thematic_category               2057 -> 2057  (+0, 1.00x)
+  film:time-period                      301 ->  301  (+0, 1.00x)
+  novel:attribute                       931 ->  931  (+0, 1.00x)
+  novel:genre                           123 ->  123  (+0, 1.00x)
+  plant:attribute                      3872 -> 3872  (+0, 1.00x)
+  plant:location                       1793 -> 1793  (+0, 1.00x)
+
+================================================================================
+  3. LABEL RESOLUTION (QID -> Human Label)
+================================================================================
+  QIDs input:             3,657
+  Successfully labeled:   3,657  (100.0%)
+  Still showing as QID:       0
+
+================================================================================
+  4. TYPE CONSTRAINT QUALITY (Concept Profiler)
+================================================================================
+  Total concept keys:        17
+  Enabled (resolved):        16
+  Disabled:                   1
+  Average confidence:     0.662
+
+--- Low confidence keys (< 0.6) ---
+  novel:genre                          conf=0.5704
+
+--- PROBLEMATIC type constraints (semantic mismatch) ---
+  book:subject (conf=0.658):
+    Issue: type constraints include grammatical 'subject' (Q164573) and 'school subject' (Q362165) — not about book topics/themes
+    - Q164573: "subject"
+    - Q362165: "school subject"
+    - Q53731850: "individual copy of a book"
+  plant:attribute (conf=0.695):
+    Issue: type constraints include 'heraldic attribute' (Q834104) and 'factory' (Q83405) — irrelevant to plant biology
+    - Q188840: "medicinal plant"
+    - Q83405: "factory"
+    - Q834104: "heraldic attribute"
+  plant:location (conf=0.612):
+    Issue: type constraints include 'place of death' (Q18658526) and 'location of burial' (Q12131650) — not about geographic regions
+    - Q12131650: "location of burial"
+    - Q18658526: "place of death"
+    - Q18711811: "map data module"
+  novel:attribute (conf=0.631):
+    Issue: type constraints include 'heraldic attribute' (Q834104) — irrelevant to novel properties
+    - Q758238: "attribute"
+    - Q8261: "novel"
+    - Q834104: "heraldic attribute"
+  film:nationality (conf=0.726):
+    Issue: type constraints include 'thin film' (Q1137203) — unrelated to country of origin
+    - Q1137203: "thin film"
+    - Q11424: "film"
+    - Q3337001: "nationality for sports"
+  animal:taxonomic-group (conf=0.645):
+    Issue: type constraints include 'musical group' (Q215380) and 'geological group' (Q824979) — neither related to biological taxonomy
+    - Q215380: "musical group"
+    - Q32945461: "taxonomic treatment"
+    - Q824979: "group"
+  book:nationality (conf=0.630):
+    Issue: type constraints include 'individual copy of a book' (Q53731850) and 'nationality for sports' (Q3337001) — not about nationalities/countries
+    - Q3337001: "nationality for sports"
+    - Q53731850: "individual copy of a book"
+    - Q571: "book"
+  book:time-period (conf=0.791):
+    Issue: type constraints include 'Time Period in Chrono Trigger' (Q12737784) — a video game concept, not a historical period
+    - Q11514315: "historical period"
+    - Q12737784: "Time Period in Chrono Trigger"
+    - Q186081: "time interval"
+  film:time-period (conf=0.738):
+    Issue: type constraints include 'Time Period in Chrono Trigger' (Q12737784) — a video game concept
+    - Q11424: "film"
+    - Q11514315: "historical period"
+    - Q12737784: "Time Period in Chrono Trigger"
+  film:setting (conf=0.751):
+    Issue: type constraints include 'thin film' (Q1137203) and 'film director' (Q2526255) — not about geographic locations
+    - Q1137203: "thin film"
+    - Q11424: "film"
+    - Q2526255: "film director"
+
+================================================================================
+  5. RESOLUTION ERRORS (Input -> Wrong Label)
+================================================================================
+  Total suspect mismatches: 206
+
+  These are cases where the input string was resolved to a QID,
+  but the final label has NO overlap with the original text,
+  suggesting the wrong Wikidata entity was chosen.
+
+  animal:geographic:distribution (14 suspect mismatches):
+    "sea" -> Q11708 -> "southeast asia"
+    "berlin" -> Q64 -> "germany"
+    "tokyo" -> Q7473516 -> "earth"
+    "small island" -> Q207524 -> "islet"
+    "mount aso" -> Q733710 -> "kyushu"
+    "kyushu" -> Q13987 -> "japan"
+    "japan" -> Q17 -> "earth"
+    "harbor" -> Q283202 -> "asia"
+
+  animal:geologic_period (13 suspect mismatches):
+    "miocene" -> Q76267 -> "paleocene"
+    "paleocene" -> Q76252 -> "miocene"
+    "late cretaceous" -> Q338199 -> "oligocene"
+    "oligocene" -> Q101873 -> "late eocene"
+    "late triassic" -> Q917293 -> "early jurassic"
+    "early jurassic" -> Q284787 -> "late jurassic"
+    "late jurassic" -> Q499312 -> "early cretaceous"
+    "early cretaceous" -> Q752187 -> "late triassic"
+
+  animal:taxonomic-group (14 suspect mismatches):
+    "rabbit" -> Q9394 -> "chordata"
+    "chicken" -> Q780 -> "archosaur"
+    "insect" -> Q1390 -> "hexapoda"
+    "chimpanzee" -> Q4126704 -> "hominoidea"
+    "bats" -> Q28425 -> "chordata"
+    "dinosaur" -> Q430 -> "reptilia"
+    "tyrannosaurus" -> Q14332 -> "archosaur"
+    "duck" -> Q7556 -> "chordata"
+
+  book:nationality (11 suspect mismatches):
+    "united states" -> Q30 -> "british"
+    "chinese" -> Q865 -> "taiwanese"
+    "danish" -> Q756617 -> "kingdom of denmark"
+    "italian" -> Q38 -> "italy"
+    "german" -> Q183 -> "british"
+    "french" -> Q142 -> "france"
+    "uk" -> Q145 -> "united kingdom"
+    "swedish" -> Q34 -> "sweden"
+
+  book:publication:period (13 suspect mismatches):
+    "1935" -> Q18658 -> "1951"
+    "1951" -> Q18591 -> "1935"
+    "1957" -> Q5311 -> "1989"
+    "1959" -> Q5302 -> "1962"
+    "1962" -> Q2764 -> "1959"
+    "1989" -> Q2425 -> "1957"
+    "1936" -> Q18649 -> "1960-1975"
+    "1986" -> Q2430 -> "2002"
+
+  book:subject (15 suspect mismatches):
+    "coming-of-age" -> Q2975633 -> "college graduates’ employment development and contract consciousness"
+    "adultery" -> Q234213 -> "seduction"
+    "seduction" -> Q1527023 -> "adultery"
+    "college graduate" -> Q120666847 -> "coming-of-age fiction"
+    "mutiny on the bounty" -> Q329709 -> "fletcher christian"
+    "fletcher christian" -> Q116476982 -> "mutiny on the bounty"
+    "censorship" -> Q543 -> "small-town scandal"
+    "autobiography" -> Q4184 -> "central intelligence agency"
+
+  book:time-period (15 suspect mismatches):
+    "1943" -> Q18623 -> "world war ii"
+    "1936" -> Q18649 -> "world war ii"
+    "1942" -> Q18625 -> "world war ii"
+    "1868" -> Q7717 -> "19th century"
+    "1815" -> Q6948 -> "1832 june rebellion"
+    "1856" -> Q7676 -> "19th century"
+    "1857" -> Q7680 -> "1856"
+    "1984" -> Q2432 -> "1986"
+
+  film:genre (13 suspect mismatches):
+    "neo-noir" -> Q2421031 -> "erotica"
+    "black and white" -> Q838368 -> "black-and-white"
+    "science fiction" -> Q24925 -> "western"
+    "western" -> Q21590660 -> "science fiction"
+    "comedy-drama" -> Q859369 -> "comedy drama"
+    "sex comedy" -> Q2991560 -> "erotica"
+    "biographical" -> Q645928 -> "crime drama film"
+    "crime drama" -> Q113485322 -> "biographical film"
+
+  film:nationality (8 suspect mismatches):
+    "filipino" -> Q928 -> "philippines"
+    "italian" -> Q38 -> "italy"
+    "danish" -> Q756617 -> "united kingdom"
+    "uk" -> Q145 -> "kingdom of denmark"
+    "german" -> Q183 -> "austrian empire"
+    "austrian" -> Q131964 -> "germany"
+    "french" -> Q142 -> "american"
+    "japanese" -> Q188712 -> "empire of japan"
+
+  film:setting (14 suspect mismatches):
+    "pasadena, california" -> Q485176 -> "united states"
+    "new york" -> Q1384 -> "united states"
+    "portsmouth" -> Q72259 -> "south america"
+    "tahiti" -> Q42000 -> "england"
+    "caribbean" -> Q664609 -> "tahiti"
+    "south america" -> Q18 -> "caribbean"
+    "long island" -> Q18438 -> "new york"
+    "new york city" -> Q60 -> "long island"
+
+  film:thematic_category (15 suspect mismatches):
+    "batman" -> Q80370 -> "robin"
+    "robin" -> Q1158139 -> "puzzle designer"
+    "joker" -> Q42759035 -> "penguin books"
+    "penguin" -> Q1336200 -> "kidnapping"
+    "riddler" -> Q12957007 -> "joker"
+    "catwoman" -> Q92776707 -> "supervillains"
+    "kidnapping" -> Q318296 -> "batman province"
+    "supervillains" -> Q56277546 -> "catwoman"
+
+  film:time-period (13 suspect mismatches):
+    "1870s" -> Q39847 -> "1983"
+    "1940s" -> Q36561 -> "hitler's final days"
+    "2000s" -> Q35024 -> "1990s"
+    "1990s" -> Q34653 -> "2000s"
+    "1980s" -> Q34644 -> "cold war"
+    "1980" -> Q34644 -> "late 1970s"
+    "1800" -> Q39577 -> "1801"
+    "1950s" -> Q36297 -> "2005"
+
+  novel:attribute (13 suspect mismatches):
+    "risque" -> Q671605 -> "serialized fiction"
+    "sensational" -> Q7450956 -> "pseudonymous bosch"
+    "serialized" -> Q1347298 -> "risqué"
+    "pseudonymous" -> Q3924913 -> "sensational"
+    "controversial" -> Q18912752 -> "disputed"
+    "semi-autobiographical" -> Q109620002 -> "autobiographical fiction"
+    "source material" -> Q31464082 -> "source entity"
+    "early 20th century" -> Q72003548 -> "early twentieth century schools in puerto rico tr"
+
+  novel:genre (8 suspect mismatches):
+    "romance" -> Q599510 -> "comedy"
+    "comedy-drama" -> Q859369 -> "romance"
+    "war novel" -> Q908667 -> "war fiction"
+    "espionage" -> Q1426213 -> "spy fiction"
+    "historical novel" -> Q192239 -> "war fiction"
+    "crime" -> Q959790 -> "detective fiction"
+    "detective fiction" -> Q186424 -> "crime fiction"
+    "adventure" -> Q319221 -> "historical novel"
+
+  plant:attribute (13 suspect mismatches):
+    "black fungus" -> Q6931254 -> "mucormycosis"
+    "spanish moss" -> Q311524 -> "bromeliaceae"
+    "toadstools" -> Q4308985 -> "mukhomory"
+    "fruits" -> Q1364 -> "vegetable"
+    "vegetables" -> Q11004 -> "fruit"
+    "primeval forest" -> Q208478 -> "genius loci of a river"
+    "trees" -> Q10884 -> "shrubsole"
+    "shrubs" -> Q16800712 -> "berries with highly sweet tasting proteins"
+
+  plant:location (14 suspect mismatches):
+    "tahiti" -> Q42000 -> "society islands"
+    "caribbean" -> Q664609 -> "central america"
+    "texas" -> Q1439 -> "united states"
+    "mexico" -> Q96 -> "neotropical realm"
+    "neotropics" -> Q217151 -> "north america"
+    "beverley brook" -> Q4899394 -> "united kingdom"
+    "britain" -> Q145 -> "beverley brook"
+    "bodhgaya" -> Q176767 -> "bodh gaya"
+
+================================================================================
+  6. FINAL TAG COVERAGE
+================================================================================
+  Total boolean tags:       17,818
+  Total documents:           1,866
+  Tags never used (0 docs):      0
+  Singleton tags (1 doc):   14,674
+  Tags >= 3 docs (usable):   1,795
+
+--- Frequency distribution ---
+  11-50_moderate           332  ██████
+  1_singleton           14,674  ████████████████████████████████████████████████████████████
+  2-3_rare               1,867  █████████████████████████████████████
+  4-10_uncommon            888  █████████████████
+  50+_frequent              57  █
+
+================================================================================
+  7. OVERALL ASSESSMENT
+================================================================================
+
+  Resolution rate: 21.1%
+  -> LOW. Most values failed to resolve to Wikidata entities.
+
+  Type constraint problems: 10 / 16 concept keys
+  Resolution mismatches:    206 (input != output label)
+
+  ** CRITICAL: Majority of concept keys have wrong type constraints. **
+  The concept profiler is resolving concept-key names against Wikidata
+  and finding entities that match the surface words (e.g., 'group',
+  'attribute') rather than the intended domain-specific semantics.
+  This causes the type-validation filter to reject correct entities
+  and accept wrong ones during canonicalization.
+
+  ** WARNING: Many resolution mismatches detected. **
+  Values like 'sea' being resolved to 'Southeast Asia' or
+  'college graduate' to a Chinese journal title indicate that
+  wrong QIDs are being selected due to type-constraint errors.
+
+  Usable tags (freq >= 3): 1,795 / 17,818 (10.1%)
+  -> Very sparse: most tags appear in < 3 documents.
+  This limits the query planner's ability to build useful filters.
+
+
+================================================================================
+  8. RECOMMENDATIONS
+================================================================================
+
+  1. FIX TYPE CONSTRAINTS: The concept profiler uses surface-word
+     matching on concept-key names (e.g., 'plant:attribute') to find
+     Wikidata scope entities. This produces irrelevant types like
+     'heraldic attribute' or 'factory' for plant biology. Consider:
+     - Using domain-aware prompting to find correct Wikidata types
+     - Adding manual overrides via ontology_config for known domains
+     - Incorporating actual sample values into type constraint inference
+
+  2. VALIDATE RESOLUTIONS: Add a post-canonicalization check that
+     compares input string similarity with resolved QID labels.
+     Flag cases where edit distance / overlap is very low.
+
+  3. IMPROVE PROPAGATION: Cross-concept propagation added 0 values.
+     The inferred_cross_concept_hierarchy is empty. Consider manual
+     hierarchy edges (e.g., bird -> animal, novel -> book).
+
+  4. REDUCE TAG SPARSITY: With only ~10% usable tags, the filter
+     catalog is very sparse. Aggressive materialization or broader
+     type constraints could help, but only if resolution quality
+     improves first.

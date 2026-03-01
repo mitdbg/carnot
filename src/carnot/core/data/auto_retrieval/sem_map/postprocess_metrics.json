@@ -1,0 +1,10 @@
+{
+  "raw_value_count": 28091,
+  "canonicalized_value_count": 28013,
+  "materialized_value_count": 37605,
+  "propagated_value_count": 28013,
+  "alias_collapse_count": 78,
+  "materialization_added_count": 9592,
+  "cross_concept_propagation_added_count": 0,
+  "active_tag_count": 17818
+}

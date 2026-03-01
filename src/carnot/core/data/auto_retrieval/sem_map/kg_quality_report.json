@@ -1,0 +1,1967 @@
+{
+  "pipeline_metrics": {
+    "raw_value_count": 28091,
+    "canonicalized_value_count": 28013,
+    "materialized_value_count": 37605,
+    "propagated_value_count": 28013,
+    "alias_collapse_count": 78,
+    "materialization_added_count": 9592,
+    "cross_concept_propagation_added_count": 0,
+    "active_tag_count": 17818
+  },
+  "canonicalization": {
+    "summary": {
+      "total_unique_values": 17344,
+      "resolved_to_qid": 3657,
+      "unresolved_kept_text": 13687,
+      "overall_resolution_rate": 0.2109,
+      "total_value_occurrences": 28013
+    },
+    "per_key": {
+      "animal:geographic:distribution": {
+        "total_value_occurrences": 4463,
+        "unique_input_values": 2625,
+        "unique_output_values": 2594,
+        "resolved_to_qid": 718,
+        "unresolved_kept_text": 1876,
+        "resolution_rate": 0.2768
+      },
+      "animal:geologic_period": {
+        "total_value_occurrences": 407,
+        "unique_input_values": 146,
+        "unique_output_values": 140,
+        "resolved_to_qid": 21,
+        "unresolved_kept_text": 119,
+        "resolution_rate": 0.15
+      },
+      "animal:taxonomic-group": {
+        "total_value_occurrences": 1456,
+        "unique_input_values": 1058,
+        "unique_output_values": 946,
+        "resolved_to_qid": 577,
+        "unresolved_kept_text": 369,
+        "resolution_rate": 0.6099
+      },
+      "bird:temporal:classification": {
+        "total_value_occurrences": 172,
+        "unique_input_values": 113,
+        "unique_output_values": 113,
+        "resolved_to_qid": 0,
+        "unresolved_kept_text": 113,
+        "resolution_rate": 0.0
+      },
+      "book:nationality": {
+        "total_value_occurrences": 476,
+        "unique_input_values": 94,
+        "unique_output_values": 88,
+        "resolved_to_qid": 40,
+        "unresolved_kept_text": 48,
+        "resolution_rate": 0.4545
+      },
+      "book:publication:period": {
+        "total_value_occurrences": 382,
+        "unique_input_values": 206,
+        "unique_output_values": 206,
+        "resolved_to_qid": 91,
+        "unresolved_kept_text": 115,
+        "resolution_rate": 0.4417
+      },
+      "book:subject": {
+        "total_value_occurrences": 3432,
+        "unique_input_values": 2607,
+        "unique_output_values": 2607,
+        "resolved_to_qid": 53,
+        "unresolved_kept_text": 2554,
+        "resolution_rate": 0.0203
+      },
+      "book:time-period": {
+        "total_value_occurrences": 673,
+        "unique_input_values": 467,
+        "unique_output_values": 467,
+        "resolved_to_qid": 158,
+        "unresolved_kept_text": 309,
+        "resolution_rate": 0.3383
+      },
+      "film:genre": {
+        "total_value_occurrences": 821,
+        "unique_input_values": 230,
+        "unique_output_values": 212,
+        "resolved_to_qid": 125,
+        "unresolved_kept_text": 87,
+        "resolution_rate": 0.5896
+      },
+      "film:nationality": {
+        "total_value_occurrences": 531,
+        "unique_input_values": 62,
+        "unique_output_values": 60,
+        "resolved_to_qid": 31,
+        "unresolved_kept_text": 29,
+        "resolution_rate": 0.5167
+      },
+      "film:setting": {
+        "total_value_occurrences": 1197,
+        "unique_input_values": 852,
+        "unique_output_values": 834,
+        "resolved_to_qid": 453,
+        "unresolved_kept_text": 381,
+        "resolution_rate": 0.5432
+      },
+      "film:thematic_category": {
+        "total_value_occurrences": 3177,
+        "unique_input_values": 2058,
+        "unique_output_values": 2057,
+        "resolved_to_qid": 310,
+        "unresolved_kept_text": 1747,
+        "resolution_rate": 0.1507
+      },
+      "film:time-period": {
+        "total_value_occurrences": 790,
+        "unique_input_values": 310,
+        "unique_output_values": 301,
+        "resolved_to_qid": 17,
+        "unresolved_kept_text": 284,
+        "resolution_rate": 0.0565
+      },
+      "novel:attribute": {
+        "total_value_occurrences": 1149,
+        "unique_input_values": 932,
+        "unique_output_values": 931,
+        "resolved_to_qid": 34,
+        "unresolved_kept_text": 897,
+        "resolution_rate": 0.0365
+      },
+      "novel:genre": {
+        "total_value_occurrences": 414,
+        "unique_input_values": 132,
+        "unique_output_values": 123,
+        "resolved_to_qid": 92,
+        "unresolved_kept_text": 31,
+        "resolution_rate": 0.748
+      },
+      "plant:attribute": {
+        "total_value_occurrences": 4591,
+        "unique_input_values": 3883,
+        "unique_output_values": 3872,
+        "resolved_to_qid": 128,
+        "unresolved_kept_text": 3744,
+        "resolution_rate": 0.0331
+      },
+      "plant:location": {
+        "total_value_occurrences": 3882,
+        "unique_input_values": 1836,
+        "unique_output_values": 1793,
+        "resolved_to_qid": 809,
+        "unresolved_kept_text": 984,
+        "resolution_rate": 0.4512
+      }
+    },
+    "unresolved_examples": {
+      "animal:geographic:distribution": [
+        "1,270 meters above sea level",
+        "10 metres depth",
+        "165 m depth",
+        "73 m depth",
+        "a cave on tioman island",
+        "a plateau near the western region of mafhaq",
+        "aachen formation of moresnet",
+        "abandoned aardvark holes",
+        "abandoned fox holes",
+        "abandoned jackal holes"
+      ],
+      "animal:geologic_period": [
+        "16 million years ago",
+        "1930",
+        "19th century",
+        "60-80 million years ago",
+        "82 million years ago",
+        "aalenian",
+        "about 13 to 5 million years ago",
+        "about 38 million years ago",
+        "albian",
+        "anisian"
+      ],
+      "animal:taxonomic-group": [
+        "a. citrinellus",
+        "acratocnidae",
+        "algae",
+        "alien",
+        "amphibamiform temnospondyls",
+        "annelid worms",
+        "antelope",
+        "anthropoids",
+        "anurans",
+        "auk-like diving petrels"
+      ],
+      "bird:temporal:classification": [
+        "1970s?",
+        "53 to 50 million years ago",
+        "58-61.6 ma",
+        "62 to 1.8 million years ago",
+        "altitudinal migration",
+        "ancient australo-papuan radiation",
+        "austral winter (may to august)",
+        "breed much of year",
+        "breeding bird",
+        "breeding season"
+      ],
+      "book:nationality": [
+        "afghan-american",
+        "algerian",
+        "american",
+        "anglo-afghan",
+        "asian-american",
+        "assamese",
+        "australian",
+        "bantam books",
+        "belgian",
+        "bengali"
+      ],
+      "book:publication:period": [
+        "1684-1687",
+        "1731-1743",
+        "1731-1745",
+        "1770s-1780",
+        "1840s",
+        "1849-1850",
+        "1856-1857",
+        "1857-1858",
+        "1862-1863",
+        "1862-1864"
+      ],
+      "book:subject": [
+        "15th-century france",
+        "1632 series",
+        "1925 film depiction",
+        "2001 war in afghanistan",
+        "2003 iraq war",
+        "2016 indian banknote demonetisation",
+        "2016 united states presidential election",
+        "26/11 attacks",
+        "26/11 mumbai attacks",
+        "39 clues series"
+      ],
+      "book:time-period": [
+        "1140s",
+        "12 years earlier",
+        "12th-14th century",
+        "1485",
+        "1502",
+        "1509",
+        "1516",
+        "1533",
+        "1590-1609",
+        "15th century"
+      ],
+      "film:genre": [
+        "3d",
+        "3d animation",
+        "3d computer animated",
+        "3d computer-animated",
+        "3d motion simulator",
+        "american adventure film",
+        "american drama film",
+        "american horror film",
+        "animated short",
+        "animated short film"
+      ],
+      "film:nationality": [
+        "american",
+        "australian",
+        "barbadian",
+        "bbc",
+        "belgian",
+        "bollywood",
+        "british",
+        "canadian",
+        "english",
+        "english-language"
+      ],
+      "film:setting": [
+        "1730",
+        "1782",
+        "1885",
+        "1930s",
+        "1936 olympics",
+        "1950s italy",
+        "1955",
+        "1960s new york city",
+        "1962",
+        "1976 election"
+      ],
+      "film:thematic_category": [
+        "3d filmmaking",
+        "45th infantry division",
+        "a cappella competition",
+        "a million volunteers",
+        "abduction",
+        "abdulrahman ibrahim ibn sori",
+        "abolition",
+        "abolitionism",
+        "abolitionist movement",
+        "abstinence"
+      ],
+      "film:time-period": [
+        "1194",
+        "12th century",
+        "1489",
+        "150 years",
+        "16th century",
+        "1768-1813",
+        "1769 to 1820",
+        "1782",
+        "1787",
+        "1788"
+      ],
+      "novel:attribute": [
+        "1868",
+        "1991 publication",
+        "2-in-1 edition",
+        "2013 publication",
+        "22 chapters",
+        "42nd book in series",
+        "48 books and 365 chapters",
+        "655,478 words in the original french",
+        "96-page",
+        "a young tree with only two flower panicles can produce seeds in its first fruiting season"
+      ],
+      "novel:genre": [
+        "abridged novel",
+        "allegorical satire",
+        "amatory fiction",
+        "assamese novel",
+        "bengali novel",
+        "contemporary novel",
+        "crime and mystery",
+        "debut novel",
+        "detective mystery",
+        "espionage thriller"
+      ],
+      "plant:attribute": [
+        "0.5-1.5 cm broad leaves",
+        "1 to 3 flowered inflorescence",
+        "1-2 cm spine length",
+        "1-3 m tall",
+        "1-4 hard, woody, warty stones",
+        "1-locular ovaries",
+        "10 stamens",
+        "10 stamens and 3 styles extend beyond throat",
+        "10-25 leaves",
+        "12 nearly opposite stemless leaflets"
+      ],
+      "plant:location": [
+        "1.0 km to 3.0 km altitude",
+        "1000-2600 m above sea level",
+        "2,500-3,300 meters elevation",
+        "2800-2850 m elevation",
+        "35° to 44° south latitude",
+        "aachen formation of moresnet",
+        "aberdare mountains",
+        "acidic soils",
+        "acre, brazil",
+        "across the us and into canada"
+      ]
+    }
+  },
+  "materialization": {
+    "summary": {
+      "total_unique_before": 17344,
+      "total_unique_after": 17344,
+      "net_added": 0,
+      "expansion_ratio": 1.0
+    },
+    "per_key": {
+      "animal:geographic:distribution": {
+        "unique_before": 2594,
+        "unique_after": 2594,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 718,
+        "qids_after": 718,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      },
+      "animal:geologic_period": {
+        "unique_before": 140,
+        "unique_after": 140,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 21,
+        "qids_after": 21,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      },
+      "animal:taxonomic-group": {
+        "unique_before": 946,
+        "unique_after": 946,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 577,
+        "qids_after": 577,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      },
+      "bird:temporal:classification": {
+        "unique_before": 113,
+        "unique_after": 113,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 0,
+        "qids_after": 0,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      },
+      "book:nationality": {
+        "unique_before": 88,
+        "unique_after": 88,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 40,
+        "qids_after": 40,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      },
+      "book:publication:period": {
+        "unique_before": 206,
+        "unique_after": 206,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 91,
+        "qids_after": 91,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      },
+      "book:subject": {
+        "unique_before": 2607,
+        "unique_after": 2607,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 53,
+        "qids_after": 53,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      },
+      "book:time-period": {
+        "unique_before": 467,
+        "unique_after": 467,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 158,
+        "qids_after": 158,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      },
+      "film:genre": {
+        "unique_before": 212,
+        "unique_after": 212,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 125,
+        "qids_after": 125,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      },
+      "film:nationality": {
+        "unique_before": 60,
+        "unique_after": 60,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 31,
+        "qids_after": 31,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      },
+      "film:setting": {
+        "unique_before": 834,
+        "unique_after": 834,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 453,
+        "qids_after": 453,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      },
+      "film:thematic_category": {
+        "unique_before": 2057,
+        "unique_after": 2057,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 310,
+        "qids_after": 310,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      },
+      "film:time-period": {
+        "unique_before": 301,
+        "unique_after": 301,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 17,
+        "qids_after": 17,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      },
+      "novel:attribute": {
+        "unique_before": 931,
+        "unique_after": 931,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 34,
+        "qids_after": 34,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      },
+      "novel:genre": {
+        "unique_before": 123,
+        "unique_after": 123,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 92,
+        "qids_after": 92,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      },
+      "plant:attribute": {
+        "unique_before": 3872,
+        "unique_after": 3872,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 128,
+        "qids_after": 128,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      },
+      "plant:location": {
+        "unique_before": 1793,
+        "unique_after": 1793,
+        "values_added": 0,
+        "values_removed": 0,
+        "qids_before": 809,
+        "qids_after": 809,
+        "ancestor_qids_added": 0,
+        "expansion_ratio": 1.0
+      }
+    }
+  },
+  "label_resolution": {
+    "summary": {
+      "total_qids_input": 3657,
+      "total_labeled": 3657,
+      "total_passthrough_qid": 0,
+      "label_rate": 1.0
+    },
+    "per_key": {
+      "animal:geographic:distribution": {
+        "qids_input": 718,
+        "qids_labeled": 718,
+        "qids_still_as_qid": 0,
+        "label_rate": 1.0,
+        "non_qid_values": 1876
+      },
+      "animal:geologic_period": {
+        "qids_input": 21,
+        "qids_labeled": 21,
+        "qids_still_as_qid": 0,
+        "label_rate": 1.0,
+        "non_qid_values": 119
+      },
+      "animal:taxonomic-group": {
+        "qids_input": 577,
+        "qids_labeled": 577,
+        "qids_still_as_qid": 0,
+        "label_rate": 1.0,
+        "non_qid_values": 369
+      },
+      "bird:temporal:classification": {
+        "qids_input": 0,
+        "qids_labeled": 0,
+        "qids_still_as_qid": 0,
+        "label_rate": 0.0,
+        "non_qid_values": 113
+      },
+      "book:nationality": {
+        "qids_input": 40,
+        "qids_labeled": 40,
+        "qids_still_as_qid": 0,
+        "label_rate": 1.0,
+        "non_qid_values": 48
+      },
+      "book:publication:period": {
+        "qids_input": 91,
+        "qids_labeled": 91,
+        "qids_still_as_qid": 0,
+        "label_rate": 1.0,
+        "non_qid_values": 115
+      },
+      "book:subject": {
+        "qids_input": 53,
+        "qids_labeled": 53,
+        "qids_still_as_qid": 0,
+        "label_rate": 1.0,
+        "non_qid_values": 2554
+      },
+      "book:time-period": {
+        "qids_input": 158,
+        "qids_labeled": 158,
+        "qids_still_as_qid": 0,
+        "label_rate": 1.0,
+        "non_qid_values": 309
+      },
+      "film:genre": {
+        "qids_input": 125,
+        "qids_labeled": 125,
+        "qids_still_as_qid": 0,
+        "label_rate": 1.0,
+        "non_qid_values": 87
+      },
+      "film:nationality": {
+        "qids_input": 31,
+        "qids_labeled": 31,
+        "qids_still_as_qid": 0,
+        "label_rate": 1.0,
+        "non_qid_values": 29
+      },
+      "film:setting": {
+        "qids_input": 453,
+        "qids_labeled": 453,
+        "qids_still_as_qid": 0,
+        "label_rate": 1.0,
+        "non_qid_values": 381
+      },
+      "film:thematic_category": {
+        "qids_input": 310,
+        "qids_labeled": 310,
+        "qids_still_as_qid": 0,
+        "label_rate": 1.0,
+        "non_qid_values": 1747
+      },
+      "film:time-period": {
+        "qids_input": 17,
+        "qids_labeled": 17,
+        "qids_still_as_qid": 0,
+        "label_rate": 1.0,
+        "non_qid_values": 284
+      },
+      "novel:attribute": {
+        "qids_input": 34,
+        "qids_labeled": 34,
+        "qids_still_as_qid": 0,
+        "label_rate": 1.0,
+        "non_qid_values": 897
+      },
+      "novel:genre": {
+        "qids_input": 92,
+        "qids_labeled": 92,
+        "qids_still_as_qid": 0,
+        "label_rate": 1.0,
+        "non_qid_values": 31
+      },
+      "plant:attribute": {
+        "qids_input": 128,
+        "qids_labeled": 128,
+        "qids_still_as_qid": 0,
+        "label_rate": 1.0,
+        "non_qid_values": 3744
+      },
+      "plant:location": {
+        "qids_input": 809,
+        "qids_labeled": 809,
+        "qids_still_as_qid": 0,
+        "label_rate": 1.0,
+        "non_qid_values": 984
+      }
+    }
+  },
+  "type_constraint_quality": {
+    "total_concept_keys": 17,
+    "enabled_keys": 16,
+    "disabled_keys": 1,
+    "avg_confidence": 0.6622,
+    "low_confidence_keys": [
+      {
+        "key": "novel:genre",
+        "confidence": 0.5704
+      }
+    ],
+    "wrong_type_constraint_suspects": [
+      {
+        "key": "book:subject",
+        "confidence": 0.6581,
+        "type_constraints": [
+          "Q164573",
+          "Q362165",
+          "Q53731850"
+        ],
+        "scope_labels": {
+          "Q164573": "subject",
+          "Q362165": "school subject",
+          "Q53731850": "individual copy of a book"
+        },
+        "issue": "type constraints include grammatical 'subject' (Q164573) and 'school subject' (Q362165) — not about book topics/themes"
+      },
+      {
+        "key": "plant:attribute",
+        "confidence": 0.6946,
+        "type_constraints": [
+          "Q834104",
+          "Q83405",
+          "Q188840"
+        ],
+        "scope_labels": {
+          "Q188840": "medicinal plant",
+          "Q83405": "factory",
+          "Q834104": "heraldic attribute"
+        },
+        "issue": "type constraints include 'heraldic attribute' (Q834104) and 'factory' (Q83405) — irrelevant to plant biology"
+      },
+      {
+        "key": "plant:location",
+        "confidence": 0.6123,
+        "type_constraints": [
+          "Q18658526",
+          "Q12131650",
+          "Q18711811"
+        ],
+        "scope_labels": {
+          "Q12131650": "location of burial",
+          "Q18658526": "place of death",
+          "Q18711811": "map data module"
+        },
+        "issue": "type constraints include 'place of death' (Q18658526) and 'location of burial' (Q12131650) — not about geographic regions"
+      },
+      {
+        "key": "novel:attribute",
+        "confidence": 0.6309,
+        "type_constraints": [
+          "Q834104",
+          "Q8261",
+          "Q758238"
+        ],
+        "scope_labels": {
+          "Q758238": "attribute",
+          "Q8261": "novel",
+          "Q834104": "heraldic attribute"
+        },
+        "issue": "type constraints include 'heraldic attribute' (Q834104) — irrelevant to novel properties"
+      },
+      {
+        "key": "film:nationality",
+        "confidence": 0.7255,
+        "type_constraints": [
+          "Q11424",
+          "Q3337001",
+          "Q1137203"
+        ],
+        "scope_labels": {
+          "Q1137203": "thin film",
+          "Q11424": "film",
+          "Q3337001": "nationality for sports"
+        },
+        "issue": "type constraints include 'thin film' (Q1137203) — unrelated to country of origin"
+      },
+      {
+        "key": "animal:taxonomic-group",
+        "confidence": 0.6448,
+        "type_constraints": [
+          "Q215380",
+          "Q824979",
+          "Q32945461"
+        ],
+        "scope_labels": {
+          "Q215380": "musical group",
+          "Q32945461": "taxonomic treatment",
+          "Q824979": "group"
+        },
+        "issue": "type constraints include 'musical group' (Q215380) and 'geological group' (Q824979) — neither related to biological taxonomy"
+      },
+      {
+        "key": "book:nationality",
+        "confidence": 0.6301,
+        "type_constraints": [
+          "Q53731850",
+          "Q3337001",
+          "Q571"
+        ],
+        "scope_labels": {
+          "Q3337001": "nationality for sports",
+          "Q53731850": "individual copy of a book",
+          "Q571": "book"
+        },
+        "issue": "type constraints include 'individual copy of a book' (Q53731850) and 'nationality for sports' (Q3337001) — not about nationalities/countries"
+      },
+      {
+        "key": "book:time-period",
+        "confidence": 0.7911,
+        "type_constraints": [
+          "Q11514315",
+          "Q12737784",
+          "Q186081"
+        ],
+        "scope_labels": {
+          "Q11514315": "historical period",
+          "Q12737784": "Time Period in Chrono Trigger",
+          "Q186081": "time interval"
+        },
+        "issue": "type constraints include 'Time Period in Chrono Trigger' (Q12737784) — a video game concept, not a historical period"
+      },
+      {
+        "key": "film:time-period",
+        "confidence": 0.7375,
+        "type_constraints": [
+          "Q11514315",
+          "Q11424",
+          "Q12737784"
+        ],
+        "scope_labels": {
+          "Q11424": "film",
+          "Q11514315": "historical period",
+          "Q12737784": "Time Period in Chrono Trigger"
+        },
+        "issue": "type constraints include 'Time Period in Chrono Trigger' (Q12737784) — a video game concept"
+      },
+      {
+        "key": "film:setting",
+        "confidence": 0.7513,
+        "type_constraints": [
+          "Q11424",
+          "Q1137203",
+          "Q2526255"
+        ],
+        "scope_labels": {
+          "Q1137203": "thin film",
+          "Q11424": "film",
+          "Q2526255": "film director"
+        },
+        "issue": "type constraints include 'thin film' (Q1137203) and 'film director' (Q2526255) — not about geographic locations"
+      }
+    ]
+  },
+  "resolution_errors": {
+    "total_suspect_mismatches": 206,
+    "per_key": {
+      "animal:geographic:distribution": {
+        "count": 14,
+        "examples": [
+          {
+            "input": "sea",
+            "qid": "Q11708",
+            "resolved_label": "southeast asia"
+          },
+          {
+            "input": "berlin",
+            "qid": "Q64",
+            "resolved_label": "germany"
+          },
+          {
+            "input": "tokyo",
+            "qid": "Q7473516",
+            "resolved_label": "earth"
+          },
+          {
+            "input": "small island",
+            "qid": "Q207524",
+            "resolved_label": "islet"
+          },
+          {
+            "input": "mount aso",
+            "qid": "Q733710",
+            "resolved_label": "kyushu"
+          },
+          {
+            "input": "kyushu",
+            "qid": "Q13987",
+            "resolved_label": "japan"
+          },
+          {
+            "input": "japan",
+            "qid": "Q17",
+            "resolved_label": "earth"
+          },
+          {
+            "input": "harbor",
+            "qid": "Q283202",
+            "resolved_label": "asia"
+          },
+          {
+            "input": "gallup",
+            "qid": "Q30669532",
+            "resolved_label": "earth"
+          },
+          {
+            "input": "siberia",
+            "qid": "Q5428",
+            "resolved_label": "earth"
+          },
+          {
+            "input": "metropolis",
+            "qid": "Q3307458",
+            "resolved_label": "museum of natural sciences of belgium"
+          },
+          {
+            "input": "museum of natural science",
+            "qid": "Q222297",
+            "resolved_label": "metropolis"
+          },
+          {
+            "input": "alaska",
+            "qid": "Q797",
+            "resolved_label": "united states"
+          },
+          {
+            "input": "nenana, alaska",
+            "qid": "Q80058",
+            "resolved_label": "north america"
+          }
+        ]
+      },
+      "animal:geologic_period": {
+        "count": 13,
+        "examples": [
+          {
+            "input": "miocene",
+            "qid": "Q76267",
+            "resolved_label": "paleocene"
+          },
+          {
+            "input": "paleocene",
+            "qid": "Q76252",
+            "resolved_label": "miocene"
+          },
+          {
+            "input": "late cretaceous",
+            "qid": "Q338199",
+            "resolved_label": "oligocene"
+          },
+          {
+            "input": "oligocene",
+            "qid": "Q101873",
+            "resolved_label": "late eocene"
+          },
+          {
+            "input": "late triassic",
+            "qid": "Q917293",
+            "resolved_label": "early jurassic"
+          },
+          {
+            "input": "early jurassic",
+            "qid": "Q284787",
+            "resolved_label": "late jurassic"
+          },
+          {
+            "input": "late jurassic",
+            "qid": "Q499312",
+            "resolved_label": "early cretaceous"
+          },
+          {
+            "input": "early cretaceous",
+            "qid": "Q752187",
+            "resolved_label": "late triassic"
+          },
+          {
+            "input": "upper triassic",
+            "qid": "Q917293",
+            "resolved_label": "late triassic"
+          },
+          {
+            "input": "late ordovician",
+            "qid": "Q13389115",
+            "resolved_label": "upper silurian"
+          },
+          {
+            "input": "upper jurassic",
+            "qid": "Q499312",
+            "resolved_label": "late jurassic"
+          },
+          {
+            "input": "lower cretaceous",
+            "qid": "Q752187",
+            "resolved_label": "early cretaceous"
+          },
+          {
+            "input": "upper cretaceous",
+            "qid": "Q338199",
+            "resolved_label": "late cretaceous"
+          }
+        ]
+      },
+      "animal:taxonomic-group": {
+        "count": 14,
+        "examples": [
+          {
+            "input": "rabbit",
+            "qid": "Q9394",
+            "resolved_label": "chordata"
+          },
+          {
+            "input": "chicken",
+            "qid": "Q780",
+            "resolved_label": "archosaur"
+          },
+          {
+            "input": "insect",
+            "qid": "Q1390",
+            "resolved_label": "hexapoda"
+          },
+          {
+            "input": "chimpanzee",
+            "qid": "Q4126704",
+            "resolved_label": "hominoidea"
+          },
+          {
+            "input": "bats",
+            "qid": "Q28425",
+            "resolved_label": "chordata"
+          },
+          {
+            "input": "dinosaur",
+            "qid": "Q430",
+            "resolved_label": "reptilia"
+          },
+          {
+            "input": "tyrannosaurus",
+            "qid": "Q14332",
+            "resolved_label": "archosaur"
+          },
+          {
+            "input": "duck",
+            "qid": "Q7556",
+            "resolved_label": "chordata"
+          },
+          {
+            "input": "bear",
+            "qid": "Q11788",
+            "resolved_label": "chordata"
+          },
+          {
+            "input": "raven",
+            "qid": "Q25357",
+            "resolved_label": "ursidae"
+          },
+          {
+            "input": "reindeer",
+            "qid": "Q39624",
+            "resolved_label": "mammaliaformes"
+          },
+          {
+            "input": "dog",
+            "qid": "Q20717272",
+            "resolved_label": "ferae"
+          },
+          {
+            "input": "kaiju",
+            "qid": "Q62569760",
+            "resolved_label": "hexapoda"
+          },
+          {
+            "input": "dragon",
+            "qid": "Q25375",
+            "resolved_label": "reptilia"
+          }
+        ]
+      },
+      "book:nationality": {
+        "count": 11,
+        "examples": [
+          {
+            "input": "united states",
+            "qid": "Q30",
+            "resolved_label": "british"
+          },
+          {
+            "input": "chinese",
+            "qid": "Q865",
+            "resolved_label": "taiwanese"
+          },
+          {
+            "input": "danish",
+            "qid": "Q756617",
+            "resolved_label": "kingdom of denmark"
+          },
+          {
+            "input": "italian",
+            "qid": "Q38",
+            "resolved_label": "italy"
+          },
+          {
+            "input": "german",
+            "qid": "Q183",
+            "resolved_label": "british"
+          },
+          {
+            "input": "french",
+            "qid": "Q142",
+            "resolved_label": "france"
+          },
+          {
+            "input": "uk",
+            "qid": "Q145",
+            "resolved_label": "united kingdom"
+          },
+          {
+            "input": "swedish",
+            "qid": "Q34",
+            "resolved_label": "sweden"
+          },
+          {
+            "input": "mexican",
+            "qid": "Q96",
+            "resolved_label": "british raj"
+          },
+          {
+            "input": "indian",
+            "qid": "Q129286",
+            "resolved_label": "united states"
+          },
+          {
+            "input": "japanese",
+            "qid": "Q188712",
+            "resolved_label": "empire of japan"
+          }
+        ]
+      },
+      "book:publication:period": {
+        "count": 13,
+        "examples": [
+          {
+            "input": "1935",
+            "qid": "Q18658",
+            "resolved_label": "1951"
+          },
+          {
+            "input": "1951",
+            "qid": "Q18591",
+            "resolved_label": "1935"
+          },
+          {
+            "input": "1957",
+            "qid": "Q5311",
+            "resolved_label": "1989"
+          },
+          {
+            "input": "1959",
+            "qid": "Q5302",
+            "resolved_label": "1962"
+          },
+          {
+            "input": "1962",
+            "qid": "Q2764",
+            "resolved_label": "1959"
+          },
+          {
+            "input": "1989",
+            "qid": "Q2425",
+            "resolved_label": "1957"
+          },
+          {
+            "input": "1936",
+            "qid": "Q18649",
+            "resolved_label": "1960-1975"
+          },
+          {
+            "input": "1986",
+            "qid": "Q2430",
+            "resolved_label": "2002"
+          },
+          {
+            "input": "2002",
+            "qid": "Q1987",
+            "resolved_label": "1986"
+          },
+          {
+            "input": "2007",
+            "qid": "Q2024",
+            "resolved_label": "18th century"
+          },
+          {
+            "input": "1994",
+            "qid": "Q2067",
+            "resolved_label": "2001"
+          },
+          {
+            "input": "2001",
+            "qid": "Q1988",
+            "resolved_label": "1994"
+          },
+          {
+            "input": "2019",
+            "qid": "Q25274",
+            "resolved_label": "1991-1993"
+          }
+        ]
+      },
+      "book:subject": {
+        "count": 15,
+        "examples": [
+          {
+            "input": "coming-of-age",
+            "qid": "Q2975633",
+            "resolved_label": "college graduates’ employment development and contract consciousness"
+          },
+          {
+            "input": "adultery",
+            "qid": "Q234213",
+            "resolved_label": "seduction"
+          },
+          {
+            "input": "seduction",
+            "qid": "Q1527023",
+            "resolved_label": "adultery"
+          },
+          {
+            "input": "college graduate",
+            "qid": "Q120666847",
+            "resolved_label": "coming-of-age fiction"
+          },
+          {
+            "input": "mutiny on the bounty",
+            "qid": "Q329709",
+            "resolved_label": "fletcher christian"
+          },
+          {
+            "input": "fletcher christian",
+            "qid": "Q116476982",
+            "resolved_label": "mutiny on the bounty"
+          },
+          {
+            "input": "censorship",
+            "qid": "Q543",
+            "resolved_label": "small-town scandal"
+          },
+          {
+            "input": "autobiography",
+            "qid": "Q4184",
+            "resolved_label": "central intelligence agency"
+          },
+          {
+            "input": "cia",
+            "qid": "Q37230",
+            "resolved_label": "autobiography"
+          },
+          {
+            "input": "korean war",
+            "qid": "Q8663",
+            "resolved_label": "friendly fire"
+          },
+          {
+            "input": "british soldiers",
+            "qid": "Q3678862",
+            "resolved_label": "national service"
+          },
+          {
+            "input": "national service",
+            "qid": "Q135842567",
+            "resolved_label": "military patrol"
+          },
+          {
+            "input": "military patrol",
+            "qid": "Q2418434",
+            "resolved_label": "cladonia cristatella"
+          },
+          {
+            "input": "retreat",
+            "qid": "Q1430466",
+            "resolved_label": "korean war"
+          },
+          {
+            "input": "friendly fire incident",
+            "qid": "Q2889117",
+            "resolved_label": "plight of national service men"
+          }
+        ]
+      },
+      "book:time-period": {
+        "count": 15,
+        "examples": [
+          {
+            "input": "1943",
+            "qid": "Q18623",
+            "resolved_label": "world war ii"
+          },
+          {
+            "input": "1936",
+            "qid": "Q18649",
+            "resolved_label": "world war ii"
+          },
+          {
+            "input": "1942",
+            "qid": "Q18625",
+            "resolved_label": "world war ii"
+          },
+          {
+            "input": "1868",
+            "qid": "Q7717",
+            "resolved_label": "19th century"
+          },
+          {
+            "input": "1815",
+            "qid": "Q6948",
+            "resolved_label": "1832 june rebellion"
+          },
+          {
+            "input": "1856",
+            "qid": "Q7676",
+            "resolved_label": "19th century"
+          },
+          {
+            "input": "1857",
+            "qid": "Q7680",
+            "resolved_label": "1856"
+          },
+          {
+            "input": "1984",
+            "qid": "Q2432",
+            "resolved_label": "1986"
+          },
+          {
+            "input": "1986",
+            "qid": "Q2430",
+            "resolved_label": "1984"
+          },
+          {
+            "input": "1994",
+            "qid": "Q2067",
+            "resolved_label": "1995 to 1999"
+          },
+          {
+            "input": "1940",
+            "qid": "Q18633",
+            "resolved_label": "1994"
+          },
+          {
+            "input": "1975",
+            "qid": "Q2479",
+            "resolved_label": "1987"
+          },
+          {
+            "input": "1978",
+            "qid": "Q2483",
+            "resolved_label": "1975"
+          },
+          {
+            "input": "1987",
+            "qid": "Q2429",
+            "resolved_label": "1978"
+          },
+          {
+            "input": "1999",
+            "qid": "Q2091",
+            "resolved_label": "seven years after the second book"
+          }
+        ]
+      },
+      "film:genre": {
+        "count": 13,
+        "examples": [
+          {
+            "input": "neo-noir",
+            "qid": "Q2421031",
+            "resolved_label": "erotica"
+          },
+          {
+            "input": "black and white",
+            "qid": "Q838368",
+            "resolved_label": "black-and-white"
+          },
+          {
+            "input": "science fiction",
+            "qid": "Q24925",
+            "resolved_label": "western"
+          },
+          {
+            "input": "western",
+            "qid": "Q21590660",
+            "resolved_label": "science fiction"
+          },
+          {
+            "input": "comedy-drama",
+            "qid": "Q859369",
+            "resolved_label": "comedy drama"
+          },
+          {
+            "input": "sex comedy",
+            "qid": "Q2991560",
+            "resolved_label": "erotica"
+          },
+          {
+            "input": "biographical",
+            "qid": "Q645928",
+            "resolved_label": "crime drama film"
+          },
+          {
+            "input": "crime drama",
+            "qid": "Q113485322",
+            "resolved_label": "biographical film"
+          },
+          {
+            "input": "action",
+            "qid": "Q188473",
+            "resolved_label": "comedy"
+          },
+          {
+            "input": "comedy",
+            "qid": "Q40831",
+            "resolved_label": "family"
+          },
+          {
+            "input": "short",
+            "qid": "Q49084",
+            "resolved_label": "silent film"
+          },
+          {
+            "input": "silent",
+            "qid": "Q226730",
+            "resolved_label": "short story"
+          },
+          {
+            "input": "slasher",
+            "qid": "Q853630",
+            "resolved_label": "black comedy"
+          }
+        ]
+      },
+      "film:nationality": {
+        "count": 8,
+        "examples": [
+          {
+            "input": "filipino",
+            "qid": "Q928",
+            "resolved_label": "philippines"
+          },
+          {
+            "input": "italian",
+            "qid": "Q38",
+            "resolved_label": "italy"
+          },
+          {
+            "input": "danish",
+            "qid": "Q756617",
+            "resolved_label": "united kingdom"
+          },
+          {
+            "input": "uk",
+            "qid": "Q145",
+            "resolved_label": "kingdom of denmark"
+          },
+          {
+            "input": "german",
+            "qid": "Q183",
+            "resolved_label": "austrian empire"
+          },
+          {
+            "input": "austrian",
+            "qid": "Q131964",
+            "resolved_label": "germany"
+          },
+          {
+            "input": "french",
+            "qid": "Q142",
+            "resolved_label": "american"
+          },
+          {
+            "input": "japanese",
+            "qid": "Q188712",
+            "resolved_label": "empire of japan"
+          }
+        ]
+      },
+      "film:setting": {
+        "count": 14,
+        "examples": [
+          {
+            "input": "pasadena, california",
+            "qid": "Q485176",
+            "resolved_label": "united states"
+          },
+          {
+            "input": "new york",
+            "qid": "Q1384",
+            "resolved_label": "united states"
+          },
+          {
+            "input": "portsmouth",
+            "qid": "Q72259",
+            "resolved_label": "south america"
+          },
+          {
+            "input": "tahiti",
+            "qid": "Q42000",
+            "resolved_label": "england"
+          },
+          {
+            "input": "caribbean",
+            "qid": "Q664609",
+            "resolved_label": "tahiti"
+          },
+          {
+            "input": "south america",
+            "qid": "Q18",
+            "resolved_label": "caribbean"
+          },
+          {
+            "input": "long island",
+            "qid": "Q18438",
+            "resolved_label": "new york"
+          },
+          {
+            "input": "new york city",
+            "qid": "Q60",
+            "resolved_label": "long island"
+          },
+          {
+            "input": "hill valley",
+            "qid": "Q49812005",
+            "resolved_label": "pennsylvania"
+          },
+          {
+            "input": "california",
+            "qid": "Q99",
+            "resolved_label": "united states"
+          },
+          {
+            "input": "arizona",
+            "qid": "Q816",
+            "resolved_label": "hill valley"
+          },
+          {
+            "input": "united states",
+            "qid": "Q30",
+            "resolved_label": "arizona"
+          },
+          {
+            "input": "rimini",
+            "qid": "Q13369",
+            "resolved_label": "italy"
+          },
+          {
+            "input": "fascist italy",
+            "qid": "Q48742118",
+            "resolved_label": "europe"
+          }
+        ]
+      },
+      "film:thematic_category": {
+        "count": 15,
+        "examples": [
+          {
+            "input": "batman",
+            "qid": "Q80370",
+            "resolved_label": "robin"
+          },
+          {
+            "input": "robin",
+            "qid": "Q1158139",
+            "resolved_label": "puzzle designer"
+          },
+          {
+            "input": "joker",
+            "qid": "Q42759035",
+            "resolved_label": "penguin books"
+          },
+          {
+            "input": "penguin",
+            "qid": "Q1336200",
+            "resolved_label": "kidnapping"
+          },
+          {
+            "input": "riddler",
+            "qid": "Q12957007",
+            "resolved_label": "joker"
+          },
+          {
+            "input": "catwoman",
+            "qid": "Q92776707",
+            "resolved_label": "supervillains"
+          },
+          {
+            "input": "kidnapping",
+            "qid": "Q318296",
+            "resolved_label": "batman province"
+          },
+          {
+            "input": "supervillains",
+            "qid": "Q56277546",
+            "resolved_label": "catwoman"
+          },
+          {
+            "input": "prostitution",
+            "qid": "Q36633",
+            "resolved_label": "serial murder"
+          },
+          {
+            "input": "therapy",
+            "qid": "Q179661",
+            "resolved_label": "sexual orientation"
+          },
+          {
+            "input": "psychotherapy",
+            "qid": "Q183257",
+            "resolved_label": "medical treatment"
+          },
+          {
+            "input": "sexuality",
+            "qid": "Q17888",
+            "resolved_label": "psychotherapy"
+          },
+          {
+            "input": "serial killing",
+            "qid": "Q16266378",
+            "resolved_label": "interpersonal relationship"
+          },
+          {
+            "input": "coming-of-age",
+            "qid": "Q2975633",
+            "resolved_label": "romance film"
+          },
+          {
+            "input": "romance",
+            "qid": "Q1054574",
+            "resolved_label": "college graduates’ employment development and contract consciousness"
+          }
+        ]
+      },
+      "film:time-period": {
+        "count": 13,
+        "examples": [
+          {
+            "input": "1870s",
+            "qid": "Q39847",
+            "resolved_label": "1983"
+          },
+          {
+            "input": "1940s",
+            "qid": "Q36561",
+            "resolved_label": "hitler's final days"
+          },
+          {
+            "input": "2000s",
+            "qid": "Q35024",
+            "resolved_label": "1990s"
+          },
+          {
+            "input": "1990s",
+            "qid": "Q34653",
+            "resolved_label": "2000s"
+          },
+          {
+            "input": "1980s",
+            "qid": "Q34644",
+            "resolved_label": "cold war"
+          },
+          {
+            "input": "1980",
+            "qid": "Q34644",
+            "resolved_label": "late 1970s"
+          },
+          {
+            "input": "1800",
+            "qid": "Q39577",
+            "resolved_label": "1801"
+          },
+          {
+            "input": "1950s",
+            "qid": "Q36297",
+            "resolved_label": "2005"
+          },
+          {
+            "input": "1970",
+            "qid": "Q35014",
+            "resolved_label": "1989"
+          },
+          {
+            "input": "1960s",
+            "qid": "Q35724",
+            "resolved_label": "1964"
+          },
+          {
+            "input": "2000",
+            "qid": "Q35024",
+            "resolved_label": "one year after the events of its predecessor"
+          },
+          {
+            "input": "1970s",
+            "qid": "Q35014",
+            "resolved_label": "cold war"
+          },
+          {
+            "input": "1200",
+            "qid": "Q1994008",
+            "resolved_label": "1970s"
+          }
+        ]
+      },
+      "novel:attribute": {
+        "count": 13,
+        "examples": [
+          {
+            "input": "risque",
+            "qid": "Q671605",
+            "resolved_label": "serialized fiction"
+          },
+          {
+            "input": "sensational",
+            "qid": "Q7450956",
+            "resolved_label": "pseudonymous bosch"
+          },
+          {
+            "input": "serialized",
+            "qid": "Q1347298",
+            "resolved_label": "risqué"
+          },
+          {
+            "input": "pseudonymous",
+            "qid": "Q3924913",
+            "resolved_label": "sensational"
+          },
+          {
+            "input": "controversial",
+            "qid": "Q18912752",
+            "resolved_label": "disputed"
+          },
+          {
+            "input": "semi-autobiographical",
+            "qid": "Q109620002",
+            "resolved_label": "autobiographical fiction"
+          },
+          {
+            "input": "source material",
+            "qid": "Q31464082",
+            "resolved_label": "source entity"
+          },
+          {
+            "input": "early 20th century",
+            "qid": "Q72003548",
+            "resolved_label": "early twentieth century schools in puerto rico tr"
+          },
+          {
+            "input": "bestselling",
+            "qid": "Q50662168",
+            "resolved_label": "finnish classical music"
+          },
+          {
+            "input": "finnish classic",
+            "qid": "Q27103155",
+            "resolved_label": "bestselling bacon fat pride chain smoking circumstance"
+          },
+          {
+            "input": "graphic novel",
+            "qid": "Q725377",
+            "resolved_label": "source entity"
+          },
+          {
+            "input": "bestseller",
+            "qid": "Q594721",
+            "resolved_label": "espionage thriller"
+          },
+          {
+            "input": "epistolary",
+            "qid": "Q465821",
+            "resolved_label": "dystopian"
+          }
+        ]
+      },
+      "novel:genre": {
+        "count": 8,
+        "examples": [
+          {
+            "input": "romance",
+            "qid": "Q599510",
+            "resolved_label": "comedy"
+          },
+          {
+            "input": "comedy-drama",
+            "qid": "Q859369",
+            "resolved_label": "romance"
+          },
+          {
+            "input": "war novel",
+            "qid": "Q908667",
+            "resolved_label": "war fiction"
+          },
+          {
+            "input": "espionage",
+            "qid": "Q1426213",
+            "resolved_label": "spy fiction"
+          },
+          {
+            "input": "historical novel",
+            "qid": "Q192239",
+            "resolved_label": "war fiction"
+          },
+          {
+            "input": "crime",
+            "qid": "Q959790",
+            "resolved_label": "detective fiction"
+          },
+          {
+            "input": "detective fiction",
+            "qid": "Q186424",
+            "resolved_label": "crime fiction"
+          },
+          {
+            "input": "adventure",
+            "qid": "Q319221",
+            "resolved_label": "historical novel"
+          }
+        ]
+      },
+      "plant:attribute": {
+        "count": 13,
+        "examples": [
+          {
+            "input": "black fungus",
+            "qid": "Q6931254",
+            "resolved_label": "mucormycosis"
+          },
+          {
+            "input": "spanish moss",
+            "qid": "Q311524",
+            "resolved_label": "bromeliaceae"
+          },
+          {
+            "input": "toadstools",
+            "qid": "Q4308985",
+            "resolved_label": "mukhomory"
+          },
+          {
+            "input": "fruits",
+            "qid": "Q1364",
+            "resolved_label": "vegetable"
+          },
+          {
+            "input": "vegetables",
+            "qid": "Q11004",
+            "resolved_label": "fruit"
+          },
+          {
+            "input": "primeval forest",
+            "qid": "Q208478",
+            "resolved_label": "genius loci of a river"
+          },
+          {
+            "input": "trees",
+            "qid": "Q10884",
+            "resolved_label": "shrubsole"
+          },
+          {
+            "input": "shrubs",
+            "qid": "Q16800712",
+            "resolved_label": "berries with highly sweet tasting proteins"
+          },
+          {
+            "input": "thorn bush",
+            "qid": "Q113469520",
+            "resolved_label": "meadowfoam family"
+          },
+          {
+            "input": "divergent evolution",
+            "qid": "Q126174907",
+            "resolved_label": "wind pollination"
+          },
+          {
+            "input": "convergent evolution",
+            "qid": "Q136907340",
+            "resolved_label": "woody lianas"
+          },
+          {
+            "input": "flowering plants",
+            "qid": "Q25314",
+            "resolved_label": "angiospermae"
+          },
+          {
+            "input": "tuber",
+            "qid": "Q7850807",
+            "resolved_label": "polysporangiophytes"
+          }
+        ]
+      },
+      "plant:location": {
+        "count": 14,
+        "examples": [
+          {
+            "input": "tahiti",
+            "qid": "Q42000",
+            "resolved_label": "society islands"
+          },
+          {
+            "input": "caribbean",
+            "qid": "Q664609",
+            "resolved_label": "central america"
+          },
+          {
+            "input": "texas",
+            "qid": "Q1439",
+            "resolved_label": "united states"
+          },
+          {
+            "input": "mexico",
+            "qid": "Q96",
+            "resolved_label": "neotropical realm"
+          },
+          {
+            "input": "neotropics",
+            "qid": "Q217151",
+            "resolved_label": "north america"
+          },
+          {
+            "input": "beverley brook",
+            "qid": "Q4899394",
+            "resolved_label": "united kingdom"
+          },
+          {
+            "input": "britain",
+            "qid": "Q145",
+            "resolved_label": "beverley brook"
+          },
+          {
+            "input": "bodhgaya",
+            "qid": "Q176767",
+            "resolved_label": "bodh gaya"
+          },
+          {
+            "input": "east yorkshire",
+            "qid": "Q23088",
+            "resolved_label": "east riding of yorkshire"
+          },
+          {
+            "input": "asia",
+            "qid": "Q48",
+            "resolved_label": "namibia"
+          },
+          {
+            "input": "eastern australia",
+            "qid": "Q5330629",
+            "resolved_label": "africa"
+          },
+          {
+            "input": "america",
+            "qid": "Q30",
+            "resolved_label": "southern africa"
+          },
+          {
+            "input": "australasia",
+            "qid": "Q45256",
+            "resolved_label": "central america"
+          },
+          {
+            "input": "africa",
+            "qid": "Q15",
+            "resolved_label": "north america"
+          }
+        ]
+      }
+    }
+  },
+  "tag_coverage": {
+    "total_tags": 17818,
+    "total_docs": 1866,
+    "frequency_histogram": {
+      "11-50_moderate": 332,
+      "1_singleton": 14674,
+      "2-3_rare": 1867,
+      "4-10_uncommon": 888,
+      "50+_frequent": 57
+    },
+    "tags_with_0_docs": 0,
+    "singleton_tags": 14674,
+    "tags_above_min_frequency_3": 1795
+  }
+}

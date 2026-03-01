@@ -1,137 +1,227 @@
 from __future__ import annotations
 
 import json
-import logging
-import sys
-import os
-from enum import Enum
-from typing import Any, Dict, List, Mapping, Sequence, Tuple, Union, get_args, get_origin
-
+import random
+from functools import lru_cache
 from pathlib import Path
-import dspy
-import palimpzest as pz
+from pprint import pprint
+import re
+from typing import Any, Dict, List, Mapping, Sequence, Tuple, get_args, get_origin
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+DEFAULT_TOP_K_CONCEPTS = 30
+CONCEPTS_JSON_REL_PATH = Path("results/quest_concepts/two_stage/per_query_concepts.json")
+INTEGER_PATTERN = re.compile(r"^[+-]?\d+$")
+FLOAT_PATTERN = re.compile(r"^[+-]?(?:\d+\.\d+|\d+\.\d*|\.\d+)$")
+
+
+def _concepts_output_path() -> Path:
+    return Path(__file__).resolve().parent / CONCEPTS_JSON_REL_PATH
+
+
+@lru_cache(maxsize=1)
+def _load_concepts_output(path: str) -> Dict[str, Any]:
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def _select_top_domain_facets(concepts_output: Mapping[str, Any], top_k: int) -> List[Tuple[str, str]]:
+    facet_frequencies = concepts_output.get("facet_frequencies", {})
+    if not isinstance(facet_frequencies, Mapping):
+        raise ValueError("Expected 'facet_frequencies' to be a mapping in concepts output JSON.")
+
+    def _as_int(val: Any) -> int:
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return 0
+
+    ranked_items = sorted(
+        facet_frequencies.items(),
+        key=lambda item: (-_as_int(item[1]), str(item[0])),
+    )[:top_k]
+
+    pairs: List[Tuple[str, str]] = []
+    for key, _ in ranked_items:
+        name = str(key)
+        if "|" not in name:
+            continue
+        domain, facet = name.split("|", 1)
+        domain = domain.strip()
+        facet = facet.strip()
+        if domain and facet:
+            pairs.append((domain, facet))
+    return pairs
+
+
+def _collect_query_examples(
+    concepts_output: Mapping[str, Any],
+) -> Dict[Tuple[str, str], List[Dict[str, Any]]]:
+    queries = concepts_output.get("queries", {})
+    if not isinstance(queries, Mapping):
+        raise ValueError("Expected 'queries' to be a mapping in concepts output JSON.")
+
+    examples: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for query_text, triples in queries.items():
+        if not isinstance(triples, list):
+            continue
+        normalized_triples: List[List[str]] = []
+        for t in triples:
+            if not isinstance(t, list) or len(t) < 3:
+                continue
+            normalized_triples.append([str(t[0]).strip(), str(t[1]).strip(), str(t[2]).strip()])
+
+        if not normalized_triples:
+            continue
+
+        by_pair: Dict[Tuple[str, str], List[List[str]]] = {}
+        for domain, facet, value in normalized_triples:
+            if not domain or not facet or not value:
+                continue
+            by_pair.setdefault((domain, facet), []).append([domain, facet, value])
+
+        query = str(query_text).strip()
+        if not query:
+            continue
+        for pair, pair_triplets in by_pair.items():
+            examples.setdefault(pair, []).append(
+                {
+                    "query": query,
+                    "triplets": pair_triplets,
+                }
+            )
+    return examples
+
+
+def _sample_examples(
+    values: Sequence[Mapping[str, Any]], max_examples: int, rng: random.Random
+) -> List[Dict[str, Any]]:
+    deduped: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in values:
+        query = str(raw.get("query", "")).strip()
+        triplets = raw.get("triplets", [])
+        if not isinstance(triplets, list) or not triplets:
+            continue
+        clean_triplets: List[List[str]] = []
+        for triplet in triplets:
+            if not isinstance(triplet, list) or len(triplet) < 3:
+                continue
+            clean_triplets.append(
+                [str(triplet[0]).strip(), str(triplet[1]).strip(), str(triplet[2]).strip()]
+            )
+        if not query or not clean_triplets:
+            continue
+        key = f"{query.casefold()}|{json.dumps(clean_triplets, ensure_ascii=False)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(
+            {
+                "query": query,
+                "triplets": clean_triplets,
+            }
+        )
+
+    if len(deduped) <= max_examples:
+        return deduped
+    return rng.sample(deduped, max_examples)
+
+
+def _is_int_like(value: str) -> bool:
+    return bool(INTEGER_PATTERN.fullmatch(value.strip()))
+
+
+def _is_float_like(value: str) -> bool:
+    s = value.strip()
+    return _is_int_like(s) or bool(FLOAT_PATTERN.fullmatch(s))
+
+
+def _list_of_str_type() -> Any:
+    """Prefer built-in generic list[str], with py<3.9 fallback."""
+    try:
+        return list[str]
+    except TypeError:
+        return List[str]
+
+
+def _infer_schema_type(example_values: Sequence[str]) -> Any:
+    if example_values and all(_is_int_like(v) for v in example_values):
+        return int
+    if example_values and all(_is_float_like(v) for v in example_values):
+        return float
+    return _list_of_str_type()
+
+
+def _build_desc(
+    domain: str,
+    facet: str,
+    sampled_examples: Sequence[Mapping[str, Any]],
+) -> str:
+    if sampled_examples:
+        example_parts: List[str] = []
+        for idx, ex in enumerate(sampled_examples, start=1):
+            query = str(ex.get("query", "")).strip()
+            triplets = ex.get("triplets", [])
+            values = [
+                str(t[2]).strip()
+                for t in triplets
+                if isinstance(t, list) and len(t) >= 3 and str(t[2]).strip()
+            ]
+            example_parts.append(
+                (
+                    f"Example {idx} - text chunk: {query!r}; "
+                    f"values: {json.dumps(values, ensure_ascii=False)}"
+                )
+            )
+        examples_str = " ".join(example_parts)
+    else:
+        examples_str = "None available."
+    return (
+    f"Extract only explicit values for (domain: {domain}, facet: {facet}) from the text chunk. Return null if the text does not explicitly state a {facet} for a {domain}. "
+    f"Return standardized, canonical values when the text clearly refers to a known value, using a consistent form across documents. Do not change the meaning. If standardization is uncertain, use the exact text-supported value (or return null if the value itself is uncertain). "
+    f"Return only concise entity-like values (i.e., node-style values suitable for a knowledge graph), not descriptive phrases, clauses, or sentences."
+    "If the expected type is list[type] and only one value is present, return it as a single-element list (e.g., [value]). "
+    "If the expected type is int, return a single numeric value (not a list). "
+    "An int type means exactly one number or null. "
+    "A list[str] type means it may return one string (as a single-element list), multiple strings, or null.\n\n"
+    "The following examples show you how to extract values for this domain and facet. "
+    f"Example: {examples_str} "
 )
-logger = logging.getLogger(__name__)
 
-class SemMapStrategy(str, Enum):
-    HIERARCHY_FIRST = "hierarchy_first"
-    FLAT = "flat"
 
-class FlatConceptSchemaSignature(dspy.Signature):
-    concepts = dspy.InputField(
-        desc="List of concept phrases. Normalize them into a FLAT, canonical schema."
-    )
-    concept_schema = dspy.OutputField(
-        desc=(
-            "Return a JSON array of objects with keys: name, type, desc.\n"
-            "Format rules:\n"
-            "- name: Create a colon-delimited hierarchy (e.g., 'film genre' -> 'film:genre').\n"
-            "  * CONSTRAINT: Use EXACT words from the input. Do not introduce new words.\n"
-            "  * CONSTRAINT: Do not end the name with a colon.\n"
-            "- type: Native Python type string: 'str', 'int', 'float', or 'List[str]'.\n"
-            "  * CONSTRAINT: Only use 'List[str]' for lists. Do NOT use 'List[int]' or 'List[float]'.\n"
-            "  * Determine the concept's cardinality. If the concept tends to have multiple mentions per document, use 'List[str]'.\n"
-            "    If it implies a single value, use 'str', 'int', or 'float'.\n"
-            "- desc: Natural-language description of the leaf node.\n"
-            "  * CRITICAL: In the description, explicitly state: 'If the document does not mention [concept], set this field to null'. Do not use 'None'.\n"
-            "Output must be valid JSON only. No markdown."
+def _build_concept_schema_cols(
+    top_k: int = DEFAULT_TOP_K_CONCEPTS,
+    concepts_output_path: str | None = None,
+) -> List[Dict[str, Any]]:
+    output_path = concepts_output_path or str(_concepts_output_path())
+    concepts_output = _load_concepts_output(output_path)
+
+    top_pairs = _select_top_domain_facets(concepts_output, top_k=top_k)
+    query_examples = _collect_query_examples(concepts_output)
+    rng = random.Random(0)
+
+    cols: List[Dict[str, Any]] = []
+    for domain, facet in top_pairs:
+        sampled = _sample_examples(
+            query_examples.get((domain, facet), []), max_examples=2, rng=rng
         )
-    )
-
-class HierarchyFirstConceptSchemaSignature(dspy.Signature):
-    concepts = dspy.InputField(
-        desc="List of concept phrases. Normalize them into a HIERARCHY-FIRST schema."
-    )
-    concept_schema = dspy.OutputField(
-        desc=(
-            "Return a JSON array of objects with keys: name, type, desc.\n"
-            "Format rules:\n"
-            "- name: Create a hierarchy. Base hierarchy must preserve word order and use EXACT words from input. Allow expansion (':subtype') ONLY when essential.\n"
-            "  * CONSTRAINT: Do not end the name with a colon.\n"
-            "- type: Native Python type string: 'str', 'int', 'float', or 'List[str]'.\n"
-            "  * CONSTRAINT: Only use 'List[str]' for lists. Do NOT use 'List[int]' or 'List[float]'.\n"
-            "- desc: Natural-language description of the leaf node.\n"
-            "  * CRITICAL: In the description, explicitly state: 'If the document does not mention [concept], set this field to null'. Do not use 'None'.\n"
-            "Output must be valid JSON only. No markdown."
+        sampled_values: List[str] = []
+        for ex in sampled:
+            triplets = ex.get("triplets", [])
+            if not isinstance(triplets, list):
+                continue
+            for triplet in triplets:
+                if not isinstance(triplet, list) or len(triplet) < 3:
+                    continue
+                sampled_values.append(str(triplet[2]).strip())
+        cols.append(
+            {
+                "name": f"{domain}:{facet}",
+                "type": _infer_schema_type(sampled_values),
+                "desc": _build_desc(domain=domain, facet=facet, sampled_examples=sampled),
+            }
         )
-    )
+    return cols
 
-class HierarchyFirstConceptSchemaModel(dspy.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self._predict = dspy.Predict(HierarchyFirstConceptSchemaSignature)
-        self._few_shot_examples = [
-            dspy.Example(
-                concepts=["film location"],
-                concept_schema=json.dumps([
-                    {"name": "film:location:city", "type": "List[str]", "desc": "Distinct film cities mentioned. If the document does not mention any cities, set this field to null."},
-                    {"name": "film:location:state", "type": "List[str]", "desc": "Distinct film states mentioned. If the document does not mention any states, set this field to null."},
-                    {"name": "film:location:province", "type": "List[str]", "desc": "Distinct film provinces mentioned. If the document does not mention any provinces, set this field to null."},
-                    {"name": "film:location:country", "type": "List[str]", "desc": "Distinct film countries mentioned. If the document does not mention any countries, set this field to null."},
-                    {"name": "film:location:continent", "type": "List[str]", "desc": "Distinct film continents mentioned. If the document does not mention any continents, set this field to null."},
-                ])
-            ).with_inputs("concepts"),
-            dspy.Example(
-                concepts=["book release-year"],
-                concept_schema=json.dumps([
-                    {"name": "book:release-year", "type": "int", "desc": "Year the book was released. If the document does not mention a book release year, set this field to null."},
-                ])
-            ).with_inputs("concepts"),
-            dspy.Example(
-                concepts=["film decade"],
-                concept_schema=json.dumps([
-                    {"name": "film:decade", "type": "int", "desc": "Decade the film was released. If the document does not mention a film decade, set this field to null."},
-                ])
-            ).with_inputs("concepts"),
-            # ... keep other examples, just ensure 'None' -> 'null' in descriptions
-        ]
-
-    def forward(self, concepts: List[str]) -> str:
-        result = self._predict(concepts=concepts, demos=self._few_shot_examples)
-        return result.concept_schema
-
-class FlatConceptSchemaModel(dspy.Module):
-    def __init__(self) -> None:
-        super().__init__()
-        self._predict = dspy.Predict(FlatConceptSchemaSignature)
-        self._few_shot_examples = [
-            dspy.Example(
-                concepts=["film location"],
-                concept_schema=json.dumps([
-                    {"name": "film:location", "type": "List[str]", "desc": "Distinct film locations mentioned. If the document does not mention any film locations, set this field to null."},
-                ])
-            ).with_inputs("concepts"),
-            dspy.Example(
-                concepts=["book release-year"],
-                concept_schema=json.dumps([
-                    {"name": "book:release-year", "type": "int", "desc": "Year the book was released. If the document does not mention a book release year, set this field to null."},
-                ])
-            ).with_inputs("concepts"),
-            dspy.Example(
-                concepts=["bird color"],
-                concept_schema=json.dumps([
-                    {"name": "bird:color", "type": "List[str]", "desc": "Distinct bird colors mentioned. If the document does not mention any bird colors, set this field to null."},
-                ])
-            ).with_inputs("concepts")
-        ]
-
-    def forward(self, concepts: List[str]) -> str:
-        result = self._predict(concepts=concepts, demos=self._few_shot_examples)
-        return result.concept_schema
-
-def _type_from_str(t: str) -> Any:
-    """Parse type string to Python type. Only allows str, int, float, List[str]."""
-    t_clean = str(t).strip()
-    if t_clean == "int": return int
-    if t_clean == "float": return float
-    if t_clean == "str": return str
-    if t_clean == "List[str]": return List[str]
-    raise ValueError(f"Unsupported schema type: {t_clean!r}")
 
 def _dedupe_list(vals: Any) -> Any:
     if not isinstance(vals, list):
@@ -158,37 +248,99 @@ def _dedupe_list(vals: Any) -> Any:
             out.append(v)
     return out
 
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if INTEGER_PATTERN.fullmatch(s):
+            return int(s)
+    return None
+
+
+def _coerce_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        s = value.strip()
+        if _is_float_like(s):
+            try:
+                return float(s)
+            except ValueError:
+                return None
+    return None
+
+
+def _normalize_by_schema_type(value: Any, schema_type: Any) -> Any:
+    value = _dedupe_list(value)
+    if value is None or value == "" or value == []:
+        return None
+
+    values = value if isinstance(value, list) else [value]
+
+    if schema_type is int:
+        for item in values:
+            coerced = _coerce_int(item)
+            if coerced is not None:
+                return coerced
+        return None
+
+    if schema_type is float:
+        for item in values:
+            coerced = _coerce_float(item)
+            if coerced is not None:
+                return coerced
+        return None
+
+    if _is_list_type(schema_type):
+        normalized_items: List[str] = []
+        for item in values:
+            if item is None:
+                continue
+            s = " ".join(str(item).strip().split())
+            if s:
+                normalized_items.append(s)
+        normalized_items = _dedupe_list(normalized_items)
+        return normalized_items if normalized_items else None
+
+    return value
+
 def sem_map(
     *,
-    concepts: Sequence[str],
     data: Sequence[Mapping[str, str]],
-    strategy: Union[SemMapStrategy, str] = SemMapStrategy.FLAT,
+    concepts_output_path: str | None = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
-    strat = SemMapStrategy(strategy)
-    model: dspy.Module = FlatConceptSchemaModel() if strat is SemMapStrategy.FLAT else HierarchyFirstConceptSchemaModel()
+    import palimpzest as pz
+
+    concept_schema_cols = _build_concept_schema_cols(top_k=DEFAULT_TOP_K_CONCEPTS, concepts_output_path=concepts_output_path)
     
-    concept_schema_cols: List[Dict[str, Any]] = []
+    if len(concept_schema_cols) != DEFAULT_TOP_K_CONCEPTS:
+        raise RuntimeError(
+            f"Expected {DEFAULT_TOP_K_CONCEPTS} schema columns, got {len(concept_schema_cols)}."
+        )
 
-    for concept in concepts:
-        raw_output = model([concept])
-        
-        if not isinstance(raw_output, str):
-            raise TypeError(f"DSPy concept_schema output expected string, got {type(raw_output)}")
-        
-        try:
-            schema_list = json.loads(raw_output)
-            # Ensure it's a list
-            if not isinstance(schema_list, list):
-                 raise ValueError("Output is not a JSON list")
-        except Exception as e:
-            print(f"DEBUG: Raw='{raw_output}'")
-            raise ValueError(f"Failed to parse DSPy concept_schema output as JSON for concept '{concept}'.") from e
-
-        for col in schema_list:
-            concept_schema_cols.append(
-                {"name": col["name"], "type": _type_from_str(col["type"]), "desc": col.get("desc", "...")}
-            )
-
+    names = [c["name"] for c in concept_schema_cols]
+    if len(names) != len(set(names)):
+        raise RuntimeError("Schema contains duplicate column names.")
+    
+    # payload = {
+    #     "top_k": DEFAULT_TOP_K_CONCEPTS,
+    #     "num_cols": len(concept_schema_cols),
+    #     "schema_preview": [
+    #         {"name": c["name"], "type": c["type"], "desc": c["desc"]}
+    #         for c in concept_schema_cols[:10]
+    #     ],
+    # }
+    # pprint(payload, sort_dicts=False)
+    # import pdb; pdb.set_trace()
+    
     rows: List[Dict[str, str]] = []
     for d in data:
         doc_id = str(d.get("id", "")).strip()
@@ -198,162 +350,55 @@ def sem_map(
 
     if not rows:
         return {}, concept_schema_cols
-    
-    logger.info(f"Running sem_map with {len(rows)} rows...")
-    logger.info(f"Number of concept schema columns: {len(concept_schema_cols)}")
 
     dataset = pz.MemoryDataset(id="sem-map", vals=rows)
     cols_for_pz = [dict(c) for c in concept_schema_cols]
     dataset = dataset.sem_map(cols=cols_for_pz)
-    config = pz.QueryProcessorConfig(available_models=[pz.Model.GPT_5])
-    output = dataset.run(config=config, max_quality=True)
-    
-    # Log token usage if available from palimpzest execution stats
-    exec_stats = getattr(output, "execution_stats", None)
-    if exec_stats is not None:
-        try:
-            total_in = getattr(exec_stats, "total_input_tokens", None)
-            total_out = getattr(exec_stats, "total_output_tokens", None)
-            total_tokens = getattr(exec_stats, "total_tokens", None)
-            num_rows = len(rows) if rows is not None else 0
-            avg_out_per_row = (float(total_out) / float(num_rows)) if (total_out is not None and num_rows > 0) else None
-            
-            if total_in is not None and total_out is not None and total_tokens is not None:
-                logger.info(f"sem_map token usage — input: {total_in:,} | output: {total_out:,} | total: {total_tokens:,}")
-            if avg_out_per_row is not None:
-                logger.info(f"sem_map average output tokens per row: {avg_out_per_row:,.2f}")
-        except Exception:
-            pass
+    output = dataset.run(max_quality=True)
     
     col_names = [c["name"] for c in concept_schema_cols]
-
-    # Ensure every input doc_id exists even if execution drops a record
-    results: Dict[str, Dict[str, Any]] = {r["id"]: {} for r in rows}
+    type_by_name = {c["name"]: c["type"] for c in concept_schema_cols}
+    results: Dict[str, Dict[str, Any]] = {}
 
     for rec in getattr(output, "data_records", []):
         doc_id = str(getattr(rec, "id", "")).strip()
         if not doc_id:
             continue
-        if doc_id not in results:
-            results[doc_id] = {}
 
         out: Dict[str, Any] = {}
         for c in col_names:
             v = getattr(rec, c, None)
-            v = _dedupe_list(v)
-            if v is None or v == "" or v == []:
+            v = _normalize_by_schema_type(v, type_by_name[c])
+            if v is None:
                 continue
             out[c] = v
 
-        results[doc_id] = out
+        results[doc_id] = out    
 
     return results, concept_schema_cols
 
 
-def _is_list_of_str_type(tp: Any) -> bool:
-    """Check if type is List[str]."""
+def _is_list_type(tp: Any) -> bool:
     origin = get_origin(tp)
-    if origin is not list:
-        return False
-    args = get_args(tp)
-    return len(args) == 1 and args[0] is str
-
+    return origin is list
 
 def _is_taggable_type(tp: Any) -> bool:
-    """Taggable = str or List[str] ONLY."""
-    return tp is str or _is_list_of_str_type(tp)
-
+    return tp is str or _is_list_type(tp)
 
 def _canon_tag_suffix(v: Any) -> str:
     """Canonical string suffix used in the tag key (keeps spaces, trims/normalizes)."""
     if v is None:
         return ""
     if isinstance(v, str):
-        return " ".join(v.strip().split())
-    # If model accidentally returns numbers for a taggable col, still stringify
+        s = " ".join(v.strip().split())
+        return s
     if isinstance(v, bool):
-        return str(v).lower()
-    if isinstance(v, (int, float)):
-        return str(v).strip()
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        return str(int(v)) if v.is_integer() else str(v)
     return str(v).strip()
-
-
-def _normalize_tag_values(v: Any) -> List[str]:
-    """
-    Normalize a tag value, potentially splitting comma-separated lists.
-    
-    Smart splitting rules:
-    - Split on ", " (comma followed by space) to handle lists like "Asia, Africa"
-    - This preserves hyphenated compound terms like "romantic comedy-drama"
-    - Normalize to lowercase for consistent tag matching
-    """
-    sfx = _canon_tag_suffix(v)
-    if not sfx:
-        return []
-    
-    # Split on ", " (comma followed by space)
-    parts = [p.strip() for p in sfx.split(", ")]
-    # Normalize to lowercase for consistent tag matching
-    return [p.lower() for p in parts if p]
-
-
-def _cast_scalar(v: Any, tp: Any) -> Any:
-    """Best-effort cast into int/float/bool. Return None if not castable."""
-    if v is None:
-        return None
-
-    # If LLM incorrectly returns list for scalar, take first non-null
-    if isinstance(v, list):
-        v = next((x for x in v if x is not None and x != ""), None)
-        if v is None:
-            return None
-
-    if tp is int:
-        if isinstance(v, bool):
-            return int(v)
-        if isinstance(v, int):
-            return v
-        if isinstance(v, float):
-            return int(v)
-        if isinstance(v, str):
-            s = v.strip()
-            if not s:
-                return None
-            try:
-                return int(float(s))  # handles "1999.0"
-            except Exception:
-                return None
-        return None
-
-    if tp is float:
-        if isinstance(v, bool):
-            return float(int(v))
-        if isinstance(v, (int, float)):
-            return float(v)
-        if isinstance(v, str):
-            s = v.strip()
-            if not s:
-                return None
-            try:
-                return float(s)
-            except Exception:
-                return None
-        return None
-
-    if tp is bool:
-        if isinstance(v, bool):
-            return v
-        if isinstance(v, (int, float)):
-            return bool(v)
-        if isinstance(v, str):
-            s = v.strip().casefold()
-            if s in {"true", "t", "yes", "y", "1"}:
-                return True
-            if s in {"false", "f", "no", "n", "0"}:
-                return False
-        return None
-
-    return None
 
 
 def expand_sem_map_results_to_tags(
@@ -361,38 +406,14 @@ def expand_sem_map_results_to_tags(
     schema: List[Dict[str, Any]],
 ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]], Dict[str, Dict[str, float]]]:
     """
-    Tagification Strategy:
-    
-    1. Taggable columns (str or List[str] ONLY):
-       - Convert each unique value to a boolean tag column (e.g., 'film:genre:action', 'film:genre:comedy')
-       - ALL documents MUST have ALL tag columns in their metadata
-       - Documents that originally had that value → set tag to True
-       - Documents that didn't have that value → set tag to False
-       
-    2. Non-taggable scalar columns (int, float, bool ONLY):
-       - Keep as-is (no tagification)
-       - Only add to metadata if the document has a value
-       - If document doesn't have a value, don't include the key at all (sparse representation)
-    
-    3. All other types are dropped (no str, no lists in final output).
-    
     Returns:
-      - expanded_results: doc_id -> { tag_col: bool, scalar_col: int|float|bool }
-        * Every document has ALL tag columns (True or False)
-        * Scalar columns only present if document has a value
-        * Output values are ONLY int/float/bool (no str, no lists)
-      - expanded_schema: schema where taggable cols are replaced by bool tag columns;
-                        scalar cols kept iff int/float/bool.
-      - expanded_stats: per-column selectivity stats (present/total/selectivity)
-        * For bool tags: present = count of True
-        * For scalar int/float: present = count of docs that have the key (sparse)
+      - expanded_results: doc_id -> { tag_col: True, scalar_col: value, ... }
+      - expanded_schema: schema where taggable cols are replaced by bool tag columns
+      - expanded_stats: present/total/selectivity for each expanded column
     """
     type_by_name: Dict[str, Any] = {c["name"]: c["type"] for c in schema}
+    taggable_cols = {name for name, tp in type_by_name.items() if _is_taggable_type(tp)}
 
-    taggable_cols = {n for n, tp in type_by_name.items() if _is_taggable_type(tp)}
-    scalar_cols = {n for n, tp in type_by_name.items() if tp in (int, float, bool)}
-
-    # 1) Collect universe of tag values per taggable column
     tag_values: Dict[str, set[str]] = {c: set() for c in taggable_cols}
     for _, cols in results.items():
         for col, v in cols.items():
@@ -400,79 +421,59 @@ def expand_sem_map_results_to_tags(
                 continue
             vs = v if isinstance(v, list) else [v]
             for x in vs:
-                # Normalize and potentially split comma-separated values
-                for normalized in _normalize_tag_values(x):
-                    tag_values[col].add(normalized)
+                sfx = _canon_tag_suffix(x)
+                if sfx:
+                    tag_values[col].add(sfx)
 
-    # 2) Build expanded schema:
-    #    - taggable => many bool tag columns
-    #    - scalar int/float/bool => keep
-    #    - everything else => dropped
     expanded_schema: List[Dict[str, Any]] = []
     for col_def in schema:
         name = col_def["name"]
-        tp = col_def["type"]
-
-        if name in taggable_cols:
-            for sfx in sorted(tag_values[name], key=lambda s: s.casefold()):
-                expanded_schema.append(
-                    {
-                        "name": f"{name}:{sfx}",
-                        "type": bool,
-                        "desc": f"True if {sfx!r} appears in {name}.",
-                    }
-                )
-            continue
-
-        if tp in (int, float, bool):
+        if name not in taggable_cols:
             expanded_schema.append(col_def)
             continue
 
-        # Everything else is dropped to satisfy "only int/float/bool values" constraint.
-        logger.warning(f"Dropping non-supported metadata column {name!r} with type {tp!r}")
+        for sfx in sorted(tag_values[name], key=lambda s: s.casefold()):
+            tag_name = f"{name}:{sfx}"
+            expanded_schema.append(
+                {
+                    "name": tag_name,
+                    "type": bool,
+                    "desc": f"True if {sfx!r} appears in {name}.",
+                }
+            )
 
-    all_bool_cols = [c["name"] for c in expanded_schema if c["type"] is bool]
-    scalar_schema_cols = [c["name"] for c in expanded_schema if c["type"] in (int, float)]
+    expanded_results: Dict[str, Dict[str, Any]] = {}
+    
+    all_bool_cols = [col["name"] for col in expanded_schema if col["type"] is bool]
+    
+    for doc_id, cols in results.items():
+        out: Dict[str, Any] = {k: False for k in all_bool_cols}
+        
+        for col, v in cols.items():
+            if col not in taggable_cols:
+                out[col] = v
+                continue
+                
+            vs = v if isinstance(v, list) else [v]
+            for x in vs:
+                sfx = _canon_tag_suffix(x)
+                if sfx:
+                    out[f"{col}:{sfx}"] = True
+        expanded_results[doc_id] = out
 
     total = float(len(results))
-
-    # Count "present" occurrences inline while building expanded_results.
-    # - For bool tags: present means True
-    # - For scalar cols: present means key exists (sparse)
-    present: Dict[str, float] = {name: 0.0 for name in (all_bool_cols + scalar_schema_cols)}
-
-    # 3) Build expanded results
-    expanded_results: Dict[str, Dict[str, Any]] = {}
-    for doc_id, cols in results.items():
-        # Dense bool grid for tags
-        out: Dict[str, Any] = {k: False for k in all_bool_cols}
-
-        for col, v in cols.items():
-            # taggable => set tag columns True
-            if col in taggable_cols:
-                vs = v if isinstance(v, list) else [v]
-                for x in vs:
-                    # Normalize and potentially split comma-separated values
-                    for normalized in _normalize_tag_values(x):
-                        key = f"{col}:{normalized}"
-                        # Key should exist if it was in the global universe; guard anyway
-                        if key in out and out[key] is False:
-                            out[key] = True
-                            present[key] += 1.0
+    present: Dict[str, float] = {c["name"]: 0.0 for c in expanded_schema}
+    
+    for _, cols in expanded_results.items():
+        for k, v in cols.items():
+            if k not in present:
                 continue
-
-            # scalar => keep sparse, cast to int/float/bool
-            if col in scalar_cols:
-                tp = type_by_name[col]
-                casted = _cast_scalar(v, tp)
-                if casted is not None:
-                    out[col] = casted
-                    present[col] += 1.0
-                continue
-
-            # drop everything else
-
-        expanded_results[doc_id] = out
+            if isinstance(v, bool):
+                if v:
+                    present[k] += 1.0
+            else:
+                if v is not None:
+                    present[k] += 1.0
 
     expanded_stats: Dict[str, Dict[str, float]] = {}
     for k, p in present.items():
@@ -480,91 +481,3 @@ def expand_sem_map_results_to_tags(
         expanded_stats[k] = {"present": p, "total": total, "selectivity": sel}
 
     return expanded_results, expanded_schema, expanded_stats
-
-
-# Example usage
-if __name__ == "__main__":
-    def _type_to_str(tp: Any) -> str:
-        if tp is str:
-            return "str"
-        if tp is int:
-            return "int"
-        if tp is float:
-            return "float"
-        if tp is bool:
-            return "bool"
-        origin = get_origin(tp)
-        args = get_args(tp)
-        if origin is list and len(args) == 1:
-            return f"List[{_type_to_str(args[0])}]"
-        return str(tp)
-
-    def _load_example_rows(example_path: Path) -> List[Dict[str, str]]:
-        lines = example_path.read_text(encoding="utf-8").splitlines()
-        rows: List[Dict[str, str]] = []
-        for i, line in enumerate(lines, start=1):
-            text = " ".join(line.strip().split())
-            if not text:
-                continue
-            rows.append({"id": f"doc_{i:03d}", "text": text})
-        return rows
-
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("Missing OPENAI_API_KEY in environment.")
-
-    lm = dspy.LM("openai/gpt-5.1", temperature=1.0, max_tokens=16000, api_key=api_key)
-    dspy.configure(lm=lm)
-
-    here = Path(__file__).resolve().parent
-    example_path = here / "example_sem_map.txt"
-    data_rows = _load_example_rows(example_path)
-
-    concepts = [
-        "amphibian location",
-        "film classification",
-        "fish classification",
-        "book release-year",
-        "crime film theme",
-    ]
-    strategy = SemMapStrategy.HIERARCHY_FIRST
-
-    sem_results, concept_schema_cols = sem_map(concepts=concepts, data=data_rows, strategy=strategy)
-
-    expanded_results, expanded_schema, expanded_stats = expand_sem_map_results_to_tags(
-        sem_results, concept_schema_cols
-    )
-
-    sem_payload = {
-        "strategy": strategy.value,
-        "concepts": list(concepts),
-        "concept_schema_cols": [
-            {"name": c["name"], "type": _type_to_str(c["type"]), "desc": c.get("desc", "")}
-            for c in concept_schema_cols
-        ],
-        "results": sem_results,
-    }
-    expanded_payload = {
-        "schema": [
-            {"name": c["name"], "type": _type_to_str(c["type"]), "desc": c.get("desc", "")}
-            for c in expanded_schema
-        ],
-        "results": expanded_results,
-        "stats": expanded_stats,
-    }
-
-    sem_out_path = here / "sem_map/example_sem_map_output.json"
-    expanded_out_path = here / "sem_map/example_sem_map_tagified_output.json"
-    
-    sem_out_path.parent.mkdir(parents=True, exist_ok=True)
-    expanded_out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    sem_out_path.write_text(json.dumps(sem_payload, indent=2, ensure_ascii=False), encoding="utf-8")
-    expanded_out_path.write_text(
-        json.dumps(expanded_payload, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
-
-    print(f"Wrote sem_map output to: {sem_out_path}")
-    print(f"Wrote expanded tag output to: {expanded_out_path}")
-
-    raise SystemExit(0)

@@ -1,0 +1,2189 @@
+{
+  "entries": [
+    {
+      "concept_key": "animal:geographic:distribution",
+      "confidence": 0.701,
+      "type_constraints": [
+        "Q7574061",
+        "Q200726",
+        "Q4257161"
+      ],
+      "parents_properties": [
+        "P279"
+      ],
+      "max_depth": 3
+    },
+    {
+      "concept_key": "book:subject",
+      "confidence": 0.6581,
+      "type_constraints": [
+        "Q164573",
+        "Q362165",
+        "Q53731850"
+      ],
+      "parents_properties": [
+        "P279",
+        "P361"
+      ],
+      "max_depth": 3
+    },
+    {
+      "concept_key": "film:genre",
+      "confidence": 0.6362,
+      "type_constraints": [
+        "Q11424",
+        "Q201658",
+        "Q108699495"
+      ],
+      "parents_properties": [
+        "P279"
+      ],
+      "max_depth": 3
+    },
+    {
+      "concept_key": "plant:attribute",
+      "confidence": 0.6946,
+      "type_constraints": [
+        "Q834104",
+        "Q83405",
+        "Q188840"
+      ],
+      "parents_properties": [
+        "P279",
+        "P361"
+      ],
+      "max_depth": 3
+    },
+    {
+      "concept_key": "bird:temporal:classification",
+      "reason": "resolve_disabled",
+      "confidence": 0.541
+    },
+    {
+      "concept_key": "plant:location",
+      "confidence": 0.6123,
+      "type_constraints": [
+        "Q18658526",
+        "Q12131650",
+        "Q18711811"
+      ],
+      "parents_properties": [
+        "P279"
+      ],
+      "max_depth": 3
+    },
+    {
+      "concept_key": "novel:attribute",
+      "confidence": 0.6309,
+      "type_constraints": [
+        "Q834104",
+        "Q8261",
+        "Q758238"
+      ],
+      "parents_properties": [
+        "P279",
+        "P361"
+      ],
+      "max_depth": 3
+    },
+    {
+      "concept_key": "novel:genre",
+      "confidence": 0.5704,
+      "type_constraints": [
+        "Q108317211",
+        "Q8261",
+        "Q214127"
+      ],
+      "parents_properties": [
+        "P279",
+        "P361"
+      ],
+      "max_depth": 3
+    },
+    {
+      "concept_key": "film:nationality",
+      "confidence": 0.7255,
+      "type_constraints": [
+        "Q11424",
+        "Q3337001",
+        "Q1137203"
+      ],
+      "parents_properties": [
+        "P279"
+      ],
+      "max_depth": 3
+    },
+    {
+      "concept_key": "animal:taxonomic-group",
+      "confidence": 0.6448,
+      "type_constraints": [
+        "Q215380",
+        "Q824979",
+        "Q32945461"
+      ],
+      "parents_properties": [
+        "P279"
+      ],
+      "max_depth": 3
+    },
+    {
+      "concept_key": "book:publication:period",
+      "confidence": 0.6375,
+      "type_constraints": [
+        "Q53731850",
+        "Q732577",
+        "Q571"
+      ],
+      "parents_properties": [
+        "P279"
+      ],
+      "max_depth": 3
+    },
+    {
+      "concept_key": "book:nationality",
+      "confidence": 0.6301,
+      "type_constraints": [
+        "Q53731850",
+        "Q3337001",
+        "Q571"
+      ],
+      "parents_properties": [
+        "P279"
+      ],
+      "max_depth": 3
+    },
+    {
+      "concept_key": "book:time-period",
+      "confidence": 0.7911,
+      "type_constraints": [
+        "Q11514315",
+        "Q12737784",
+        "Q186081"
+      ],
+      "parents_properties": [
+        "P279"
+      ],
+      "max_depth": 3
+    },
+    {
+      "concept_key": "film:time-period",
+      "confidence": 0.7375,
+      "type_constraints": [
+        "Q11514315",
+        "Q11424",
+        "Q12737784"
+      ],
+      "parents_properties": [
+        "P279"
+      ],
+      "max_depth": 3
+    },
+    {
+      "concept_key": "animal:geologic_period",
+      "confidence": 0.6151,
+      "type_constraints": [
+        "Q11514315",
+        "Q736917",
+        "Q392928"
+      ],
+      "parents_properties": [
+        "P279",
+        "P361"
+      ],
+      "max_depth": 3
+    },
+    {
+      "concept_key": "film:thematic_category",
+      "confidence": 0.6806,
+      "type_constraints": [
+        "Q11424",
+        "Q2560570",
+        "Q719395"
+      ],
+      "parents_properties": [
+        "P279"
+      ],
+      "max_depth": 3
+    },
+    {
+      "concept_key": "film:setting",
+      "confidence": 0.7513,
+      "type_constraints": [
+        "Q11424",
+        "Q1137203",
+        "Q2526255"
+      ],
+      "parents_properties": [
+        "P279"
+      ],
+      "max_depth": 3
+    }
+  ],
+  "skipped": [
+    "bird:temporal:classification"
+  ],
+  "profiling_report": {
+    "profile_cache_key": "ef08638f77e6d9dfa04727ff7161875727215456",
+    "profile_cache_hit": true,
+    "mode": "concept_key",
+    "profiles": {
+      "animal:geographic:distribution": {
+        "concept_key": "animal:geographic:distribution",
+        "resolve_enabled": true,
+        "type_constraints": [
+          "Q7574061",
+          "Q200726",
+          "Q4257161"
+        ],
+        "parents_properties": [
+          "P279"
+        ],
+        "max_depth": 3,
+        "confidence": 0.701,
+        "sample_count": 7,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": true,
+          "ambiguous_scope": false,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 0.9286,
+                "token_overlap": 0.6667
+              },
+              "description": "spatial arrangement of a set of objects, events, or phenomenons localized across the Earth's surface, applied on a geographic map completed by a statistical analysis",
+              "label": "spatial distribution",
+              "qid": "Q7574061",
+              "score": 0.8452
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 4,
+                "p31_count": 0,
+                "rank_score": 1.0,
+                "token_overlap": 0.3333
+              },
+              "description": "mathematical function that describes the probability of occurrence of different possible outcomes in an experiment",
+              "label": "probability distribution",
+              "qid": "Q200726",
+              "score": 0.7833
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.6667,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 1.0,
+                "token_overlap": 0.0
+              },
+              "description": "geographical area in which a taxon can be found",
+              "label": "range",
+              "qid": "Q4257161",
+              "score": 0.75
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q200726": "probability distribution",
+            "Q4257161": "range",
+            "Q7574061": "spatial distribution"
+          },
+          "chosen_scope_qids": [
+            "Q7574061",
+            "Q200726",
+            "Q4257161"
+          ],
+          "class_instance_signals": {
+            "Q200726": {
+              "p279_count": 4,
+              "p31_count": 0
+            },
+            "Q4257161": {
+              "p279_count": 1,
+              "p31_count": 0
+            },
+            "Q7574061": {
+              "p279_count": 1,
+              "p31_count": 0
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279"
+          ],
+          "query_variants": [
+            "animal:geographic:distribution",
+            "animal geographic distribution",
+            "geographic distribution",
+            "animal geographic",
+            "animal",
+            "geographic",
+            "distribution"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q200726": 1,
+            "Q4257161": 1,
+            "Q7574061": 1
+          },
+          "type_labels": {
+            "Q200726": "probability distribution",
+            "Q4257161": "range",
+            "Q7574061": "spatial distribution"
+          },
+          "year_like_ratio": 0.0
+        }
+      },
+      "animal:geologic_period": {
+        "concept_key": "animal:geologic_period",
+        "resolve_enabled": true,
+        "type_constraints": [
+          "Q11514315",
+          "Q736917",
+          "Q392928"
+        ],
+        "parents_properties": [
+          "P279",
+          "P361"
+        ],
+        "max_depth": 3,
+        "confidence": 0.6151,
+        "sample_count": 7,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": false,
+          "ambiguous_scope": false,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 0.8571,
+                "token_overlap": 0.3333
+              },
+              "description": "segment of time in history",
+              "label": "historical period",
+              "qid": "Q11514315",
+              "score": 0.7405
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 1.0,
+                "token_overlap": 0.0
+              },
+              "description": "body of rock identified by lithic characteristics and stratigraphic position; it is usually but not necessarily tabular and is mappable at the Earth's surface or traceable in the subsurface. Smaller than a subgroup",
+              "label": "geological formation",
+              "qid": "Q736917",
+              "score": 0.7
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 2,
+                "p31_count": 0,
+                "rank_score": 0.5,
+                "token_overlap": 0.3333
+              },
+              "description": "subdivision of geological time; shorter than an era and longer than an epoch",
+              "label": "period",
+              "qid": "Q392928",
+              "score": 0.6333
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q11514315": "historical period",
+            "Q392928": "period",
+            "Q736917": "geological formation"
+          },
+          "chosen_scope_qids": [
+            "Q11514315",
+            "Q736917",
+            "Q392928"
+          ],
+          "class_instance_signals": {
+            "Q11514315": {
+              "p279_count": 1,
+              "p31_count": 0
+            },
+            "Q392928": {
+              "p279_count": 2,
+              "p31_count": 0
+            },
+            "Q736917": {
+              "p279_count": 1,
+              "p31_count": 0
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279",
+            "P361"
+          ],
+          "query_variants": [
+            "animal:geologic_period",
+            "animal geologic period",
+            "geologic period",
+            "animal geologic",
+            "animal",
+            "geologic",
+            "period"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q11514315": 1,
+            "Q392928": 1,
+            "Q736917": 1
+          },
+          "type_labels": {
+            "Q11514315": "historical period",
+            "Q392928": "period",
+            "Q736917": "geological formation"
+          },
+          "year_like_ratio": 0.0
+        }
+      },
+      "animal:taxonomic-group": {
+        "concept_key": "animal:taxonomic-group",
+        "resolve_enabled": true,
+        "type_constraints": [
+          "Q215380",
+          "Q824979",
+          "Q32945461"
+        ],
+        "parents_properties": [
+          "P279"
+        ],
+        "max_depth": 3,
+        "confidence": 0.6448,
+        "sample_count": 7,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": false,
+          "ambiguous_scope": false,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 1.0,
+                "token_overlap": 0.3333
+              },
+              "description": "musical ensemble which performs music",
+              "label": "musical group",
+              "qid": "Q215380",
+              "score": 0.7833
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 0.8571,
+                "token_overlap": 0.3333
+              },
+              "description": "in geology, a stratigraphic unit, smaller than a supergroup and larger than a subgroup",
+              "label": "group",
+              "qid": "Q824979",
+              "score": 0.7405
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 0.7857,
+                "token_overlap": 0.3333
+              },
+              "description": "description in biological classification",
+              "label": "taxonomic treatment",
+              "qid": "Q32945461",
+              "score": 0.719
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q215380": "musical group",
+            "Q32945461": "taxonomic treatment",
+            "Q824979": "group"
+          },
+          "chosen_scope_qids": [
+            "Q215380",
+            "Q824979",
+            "Q32945461"
+          ],
+          "class_instance_signals": {
+            "Q215380": {
+              "p279_count": 1,
+              "p31_count": 0
+            },
+            "Q32945461": {
+              "p279_count": 1,
+              "p31_count": 0
+            },
+            "Q824979": {
+              "p279_count": 1,
+              "p31_count": 0
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279"
+          ],
+          "query_variants": [
+            "animal:taxonomic-group",
+            "animal taxonomic group",
+            "taxonomic group",
+            "animal taxonomic",
+            "animal",
+            "taxonomic",
+            "group"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q215380": 1,
+            "Q32945461": 1,
+            "Q824979": 1
+          },
+          "type_labels": {
+            "Q215380": "musical group",
+            "Q32945461": "taxonomic treatment",
+            "Q824979": "group"
+          },
+          "year_like_ratio": 0.0
+        }
+      },
+      "bird:temporal:classification": {
+        "concept_key": "bird:temporal:classification",
+        "resolve_enabled": false,
+        "type_constraints": [
+          "Q5128386",
+          "Q13582682",
+          "Q5962346"
+        ],
+        "parents_properties": [
+          "P279"
+        ],
+        "max_depth": 3,
+        "confidence": 0.541,
+        "sample_count": 7,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": false,
+          "ambiguous_scope": true,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 0.6429,
+                "token_overlap": 0.3333
+              },
+              "description": "figure of speech linking a proper noun to a common noun",
+              "label": "classification",
+              "qid": "Q5128386",
+              "score": 0.6762
+            },
+            {
+              "components": {
+                "class_likeness": 0.75,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 3,
+                "p31_count": 1,
+                "rank_score": 0.9286,
+                "token_overlap": 0.3333
+              },
+              "description": "process of grouping of objects into classes",
+              "label": "classification",
+              "qid": "Q13582682",
+              "score": 0.6744
+            },
+            {
+              "components": {
+                "class_likeness": 0.6667,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 2,
+                "p31_count": 1,
+                "rank_score": 1.0,
+                "token_overlap": 0.3333
+              },
+              "description": "system of descriptive information for an arrangement or division of objects into groups based on characteristics, which the objects have in common",
+              "label": "classification scheme",
+              "qid": "Q5962346",
+              "score": 0.6667
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q13582682": "classification",
+            "Q5128386": "classification",
+            "Q5962346": "classification scheme"
+          },
+          "chosen_scope_qids": [
+            "Q5128386",
+            "Q13582682",
+            "Q5962346"
+          ],
+          "class_instance_signals": {
+            "Q13582682": {
+              "p279_count": 3,
+              "p31_count": 1
+            },
+            "Q5128386": {
+              "p279_count": 1,
+              "p31_count": 0
+            },
+            "Q5962346": {
+              "p279_count": 2,
+              "p31_count": 1
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279"
+          ],
+          "query_variants": [
+            "bird:temporal:classification",
+            "bird temporal classification",
+            "temporal classification",
+            "bird temporal",
+            "bird",
+            "temporal",
+            "classification"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q13582682": 1,
+            "Q5128386": 1,
+            "Q5962346": 1
+          },
+          "type_labels": {
+            "Q13582682": "classification",
+            "Q5128386": "classification",
+            "Q5962346": "classification scheme"
+          },
+          "year_like_ratio": 0.0
+        }
+      },
+      "book:nationality": {
+        "concept_key": "book:nationality",
+        "resolve_enabled": true,
+        "type_constraints": [
+          "Q53731850",
+          "Q3337001",
+          "Q571"
+        ],
+        "parents_properties": [
+          "P279"
+        ],
+        "max_depth": 3,
+        "confidence": 0.6301,
+        "sample_count": 4,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": false,
+          "ambiguous_scope": false,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 6,
+                "p31_count": 0,
+                "rank_score": 0.7857,
+                "token_overlap": 0.5
+              },
+              "description": "specific physical copy of a book",
+              "label": "individual copy of a book",
+              "qid": "Q53731850",
+              "score": 0.7607
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 2,
+                "p31_count": 0,
+                "rank_score": 0.6429,
+                "token_overlap": 0.5
+              },
+              "description": "term in international sport",
+              "label": "nationality for sports",
+              "qid": "Q3337001",
+              "score": 0.7179
+            },
+            {
+              "components": {
+                "class_likeness": 0.6667,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 4,
+                "p31_count": 2,
+                "rank_score": 1.0,
+                "token_overlap": 0.5
+              },
+              "description": "medium for recording information (words or images) typically on bound pages or more abstractly in electronic or audio form",
+              "label": "book",
+              "qid": "Q571",
+              "score": 0.7083
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q3337001": "nationality for sports",
+            "Q53731850": "individual copy of a book",
+            "Q571": "book"
+          },
+          "chosen_scope_qids": [
+            "Q53731850",
+            "Q3337001",
+            "Q571"
+          ],
+          "class_instance_signals": {
+            "Q3337001": {
+              "p279_count": 2,
+              "p31_count": 0
+            },
+            "Q53731850": {
+              "p279_count": 6,
+              "p31_count": 0
+            },
+            "Q571": {
+              "p279_count": 4,
+              "p31_count": 2
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279"
+          ],
+          "query_variants": [
+            "book:nationality",
+            "book nationality",
+            "book",
+            "nationality"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q3337001": 1,
+            "Q53731850": 1,
+            "Q571": 1
+          },
+          "type_labels": {
+            "Q3337001": "nationality for sports",
+            "Q53731850": "individual copy of a book",
+            "Q571": "book"
+          },
+          "year_like_ratio": 0.0
+        }
+      },
+      "book:publication:period": {
+        "concept_key": "book:publication:period",
+        "resolve_enabled": true,
+        "type_constraints": [
+          "Q53731850",
+          "Q732577",
+          "Q571"
+        ],
+        "parents_properties": [
+          "P279"
+        ],
+        "max_depth": 3,
+        "confidence": 0.6375,
+        "sample_count": 7,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": false,
+          "ambiguous_scope": true,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 6,
+                "p31_count": 0,
+                "rank_score": 0.7857,
+                "token_overlap": 0.6667
+              },
+              "description": "specific physical copy of a book",
+              "label": "individual copy of a book",
+              "qid": "Q53731850",
+              "score": 0.8024
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 2,
+                "p31_count": 0,
+                "rank_score": 1.0,
+                "token_overlap": 0.3333
+              },
+              "description": "content made available to the general public",
+              "label": "publication",
+              "qid": "Q732577",
+              "score": 0.7833
+            },
+            {
+              "components": {
+                "class_likeness": 0.6667,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 4,
+                "p31_count": 2,
+                "rank_score": 1.0,
+                "token_overlap": 0.6667
+              },
+              "description": "medium for recording information (words or images) typically on bound pages or more abstractly in electronic or audio form",
+              "label": "book",
+              "qid": "Q571",
+              "score": 0.75
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q53731850": "individual copy of a book",
+            "Q571": "book",
+            "Q732577": "publication"
+          },
+          "chosen_scope_qids": [
+            "Q53731850",
+            "Q732577",
+            "Q571"
+          ],
+          "class_instance_signals": {
+            "Q53731850": {
+              "p279_count": 6,
+              "p31_count": 0
+            },
+            "Q571": {
+              "p279_count": 4,
+              "p31_count": 2
+            },
+            "Q732577": {
+              "p279_count": 2,
+              "p31_count": 0
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279"
+          ],
+          "query_variants": [
+            "book:publication:period",
+            "book publication period",
+            "publication period",
+            "book publication",
+            "book",
+            "publication",
+            "period"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q53731850": 1,
+            "Q571": 1,
+            "Q732577": 1
+          },
+          "type_labels": {
+            "Q53731850": "individual copy of a book",
+            "Q571": "book",
+            "Q732577": "publication"
+          },
+          "year_like_ratio": 0.0
+        }
+      },
+      "book:subject": {
+        "concept_key": "book:subject",
+        "resolve_enabled": true,
+        "type_constraints": [
+          "Q164573",
+          "Q362165",
+          "Q53731850"
+        ],
+        "parents_properties": [
+          "P279",
+          "P361"
+        ],
+        "max_depth": 3,
+        "confidence": 0.6581,
+        "sample_count": 4,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": false,
+          "ambiguous_scope": false,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 0.9286,
+                "token_overlap": 0.5
+              },
+              "description": "word or phrase which controls the verb in the clause; one of the two main constituents of a clause (the other being predicate)",
+              "label": "subject",
+              "qid": "Q164573",
+              "score": 0.8036
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 0.7857,
+                "token_overlap": 0.5
+              },
+              "description": "field of knowledge defined and organized for teaching in school",
+              "label": "school subject",
+              "qid": "Q362165",
+              "score": 0.7607
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 6,
+                "p31_count": 0,
+                "rank_score": 0.7857,
+                "token_overlap": 0.5
+              },
+              "description": "specific physical copy of a book",
+              "label": "individual copy of a book",
+              "qid": "Q53731850",
+              "score": 0.7607
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q164573": "subject",
+            "Q362165": "school subject",
+            "Q53731850": "individual copy of a book"
+          },
+          "chosen_scope_qids": [
+            "Q164573",
+            "Q362165",
+            "Q53731850"
+          ],
+          "class_instance_signals": {
+            "Q164573": {
+              "p279_count": 1,
+              "p31_count": 0
+            },
+            "Q362165": {
+              "p279_count": 1,
+              "p31_count": 0
+            },
+            "Q53731850": {
+              "p279_count": 6,
+              "p31_count": 0
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279",
+            "P361"
+          ],
+          "query_variants": [
+            "book:subject",
+            "book subject",
+            "book",
+            "subject"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q164573": 1,
+            "Q362165": 1,
+            "Q53731850": 1
+          },
+          "type_labels": {
+            "Q164573": "subject",
+            "Q362165": "school subject",
+            "Q53731850": "individual copy of a book"
+          },
+          "year_like_ratio": 0.0
+        }
+      },
+      "book:time-period": {
+        "concept_key": "book:time-period",
+        "resolve_enabled": true,
+        "type_constraints": [
+          "Q11514315",
+          "Q12737784",
+          "Q186081"
+        ],
+        "parents_properties": [
+          "P279"
+        ],
+        "max_depth": 3,
+        "confidence": 0.7911,
+        "sample_count": 7,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": true,
+          "ambiguous_scope": false,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.6667,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 1.0,
+                "token_overlap": 0.6667
+              },
+              "description": "segment of time in history",
+              "label": "historical period",
+              "qid": "Q11514315",
+              "score": 0.9167
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 0.7857,
+                "token_overlap": 0.6667
+              },
+              "description": "",
+              "label": "Time Period in Chrono Trigger",
+              "qid": "Q12737784",
+              "score": 0.8024
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 2,
+                "p31_count": 0,
+                "rank_score": 0.9286,
+                "token_overlap": 0.3333
+              },
+              "description": "temporal extent having a beginning, an end and a duration",
+              "label": "time interval",
+              "qid": "Q186081",
+              "score": 0.7619
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q11514315": "historical period",
+            "Q12737784": "Time Period in Chrono Trigger",
+            "Q186081": "time interval"
+          },
+          "chosen_scope_qids": [
+            "Q11514315",
+            "Q12737784",
+            "Q186081"
+          ],
+          "class_instance_signals": {
+            "Q11514315": {
+              "p279_count": 1,
+              "p31_count": 0
+            },
+            "Q12737784": {
+              "p279_count": 1,
+              "p31_count": 0
+            },
+            "Q186081": {
+              "p279_count": 2,
+              "p31_count": 0
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279"
+          ],
+          "query_variants": [
+            "book:time-period",
+            "book time period",
+            "time period",
+            "book time",
+            "book",
+            "time",
+            "period"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q11514315": 1,
+            "Q12737784": 1,
+            "Q186081": 1
+          },
+          "type_labels": {
+            "Q11514315": "historical period",
+            "Q12737784": "Time Period in Chrono Trigger",
+            "Q186081": "time interval"
+          },
+          "year_like_ratio": 0.0
+        }
+      },
+      "film:genre": {
+        "concept_key": "film:genre",
+        "resolve_enabled": true,
+        "type_constraints": [
+          "Q11424",
+          "Q201658",
+          "Q108699495"
+        ],
+        "parents_properties": [
+          "P279"
+        ],
+        "max_depth": 3,
+        "confidence": 0.6362,
+        "sample_count": 4,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": false,
+          "ambiguous_scope": true,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 3,
+                "p31_count": 0,
+                "rank_score": 1.0,
+                "token_overlap": 0.5
+              },
+              "description": "sequence of images that give the impression of movement, stored on film stock",
+              "label": "film",
+              "qid": "Q11424",
+              "score": 0.825
+            },
+            {
+              "components": {
+                "class_likeness": 0.5,
+                "hit_score": 0.6667,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 1,
+                "rank_score": 1.0,
+                "token_overlap": 1.0
+              },
+              "description": "classification of films based on similarities in narrative elements",
+              "label": "film genre",
+              "qid": "Q201658",
+              "score": 0.825
+            },
+            {
+              "components": {
+                "class_likeness": 0.6667,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 2,
+                "p31_count": 1,
+                "rank_score": 0.9286,
+                "token_overlap": 1.0
+              },
+              "description": "",
+              "label": "film genre by country",
+              "qid": "Q108699495",
+              "score": 0.8119
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q108699495": "film genre by country",
+            "Q11424": "film",
+            "Q201658": "film genre"
+          },
+          "chosen_scope_qids": [
+            "Q11424",
+            "Q201658",
+            "Q108699495"
+          ],
+          "class_instance_signals": {
+            "Q108699495": {
+              "p279_count": 2,
+              "p31_count": 1
+            },
+            "Q11424": {
+              "p279_count": 3,
+              "p31_count": 0
+            },
+            "Q201658": {
+              "p279_count": 1,
+              "p31_count": 1
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279"
+          ],
+          "query_variants": [
+            "film:genre",
+            "film genre",
+            "film",
+            "genre"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q108699495": 1,
+            "Q11424": 1,
+            "Q201658": 1
+          },
+          "type_labels": {
+            "Q108699495": "film genre by country",
+            "Q11424": "film",
+            "Q201658": "film genre"
+          },
+          "year_like_ratio": 0.0
+        }
+      },
+      "film:nationality": {
+        "concept_key": "film:nationality",
+        "resolve_enabled": true,
+        "type_constraints": [
+          "Q11424",
+          "Q3337001",
+          "Q1137203"
+        ],
+        "parents_properties": [
+          "P279"
+        ],
+        "max_depth": 3,
+        "confidence": 0.7255,
+        "sample_count": 4,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": true,
+          "ambiguous_scope": false,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 3,
+                "p31_count": 0,
+                "rank_score": 1.0,
+                "token_overlap": 0.5
+              },
+              "description": "sequence of images that give the impression of movement, stored on film stock",
+              "label": "film",
+              "qid": "Q11424",
+              "score": 0.825
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 2,
+                "p31_count": 0,
+                "rank_score": 0.6429,
+                "token_overlap": 0.5
+              },
+              "description": "term in international sport",
+              "label": "nationality for sports",
+              "qid": "Q3337001",
+              "score": 0.7179
+            },
+            {
+              "components": {
+                "class_likeness": 0.6667,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 2,
+                "p31_count": 1,
+                "rank_score": 0.9286,
+                "token_overlap": 0.5
+              },
+              "description": "a layer of material ranging from fractions of a nanometer to several micrometers in thickness",
+              "label": "thin film",
+              "qid": "Q1137203",
+              "score": 0.6869
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q1137203": "thin film",
+            "Q11424": "film",
+            "Q3337001": "nationality for sports"
+          },
+          "chosen_scope_qids": [
+            "Q11424",
+            "Q3337001",
+            "Q1137203"
+          ],
+          "class_instance_signals": {
+            "Q1137203": {
+              "p279_count": 2,
+              "p31_count": 1
+            },
+            "Q11424": {
+              "p279_count": 3,
+              "p31_count": 0
+            },
+            "Q3337001": {
+              "p279_count": 2,
+              "p31_count": 0
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279"
+          ],
+          "query_variants": [
+            "film:nationality",
+            "film nationality",
+            "film",
+            "nationality"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q1137203": 1,
+            "Q11424": 1,
+            "Q3337001": 1
+          },
+          "type_labels": {
+            "Q1137203": "thin film",
+            "Q11424": "film",
+            "Q3337001": "nationality for sports"
+          },
+          "year_like_ratio": 0.0
+        }
+      },
+      "film:setting": {
+        "concept_key": "film:setting",
+        "resolve_enabled": true,
+        "type_constraints": [
+          "Q11424",
+          "Q1137203",
+          "Q2526255"
+        ],
+        "parents_properties": [
+          "P279"
+        ],
+        "max_depth": 3,
+        "confidence": 0.7513,
+        "sample_count": 4,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": true,
+          "ambiguous_scope": false,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 3,
+                "p31_count": 0,
+                "rank_score": 1.0,
+                "token_overlap": 0.5
+              },
+              "description": "sequence of images that give the impression of movement, stored on film stock",
+              "label": "film",
+              "qid": "Q11424",
+              "score": 0.825
+            },
+            {
+              "components": {
+                "class_likeness": 0.6667,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 2,
+                "p31_count": 1,
+                "rank_score": 0.9286,
+                "token_overlap": 0.5
+              },
+              "description": "a layer of material ranging from fractions of a nanometer to several micrometers in thickness",
+              "label": "thin film",
+              "qid": "Q1137203",
+              "score": 0.6869
+            },
+            {
+              "components": {
+                "class_likeness": 0.6667,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 4,
+                "p31_count": 2,
+                "rank_score": 0.7857,
+                "token_overlap": 0.5
+              },
+              "description": "person who controls the artistic and dramatic aspects of a film production",
+              "label": "film director",
+              "qid": "Q2526255",
+              "score": 0.644
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q1137203": "thin film",
+            "Q11424": "film",
+            "Q2526255": "film director"
+          },
+          "chosen_scope_qids": [
+            "Q11424",
+            "Q1137203",
+            "Q2526255"
+          ],
+          "class_instance_signals": {
+            "Q1137203": {
+              "p279_count": 2,
+              "p31_count": 1
+            },
+            "Q11424": {
+              "p279_count": 3,
+              "p31_count": 0
+            },
+            "Q2526255": {
+              "p279_count": 4,
+              "p31_count": 2
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279"
+          ],
+          "query_variants": [
+            "film:setting",
+            "film setting",
+            "film",
+            "setting"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q1137203": 1,
+            "Q11424": 1,
+            "Q2526255": 1
+          },
+          "type_labels": {
+            "Q1137203": "thin film",
+            "Q11424": "film",
+            "Q2526255": "film director"
+          },
+          "year_like_ratio": 0.0
+        }
+      },
+      "film:thematic_category": {
+        "concept_key": "film:thematic_category",
+        "resolve_enabled": true,
+        "type_constraints": [
+          "Q11424",
+          "Q2560570",
+          "Q719395"
+        ],
+        "parents_properties": [
+          "P279"
+        ],
+        "max_depth": 3,
+        "confidence": 0.6806,
+        "sample_count": 7,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": true,
+          "ambiguous_scope": false,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 3,
+                "p31_count": 0,
+                "rank_score": 1.0,
+                "token_overlap": 0.3333
+              },
+              "description": "sequence of images that give the impression of movement, stored on film stock",
+              "label": "film",
+              "qid": "Q11424",
+              "score": 0.7833
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 0.7143,
+                "token_overlap": 0.3333
+              },
+              "description": "index used to identify musical compositions through the citation of either the opening notes or main theme of the work",
+              "label": "thematic catalog",
+              "qid": "Q2560570",
+              "score": 0.6976
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 0.7143,
+                "token_overlap": 0.3333
+              },
+              "description": "algebraic structure of objects and morphisms between objects, which can be associatively composed if the (co)domains agree",
+              "label": "category",
+              "qid": "Q719395",
+              "score": 0.6976
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q11424": "film",
+            "Q2560570": "thematic catalog",
+            "Q719395": "category"
+          },
+          "chosen_scope_qids": [
+            "Q11424",
+            "Q2560570",
+            "Q719395"
+          ],
+          "class_instance_signals": {
+            "Q11424": {
+              "p279_count": 3,
+              "p31_count": 0
+            },
+            "Q2560570": {
+              "p279_count": 1,
+              "p31_count": 0
+            },
+            "Q719395": {
+              "p279_count": 1,
+              "p31_count": 0
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279"
+          ],
+          "query_variants": [
+            "film:thematic_category",
+            "film thematic category",
+            "thematic category",
+            "film thematic",
+            "film",
+            "thematic",
+            "category"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q11424": 1,
+            "Q2560570": 1,
+            "Q719395": 1
+          },
+          "type_labels": {
+            "Q11424": "film",
+            "Q2560570": "thematic catalog",
+            "Q719395": "category"
+          },
+          "year_like_ratio": 0.0
+        }
+      },
+      "film:time-period": {
+        "concept_key": "film:time-period",
+        "resolve_enabled": true,
+        "type_constraints": [
+          "Q11514315",
+          "Q11424",
+          "Q12737784"
+        ],
+        "parents_properties": [
+          "P279"
+        ],
+        "max_depth": 3,
+        "confidence": 0.7375,
+        "sample_count": 7,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": true,
+          "ambiguous_scope": false,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.6667,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 1.0,
+                "token_overlap": 0.6667
+              },
+              "description": "segment of time in history",
+              "label": "historical period",
+              "qid": "Q11514315",
+              "score": 0.9167
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 3,
+                "p31_count": 0,
+                "rank_score": 1.0,
+                "token_overlap": 0.6667
+              },
+              "description": "sequence of images that give the impression of movement, stored on film stock",
+              "label": "film",
+              "qid": "Q11424",
+              "score": 0.8667
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 0.7857,
+                "token_overlap": 0.6667
+              },
+              "description": "",
+              "label": "Time Period in Chrono Trigger",
+              "qid": "Q12737784",
+              "score": 0.8024
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q11424": "film",
+            "Q11514315": "historical period",
+            "Q12737784": "Time Period in Chrono Trigger"
+          },
+          "chosen_scope_qids": [
+            "Q11514315",
+            "Q11424",
+            "Q12737784"
+          ],
+          "class_instance_signals": {
+            "Q11424": {
+              "p279_count": 3,
+              "p31_count": 0
+            },
+            "Q11514315": {
+              "p279_count": 1,
+              "p31_count": 0
+            },
+            "Q12737784": {
+              "p279_count": 1,
+              "p31_count": 0
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279"
+          ],
+          "query_variants": [
+            "film:time-period",
+            "film time period",
+            "time period",
+            "film time",
+            "film",
+            "time",
+            "period"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q11424": 1,
+            "Q11514315": 1,
+            "Q12737784": 1
+          },
+          "type_labels": {
+            "Q11424": "film",
+            "Q11514315": "historical period",
+            "Q12737784": "Time Period in Chrono Trigger"
+          },
+          "year_like_ratio": 0.0
+        }
+      },
+      "novel:attribute": {
+        "concept_key": "novel:attribute",
+        "resolve_enabled": true,
+        "type_constraints": [
+          "Q834104",
+          "Q8261",
+          "Q758238"
+        ],
+        "parents_properties": [
+          "P279",
+          "P361"
+        ],
+        "max_depth": 3,
+        "confidence": 0.6309,
+        "sample_count": 4,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": false,
+          "ambiguous_scope": true,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 0.8571,
+                "token_overlap": 0.5
+              },
+              "description": "describing term used in heraldry",
+              "label": "heraldic attribute",
+              "qid": "Q834104",
+              "score": 0.7821
+            },
+            {
+              "components": {
+                "class_likeness": 0.8,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 4,
+                "p31_count": 1,
+                "rank_score": 1.0,
+                "token_overlap": 0.5
+              },
+              "description": "narrative text, normally of a substantial length and in the form of prose describing a fictional and sequential story",
+              "label": "novel",
+              "qid": "Q8261",
+              "score": 0.755
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 3,
+                "p31_count": 0,
+                "rank_score": 0.3571,
+                "token_overlap": 0.5
+              },
+              "description": "characteristic feature of a figure in the visual arts, often an object attached to or held by the figure portrayed",
+              "label": "attribute",
+              "qid": "Q758238",
+              "score": 0.6321
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q758238": "attribute",
+            "Q8261": "novel",
+            "Q834104": "heraldic attribute"
+          },
+          "chosen_scope_qids": [
+            "Q834104",
+            "Q8261",
+            "Q758238"
+          ],
+          "class_instance_signals": {
+            "Q758238": {
+              "p279_count": 3,
+              "p31_count": 0
+            },
+            "Q8261": {
+              "p279_count": 4,
+              "p31_count": 1
+            },
+            "Q834104": {
+              "p279_count": 1,
+              "p31_count": 0
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279",
+            "P361"
+          ],
+          "query_variants": [
+            "novel:attribute",
+            "novel attribute",
+            "novel",
+            "attribute"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q758238": 1,
+            "Q8261": 1,
+            "Q834104": 1
+          },
+          "type_labels": {
+            "Q758238": "attribute",
+            "Q8261": "novel",
+            "Q834104": "heraldic attribute"
+          },
+          "year_like_ratio": 0.0
+        }
+      },
+      "novel:genre": {
+        "concept_key": "novel:genre",
+        "resolve_enabled": true,
+        "type_constraints": [
+          "Q108317211",
+          "Q8261",
+          "Q214127"
+        ],
+        "parents_properties": [
+          "P279",
+          "P361"
+        ],
+        "max_depth": 3,
+        "confidence": 0.5704,
+        "sample_count": 4,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": false,
+          "ambiguous_scope": true,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 0.5,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 1,
+                "rank_score": 1.0,
+                "token_overlap": 1.0
+              },
+              "description": "refers to a category of novels",
+              "label": "novel genre",
+              "qid": "Q108317211",
+              "score": 0.775
+            },
+            {
+              "components": {
+                "class_likeness": 0.8,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 4,
+                "p31_count": 1,
+                "rank_score": 1.0,
+                "token_overlap": 0.5
+              },
+              "description": "narrative text, normally of a substantial length and in the form of prose describing a fictional and sequential story",
+              "label": "novel",
+              "qid": "Q8261",
+              "score": 0.755
+            },
+            {
+              "components": {
+                "class_likeness": 0.6667,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 2,
+                "p31_count": 1,
+                "rank_score": 0.7857,
+                "token_overlap": 0.5
+              },
+              "description": "paintings of scenes or events from everyday life",
+              "label": "genre painting",
+              "qid": "Q214127",
+              "score": 0.644
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q108317211": "novel genre",
+            "Q214127": "genre painting",
+            "Q8261": "novel"
+          },
+          "chosen_scope_qids": [
+            "Q108317211",
+            "Q8261",
+            "Q214127"
+          ],
+          "class_instance_signals": {
+            "Q108317211": {
+              "p279_count": 1,
+              "p31_count": 1
+            },
+            "Q214127": {
+              "p279_count": 2,
+              "p31_count": 1
+            },
+            "Q8261": {
+              "p279_count": 4,
+              "p31_count": 1
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279",
+            "P361"
+          ],
+          "query_variants": [
+            "novel:genre",
+            "novel genre",
+            "novel",
+            "genre"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q108317211": 1,
+            "Q214127": 1,
+            "Q8261": 1
+          },
+          "type_labels": {
+            "Q108317211": "novel genre",
+            "Q214127": "genre painting",
+            "Q8261": "novel"
+          },
+          "year_like_ratio": 0.0
+        }
+      },
+      "plant:attribute": {
+        "concept_key": "plant:attribute",
+        "resolve_enabled": true,
+        "type_constraints": [
+          "Q834104",
+          "Q83405",
+          "Q188840"
+        ],
+        "parents_properties": [
+          "P279",
+          "P361"
+        ],
+        "max_depth": 3,
+        "confidence": 0.6946,
+        "sample_count": 4,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": true,
+          "ambiguous_scope": false,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 0.8571,
+                "token_overlap": 0.5
+              },
+              "description": "describing term used in heraldry",
+              "label": "heraldic attribute",
+              "qid": "Q834104",
+              "score": 0.7821
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 5,
+                "p31_count": 0,
+                "rank_score": 0.9286,
+                "token_overlap": 0.0
+              },
+              "description": "facility where goods are industrially made, or processed",
+              "label": "factory",
+              "qid": "Q83405",
+              "score": 0.6786
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 3,
+                "p31_count": 0,
+                "rank_score": 0.5,
+                "token_overlap": 0.5
+              },
+              "description": "plants or derivatives used to treat medical conditions in humans or animals",
+              "label": "medicinal plant",
+              "qid": "Q188840",
+              "score": 0.675
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q188840": "medicinal plant",
+            "Q83405": "factory",
+            "Q834104": "heraldic attribute"
+          },
+          "chosen_scope_qids": [
+            "Q834104",
+            "Q83405",
+            "Q188840"
+          ],
+          "class_instance_signals": {
+            "Q188840": {
+              "p279_count": 3,
+              "p31_count": 0
+            },
+            "Q83405": {
+              "p279_count": 5,
+              "p31_count": 0
+            },
+            "Q834104": {
+              "p279_count": 1,
+              "p31_count": 0
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279",
+            "P361"
+          ],
+          "query_variants": [
+            "plant:attribute",
+            "plant attribute",
+            "plant",
+            "attribute"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q188840": 1,
+            "Q83405": 1,
+            "Q834104": 1
+          },
+          "type_labels": {
+            "Q188840": "medicinal plant",
+            "Q83405": "factory",
+            "Q834104": "heraldic attribute"
+          },
+          "year_like_ratio": 0.0
+        }
+      },
+      "plant:location": {
+        "concept_key": "plant:location",
+        "resolve_enabled": true,
+        "type_constraints": [
+          "Q18658526",
+          "Q12131650",
+          "Q18711811"
+        ],
+        "parents_properties": [
+          "P279"
+        ],
+        "max_depth": 3,
+        "confidence": 0.6123,
+        "sample_count": 4,
+        "resolved_count": 3,
+        "evidence": {
+          "ambiguity_override": false,
+          "ambiguous_scope": true,
+          "candidate_scores": [
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 0.7857,
+                "token_overlap": 0.5
+              },
+              "description": "place where a person died",
+              "label": "place of death",
+              "qid": "Q18658526",
+              "score": 0.7607
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 0.7143,
+                "token_overlap": 0.5
+              },
+              "description": "place where a particular dead person is buried (cemetery, burial chamber, sea, ...) as a detail in that person's life; even about a pet animal",
+              "label": "location of burial",
+              "qid": "Q12131650",
+              "score": 0.7393
+            },
+            {
+              "components": {
+                "class_likeness": 1.0,
+                "hit_score": 0.3333,
+                "instance_penalty": 0.0,
+                "p279_count": 1,
+                "p31_count": 0,
+                "rank_score": 0.5714,
+                "token_overlap": 0.5
+              },
+              "description": "type of Wikimedia modules for location map datas",
+              "label": "map data module",
+              "qid": "Q18711811",
+              "score": 0.6964
+            }
+          ],
+          "chosen_scope_labels": {
+            "Q12131650": "location of burial",
+            "Q18658526": "place of death",
+            "Q18711811": "map data module"
+          },
+          "chosen_scope_qids": [
+            "Q18658526",
+            "Q12131650",
+            "Q18711811"
+          ],
+          "class_instance_signals": {
+            "Q12131650": {
+              "p279_count": 1,
+              "p31_count": 0
+            },
+            "Q18658526": {
+              "p279_count": 1,
+              "p31_count": 0
+            },
+            "Q18711811": {
+              "p279_count": 1,
+              "p31_count": 0
+            }
+          },
+          "mode": "concept_key",
+          "parent_properties_signal": [
+            "P279"
+          ],
+          "query_variants": [
+            "plant:location",
+            "plant location",
+            "plant",
+            "location"
+          ],
+          "scope_strategy": "class_anchor_p279",
+          "type_counts": {
+            "Q12131650": 1,
+            "Q18658526": 1,
+            "Q18711811": 1
+          },
+          "type_labels": {
+            "Q12131650": "location of burial",
+            "Q18658526": "place of death",
+            "Q18711811": "map data module"
+          },
+          "year_like_ratio": 0.0
+        }
+      }
+    }
+  },
+  "overrides_applied": {},
+  "inferred_cross_concept_hierarchy": {}
+}
