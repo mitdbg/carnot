@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Generator
 
 from smolagents.tools import Tool
 
@@ -8,6 +9,7 @@ from carnot.agents.models import LiteLLMModel
 from carnot.agents.planner import Planner
 from carnot.conversation.conversation import Conversation
 from carnot.data.dataset import Dataset
+from carnot.execution.progress import ExecutionProgress, PlanningProgress
 from carnot.index.index import CarnotIndex
 from carnot.memory.memory import Memory
 from carnot.operators.code import CodeOperator
@@ -124,6 +126,88 @@ class Execution:
             self.datasets,
             conversation=self.conversation,
             cost_budget=self.cost_budget,
+        )
+
+        return nl_plan, logical_plan
+
+    def plan_stream(self) -> Generator[PlanningProgress, None, tuple[str, dict]]:
+        """Generate a logical execution plan, yielding progress events.
+
+        This is the streaming counterpart of :meth:`plan`.  It performs
+        the same two-phase approach (logical plan generation → paraphrase)
+        but yields :class:`PlanningProgress` events between steps so
+        that callers can keep the user informed of progress.
+
+        The **return value** (accessed via ``StopIteration.value`` or by
+        collecting the generator with a helper) is the same
+        ``(natural_language_plan, logical_plan_dict)`` tuple that
+        :meth:`plan` returns.
+
+        Typical usage from an async context::
+
+            gen = execution.plan_stream()
+            result = None
+            try:
+                while True:
+                    progress = next(gen)
+                    # forward ``progress`` to SSE / websocket
+            except StopIteration as exc:
+                result = exc.value  # (nl_plan, logical_plan)
+
+        Requires:
+            - ``self.query`` is a non-empty string.
+            - ``self.datasets`` is a non-empty list.
+
+        Returns:
+            A generator that yields :class:`PlanningProgress` objects.
+            The generator's return value is
+            ``(natural_language_plan, logical_plan_dict)``.
+
+        Raises:
+            AgentGenerationError: If the LLM fails to produce valid
+            output during either phase.
+        """
+        # ----------------------------------------------------------
+        # Phase 1: Generate the code-based logical plan
+        # ----------------------------------------------------------
+        logical_plan = None
+        for event in self.planner.generate_logical_plan_stream(
+            self.query,
+            self.datasets,
+            conversation=self.conversation,
+            cost_budget=self.cost_budget,
+        ):
+            if isinstance(event, PlanningProgress):
+                yield event
+            else:
+                # Terminal value — the logical plan dict
+                logical_plan = event
+
+        yield PlanningProgress(
+            phase="logical_plan",
+            message="Logical plan generated. Preparing summary…",
+        )
+
+        # ----------------------------------------------------------
+        # Phase 2: Translate the logical plan to natural language
+        # ----------------------------------------------------------
+        nl_plan = None
+        for event in self.planner.paraphrase_logical_plan_stream(
+            self.query,
+            logical_plan,
+            self.datasets,
+            conversation=self.conversation,
+            cost_budget=self.cost_budget,
+        ):
+            if isinstance(event, PlanningProgress):
+                yield event
+            else:
+                # Terminal value — the NL plan string
+                nl_plan = event
+
+        yield PlanningProgress(
+            phase="paraphrase",
+            message="Plan summary complete.",
         )
 
         return nl_plan, logical_plan
@@ -272,8 +356,7 @@ class Execution:
         for operator, parent_ids in operators:
             if isinstance(operator, Dataset):
                 # materialize items through the storage layer (or fallback)
-                operator.materialize(self.storage)
-                input_datasets[operator.name] = operator
+                input_datasets[operator.name] = operator.materialize(self.storage)
             elif isinstance(operator, CodeOperator):
                 input_datasets = operator(input_datasets)
             elif isinstance(operator, SemJoinOperator):
@@ -292,5 +375,140 @@ class Execution:
         final_answer_operator = ReasoningOperator(task=self.query, output_dataset_id="final_dataset", model_id="openai/gpt-5-mini", llm_config=self.llm_config)
         output_datasets = final_answer_operator(input_datasets)
         final_dataset = output_datasets["final_dataset"]
+
+        return final_dataset.items, final_dataset.code_state.get("final_answer_str", "")
+
+    # -- operator display helpers ------------------------------------------------
+
+    _OPERATOR_DISPLAY_NAMES: dict[type, str] = {
+        SemFilterOperator: "Semantic Filter",
+        SemMapOperator: "Semantic Map",
+        SemFlatMapOperator: "Semantic Flat Map",
+        SemGroupByOperator: "Semantic Group By",
+        SemJoinOperator: "Semantic Join",
+        SemTopKOperator: "Semantic Top-K",
+        SemAggOperator: "Semantic Aggregation",
+        CodeOperator: "Code",
+        ReasoningOperator: "Reasoning",
+        LimitOperator: "Limit",
+    }
+
+    @staticmethod
+    def _operator_display_name(operator: Operator | Dataset) -> str:
+        """Return a human-readable label for an operator or dataset.
+
+        Requires:
+            - *operator* is an instance of a known operator type or
+              :class:`Dataset`.
+
+        Returns:
+            A short display string such as ``"Semantic Filter"`` or
+            ``"Dataset: Movies"``.
+
+        Raises:
+            None.
+        """
+        if isinstance(operator, Dataset):
+            return f"Dataset: {operator.name}"
+        return Execution._OPERATOR_DISPLAY_NAMES.get(
+            type(operator), type(operator).__name__
+        )
+
+    # -- streaming run -----------------------------------------------------------
+
+    def run_stream(self) -> Generator[ExecutionProgress, None, tuple[list[dict], str]]:
+        """Execute the physical plan, yielding progress events.
+
+        This is the streaming counterpart of :meth:`run`.  It performs
+        the same operator-by-operator execution but yields
+        :class:`ExecutionProgress` events between operators so that
+        callers can keep the user informed of progress.
+
+        The **return value** (accessed via ``StopIteration.value``) is
+        the same ``(items, answer_str)`` tuple that :meth:`run` returns.
+
+        Typical usage from an async context::
+
+            gen = execution.run_stream()
+            result = None
+            try:
+                while True:
+                    progress = next(gen)
+                    # forward ``progress`` to SSE / websocket
+            except StopIteration as exc:
+                result = exc.value  # (items, answer_str)
+
+        Requires:
+            - ``self._plan`` is a valid plan dict.
+            - ``self.datasets`` is a non-empty list.
+
+        Returns:
+            A generator that yields :class:`ExecutionProgress` objects.
+            The generator's return value is ``(items, answer_str)``.
+
+        Raises:
+            ValueError: If the plan contains unrecognized operators.
+        """
+        input_datasets: dict[str, Dataset] = {}
+        operators = self._get_ops_in_topological_order(self._plan)
+        total = len(operators)
+
+        yield ExecutionProgress(
+            message=f"Starting execution — {total} step(s) in plan.",
+            total_operators=total,
+        )
+
+        for idx, (operator, parent_ids) in enumerate(operators):
+            display = self._operator_display_name(operator)
+
+            yield ExecutionProgress(
+                message=f"Running step {idx + 1}/{total}: {display}…",
+                operator_index=idx,
+                total_operators=total,
+                operator_name=display,
+            )
+
+            if isinstance(operator, Dataset):
+                input_datasets[operator.name] = operator.materialize(self.storage)
+            elif isinstance(operator, CodeOperator):
+                input_datasets = operator(input_datasets)
+            elif isinstance(operator, SemJoinOperator):
+                left_dataset_id = parent_ids[0]
+                right_dataset_id = parent_ids[1]
+                input_datasets = operator(left_dataset_id, right_dataset_id, input_datasets)
+            else:
+                dataset_id = parent_ids[0]
+                input_datasets = operator(dataset_id, input_datasets)
+
+            yield ExecutionProgress(
+                message=f"Completed step {idx + 1}/{total}: {display}.",
+                operator_index=idx,
+                total_operators=total,
+                operator_name=display,
+            )
+
+        # Final reasoning step
+        yield ExecutionProgress(
+            message="Generating final answer…",
+            operator_index=total,
+            total_operators=total + 1,
+            operator_name="Reasoning",
+        )
+
+        final_answer_operator = ReasoningOperator(
+            task=self.query,
+            output_dataset_id="final_dataset",
+            model_id="openai/gpt-5-mini",
+            llm_config=self.llm_config,
+        )
+        output_datasets = final_answer_operator(input_datasets)
+        final_dataset = output_datasets["final_dataset"]
+
+        yield ExecutionProgress(
+            message="Execution complete.",
+            operator_index=total + 1,
+            total_operators=total + 1,
+            operator_name="Reasoning",
+        )
 
         return final_dataset.items, final_dataset.code_state.get("final_answer_str", "")

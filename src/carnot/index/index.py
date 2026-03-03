@@ -9,7 +9,6 @@ import faiss
 import litellm
 import numpy as np
 
-from carnot.data.item import DataItem
 from carnot.index.sem_indices import FlatFileIndex, HierarchicalFileIndex
 from carnot.storage.config import StorageConfig
 
@@ -32,10 +31,9 @@ class CarnotIndex(ABC):
     - *name* (``str``): unique name for this index (used for on-disk
       persistence).  Callers should ensure uniqueness across datasets,
       e.g. ``"ds{dataset_id}_{kind}"``.
-    - *items* (``list | None``): the data items to be indexed.  May be
-      ``DataItem`` references, raw ``dict`` objects, or plain strings,
-      depending on the subclass.  When *index* is provided (pre-built
-      index reuse), ``items`` enables result mapping (e.g., URI → item).
+    - *items* (``list[dict] | None``): the data items to be indexed.
+      Will be raw materialized ``dict`` objects. When *index* is provided
+      (pre-built index reuse), ``items`` enables result mapping (e.g., URI → item).
     - *index*: an optional pre-built inner index object.  When
       provided, subclasses should assign it to ``self._index`` and
       skip the expensive build step.  **Must not be provided without
@@ -65,7 +63,7 @@ class CarnotIndex(ABC):
     def __init__(
         self,
         name: str,
-        items: list | None = None,
+        items: list[dict] | None = None,
         index = None,
     ):
         if index is not None and not items:
@@ -115,10 +113,9 @@ class HierarchicalCarnotIndex(CarnotIndex):
     so that the index is ready for ``search`` immediately after
     ``__init__``.
 
-    Items may be ``DataItem`` instances or ``dict`` objects with a
-    ``"uri"`` key.  The underlying ``HierarchicalFileIndex`` operates
-    on file URIs; ``search`` maps the returned URIs back to the
-    original items.
+    Items are materialized ``dict`` objects with a ``"uri"`` key.
+    The underlying ``HierarchicalFileIndex`` operates on file URIs;
+    ``search`` maps the returned URIs back to the original items.
 
     Representation invariant:
         - ``_index`` is ``None`` iff no items with a valid URI were
@@ -141,7 +138,7 @@ class HierarchicalCarnotIndex(CarnotIndex):
     def __init__(
         self,
         name: str,
-        items: list[DataItem] | list[dict] | None = None,
+        items: list[dict] | None = None,
         config=None,
         api_key: str | None = None,
         index = None,
@@ -173,13 +170,12 @@ class HierarchicalCarnotIndex(CarnotIndex):
         if self._index is not None:
             return self._index
 
-        data_items = _items_to_data_items(self.items)
-        if not data_items:
+        if not self.items:
             raise ValueError("HierarchicalCarnotIndex: no items with uri to build index")
 
         index = HierarchicalFileIndex.from_items(
             name=self.name,
-            items=data_items,
+            items=self.items,
             config=self._config,
             api_key=self._api_key,
         )
@@ -221,8 +217,7 @@ class FlatCarnotIndex(CarnotIndex):
     All file summaries live in a flat list.  At query time the LLM
     (or embedding pre-filter) selects the top-k most relevant files.
 
-    Items may be ``DataItem`` instances or ``dict`` objects with a
-    ``"uri"`` key.
+    Items will have previously been materialized to dictionaries.
 
     Representation invariant:
         - ``_index`` is ``None`` iff no items with a valid URI were
@@ -245,7 +240,7 @@ class FlatCarnotIndex(CarnotIndex):
     def __init__(
         self,
         name: str,
-        items: list[DataItem | dict] | None = None,
+        items: list[dict] | None = None,
         config=None,
         api_key: str | None = None,
         index = None,
@@ -277,13 +272,12 @@ class FlatCarnotIndex(CarnotIndex):
         if self._index is not None:
             return self._index
 
-        data_items = _items_to_data_items(self.items)
-        if not data_items:
+        if not self.items:
             raise ValueError("FlatCarnotIndex: no items with uri to build index")
 
         index = FlatFileIndex.from_items(
             name=self.name,
-            items=data_items,
+            items=self.items,
             config=self._config,
             api_key=self._api_key,
         )
@@ -344,7 +338,7 @@ class ChromaIndex(CarnotIndex):
     def __init__(
         self,
         name: str,
-        items: list | None = None,
+        items: list[dict] | None = None,
         model: str = "openai/text-embedding-3-small",
         api_key: str = None,
         index = None,
@@ -364,7 +358,7 @@ class ChromaIndex(CarnotIndex):
         non-empty, it is returned without re-indexing.
 
         Requires:
-            - ``self.items`` elements are ``str`` or ``dict``.
+            - ``self.items`` elements are ``dict``.
 
         Returns:
             A ``chromadb.Collection`` containing all items.
@@ -384,12 +378,10 @@ class ChromaIndex(CarnotIndex):
 
         item_strs = []
         for item in self.items:
-            if isinstance(item, str):
-                item_strs.append(item)
-            elif isinstance(item, dict):
+            if isinstance(item, dict):
                 item_strs.append(json.dumps(item))
             else:
-                raise ValueError("ChromaIndex currently only supports items of type: [str, dict].")
+                raise ValueError("ChromaIndex currently only supports items of type: [dict].")
 
         for start in range(0, len(item_strs), INDEX_BATCH_SIZE):
             batch = item_strs[start : start + INDEX_BATCH_SIZE]
@@ -452,7 +444,7 @@ class FaissIndex(CarnotIndex):
     def __init__(
         self,
         name: str,
-        items: list | None = None,
+        items: list[dict] | None = None,
         model: str = "openai/text-embedding-3-small",
         api_key: str = None,
         index = None,
@@ -595,29 +587,3 @@ def _build_uri_to_idx(items: list) -> dict[str, int]:
         if uri:
             mapping[uri] = i
     return mapping
-
-
-def _items_to_data_items(items: list) -> list[DataItem]:
-    """Convert a heterogeneous item list to ``DataItem`` instances.
-
-    Accepts ``DataItem`` (with non-empty ``uri``) and ``dict`` (with a
-    ``"uri"`` key).  Items that have no URI are skipped.
-
-    Requires:
-        - *items* is a list.
-
-    Returns:
-        A list of ``DataItem`` instances with non-empty ``uri``.
-
-    Raises:
-        None.
-    """
-    result: list[DataItem] = []
-    for i in items:
-        if isinstance(i, DataItem) and i.uri:
-            result.append(i)
-        elif isinstance(i, dict) and i.get("uri"):
-            di = DataItem(uri=i["uri"])
-            di._dict = i
-            result.append(di)
-    return result

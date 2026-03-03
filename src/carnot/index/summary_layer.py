@@ -14,7 +14,6 @@ from pathlib import Path
 
 import litellm
 
-from carnot.data.item import DataItem
 from carnot.index.models import FileSummaryEntry, HierarchicalIndexConfig
 from carnot.index.sem_indices_cache import FileSummaryCache
 from carnot.storage.config import StorageConfig
@@ -35,7 +34,7 @@ _SUMMARY_TEMPERATURE = 0.3
 
 
 class SummaryLayer:
-    """Builds and caches :class:`FileSummaryEntry` objects from ``DataItem`` instances.
+    """Builds and caches :class:`FileSummaryEntry` objects from dict instances.
 
     Combines LLM-based summarization with embedding generation and
     transparent per-file caching via :class:`FileSummaryCache`.
@@ -55,10 +54,9 @@ class SummaryLayer:
         - ``_config`` is a non-``None`` :class:`HierarchicalIndexConfig`.
 
     Abstraction function:
-        Represents a service that, given a list of ``DataItem``
-        instances, produces corresponding ``FileSummaryEntry`` objects
-        — fetching from cache when available, and generating via LLM +
-        embedding otherwise.
+        Represents a service that, given a list of dictionaries, produces corresponding
+        ``FileSummaryEntry`` objects — fetching from cache when available, and generating
+        via LLM + embedding otherwise.
     """
 
     def __init__(
@@ -75,7 +73,7 @@ class SummaryLayer:
     # ── Public API ──────────────────────────────────────────────────────
 
     def get_or_build_summaries(
-        self, items: list[DataItem]
+        self, items: list[dict]
     ) -> list[FileSummaryEntry]:
         """Return :class:`FileSummaryEntry` objects for each item.
 
@@ -83,7 +81,7 @@ class SummaryLayer:
         are summarized via LLM and then cached.
 
         Requires:
-            - *items* is a list of ``DataItem`` instances.
+            - *items* is a list of dict instances.
 
         Returns:
             A list of ``FileSummaryEntry`` objects for all items that
@@ -95,14 +93,14 @@ class SummaryLayer:
             None.  Errors for individual items are logged and skipped.
         """
         paths = [
-            i.path
+            i['path']
             for i in items
-            if i.path and Path(i.path).suffix.lower() not in _SKIP_SUFFIXES
+            if i['path'] and Path(i['path']).suffix.lower() not in _SKIP_SUFFIXES
         ]
 
         loaded, missing_paths = self._cache.load_many(paths)
         items_to_compute = [
-            i for i in items if i.path in missing_paths
+            i for i in items if i['path'] in missing_paths
         ]
 
         if items_to_compute:
@@ -115,12 +113,12 @@ class SummaryLayer:
     # ── Private helpers ─────────────────────────────────────────────────
 
     def _build_file_summaries(
-        self, items: list[DataItem]
+        self, items: list[dict]
     ) -> list[FileSummaryEntry]:
         """Generate summaries for items that are not in cache.
 
         Requires:
-            - *items* is a list of ``DataItem`` instances.
+            - *items* is a list of dictionaries with valid ``"path"`` keys.
 
         Returns:
             A list of newly-generated ``FileSummaryEntry`` objects.
@@ -131,22 +129,22 @@ class SummaryLayer:
         entries: list[FileSummaryEntry] = []
 
         for item in items:
-            if not item.path:
+            if not item['path']:
                 continue
-            if Path(item.path).suffix.lower() in _SKIP_SUFFIXES:
+            if Path(item['path']).suffix.lower() in _SKIP_SUFFIXES:
                 continue
             try:
                 text = self._get_file_text(item)
                 if not text.strip():
                     continue
 
-                summary_text = self._generate_summary(item.path, text)
+                summary_text = self._generate_summary(item['path'], text)
                 embedding = self._generate_embedding(summary_text)
                 if embedding is None:
                     continue
 
                 entry = FileSummaryEntry(
-                    path=item.path,
+                    path=item['path'],
                     summary=summary_text,
                     embedding=embedding,
                 )
@@ -156,19 +154,19 @@ class SummaryLayer:
                     self._cache.save(entry)
                 except Exception as e:
                     logger.warning(
-                        f"Failed to persist summary for {item.path}: {e}"
+                        f"Failed to persist summary for {item['path']}: {e}"
                     )
             except Exception as e:
-                logger.warning(f"Failed to summarize {item.path}: {e}")
+                logger.warning(f"Failed to summarize {item['path']}: {e}")
 
         return entries
 
     @staticmethod
-    def _get_file_text(item: DataItem) -> str:
-        """Extract text content from a ``DataItem``.
+    def _get_file_text(item: dict) -> str:
+        """Extract text content from a dict.
 
         Requires:
-            - *item* is a ``DataItem`` instance.
+            - *item* is a dict instance.
 
         Returns:
             The text content, or an empty string if extraction fails.
@@ -177,8 +175,7 @@ class SummaryLayer:
             None.
         """
         try:
-            d = item.to_dict()
-            return json.dumps(d, indent=2)
+            return json.dumps(item, indent=2)
         except Exception:
             return ""
 

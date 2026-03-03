@@ -5,6 +5,8 @@ Tests cover:
    type for every known operator name, and raises for unknowns.
 2. ``_get_ops_in_topological_order`` — produces the correct linearised
    order for single-op, chained, and branching (join) plan DAGs.
+3. ``_operator_display_name`` — returns human-readable labels.
+4. ``ExecutionProgress.to_dict`` — serializes correctly.
 """
 
 from __future__ import annotations
@@ -13,8 +15,10 @@ import pytest
 
 from carnot.data.dataset import Dataset
 from carnot.execution.execution import Execution
+from carnot.execution.progress import ExecutionProgress
 from carnot.operators.code import CodeOperator
 from carnot.operators.limit import LimitOperator
+from carnot.operators.reasoning import ReasoningOperator
 from carnot.operators.sem_agg import SemAggOperator
 from carnot.operators.sem_filter import SemFilterOperator
 from carnot.operators.sem_flat_map import SemFlatMapOperator
@@ -266,3 +270,137 @@ class TestGetOpsInTopologicalOrder:
         # The filter's parent_ids should be ["Movies"]
         _, parent_ids = ops[1]
         assert parent_ids == ["Movies"]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# _operator_display_name
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestOperatorDisplayName:
+    """Verify that _operator_display_name returns readable labels."""
+
+    def test_dataset_includes_name(self):
+        """A Dataset produces 'Dataset: <name>'."""
+        ds = Dataset(name="Movies")
+        assert Execution._operator_display_name(ds) == "Dataset: Movies"
+
+    def test_sem_filter(self):
+        """SemFilterOperator → 'Semantic Filter'."""
+        ex = _make_execution()
+        plan = _op_plan("SemanticFilter", "f1", [], condition="x")
+        op, _ = ex._get_op_from_plan_dict(plan)
+        assert Execution._operator_display_name(op) == "Semantic Filter"
+
+    def test_sem_map(self):
+        """SemMapOperator → 'Semantic Map'."""
+        ex = _make_execution()
+        plan = _op_plan("SemanticMap", "m1", [], field="x", type="str", field_desc="d")
+        op, _ = ex._get_op_from_plan_dict(plan)
+        assert Execution._operator_display_name(op) == "Semantic Map"
+
+    def test_sem_join(self):
+        """SemJoinOperator → 'Semantic Join'."""
+        ex = _make_execution()
+        plan = _op_plan("SemanticJoin", "j1", [_leaf_plan("A"), _leaf_plan("B")], condition="c")
+        op, _ = ex._get_op_from_plan_dict(plan)
+        assert Execution._operator_display_name(op) == "Semantic Join"
+
+    def test_limit(self):
+        """LimitOperator → 'Limit'."""
+        ex = _make_execution()
+        plan = _op_plan("Limit", "l1", [], n=5)
+        op, _ = ex._get_op_from_plan_dict(plan)
+        assert Execution._operator_display_name(op) == "Limit"
+
+    def test_code(self):
+        """CodeOperator → 'Code'."""
+        ex = _make_execution()
+        plan = _op_plan("Code", "c1", [], task="compute")
+        op, _ = ex._get_op_from_plan_dict(plan)
+        assert Execution._operator_display_name(op) == "Code"
+
+    def test_sem_topk(self):
+        """SemTopKOperator → 'Semantic Top-K'."""
+        ex = _make_execution()
+        plan = _op_plan("SemanticTopK", "t1", [], search_str="best", k=3, index_name="flat")
+        op, _ = ex._get_op_from_plan_dict(plan)
+        assert Execution._operator_display_name(op) == "Semantic Top-K"
+
+    def test_sem_agg(self):
+        """SemAggOperator → 'Semantic Aggregation'."""
+        ex = _make_execution()
+        plan = _op_plan("SemanticAgg", "a1", [], task="summarize", agg_fields=[{"name": "s", "type": "str"}])
+        op, _ = ex._get_op_from_plan_dict(plan)
+        assert Execution._operator_display_name(op) == "Semantic Aggregation"
+
+    def test_sem_groupby(self):
+        """SemGroupByOperator → 'Semantic Group By'."""
+        ex = _make_execution()
+        plan = _op_plan(
+            "SemanticGroupBy", "g1", [],
+            gby_fields=[{"name": "genre", "type": "str"}],
+            agg_fields=[{"name": "count", "type": "int", "func": "count"}],
+        )
+        op, _ = ex._get_op_from_plan_dict(plan)
+        assert Execution._operator_display_name(op) == "Semantic Group By"
+
+    def test_sem_flat_map(self):
+        """SemFlatMapOperator → 'Semantic Flat Map'."""
+        ex = _make_execution()
+        plan = _op_plan("SemanticFlatMap", "fm1", [], field="kw", type="str", field_desc="keyword")
+        op, _ = ex._get_op_from_plan_dict(plan)
+        assert Execution._operator_display_name(op) == "Semantic Flat Map"
+
+    def test_reasoning_operator(self):
+        """ReasoningOperator → 'Reasoning' (inherits from CodeOperator)."""
+        op = ReasoningOperator(
+            task="reason",
+            output_dataset_id="out",
+            model_id="openai/gpt-5-mini",
+            llm_config=_LLM_CONFIG,
+        )
+        # ReasoningOperator is a subclass of CodeOperator, so the lookup
+        # falls through to the exact-type match for ReasoningOperator.
+        assert Execution._operator_display_name(op) == "Reasoning"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ExecutionProgress
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestExecutionProgress:
+    """Verify ExecutionProgress serialization."""
+
+    def test_to_dict_full(self):
+        """All fields present when set."""
+        ep = ExecutionProgress(
+            message="Running step 1/3: Semantic Filter…",
+            operator_index=0,
+            total_operators=3,
+            operator_name="Semantic Filter",
+            detail={"items": 42},
+        )
+        d = ep.to_dict()
+        assert d["message"] == "Running step 1/3: Semantic Filter…"
+        assert d["operator_index"] == 0
+        assert d["total_operators"] == 3
+        assert d["operator_name"] == "Semantic Filter"
+        assert d["detail"] == {"items": 42}
+
+    def test_to_dict_omits_none(self):
+        """None fields are omitted from the dict."""
+        ep = ExecutionProgress(message="Starting execution")
+        d = ep.to_dict()
+        assert "operator_index" not in d
+        assert "total_operators" not in d
+        assert "operator_name" not in d
+        assert d["message"] == "Starting execution"
+
+    def test_to_dict_omits_empty_detail(self):
+        """Empty detail dict is still included (it's not None)."""
+        ep = ExecutionProgress(message="test")
+        d = ep.to_dict()
+        # The empty dict is truthy by dataclass default, so it appears
+        assert d["detail"] == {}

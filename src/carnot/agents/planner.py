@@ -1,3 +1,4 @@
+import re
 import time
 from collections.abc import Generator
 from importlib import resources
@@ -33,6 +34,7 @@ from carnot.agents.utils import (
 )
 from carnot.conversation.conversation import Conversation
 from carnot.data.dataset import Dataset
+from carnot.execution.progress import PlanningProgress
 from carnot.index import INDEX_TYPES
 from carnot.operators import LOGICAL_OPERATORS
 
@@ -417,8 +419,6 @@ class Planner(BaseAgent):
         Raises:
             AgentParsingError: If an anti-pattern is detected
         """
-        import re
-        
         # Check if code contains both data_discovery and final_answer calls
         has_data_discovery = bool(re.search(r'\bdata_discovery\s*\(', code_action))
         has_final_answer = bool(re.search(r'\bfinal_answer\s*\(', code_action))
@@ -806,3 +806,185 @@ class Planner(BaseAgent):
         steps = list(self._run_stream(phase="paraphrase", memory=paraphrase_memory))
         assert isinstance(steps[-1], FinalAnswerStep)
         return steps[-1].output
+
+    # ------------------------------------------------------------------
+    # Streaming variants — yield PlanningProgress events between steps
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _code_calls_data_discovery(code_action: str | None) -> bool:
+        """Return ``True`` if *code_action* contains a ``data_discovery(`` call.
+
+        Requires:
+            - *code_action* may be ``None`` (returns ``False``).
+
+        Returns:
+            Whether the code text contains the pattern ``data_discovery(``.
+
+        Raises:
+            None.
+        """
+        if not code_action:
+            return False
+        return bool(re.search(r"\bdata_discovery\s*\(", code_action))
+
+    def generate_logical_plan_stream(
+        self,
+        query: str,
+        datasets: list[Dataset],
+        conversation: Conversation | None = None,
+        cost_budget: float | None = None,
+    ) -> Generator[PlanningProgress | dict, None, None]:
+        """Generate a logical plan, yielding progress events along the way.
+
+        This is the streaming counterpart of :meth:`generate_logical_plan`.
+        It performs exactly the same work but yields
+        :class:`PlanningProgress` objects between steps so that callers
+        can forward them to users.
+
+        The **last value** yielded is always the logical-plan ``dict``
+        (i.e. the same value that ``generate_logical_plan`` returns).
+
+        Requires:
+            - *query* is a non-empty string.
+            - *datasets* is a non-empty list of ``Dataset`` objects.
+
+        Returns:
+            A generator that yields zero or more ``PlanningProgress``
+            objects followed by exactly one ``dict`` (the logical plan).
+
+        Raises:
+            AgentGenerationError: If the LLM fails to produce valid output.
+            AssertionError: If the underlying stream does not end with a
+            ``FinalAnswerStep``.
+        """
+        _ = cost_budget  # reserved for future cost-aware planning
+
+        # Update datasets if provided (also updates managed agent)
+        if datasets:
+            self._datasets = datasets
+            if hasattr(self, "data_discovery_agent"):
+                self.data_discovery_agent._datasets = datasets
+
+        # Setup phase memory (identical to non-streaming variant)
+        planning_memory = self._setup_phase_execution(
+            phase_type="planning",
+            prompt_template_key="system_prompt",
+            template_vars={
+                "logical_operators": {op: op.desc() for op in LOGICAL_OPERATORS},
+                "code_opening_tag": self.code_block_tags[0],
+                "code_closing_tag": self.code_block_tags[1],
+                "plan_opening_tag": self.plan_tags[0],
+                "plan_closing_tag": self.plan_tags[1],
+                "has_conversation": conversation is not None,
+                "managed_agents": self.managed_agents,
+            },
+            task_step_class=PlannerTaskStep,
+            task_kwargs={"task": query, "datasets": datasets},
+            conversation=conversation,
+            plan_type_for_history="logical-plan",
+        )
+
+        yield PlanningProgress(
+            phase="logical_plan",
+            step=1,
+            total_steps=self.max_steps,
+            message="Starting to analyze query and plan execution…",
+        )
+
+        logical_plan = None
+        for step in self._run_stream(phase="planning", memory=planning_memory):
+            if isinstance(step, ActionStep):
+                # Detect whether this step invoked the DataDiscoveryAgent
+                if self._code_calls_data_discovery(step.code_action):
+                    yield PlanningProgress(
+                        phase="data_discovery",
+                        step=step.step_number,
+                        total_steps=self.max_steps,
+                        message="Exploring datasets to understand their structure…",
+                    )
+                else:
+                    yield PlanningProgress(
+                        phase="logical_plan",
+                        step=step.step_number,
+                        total_steps=self.max_steps,
+                        message=f"Building execution plan (step {step.step_number})…",
+                    )
+
+            elif isinstance(step, FinalAnswerStep):
+                logical_plan = step.output
+
+        assert logical_plan is not None, "Planner stream did not produce a FinalAnswerStep"
+        # Yield the plan itself as the terminal value
+        yield logical_plan
+
+    def paraphrase_logical_plan_stream(
+        self,
+        query: str,
+        logical_plan: dict,
+        datasets: list[Dataset],
+        conversation: Conversation | None = None,
+        cost_budget: float | None = None,
+    ) -> Generator[PlanningProgress | str, None, None]:
+        """Translate a logical plan to natural language, yielding progress events.
+
+        This is the streaming counterpart of
+        :meth:`paraphrase_logical_plan`.  It yields
+        :class:`PlanningProgress` events followed by exactly one ``str``
+        (the natural-language plan).
+
+        Requires:
+            - *logical_plan* is a non-empty dict.
+            - *datasets* lists the datasets referenced in the plan.
+
+        Returns:
+            A generator that yields zero or more ``PlanningProgress``
+            objects followed by exactly one ``str``.
+
+        Raises:
+            AgentGenerationError: If the LLM fails to produce valid output.
+            AssertionError: If the underlying stream does not end with a
+            ``FinalAnswerStep``.
+        """
+        _ = cost_budget  # reserved for future cost-aware content
+
+        paraphrase_memory = self._setup_phase_execution(
+            phase_type="paraphrase",
+            prompt_template_key="paraphrase_prompt",
+            template_vars={
+                "code_opening_tag": self.code_block_tags[0],
+                "code_closing_tag": self.code_block_tags[1],
+                "plan_opening_tag": self.plan_tags[0],
+                "plan_closing_tag": self.plan_tags[1],
+                "logical_plan": str(logical_plan),
+                "has_conversation": conversation is not None,
+            },
+            task_step_class=PlannerTaskStep,
+            task_kwargs={"task": query, "datasets": datasets},
+            conversation=conversation,
+            plan_type_for_history="natural-language-plan",
+            log_title="Plan Paraphrase",
+        )
+
+        yield PlanningProgress(
+            phase="paraphrase",
+            step=1,
+            total_steps=self.max_steps,
+            message="Summarizing the execution plan in natural language…",
+        )
+
+        nl_plan = None
+        for step in self._run_stream(phase="paraphrase", memory=paraphrase_memory):
+            if isinstance(step, ActionStep):
+                yield PlanningProgress(
+                    phase="paraphrase",
+                    step=step.step_number,
+                    total_steps=self.max_steps,
+                    message=f"Generating plan summary (step {step.step_number})…",
+                )
+            elif isinstance(step, FinalAnswerStep):
+                nl_plan = step.output
+
+        assert nl_plan is not None, "Paraphrase stream did not produce a FinalAnswerStep"
+        # Yield the NL plan as the terminal value
+        yield nl_plan

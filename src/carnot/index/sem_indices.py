@@ -6,7 +6,6 @@ from pathlib import Path
 
 import numpy as np
 
-from carnot.data.item import DataItem
 from carnot.index.models import (
     FileSummaryEntry,
     HierarchicalIndexConfig,
@@ -61,20 +60,20 @@ class FlatFileIndex:
     def from_items(
         cls,
         name: str,
-        items: list[DataItem],
+        items: list[dict],
         config: HierarchicalIndexConfig | None = None,
         api_key: str | None = None,
         storage_dir: Path | None = None,
         summary_layer=None,
     ) -> FlatFileIndex | None:
-        """Build a :class:`FlatFileIndex` from ``DataItem`` objects.
+        """Build a :class:`FlatFileIndex` from dict objects.
 
         Summarises each item via *summary_layer* (defaulting to a new
         :class:`SummaryLayer`), caches summaries on disk, and constructs
         the index.
 
         Requires:
-            - *items* is a non-empty list of ``DataItem`` instances.
+            - *items* is a non-empty list of dict instances.
 
         Returns:
             A :class:`FlatFileIndex`, or ``None`` if no summaries could
@@ -185,7 +184,7 @@ class HierarchicalFileIndex:
     - Top level sized to fit router context
     - Search: top-down traversal by query embedding similarity
 
-    Use ``from_items()`` to build from raw DataItems (summaries, embeds, caches).
+    Use ``from_items()`` to build from raw dictionaries (summaries, embeds, caches).
 
     Construction parameters:
 
@@ -240,19 +239,19 @@ class HierarchicalFileIndex:
     def from_items(
         cls,
         name: str,
-        items: list[DataItem],
+        items: list[dict],
         config: HierarchicalIndexConfig | None = None,
         api_key: str | None = None,
         storage_dir: Path | None = None,
         summary_layer=None,
     ) -> HierarchicalFileIndex | None:
-        """Build a :class:`HierarchicalFileIndex` from ``DataItem`` objects.
+        """Build a :class:`HierarchicalFileIndex` from dict objects.
 
         Summarises each item, caches summaries and the built index on
         disk, and constructs the hierarchy.
 
         Requires:
-            - *items* is a non-empty list of ``DataItem`` instances.
+            - *items* is a non-empty list of dict instances.
 
         Returns:
             A :class:`HierarchicalFileIndex`, or ``None`` if no

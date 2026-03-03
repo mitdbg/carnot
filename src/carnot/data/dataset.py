@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import textwrap
 from collections.abc import Iterator
+from random import sample as random_sample
 
 from carnot.data.item import DataItem
 from carnot.index.index import CarnotIndex
@@ -150,6 +151,35 @@ class Dataset:
     def is_materialized(self) -> bool:
         """Whether this dataset's items have been materialized (read + parsed)."""
         return self._is_materialized
+
+    def sample(self, n: int, random: bool = True) -> list[dict]:
+        """Return a sample of *n* items as dicts, materializing if needed.
+
+        If random is true, returns a random sample; otherwise returns the first *n* items.
+        For each item, the dataset will materialize it if it is not already.
+
+        Requires:
+            - *n* is a positive integer.
+
+        Returns:
+            A list of *n* items as dicts.  If the dataset has fewer than *n* items,
+            returns all items.
+        """
+        if n <= 0:
+            raise ValueError("Sample size n must be a positive integer.")
+
+        sample_indices = (random_sample(range(len(self.items)), min(n, len(self.items))) if random else range(min(n, len(self.items))))
+        sampled_items = []
+        for idx in sample_indices:
+            item = self.items[idx]
+            if isinstance(item, DataItem):
+                sampled_items.append(item.materialize(self._storage))
+            elif isinstance(item, dict):
+                sampled_items.append(item)
+            else:
+                sampled_items.append(item)
+
+        return sampled_items
 
     def materialize(self, storage: TieredStorageManager | None = None) -> Dataset:
         """Trigger materialization and pin results.  Returns *self* for chaining.

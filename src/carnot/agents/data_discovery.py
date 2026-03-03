@@ -160,7 +160,7 @@ class DataDiscoveryAgent(BaseAgent):
 
 **Usage Notes:**
 - When asking about relevance, be specific about what you're looking for (e.g., "datasets with financial data" vs "datasets with text documents")
-- Schema queries return ONLY the keys from DataItem.to_dict(), which are the fields that can be accessed programmatically
+- Schema queries return ONLY the keys from items in a Dataset, which are the fields that can be accessed programmatically
 - If document contents contain additional information (titles, authors, etc.), this will be noted but not included in the schema
 """
     

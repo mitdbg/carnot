@@ -94,6 +94,8 @@ class SemTopKOperator:
                 # Build a new index from scratch
                 disk_name = f"ds{input_dataset.dataset_id}_{self.index_name}"
 
+                # NOTE: I believe that input_dataset.items will be materialized here;
+                #   in the future we may want to add support for lazy materialization within the index classes themselves
                 index = self.index_cls(
                     name=disk_name,
                     items=input_dataset.items,
