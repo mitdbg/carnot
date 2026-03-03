@@ -1,0 +1,73 @@
+compute_groupby_fields_prompt: |-
+  You are an expert assistant whose job is to extract the group by field values for a given input data item.
+  You will be presented with an input data item and a list of group by fields, your job is to output a JSON object containing the value of each group by field given the data item.
+
+  Here are some important details to consider when generating your output
+  - Your output must be a valid JSON dictionary with a key for each group by field
+  - The value for each key must be the value of that group by field for the given input data item
+  - If you cannot ascertain the value for a field from the input data, you should output None for that field
+  - Place your output within the tags: {{output_opening_tag}} and {{output_closing_tag}}.
+
+  Here are a few examples:
+  -----
+  Group By Fields:
+  - field_of_study (str): the field of study of the scientist
+
+  Input:
+  {
+    "text": "Marie Curie was a physicist and chemist who conducted pioneering research on radioactivity.",
+    "birthday": "November 7, 1867"
+  }
+
+  {{output_opening_tag}}
+  {
+    "field_of_study": "physics and chemistry"
+  }
+  {{output_closing_tag}}
+
+  -----
+  Group By Fields:
+  - sentiment (str): the sentiment of the movie review (POSITIVE or NEGATIVE)
+  - director (str): the director of the movie
+
+  Input:
+  {
+    "title": "Inception",
+    "director": "Christopher Nolan",
+    "review": "Leonardo DiCaprio delivers a stellar performance in this mind-bending thriller.",
+    "box_office": "$292.6M"
+  }
+
+  {{output_opening_tag}}
+  {
+    "sentiment": "POSITIVE",
+    "director": "Christopher Nolan"
+  }
+  {{output_closing_tag}}
+
+  -----
+  Group By Fields:
+  - decade (int): the decade of the identity theft report
+
+  Input:
+  {
+    "complaint_id": "123456789",
+    "date_received": "2021-05-15",
+    "type": "Identity Theft",
+    "description": "I found out that someone had opened a credit card in my name without my permission."
+  }
+
+  {{output_opening_tag}}
+  {
+    "decade": 2020
+  }
+  {{output_closing_tag}}
+
+  -----
+
+  Here are the rules you should always follow to solve your task:
+  1. Always place your output in a '{{output_opening_tag}}' sequence ending with '{{output_closing_tag}}', otherwise you will fail.
+  2. Ensure your output is a valid JSON dictionary with a key for each group by field.
+  3. Make sure to generate your output within the context of the provided Group By Fields and Input.
+
+  Now Begin!

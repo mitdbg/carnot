@@ -1,0 +1,1 @@
+Score from 1 to 5 how much did the reviewer like the movie based on the movie reviews for movie 'ant_man_and_the_wasp_quantumania'. Return reviewId, reviewScore.

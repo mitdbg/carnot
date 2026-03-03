@@ -1,0 +1,38 @@
+[metadata]
+query_id = 8
+modalities = ["text", "image"]
+required_operators = ["SEMANTIC_JOIN"]
+description = """
+Text-to-image join.
+
+Note: We try to be very spcific by only allowing product descriptions of a certain length.
+However, there might still be multiple different images matching the (long) description.
+To solve this, we might also only use recall instead of f1-score for accuracy.
+"""
+
+[definition]
+# For systems that accept free-text queries
+natural_language = """
+Perform a self-join of the dataset.
+For each product with a product description having at least 3000 characters,
+find the matching product images based on the title and the description
+of the product.
+"""
+# Equivalent to the natural language query
+sql = ""
+
+# Traditional SQL query to compute the exact result on the non-omitted data.
+ground_truth = """
+WITH product_selection AS (
+  SELECT *
+  FROM read_parquet('styles_details.parquet')
+  WHERE true
+    AND character_length(productDescriptors.description.value) >= 3000
+)
+SELECT
+  id || '-' || id as id
+FROM product_selection;
+"""
+
+# Which accuracy metric to use for evaluation
+accuracy_metric = "f1-score"

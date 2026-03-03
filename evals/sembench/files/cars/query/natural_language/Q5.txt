@@ -1,0 +1,1 @@
+How many automatic cars are damaged according to both audio and images?

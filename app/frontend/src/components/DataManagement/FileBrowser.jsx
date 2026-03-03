@@ -17,6 +17,8 @@ import {
 import { configApi, filesApi } from '../../services/api'
 import { useApiToken } from '../../hooks/useApiToken';
 
+const MAX_FILES_PER_REQUEST = 50; // matches the backend limit for consistency
+
 function formatFileSize(bytes) {
   if (bytes === 0) return '0 Bytes'
   const k = 1024
@@ -33,13 +35,18 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
   const [dataDirPathFull, setDataDirPathFull] = useState('')
   const [sharedDataDirPathFull, setSharedDataDirPathFull] = useState('')
   const [loading, setLoading] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
   const [error, setError] = useState(null)
   const [expandedDirs, setExpandedDirs] = useState(new Set())
-  const [directorySelectionState, setDirectorySelectionState] = useState(new Map())
   const [isCreatingDirectory, setIsCreatingDirectory] = useState(false)
   const [newDirectoryName, setNewDirectoryName] = useState('')
   const [isCreating, setIsCreating] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
+  
+  // Pagination state
+  const [nextToken, setNextToken] = useState(null)
+  const [hasMore, setHasMore] = useState(false)
+  const [totalCount, setTotalCount] = useState(null)
 
   useEffect(() => {
     const fetchConfig = async () => {
@@ -74,20 +81,50 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
     handleFileUpload(e.dataTransfer.files);
   };
 
-  const loadDirectory = async (path) => {
+  const loadDirectory = async (path, isLoadMore = false) => {
     try {
-      setLoading(true)
+      if (isLoadMore) {
+        setLoadingMore(true)
+      } else {
+        setLoading(true)
+        // Reset pagination state when navigating to new directory
+        setNextToken(null)
+        setHasMore(false)
+        setTotalCount(null)
+      }
       setError(null)
       const token = await getValidToken();
       if (!token) return;
 
-      const response = await filesApi.browse(token, path)
-      const loadedItems = response.data || []
-      setItems(loadedItems)
+      const continuationToken = isLoadMore ? nextToken : null;
+      const response = await filesApi.browse(token, path, MAX_FILES_PER_REQUEST, continuationToken)
+      const data = response.data || {}
+      const loadedItems = data.items || []
+      
+      if (isLoadMore) {
+        // Append to existing items
+        setItems(prev => [...prev, ...loadedItems])
+      } else {
+        // Replace items for new directory
+        setItems(loadedItems)
+        if (data.total_count !== null && data.total_count !== undefined) {
+          setTotalCount(data.total_count)
+        }
+      }
+      
+      setNextToken(data.next_token || null)
+      setHasMore(data.has_more || false)
     } catch (err) {
       setError('Failed to load directory: ' + err.message)
     } finally {
       setLoading(false)
+      setLoadingMore(false)
+    }
+  }
+
+  const loadMore = () => {
+    if (hasMore && !loadingMore) {
+      loadDirectory(currentPath, true)
     }
   }
 
@@ -165,48 +202,11 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
     return selectedFiles.has(item.path);
   };
 
-  const checkDirectorySelection = async (directoryPath) => {
-    // If the directory path itself is in the selection set, it's selected
-    if (selectedFiles.has(directoryPath)) return true;
-
-    try {
-      const allFiles = await getAllFilesInDirectory(directoryPath);
-      if (allFiles.length === 0) return false;
-      // Check if all files within are selected (legacy behavior support)
-      return allFiles.every(filePath => selectedFiles.has(filePath));
-    } catch (err) {
-      return false;
-    }
+  // Simplified directory selection check - only checks if folder path is directly selected
+  // No more recursive API calls!
+  const isDirectorySelected = (directoryPath) => {
+    return selectedFiles.has(directoryPath);
   };
-
-  // Update directory selection states when selectedFiles or items change
-  useEffect(() => {
-    const updateDirectoryStates = async () => {
-      const newState = new Map()
-      for (const item of items) {
-        if (item.is_directory) {
-          try {
-            const allFiles = await getAllFilesInDirectory(item.path)
-            if (allFiles.length > 0) {
-              const allSelected = allFiles.every(filePath => {
-                return selectedFiles.has(filePath)
-              })
-              newState.set(item.path, allSelected)
-            } else {
-              newState.set(item.path, false)
-            }
-          } catch (err) {
-            newState.set(item.path, false)
-          }
-        }
-      }
-      setDirectorySelectionState(newState)
-    }
-    if (items.length > 0) {
-      updateDirectoryStates()
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedFiles, items])
 
   // state to manage Select/Delete button visibility
   const hasSelectedFiles = selectedFiles.size > 0;
@@ -241,40 +241,10 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
     }
   }
 
-  const getAllFilesInDirectory = async (dirPath) => {
-    const allFiles = []
-    const token = await getValidToken();
-    if (!token) return allFiles;
-
-    const loadDirRecursive = async (path) => {
-      try {
-        const response = await filesApi.browse(token, path)
-        const items = response.data || []
-
-        for (const item of items) {
-          if (item.is_directory) {
-            // recursively load subdirectory
-            await loadDirRecursive(item.path)
-          } else {
-            // add file path to list of files
-            allFiles.push(item.path)
-          }
-        }
-      } catch (err) {
-        console.error(`Failed to load directory ${path}:`, err)
-      }
-    }
-
-    await loadDirRecursive(dirPath)
-    return allFiles
-  }
-
-  const handleDirectoryToggle = async (directory) => {
-    const allFiles = await getAllFilesInDirectory(directory.path);
+  // Simplified directory toggle - just adds/removes the folder path
+  // The backend will expand folder paths to files when creating datasets
+  const handleDirectoryToggle = (directory) => {
     const directoryPath = directory.path;
-    
-    // A directory is considered "active" if its path is selected 
-    // OR all its files are selected
     const isCurrentlySelected = selectedFiles.has(directoryPath);
 
     const newSelected = new Set(selectedFiles);
@@ -282,13 +252,9 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
     if (isCurrentlySelected) {
       // Deselect the directory itself
       newSelected.delete(directoryPath);
-      // Deselect all nested files
-      allFiles.forEach(filePath => newSelected.delete(filePath));
     } else {
-      // Select the directory itself (this allows deleting empty folders!)
+      // Select the directory itself (backend expands this when needed)
       newSelected.add(directoryPath);
-      // Select all nested files (for dataset creation compatibility)
-      allFiles.forEach(filePath => newSelected.add(filePath));
     }
 
     onFileToggle(null, newSelected);
@@ -302,7 +268,8 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
     return items.filter(item => item.is_directory)
   }
 
-  const areAllItemsSelected = async () => {
+  // Simplified - no async, just check direct selection
+  const areAllCurrentItemsSelected = () => {
     const files = getCurrentDirectoryFiles()
     const folders = getCurrentDirectoryFolders()
 
@@ -311,23 +278,17 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
     // Check all files are selected
     const allFilesSelected = files.length === 0 || files.every(file => isItemSelected(file))
 
-    // Check all folders are fully selected
-    let allFoldersSelected = true
-    for (const folder of folders) {
-      const folderSelected = await checkDirectorySelection(folder.path)
-      if (!folderSelected) {
-        allFoldersSelected = false
-        break
-      }
-    }
+    // Check all folders are selected (just the folder path itself)
+    const allFoldersSelected = folders.length === 0 || folders.every(folder => isDirectorySelected(folder.path))
 
     return allFilesSelected && allFoldersSelected
   }
 
-  const handleSelectAll = async () => {
+  // Simplified handleSelectAll - no async recursive calls
+  const handleSelectAll = () => {
     const files = getCurrentDirectoryFiles()
     const folders = getCurrentDirectoryFolders()
-    const allSelected = await areAllItemsSelected()
+    const allSelected = areAllCurrentItemsSelected()
 
     const newSelected = new Set(selectedFiles)
 
@@ -337,26 +298,20 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
         newSelected.delete(file.path)
       })
 
-      // Deselect all folders (and their contents)
-      for (const folder of folders) {
-        const allFiles = await getAllFilesInDirectory(folder.path)
-        allFiles.forEach(filePath => {
-          newSelected.delete(filePath)
-        })
-      }
+      // Deselect all folders (just the folder path)
+      folders.forEach(folder => {
+        newSelected.delete(folder.path)
+      })
     } else {
       // Select all files in current directory
       files.forEach(file => {
         newSelected.add(file.path)
       })
 
-      // Select all folders (and their contents)
-      for (const folder of folders) {
-        const allFiles = await getAllFilesInDirectory(folder.path)
-        allFiles.forEach(filePath => {
-          newSelected.add(filePath)
-        })
-      }
+      // Select all folders (backend will expand when needed)
+      folders.forEach(folder => {
+        newSelected.add(folder.path)
+      })
     }
 
     // update all at once
@@ -527,13 +482,7 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
             onClick={handleSelectAll}
             className="flex items-center gap-2 px-3 py-1.5 text-sm font-medium text-primary-600 hover:bg-primary-50 rounded-lg transition-colors border border-primary-200"
           >
-            {(() => {
-              const files = getCurrentDirectoryFiles()
-              const folders = getCurrentDirectoryFolders()
-              const allFilesSelected = files.length === 0 || files.every(f => isItemSelected(f))
-              const allFoldersSelected = folders.length === 0 || folders.every(f => directorySelectionState.get(f.path) === true)
-              return allFilesSelected && allFoldersSelected
-            })() ? (
+            {areAllCurrentItemsSelected() ? (
               <>
                 <CheckSquare className="w-4 h-4" />
                 Deselect All
@@ -653,7 +602,7 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
                   <input
                     type="checkbox"
                     checked={item.is_directory 
-                      ? (selectedFiles.has(item.path) || directorySelectionState.get(item.path)) 
+                      ? isDirectorySelected(item.path)
                       : isItemSelected(item)}
                     onChange={(e) => handleCheckboxChange(item, e)}
                     className="w-4 h-4 text-primary-600 rounded border-gray-300 focus:ring-primary-500"
@@ -664,11 +613,6 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
                     onClick={() => handleItemClick(item)}
                     className="flex items-center gap-2 flex-1 text-left"
                     disabled={!item.is_directory}
-                    onMouseEnter={() => {
-                      if (item.is_directory) {
-                        checkDirectorySelection(item.path)
-                      }
-                    }}
                   >
                     {item.is_directory ? (
                       <>
@@ -691,6 +635,29 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
                   )}
                 </div>
               ))
+            )}
+            
+            {/* Load More Button */}
+            {hasMore && (
+              <div className="px-4 py-3 border-t border-gray-100">
+                <button
+                  onClick={loadMore}
+                  disabled={loadingMore}
+                  className="w-full flex items-center justify-center gap-2 py-2 text-sm font-medium text-primary-600 hover:bg-primary-50 rounded-lg transition-colors"
+                >
+                  {loadingMore ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Loading...
+                    </>
+                  ) : (
+                    <>
+                      Load More
+                      {totalCount && ` (${items.length} of ${totalCount})`}
+                    </>
+                  )}
+                </button>
+              </div>
             )}
           </div>
         )}

@@ -1,11 +1,114 @@
-import { useState, useEffect, useRef } from 'react'
-import { Send, Database, CheckSquare, Square, AlertCircle, Loader2, XCircle, RotateCcw, MessageSquare, Trash2, ChevronLeft, ChevronRight, Search } from 'lucide-react'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { Send, Database, CheckSquare, Square, AlertCircle, Loader2, XCircle, MessageSquare, Trash2, ChevronLeft, ChevronRight, Search, Play, Plus, X } from 'lucide-react'
 import { useApiToken } from '../hooks/useApiToken'
-import axios from 'axios'
 import ProgressDisplay from '../components/ProgressDisplay'
+import CostBudgetPicker from '../components/CostBudgetPicker'
 import { conversationsApi, datasetsApi } from '../services/api'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api"
+const DEFAULT_COST_BUDGET = 5.00; // Default cost budget in dollars if user doesn't specify
+
+function PlanVisualizer({ plan }) {
+  // Recursively flattens the tree into chronological steps
+  const flattenPlan = (node, acc = new Map()) => {
+    if (!node) return acc;
+
+    // Recurse through parents first
+    if (node.parents && node.parents.length > 0) {
+      node.parents.forEach(parent => flattenPlan(parent, acc));
+    }
+
+    // Use a Map keyed by the serialized node to avoid duplicate steps 
+    // (common in complex join branches)
+    const nodeKey = JSON.stringify({ name: node.name, params: node.params });
+    if (!acc.has(nodeKey)) {
+      acc.set(nodeKey, {
+        name: node.name,
+        operator: node.params?.operator || "Source",
+        description: node.params?.description || `Load dataset: ${node.name}`,
+        parents: node.parents?.map(p => p.name) || [],
+        details: node.params || {}
+      });
+    }
+
+    return acc;
+  };
+
+  const stepsMap = plan ? flattenPlan(plan) : new Map();
+  const steps = Array.from(stepsMap.values());
+
+  if (steps.length === 0) return (
+    <div className="flex flex-col items-center justify-center h-full text-gray-400 p-4 text-center">
+      <p>No active execution plan.</p>
+    </div>
+  );
+
+  return (
+    <div className="p-4 overflow-y-auto h-full">
+      <h3 className="text-sm font-bold text-gray-500 uppercase tracking-wider mb-6">Logical DAG</h3>
+      <div className="space-y-0">
+        {steps.map((step, idx) => {
+          const isCombination = step.parents.length > 1;
+          
+          return (
+            <div key={idx} className="flex gap-4">
+              {/* Visual Connector Line */}
+              <div className="flex flex-col items-center">
+                <div className={`w-3 h-3 rounded-full border-2 transition-colors ${
+                  idx === steps.length - 1 
+                    ? 'bg-primary-500 border-primary-500' 
+                    : 'bg-white border-gray-300'
+                }`} />
+                {idx !== steps.length - 1 && <div className="w-0.5 h-full bg-gray-200" />}
+              </div>
+
+              {/* Step Content */}
+              <div className="flex-1 pb-8">
+                <div className={`bg-white p-3 rounded-lg border shadow-sm transition-all ${
+                  isCombination ? 'border-amber-200 bg-amber-50/30' : 'border-gray-200'
+                }`}>
+                  <div className="flex items-center justify-between mb-2">
+                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded uppercase font-mono ${
+                      isCombination 
+                        ? 'bg-amber-100 text-amber-700' 
+                        : 'bg-primary-50 text-primary-700'
+                    }`}>
+                      {step.operator}
+                    </span>
+                    <span className="text-[10px] text-gray-400 font-mono">Node {idx + 1}</span>
+                  </div>
+
+                  <p className="text-sm text-gray-800 leading-snug">{step.description}</p>
+
+                  {/* Multi-parent branch indicator */}
+                  {isCombination && (
+                    <div className="mt-3 pt-2 border-t border-amber-100">
+                      <p className="text-[10px] font-bold text-amber-600 uppercase mb-1">Combining Inputs:</p>
+                      <div className="flex flex-wrap gap-1">
+                        {step.parents.map((p, pIdx) => (
+                          <span key={pIdx} className="text-[9px] bg-white border border-amber-200 px-1.5 py-0.5 rounded text-gray-600 italic">
+                            {p}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Parameter Details */}
+                  {step.details.condition && (
+                    <div className="mt-2 text-[11px] bg-gray-50 p-1.5 rounded border border-gray-100 font-mono text-gray-600 break-all">
+                      <span className="text-blue-600 font-bold">WHERE:</span> {step.details.condition}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
 
 function UserChatPage() {
   const getValidToken = useApiToken();
@@ -13,14 +116,32 @@ function UserChatPage() {
   const [selectedDatasets, setSelectedDatasets] = useState(new Set())
   const [messages, setMessages] = useState([])
   const [inputQuery, setInputQuery] = useState('')
+  const [isExecuting, setIsExecuting] = useState(false);
   const [isLoading, setIsLoading] = useState(false)
   const [sessionId, setSessionId] = useState(null)
   const [conversations, setConversations] = useState([])
   const [currentConversationId, setCurrentConversationId] = useState(null)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [datasetSearchQuery, setDatasetSearchQuery] = useState('')
+  const [currentPlan, setCurrentPlan] = useState(null);
+  const [lastQuery, setLastQuery] = useState('');
+  const [costBudget, setCostBudget] = useState(DEFAULT_COST_BUDGET);
   const messagesEndRef = useRef(null)
   const abortControllerRef = useRef(null)
+  const textareaRef = useRef(null)
+
+  // Auto-resize the textarea as the user types, up to ~6 lines (~1–1.5 paragraphs).
+  // Beyond that it scrolls internally.
+  const autoResizeTextarea = useCallback(() => {
+    const el = textareaRef.current
+    if (!el) return
+    el.style.height = 'auto'                  // shrink first so scrollHeight is accurate
+    el.style.height = `${el.scrollHeight}px`  // expand to fit content
+  }, [])
+
+  useEffect(() => {
+    autoResizeTextarea()
+  }, [inputQuery, autoResizeTextarea])
 
   // Generate session ID on component mount
   useEffect(() => {
@@ -65,7 +186,10 @@ function UserChatPage() {
       setCurrentConversationId(conversation.id)
       
       // Convert database messages to frontend format
-      const formattedMessages = conversation.messages.map(msg => ({
+      // filter out logical-plan messages which are stored in the conversation history but not displayed to users
+      const formattedMessages = conversation.messages
+      .filter(msg => msg.type !== 'logical-plan')
+      .map(msg => ({
         type: msg.role,
         content: msg.content,
         csv_file: msg.csv_file,
@@ -161,9 +285,8 @@ function UserChatPage() {
     }
   }
 
-  const handleSubmit = async (e) => {
-    e.preventDefault()
-    
+  const handleRequestPlan = async (e) => {
+    if (e) e.preventDefault();
     if (!inputQuery.trim()) {
       return
     }
@@ -176,22 +299,188 @@ function UserChatPage() {
       return
     }
 
+    let currentSessionId = sessionId || crypto.randomUUID();
+    if (!sessionId) setSessionId(currentSessionId);
+
+    const queryToPlan = inputQuery;
+    setLastQuery(queryToPlan);
+
+    const userMsg = { type: 'user', content: queryToPlan };
+    setMessages(prev => [...prev, userMsg]);
+    setInputQuery('');
+    setIsLoading(true);
+    setIsExecuting(false);
+
+    // Track whether we currently have a planning-status message at the
+    // tail of the messages list so we can *replace* it instead of stacking.
+    let hasActiveStatus = false;
+
+    try {
+      const token = await getValidToken();
+      if (!token) return;
+
+      // Create abort controller for this request
+      abortControllerRef.current = new AbortController();
+
+      const datasetIds = Array.from(selectedDatasets).map(id => parseInt(id));
+      const response = await fetch(`${API_BASE_URL}/query/plan`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          query: queryToPlan,
+          dataset_ids: datasetIds,
+          session_id: currentSessionId,
+          plan: currentPlan,
+          cost_budget: costBudget
+        }),
+        signal: abortControllerRef.current.signal
+      });
+
+      // Handle non-streaming errors (e.g., 400 No API Keys)
+      if (!response.ok) {
+        let errorData;
+        try {
+          errorData = await response.json();
+        } catch (_) {
+          throw new Error(`Server responded with ${response.status}: ${response.statusText}`);
+        }
+        throw errorData.detail || new Error(errorData.message || 'An unknown server error occurred.');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+
+              // Update session_id if received from server
+              if (data.session_id && data.session_id !== sessionId) {
+                setSessionId(data.session_id);
+              }
+
+              if (data.type === 'planning_status') {
+                if (hasActiveStatus) {
+                  // Replace the last status message with the new one
+                  setMessages(prev => [
+                    ...prev.slice(0, -1),
+                    { type: 'status', content: data.message }
+                  ]);
+                } else {
+                  setMessages(prev => [...prev, {
+                    type: 'status',
+                    content: data.message
+                  }]);
+                  hasActiveStatus = true;
+                }
+              } else if (data.type === 'plan_complete') {
+                // Remove the trailing status pill before appending the plan
+                if (hasActiveStatus) {
+                  setMessages(prev => [
+                    ...prev.slice(0, -1),
+                    {
+                      type: 'agent',
+                      content: data.natural_language_plan,
+                      isPlanConfirmation: true,
+                      attachedPlan: data.plan
+                    }
+                  ]);
+                } else {
+                  setMessages(prev => [...prev, {
+                    type: 'agent',
+                    content: data.natural_language_plan,
+                    isPlanConfirmation: true,
+                    attachedPlan: data.plan
+                  }]);
+                }
+                hasActiveStatus = false;
+                setCurrentPlan(data.plan);
+              } else if (data.type === 'error') {
+                // Remove trailing status pill if present
+                if (hasActiveStatus) {
+                  setMessages(prev => [
+                    ...prev.slice(0, -1),
+                    { type: 'error', content: data.message }
+                  ]);
+                } else {
+                  setMessages(prev => [...prev, {
+                    type: 'error',
+                    content: data.message
+                  }]);
+                }
+                hasActiveStatus = false;
+              }
+            } catch (e) {
+              console.error('Error parsing SSE data:', e);
+            }
+          }
+        }
+      }
+    } catch (error) {
+      // Remove trailing status pill on error
+      if (hasActiveStatus) {
+        setMessages(prev => prev.slice(0, -1));
+      }
+      if (error && error.type === 'API_KEY_MISSING') {
+        setMessages(prev => [...prev, {
+          type: 'error',
+          content: `${error.message} Please go to the Settings page to configure your keys.`
+        }]);
+      } else if (error.name !== 'AbortError') {
+        console.error('Error planning query:', error);
+        setMessages(prev => [...prev, {
+          type: 'error',
+          content: error?.message || 'Failed to generate plan. Please try again.'
+        }]);
+      }
+    } finally {
+      setIsLoading(false);
+      abortControllerRef.current = null;
+    }
+  };
+
+  const handleExecutePlan = async (planToUse) => {
+    const plan = planToUse || currentPlan;
+    setIsLoading(true);
+    setIsExecuting(true);
+
+    if (!lastQuery) {
+        setIsLoading(false);
+        return;
+    }
+
+    if (selectedDatasets.size === 0) {
+      setMessages(prev => [...prev, {
+        type: 'error',
+        content: 'Please select at least one dataset before submitting a query.'
+      }])
+      setIsLoading(false);
+      return
+    }
+
     // if sessionId is null (due to initial state/race condition), generate a new one immediately.
     let currentSessionId = sessionId;
     if (!currentSessionId) {
-      const newSessionId = crypto.randomUUID();
-      setSessionId(newSessionId); 
-      currentSessionId = newSessionId;
+      currentSessionId = crypto.randomUUID();
+      setSessionId(currentSessionId); 
     }
 
-    // Add user message
-    const userMessage = {
-      type: 'user',
-      content: inputQuery
-    }
-    setMessages(prev => [...prev, userMessage])
-    setInputQuery('')
-    setIsLoading(true)
+    // Track whether we currently have an execution-status message at the
+    // tail of the messages list so we can *replace* it instead of stacking.
+    let hasActiveStatus = false;
 
     try {
       // fetch access token
@@ -200,7 +489,7 @@ function UserChatPage() {
 
       // Create abort controller for this request
       abortControllerRef.current = new AbortController()
-
+      const datasetIds = Array.from(selectedDatasets).map(id => parseInt(id));
       const response = await fetch(`${API_BASE_URL}/query/execute`, {
         method: 'POST',
         headers: {
@@ -208,9 +497,11 @@ function UserChatPage() {
           'Authorization': `Bearer ${token}`,
         },
         body: JSON.stringify({
-          query: userMessage.content,
-          dataset_ids: Array.from(selectedDatasets),
-          session_id: sessionId
+          query: lastQuery,
+          dataset_ids: datasetIds,
+          session_id: currentSessionId,
+          plan: plan,
+          cost_budget: costBudget
         }),
         signal: abortControllerRef.current.signal
       })
@@ -253,25 +544,58 @@ function UserChatPage() {
                 setSessionId(data.session_id)
               }
               
-              if (data.type === 'status') {
-                setMessages(prev => [...prev, {
-                  type: 'status',
-                  content: data.message
-                }])
+              if (data.type === 'execution_status') {
+                if (hasActiveStatus) {
+                  // Replace the last status message with the new one
+                  setMessages(prev => [
+                    ...prev.slice(0, -1),
+                    { type: 'status', content: data.message }
+                  ])
+                } else {
+                  setMessages(prev => [...prev, {
+                    type: 'status',
+                    content: data.message
+                  }])
+                  hasActiveStatus = true;
+                }
               } else if (data.type === 'result') {
-                setMessages(prev => [...prev, {
-                  type: 'result',
-                  content: data.message,
-                  csv_file: data.csv_file,
-                  row_count: data.row_count
-                }])
+                // Remove trailing status pill before showing result
+                if (hasActiveStatus) {
+                  setMessages(prev => [
+                    ...prev.slice(0, -1),
+                    {
+                      type: 'result',
+                      content: data.message,
+                      csv_file: data.csv_file,
+                      row_count: data.row_count
+                    }
+                  ])
+                } else {
+                  setMessages(prev => [...prev, {
+                    type: 'result',
+                    content: data.message,
+                    csv_file: data.csv_file,
+                    row_count: data.row_count
+                  }])
+                }
+                hasActiveStatus = false;
                 // Reload conversations after query completes
                 loadConversations()
+                setCurrentPlan(null);
               } else if (data.type === 'error') {
-                setMessages(prev => [...prev, {
-                  type: 'error',
-                  content: data.message
-                }])
+                // Remove trailing status pill if present
+                if (hasActiveStatus) {
+                  setMessages(prev => [
+                    ...prev.slice(0, -1),
+                    { type: 'error', content: data.message }
+                  ])
+                } else {
+                  setMessages(prev => [...prev, {
+                    type: 'error',
+                    content: data.message
+                  }])
+                }
+                hasActiveStatus = false;
               }
             } catch (e) {
               console.error('Error parsing SSE data:', e)
@@ -280,6 +604,10 @@ function UserChatPage() {
         }
       }
     } catch (error) {
+      // Remove trailing status pill on error
+      if (hasActiveStatus) {
+        setMessages(prev => prev.slice(0, -1));
+      }
       if (error && error.type === 'API_KEY_MISSING') {
         console.warn('API Key missing:', error.message)
         setMessages(prev => [...prev, {
@@ -302,6 +630,7 @@ function UserChatPage() {
   }
 
   const renderMessage = (message, index) => {
+    const isLastMessage = index === messages.length - 1;
     switch (message.type) {
       case 'user':
         return (
@@ -312,11 +641,24 @@ function UserChatPage() {
           </div>
         )
       
-      case 'assistant':
+      case 'agent':
         return (
-          <div key={index} className="flex justify-start mb-4">
-            <div className="bg-gray-100 p-3 rounded-lg max-w-[70%] whitespace-pre-wrap">
-              {message.content}
+          <div key={index} className="flex flex-col items-start mb-4">
+            <div className="bg-white border border-gray-200 p-4 rounded-lg max-w-[85%] shadow-sm">
+              <div className="prose prose-sm text-gray-700 whitespace-pre-wrap">
+                {message.content}
+              </div>
+              
+              {message.isPlanConfirmation && isLastMessage && !isLoading && (
+                <div className="mt-4 flex gap-3 border-t pt-4">
+                  <button
+                    onClick={() => handleExecutePlan(message.attachedPlan)}
+                    className="flex items-center gap-2 bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-md text-sm font-medium transition-colors"
+                  >
+                    <Play className="w-4 h-4" /> Execute Plan
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         )
@@ -383,202 +725,187 @@ function UserChatPage() {
   }
 
   return (
-    <div className="h-[calc(100vh-4rem)] flex">
-      {/* Left sidebar - Conversation history */}
-      <div className={`${sidebarCollapsed ? 'w-16' : 'w-64'} bg-gray-50 border-r border-gray-200 flex flex-col transition-all duration-300`}>
-        <div className="p-4 border-b border-gray-200 flex items-center justify-between">
-          {!sidebarCollapsed && <h2 className="text-lg font-bold text-gray-800">Conversations</h2>}
-          <button
-            onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-            className="p-1 hover:bg-gray-200 rounded transition-colors"
-            title={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-          >
-            {sidebarCollapsed ? <ChevronRight className="w-5 h-5" /> : <ChevronLeft className="w-5 h-5" />}
-          </button>
-        </div>
+    /* h-full ensures it fills the flex-1 area of the Layout */
+    <div className="flex h-full w-full bg-white overflow-hidden">
+      
+      {/* 1. Flush Left Sidebar (Consolidated) */}
+      <div className={`${sidebarCollapsed ? 'w-0 overflow-hidden' : 'w-80'} bg-gray-50 border-r border-gray-200 flex flex-col transition-all duration-300 flex-shrink-0`}>
         
-        {!sidebarCollapsed && (
-          <div className="flex-1 overflow-y-auto p-2">
-            {conversations.length === 0 ? (
-              <p className="text-sm text-gray-500 text-center mt-4">No conversations yet</p>
-            ) : (
-              <div className="space-y-2">
-                {conversations.map(conv => (
-                  <div
-                    key={conv.id}
-                    onClick={() => loadConversation(conv.id)}
-                    className={`p-3 rounded-lg cursor-pointer transition-colors group hover:bg-gray-200 ${
-                      conv.id === currentConversationId ? 'bg-primary-100 border border-primary-300' : 'bg-white border border-gray-200'
-                    }`}
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-1">
-                          <MessageSquare className="w-4 h-4 text-gray-500 flex-shrink-0" />
-                          <p className="text-sm font-medium text-gray-800 truncate">
-                            {conv.title || 'Untitled'}
-                          </p>
-                        </div>
-                        <p className="text-xs text-gray-500">{formatDate(conv.updated_at)}</p>
-                        {conv.message_count > 0 && (
-                          <p className="text-xs text-gray-400 mt-1">{conv.message_count} messages</p>
-                        )}
-                      </div>
-                      <button
-                        onClick={(e) => deleteConversation(conv.id, e)}
-                        className="opacity-0 group-hover:opacity-100 p-1 hover:bg-red-100 rounded transition-all"
-                        title="Delete conversation"
-                      >
-                        <Trash2 className="w-4 h-4 text-red-500" />
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
-      </div>
-
-      {/* Middle - Chat */}
-      <div className="flex-1 flex flex-col border-r border-gray-200">
-        {/* Chat header */}
-        <div className="bg-white border-b border-gray-200 px-6 py-4 flex items-center justify-between">
-          <div>
-            <h1 className="text-2xl font-bold text-gray-800">Query Chat</h1>
-            <p className="text-sm text-gray-600 mt-1">
-              Ask questions about your data {sessionId && <span className="text-xs text-gray-400">(Session: {sessionId.slice(0, 8)}...)</span>}
-            </p>
-          </div>
+        {/* New Research Button with Plus sign */}
+        <div className="p-4">
           <button
             onClick={generateNewSession}
             disabled={isLoading}
-            className="flex items-center gap-2 px-4 py-2 bg-gray-100 hover:bg-gray-200 disabled:bg-gray-50 disabled:cursor-not-allowed text-gray-700 rounded-lg transition-colors"
-            title="Start a new conversation"
+            className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-white hover:bg-gray-50 border border-gray-200 text-gray-700 rounded-xl transition-all shadow-sm font-medium"
           >
-            <RotateCcw className="w-4 h-4" />
-            New Conversation
+            <Plus className="w-5 h-5" />
+            New Research
           </button>
         </div>
 
-        {/* Messages container */}
-        <div className="flex-1 overflow-y-auto px-6 py-4 bg-gray-50">
-          {messages.length === 0 && (
-            <div className="flex flex-col items-center justify-center h-full text-center">
-              <Database className="w-16 h-16 text-gray-300 mb-4" />
-              <h2 className="text-xl font-semibold text-gray-600 mb-2">
-                No messages yet
-              </h2>
-              <p className="text-gray-500 max-w-md">
-                Select datasets from the right panel and start asking questions about your data
-              </p>
-            </div>
-          )}
-          
-          {messages.map((message, index) => renderMessage(message, index))}
-          
-          {/* Show progress display when loading - after messages */}
-          {isLoading && sessionId && (
-            <ProgressDisplay sessionId={sessionId} isActive={isLoading} />
-          )}
-          
-          <div ref={messagesEndRef} />
-        </div>
-
-        {/* Input area */}
-        <div className="bg-white border-t border-gray-200 px-6 py-4">
-          <form onSubmit={handleSubmit} className="flex gap-2">
-            <input
-              type="text"
-              value={inputQuery}
-              onChange={(e) => setInputQuery(e.target.value)}
-              placeholder="Type your query here..."
-              className="flex-1 border border-gray-300 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-primary-500"
-              disabled={isLoading}
-            />
-            <button
-              type="submit"
-              className="bg-primary-500 hover:bg-primary-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 disabled:bg-primary-300 disabled:cursor-not-allowed transition-colors"
-              disabled={isLoading}
-            >
-              {isLoading ? (
-                <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  Processing...
-                </>
-              ) : (
-                <>
-                  <Send className="w-4 h-4" />
-                  Send
-                </>
-              )}
-            </button>
-            {isLoading && (
-              <button
-                type="button"
-                onClick={handleCancel}
-                className="bg-red-500 hover:bg-red-600 text-white px-4 py-2 rounded-lg flex items-center gap-2 transition-colors"
-              >
-                <XCircle className="w-4 h-4" />
-                Cancel
-              </button>
-            )}
-          </form>
-        </div>
-      </div>
-
-      {/* Right side - Dataset selection */}
-      <div className="w-1/3 bg-white border-l border-gray-200 flex flex-col">
-        <div className="px-6 py-4 border-b border-gray-200">
-          <h2 className="text-xl font-bold text-gray-800">Datasets</h2>
-          <p className="text-sm text-gray-600 mt-1 mb-3">
-            Select datasets to query
-          </p>
-          {/* Search bar */}
-          <div className="relative">
-            <Search className="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 text-gray-400" />
+        {/* Datasets Section (Top Half) */}
+        <div className="flex-1 flex flex-col min-h-0 px-4">
+          <h2 className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2">Datasets</h2>
+          <div className="relative mb-3">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
             <input
               type="text"
               value={datasetSearchQuery}
               onChange={(e) => setDatasetSearchQuery(e.target.value)}
-              placeholder="Search datasets..."
-              className="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500 text-sm"
+              placeholder="Filter..."
+              className="w-full pl-9 pr-3 py-1.5 bg-gray-200/50 border-none rounded-lg focus:ring-1 focus:ring-primary-500 text-sm"
             />
           </div>
+          
+          <div className="flex-1 overflow-y-auto space-y-1 pr-1">
+            {filteredDatasets.map(dataset => (
+              <div
+                key={dataset.id}
+                onClick={() => toggleDataset(dataset.id)}
+                className={`flex items-start gap-3 p-2 rounded-lg cursor-pointer transition-colors ${
+                  selectedDatasets.has(dataset.id) ? 'bg-primary-50 border border-primary-100' : 'hover:bg-gray-200'
+                }`}
+              >
+                <div className="mt-0.5">
+                  {selectedDatasets.has(dataset.id) ? 
+                    <CheckSquare className="w-4 h-4 text-primary-600" /> : 
+                    <Square className="w-4 h-4 text-gray-400" />
+                  }
+                </div>
+                <div className="min-w-0">
+                  <p className="text-sm font-medium text-gray-800 truncate">{dataset.name}</p>
+                  {/* CSS-only truncation as requested */}
+                  <p className="text-[11px] text-gray-500 line-clamp-2 leading-snug">{dataset.annotation}</p>
+                </div>
+              </div>
+            ))}
+          </div>
         </div>
-        <div className="flex-1 overflow-y-auto p-6">
-          {datasets.length === 0 ? (
-            <p className="text-gray-500">No datasets available.</p>
-          ) : filteredDatasets.length === 0 ? (
-            <p className="text-gray-500">No datasets match your search.</p>
-          ) : (
-            <ul className="space-y-3">
-              {filteredDatasets.map(dataset => (
-                <li
-                  key={dataset.id}
-                  className="flex items-center justify-between p-3 bg-gray-50 rounded-lg border border-gray-200"
+
+        <div className="h-px bg-gray-200 mx-4 my-4" />
+
+        {/* History Section (Bottom Half) */}
+        <div className="flex-1 overflow-y-auto px-4 pb-4">
+          <h2 className="text-xs font-bold text-gray-400 uppercase tracking-widest mb-2">History</h2>
+          <div className="space-y-1">
+            {conversations.map(conv => (
+              <div
+                key={conv.id}
+                onClick={() => loadConversation(conv.id)}
+                className={`group flex items-center justify-between p-2 rounded-lg cursor-pointer transition-colors ${
+                  conv.id === currentConversationId ? 'bg-gray-200' : 'hover:bg-gray-100'
+                }`}
+              >
+                <div className="flex items-center gap-3 min-w-0">
+                  <MessageSquare className="w-4 h-4 text-gray-400 flex-shrink-0" />
+                  <span className="text-sm text-gray-600 truncate">{conv.title || 'Untitled'}</span>
+                </div>
+                <button
+                  onClick={(e) => deleteConversation(conv.id, e)}
+                  className="opacity-0 group-hover:opacity-100 p-1 hover:text-red-600 transition-opacity"
                 >
-                  <div className="flex-1">
-                    <p className="font-semibold text-gray-800">{dataset.name}</p>
-                    <p className="text-sm text-gray-600">{dataset.annotation}</p>
-                  </div>
-                  <button
-                    onClick={() => toggleDataset(dataset.id)}
-                    className="p-2 rounded-full text-gray-500 hover:bg-gray-200 transition-colors"
-                    title={selectedDatasets.has(dataset.id) ? 'Deselect dataset' : 'Select dataset'}
-                  >
-                    {selectedDatasets.has(dataset.id) ? (
-                      <CheckSquare className="w-5 h-5 text-primary-500" />
-                    ) : (
-                      <Square className="w-5 h-5" />
-                    )}
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
         </div>
       </div>
+
+      {/* 2. Chat Area: Wider and Flexible */}
+      <div className="flex-1 flex flex-col min-w-0 relative bg-white">
+        
+        {/* Toggle Sidebar Icon (Floating) */}
+        <button
+          onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
+          className="absolute left-4 top-4 z-10 p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg transition-all"
+        >
+          {sidebarCollapsed ? <ChevronRight className="w-5 h-5" /> : <ChevronLeft className="w-5 h-5" />}
+        </button>
+
+        {/* Messages: flex-1 + overflow-y-auto makes this the scrollable region */}
+        <div className="flex-1 overflow-y-auto px-6 py-12">
+          {messages.length === 0 && (
+            <div className="flex flex-col items-center justify-center h-full text-center">
+              <div className="w-16 h-16 bg-gray-50 rounded-full flex items-center justify-center mb-6">
+                <Database className="w-8 h-8 text-gray-300" />
+              </div>
+              <h2 className="text-2xl font-semibold text-gray-800 mb-2">Let's get to work.</h2>
+              <p className="text-gray-500 max-w-sm">Select a dataset from the left to begin your deep research analysis.</p>
+            </div>
+          )}
+          
+          <div className="max-w-4xl mx-auto w-full">
+            {messages.map((message, index) => renderMessage(message, index))}
+            {isLoading && isExecuting && sessionId && <ProgressDisplay sessionId={sessionId} isActive={isLoading} />}
+            <div ref={messagesEndRef} />
+          </div>
+        </div>
+
+        {/* 3. Sticky Chat Input: Pins to the bottom of the parent flex-col */}
+        <div className="w-full border-t border-gray-100 bg-white px-6 py-4">
+          <div className="max-w-4xl mx-auto">
+            <div className="flex items-end gap-2">
+              {/* Main chat form */}
+              <form 
+                onSubmit={handleRequestPlan} 
+                className="relative flex flex-1 items-end gap-2 bg-gray-50 border border-gray-300 rounded-2xl p-2 focus-within:ring-2 focus-within:ring-primary-500 transition-all shadow-sm"
+              >
+                <textarea
+                  ref={textareaRef}
+                  rows="1"
+                  value={inputQuery}
+                  onChange={(e) => setInputQuery(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleRequestPlan(); } }}
+                  placeholder="Ask a question..."
+                  className="flex-1 bg-transparent border-none focus:ring-0 resize-none py-3 px-4 text-gray-800 overflow-y-auto"
+                  style={{ maxHeight: '9rem' }}
+                  disabled={isLoading}
+                />
+                <div className="flex gap-1 pb-1 pr-1">
+                  {isLoading && (
+                    <button type="button" onClick={handleCancel} className="p-2 text-red-500 hover:bg-red-50 rounded-lg">
+                      <XCircle className="w-6 h-6" />
+                    </button>
+                  )}
+                  <button
+                    type="submit"
+                    className="bg-primary-600 hover:bg-primary-700 text-white p-2 rounded-xl disabled:bg-gray-300 transition-colors"
+                    disabled={isLoading || !inputQuery.trim()}
+                  >
+                    {isLoading ? <Loader2 className="w-6 h-6 animate-spin" /> : <Send className="w-6 h-6" />}
+                  </button>
+                </div>
+              </form>
+
+              {/* Cost budget picker — lives outside the chat form */}
+              <CostBudgetPicker
+                value={costBudget}
+                onChange={setCostBudget}
+                disabled={isLoading}
+              />
+            </div>
+            <p className="text-[10px] text-gray-400 text-center mt-3 uppercase tracking-widest">
+              Carnot Research Engine • {sessionId ? `Session: ${sessionId.slice(0,8)}` : 'Ready'}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      {/* 4. Plan Visualizer (Right-side slide-in) */}
+      {currentPlan && (
+        <div className="w-96 bg-white border-l border-gray-200 flex flex-col flex-shrink-0">
+          <div className="p-4 border-b border-gray-200 flex items-center justify-between">
+            <h2 className="text-xs font-bold text-gray-500 uppercase tracking-widest">Plan Visualizer</h2>
+            <button onClick={() => setCurrentPlan(null)} className="p-1 hover:bg-gray-100 rounded-lg">
+              <X className="w-5 h-5 text-gray-400" />
+            </button>
+          </div>
+          <div className="flex-1 overflow-y-auto">
+            <PlanVisualizer plan={currentPlan} />
+          </div>
+        </div>
+      )}
     </div>
   )
 }

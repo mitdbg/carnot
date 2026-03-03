@@ -22,7 +22,10 @@ dependencies = [
     "palimpzest>=1.2.0",
     "pandas>=2.3.1",
     "pydantic>=2.11.7",
+    "PyMuPDF>=1.26.7",
     "pypdf>=5.1.0",
+    "python-docx>=1.2.0",
+    "python-pptx>=1.0.2",
     "regex>=2024.5.15",
     "requests>=2.25",
     "rich[jupyter]>=13.9.2",
@@ -50,6 +53,12 @@ tests = [
     "mock",
     "kagglehub",
 ]
+evals = [
+    "duckdb",
+    "cdlib",
+    "gdown",
+    "tomli",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -65,6 +74,12 @@ namespaces = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests/pytest"]
+markers = [
+    "llm: test requires a live LLM API call (deselect with '-m not llm')",
+    "s3: test requires S3 credentials (deselect with '-m not s3')",
+    "slow: test takes > 10 seconds",
+    "integration: test requires a running docker-compose stack (deselect with '-m not integration')",
+]
 filterwarnings = [
     "error",
     "ignore::DeprecationWarning",

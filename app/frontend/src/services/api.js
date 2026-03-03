@@ -1,6 +1,7 @@
 import axios from 'axios'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api'
+const MAX_FILES_PER_REQUEST = 50; // cap for file browsing to prevent overload
 
 const api = axios.create({
   baseURL: API_BASE_URL,
@@ -54,11 +55,16 @@ export const conversationsApi = {
 
 // Files API
 export const filesApi = {
-  browse: (token, path = '') =>
-    api.get('/files/browse', {
-      params: { path },
+  browse: (token, path = '', limit = MAX_FILES_PER_REQUEST, continuationToken = null) => {
+    const params = { path, limit };
+    if (continuationToken) {
+      params.continuation_token = continuationToken;
+    }
+    return api.get('/files/browse', {
+      params,
       headers: { Authorization: `Bearer ${token}` }
-    }),
+    });
+  },
   createDirectory: (path, name, token) => {
     return api.post('/files/create-directory', { path, name }, {
       headers: { Authorization: `Bearer ${token}` }
@@ -76,6 +82,10 @@ export const filesApi = {
     })
   },
   delete: (filePaths) => api.post('/files/delete', { files: filePaths }),
+  expandPaths: (paths, token) => 
+    api.post('/files/expand-paths', paths, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
 }
 
 // Datasets API

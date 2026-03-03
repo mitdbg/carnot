@@ -209,6 +209,41 @@ __marimo__/
 # allow env/ within deploy/terraform/env/
 !deploy/terraform/env/
 
+# test data files
+tests/pytest/data/movie-reviews
+tests/pytest/data/quest/
+tests/pytest/data/enron-eval-medium/
+tests/pytest/data/emails/
+tests/pytest/.auth
+
+# evals data / results files
+evals/sembench/files/movie/data/
+evals/sembench/files/movie/metrics/
+evals/sembench/files/movie/raw_results/
+evals/sembench/files/movie/source_data/
+evals/sembench/files/mmqa/data/
+evals/sembench/files/mmqa/metrics/
+evals/sembench/files/mmqa/raw_results/
+evals/sembench/files/mmqa/source_data/
+evals/sembench/files/ecomm/data/
+evals/sembench/files/ecomm/metrics/
+evals/sembench/files/ecomm/raw_results/
+evals/sembench/files/ecomm/source_data/
+evals/sembench/files/cars/data/
+evals/sembench/files/cars/metrics/
+evals/sembench/files/cars/raw_results/
+evals/sembench/files/cars/source_data/
+evals/sembench/files/animals/data/
+evals/sembench/files/animals/metrics/
+evals/sembench/files/animals/raw_results/
+evals/sembench/files/animals/source_data/
+evals/sembench/results/
+evals/quest/data/
+
+# Copilot things
+.github/copilot-instructions.md
+examples/
+
 # Miscellaneous
 .github/workflows/github-trust-policy.json
 venv_web/
@@ -217,4 +252,19 @@ backend.log
 frontend.log
 secrets/
 how-tos/
+make_password.py
+test_output.txt
+inspect_cluster.py
+agent-indices.py
+b-tree-demo.py
 
+# local envs
+.venv*/
+
+# generated outputs
+*.csv
+*.json
+summaries_dump.txt
+cidr-legal-results/
+parse-answer-errors/
+raptor/

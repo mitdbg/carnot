@@ -1,6 +1,6 @@
 import os
 
-IS_LOCAL_ENV = os.getenv("LOCAL_ENV").lower() == "true"
+IS_LOCAL_ENV = os.getenv("LOCAL_ENV", "").lower() == "true"
 FILESYSTEM = "file" if IS_LOCAL_ENV else "s3"
 REGION_NAME = os.getenv("AWS_REGION", "us-east-1")
 COMPANY_ENV = os.getenv("COMPANY_ENV", "dev")

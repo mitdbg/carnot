@@ -1,8 +1,9 @@
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
-import re
+import queue as _queue_mod
 import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -16,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.background import BackgroundTask
 
 import carnot
@@ -32,13 +33,42 @@ from app.database import (
 from app.database import (
     File as FileRecord,
 )
-from app.env import BACKEND_ROOT, BASE_DIR, FILESYSTEM, IS_LOCAL_ENV
+from app.env import BASE_DIR, FILESYSTEM, IS_LOCAL_ENV
 from app.services.file_service import LocalFileService, S3FileService
 from app.services.llm import get_user_llm_config
+from carnot.data.dataset import Dataset as CarnotDataset
+from carnot.data.item import DataItem
+from carnot.execution.progress import ExecutionProgress, PlanningProgress
+from carnot.storage.backend import LocalStorageBackend, S3StorageBackend
+from carnot.storage.tiered import TieredStorageManager
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
+# logger = logging.getLogger(__name__)
+logger = logging.getLogger('uvicorn.error')
 file_service = LocalFileService() if IS_LOCAL_ENV else S3FileService()
+
+
+def _build_storage() -> TieredStorageManager:
+    """Create a TieredStorageManager appropriate for the current environment.
+
+    Requires:
+        - ``IS_LOCAL_ENV`` is set correctly.
+        - For S3: the ``S3_BUCKET`` / ``S3_PREFIX`` env vars are present.
+
+    Returns:
+        A ready-to-use :class:`TieredStorageManager` wrapping either a
+        :class:`LocalStorageBackend` or :class:`S3StorageBackend`.
+
+    Raises:
+        None.
+    """
+    if IS_LOCAL_ENV:
+        backend = LocalStorageBackend(base_dir=BASE_DIR)
+    else:
+        bucket = os.getenv("S3_BUCKET", "")
+        prefix = os.getenv("S3_PREFIX", "")
+        backend = S3StorageBackend(bucket=bucket, prefix=prefix)
+    return TieredStorageManager(backend=backend)
 
 # heartbeat and session timeout settings; the heartbeat ensures that the connection
 # to the frontend is kept alive during long-running queries
@@ -87,12 +117,14 @@ class QueryExecutionStreamer:
     Encapsulates the query execution and concurrent heartbeat task for SSE streaming.
     Uses an asyncio.Queue to safely merge output from the query task and the heartbeat task.
     """
-    def __init__(self, query: str, dataset_ids: list[int], user_id: str, session_id: str, user_config: dict):
+    def __init__(self, query: str, plan: dict, dataset_ids: list[int], user_id: str, session_id: str, user_config: dict, cost_budget: float | None = None):
         self.query = query
+        self.plan = plan
         self.dataset_ids = dataset_ids
         self.user_id = user_id
         self.session_id = session_id
         self.user_config = user_config
+        self.cost_budget = cost_budget
         self.queue = asyncio.Queue()
         self.heartbeat_task = None
         self.query_task = None
@@ -121,23 +153,21 @@ class QueryExecutionStreamer:
             conversation_id = await get_or_create_conversation(
                 self.user_id, session_id, self.query, self.dataset_ids
             )
-            await save_message(conversation_id, "user", self.query)
+            # NOTE: removing b/c I believe this adds a duplicate user query message to the conversation
+            # await save_message(conversation_id, "user", self.query)
 
-            await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Starting query execution...', 'session_id': session_id})}\n\n")
-            await asyncio.sleep(0.1)
-            await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Loading datasets...'})}\n\n")
-            await asyncio.sleep(0.1)
+            await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': 'Starting query execution...', 'session_id': session_id})}\n\n")
+            await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': 'Loading datasets...'})}\n\n")
 
             async with AsyncSessionLocal() as db:
-                datasets = []
+                datasets: list[CarnotDataset] = []
                 for dataset_id in self.dataset_ids:
                     dataset_result = await db.execute(
                         select(Dataset).where(Dataset.id == dataset_id)
                     )
                     dataset = dataset_result.scalar_one_or_none()
                     if not dataset:
-                        await self.queue.put(f"data: {json.dumps({'type': 'error', 'message': f'Dataset {dataset_id} not found'})}\n\n")
-                        return
+                        raise HTTPException(status_code=404, detail=f"Dataset {dataset_id} not found")
 
                     files_result = await db.execute(
                         select(FileRecord)
@@ -145,22 +175,29 @@ class QueryExecutionStreamer:
                         .where(DatasetFile.dataset_id == dataset_id)
                     )
                     files = files_result.scalars().all()
-                    datasets.append([file.file_path for file in files])
+                    carnot_dataset = CarnotDataset(
+                        name=dataset.name,
+                        annotation=dataset.annotation,
+                        items=[DataItem(path=file.file_path) for file in files],
+                        storage=_build_storage(),
+                    )
+                    datasets.append(carnot_dataset)
+                
+                for dataset in datasets:
+                    logger.info(f"Dataset: {dataset.name}, Annotation: {dataset.annotation}, Items: {[item.path for item in dataset.items]}")
 
-            await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': f'Loaded {len(datasets)} dataset(s)'})}\n\n")
-            await asyncio.sleep(0.1)
+            await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': f'Loaded {len(datasets)} dataset(s)'})}\n\n")
 
             all_files = [
-                S3Path(path) if path.startswith("s3://") else Path(path)
+                S3Path(item.path) if item.path.startswith("s3://") else Path(item.path)
                 for dataset in datasets
-                for path in dataset
+                for item in dataset
             ]
             if not all_files:
                 await self.queue.put(f"data: {json.dumps({'type': 'error', 'message': 'No files found in selected datasets'})}\n\n")
                 return
 
-            await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': f'Processing {len(all_files)} files...'})}\n\n")
-            await asyncio.sleep(0.1)
+            await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': f'Processing {len(all_files)} files...'})}\n\n")
 
             session_exists = session_id in active_sessions
             if session_exists and set(active_sessions[session_id]["dataset_ids"]) != set(self.dataset_ids):
@@ -169,8 +206,7 @@ class QueryExecutionStreamer:
             session_dir = Path(BASE_DIR, ".sessions", session_id) if IS_LOCAL_ENV else S3Path(BASE_DIR, ".sessions", session_id)
             file_service.create_dir(str(session_dir))
 
-            await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Preparing data context...'})}\n\n")
-            await asyncio.sleep(0.1)
+            await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': 'Preparing data context...'})}\n\n")
 
             # TODO: remove this and place file check into Carnot context
             if not session_exists:
@@ -184,25 +220,11 @@ class QueryExecutionStreamer:
                     await self.queue.put(f"data: {json.dumps({'type': 'error', 'message': 'No text files found in selected datasets'})}\n\n")
                     return
 
-                await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': f'Processing {text_file_count} text files...'})}\n\n")
-                await asyncio.sleep(0.1)
+                await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': f'Processing {text_file_count} text files...'})}\n\n")
             else:
-                await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Continuing conversation...'})}\n\n")
-                await asyncio.sleep(0.1)
+                await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': 'Continuing conversation...'})}\n\n")
 
-            if session_exists:
-                ctx = active_sessions[session_id]["context"]
-            else:
-                context_id = f"session_{session_id[:8]}"
-                ctx = carnot.TextFileContext(
-                    paths=[str(fp) for fp in all_files],
-                    id=context_id,
-                    description=f"Query on {len(datasets)} dataset(s)",
-                    llm_config=self.user_config,
-                )
-
-            await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': f'Executing query: {self.query}'})}\n\n")
-            await asyncio.sleep(0.1)
+            await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': f'Executing query: {self.query}'})}\n\n")
 
             # setup progress logging and clear old progress log if it exists
             fs = fsspec.filesystem(FILESYSTEM)
@@ -210,17 +232,30 @@ class QueryExecutionStreamer:
             if fs.exists(progress_log):
                 fs.rm(progress_log, recursive=False)
 
-            compute_ctx = ctx.compute(self.query)
-            config = carnot.QueryProcessorConfig(
-                policy=carnot.MaxQuality(),
+            logger.info(f"Query: {self.query}")
+            logger.info(f"Plan: {json.dumps(self.plan, indent=2)}")
+            logger.info(f"Datasets: {[dataset.name for dataset in datasets]}")
+            logger.info(f"Cost budget: ${self.cost_budget}" if self.cost_budget else "Cost budget: None")
+            
+            # Load existing conversation history from database
+            conversation = await load_conversation_from_db(self.user_id, self.session_id)
+            
+            # create execution and execute plan
+            exec_instance = carnot.Execution(
+                query=self.query,
+                datasets=datasets,
+                plan=self.plan,
+                conversation=conversation,
+                tools=[],
+                memory=None,
+                indices=[],
                 llm_config=self.user_config,
-                progress=True,  # Enable console progress
-                session_id=session_id,  # Add session ID for tracking
-                progress_log_file=progress_log,  # Add progress log file path
+                progress_log_file=progress_log,
+                cost_budget=self.cost_budget,
+                storage=_build_storage(),
             )
 
-            await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Running Carnot query processor...'})}\n\n")
-            await asyncio.sleep(0.1)
+            await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': 'Running Carnot query processor...'})}\n\n")
 
             output_log = str(Path(session_dir, "output.txt") if IS_LOCAL_ENV else str(S3Path(session_dir, "output.txt")))
             if fs.exists(output_log):
@@ -246,12 +281,30 @@ class QueryExecutionStreamer:
                 "local_output_path": current_local_output_path,
             }
 
+            # Use run_stream() to get operator-level progress events.
+            # The generator is synchronous; we drive it in a background
+            # thread and ferry ExecutionProgress events through a
+            # thread-safe queue so we can push them to the SSE stream.
+            exec_progress_queue: _queue_mod.Queue = _queue_mod.Queue()
+
             def run_query_with_capture():
                 local_output_path = None
                 try:
                     sys.stdout = stdout_capture
                     sys.stderr = stderr_capture
-                    return compute_ctx.run(config=config)
+                    gen = exec_instance.run_stream()
+                    items = None
+                    answer = None
+                    try:
+                        while True:
+                            event = next(gen)
+                            if isinstance(event, ExecutionProgress):
+                                exec_progress_queue.put(event.to_dict())
+                    except StopIteration as exc:
+                        result = exc.value
+                        if result is not None:
+                            items, answer = result
+                    return items, answer
                 finally:
                     sys.stdout = original_stdout
                     sys.stderr = original_stderr
@@ -270,19 +323,33 @@ class QueryExecutionStreamer:
                             # clean up the local temp file
                             Path(local_output_path).unlink(missing_ok=True)
 
-            loop = asyncio.get_event_loop()
-            output = await loop.run_in_executor(None, run_query_with_capture)
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(run_query_with_capture)
 
-            active_sessions[session_id]["context"] = compute_ctx
+            # Poll for execution progress events while the thread is working
+            while not future.done():
+                try:
+                    progress_dict = exec_progress_queue.get(timeout=0.25)
+                    await self.queue.put(
+                        f"data: {json.dumps({'type': 'execution_status', 'message': progress_dict.get('message', ''), 'operator_name': progress_dict.get('operator_name', ''), 'operator_index': progress_dict.get('operator_index'), 'total_operators': progress_dict.get('total_operators')})}\n\n"
+                    )
+                except _queue_mod.Empty:
+                    await asyncio.sleep(0.1)
 
-            plan_text = extract_plan_from_output(output)
-            if plan_text:
-                await save_message(conversation_id, "plan", plan_text)
-                await self.queue.put(f"data: {json.dumps({'type': 'plan', 'message': plan_text, 'session_id': session_id})}\n\n")
-                await asyncio.sleep(0.1)
+            # Drain any remaining progress events
+            while not exec_progress_queue.empty():
+                try:
+                    progress_dict = exec_progress_queue.get_nowait()
+                    await self.queue.put(
+                        f"data: {json.dumps({'type': 'execution_status', 'message': progress_dict.get('message', ''), 'operator_name': progress_dict.get('operator_name', ''), 'operator_index': progress_dict.get('operator_index'), 'total_operators': progress_dict.get('total_operators')})}\n\n"
+                    )
+                except _queue_mod.Empty:
+                    break
 
-            await self.queue.put(f"data: {json.dumps({'type': 'status', 'message': 'Processing results...'})}\n\n")
-            await asyncio.sleep(0.1)
+            items, answer = future.result()
+            executor.shutdown(wait=False)
+
+            await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': 'Processing results...'})}\n\n")
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             csv_filename = f"query_results_{timestamp}.csv"
@@ -293,62 +360,44 @@ class QueryExecutionStreamer:
 
             try:
                 # First, save to our timestamp-based file
-                df = output.to_df()
+                df = pd.DataFrame(items)
                 with fs.open(str(csv_path), 'w', encoding='utf-8') as f:
                     df.to_csv(f, index=False)
 
-                # Try to extract the actual filename from Carnot's output
-                csv_filename_from_output = None
-                if not df.empty:
-                    # Check all columns for CSV filename mentions
-                    csv_pattern = r'\b([a-zA-Z0-9_\-]+\.csv)\b'
-                    for col in df.columns:
-                        for value in df[col]:
-                            if isinstance(value, str):
-                                matches = re.findall(csv_pattern, value, re.IGNORECASE)
-                                if matches:
-                                    csv_filename_from_output = matches[-1]
-                                    break
-                        if csv_filename_from_output:
-                            break
-
-                    # If we found a filename, check if that file exists and use it
-                    if csv_filename_from_output:
-                        actual_csv_path = Path(BACKEND_ROOT) / csv_filename_from_output
-                        if actual_csv_path.exists() and actual_csv_path != csv_path:
-                            # Use the file that Carnot created
-                            csv_filename = csv_filename_from_output
-                            csv_path = actual_csv_path
-                            df = pd.read_csv(str(csv_path))  # Re-read from the actual file
-
-                if df.empty:
+                if df.empty and (not answer or answer.strip() == ""):
                     message_text = "No results found for your query."
-                    await save_message(conversation_id, "result", message_text)
+                    await save_message(conversation_id, "agent", message_text, "result")
                     await self.queue.put(f"data: {json.dumps({'type': 'result', 'message': message_text, 'session_id': session_id})}\n\n")
-                else:
-                    if len(df.columns) >= 2:
-                        result_column = df.iloc[:, 1]
-                        lines = [
-                            f"  {index + 1}. {value}"
-                            for index, value in enumerate(result_column.tolist())
-                        ]
-                        body = "\n".join(lines)
-                    else:
-                        body = df.to_string(index=False)
-
+                elif df.empty:
                     message_text = (
                         "Query completed successfully!\n\n"
-                        f"Found {len(df)} result(s):\n\n{body}"
+                        f"Answer Text: {answer}\n\n"
+                        "No tabular results found."
                     )
-                    await save_message(
-                        conversation_id, "result", message_text, csv_filename, len(df)
+                    await save_message(conversation_id, "agent", message_text, "result")
+                    await self.queue.put(f"data: {json.dumps({'type': 'result', 'message': message_text, 'session_id': session_id})}\n\n")
+                elif not answer or answer.strip() == "":
+                    body = str(df.head())
+                    message_text = (
+                        "Query completed successfully!\n\n"
+                        f"Found {len(df)} result(s):\n\n{body}\n..."
                     )
+                    await save_message(conversation_id, "agent", message_text, "result", csv_filename, len(df))
+                    await self.queue.put(f"data: {json.dumps({'type': 'result', 'message': message_text, 'csv_file': csv_filename, 'row_count': len(df), 'session_id': session_id})}\n\n")
+                else:
+                    body = str(df.head())
+                    message_text = (
+                        "Query completed successfully!\n\n"
+                        f"Answer Text: {answer}\n\n"
+                        f"Found {len(df)} result(s):\n\n{body}\n..."
+                    )
+                    await save_message(conversation_id, "agent", message_text, "result", csv_filename, len(df))
                     await self.queue.put(f"data: {json.dumps({'type': 'result', 'message': message_text, 'csv_file': csv_filename, 'row_count': len(df), 'session_id': session_id})}\n\n")
 
             except Exception as exc:
                 logger.exception("Error processing query results")
                 error_msg = f"Error processing results: {exc}"
-                await save_message(conversation_id, "error", error_msg)
+                await save_message(conversation_id, "agent", error_msg, "error")
                 await self.queue.put(f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n")
 
             await self.queue.put(f"data: {json.dumps({'type': 'done', 'message': 'Query execution complete'})}\n\n")
@@ -358,14 +407,13 @@ class QueryExecutionStreamer:
             error_msg = f"Error executing query: {exc}"
             if conversation_id is not None:
                 try:
-                    await save_message(conversation_id, "error", error_msg)
+                    await save_message(conversation_id, "agent", error_msg, "error")
                 except Exception:
                     logger.exception("Failed to save error message")
             await self.queue.put(f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n")
         finally:
             # Signal the consumer in stream_response_iterator to stop iterating
             await self.queue.put(None)
-
 
     async def stream_response_iterator(self):
         """The async iterator that FastAPI's StreamingResponse will consume."""
@@ -388,41 +436,217 @@ class QueryExecutionStreamer:
             await asyncio.gather(self.heartbeat_task, self.query_task, return_exceptions=True)
 
 
-def extract_plan_from_output(output) -> str | None:
-    """Extract the CodeAgent planning steps from the DataRecordCollection."""
-    try:
-        data_records = getattr(output, "data_records", None)
-        if not data_records:
-            return None
+class PlanningStreamer:
+    """Encapsulates plan generation with SSE streaming and a heartbeat.
 
-        seen: set[str] = set()
-        ordered_plans: list[str] = []
+    Uses the same queue + heartbeat pattern as :class:`QueryExecutionStreamer`
+    so the connection stays alive during long-running LLM calls.  Progress
+    events emitted by :meth:`Execution.plan_stream` are forwarded to the
+    SSE stream so the frontend can keep the user informed.
+    """
 
-        for record in data_records:
-            try:
-                context_obj = record["context"]
-            except Exception:
-                context_obj = None
+    def __init__(
+        self,
+        query: str,
+        dataset_ids: list[int],
+        user_id: str,
+        session_id: str,
+        user_config: dict,
+        cost_budget: float | None = None,
+    ):
+        self.query = query
+        self.dataset_ids = dataset_ids
+        self.user_id = user_id
+        self.session_id = session_id
+        self.user_config = user_config
+        self.cost_budget = cost_budget
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.heartbeat_task = None
+        self.plan_task = None
 
-            plan_value = getattr(context_obj, "plan", None) if context_obj is not None else None
-            if isinstance(plan_value, str):
-                plan_str = plan_value.strip()
-                if plan_str and plan_str not in seen:
-                    ordered_plans.append(plan_str)
-                    seen.add(plan_str)
+    async def _heartbeat_sender(self):
+        """Send periodic keep-alive comments on the SSE stream."""
+        try:
+            while True:
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                await self.queue.put(":keep-alive\n\n")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Planning heartbeat sender failed: {e}")
 
-        if ordered_plans:
-            return "\n\n".join(ordered_plans)
-    except Exception:
-        logger.debug("Failed to extract plan from output", exc_info=True)
+    async def _run_plan_logic(self):
+        """Run plan generation in a thread and push SSE events to the queue."""
+        conversation_id = None
+        try:
+            # --- load datasets -------------------------------------------------
+            async with AsyncSessionLocal() as db:
+                # Validate user LLM config
+                user_config = await get_user_llm_config(db, self.user_id)
+                if not user_config:
+                    await self.queue.put(
+                        f"data: {json.dumps({'type': 'error', 'message': 'No LLM API keys found for this user. Please go to the Settings page to configure your keys.'})}\n\n"
+                    )
+                    return
 
-    return None
+                datasets: list[CarnotDataset] = []
+                for dataset_id in self.dataset_ids:
+                    dataset_result = await db.execute(
+                        select(Dataset).where(Dataset.id == dataset_id)
+                    )
+                    dataset = dataset_result.scalar_one_or_none()
+                    if not dataset:
+                        await self.queue.put(
+                            f"data: {json.dumps({'type': 'error', 'message': f'Dataset {dataset_id} not found'})}\n\n"
+                        )
+                        return
+
+                    files_result = await db.execute(
+                        select(FileRecord)
+                        .join(DatasetFile, FileRecord.id == DatasetFile.file_id)
+                        .where(DatasetFile.dataset_id == dataset_id)
+                    )
+                    files = files_result.scalars().all()
+                    carnot_dataset = CarnotDataset(
+                        name=dataset.name,
+                        annotation=dataset.annotation,
+                        items=[DataItem(path=file.file_path) for file in files],
+                        storage=_build_storage(),
+                    )
+                    datasets.append(carnot_dataset)
+
+            # --- conversation bookkeeping --------------------------------------
+            conversation_id = await get_or_create_conversation(
+                self.user_id, self.session_id, self.query, self.dataset_ids
+            )
+            conversation = await load_conversation_from_db(self.user_id, self.session_id)
+            await save_message(conversation_id, "user", self.query, cost_budget=self.cost_budget)
+
+            await self.queue.put(
+                f"data: {json.dumps({'type': 'planning_status', 'message': 'Starting plan generation…', 'session_id': self.session_id})}\n\n"
+            )
+
+            # --- build Execution and run plan_stream in a thread ---------------
+            exec_instance = carnot.Execution(
+                query=self.query,
+                datasets=datasets,
+                conversation=conversation,
+                tools=[],
+                memory=None,
+                indices=[],
+                llm_config=self.user_config,
+                cost_budget=self.cost_budget,
+                storage=_build_storage(),
+            )
+
+            # plan_stream() is a synchronous generator; we drive it from a
+            # background thread so the event loop stays free for heartbeats.
+            # We use a thread-safe queue so progress events can be pushed to
+            # the SSE stream in real time while the generator runs.
+            progress_sync_queue: _queue_mod.Queue = _queue_mod.Queue()
+
+            def _run_plan_stream_with_progress():
+                """Drive the plan_stream generator, posting progress to a sync queue."""
+                nl_plan = None
+                logical_plan = None
+                gen = exec_instance.plan_stream()
+                try:
+                    while True:
+                        event = next(gen)
+                        if isinstance(event, PlanningProgress):
+                            progress_sync_queue.put(event.to_dict())
+                except StopIteration as exc:
+                    result = exc.value
+                    if result is not None:
+                        nl_plan, logical_plan = result
+                return nl_plan, logical_plan
+
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(_run_plan_stream_with_progress)
+
+            # Poll for progress events while the thread is working
+            while not future.done():
+                try:
+                    progress_dict = progress_sync_queue.get(timeout=0.25)
+                    await self.queue.put(
+                        f"data: {json.dumps({'type': 'planning_status', 'message': progress_dict.get('message', ''), 'phase': progress_dict.get('phase', ''), 'step': progress_dict.get('step'), 'total_steps': progress_dict.get('total_steps')})}\n\n"
+                    )
+                except _queue_mod.Empty:
+                    await asyncio.sleep(0.1)
+
+            # Drain any remaining progress events
+            while not progress_sync_queue.empty():
+                try:
+                    progress_dict = progress_sync_queue.get_nowait()
+                    await self.queue.put(
+                        f"data: {json.dumps({'type': 'planning_status', 'message': progress_dict.get('message', ''), 'phase': progress_dict.get('phase', ''), 'step': progress_dict.get('step'), 'total_steps': progress_dict.get('total_steps')})}\n\n"
+                    )
+                except _queue_mod.Empty:
+                    break
+
+            nl_plan, logical_plan = future.result()
+            executor.shutdown(wait=False)
+
+            # --- save results to DB -------------------------------------------
+            if nl_plan:
+                await save_message(
+                    conversation_id, "agent", nl_plan,
+                    message_type="natural-language-plan",
+                )
+            if logical_plan:
+                plan_json = json.dumps(logical_plan, indent=2)
+                await save_message(
+                    conversation_id, "agent", plan_json,
+                    message_type="logical-plan",
+                )
+
+            logger.info(
+                f"Generated plan for session {self.session_id}:\n{nl_plan}\n"
+                f"{json.dumps(logical_plan, indent=2) if logical_plan else '(none)'}"
+            )
+
+            # --- send final plan_complete event --------------------------------
+            await self.queue.put(
+                f"data: {json.dumps({'type': 'plan_complete', 'natural_language_plan': nl_plan, 'plan': logical_plan, 'session_id': self.session_id})}\n\n"
+            )
+
+        except Exception as exc:
+            logger.exception("Plan generation failed")
+            error_msg = f"Error generating plan: {exc}"
+            if conversation_id is not None:
+                try:
+                    await save_message(conversation_id, "agent", error_msg, "error")
+                except Exception:
+                    logger.exception("Failed to save error message")
+            await self.queue.put(
+                f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n"
+            )
+        finally:
+            await self.queue.put(None)
+
+    async def stream_response_iterator(self):
+        """Async iterator consumed by FastAPI's ``StreamingResponse``."""
+        self.heartbeat_task = asyncio.create_task(self._heartbeat_sender())
+        self.plan_task = asyncio.create_task(self._run_plan_logic())
+
+        try:
+            while True:
+                item = await self.queue.get()
+                if item is None:
+                    break
+                yield item
+        finally:
+            self.heartbeat_task.cancel()
+            self.plan_task.cancel()
+            await asyncio.gather(self.heartbeat_task, self.plan_task, return_exceptions=True)
 
 
 class QueryRequest(BaseModel):
     query: str
     dataset_ids: list[int]
     session_id: str
+    plan: dict | None = None
+    cost_budget: float | None = None  # Maximum dollar amount user is willing to spend
 
 
 def cleanup_old_sessions() -> None:
@@ -469,16 +693,20 @@ async def save_message(
     conversation_id: int,
     role: str,
     content: str,
+    message_type: str | None = None,
     csv_file: str | None = None,
     row_count: int | None = None,
+    cost_budget: float | None = None,
 ) -> None:
     async with AsyncSessionLocal() as db:
         message = Message(
             conversation_id=conversation_id,
             role=role,
             content=content,
+            type=message_type,
             csv_file=csv_file,
             row_count=row_count,
+            cost_budget=cost_budget,
         )
         db.add(message)
 
@@ -487,16 +715,121 @@ async def save_message(
         )
         conversation = result.scalar_one_or_none()
         if conversation:
-            conversation.updated_at = datetime.now(timezone.utc)
+            conversation.updated_at = datetime.now(timezone.utc)  # noqa: UP017
 
         await db.commit()
 
+
+async def load_conversation_from_db(
+    user_id: str,
+    session_id: str,
+) -> carnot.Conversation | None:
+    """
+    Load conversation history from the database and construct a carnot.Conversation object.
+    
+    Returns None if the conversation doesn't exist.
+    """
+    async with AsyncSessionLocal() as db:
+        # Get the conversation record
+        conv_result = await db.execute(
+            select(Conversation).where(
+                Conversation.session_id == session_id,
+                Conversation.user_id == user_id,
+            )
+        )
+        db_conversation = conv_result.scalar_one_or_none()
+        
+        if not db_conversation:
+            return None
+        
+        # Get all messages for this conversation, ordered by creation time
+        messages_result = await db.execute(
+            select(Message)
+            .where(Message.conversation_id == db_conversation.id)
+            .order_by(Message.created_at)
+        )
+        db_messages = messages_result.scalars().all()
+        
+        # Convert database messages to conversation message format
+        conversation_messages = []
+        for msg in db_messages:
+            # Only include user and agent messages in the conversation history
+            if msg.role in ["user", "agent"]:
+                message_dict = {
+                    "role": msg.role,
+                    "content": msg.content,
+                }
+                if msg.type:
+                    message_dict["type"] = msg.type
+                conversation_messages.append(message_dict)
+        
+        # Parse dataset_ids from comma-separated string
+        dataset_ids = []
+        if db_conversation.dataset_ids:
+            dataset_ids = db_conversation.dataset_ids.split(",")
+        
+        # Create and return carnot.Conversation object
+        return carnot.Conversation(
+            user_id=user_id,
+            session_id=session_id,
+            title=db_conversation.title or "",
+            dataset_ids=dataset_ids,
+            messages=conversation_messages,
+        )
+
+@router.post("/plan")
+async def plan_query(
+    request: QueryRequest,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """Generate a logical execution plan with streaming progress updates.
+
+    Returns an SSE stream that emits:
+    - ``planning_status`` events as the planner/data-discovery agent work.
+    - A single ``plan_complete`` event with the final NL plan and logical plan.
+    - An ``error`` event if anything goes wrong.
+
+    Supports multi-turn conversations via *session_id*.
+    """
+    if not request.dataset_ids:
+        raise HTTPException(status_code=400, detail="At least one dataset must be selected")
+
+    if not request.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+
+    # Pre-flight check: make sure the user has LLM keys configured.
+    # We do this *before* entering the stream so we can return a clean
+    # HTTP 400 instead of an SSE error event.
+    user_config = await get_user_llm_config(db, user_id)
+    if not user_config:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "type": "API_KEY_MISSING",
+                "message": "No LLM API keys found for this user.",
+            },
+        )
+
+    streamer = PlanningStreamer(
+        query=request.query,
+        dataset_ids=request.dataset_ids,
+        user_id=user_id,
+        session_id=request.session_id,
+        user_config=user_config,
+        cost_budget=request.cost_budget,
+    )
+
+    return StreamingResponse(
+        streamer.stream_response_iterator(),
+        media_type="text/event-stream",
+    )
 
 @router.post("/execute")
 async def execute_query(
     request: QueryRequest,
     user_id: str = Depends(get_current_user),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
     """
     Execute a Carnot query on selected datasets with streaming progress.
@@ -515,13 +848,15 @@ async def execute_query(
             status_code=400,
             detail={
                 "type": "API_KEY_MISSING",
-                "message": "No LLM API keys found for this user. Please configure them in Settings.",
+                "message": "No LLM API keys found for this user.",
             }
         )
 
     # Instantiate the streamer class
+    logger.info(f"Request.plan: {request.plan}")
+    logger.info(f"Request.cost_budget: {request.cost_budget}")
     streamer = QueryExecutionStreamer(
-        request.query, request.dataset_ids, user_id, request.session_id, user_config
+        request.query, request.plan, request.dataset_ids, user_id, request.session_id, user_config, request.cost_budget,
     )
 
     return StreamingResponse(
@@ -533,7 +868,7 @@ async def execute_query(
 @router.get("/progress/{session_id}")
 async def get_progress(session_id: str, since_timestamp: str | None = None):
     """
-    Get progress events for a session, optionally filtering by timestamp
+    Get progress events for a session, optionally filtering by timestamp.
     """
     try:
         fs = fsspec.filesystem(FILESYSTEM)

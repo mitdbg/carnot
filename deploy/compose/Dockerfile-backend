@@ -1,5 +1,14 @@
 # syntax=docker/dockerfile:1
 FROM python:3.12-slim
+
+# grab the uv binary from the official image
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# set environment variables for uv
+ENV UV_SYSTEM_PYTHON=1 \
+    UV_COMPILE_BYTECODE=1
+
+# create data directory and set working directory
 RUN mkdir -p /carnot/data
 WORKDIR /code
 
@@ -10,11 +19,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 COPY ./backend/requirements.txt requirements.txt
 COPY ./pyproject.toml .
 COPY ./README.md .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN uv pip install -r requirements.txt
 
 # install Carnot
 COPY ./src ./src
-RUN pip install --no-cache-dir .
+RUN uv pip install .
 RUN rm -rf /var/lib/apt/lists/*
 
 EXPOSE 8000

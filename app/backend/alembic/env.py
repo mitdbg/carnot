@@ -14,10 +14,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 # import the Base and DATABASE_URL logic
 from app.database import DB_HOST, DB_NAME, DB_PASSWORD, DB_PORT, DB_USER, Base
 
+# Import the carnot library's catalog Base so --autogenerate sees both
+# the app tables and the catalog tables (datasets, indices).
+from carnot.storage.models import Base as CatalogBase
+
 # setup Alembic config
 config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
+
+# Merge metadata from both Bases so Alembic sees all tables.
+# We use the app Base's metadata as the primary target and copy
+# catalog tables into it.
+for table in CatalogBase.metadata.tables.values():
+    if table.key not in Base.metadata.tables:
+        table.tometadata(Base.metadata)
 
 # set target metadata for 'autogenerate' support
 target_metadata = Base.metadata

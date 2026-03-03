@@ -14,9 +14,12 @@ from cloudpathlib import S3Path
 from fastapi import HTTPException, UploadFile
 
 from app.env import BASE_DIR, DATA_DIR, SHARED_DATA_DIR
-from app.models.schemas import FileItem
+from app.models.schemas import FileItem, PaginatedFileList
 
 logger = logging.getLogger('uvicorn.error')
+
+# Default page size for paginated directory listings
+DEFAULT_PAGE_SIZE = 50
 
 # predefined set of archive extensions
 ARCHIVE_EXTENSIONS = (
@@ -220,6 +223,16 @@ class BaseFileService(ABC):
         pass
 
     @abstractmethod
+    def list_directory_paginated(
+        self,
+        path: str,
+        limit: int = DEFAULT_PAGE_SIZE,
+        continuation_token: str | None = None
+    ) -> PaginatedFileList:
+        """List directory contents with pagination support for large directories."""
+        pass
+
+    @abstractmethod
     def delete_directory(self, path: str) -> None:
         pass
 
@@ -292,6 +305,57 @@ class LocalFileService(BaseFileService):
             ))
 
         return items
+
+    def list_directory_paginated(
+        self,
+        path: str,
+        limit: int = DEFAULT_PAGE_SIZE,
+        continuation_token: str | None = None
+    ) -> PaginatedFileList:
+        """List directory contents with pagination for local filesystem."""
+        entries = sorted(os.listdir(path))
+        total_count = len(entries)
+        
+        # Decode continuation token (simple offset-based for local)
+        start_idx = 0
+        if continuation_token:
+            try:
+                import base64
+                start_idx = int(base64.b64decode(continuation_token).decode('utf-8'))
+            except (ValueError, TypeError):
+                start_idx = 0
+        
+        # Slice entries for this page
+        end_idx = min(start_idx + limit, total_count)
+        page_entries = entries[start_idx:end_idx]
+        
+        items = []
+        for entry in page_entries:
+            entry_path = os.path.join(path, entry)
+            is_dir = os.path.isdir(entry_path)
+            stat = os.stat(entry_path)
+            items.append(FileItem(
+                path=entry_path,
+                display_name=entry + ("/" if is_dir else ""),
+                is_directory=is_dir,
+                is_hidden=entry.startswith("."),
+                size=stat.st_size if not is_dir else None,
+                modified=datetime.fromtimestamp(stat.st_mtime)
+            ))
+        
+        # Generate next token if more items exist
+        next_token = None
+        has_more = end_idx < total_count
+        if has_more:
+            import base64
+            next_token = base64.b64encode(str(end_idx).encode('utf-8')).decode('utf-8')
+        
+        return PaginatedFileList(
+            items=items,
+            next_token=next_token,
+            total_count=total_count if start_idx == 0 else None,
+            has_more=has_more
+        )
 
     def delete_directory(self, path: str) -> None:
         if self.is_dir(path):
@@ -386,6 +450,76 @@ class S3FileService(BaseFileService):
                 ))
 
         return items
+
+    def list_directory_paginated(
+        self,
+        path: str,
+        limit: int = DEFAULT_PAGE_SIZE,
+        continuation_token: str | None = None
+    ) -> PaginatedFileList:
+        """List contents of an S3 prefix with pagination support.
+        
+        Uses S3's native ContinuationToken for efficient pagination without
+        fetching all objects first.
+        """
+        items = []
+        prefix = self._get_s3_key_from_path(path).rstrip("/") + "/"
+        prefix = "" if prefix == "/" else prefix
+        
+        # Build request parameters
+        request_params = {
+            'Bucket': self.s3_bucket,
+            'Prefix': prefix,
+            'Delimiter': '/',
+            'MaxKeys': limit
+        }
+        
+        if continuation_token:
+            request_params['ContinuationToken'] = continuation_token
+        
+        # Make single paginated request
+        response = self.s3.list_objects_v2(**request_params)
+        
+        # CommonPrefixes contains "directories"
+        for cp in response.get('CommonPrefixes', []):
+            dir_path = f"s3://{self.s3_bucket}/{cp['Prefix']}"
+            display_name = dir_path.rstrip("/").split("/")[-1]
+            items.append(FileItem(
+                path=dir_path,
+                display_name=display_name.rstrip("/") + "/",
+                is_directory=True,
+                is_hidden=display_name.startswith("."),
+            ))
+
+        # Contents contains files
+        for obj in response.get('Contents', []):
+            if obj['Key'] == prefix:
+                continue
+            file_path = f"s3://{self.s3_bucket}/{obj['Key']}"
+            display_name = file_path.rstrip("/").split("/")[-1]
+            items.append(FileItem(
+                path=file_path,
+                display_name=display_name,
+                is_directory=False,
+                is_hidden=display_name.startswith("."),
+                size=obj['Size'],
+                modified=obj['LastModified'],
+            ))
+        
+        # Check if there are more results
+        has_more = response.get('IsTruncated', False)
+        next_token = response.get('NextContinuationToken') if has_more else None
+        
+        # Note: S3 doesn't provide total count without listing all objects
+        # We only provide it if we know we're at the end
+        total_count = len(items) if not has_more and not continuation_token else None
+        
+        return PaginatedFileList(
+            items=items,
+            next_token=next_token,
+            total_count=total_count,
+            has_more=has_more
+        )
 
     def delete_directory(self, path: str) -> None:
         """Delete a directory (prefix) from s3"""

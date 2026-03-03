@@ -1,0 +1,1 @@
+How many pictures of zebras do we have in our database?

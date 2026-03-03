@@ -1,0 +1,54 @@
+{
+    "queries": [
+      {
+        "id": "Q1",
+        "modalities": ["image"],
+        "operators": ["filter"]
+      },
+      {
+        "id": "Q2",
+        "modalities": ["audio"],
+        "operators": ["filter"]
+      },
+      {
+        "id": "Q3",
+        "modalities": ["image"],
+        "operators": ["filter"]
+      },
+      {
+        "id": "Q4",
+        "modalities": ["audio"],
+        "operators": ["filter"]
+      },
+      {
+        "id": "Q5",
+        "modalities": ["image", "audio"],
+        "operators": ["filter"]
+      },
+      {
+        "id": "Q6",
+        "modalities": ["image", "audio"],
+        "operators": ["filter"]
+      },
+      {
+        "id": "Q7",
+        "modalities": ["audio"],
+        "operators": ["filter"]
+      },
+      {
+        "id": "Q8",
+        "modalities": ["image", "audio"],
+        "operators": ["filter"]
+      },
+      {
+        "id": "Q9",
+        "modalities": ["image", "audio"],
+        "operators": ["filter"]
+      },
+      {
+        "id": "Q10",
+        "modalities": ["image"],
+        "operators": ["filter"]
+      }
+    ]
+  }

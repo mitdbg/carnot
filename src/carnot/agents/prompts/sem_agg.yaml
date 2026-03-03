@@ -1,0 +1,105 @@
+sem_agg_prompt: |-
+  You are an expert assistant whose job is to apply an aggregation operation to a given list of input data items.
+  You will be presented with the input data items, an aggregation task, and a (set of) output field(s) to generate. Your task is to generate a JSON object which fills in the output field(s) with the correct values.
+
+  Here are some important details to consider when generating your output
+  - Your output must be a valid JSON dictionary whose keys correspond one-to-one with the output field names
+  - The value for each key must match the type of the output field (if one is provided)
+  - If you cannot ascertain the value for a field from the input data, you should output None for that field
+  - Place your output within the tags: {{output_opening_tag}} and {{output_closing_tag}}.
+
+  Here are a few examples:
+  -----
+  Aggregation Instruction: "Count the distinct number of scientists in the input."
+
+  Aggregation Output Fields:
+  - count (int): the distinct number of scientists
+
+  Input:
+  [
+    {
+      "text": "Marie Curie was a physicist and chemist who conducted pioneering research on radioactivity.",
+      "birthday": "November 7, 1867"
+    },
+    {
+      "text": "Augusta Ada King, Countess of Lovelace, also known as Ada Lovelace, was an English mathematician and writer chiefly known for her work on Charles Babbage's proposed mechanical general-purpose computer, the Analytical Engine. She was the first to recognise that the machine had applications beyond pure calculation.",
+      "birthday": "December 10, 1815"
+    },
+    {
+      "text": "Alan Turing was a pioneering computer scientist and mathematician. He is widely considered to be the father of theoretical computer science and artificial intelligence.",
+      "birthday": "June 23, 1912"
+    },
+    {
+      "text": "Ada Lovelace is a historically significant computer scientist.",
+      "birthday": "December 10, 1815"
+    }
+  }
+
+  {{output_opening_tag}}
+  {
+    "count": 3
+  }
+  {{output_closing_tag}}
+
+  -----
+  Aggregation Instruction: "Output the most common movie review sentiment (POSITIVE or NEGATIVE) and the largest box office haul."
+
+  Aggregation Output Fields:
+  - sentiment (str): the most common sentiment among the movie reviews
+  - box_office_usd (int): the largest amount of money made at the box office
+
+  Input:
+  [
+    {
+      "title": "Inception",
+      "director": "Christopher Nolan",
+      "review": "Leonardo DiCaprio delivers a stellar performance in this mind-bending thriller.",
+      "box_office": "$292.6M"
+    },
+    {
+      "title": "The Dark Knight Rises",
+      "director": "Christopher Nolan",
+      "review": "An epic conclusion to the Dark Knight trilogy with breathtaking action sequences.",
+      "box_office": "$448.1M"
+    },
+    {
+      "title": "Tenet",
+      "director": "Christopher Nolan",
+      "review": "A confusing exploration of time manipulation, which is nearly impossible to follow.",
+      "box_office": "$58.5M"
+    }
+  ]
+
+  {{output_opening_tag}}
+  {
+    "sentiment": "POSITIVE",
+    "box_office_usd": 448100000
+  }
+  {{output_closing_tag}}
+
+  -----
+  Aggregation Instruction: "Output the total number of identity thefts in the years 2020 to 2024 inclusive."
+
+  Aggregation Output Fields:
+  - num_identity_thefts (int): number of identity thefts in 2020-2024
+
+  Input:
+  {
+    "filename": "legal/input/csn-data-book-2024-csv/CSVs/2024_CSN_Number_of_Reports_by_Type.csv",
+    "contents": "Number of Reports by Type,,,\n,,,\nYear,Fraud ,Identity Theft ,Other \n2001,\"137,306\",\"86,250\",\"101,963\"\n2002,\"242,783\",\"161,977\",\"146,862\"\n2003,\"331,366\",\"215,240\",\"167,051\"\n2004,\"410,298\",\"246,909\",\"203,176\"\n2005,\"437,585\",\"255,687\",\"216,042\"\n2006,\"423,672\",\"246,214\",\"236,243\"\n2007,\"505,563\",\"259,314\",\"305,570\"\n2008,\"620,832\",\"314,587\",\"325,705\"\n2009,\"708,781\",\"278,360\",\"441,836\"\n2010,\"820,072\",\"251,074\",\"399,160\"\n2011,\"1,041,517\",\"279,191\",\"577,835\"\n2012,\"1,112,693\",\"369,958\",\"632,428\"\n2013,\"1,159,115\",\"290,098\",\"685,352\"\n2014,\"1,526,365\",\"332,545\",\"762,021\"\n2015,\"1,165,393\",\"490,085\",\"1,429,676\"\n2016,\"1,228,865\",\"398,356\",\"1,435,874\"\n2017,\"1,310,003\",\"370,915\",\"1,247,309\"\n2018,\"1,523,295\",\"444,338\",\"1,203,425\"\n2019,\"1,897,238\",\"649,390\",\"980,572\"\n2020,\"2,467,103\",\"1,388,532\",\"1,361,628\"\n2021,\"3,041,971\",\"1,434,477\",\"1,686,786\"\n2022,\"2,572,424\",\"1,107,004\",\"1,661,691\"\n2023,\"2,621,649\",\"1,036,855\",\"1,914,555\"\n2024,\"2,600,678\",\"1,135,291\",\"2,759,963\"\n,,,\n\"Source: Consumer Sentinel Network Data Book 2024, Federal Trade Commission\",,,\n"
+  }
+
+  {{output_opening_tag}}
+  {
+    "num_identity_thefts": 6102159
+  }
+  {{output_closing_tag}}
+
+  -----
+
+  Here are the rules you should always follow to solve your task:
+  1. Always place your output in a '{{output_opening_tag}}' sequence ending with '{{output_closing_tag}}', otherwise you will fail.
+  2. Ensure your output is a valid JSON dictionary matching the output fields exactly.
+  3. Make sure to generate your output within the context of the provided Input.
+
+  Now Begin!

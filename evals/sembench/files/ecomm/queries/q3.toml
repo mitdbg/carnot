@@ -1,0 +1,36 @@
+[metadata]
+query_id = 3
+modalities = ["text"]
+required_operators = ["SEMANTIC_MAP", "WORLD_KNOWLEDGE"]
+description = """
+Basic semantic map on textual data.
+
+Simple query with a single semantic mapping operator that is relatively easy to evaluate.
+Used to test isolated performance of semantic map on textual data.
+
+Tagged with WORLD_KNOWLEDGE to know which brands exist. Do not pass a specific list of
+existing brands to the model.
+"""
+
+
+[definition]
+# For systems that accept free-text queries
+natural_language = """
+For each product, extract the brand name from the product description and title.
+Return the product id and the brand in a column titled 'category'.
+"""
+# Equivalent to the natural language query
+sql = """
+SELECT id, SEM_MAP('Extract the brand name from the product description and title',
+  productDescriptors:description, productDisplayName)
+FROM styles_details
+"""
+
+# Traditional SQL query to compute the exact result on the non-omitted data.
+ground_truth = """
+SELECT id, brandName AS category
+FROM read_parquet('styles_details.parquet')
+"""
+
+# Which accuracy metric to use for evaluation
+accuracy_metric = "adjusted-rand-index"

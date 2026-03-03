@@ -1,0 +1,55 @@
+{
+    "queries": [
+      {
+        "id": "Q1",
+        "modalities": ["text"],
+        "operators": ["filter"]
+      },
+      {
+        "id": "Q2",
+        "modalities": ["text"],
+        "operators": ["filter"]
+      },
+      {
+        "id": "Q3",
+        "modalities": ["text"],
+        "operators": ["filter"]
+      },
+      {
+        "id": "Q4",
+        "modalities": ["text"],
+        "operators": ["filter"]
+      },
+      {
+        "id": "Q5",
+        "modalities": ["text"],
+        "operators": ["join"]
+      },
+      {
+        "id": "Q6",
+        "modalities": ["text"],
+        "operators": ["join"]
+      },
+      {
+        "id": "Q7",
+        "modalities": ["text"],
+        "operators": ["join"]
+      },
+      {
+        "id": "Q8",
+        "modalities": ["text"],
+        "operators": ["classify"]
+      },
+      {
+        "id": "Q9",
+        "modalities": ["text"],
+        "operators": ["rank"]
+      },
+      {
+        "id": "Q10",
+        "modalities": ["text"],
+        "operators": ["rank"]
+      }
+    ]
+  }
+  

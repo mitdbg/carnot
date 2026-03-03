@@ -1,0 +1,1 @@
+What is the city where we captured most pictures of zebras (ties are broken arbitrarily, consider only cities with at least one zebra picture)?
