@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 
 from _internal.chroma_store import ChromaStore
 from _internal.query_planner import LLMQueryPlanner
@@ -164,10 +165,57 @@ def expand_metas(
     return metadata
 
 
-def recall(predicted: List[str], gold: List[str]) -> float:
-    if not gold or not predicted:
+def recall_at_k(ranked_list: List[str], relevant_set: Set[str], k: int) -> float:
+    """Fraction of all relevant items found in the top-K."""
+    if not relevant_set:
         return 0.0
-    return len(set(predicted) & set(gold)) / len(gold)
+    top_k = ranked_list[:k]
+    return sum(1 for doc in top_k if doc in relevant_set) / len(relevant_set)
+
+
+def precision_at_k(ranked_list: List[str], relevant_set: Set[str], k: int) -> float:
+    """Fraction of the top-K that are relevant."""
+    top_k = ranked_list[:k]
+    if not top_k:
+        return 0.0
+    return sum(1 for doc in top_k if doc in relevant_set) / len(top_k)
+
+
+def reciprocal_rank_at_k(ranked_list: List[str], relevant_set: Set[str], k: int) -> float:
+    """1/position of the first relevant hit within top K, or 0 if none."""
+    for i, doc in enumerate(ranked_list[:k], start=1):
+        if doc in relevant_set:
+            return 1.0 / i
+    return 0.0
+
+
+def dcg_at_k(
+    ranked_list: List[str],
+    relevance_fn: Callable[[str], float],
+    k: int,
+) -> float:
+    """Sum of relevance scores weighted by 1/log2(rank+1)."""
+    dcg = 0.0
+    for i, doc in enumerate(ranked_list[:k], start=1):
+        rel = relevance_fn(doc)
+        dcg += rel / math.log2(i + 1)
+    return dcg
+
+
+def ndcg_at_k(
+    ranked_list: List[str],
+    relevance_fn: Callable[[str], float],
+    all_relevant_docs: List[str],
+    k: int,
+) -> float:
+    """DCG normalized by ideal DCG. Returns value in [0, 1]."""
+    dcg_val = dcg_at_k(ranked_list, relevance_fn, k)
+    # For binary relevance: ideal DCG = 1/log2(2) + 1/log2(3) + ... for min(|relevant|, k) terms
+    n_ideal = min(len(all_relevant_docs), k)
+    if n_ideal == 0:
+        return 0.0
+    idcg_val = sum(1.0 / math.log2(i + 2) for i in range(n_ideal))
+    return dcg_val / idcg_val if idcg_val > 0 else 0.0
 
 
 def create_collection(
@@ -241,7 +289,13 @@ def evaluate_collection(
         return 0.0
 
     total_recall = 0.0
+    total_precision = 0.0
+    total_mrr = 0.0
+    total_ndcg = 0.0
     f_out = open(output_path, "w", encoding="utf-8") if output_path else None
+
+    gold_set = set()
+    relevance_fn = lambda d: 1.0 if d in gold_set else 0.0
 
     try:
         for i, q in enumerate(queries):
@@ -267,24 +321,45 @@ def evaluate_collection(
                         "score": result.get("distance"),
                     })
 
-            score = recall(predicted, q.docs)
-            total_recall += score
+            gold_set.clear()
+            gold_set.update(q.docs)
+            rec = recall_at_k(predicted, gold_set, top_k)
+            prec = precision_at_k(predicted, gold_set, top_k)
+            rr = reciprocal_rank_at_k(predicted, gold_set, top_k)
+            ndcg = ndcg_at_k(predicted, relevance_fn, q.docs, top_k)
+
+            total_recall += rec
+            total_precision += prec
+            total_mrr += rr
+            total_ndcg += ndcg
 
             if f_out:
                 f_out.write(json.dumps({
                     "query_index": i,
                     "query": q.query,
-                    f"recall@{top_k}": score,
+                    f"recall@{top_k}": rec,
+                    f"precision@{top_k}": prec,
+                    f"mrr@{top_k}": rr,
+                    f"ndcg@{top_k}": ndcg,
                     f"retrieved_top_{top_k}": retrieved_details,
                 }) + "\n")
                 f_out.flush()
 
             if i % 10 == 0:
-                logger.info(f"Evaluated {i + 1}/{len(queries)} queries. Recall@{top_k}: {score:.4f}")
+                logger.info(f"Evaluated {i + 1}/{len(queries)} queries. Recall@{top_k}: {rec:.4f}")
     finally:
         if f_out:
-            avg = total_recall / (i + 1)
-            f_out.write(json.dumps({f"Average Recall@{top_k}": avg}) + "\n")
+            n = len(queries)
+            avg_recall = total_recall / n
+            avg_precision = total_precision / n
+            avg_mrr = total_mrr / n
+            avg_ndcg = total_ndcg / n
+            f_out.write(json.dumps({
+                f"Average Recall@{top_k}": avg_recall,
+                f"Average Precision@{top_k}": avg_precision,
+                f"Average MRR@{top_k}": avg_mrr,
+                f"Average nDCG@{top_k}": avg_ndcg,
+            }) + "\n")
             f_out.close()
 
     avg_recall = total_recall / len(queries)
