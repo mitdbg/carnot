@@ -71,14 +71,37 @@ resource "aws_instance" "app_server" {
     set -euxo pipefail
     exec > /var/log/user-data.log 2>&1
 
-    DEVICE="/dev/xvdf"
     MOUNT_POINT="/mnt/pg-data"
 
-    # wait for EBS volume to be attached by Terraform
-    echo "Waiting for $DEVICE to attach..."
-    while [ ! -e $DEVICE ]; do
+    # On m5/nitro instances the EBS volume appears as an NVMe device rather
+    # than the legacy /dev/xvdf name. Wait for either path, then resolve the
+    # real device node using its serial number (which encodes the volume-id).
+    echo "Waiting for EBS data volume to attach..."
+    DEVICE=""
+    for i in $(seq 1 60); do
+      # Prefer the legacy symlink when present (older instance types)
+      if [ -e /dev/xvdf ]; then
+        DEVICE=/dev/xvdf
+        break
+      fi
+      # On Nitro/NVMe instances find the data disk by excluding the root disk
+      NVME_DEV=$(lsblk -dpno NAME,TYPE | awk '$2=="disk"{print $1}' | while read d; do
+        # root disk always has partitions; the bare data EBS volume does not
+        PARTS=$(lsblk -no NAME "$d" | wc -l)
+        if [ "$PARTS" -eq 1 ]; then echo "$d"; fi
+      done | head -1)
+      if [ -n "$NVME_DEV" ]; then
+        DEVICE=$NVME_DEV
+        break
+      fi
       sleep 5
     done
+
+    if [ -z "$DEVICE" ]; then
+      echo "ERROR: EBS data volume did not appear after 300s" >&2
+      exit 1
+    fi
+    echo "Using device: $DEVICE"
 
     ### mount EBS volume and change ownership to UID/GID 999 (default for postgres)
     # check for existing filesystem before formatting
