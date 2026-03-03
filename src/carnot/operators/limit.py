@@ -2,18 +2,34 @@ from carnot.data.dataset import Dataset
 
 
 class LimitOperator:
-    """
-    Represents a limit operator.
+    """Limit operator — truncates a dataset to the first *n* items.
+
+    This is a purely deterministic operator with no LLM involvement.
+
+    Representation invariant:
+        - ``n >= 0``.
+
+    Abstraction function:
+        An instance of this class is a callable that, given a dataset, returns a new dataset
+        containing at most ``n`` items (the first *n* in order).
     """
     def __init__(self, n: int, output_dataset_id: str):
         self.n = n
         self.output_dataset_id = output_dataset_id
 
     def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> dict[str, Dataset]:
-        """
-        Apply a semantic top-k operator to the input dataset specified by the `dataset_id`.
-        Semantic Top-K operator uses the input dataset's index() method to retrieve the top-k most semantically similar items.
-        If the index() method is not implemented for the dataset, then the index is constructed on-the-fly.
+        """Truncate the input dataset to the first *n* items.
+
+        Requires:
+            - *dataset_id* is a key in *input_datasets*.
+
+        Returns:
+            A new ``dict[str, Dataset]`` that is a copy of *input_datasets*
+            with an additional entry keyed by ``self.output_dataset_id``
+            containing at most ``self.n`` items.
+
+        Raises:
+            KeyError: If *dataset_id* is not in *input_datasets*.
         """
         # retrieve the input dataset
         input_dataset = input_datasets[dataset_id]

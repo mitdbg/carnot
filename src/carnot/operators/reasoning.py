@@ -31,9 +31,20 @@ from carnot.operators.code import CodeActionOutput, CodeOperator, FinalAnswerSte
 
 
 class ReasoningOperator(CodeOperator):
-    """
-    Represents a reasoning operator. For our purposes, this is a code operator with a prompt specialized
-    for reasoning over the input datasets to produce an output dataset.
+    """Reasoning operator — a ``CodeOperator`` with a prompt specialised for reasoning.
+
+    Inherits the full agentic generate/execute loop from ``CodeOperator``
+    but loads ``reasoning_operator.yaml`` prompts instead of
+    ``code_operator.yaml``.  The final answer is expected to include a
+    ``final_items`` key in its code state.
+
+    Representation invariant:
+        Same as ``CodeOperator``, plus ``prompt_templates`` are loaded from
+        ``reasoning_operator.yaml``.
+
+    Abstraction function:
+        An instance of this class is a ``CodeOperator`` whose prompts guide the LLM to
+        reason over the input datasets and produce structured output items.
     """
     def __init__(self, task: str, output_dataset_id: str, model_id: str, llm_config: dict, tools: list[Tool] | None = None, additional_authorized_imports: list[str] | None = None, max_steps: int = 20):
         super().__init__(task, output_dataset_id, model_id, llm_config, tools, additional_authorized_imports, max_steps)
@@ -190,9 +201,19 @@ class ReasoningOperator(CodeOperator):
         )
 
     def __call__(self, input_datasets: dict[str, Dataset]) -> dict[str, Dataset]:
-        """
-        Reason and execute code to complete the task with the given input datasets.
-        The operator will return a new dataset containing the output of the reasoning process.
+        """Execute the reasoning loop and return the resulting datasets.
+
+        Requires:
+            - *input_datasets* is a non-empty ``dict[str, Dataset]``.
+
+        Returns:
+            A new ``dict[str, Dataset]`` with an additional entry keyed by
+            ``self.output_dataset_id`` whose ``items`` are the
+            ``final_items`` from the code state.
+
+        Raises:
+            AgentGenerationError: If the LLM fails on the first step.
+            KeyError: If ``final_items`` is absent from the code state.
         """
         self.python_executor.send_variables(variables={"input_datasets": input_datasets})
         self.python_executor.send_tools({**self.tools})

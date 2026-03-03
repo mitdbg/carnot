@@ -24,8 +24,21 @@ from carnot.data.dataset import Dataset
 
 
 class SemAggOperator:
-    """
-    Represents a semantic aggregation operator.
+    """Semantic aggregation operator — reduces a dataset to a single output row.
+
+    All items are sent to the LLM in a single call.  The LLM produces JSON
+    with the requested ``agg_fields``.  Missing fields default to ``None``.
+
+    Representation invariant:
+        - ``agg_fields`` is a non-empty list of dicts, each with a ``'name'``
+          key.
+        - ``output_tags`` is ``["```json", "```"]``.
+        - ``max_steps >= 1``.
+
+    Abstraction function:
+        An instance of this class is a callable that, given a dataset, returns
+        a new single-item dataset containing the LLM-produced aggregation of
+        all input items.
     """
     def __init__(self, task: str, agg_fields: list[dict], output_dataset_id: str, model_id: str, llm_config: dict, max_workers: int, max_steps: int = 3):
         self.task = task
@@ -60,8 +73,18 @@ class SemAggOperator:
         return messages
 
     def _sem_agg(self, items: list[dict], system_prompt: str) -> dict | None:
-        """
-        Apply the semantic agg to the given items. Returns a single output item with the aggregated fields.
+        """Aggregate all *items* via a single LLM call.
+
+        Requires:
+            - *items* is a non-empty list of dicts.
+            - *system_prompt* is a pre-populated prompt string.
+
+        Returns:
+            A single dict with keys from ``agg_fields``.  Missing fields
+            are set to ``None``.
+
+        Raises:
+            AgentGenerationError: If the LLM call itself fails.
         """
         memory = AgentMemory("")
         memory.system_prompt = SystemPromptStep(system_prompt=system_prompt)
@@ -110,9 +133,18 @@ class SemAggOperator:
         return output_json
 
     def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> dict[str, Dataset]:
-        """
-        Apply a semantic aggregation to the input dataset specified by the `dataset_id`.
-        Semantic aggregations may only be applied to the input dataset's `items` attribute.
+        """Execute the semantic aggregation over the input dataset.
+
+        Requires:
+            - *dataset_id* is a key in *input_datasets*.
+
+        Returns:
+            A new ``dict[str, Dataset]`` that is a copy of *input_datasets*
+            with an additional entry keyed by ``self.output_dataset_id``
+            containing a single aggregated item.
+
+        Raises:
+            KeyError: If *dataset_id* is not in *input_datasets*.
         """
         # retrieve items from the input dataset
         items = input_datasets[dataset_id].items

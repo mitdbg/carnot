@@ -1,7 +1,10 @@
+import pytest
+
 from carnot.data.dataset import Dataset
 from carnot.operators.sem_filter import SemFilterOperator
 
 
+@pytest.mark.llm
 def test_sem_filter_operator_basic(test_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [
@@ -31,6 +34,7 @@ def test_sem_filter_operator_basic(test_model_id, llm_config):
     assert {"animal": "elephant"} in output_dataset.items
 
 
+@pytest.mark.llm
 def test_sem_filter_operator_movie_reviews(test_model_id, llm_config, movie_reviews_data):
     # load movie reviews data
     _, reviews_df = movie_reviews_data

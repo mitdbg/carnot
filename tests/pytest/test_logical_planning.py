@@ -7,44 +7,18 @@ Tests cover:
 3. Plan paraphrasing to natural language
 """
 import json
-import os
 
 import pytest
+from helpers.assertions import (
+    assert_agent_did_not_hit_max_steps,
+    assert_planner_did_not_hit_max_steps,
+)
 
 from carnot.agents.data_discovery import DataDiscoveryAgent
 from carnot.agents.models import LiteLLMModel
 from carnot.agents.planner import Planner
-from carnot.agents.utils import AgentMaxStepsError
 
-
-def assert_agent_did_not_hit_max_steps(agent) -> None:
-    """
-    Assert that an agent did not hit its max_steps limit.
-    
-    Checks the agent's memory for AgentMaxStepsError in the last step.
-    These simple tests should never require the agent to reach max_steps.
-    """
-    if agent.memory.steps:
-        last_step = agent.memory.steps[-1]
-        error = getattr(last_step, "error", None)
-        assert not isinstance(error, AgentMaxStepsError), (
-            f"Agent hit max_steps limit ({agent.max_steps}). "
-            "This simple task should complete in fewer steps."
-        )
-
-
-def assert_planner_did_not_hit_max_steps(planner, result) -> None:
-    """
-    Assert that the planner did not hit its max_steps limit.
-    
-    The planner returns a specific string when max_steps is reached.
-    These simple tests should never require the planner to reach max_steps.
-    """
-    max_steps_message = "The agent did not return a final answer within the maximum number of steps."
-    assert result != max_steps_message, (
-        f"Planner hit max_steps limit ({planner.max_steps}). "
-        "This simple task should complete in fewer steps."
-    )
+pytestmark = pytest.mark.llm
 
 
 class TestDataDiscoveryAgent:
@@ -441,10 +415,3 @@ class TestEndToEndPlanning:
         assert "Code" in operators, f"Expected Code operator for field lookup, got: {operators}"
         
         planner.cleanup()
-
-
-# Mark tests that require API key
-pytestmark = pytest.mark.skipif(
-    not os.getenv("OPENAI_API_KEY"),
-    reason="OPENAI_API_KEY not set"
-)

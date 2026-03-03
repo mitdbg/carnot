@@ -1,7 +1,10 @@
+import pytest
+
 from carnot.data.dataset import Dataset
 from carnot.operators.sem_flat_map import SemFlatMapOperator
 
 
+@pytest.mark.llm
 def test_sem_flat_map_operator_basic(test_model_id, llm_config):
     # construct dataset of various fruits
     fruit_data = [
@@ -40,6 +43,7 @@ def test_sem_flat_map_operator_basic(test_model_id, llm_config):
     assert {"fruit": "grape", "color": "purple"} in output_dataset.items
 
 
+@pytest.mark.llm
 def test_sem_flat_map_operator_movie_reviews(test_model_id, llm_config, research_papers_data):
     # load movie reviews data
     papers = research_papers_data

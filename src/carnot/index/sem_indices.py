@@ -6,33 +6,37 @@ from pathlib import Path
 
 import numpy as np
 
-from carnot.data.item import DataItem
-from carnot.index.hierarchical_types import (
+from carnot.index.models import (
     FileSummaryEntry,
     HierarchicalIndexConfig,
     InternalNode,
 )
-from carnot.index.persistence import FileSummaryCache
-from carnot.index.smv_generator import SMVGenerator
+from carnot.storage.config import StorageConfig
 from carnot.utils.hash_helpers import hash_for_id
 
 logger = logging.getLogger(__name__)
-
-
-def _get_routing_storage_base() -> Path:
-    base = Path.home() / ".carnot"
-    if os.getenv("CARNOT_HOME"):
-        base = Path(os.getenv("CARNOT_HOME"))
-    return base / "routing"
 
 
 # Max file summaries to send to LLM at once (context limit)
 FLAT_INDEX_MAX_LLM_ITEMS = 40
 
 class FlatFileIndex:
-    """
-    Single-level index: all file summaries in one flat list. At query time, sends summaries to LLM to pick the top-K most relevant.
-    When file count exceeds context limit, uses embedding similarity to pre-filter then LLM picks top-K from that set.
+    """Single-level index over file summaries for query-time retrieval.
+
+    All file summaries are stored in a flat list.  At query time, if the
+    number of summaries fits within the LLM context limit (controlled by
+    ``max_llm_items``), they are sent directly to the LLM for top-k
+    selection.  Otherwise, embedding cosine similarity pre-filters to
+    ``max_llm_items`` candidates, and the LLM selects from that subset.
+
+    Public attributes after construction:
+
+    - ``file_summaries`` (``list[FileSummaryEntry]``): the stored summaries.
+    - ``max_llm_items`` (``int``): defaults to ``FLAT_INDEX_MAX_LLM_ITEMS``.
+
+    Representation invariant:
+        - ``_embeddings`` is ``None`` iff ``file_summaries`` is empty.
+        - When not ``None``, ``_embeddings.shape == (len(file_summaries), embedding_dim)``.
     """
 
     def __init__(
@@ -56,23 +60,37 @@ class FlatFileIndex:
     def from_items(
         cls,
         name: str,
-        items: list[DataItem],
+        items: list[dict],
         config: HierarchicalIndexConfig | None = None,
         api_key: str | None = None,
         storage_dir: Path | None = None,
-        use_persistence: bool = True,
-        summary_generator=None,
+        summary_layer=None,
     ) -> FlatFileIndex | None:
-        """Build index from DataItems. Summarizes files, caches. Returns None if summaries cannot be generated."""
+        """Build a :class:`FlatFileIndex` from dict objects.
+
+        Summarises each item via *summary_layer* (defaulting to a new
+        :class:`SummaryLayer`), caches summaries on disk, and constructs
+        the index.
+
+        Requires:
+            - *items* is a non-empty list of dict instances.
+
+        Returns:
+            A :class:`FlatFileIndex`, or ``None`` if no summaries could
+            be generated.
+
+        Raises:
+            None.  Failures for individual items are logged and skipped.
+        """
         if not items:
             return None
 
-        base = storage_dir or _get_routing_storage_base()
-        summary_cache = FileSummaryCache(base / "summaries") if use_persistence else None
-        summary_generator = summary_generator or SMVGenerator()
-        summaries = HierarchicalFileIndex._get_or_build_summaries(
-            items, summary_generator, summary_cache
+        from carnot.index.summary_layer import SummaryLayer
+
+        layer = summary_layer or SummaryLayer(
+            config=config, api_key=api_key, storage_dir=storage_dir,
         )
+        summaries = layer.get_or_build_summaries(items)
         if not summaries:
             logger.warning("No file summaries could be generated for FlatFileIndex")
             return None
@@ -159,15 +177,37 @@ Return only the comma-separated numbers, nothing else:"""
 
 
 class HierarchicalFileIndex:
-    """
-    B-tree-like index over file summaries.
+    """B-tree-like index over file summaries.
 
     - Leaves: file summaries (path, summary, embedding)
     - Internal nodes: LLM-generated summaries of children
     - Top level sized to fit router context
     - Search: top-down traversal by query embedding similarity
 
-    Use from_items() to build from raw DataItems (summarizes, embeds, caches).
+    Use ``from_items()`` to build from raw dictionaries (summaries, embeds, caches).
+
+    Construction parameters:
+
+    - *build* (``bool``, default ``True``): if ``True``, ``_build()`` is
+      called automatically.  Pass ``False`` to defer building (useful for
+      testing or when loading from cache).
+
+    After construction (with ``build=True`` or after calling ``_build()``):
+
+    - ``_path_to_summary``: ``dict[str, FileSummaryEntry]`` mapping each
+      file path to its summary entry.
+    - ``_root_level``: ``list[InternalNode | FileSummaryEntry]``.
+      When the file count is below ``config.min_files_for_hierarchy``,
+      the root level is the raw ``FileSummaryEntry`` list (flat mode).
+      Otherwise it is a list of ``InternalNode`` objects.
+    - ``_embeddings``: ``np.ndarray | None``.  ``None`` only when
+      ``file_summaries`` is empty.
+
+    ``_max_root_nodes()`` returns the maximum number of nodes that fit
+    in the router context, calculated as::
+
+        max(2, router_context_limit * context_usage_fraction
+                / tokens_per_summary_estimate)
     """
 
     def __init__(
@@ -199,43 +239,52 @@ class HierarchicalFileIndex:
     def from_items(
         cls,
         name: str,
-        items: list[DataItem],
+        items: list[dict],
         config: HierarchicalIndexConfig | None = None,
         api_key: str | None = None,
         storage_dir: Path | None = None,
-        use_persistence: bool = True,
-        summary_generator=None,
-    ) -> "HierarchicalFileIndex | None":
-        """
-        Build index from DataItems. Summarizes files, caches, builds hierarchy.
-        Returns None if summaries cannot be generated.
+        summary_layer=None,
+    ) -> HierarchicalFileIndex | None:
+        """Build a :class:`HierarchicalFileIndex` from dict objects.
+
+        Summarises each item, caches summaries and the built index on
+        disk, and constructs the hierarchy.
+
+        Requires:
+            - *items* is a non-empty list of dict instances.
+
+        Returns:
+            A :class:`HierarchicalFileIndex`, or ``None`` if no
+            summaries could be generated.
+
+        Raises:
+            None.  Failures for individual items are logged and skipped.
         """
         if not items:
             return None
 
-        from carnot.index.persistence import FileSummaryCache, HierarchicalIndexCache
-        from carnot.index.smv_generator import SMVGenerator
+        from carnot.index.sem_indices_cache import HierarchicalIndexCache
+        from carnot.index.summary_layer import SummaryLayer
 
         api_key = api_key or os.getenv("OPENAI_API_KEY")
         config = config or HierarchicalIndexConfig()
-        summary_generator = summary_generator or SMVGenerator()
 
-        base = storage_dir or _get_routing_storage_base()
-        summary_cache = FileSummaryCache(base / "summaries") if use_persistence else None
-        index_cache = HierarchicalIndexCache(base / "indices") if use_persistence else None
+        storage_config = StorageConfig()
+        hier_dir = storage_dir or storage_config.hierarchical_dir
+        index_cache = HierarchicalIndexCache(storage_dir=hier_dir)
 
         paths = [i.path for i in items if i.path]
         cache_key = hash_for_id("|".join(sorted(paths)))
 
-        if index_cache:
-            index = index_cache.load(paths, config=config, api_key=api_key)
-            if index is not None:
-                logger.debug("Loaded index from cache for %d files", len(paths))
-                return index
+        index = index_cache.load(paths, config=config, api_key=api_key)
+        if index is not None:
+            logger.debug("Loaded index from cache for %d files", len(paths))
+            return index
 
-        summaries = cls._get_or_build_summaries(
-            items, summary_generator, summary_cache
+        layer = summary_layer or SummaryLayer(
+            config=config, api_key=api_key, storage_dir=storage_dir,
         )
+        summaries = layer.get_or_build_summaries(items)
         if not summaries:
             logger.warning("No file summaries could be generated")
             return None
@@ -246,84 +295,11 @@ class HierarchicalFileIndex:
             config=config,
             api_key=api_key,
         )
-        if index_cache:
-            try:
-                index_cache.save(index)
-            except Exception as e:
-                logger.warning("Failed to persist index: %s", e)
-        return index
-
-    @staticmethod
-    def _get_file_text(item: DataItem) -> str:
         try:
-            d = item.to_dict()
-            return d.get("contents", "") or ""
-        except Exception:
-            return ""
-
-    @staticmethod
-    def _build_file_summaries(
-        items: list[DataItem],
-        summary_generator,
-        summary_cache: "FileSummaryCache | None",
-    ) -> list[FileSummaryEntry]:
-        skip_suffixes = {".jpg", ".jpeg", ".png", ".gif", ".zip", ".exe", ".bin"}
-        entries: list[FileSummaryEntry] = []
-
-        for item in items:
-            if not item.path:
-                continue
-            if Path(item.path).suffix.lower() in skip_suffixes:
-                continue
-            try:
-                text = HierarchicalFileIndex._get_file_text(item)
-                if not text.strip():
-                    continue
-                fs = summary_generator.generate_file_summary(
-                    file_id=item.path,
-                    text_content=text,
-                    file_path=item.path,
-                )
-                emb = fs.summary_embedding
-                if emb is None and summary_generator.emb_fn:
-                    emb = summary_generator.emb_fn([fs.global_summary])[0]
-                if emb is None:
-                    continue
-                entry = FileSummaryEntry(path=item.path, summary=fs.global_summary, embedding=emb)
-                entries.append(entry)
-                if summary_cache:
-                    try:
-                        summary_cache.save(entry)
-                    except Exception as e:
-                        logger.warning("Failed to persist summary for %s: %s", item.path, e)
-            except Exception as e:
-                logger.warning("Failed to summarize %s: %s", item.path, e)
-        return entries
-
-    @staticmethod
-    def _get_or_build_summaries(
-        items: list[DataItem],
-        summary_generator,
-        summary_cache: "FileSummaryCache | None",
-    ) -> list[FileSummaryEntry]:
-        skip_suffixes = {".jpg", ".jpeg", ".png", ".gif", ".zip", ".exe", ".bin"}
-        paths = [
-            i.path for i in items
-            if i.path and Path(i.path).suffix.lower() not in skip_suffixes
-        ]
-        if summary_cache:
-            loaded, missing_paths = summary_cache.load_many(paths)
-            items_to_compute = [i for i in items if i.path in missing_paths]
-        else:
-            loaded = {}
-            items_to_compute = [i for i in items if i.path and Path(i.path).suffix.lower() not in skip_suffixes]
-        if items_to_compute:
-            new_entries = HierarchicalFileIndex._build_file_summaries(
-                items_to_compute, summary_generator, summary_cache
-            )
-            for entry in new_entries:
-                loaded[entry.path] = entry
-        return list(loaded.values())
+            index_cache.save(index)
+        except Exception as e:
+            logger.warning("Failed to persist index: %s", e)
+        return index
 
     def _max_root_nodes(self) -> int:
         """Max nodes at root level that fit in router context."""

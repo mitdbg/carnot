@@ -20,12 +20,26 @@ from carnot.agents.utils import (
     AgentParsingError,
     parse_boolean_output,
 )
-from carnot.data.dataset import DataItem, Dataset
+from carnot.data.dataset import Dataset
 
 
 class SemFilterOperator:
-    """
-    Represents a semantic filter operator.
+    """Semantic filter operator — retains or discards items via an LLM boolean judgement.
+
+    For every item in the input dataset the operator asks the LLM whether the
+    item satisfies *task*.  Items for which the LLM answers ``True`` are kept;
+    all others are dropped.  Retries up to *max_steps* times per item on parse
+    errors.
+
+    Representation invariant:
+        - ``model`` is a ready-to-call ``LiteLLMModel`` instance.
+        - ``output_tags`` is a two-element list ``[open_tag, close_tag]``.
+        - ``max_steps >= 1``.
+
+    Abstraction function:
+        An instance of this class is a callable that, given a dataset, returns
+        a new dataset containing only the items for which the LLM answers ``True``
+        to the natural-language predicate ``task``.
     """
     def __init__(self, task: str, output_dataset_id: str, model_id: str, llm_config: dict, max_workers: int, max_steps: int = 3):
         self.task = task
@@ -59,14 +73,22 @@ class SemFilterOperator:
         return messages
 
     def _sem_filter(self, item: dict, system_prompt: str) -> dict | None:
-        """
-        Apply the semantic filter to the given item.
-        Returns the item if it passes the filter otherwise it returns None.
+        """Apply the semantic filter to a single item.
+
+        Requires:
+            - *item* is a dict (or ``DataItem``) representing one dataset row.
+            - *system_prompt* is a pre-populated prompt string.
+
+        Returns:
+            The original *item* if the LLM judges it passes the filter,
+            otherwise ``None``.
+
+        Raises:
+            AgentGenerationError: If the LLM call itself fails.
         """
         memory = AgentMemory("")
         memory.system_prompt = SystemPromptStep(system_prompt=system_prompt)
-        item_dict = item.to_dict() if isinstance(item, DataItem) else item
-        memory.steps.append(SemFilterOperatorStep(task=self.task, item=item_dict))
+        memory.steps.append(SemFilterOperatorStep(task=self.task, item=item))
         passes_filter, step_number = None, 0
         while passes_filter is None and step_number < self.max_steps:
             memory_step = ActionStep(step_number=1, timing=Timing(start_time=time.time()))
@@ -104,9 +126,20 @@ class SemFilterOperator:
         return item if passes_filter else None
 
     def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> dict[str, Dataset]:
-        """
-        Apply a semantic filter to the input dataset specified by the `dataset_id`.
-        Semantic filters may only be applied to the input dataset's `items` attribute.
+        """Execute the semantic filter over every item in the input dataset.
+
+        Requires:
+            - *dataset_id* is a key in *input_datasets*.
+            - ``input_datasets[dataset_id].items`` is an iterable of dicts.
+
+        Returns:
+            A **new** ``dict[str, Dataset]`` that is a copy of
+            *input_datasets* with an additional entry keyed by
+            ``self.output_dataset_id`` containing only the items that
+            passed the filter.
+
+        Raises:
+            KeyError: If *dataset_id* is not in *input_datasets*.
         """
         # retrieve items from the input dataset
         items = input_datasets[dataset_id].items

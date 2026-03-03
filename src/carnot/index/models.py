@@ -16,7 +16,13 @@ MAX_CHILDREN_PER_NODE = 10
 
 @dataclass
 class FileSummaryEntry:
-    """A file with its summary and embedding for indexing."""
+    """A file with its summary and embedding for indexing.
+
+    Fields:
+        - ``path`` (``str``): the file's URI / path.
+        - ``summary`` (``str``): human-readable summary text.
+        - ``embedding`` (``list[float]``): dense vector representation.
+    """
 
     path: str
     summary: str
@@ -25,7 +31,17 @@ class FileSummaryEntry:
 
 @dataclass
 class InternalNode:
-    """Internal node summarizing a cluster of files or child nodes."""
+    """Internal node summarizing a cluster of files or child nodes.
+
+    Fields:
+        - ``summary`` (``str``): text summary of the cluster.
+        - ``embedding`` (``list[float]``): dense vector representation.
+        - ``child_paths`` (``list[str]``): file paths when ``is_leaf_cluster`` is ``True``.
+        - ``is_leaf_cluster`` (``bool``): ``True`` if direct children
+          are files, ``False`` if they are ``InternalNode`` objects.
+        - ``children`` (``list[InternalNode] | None``): child nodes
+          when ``is_leaf_cluster`` is ``False``; ``None`` otherwise.
+    """
 
     summary: str
     embedding: list[float]
@@ -36,7 +52,16 @@ class InternalNode:
 
 @dataclass
 class HierarchicalIndexConfig:
-    """Configuration for building the hierarchical index."""
+    """Configuration for building the hierarchical index.
+
+    Defaults:
+        - ``min_files_for_hierarchy``: 20 (below this, flat mode).
+        - ``max_children_per_node``: 10.
+        - ``context_usage_fraction``: 0.5 (fraction of ``router_context_limit``
+          available for summaries).
+        - ``router_context_limit``: 32 000 tokens.
+        - ``tokens_per_summary_estimate``: 80.
+    """
 
     router_context_limit: int = DEFAULT_ROUTER_CONTEXT_LIMIT
     context_usage_fraction: float = CONTEXT_USAGE_FRACTION

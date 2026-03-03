@@ -53,8 +53,22 @@ class CodeActionOutput:
     is_final_answer: bool
 
 class CodeOperator:
-    """
-    Represents a code execution operator.
+    """Multi-step agentic code execution operator.
+
+    The operator uses an LLM to generate Python code, executes it in a
+    sandboxed ``LocalPythonExecutor``, observes the output, and iterates
+    until the LLM calls ``final_answer()`` or ``max_steps`` is reached.
+
+    Representation invariant:
+        - ``tools`` always contains a ``"final_answer"`` key mapping to a
+          ``FinalAnswerTool`` instance.
+        - ``python_executor`` is a ``LocalPythonExecutor`` instance.
+        - ``max_steps >= 1``.
+
+    Abstraction function:
+        An instance of this class is a callable that, given input datasets, uses an LLM to
+        iteratively generate and execute Python code until a final answer is produced, then
+        returns the result wrapped in a new ``Dataset``.
     """
     def __init__(self, task: str, output_dataset_id: str, model_id: str, llm_config: dict, tools: list[Tool] | None = None, additional_authorized_imports: list[str] | None = None, max_steps: int = 20):
         self.task = task
@@ -101,7 +115,10 @@ class CodeOperator:
         self.cleanup()
 
     def cleanup(self):
-        """Clean up resources used by the operator, such as the Python executor."""
+        """Release resources held by the Python executor.
+
+        Safe to call multiple times.
+        """
         if hasattr(self.python_executor, "cleanup"):
             self.python_executor.cleanup()
 
@@ -123,15 +140,20 @@ class CodeOperator:
         return messages
 
     def provide_final_answer(self, task: str) -> ChatMessage:
-        """
-        Provide the final answer to the task, based on the logs of the agent's interactions.
+        """Ask the LLM for a final answer based on the accumulated memory.
 
-        Args:
-            task (`str`): Task to perform.
-            images (`list[PIL.Image.Image]`, *optional*): Image(s) objects.
+        Called when ``max_steps`` is reached without an explicit
+        ``final_answer()`` call in generated code.
+
+        Requires:
+            - ``self.memory`` has at least one step recorded.
 
         Returns:
-            `str`: Final answer to the task.
+            A ``ChatMessage`` containing the LLM's final-answer response.
+
+        Raises:
+            None — generation errors are caught and returned as a
+            ``ChatMessage`` with the error text.
         """
         messages = [
             ChatMessage(
@@ -226,8 +248,20 @@ class CodeOperator:
         yield FinalAnswerStep(final_answer, final_execution_logs, final_code)
 
     def _step_generate_code(self, memory_step: ActionStep, input_datasets: dict[str, Dataset]) -> Generator[ToolCall | CodeActionOutput]:
-        """
-        Generate code to execute the given task on the input datasets.
+        """Run one generate → parse → execute cycle.
+
+        Requires:
+            - *memory_step* is a fresh ``ActionStep`` for this iteration.
+            - *input_datasets* is the current dataset dict.
+
+        Returns:
+            Yields a ``ToolCall`` (the parsed code) followed by a
+            ``CodeActionOutput`` (execution result).
+
+        Raises:
+            AgentGenerationError: If the LLM call fails.
+            AgentParsingError: If the output cannot be parsed as code.
+            AgentExecutionError: If the generated code raises at runtime.
         """
         system_prompt = populate_template(
             self.prompt_templates["code_gen_prompt"],
@@ -330,11 +364,23 @@ class CodeOperator:
         )
 
     def __call__(self, input_datasets: dict[str, Dataset]) -> dict[str, Dataset]:
-        """
-        Generate code to execute the given task on the input datasets.
-        The operator generates code and then immediately executes it using the PythonExecutor to observe the output.
-        The operator is then able to iterate on the code if needed until a satisfactory output is achieved or a
-        maximum number of iterations is reached.
+        """Execute the agentic code loop and return the resulting datasets.
+
+        The operator injects *input_datasets* and its tools into the
+        sandboxed executor, then iterates through generate/execute steps
+        until the LLM calls ``final_answer()`` or ``max_steps`` is reached.
+
+        Requires:
+            - *input_datasets* is a non-empty ``dict[str, Dataset]``.
+
+        Returns:
+            A new ``dict[str, Dataset]`` that is a copy of *input_datasets*
+            with an additional entry keyed by ``self.output_dataset_id``.
+
+        Raises:
+            AgentGenerationError: If the LLM fails on the first step.
+            AssertionError: If the run stream does not end with a
+            ``FinalAnswerStep``.
         """
         
         self.python_executor.send_variables(variables={"input_datasets": input_datasets})

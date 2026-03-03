@@ -25,11 +25,30 @@ from carnot.data.dataset import Dataset
 
 
 class SemGroupByOperator:
-    """
-    Represents a semantic group by operator.
+    """Semantic group-by operator — groups items then aggregates per group.
 
-    Supports min, max, mean, sum, count aggregations in addition to semantic aggregations.
-    Supports grouping over structured fields as well as grouping over semantic fields.
+    Execution proceeds in two phases:
+
+    1. **Grouping** (``_sem_group``): The LLM assigns group-by field values
+       to each item.  Deterministic fields could skip the LLM call (not yet
+       optimised).
+    2. **Aggregation**: Built-in aggregations (``min``, ``max``, ``mean``,
+       ``sum``, ``count``) are computed locally.  Any remaining aggregation
+       functions are delegated to the LLM via ``_sem_agg``.
+
+    Representation invariant:
+        - ``group_by_fields`` is a non-empty list of dicts with ``'name'``
+          keys.
+        - ``agg_fields`` is a non-empty list of dicts with ``'name'`` and
+          ``'func'`` keys.
+        - ``_sem_agg_fields`` ⊆ ``agg_fields`` and contains only fields
+          whose ``'func'`` is not in ``{min, max, count, sum, mean}``.
+        - ``max_steps >= 1``.
+
+    Abstraction function:
+        An instance of this class is a callable that, given a dataset, returns
+        a new dataset with one row per group, each containing the computed
+        aggregation values.
     """
     def __init__(self, task: str, group_by_fields: list[dict], agg_fields: list[dict], output_dataset_id: str, model_id: str, llm_config: dict, max_workers: int, max_steps: int = 3):
         self.task = task
@@ -69,8 +88,17 @@ class SemGroupByOperator:
         return messages
 
     def _sem_group(self, item: dict, system_prompt: str) -> dict | None:
-        """
-        Compute the (semantic) group by fields for each input item.
+        """Compute the group-by field values for a single item via the LLM.
+
+        Requires:
+            - *item* is a dict representing one dataset row.
+
+        Returns:
+            The *item* dict, mutated in-place with the group-by field values.
+            Missing fields are set to ``None``.
+
+        Raises:
+            AgentGenerationError: If the LLM call itself fails.
         """
         memory = AgentMemory("")
         memory.system_prompt = SystemPromptStep(system_prompt=system_prompt)
@@ -126,10 +154,21 @@ class SemGroupByOperator:
         return item
 
     def _sem_agg(self, items: list[dict], system_prompt: str, group_key: tuple[str]) -> dict | None:
-        """
-        Apply the semantic agg to the given items. Returns a single output item with the aggregated fields.
+        """Aggregate items within a single group via the LLM.
 
-        TODO: reduce code duplication by actually reusing this from Semantic Aggregation function
+        Only the fields in ``_sem_agg_fields`` are aggregated here; built-in
+        aggregations are handled in ``__call__``.
+
+        Requires:
+            - *items* is a non-empty list of dicts belonging to the same group.
+            - *group_key* identifies the group.
+
+        Returns:
+            ``(group_key, output_dict)`` where *output_dict* contains the
+            aggregated field values.
+
+        Raises:
+            AgentGenerationError: If the LLM call itself fails.
         """
         memory = AgentMemory("")
         memory.system_prompt = SystemPromptStep(system_prompt=system_prompt)
@@ -178,9 +217,22 @@ class SemGroupByOperator:
         return group_key, output_json
 
     def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> dict[str, Dataset]:
-        """
-        Apply a semantic group by to the input dataset specified by the `dataset_id`.
-        Semantic group bys may only be applied to the input dataset's `items` attribute.
+        """Execute the two-phase semantic group-by over the input dataset.
+
+        Phase 1 computes group-by field values (potentially via LLM).
+        Phase 2 computes aggregations per group — built-in functions are
+        evaluated locally; semantic aggregations are delegated to the LLM.
+
+        Requires:
+            - *dataset_id* is a key in *input_datasets*.
+
+        Returns:
+            A new ``dict[str, Dataset]`` that is a copy of *input_datasets*
+            with an additional entry keyed by ``self.output_dataset_id``
+            containing one row per group.
+
+        Raises:
+            KeyError: If *dataset_id* is not in *input_datasets*.
         """
         # retrieve items from the input dataset
         items = input_datasets[dataset_id].items

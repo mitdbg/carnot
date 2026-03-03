@@ -69,7 +69,6 @@ def small_enron_dataset_with_index(llm_config, enron_data_items_small):
         name="enron-flat",
         items=enron_data_items_small,
         api_key=llm_config.get("OPENAI_API_KEY"),
-        use_persistence=True,
     )
     return Dataset(
         name="Enron Emails",
@@ -88,7 +87,6 @@ def enron_dataset_with_flat_index(llm_config, enron_data_items):
         name="enron-flat-big",
         items=enron_data_items,
         api_key=llm_config.get("OPENAI_API_KEY"),
-        use_persistence=True,
     )
 
     return Dataset(
@@ -105,7 +103,6 @@ def enron_dataset_with_hierarchical_index(llm_config, enron_data_items):
         name="enron-hierarchical",
         items=enron_data_items,
         api_key=llm_config.get("OPENAI_API_KEY"),
-        use_persistence=True,
     )
 
     return Dataset(

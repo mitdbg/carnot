@@ -1,19 +1,9 @@
+import pytest
+from helpers.assertions import assert_planner_did_not_hit_max_steps
+
 from carnot.execution.execution import Execution
 
-
-def assert_planner_did_not_hit_max_steps(planner, result) -> None:
-    """Assert planner did not hit max_steps limit."""
-    from carnot.agents.utils import AgentMaxStepsError
-
-    max_steps_message = "The agent did not return a final answer within the maximum number of steps."
-    assert result != max_steps_message, (
-        f"Planner hit max_steps limit ({planner.max_steps}). "
-        "This simple task should complete in fewer steps."
-    )
-    if hasattr(planner, "planning_memory") and planner.planning_memory and planner.planning_memory.steps:
-        last_step = planner.planning_memory.steps[-1]
-        error = getattr(last_step, "error", None)
-        assert not isinstance(error, AgentMaxStepsError), f"Planner hit max_steps: {error}"
+pytestmark = pytest.mark.llm
 
 
 def _plan_contains_sem_topk(logical_plan) -> bool:

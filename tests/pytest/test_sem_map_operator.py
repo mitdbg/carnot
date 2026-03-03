@@ -1,7 +1,10 @@
+import pytest
+
 from carnot.data.dataset import Dataset
 from carnot.operators.sem_map import SemMapOperator
 
 
+@pytest.mark.llm
 def test_sem_map_operator_basic(test_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [
@@ -35,6 +38,7 @@ def test_sem_map_operator_basic(test_model_id, llm_config):
     assert {"animal": "tucan", "animal_group": "bird"} in output_dataset.items
 
 
+@pytest.mark.llm
 def test_sem_map_operator_movie_reviews(test_model_id, llm_config, movie_reviews_data):
     # load movie reviews data
     _, reviews_df = movie_reviews_data

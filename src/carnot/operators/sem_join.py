@@ -24,8 +24,20 @@ from carnot.data.dataset import Dataset
 
 
 class SemJoinOperator:
-    """
-    Represents a semantic join operator.
+    """Semantic join operator — cross-product join filtered by an LLM boolean predicate.
+
+    For every ``(left, right)`` pair the LLM is asked whether the pair
+    satisfies *task*.  Pairs that pass are merged into a single output
+    dict.  Shared keys are prefixed with ``left_`` / ``right_``.
+
+    Representation invariant:
+        - ``output_tags`` is ``["```text", "```"]``.
+        - ``max_steps >= 1``.
+
+    Abstraction function:
+        An instance of this class is a callable that, given a left and right dataset,
+        returns a new dataset containing the cross-product of items that the LLM judges
+        as matching under ``task``.
     """
     def __init__(self, task: str, model_id: str, llm_config: dict, output_dataset_id: str, max_workers: int, max_steps: int = 3):
         self.task = task
@@ -59,8 +71,18 @@ class SemJoinOperator:
         return messages
 
     def _sem_join(self, left_item: dict, right_item: dict, system_prompt: str) -> dict | None:
-        """
-        Apply the semantic join to the given item. Returns the item with the additional mapped fields.
+        """Evaluate whether a single ``(left, right)`` pair should be joined.
+
+        Requires:
+            - *left_item* and *right_item* are dicts.
+            - *system_prompt* is a pre-populated prompt string.
+
+        Returns:
+            A merged dict if the LLM judges the pair as matching, otherwise
+            ``None``.  Shared keys receive ``left_`` / ``right_`` prefixes.
+
+        Raises:
+            AgentGenerationError: If the LLM call itself fails.
         """
         memory = AgentMemory("")
         memory.system_prompt = SystemPromptStep(system_prompt=system_prompt)
@@ -119,9 +141,19 @@ class SemJoinOperator:
         return output_dict
 
     def __call__(self, left_dataset_id: str, right_dataset_id: str, input_datasets: dict[str, Dataset]) -> dict[str, Dataset]:
-        """
-        Apply a semantic map to the input dataset specified by the `dataset_id`.
-        Semantic maps may only be applied to the input dataset's `items` attribute.
+        """Execute the semantic join over the cross-product of two datasets.
+
+        Requires:
+            - *left_dataset_id* and *right_dataset_id* are keys in
+              *input_datasets*.
+
+        Returns:
+            A new ``dict[str, Dataset]`` that is a copy of *input_datasets*
+            with an additional entry keyed by ``self.output_dataset_id``
+            containing the joined rows.
+
+        Raises:
+            KeyError: If either dataset id is not in *input_datasets*.
         """
         # retrieve left and right items from the input datasets
         left_items = input_datasets[left_dataset_id].items

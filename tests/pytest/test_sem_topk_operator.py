@@ -1,7 +1,10 @@
+import pytest
+
 from carnot.data.dataset import Dataset
 from carnot.operators.sem_topk import SemTopKOperator
 
 
+@pytest.mark.llm
 def test_sem_topk_operator_basic(test_embedding_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [
@@ -31,6 +34,7 @@ def test_sem_topk_operator_basic(test_embedding_model_id, llm_config):
     assert {"animal": "elephant"} in output_dataset.items
 
 
+@pytest.mark.llm
 def test_sem_topk_operator_movie_reviews(test_embedding_model_id, llm_config, movie_reviews_data):
     # load movie reviews data
     _, reviews_df = movie_reviews_data
@@ -65,6 +69,7 @@ def test_sem_topk_operator_movie_reviews(test_embedding_model_id, llm_config, mo
     accuracy = total_correct / total
     assert accuracy >= 0.8
 
+@pytest.mark.llm
 def test_sem_topk_operator_with_index(test_embedding_model_id, llm_config, enron_data_items):
     """SemTopKOperator with Flat index finds Raptor-related emails."""
     emails_dataset = Dataset(

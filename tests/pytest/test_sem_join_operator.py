@@ -1,7 +1,10 @@
+import pytest
+
 from carnot.data.dataset import Dataset
 from carnot.operators.sem_join import SemJoinOperator
 
 
+@pytest.mark.llm
 def test_sem_join_operator_basic(test_model_id, llm_config):
     # construct two datasets with various animals and sounds
     animal_data = [
@@ -42,6 +45,7 @@ def test_sem_join_operator_basic(test_model_id, llm_config):
     assert {"animal": "sheep", "sound": "baaa"} in output_dataset.items
     assert {"animal": "pig", "sound": "oink"} in output_dataset.items
 
+@pytest.mark.llm
 def test_sem_join_operator_papers(test_model_id, llm_config, research_papers_data):
     # load research papers data
     papers = research_papers_data

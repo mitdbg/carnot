@@ -18,20 +18,20 @@ system_prompt: |-
   print(f"Dataset: {ds.name}")
   print(f"Annotation: {ds.annotation}")
   print(f"Number of items: {len(ds.items)}")
-  print(f"Has index: {ds.has_index()}")
+  print(f"Has index: {ds.has_indices()}")
   {{code_closing_tag}}
 
   **Inspecting Dataset Schema:**
-  Each item in a dataset is a `DataItem` object. To see the available fields, call `.to_dict()` on an item:
+  To see the available fields, call `.sample(n: int, random: bool = True)` on the dataset. This will return a list of `n` dictionaries where each dictionary is a materialized item in the dataset. You can inspect the keys of these dictionaries to understand the schema. For example:
   {{code_opening_tag}}
   ds = datasets["Dataset Name"]
   if ds.items:
-      sample_item = ds.items[0]
-      item_dict = sample_item.to_dict()
+      sample_items = ds.sample(n=5, random=True)
       print("Available fields:")
-      for key, value in item_dict.items():
-          # Use typename() helper to get the type name safely
-          print(f"  - {key}: {typename(value)}")
+      for item_dict in sample_items:
+        for key, value in item_dict.items():
+            # Use typename() helper to get the type name safely
+            print(f"  - {key}: {typename(value)}")
   {{code_closing_tag}}
 
   **Helper Functions:**
@@ -41,7 +41,7 @@ system_prompt: |-
   **Available Imports:**
   You can import these modules: json, html, textwrap, copy, functools, operator, string, csv, collections, datetime, itertools, math, random, re, statistics, time, unicodedata
 
-  **Important:** The schema consists ONLY of the keys returned by `DataItem.to_dict()`. These are the programmatically accessible fields. If you observe that the *contents* of a field (e.g., document text) contains additional information like titles, authors, or dates, you should note this as potential information that could be extracted using semantic operators, but these are NOT part of the schema.
+  **Important:** The schema consists ONLY of the keys returned by printing the `sample_items` sampled from the dataset. These are the programmatically accessible fields. If you observe that the *contents* of a field (e.g., document text) contains additional information like titles, authors, or dates, you should note this as potential information that could be extracted using semantic operators, but these are NOT part of the schema.
 
   **Classifying Field Types:**
   When reporting schemas, classify each field as:
@@ -52,9 +52,10 @@ system_prompt: |-
   To understand dataset contents, sample multiple items:
   {{code_opening_tag}}
   ds = datasets["Dataset Name"]
-  sample_size = min(5, len(ds.items))
-  for item in ds.items[:sample_size]:
-      print(item.to_dict())
+  sample_items = ds.sample(n=5, random=True)
+  print("Sample items:")
+  for item in sample_items:
+      print(item)
       print("---")
   {{code_closing_tag}}
 
@@ -76,7 +77,7 @@ system_prompt: |-
   You can use this to draw samples and to report on which indices exist for the dataset.
 
   **Index Types:**
-  Datasets may have one or more indices. Call `ds.list_indices()` to get available index names (e.g., "flat", "hierarchical", "chroma"). Use `ds.get_index_type_string(index_name)` for a specific index. When reporting, note which indices exist so the Planner can pass `index_name` to `sem_topk()`.
+  Datasets may have one or more indices. Call `ds.list_indices()` to get available index names (e.g., "flat", "hierarchical", "chroma"). Use `ds.get_index_type_string(index_name)` to get the class name for a specific index. When reporting, note which indices exist so the Planner can pass `index_name` to `sem_topk()`.
   {%- for class_name, description in index_types.items() %}
   - **{{ class_name }}**: {{ description }}
   {%- endfor %}
@@ -119,10 +120,10 @@ system_prompt: |-
   # Step 1: List all datasets
   for name, ds in datasets.items():
       print(f"Dataset: {name}, Items: {len(ds.items)}, Annotation: {ds.annotation}")
-      print(f"  Has index: {ds.has_index()}")
+      print(f"  Has index: {ds.has_indices()}")
       # Show schema from first item
       if ds.items:
-          item_dict = ds.items[0].to_dict()
+          item_dict = ds.sample(n=1, random=False)[0]
           print(f"  Fields: {list(item_dict.keys())}")
       print()
   {{code_closing_tag}}
@@ -131,7 +132,7 @@ system_prompt: |-
   {{code_opening_tag}}
   # Step 2: Examine "SEC Filings" dataset
   ds = datasets["SEC Filings"]
-  item = ds.items[0].to_dict()
+  item = ds.sample(n=1, random=False)[0]
   for key, val in item.items():
       val_preview = str(val)[:100] + "..." if len(str(val)) > 100 else str(val)
       print(f"  - {key} ({typename(val)}): {val_preview}")

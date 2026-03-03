@@ -24,8 +24,22 @@ from carnot.data.dataset import Dataset
 
 
 class SemFlatMapOperator:
-    """
-    Represents a semantic flat map operator.
+    """Semantic flat-map operator — expands each item into zero or more output items.
+
+    For every item the LLM is asked to produce a JSON *list* of new items
+    with the specified ``output_fields``.  All per-item lists are flattened
+    into a single output dataset.  Missing fields default to ``None``.
+
+    Representation invariant:
+        - ``output_fields`` is a non-empty list of dicts, each with a
+          ``'name'`` key.
+        - ``output_tags`` is ``["```json", "```"]``.
+        - ``max_steps >= 1``.
+
+    Abstraction function:
+        An instance of this class is a callable that, given a dataset, returns
+        a new dataset where each original item has been expanded into zero or
+        more items according to the LLM's response.
     """
     def __init__(self, task: str, output_fields: list[dict], output_dataset_id: str, model_id: str, llm_config: dict, max_workers: int, max_steps: int = 3):
         self.task = task
@@ -60,8 +74,18 @@ class SemFlatMapOperator:
         return messages
 
     def _sem_flat_map(self, item: dict, system_prompt: str) -> list[dict] | None:
-        """
-        Apply the semantic flat map to the given item. Returns the item with the additional mapped fields.
+        """Expand a single item into a list of output dicts via the LLM.
+
+        Requires:
+            - *item* is a dict representing one dataset row.
+            - *system_prompt* is a pre-populated prompt string.
+
+        Returns:
+            A ``list[dict]`` of expanded items with ``output_fields`` keys.
+            Missing fields default to ``None``.
+
+        Raises:
+            AgentGenerationError: If the LLM call itself fails.
         """
         memory = AgentMemory("")
         memory.system_prompt = SystemPromptStep(system_prompt=system_prompt)
@@ -111,9 +135,18 @@ class SemFlatMapOperator:
         return output_json
 
     def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> dict[str, Dataset]:
-        """
-        Apply a semantic map to the input dataset specified by the `dataset_id`.
-        Semantic maps may only be applied to the input dataset's `items` attribute.
+        """Execute the semantic flat-map over every item in the input dataset.
+
+        Requires:
+            - *dataset_id* is a key in *input_datasets*.
+
+        Returns:
+            A new ``dict[str, Dataset]`` that is a copy of *input_datasets*
+            with an additional entry keyed by ``self.output_dataset_id``
+            containing the flattened expansion of all items.
+
+        Raises:
+            KeyError: If *dataset_id* is not in *input_datasets*.
         """
         # retrieve items from the input dataset
         items = input_datasets[dataset_id].items

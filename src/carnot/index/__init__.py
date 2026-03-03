@@ -6,15 +6,10 @@ from carnot.index.index import (
     HierarchicalCarnotIndex,
     SemanticIndex,
 )
-from carnot.index.persistence import FileSummaryCache, HierarchicalIndexCache
-from carnot.index.smv import (
-    Chunk,
-    ChunkIndex,
-    FileSummary,
-    MetadataRegistry,
-    TaggedFiles,
-)
-from carnot.index.summary_indices import FlatFileIndex, HierarchicalFileIndex, HierarchicalIndexConfig
+from carnot.index.models import FileSummaryEntry, HierarchicalIndexConfig, InternalNode
+from carnot.index.sem_indices import FlatFileIndex, HierarchicalFileIndex
+from carnot.index.sem_indices_cache import FileSummaryCache, HierarchicalIndexCache
+from carnot.index.summary_layer import SummaryLayer
 
 INDEX_TYPES = [
     FlatCarnotIndex,
@@ -25,20 +20,18 @@ INDEX_TYPES = [
 
 __all__ = [
     "INDEX_TYPES",
-    "Chunk",
-    "ChunkIndex",
-    "FileSummary",
-    "MetadataRegistry",
-    "TaggedFiles",
     "CarnotIndex",
     "ChromaIndex",
     "FaissIndex",
+    "FileSummaryCache",
+    "FileSummaryEntry",
     "FlatCarnotIndex",
     "FlatFileIndex",
     "HierarchicalCarnotIndex",
     "HierarchicalFileIndex",
-    "HierarchicalIndexConfig",
-    "FileSummaryCache",
     "HierarchicalIndexCache",
+    "HierarchicalIndexConfig",
+    "InternalNode",
     "SemanticIndex",
+    "SummaryLayer",
 ]

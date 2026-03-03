@@ -1,7 +1,10 @@
+import pytest
+
 from carnot.data.dataset import Dataset
 from carnot.operators.sem_groupby import SemGroupByOperator
 
 
+@pytest.mark.llm
 def test_sem_groupby_operator_sem_group_relational_agg(test_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [
@@ -35,6 +38,7 @@ def test_sem_groupby_operator_sem_group_relational_agg(test_model_id, llm_config
     assert {"animal_group": "bird", "count": 1} in output_dataset.items
 
 
+@pytest.mark.llm
 def test_sem_groupby_operator_sem_group_sem_agg(test_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [
@@ -77,6 +81,7 @@ def test_sem_groupby_operator_sem_group_sem_agg(test_model_id, llm_config):
     assert {"animal_group": "bird", "count": 1, "heaviest_animal": "sam"} in output_dataset.items
 
 
+@pytest.mark.llm
 def test_sem_groupby_operator_relational_group_sem_agg(test_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [
@@ -118,6 +123,7 @@ def test_sem_groupby_operator_relational_group_sem_agg(test_model_id, llm_config
     assert {"animal": "tucan", "heaviest_weight": 0.5} in output_dataset.items
 
 
+@pytest.mark.llm
 def test_sem_groupby_operator_relational_group_relational_agg(test_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [

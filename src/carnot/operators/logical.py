@@ -5,7 +5,6 @@ import textwrap
 
 from pydantic import BaseModel
 
-from carnot.data.dataset import Dataset
 from carnot.utils.hash_helpers import hash_for_id
 
 

@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { Send, Database, CheckSquare, Square, AlertCircle, Loader2, XCircle, MessageSquare, Trash2, ChevronLeft, ChevronRight, Search, Play, Plus, X } from 'lucide-react'
 import { useApiToken } from '../hooks/useApiToken'
-import axios from 'axios'
 import ProgressDisplay from '../components/ProgressDisplay'
 import CostBudgetPicker from '../components/CostBudgetPicker'
 import { conversationsApi, datasetsApi } from '../services/api'
@@ -311,43 +310,145 @@ function UserChatPage() {
     setInputQuery('');
     setIsLoading(true);
     setIsExecuting(false);
+
+    // Track whether we currently have a planning-status message at the
+    // tail of the messages list so we can *replace* it instead of stacking.
+    let hasActiveStatus = false;
+
     try {
       const token = await getValidToken();
       if (!token) return;
+
+      // Create abort controller for this request
+      abortControllerRef.current = new AbortController();
+
       const datasetIds = Array.from(selectedDatasets).map(id => parseInt(id));
-      const response = await axios.post(`${API_BASE_URL}/query/plan`, {
-        query: queryToPlan,
-        dataset_ids: datasetIds,
-        session_id: currentSessionId,
-        plan: currentPlan,
-        cost_budget: costBudget
-      }, {
-        headers: { Authorization: `Bearer ${token}` }
+      const response = await fetch(`${API_BASE_URL}/query/plan`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          query: queryToPlan,
+          dataset_ids: datasetIds,
+          session_id: currentSessionId,
+          plan: currentPlan,
+          cost_budget: costBudget
+        }),
+        signal: abortControllerRef.current.signal
       });
 
-      setMessages(prev => [...prev, {
-        type: 'agent',
-        content: response.data.natural_language_plan,
-        isPlanConfirmation: true, // Flag to show "Execute" buttons
-        attachedPlan: response.data.plan
-      }]);
-      setCurrentPlan(response.data.plan); // TODO: maybe redundant now that we use attachedPlan? (still used by visualizer)
+      // Handle non-streaming errors (e.g., 400 No API Keys)
+      if (!response.ok) {
+        let errorData;
+        try {
+          errorData = await response.json();
+        } catch (_) {
+          throw new Error(`Server responded with ${response.status}: ${response.statusText}`);
+        }
+        throw errorData.detail || new Error(errorData.message || 'An unknown server error occurred.');
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            try {
+              const data = JSON.parse(line.slice(6));
+
+              // Update session_id if received from server
+              if (data.session_id && data.session_id !== sessionId) {
+                setSessionId(data.session_id);
+              }
+
+              if (data.type === 'planning_status') {
+                if (hasActiveStatus) {
+                  // Replace the last status message with the new one
+                  setMessages(prev => [
+                    ...prev.slice(0, -1),
+                    { type: 'status', content: data.message }
+                  ]);
+                } else {
+                  setMessages(prev => [...prev, {
+                    type: 'status',
+                    content: data.message
+                  }]);
+                  hasActiveStatus = true;
+                }
+              } else if (data.type === 'plan_complete') {
+                // Remove the trailing status pill before appending the plan
+                if (hasActiveStatus) {
+                  setMessages(prev => [
+                    ...prev.slice(0, -1),
+                    {
+                      type: 'agent',
+                      content: data.natural_language_plan,
+                      isPlanConfirmation: true,
+                      attachedPlan: data.plan
+                    }
+                  ]);
+                } else {
+                  setMessages(prev => [...prev, {
+                    type: 'agent',
+                    content: data.natural_language_plan,
+                    isPlanConfirmation: true,
+                    attachedPlan: data.plan
+                  }]);
+                }
+                hasActiveStatus = false;
+                setCurrentPlan(data.plan);
+              } else if (data.type === 'error') {
+                // Remove trailing status pill if present
+                if (hasActiveStatus) {
+                  setMessages(prev => [
+                    ...prev.slice(0, -1),
+                    { type: 'error', content: data.message }
+                  ]);
+                } else {
+                  setMessages(prev => [...prev, {
+                    type: 'error',
+                    content: data.message
+                  }]);
+                }
+                hasActiveStatus = false;
+              }
+            } catch (e) {
+              console.error('Error parsing SSE data:', e);
+            }
+          }
+        }
+      }
     } catch (error) {
-      const errorData = error.response?.data?.detail;
-      if (errorData?.type === 'API_KEY_MISSING') {
+      // Remove trailing status pill on error
+      if (hasActiveStatus) {
+        setMessages(prev => prev.slice(0, -1));
+      }
+      if (error && error.type === 'API_KEY_MISSING') {
         setMessages(prev => [...prev, {
           type: 'error',
-          content: `${errorData.message} Please go to the Settings page to configure your keys.`
-        }])
-      } else if (error.name !== 'CanceledError') {
-        console.error('Error planning query:', error)
+          content: `${error.message} Please go to the Settings page to configure your keys.`
+        }]);
+      } else if (error.name !== 'AbortError') {
+        console.error('Error planning query:', error);
         setMessages(prev => [...prev, {
           type: 'error',
-          content: errorData?.message || 'Failed to generate plan. Please try again.'
-        }])
+          content: error?.message || 'Failed to generate plan. Please try again.'
+        }]);
       }
     } finally {
       setIsLoading(false);
+      abortControllerRef.current = null;
     }
   };
 
@@ -376,6 +477,10 @@ function UserChatPage() {
       currentSessionId = crypto.randomUUID();
       setSessionId(currentSessionId); 
     }
+
+    // Track whether we currently have an execution-status message at the
+    // tail of the messages list so we can *replace* it instead of stacking.
+    let hasActiveStatus = false;
 
     try {
       // fetch access token
@@ -439,26 +544,58 @@ function UserChatPage() {
                 setSessionId(data.session_id)
               }
               
-              if (data.type === 'status') {
-                setMessages(prev => [...prev, {
-                  type: 'status',
-                  content: data.message
-                }])
+              if (data.type === 'execution_status') {
+                if (hasActiveStatus) {
+                  // Replace the last status message with the new one
+                  setMessages(prev => [
+                    ...prev.slice(0, -1),
+                    { type: 'status', content: data.message }
+                  ])
+                } else {
+                  setMessages(prev => [...prev, {
+                    type: 'status',
+                    content: data.message
+                  }])
+                  hasActiveStatus = true;
+                }
               } else if (data.type === 'result') {
-                setMessages(prev => [...prev, {
-                  type: 'result',
-                  content: data.message,
-                  csv_file: data.csv_file,
-                  row_count: data.row_count
-                }])
+                // Remove trailing status pill before showing result
+                if (hasActiveStatus) {
+                  setMessages(prev => [
+                    ...prev.slice(0, -1),
+                    {
+                      type: 'result',
+                      content: data.message,
+                      csv_file: data.csv_file,
+                      row_count: data.row_count
+                    }
+                  ])
+                } else {
+                  setMessages(prev => [...prev, {
+                    type: 'result',
+                    content: data.message,
+                    csv_file: data.csv_file,
+                    row_count: data.row_count
+                  }])
+                }
+                hasActiveStatus = false;
                 // Reload conversations after query completes
                 loadConversations()
                 setCurrentPlan(null);
               } else if (data.type === 'error') {
-                setMessages(prev => [...prev, {
-                  type: 'error',
-                  content: data.message
-                }])
+                // Remove trailing status pill if present
+                if (hasActiveStatus) {
+                  setMessages(prev => [
+                    ...prev.slice(0, -1),
+                    { type: 'error', content: data.message }
+                  ])
+                } else {
+                  setMessages(prev => [...prev, {
+                    type: 'error',
+                    content: data.message
+                  }])
+                }
+                hasActiveStatus = false;
               }
             } catch (e) {
               console.error('Error parsing SSE data:', e)
@@ -467,6 +604,10 @@ function UserChatPage() {
         }
       }
     } catch (error) {
+      // Remove trailing status pill on error
+      if (hasActiveStatus) {
+        setMessages(prev => prev.slice(0, -1));
+      }
       if (error && error.type === 'API_KEY_MISSING') {
         console.warn('API Key missing:', error.message)
         setMessages(prev => [...prev, {

@@ -9,17 +9,21 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
-from carnot.index.hierarchical_types import (
+from carnot.index.models import (
     FileSummaryEntry,
     HierarchicalIndexConfig,
     InternalNode,
 )
+from carnot.storage.config import StorageConfig
 from carnot.utils.hash_helpers import hash_for_id
+
+if TYPE_CHECKING:
+    from carnot.index.sem_indices import HierarchicalFileIndex
 
 logger = logging.getLogger(__name__)
 
@@ -31,19 +35,34 @@ def _embedding_to_json_safe(emb) -> list:
     return emb
 
 
-def _get_routing_storage_dir() -> Path:
-    """Return the base directory for routing cache storage."""
-    base = Path.home() / ".carnot"
-    if os.getenv("CARNOT_HOME"):
-        base = Path(os.getenv("CARNOT_HOME"))
-    return base / "routing"
-
-
 class FileSummaryCache:
-    """Persistent cache for per-file summaries (path, summary, embedding)."""
+    """Persistent cache for per-file summaries (path, summary, embedding).
 
-    def __init__(self, storage_dir: Path | None = None):
-        self.storage_dir = storage_dir or (_get_routing_storage_dir() / "summaries")
+    Each summary is stored as a JSON file in ``storage_dir``, keyed by a
+    hash of the file path.
+
+    - ``save(entry)`` writes the summary to disk.
+    - ``load(path)`` returns a :class:`FileSummaryEntry` or ``None`` if
+      not found or corrupt.
+    - ``load_many(paths)`` returns ``(dict[path, entry], list[missing_paths])``.
+
+    Parameters
+    ----------
+    storage_dir:
+        Explicit directory override. When *None*, uses ``StorageConfig().summaries_dir``.
+    config:
+        A :class:`StorageConfig` instance. Used only when *storage_dir* is not supplied.
+    """
+
+    def __init__(
+        self,
+        storage_dir: Path | None = None,
+        config: StorageConfig | None = None,
+    ):
+        if storage_dir is not None:
+            self.storage_dir = storage_dir
+        else:
+            self.storage_dir = (config or StorageConfig()).summaries_dir
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
     def _path_to_key(self, path: str) -> str:
@@ -102,10 +121,27 @@ class FileSummaryCache:
 
 
 class HierarchicalIndexCache:
-    """Persistent cache for built HierarchicalFileIndex by path set."""
+    """Persistent cache for built HierarchicalFileIndex by path set.
 
-    def __init__(self, storage_dir: Path | None = None):
-        self.storage_dir = storage_dir or (_get_routing_storage_dir() / "indices")
+    Parameters
+    ----------
+    storage_dir:
+        Explicit directory override. When *None*, uses
+        ``StorageConfig().hierarchical_dir``.
+    config:
+        A :class:`StorageConfig` instance. Used only when *storage_dir*
+        is not supplied.
+    """
+
+    def __init__(
+        self,
+        storage_dir: Path | None = None,
+        config: StorageConfig | None = None,
+    ):
+        if storage_dir is not None:
+            self.storage_dir = storage_dir
+        else:
+            self.storage_dir = (config or StorageConfig()).hierarchical_dir
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
     def _path_set_to_key(self, paths: list[str]) -> str:
@@ -117,9 +153,8 @@ class HierarchicalIndexCache:
         paths: list[str],
         config: HierarchicalIndexConfig | None = None,
         api_key: str | None = None,
-    ) -> "HierarchicalFileIndex | None":
+    ) -> HierarchicalFileIndex | None:
         """Load a cached index for the given path set. Returns None if not found."""
-        from carnot.index.summary_indices import HierarchicalFileIndex
         key = self._path_set_to_key(paths)
         filepath = self.storage_dir / f"{key}.json"
         if not filepath.exists():
@@ -132,7 +167,7 @@ class HierarchicalIndexCache:
             logger.warning("Failed to load index cache %s: %s", key, e)
             return None
 
-    def save(self, index: "HierarchicalFileIndex") -> None:
+    def save(self, index: HierarchicalFileIndex) -> None:
         """Save an index to the cache (keyed by its path set)."""
         paths = [e.path for e in index.file_summaries]
         key = self._path_set_to_key(paths)
@@ -141,7 +176,7 @@ class HierarchicalIndexCache:
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=0)
 
-    def _serialize(self, index: "HierarchicalFileIndex") -> dict:
+    def _serialize(self, index: HierarchicalFileIndex) -> dict:
         """Serialize index to JSON-safe dict, including nested tree structure."""
         file_summaries = [
             {
@@ -203,9 +238,9 @@ class HierarchicalIndexCache:
         data: dict,
         config: HierarchicalIndexConfig | None = None,
         api_key: str | None = None,
-    ) -> "HierarchicalFileIndex":
+    ) -> HierarchicalFileIndex:
         """Deserialize index from dict."""
-        from carnot.index.summary_indices import HierarchicalFileIndex
+        from carnot.index.sem_indices import HierarchicalFileIndex
 
         file_summaries = [
             FileSummaryEntry(

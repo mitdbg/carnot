@@ -214,6 +214,7 @@ tests/pytest/data/movie-reviews
 tests/pytest/data/quest/
 tests/pytest/data/enron-eval-medium/
 tests/pytest/data/emails/
+tests/pytest/.auth
 
 # evals data / results files
 evals/sembench/files/movie/data/

@@ -4,4 +4,6 @@ pytest_plugins = [
     "fixtures.config",
     "fixtures.data",
     "fixtures.datasets",
+    "fixtures.mocks",
+    "fixtures.storage",
 ]

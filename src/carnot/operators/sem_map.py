@@ -24,8 +24,22 @@ from carnot.data.dataset import Dataset
 
 
 class SemMapOperator:
-    """
-    Represents a semantic map operator.
+    """Semantic map operator — enriches each item with LLM-generated fields.
+
+    For every item the LLM is asked to produce JSON containing the
+    ``output_fields``.  The new key/value pairs are merged into the
+    original item.  Missing fields default to ``None``.
+
+    Representation invariant:
+        - ``output_fields`` is a non-empty list of dicts, each with at least
+          a ``'name'`` key.
+        - ``output_tags`` is ``["```json", "```"]``.
+        - ``max_steps >= 1``.
+
+    Abstraction function:
+        An instance of this class is a callable that, given a dataset, returns
+        a new dataset whose items are the originals augmented with the fields
+        described in ``output_fields``.
     """
     def __init__(self, task: str, output_fields: list[dict], output_dataset_id: str, model_id: str, llm_config: dict, max_workers: int, max_steps: int = 3):
         self.task = task
@@ -60,8 +74,18 @@ class SemMapOperator:
         return messages
 
     def _sem_map(self, item: dict, system_prompt: str) -> dict | None:
-        """
-        Apply the semantic map to the given item. Returns the item with the additional mapped fields.
+        """Apply the semantic map to a single item.
+
+        Requires:
+            - *item* is a dict representing one dataset row.
+            - *system_prompt* is a pre-populated prompt string.
+
+        Returns:
+            The *item* dict, mutated in-place with the new output fields.
+            Fields the LLM fails to produce are set to ``None``.
+
+        Raises:
+            AgentGenerationError: If the LLM call itself fails.
         """
         memory = AgentMemory("")
         memory.system_prompt = SystemPromptStep(system_prompt=system_prompt)
@@ -113,9 +137,18 @@ class SemMapOperator:
         return item
 
     def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> dict[str, Dataset]:
-        """
-        Apply a semantic map to the input dataset specified by the `dataset_id`.
-        Semantic maps may only be applied to the input dataset's `items` attribute.
+        """Execute the semantic map over every item in the input dataset.
+
+        Requires:
+            - *dataset_id* is a key in *input_datasets*.
+
+        Returns:
+            A new ``dict[str, Dataset]`` that is a copy of *input_datasets*
+            with an additional entry keyed by ``self.output_dataset_id``
+            containing the enriched items.
+
+        Raises:
+            KeyError: If *dataset_id* is not in *input_datasets*.
         """
         # retrieve items from the input dataset
         items = input_datasets[dataset_id].items

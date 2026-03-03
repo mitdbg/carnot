@@ -7,43 +7,20 @@ Tests cover:
 3. Plan paraphrasing with conversation context
 4. End-to-end execution with conversation context
 """
+import pytest
+from helpers.assertions import (
+    assert_agent_did_not_hit_max_steps,
+    assert_planner_did_not_hit_max_steps,
+)
+
 from carnot.agents.data_discovery import DataDiscoveryAgent
 from carnot.agents.memory import ConversationAgentStep, ConversationUserStep
 from carnot.agents.models import LiteLLMModel
 from carnot.agents.planner import Planner
-from carnot.agents.utils import AgentMaxStepsError
 from carnot.conversation.conversation import Conversation
 from carnot.execution.execution import Execution
 
-
-def assert_agent_did_not_hit_max_steps(agent) -> None:
-    """
-    Assert that an agent did not hit its max_steps limit.
-    
-    Checks the agent's memory for AgentMaxStepsError in the last step.
-    These simple tests should never require the agent to reach max_steps.
-    """
-    if agent.memory.steps:
-        last_step = agent.memory.steps[-1]
-        error = getattr(last_step, "error", None)
-        assert not isinstance(error, AgentMaxStepsError), (
-            f"Agent hit max_steps limit ({agent.max_steps}). "
-            "This simple task should complete in fewer steps."
-        )
-
-
-def assert_planner_did_not_hit_max_steps(planner, result) -> None:
-    """
-    Assert that the planner did not hit its max_steps limit.
-    
-    The planner returns a specific string when max_steps is reached.
-    These simple tests should never require the planner to reach max_steps.
-    """
-    max_steps_message = "The agent did not return a final answer within the maximum number of steps."
-    assert result != max_steps_message, (
-        f"Planner hit max_steps limit ({planner.max_steps}). "
-        "This simple task should complete in fewer steps."
-    )
+pytestmark = pytest.mark.llm
 
 
 class TestConversationalDataDiscovery:

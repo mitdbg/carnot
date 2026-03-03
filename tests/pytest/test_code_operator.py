@@ -1,7 +1,10 @@
+import pytest
+
 from carnot.data.dataset import Dataset
 from carnot.operators.code import CodeOperator
 
 
+@pytest.mark.llm
 def test_code_operator_no_inputs(test_model_id, llm_config):
     task = "what is 2 + 2?"
     code_operator = CodeOperator(task, "output-dataset-id", test_model_id, llm_config)
@@ -17,6 +20,7 @@ def test_code_operator_no_inputs(test_model_id, llm_config):
     assert list(output_state.values())[0] == 4
 
 
+@pytest.mark.llm
 def test_code_operator_one_dataset(test_model_id, llm_config, movie_reviews_data):
     movies_df, _ = movie_reviews_data
 
@@ -43,6 +47,7 @@ def test_code_operator_one_dataset(test_model_id, llm_config, movie_reviews_data
     assert "mean girls" in output_movies
     assert "volver" not in output_movies
 
+@pytest.mark.llm
 def test_code_operator_two_datasets(test_model_id, llm_config, movie_reviews_data):
     # load movie reviews data
     movies_df, reviews_df = movie_reviews_data
