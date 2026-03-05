@@ -62,10 +62,7 @@ def expand_metas(
     metadata: List[Dict[str, Any]],
     data_rows: List[Dict[str, str]],
     min_frequency: int = 3,
-    ontology_config_path: Optional[Path] = None,
     dump_intermediate: Optional[bool] = None,
-    profile_cache_mode: str = "reuse",
-    kg_confidence_threshold: float = 0.55,
 ) -> List[Dict[str, Any]]:
     """Run the full post-processing pipeline on sem_map results.
 
@@ -224,9 +221,6 @@ def create_collection(
     persist_directory: str,
     expand_meta: bool = False,
     max_docs: Optional[int] = None,
-    ontology_config_path: Optional[Path] = None,
-    profile_cache_mode: str = "reuse",
-    kg_confidence_threshold: float = 0.55,
     dump_intermediate: bool = True,
 ) -> ChromaStore:
     if expand_meta:
@@ -264,10 +258,7 @@ def create_collection(
             metas,
             data_rows,
             min_frequency=3,
-            ontology_config_path=ontology_config_path,
             dump_intermediate=dump_intermediate,
-            profile_cache_mode=profile_cache_mode,
-            kg_confidence_threshold=kg_confidence_threshold,
         )
 
     if docs:
@@ -414,9 +405,9 @@ if __name__ == "__main__":
     USE_SUBSET = not args.full
 
     if USE_SUBSET:
-        documents_path = str(HERE / "tmp/subset_documents.jsonl")
-        queries_source = str(HERE / "tmp/subset_quest_queries.jsonl")
-        collection_suffix = "_subset"
+        documents_path = str(HERE / "tmp/subset_2_documents.jsonl")
+        queries_source = str(HERE / "tmp/subset_2_quest_queries.jsonl")
+        collection_suffix = "_subset_2"
         max_docs = None
     else:
         documents_path = str(HERE / "tmp/documents.jsonl")
@@ -424,24 +415,40 @@ if __name__ == "__main__":
         collection_suffix = ""
         max_docs = 100
 
-    store = create_collection(
+    queries = prepare_quest_queries(source=queries_source)
+    
+    # Base collection
+    # store = create_collection(
+    #     documents_path=documents_path,
+    #     collection_name=f"quest_base{collection_suffix}",
+    #     persist_directory="./chroma_collections",
+    #     expand_meta=False,
+    #     max_docs=max_docs,
+    #     dump_intermediate=args.dump_intermediate,
+    # )
+    
+    # avg_recall = evaluate_collection(
+    #     store,
+    #     queries,
+    #     output_path=f"quest_eval_results_val_base{collection_suffix}.jsonl",
+    # )
+    # print(f"Average Recall (Base Collection): {avg_recall:.4f}")
+
+    # Expanded collection
+    store_expanded = create_collection(
         documents_path=documents_path,
         collection_name=f"quest_expanded{collection_suffix}",
         persist_directory="./chroma_collections",
-        expand_meta=False,
+        expand_meta=True,
         max_docs=max_docs,
-        ontology_config_path=ontology_config_path,
-        profile_cache_mode=args.profile_cache_mode,
-        kg_confidence_threshold=args.kg_confidence_threshold,
         dump_intermediate=args.dump_intermediate,
     )
 
-    queries = prepare_quest_queries(source=queries_source)
     filter_catalog_path = HERE / "sem_map/filter_catalog.json"
     query_planner = LLMQueryPlanner(filter_catalog_path) if filter_catalog_path.exists() else None
 
     avg_recall = evaluate_collection(
-        store,
+        store_expanded,
         queries,
         query_planner=query_planner,
         output_path=f"quest_eval_results_val_expanded{collection_suffix}.jsonl",
