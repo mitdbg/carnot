@@ -1,8 +1,11 @@
 from _internal.chroma_store import ChromaStore
 import pdb
 
-store = ChromaStore("quest_expanded_subset", "./chroma_collections")
-# store = ChromaStore("quest_base_subset", "./chroma_collections")
+embedding_model_name = "Qwen/Qwen3-Embedding-4B"
+collection_suffix = "_subset_2"
+
+store = ChromaStore(f"quest_expanded{collection_suffix}", f"./chroma_collections_{embedding_model_name}", embedding_model_name=None)
+# store = ChromaStore(f"quest_base{collection_suffix}", f"./chroma_collections_{embedding_model_name}")
 
 
 def get_doc_by_entity_id(entity_id: str):
@@ -27,7 +30,7 @@ def get_doc_by_title(title: str):
 
 
 pdb.set_trace()
-doc = get_doc_by_title("Dickson Greeting")
+doc = get_doc_by_title("White Nights (1985 film)")
 
 doc = get_doc_by_entity_id("Serial_Killing_4_Dummys-046e750d")
 print(len(doc["metadata"]))

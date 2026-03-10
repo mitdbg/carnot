@@ -221,3 +221,4 @@ secrets/
 src/carnot/core/data/auto_retrieval/chroma_collections
 src/carnot/core/data/auto_retrieval/tmp
 src/carnot/core/data/auto_retrieval/parse-answer-errors
+src/carnot/core/data/auto_retrieval/chroma_collections_*

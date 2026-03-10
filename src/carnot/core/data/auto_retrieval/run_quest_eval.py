@@ -120,24 +120,24 @@ def expand_metas(
         )
     ]
         
-    sem_results, concept_schema_cols = sem_map(data=data_rows, concept_schema_cols=concept_schema_cols)
+    # sem_results, concept_schema_cols = sem_map(data=data_rows, concept_schema_cols=concept_schema_cols)
 
-    logger.info("Postprocessing sem_map raw output...")
-    sem_results = postprocess_sem_map(
-        sem_results,
-        concept_schema_cols,
-        out_dir=str(out_dir) if dump_intermediate else None
-        )
-    logger.info("Postprocessing complete: step 1-3.")
+    # logger.info("Postprocessing sem_map raw output...")
+    # sem_results = postprocess_sem_map(
+    #     sem_results,
+    #     concept_schema_cols,
+    #     out_dir=str(out_dir) if dump_intermediate else None
+    #     )
+    # logger.info("Postprocessing complete: step 1-3.")
     
     # Load augmented sem_map output (output of postprocess Steps 1–3).
-    # augmented_path = HERE / "sem_map_subset_1/postprocess_step3_augmented.json"
-    # if not augmented_path.exists():
-    #     raise FileNotFoundError(
-    #         f"Missing augmented sem_map file: {augmented_path}. "
-    #         "Run postprocess_sem_map first to generate it."
-    #     )
-    # sem_results = json.loads(augmented_path.read_text(encoding="utf-8"))
+    augmented_path = HERE / "sem_map_subset_3/postprocess_step3_augmented.json"
+    if not augmented_path.exists():
+        raise FileNotFoundError(
+            f"Missing augmented sem_map file: {augmented_path}. "
+            "Run postprocess_sem_map first to generate it."
+        )
+    sem_results = json.loads(augmented_path.read_text(encoding="utf-8"))
 
     # Step 4: Flatten string/list columns into boolean tag columns for ChromaDB.
     logger.info("Expanding sem_map results to tags...")
@@ -223,11 +223,13 @@ def create_collection(
     documents_path: str,
     collection_name: str,
     persist_directory: str,
+    embedding_model_name: str = "Qwen/Qwen3-Embedding-4B",
     expand_meta: bool = False,
+    reset_collection: bool = False,
     max_docs: Optional[int] = None,
     dump_intermediate: bool = True,
 ) -> ChromaStore:
-    if expand_meta:
+    if reset_collection:
         ChromaStore.reset_collection(
             collection_name=collection_name,
             persist_directory=persist_directory,
@@ -236,6 +238,7 @@ def create_collection(
     store = ChromaStore(
         collection_name=collection_name,
         persist_directory=persist_directory,
+        embedding_model_name=embedding_model_name,
     )
 
     existing_count = store.count()
@@ -287,7 +290,7 @@ def evaluate_collection(
     total_precision = 0.0
     total_mrr = 0.0
     total_ndcg = 0.0
-    f_out = open(output_path, "w", encoding="utf-8") if output_path else None
+    f_out = (Path(output_path).parent.mkdir(parents=True, exist_ok=True) or open(output_path, "w", encoding="utf-8")) if output_path else None
 
     gold_set = set()
     relevance_fn = lambda d: 1.0 if d in gold_set else 0.0
@@ -420,13 +423,16 @@ if __name__ == "__main__":
         max_docs = 100
 
     queries = prepare_quest_queries(source=queries_source)
+    embedding_model_name = "Qwen/Qwen3-Embedding-4B"
     
     # Base collection
     # store = create_collection(
     #     documents_path=documents_path,
     #     collection_name=f"quest_base{collection_suffix}",
-    #     persist_directory="./chroma_collections",
+    #     persist_directory=f"./chroma_collections_{embedding_model_name}",
+    #     embedding_model_name=embedding_model_name,
     #     expand_meta=False,
+    #     reset_collection=True,
     #     max_docs=max_docs,
     #     dump_intermediate=args.dump_intermediate,
     # )
@@ -434,16 +440,18 @@ if __name__ == "__main__":
     # avg_recall = evaluate_collection(
     #     store,
     #     queries,
-    #     output_path=f"quest_eval_results_val_base{collection_suffix}.jsonl",
+    #     output_path=f"results_{embedding_model_name}/quest_eval_results_val_base{collection_suffix}.jsonl",
     # )
     # print(f"Average Recall (Base Collection): {avg_recall:.4f}")
 
-    # Expanded collection
+    # # Expanded collection
     store_expanded = create_collection(
         documents_path=documents_path,
         collection_name=f"quest_expanded{collection_suffix}",
-        persist_directory="./chroma_collections",
+        persist_directory=f"./chroma_collections_{embedding_model_name}",
+        embedding_model_name=embedding_model_name,
         expand_meta=True,
+        reset_collection=True,
         max_docs=max_docs,
         dump_intermediate=args.dump_intermediate,
     )
@@ -455,6 +463,6 @@ if __name__ == "__main__":
         store_expanded,
         queries,
         query_planner=query_planner,
-        output_path=f"quest_eval_results_val_expanded{collection_suffix}.jsonl",
+        output_path=f"results_{embedding_model_name}/quest_eval_results_val_expanded{collection_suffix}.jsonl",
     )
     print(f"Average Recall (Expanded Collection): {avg_recall:.4f}")
