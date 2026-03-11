@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -34,6 +36,9 @@ _MAX_PREVIEW_CHARS = 500
 
 # default temperature for LLM summarization (can be tuned for more creative vs. focused summaries)
 _SUMMARY_TEMPERATURE = 0.3
+
+# number of concurrent workers for parallel summarization
+_SUMMARIZATION_WORKERS = 64
 
 
 class SummaryLayer:
@@ -89,6 +94,7 @@ class SummaryLayer:
             )
 
         self._llm_call_stats: list[LLMCallStats] = []
+        self._stats_lock = threading.Lock()
 
     @property
     def llm_call_stats(self) -> list[LLMCallStats]:
@@ -142,6 +148,9 @@ class SummaryLayer:
     ) -> list[FileSummaryEntry]:
         """Generate summaries for items that are not in cache.
 
+        Uses parallel processing with up to 64 concurrent workers
+        to speed up LLM summarization calls.
+
         Requires:
             - *items* is a list of dictionaries with valid ``"path"`` keys.
 
@@ -151,40 +160,68 @@ class SummaryLayer:
         Raises:
             None.  Errors for individual items are logged and skipped.
         """
+        valid_items = [
+            item for item in items
+            if item.get('path') and Path(item['path']).suffix.lower() not in _SKIP_SUFFIXES
+        ]
+
+        if not valid_items:
+            return []
+
         entries: list[FileSummaryEntry] = []
+        completed = 0
+        total = len(valid_items)
 
-        for item in items:
-            if not item['path']:
-                continue
-            if Path(item['path']).suffix.lower() in _SKIP_SUFFIXES:
-                continue
-            try:
-                text = self._get_file_text(item)
-                if not text.strip():
-                    continue
+        with ThreadPoolExecutor(max_workers=_SUMMARIZATION_WORKERS) as executor:
+            futures = {
+                executor.submit(self._process_single_item, item): item
+                for item in valid_items
+            }
 
-                summary_text = self._generate_summary(item['path'], text)
-                embedding = self._generate_embedding(summary_text)
-                if embedding is None:
-                    continue
+            for future in as_completed(futures):
+                completed += 1
+                if completed % 50 == 0 or completed == total:
+                    logger.info(f"Summarization progress: {completed}/{total}")
 
-                entry = FileSummaryEntry(
-                    path=item['path'],
-                    summary=summary_text,
-                    embedding=embedding,
-                )
-                entries.append(entry)
-
-                try:
-                    self._cache.save(entry)
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to persist summary for {item['path']}: {e}"
-                    )
-            except Exception as e:
-                logger.warning(f"Failed to summarize {item['path']}: {e}")
+                result = future.result()
+                if result is not None:
+                    entries.append(result)
 
         return entries
+
+    def _process_single_item(self, item: dict) -> FileSummaryEntry | None:
+        """Process a single item: summarize, embed, cache, and return entry.
+
+        Thread-safe helper for parallel summarization.
+
+        Returns:
+            A ``FileSummaryEntry`` if successful, ``None`` otherwise.
+        """
+        try:
+            text = self._get_file_text(item)
+            if not text.strip():
+                return None
+
+            summary_text = self._generate_summary(item['path'], text)
+            embedding = self._generate_embedding(summary_text)
+            if embedding is None:
+                return None
+
+            entry = FileSummaryEntry(
+                path=item['path'],
+                summary=summary_text,
+                embedding=embedding,
+            )
+
+            try:
+                self._cache.save(entry)
+            except Exception as e:
+                logger.warning(f"Failed to persist summary for {item['path']}: {e}")
+
+            return entry
+        except Exception as e:
+            logger.warning(f"Failed to summarize {item['path']}: {e}")
+            return None
 
     @staticmethod
     def _get_file_text(item: dict) -> str:
@@ -248,7 +285,8 @@ Summary:"""
                 temperature=_SUMMARY_TEMPERATURE,
             )
             if response.llm_call_stats is not None:
-                self._llm_call_stats.append(response.llm_call_stats)
+                with self._stats_lock:
+                    self._llm_call_stats.append(response.llm_call_stats)
             return response.content.strip()
         except Exception as e:
             logger.warning(
@@ -275,7 +313,8 @@ Summary:"""
                 texts=[text],
                 model=self._config.embedding_model,
             )
-            self._llm_call_stats.append(embed_stats)
+            with self._stats_lock:
+                self._llm_call_stats.append(embed_stats)
             return embeddings[0]
         except Exception as e:
             logger.warning(f"Embedding generation failed: {e}")

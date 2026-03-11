@@ -19,6 +19,30 @@ logger = logging.getLogger(__name__)
 
 INDEX_BATCH_SIZE = 50
 
+# Chunking constants for embedding models with token limits
+MAX_EMBED_CHARS = 28000  # ~7000 tokens, safely under 8192 limit
+CHUNK_OVERLAP_CHARS = 1000  # ~250 tokens overlap between chunks
+
+
+def _chunk_text(text: str, max_chars: int = MAX_EMBED_CHARS, overlap: int = CHUNK_OVERLAP_CHARS) -> list[str]:
+    """Split text into overlapping chunks that fit within embedding limits.
+    
+    Returns a list of chunks. If text is short enough, returns [text].
+    """
+    if len(text) <= max_chars:
+        return [text]
+    
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + max_chars
+        chunk = text[start:end]
+        chunks.append(chunk)
+        start = end - overlap  # overlap with previous chunk
+        if start >= len(text):
+            break
+    return chunks
+
 
 def _resolve_model(model, api_key) -> LiteLLMModel:
     """Resolve *model* to a :class:`LiteLLMModel` instance.
@@ -205,7 +229,7 @@ class HierarchicalCarnotIndex(CarnotIndex):
         index = HierarchicalFileIndex.from_items(
             name=self.name,
             items=self.items,
-            model=self._llm_model,
+            model=None,  # Let SummaryLayer create model from config.summary_model
             config=self._config,
             api_key=self._api_key,
         )
@@ -317,7 +341,7 @@ class FlatCarnotIndex(CarnotIndex):
         index = FlatFileIndex.from_items(
             name=self.name,
             items=self.items,
-            model=self._llm_model,
+            model=None,  # Let SummaryLayer create model from config.summary_model
             config=self._config,
             api_key=self._api_key,
         )
@@ -396,6 +420,7 @@ class ChromaIndex(CarnotIndex):
         self.api_key = api_key
         self._llm_model = _resolve_model(model, api_key)
         self._llm_call_stats: list = []
+        self._chunk_to_item_idx: dict[str, int] = {}  # maps chunk_id -> original item index
         if self._index is None:
             self._index = self._get_or_create_index()
 
@@ -405,6 +430,9 @@ class ChromaIndex(CarnotIndex):
         Uses ``StorageConfig().chroma_dir`` for persistent storage.
         If a collection with ``self.name`` already exists and is
         non-empty, it is returned without re-indexing.
+        
+        Long documents are automatically chunked to fit within embedding
+        model limits (8192 tokens for text-embedding-3-small).
 
         Requires:
             - ``self.items`` elements are ``dict``.
@@ -423,24 +451,41 @@ class ChromaIndex(CarnotIndex):
         collection = chroma_client.get_or_create_collection(name=self.name)
 
         if collection.count() > 0:
+            # Rebuild chunk_to_item_idx mapping from existing collection
+            existing_ids = collection.get()["ids"]
+            for chunk_id in existing_ids:
+                # Parse item index from chunk ID format: "{item_idx}_c{chunk_idx}"
+                item_idx = int(chunk_id.split("_")[0])
+                self._chunk_to_item_idx[chunk_id] = item_idx
             return collection
 
-        item_strs = []
-        for item in self.items:
+        # Chunk long documents and build mapping from chunk_id -> item_idx
+        all_chunks = []
+        all_chunk_ids = []
+        for item_idx, item in enumerate(self.items):
             if isinstance(item, dict):
-                item_strs.append(json.dumps(item))
+                item_str = json.dumps(item)
             else:
                 raise ValueError("ChromaIndex currently only supports items of type: [dict].")
+            
+            chunks = _chunk_text(item_str)
+            for chunk_idx, chunk in enumerate(chunks):
+                chunk_id = f"{item_idx}_c{chunk_idx}"
+                all_chunks.append(chunk)
+                all_chunk_ids.append(chunk_id)
+                self._chunk_to_item_idx[chunk_id] = item_idx
 
-        for start in range(0, len(item_strs), INDEX_BATCH_SIZE):
-            batch = item_strs[start : start + INDEX_BATCH_SIZE]
+        # Embed and add chunks in batches
+        for start in range(0, len(all_chunks), INDEX_BATCH_SIZE):
+            batch = all_chunks[start : start + INDEX_BATCH_SIZE]
+            batch_ids = all_chunk_ids[start : start + INDEX_BATCH_SIZE]
             embeddings, embed_stats = self._llm_model.embed(texts=batch, model=self.model)
             self._llm_call_stats.append(embed_stats)
 
             collection.add(
-                documents=item_strs[start : start + INDEX_BATCH_SIZE],
+                documents=batch,
                 embeddings=embeddings,
-                ids=self.ids[start : start + INDEX_BATCH_SIZE],
+                ids=batch_ids,
             )
 
         return collection
@@ -449,6 +494,8 @@ class ChromaIndex(CarnotIndex):
         """Return up to *k* items most similar to *query*.
 
         Embeds the query and performs a ChromaDB vector search.
+        Since documents may be chunked, this method deduplicates results
+        to return unique original items.
 
         Requires:
             - *query* is a non-empty string.
@@ -465,8 +512,27 @@ class ChromaIndex(CarnotIndex):
         self._llm_call_stats.append(embed_stats)
         query_embedding = query_embedding[0]
 
-        results = self._index.query(query_embeddings=[query_embedding], n_results=k)
-        return [self.items[int(idx)] for idx in results["ids"][0]]
+        # Query for more results than k since multiple chunks may match the same item
+        n_results = min(k * 3, self._index.count())
+        results = self._index.query(query_embeddings=[query_embedding], n_results=n_results)
+        
+        # Map chunk IDs back to original items, preserving order and deduplicating
+        seen_item_indices = set()
+        unique_items = []
+        for chunk_id in results["ids"][0]:
+            if chunk_id in self._chunk_to_item_idx:
+                item_idx = self._chunk_to_item_idx[chunk_id]
+            else:
+                # Fallback for non-chunked IDs (backward compatibility)
+                item_idx = int(chunk_id.split("_")[0])
+            
+            if item_idx not in seen_item_indices:
+                seen_item_indices.add(item_idx)
+                unique_items.append(self.items[item_idx])
+                if len(unique_items) >= k:
+                    break
+        
+        return unique_items
 
 
 class FaissIndex(CarnotIndex):

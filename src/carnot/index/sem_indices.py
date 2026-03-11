@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -23,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 # Max file summaries to send to LLM at once (context limit)
 FLAT_INDEX_MAX_LLM_ITEMS = 40
+
+# Number of concurrent workers for parallel cluster summarization
+_CLUSTER_SUMMARIZATION_WORKERS = 64
 
 class FlatFileIndex:
     """Single-level index over file summaries for query-time retrieval.
@@ -260,6 +265,7 @@ class HierarchicalFileIndex:
         self._root_level: list[InternalNode | FileSummaryEntry] = []
         self._embeddings: np.ndarray | None = None  # for flat or root-level search
         self._llm_call_stats: list = []
+        self._stats_lock = threading.Lock()
 
         if build:
             self._build()
@@ -303,7 +309,7 @@ class HierarchicalFileIndex:
         hier_dir = storage_dir or storage_config.hierarchical_dir
         index_cache = HierarchicalIndexCache(storage_dir=hier_dir)
 
-        paths = [i.path for i in items if i.path]
+        paths = [i.get("path") for i in items if i.get("path")]
         cache_key = hash_for_id("|".join(sorted(paths)))
 
         index = index_cache.load(paths, config=config, api_key=api_key)
@@ -368,6 +374,8 @@ class HierarchicalFileIndex:
         """
         Cluster members and create internal nodes. Recurse if result
         exceeds context limit.
+
+        Uses parallel processing for cluster summarization.
         """
         if not members:
             return []
@@ -402,15 +410,38 @@ class HierarchicalFileIndex:
                 clusters[cid] = []
             clusters[cid].append(m)
 
-        # Build internal node for each cluster
+        # Filter out empty clusters
+        cluster_list = [c for c in clusters.values() if c]
+
+        # Build internal nodes in parallel
         level_nodes: list[InternalNode] = []
-        for members_in_cluster in clusters.values():
-            if not members_in_cluster:
-                continue
+        with ThreadPoolExecutor(max_workers=_CLUSTER_SUMMARIZATION_WORKERS) as executor:
+            futures = {
+                executor.submit(self._build_cluster_node, members_in_cluster, are_leaves): idx
+                for idx, members_in_cluster in enumerate(cluster_list)
+            }
+
+            for future in as_completed(futures):
+                node = future.result()
+                if node is not None:
+                    level_nodes.append(node)
+
+        # Recurse if we still have too many nodes for context
+        if len(level_nodes) > max_root:
+            return self._build_level(level_nodes, are_leaves=False)
+        return level_nodes
+
+    def _build_cluster_node(
+        self,
+        members_in_cluster: list,
+        are_leaves: bool,
+    ) -> InternalNode | None:
+        """Build a single internal node for a cluster. Thread-safe helper."""
+        try:
             if are_leaves:
                 summary_text = self._summarize_file_members(members_in_cluster)
                 child_paths = [m.path for m in members_in_cluster]
-                node = InternalNode(
+                return InternalNode(
                     summary=summary_text,
                     embedding=self._embed_texts([summary_text])[0],
                     child_paths=child_paths,
@@ -420,19 +451,16 @@ class HierarchicalFileIndex:
             else:
                 summary_text = self._summarize_internal_members(members_in_cluster)
                 child_paths = self._collect_all_paths(members_in_cluster)
-                node = InternalNode(
+                return InternalNode(
                     summary=summary_text,
                     embedding=self._embed_texts([summary_text])[0],
                     child_paths=child_paths,
                     is_leaf_cluster=False,
                     children=members_in_cluster,
                 )
-            level_nodes.append(node)
-
-        # Recurse if we still have too many nodes for context
-        if len(level_nodes) > max_root:
-            return self._build_level(level_nodes, are_leaves=False)
-        return level_nodes
+        except Exception as e:
+            logger.warning(f"Failed to build cluster node: {e}")
+            return None
 
     def _collect_all_paths(self, nodes: list[InternalNode]) -> list[str]:
         """Collect all file paths under these internal nodes."""
@@ -469,6 +497,9 @@ Concise cluster summary:"""
                 messages=[message],
                 temperature=0.2,
             )
+            if response.llm_call_stats is not None:
+                with self._stats_lock:
+                    self._llm_call_stats.append(response.llm_call_stats)
             return response.content.strip()
         except Exception as e:
             logger.warning(f"LLM summarization failed: {e}, using first summary")
@@ -498,6 +529,9 @@ Concise meta-cluster summary:"""
                 messages=[message],
                 temperature=0.2,
             )
+            if response.llm_call_stats is not None:
+                with self._stats_lock:
+                    self._llm_call_stats.append(response.llm_call_stats)
             return response.content.strip()
         except Exception as e:
             logger.warning(f"LLM summarization failed: {e}, using first summary")
@@ -509,7 +543,8 @@ Concise meta-cluster summary:"""
             texts=texts,
             model=self.config.embedding_model,
         )
-        self._llm_call_stats.append(embed_stats)
+        with self._stats_lock:
+            self._llm_call_stats.append(embed_stats)
         return embeddings
 
     def _llm_select_node_indices(
