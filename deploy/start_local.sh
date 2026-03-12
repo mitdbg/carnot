@@ -16,23 +16,20 @@ export LOCAL_BASE_DIR="$LOCAL_BASE_DIR"
 export DOCKERHUB_USERNAME="carnotlocal"
 export SETTINGS_ENCRYPTION_KEY="12u1STDIIImTyKtTfkqwPDRCK4dCe65xHfXrPjrTeIU="
 
-# Frontend Build Arguments (Vite variables)
-# NOTE: if you want Auth0 to work locally, you will need to set the following variables:
-#  - VITE_AUTH0_DOMAIN
-#  - VITE_AUTH0_AUDIENCE
-#  - VITE_AUTH0_CLIENT_ID
-#  - VITE_AUTH0_ORGANIZATION_ID
-#  - AUTH0_CLAIMS_NAMESPACE
-# mdrusso has the local Auth0 setup for Carnot, ask him for details.
-export VITE_API_BASE_URL="http://localhost:8000/api"
-
+# Auth0 configuration — required for login to work.
+# Unset by default; export these before running this script if you need auth:
+#   export AUTH0_DOMAIN=...
+#   export AUTH0_AUDIENCE=...
+#   export AUTH0_CLAIMS_NAMESPACE=...
+# Ask mdrusso for the local Auth0 app credentials.
 # Backend Runtime Environment
-export BASE_ORIGINS="http://localhost"
+# localhost:5173 is the Vite dev server — run 'npm run dev' in app/frontend/
+export BASE_ORIGINS="http://localhost:5173"
 
-# --- Database Secrets Defaults ---
+# --- Database Defaults ---
 DB_PASSWORD_DEFAULT="supersecretpassword"
 DB_USER_DEFAULT="carnotuser"
-DB_NAME_DEFAULT="carnotdb"
+export DB_NAME="carnotdb"
 
 # --- Create Directories ---
 echo "Creating local data directory: $LOCAL_BASE_DIR"
@@ -48,12 +45,10 @@ mkdir -p "$PG_DATA_DIR"
 echo "Copying source files to Docker build context..."
 
 # copy relevant source files to build context
-rm -rf $COMPOSE_DIR/frontend
 rm -rf $COMPOSE_DIR/backend
 rm -rf $COMPOSE_DIR/src
 rm $COMPOSE_DIR/pyproject.toml
 rm $COMPOSE_DIR/README.md
-cp -r ../app/frontend $COMPOSE_DIR/frontend
 cp -r ../app/backend $COMPOSE_DIR/backend
 cp -r ../src $COMPOSE_DIR/src
 cp ../pyproject.toml $COMPOSE_DIR/pyproject.toml
@@ -61,8 +56,6 @@ cp ../README.md $COMPOSE_DIR/README.md
 
 echo "Cleaning up local artifacts from build context..."
 rm -rf $COMPOSE_DIR/secrets/*
-rm -rf $COMPOSE_DIR/frontend/node_modules
-rm -rf $COMPOSE_DIR/frontend/dist
 rm -rf $COMPOSE_DIR/backend/.venv
 rm -rf $COMPOSE_DIR/backend/__pycache__
 rm -rf $COMPOSE_DIR/backend/src/__pycache__
@@ -71,7 +64,6 @@ rm -rf $COMPOSE_DIR/backend/src/__pycache__
 echo "Creating default secrets files in $SECRETS_DIR..."
 echo "$DB_PASSWORD_DEFAULT" > "$SECRETS_DIR/db_password.txt"
 echo "$DB_USER_DEFAULT" > "$SECRETS_DIR/db_user.txt"
-echo "$DB_NAME_DEFAULT" > "$SECRETS_DIR/db_name.txt"
 
 # Change to the directory containing the compose files
 pushd $COMPOSE_DIR > /dev/null
@@ -88,10 +80,13 @@ EXIT_CODE=$?
 if [ $EXIT_CODE -eq 0 ]; then
     echo "---"
     echo "✅ Services started successfully!"
-    echo "Frontend available at: http://localhost"
     echo "Backend available at: http://localhost:8000"
     echo "PostgreSQL available on port 5432 (data in /tmp/pg-data/data on host)"
     echo "Local data mounted to: $LOCAL_BASE_DIR"
+    echo ""
+    echo "To start the frontend, run in a separate terminal:"
+    echo "  cd app/frontend && npm run dev"
+    echo "Frontend will be available at: http://localhost:5173"
     echo "---"
     # Run PS here while we are still in the correct directory
     docker compose -f $COMPOSE_FILE -f $OVERRIDE_FILE ps
@@ -106,7 +101,6 @@ popd > /dev/null
 
 # Clean up build artifacts only if successful
 if [ $EXIT_CODE -eq 0 ]; then
-  rm -rf $COMPOSE_DIR/frontend
   rm -rf $COMPOSE_DIR/backend
   rm -rf $COMPOSE_DIR/src
   rm $COMPOSE_DIR/pyproject.toml

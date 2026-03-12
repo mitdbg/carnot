@@ -1,0 +1,40 @@
+{{- if .Values.apiHostname }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: carnot-backend
+  namespace: {{ .Values.env }}
+  labels:
+    app.kubernetes.io/name: carnot
+    app.kubernetes.io/instance: {{ .Values.env }}
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: carnot-{{ .Chart.Version }}
+  annotations:
+    kubernetes.io/ingress.class: alb
+    # internet-facing: ALB is publicly accessible (behind Route53)
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    # IngressGroup: all environments share one ALB, routing by hostname
+    alb.ingress.kubernetes.io/group.name: carnot
+    # ip mode: routes directly to pod IPs (required for Fargate and preferred for EKS)
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/certificate-arn: {{ .Values.acmCertificateArn }}
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443},{"HTTP":80}]'
+    # Redirect all HTTP traffic to HTTPS
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    # 300s idle timeout matches the proxy_read_timeout previously set in nginx.conf
+    # to support long-running LLM queries streamed via SSE.
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300
+spec:
+  rules:
+    - host: {{ .Values.apiHostname }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: carnot-backend
+                port:
+                  number: 8000
+{{- end }}

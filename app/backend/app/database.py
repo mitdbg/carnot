@@ -21,7 +21,7 @@ def read_secret(secret_name: str) -> str:
 
 DB_USER = read_secret("db_user")
 DB_PASSWORD = read_secret("db_password")
-DB_NAME = read_secret("db_name")
+DB_NAME = os.getenv("DB_NAME")
 DB_HOST = os.getenv("DB_HOST", "db")
 DB_PORT = os.getenv("DB_PORT", 5432)
 

@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: carnot-backend
+  namespace: {{ .Values.env }}
+  labels:
+    app.kubernetes.io/name: carnot
+    app.kubernetes.io/instance: {{ .Values.env }}
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: carnot-{{ .Chart.Version }}
+spec:
+  replicas: {{ .Values.backend.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: carnot
+      app.kubernetes.io/instance: {{ .Values.env }}
+      app.kubernetes.io/component: backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: carnot
+        app.kubernetes.io/instance: {{ .Values.env }}
+        app.kubernetes.io/component: backend
+    spec:
+      serviceAccountName: carnot-backend
+
+      # DB credential files are mounted at /run/secrets/ to match the path
+      # that app/backend/app/database.py:19-20 reads from.
+      volumes:
+        - name: db-secrets
+          projected:
+            sources:
+              - secret:
+                  name: carnot-secrets
+                  items:
+                    - key: db_user
+                      path: db_user
+                    - key: db_password
+                      path: db_password
+
+      containers:
+        - name: backend
+          image: "{{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag }}"
+          imagePullPolicy: Always
+
+          # Matches the entrypoint in deploy/compose/docker-compose.yaml
+          command:
+            - sh
+            - -c
+            - "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+
+          env:
+            - name: AUTH0_DOMAIN
+              value: {{ .Values.auth0.domain | quote }}
+            - name: AUTH0_AUDIENCE
+              value: {{ .Values.auth0.audience | quote }}
+            - name: AUTH0_CLAIMS_NAMESPACE
+              value: {{ .Values.auth0.claimsNamespace | quote }}
+            - name: BASE_ORIGINS
+              value: {{ .Values.frontendOrigin | quote }}
+            - name: COMPANY_ENV
+              value: {{ .Values.env | quote }}
+            - name: LOCAL_ENV
+              value: "false"
+            - name: SETTINGS_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: carnot-secrets
+                  key: settings_encryption_key
+            - name: DB_NAME
+              value: carnotdb
+            # DB host points to the headless postgres Service in the same namespace
+            - name: DB_HOST
+              value: carnot-postgres
+
+          volumeMounts:
+            - name: db-secrets
+              mountPath: /run/secrets
+              readOnly: true
+
+          resources:
+            {{- toYaml .Values.backend.resources | nindent 12 }}
+
+          # Uses the existing /health endpoint at app/backend/app/main.py:47
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3

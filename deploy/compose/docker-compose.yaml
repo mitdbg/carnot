@@ -1,25 +1,4 @@
 services:
-  web-frontend:
-    image: ${DOCKERHUB_USERNAME}/carnot:frontend-${ENV_NAME}
-    build:
-      context: .
-      dockerfile: Dockerfile-frontend
-      args:
-        VITE_AUTH0_AUDIENCE: ${VITE_AUTH0_AUDIENCE}
-        VITE_AUTH0_DOMAIN: ${VITE_AUTH0_DOMAIN}
-        VITE_AUTH0_CLIENT_ID: ${VITE_AUTH0_CLIENT_ID}
-        VITE_AUTH0_ORGANIZATION_ID: ${VITE_AUTH0_ORGANIZATION_ID}
-        VITE_API_BASE_URL: ${VITE_API_BASE_URL}
-    ports:
-      - "80:80"
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "7"
-    depends_on:
-      - web-backend
-
   web-backend:
     image: ${DOCKERHUB_USERNAME}/carnot:backend-${ENV_NAME}
     build:
@@ -33,9 +12,7 @@ services:
       COMPANY_ENV: ${ENV_NAME}
       LOCAL_ENV: ${LOCAL_ENV}
       SETTINGS_ENCRYPTION_KEY: ${SETTINGS_ENCRYPTION_KEY}
-      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
-      POSTGRES_USER_FILE: /run/secrets/db_user
-      POSTGRES_DB_FILE: /run/secrets/db_name
+      DB_NAME: ${DB_NAME}
     ports:
       - "8000:8000"
     command: >
@@ -43,7 +20,6 @@ services:
     secrets:
       - db_password
       - db_user
-      - db_name
     logging:
       driver: "json-file"
       options:
@@ -59,7 +35,7 @@ services:
     environment:
       POSTGRES_PASSWORD_FILE: /run/secrets/db_password
       POSTGRES_USER_FILE: /run/secrets/db_user
-      POSTGRES_DB_FILE: /run/secrets/db_name
+      POSTGRES_DB: ${DB_NAME}
     ports:
       - "5432:5432"
     volumes:
@@ -67,14 +43,13 @@ services:
     secrets:
       - db_password
       - db_user
-      - db_name
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "7"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$(cat /run/secrets/db_user) -d $$(cat /run/secrets/db_name)"]
+      test: ["CMD-SHELL", "pg_isready -U $$(cat /run/secrets/db_user) -d $$POSTGRES_DB"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -84,5 +59,3 @@ secrets:
     file: secrets/db_password.txt
   db_user:
     file: secrets/db_user.txt
-  db_name:
-    file: secrets/db_name.txt

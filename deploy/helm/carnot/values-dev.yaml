@@ -1,0 +1,21 @@
+env: dev
+apiHostname: api-dev.carnot-research.org
+frontendOrigin: https://dev.carnot-research.org
+
+backend:
+  autoscaling:
+    minReplicas: 1
+    maxReplicas: 3
+
+irsa:
+  roleArn: arn:aws:iam::422297141788:role/carnot-dev-sa-role
+
+auth0:
+  domain: ""        # TODO: fill in when AWS access is available
+  audience: ""      # TODO: fill in when AWS access is available
+  claimsNamespace: ""
+
+secretsManager:
+  enabled: true
+  dbSecretName: carnot/dev/db
+  appSecretName: carnot/dev/app

@@ -1,0 +1,21 @@
+env: at-prod
+apiHostname: ""     # TODO: fill in subdomain from AT_PROD_SUBDOMAIN secret
+frontendOrigin: ""  # TODO: fill in when subdomain is known
+
+backend:
+  autoscaling:
+    minReplicas: 1
+    maxReplicas: 5
+
+irsa:
+  roleArn: arn:aws:iam::422297141788:role/carnot-at-prod-sa-role
+
+auth0:
+  domain: ""        # TODO: fill in when AWS access is available
+  audience: ""      # TODO: fill in when AWS access is available
+  claimsNamespace: ""
+
+secretsManager:
+  enabled: true
+  dbSecretName: carnot/at-prod/db
+  appSecretName: carnot/at-prod/app

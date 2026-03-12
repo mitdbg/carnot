@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: carnot-postgres
+  namespace: {{ .Values.env }}
+  labels:
+    app.kubernetes.io/name: carnot
+    app.kubernetes.io/instance: {{ .Values.env }}
+    app.kubernetes.io/component: postgres
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: carnot-{{ .Chart.Version }}
+spec:
+  # Headless — pods are addressed directly by hostname rather than through
+  # a virtual IP. The backend connects via the service name 'carnot-postgres'
+  # which resolves to the StatefulSet pod.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: carnot
+    app.kubernetes.io/instance: {{ .Values.env }}
+    app.kubernetes.io/component: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+      protocol: TCP

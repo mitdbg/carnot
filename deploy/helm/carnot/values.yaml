@@ -1,0 +1,78 @@
+# Environment name — also used as the Kubernetes namespace.
+# Must be one of: dev, wl-prod, lm-prod, at-prod
+env: ""
+
+# Public hostname for the backend API ingress rule.
+# e.g. api-dev.carnot-research.org
+apiHostname: ""
+
+# Origin of the frontend (CloudFront domain). Passed to FastAPI as BASE_ORIGINS
+# for CORS. e.g. https://dev.carnot-research.org
+frontendOrigin: ""
+
+backend:
+  image:
+    # ECR repository URI — set at deploy time by CI via --set
+    repository: ""
+    # Image tag (git SHA) — set at deploy time by CI via --set
+    tag: ""
+
+  # Initial replica count before HPA takes over
+  replicaCount: 1
+
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 5
+    # HPA scales up when average CPU across pods exceeds this percentage
+    targetCPUUtilizationPercentage: 60
+
+postgres:
+  image: postgres:13-alpine
+  # Size of the EBS-backed PersistentVolumeClaim
+  storage: 50Gi
+  # StorageClass used to provision the PVC.
+  # AWS: gp3 (provisioned by EBS CSI driver)
+  storageClass: gp3
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+    limits:
+      cpu: "1"
+      memory: "2Gi"
+
+# IRSA: IAM role ARN to annotate on the backend ServiceAccount.
+# Grants the backend pod access to S3 and Secrets Manager for this environment.
+irsa:
+  roleArn: ""
+
+auth0:
+  domain: ""
+  audience: ""
+  claimsNamespace: ""
+
+# AWS Secrets Manager paths for this environment.
+# ExternalSecret will pull these and materialise them as a Kubernetes Secret.
+# Set enabled=false for local development — create the Kubernetes Secret manually:
+#   kubectl create secret generic carnot-secrets -n <env> \
+#     --from-literal=db_user=... \
+#     --from-literal=db_password=... \
+#     --from-literal=settings_encryption_key=...
+secretsManager:
+  enabled: true
+  # Secret containing db_user, db_password — e.g. carnot/dev/db
+  dbSecretName: ""
+  # Secret containing settings_encryption_key — e.g. carnot/dev/app
+  appSecretName: ""
+
+# ARN of the ACM certificate covering *.carnot-research.org
+acmCertificateArn: ""
