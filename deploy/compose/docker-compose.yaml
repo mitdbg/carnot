@@ -5,8 +5,8 @@ services:
       context: .
       dockerfile: Dockerfile-backend
     environment:
-      AUTH0_DOMAIN: ${AUTH0_DOMAIN}
-      AUTH0_AUDIENCE: ${AUTH0_AUDIENCE}
+      AUTH0_DOMAIN: ${VITE_AUTH0_DOMAIN}
+      AUTH0_AUDIENCE: ${VITE_AUTH0_AUDIENCE}
       AUTH0_CLAIMS_NAMESPACE: ${AUTH0_CLAIMS_NAMESPACE}
       BASE_ORIGINS: ${BASE_ORIGINS}
       COMPANY_ENV: ${ENV_NAME}

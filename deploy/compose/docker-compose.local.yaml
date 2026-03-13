@@ -1,8 +1,8 @@
 services:
   web-backend:
     environment:
-      AUTH0_DOMAIN: ${AUTH0_DOMAIN}
-      AUTH0_AUDIENCE: ${AUTH0_AUDIENCE}
+      AUTH0_DOMAIN: ${VITE_AUTH0_DOMAIN}
+      AUTH0_AUDIENCE: ${VITE_AUTH0_AUDIENCE}
     volumes:
       # maps the host directory created in start_local.sh to the container's /carnot/data
       - ${LOCAL_BASE_DIR}:/carnot

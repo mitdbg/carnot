@@ -16,15 +16,31 @@ export LOCAL_BASE_DIR="$LOCAL_BASE_DIR"
 export DOCKERHUB_USERNAME="carnotlocal"
 export SETTINGS_ENCRYPTION_KEY="12u1STDIIImTyKtTfkqwPDRCK4dCe65xHfXrPjrTeIU="
 
-# Auth0 configuration — required for login to work.
-# Unset by default; export these before running this script if you need auth:
-#   export AUTH0_DOMAIN=...
-#   export AUTH0_AUDIENCE=...
-#   export AUTH0_CLAIMS_NAMESPACE=...
-# Ask mdrusso for the local Auth0 app credentials.
+# Auth0 configuration.
+# VITE_AUTH0_CLIENT_ID and VITE_AUTH0_ORGANIZATION_ID must be exported before
+# running this script — ask the team for the local dev app credentials.
+export VITE_AUTH0_DOMAIN="${VITE_AUTH0_DOMAIN:-login.carnot-research.org}"
+export VITE_AUTH0_AUDIENCE="${VITE_AUTH0_AUDIENCE:-https://carnot.api.com}"
+export AUTH0_CLAIMS_NAMESPACE="${AUTH0_CLAIMS_NAMESPACE:-https://carnot.api.com/claims}"
+
 # Backend Runtime Environment
-# localhost:5173 is the Vite dev server — run 'npm run dev' in app/frontend/
-export BASE_ORIGINS="http://localhost:5173"
+# localhost:80 is the Vite dev server — run 'npm run dev' in app/frontend/
+export BASE_ORIGINS="http://localhost:80"
+
+# --- Generate frontend .env.local ---
+FRONTEND_ENV="../app/frontend/.env.local"
+if [[ -z "$VITE_AUTH0_CLIENT_ID" || -z "$VITE_AUTH0_ORGANIZATION_ID" ]]; then
+  echo "⚠️  VITE_AUTH0_CLIENT_ID and/or VITE_AUTH0_ORGANIZATION_ID are not set."
+  echo "   Login will not work. Export these vars and re-run, or create $FRONTEND_ENV manually."
+else
+  echo "Writing Auth0 config to $FRONTEND_ENV..."
+  cat > "$FRONTEND_ENV" <<EOF
+VITE_AUTH0_DOMAIN=${VITE_AUTH0_DOMAIN}
+VITE_AUTH0_CLIENT_ID=${VITE_AUTH0_CLIENT_ID}
+VITE_AUTH0_AUDIENCE=${VITE_AUTH0_AUDIENCE}
+VITE_AUTH0_ORGANIZATION_ID=${VITE_AUTH0_ORGANIZATION_ID}
+EOF
+fi
 
 # --- Database Defaults ---
 DB_PASSWORD_DEFAULT="supersecretpassword"
