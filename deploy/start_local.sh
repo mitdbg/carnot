@@ -30,17 +30,24 @@ export BASE_ORIGINS="http://localhost:80"
 # --- Generate frontend .env.local ---
 FRONTEND_ENV="../app/frontend/.env.local"
 if [[ -z "$VITE_AUTH0_CLIENT_ID" || -z "$VITE_AUTH0_ORGANIZATION_ID" ]]; then
-  echo "⚠️  VITE_AUTH0_CLIENT_ID and/or VITE_AUTH0_ORGANIZATION_ID are not set."
-  echo "   Login will not work. Export these vars and re-run, or create $FRONTEND_ENV manually."
-else
-  echo "Writing Auth0 config to $FRONTEND_ENV..."
-  cat > "$FRONTEND_ENV" <<EOF
+  echo "❌ Missing required Auth0 credentials:"
+  [[ -z "$VITE_AUTH0_CLIENT_ID" ]] && echo "   VITE_AUTH0_CLIENT_ID is not set"
+  [[ -z "$VITE_AUTH0_ORGANIZATION_ID" ]] && echo "   VITE_AUTH0_ORGANIZATION_ID is not set"
+  echo ""
+  echo "   Export these variables before running this script:"
+  echo "     export VITE_AUTH0_CLIENT_ID=<client-id>"
+  echo "     export VITE_AUTH0_ORGANIZATION_ID=<org-id>"
+  echo "   Ask the team for the local dev app credentials."
+  exit 1
+fi
+
+echo "Writing Auth0 config to $FRONTEND_ENV..."
+cat > "$FRONTEND_ENV" <<EOF
 VITE_AUTH0_DOMAIN=${VITE_AUTH0_DOMAIN}
 VITE_AUTH0_CLIENT_ID=${VITE_AUTH0_CLIENT_ID}
 VITE_AUTH0_AUDIENCE=${VITE_AUTH0_AUDIENCE}
 VITE_AUTH0_ORGANIZATION_ID=${VITE_AUTH0_ORGANIZATION_ID}
 EOF
-fi
 
 # --- Database Defaults ---
 DB_PASSWORD_DEFAULT="supersecretpassword"
