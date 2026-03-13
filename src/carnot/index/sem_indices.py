@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 # Max file summaries to send to LLM at once (context limit)
-FLAT_INDEX_MAX_LLM_ITEMS = 40
+FLAT_INDEX_MAX_LLM_ITEMS = 150
 
 # Number of concurrent workers for parallel cluster summarization
 _CLUSTER_SUMMARIZATION_WORKERS = 64
@@ -136,34 +136,45 @@ class FlatFileIndex:
         if len(entries) <= top_k:
             return list(range(len(entries)))
 
-        import re
+        import json
 
         max_chars = 1200
         numbered = "\n".join(
             f"{i + 1}. {(e.summary[:max_chars] + '...' if len(e.summary) > max_chars else e.summary)}"
             for i, e in enumerate(entries)
         )
-        prompt = f"""Given the user query, which of the following file summaries are most relevant? Return ONLY the numbers of the top {min(top_k, len(entries))} most relevant items, in order of relevance, as a comma-separated list (e.g. 3,1,7).
+        prompt = f"""Given the user query, select the most relevant file summaries.
+
+Return JSON only in this format:
+{{"indices": [3, 1, 7]}}
+
+The "indices" array must contain EXACTLY {min(top_k, len(entries))} DISTINCT integers.
+Choose the best remaining items until you have exactly {min(top_k, len(entries))}.
+Do not return any text outside the JSON object.
 
 Query: {query}
 
 File summaries:
 {numbered}
-
-Return only the comma-separated numbers, nothing else:"""
+"""
 
         try:
             from carnot.agents.models import ChatMessage
 
             message = ChatMessage(role="user", content=prompt)
+            model_id = getattr(self._model, "model_id", "") or ""
+            is_gpt5 = "gpt-5" in model_id
             response = self._model.generate(
                 messages=[message],
-                temperature=0.1,
+                temperature=1.0 if is_gpt5 else 0.1,
             )
+            if response.llm_call_stats is not None:
+                self._llm_call_stats.append(response.llm_call_stats)
             text = response.content.strip()
-            numbers = re.findall(r"\b(\d+)\b", text)
+            payload = json.loads(text)
+            raw_indices = payload.get("indices", [])
             indices = []
-            for n in numbers:
+            for n in raw_indices:
                 idx = int(n) - 1
                 if 0 <= idx < len(entries) and idx not in indices:
                     indices.append(idx)
@@ -179,6 +190,7 @@ Return only the comma-separated numbers, nothing else:"""
         if not self.file_summaries:
             return []
         k = min(k, len(self.file_summaries))
+        query_emb = None
 
         if len(self.file_summaries) <= self.max_llm_items:
             candidates = self.file_summaries
@@ -190,11 +202,20 @@ Return only the comma-separated numbers, nothing else:"""
             indices = order[:top_n].tolist()
             candidates = [self.file_summaries[i] for i in indices]
         indices = self._llm_select_indices(query, candidates, k)
-        if not indices:
-            query_emb = np.array(self._embed_texts([query])[0], dtype="float32")
+        if len(indices) < k:
+            if query_emb is None:
+                query_emb = np.array(self._embed_texts([query])[0], dtype="float32")
             emb = np.array([candidates[i].embedding for i in range(len(candidates))], dtype="float32")
             sims = -np.dot(emb, query_emb)
-            indices = np.argsort(sims)[:k].tolist()
+            embedding_order = np.argsort(sims).tolist()
+            seen = set(indices)
+            for idx in embedding_order:
+                if idx not in seen:
+                    indices.append(idx)
+                    seen.add(idx)
+                if len(indices) >= k:
+                    break
+        indices = indices[:k]
         return [candidates[i].path for i in indices]
 
 
@@ -495,7 +516,7 @@ Concise cluster summary:"""
             message = ChatMessage(role="user", content=prompt)
             response = self._model.generate(
                 messages=[message],
-                temperature=0.2,
+                temperature=0.1,
             )
             if response.llm_call_stats is not None:
                 with self._stats_lock:
@@ -560,8 +581,6 @@ Concise meta-cluster summary:"""
         """
         if not nodes or top_k <= 0:
             return []
-        if len(nodes) <= top_k:
-            return list(range(len(nodes)))
 
         import re
 
@@ -586,6 +605,9 @@ Return only the comma-separated numbers, nothing else:"""
                 messages=[message],
                 temperature=0.1,
             )
+            if response.llm_call_stats is not None:
+                with self._stats_lock:
+                    self._llm_call_stats.append(response.llm_call_stats)
             text = response.content.strip()
             # Parse "3, 1, 7" or "3,1,7" or "1. 3 2. 1" etc
             numbers = re.findall(r"\b(\d+)\b", text)

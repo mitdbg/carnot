@@ -72,4 +72,4 @@ class HierarchicalIndexConfig:
     tokens_per_summary_estimate: int = 80  # rough chars/4 for internal node summaries
     use_llm_routing: bool = True  # use LLM to select nodes when they fit in context
     llm_routing_model: str = "openai/gpt-5-mini-2025-08-07"
-    llm_routing_max_nodes: int = 15  # max nodes to send to LLM at once (context limit)
+    llm_routing_max_nodes: int = 100  # max nodes to send to LLM at once (context limit)
