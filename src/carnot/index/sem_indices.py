@@ -269,12 +269,22 @@ class HierarchicalFileIndex:
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
 
         if model is not None:
-            self._model = model
+            self._summary_model = model
+            self._routing_model = model
+            self._embed_model = model
         else:
             from carnot.agents.models import LiteLLMModel as _LiteLLMModel
 
-            self._model = _LiteLLMModel(
+            self._summary_model = _LiteLLMModel(
+                model_id=self.config.summary_model,
+                api_key=self.api_key,
+            )
+            self._routing_model = _LiteLLMModel(
                 model_id=self.config.llm_routing_model,
+                api_key=self.api_key,
+            )
+            self._embed_model = _LiteLLMModel(
+                model_id=self.config.embedding_model,
                 api_key=self.api_key,
             )
 
@@ -514,9 +524,9 @@ Concise cluster summary:"""
             from carnot.agents.models import ChatMessage
 
             message = ChatMessage(role="user", content=prompt)
-            response = self._model.generate(
+            response = self._summary_model.generate(
                 messages=[message],
-                temperature=0.1,
+                temperature=self._model_temperature(self._summary_model, default=0.1),
             )
             if response.llm_call_stats is not None:
                 with self._stats_lock:
@@ -546,9 +556,9 @@ Concise meta-cluster summary:"""
             from carnot.agents.models import ChatMessage
 
             message = ChatMessage(role="user", content=prompt)
-            response = self._model.generate(
+            response = self._summary_model.generate(
                 messages=[message],
-                temperature=0.2,
+                temperature=self._model_temperature(self._summary_model, default=0.2),
             )
             if response.llm_call_stats is not None:
                 with self._stats_lock:
@@ -560,13 +570,19 @@ Concise meta-cluster summary:"""
 
     def _embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed texts using the configured model."""
-        embeddings, embed_stats = self._model.embed(
+        embeddings, embed_stats = self._embed_model.embed(
             texts=texts,
             model=self.config.embedding_model,
         )
         with self._stats_lock:
             self._llm_call_stats.append(embed_stats)
         return embeddings
+
+    @staticmethod
+    def _model_temperature(model: LiteLLMModel, default: float) -> float:
+        """GPT-5 models only support temperature=1."""
+        model_id = getattr(model, "model_id", "") or ""
+        return 1.0 if "gpt-5" in model_id else default
 
     def _llm_select_node_indices(
         self,
@@ -582,37 +598,43 @@ Concise meta-cluster summary:"""
         if not nodes or top_k <= 0:
             return []
 
-        import re
+        import json
 
         numbered = "\n".join(
             f"{i + 1}. {self._get_node_summary(n)}"
             for i, n in enumerate(nodes)
         )
-        prompt = f"""Given the user query, which of the following items are most relevant? Return ONLY the numbers of the top {min(top_k, len(nodes))} most relevant items, in order of relevance, as a comma-separated list (e.g. 3,1,7).
+        prompt = f"""Given the user query, select the most relevant items.
+
+Return JSON only in this format:
+{{"indices": [3, 1, 7]}}
+
+The "indices" array must contain EXACTLY {min(top_k, len(nodes))} DISTINCT integers.
+Choose the best remaining items until you have exactly {min(top_k, len(nodes))}.
+Do not return any text outside the JSON object.
 
 Query: {query}
 
 Items:
 {numbered}
-
-Return only the comma-separated numbers, nothing else:"""
+"""
 
         try:
             from carnot.agents.models import ChatMessage
 
             message = ChatMessage(role="user", content=prompt)
-            response = self._model.generate(
+            response = self._routing_model.generate(
                 messages=[message],
-                temperature=0.1,
+                temperature=self._model_temperature(self._routing_model, default=0.1),
             )
             if response.llm_call_stats is not None:
                 with self._stats_lock:
                     self._llm_call_stats.append(response.llm_call_stats)
             text = response.content.strip()
-            # Parse "3, 1, 7" or "3,1,7" or "1. 3 2. 1" etc
-            numbers = re.findall(r"\b(\d+)\b", text)
+            payload = json.loads(text)
+            raw_indices = payload.get("indices", [])
             indices = []
-            for n in numbers:
+            for n in raw_indices:
                 idx = int(n) - 1  # 1-based in prompt
                 if 0 <= idx < len(nodes) and idx not in indices:
                     indices.append(idx)
@@ -642,17 +664,25 @@ Return only the comma-separated numbers, nothing else:"""
         Return indices of nodes ordered by relevance (best first).
         Uses LLM when enabled and node count fits; otherwise embedding similarity.
         """
+        embeddings = np.array([n.embedding for n in nodes], dtype="float32")
+        sims = -np.dot(embeddings, query_emb)
+        embedding_order = np.argsort(sims).tolist()
+
         max_llm = self.config.llm_routing_max_nodes
         if self.config.use_llm_routing and len(nodes) <= max_llm:
             indices = self._llm_select_node_indices(query, nodes, top_k)
+            if len(indices) < top_k:
+                seen = set(indices)
+                for idx in embedding_order:
+                    if idx not in seen:
+                        indices.append(idx)
+                        seen.add(idx)
+                    if len(indices) >= top_k:
+                        break
             if indices:
-                return indices
+                return indices[:top_k]
 
-        # Embedding fallback
-        embeddings = np.array([n.embedding for n in nodes], dtype="float32")
-        sims = -np.dot(embeddings, query_emb)
-        order = np.argsort(sims)
-        return order[:top_k].tolist()
+        return embedding_order[:top_k]
 
     def search(self, query: str, k: int = 50) -> list[str]:
         """
@@ -721,7 +751,19 @@ Return only the comma-separated numbers, nothing else:"""
             return
 
         if node.is_leaf_cluster:
-            for path in node.child_paths:
+            leaf_entries = [
+                self._path_to_summary[path]
+                for path in node.child_paths
+                if path in self._path_to_summary
+            ]
+            if leaf_entries:
+                leaf_embeddings = np.array([e.embedding for e in leaf_entries], dtype="float32")
+                sims = -np.dot(leaf_embeddings, query_emb)
+                ordered_paths = [leaf_entries[i].path for i in np.argsort(sims).tolist()]
+            else:
+                ordered_paths = node.child_paths
+
+            for path in ordered_paths:
                 if path not in seen_paths:
                     seen_paths.add(path)
                     result_paths.append(path)

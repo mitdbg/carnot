@@ -1,16 +1,3 @@
-#!/usr/bin/env python3
-"""Evaluate Carnot with different index configurations.
-
-Runs 4 query plan modes:
-- chroma: SemTopK(chroma) + SemFilter
-- flat: SemTopK(flat) + SemFilter  
-- hierarchical: SemTopK(hierarchical) + SemFilter
-- no-index: SemFilter only (no SemTopK)
-
-Usage:
-    python eval_indices.py --mode flat --queries data/quest_all.jsonl --domain films
-    python eval_indices.py --mode no-index --num-queries 5 --model openai/gpt-4o
-"""
 import argparse
 import json
 import os
@@ -78,8 +65,11 @@ def run_with_index(
         llm_config=llm_config,
         index_name=index_name,
     )
+
     topk_datasets, topk_stats = topk_op("Documents", input_datasets)
     
+    topk_titles = [item.get("title", "") for item in topk_datasets["topk_output"].items[:10]]
+    print(f"  TopK sample: {topk_titles}")
     # Run SemFilter on TopK results
     filter_op = SemFilterOperator(
         task=query,
@@ -122,6 +112,67 @@ def run_with_index(
         "filter_items_out": filter_stats.items_out,
     }
     
+    return titles, stats
+
+
+def run_only_topk(
+    query: str,
+    corpus_items: list[dict],
+    index_name: str,
+    api_key: str,
+    topk: int = 50,
+    embedding_model_id="openai/text-embedding-3-small"
+) -> tuple[list[str], dict]:
+    """Run SemTopK only (no SemFilter).
+
+    Returns:
+        Tuple of (predicted_titles, stats_dict)
+    """
+    start_time = time.perf_counter()
+
+    dataset = carnot.Dataset(
+        name="Documents",
+        annotation="A set of documents with their titles and content.",
+        items=corpus_items,
+        dataset_id=DATASET_ID,
+    )
+    input_datasets = {"Documents": dataset}
+    llm_config = {"OPENAI_API_KEY": api_key}
+
+    topk_op = SemTopKOperator(
+        task=query,
+        k=topk,
+        output_dataset_id="topk_output",
+        max_workers=64,
+        model_id="openai/text-embedding-3-small",  # Embedding model for ChromaIndex
+        llm_config=llm_config,
+        index_name=index_name,
+    )
+    topk_datasets, topk_stats = topk_op("Documents", input_datasets)
+
+    end_time = time.perf_counter()
+
+    results = topk_datasets["topk_output"].items
+    titles = [item.get("title", "") for item in results]
+
+    total_cost = 0.0
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    for stat in topk_stats.llm_calls:
+        total_cost += stat.cost_usd
+        total_input_tokens += stat.total_input_tokens
+        total_output_tokens += stat.total_output_tokens
+
+    stats = {
+        "total_cost_usd": total_cost,
+        "total_input_tokens": total_input_tokens,
+        "total_output_tokens": total_output_tokens,
+        "total_wall_clock_secs": end_time - start_time,
+        "topk_wall_clock_secs": topk_stats.wall_clock_secs,
+        "topk_items_out": topk_stats.items_out,
+    }
+
     return titles, stats
 
 
@@ -214,7 +265,7 @@ def main():
         "--mode",
         type=str,
         required=True,
-        choices=["chroma", "flat", "hierarchical", "no-index"],
+        choices=["chroma", "flat", "hierarchical", "vector-only", "no-index"],
         help="Index mode to use",
     )
     parser.add_argument(
@@ -246,6 +297,12 @@ def main():
         type=str,
         default="openai/gpt-5-2025-08-07",
         help="Model to use for SemFilter execution",
+    )
+    parser.add_argument(
+        "--embedding-model",
+        type=str,
+        default="openai/text-embedding-3-small",
+        help="Model to use for embedding (default: openai/text-embedding-3-small)",
     )
     parser.add_argument(
         "--topk",
@@ -310,6 +367,15 @@ def main():
                     model_id=args.model,
                     api_key=api_key,
                 )
+            elif args.mode == "vector-only":
+                pred_titles, exec_stats = run_only_topk(
+                    query=query['query'],
+                    corpus_items=corpus_items,
+                    embedding_model_id=args.embedding_model,
+                    index_name="chroma",
+                    api_key=api_key,
+                    topk=args.topk,
+                )
             else:
                 pred_titles, exec_stats = run_with_index(
                     query=query['query'],
@@ -330,8 +396,12 @@ def main():
             total_stats["total_wall_clock_secs"] += exec_stats["total_wall_clock_secs"]
             
             print(f"  P: {metrics['precision']:.3f}, R: {metrics['recall']:.3f}, F1: {metrics['f1']:.3f}")
-            print(f"  Cost: ${exec_stats['total_cost_usd']:.4f}, Time: {exec_stats['total_wall_clock_secs']:.2f}s")
+            print(f"  Cost: ${exec_stats['total_cost_usd']:.8f}, Time: {exec_stats['total_wall_clock_secs']:.2f}s")
             print(f"  Predicted: {len(pred_titles)}, GT: {len(query['docs'])}")
+            print(
+                f"  TopK out: {exec_stats.get('topk_items_out', 'n/a')}, "
+                f"Filter out: {exec_stats.get('filter_items_out', 'n/a')}"
+            )
             
             result = {
                 "query": query['query'],
@@ -372,8 +442,8 @@ def main():
     print(f"Average F1 Score:  {avg_f1:.4f}")
     print("-" * 60)
     print(f"Average Latency:   {avg_latency:.2f}s")
-    print(f"Average Cost:      ${avg_cost:.4f}")
-    print(f"Total Cost:        ${total_stats['total_cost_usd']:.4f}")
+    print(f"Average Cost:      ${avg_cost:.8f}")
+    print(f"Total Cost:        ${total_stats['total_cost_usd']:.8f}")
     print(f"Total Time:        {total_stats['total_wall_clock_secs']:.2f}s")
     print(f"Total Input Tokens:  {total_stats['total_input_tokens']:,}")
     print(f"Total Output Tokens: {total_stats['total_output_tokens']:,}")
