@@ -1,0 +1,85 @@
+name: Deploy to EKS (k8s branch)
+
+# Triggers only on pushes to the k8s branch.
+# This is a parallel deploy path that does not touch the existing EC2/Docker Compose pipeline.
+on:
+  push:
+    branches:
+      - k8s
+
+permissions:
+  id-token: write   # required for OIDC auth with AWS
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: wonderful-bluegrass-orca
+  # Deploy to the dev namespace for now
+  ENV_NAME: dev
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Authenticate to AWS using OIDC — no long-lived credentials stored in GitHub.
+      # CarnotGithubRole must have AmazonEKSClusterPolicy attached (for eks update-kubeconfig).
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@main
+        with:
+          role-to-assume: arn:aws:iam::422297141788:role/CarnotGithubRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      ######################################################################
+      # STEP 1 — BUILD & PUSH BACKEND IMAGE TO DOCKER HUB
+      ######################################################################
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Mirror the file layout the Dockerfile expects (same as existing workflow)
+      - name: Copy source files into build context
+        run: |
+          cp -r app/backend deploy/compose/backend
+          cp -r src         deploy/compose/src
+          cp pyproject.toml deploy/compose/pyproject.toml
+          cp README.md      deploy/compose/README.md
+
+      - name: Build and push backend image
+        run: |
+          IMAGE=${{ vars.DOCKERHUB_USERNAME }}/carnot-backend:$GITHUB_SHA
+          docker build \
+            -f deploy/compose/Dockerfile-backend \
+            -t $IMAGE \
+            deploy/compose
+          docker push $IMAGE
+          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
+
+      ######################################################################
+      # STEP 2 — DEPLOY VIA HELM
+      ######################################################################
+
+      - name: Connect kubectl to EKS cluster
+        run: |
+          aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
+
+      - name: Helm deploy
+        run: |
+          helm upgrade --install carnot deploy/helm/carnot \
+            --namespace $ENV_NAME \
+            --create-namespace \
+            --values deploy/helm/carnot/values-$ENV_NAME.yaml \
+            --set backend.image.repository=${{ vars.DOCKERHUB_USERNAME }}/carnot-backend \
+            --set backend.image.tag=$GITHUB_SHA \
+            --wait \
+            --timeout 5m
+
+      - name: Verify rollout
+        run: |
+          kubectl rollout status deployment/carnot-backend -n $ENV_NAME
