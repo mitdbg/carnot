@@ -202,9 +202,156 @@ helm repo add external-secrets https://charts.external-secrets.io 2>/dev/null ||
 helm repo update
 
 helm upgrade --install external-secrets external-secrets/external-secrets \
-  -n kube-system
+  --namespace external-secrets \
+  --create-namespace
 
-kubectl wait --for=condition=Ready pods -l app.kubernetes.io/name=external-secrets -n kube-system --timeout=120s
+kubectl wait --for=condition=Ready pods -l app.kubernetes.io/name=external-secrets -n external-secrets --timeout=120s
+
+# ---------------------------------------------------------------------------
+# Step 7: IRSA role for External Secrets Operator
+#
+# The ESO controller pod must call secretsmanager:GetSecretValue to sync secrets.
+# We create an IAM role scoped to the ESO ServiceAccount via IRSA, then annotate
+# the ServiceAccount so the pod inherits the credentials automatically.
+# ---------------------------------------------------------------------------
+echo "==> Setting up IRSA role for External Secrets Operator..."
+
+python3 -c "
+import json
+policy = {
+  'Version': '2012-10-17',
+  'Statement': [{
+    'Effect': 'Allow',
+    'Principal': {'Federated': 'arn:aws:iam::${ACCOUNT_ID}:oidc-provider/oidc.eks.${REGION}.amazonaws.com/id/${OIDC_ID}'},
+    'Action': 'sts:AssumeRoleWithWebIdentity',
+    'Condition': {'StringEquals': {
+      'oidc.eks.${REGION}.amazonaws.com/id/${OIDC_ID}:aud': 'sts.amazonaws.com',
+      'oidc.eks.${REGION}.amazonaws.com/id/${OIDC_ID}:sub': 'system:serviceaccount:external-secrets:external-secrets'
+    }}
+  }]
+}
+print(json.dumps(policy))
+" > /tmp/eso-trust-policy.json
+
+aws iam create-role \
+  --role-name carnot-external-secrets-role \
+  --assume-role-policy-document file:///tmp/eso-trust-policy.json \
+  || echo "Role already exists, skipping"
+
+aws iam put-role-policy \
+  --role-name carnot-external-secrets-role \
+  --policy-name SecretsManagerRead \
+  --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"secretsmanager:GetSecretValue\",\"secretsmanager:DescribeSecret\"],\"Resource\":\"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:carnot/*\"}]}"
+
+kubectl annotate serviceaccount external-secrets -n external-secrets \
+  eks.amazonaws.com/role-arn=arn:aws:iam::${ACCOUNT_ID}:role/carnot-external-secrets-role \
+  --overwrite
+
+kubectl rollout restart deployment external-secrets -n external-secrets
+kubectl wait --for=condition=Ready pods -l app.kubernetes.io/name=external-secrets -n external-secrets --timeout=120s
+
+# ---------------------------------------------------------------------------
+# Step 8: ClusterSecretStore
+#
+# The ExternalSecret resources in each Helm release reference a ClusterSecretStore
+# named 'aws-secrets-manager'. This store must exist before any Carnot environment
+# is deployed, otherwise ExternalSecret sync will fail with "store not found".
+#
+# Authentication uses the ESO ServiceAccount's IRSA role (set up in Step 7).
+# ---------------------------------------------------------------------------
+echo "==> Creating ClusterSecretStore..."
+
+kubectl apply -f - <<EOF
+apiVersion: external-secrets.io/v1
+kind: ClusterSecretStore
+metadata:
+  name: aws-secrets-manager
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: ${REGION}
+      auth:
+        jwt:
+          serviceAccountRef:
+            name: external-secrets
+            namespace: external-secrets
+EOF
+
+echo "==> Waiting for ClusterSecretStore to become ready..."
+kubectl wait clustersecretstore/aws-secrets-manager \
+  --for=condition=Ready \
+  --timeout=60s
+
+# ---------------------------------------------------------------------------
+# Step 9: Backend ServiceAccount IAM roles (one per environment)
+#
+# Each Carnot environment's backend pod uses a dedicated IAM role (IRSA) to
+# access its own S3 bucket and Secrets Manager path. The role ARN is referenced
+# in each values-{env}.yaml and annotated onto the carnot-backend ServiceAccount
+# by the Helm chart.
+#
+# Environments: dev, wl-prod, lm-prod, at-prod
+# ---------------------------------------------------------------------------
+echo "==> Creating per-environment backend ServiceAccount IAM roles..."
+
+for ENV in dev wl-prod lm-prod at-prod; do
+  echo "    -> carnot-${ENV}-sa-role"
+
+  python3 -c "
+import json
+policy = {
+  'Version': '2012-10-17',
+  'Statement': [{
+    'Effect': 'Allow',
+    'Principal': {'Federated': 'arn:aws:iam::${ACCOUNT_ID}:oidc-provider/oidc.eks.${REGION}.amazonaws.com/id/${OIDC_ID}'},
+    'Action': 'sts:AssumeRoleWithWebIdentity',
+    'Condition': {'StringEquals': {
+      'oidc.eks.${REGION}.amazonaws.com/id/${OIDC_ID}:aud': 'sts.amazonaws.com',
+      'oidc.eks.${REGION}.amazonaws.com/id/${OIDC_ID}:sub': 'system:serviceaccount:${ENV}:carnot-backend'
+    }}
+  }]
+}
+print(json.dumps(policy))
+" > /tmp/backend-sa-trust-policy.json
+
+  aws iam create-role \
+    --role-name "carnot-${ENV}-sa-role" \
+    --assume-role-policy-document file:///tmp/backend-sa-trust-policy.json \
+    || echo "    Role already exists, skipping"
+
+  aws iam put-role-policy \
+    --role-name "carnot-${ENV}-sa-role" \
+    --policy-name S3AndSecretsAccess \
+    --policy-document "{
+      \"Version\": \"2012-10-17\",
+      \"Statement\": [
+        {
+          \"Effect\": \"Allow\",
+          \"Action\": [\"s3:ListBucket\"],
+          \"Resource\": [\"arn:aws:s3:::carnot-research-${ENV}\"]
+        },
+        {
+          \"Effect\": \"Allow\",
+          \"Action\": [\"s3:*\"],
+          \"Resource\": [
+            \"arn:aws:s3:::carnot-research-${ENV}\",
+            \"arn:aws:s3:::carnot-research-${ENV}/*\"
+          ]
+        },
+        {
+          \"Effect\": \"Allow\",
+          \"Action\": [
+            \"secretsmanager:GetSecretValue\",
+            \"secretsmanager:DescribeSecret\"
+          ],
+          \"Resource\": [
+            \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:carnot/${ENV}/*\"
+          ]
+        }
+      ]
+    }"
+done
 
 # ---------------------------------------------------------------------------
 # Done
