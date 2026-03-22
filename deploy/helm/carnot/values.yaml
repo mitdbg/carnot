@@ -6,13 +6,24 @@ env: ""
 # e.g. api-dev.carnot-research.org
 apiHostname: ""
 
-# Origin of the frontend (CloudFront domain). Passed to FastAPI as BASE_ORIGINS
-# for CORS. e.g. https://dev.carnot-research.org
+# Public hostname for the frontend ingress rule.
+# e.g. dev.carnot-research.org
+frontendHostname: ""
+
+# Origin of the frontend. Passed to FastAPI as BASE_ORIGINS for CORS.
+# e.g. https://dev.carnot-research.org
 frontendOrigin: ""
+
+frontend:
+  image:
+    # Docker Hub image — set at deploy time by CI via --set
+    repository: ""
+    # Image tag (git SHA) — set at deploy time by CI via --set
+    tag: ""
 
 backend:
   image:
-    # ECR repository URI — set at deploy time by CI via --set
+    # Docker Hub image — set at deploy time by CI via --set
     repository: ""
     # Image tag (git SHA) — set at deploy time by CI via --set
     tag: ""

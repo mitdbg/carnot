@@ -1,4 +1,15 @@
 services:
+  web-frontend:
+    image: ${DOCKERHUB_USERNAME}/carnot:frontend-${ENV_NAME}
+    build:
+      context: .
+      dockerfile: Dockerfile-frontend
+      args:
+        VITE_AUTH0_DOMAIN: ${VITE_AUTH0_DOMAIN}
+        VITE_AUTH0_CLIENT_ID: ${VITE_AUTH0_CLIENT_ID}
+        VITE_AUTH0_ORGANIZATION_ID: ${VITE_AUTH0_ORGANIZATION_ID}
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL}
+
   web-backend:
     environment:
       AUTH0_DOMAIN: ${VITE_AUTH0_DOMAIN}
