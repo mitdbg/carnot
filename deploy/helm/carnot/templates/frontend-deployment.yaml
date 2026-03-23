@@ -23,6 +23,8 @@ spec:
         app.kubernetes.io/instance: {{ .Values.env }}
         app.kubernetes.io/component: frontend
     spec:
+      imagePullSecrets:
+        - name: dockerhub-pull-secret
       containers:
         - name: frontend
           image: "{{ .Values.frontend.image.repository }}:{{ .Values.frontend.image.tag }}"

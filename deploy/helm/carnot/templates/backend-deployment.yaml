@@ -24,6 +24,8 @@ spec:
         app.kubernetes.io/component: backend
     spec:
       serviceAccountName: carnot-backend
+      imagePullSecrets:
+        - name: dockerhub-pull-secret
 
       # DB credential files are mounted at /run/secrets/ to match the path
       # that app/backend/app/database.py:19-20 reads from.
