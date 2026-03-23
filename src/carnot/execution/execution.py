@@ -272,7 +272,6 @@ class Execution:
             logical_plan,
             self.datasets,
             conversation=self.conversation,
-            cost_budget=self.cost_budget,
         ):
             if isinstance(event, PlanningProgress):
                 yield event
