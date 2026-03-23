@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: carnot-frontend-nginx-conf
+  namespace: {{ .Values.env }}
+  labels:
+    app.kubernetes.io/name: carnot
+    app.kubernetes.io/instance: {{ .Values.env }}
+    app.kubernetes.io/component: frontend
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: carnot-{{ .Chart.Version }}
+data:
+  default.conf: |
+    server {
+        listen 80;
+        server_name _;
+
+        # accept file uploads up to 10GB
+        client_max_body_size 10G;
+
+        # Serve static files
+        root /usr/share/nginx/html;
+        index index.html;
+
+        # Support SPA routing
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+    }
