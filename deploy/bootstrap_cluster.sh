@@ -15,7 +15,7 @@
 #   ./bootstrap_cluster.sh <cluster-name> <region> <aws-account-id>
 #
 # Example:
-#   ./bootstrap_cluster.sh wonderful-bluegrass-orca us-east-1 422297141788
+#   ./bootstrap_cluster.sh carnot-unified-backend us-east-1 422297141788
 
 set -euo pipefail
 
