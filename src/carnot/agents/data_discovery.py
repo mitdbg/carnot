@@ -1,12 +1,11 @@
-"""
-Data Discovery Agent for Carnot.
+"""Data Discovery Agent for Carnot.
 
 This agent specializes in analyzing datasets to discover relevant data,
 inspect schemas, and provide information about dataset structure.
 It can be used as a managed agent by the Planner.
 
-This agent inherits directly from BaseAgent (not CodeAgent) to minimize
-dependency on the SmolAgents library code.
+This agent inherits from ``CarnotBaseAgent``, a minimal base class that
+contains only the machinery needed by the Planner and DataDiscoveryAgent.
 """
 
 import queue
@@ -16,20 +15,13 @@ from typing import Any
 
 import yaml
 
-from carnot.agents.base import (
-    ActionOutput,
-    ActionStep,
-    BaseAgent,
-    FinalAnswerStep,
-    PlanningStep,
-    populate_template,
-)
+from carnot.agents.base import ActionOutput, BaseAgent, populate_template
 from carnot.agents.local_python_executor import (
     BASE_BUILTIN_MODULES,
     LocalPythonExecutor,
     PythonExecutor,
 )
-from carnot.agents.memory import ToolCall
+from carnot.agents.memory import ActionStep, FinalAnswerStep, PlanningStep, ToolCall
 from carnot.agents.models import Model
 from carnot.agents.monitoring import LogLevel
 from carnot.agents.tools import Tool
@@ -237,41 +229,36 @@ class DataDiscoveryAgent(BaseAgent):
     def run(
         self,
         task: str,
-        stream: bool = False,
         reset: bool = True,
-        images: list | None = None,
         additional_args: dict | None = None,
         max_steps: int | None = None,
     ):
-        """
-        Run the data discovery agent on a task.
-        
-        Injects datasets into the executor state before running.
-        
-        Args:
-            task: The task to perform (e.g., "Which datasets have research papers?")
-            stream: Whether to stream outputs.
-            reset: Whether to reset conversation state.
-            images: Optional images to include.
-            additional_args: Additional arguments to pass.
-            max_steps: Maximum number of steps.
-            
+        """Run the data discovery agent on a task.
+
+        Injects datasets into the executor state before delegating to the
+        parent ``CarnotBaseAgent.run``.
+
+        Requires:
+            - *task* is a non-empty string.
+            - ``self._datasets`` is populated.
+
         Returns:
-            The result of the data discovery task.
+            The result of the data discovery task (a string report).
+
+        Raises:
+            Whatever the parent ``run`` raises.
         """
         # Inject datasets into the executor state
         self.python_executor.state.update(self._get_executor_state())
-        
+
         # Merge any additional args
         if additional_args:
             self.python_executor.state.update(additional_args)
-        
+
         # Run the parent class implementation
         return super().run(
             task=task,
-            stream=stream,
             reset=reset,
-            images=images,
             additional_args=additional_args,
             max_steps=max_steps,
         )
@@ -524,7 +511,7 @@ class DataDiscoveryAgent(BaseAgent):
         yield ActionOutput(output=code_output.output, is_final_answer=code_output.is_final_answer)
 
     def _run_stream(
-        self, task: str, max_steps: int, images: list | None = None
+        self, task: str, max_steps: int
     ) -> Generator[ActionStep | PlanningStep | FinalAnswerStep, None, None]:
         """Override ``_run_stream`` to add countdown warnings and push
         progress events to the progress queue.
@@ -539,7 +526,7 @@ class DataDiscoveryAgent(BaseAgent):
         """
         from carnot.execution.progress import PlanningProgress
 
-        for step in super()._run_stream(task, max_steps, images):
+        for step in super()._run_stream(task, max_steps):
             yield step
 
             # After yielding an ActionStep, check if we should warn the agent

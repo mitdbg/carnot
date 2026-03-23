@@ -121,6 +121,7 @@ class Conversation(Base):
     user_id = Column(String, index=True, nullable=False)
     session_id = Column(String, unique=True, nullable=False, index=True)
     title = Column(String, nullable=True)  # Auto-generated from first query
+    is_query_active = Column(Boolean, default=False, nullable=False)
     created_at = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))  # noqa: UP017
     updated_at = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))  # noqa: UP017
 
@@ -220,6 +221,51 @@ class Notebook(Base):
     cells_json = Column(JSONB, nullable=True)
     created_at = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))  # noqa: UP017
     updated_at = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))  # noqa: UP017
+
+
+class QueryEvent(Base):
+    """Append-only log of SSE events emitted during planning and execution.
+
+    Each row captures a single SSE event (``step_detail``, ``result``,
+    ``execution_stats``, ``done``, ``error``) together with its per-step
+    cost.  Summing ``step_cost_usd`` over a conversation gives the total
+    cost for a workspace, enabling the frontend to restore the cost pill
+    after a page navigation without replaying the SSE stream.
+
+    Representation invariant:
+        - ``conversation_id`` references a valid conversation.
+        - ``event_type`` is one of ``"step_detail"``, ``"planning_stats"``,
+          ``"execution_stats"``, ``"result"``, ``"error"``, ``"done"``.
+        - ``source`` is ``"planning"`` or ``"execution"`` when
+          ``event_type == "step_detail"``; may be ``None`` otherwise.
+        - ``payload`` is a non-empty JSONB dict matching the SSE event
+          structure.
+
+    Abstraction function:
+        Represents a single SSE event persisted to the database so that
+        workspace cost can be reconstructed without an active stream.
+    """
+    __tablename__ = "query_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    conversation_id = Column(
+        Integer,
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    session_id = Column(String, nullable=False, index=True)
+    event_type = Column(String, nullable=False)
+    source = Column(String, nullable=True)
+    payload = Column(JSONB, nullable=False)
+    step_cost_usd = Column(Float, nullable=True)
+    created_at = Column(
+        TIMESTAMP(timezone=True),
+        default=lambda: datetime.now(timezone.utc),  # noqa: UP017
+    )
+
+    __table_args__ = (
+        Index("ix_query_events_conv_id_created", "conversation_id", "created_at"),
+    )
 
 
 # dependency to get database session

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { Database, CheckSquare, Square, MessageSquare, Trash2, ChevronLeft, ChevronRight, Search, Plus, X } from 'lucide-react'
 import { useApiToken } from '../hooks/useApiToken'
+import { useQueryEventsPolling } from '../hooks/useQueryEventsPolling'
 import { conversationsApi, datasetsApi, notebookApi, workspacesApi } from '../services/api'
 import TabBar from '../components/TabBar'
 import ChatView from '../components/ChatView'
@@ -119,6 +120,7 @@ function UserWorkspacePage() {
   const [costBudget, setCostBudget] = useState(DEFAULT_COST_BUDGET)
   const [queryCostUsd, setQueryCostUsd] = useState(null)
   const abortControllerRef = useRef(null)
+  const currentWorkspaceIdRef = useRef(null)
 
   // ─── Workspace tab state ──────────────────────────────────────────
   const [tabs, setTabs] = useState([
@@ -130,12 +132,112 @@ function UserWorkspacePage() {
   // Track the plan visualizer state — auto-dismiss on notebook switch
   const [showPlanVisualizer, setShowPlanVisualizer] = useState(true)
 
+  // ─── Poll-based catch-up for in-flight queries (Phase 5) ──────────
+  // When the user navigates back to a workspace whose query is still
+  // running, we poll GET /query/events to reconstruct the streaming UI.
+  // shouldPoll is only true when an active query was detected AND no
+  // SSE stream is connected (to avoid double-counting events).
+  const [queryActiveOnLoad, setQueryActiveOnLoad] = useState(false)
+  const shouldPoll = queryActiveOnLoad && !isLoading && !isExecuting
+
+  const { events: polledEvents, isComplete: pollIsComplete, reset: resetPolling } =
+    useQueryEventsPolling(currentConversationId, shouldPoll, getValidToken)
+
   // ─── Lifecycle ────────────────────────────────────────────────────
   useEffect(() => {
     loadWorkspaces()
   }, [])
 
   useEffect(() => { loadDatasets() }, [])
+
+  // ─── Dispatch polled events into the same state as SSE (Phase 5) ──
+  // polledEvents is an ever-growing array; we track how many we've
+  // already processed so we only dispatch new ones.
+  const processedPollCountRef = useRef(0)
+
+  useEffect(() => {
+    if (polledEvents.length <= processedPollCountRef.current) return
+
+    const newEvents = polledEvents.slice(processedPollCountRef.current)
+    processedPollCountRef.current = polledEvents.length
+
+    for (const event of newEvents) {
+      const data = event.payload
+
+      if (event.event_type === 'step_detail') {
+        const source = event.source || data.source
+        if (event.step_cost_usd != null) {
+          setQueryCostUsd(prev => (prev || 0) + event.step_cost_usd)
+        }
+        setMessages(prev => {
+          const last = prev[prev.length - 1]
+          if (last?.type === 'step_group' && last.source === source) {
+            const updated = { ...last, steps: [...last.steps, data] }
+            return [...prev.slice(0, -1), updated]
+          }
+          return [...prev, { type: 'step_group', source, steps: [data], isActive: true }]
+        })
+      } else if (event.event_type === 'result') {
+        setMessages(prev => [
+          ...prev.map(m =>
+            m.type === 'step_group' && m.isActive ? { ...m, isActive: false } : m
+          ),
+          {
+            type: 'result',
+            content: data.message,
+            csv_file: data.csv_file,
+            row_count: data.row_count,
+          },
+        ])
+        loadWorkspaces()
+        setCurrentPlan(null)
+      } else if (event.event_type === 'error') {
+        setMessages(prev => [
+          ...prev.map(m =>
+            m.type === 'step_group' && m.isActive ? { ...m, isActive: false } : m
+          ),
+          { type: 'error', content: data.message },
+        ])
+      } else if (event.event_type === 'execution_stats') {
+        if (data.total_cost_usd != null) {
+          setQueryCostUsd(data.total_cost_usd)
+        }
+      } else if (event.event_type === 'planning_stats') {
+        if (data.total_cost_usd != null) {
+          setQueryCostUsd(data.total_cost_usd)
+        }
+      } else if (event.event_type === 'plan_complete') {
+        setMessages(prev => {
+          const planMsg = {
+            type: 'agent',
+            content: data.natural_language_plan,
+            isPlanConfirmation: true,
+            attachedPlan: data.plan,
+          }
+          return [
+            ...prev.map(m =>
+              m.type === 'step_group' && m.isActive ? { ...m, isActive: false } : m
+            ),
+            planMsg,
+          ]
+        })
+        if (data.plan) setCurrentPlan(data.plan)
+      } else if (event.event_type === 'done') {
+        setMessages(prev =>
+          prev.map(m =>
+            m.type === 'step_group' && m.isActive ? { ...m, isActive: false } : m
+          )
+        )
+      }
+    }
+  }, [polledEvents])
+
+  // When polling detects the query finished, turn off the active flag
+  useEffect(() => {
+    if (pollIsComplete && queryActiveOnLoad) {
+      setQueryActiveOnLoad(false)
+    }
+  }, [pollIsComplete, queryActiveOnLoad])
 
   // ─── Data loaders ──────────────────────────────────────────────────
   const loadWorkspaces = async () => {
@@ -150,6 +252,24 @@ function UserWorkspacePage() {
   }
 
   const loadWorkspace = async (workspaceId) => {
+    // Update the ref synchronously (before any await) so inflight SSE
+    // handlers can detect the switch immediately.
+    currentWorkspaceIdRef.current = workspaceId
+
+    // Abort any inflight SSE stream from a previous workspace.
+    // This is safe because the backend persists events independently
+    // of the SSE consumer — no data is lost.
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort()
+      abortControllerRef.current = null
+    }
+    setIsLoading(false)
+    setIsExecuting(false)
+    // Reset polling state from any previous workspace
+    resetPolling()
+    processedPollCountRef.current = 0
+    setQueryActiveOnLoad(false)
+
     try {
       const token = await getValidToken()
       if (!token) return
@@ -193,6 +313,20 @@ function UserWorkspacePage() {
           // Skip raw logical-plan messages — they're consumed by the
           // natural-language-plan handler below.
           if (msg.type === 'logical-plan') continue
+
+          // Restore persisted step_group messages as collapsed card groups.
+          if (msg.type === 'step_group') {
+            try {
+              const steps = JSON.parse(msg.content)
+              formattedMessages.push({
+                type: 'step_group',
+                source: steps[0]?.source || 'planning',
+                steps,
+                isActive: false,
+              })
+            } catch (_) { /* malformed JSON — skip */ }
+            continue
+          }
 
           // Track the last user query so execute handlers can use it
           if (msg.role === 'user') {
@@ -239,7 +373,14 @@ function UserWorkspacePage() {
         setLastQuery('')
       }
 
-      setQueryCostUsd(null)
+      setQueryCostUsd(workspace.total_cost_usd || null)
+
+      // If any conversation has an active in-flight query, enable
+      // poll-based catch-up so the streaming UI reconstructs.
+      const activeConv = (workspace.conversations || []).find(c => c.is_query_active)
+      if (activeConv) {
+        setQueryActiveOnLoad(true)
+      }
 
       // Switch to chat tab when loading a workspace
       setActiveTabId('chat')
@@ -492,7 +633,6 @@ function UserWorkspacePage() {
     setIsExecuting(false)
     setQueryCostUsd(null)
 
-    let hasActiveStatus = false
     let titleRefreshed = false
 
     try {
@@ -500,6 +640,7 @@ function UserWorkspacePage() {
       if (!token) return
 
       abortControllerRef.current = new AbortController()
+      const workspaceAtStart = currentWorkspaceIdRef.current
       const datasetIds = Array.from(selectedDatasets).map(id => parseInt(id))
 
       const response = await fetch(`${API_BASE_URL}/query/plan`, {
@@ -536,23 +677,31 @@ function UserWorkspacePage() {
 
         for (const line of lines) {
           if (line.startsWith('data: ')) {
+            // Phase 1: stop processing if the user navigated away
+            if (currentWorkspaceIdRef.current !== workspaceAtStart) break
             try {
               const data = JSON.parse(line.slice(6))
               if (data.session_id && data.session_id !== sessionId) setSessionId(data.session_id)
 
-              if (data.type === 'planning_status') {
-                if (data.cumulative_cost_usd != null) setQueryCostUsd(data.cumulative_cost_usd)
+              if (data.type === 'step_detail' && data.source === 'planning') {
+                if (data.step_cost_usd != null) setQueryCostUsd(prev => (prev || 0) + data.step_cost_usd)
                 // Refresh sidebar on the first status event so the
                 // workspace title (set by the backend immediately after
                 // receiving the user message) appears without waiting
                 // for plan_complete.
                 if (!titleRefreshed) { loadWorkspaces(); titleRefreshed = true }
-                if (hasActiveStatus) {
-                  setMessages(prev => [...prev.slice(0, -1), { type: 'status', content: data.message }])
-                } else {
-                  setMessages(prev => [...prev, { type: 'status', content: data.message }])
-                  hasActiveStatus = true
-                }
+
+                setMessages(prev => {
+                  const last = prev[prev.length - 1]
+                  if (last?.type === 'step_group' && last.source === 'planning') {
+                    // Append to existing step group
+                    const updated = { ...last, steps: [...last.steps, data] }
+                    return [...prev.slice(0, -1), updated]
+                  } else {
+                    // Start a new step group
+                    return [...prev, { type: 'step_group', source: 'planning', steps: [data], isActive: true }]
+                  }
+                })
               } else if (data.type === 'planning_stats') {
                 if (data.total_cost_usd != null) setQueryCostUsd(data.total_cost_usd)
               } else if (data.type === 'plan_complete') {
@@ -562,22 +711,24 @@ function UserWorkspacePage() {
                   isPlanConfirmation: true,
                   attachedPlan: data.plan
                 }
-                if (hasActiveStatus) {
-                  setMessages(prev => [...prev.slice(0, -1), planMsg])
-                } else {
-                  setMessages(prev => [...prev, planMsg])
-                }
-                hasActiveStatus = false
+                // Mark the step group as no longer active and append the plan message
+                setMessages(prev => {
+                  const updated = prev.map(m =>
+                    m.type === 'step_group' && m.isActive ? { ...m, isActive: false } : m
+                  )
+                  return [...updated, planMsg]
+                })
                 setCurrentPlan(data.plan)
                 loadWorkspaces()  // refresh sidebar — title derived from query
               } else if (data.type === 'error') {
                 const errMsg = { type: 'error', content: data.message }
-                if (hasActiveStatus) {
-                  setMessages(prev => [...prev.slice(0, -1), errMsg])
-                } else {
-                  setMessages(prev => [...prev, errMsg])
-                }
-                hasActiveStatus = false
+                // Mark the step group as no longer active and append the error
+                setMessages(prev => {
+                  const updated = prev.map(m =>
+                    m.type === 'step_group' && m.isActive ? { ...m, isActive: false } : m
+                  )
+                  return [...updated, errMsg]
+                })
               }
             } catch (e) {
               console.error('Error parsing SSE data:', e)
@@ -586,7 +737,10 @@ function UserWorkspacePage() {
         }
       }
     } catch (error) {
-      if (hasActiveStatus) setMessages(prev => prev.slice(0, -1))
+      // Mark any active step group as no longer active
+      setMessages(prev => prev.map(m =>
+        m.type === 'step_group' && m.isActive ? { ...m, isActive: false } : m
+      ))
       if (error && error.type === 'API_KEY_MISSING') {
         setMessages(prev => [...prev, { type: 'error', content: `${error.message} Please go to the Settings page to configure your keys.` }])
       } else if (error.name !== 'AbortError') {
@@ -640,13 +794,12 @@ function UserWorkspacePage() {
       }
     }
 
-    let hasActiveStatus = false
-
     try {
       const token = await getValidToken()
       if (!token) return
 
       abortControllerRef.current = new AbortController()
+      const workspaceAtStart = currentWorkspaceIdRef.current
       const datasetIds = Array.from(selectedDatasets).map(id => parseInt(id))
 
       const response = await fetch(`${API_BASE_URL}/query/execute`, {
@@ -683,46 +836,51 @@ function UserWorkspacePage() {
 
         for (const line of lines) {
           if (line.startsWith('data: ')) {
+            // stop processing if the user navigated away
+            if (currentWorkspaceIdRef.current !== workspaceAtStart) break
             try {
               const data = JSON.parse(line.slice(6))
               if (data.session_id && data.session_id !== sessionId) setSessionId(data.session_id)
 
-              if (data.type === 'execution_status') {
-                if (hasActiveStatus) {
-                  setMessages(prev => [...prev.slice(0, -1), { type: 'status', content: data.message }])
-                } else {
-                  setMessages(prev => [...prev, { type: 'status', content: data.message }])
-                  hasActiveStatus = true
-                }
+              if (data.type === 'step_detail' && data.source === 'execution') {
+                if (data.step_cost_usd != null) setQueryCostUsd(prev => (prev || 0) + data.step_cost_usd)
+                setMessages(prev => {
+                  const last = prev[prev.length - 1]
+                  if (last?.type === 'step_group' && last.source === 'execution') {
+                    const updated = { ...last, steps: [...last.steps, data] }
+                    return [...prev.slice(0, -1), updated]
+                  } else {
+                    return [...prev, { type: 'step_group', source: 'execution', steps: [data], isActive: true }]
+                  }
+                })
               } else if (data.type === 'result') {
-                const resultMsg = {
-                  type: 'result',
-                  content: data.message,
-                  csv_file: data.csv_file,
-                  row_count: data.row_count
-                }
-                if (hasActiveStatus) {
-                  setMessages(prev => [...prev.slice(0, -1), resultMsg])
-                } else {
-                  setMessages(prev => [...prev, resultMsg])
-                }
-                hasActiveStatus = false
+                // Mark step_group inactive, then append result
+                setMessages(prev => [
+                  ...prev.map(m =>
+                    m.type === 'step_group' && m.isActive ? { ...m, isActive: false } : m
+                  ),
+                  {
+                    type: 'result',
+                    content: data.message,
+                    csv_file: data.csv_file,
+                    row_count: data.row_count
+                  }
+                ])
                 loadWorkspaces()
                 setCurrentPlan(null)
               } else if (data.type === 'error') {
-                const errMsg = { type: 'error', content: data.message }
-                if (hasActiveStatus) {
-                  setMessages(prev => [...prev.slice(0, -1), errMsg])
-                } else {
-                  setMessages(prev => [...prev, errMsg])
-                }
-                hasActiveStatus = false
+                setMessages(prev => [
+                  ...prev.map(m =>
+                    m.type === 'step_group' && m.isActive ? { ...m, isActive: false } : m
+                  ),
+                  { type: 'error', content: data.message }
+                ])
               } else if (data.type === 'execution_stats') {
                 if (data.total_cost_usd != null) {
-                  // Accumulate: execution_stats only contains execution-phase
-                  // cost (planning ran in a separate Execution instance), so
-                  // add it to the planning cost already shown.
-                  setQueryCostUsd(prev => (prev || 0) + data.total_cost_usd)
+                  // execution_stats now includes planning + execution costs
+                  // (planning_stats is threaded into the Execution constructor), 
+                  // so overwrite rather than accumulate.
+                  setQueryCostUsd(data.total_cost_usd)
                 }
                 console.debug('Execution stats received:', data)
               }
@@ -733,7 +891,9 @@ function UserWorkspacePage() {
         }
       }
     } catch (error) {
-      if (hasActiveStatus) setMessages(prev => prev.slice(0, -1))
+      setMessages(prev => prev.map(m =>
+        m.type === 'step_group' && m.isActive ? { ...m, isActive: false } : m
+      ))
       if (error && error.type === 'API_KEY_MISSING') {
         setMessages(prev => [...prev, { type: 'error', content: `${error.message} Please go to the Settings page to configure your keys.` }])
       } else if (error.name !== 'AbortError') {

@@ -394,14 +394,12 @@ class TestExecutionProgress:
             operator_index=0,
             total_operators=3,
             operator_name="Semantic Filter",
-            detail={"items": 42},
         )
         d = ep.to_dict()
         assert d["message"] == "Running step 1/3: Semantic Filter…"
         assert d["operator_index"] == 0
         assert d["total_operators"] == 3
         assert d["operator_name"] == "Semantic Filter"
-        assert d["detail"] == {"items": 42}
 
     def test_to_dict_omits_none(self):
         """None fields are omitted from the dict."""
@@ -411,14 +409,6 @@ class TestExecutionProgress:
         assert "total_operators" not in d
         assert "operator_name" not in d
         assert d["message"] == "Starting execution"
-
-    def test_to_dict_omits_empty_detail(self):
-        """Empty detail dict is still included (it's not None)."""
-        ep = ExecutionProgress(message="test")
-        d = ep.to_dict()
-        # The empty dict is truthy by dataclass default, so it appears
-        assert d["detail"] == {}
-
 
 # ═══════════════════════════════════════════════════════════════════════
 # Execution.reoptimize

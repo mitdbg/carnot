@@ -4,11 +4,12 @@ from carnot.operators.logical import (
     FilteredScan,
     JoinOp,
     Limit,
+    LogicalOperator,
     MapScan,
     TopK,
 )
 
-LOGICAL_OPERATORS = [
+LOGICAL_OPERATORS: list[LogicalOperator] = [
     Aggregate,
     Code,
     FilteredScan,

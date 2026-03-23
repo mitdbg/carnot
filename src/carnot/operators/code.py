@@ -199,7 +199,7 @@ class CodeOperator:
             timing=Timing(start_time=action_step_start_time, end_time=time.time()),
             token_usage=final_answer.token_usage,
         )
-        final_memory_step.action_output = final_answer.content
+        final_memory_step.final_output = final_answer.content
         self._finalize_step(final_memory_step)
         self.memory.steps.append(final_memory_step)
         return final_answer.content
@@ -356,7 +356,7 @@ class CodeOperator:
                 ),
             ]
         self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
-        memory_step.action_output = code_output.output
+        memory_step.code_action_output = code_output.output
         yield CodeActionOutput(
             code=code_action,
             output=code_output.output,

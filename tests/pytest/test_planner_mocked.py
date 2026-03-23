@@ -103,7 +103,7 @@ class TestPlannerMocked:
         mock_litellm.set_completion_handler(handler)
 
         planner = _make_planner(mock_llm_config, [movies])
-        plan = planner.generate_logical_plan(query="List all movies", datasets=[movies])
+        plan = planner.generate_logical_plan(query="List all movies")
 
         _validate_plan_node(plan)
         assert plan["name"] == "Movies"
@@ -127,7 +127,7 @@ class TestPlannerMocked:
         mock_litellm.set_completion_handler(handler)
 
         planner = _make_planner(mock_llm_config, [movies])
-        plan = planner.generate_logical_plan(query="Find sci-fi movies", datasets=[movies])
+        plan = planner.generate_logical_plan(query="Find sci-fi movies")
 
         _validate_plan_node(plan)
         assert plan["params"].get("operator") == "SemanticFilter"
@@ -151,7 +151,7 @@ class TestPlannerMocked:
         mock_litellm.set_completion_handler(handler)
 
         planner = _make_planner(mock_llm_config, [movies])
-        plan = planner.generate_logical_plan(query="Classify genres", datasets=[movies])
+        plan = planner.generate_logical_plan(query="Classify genres")
 
         _validate_plan_node(plan)
         assert plan["params"].get("operator") == "SemanticMap"
@@ -175,7 +175,7 @@ class TestPlannerMocked:
         mock_litellm.set_completion_handler(handler)
 
         planner = _make_planner(mock_llm_config, [movies])
-        plan = planner.generate_logical_plan(query="Average rating of top movies", datasets=[movies])
+        plan = planner.generate_logical_plan(query="Average rating of top movies")
 
         _validate_plan_node(plan)
         # Root should be the second filter, with one parent (the first filter)
@@ -207,7 +207,7 @@ class TestPlannerMocked:
         mock_litellm.set_completion_handler(handler)
 
         planner = _make_planner(mock_llm_config, [movies])
-        plan = planner.generate_logical_plan(query="sci-fi movies", datasets=[movies])
+        plan = planner.generate_logical_plan(query="sci-fi movies")
 
         json_str = json.dumps(plan)
         assert json.loads(json_str) == plan
@@ -229,7 +229,7 @@ class TestPlannerMocked:
         mock_litellm.set_completion_handler(handler)
 
         planner = _make_planner(mock_llm_config, [movies])
-        plan = planner.generate_logical_plan(query="some query", datasets=[movies])
+        plan = planner.generate_logical_plan(query="some query")
 
         # Walk to the leaf
         leaf = plan["parents"][0]
@@ -284,7 +284,7 @@ class TestPlannerMocked:
         mock_litellm.set_completion_handler(handler)
 
         planner = _make_planner(mock_llm_config, [movies])
-        plan = planner.generate_logical_plan(query="Find sci-fi movies", datasets=[movies])
+        plan = planner.generate_logical_plan(query="Find sci-fi movies")
 
         _validate_plan_node(plan)
         assert plan["params"].get("operator") == "SemanticFilter"
@@ -304,7 +304,7 @@ class TestPlannerMocked:
         mock_litellm.set_completion_handler(handler)
 
         planner = _make_planner(mock_llm_config, [movies])
-        planner.generate_logical_plan(query="list movies", datasets=[movies])
+        planner.generate_logical_plan(query="list movies")
 
         assert len(mock_litellm.completion_calls) >= 1
         planner.cleanup()
@@ -322,7 +322,7 @@ class TestPlannerMocked:
 
         query = "Find movies directed by Nolan"
         planner = _make_planner(mock_llm_config, [movies])
-        planner.generate_logical_plan(query=query, datasets=[movies])
+        planner.generate_logical_plan(query=query)
 
         # Check the first completion call's messages contain the query
         _, messages, _ = mock_litellm.completion_calls[0]
@@ -343,7 +343,7 @@ class TestPlannerMocked:
         mock_litellm.set_completion_handler(handler)
 
         planner = _make_planner(mock_llm_config, [movies])
-        planner.generate_logical_plan(query="anything", datasets=[movies])
+        planner.generate_logical_plan(query="anything")
 
         _, messages, _ = mock_litellm.completion_calls[0]
         all_text = msg_text(messages)
@@ -383,12 +383,11 @@ class TestPlannerMocked:
         mock_litellm.set_completion_handler(handler)
 
         planner = _make_planner(mock_llm_config, [movies])
-        plan = planner.generate_logical_plan(query="Find sci-fi movies", datasets=[movies])
+        plan = planner.generate_logical_plan(query="Find sci-fi movies")
 
         nl = planner.paraphrase_logical_plan(
             query="Find sci-fi movies",
             logical_plan=plan,
-            datasets=[movies],
         )
 
         assert isinstance(nl, str)
@@ -413,7 +412,7 @@ class TestPlannerMocked:
         mock_litellm.set_completion_handler(handler)
 
         planner = _make_planner(mock_llm_config, [movies])
-        plan = planner.generate_logical_plan(query="anything", datasets=[movies])
+        plan = planner.generate_logical_plan(query="anything")
 
         # The planner should have exhausted its steps and returned a
         # fallback message string (not a dict).

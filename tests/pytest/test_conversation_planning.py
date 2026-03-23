@@ -157,7 +157,6 @@ class TestConversationalLogicalPlanGeneration:
         # Generate refined plan
         refined_plan = planner.generate_logical_plan(
             query="You forgot to filter by genre='Sci-Fi'. Please add that step.",
-            datasets=[simple_movie_dataset],
             conversation=conversation,
         )
 
@@ -226,7 +225,6 @@ class TestConversationalLogicalPlanGeneration:
         # Generate refined plan
         refined_plan = planner.generate_logical_plan(
             query="Instead of using the movie rating, calculate the average review score from the Reviews dataset for each movie.",
-            datasets=[movies_dataset, reviews_dataset],
             conversation=conversation,
         )
         
@@ -296,7 +294,6 @@ class TestConversationalPlanRefinement:
         # Generate new plan with the sorting feedback
         new_plan = planner.generate_logical_plan(
             query="Please add a step to sort the results by rating in descending order.",
-            datasets=[simple_movie_dataset],
             conversation=conversation
         )
         
@@ -361,7 +358,6 @@ class TestConversationalPlanRefinement:
         # Generate new plan with limit feedback
         new_plan = planner.generate_logical_plan(
             query="Return only the top 5 results, not all of them.",
-            datasets=[simple_movie_dataset],
             conversation=conversation
         )
         
@@ -427,7 +423,6 @@ class TestConversationalPlanRefinement:
         # Generate new plan with join feedback
         new_plan = planner.generate_logical_plan(
             query="Actually, join with the Reviews dataset and filter reviews by sentiment score > 0.7",
-            datasets=[movies_dataset, reviews_dataset],
             conversation=conversation
         )
         
@@ -736,7 +731,6 @@ class TestConversationMemoryIntegration:
         # Generate plan - this should only add latest user message to memory
         logical_plan = planner.generate_logical_plan(
             query="From after 2010",
-            datasets=[simple_movie_dataset],
             conversation=conversation,
         )
 
@@ -812,7 +806,6 @@ class TestConversationMemoryIntegration:
         # Generate new plan with conversation containing prior logical plan
         new_plan = planner.generate_logical_plan(
             query="Make it top 3 instead of top 5",
-            datasets=[simple_movie_dataset],
             conversation=conversation
         )
 

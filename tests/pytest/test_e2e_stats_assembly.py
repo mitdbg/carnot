@@ -400,15 +400,17 @@ class TestRunReturnsExecutionStats:
 
 
 # ---------------------------------------------------------------------------
-# Test: run_stream() yields OperatorStats on completion events
+# Test: run() pushes OperatorStats on completion events via progress queue
 # ---------------------------------------------------------------------------
 
 
-class TestRunStreamProgressStats:
-    """Verify that ``run_stream()`` enriches completion events with stats."""
+class TestRunProgressStats:
+    """Verify that ``run()`` enriches completion events with stats."""
 
     def test_completed_events_carry_operator_stats(self, mock_litellm, animals):
         """After each operator, the 'Completed' event has ``operator_stats``."""
+
+        import queue
 
         plan_code = (
             'ds = datasets["Animals"]\n'
@@ -452,18 +454,15 @@ class TestRunStreamProgressStats:
         phase["state"] = "running"
         execution._plan = logical_plan
 
-        gen = execution.run_stream()
-        events: list[ExecutionProgress] = []
-        result = None
-        try:
-            while True:
-                events.append(next(gen))
-        except StopIteration as exc:
-            result = exc.value
-
-        assert result is not None
-        items, answer_str, stats = result
+        progress_queue: queue.Queue = queue.Queue()
+        items, answer_str, stats = execution.run(progress_queue=progress_queue)
         assert isinstance(stats, ExecutionStats)
+
+        # Drain all progress events from the queue
+        events: list[ExecutionProgress] = []
+        while not progress_queue.empty():
+            event_dict = progress_queue.get_nowait()
+            events.append(ExecutionProgress(**event_dict))
 
         # Find "Completed" events (they contain operator_stats)
         completed = [e for e in events if "Completed" in e.message or "complete" in e.message.lower()]
@@ -482,8 +481,8 @@ class TestRunStreamProgressStats:
 
         execution.planner.cleanup()
 
-    def test_run_stream_returns_three_tuple(self, mock_litellm, animals):
-        """``run_stream()`` return value is a 3-tuple with ``ExecutionStats``."""
+    def test_run_returns_three_tuple(self, mock_litellm, animals):
+        """``run()`` return value is a 3-tuple with ``ExecutionStats``."""
 
         plan_code = (
             'ds = datasets["Animals"]\n'
@@ -527,17 +526,8 @@ class TestRunStreamProgressStats:
         phase["state"] = "running"
         execution._plan = logical_plan
 
-        gen = execution.run_stream()
-        result = None
-        try:
-            while True:
-                next(gen)
-        except StopIteration as exc:
-            result = exc.value
+        items, answer_str, stats = execution.run()
 
-        assert result is not None
-        assert len(result) == 3
-        items, answer_str, stats = result
         assert isinstance(items, list)
         assert isinstance(answer_str, str)
         assert isinstance(stats, ExecutionStats)
@@ -548,15 +538,15 @@ class TestRunStreamProgressStats:
 
 
 # ---------------------------------------------------------------------------
-# Test: plan_stream() emits cumulative_cost_usd on final event
+# Test: plan() pushes step_cost_usd on final event via progress queue
 # ---------------------------------------------------------------------------
 
 
-class TestPlanStreamCumulativeCost:
-    """Verify that ``plan_stream()`` reports cost on the final event."""
+class TestPlanProgressCost:
+    """Verify that ``plan()`` reports cost on the final event."""
 
-    def test_final_event_has_cumulative_cost(self, mock_litellm, animals):
-        """The last ``PlanningProgress`` event includes ``cumulative_cost_usd``."""
+    def test_final_event_has_step_cost(self, mock_litellm, animals):
+        """The last ``PlanningProgress`` event includes ``step_cost_usd``."""
 
         plan_code = (
             'ds = datasets["Animals"]\n'
@@ -581,29 +571,30 @@ class TestPlanStreamCumulativeCost:
             llm_config=_LLM_CONFIG,
         )
 
-        gen = execution.plan_stream()
-        events: list[PlanningProgress] = []
-        result = None
-        try:
-            while True:
-                events.append(next(gen))
-        except StopIteration as exc:
-            result = exc.value
+        import queue
+        progress_queue: queue.Queue = queue.Queue()
+        nl_plan, logical_plan = execution.plan(progress_queue=progress_queue)
 
-        assert result is not None
-        nl_plan, logical_plan = result
+        # Drain all progress events from the queue
+        events: list[PlanningProgress] = []
+        while not progress_queue.empty():
+            event_dict = progress_queue.get_nowait()
+            events.append(PlanningProgress(**event_dict))
+
+        assert nl_plan is not None
+        assert logical_plan is not None
 
         # Find the final "Plan summary complete" event
         final_events = [
             e for e in events
-            if isinstance(e, PlanningProgress) and "complete" in e.message.lower()
+            if "complete" in e.message.lower()
         ]
         assert len(final_events) >= 1
 
         last_event = final_events[-1]
-        assert last_event.cumulative_cost_usd is not None
-        assert last_event.cumulative_cost_usd > 0.0, (
-            f"Expected positive cumulative cost, got {last_event.cumulative_cost_usd}"
+        assert last_event.step_cost_usd is not None
+        assert last_event.step_cost_usd > 0.0, (
+            f"Expected positive step cost, got {last_event.step_cost_usd}"
         )
 
         execution.planner.cleanup()

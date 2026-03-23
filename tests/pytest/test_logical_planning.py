@@ -115,7 +115,6 @@ class TestLogicalPlanGeneration:
         # Generate logical plan (code-based)
         logical_plan = planner.generate_logical_plan(
             query=query,
-            datasets=[simple_movie_dataset],
             conversation=None,
         )
         
@@ -154,7 +153,6 @@ class TestLogicalPlanGeneration:
         # Generate logical plan - the planner can use its managed agent internally
         logical_plan = planner.generate_logical_plan(
             query=query,
-            datasets=[movies_dataset, reviews_dataset],
             conversation=None,
         )
         
@@ -187,7 +185,6 @@ class TestPlanParaphrasing:
         # Generate logical plan
         logical_plan = planner.generate_logical_plan(
             query=query,
-            datasets=[simple_movie_dataset],
             conversation=None,
         )
         
@@ -198,7 +195,6 @@ class TestPlanParaphrasing:
         nl_plan = planner.paraphrase_logical_plan(
             query=query,
             logical_plan=logical_plan,
-            datasets=[simple_movie_dataset],
             conversation=None,
         )
         
@@ -230,7 +226,6 @@ class TestPlanParaphrasing:
         
         logical_plan = planner.generate_logical_plan(
             query=query,
-            datasets=[simple_movie_dataset],
             conversation=None,
         )
         
@@ -284,7 +279,6 @@ class TestPlanParaphrasing:
         # Generate plan - the planner can use its managed agent to discover schema
         logical_plan = planner.generate_logical_plan(
             query=query,
-            datasets=[movies_dataset, reviews_dataset],
             conversation=None,
         )
         
@@ -333,7 +327,6 @@ class TestEndToEndPlanning:
         # The planner can call its managed DataDiscoveryAgent during this phase
         logical_plan = planner.generate_logical_plan(
             query=query,
-            datasets=[movies_dataset, reviews_dataset],
             conversation=None,
         )
         
@@ -361,7 +354,6 @@ class TestEndToEndPlanning:
         nl_plan = planner.paraphrase_logical_plan(
             query=query,
             logical_plan=logical_plan,
-            datasets=[movies_dataset, reviews_dataset],
             conversation=None,
         )
         
@@ -394,7 +386,6 @@ class TestEndToEndPlanning:
         # Generate logical plan - planner can use managed agent to discover schema
         logical_plan = planner.generate_logical_plan(
             query=query,
-            datasets=[movies_dataset, reviews_dataset],
             conversation=None,
         )
         

@@ -64,22 +64,55 @@ class MemoryStep:
 
 @dataclass
 class ActionStep(MemoryStep):
+    """Represents a single action taken by the agent during execution, including the model input and output,
+    any tool calls made, and the resulting observations and outputs from those tool calls. (In this setting,
+    code execution is a type of tool call). The final output of the step is stored in `final_output`."""
+
     step_number: int
+    """1-based index of the step within an agent's execution trace."""
+
     timing: Timing
+    """Timing information for the step, including start time and duration."""
+
     model_input_messages: list[ChatMessage] | None = None
+    """The list of messages sent as input to the model for this step, if applicable."""
+
     tool_calls: list[ToolCall] | None = None
+    """List of tools called during this step, if applicable. Each tool call includes the tool name, arguments, and a unique ID.
+       NOTE: for now, each tool_calls is a singleton list of an invocation of the Python Interpreter."""  # noqa: E501
+
     error: AgentError | None = None
+    """Error encountered during this step, if applicable. Contains the error message and type."""
+
     model_output_message: ChatMessage | None = None
+    """The message received as output from the model for this step, if applicable."""
+
     model_output: str | list[dict[str, Any]] | None = None
+    """The raw output content from the model for this step, if applicable. Can be a string or a structured list of dicts (e.g., for tool calls). Used for logging and callbacks; not necessarily human-readable."""  # noqa: E501
+
     code_action: str | None = None
+    """The code to execute for this step, if applicable. Extracted from the model output. Should be human-readable and executable code."""  # noqa: E501
+
     observations: str | None = None
+    """The (serialized) observations received after executing the tool call(s) for this step, if applicable. Should be human-readable."""  # noqa: E501
+
     observations_images: list["PIL.Image.Image"] | None = None
-    action_output: Any = None
+    """The images received as observations after executing the code action for this step, if applicable."""  # noqa: E501
+
+    code_action_output: Any = None
+    """The output of executing the code action for this step, if applicable. Can be any data type depending on the action executed; used for logging and callbacks."""  # noqa: E501
+
     token_usage: TokenUsage | None = None
+    """Token usage information for this step, if applicable. Includes counts of prompt tokens, completion tokens, and total tokens used in the model call for this step."""  # noqa: E501
+
     is_final_answer: bool = False
+    """Whether this step produced the final answer to the original task. Should be True if the agent has completed its task and is returning a final answer, and False otherwise."""  # noqa: E501
+
+    final_output: Any = None
+    """The final output produced by the agent if is_final_answer is True. Can be any data type depending on the task."""  # noqa: E501
 
     def dict(self):
-        # We overwrite the method to parse the tool_calls and action_output manually
+        # We overwrite the method to parse the tool_calls, code_action_output, and final_output manually
         return {
             "step_number": self.step_number,
             "timing": self.timing.dict(),
@@ -91,9 +124,10 @@ class ActionStep(MemoryStep):
             "code_action": self.code_action,
             "observations": self.observations,
             "observations_images": [image.tobytes() for image in self.observations_images] if self.observations_images else None,
-            "action_output": make_json_serializable(self.action_output),
+            "code_action_output": make_json_serializable(self.code_action_output),
             "token_usage": asdict(self.token_usage) if self.token_usage else None,
             "is_final_answer": self.is_final_answer,
+            "final_output": make_json_serializable(self.final_output),
         }
 
     def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:

@@ -193,7 +193,7 @@ class ReasoningOperator(CodeOperator):
                 ),
             ]
         self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
-        memory_step.action_output = code_output.output
+        memory_step.code_action_output = code_output.output
         yield CodeActionOutput(
             code=code_action,
             output=code_output.output,
