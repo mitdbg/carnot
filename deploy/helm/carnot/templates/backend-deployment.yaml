@@ -24,7 +24,6 @@ spec:
         app.kubernetes.io/component: backend
     spec:
       serviceAccountName: carnot-backend
-      automountServiceAccountToken: false
       imagePullSecrets:
         - name: dockerhub-pull-secret
 
@@ -83,8 +82,16 @@ spec:
               value: carnot-postgres
 
           volumeMounts:
+            # Mount individual files rather than the directory so the EKS IRSA
+            # webhook can still create /run/secrets/eks.amazonaws.com/ alongside them.
+            # Mounting the whole directory read-only blocks that subdirectory creation.
             - name: db-secrets
-              mountPath: /run/secrets
+              mountPath: /run/secrets/db_user
+              subPath: db_user
+              readOnly: true
+            - name: db-secrets
+              mountPath: /run/secrets/db_password
+              subPath: db_password
               readOnly: true
 
           resources:

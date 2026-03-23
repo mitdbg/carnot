@@ -108,15 +108,16 @@ aws iam attach-role-policy \
   --role-name carnot-ebs-csi-driver-role \
   --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
 
-# Install the add-on and annotate the service account with the role ARN
-aws eks create-addon --cluster-name "$CLUSTER_NAME" --addon-name aws-ebs-csi-driver --region "$REGION" \
+# Install the add-on with the IRSA role ARN so EKS wires up the service account
+# annotation before the controller pod starts — avoids a race where the pod
+# launches without AWS credentials and needs a manual restart.
+aws eks create-addon \
+  --cluster-name "$CLUSTER_NAME" \
+  --addon-name aws-ebs-csi-driver \
+  --region "$REGION" \
+  --service-account-role-arn "arn:aws:iam::${ACCOUNT_ID}:role/carnot-ebs-csi-driver-role" \
   || echo "aws-ebs-csi-driver already exists, skipping"
 
-kubectl annotate serviceaccount ebs-csi-controller-sa -n kube-system \
-  eks.amazonaws.com/role-arn=arn:aws:iam::${ACCOUNT_ID}:role/carnot-ebs-csi-driver-role \
-  --overwrite
-
-kubectl rollout restart deployment ebs-csi-controller -n kube-system
 kubectl wait --for=condition=Ready pods -l app=ebs-csi-controller -n kube-system --timeout=120s
 
 # ---------------------------------------------------------------------------
