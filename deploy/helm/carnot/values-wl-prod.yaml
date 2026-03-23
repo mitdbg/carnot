@@ -1,6 +1,7 @@
 env: wl-prod
-apiHostname: ""     # TODO: fill in subdomain from WL_PROD_SUBDOMAIN secret
-frontendOrigin: ""  # TODO: fill in when subdomain is known
+apiHostname: ""        # TODO: fill in when subdomain is known
+frontendHostname: ""   # TODO: fill in when subdomain is known
+frontendOrigin: ""     # TODO: fill in when subdomain is known
 
 backend:
   autoscaling:
@@ -14,6 +15,8 @@ auth0:
   domain: ""        # TODO: fill in when AWS access is available
   audience: ""      # TODO: fill in when AWS access is available
   claimsNamespace: ""
+
+acmCertificateArn: "arn:aws:acm:us-east-1:422297141788:certificate/10be4bdb-461d-4dec-9ddf-501e2f157fab"
 
 secretsManager:
   enabled: true

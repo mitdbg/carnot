@@ -68,7 +68,7 @@ resource "helm_release" "alb_controller" {
 # -----------------------------------------------------------------
 # External Secrets Operator — Helm
 # Syncs secrets from AWS Secrets Manager into k8s Secrets at pod
-# startup. The ClusterSecretStore is managed by the eks-config/ module (Phase 2).
+# startup. The ClusterSecretStore is deployed by the cluster_config Helm release below.
 # -----------------------------------------------------------------
 resource "helm_release" "external_secrets" {
   name             = "external-secrets"
