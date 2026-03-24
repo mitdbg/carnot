@@ -18,7 +18,7 @@ dependencies = [
     "fastapi>=0.115.0",
     "fsspec>=2025.10.0",
     "google-cloud-aiplatform>=1.38",
-    "litellm>=1.76.1",
+    "litellm>=1.76.1,<=1.82.6",
     "palimpzest>=1.2.0",
     "pandas>=2.3.1",
     "pydantic>=2.11.7",
