@@ -807,6 +807,18 @@ class LiteLLMModel(ApiModel):
         )
         self._apply_rate_limit()
 
+        import json
+        #print("MODEL:", completion_kwargs.get("model"))
+        #print("NUM MESSAGES:", len(completion_kwargs.get("messages", [])))
+        #print("FIRST MESSAGE ROLE:", completion_kwargs["messages"][0]["role"])
+       # print("LAST MESSAGE ROLE:", completion_kwargs["messages"][-1]["role"])
+        try:
+            json.dumps(completion_kwargs)
+            #print("Payload JSON serialization succeeded")
+        except Exception as ser_e:
+            print("Payload JSON serialization failed")
+            print(type(ser_e), repr(ser_e))
+
         start = time.perf_counter()
         response = self.client.completion(**completion_kwargs)
         duration = time.perf_counter() - start

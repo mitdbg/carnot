@@ -20,7 +20,9 @@ logger = logging.getLogger(__name__)
 INDEX_BATCH_SIZE = 50
 
 # Chunking constants for embedding models with token limits
-MAX_EMBED_CHARS = 28000  # ~7000 tokens, safely under 8192 limit
+# Use a conservative cap because some corpora are token-dense enough that
+# 28k characters can still exceed an 8k-token embedding limit.
+MAX_EMBED_CHARS = 10000  # ~2500 tokens for typical English text
 CHUNK_OVERLAP_CHARS = 1000  # ~250 tokens overlap between chunks
 
 
@@ -42,6 +44,20 @@ def _chunk_text(text: str, max_chars: int = MAX_EMBED_CHARS, overlap: int = CHUN
         if start >= len(text):
             break
     return chunks
+
+
+def _item_text_for_embedding(item: dict) -> str:
+    """Extract the most relevant text payload for vector indexing.
+
+    Prefer the document body when available to avoid wasting embedding
+    context on JSON field names and other metadata. Fall back to the full
+    JSON payload for compatibility with datasets that do not expose a
+    dedicated text field.
+    """
+    text = item.get("text")
+    if isinstance(text, str) and text.strip():
+        return text
+    return json.dumps(item)
 
 
 def _resolve_model(model, api_key) -> LiteLLMModel:
@@ -464,7 +480,7 @@ class ChromaIndex(CarnotIndex):
         all_chunk_ids = []
         for item_idx, item in enumerate(self.items):
             if isinstance(item, dict):
-                item_str = json.dumps(item)
+                item_str = _item_text_for_embedding(item)
             else:
                 raise ValueError("ChromaIndex currently only supports items of type: [dict].")
             
@@ -512,27 +528,34 @@ class ChromaIndex(CarnotIndex):
         self._llm_call_stats.append(embed_stats)
         query_embedding = query_embedding[0]
 
-        # Query for more results than k since multiple chunks may match the same item
-        n_results = min(k * 3, self._index.count())
-        results = self._index.query(query_embeddings=[query_embedding], n_results=n_results)
-        
-        # Map chunk IDs back to original items, preserving order and deduplicating
-        seen_item_indices = set()
-        unique_items = []
-        for chunk_id in results["ids"][0]:
-            if chunk_id in self._chunk_to_item_idx:
-                item_idx = self._chunk_to_item_idx[chunk_id]
-            else:
-                # Fallback for non-chunked IDs (backward compatibility)
-                item_idx = int(chunk_id.split("_")[0])
-            
-            if item_idx not in seen_item_indices:
-                seen_item_indices.add(item_idx)
-                unique_items.append(self.items[item_idx])
-                if len(unique_items) >= k:
-                    break
-        
-        return unique_items
+        total_chunks = self._index.count()
+        target_docs = min(k, len(self.items))
+        n_results = min(max(k * 3, k), total_chunks)
+
+        while True:
+            results = self._index.query(query_embeddings=[query_embedding], n_results=n_results)
+
+            # Map chunk IDs back to original items, preserving order and deduplicating.
+            seen_item_indices = set()
+            unique_items = []
+            for chunk_id in results["ids"][0]:
+                if chunk_id in self._chunk_to_item_idx:
+                    item_idx = self._chunk_to_item_idx[chunk_id]
+                else:
+                    # Fallback for non-chunked IDs (backward compatibility)
+                    item_idx = int(chunk_id.split("_")[0])
+
+                if item_idx not in seen_item_indices:
+                    seen_item_indices.add(item_idx)
+                    unique_items.append(self.items[item_idx])
+                    if len(unique_items) >= target_docs:
+                        return unique_items
+
+            if n_results >= total_chunks:
+                return unique_items
+
+            # Increase chunk recall until we accumulate k unique docs or exhaust the collection.
+            n_results = min(n_results * 2, total_chunks)
 
 
 class FaissIndex(CarnotIndex):

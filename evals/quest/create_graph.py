@@ -20,7 +20,7 @@ VECTOR_INDEX_DATA = {
     "precision": [0.9810, 0.9810, 0.9810, 0.9716],
     "recall": [0.6867, 0.7259, 0.7463, 0.7672],
     "f1": [0.7808, 0.8162, 0.8316, 0.8417],
-    "time_s": [20.47, 22.44, 54.45, 37.61],
+    "time_s": [20.47, 13.83, 22.41, 30.97],
     "cost_usd": [0.2366, 0.4585, 0.8767, 1.6814],
 }
 
@@ -55,11 +55,19 @@ LOTUS = {
 }
 
 PZ = {
-    "precision": 0.9606,
-    "recall": 0.8451,
-    "f1": 0.8891,
-    "time_s": 98.3278,
-    "cost_usd": 2.8608,
+    "precision": 0.9445,
+    "recall": 0.8410,
+    "f1": 0.8825,
+    "time_s": 106.0524,
+    "cost_usd": 3.0860,
+}
+
+SEMFILTER_ALL_DOCS = {
+    "precision": 0.9716,
+    "recall": 0.7591,
+    "f1": 0.8367,
+    "time_s": 66.29,
+    "cost_usd": 3.67203715,
 }
 
 
@@ -93,10 +101,10 @@ def create_vector_quality_graph(output_path: Path) -> None:
     # Origin point
     ax.plot([0], [0], "k+", markersize=10, markeredgewidth=2, label="Origin")
 
-    # Vector Index lines
-    ax.plot(K, VECTOR_INDEX_DATA["precision"], "o-", label="Vector Index (Precision)", color="C0")
-    ax.plot(K, VECTOR_INDEX_DATA["recall"], "s-", label="Vector Index (Recall)", color="C1")
-    ax.plot(K, VECTOR_INDEX_DATA["f1"], "^-", label="Vector Index (F1)", color="C2")
+    # Vector + SemFilter lines
+    ax.plot(K, VECTOR_INDEX_DATA["precision"], "o-", label="Vector + SemFilter (Precision)", color="C0")
+    ax.plot(K, VECTOR_INDEX_DATA["recall"], "s-", label="Vector + SemFilter (Recall)", color="C1")
+    ax.plot(K, VECTOR_INDEX_DATA["f1"], "^-", label="Vector + SemFilter (F1)", color="C2")
 
     # LOTUS and PZ as horizontal lines
     ax.hlines(LOTUS["precision"], x_min, x_max, colors="C0", linestyles="--", alpha=0.7, label="LOTUS (Precision)")
@@ -129,7 +137,7 @@ def create_vector_time_graph(output_path: Path) -> None:
     x_min, x_max = 0, 400
 
     ax.plot([0], [0], "k+", markersize=10, markeredgewidth=2, label="Origin")
-    ax.plot(K, VECTOR_INDEX_DATA["time_s"], "o-", label="Vector Index", color="C0", linewidth=2)
+    ax.plot(K, VECTOR_INDEX_DATA["time_s"], "o-", label="Vector + SemFilter", color="C0", linewidth=2)
 
     ax.hlines(LOTUS["time_s"], x_min, x_max, colors="C1", linestyles="--", linewidth=2, label="LOTUS")
     ax.hlines(PZ["time_s"], x_min, x_max, colors="C2", linestyles=":", linewidth=2, label="PZ")
@@ -157,7 +165,7 @@ def create_vector_cost_graph(output_path: Path) -> None:
     x_min, x_max = 0, 400
 
     ax.plot([0], [0], "k+", markersize=10, markeredgewidth=2, label="Origin")
-    ax.plot(K, VECTOR_INDEX_DATA["cost_usd"], "o-", label="Vector Index", color="C0", linewidth=2)
+    ax.plot(K, VECTOR_INDEX_DATA["cost_usd"], "o-", label="Vector + SemFilter", color="C0", linewidth=2)
 
     ax.hlines(LOTUS["cost_usd"], x_min, x_max, colors="C1", linestyles="--", linewidth=2, label="LOTUS")
     ax.hlines(PZ["cost_usd"], x_min, x_max, colors="C2", linestyles=":", linewidth=2, label="PZ")
@@ -187,9 +195,9 @@ def create_vector_combined_graph(output_path: Path) -> None:
     # Quality (Precision, Recall, F1)
     ax = axes[0, 0]
     ax.plot([0], [0], "k+", markersize=8, markeredgewidth=2)
-    ax.plot(K, VECTOR_INDEX_DATA["precision"], "o-", label="Vector (P)", color="C0")
-    ax.plot(K, VECTOR_INDEX_DATA["recall"], "s-", label="Vector (R)", color="C1")
-    ax.plot(K, VECTOR_INDEX_DATA["f1"], "^-", label="Vector (F1)", color="C2")
+    ax.plot(K, VECTOR_INDEX_DATA["precision"], "o-", label="Vector + SemFilter (P)", color="C0")
+    ax.plot(K, VECTOR_INDEX_DATA["recall"], "s-", label="Vector + SemFilter (R)", color="C1")
+    ax.plot(K, VECTOR_INDEX_DATA["f1"], "^-", label="Vector + SemFilter (F1)", color="C2")
     ax.hlines(LOTUS["precision"], x_min, x_max, colors="C0", linestyles="--", alpha=0.6)
     ax.hlines(LOTUS["recall"], x_min, x_max, colors="C1", linestyles="--", alpha=0.6)
     ax.hlines(LOTUS["f1"], x_min, x_max, colors="C2", linestyles="--", alpha=0.6)
@@ -208,7 +216,7 @@ def create_vector_combined_graph(output_path: Path) -> None:
     # Recall only (clearer comparison)
     ax = axes[0, 1]
     ax.plot([0], [0], "k+", markersize=8, markeredgewidth=2)
-    ax.plot(K, VECTOR_INDEX_DATA["recall"], "o-", label="Vector Index", color="C0", linewidth=2)
+    ax.plot(K, VECTOR_INDEX_DATA["recall"], "o-", label="Vector + SemFilter", color="C0", linewidth=2)
     ax.hlines(LOTUS["recall"], x_min, x_max, colors="C1", linestyles="--", linewidth=2, label="LOTUS")
     ax.hlines(PZ["recall"], x_min, x_max, colors="C2", linestyles=":", linewidth=2, label="PZ")
     ax.set_xlabel("K")
@@ -222,7 +230,7 @@ def create_vector_combined_graph(output_path: Path) -> None:
     # Time
     ax = axes[1, 0]
     ax.plot([0], [0], "k+", markersize=8, markeredgewidth=2)
-    ax.plot(K, VECTOR_INDEX_DATA["time_s"], "o-", label="Vector Index", color="C0", linewidth=2)
+    ax.plot(K, VECTOR_INDEX_DATA["time_s"], "o-", label="Vector + SemFilter", color="C0", linewidth=2)
     ax.hlines(LOTUS["time_s"], x_min, x_max, colors="C1", linestyles="--", linewidth=2, label="LOTUS")
     ax.hlines(PZ["time_s"], x_min, x_max, colors="C2", linestyles=":", linewidth=2, label="PZ")
     ax.set_xlabel("K")
@@ -237,7 +245,7 @@ def create_vector_combined_graph(output_path: Path) -> None:
     # Cost
     ax = axes[1, 1]
     ax.plot([0], [0], "k+", markersize=8, markeredgewidth=2)
-    ax.plot(K, VECTOR_INDEX_DATA["cost_usd"], "o-", label="Vector Index", color="C0", linewidth=2)
+    ax.plot(K, VECTOR_INDEX_DATA["cost_usd"], "o-", label="Vector + SemFilter", color="C0", linewidth=2)
     ax.hlines(LOTUS["cost_usd"], x_min, x_max, colors="C1", linestyles="--", linewidth=2, label="LOTUS")
     ax.hlines(PZ["cost_usd"], x_min, x_max, colors="C2", linestyles=":", linewidth=2, label="PZ")
     ax.set_xlabel("K")
@@ -249,7 +257,7 @@ def create_vector_combined_graph(output_path: Path) -> None:
     ax.legend()
     ax.grid(True, alpha=0.3)
 
-    fig.suptitle("Evaluation Results: Vector Index vs LOTUS vs PZ", fontsize=14, y=1.02)
+    fig.suptitle("Evaluation Results: Vector + SemFilter vs LOTUS vs PZ", fontsize=14, y=1.02)
     fig.tight_layout()
     fig.savefig(output_path / "eval_comparison.png", dpi=150)
     plt.close()
@@ -590,9 +598,9 @@ def create_summary_comparison_graph(output_path: Path) -> None:
 
     # Quality panel shows precision, recall, and F1 together.
     ax = axes[0]
-    ax.plot(vector_x, VECTOR_INDEX_DATA["precision"], "o-", label="Vector (Precision)", color="C0")
-    ax.plot(vector_x, VECTOR_INDEX_DATA["recall"], "s-", label="Vector (Recall)", color="C1")
-    ax.plot(vector_x, VECTOR_INDEX_DATA["f1"], "^-", label="Vector (F1)", color="C2")
+    ax.plot(vector_x, VECTOR_INDEX_DATA["precision"], "o-", label="Vector + SemFilter (Precision)", color="C0")
+    ax.plot(vector_x, VECTOR_INDEX_DATA["recall"], "s-", label="Vector + SemFilter (Recall)", color="C1")
+    ax.plot(vector_x, VECTOR_INDEX_DATA["f1"], "^-", label="Vector + SemFilter (F1)", color="C2")
     ax.plot(flat_x, flat_precision, "o--", label="Flat (Precision)", color="C3")
     ax.plot(flat_x, flat_recall, "s--", label="Flat (Recall)", color="C4")
     ax.plot(flat_x, flat_f1, "^--", label="Flat (F1)", color="C5")
@@ -612,7 +620,7 @@ def create_summary_comparison_graph(output_path: Path) -> None:
     ax.legend(fontsize=8, ncol=2)
 
     ax = axes[1]
-    ax.plot(vector_x, VECTOR_INDEX_DATA["time_s"], "o-", label="Vector Index", color="C0", linewidth=2)
+    ax.plot(vector_x, VECTOR_INDEX_DATA["time_s"], "o-", label="Vector + SemFilter", color="C0", linewidth=2)
     ax.plot(flat_x, flat_time, "s--", label="Flat Index", color="C3", linewidth=2)
     ax.hlines(LOTUS["time_s"], x_min, x_max, colors="C1", linestyles="--", linewidth=2, label="LOTUS")
     ax.hlines(PZ["time_s"], x_min, x_max, colors="C2", linestyles=":", linewidth=2, label="PZ")
@@ -626,7 +634,7 @@ def create_summary_comparison_graph(output_path: Path) -> None:
     ax.legend()
 
     ax = axes[2]
-    ax.plot(vector_x, VECTOR_INDEX_DATA["cost_usd"], "o-", label="Vector Index", color="C0", linewidth=2)
+    ax.plot(vector_x, VECTOR_INDEX_DATA["cost_usd"], "o-", label="Vector + SemFilter", color="C0", linewidth=2)
     ax.plot(flat_x, flat_cost, "s--", label="Flat Index", color="C3", linewidth=2)
     ax.hlines(LOTUS["cost_usd"], x_min, x_max, colors="C1", linestyles="--", linewidth=2, label="LOTUS")
     ax.hlines(PZ["cost_usd"], x_min, x_max, colors="C2", linestyles=":", linewidth=2, label="PZ")
@@ -639,7 +647,7 @@ def create_summary_comparison_graph(output_path: Path) -> None:
     ax.grid(True, alpha=0.3)
     ax.legend()
 
-    fig.suptitle("Summary Comparison: Flat Index, Vector Index, LOTUS, and PZ", fontsize=14, y=1.03)
+    fig.suptitle("Summary Comparison: Flat Index, Vector + SemFilter, LOTUS, and PZ", fontsize=14, y=1.03)
     fig.tight_layout()
     fig.savefig(output_path / "summary_comparison.png", dpi=150)
     plt.close()
@@ -655,10 +663,11 @@ def _build_pareto_points() -> list[dict]:
         VECTOR_INDEX_DATA["f1"],
         VECTOR_INDEX_DATA["time_s"],
         VECTOR_INDEX_DATA["cost_usd"],
+        strict=False,
     ):
         points.append(
             {
-                "label": f"Vector K={k}",
+                "label": f"Vector K = {k} + SemFilter",
                 "family": "vector",
                 "recall": recall,
                 "f1": f1,
@@ -685,6 +694,7 @@ def _build_pareto_points() -> list[dict]:
         FLAT_INDEX_DATA["f1"],
         FLAT_INDEX_DATA["time_s"],
         FLAT_INDEX_DATA["cost_usd"],
+        strict=False,
     ):
         points.append(
             {
@@ -717,6 +727,16 @@ def _build_pareto_points() -> list[dict]:
             "cost_usd": PZ["cost_usd"],
         }
     )
+    points.append(
+        {
+            "label": "SemFilter All Docs",
+            "family": "semfilter_all_docs",
+            "recall": SEMFILTER_ALL_DOCS["recall"],
+            "f1": SEMFILTER_ALL_DOCS["f1"],
+            "time_s": SEMFILTER_ALL_DOCS["time_s"],
+            "cost_usd": SEMFILTER_ALL_DOCS["cost_usd"],
+        }
+    )
     return points
 
 
@@ -731,11 +751,12 @@ def _create_pareto_frontier_graph(
     points = _build_pareto_points()
 
     styles = {
-        "vector": {"color": "C0", "marker": "o", "label": "Vector Index"},
+        "vector": {"color": "C0", "marker": "o", "label": "Vector + SemFilter"},
         "just_vector": {"color": "C6", "marker": "P", "label": "Just Vector Index"},
         "flat": {"color": "C3", "marker": "s", "label": "Flat Index"},
         "lotus": {"color": "C1", "marker": "^", "label": "LOTUS"},
         "pz": {"color": "C2", "marker": "D", "label": "PZ"},
+        "semfilter_all_docs": {"color": "C4", "marker": "X", "label": "SemFilter All Docs"},
     }
 
     def plot_panel(ax, x_key: str, x_label: str, title: str) -> None:

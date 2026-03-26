@@ -105,6 +105,9 @@ class SemFilterOperator:
                 memory_step.model_input_messages = input_messages
                 stop_sequences = []
                 try:
+                    #print("DOCID:", item.get("docid"))
+                    #print("TEXT_LEN:", len(item.get("text", "") or ""))
+                    #print("TEXT_PREVIEW_REPR:", repr((item.get("text", "") or "")[:200]))
                     chat_message: ChatMessage = self.model.generate(input_messages, stop_sequences=stop_sequences)
                     memory_step.model_output_message = chat_message
                     memory_step.token_usage = chat_message.token_usage
@@ -112,6 +115,11 @@ class SemFilterOperator:
                     if chat_message.llm_call_stats is not None:
                         call_stats.append(chat_message.llm_call_stats)
                 except Exception as e:
+                    import traceback
+                    print("GENERATION EXCEPTION TYPE:", type(e))
+                    print("GENERATION EXCEPTION REPR:", repr(e))
+                    print("GENERATION EXCEPTION STR:", str(e))
+                    traceback.print_exc()
                     raise AgentGenerationError(f"Error in generating model output:\n{e}", self.logger) from e
 
                 ### Parse output ###

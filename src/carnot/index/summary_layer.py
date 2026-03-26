@@ -35,7 +35,7 @@ _MAX_SUMMARY_CHARS = 50_000
 _MAX_PREVIEW_CHARS = 500
 
 # default temperature for LLM summarization (can be tuned for more creative vs. focused summaries)
-_SUMMARY_TEMPERATURE = 0.3
+_SUMMARY_TEMPERATURE = 1
 
 # number of concurrent workers for parallel summarization
 _SUMMARIZATION_WORKERS = 64
@@ -289,6 +289,7 @@ Summary:"""
                     self._llm_call_stats.append(response.llm_call_stats)
             return response.content.strip()
         except Exception as e:
+            print(f"LLM summarization failed for {file_path}: {e}, using preview fallback")
             logger.warning(
                 f"LLM summarization failed for {file_path}: {e}, using preview fallback",
             )
