@@ -27,6 +27,7 @@ __all__ = [
     "PlanningStep",
     "TaskStep",
     "PlannerTaskStep",
+    "ParaphraseTaskStep",
     "SystemPromptStep",
     "FinalAnswerStep",
     "ToolCall",
@@ -253,6 +254,46 @@ class PlannerTaskStep(MemoryStep):
     def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
         dataset_list = "\n".join([f"- {dataset.name}: {dataset.annotation}" for dataset in self.datasets])
         content = f"\n\nDatasets:\n{dataset_list}\n\nTask: \"{self.task}\"\n"
+        return [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": content}])]
+
+
+@dataclass
+class ParaphraseTaskStep(MemoryStep):
+    """Task step for the paraphrase phase of the Planner.
+
+    Provides the LLM with the user's original query and the logical or
+    physical plan to paraphrase.
+
+    Representation invariant:
+        - ``task`` is a non-empty string (the user's original query).
+        - ``plan`` is a non-empty dict (a serialized logical or physical plan).
+
+    Abstraction function:
+        Represents a user message that presents the query and plan to
+        the LLM so it can produce a natural-language summary.
+    """
+
+    task: str
+    plan: dict
+
+    def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
+        """Format the query and plan as a user message.
+
+        Requires:
+            - Instance satisfies the representation invariant.
+
+        Returns:
+            A single-element list containing a ``ChatMessage`` with role
+            ``USER`` whose text includes the query, dataset list, and
+            JSON-serialised plan.
+
+        Raises:
+            None.
+        """
+        content = (
+            f"\n\nQuery: \"{self.task}\"\n\n"
+            f"Plan:\n{json.dumps(self.plan, indent=2)}\n"
+        )
         return [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": content}])]
 
 

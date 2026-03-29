@@ -22,7 +22,7 @@ def test_sem_topk_operator_basic(test_embedding_model_id, llm_config):
     input_datasets = {animal_dataset.name: animal_dataset}
 
     # execute the operator
-    sem_topk_operator = SemTopKOperator(task, k=2, output_dataset_id="output-dataset-id", model_id=test_embedding_model_id, llm_config=llm_config, max_workers=4)
+    sem_topk_operator = SemTopKOperator(task, k=2, dataset_id="output-dataset-id", model_id=test_embedding_model_id, llm_config=llm_config, max_workers=4)
     output_datasets, _stats = sem_topk_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
@@ -54,7 +54,7 @@ def test_sem_topk_operator_movie_reviews(test_embedding_model_id, llm_config, mo
     input_datasets = {"Reviews Dataset": reviews_dataset}
 
     # generate output
-    sem_topk_operator = SemTopKOperator(task, k=5, output_dataset_id="output-dataset-id", model_id=test_embedding_model_id, llm_config=llm_config, max_workers=4)
+    sem_topk_operator = SemTopKOperator(task, k=5, dataset_id="output-dataset-id", model_id=test_embedding_model_id, llm_config=llm_config, max_workers=4)
     output_datasets, _stats = sem_topk_operator("Reviews Dataset", input_datasets)
 
     assert len(output_datasets) == 2
@@ -82,7 +82,7 @@ def test_sem_topk_operator_with_index(test_embedding_model_id, llm_config, enron
     sem_topk_operator = SemTopKOperator(
         task=task,
         k=10,
-        output_dataset_id="output-dataset-id",
+        dataset_id="output-dataset-id",
         model_id=test_embedding_model_id,
         llm_config=llm_config,
         max_workers=4,

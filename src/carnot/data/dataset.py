@@ -6,8 +6,41 @@ from random import sample as random_sample
 
 from carnot.data.item import DataItem
 from carnot.index.index import CarnotIndex
+from carnot.operators.logical import (
+    Aggregate,
+    Code,
+    Filter,
+    FlatMap,
+    GroupBy,
+    Join,
+    Limit,
+    LogicalOperator,
+    Map,
+    Reason,
+    TopK,
+)
 from carnot.storage.catalog import IndexCatalog
 from carnot.storage.tiered import TieredStorageManager
+
+
+def _type_to_str(t: type | str) -> str:
+    """Convert a type annotation to a JSON-safe string.
+
+    Handles plain types (``str``, ``int``), parameterised generics
+    (``list[str]``), and values that are already strings.
+
+    Requires:
+        - *t* is a type, a generic alias, or a string.
+
+    Returns:
+        A string representation (e.g. ``"str"``, ``"list[str]"``).
+
+    Raises:
+        None.
+    """
+    if isinstance(t, str):
+        return t
+    return getattr(t, "__name__", None) or str(t)
 
 
 class Dataset:
@@ -30,16 +63,15 @@ class Dataset:
 
     Public attributes (always available after construction):
 
-    - ``name`` (``str``): display name for this dataset node.
+    - ``name`` (``str``): display name for this dataset node. The name is useful for
+      producing human readable code in code operators (datasets are accessed by name).
     - ``annotation`` (``str``): human-readable description.
-    - ``dataset_id`` (``int | None``): optional numeric identifier.
+    - ``dataset_id`` (``str``): unique identifier for this dataset node in the
+      plan DAG.  Defaults to ``name`` when not explicitly provided.
     - ``parents`` (``list[Dataset]``): parent nodes in the plan DAG
       (empty for leaf datasets).
-    - ``params`` (``dict``): operator parameters.  For derived datasets
-      this always contains ``"operator"`` (the operator type string)
-      plus operator-specific keys (see each operator method's docstring).
-      For leaf datasets this is empty.
-    - ``output_dataset_id`` (``str``): identifier for this node's output.
+    - ``operator`` (``LogicalOperator | None``): the logical operator that produces
+      this dataset from its parents (``None`` for leaf datasets).
 
     Representation invariant:
         - ``is_materialized`` is ``True`` iff ``items`` returns
@@ -54,29 +86,28 @@ class Dataset:
 
     Abstraction function:
         Represents a node in a logical query plan.  Leaf nodes wrap raw
-        data; derived nodes record the operator and its parameters
-        together with references to parent nodes.
+        data; derived nodes record the operator and parent datasets that produce them.
     """
 
     def __init__(
         self,
-        name: str = "",
+        name: str,
         annotation: str = "",
         items: list[DataItem] | list[dict] | None = None,
         indices: dict[str, CarnotIndex] | None = None,
         code: str | None = None,
         code_state: dict | None = None,
         parents: list[Dataset] | None = None,
-        id_params: dict | None = None,
+        operator: LogicalOperator | None = None,
         storage: TieredStorageManager | None = None,
         index_catalog: IndexCatalog | None = None,
-        dataset_id: int | None = None,
-        **kwargs,
+        dataset_id: str | None = None,
+        op_counts: dict[str, int] | None = None,
     ):
         # dataset metadata
         self.name = name
         self.annotation = annotation
-        self.dataset_id = dataset_id
+        self.dataset_id = dataset_id or name
 
         # determine whether we were given pre-materialized dicts or DataItem refs
         if items and isinstance(items[0], dict):
@@ -101,21 +132,8 @@ class Dataset:
 
         # plan graph
         self.parents = parents or []
-        self.id_params = id_params or {
-            "limit_id": 0,
-            "merge_id": 0,
-            "code_id": 0,
-            "reason_id": 0,
-            "sem_agg_id": 0,
-            "sem_filter_id": 0,
-            "sem_map_id": 0,
-            "sem_flat_map_id": 0,
-            "sem_groupby_id": 0,
-            "sem_join_id": 0,
-            "sem_topk_id": 0,
-        }
-        self.params = kwargs
-        self.output_dataset_id = kwargs.get("output_dataset_id") or name
+        self.operator = operator
+        self.op_counts = op_counts or {}
 
     # ═══════════════════════════════════════════════════════════════════
     # DATA ACCESS — Lazy materialization
@@ -307,15 +325,15 @@ class Dataset:
         Returns:
             A ``dict`` with keys:
             - ``"name"``: the dataset's name (``str``).
-            - ``"output_dataset_id"``: the output dataset id (``str``).
-            - ``"params"``: the operator params ``dict`` (empty for leaf nodes).
+            - ``"dataset_id"``: the dataset id (``str``).
+            - ``"operator"``: the logical operator that produces this dataset, serialized as a dict.
             - ``"parents"``: a ``list`` of serialized parent dicts
               (empty for leaf nodes, one entry per parent otherwise).
         """
         return {
             "name": self.name,
-            "output_dataset_id": self.output_dataset_id,
-            "params": self.params,
+            "dataset_id": self.dataset_id,
+            "operator": self.operator.serialize() if self.operator else {},
             "parents": [p.serialize() for p in self.parents],
         }
 
@@ -350,259 +368,198 @@ class Dataset:
         Returns:
             A new :class:`Dataset` whose sole parent is *self*.
         """
-        limited_name = f"LimitOperation{self.id_params['limit_id'] + 1}"
-        self.id_params["limit_id"] += 1
-        params = {"operator": "Limit", "description": f"Limited {self.name} to first {n} records", "n": n}
+        op_count = self.op_counts.get("Limit", 1)
+        operator = Limit(name=f"Limit{op_count}", n=n)
         return Dataset(
-            name=limited_name,
-            annotation=f"Limited version of ({self.annotation})",
+            name=operator.name,
+            annotation=f"Limit {n} applied to ({self.name})",
             parents=[self],
-            id_params=self.id_params,
-            output_dataset_id=limited_name,
-            **params,
+            operator=operator,
+            dataset_id=operator.name,
+            op_counts={**self.op_counts, "Limit": op_count + 1},
         )
-
-    # TODO: implement logical and physical operators for merge (and rename to `union`)
-    # def merge(self, other: Dataset) -> Dataset:
-    #     """Merge this dataset with another dataset."""
-    #     merged_name = f"MergeOperation{self.id_params['merge_id'] + 1}"
-    #     self.id_params["merge_id"] += 1
-    #     params = {"operator": "Merge", "description": f"Merged {self.name} with {other.name}"}
-    #     return Dataset(
-    #         name=merged_name,
-    #         annotation=f"Merge of ({self.annotation}) and ({other.annotation})",
-    #         parents=[self, other],
-    #         id_params=self.id_params,
-    #         output_dataset_id=merged_name,
-    #         **params,
-    #     )
 
     def write_code(self, task: str) -> Dataset:
         """Return a new derived Dataset representing a code operation.
 
-        The child's ``params`` dict contains:
-        - ``"operator": "Code"``
-        - ``"task"``: the *task* string.
-
-        The child's ``name`` is ``"CodeOperation{n}"``.
+        The child's ``name`` is ``"Code{n}"``.
 
         Returns:
             A new :class:`Dataset` whose sole parent is *self*.
         """
-        coded_name = f"CodeOperation{self.id_params['code_id'] + 1}"
-        self.id_params["code_id"] += 1
-        params = {"operator": "Code", "description": f"Coded {self.name} for task: {task}", "task": task}
+        op_count = self.op_counts.get("Code", 1)
+        operator = Code(name=f"Code{op_count}", task=task)
         return Dataset(
-            name=coded_name,
-            annotation=f"Code operation on ({self.annotation})",
+            name=operator.name,
+            annotation=f"Code operation on ({self.name})",
             parents=[self],
-            id_params=self.id_params,
-            output_dataset_id=coded_name,
-            **params,
+            operator=operator,
+            dataset_id=operator.name,
+            op_counts={**self.op_counts, "Code": op_count + 1},
         )
 
     def reason(self, task: str) -> Dataset:
-        """Apply a reasoning operation to the dataset."""
-        reasoned_name = f"ReasonOperation{self.id_params['reason_id'] + 1}"
-        self.id_params["reason_id"] += 1
-        params = {"operator": "Reason", "description": f"Reasoned {self.name} for task: {task}", "task": task}
+        """Return a new derived Dataset representing a reasoning operation.
+
+        The child's ``name`` is ``"Reason{n}"``.
+
+        Returns:
+            A new :class:`Dataset` whose sole parent is *self*.
+        """
+        op_count = self.op_counts.get("Reason", 1)
+        operator = Reason(name=f"Reason{op_count}", task=task)
         return Dataset(
-            name=reasoned_name,
-            annotation=f"Reasoning operation on ({self.annotation})",
+            name=operator.name,
+            annotation=f"Reasoning operation on ({self.name})",
             parents=[self],
-            id_params=self.id_params,
-            output_dataset_id=reasoned_name,
-            **params,
+            operator=operator,
+            dataset_id=operator.name,
+            op_counts={**self.op_counts, "Reason": op_count + 1},
         )
 
     def sem_aggregate(self, task: str, agg_fields: list[dict]) -> Dataset:
-        """Apply a semantic aggregation."""
-        agg_name = f"AggregateOperation{self.id_params['sem_agg_id'] + 1}"
-        self.id_params["sem_agg_id"] += 1
+        """Return a new derived Dataset representing a semantic aggregation.
+
+        The child's ``name`` is ``"Aggregate{n}"``.
+
+        Returns:
+            A new :class:`Dataset` whose sole parent is *self*.
+        """
         for field_dict in agg_fields:
-            field_dict["type"] = field_dict["type"].__name__
-        params = {"operator": "SemanticAgg", "description": f"Aggregated {self.name} on fields: {agg_fields}", "task": task, "agg_fields": agg_fields}
+            field_dict["type"] = _type_to_str(field_dict["type"])
+
+        op_count = self.op_counts.get("Aggregate", 1)
+        operator = Aggregate(name=f"Aggregate{op_count}", agg_fields=agg_fields)
         return Dataset(
-            name=agg_name,
-            annotation=f"Aggregation on ({self.annotation})",
+            name=operator.name,
+            annotation=f"Aggregation on ({self.name})",
             parents=[self],
-            id_params=self.id_params,
-            output_dataset_id=agg_name,
-            **params,
+            operator=operator,
+            dataset_id=operator.name,
+            op_counts={**self.op_counts, "Aggregate": op_count + 1},
         )
 
     def sem_filter(self, condition: str) -> Dataset:
         """Return a new derived Dataset representing a semantic filter.
 
-        The child's ``params`` dict contains:
-        - ``"operator": "SemanticFilter"``
-        - ``"condition"``: the *condition* string.
-
-        The child's ``name`` is ``"FilterOperation{n}"``.
+        The child's ``name`` is ``"Filter{n}"``.
 
         Returns:
             A new :class:`Dataset` whose sole parent is *self*.
         """
-        filtered_name = f"FilterOperation{self.id_params['sem_filter_id'] + 1}"
-        self.id_params["sem_filter_id"] += 1
-        params = {"operator": "SemanticFilter", "description": f"Filtered {self.name} by condition: {condition}", "condition": condition}
+        op_count = self.op_counts.get("Filter", 1)
+        operator = Filter(name=f"Filter{op_count}", filter=condition)
         return Dataset(
-            name=filtered_name,
-            annotation=f"Filtered ({self.annotation})",
+            name=operator.name,
+            annotation=f"Filtered ({self.name})",
             parents=[self],
-            id_params=self.id_params,
-            output_dataset_id=filtered_name,
-            **params,
+            operator=operator,
+            dataset_id=operator.name,
+            op_counts={**self.op_counts, "Filter": op_count + 1},
         )
 
-    def sem_map(self, field: str, type: type, description: str) -> Dataset:
+    def sem_map(self, fields: list[dict]) -> Dataset:
         """Return a new derived Dataset representing a semantic map.
 
-        The child's ``params`` dict contains:
-        - ``"operator": "SemanticMap"``
-        - ``"field"``: the *field* name (``str``).
-        - ``"type"``: ``type.__name__`` (``str``).
-        - ``"field_desc"``: the *description* string.
-
-        The child's ``name`` is ``"MapOperation{n}"``.
+        The child's ``name`` is ``"Map{n}"``.
 
         Returns:
             A new :class:`Dataset` whose sole parent is *self*.
         """
-        mapped_name = f"MapOperation{self.id_params['sem_map_id'] + 1}"
-        self.id_params["sem_map_id"] += 1
-        params = {
-            "operator": "SemanticMap",
-            "description": f"Created field {field} with type {type.__name__} and description {description}",
-            "field": field,
-            "type": type.__name__,
-            "field_desc": description,
-        }
+        for field_dict in fields:
+            field_dict["type"] = _type_to_str(field_dict["type"])
+
+        op_count = self.op_counts.get("Map", 1)
+        operator = Map(name=f"Map{op_count}", fields=fields, desc=f"Created fields: {fields}")
         return Dataset(
-            name=mapped_name,
-            annotation=f"Mapped ({self.annotation})",
+            name=operator.name,
+            annotation=f"Mapped ({self.name})",
             parents=[self],
-            id_params=self.id_params,
-            output_dataset_id=mapped_name,
-            **params,
+            operator=operator,
+            dataset_id=operator.name,
+            op_counts={**self.op_counts, "Map": op_count + 1},
         )
 
-    def sem_flat_map(self, field: str, type: type, description: str) -> Dataset:
+    def sem_flat_map(self, fields: list[dict]) -> Dataset:
         """Return a new derived Dataset representing a semantic flat map.
 
-        The child's ``params`` dict contains:
-        - ``"operator": "SemanticFlatMap"``
-        - ``"field"``: the *field* name (``str``).
-        - ``"type"``: ``type.__name__`` (``str``).
-        - ``"field_desc"``: the *description* string.
-
-        The child's ``name`` is ``"FlatMapOperation{n}"``.
+        The child's ``name`` is ``"FlatMap{n}"``.
 
         Returns:
             A new :class:`Dataset` whose sole parent is *self*.
         """
-        flat_mapped_name = f"FlatMapOperation{self.id_params['sem_flat_map_id'] + 1}"
-        self.id_params["sem_flat_map_id"] += 1
-        params = {
-            "operator": "SemanticFlatMap",
-            "description": f"Flat mapped field {field} with type {type.__name__} and description {description}",
-            "field": field,
-            "type": type.__name__,
-            "field_desc": description,
-        }
+        for field_dict in fields:
+            field_dict["type"] = _type_to_str(field_dict["type"])
+
+        op_count = self.op_counts.get("FlatMap", 1)
+        operator = FlatMap(name=f"FlatMap{op_count}", fields=fields, desc=f"Created fields: {fields}")
         return Dataset(
-            name=flat_mapped_name,
-            annotation=f"Flat mapped ({self.annotation})",
+            name=operator.name,
+            annotation=f"Flat mapped ({self.name})",
             parents=[self],
-            id_params=self.id_params,
-            output_dataset_id=flat_mapped_name,
-            **params,
+            operator=operator,
+            dataset_id=operator.name,
+            op_counts={**self.op_counts, "FlatMap": op_count + 1},
         )
 
     def sem_groupby(self, gby_fields: list[dict], agg_fields: list[dict]) -> Dataset:
-        """Apply a semantic group by operation."""
-        gby_name = f"GroupByOperation{self.id_params['sem_groupby_id'] + 1}"
-        self.id_params["sem_groupby_id"] += 1
-        gby_field_names = [field['name'] for field in gby_fields]
-        agg_field_names = [field['name'] for field in agg_fields]
+        """Return a new derived Dataset representing a semantic group-by operation.
+
+        The child's ``name`` is ``"GroupBy{n}"``.
+
+        Returns:
+            A new :class:`Dataset` whose sole parent is *self*.
+        """
         for field_dict in gby_fields:
-            field_dict["type"] = field_dict["type"].__name__
+            field_dict["type"] = _type_to_str(field_dict["type"])
         for field_dict in agg_fields:
-            field_dict["type"] = field_dict["type"].__name__
-        params = {
-            "operator": "SemanticGroupBy",
-            "description": f"Grouped {self.name} by fields {gby_field_names} with aggregations on {agg_field_names}",
-            "gby_fields": gby_fields,
-            "agg_fields": agg_fields,
-        }
+            field_dict["type"] = _type_to_str(field_dict["type"])
+
+        op_count = self.op_counts.get("GroupBy", 1)
+        operator = GroupBy(name=f"GroupBy{op_count}", gby_fields=gby_fields, agg_fields=agg_fields)
         return Dataset(
-            name=gby_name,
-            annotation=f"Grouped ({self.annotation})",
+            name=operator.name,
+            annotation=f"Grouped ({self.name})",
             parents=[self],
-            id_params=self.id_params,
-            output_dataset_id=gby_name,
-            **params,
+            operator=operator,
+            dataset_id=operator.name,
+            op_counts={**self.op_counts, "GroupBy": op_count + 1},
         )
 
     def sem_join(self, other: Dataset, condition: str) -> Dataset:
         """Return a new derived Dataset representing a semantic join.
 
-        The child's ``params`` dict contains:
-        - ``"operator": "SemanticJoin"``
-        - ``"condition"``: the *condition* string.
-
-        The child's ``name`` is ``"JoinOperation{n}"``.
+        The child's ``name`` is ``"Join{n}"``.
 
         Returns:
             A new :class:`Dataset` whose parents are ``[self, other]``.
         """
-        joined_name = f"JoinOperation{self.id_params['sem_join_id'] + 1}"
-        self.id_params["sem_join_id"] += 1
-        params = {
-            "operator": "SemanticJoin",
-            "description": f"Joined {self.name} with {other.name} on condition: {condition}",
-            "condition": condition,
-        }
+        op_count = self.op_counts.get("Join", 1)
+        operator = Join(name=f"Join{op_count}", condition=condition)
         return Dataset(
-            name=joined_name,
-            annotation=f"Join of ({self.annotation}) and ({other.annotation})",
+            name=operator.name,
+            annotation=f"Join of ({self.name}) and ({other.name})",
             parents=[self, other],
-            id_params=self.id_params,
-            output_dataset_id=joined_name,
-            **params,
+            operator=operator,
+            dataset_id=operator.name,
+            op_counts={**self.op_counts, "Join": op_count + 1},
         )
 
     def sem_topk(self, index_name: str, search_str: str, k: int = 5) -> Dataset:
         """Return a new derived Dataset representing a semantic top-k operation.
 
-        The child's ``params`` dict contains:
-        - ``"operator": "SemanticTopK"``
-        - ``"index_name"``: the *index_name* string (passed through as-is;
-          validation against available index types happens at the physical
-          operator layer, not here).
-        - ``"search_str"``: the *search_str* string.
-        - ``"k"``: the *k* integer.
-
-        The child's ``name`` is ``"TopKOperation{n}"``.
+        The child's ``name`` is ``"TopK{n}"``.
 
         Returns:
             A new :class:`Dataset` whose sole parent is *self*.
         """
-        top_k_name = f"TopKOperation{self.id_params['sem_topk_id'] + 1}"
-        self.id_params["sem_topk_id"] += 1
-        params = {
-            "operator": "SemanticTopK",
-            "index_name": index_name,
-            "description": f"Top-{k} items from {self.name} for search string: {search_str}",
-            "search_str": search_str,
-            "k": k,
-        }
-
+        op_count = self.op_counts.get("TopK", 1)
+        operator = TopK(name=f"TopK{op_count}", task=search_str, k=k, index_name=index_name)
         return Dataset(
-            name=top_k_name,
-            annotation=f"Top-{k} from ({self.annotation})",
+            name=operator.name,
+            annotation=f"Top-{k} from ({self.name})",
             parents=[self],
-            id_params=self.id_params,
-            output_dataset_id=top_k_name,
-            **params,
+            operator=operator,
+            dataset_id=operator.name,
+            op_counts={**self.op_counts, "TopK": op_count + 1},
         )

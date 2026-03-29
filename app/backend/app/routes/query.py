@@ -183,7 +183,7 @@ class NotebookState:
         - ``notebook_id`` is a non-empty UUID string.
         - ``physical_plan`` is a ``PhysicalPlan`` with at least one node.
         - ``datasets_store`` keys are a superset of all
-          ``output_dataset_id`` values for executed nodes.
+          ``dataset_id`` values for executed nodes.
         - ``cell_statuses`` maps ``node_id`` → ``"pending"`` |
           ``"running"`` | ``"success"`` | ``"error"``.  This is
           application-level state, not part of the plan itself.
@@ -2068,7 +2068,7 @@ async def execute_cell(
                 nb.cell_outputs.pop(inv_id, None)
                 # Evict cached output
                 inv_node = nb.physical_plan.get_node(inv_id)
-                nb.datasets_store.pop(inv_node.output_dataset_id, None)
+                nb.datasets_store.pop(inv_node.dataset_id, None)
 
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -2099,7 +2099,7 @@ async def execute_cell(
                 updated_store, op_stats = exec_instance.run_node(
                     node_id, nb.datasets_store
                 )
-                output_dataset = updated_store.get(node.output_dataset_id)
+                output_dataset = updated_store.get(node.dataset_id)
                 preview = (
                     exec_instance._build_output_preview(output_dataset)
                     if output_dataset
@@ -2322,9 +2322,9 @@ async def add_cell(
         counter += 1
     new_node_id = f"node-{counter}"
 
-    # Determine output_dataset_id
+    # Determine dataset_id
     op_type = request.operator_type or ""
-    output_dataset_id = f"{op_type or 'Custom'}Operation_{new_node_id}"
+    dataset_id = f"{op_type or 'Custom'}Operation_{new_node_id}"
 
     # Determine parent for code generation
     after_node_id = request.after_cell_id
@@ -2342,7 +2342,7 @@ async def add_cell(
         description=f"New {request.operator_type or 'custom'} cell",
         params={},
         parent_ids=[after_node_id] if after_node_id else [],
-        output_dataset_id=output_dataset_id,
+        dataset_id=dataset_id,
     )
 
     if after_node_id:
@@ -2357,7 +2357,7 @@ async def add_cell(
         nb.cell_statuses[inv_id] = "pending"
         nb.cell_outputs.pop(inv_id, None)
         inv_node = nb.physical_plan.get_node(inv_id)
-        nb.datasets_store.pop(inv_node.output_dataset_id, None)
+        nb.datasets_store.pop(inv_node.dataset_id, None)
 
     cells = nb.get_cells()
     new_cell = next((c for c in cells if c["cell_id"] == new_node_id), None)
@@ -2421,13 +2421,13 @@ async def delete_cell(
     # Clean up statuses and cached datasets
     nb.cell_statuses.pop(cell_id, None)
     nb.cell_outputs.pop(cell_id, None)
-    nb.datasets_store.pop(node.output_dataset_id, None)
+    nb.datasets_store.pop(node.dataset_id, None)
     for inv_id in invalidated:
         nb.cell_statuses[inv_id] = "pending"
         nb.cell_outputs.pop(inv_id, None)
         try:
             inv_node = nb.physical_plan.get_node(inv_id)
-            nb.datasets_store.pop(inv_node.output_dataset_id, None)
+            nb.datasets_store.pop(inv_node.dataset_id, None)
         except KeyError:
             pass
 
@@ -2539,7 +2539,7 @@ async def move_cell(
         nb.cell_outputs.pop(inv_id, None)
         try:
             inv_node = nb.physical_plan.get_node(inv_id)
-            nb.datasets_store.pop(inv_node.output_dataset_id, None)
+            nb.datasets_store.pop(inv_node.dataset_id, None)
         except KeyError:
             pass
 

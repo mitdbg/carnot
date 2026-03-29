@@ -511,7 +511,7 @@ class DataDiscoveryAgent(BaseAgent):
         yield ActionOutput(output=code_output.output, is_final_answer=code_output.is_final_answer)
 
     def _run_stream(
-        self, task: str, max_steps: int
+        self, task: str, max_steps: int, images: list | None = None
     ) -> Generator[ActionStep | PlanningStep | FinalAnswerStep, None, None]:
         """Override ``_run_stream`` to add countdown warnings and push
         progress events to the progress queue.
@@ -526,7 +526,7 @@ class DataDiscoveryAgent(BaseAgent):
         """
         from carnot.execution.progress import PlanningProgress
 
-        for step in super()._run_stream(task, max_steps):
+        for step in super()._run_stream(task, max_steps, images=images):
             yield step
 
             # After yielding an ActionStep, check if we should warn the agent

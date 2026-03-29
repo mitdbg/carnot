@@ -74,7 +74,7 @@ class TestSemMapMocked:
         op = SemMapOperator(
             task="Classify the animal",
             output_fields=output_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -97,7 +97,7 @@ class TestSemMapMocked:
         op = SemMapOperator(
             task="Classify",
             output_fields=output_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -121,7 +121,7 @@ class TestSemMapMocked:
         op = SemMapOperator(
             task="extract",
             output_fields=output_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -141,7 +141,7 @@ class TestSemMapMocked:
         op = SemMapOperator(
             task="Classify",
             output_fields=output_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -159,7 +159,7 @@ class TestSemMapMocked:
         op = SemMapOperator(
             task="Classify",
             output_fields=output_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -178,7 +178,7 @@ class TestSemMapMocked:
         op = SemMapOperator(
             task="Classify",
             output_fields=output_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -196,7 +196,7 @@ class TestSemMapMocked:
         op = SemMapOperator(
             task="Classify",
             output_fields=output_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,

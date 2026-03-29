@@ -47,8 +47,19 @@ class ReasoningOperator(CodeOperator):
         An instance of this class is a ``CodeOperator`` whose prompts guide the LLM to
         reason over the input datasets and produce structured output items.
     """
-    def __init__(self, task: str, output_dataset_id: str, model_id: str, llm_config: dict, tools: list[Tool] | None = None, additional_authorized_imports: list[str] | None = None, max_steps: int = 20):
-        super().__init__(task, output_dataset_id, model_id, llm_config, tools, additional_authorized_imports, max_steps)
+    def __init__(
+            self,
+            task: str,
+            dataset_id: str,
+            model_id: str,
+            llm_config: dict,
+            tools: list[Tool] | None = None,
+            additional_authorized_imports: list[str] | None = None,
+            max_steps: int = 20,
+            logical_op_id: str | None = None,
+            logical_op_class_name: str | None = None,
+        ):
+        super().__init__(task, dataset_id, model_id, llm_config, tools, additional_authorized_imports, max_steps, logical_op_id, logical_op_class_name)
         self.prompt_templates = yaml.safe_load(
             resources.files("carnot.agents.prompts").joinpath("reasoning_operator.yaml").read_text()
         )
@@ -210,7 +221,7 @@ class ReasoningOperator(CodeOperator):
         Returns:
             A tuple ``(output_datasets, stats)`` where *output_datasets*
             is a new ``dict[str, Dataset]`` with an additional entry keyed
-            by ``self.output_dataset_id`` whose ``items`` are the
+            by ``self.dataset_id`` whose ``items`` are the
             ``final_items`` from the code state, and *stats* is an
             :class:`OperatorStats` summarising all LLM calls made.
 
@@ -241,7 +252,7 @@ class ReasoningOperator(CodeOperator):
 
         # create new dataset and return it with the input datasets
         output_dataset = Dataset(
-            name=self.output_dataset_id,
+            name=self.dataset_id,
             annotation=f"Reasoning operator output for task: {self.task}",
             items=output_state["final_items"],
             code_state=output_state,
@@ -250,7 +261,7 @@ class ReasoningOperator(CodeOperator):
 
         op_stats = OperatorStats(
             operator_name="Reasoning",
-            operator_id=self.output_dataset_id,
+            operator_id=self.dataset_id,
             wall_clock_secs=time.perf_counter() - op_start,
             llm_calls=all_call_stats,
             items_in=sum(len(ds.items) for ds in input_datasets.values()),

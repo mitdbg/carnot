@@ -6,9 +6,10 @@ from carnot.core.models import LLMCallStats, OperatorStats
 from carnot.data.dataset import Dataset
 from carnot.index import FlatCarnotIndex, HierarchicalCarnotIndex
 from carnot.index.index import ChromaIndex, FaissIndex
+from carnot.operators.physical import PhysicalOperator
 
 
-class SemTopKOperator:
+class SemTopKOperator(PhysicalOperator):
     """Semantic top-k operator — retrieves the *k* most relevant items via index search.
 
     Unlike other semantic operators this does **not** use an LLM for
@@ -42,17 +43,22 @@ class SemTopKOperator:
         self,
         task: str,
         k: int,
-        output_dataset_id: str,
+        dataset_id: str,
         max_workers: int,
         model_id: str = "openai/text-embedding-3-small",
         llm_config: dict | None = None,
         index_name: str = "chroma",
         catalog=None,
+        logical_op_id: str | None = None,
+        logical_op_class_name: str | None = None,
     ):
+        super().__init__(logical_op_id=logical_op_id, logical_op_class_name=logical_op_class_name)
         self.task = task
-        self.output_dataset_id = output_dataset_id
         self.k = k
+        self.dataset_id = dataset_id
+        self.max_workers = max_workers
         self.model_id = model_id
+        self.llm_config = llm_config or {}
         self.api_key = llm_config.get("OPENAI_API_KEY")
         self.index_name = index_name
         self.catalog = catalog
@@ -63,6 +69,35 @@ class SemTopKOperator:
             "flat": FlatCarnotIndex,
         }
         self.index_cls = index_map[index_name]
+
+    def get_id_params(self):
+        id_params = super().get_id_params()
+        id_params = {
+            "task": self.task,
+            "k": self.k,
+            "dataset_id": self.dataset_id,
+            "model_id": self.model_id,
+            "index_name": self.index_name,
+            **id_params,
+        }
+
+        return id_params
+
+    def get_op_params(self):
+        op_params = super().get_op_params()
+        op_params = {
+            "task": self.task,
+            "k": self.k,
+            "dataset_id": self.dataset_id,
+            "model_id": self.model_id,
+            "llm_config": self.llm_config,
+            "max_workers": self.max_workers,
+            "index_name": self.index_name,
+            "catalog": self.catalog,
+            **op_params,
+        }
+
+        return op_params
 
     def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> tuple[dict[str, Dataset], OperatorStats]:
         """Retrieve the top-k items from the input dataset via index search.
@@ -82,7 +117,7 @@ class SemTopKOperator:
         Returns:
             A tuple ``(output_datasets, stats)`` where *output_datasets*
             is a new ``dict[str, Dataset]`` with an additional entry
-            keyed by ``self.output_dataset_id`` containing up to *k*
+            keyed by ``self.dataset_id`` containing up to *k*
             items, and *stats* is an :class:`OperatorStats` with
             embedding call statistics collected from the index.
 
@@ -128,12 +163,12 @@ class SemTopKOperator:
         if hasattr(index_obj, "_llm_call_stats"):
             embed_stats = list(index_obj._llm_call_stats)
 
-        output_dataset = Dataset(name=self.output_dataset_id, annotation=f"Sem Top-K operator output for task: {self.task}", items=results)
+        output_dataset = Dataset(name=self.dataset_id, annotation=f"Sem Top-K operator output for task: {self.task}", items=results)
         output_datasets = {**input_datasets, output_dataset.name: output_dataset}
 
         op_stats = OperatorStats(
             operator_name="SemTopK",
-            operator_id=self.output_dataset_id,
+            operator_id=self.dataset_id,
             wall_clock_secs=time.perf_counter() - op_start,
             llm_calls=embed_stats,
             items_in=len(input_dataset.items),

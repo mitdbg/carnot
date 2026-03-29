@@ -631,7 +631,7 @@ class TestRunWithoutPlan:
         # Manually set a plan, skip plan()
         plan = {
             "name": "filtered_animals",
-            "output_dataset_id": "filtered_animals",
+            "dataset_id": "filtered_animals",
             "params": {
                 "operator": "SemanticFilter",
                 "condition": "the animal is a mammal",
@@ -639,7 +639,7 @@ class TestRunWithoutPlan:
             "parents": [
                 {
                     "name": "Animals",
-                    "output_dataset_id": "Animals",
+                    "dataset_id": "Animals",
                     "params": {},
                     "parents": [],
                 }

@@ -1,5 +1,5 @@
 """Tier 2 mocked tests for ``Planner.generate_logical_plan`` and
-``Planner.paraphrase_logical_plan``.
+``Planner.paraphrase_plan``.
 
 These tests verify that the Planner produces structurally valid plans
 **without** contacting a real LLM.  The ``mock_litellm`` fixture
@@ -9,8 +9,8 @@ resulting plan dictionaries.
 
 Contracts under test (from ``Planner`` docstrings):
     - ``generate_logical_plan`` returns a ``dict`` with keys
-      ``name``, ``output_dataset_id``, ``params``, ``parents``.
-    - ``paraphrase_logical_plan`` returns a ``str``.
+      ``name``, ``dataset_id``, ``params``, ``parents``.
+    - ``paraphrase_plan`` returns a ``str``.
     - The Planner respects ``max_steps`` and yields a
       ``FinalAnswerStep`` at the end of the stream.
 """
@@ -32,7 +32,7 @@ from carnot.data.item import DataItem
 # ---------------------------------------------------------------------------
 
 # Required keys for every node produced by ``Dataset.serialize()``.
-_PLAN_KEYS = {"name", "output_dataset_id", "params", "parents"}
+_PLAN_KEYS = {"name", "dataset_id", "params", "parents"}
 
 
 def _wrap_code(code: str) -> str:
@@ -104,6 +104,7 @@ class TestPlannerMocked:
 
         planner = _make_planner(mock_llm_config, [movies])
         plan = planner.generate_logical_plan(query="List all movies")
+        plan = plan.serialize()
 
         _validate_plan_node(plan)
         assert plan["name"] == "Movies"
@@ -128,6 +129,7 @@ class TestPlannerMocked:
 
         planner = _make_planner(mock_llm_config, [movies])
         plan = planner.generate_logical_plan(query="Find sci-fi movies")
+        plan = plan.serialize()
 
         _validate_plan_node(plan)
         assert plan["params"].get("operator") == "SemanticFilter"
@@ -152,6 +154,7 @@ class TestPlannerMocked:
 
         planner = _make_planner(mock_llm_config, [movies])
         plan = planner.generate_logical_plan(query="Classify genres")
+        plan = plan.serialize()
 
         _validate_plan_node(plan)
         assert plan["params"].get("operator") == "SemanticMap"
@@ -176,6 +179,7 @@ class TestPlannerMocked:
 
         planner = _make_planner(mock_llm_config, [movies])
         plan = planner.generate_logical_plan(query="Average rating of top movies")
+        plan = plan.serialize()
 
         _validate_plan_node(plan)
         # Root should be the second filter, with one parent (the first filter)
@@ -208,6 +212,7 @@ class TestPlannerMocked:
 
         planner = _make_planner(mock_llm_config, [movies])
         plan = planner.generate_logical_plan(query="sci-fi movies")
+        plan = plan.serialize()
 
         json_str = json.dumps(plan)
         assert json.loads(json_str) == plan
@@ -230,6 +235,7 @@ class TestPlannerMocked:
 
         planner = _make_planner(mock_llm_config, [movies])
         plan = planner.generate_logical_plan(query="some query")
+        plan = plan.serialize()
 
         # Walk to the leaf
         leaf = plan["parents"][0]
@@ -285,6 +291,7 @@ class TestPlannerMocked:
 
         planner = _make_planner(mock_llm_config, [movies])
         plan = planner.generate_logical_plan(query="Find sci-fi movies")
+        plan = plan.serialize()
 
         _validate_plan_node(plan)
         assert plan["params"].get("operator") == "SemanticFilter"
@@ -353,7 +360,7 @@ class TestPlannerMocked:
     # -- Paraphrase -----------------------------------------------------------
 
     def test_paraphrase_returns_string(self, mock_litellm, mock_llm_config, movies):
-        """``paraphrase_logical_plan`` should return a non-empty ``str``
+        """``paraphrase_plan`` should return a non-empty ``str``
         when the LLM responds with a plan description inside the expected
         tags."""
         from fixtures.mocks import _make_completion_response
@@ -385,9 +392,9 @@ class TestPlannerMocked:
         planner = _make_planner(mock_llm_config, [movies])
         plan = planner.generate_logical_plan(query="Find sci-fi movies")
 
-        nl = planner.paraphrase_logical_plan(
+        nl = planner.paraphrase_plan(
             query="Find sci-fi movies",
-            logical_plan=plan,
+            logical_plan=plan.serialize(),
         )
 
         assert isinstance(nl, str)

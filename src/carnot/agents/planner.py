@@ -20,6 +20,7 @@ from carnot.agents.memory import (
     ActionStep,
     AgentMemory,
     FinalAnswerStep,
+    ParaphraseTaskStep,
     PlannerTaskStep,
     ToolCall,
 )
@@ -51,7 +52,7 @@ class Planner(BaseAgent):
     1. ``generate_logical_plan()`` — creates a code-based logical plan
        using semantic operators.  May call the ``DataDiscoveryAgent``
        to understand dataset schemas before planning.
-    2. ``paraphrase_logical_plan()`` — translates the code-based plan
+    2. ``paraphrase_plan()`` — translates the code-based plan
        into a natural-language summary for user presentation.
 
     Each phase operates with its own isolated ``AgentMemory`` to prevent
@@ -263,9 +264,19 @@ class Planner(BaseAgent):
 
             # Other AgentError types are caused by the Model, so we should log them and iterate.
             except AgentError as e:
+                if action_step is None:
+                    action_step = ActionStep(
+                        step_number=self.step_number,
+                        timing=Timing(start_time=time.time()),
+                    )
                 action_step.error = e
 
             finally:
+                if action_step is None:
+                    action_step = ActionStep(
+                        step_number=self.step_number,
+                        timing=Timing(start_time=time.time()),
+                    )
                 # set the end time for the step and add to memory
                 action_step.timing.end_time = time.time()
                 memory.steps.append(action_step)
@@ -664,6 +675,7 @@ class Planner(BaseAgent):
         prompt_template_key: str,
         template_vars: dict,
         conversation: Conversation | None = None,
+        plan: dict | None = None,
     ) -> tuple[AgentMemory, PythonExecutor]:
         """Initialise system prompt, memory, and executor for a phase.
 
@@ -674,6 +686,7 @@ class Planner(BaseAgent):
         Requires:
             - *phase* is either ``"planning"`` or ``"paraphrase"``.
             - *prompt_template_key* exists in ``self.prompt_templates``.
+            - When *phase* is ``"paraphrase"``, *plan* must be a non-empty dict.
 
         Returns:
             A new ``AgentMemory`` instance ready for ``_run_stream`` and a configured ``PythonExecutor``.
@@ -705,13 +718,15 @@ class Planner(BaseAgent):
             title="Logical Plan Generation" if phase == "planning" else "Logical Plan Paraphrasing",
         )
 
-        # add task step to phase memory
-        task_kwargs = {"task": query, "datasets": self._datasets}
-        task_step = PlannerTaskStep(**task_kwargs)
+        # add the appropriate task step to phase memory
+        if phase == "paraphrase":
+            task_step = ParaphraseTaskStep(task=query, plan=plan)
+        else:
+            task_step = PlannerTaskStep(task=query, datasets=self._datasets)
         phase_memory.steps.append(task_step)
 
         # setup Python executor state
-        datasets_dict = {dataset.name: dataset for dataset in task_kwargs.get("datasets", [])}
+        datasets_dict = {dataset.name: dataset for dataset in self._datasets}
         conversation_list = conversation.to_dict_list() if conversation else []
         state = {
             "datasets": datasets_dict,
@@ -733,9 +748,8 @@ class Planner(BaseAgent):
         self,
         query: str,
         conversation: Conversation | None = None,
-        cost_budget: float | None = None,
         progress_queue: queue.Queue | None = None,
-    ) -> dict:
+    ) -> Dataset:
         """Generate a logical execution plan as code.
 
         Uses the managed ``DataDiscoveryAgent`` to explore datasets and then
@@ -752,15 +766,13 @@ class Planner(BaseAgent):
             - *progress_queue*, if provided, is a thread-safe ``queue.Queue``.
 
         Returns:
-            A dict representing the logical plan.
+            A Dataset object which captures the logical plan of the query execution.
 
         Raises:
             AgentGenerationError: If the LLM fails to produce valid output.
             AssertionError: If no ``FinalAnswerStep`` is found in the
             underlying stream.
         """
-        _ = cost_budget  # reserved for future cost-aware planning
-
         # TODO: execute basic data discovery and template into the prompt here
 
         # setup planning memory and python executor
@@ -809,28 +821,28 @@ class Planner(BaseAgent):
 
         return logical_plan
 
-    def paraphrase_logical_plan(
+    def paraphrase_plan(
         self,
         query: str,
-        logical_plan: dict,
+        plan: dict,
         conversation: Conversation | None = None,
         progress_queue: queue.Queue | None = None,
     ) -> str:
-        """Translate a logical plan into a natural-language description.
+        """Translate a logical or physical plan into a natural-language description.
 
         When *progress_queue* is provided, ``PlanningProgress`` events are
         pushed to it in real time.  The queue is scoped to this call via
         :meth:`_progress_scope`.
 
         Requires:
-            - *logical_plan* is a non-empty dict produced by
-              ``generate_logical_plan``.
+            - *plan* is a non-empty dict with a serialized logical or physical plan
+            (produced by ``generate_logical_plan`` or Carnot's ``Optimizer``).
             - *self._datasets* lists the datasets referenced in the plan.
             - *progress_queue*, if provided, is a thread-safe ``queue.Queue``.
 
         Returns:
             A human-readable string summarising the plan.
-
+6.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 
         Raises:
             AgentGenerationError: If the LLM fails to produce valid output.
             AssertionError: If no ``FinalAnswerStep`` is found in the
@@ -846,10 +858,10 @@ class Planner(BaseAgent):
                 "code_closing_tag": self.code_block_tags[1],
                 "plan_opening_tag": self.plan_tags[0],
                 "plan_closing_tag": self.plan_tags[1],
-                "logical_plan": str(logical_plan),
                 "has_conversation": conversation is not None,
             },
             conversation=conversation,
+            plan=plan,
         )
 
         # push initial progress update before starting the paraphrasing phase

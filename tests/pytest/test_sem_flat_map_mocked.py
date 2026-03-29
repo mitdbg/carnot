@@ -73,7 +73,7 @@ class TestSemFlatMapMocked:
         op = SemFlatMapOperator(
             task="Extract fruits",
             output_fields=output_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -98,7 +98,7 @@ class TestSemFlatMapMocked:
         op = SemFlatMapOperator(
             task="Extract fruits",
             output_fields=output_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -117,7 +117,7 @@ class TestSemFlatMapMocked:
         op = SemFlatMapOperator(
             task="extract",
             output_fields=output_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -136,7 +136,7 @@ class TestSemFlatMapMocked:
         op = SemFlatMapOperator(
             task="extract",
             output_fields=output_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -157,7 +157,7 @@ class TestSemFlatMapMocked:
         op = SemFlatMapOperator(
             task="extract",
             output_fields=output_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -180,7 +180,7 @@ class TestSemFlatMapMocked:
         op = SemFlatMapOperator(
             task="extract",
             output_fields=output_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -199,7 +199,7 @@ class TestSemFlatMapMocked:
         op = SemFlatMapOperator(
             task="extract",
             output_fields=output_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,

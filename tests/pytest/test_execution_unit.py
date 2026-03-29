@@ -49,7 +49,7 @@ def _leaf_plan(name: str) -> dict:
     """
     return {
         "name": name,
-        "output_dataset_id": name,
+        "dataset_id": name,
         "params": {},
         "parents": [],
     }
@@ -76,7 +76,7 @@ def _op_plan(
     params = {"operator": operator, **extra_params}
     return {
         "name": output_id,
-        "output_dataset_id": output_id,
+        "dataset_id": output_id,
         "params": params,
         "parents": parents,
     }
@@ -107,7 +107,7 @@ def _make_node(
         description=f"test {operator_type}",
         params=extra_params,
         parent_ids=parent_ids or [],
-        output_dataset_id=output_id,
+        dataset_id=output_id,
     )
 
 
@@ -202,7 +202,7 @@ class TestPlanNodeToOperator:
         node = PlanNode(
             node_id="movies", node_type="dataset", operator_type=None,
             name="Movies", description="film data",
-            output_dataset_id="Movies",
+            dataset_id="Movies",
         )
         with pytest.raises(ValueError, match="Cannot create an operator"):
             node.to_operator(_LLM_CONFIG)
@@ -315,7 +315,7 @@ class TestPlanNodeDisplayName:
         node = PlanNode(
             node_id="movies", node_type="dataset", operator_type=None,
             name="Movies", description="film data",
-            output_dataset_id="Movies",
+            dataset_id="Movies",
         )
         assert node.display_name() == "Dataset: Movies"
 
@@ -374,7 +374,7 @@ class TestPlanNodeDisplayName:
             node_id="reasoning", node_type="reasoning",
             operator_type="Reasoning", name="reasoning",
             description="synthesize results",
-            output_dataset_id="final_dataset",
+            dataset_id="final_dataset",
         )
         assert node.display_name() == "Reasoning"
 
@@ -440,18 +440,18 @@ class TestReoptimize:
         a = PlanNode(
             node_id="a", node_type="dataset", operator_type=None,
             name="A", description="Load A", params={},
-            parent_ids=[], output_dataset_id="A",
+            parent_ids=[], dataset_id="A",
         )
         b = PlanNode(
             node_id="b", node_type="operator", operator_type="SemanticFilter",
             name="B", description="filter", params={"operator": "SemanticFilter", "condition": "old"},
-            parent_ids=["a"], output_dataset_id="B",
+            parent_ids=["a"], dataset_id="B",
         )
         c = PlanNode(
             node_id="c", node_type="operator", operator_type="SemanticMap",
             name="C", description="map",
             params={"operator": "SemanticMap", "field": "f", "type": "str", "field_desc": "d"},
-            parent_ids=["b"], output_dataset_id="C",
+            parent_ids=["b"], dataset_id="C",
         )
         return PhysicalPlan(nodes={"a": a, "b": b, "c": c})
 
@@ -561,13 +561,13 @@ class TestReoptimize:
         n0 = PlanNode(
             node_id="node-0", node_type="dataset", operator_type=None,
             name="A", description="A", params={}, parent_ids=[],
-            output_dataset_id="A",
+            dataset_id="A",
         )
         n1 = PlanNode(
             node_id="node-1", node_type="operator",
             operator_type="SemanticFilter", name="B", description="B",
             params={"operator": "SemanticFilter", "condition": "x"},
-            parent_ids=["node-0"], output_dataset_id="B",
+            parent_ids=["node-0"], dataset_id="B",
         )
         plan = PhysicalPlan(nodes={"node-0": n0, "node-1": n1})
 

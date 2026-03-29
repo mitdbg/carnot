@@ -18,6 +18,7 @@ from carnot.agents.memory import ConversationAgentStep, ConversationUserStep
 from carnot.agents.models import LiteLLMModel
 from carnot.agents.planner import Planner
 from carnot.conversation.conversation import Conversation
+from carnot.data.dataset import Dataset
 from carnot.execution.execution import Execution
 
 pytestmark = pytest.mark.llm
@@ -123,15 +124,15 @@ class TestConversationalLogicalPlanGeneration:
         initial_query = "Find all sci-fi movies from the year 2020"
         incomplete_plan = {
             "name": "FilterOperation1",
-            "output_dataset_id": "FilterOperation1",
+            "dataset_id": "FilterOperation1",
             "params": {
-                "output_dataset_id": "FilterOperation1",
+                "dataset_id": "FilterOperation1",
                 "operator": "SemanticFilter",
                 "description": "Filtered Movies by condition: The movie was released in 2020",
                 "condition": "The movie was released in 2020"
             },
             "parents": [
-                {'name': 'Movies', 'output_dataset_id': 'Movies', 'params': {}, 'parents': []}
+                {'name': 'Movies', 'dataset_id': 'Movies', 'params': {}, 'parents': []}
             ]
         }
 
@@ -164,10 +165,10 @@ class TestConversationalLogicalPlanGeneration:
         assert_planner_did_not_hit_max_steps(planner, refined_plan)
 
         # Verify the refined plan includes the genre filter
-        assert isinstance(refined_plan, dict)
+        assert isinstance(refined_plan, Dataset)
         
         # Convert to string for checking content
-        plan_str = str(refined_plan).lower()
+        plan_str = str(refined_plan.serialize()).lower()
 
         # Plan should now mention filtering by genre or sci-fi
         assert any(keyword in plan_str for keyword in [
@@ -191,7 +192,7 @@ class TestConversationalLogicalPlanGeneration:
         initial_query = "Find the best movie"
         initial_plan = {
             "name": "AggregateOperation1",
-            "output_dataset_id": "AggregateOperation1",
+            "dataset_id": "AggregateOperation1",
             "params": {
                 "operator": "SemanticAgg",
                 "description": "Aggregated Movies on fields: [{'name': 'best_movie', 'type': 'str', 'description': 'The best movie based on rating'}]",
@@ -199,7 +200,7 @@ class TestConversationalLogicalPlanGeneration:
                 "agg_fields": [{"name": "best_movie", "type": "str", "description": "The best movie based on rating"}]
             },
             "parents": [
-                {"name": "Movies", "output_dataset_id": "Movies", "params": {}, "parents": []}
+                {"name": "Movies", "dataset_id": "Movies", "params": {}, "parents": []}
             ]
         }
         
@@ -232,10 +233,10 @@ class TestConversationalLogicalPlanGeneration:
         assert_planner_did_not_hit_max_steps(planner, refined_plan)
         
         # Verify the refined plan
-        assert isinstance(refined_plan, dict)
+        assert isinstance(refined_plan, Dataset)
         
         # Convert to string for checking content
-        plan_str = str(refined_plan).lower()
+        plan_str = str(refined_plan.serialize()).lower()
         
         # Plan should mention reviews or calculations
         assert any(keyword in plan_str for keyword in [
@@ -261,14 +262,14 @@ class TestConversationalPlanRefinement:
         # Realistic structure based on Dataset.sem_filter()
         initial_plan = {
             "name": "FilterOperation1",
-            "output_dataset_id": "FilterOperation1",
+            "dataset_id": "FilterOperation1",
             "params": {
                 "operator": "SemanticFilter",
                 "description": "Filtered Movies by condition: The movie is a sci-fi genre film",
                 "condition": "The movie is a sci-fi genre film"
             },
             "parents": [
-                {"name": "Movies", "output_dataset_id": "Movies", "params": {}, "parents": []}
+                {"name": "Movies", "dataset_id": "Movies", "params": {}, "parents": []}
             ]
         }
         
@@ -301,7 +302,8 @@ class TestConversationalPlanRefinement:
         assert_planner_did_not_hit_max_steps(planner, new_plan)
         
         # Verify plan structure
-        assert isinstance(new_plan, dict)
+        assert isinstance(new_plan, Dataset)
+        new_plan = new_plan.serialize()
         assert "params" in new_plan
         
         # Check that the plan includes sorting logic
@@ -325,14 +327,14 @@ class TestConversationalPlanRefinement:
         # Realistic structure based on Dataset.limit()
         initial_plan = {
             "name": "LimitOperation1",
-            "output_dataset_id": "LimitOperation1",
+            "dataset_id": "LimitOperation1",
             "params": {
                 "operator": "Limit",
                 "description": "Limited Movies to first 10 records",
                 "n": 10
             },
             "parents": [
-                {"name": "Movies", "output_dataset_id": "Movies", "params": {}, "parents": []}
+                {"name": "Movies", "dataset_id": "Movies", "params": {}, "parents": []}
             ]
         }
         
@@ -365,10 +367,10 @@ class TestConversationalPlanRefinement:
         assert_planner_did_not_hit_max_steps(planner, new_plan)
         
         # Verify plan includes limit
-        assert isinstance(new_plan, dict)
+        assert isinstance(new_plan, Dataset)
         
         # Check for limit/top-k operator or parameter
-        plan_str = str(new_plan).lower()
+        plan_str = str(new_plan.serialize()).lower()
         assert any(keyword in plan_str for keyword in [
             "limit", "top", "5", "topk"
         ])
@@ -390,14 +392,14 @@ class TestConversationalPlanRefinement:
         # Realistic structure based on Dataset.sem_filter()
         initial_plan = {
             "name": "FilterOperation1",
-            "output_dataset_id": "FilterOperation1",
+            "dataset_id": "FilterOperation1",
             "params": {
                 "operator": "SemanticFilter",
                 "description": "Filtered Movies by condition: The movie has positive sentiment",
                 "condition": "The movie has positive sentiment"
             },
             "parents": [
-                {"name": "Movies", "output_dataset_id": "Movies", "params": {}, "parents": []}
+                {"name": "Movies", "dataset_id": "Movies", "params": {}, "parents": []}
             ]
         }
         
@@ -430,10 +432,10 @@ class TestConversationalPlanRefinement:
         assert_planner_did_not_hit_max_steps(planner, new_plan)
         
         # Verify plan references both datasets
-        assert isinstance(new_plan, dict)
+        assert isinstance(new_plan, Dataset)
         
         # Check that the plan involves both datasets (likely through join or separate operations)
-        plan_str = str(new_plan).lower()
+        plan_str = str(new_plan.serialize()).lower()
         
         # Should mention reviews dataset or sentiment
         assert any(keyword in plan_str for keyword in [
@@ -691,20 +693,20 @@ class TestConversationMemoryIntegration:
         # Create conversation with multiple user messages and realistic logical plans
         plan1 = {
             "name": "Movies",
-            "output_dataset_id": "Movies",
+            "dataset_id": "Movies",
             "params": {},
             "parents": []
         }
         plan2 = {
             "name": "FilterOperation1",
-            "output_dataset_id": "FilterOperation1",
+            "dataset_id": "FilterOperation1",
             "params": {
                 "operator": "SemanticFilter",
                 "description": "Filtered Movies by condition: The movie is a sci-fi genre film",
                 "condition": "The movie is a sci-fi genre film"
             },
             "parents": [
-                {"name": "Movies", "output_dataset_id": "Movies", "params": {}, "parents": []}
+                {"name": "Movies", "dataset_id": "Movies", "params": {}, "parents": []}
             ]
         }
         
@@ -738,7 +740,7 @@ class TestConversationMemoryIntegration:
         assert_planner_did_not_hit_max_steps(planner, logical_plan)
 
         # Verify plan was generated
-        assert isinstance(logical_plan, dict)
+        assert isinstance(logical_plan, Dataset)
 
         # Check memory contains only latest user message and latest plan
         # Use planning_memory which is the phase-specific memory for logical plan generation
@@ -762,7 +764,7 @@ class TestConversationMemoryIntegration:
         # Realistic prior plan structure based on Dataset.sem_filter() and sem_topk()
         prior_plan = {
             "name": "TopKOperation1",
-            "output_dataset_id": "TopKOperation1",
+            "dataset_id": "TopKOperation1",
             "params": {
                 "operator": "SemanticTopK",
                 "index_name": "chroma",
@@ -772,14 +774,14 @@ class TestConversationMemoryIntegration:
             },
             "parents": [{
                 "name": "FilterOperation1",
-                "output_dataset_id": "FilterOperation1",
+                "dataset_id": "FilterOperation1",
                 "params": {
                     "operator": "SemanticFilter",
                     "description": "Filtered Movies by condition: The movie is a sci-fi genre film",
                     "condition": "The movie is a sci-fi genre film"
                 },
                 "parents": [
-                    {"name": "Movies", "output_dataset_id": "Movies", "params": {}, "parents": []}
+                    {"name": "Movies", "dataset_id": "Movies", "params": {}, "parents": []}
                 ]
             }]
         }
@@ -813,7 +815,7 @@ class TestConversationMemoryIntegration:
         assert_planner_did_not_hit_max_steps(planner, new_plan)
 
         # Verify plan was generated
-        assert isinstance(new_plan, dict)
+        assert isinstance(new_plan, Dataset)
 
         # Check that memory includes the logical plan
         # Use planning_memory which is the phase-specific memory for logical plan generation

@@ -15,6 +15,7 @@ export function phaseToColor(phase) {
   switch (phase) {
     case 'data_discovery': return 'amber'
     case 'logical_plan':   return 'blue'
+    case 'optimizing':     return 'green'
     case 'paraphrase':     return 'purple'
     case 'sem_filter':     return 'teal'
     case 'sem_map':        return 'indigo'
@@ -29,6 +30,7 @@ function PhaseIcon({ phase, className }) {
   switch (phase) {
     case 'data_discovery': return <Search className={className} />
     case 'logical_plan':   return <BrainCircuit className={className} />
+    case 'optimizing':     return <Cog className={className} />
     case 'paraphrase':     return <FileText className={className} />
     default:               return <Cog className={className} />
   }
@@ -39,6 +41,7 @@ function phaseLabel(phase) {
   switch (phase) {
     case 'data_discovery': return 'Data Discovery'
     case 'logical_plan':   return 'Logical Plan'
+    case 'optimizing':     return 'Optimizing'
     case 'paraphrase':     return 'Paraphrase'
     default:               return phase?.replace(/_/g, ' ') ?? 'Step'
   }

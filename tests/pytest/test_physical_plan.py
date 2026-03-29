@@ -38,7 +38,7 @@ def _leaf_plan(name: str) -> dict:
     """Build a leaf plan-dict node representing a raw Dataset."""
     return {
         "name": name,
-        "output_dataset_id": name,
+        "dataset_id": name,
         "params": {},
         "parents": [],
     }
@@ -54,7 +54,7 @@ def _op_plan(
     params = {"operator": operator, **extra_params}
     return {
         "name": output_id,
-        "output_dataset_id": output_id,
+        "dataset_id": output_id,
         "params": params,
         "parents": parents,
     }
@@ -70,7 +70,7 @@ def _dataset_node(name: str, node_id: str = "node-0") -> PlanNode:
         description=f"Load dataset: {name}",
         params={},
         parent_ids=[],
-        output_dataset_id=name,
+        dataset_id=name,
     )
 
 
@@ -90,7 +90,7 @@ def _operator_node(
         description=f"{operator_type} operation",
         params={"operator": operator_type, **extra_params},
         parent_ids=parent_ids,
-        output_dataset_id=output_id,
+        dataset_id=output_id,
     )
 
 
@@ -124,7 +124,7 @@ class TestPlanNodeDisplayName:
         node = PlanNode(
             node_id="r", node_type="reasoning", operator_type="Reasoning",
             name="Reasoning", description="Generate final answer",
-            parent_ids=["p"], output_dataset_id="final_dataset",
+            parent_ids=["p"], dataset_id="final_dataset",
         )
         assert node.display_name() == "Reasoning"
 
@@ -212,7 +212,7 @@ class TestPlanNodeToOperator:
             node_id="r", node_type="reasoning", operator_type="Reasoning",
             name="Reasoning", description="Generate final answer",
             params={"task": "Summarize"},
-            parent_ids=["p"], output_dataset_id="final_dataset",
+            parent_ids=["p"], dataset_id="final_dataset",
         )
         op = node.to_operator(_LLM_CONFIG)
         assert isinstance(op, ReasoningOperator)
@@ -248,7 +248,7 @@ class TestPlanNodeToCode:
             node_id="r", node_type="reasoning", operator_type="Reasoning",
             name="Reasoning", description="Generate final answer",
             params={"task": "Find mammals"},
-            parent_ids=["p"], output_dataset_id="final_dataset",
+            parent_ids=["p"], dataset_id="final_dataset",
         )
         code = node.to_code()
         assert "Final Reasoning" in code
@@ -350,7 +350,7 @@ class TestPlanNodeToDict:
         required_keys = {
             "node_id", "node_type", "operator_name", "operator_type",
             "description", "code", "original_code", "params",
-            "parent_dataset_ids", "output_dataset_id",
+            "parent_dataset_ids", "dataset_id",
         }
         assert required_keys == set(d.keys())
 
@@ -360,7 +360,7 @@ class TestPlanNodeToDict:
         assert d["node_id"] == "node-1"
         assert d["node_type"] == "operator"
         assert d["operator_type"] == "SemanticFilter"
-        assert d["output_dataset_id"] == "f1"
+        assert d["dataset_id"] == "f1"
         assert d["parent_dataset_ids"] == ["p"]
 
     def test_code_equals_original_code(self):
@@ -518,7 +518,7 @@ class TestPhysicalPlanFromPlanDict:
         assert all(di < join_index for di in dataset_indices)
 
     def test_parent_ids_are_node_ids(self):
-        """Parent IDs in PlanNodes reference node_ids, not output_dataset_ids."""
+        """Parent IDs in PlanNodes reference node_ids, not dataset_ids."""
         ds = Dataset(name="Movies")
         leaf = _leaf_plan("Movies")
         plan_dict = _op_plan(
@@ -748,7 +748,7 @@ class TestPhysicalPlanRoundTrip:
             assert orig_node.name == rest_node.name
             assert orig_node.params == rest_node.params
             assert orig_node.parent_ids == rest_node.parent_ids
-            assert orig_node.output_dataset_id == rest_node.output_dataset_id
+            assert orig_node.dataset_id == rest_node.dataset_id
 
     def test_round_trip_join_plan(self):
         """Round-trip preserves a join plan with two parents."""

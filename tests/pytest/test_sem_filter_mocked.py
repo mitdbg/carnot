@@ -64,7 +64,7 @@ class TestSemFilterMocked:
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
         op = SemFilterOperator(
             task="The animal is a mammal",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -84,7 +84,7 @@ class TestSemFilterMocked:
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
         op = SemFilterOperator(
             task="always true",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -100,7 +100,7 @@ class TestSemFilterMocked:
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
         op = SemFilterOperator(
             task="always false",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -116,7 +116,7 @@ class TestSemFilterMocked:
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
         op = SemFilterOperator(
             task="pass",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -134,7 +134,7 @@ class TestSemFilterMocked:
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
         op = SemFilterOperator(
             task="pass",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -162,7 +162,7 @@ class TestSemFilterMocked:
         ds = Dataset(name="d", annotation="test", items=[{"x": 1}])
         op = SemFilterOperator(
             task="pass",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -182,7 +182,7 @@ class TestSemFilterMocked:
         ds = Dataset(name="empty", annotation="test", items=[])
         op = SemFilterOperator(
             task="irrelevant",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,

@@ -14,6 +14,7 @@ from carnot.data.dataset import Dataset
 from carnot.execution.progress import ExecutionProgress, PlanningProgress
 from carnot.index.index import CarnotIndex
 from carnot.memory.memory import Memory
+from carnot.optimizer.optimizer import Optimizer
 from carnot.plan import PhysicalPlan
 from carnot.plan.feedback import PlanFeedback
 from carnot.plan.node import PlanNode
@@ -64,6 +65,7 @@ class Execution:
             storage: TieredStorageManager | None = None,
             index_catalog: IndexCatalog | None = None,
             storage_config: StorageConfig | None = None,
+            max_workers: int = 64
         ):
         self.query = query
         self.datasets = datasets
@@ -83,6 +85,7 @@ class Execution:
         self.progress_log_file = progress_log_file
         self.cost_budget = cost_budget
         self.storage_config = storage_config or StorageConfig()
+        self.max_workers = max_workers
 
         # Build the PhysicalPlan from whatever was passed in.
         # Uses the _plan property setter which handles dict->PhysicalPlan
@@ -105,21 +108,33 @@ class Execution:
             db_session_factory=db_factory,
         )
 
-        self.planner_model_id = "openai/gpt-5-2025-08-07"
+        # get model for the planner and optimizer based on llm_config
+        self.model_id = "openai/gpt-5-2025-08-07"
         self.api_key_name = "OPENAI_API_KEY"
         if "OPENAI_API_KEY" not in self.llm_config and "ANTHROPIC_API_KEY" in self.llm_config:
-            self.planner_model_id = "anthropic/claude-sonnet-4-5-20250929"
+            self.model_id = "anthropic/claude-sonnet-4-5-20250929"
             self.api_key_name = "ANTHROPIC_API_KEY"
         elif "OPENAI_API_KEY" not in self.llm_config and "GEMINI_API_KEY" in self.llm_config:
-            self.planner_model_id = "google/gemini-2.5-flash"
+            self.model_id = "google/gemini-2.5-flash"
             self.api_key_name = "GEMINI_API_KEY"
         elif "OPENAI_API_KEY" not in self.llm_config and "GOOGLE_API_KEY" in self.llm_config:
-            self.planner_model_id = "google/gemini-2.5-flash"
+            self.model_id = "google/gemini-2.5-flash"
             self.api_key_name = "GOOGLE_API_KEY"
+
+        # create instance of the planner with the appropriate model and API key based on llm_config
         self.planner = Planner(
             datasets=self.datasets,
             tools=self.tools, 
-            model=LiteLLMModel(model_id=self.planner_model_id, api_key=llm_config.get(self.api_key_name))
+            model=LiteLLMModel(model_id=self.model_id, api_key=llm_config.get(self.api_key_name))
+        )
+
+        # create instance of the optimizer with the appropriate model and API key based on llm_config
+        self.available_model_ids = [self.model_id]
+        self.optimizer = Optimizer(
+            model=LiteLLMModel(model_id=self.model_id, api_key=llm_config.get(self.api_key_name)),
+            available_model_ids=self.available_model_ids,
+            llm_config=self.llm_config,
+            max_workers=self.max_workers,
         )
 
     # -- _plan property (backward-compatible) --------------------------------
@@ -216,28 +231,31 @@ class Execution:
         logical_plan = self.planner.generate_logical_plan(
             self.query,
             conversation=self.conversation,
-            cost_budget=self.cost_budget,
             progress_queue=progress_queue,
         )
-
         self._update_progress(
             progress_queue,
             is_planning=True,
             phase="logical_plan",
-            message="Logical plan generated. Preparing summary...",
+            message="Logical plan generated. Optimizing implementation...",
+        )
+
+        # generate a physical plan which satisfies the cost budget
+        physical_plan = self.optimizer.optimize(logical_plan, self.cost_budget)
+        self._update_progress(
+            progress_queue,
+            is_planning=True,
+            phase="optimizing",
+            message="Physical plan generated. Preparing plan summary...",
         )
 
         # translate the logical plan to natural language
-        nl_plan = self.planner.paraphrase_logical_plan(
+        nl_plan = self.planner.paraphrase_plan(
             self.query,
-            logical_plan,
+            physical_plan,
             conversation=self.conversation,
             progress_queue=progress_queue,
         )
-
-        plan_wall_clock = time.perf_counter() - plan_start
-        self._planning_stats = self._build_planning_stats(plan_wall_clock)
-
         self._update_progress(
             progress_queue,
             is_planning=True,
@@ -245,7 +263,10 @@ class Execution:
             message="Plan summary complete.",
         )
 
-        return nl_plan, logical_plan
+        plan_wall_clock = time.perf_counter() - plan_start
+        self._planning_stats = self._build_planning_stats(plan_wall_clock)
+
+        return nl_plan, physical_plan
 
     # -- stats helpers -------------------------------------------------------
 
@@ -358,9 +379,9 @@ class Execution:
         plan = self._physical_plan
         node = plan.get_node(node_id)
 
-        # Resolve parent output_dataset_ids for operator calling convention
+        # Resolve parent dataset_ids for operator calling convention
         parent_output_ids = [
-            plan.get_node(pid).output_dataset_id
+            plan.get_node(pid).dataset_id
             for pid in node.parent_ids
         ]
 
@@ -385,7 +406,7 @@ class Execution:
         ``node_type`` (``"dataset"`` | ``"operator"`` | ``"reasoning"``),
         ``operator_name``, ``operator_type``, ``description``, ``code``,
         ``original_code``, ``params``, ``parent_dataset_ids``, and
-        ``output_dataset_id``.
+        ``dataset_id``.
 
         Requires:
             - ``self._physical_plan`` is not None.
@@ -429,7 +450,7 @@ class Execution:
 
         updated, op_stats = self.run_node(node_id, input_datasets)
 
-        output_dataset = updated.get(node.output_dataset_id)
+        output_dataset = updated.get(node.dataset_id)
         preview = self._build_output_preview(output_dataset) if output_dataset else {}
 
         # Add answer text for reasoning nodes
@@ -548,7 +569,7 @@ class Execution:
         operator_type = params.get("operator", "")
         name = params.get("name", operator_type)
         description = params.get("description", name)
-        output_dataset_id = params.get("output_dataset_id", name)
+        dataset_id = params.get("dataset_id", name)
         node_type = "reasoning" if operator_type == "Reasoning" else "operator"
 
         return PlanNode(
@@ -559,7 +580,7 @@ class Execution:
             description=description,
             params=dict(params),
             parent_ids=[],  # Will be set by insert_node()
-            output_dataset_id=output_dataset_id,
+            dataset_id=dataset_id,
         )
 
     # ------------------------------------------------------------------
@@ -623,7 +644,7 @@ class Execution:
                 all_operator_stats.append(op_stats)
 
             # peek at the output dataset for item count / preview
-            output_ds = datasets_store.get(node.output_dataset_id)
+            output_ds = datasets_store.get(node.dataset_id)
             item_count, preview = None, None
             if output_ds is not None and hasattr(output_ds, "items"):
                 try:
