@@ -247,7 +247,18 @@ class SemFilterOperatorStep(MemoryStep):
 
     def to_messages(self, summary_mode = False) -> list[ChatMessage]:
         input_str = json.dumps(self.item, indent=2)
-        content = f"Filter Condition: \"{self.task}\"\n\nInput:\n{input_str}"
+        content = f"Query: \"{self.task}\"\n\nInput:\n{input_str}"
+        return [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": content}])]
+
+
+@dataclass
+class SemFilterBatchOperatorStep(MemoryStep):
+    task: str
+    items: list[dict]
+
+    def to_messages(self, summary_mode = False) -> list[ChatMessage]:
+        input_str = json.dumps(self.items, indent=2)
+        content = f"Query: \"{self.task}\"\n\nInputs:\n{input_str}"
         return [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": content}])]
 
 
