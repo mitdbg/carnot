@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+from ast import Continue
+import importlib.util
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +20,16 @@ from carnot.operators.sem_topk import SemTopKOperator
 
 load_dotenv()
 
+_BCP_EVAL_DIR = Path(__file__).resolve().parent
+_spec_qdt = importlib.util.spec_from_file_location(
+    "browsercomp_qdt_retrieval",
+    _BCP_EVAL_DIR / "qdt_retrieval.py",
+)
+_qdt_mod = importlib.util.module_from_spec(_spec_qdt)
+assert _spec_qdt.loader is not None
+_spec_qdt.loader.exec_module(_qdt_mod)
+generate_qdt_from_query = _qdt_mod.generate_qdt_from_query
+dedupe_qdt_tasks = _qdt_mod.dedupe_qdt_tasks
 
 DATASET_ID = 3
 
@@ -34,6 +47,7 @@ SUMMARY_PREP_MODES = SUMMARY_FILTER_MODES | {
     "summary-embedding-topk",
     "summary-embedding-topk-filter-batched",
     "summary-embedding-topk-batched-full-doc",
+    "summary-qdt-semfilter",
 }
 
 # Subset of summary prep modes that need cached vectors in memory for ranking.
@@ -42,6 +56,7 @@ SUMMARY_MODES_WITH_EMBEDDINGS = frozenset(
         "summary-embedding-topk",
         "summary-embedding-topk-filter-batched",
         "summary-embedding-topk-batched-full-doc",
+        "summary-qdt-semfilter",
     }
 )
 
@@ -259,6 +274,165 @@ def run_summary_embedding_topk_then_batched_filter(
     return docids, combined
 
 
+def run_summary_embedding_topk_batched_then_qdt_semfilter(
+    query: str,
+    summary_items: list[dict],
+    model_id: str,
+    qdt_model_id: str,
+    api_key: str,
+    topk: int,
+    embedding_model_id: str,
+    summary_filter_batch_size: int,
+    qdt_semfilter_batch_size: int,
+) -> tuple[list[str], dict]:
+    """Summary embedding top-*K* → batched SemFilter (full query) → QDT tasks on survivors, union docids."""
+    start_total = time.perf_counter()
+    top_with_emb, retr_stats = _topk_summary_items_by_embedding(
+        query, summary_items, api_key, topk, embedding_model_id
+    )
+    top_for_filter = [
+        {k: v for k, v in item.items() if k != "embedding"} for item in top_with_emb
+    ]
+    print("TOP K DONE")
+    if not top_for_filter:
+        return [], {
+            **retr_stats,
+            "summary_filter_items_out": 0,
+            "summary_filter_wall_clock_secs": 0.0,
+            "qdt_union_docids_count": 0,
+            "qdt_tasks": 0,
+            "qdt_passes": [],
+            "qdt_wall_clock_secs": 0.0,
+            "filter_items_out": 0,
+            "total_wall_clock_secs": time.perf_counter() - start_total,
+            "filter_batch_size": max(1, summary_filter_batch_size),
+        }
+
+    s2_docids, s2_stats = run_summary_filter_only(
+        query=query,
+        summary_items=top_for_filter,
+        model_id=model_id,
+        api_key=api_key,
+        batch_size=max(1, summary_filter_batch_size),
+    )
+    s2_set = {str(d) for d in s2_docids}
+    s2_items = [it for it in top_for_filter if str(it.get("docid", "")) in s2_set]
+
+    print("SUMMARY FILTER DONE")
+
+    if not s2_items:
+        return [], {
+            "total_cost_usd": retr_stats["total_cost_usd"] + s2_stats["total_cost_usd"],
+            "total_input_tokens": retr_stats["total_input_tokens"]
+            + s2_stats["total_input_tokens"],
+            "total_output_tokens": retr_stats["total_output_tokens"]
+            + s2_stats["total_output_tokens"],
+            "total_wall_clock_secs": time.perf_counter() - start_total,
+            "topk_wall_clock_secs": retr_stats["topk_wall_clock_secs"],
+            "summary_filter_wall_clock_secs": s2_stats["filter_wall_clock_secs"],
+            "summary_filter_items_out": s2_stats["filter_items_out"],
+            "qdt_union_docids_count": 0,
+            "qdt_tasks": 0,
+            "qdt_passes": [],
+            "qdt_wall_clock_secs": 0.0,
+            "filter_items_out": 0,
+            "topk_items_out": retr_stats["topk_items_out"],
+            "summary_items_out": retr_stats["summary_items_out"],
+            "summary_items_with_embedding": retr_stats["summary_items_with_embedding"],
+            "filter_batch_size": max(1, summary_filter_batch_size),
+        }
+
+    qdt, qdt_stat = generate_qdt_from_query(
+        query=query,
+        api_key=api_key,
+        model_id=qdt_model_id,
+    )
+    print("QDT GENERATION DONE")
+    tasks = dedupe_qdt_tasks(qdt["anchor"], qdt["probes"])
+
+    union: set[str] = set()
+    passes: list[dict] = []
+    qdt_sf_cost = 0.0
+    qdt_sf_in = 0
+    qdt_sf_out = 0
+
+    def _qdt_semfilter_one(pair: tuple[str, str]) -> tuple[str, str, list[str], dict]:
+        label, task = pair
+        docids, st = _run_sem_filter_items(
+            query=task,
+            items=s2_items,
+            model_id=model_id,
+            api_key=api_key,
+            batch_size=max(1, qdt_semfilter_batch_size),
+            dataset_name="SummaryDocuments",
+            annotation="A set of BrowserComp+ document summaries with docids and URLs.",
+            max_workers = 16
+        )
+        return label, task, docids, st
+
+    # One SemFilter run has few batches on ~5–15 docs; run distinct QDT tasks concurrently
+    # so up to 64 workers are used across passes (capped by number of tasks).
+    n_qdt_workers = min(64, max(1, len(tasks)))
+    qdt_sf_t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=n_qdt_workers) as pool:
+        qdt_pass_results = list(pool.map(_qdt_semfilter_one, tasks))
+    qdt_sf_wall = time.perf_counter() - qdt_sf_t0
+
+    for label, task, docids, st in qdt_pass_results:
+        for d in docids:
+            union.add(str(d))
+        qdt_sf_cost += float(st.get("total_cost_usd", 0.0))
+        qdt_sf_in += int(st.get("total_input_tokens", 0))
+        qdt_sf_out += int(st.get("total_output_tokens", 0))
+        preview = task if len(task) <= 500 else task[:500] + "..."
+        passes.append(
+            {
+                "label": label,
+                "task": preview,
+                "filter_items_out": st.get("filter_items_out"),
+                "semfilter_items_in": st.get("semfilter_items_in"),
+            }
+        )
+
+    qdt_cost = float(qdt_stat.cost_usd) if qdt_stat else 0.0
+    qdt_in = int(qdt_stat.total_input_tokens) if qdt_stat else 0
+    qdt_out = int(qdt_stat.total_output_tokens) if qdt_stat else 0
+    qdt_wall = float(qdt_stat.duration_secs) if qdt_stat else 0.0
+
+    combined = {
+        "total_cost_usd": retr_stats["total_cost_usd"]
+        + s2_stats["total_cost_usd"]
+        + qdt_cost
+        + qdt_sf_cost,
+        "total_input_tokens": retr_stats["total_input_tokens"]
+        + s2_stats["total_input_tokens"]
+        + qdt_in
+        + qdt_sf_in,
+        "total_output_tokens": retr_stats["total_output_tokens"]
+        + s2_stats["total_output_tokens"]
+        + qdt_out
+        + qdt_sf_out,
+        "total_wall_clock_secs": time.perf_counter() - start_total,
+        "topk_wall_clock_secs": retr_stats["topk_wall_clock_secs"],
+        "summary_filter_wall_clock_secs": s2_stats["filter_wall_clock_secs"],
+        "qdt_wall_clock_secs": qdt_wall,
+        "qdt_semfilter_wall_clock_secs": qdt_sf_wall,
+        "topk_items_out": retr_stats["topk_items_out"],
+        "summary_items_out": retr_stats["summary_items_out"],
+        "summary_items_with_embedding": retr_stats["summary_items_with_embedding"],
+        "summary_filter_items_out": s2_stats["filter_items_out"],
+        "filter_batch_size": max(1, summary_filter_batch_size),
+        "qdt_semfilter_batch_size": max(1, qdt_semfilter_batch_size),
+        "qdt": qdt,
+        "qdt_tasks": len(tasks),
+        "qdt_passes": passes,
+        "qdt_union_docids_count": len(union),
+        "filter_items_out": len(union),
+    }
+
+    return sorted(union), combined
+
+
 def _run_sem_filter_items(
     query: str,
     items: list[dict],
@@ -267,6 +441,7 @@ def _run_sem_filter_items(
     batch_size: int,
     dataset_name: str,
     annotation: str,
+    max_workers = 64
 ) -> tuple[list[str], dict]:
     """Run SemFilter on an arbitrary item list (single- or multi-document batches)."""
     start_time = time.perf_counter()
@@ -285,7 +460,7 @@ def _run_sem_filter_items(
         output_dataset_id="final_output",
         model_id=model_id,
         llm_config=llm_config,
-        max_workers=64,
+        max_workers=max_workers,
         batch_size=max(1, batch_size),
     )
     final_datasets, filter_stats = filter_op(dataset_name, input_datasets)
@@ -769,6 +944,7 @@ def main():
             "summary-embedding-topk",
             "summary-embedding-topk-filter-batched",
             "summary-embedding-topk-batched-full-doc",
+            "summary-qdt-semfilter",
             "no-index",
         ],
         help="Index mode to use",
@@ -825,7 +1001,18 @@ def main():
         help=(
             "SemFilter batch size for summary batched modes: summary-filter-batched, "
             "chroma-summary-filter-batched, summary-embedding-topk-filter-batched, "
-            "summary-embedding-topk-batched-full-doc (summary pass only; default 16)"
+            "summary-embedding-topk-batched-full-doc (summary pass only), "
+            "summary-qdt-semfilter: stage-2 batched SemFilter on top-K summaries; "
+            "stage-3 SemFilter batch size defaults to --qdt-filter-batch-size or same as this (default 16)"
+        ),
+    )
+    parser.add_argument(
+        "--qdt-filter-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "SemFilter batch size for QDT anchor/probe passes on stage-2 survivors "
+            "(summary-qdt-semfilter; default: same as --filter-batch-size)"
         ),
     )
     parser.add_argument(
@@ -834,7 +1021,17 @@ def main():
         default="results",
         help="Directory to save results",
     )
+    parser.add_argument(
+        "--qdt-model",
+        type=str,
+        default=None,
+        help="Model for QDT anchor/probe generation (summary-qdt-semfilter; default: same as --model)",
+    )
     args = parser.parse_args()
+    if args.qdt_model is None:
+        args.qdt_model = args.model
+    if args.qdt_filter_batch_size is None:
+        args.qdt_filter_batch_size = args.filter_batch_size
 
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -891,6 +1088,8 @@ def main():
         total_stats["total_wall_clock_secs"] += summary_prep_stats["summary_build_wall_clock_secs"]
 
     for i, query in enumerate(queries):
+        if i != 6: 
+            continue
         print(f"\n[{i+1}/{len(queries)}] {query['query'][:70]}...")
 
         try:
@@ -955,6 +1154,18 @@ def main():
                     embedding_model_id=args.embedding_model,
                     summary_filter_batch_size=max(1, args.filter_batch_size),
                 )
+            elif args.mode == "summary-qdt-semfilter":
+                pred_docids, exec_stats = run_summary_embedding_topk_batched_then_qdt_semfilter(
+                    query=query["query"],
+                    summary_items=summary_items or [],
+                    model_id=args.model,
+                    qdt_model_id=args.qdt_model,
+                    api_key=api_key,
+                    topk=args.topk,
+                    embedding_model_id=args.embedding_model,
+                    summary_filter_batch_size=max(1, args.filter_batch_size),
+                    qdt_semfilter_batch_size=max(1, args.qdt_filter_batch_size),
+                )
             elif args.mode == "chroma-summary-filter":
                 pred_docids, exec_stats = run_with_index_summary_filter(
                     query=query["query"],
@@ -1011,6 +1222,14 @@ def main():
                 f"  TopK out: {exec_stats.get('topk_items_out', 'n/a')}, "
                 f"Filter out: {exec_stats.get('filter_items_out', 'n/a')}"
             )
+            if args.mode == "summary-qdt-semfilter":
+                qdt_obj = exec_stats.get("qdt") or {}
+                n_probes = len(qdt_obj.get("probes", []))
+                print(
+                    f"  QDT: {exec_stats.get('qdt_tasks', 'n/a')} tasks "
+                    f"({n_probes} probes + anchor), "
+                    f"union docids: {exec_stats.get('qdt_union_docids_count', 'n/a')}"
+                )
 
             results.append(
                 {
@@ -1079,7 +1298,12 @@ def main():
             "chroma-summary-filter-batched",
             "summary-embedding-topk-filter-batched",
             "summary-embedding-topk-batched-full-doc",
+            "summary-qdt-semfilter",
         }
+        else None,
+        "qdt_model": args.qdt_model if args.mode == "summary-qdt-semfilter" else None,
+        "qdt_filter_batch_size": args.qdt_filter_batch_size
+        if args.mode == "summary-qdt-semfilter"
         else None,
         "summary_prep_stats": summary_prep_stats if args.mode in SUMMARY_PREP_MODES else None,
         "num_queries": len(queries),
