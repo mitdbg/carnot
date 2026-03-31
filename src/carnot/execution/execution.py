@@ -161,8 +161,19 @@ class Execution:
         elif isinstance(value, PhysicalPlan):
             self._physical_plan = value
         elif isinstance(value, dict):
+            # Recover the original query from conversation history (first
+            # user message) so the reasoning node retains full context
+            # even when the current query is a follow-up modification.
+            original_query = ""
+            if self.conversation and self.conversation.messages:
+                for msg in self.conversation.messages:
+                    if msg.get("role") == "user":
+                        original_query = msg.get("content", "")
+                        break
+
             self._physical_plan = PhysicalPlan.from_plan_dict(
                 value, self.datasets, query=self.query,
+                original_query=original_query,
             )
         else:
             self._physical_plan = None

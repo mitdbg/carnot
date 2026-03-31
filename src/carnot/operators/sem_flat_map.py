@@ -1,5 +1,5 @@
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor
 from importlib import resources
 
 import yaml
@@ -171,21 +171,24 @@ class SemFlatMapOperator:
             },
         )
 
-        # construct futures
-        futures = []
+        # construct futures — preserve (item, future) pairing so we can
+        # merge input fields into each expanded output row.
+        item_future_pairs = []
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             for item in items:
                 future = executor.submit(self._sem_flat_map, item, system_prompt)
-                futures.append(future)
+                item_future_pairs.append((item, future))
 
-        # block until futures complete
-        done_futures, _ = wait(futures)
+        # block until futures complete and merge input fields
         all_call_stats: list[LLMCallStats] = []
         results = []
-        for fut in done_futures:
+        for input_item, fut in item_future_pairs:
             expanded_items, item_stats = fut.result()
             all_call_stats.extend(item_stats)
-            results.extend(expanded_items)
+            for expanded in expanded_items:
+                # Copy all input fields, then overlay the LLM-generated fields
+                merged = {**input_item, **expanded}
+                results.append(merged)
 
         # create new dataset and return it with the input datasets
         output_dataset = Dataset(name=self.output_dataset_id, annotation=f"Sem flat map operator output for task: {self.task}", items=results)

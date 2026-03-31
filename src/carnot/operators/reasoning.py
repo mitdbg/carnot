@@ -145,6 +145,9 @@ class ReasoningOperator(CodeOperator):
             error_msg = f"Error in code parsing:\n{e}\nMake sure to provide correct code blobs."
             raise AgentParsingError(error_msg, self.logger) from e
 
+        # Check for anti-patterns before executing
+        self._check_for_anti_patterns(code_action)
+
         tool_call = ToolCall(
             name="python_interpreter",
             arguments=code_action,

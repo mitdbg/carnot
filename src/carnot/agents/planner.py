@@ -263,9 +263,19 @@ class Planner(BaseAgent):
 
             # Other AgentError types are caused by the Model, so we should log them and iterate.
             except AgentError as e:
+                if action_step is None:
+                    action_step = ActionStep(
+                        step_number=self.step_number,
+                        timing=Timing(start_time=time.time()),
+                    )
                 action_step.error = e
 
             finally:
+                if action_step is None:
+                    action_step = ActionStep(
+                        step_number=self.step_number,
+                        timing=Timing(start_time=time.time()),
+                    )
                 # set the end time for the step and add to memory
                 action_step.timing.end_time = time.time()
                 memory.steps.append(action_step)

@@ -1,3 +1,4 @@
+import re
 import time
 from collections.abc import Generator
 from dataclasses import dataclass
@@ -39,6 +40,24 @@ from carnot.agents.utils import (
 from carnot.core.models import LLMCallStats, OperatorStats
 from carnot.data.dataset import Dataset
 
+# Default imports that are always authorized for the CodeOperator beyond BASE_BUILTIN_MODULES.
+# These cover common data-science and data-manipulation workflows that generated code
+# routinely relies on.  Security-sensitive modules (subprocess, socket, shutil, etc.) are
+# deliberately excluded.
+CODE_OPERATOR_DEFAULT_IMPORTS = [
+    "copy",        # Deep copying data structures
+    "csv",         # CSV parsing (in-memory)
+    "functools",   # Functional programming utilities
+    "io",          # StringIO / BytesIO for in-memory streams
+    "json",        # JSON parsing / formatting
+    "numpy",       # Numerical computing
+    "operator",    # Operator functions
+    "pandas",      # DataFrames and tabular data manipulation
+    "string",      # String constants and helpers
+    "textwrap",    # Text formatting utilities
+    "typing",      # Type hint helpers
+]
+
 
 @dataclass
 class FinalAnswerStep(MemoryStep):
@@ -75,7 +94,9 @@ class CodeOperator:
         self.task = task
         self.output_dataset_id = output_dataset_id
         self.model = LiteLLMModel(model_id=model_id, api_key=llm_config.get("OPENAI_API_KEY"))
-        self.additional_authorized_imports = additional_authorized_imports if additional_authorized_imports else []
+        self.additional_authorized_imports = (
+            sorted(set(CODE_OPERATOR_DEFAULT_IMPORTS) | set(additional_authorized_imports or []))
+        )
         self.authorized_imports = sorted(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
         self.code_block_tags = ["```python", "```"]
         self.python_executor = self.create_python_executor()
@@ -103,6 +124,34 @@ class CodeOperator:
                 "Each tool should have a unique name! You passed these duplicate names: "
                 f"{[name for name in tool_names if tool_names.count(name) > 1]}"
             )
+
+    def _check_for_anti_patterns(self, code_action: str) -> None:
+        """Check for anti-patterns in generated code and raise errors with guidance.
+
+        Requires:
+            - *code_action* is a non-empty string of parsed Python code.
+
+        Returns:
+            None — returns normally when no anti-patterns are detected.
+
+        Raises:
+            AgentParsingError: If the code contains both ``print()`` and
+            ``final_answer()`` calls in the same block.
+        """
+        has_print = bool(re.search(r'\bprint\s*\(', code_action))
+        has_final_answer = bool(re.search(r'\bfinal_answer\s*\(', code_action))
+
+        if has_print and has_final_answer:
+            error_msg = (
+                "Anti-pattern detected: You cannot call both 'print()' and 'final_answer()' "
+                "in the same code block.\n\n"
+                "You should:\n"
+                "1. First use print() to explore and inspect dataset items\n"
+                "2. Observe the printed output to understand the data structure\n"
+                "3. Then in a SEPARATE step, call final_answer() using the actual keys/values you discovered\n\n"
+                "Please split these into separate steps."
+            )
+            raise AgentParsingError(error_msg, self.logger)
 
     def _finalize_step(self, memory_step: ActionStep):
         memory_step.timing.end_time = time.time()
@@ -308,6 +357,9 @@ class CodeOperator:
             error_msg = f"Error in code parsing:\n{e}\nMake sure to provide correct code blobs."
             raise AgentParsingError(error_msg, self.logger) from e
 
+        # Check for anti-patterns before executing
+        self._check_for_anti_patterns(code_action)
+
         tool_call = ToolCall(
             name="python_interpreter",
             arguments=code_action,
@@ -409,8 +461,22 @@ class CodeOperator:
             ):
                 all_call_stats.append(step.model_output_message.llm_call_stats)
 
+        # If the code operator produced a list of items under the "final_items" key,
+        # surface them as the Dataset's items so downstream operators can consume them.
+        output_items = None
+        if isinstance(output_state, dict) and "final_items" in output_state:
+            candidate = output_state["final_items"]
+            if isinstance(candidate, list) and all(isinstance(item, dict) for item in candidate):
+                output_items = candidate
+
         # create new dataset and return it with the input datasets
-        output_dataset = Dataset(name=self.output_dataset_id, annotation=f"Code operator output for task: {self.task}", code=output_code, code_state=output_state)
+        output_dataset = Dataset(
+            name=self.output_dataset_id,
+            annotation=f"Code operator output for task: {self.task}",
+            items=output_items,
+            code=output_code,
+            code_state=output_state,
+        )
         output_datasets = {**input_datasets, output_dataset.name: output_dataset}
 
         op_stats = OperatorStats(

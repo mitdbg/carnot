@@ -451,7 +451,7 @@ class QueryExecutionStreamer:
             await self.queue.put(f"data: {json.dumps({'type': 'step_detail', 'source': 'execution', 'message': f'Processing {len(all_files)} files...'})}\n\n")
 
             session_exists = session_id in active_sessions
-            if session_exists and set(active_sessions[session_id]["dataset_ids"]) != set(self.dataset_ids):
+            if session_exists and set(active_sessions[session_id].get("dataset_ids", [])) != set(self.dataset_ids):
                 session_exists = False
 
             session_dir = Path(BASE_DIR, ".sessions", session_id) if IS_LOCAL_ENV else S3Path(BASE_DIR, ".sessions", session_id)
@@ -1732,6 +1732,36 @@ class MoveCellRequest(BaseModel):
     direction: str  # "up" or "down"
 
 
+def _extract_quoted(code: str, key: str, *, dotall: bool = False) -> str | None:
+    """Extract a quoted ``key=value`` from pseudocode.
+
+    Uses a backreference so the closing quote matches the opening
+    quote, allowing embedded quotes of the *other* type.
+    Triple-quoted strings (``'''`` / ``\"\"\"``) are tried first.
+
+    Requires:
+        - *code* is a non-empty string.
+        - *key* is a bare keyword name (no special regex characters).
+
+    Returns:
+        The captured value string, or ``None`` if no match is found.
+
+    Raises:
+        None.
+    """
+    flags = re.DOTALL if dotall else 0
+    # Try triple-quoted first.
+    m = re.search(rf"{key}\s*=\s*'''(.*?)'''", code, flags)
+    if m:
+        return m.group(1)
+    m = re.search(rf'{key}\s*=\s*"""(.*?)"""', code, flags)
+    if m:
+        return m.group(1)
+    # Single-quote with backreference.
+    m = re.search(rf"{key}\s*=\s*([\"'])(.*?)\1", code, flags)
+    return m.group(2) if m else None
+
+
 def _parse_code_to_params(
     code: str, node_type: str, operator_type: str | None
 ) -> dict | None:
@@ -1741,6 +1771,10 @@ def _parse_code_to_params(
     by ``PlanNode.to_code()``.  Returns ``None`` if the code cannot be
     parsed (in which case the backend falls back to the existing params).
 
+    Additionally extracts ``_input_dataset_ids`` and
+    ``_output_dataset_id`` when the user edits the ``datasets['...']``
+    references, enabling dataset rewiring.
+
     Requires:
         - ``code`` is a non-empty string.
         - ``node_type`` is one of ``"dataset"``, ``"operator"``,
@@ -1748,6 +1782,8 @@ def _parse_code_to_params(
 
     Returns:
         A dict of extracted params, or ``None`` if parsing fails.
+        May contain special keys ``_input_dataset_ids`` (list of str)
+        and ``_output_dataset_id`` (str) for dataset rewiring.
 
     Raises:
         None.  Parse failures are logged and silently ignored.
@@ -1760,51 +1796,97 @@ def _parse_code_to_params(
             return None
 
         if node_type == "reasoning":
-            m = re.search(r'query\s*=\s*["\'](.+?)["\']', code, re.DOTALL)
-            if m:
-                return {"task": m.group(1)}
+            val = _extract_quoted(code, "query", dotall=True)
+            if val:
+                return {"task": val}
             return None
 
+        # -- common: extract dataset references for rewiring --------
+        result: dict = {}
+
+        # Output dataset: datasets['XXX'] = ...
+        out_m = re.search(r"datasets\[([\"'])(.*?)\1\]\s*=", code)
+        if out_m:
+            result["_output_dataset_id"] = out_m.group(2)
+
+        # Input dataset(s): dataset=datasets['XXX'] or left/right
+        input_ids: list[str] = []
+        for ref_m in re.finditer(
+            r"(?:dataset|left|right)\s*=\s*datasets\[([\"'])(.*?)\1\]", code
+        ):
+            input_ids.append(ref_m.group(2))
+        if input_ids:
+            result["_input_dataset_ids"] = input_ids
+
+        # -- operator-specific params ------------------------------
         if operator_type == "SemanticFilter":
-            m = re.search(r'condition\s*=\s*["\'](.+?)["\']', code, re.DOTALL)
-            if m:
-                return {"condition": m.group(1)}
+            val = _extract_quoted(code, "condition", dotall=True)
+            if val:
+                result["condition"] = val
 
         elif operator_type == "SemanticMap":
-            params: dict = {}
             for key in ("field", "type", "description"):
-                m = re.search(rf'{key}\s*=\s*["\'](.+?)["\']', code)
-                if m:
+                val = _extract_quoted(code, key)
+                if val is not None:
                     k = "field_desc" if key == "description" else key
-                    params[k] = m.group(1)
-            return params if params else None
+                    result[k] = val
 
         elif operator_type == "SemanticJoin":
-            m = re.search(r'condition\s*=\s*["\'](.+?)["\']', code, re.DOTALL)
-            if m:
-                return {"condition": m.group(1)}
+            val = _extract_quoted(code, "condition", dotall=True)
+            if val:
+                result["condition"] = val
+
+        elif operator_type == "SemanticFlatMap":
+            for key in ("field", "type", "description"):
+                val = _extract_quoted(code, key)
+                if val is not None:
+                    k = "field_desc" if key == "description" else key
+                    result[k] = val
+
+        elif operator_type == "SemanticGroupBy":
+            # Parse group_by=['field1', 'field2']
+            gby_m = re.search(r'group_by\s*=\s*\[(.+?)\]', code)
+            if gby_m:
+                gby_names = re.findall(r"[\"']([^\"']+)[\"']", gby_m.group(1))
+                result["gby_fields"] = [{"name": n} for n in gby_names]
+
+            # Parse aggregations=['name(func)', ...]
+            agg_m = re.search(r'aggregations\s*=\s*\[(.+?)\]', code)
+            if agg_m:
+                agg_entries = re.findall(r"[\"']([^\"']+)[\"']", agg_m.group(1))
+                agg_fields = []
+                for entry in agg_entries:
+                    # Format: "field_name(func)"
+                    parts = re.match(r'^(.+?)\((.+?)\)$', entry.strip())
+                    if parts:
+                        agg_fields.append({"name": parts.group(1), "func": parts.group(2)})
+                if agg_fields:
+                    result["agg_fields"] = agg_fields
 
         elif operator_type == "SemanticTopK":
-            params = {}
-            m = re.search(r'search\s*=\s*["\'](.+?)["\']', code, re.DOTALL)
-            if m:
-                params["search_str"] = m.group(1)
+            val = _extract_quoted(code, "search", dotall=True)
+            if val:
+                result["search_str"] = val
             m = re.search(r'k\s*=\s*(\d+)', code)
             if m:
-                params["k"] = int(m.group(1))
-            return params if params else None
+                result["k"] = int(m.group(1))
 
         elif operator_type == "SemanticAgg":
-            m = re.search(r'task\s*=\s*["\'](.+?)["\']', code, re.DOTALL)
-            if m:
-                return {"task": m.group(1)}
+            val = _extract_quoted(code, "task", dotall=True)
+            if val:
+                result["task"] = val
+
+        elif operator_type == "Code":
+            val = _extract_quoted(code, "task", dotall=True)
+            if val:
+                result["task"] = val.strip()
 
         elif operator_type == "Limit":
             m = re.search(r'n\s*=\s*(\d+)', code)
             if m:
-                return {"n": int(m.group(1))}
+                result["n"] = int(m.group(1))
 
-        return None
+        return result if result else None
     except Exception:
         logger.warning("Failed to parse code to params", exc_info=True)
         return None
@@ -1921,11 +2003,16 @@ async def execute_jupyter(
     # Load datasets from DB
     datasets = await _load_carnot_datasets(request.dataset_ids)
 
+    # Load conversation so the _plan setter can extract original_query
+    # for the reasoning node (needed when query is a follow-up).
+    conversation = await load_conversation_from_db(user_id, request.session_id)
+
     storage = _build_storage()
     exec_instance = carnot.Execution(
         query=request.query,
         datasets=datasets,
         plan=request.plan,
+        conversation=conversation,
         tools=[],
         memory=None,
         indices=[],
@@ -2055,12 +2142,42 @@ async def execute_cell(
     # If code was modified, invalidate downstream cells
     invalidated_cells: list[str] = []
     if request.code is not None:
-        original_code = node.to_code()
+        # Build parent_output_map so original_code uses the same format
+        # the frontend received (output_dataset_ids, not node IDs).
+        parent_output_map = {
+            n.node_id: n.output_dataset_id
+            for n in nb.physical_plan.nodes
+        }
+        original_code = node.to_code(parent_output_map=parent_output_map)
         if request.code != original_code:
             # Parse updated params from the modified code (best-effort)
             parsed = _parse_code_to_params(request.code, node.node_type, node.operator_type)
             if parsed:
-                node.params.update(parsed)
+                # Handle output dataset renaming
+                new_out = parsed.pop("_output_dataset_id", None)
+                if new_out and new_out != node.output_dataset_id:
+                    node.output_dataset_id = new_out
+
+                # Handle input dataset rewiring
+                new_inputs = parsed.pop("_input_dataset_ids", None)
+                if new_inputs:
+                    # Map output_dataset_id → node_id for reverse lookup
+                    out_to_node = {
+                        n.output_dataset_id: n.node_id
+                        for n in nb.physical_plan.nodes
+                    }
+                    new_parent_ids = [
+                        out_to_node[dsid]
+                        for dsid in new_inputs
+                        if dsid in out_to_node
+                    ]
+                    if new_parent_ids:
+                        node.parent_ids = new_parent_ids
+
+                # Apply remaining operator-specific params
+                if parsed:
+                    node.params.update(parsed)
+
             # Invalidate downstream
             invalidated_cells = nb.physical_plan.invalidated_downstream(node_id)
             for inv_id in invalidated_cells:
@@ -2141,8 +2258,11 @@ async def execute_cell(
                 len(json.dumps(safe_preview)),
             )
 
-            # Persist updated cells_json (now including output) to DB
-            await _persist_notebook_cells(nb.notebook_id, nb.get_cells())
+            # Persist updated cells_json (now including output) to DB.
+            # When params were modified (code edit), also persist the
+            # updated plan so rehydration picks up the new values.
+            plan_update = nb.physical_plan.to_dict() if invalidated_cells else None
+            await _persist_notebook_cells(nb.notebook_id, nb.get_cells(), plan_dict=plan_update)
 
             # Build the response
             payload = {
