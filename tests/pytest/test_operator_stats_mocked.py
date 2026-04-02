@@ -208,6 +208,38 @@ class TestSemFilterStats:
         )
         assert stats.items_out == 2  # giraffe + elephant
 
+    def test_batched_stats_populated(self, mock_litellm, mock_llm_config):
+        """Batched filtering tracks one LLM call per successful batch."""
+        from fixtures.mocks import _make_completion_response
+
+        def _batch_handler(model, messages, **kwargs):
+            payload = msg_text(messages)
+            if "Inputs:\n" in payload:
+                return _make_completion_response('```json\n{"matching_indices": [0]}\n```')
+            return _make_completion_response("```text\nFALSE\n```")
+
+        mock_litellm.set_completion_handler(_batch_handler)
+
+        ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
+        op = SemFilterOperator(
+            task="is first item in each batch",
+            output_dataset_id="out",
+            model_id="mock-model",
+            llm_config=mock_llm_config,
+            max_workers=1,
+            batch_size=2,
+        )
+        _, stats = op("animals", {"animals": ds})
+
+        _assert_valid_stats(
+            stats,
+            operator_name="SemFilter",
+            items_in=len(_ANIMALS),
+            min_llm_calls=3,
+            max_llm_calls=3,
+        )
+        assert stats.items_out == 2
+
     def test_empty_dataset_zero_calls(self, mock_litellm, mock_llm_config):
         """An empty dataset produces zero LLM calls and zero items out."""
         mock_litellm.set_completion_handler(_filter_handler)

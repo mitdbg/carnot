@@ -58,6 +58,7 @@ evals = [
     "cdlib",
     "gdown",
     "tomli",
+    "matplotlib",
 ]
 
 [tool.setuptools]
