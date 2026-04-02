@@ -29,7 +29,7 @@ export default function QueryCostDisplay({ cost, budget }) {
     colorClasses = 'bg-green-50 border-green-300 text-green-600'
   }
 
-  const display = cost < 0.005 ? '<0.01' : cost.toFixed(2)
+  const display = cost < 0.001 ? '<0.001' : cost < 10 ? cost.toFixed(3) : cost.toFixed(2)
 
   return (
     <div

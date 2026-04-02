@@ -257,6 +257,7 @@ test_output.txt
 inspect_cluster.py
 agent-indices.py
 b-tree-demo.py
+.local-secrets
 
 # local envs
 .venv*/

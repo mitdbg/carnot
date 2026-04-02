@@ -38,6 +38,7 @@ from carnot.agents.utils import (
 )
 from carnot.core.models import LLMCallStats, OperatorStats
 from carnot.data.dataset import Dataset
+from carnot.operators.physical import PhysicalOperator
 
 
 @dataclass
@@ -53,7 +54,7 @@ class CodeActionOutput:
     execution_logs: str
     is_final_answer: bool
 
-class CodeOperator:
+class CodeOperator(PhysicalOperator):
     """Multi-step agentic code execution operator.
 
     The operator uses an LLM to generate Python code, executes it in a
@@ -71,9 +72,24 @@ class CodeOperator:
         iteratively generate and execute Python code until a final answer is produced, then
         returns the result wrapped in a new ``Dataset``.
     """
-    def __init__(self, task: str, output_dataset_id: str, model_id: str, llm_config: dict, tools: list[Tool] | None = None, additional_authorized_imports: list[str] | None = None, max_steps: int = 20):
+    def __init__(
+            self,
+            task: str,
+            dataset_id: str,
+            model_id: str,
+            llm_config: dict,
+            tools: list[Tool] | None = None,
+            additional_authorized_imports: list[str] | None = None,
+            max_steps: int = 20,
+            logical_op_id: str | None = None,
+            logical_op_class_name: str | None = None,
+        ):
+        super().__init__(logical_op_id=logical_op_id, logical_op_class_name=logical_op_class_name)
         self.task = task
-        self.output_dataset_id = output_dataset_id
+        self.dataset_id = dataset_id
+        self.model_id = model_id
+        self.llm_config = llm_config
+        self._tools = tools or []
         self.model = LiteLLMModel(model_id=model_id, api_key=llm_config.get("OPENAI_API_KEY"))
         self.additional_authorized_imports = additional_authorized_imports if additional_authorized_imports else []
         self.authorized_imports = sorted(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
@@ -84,10 +100,35 @@ class CodeOperator:
         )
         self.memory = AgentMemory("")
         self.logger = AgentLogger(level=LogLevel.INFO)
-        tools = tools or []
-        self._setup_tools(tools)
-        self._validate_tools(tools)
+        self._setup_tools(self._tools)
+        self._validate_tools(self._tools)
         self.max_steps = max_steps
+
+    def get_id_params(self):
+        id_params = super().get_id_params()
+        id_params = {
+            "task": self.task,
+            "dataset_id": self.dataset_id,
+            "model_id": self.model_id,
+            **id_params,
+        }
+
+        return id_params
+
+    def get_op_params(self):
+        op_params = super().get_op_params()
+        op_params = {
+            "task": self.task,
+            "dataset_id": self.dataset_id,
+            "model_id": self.model_id,
+            "llm_config": self.llm_config,
+            "tools": self._tools,
+            "additional_authorized_imports": self.additional_authorized_imports,
+            "max_steps": self.max_steps,
+            **op_params,
+        }
+
+        return op_params
 
     def _setup_tools(self, tools: list[BaseTool]):
         assert all(isinstance(tool, BaseTool) for tool in tools), (
@@ -199,7 +240,7 @@ class CodeOperator:
             timing=Timing(start_time=action_step_start_time, end_time=time.time()),
             token_usage=final_answer.token_usage,
         )
-        final_memory_step.action_output = final_answer.content
+        final_memory_step.final_output = final_answer.content
         self._finalize_step(final_memory_step)
         self.memory.steps.append(final_memory_step)
         return final_answer.content
@@ -356,7 +397,7 @@ class CodeOperator:
                 ),
             ]
         self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
-        memory_step.action_output = code_output.output
+        memory_step.code_action_output = code_output.output
         yield CodeActionOutput(
             code=code_action,
             output=code_output.output,
@@ -377,7 +418,7 @@ class CodeOperator:
         Returns:
             A tuple ``(output_datasets, stats)`` where *output_datasets*
             is a new ``dict[str, Dataset]`` with an additional entry keyed
-            by ``self.output_dataset_id``, and *stats* is an
+            by ``self.dataset_id``, and *stats* is an
             :class:`OperatorStats` summarising all LLM calls made across
             the agentic loop.
 
@@ -410,12 +451,12 @@ class CodeOperator:
                 all_call_stats.append(step.model_output_message.llm_call_stats)
 
         # create new dataset and return it with the input datasets
-        output_dataset = Dataset(name=self.output_dataset_id, annotation=f"Code operator output for task: {self.task}", code=output_code, code_state=output_state)
+        output_dataset = Dataset(name=self.dataset_id, annotation=f"Code operator output for task: {self.task}", code=output_code, code_state=output_state)
         output_datasets = {**input_datasets, output_dataset.name: output_dataset}
 
         op_stats = OperatorStats(
             operator_name="Code",
-            operator_id=self.output_dataset_id,
+            operator_id=self.dataset_id,
             wall_clock_secs=time.perf_counter() - op_start,
             llm_calls=all_call_stats,
             items_in=sum(len(ds.items) for ds in input_datasets.values()),

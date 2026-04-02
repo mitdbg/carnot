@@ -192,7 +192,7 @@ class TestSemFilterStats:
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
         op = SemFilterOperator(
             task="is mammal",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -247,7 +247,7 @@ class TestSemFilterStats:
         ds = Dataset(name="empty", annotation="test", items=[])
         op = SemFilterOperator(
             task="pass",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -276,7 +276,7 @@ class TestSemMapStats:
         op = SemMapOperator(
             task="Classify",
             output_fields=[{"name": "animal_group", "type": str, "description": "group"}],
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -304,7 +304,7 @@ class TestSemFlatMapStats:
         op = SemFlatMapOperator(
             task="Extract",
             output_fields=[{"name": "fruit", "type": str, "description": "fruit"}],
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -333,7 +333,7 @@ class TestSemAggStats:
         op = SemAggOperator(
             task="Find largest",
             agg_fields=[{"name": "largest", "type": str, "description": "largest"}],
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -366,7 +366,7 @@ class TestSemJoinStats:
             task="animal makes sound",
             model_id="mock-model",
             llm_config=mock_llm_config,
-            output_dataset_id="out",
+            dataset_id="out",
             max_workers=1,
         )
         _, stats = op("left", "right", {"left": left_ds, "right": right_ds})
@@ -394,7 +394,7 @@ class TestSemGroupByStats:
             task="Count per group",
             group_by_fields=[{"name": "animal_group", "type": str, "description": "class"}],
             agg_fields=[{"name": "count", "type": int, "description": "count", "func": "count"}],
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -419,7 +419,7 @@ class TestSemTopKStats:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find mammals"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 2
             op.model_id = "mock-embedding"
             op.api_key = "fake"
@@ -445,7 +445,7 @@ class TestLimitStats:
     def test_stats_no_llm_calls(self, mock_llm_config):
         """Limit is a non-LLM operator; stats have zero LLM calls."""
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
-        op = LimitOperator(n=3, output_dataset_id="out")
+        op = LimitOperator(n=3, dataset_id="out")
         _, stats = op("animals", {"animals": ds})
 
         _assert_valid_stats(
@@ -461,7 +461,7 @@ class TestLimitStats:
     def test_limit_greater_than_items(self, mock_llm_config):
         """When n > len(items), items_out equals the actual item count."""
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
-        op = LimitOperator(n=100, output_dataset_id="out")
+        op = LimitOperator(n=100, dataset_id="out")
         _, stats = op("animals", {"animals": ds})
 
         assert stats.items_out == len(_ANIMALS)
@@ -477,7 +477,7 @@ class TestStatsHaveCostData:
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
         op = SemFilterOperator(
             task="is mammal",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -497,7 +497,7 @@ class TestStatsHaveCostData:
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
         op = SemFilterOperator(
             task="is mammal",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,

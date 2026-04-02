@@ -63,7 +63,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find mammals"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 2
             op.model_id = "mock-embedding"
             op.api_key = "fake"
@@ -82,7 +82,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find mammals"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 3
             op.model_id = "mock-embedding"
             op.api_key = "fake"
@@ -110,7 +110,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find mammals"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 1
             op.model_id = "mock-embedding"
             op.api_key = "fake"
@@ -130,7 +130,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 1
             op.model_id = "mock"
             op.api_key = "fake"
@@ -150,7 +150,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 100
             op.model_id = "mock"
             op.api_key = "fake"
@@ -175,7 +175,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 2
             op.model_id = "mock"
             op.api_key = "fake"
@@ -203,7 +203,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 2
             op.model_id = "mock"
             op.api_key = "fake"
@@ -236,7 +236,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find mammals"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 2
             op.model_id = "mock-embedding"
             op.api_key = "fake"
@@ -270,7 +270,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 2
             op.model_id = "mock"
             op.api_key = "fake"
@@ -297,7 +297,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 2
             op.model_id = "mock"
             op.api_key = "fake"
@@ -328,7 +328,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 2
             op.model_id = "mock"
             op.api_key = "fake"

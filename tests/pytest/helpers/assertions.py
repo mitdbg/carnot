@@ -8,6 +8,8 @@ Import them directly::
 
 from __future__ import annotations
 
+from typing import Any
+
 from carnot.agents.base import BaseAgent
 from carnot.agents.planner import Planner
 
@@ -37,7 +39,7 @@ def assert_agent_did_not_hit_max_steps(agent: BaseAgent) -> None:
         )
 
 
-def assert_planner_did_not_hit_max_steps(planner: Planner, result: str) -> None:
+def assert_planner_did_not_hit_max_steps(planner: Planner, result: Any) -> None:
     """Assert that the planner did not exhaust its step budget.
 
     Checks two conditions:
@@ -62,7 +64,7 @@ def assert_planner_did_not_hit_max_steps(planner: Planner, result: str) -> None:
         "This simple task should complete in fewer steps."
     )
 
-    # Also check planning_memory if present (used by some planner variants).
+    # also check planning_memory if present (used by some planner variants).
     planning_memory = getattr(planner, "planning_memory", None)
     if planning_memory and planning_memory.steps:
         last_step = planning_memory.steps[-1]

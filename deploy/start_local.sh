@@ -79,6 +79,7 @@ pushd $COMPOSE_DIR > /dev/null
 # Run Docker Compose
 echo "Starting services with Docker Compose..."
 docker compose -f $COMPOSE_FILE -f $OVERRIDE_FILE up --build -d
+# docker compose -f $COMPOSE_FILE -f $OVERRIDE_FILE build --no-cache && docker compose up -d
 
 # CAPTURE THE EXIT CODE IMMEDIATELY
 EXIT_CODE=$?
@@ -114,3 +115,4 @@ fi
 
 # Exit with the captured code so the shell knows if it failed
 exit $EXIT_CODE
+

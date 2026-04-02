@@ -327,6 +327,7 @@ class IndexCatalog:
         if self._db_factory is not None:
             _run_async(self._create_index_db(meta))
         else:
+            # TODO: does this persist to disk across queries?
             self._memory_store[meta.id] = meta
             self._next_id += 1
         return meta

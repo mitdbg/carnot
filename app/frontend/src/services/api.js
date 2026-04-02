@@ -53,6 +53,30 @@ export const conversationsApi = {
     }),
 }
 
+// Workspaces API
+export const workspacesApi = {
+  list: (token) =>
+    api.get('/workspaces/', {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  get: (id, token) =>
+    api.get(`/workspaces/${id}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  create: (data, token) =>
+    api.post('/workspaces/', data, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  update: (id, data, token) =>
+    api.put(`/workspaces/${id}`, data, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  delete: (id, token) =>
+    api.delete(`/workspaces/${id}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+}
+
 // Files API
 export const filesApi = {
   browse: (token, path = '', limit = MAX_FILES_PER_REQUEST, continuationToken = null) => {
@@ -119,6 +143,34 @@ export const searchApi = {
       { query, paths },
       {headers: { Authorization: `Bearer ${token}` }}
     ),
+}
+
+// Notebook API
+export const notebookApi = {
+  create: (data, token) =>
+    api.post('/query/execute-jupyter', data, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  get: (notebookId, token) =>
+    api.get(`/query/notebook/${notebookId}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  close: (notebookId, token) =>
+    api.delete(`/query/notebook/${notebookId}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  addCell: (notebookId, data, token) =>
+    api.post(`/query/notebook/${notebookId}/cells`, data, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  deleteCell: (notebookId, cellId, token) =>
+    api.delete(`/query/notebook/${notebookId}/cells/${cellId}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
+  moveCell: (notebookId, data, token) =>
+    api.post(`/query/notebook/${notebookId}/cells/move`, data, {
+      headers: { Authorization: `Bearer ${token}` }
+    }),
 }
 
 export default api

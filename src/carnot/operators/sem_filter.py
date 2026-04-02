@@ -25,6 +25,7 @@ from carnot.agents.utils import (
 )
 from carnot.core.models import LLMCallStats, OperatorStats
 from carnot.data.dataset import Dataset
+from carnot.operators.physical import PhysicalOperator
 
 
 def _strip_sem_filter_now_begin_suffix(system_prompt: str) -> str:
@@ -60,22 +61,27 @@ class SemFilterOperator:
         a new dataset containing only the items for which the LLM answers ``True``
         to the natural-language predicate ``task``.
     """
-    _MAX_BATCH_INPUT_CHARS = 32000
-
+    MAX_BATCH_INPUT_CHARS = 32000
     def __init__(
-        self,
-        task: str,
-        output_dataset_id: str,
-        model_id: str,
-        llm_config: dict,
-        max_workers: int,
-        max_steps: int = 3,
-        batch_size: int = 1,
-    ):
+            self,
+            task: str,
+            dataset_id: str,
+            model_id: str,
+            llm_config: dict,
+            max_workers: int,
+            max_steps: int = 3,
+            logical_op_id: str | None = None,
+            logical_op_class_name: str | None = None,
+            batch_size: int = 1
+        ):
+        super().__init__(logical_op_id=logical_op_id, logical_op_class_name=logical_op_class_name)
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
+
         self.task = task
-        self.output_dataset_id = output_dataset_id
+        self.dataset_id = dataset_id
+        self.model_id = model_id
+        self.llm_config = llm_config
         self.model = LiteLLMModel(model_id=model_id, api_key=llm_config.get("OPENAI_API_KEY"))
         self.max_workers = max_workers
         _sem_filter_yaml = (
@@ -95,6 +101,31 @@ class SemFilterOperator:
         self.json_output_tags = ["```json", "```"]
         self.max_steps = max_steps
         self.batch_size = batch_size
+
+    def get_id_params(self):
+        id_params = super().get_id_params()
+        id_params = {
+            "task": self.task,
+            "dataset_id": self.dataset_id,
+            "model_id": self.model_id,
+            **id_params,
+        }
+
+        return id_params
+
+    def get_op_params(self):
+        op_params = super().get_op_params()
+        op_params = {
+            "task": self.task,
+            "dataset_id": self.dataset_id,
+            "model_id": self.model_id,
+            "llm_config": self.llm_config,
+            "max_workers": self.max_workers,
+            "max_steps": self.max_steps,
+            **op_params,
+        }
+
+        return op_params
 
     def _finalize_step(self, memory_step: ActionStep):
         memory_step.timing.end_time = time.time()
@@ -329,7 +360,7 @@ class SemFilterOperator:
             A tuple ``(output_datasets, stats)`` where *output_datasets* is
             a **new** ``dict[str, Dataset]`` that is a copy of
             *input_datasets* with an additional entry keyed by
-            ``self.output_dataset_id`` containing only the items that
+            ``self.dataset_id`` containing only the items that
             passed the filter, and *stats* is an :class:`OperatorStats`
             summarising the LLM calls made.
 
@@ -398,12 +429,12 @@ class SemFilterOperator:
                 results.extend(batch_results)
 
         # create new dataset and return it with the input datasets
-        output_dataset = Dataset(name=self.output_dataset_id, annotation=f"Sem filter operator output for task: {self.task}", items=results)
+        output_dataset = Dataset(name=self.dataset_id, annotation=f"Sem filter operator output for task: {self.task}", items=results)
         output_datasets = {**input_datasets, output_dataset.name: output_dataset}
 
         op_stats = OperatorStats(
             operator_name="SemFilter",
-            operator_id=self.output_dataset_id,
+            operator_id=self.dataset_id,
             wall_clock_secs=time.perf_counter() - op_start,
             llm_calls=all_call_stats,
             items_in=len(items),

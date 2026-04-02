@@ -1,11 +1,13 @@
-"""Unit tests for Execution helper methods (no LLM required).
+"""Unit tests for Execution helper methods and PlanNode/PhysicalPlan (no LLM required).
 
 Tests cover:
-1. ``_get_op_from_plan_dict`` — returns the correct physical operator
+1. ``PlanNode.to_operator`` — returns the correct physical operator
    type for every known operator name, and raises for unknowns.
-2. ``_get_ops_in_topological_order`` — produces the correct linearised
-   order for single-op, chained, and branching (join) plan DAGs.
-3. ``_operator_display_name`` — returns human-readable labels.
+2. ``PhysicalPlan.topo_order`` via ``from_plan_dict`` — produces the
+   correct linearised order for single-op, chained, and branching
+   (join) plan DAGs.
+3. ``PlanNode.display_name`` and ``OPERATOR_DISPLAY_NAMES`` —
+   returns human-readable labels.
 4. ``ExecutionProgress.to_dict`` — serializes correctly.
 """
 
@@ -14,11 +16,9 @@ from __future__ import annotations
 import pytest
 
 from carnot.data.dataset import Dataset
-from carnot.execution.execution import Execution
 from carnot.execution.progress import ExecutionProgress
 from carnot.operators.code import CodeOperator
 from carnot.operators.limit import LimitOperator
-from carnot.operators.reasoning import ReasoningOperator
 from carnot.operators.sem_agg import SemAggOperator
 from carnot.operators.sem_filter import SemFilterOperator
 from carnot.operators.sem_flat_map import SemFlatMapOperator
@@ -26,38 +26,30 @@ from carnot.operators.sem_groupby import SemGroupByOperator
 from carnot.operators.sem_join import SemJoinOperator
 from carnot.operators.sem_map import SemMapOperator
 from carnot.operators.sem_topk import SemTopKOperator
+from carnot.plan import PhysicalPlan
+from carnot.plan.node import PlanNode
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
-# Minimal llm_config so Execution can be instantiated without env vars.
+# Minimal llm_config so operators can be instantiated without env vars.
 _LLM_CONFIG = {"OPENAI_API_KEY": "test-key-not-real"}
-
-
-def _make_execution(datasets: list[Dataset] | None = None) -> Execution:
-    """Create a minimal Execution instance for unit-testing helper methods.
-
-    Requires:
-        - ``_LLM_CONFIG`` provides a dummy API key.
-
-    Returns:
-        An ``Execution`` object ready for plan-parsing tests.
-    """
-    return Execution(
-        query="test query",
-        datasets=datasets or [],
-        llm_config=_LLM_CONFIG,
-    )
 
 
 def _leaf_plan(name: str) -> dict:
     """Build a leaf plan node representing a raw Dataset reference.
 
-    The plan node has no operator param so ``_get_op_from_plan_dict``
-    falls through to the dataset-name lookup.
+    Requires:
+        - *name* is a non-empty string.
+
+    Returns:
+        A dict in the canonical plan-dict format with no operator.
+
+    Raises:
+        None.
     """
     return {
         "name": name,
-        "output_dataset_id": name,
+        "dataset_id": name,
         "params": {},
         "parents": [],
     }
@@ -69,300 +61,322 @@ def _op_plan(
     parents: list[dict],
     **extra_params,
 ) -> dict:
-    """Build an operator plan node with given parents."""
+    """Build an operator plan node with given parents.
+
+    Requires:
+        - *operator* is a valid operator type string.
+        - *output_id* is a non-empty string.
+
+    Returns:
+        A dict in the canonical plan-dict format.
+
+    Raises:
+        None.
+    """
     params = {"operator": operator, **extra_params}
     return {
         "name": output_id,
-        "output_dataset_id": output_id,
+        "dataset_id": output_id,
         "params": params,
         "parents": parents,
     }
 
 
+def _make_node(
+    operator_type: str,
+    output_id: str = "out",
+    parent_ids: list[str] | None = None,
+    **extra_params,
+) -> PlanNode:
+    """Build a PlanNode for an operator with the given type and params.
+
+    Requires:
+        - *operator_type* is a valid operator type string.
+
+    Returns:
+        A ``PlanNode`` with ``node_type="operator"``.
+
+    Raises:
+        None.
+    """
+    return PlanNode(
+        node_id=output_id,
+        node_type="operator",
+        operator_type=operator_type,
+        name=output_id,
+        description=f"test {operator_type}",
+        params=extra_params,
+        parent_ids=parent_ids or [],
+        dataset_id=output_id,
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════
-# _get_op_from_plan_dict
+# PlanNode.to_operator
 # ═══════════════════════════════════════════════════════════════════════
 
 
-class TestGetOpFromPlanDict:
-    """Verify that each operator name maps to the correct physical class."""
+class TestPlanNodeToOperator:
+    """Verify that each operator type maps to the correct physical class.
+
+    These tests exercise ``PlanNode.to_operator()`` — the Phase 2
+    replacement for the deleted ``Execution._get_op_from_plan_dict()``.
+    """
 
     def test_code_operator(self):
         """'Code' → CodeOperator."""
-        ex = _make_execution()
-        plan = _op_plan("Code", "code1", [], task="compute stats")
-        op, parent_ids = ex._get_op_from_plan_dict(plan)
+        node = _make_node("Code", "code1", task="compute stats")
+        op = node.to_operator(_LLM_CONFIG)
         assert isinstance(op, CodeOperator)
-        assert parent_ids == []
 
     def test_limit_operator(self):
         """'Limit' → LimitOperator."""
-        ex = _make_execution()
-        plan = _op_plan("Limit", "limit1", [], n=5)
-        op, parent_ids = ex._get_op_from_plan_dict(plan)
+        node = _make_node("Limit", "limit1", n=5)
+        op = node.to_operator(_LLM_CONFIG)
         assert isinstance(op, LimitOperator)
 
     def test_semantic_filter(self):
         """'SemanticFilter' → SemFilterOperator."""
-        ex = _make_execution()
-        leaf = _leaf_plan("Movies")
-        plan = _op_plan("SemanticFilter", "filter1", [leaf], condition="rating > 8")
-        op, parent_ids = ex._get_op_from_plan_dict(plan)
+        node = _make_node("SemanticFilter", "filter1", ["Movies"], condition="rating > 8")
+        op = node.to_operator(_LLM_CONFIG)
         assert isinstance(op, SemFilterOperator)
-        assert parent_ids == ["Movies"]
 
     def test_semantic_map(self):
         """'SemanticMap' → SemMapOperator."""
-        ex = _make_execution()
-        leaf = _leaf_plan("Movies")
-        plan = _op_plan(
-            "SemanticMap", "map1", [leaf],
+        node = _make_node(
+            "SemanticMap", "map1", ["Movies"],
             field="sentiment", type="str", field_desc="overall sentiment",
         )
-        op, _ = ex._get_op_from_plan_dict(plan)
+        op = node.to_operator(_LLM_CONFIG)
         assert isinstance(op, SemMapOperator)
 
     def test_semantic_flat_map(self):
         """'SemanticFlatMap' → SemFlatMapOperator."""
-        ex = _make_execution()
-        leaf = _leaf_plan("Movies")
-        plan = _op_plan(
-            "SemanticFlatMap", "flatmap1", [leaf],
+        node = _make_node(
+            "SemanticFlatMap", "flatmap1", ["Movies"],
             field="keyword", type="str", field_desc="extracted keyword",
         )
-        op, _ = ex._get_op_from_plan_dict(plan)
+        op = node.to_operator(_LLM_CONFIG)
         assert isinstance(op, SemFlatMapOperator)
 
     def test_semantic_agg(self):
         """'SemanticAgg' → SemAggOperator."""
-        ex = _make_execution()
-        leaf = _leaf_plan("Movies")
-        plan = _op_plan(
-            "SemanticAgg", "agg1", [leaf],
+        node = _make_node(
+            "SemanticAgg", "agg1", ["Movies"],
             task="summarize reviews",
             agg_fields=[{"name": "summary", "type": "str"}],
         )
-        op, _ = ex._get_op_from_plan_dict(plan)
+        op = node.to_operator(_LLM_CONFIG)
         assert isinstance(op, SemAggOperator)
 
     def test_semantic_groupby(self):
         """'SemanticGroupBy' → SemGroupByOperator."""
-        ex = _make_execution()
-        leaf = _leaf_plan("Movies")
-        plan = _op_plan(
-            "SemanticGroupBy", "gby1", [leaf],
+        node = _make_node(
+            "SemanticGroupBy", "gby1", ["Movies"],
             gby_fields=[{"name": "genre", "type": "str"}],
             agg_fields=[{"name": "count", "type": "int", "func": "count"}],
         )
-        op, _ = ex._get_op_from_plan_dict(plan)
+        op = node.to_operator(_LLM_CONFIG)
         assert isinstance(op, SemGroupByOperator)
 
     def test_semantic_join(self):
-        """'SemanticJoin' → SemJoinOperator with two parent ids."""
-        ex = _make_execution()
-        left = _leaf_plan("Movies")
-        right = _leaf_plan("Reviews")
-        plan = _op_plan("SemanticJoin", "join1", [left, right], condition="same movie")
-        op, parent_ids = ex._get_op_from_plan_dict(plan)
+        """'SemanticJoin' → SemJoinOperator."""
+        node = _make_node(
+            "SemanticJoin", "join1", ["Movies", "Reviews"],
+            condition="same movie",
+        )
+        op = node.to_operator(_LLM_CONFIG)
         assert isinstance(op, SemJoinOperator)
-        assert parent_ids == ["Movies", "Reviews"]
 
     def test_semantic_topk(self):
         """'SemanticTopK' → SemTopKOperator."""
-        ex = _make_execution()
-        leaf = _leaf_plan("Movies")
-        plan = _op_plan(
-            "SemanticTopK", "topk1", [leaf],
+        node = _make_node(
+            "SemanticTopK", "topk1", ["Movies"],
             search_str="best action", k=5, index_name="flat",
         )
-        op, _ = ex._get_op_from_plan_dict(plan)
+        op = node.to_operator(_LLM_CONFIG)
         assert isinstance(op, SemTopKOperator)
 
-    def test_dataset_reference(self):
-        """A plan node whose name matches a dataset returns that Dataset."""
-        ds = Dataset(name="Movies", annotation="film data")
-        ex = _make_execution(datasets=[ds])
-        plan = _leaf_plan("Movies")
-        op, parent_ids = ex._get_op_from_plan_dict(plan)
-        assert op is ds
-        assert parent_ids == []
+    def test_dataset_node_raises(self):
+        """A dataset-type node raises ValueError when to_operator is called."""
+        node = PlanNode(
+            node_id="movies", node_type="dataset", operator_type=None,
+            name="Movies", description="film data",
+            dataset_id="Movies",
+        )
+        with pytest.raises(ValueError, match="Cannot create an operator"):
+            node.to_operator(_LLM_CONFIG)
 
     def test_unknown_operator_raises(self):
-        """An unrecognized operator name raises ValueError."""
-        ex = _make_execution()
-        plan = _op_plan("UnknownOp", "unk1", [])
+        """An unrecognized operator type raises ValueError."""
+        node = _make_node("UnknownOp", "unk1")
         with pytest.raises(ValueError, match="Unknown operator"):
-            ex._get_op_from_plan_dict(plan)
+            node.to_operator(_LLM_CONFIG)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# _get_ops_in_topological_order
+# PhysicalPlan.topo_order (via from_plan_dict)
 # ═══════════════════════════════════════════════════════════════════════
 
 
-class TestGetOpsInTopologicalOrder:
-    """Verify topological linearization of plan DAGs."""
+class TestPhysicalPlanTopoOrder:
+    """Verify topological linearization of plan DAGs.
+
+    These tests exercise ``PhysicalPlan.from_plan_dict()`` +
+    ``topo_order()`` — the Phase 2 replacement for the deleted
+    ``Execution._get_ops_in_topological_order()``.
+    """
 
     def test_single_leaf(self):
-        """A single dataset node yields one entry."""
+        """A single dataset plan yields one dataset node."""
         ds = Dataset(name="Movies")
-        ex = _make_execution(datasets=[ds])
-        plan = _leaf_plan("Movies")
-        ops = ex._get_ops_in_topological_order(plan)
-        assert len(ops) == 1
-        assert ops[0][0] is ds
+        plan_dict = _leaf_plan("Movies")
+        pp = PhysicalPlan.from_plan_dict(plan_dict, [ds], include_reasoning=False)
+        nodes = pp.topo_order()
+        assert len(nodes) == 1
+        assert nodes[0].node_type == "dataset"
+        assert nodes[0].name == "Movies"
 
     def test_linear_chain(self):
         """Dataset → Filter yields [Dataset, Filter] in order."""
         ds = Dataset(name="Movies")
-        ex = _make_execution(datasets=[ds])
         leaf = _leaf_plan("Movies")
-        plan = _op_plan("SemanticFilter", "filter1", [leaf], condition="rating > 8")
-        ops = ex._get_ops_in_topological_order(plan)
-        assert len(ops) == 2
-        # First is the dataset, second is the filter
-        assert ops[0][0] is ds
-        assert isinstance(ops[1][0], SemFilterOperator)
+        plan_dict = _op_plan("SemanticFilter", "filter1", [leaf], condition="rating > 8")
+        pp = PhysicalPlan.from_plan_dict(plan_dict, [ds], include_reasoning=False)
+        nodes = pp.topo_order()
+        assert len(nodes) == 2
+        assert nodes[0].node_type == "dataset"
+        assert nodes[1].operator_type == "SemanticFilter"
 
     def test_two_step_chain(self):
         """Dataset → Filter → Map yields three entries in correct order."""
         ds = Dataset(name="Movies")
-        ex = _make_execution(datasets=[ds])
         leaf = _leaf_plan("Movies")
         filt = _op_plan("SemanticFilter", "filter1", [leaf], condition="rating > 8")
         mapped = _op_plan(
             "SemanticMap", "map1", [filt],
             field="label", type="str", field_desc="genre label",
         )
-        ops = ex._get_ops_in_topological_order(mapped)
-        assert len(ops) == 3
-        assert ops[0][0] is ds
-        assert isinstance(ops[1][0], SemFilterOperator)
-        assert isinstance(ops[2][0], SemMapOperator)
+        pp = PhysicalPlan.from_plan_dict(mapped, [ds], include_reasoning=False)
+        nodes = pp.topo_order()
+        assert len(nodes) == 3
+        assert nodes[0].node_type == "dataset"
+        assert nodes[1].operator_type == "SemanticFilter"
+        assert nodes[2].operator_type == "SemanticMap"
 
     def test_join_has_both_parents_before_join(self):
         """A join node is preceded by both parent datasets."""
         ds_a = Dataset(name="Movies")
         ds_b = Dataset(name="Reviews")
-        ex = _make_execution(datasets=[ds_a, ds_b])
 
         left = _leaf_plan("Movies")
         right = _leaf_plan("Reviews")
-        plan = _op_plan("SemanticJoin", "join1", [left, right], condition="same movie")
+        plan_dict = _op_plan("SemanticJoin", "join1", [left, right], condition="same movie")
 
-        ops = ex._get_ops_in_topological_order(plan)
-        assert len(ops) == 3
-
+        pp = PhysicalPlan.from_plan_dict(plan_dict, [ds_a, ds_b], include_reasoning=False)
+        nodes = pp.topo_order()
+        assert len(nodes) == 3
         # The join must be last
-        assert isinstance(ops[2][0], SemJoinOperator)
-
+        assert nodes[2].operator_type == "SemanticJoin"
         # Both datasets appear before the join
-        pre_join_types = {type(o[0]) for o in ops[:2]}
-        assert Dataset in pre_join_types
+        pre_join_types = {n.node_type for n in nodes[:2]}
+        assert pre_join_types == {"dataset"}
 
     def test_parent_ids_propagated(self):
-        """Parent dataset IDs are correctly threaded through the order."""
+        """Parent node IDs are correctly threaded through the plan."""
         ds = Dataset(name="Movies")
-        ex = _make_execution(datasets=[ds])
         leaf = _leaf_plan("Movies")
-        plan = _op_plan("SemanticFilter", "filter1", [leaf], condition="x")
-        ops = ex._get_ops_in_topological_order(plan)
-        # The filter's parent_ids should be ["Movies"]
-        _, parent_ids = ops[1]
-        assert parent_ids == ["Movies"]
+        plan_dict = _op_plan("SemanticFilter", "filter1", [leaf], condition="x")
+        pp = PhysicalPlan.from_plan_dict(plan_dict, [ds], include_reasoning=False)
+        nodes = pp.topo_order()
+        # The filter's parent_ids should reference the dataset node
+        filter_node = nodes[1]
+        assert len(filter_node.parent_ids) == 1
+        # Parent should be the dataset node
+        parent_node = pp.get_node(filter_node.parent_ids[0])
+        assert parent_node.node_type == "dataset"
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# _operator_display_name
+# PlanNode.display_name and OPERATOR_DISPLAY_NAMES
 # ═══════════════════════════════════════════════════════════════════════
 
 
-class TestOperatorDisplayName:
-    """Verify that _operator_display_name returns readable labels."""
+class TestPlanNodeDisplayName:
+    """Verify that PlanNode.display_name() returns readable labels.
+
+    These tests exercise ``PlanNode.display_name()`` and the
+    ``OPERATOR_DISPLAY_NAMES`` mapping — the Phase 2 replacement
+    for the deleted ``Execution._operator_display_name()``.
+    """
 
     def test_dataset_includes_name(self):
-        """A Dataset produces 'Dataset: <name>'."""
-        ds = Dataset(name="Movies")
-        assert Execution._operator_display_name(ds) == "Dataset: Movies"
+        """A dataset node produces 'Dataset: <name>'."""
+        node = PlanNode(
+            node_id="movies", node_type="dataset", operator_type=None,
+            name="Movies", description="film data",
+            dataset_id="Movies",
+        )
+        assert node.display_name() == "Dataset: Movies"
 
     def test_sem_filter(self):
-        """SemFilterOperator → 'Semantic Filter'."""
-        ex = _make_execution()
-        plan = _op_plan("SemanticFilter", "f1", [], condition="x")
-        op, _ = ex._get_op_from_plan_dict(plan)
-        assert Execution._operator_display_name(op) == "Semantic Filter"
+        """SemanticFilter → 'Semantic Filter'."""
+        node = _make_node("SemanticFilter", condition="x")
+        assert node.display_name() == "Semantic Filter"
 
     def test_sem_map(self):
-        """SemMapOperator → 'Semantic Map'."""
-        ex = _make_execution()
-        plan = _op_plan("SemanticMap", "m1", [], field="x", type="str", field_desc="d")
-        op, _ = ex._get_op_from_plan_dict(plan)
-        assert Execution._operator_display_name(op) == "Semantic Map"
+        """SemanticMap → 'Semantic Map'."""
+        node = _make_node("SemanticMap", field="x", type="str", field_desc="d")
+        assert node.display_name() == "Semantic Map"
 
     def test_sem_join(self):
-        """SemJoinOperator → 'Semantic Join'."""
-        ex = _make_execution()
-        plan = _op_plan("SemanticJoin", "j1", [_leaf_plan("A"), _leaf_plan("B")], condition="c")
-        op, _ = ex._get_op_from_plan_dict(plan)
-        assert Execution._operator_display_name(op) == "Semantic Join"
+        """SemanticJoin → 'Semantic Join'."""
+        node = _make_node("SemanticJoin", condition="c")
+        assert node.display_name() == "Semantic Join"
 
     def test_limit(self):
-        """LimitOperator → 'Limit'."""
-        ex = _make_execution()
-        plan = _op_plan("Limit", "l1", [], n=5)
-        op, _ = ex._get_op_from_plan_dict(plan)
-        assert Execution._operator_display_name(op) == "Limit"
+        """Limit → 'Limit'."""
+        node = _make_node("Limit", n=5)
+        assert node.display_name() == "Limit"
 
     def test_code(self):
-        """CodeOperator → 'Code'."""
-        ex = _make_execution()
-        plan = _op_plan("Code", "c1", [], task="compute")
-        op, _ = ex._get_op_from_plan_dict(plan)
-        assert Execution._operator_display_name(op) == "Code"
+        """Code → 'Code'."""
+        node = _make_node("Code", task="compute")
+        assert node.display_name() == "Code"
 
     def test_sem_topk(self):
-        """SemTopKOperator → 'Semantic Top-K'."""
-        ex = _make_execution()
-        plan = _op_plan("SemanticTopK", "t1", [], search_str="best", k=3, index_name="flat")
-        op, _ = ex._get_op_from_plan_dict(plan)
-        assert Execution._operator_display_name(op) == "Semantic Top-K"
+        """SemanticTopK → 'Semantic Top-K'."""
+        node = _make_node("SemanticTopK", search_str="best", k=3, index_name="flat")
+        assert node.display_name() == "Semantic Top-K"
 
     def test_sem_agg(self):
-        """SemAggOperator → 'Semantic Aggregation'."""
-        ex = _make_execution()
-        plan = _op_plan("SemanticAgg", "a1", [], task="summarize", agg_fields=[{"name": "s", "type": "str"}])
-        op, _ = ex._get_op_from_plan_dict(plan)
-        assert Execution._operator_display_name(op) == "Semantic Aggregation"
+        """SemanticAgg → 'Semantic Aggregation'."""
+        node = _make_node("SemanticAgg", task="summarize", agg_fields=[{"name": "s", "type": "str"}])
+        assert node.display_name() == "Semantic Aggregation"
 
     def test_sem_groupby(self):
-        """SemGroupByOperator → 'Semantic Group By'."""
-        ex = _make_execution()
-        plan = _op_plan(
-            "SemanticGroupBy", "g1", [],
+        """SemanticGroupBy → 'Semantic Group By'."""
+        node = _make_node(
+            "SemanticGroupBy",
             gby_fields=[{"name": "genre", "type": "str"}],
             agg_fields=[{"name": "count", "type": "int", "func": "count"}],
         )
-        op, _ = ex._get_op_from_plan_dict(plan)
-        assert Execution._operator_display_name(op) == "Semantic Group By"
+        assert node.display_name() == "Semantic Group By"
 
     def test_sem_flat_map(self):
-        """SemFlatMapOperator → 'Semantic Flat Map'."""
-        ex = _make_execution()
-        plan = _op_plan("SemanticFlatMap", "fm1", [], field="kw", type="str", field_desc="keyword")
-        op, _ = ex._get_op_from_plan_dict(plan)
-        assert Execution._operator_display_name(op) == "Semantic Flat Map"
+        """SemanticFlatMap → 'Semantic Flat Map'."""
+        node = _make_node("SemanticFlatMap", field="kw", type="str", field_desc="keyword")
+        assert node.display_name() == "Semantic Flat Map"
 
-    def test_reasoning_operator(self):
-        """ReasoningOperator → 'Reasoning' (inherits from CodeOperator)."""
-        op = ReasoningOperator(
-            task="reason",
-            output_dataset_id="out",
-            model_id="openai/gpt-5-mini",
-            llm_config=_LLM_CONFIG,
+    def test_reasoning(self):
+        """Reasoning → 'Reasoning'."""
+        node = PlanNode(
+            node_id="reasoning", node_type="reasoning",
+            operator_type="Reasoning", name="reasoning",
+            description="synthesize results",
+            dataset_id="final_dataset",
         )
-        # ReasoningOperator is a subclass of CodeOperator, so the lookup
-        # falls through to the exact-type match for ReasoningOperator.
-        assert Execution._operator_display_name(op) == "Reasoning"
+        assert node.display_name() == "Reasoning"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -380,14 +394,12 @@ class TestExecutionProgress:
             operator_index=0,
             total_operators=3,
             operator_name="Semantic Filter",
-            detail={"items": 42},
         )
         d = ep.to_dict()
         assert d["message"] == "Running step 1/3: Semantic Filter…"
         assert d["operator_index"] == 0
         assert d["total_operators"] == 3
         assert d["operator_name"] == "Semantic Filter"
-        assert d["detail"] == {"items": 42}
 
     def test_to_dict_omits_none(self):
         """None fields are omitted from the dict."""
@@ -398,9 +410,169 @@ class TestExecutionProgress:
         assert "operator_name" not in d
         assert d["message"] == "Starting execution"
 
-    def test_to_dict_omits_empty_detail(self):
-        """Empty detail dict is still included (it's not None)."""
-        ep = ExecutionProgress(message="test")
-        d = ep.to_dict()
-        # The empty dict is truthy by dataclass default, so it appears
-        assert d["detail"] == {}
+# ═══════════════════════════════════════════════════════════════════════
+# Execution.reoptimize
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestReoptimize:
+    """Verify ``Execution.reoptimize()`` contract.
+
+    Postconditions (from docstring):
+        - Node edits update params in-place.
+        - Structural deletions remove nodes and rewire edges.
+        - Structural insertions add nodes and rewire edges.
+        - Returns a dict mapping edit labels to invalidated IDs.
+    """
+
+    @staticmethod
+    def _make_execution_with_plan(plan: PhysicalPlan):
+        """Create an Execution with a pre-built PhysicalPlan."""
+        from carnot.execution.execution import Execution
+        ds = Dataset(name="A")
+        ex = Execution(query="test", datasets=[ds], llm_config=_LLM_CONFIG)
+        ex._plan = plan
+        return ex
+
+    @staticmethod
+    def _linear_plan() -> PhysicalPlan:
+        """A → B(filter) → C(map): three-node linear plan."""
+        a = PlanNode(
+            node_id="a", node_type="dataset", operator_type=None,
+            name="A", description="Load A", params={},
+            parent_ids=[], dataset_id="A",
+        )
+        b = PlanNode(
+            node_id="b", node_type="operator", operator_type="SemanticFilter",
+            name="B", description="filter", params={"operator": "SemanticFilter", "condition": "old"},
+            parent_ids=["a"], dataset_id="B",
+        )
+        c = PlanNode(
+            node_id="c", node_type="operator", operator_type="SemanticMap",
+            name="C", description="map",
+            params={"operator": "SemanticMap", "field": "f", "type": "str", "field_desc": "d"},
+            parent_ids=["b"], dataset_id="C",
+        )
+        return PhysicalPlan(nodes={"a": a, "b": b, "c": c})
+
+    def test_edit_updates_params(self):
+        """Node edit merges new params in-place."""
+        from carnot.plan.feedback import NodeEdit, PlanFeedback
+
+        plan = self._linear_plan()
+        ex = self._make_execution_with_plan(plan)
+        fb = PlanFeedback(node_edits=[
+            NodeEdit(node_id="b", new_params={"condition": "new"}),
+        ])
+
+        result = ex.reoptimize(fb)
+
+        assert plan.get_node("b").params["condition"] == "new"
+        assert "edit:b" in result
+        assert result["edit:b"] == ["c"]
+
+    def test_delete_removes_node(self):
+        """Structural delete removes node and rewires edges."""
+        from carnot.plan.feedback import PlanFeedback, StructuralChange
+
+        plan = self._linear_plan()
+        ex = self._make_execution_with_plan(plan)
+        fb = PlanFeedback(structural_changes=[
+            StructuralChange(change_type="delete", node_id="b"),
+        ])
+
+        result = ex.reoptimize(fb)
+
+        assert "b" not in plan
+        assert plan.get_node("c").parent_ids == ["a"]
+        assert "delete:b" in result
+
+    def test_insert_adds_node(self):
+        """Structural insert adds a node between two existing nodes."""
+        from carnot.plan.feedback import PlanFeedback, StructuralChange
+
+        plan = self._linear_plan()
+        ex = self._make_execution_with_plan(plan)
+        fb = PlanFeedback(structural_changes=[
+            StructuralChange(
+                change_type="insert",
+                after_node_id="a",
+                new_node_params={"operator": "Limit", "name": "lim", "n": 10},
+            ),
+        ])
+
+        result = ex.reoptimize(fb)
+
+        # Find the insert key
+        insert_keys = [k for k in result if k.startswith("insert:")]
+        assert len(insert_keys) == 1
+        new_node_id = insert_keys[0].split(":")[1]
+
+        # New node is in the plan
+        assert new_node_id in plan
+        # New node's parent is "a"
+        assert plan.get_node(new_node_id).parent_ids == ["a"]
+        # b now points to new node instead of a
+        assert plan.get_node("b").parent_ids == [new_node_id]
+
+    def test_combined_edit_and_delete(self):
+        """Multiple feedback items applied in order."""
+        from carnot.plan.feedback import NodeEdit, PlanFeedback, StructuralChange
+
+        plan = self._linear_plan()
+        ex = self._make_execution_with_plan(plan)
+        fb = PlanFeedback(
+            node_edits=[
+                NodeEdit(node_id="c", new_params={"field": "new_f"}),
+            ],
+            structural_changes=[
+                StructuralChange(change_type="delete", node_id="b"),
+            ],
+        )
+
+        result = ex.reoptimize(fb)
+
+        # Edit was applied
+        assert plan.get_node("c").params["field"] == "new_f"
+        assert "edit:c" in result
+        # Delete was applied
+        assert "b" not in plan
+        assert "delete:b" in result
+        # c now points to a
+        assert plan.get_node("c").parent_ids == ["a"]
+
+    def test_empty_feedback_returns_empty(self):
+        """PlanFeedback with no edits → empty result dict."""
+        from carnot.plan.feedback import PlanFeedback
+
+        plan = self._linear_plan()
+        ex = self._make_execution_with_plan(plan)
+        fb = PlanFeedback()
+
+        result = ex.reoptimize(fb)
+
+        assert result == {}
+
+    def test_node_from_params_generates_unique_id(self):
+        """_node_from_params avoids collision with existing IDs."""
+        from carnot.execution.execution import Execution
+
+        # Build a plan where node-0 and node-1 already exist.
+        n0 = PlanNode(
+            node_id="node-0", node_type="dataset", operator_type=None,
+            name="A", description="A", params={}, parent_ids=[],
+            dataset_id="A",
+        )
+        n1 = PlanNode(
+            node_id="node-1", node_type="operator",
+            operator_type="SemanticFilter", name="B", description="B",
+            params={"operator": "SemanticFilter", "condition": "x"},
+            parent_ids=["node-0"], dataset_id="B",
+        )
+        plan = PhysicalPlan(nodes={"node-0": n0, "node-1": n1})
+
+        new_node = Execution._node_from_params(
+            {"operator": "Limit", "name": "lim"}, plan,
+        )
+
+        assert new_node.node_id == "node-2"  # node-0, node-1 taken

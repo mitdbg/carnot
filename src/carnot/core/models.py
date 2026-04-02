@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -110,7 +112,7 @@ class OperatorStats(BaseModel):
     """
 
     operator_name: str  # e.g. "SemFilter", "Planner", "DataDiscovery"
-    operator_id: str = ""  # the output_dataset_id or agent name
+    operator_id: str = ""  # the dataset_id or agent name
     wall_clock_secs: float = 0.0
     llm_calls: list[LLMCallStats] = Field(default_factory=list)
     items_in: int = 0
@@ -461,3 +463,148 @@ class ExecutionStats(BaseModel):
             "planning": _phase_dict(self.planning),
             "execution": _phase_dict(self.execution),
         }
+
+
+class PlanCost(BaseModel):
+    """Unified cost estimate for a (sub-)plan.
+
+    Combines cumulative plan-level metrics (``cost``, ``time``,
+    ``total_input_tokens``, ``total_scanned_input_tokens``) with
+    per-operator metrics (``cardinality``, ``cost_per_record``,
+    ``time_per_record``).  This replaces the previous two-class design
+    where ``OperatorCostEstimates`` was a separate model embedded inside
+    ``PlanCost`` via an ``op_estimates`` field.
+
+    Representation invariant:
+        - All numeric fields are non-negative.
+        - ``total_scanned_input_tokens <= total_input_tokens``.
+
+    Abstraction function:
+        Represents a point in the (cost, time, quality) space for a
+        plan or sub-plan, where *quality* is the ratio of scanned
+        input tokens to total input tokens.
+    """
+
+    # cumulative plan metrics
+    cost: float
+    time: float
+    total_input_tokens: float
+    total_scanned_input_tokens: float
+
+    # per-operator metrics (set by the cost model for the current operator)
+    cardinality: float = 0.0
+    cost_per_record: float = 0.0
+    time_per_record: float = 0.0
+
+    @property
+    def quality(self) -> float:
+        """Ratio of scanned input tokens to total input tokens.
+
+        Requires:
+            None.
+
+        Returns:
+            ``total_scanned_input_tokens / total_input_tokens`` when
+            ``total_input_tokens > 0``, otherwise ``1.0``.
+
+        Raises:
+            None.
+        """
+        if self.total_input_tokens == 0:
+            return 1.0
+        return self.total_scanned_input_tokens / self.total_input_tokens
+
+    def __hash__(self):
+        return hash(f"{self.cost}-{self.time}-{self.quality}")
+
+    def __eq__(self, other: Any) -> bool:
+        if not isinstance(other, PlanCost):
+            return False
+        return (
+            self.cost == other.cost
+            and self.time == other.time
+            and self.quality == other.quality
+        )
+
+    def join_add(self, left_plan_cost: PlanCost, right_plan_cost: PlanCost) -> PlanCost:
+        """Combine this operator's cost with two joined input plan costs.
+
+        Sums ``cost``, ``time``, ``total_input_tokens`, and ``total_scanned_input_tokens``
+        across all three ``PlanCost`` objects (operator + left + right).
+
+        Per-operator fields (``cardinality``, ``cost_per_record``,
+        ``time_per_record``) are taken from *self* (the operator cost).
+
+        Requires:
+            - *left_plan_cost* and *right_plan_cost* are valid ``PlanCost`` objects.
+
+        Returns:
+            A new ``PlanCost`` combining all three.
+
+        Raises:
+            None.
+        """
+        return PlanCost(
+            cost=self.cost + left_plan_cost.cost + right_plan_cost.cost,
+            time=self.time + left_plan_cost.time + right_plan_cost.time,
+            total_input_tokens=(
+                self.total_input_tokens + left_plan_cost.total_input_tokens + right_plan_cost.total_input_tokens
+            ),
+            total_scanned_input_tokens=(
+                self.total_scanned_input_tokens + left_plan_cost.total_scanned_input_tokens + right_plan_cost.total_scanned_input_tokens
+            ),
+            cardinality=self.cardinality,
+            cost_per_record=self.cost_per_record,
+            time_per_record=self.time_per_record,
+        )
+
+    def __iadd__(self, other: PlanCost) -> PlanCost:
+        """In-place addition of another ``PlanCost`` (non-join).
+
+        Sums the cumulative fields.  Per-operator fields are left
+        unchanged (caller should set them explicitly if needed).
+
+        Requires:
+            - *other* is a valid ``PlanCost``.
+
+        Returns:
+            *self*, mutated in place.
+
+        Raises:
+            None.
+        """
+        self.cost += other.cost
+        self.time += other.time
+        self.total_input_tokens += other.total_input_tokens
+        self.total_scanned_input_tokens += other.total_scanned_input_tokens
+
+        return self
+
+    def __add__(self, other: PlanCost) -> PlanCost:
+        """Add two ``PlanCost`` objects (non-join).
+
+        Sums the cumulative fields.  Per-operator fields are taken from
+        *self*.
+
+        Requires:
+            - *other* is a valid ``PlanCost``.
+
+        Returns:
+            A new ``PlanCost`` with summed cumulative fields.
+
+        Raises:
+            None.
+        """
+        return PlanCost(
+            cost=self.cost + other.cost,
+            time=self.time + other.time,
+            total_input_tokens=self.total_input_tokens + other.total_input_tokens,
+            total_scanned_input_tokens=self.total_scanned_input_tokens + other.total_scanned_input_tokens,
+            cardinality=self.cardinality,
+            cost_per_record=self.cost_per_record,
+            time_per_record=self.time_per_record,
+        )
+
+
+# Backward-compatibility alias — deprecated.
+OperatorCostEstimates = PlanCost
