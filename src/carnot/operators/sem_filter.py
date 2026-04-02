@@ -78,9 +78,17 @@ class SemFilterOperator:
         self.output_dataset_id = output_dataset_id
         self.model = LiteLLMModel(model_id=model_id, api_key=llm_config.get("OPENAI_API_KEY"))
         self.max_workers = max_workers
-        self.prompt_templates = yaml.safe_load(
+        _sem_filter_yaml = (
             resources.files("carnot.agents.prompts").joinpath("sem_filter.yaml").read_text()
         )
+        self.prompt_templates = yaml.safe_load(_sem_filter_yaml)
+        if not isinstance(self.prompt_templates, dict):
+            raise RuntimeError(
+                "carnot.agents.prompts.sem_filter.yaml must parse to a YAML mapping with "
+                "sem_filter_prompt, sem_filter_batch_header, and sem_filter_batch_footer. "
+                f"Got {type(self.prompt_templates).__name__} ({self.prompt_templates!r}). "
+                "If the file is empty, yaml.safe_load returns None."
+            )
         self.memory = AgentMemory("")
         self.logger = AgentLogger(level=LogLevel.INFO)
         self.boolean_output_tags = ["```text", "```"]

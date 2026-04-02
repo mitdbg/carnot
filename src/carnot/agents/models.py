@@ -325,14 +325,26 @@ def get_clean_message_list(
         if len(output_message_list) > 0 and message.role == output_message_list[-1]["role"]:
             assert isinstance(message.content, list), "Error: wrong content:" + str(message.content)
             if flatten_messages_as_text:
-                output_message_list[-1]["content"] += "\n" + message.content[0]["text"]
+                prev_flat = output_message_list[-1]["content"]
+                suffix = message.content[0]["text"]
+                if prev_flat is None:
+                    output_message_list[-1]["content"] = suffix
+                else:
+                    output_message_list[-1]["content"] += "\n" + suffix
             else:
+                prev_content = output_message_list[-1]["content"]
+                if prev_content is None:
+                    prev_content = []
+                    output_message_list[-1]["content"] = prev_content
                 for el in message.content:
-                    if el["type"] == "text" and output_message_list[-1]["content"][-1]["type"] == "text":
-                        # Merge consecutive text messages rather than creating new ones
-                        output_message_list[-1]["content"][-1]["text"] += "\n" + el["text"]
+                    if (
+                        el["type"] == "text"
+                        and prev_content
+                        and prev_content[-1]["type"] == "text"
+                    ):
+                        prev_content[-1]["text"] += "\n" + el["text"]
                     else:
-                        output_message_list[-1]["content"].append(el)
+                        prev_content.append(el)
         else:
             content = message.content[0]["text"] if flatten_messages_as_text else message.content
             output_message_list.append(
@@ -773,9 +785,44 @@ class LiteLLMModel(ApiModel):
         duration = time.perf_counter() - start
 
         cost = getattr(response, "_hidden_params", {}).get("response_cost", 0.0) or 0.0
-        total_tokens = getattr(response.usage, "total_tokens", 0) or 0
+        usage = getattr(response, "usage", None)
+        total_tokens = (
+            (getattr(usage, "total_tokens", 0) or 0) if usage is not None else 0
+        )
 
-        embeddings = [item["embedding"] for item in response.data]
+        raw_data = getattr(response, "data", None)
+        if raw_data is None:
+            raise ValueError(
+                f"Embedding API returned response.data=None (model={embed_model!r}, "
+                f"num_texts={len(texts)})."
+            )
+        if len(raw_data) != len(texts):
+            raise ValueError(
+                f"Embedding API returned {len(raw_data)} vectors for {len(texts)} inputs "
+                f"(model={embed_model!r})."
+            )
+
+        embeddings: list[list[float]] = []
+        for i, item in enumerate(raw_data):
+            if item is None:
+                raise ValueError(
+                    f"Embedding API returned None at response.data[{i}] "
+                    f"(model={embed_model!r}). Retry or update litellm/provider."
+                )
+            if not isinstance(item, dict) or "embedding" not in item:
+                raise ValueError(
+                    f"Embedding API returned invalid entry at response.data[{i}]: "
+                    f"{type(item).__name__!r} (model={embed_model!r}); "
+                    "expected dict with 'embedding'."
+                )
+            vec = item.get("embedding")
+            if vec is None:
+                raise ValueError(
+                    f"Embedding API returned embedding=None at response.data[{i}] "
+                    f"(model={embed_model!r})."
+                )
+            embeddings.append(list(vec))
+
         stats = LLMCallStats(
             model_id=embed_model or "",
             call_type="embedding",
@@ -823,20 +870,48 @@ class LiteLLMModel(ApiModel):
         response = self.client.completion(**completion_kwargs)
         duration = time.perf_counter() - start
 
-        usage = response.usage
+        choices = getattr(response, "choices", None)
+        if choices is None or len(choices) == 0:
+            raise ValueError(
+                f"LLM completion returned no choices (model={self.model_id!r}). "
+                f"response_model={getattr(response, 'model', None)!r}"
+            )
+        first_choice = choices[0]
+        if first_choice is None:
+            raise ValueError(
+                f"LLM completion returned choices[0]=None (model={self.model_id!r})."
+            )
+        message = getattr(first_choice, "message", None)
+        if message is None:
+            raise ValueError(
+                f"LLM completion returned no message on first choice (model={self.model_id!r})."
+            )
+
+        usage = getattr(response, "usage", None)
         cost = getattr(response, "_hidden_params", {}).get("response_cost", 0.0) or 0.0
 
-        # Extract multimodal token details when available.
-        prompt_details = getattr(usage, "prompt_tokens_details", None) or {}
-        completion_details = getattr(usage, "completion_tokens_details", None) or {}
+        if usage is None:
+            prompt_tok = 0
+            completion_tok = 0
+            prompt_details: Any = {}
+            completion_details: Any = {}
+            cache_read = 0
+            cache_creation = 0
+        else:
+            prompt_tok = getattr(usage, "prompt_tokens", 0) or 0
+            completion_tok = getattr(usage, "completion_tokens", 0) or 0
+            prompt_details = getattr(usage, "prompt_tokens_details", None) or {}
+            completion_details = getattr(usage, "completion_tokens_details", None) or {}
+            cache_read = getattr(usage, "cache_read_input_tokens", 0) or 0
+            cache_creation = getattr(usage, "cache_creation_input_tokens", 0) or 0
 
         input_audio = getattr(prompt_details, "audio_tokens", 0) or 0
         output_audio = getattr(completion_details, "audio_tokens", 0) or 0
         input_image = getattr(prompt_details, "image_tokens", 0) or 0
 
         # Text tokens = total minus audio minus image (the remainder).
-        input_text = usage.prompt_tokens - input_audio - input_image
-        output_text = usage.completion_tokens - output_audio
+        input_text = prompt_tok - input_audio - input_image
+        output_text = completion_tok - output_audio
 
         llm_call_stats = LLMCallStats(
             model_id=self.model_id or "",
@@ -848,16 +923,16 @@ class LiteLLMModel(ApiModel):
             input_image_tokens=input_image,
             cost_usd=cost,
             duration_secs=duration,
-            cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
-            cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+            cache_read_tokens=cache_read,
+            cache_creation_tokens=cache_creation,
         )
 
         return ChatMessage.from_dict(
-            response.choices[0].message.model_dump(include={"role", "content", "tool_calls"}),
+            message.model_dump(include={"role", "content", "tool_calls"}),
             raw=response,
             token_usage=TokenUsage(
-                input_tokens=usage.prompt_tokens,
-                output_tokens=usage.completion_tokens,
+                input_tokens=prompt_tok,
+                output_tokens=completion_tok,
             ),
             llm_call_stats=llm_call_stats,
         )

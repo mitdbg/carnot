@@ -41,9 +41,67 @@ SYSTEMS = [
         "recall": 0.4071,
         "f1": 0.4938,
         "time_s": 65.5679,
-        "cost_usd": 1.3725 , 
+        "cost_usd": 1.3725,
         "color": "C3",
         "marker": "D",
+    },
+    # Pipeline ablations (short label on points; full text in legend only).
+    # Matplotlib mathtext: B is subscript via $\mathrm{Filter}_{B}(n)$.
+    {
+        "label": r"$\mathrm{Filter}_{B}(16)$",
+        "legend_label": (
+            "Batched SemFilter over all doc summaries (batch size = 16)"
+        ),
+        "precision": 0.7121,
+        "recall": 0.8516,
+        "f1": 0.7452,
+        "time_s": 37.29,
+        "cost_usd": 0.38957091,
+        "color": "C4",
+        "marker": "P",
+    },
+    {
+        "label": r"Vec384 + $\mathrm{Filter}_{B}(6)$",
+        "legend_label": (
+            "Vector index over summaries (K = 384) + batched SemFilter "
+            "over summaries (batch size = 6)"
+        ),
+        "precision": 0.7447,
+        "recall": 0.8518,
+        "f1": 0.7585,
+        "time_s": 30.57,
+        "cost_usd": 0.17152455,
+        "color": "C5",
+        "marker": "X",
+    },
+    {
+        "label": r"Vec384 + $\mathrm{Filter}_{B}(6)$ + Doc SemFilter",
+        "legend_label": (
+            "Vector index over summaries (K = 384) + batched SemFilter "
+            "over summaries (batch size = 6) + SemFilter over full docs"
+        ),
+        "precision": 0.8626,
+        "recall": 0.7784,
+        "f1": 0.7876,
+        "time_s": 23.97,
+        "cost_usd": 0.18761703,
+        "color": "C6",
+        "marker": "*",
+    },
+    {
+        "label": r"Vec384 + $\mathrm{Filter}_{B}(6)$ + QDT",
+        "legend_label": (
+            "Vector index over summaries (K = 384) + batched SemFilter "
+            "over summaries (batch size = 6, 64 workers) + "
+            "query decomposition tree filter union"
+        ),
+        "precision": 0.8452,
+        "recall": 0.8416,
+        "f1": 0.8434,
+        "time_s": 75.19,
+        "cost_usd": 0.20684636,
+        "color": "C7",
+        "marker": "h",
     },
 ]
 
@@ -78,8 +136,13 @@ def pareto_frontier(points, x_key, y_key):
     return sorted(frontier, key=lambda p: p[x_key])
 
 
+def _legend_entry(p: dict) -> str:
+    """Full text for legend; short `label` on the marker when `legend_label` is set."""
+    return p.get("legend_label", p["label"])
+
+
 def plot_pareto(points, x_key, y_key, x_label, y_label, title, output_path):
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(10, 6))
 
     # Plot all points
     for p in points:
@@ -89,7 +152,7 @@ def plot_pareto(points, x_key, y_key, x_label, y_label, title, output_path):
             s=90,
             color=p["color"],
             marker=p["marker"],
-            label=p["label"],
+            label=_legend_entry(p),
             zorder=3,
         )
         ax.annotate(
@@ -116,21 +179,34 @@ def plot_pareto(points, x_key, y_key, x_label, y_label, title, output_path):
     ax.set_ylabel(y_label)
     ax.set_title(title)
     ax.grid(True, alpha=0.3)
-    ax.legend(fontsize=8)
+    ax.legend(
+        fontsize=7,
+        loc="center left",
+        bbox_to_anchor=(1.02, 0.5),
+        frameon=True,
+    )
     ax.set_ylim(bottom=0)
     ax.set_xlim(left=0)
 
     fig.tight_layout()
-    fig.savefig(output_path, dpi=150)
+    fig.subplots_adjust(right=0.62)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {output_path}")
 
 
-def create_pareto_frontier_graph(points, metric_key, metric_label, output_path):
+def create_pareto_frontier_graph(
+    points,
+    metric_key,
+    metric_label,
+    output_path,
+    *,
+    show_point_labels: bool = True,
+):
     """Plot Pareto frontiers for one metric vs latency and cost."""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
 
-    def plot_panel(ax, x_key, x_label, title):
+    def plot_panel(ax, x_key, x_label, title, *, show_legend: bool):
         for p in points:
             ax.scatter(
                 p[x_key],
@@ -138,16 +214,17 @@ def create_pareto_frontier_graph(points, metric_key, metric_label, output_path):
                 s=90,
                 color=p["color"],
                 marker=p["marker"],
-                label=p["label"],
+                label=_legend_entry(p),
                 zorder=3,
             )
-            ax.annotate(
-                p["label"],
-                (p[x_key], p[metric_key]),
-                xytext=(6, 6),
-                textcoords="offset points",
-                fontsize=9,
-            )
+            if show_point_labels:
+                ax.annotate(
+                    p["label"],
+                    (p[x_key], p[metric_key]),
+                    xytext=(6, 6),
+                    textcoords="offset points",
+                    fontsize=9,
+                )
 
         frontier = pareto_frontier(points, x_key, metric_key)
         ax.plot(
@@ -164,7 +241,13 @@ def create_pareto_frontier_graph(points, metric_key, metric_label, output_path):
         ax.set_ylabel(metric_label)
         ax.set_title(title)
         ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
+        if show_legend:
+            ax.legend(
+                fontsize=7,
+                loc="center left",
+                bbox_to_anchor=(1.02, 0.5),
+                frameon=True,
+            )
         ax.set_xlim(left=0)
 
         metric_values = [p[metric_key] for p in points]
@@ -178,16 +261,19 @@ def create_pareto_frontier_graph(points, metric_key, metric_label, output_path):
         x_key="time_s",
         x_label="Latency (s)",
         title=f"Pareto Frontier: {metric_label} vs Latency",
+        show_legend=False,
     )
     plot_panel(
         axes[1],
         x_key="cost_usd",
         x_label="Cost ($)",
         title=f"Pareto Frontier: {metric_label} vs Cost",
+        show_legend=True,
     )
 
     fig.tight_layout()
-    fig.savefig(output_path, dpi=150)
+    fig.subplots_adjust(right=0.72, wspace=0.35)
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {output_path}")
 
@@ -287,6 +373,7 @@ def main():
         metric_key="recall",
         metric_label="Recall",
         output_path=out_dir / "pareto_frontier_recall.png",
+        show_point_labels=False,
     )
 
     plot_vector_recall_vs_k(

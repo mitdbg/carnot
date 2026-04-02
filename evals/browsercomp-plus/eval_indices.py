@@ -1088,8 +1088,6 @@ def main():
         total_stats["total_wall_clock_secs"] += summary_prep_stats["summary_build_wall_clock_secs"]
 
     for i, query in enumerate(queries):
-        if i != 6: 
-            continue
         print(f"\n[{i+1}/{len(queries)}] {query['query'][:70]}...")
 
         try:

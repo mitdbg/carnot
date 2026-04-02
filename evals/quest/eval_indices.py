@@ -1,9 +1,13 @@
 import argparse
+import importlib.util
 import json
 import os
 import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import numpy as np
 from dotenv import load_dotenv
 
 import carnot
@@ -15,8 +19,34 @@ from carnot.operators.sem_topk import SemTopKOperator
 
 load_dotenv()
 
+_QUEST_EVAL_DIR = Path(__file__).resolve().parent
+_BCP_EVAL_DIR = _QUEST_EVAL_DIR.parent / "browsercomp-plus"
+_spec_qdt = importlib.util.spec_from_file_location(
+    "browsercomp_qdt_retrieval_quest",
+    _BCP_EVAL_DIR / "qdt_retrieval.py",
+)
+_qdt_mod = importlib.util.module_from_spec(_spec_qdt)
+assert _spec_qdt.loader is not None
+_spec_qdt.loader.exec_module(_qdt_mod)
+generate_qdt_from_query = _qdt_mod.generate_qdt_from_query
+dedupe_qdt_tasks = _qdt_mod.dedupe_qdt_tasks
 
 DATASET_ID = 1
+
+# Modes that load per-file summaries (cached under SummaryLayer).
+SUMMARY_PREP_MODES = frozenset(
+    {
+        "summary-filter-only",
+        "summary-filter-batched",
+        "chroma-summary-filter",
+        "summary-embedding-topk",
+        "summary-embedding-topk-filter-batched",
+    }
+)
+# Subset that loads summary embeddings for dense retrieval.
+SUMMARY_MODES_WITH_EMBEDDINGS = frozenset(
+    {"summary-embedding-topk", "summary-embedding-topk-filter-batched"}
+)
 
 
 def add_paths_to_items(items: list[dict]) -> list[dict]:
@@ -53,11 +83,20 @@ def build_summary_items(
     items: list[dict],
     api_key: str,
     summary_model_id: str = "openai/gpt-5-mini-2025-08-07",
+    embedding_model_id: str = "openai/text-embedding-3-small",
+    include_embeddings: bool = False,
 ) -> tuple[list[dict], dict]:
-    """Build summary-backed items, reusing cached summaries when available."""
+    """Build summary-backed items, reusing cached summaries when available.
+
+    When *include_embeddings* is True, each item includes an ``embedding`` list
+    (same model as *embedding_model_id*, matching :class:`SummaryLayer` cache).
+    """
     start_time = time.perf_counter()
 
-    config = HierarchicalIndexConfig(summary_model=summary_model_id)
+    config = HierarchicalIndexConfig(
+        summary_model=summary_model_id,
+        embedding_model=embedding_model_id,
+    )
     layer = SummaryLayer(config=config, api_key=api_key)
     summaries = layer.get_or_build_summaries(items)
 
@@ -67,21 +106,153 @@ def build_summary_items(
         original_item = item_by_path.get(entry.path)
         if original_item is None:
             continue
-        summary_items.append(
-            {
-                "title": original_item.get("title", ""),
-                "docid": original_item.get("docid", ""),
-                "url": original_item.get("url", ""),
-                "uri": original_item.get("uri", ""),
-                "path": original_item.get("path", ""),
-                "summary": entry.summary,
-            }
-        )
+        row = {
+            "title": original_item.get("title", ""),
+            "docid": original_item.get("docid", ""),
+            "url": original_item.get("url", ""),
+            "uri": original_item.get("uri", ""),
+            "path": original_item.get("path", ""),
+            "summary": entry.summary,
+        }
+        if include_embeddings:
+            row["embedding"] = list(entry.embedding)
+        summary_items.append(row)
 
     stats = aggregate_llm_stats(layer.llm_call_stats)
     stats["summary_build_wall_clock_secs"] = time.perf_counter() - start_time
     stats["summary_items_out"] = len(summary_items)
     return summary_items, stats
+
+
+def _topk_summary_items_by_embedding(
+    query: str,
+    summary_items: list[dict],
+    api_key: str,
+    topk: int,
+    embedding_model_id: str = "openai/text-embedding-3-small",
+) -> tuple[list[dict], dict]:
+    """Select up to *topk* summary rows by cosine(query_emb, summary_emb)."""
+    start_time = time.perf_counter()
+
+    with_embedding = [
+        item
+        for item in summary_items
+        if item.get("embedding") is not None
+        and isinstance(item["embedding"], list)
+        and len(item["embedding"]) > 0
+    ]
+    empty_stats = {
+        "total_cost_usd": 0.0,
+        "total_input_tokens": 0,
+        "total_output_tokens": 0,
+        "total_wall_clock_secs": time.perf_counter() - start_time,
+        "topk_wall_clock_secs": time.perf_counter() - start_time,
+        "topk_items_out": 0,
+        "summary_items_out": len(summary_items),
+        "summary_items_with_embedding": 0,
+    }
+    if not with_embedding:
+        return [], empty_stats
+
+    model = LiteLLMModel(model_id=embedding_model_id, api_key=api_key)
+    query_embeddings, embed_stats = model.embed(texts=[query], model=embedding_model_id)
+    query_vec = np.asarray(query_embeddings[0], dtype=np.float64)
+    qn = query_vec / (np.linalg.norm(query_vec) + 1e-12)
+
+    matrix = np.asarray([item["embedding"] for item in with_embedding], dtype=np.float64)
+    norms = np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-12
+    matrix_n = matrix / norms
+    scores = matrix_n @ qn
+
+    k = max(0, min(topk, len(with_embedding)))
+    if k == 0:
+        top_items: list[dict] = []
+    else:
+        top_indices = np.argpartition(-scores, k - 1)[:k]
+        top_indices = top_indices[np.argsort(-scores[top_indices])]
+        top_items = [with_embedding[i] for i in top_indices]
+
+    end_time = time.perf_counter()
+    stats = {
+        "total_cost_usd": embed_stats.cost_usd,
+        "total_input_tokens": embed_stats.total_input_tokens,
+        "total_output_tokens": embed_stats.total_output_tokens,
+        "total_wall_clock_secs": end_time - start_time,
+        "topk_wall_clock_secs": end_time - start_time,
+        "topk_items_out": len(top_items),
+        "summary_items_out": len(summary_items),
+        "summary_items_with_embedding": len(with_embedding),
+    }
+
+    return top_items, stats
+
+
+def run_summary_embedding_topk(
+    query: str,
+    summary_items: list[dict],
+    api_key: str,
+    topk: int,
+    embedding_model_id: str = "openai/text-embedding-3-small",
+) -> tuple[list[str], dict]:
+    """Top-*k* titles by cosine similarity of query embedding to summary embeddings (no SemFilter)."""
+    top_items, stats = _topk_summary_items_by_embedding(
+        query, summary_items, api_key, topk, embedding_model_id
+    )
+    titles = [str(item.get("title", "")) for item in top_items]
+    return titles, stats
+
+
+def run_summary_embedding_topk_then_batched_filter(
+    query: str,
+    summary_items: list[dict],
+    model_id: str,
+    api_key: str,
+    topk: int,
+    embedding_model_id: str,
+    batch_size: int,
+) -> tuple[list[str], dict]:
+    """Summary embedding top-*k*, then batched SemFilter on those *k* rows only."""
+    top_with_emb, retr_stats = _topk_summary_items_by_embedding(
+        query, summary_items, api_key, topk, embedding_model_id
+    )
+    top_for_filter = [
+        {k: v for k, v in item.items() if k != "embedding"} for item in top_with_emb
+    ]
+
+    if not top_for_filter:
+        return [], {
+            **retr_stats,
+            "filter_wall_clock_secs": 0.0,
+            "filter_items_out": 0,
+            "filter_batch_size": max(1, batch_size),
+        }
+
+    titles, filter_stats = run_summary_filter_only(
+        query=query,
+        summary_items=top_for_filter,
+        model_id=model_id,
+        api_key=api_key,
+        batch_size=max(1, batch_size),
+    )
+
+    combined = {
+        "total_cost_usd": retr_stats["total_cost_usd"] + filter_stats["total_cost_usd"],
+        "total_input_tokens": retr_stats["total_input_tokens"]
+        + filter_stats["total_input_tokens"],
+        "total_output_tokens": retr_stats["total_output_tokens"]
+        + filter_stats["total_output_tokens"],
+        "total_wall_clock_secs": retr_stats["total_wall_clock_secs"]
+        + filter_stats["total_wall_clock_secs"],
+        "topk_wall_clock_secs": retr_stats["topk_wall_clock_secs"],
+        "filter_wall_clock_secs": filter_stats["filter_wall_clock_secs"],
+        "topk_items_out": retr_stats["topk_items_out"],
+        "summary_items_out": retr_stats["summary_items_out"],
+        "summary_items_with_embedding": retr_stats["summary_items_with_embedding"],
+        "filter_items_out": filter_stats["filter_items_out"],
+        "filter_batch_size": filter_stats["filter_batch_size"],
+    }
+
+    return titles, combined
 
 
 def generate_query_variations(
@@ -714,6 +885,259 @@ def run_with_index(
     return titles, stats
 
 
+def run_vector_topk_then_batched_filter(
+    query: str,
+    corpus_items: list[dict],
+    index_name: str,
+    model_id: str,
+    api_key: str,
+    topk: int = 50,
+    embedding_model_id: str = "openai/text-embedding-3-small",
+    batch_size: int = 16,
+) -> tuple[list[str], dict]:
+    """Vector top-*K* over full documents (SemTopK / Chroma), then batched SemFilter on those *K* rows only."""
+    start_time = time.perf_counter()
+
+    dataset = carnot.Dataset(
+        name="Documents",
+        annotation="A set of documents with their titles and content.",
+        items=corpus_items,
+        dataset_id=DATASET_ID,
+    )
+    input_datasets = {"Documents": dataset}
+    llm_config = {"OPENAI_API_KEY": api_key}
+
+    topk_op = SemTopKOperator(
+        task=query,
+        k=topk,
+        output_dataset_id="topk_output",
+        max_workers=64,
+        model_id=embedding_model_id,
+        llm_config=llm_config,
+        index_name=index_name,
+    )
+    topk_datasets, topk_stats = topk_op("Documents", input_datasets)
+
+    topk_titles = [item.get("title", "") for item in topk_datasets["topk_output"].items[:10]]
+    print(f"  TopK sample: {topk_titles}")
+
+    filter_op = SemFilterOperator(
+        task=query,
+        output_dataset_id="final_output",
+        model_id=model_id,
+        llm_config=llm_config,
+        max_workers=64,
+        batch_size=max(1, batch_size),
+    )
+    final_datasets, filter_stats = filter_op("topk_output", topk_datasets)
+
+    end_time = time.perf_counter()
+
+    results = final_datasets["final_output"].items
+    titles = [item.get("title", "") for item in results]
+
+    topk_agg = aggregate_llm_stats(topk_stats.llm_calls)
+    filter_agg = aggregate_llm_stats(filter_stats.llm_calls)
+    stats = {
+        "total_cost_usd": topk_agg["total_cost_usd"] + filter_agg["total_cost_usd"],
+        "total_input_tokens": topk_agg["total_input_tokens"] + filter_agg["total_input_tokens"],
+        "total_output_tokens": topk_agg["total_output_tokens"] + filter_agg["total_output_tokens"],
+        "total_wall_clock_secs": end_time - start_time,
+        "topk_wall_clock_secs": topk_stats.wall_clock_secs,
+        "filter_wall_clock_secs": filter_stats.wall_clock_secs,
+        "topk_items_out": topk_stats.items_out,
+        "filter_items_out": filter_stats.items_out,
+        "filter_batch_size": max(1, batch_size),
+    }
+    return titles, stats
+
+
+def _run_sem_filter_items_titles(
+    query: str,
+    items: list[dict],
+    model_id: str,
+    api_key: str,
+    batch_size: int,
+    dataset_name: str,
+    annotation: str,
+    max_workers: int = 64,
+) -> tuple[list[str], dict]:
+    """Run SemFilter on an item list; return passing items' titles (QUEST metrics)."""
+    start_time = time.perf_counter()
+
+    dataset = carnot.Dataset(
+        name=dataset_name,
+        annotation=annotation,
+        items=items,
+        dataset_id=DATASET_ID,
+    )
+    input_datasets = {dataset_name: dataset}
+    llm_config = {"OPENAI_API_KEY": api_key}
+
+    filter_op = SemFilterOperator(
+        task=query,
+        output_dataset_id="final_output",
+        model_id=model_id,
+        llm_config=llm_config,
+        max_workers=max_workers,
+        batch_size=max(1, batch_size),
+    )
+    final_datasets, filter_stats = filter_op(dataset_name, input_datasets)
+
+    end_time = time.perf_counter()
+
+    results = final_datasets["final_output"].items
+    titles = [item.get("title", "") for item in results]
+
+    agg = aggregate_llm_stats(filter_stats.llm_calls)
+    stats = {
+        "total_cost_usd": agg["total_cost_usd"],
+        "total_input_tokens": agg["total_input_tokens"],
+        "total_output_tokens": agg["total_output_tokens"],
+        "total_wall_clock_secs": end_time - start_time,
+        "filter_wall_clock_secs": filter_stats.wall_clock_secs,
+        "filter_items_out": filter_stats.items_out,
+        "filter_batch_size": max(1, batch_size),
+        "semfilter_items_in": len(items),
+    }
+
+    return titles, stats
+
+
+def run_vector_topk_then_qdt_semfilter(
+    query: str,
+    corpus_items: list[dict],
+    index_name: str,
+    model_id: str,
+    qdt_model_id: str,
+    api_key: str,
+    topk: int,
+    embedding_model_id: str,
+    qdt_semfilter_batch_size: int,
+) -> tuple[list[str], dict]:
+    """Vector top-*K* over full docs → QDT (anchor + probes) → SemFilter per task on survivors; union titles."""
+    start_total = time.perf_counter()
+
+    dataset = carnot.Dataset(
+        name="Documents",
+        annotation="A set of documents with their titles and content.",
+        items=corpus_items,
+        dataset_id=DATASET_ID,
+    )
+    input_datasets = {"Documents": dataset}
+    llm_config = {"OPENAI_API_KEY": api_key}
+
+    topk_op = SemTopKOperator(
+        task=query,
+        k=topk,
+        output_dataset_id="topk_output",
+        max_workers=64,
+        model_id=embedding_model_id,
+        llm_config=llm_config,
+        index_name=index_name,
+    )
+    topk_datasets, topk_stats = topk_op("Documents", input_datasets)
+
+    topk_items = list(topk_datasets["topk_output"].items)
+    topk_titles = [item.get("title", "") for item in topk_items[:10]]
+    print(f"  TopK sample: {topk_titles}")
+    print("TOP K DONE")
+
+    topk_agg = aggregate_llm_stats(topk_stats.llm_calls)
+
+    if not topk_items:
+        return [], {
+            "total_cost_usd": topk_agg["total_cost_usd"],
+            "total_input_tokens": topk_agg["total_input_tokens"],
+            "total_output_tokens": topk_agg["total_output_tokens"],
+            "total_wall_clock_secs": time.perf_counter() - start_total,
+            "topk_wall_clock_secs": topk_stats.wall_clock_secs,
+            "topk_items_out": topk_stats.items_out,
+            "qdt_union_titles_count": 0,
+            "qdt_tasks": 0,
+            "qdt_passes": [],
+            "qdt_wall_clock_secs": 0.0,
+            "qdt_semfilter_wall_clock_secs": 0.0,
+            "filter_items_out": 0,
+            "qdt_semfilter_batch_size": max(1, qdt_semfilter_batch_size),
+        }
+
+    qdt, qdt_stat = generate_qdt_from_query(
+        query=query,
+        api_key=api_key,
+        model_id=qdt_model_id,
+    )
+    print("QDT GENERATION DONE")
+    tasks = dedupe_qdt_tasks(qdt["anchor"], qdt["probes"])
+
+    union: set[str] = set()
+    passes: list[dict] = []
+    qdt_sf_cost = 0.0
+    qdt_sf_in = 0
+    qdt_sf_out = 0
+
+    def _qdt_semfilter_one(pair: tuple[str, str]) -> tuple[str, str, list[str], dict]:
+        label, task = pair
+        titles, st = _run_sem_filter_items_titles(
+            query=task,
+            items=topk_items,
+            model_id=model_id,
+            api_key=api_key,
+            batch_size=max(1, qdt_semfilter_batch_size),
+            dataset_name="TopKDocuments",
+            annotation="Top-K full documents from vector retrieval (QUEST corpus).",
+            max_workers=16,
+        )
+        return label, task, titles, st
+
+    n_qdt_workers = min(64, max(1, len(tasks)))
+    qdt_sf_t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=n_qdt_workers) as pool:
+        qdt_pass_results = list(pool.map(_qdt_semfilter_one, tasks))
+    qdt_sf_wall = time.perf_counter() - qdt_sf_t0
+
+    for label, task, titles, st in qdt_pass_results:
+        for t in titles:
+            if t:
+                union.add(str(t))
+        qdt_sf_cost += float(st.get("total_cost_usd", 0.0))
+        qdt_sf_in += int(st.get("total_input_tokens", 0))
+        qdt_sf_out += int(st.get("total_output_tokens", 0))
+        preview = task if len(task) <= 500 else task[:500] + "..."
+        passes.append(
+            {
+                "label": label,
+                "task": preview,
+                "filter_items_out": st.get("filter_items_out"),
+                "semfilter_items_in": st.get("semfilter_items_in"),
+            }
+        )
+
+    qdt_cost = float(qdt_stat.cost_usd) if qdt_stat else 0.0
+    qdt_in = int(qdt_stat.total_input_tokens) if qdt_stat else 0
+    qdt_out = int(qdt_stat.total_output_tokens) if qdt_stat else 0
+    qdt_wall = float(qdt_stat.duration_secs) if qdt_stat else 0.0
+
+    combined = {
+        "total_cost_usd": topk_agg["total_cost_usd"] + qdt_cost + qdt_sf_cost,
+        "total_input_tokens": topk_agg["total_input_tokens"] + qdt_in + qdt_sf_in,
+        "total_output_tokens": topk_agg["total_output_tokens"] + qdt_out + qdt_sf_out,
+        "total_wall_clock_secs": time.perf_counter() - start_total,
+        "topk_wall_clock_secs": topk_stats.wall_clock_secs,
+        "qdt_wall_clock_secs": qdt_wall,
+        "qdt_semfilter_wall_clock_secs": qdt_sf_wall,
+        "topk_items_out": topk_stats.items_out,
+        "qdt_semfilter_batch_size": max(1, qdt_semfilter_batch_size),
+        "qdt": qdt,
+        "qdt_tasks": len(tasks),
+        "qdt_passes": passes,
+        "qdt_union_titles_count": len(union),
+        "filter_items_out": len(union),
+    }
+
+    return sorted(union), combined
+
+
 def run_only_topk(
     query: str,
     corpus_items: list[dict],
@@ -840,6 +1264,7 @@ def run_summary_filter_only(
     summary_items: list[dict],
     model_id: str,
     api_key: str,
+    batch_size: int = 1,
 ) -> tuple[list[str], dict]:
     """Run SemFilter directly over summary-backed items."""
     start_time = time.perf_counter()
@@ -859,6 +1284,7 @@ def run_summary_filter_only(
         model_id=model_id,
         llm_config=llm_config,
         max_workers=64,
+        batch_size=max(1, batch_size),
     )
     final_datasets, filter_stats = filter_op("SummaryDocuments", input_datasets)
 
@@ -876,6 +1302,7 @@ def run_summary_filter_only(
         "filter_wall_clock_secs": filter_stats.wall_clock_secs,
         "summary_items_out": len(summary_items),
         "filter_items_out": filter_stats.items_out,
+        "filter_batch_size": max(1, batch_size),
     }
     return titles, stats
 
@@ -1088,12 +1515,17 @@ def main():
             "flat",
             "hierarchical",
             "vector-only",
+            "vector-topk-filter-batched",
+            "vector-topk-qdt-semfilter",
             "vector-paraphrase-union",
             "vector-or-topk-union-only",
             "vector-or-topk-union-filter-query",
             "vector-or-topk-union-filter-union",
             "vector-or-topk-query-filter-union",
             "summary-filter-only",
+            "summary-filter-batched",
+            "summary-embedding-topk",
+            "summary-embedding-topk-filter-batched",
             "chroma-summary-filter",
             "no-index",
         ],
@@ -1139,7 +1571,36 @@ def main():
         "--topk",
         type=int,
         default=50,
-        help="Number of items to retrieve with SemTopK (default: 50)",
+        help=(
+            "Top-k for SemTopK, vector-topk-filter-batched, vector-topk-qdt-semfilter, "
+            "summary-embedding-topk, and summary-embedding-topk-filter-batched (default: 50). "
+            "Match --embedding-model to cached summaries for embedding modes."
+        ),
+    )
+    parser.add_argument(
+        "--filter-batch-size",
+        type=int,
+        default=16,
+        help=(
+            "SemFilter batch size for summary-filter-batched, "
+            "summary-embedding-topk-filter-batched, vector-topk-filter-batched, and "
+            "vector-topk-qdt-semfilter QDT passes (default: 16; overridden by --qdt-filter-batch-size)"
+        ),
+    )
+    parser.add_argument(
+        "--qdt-filter-batch-size",
+        type=int,
+        default=None,
+        help=(
+            "SemFilter batch size for QDT anchor/probe passes on vector-topk survivors "
+            "(vector-topk-qdt-semfilter; default: same as --filter-batch-size)"
+        ),
+    )
+    parser.add_argument(
+        "--qdt-model",
+        type=str,
+        default=None,
+        help="Model for QDT anchor/probe generation (vector-topk-qdt-semfilter; default: same as --model)",
     )
     parser.add_argument(
         "--num-query-variations",
@@ -1172,7 +1633,12 @@ def main():
         help="Directory to save results",
     )
     args = parser.parse_args()
-    
+
+    if args.qdt_model is None:
+        args.qdt_model = args.model
+    if args.qdt_filter_batch_size is None:
+        args.qdt_filter_batch_size = args.filter_batch_size
+
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OPENAI_API_KEY environment variable not set")
@@ -1188,12 +1654,14 @@ def main():
     summary_items = None
     summary_items_by_path = None
     summary_prep_stats = None
-    if args.mode in {"summary-filter-only", "chroma-summary-filter"}:
+    if args.mode in SUMMARY_PREP_MODES:
         print(f"Loading cached summaries with model: {args.summary_model}...")
         summary_items, summary_prep_stats = build_summary_items(
             items=corpus_items,
             api_key=api_key,
             summary_model_id=args.summary_model,
+            embedding_model_id=args.embedding_model,
+            include_embeddings=(args.mode in SUMMARY_MODES_WITH_EMBEDDINGS),
         )
         summary_items_by_path = {
             item["path"]: item for item in summary_items if item.get("path")
@@ -1250,6 +1718,29 @@ def main():
                     index_name="chroma",
                     api_key=api_key,
                     topk=args.topk,
+                )
+            elif args.mode == "vector-topk-filter-batched":
+                pred_titles, exec_stats = run_vector_topk_then_batched_filter(
+                    query=query['query'],
+                    corpus_items=corpus_items,
+                    index_name="chroma",
+                    model_id=args.model,
+                    api_key=api_key,
+                    topk=args.topk,
+                    embedding_model_id=args.embedding_model,
+                    batch_size=max(1, args.filter_batch_size),
+                )
+            elif args.mode == "vector-topk-qdt-semfilter":
+                pred_titles, exec_stats = run_vector_topk_then_qdt_semfilter(
+                    query=query['query'],
+                    corpus_items=corpus_items,
+                    index_name="chroma",
+                    model_id=args.model,
+                    qdt_model_id=args.qdt_model,
+                    api_key=api_key,
+                    topk=args.topk,
+                    embedding_model_id=args.embedding_model,
+                    qdt_semfilter_batch_size=max(1, args.qdt_filter_batch_size),
                 )
             elif args.mode == "vector-paraphrase-union":
                 pred_titles, exec_stats = run_with_index_paraphrase_union(
@@ -1311,6 +1802,33 @@ def main():
                     summary_items=summary_items or [],
                     model_id=args.model,
                     api_key=api_key,
+                    batch_size=1,
+                )
+            elif args.mode == "summary-filter-batched":
+                pred_titles, exec_stats = run_summary_filter_only(
+                    query=query['query'],
+                    summary_items=summary_items or [],
+                    model_id=args.model,
+                    api_key=api_key,
+                    batch_size=max(1, args.filter_batch_size),
+                )
+            elif args.mode == "summary-embedding-topk":
+                pred_titles, exec_stats = run_summary_embedding_topk(
+                    query=query['query'],
+                    summary_items=summary_items or [],
+                    api_key=api_key,
+                    topk=args.topk,
+                    embedding_model_id=args.embedding_model,
+                )
+            elif args.mode == "summary-embedding-topk-filter-batched":
+                pred_titles, exec_stats = run_summary_embedding_topk_then_batched_filter(
+                    query=query['query'],
+                    summary_items=summary_items or [],
+                    model_id=args.model,
+                    api_key=api_key,
+                    topk=args.topk,
+                    embedding_model_id=args.embedding_model,
+                    batch_size=max(1, args.filter_batch_size),
                 )
             elif args.mode == "chroma-summary-filter":
                 pred_titles, exec_stats = run_with_index_summary_filter(
@@ -1349,7 +1867,15 @@ def main():
                 f"  TopK out: {exec_stats.get('topk_items_out', 'n/a')}, "
                 f"Filter out: {exec_stats.get('filter_items_out', 'n/a')}"
             )
-            
+            if args.mode == "vector-topk-qdt-semfilter":
+                qdt_obj = exec_stats.get("qdt") or {}
+                n_probes = len(qdt_obj.get("probes", []))
+                print(
+                    f"  QDT: {exec_stats.get('qdt_tasks', 'n/a')} tasks "
+                    f"({1 + n_probes} anchor+probes), "
+                    f"union titles: {exec_stats.get('qdt_union_titles_count', 'n/a')}"
+                )
+
             result = {
                 "query": query['query'],
                 "predicted_docs": pred_titles,
@@ -1361,9 +1887,11 @@ def main():
             
         except Exception as e:
             print(f"  ERROR: {e}")
+            traceback.print_exc()
             results.append({
                 "query": query['query'],
                 "error": str(e),
+                "traceback": traceback.format_exc(),
             })
     
     # Compute averages
@@ -1404,7 +1932,31 @@ def main():
         "mode": args.mode,
         "domain": args.domain,
         "model": args.model,
-        "topk": args.topk if args.mode not in {"no-index", "summary-filter-only"} else None,
+        "topk": args.topk
+        if args.mode
+        not in {"no-index", "summary-filter-only", "summary-filter-batched"}
+        else None,
+        "embedding_model": args.embedding_model
+        if args.mode
+        in {
+            "vector-topk-filter-batched",
+            "vector-topk-qdt-semfilter",
+            "summary-embedding-topk",
+            "summary-embedding-topk-filter-batched",
+        }
+        else None,
+        "filter_batch_size": args.filter_batch_size
+        if args.mode
+        in {
+            "summary-filter-batched",
+            "summary-embedding-topk-filter-batched",
+            "vector-topk-filter-batched",
+        }
+        else None,
+        "qdt_model": args.qdt_model if args.mode == "vector-topk-qdt-semfilter" else None,
+        "qdt_filter_batch_size": args.qdt_filter_batch_size
+        if args.mode == "vector-topk-qdt-semfilter"
+        else None,
         "paraphrase_model": args.paraphrase_model if args.mode == "vector-paraphrase-union" else None,
         "num_query_variations": args.num_query_variations if args.mode == "vector-paraphrase-union" else None,
         "decomposition_model": args.decomposition_model if args.mode in {
@@ -1413,8 +1965,8 @@ def main():
             "vector-or-topk-union-filter-union",
             "vector-or-topk-query-filter-union",
         } else None,
-        "summary_model": args.summary_model if args.mode in {"summary-filter-only", "chroma-summary-filter"} else None,
-        "summary_prep_stats": summary_prep_stats if args.mode in {"summary-filter-only", "chroma-summary-filter"} else None,
+        "summary_model": args.summary_model if args.mode in SUMMARY_PREP_MODES else None,
+        "summary_prep_stats": summary_prep_stats if args.mode in SUMMARY_PREP_MODES else None,
         "num_queries": len(queries),
         "num_successful": n,
         "summary": {

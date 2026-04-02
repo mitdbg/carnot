@@ -1,29 +1,27 @@
 sem_filter_prompt: |-
-  You are an expert assistant whose job is to determine whether a given input document is likely to contain useful evidence for answering a query.
-
-  You will be presented with a query and one input document. Output TRUE if the document contains information that is likely useful for answering the query, and FALSE otherwise.
+  You are an expert assistant whose job is to determine whether a given input data item satisfies a given filter condition.
+  You will be presented with the input data item and a filter condition. Output TRUE if the item satisfies the filter condition, and FALSE otherwise.
 
   Here are some important details to consider when generating your output
   - Your output must be TRUE or FALSE.
   - Place your output within the tags: {{output_opening_tag}} and {{output_closing_tag}}.
-  - Evaluate the document as potential evidence, not as a complete final answer.
-  - A document does NOT need to fully answer the query by itself to be relevant.
-  - Output TRUE if the document contains facts, entities, dates, relationships, quotations, locations, affiliations, or other details that could help answer part of the query.
-  - Output TRUE if the document appears to support one step in a multi-step reasoning chain needed to answer the query.
-  - Treat paraphrases, synonyms, equivalent descriptions, and indirect but clearly useful evidence as valid.
+  - Evaluate the filter condition semantically, not by exact keyword overlap.
+  - Treat paraphrases, synonyms, equivalent descriptions, and reworded expressions as valid evidence.
   - Use all fields in the Input together when making your decision.
-  - Output FALSE only if the document appears unrelated, off-topic, or unlikely to contribute useful evidence toward answering the query.
-  - Do not require the document to satisfy every condition in the query by itself.
-  - Do not require the document to explicitly state the final answer.
+  - If the condition is clearly supported by the Input, output TRUE even if the wording does not exactly match the filter condition.
+  - For AND conditions, all required parts must be satisfied.
+  - For OR conditions, satisfying at least one branch is enough.
+  - For NOT conditions, ensure the excluded condition is not supported by the Input.
+  - Output FALSE only when the condition is not supported or is contradicted by the Input.
 
   Here are a few examples:
   -----
-  Query: "What is the name of the university where a researcher was teaching in 2019, if that researcher later co-authored a 2021 paper on migration policy?"
+  Filter Condition: "The subject of the input is a foundational computer scientist."
 
   Input:
   {
-    "title": "Faculty Profile: Dr. Elena Morris",
-    "text": "In 2019, Elena Morris was an associate professor at Northlake University. Her work focused on refugee integration and migration policy."
+    "text": "Augusta Ada King, Countess of Lovelace, also known as Ada Lovelace, was an English mathematician and writer chiefly known for her work on Charles Babbage's proposed mechanical general-purpose computer, the Analytical Engine. She was the first to recognise that the machine had applications beyond pure calculation.",
+    "birthday": "December 10, 1815"
   }
 
   {{output_opening_tag}}
@@ -31,25 +29,13 @@ sem_filter_prompt: |-
   {{output_closing_tag}}
 
   -----
-  Query: "What is the name of the university where a researcher was teaching in 2019, if that researcher later co-authored a 2021 paper on migration policy?"
+  Filter Condition: "The movie's lead actor is Julia Roberts"
 
   Input:
   {
-    "title": "Migration Policy Review 2021",
-    "text": "Elena Morris and David Ng published a paper in 2021 about refugee integration policies across Europe."
-  }
-
-  {{output_opening_tag}}
-  TRUE
-  {{output_closing_tag}}
-
-  -----
-  Query: "What is the name of the university where a researcher was teaching in 2019, if that researcher later co-authored a 2021 paper on migration policy?"
-
-  Input:
-  {
-    "title": "University Rankings in 2019",
-    "text": "Northlake University rose three places in the 2019 national rankings."
+    "title": "Inception",
+    "director": "Christopher Nolan",
+    "review": "Leonardo DiCaprio delivers a stellar performance in this mind-bending thriller."
   }
 
   {{output_opening_tag}}
@@ -57,12 +43,12 @@ sem_filter_prompt: |-
   {{output_closing_tag}}
 
   -----
-  Query: "Identify the title of a report published in 1940 after an explorer encouraged another person to write about cultural discoveries."
+  Filter Condition: "The file contains identity theft statistics for 2001."
 
   Input:
   {
-    "title": "Graham Rowley Biography",
-    "text": "Graham Westbrook Rowley later encouraged another researcher to write up findings from Arctic cultural discoveries."
+    "filename": "legal/input/csn-data-book-2024-csv/CSVs/2024_CSN_Number_of_Reports_by_Type.csv",
+    "contents": "Number of Reports by Type,,,\n,,,\nYear,Fraud ,Identity Theft ,Other \n2001,\"137,306\",\"86,250\",\"101,963\"\n2002,\"242,783\",\"161,977\",\"146,862\"\n2003,\"331,366\",\"215,240\",\"167,051\"\n2004,\"410,298\",\"246,909\",\"203,176\"\n2005,\"437,585\",\"255,687\",\"216,042\"\n2006,\"423,672\",\"246,214\",\"236,243\"\n2007,\"505,563\",\"259,314\",\"305,570\"\n2008,\"620,832\",\"314,587\",\"325,705\"\n2009,\"708,781\",\"278,360\",\"441,836\"\n2010,\"820,072\",\"251,074\",\"399,160\"\n2011,\"1,041,517\",\"279,191\",\"577,835\"\n2012,\"1,112,693\",\"369,958\",\"632,428\"\n2013,\"1,159,115\",\"290,098\",\"685,352\"\n2014,\"1,526,365\",\"332,545\",\"762,021\"\n2015,\"1,165,393\",\"490,085\",\"1,429,676\"\n2016,\"1,228,865\",\"398,356\",\"1,435,874\"\n2017,\"1,310,003\",\"370,915\",\"1,247,309\"\n2018,\"1,523,295\",\"444,338\",\"1,203,425\"\n2019,\"1,897,238\",\"649,390\",\"980,572\"\n2020,\"2,467,103\",\"1,388,532\",\"1,361,628\"\n2021,\"3,041,971\",\"1,434,477\",\"1,686,786\"\n2022,\"2,572,424\",\"1,107,004\",\"1,661,691\"\n2023,\"2,621,649\",\"1,036,855\",\"1,914,555\"\n2024,\"2,600,678\",\"1,135,291\",\"2,759,963\"\n,,,\n\"Source: Consumer Sentinel Network Data Book 2024, Federal Trade Commission\",,,\n"
   }
 
   {{output_opening_tag}}
@@ -70,12 +56,12 @@ sem_filter_prompt: |-
   {{output_closing_tag}}
 
   -----
-  Query: "Identify the title of a report published in 1940 after an explorer encouraged another person to write about cultural discoveries."
+  Filter Condition: "The movie is about dreams entering other people's minds."
 
   Input:
   {
-    "title": "Quarterly Journal Archive 1940",
-    "text": "The 1940 records list an article titled 'The Dorset Culture of the Eastern Arctic.'"
+    "title": "Inception",
+    "summary": "A skilled thief infiltrates targets by entering and manipulating their dreams."
   }
 
   {{output_opening_tag}}
@@ -83,25 +69,12 @@ sem_filter_prompt: |-
   {{output_closing_tag}}
 
   -----
-  Query: "Identify the title of a report published in 1940 after an explorer encouraged another person to write about cultural discoveries."
+  Filter Condition: "The document is about either climate change or renewable energy."
 
   Input:
   {
-    "title": "Arctic Wildlife Notes",
-    "text": "This document discusses birds and marine mammals observed during northern expeditions."
-  }
-
-  {{output_opening_tag}}
-  FALSE
-  {{output_closing_tag}}
-
-  -----
-  Query: "What was the month and year of birth of a content creator who had a medical degree, married by 2022, and whose parents were both in the medical field?"
-
-  Input:
-  {
-    "title": "Interview with Dr. Kelechi Okafor",
-    "text": "Kelechi Okafor, born in December 1991, is a medical doctor and online content creator."
+    "title": "Advances in Solar Power Storage",
+    "abstract": "This paper studies recent improvements in battery systems for large-scale solar energy deployment."
   }
 
   {{output_opening_tag}}
@@ -109,29 +82,17 @@ sem_filter_prompt: |-
   {{output_closing_tag}}
 
   -----
-  Query: "What was the month and year of birth of a content creator who had a medical degree, married by 2022, and whose parents were both in the medical field?"
+  Filter Condition: "The article is about a film directed by Christopher Nolan and starring Leonardo DiCaprio."
 
   Input:
   {
-    "title": "Wedding Feature",
-    "text": "By 2022, Kelechi Okafor had gotten married. Both of her parents are doctors."
+    "title": "Inception",
+    "metadata": "Director: Christopher Nolan",
+    "review": "Leonardo DiCaprio leads this cerebral science fiction thriller."
   }
 
   {{output_opening_tag}}
   TRUE
-  {{output_closing_tag}}
-
-  -----
-  Query: "What was the month and year of birth of a content creator who had a medical degree, married by 2022, and whose parents were both in the medical field?"
-
-  Input:
-  {
-    "title": "Medical School Admissions Statistics",
-    "text": "This document reports aggregate medical school enrollment by year."
-  }
-
-  {{output_opening_tag}}
-  FALSE
   {{output_closing_tag}}
 
   -----
@@ -139,16 +100,16 @@ sem_filter_prompt: |-
   Here are the rules you should always follow to solve your task:
   1. Always place your output in a '{{output_opening_tag}}' sequence ending with '{{output_closing_tag}}', otherwise you will fail.
   2. Ensure your output is TRUE or FALSE.
-  3. Judge whether the document is useful evidence for answering the query, not whether it fully answers the query by itself.
-  4. A document may be relevant even if it only supports one part of a multi-step reasoning chain.
-  5. Treat semantic matches, paraphrases, and indirect but clearly useful evidence as relevant.
-  6. Output FALSE only when the document is unlikely to help answer the query.
+  3. Make sure to assess your output decision within the context of the provided Input.
+  4. Evaluate meaning, not just exact wording.
+  5. Treat paraphrases and equivalent descriptions as satisfying the filter condition when they clearly match.
+  6. Use all fields in the Input together when making your decision.
 
   Now Begin!
 sem_filter_batch_header: |-
-  The user message has a line `Query: "..."` and a JSON array labeled `Inputs`. Each element includes `batch_index` (0, 1, …) and the same fields as a single Input in the reference below (`title`, `text`, etc.).
+  The user message has a line `Query: "..."` (the filter condition) and a JSON array labeled `Inputs`. Each element includes `batch_index` (0, 1, …) and the same fields as a single Input in the reference below (`title`, `text`, etc.).
 
-  For **each** document, use **exactly** the same judgment as in the reference: if that document were the only Input, you would output TRUE if it is likely useful evidence for the query, FALSE otherwise. Decide each document **independently**—other items in `Inputs` must not change TRUE/FALSE for a given document.
+  For **each** item, use **exactly** the same judgment as in the reference: if that item were the only Input, you would output TRUE if it satisfies the filter condition, FALSE otherwise. Decide each item **independently**—other items in `Inputs` must not change TRUE/FALSE for a given item.
 
   Your **only** reply for the batch is one JSON object inside {{output_opening_tag}} and {{output_closing_tag}}:
   {
@@ -156,9 +117,9 @@ sem_filter_batch_header: |-
   }
   List every `batch_index` for which the verdict would be TRUE; omit indices for FALSE. If none are TRUE, return `"matching_indices": []`. The JSON must have exactly one key, `"matching_indices"`. No explanations or other text outside that JSON block.
 
-  The rest of this system message is the **full single-document prompt** (definition, criteria, TRUE/FALSE examples, and rules). It is the per-document standard.
+  The rest of this system message is the **full single-document prompt** (definition, criteria, TRUE/FALSE examples, and rules). It is the per-item standard.
 
 sem_filter_batch_footer: |-
-  For the batched user message: respond with **only** the JSON object described in the header (with `matching_indices`). Do not print TRUE or FALSE lines per document; those appear only in the reference examples above.
+  For the batched user message: respond with **only** the JSON object described in the header (with `matching_indices`). Do not print TRUE or FALSE lines per item; those appear only in the reference examples above.
 
   Now Begin!
