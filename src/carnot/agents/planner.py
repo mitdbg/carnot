@@ -1,13 +1,15 @@
+import queue
 import re
 import time
 from collections.abc import Generator
+from contextlib import contextmanager
 from importlib import resources
 
 import yaml
 from rich.console import Group
 from rich.text import Text
 
-from carnot.agents.base import ActionOutput, BaseAgent, populate_template
+from carnot.agents.base import BaseAgent, populate_template
 from carnot.agents.local_python_executor import (
     BASE_BUILTIN_MODULES,
     LocalPythonExecutor,
@@ -18,11 +20,10 @@ from carnot.agents.memory import (
     ActionStep,
     AgentMemory,
     FinalAnswerStep,
+    ParaphraseTaskStep,
     PlannerTaskStep,
-    PlanningStep,
     ToolCall,
 )
-from carnot.agents.models import ChatMessageStreamDelta
 from carnot.agents.monitoring import YELLOW_HEX, LogLevel, Timing
 from carnot.agents.utils import (
     AgentError,
@@ -51,7 +52,7 @@ class Planner(BaseAgent):
     1. ``generate_logical_plan()`` — creates a code-based logical plan
        using semantic operators.  May call the ``DataDiscoveryAgent``
        to understand dataset schemas before planning.
-    2. ``paraphrase_logical_plan()`` — translates the code-based plan
+    2. ``paraphrase_plan()`` — translates the code-based plan
        into a natural-language summary for user presentation.
 
     Each phase operates with its own isolated ``AgentMemory`` to prevent
@@ -81,6 +82,7 @@ class Planner(BaseAgent):
         datasets: list[Dataset],
         *args,
         managed_agents: list | None = None,
+        max_steps: int = 5,
         **kwargs
     ):
         # Store datasets for use in planning
@@ -97,36 +99,39 @@ class Planner(BaseAgent):
         self.code_block_tags = ["```python", "\n```"]
         self.additional_authorized_imports = ["carnot"]
         self.authorized_imports = sorted(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
-        
+
         # Create the DataDiscoveryAgent as a managed agent
         # Import here to avoid circular imports
         from carnot.agents.data_discovery import DataDiscoveryAgent
-        
+
         # Get the model from kwargs (required for creating managed agent)
         model = kwargs.get("model") or (args[1] if len(args) > 1 else None)
         if model is None:
             raise ValueError("Planner requires a 'model' argument")
-        
+
         self._data_discovery_agent = DataDiscoveryAgent(
             datasets=datasets,
             model=model,
             max_steps=10,
         )
-        
+
         # Combine with any user-provided managed agents
         all_managed_agents = [self._data_discovery_agent]
         if managed_agents:
             all_managed_agents.extend(managed_agents)
-        
+
         super().__init__(*args, prompt_templates=prompt_templates, managed_agents=all_managed_agents, **kwargs)
 
-        # Phase-specific memories to prevent context bleeding between phases
+        # phase-specific memories to prevent context bleeding between phases
         self.planning_memory = None
         self.paraphrase_memory = None
 
-        self.python_executor = self.create_python_executor()
-        self.max_steps = 5
-    
+        # python executor for code execution during planning
+        self.python_executor = None
+
+        # maximum steps for planning and paraphrasing phases
+        self.max_steps = max_steps
+
     def __enter__(self):
         return self
 
@@ -135,11 +140,54 @@ class Planner(BaseAgent):
 
     def cleanup(self):
         """Clean up resources used by the agent, such as the remote Python executor."""
-        if hasattr(self.python_executor, "cleanup"):
+        if self.python_executor and hasattr(self.python_executor, "cleanup"):
             self.python_executor.cleanup()
 
     def create_python_executor(self) -> PythonExecutor:
         return LocalPythonExecutor(self.additional_authorized_imports)
+
+    @contextmanager
+    def _progress_scope(self, progress_queue: queue.Queue | None):
+        """Bind a progress queue to all managed agents for the duration of a call.
+
+        Sets ``progress_queue`` on every managed agent that supports it,
+        then unconditionally clears the reference in a ``finally`` block.
+        This ensures the queue is scoped to a single call and no dangling
+        references survive after the call completes.
+
+        Requires:
+            - *progress_queue* is ``None`` or a thread-safe ``queue.Queue``.
+
+        Returns:
+            A context manager that yields *progress_queue*.
+
+        Raises:
+            None.
+        """
+        if progress_queue is not None:
+            for agent in self.managed_agents.values():
+                if hasattr(agent, 'progress_queue'):
+                    agent.progress_queue = progress_queue
+        try:
+            yield progress_queue
+        finally:
+            for agent in self.managed_agents.values():
+                if hasattr(agent, 'progress_queue'):
+                    agent.progress_queue = None
+
+    def _update_progress(self, progress_queue: queue.Queue | None, **kwargs):
+        """Helper to put a PlanningProgress update on the queue if it exists."""
+        if progress_queue is not None:
+            progress_event = PlanningProgress(**kwargs)
+            progress_queue.put(progress_event.to_dict())
+
+    def _get_step_cost_usd(self, step: ActionStep) -> float:
+        """Helper to extract USD cost from an ActionStep's model output message."""
+        # NOTE: I think we can safely assume model_output_message is always present
+        msg = getattr(step, "model_output_message", None)
+        if msg is not None and getattr(msg, "llm_call_stats", None) is not None:
+            return msg.llm_call_stats.cost_usd
+        return 0.0
 
     def initialize_system_prompt(self) -> str:
         """Initialize the system prompt with template variables including managed agents."""
@@ -160,109 +208,110 @@ class Planner(BaseAgent):
 
     def _run_stream(
         self,
-        phase: str = "planning",
-        memory: AgentMemory | None = None,
-    ) -> Generator[ActionStep | PlanningStep | FinalAnswerStep | ChatMessageStreamDelta]:
-        """Execute a planning phase, yielding intermediate steps.
+        phase: str,
+        memory: AgentMemory,
+    ) -> Generator[ActionStep | FinalAnswerStep, None, None]:
+        """Execute a planning phase, yielding intermediate steps. Each ActionStep
+        represents a single complete trace of one call to the LLM, including the
+        input messages, output, and any tool calls made (including code execution).
+        The observation from executing the tool calls (e.g. code output) is included
+        in the ActionStep, and the next step's input messages will include the updated
+        memory with those observations.
 
         Requires:
             - *phase* is ``"planning"`` or ``"paraphrase"``.
-            - *memory* (if supplied) is a properly initialised
-              ``AgentMemory`` with system prompt and task step.
+            - *memory* is a properly initialized ``AgentMemory`` instance with
+              a system prompt and task step for the current phase.
 
         Returns:
-            A generator of step objects, always ending with a
-            ``FinalAnswerStep``.
+            A generator of step objects.  The last yielded value
+            is always a ``FinalAnswerStep``.
 
         Raises:
             AgentGenerationError: If the LLM fails to produce valid output.
             ValueError: If *phase* is not recognised.
         """
-        # use provided memory or fall back to self.memory
-        if memory is None:
-            memory = self.memory
-
-        # temporarily swap memory for helper method compatibility
-        original_memory = self.memory
+        # Point the inherited self.memory at the phase-specific memory so
+        # that write_memory_to_messages() (called by _generate_model_output)
+        # reads from the correct context instead of the stale base-class default.
         self.memory = memory
 
-        try:
-            self.step_number = 1
-            returned_final_answer = False
-            while not returned_final_answer and self.step_number <= self.max_steps:
-                # Start action step based on phase
+        self.step_number = 1
+        returned_final_answer = False
+        while not returned_final_answer and self.step_number <= self.max_steps:
+            try:
+                # execute one action step for the given phase
+                action_step = None
                 if phase == "planning":
-                    action_step = ActionStep(step_number=self.step_number, timing=Timing(start_time=time.time()))
-                    generator = self._step_generating_logical_plan_stream(action_step)
+                    action_step = self._step_generating_logical_plan_stream(step_num=self.step_number)
                 elif phase == "paraphrase":
-                    action_step = ActionStep(step_number=self.step_number, timing=Timing(start_time=time.time()))
-                    generator = self._step_paraphrase_stream(action_step)
+                    action_step = self._step_paraphrase_stream(step_num=self.step_number)
                 else:
                     raise ValueError(f"Unknown phase: {phase}")
 
                 self.logger.log_rule(f"Step {self.step_number}", level=LogLevel.INFO)
-                try:
-                    for output in generator:
-                        # Yield all
-                        yield output
-
-                        if isinstance(output, ActionOutput) and output.is_final_answer:
-                            final_answer = output.output
-                            self.logger.log(
-                                Text(f"Final answer: {final_answer}", style=f"bold {YELLOW_HEX}"),
-                                level=LogLevel.INFO,
-                            )
-
-                            if self.final_answer_checks:
-                                self._validate_final_answer(final_answer)
-                            returned_final_answer = True
-
-                # Agent generation errors are not caused by a Model error but an implementation error: so we should raise them and exit.
-                except AgentGenerationError as e:
-                    raise e
-
-                # Other AgentError types are caused by the Model, so we should log them and iterate.
-                except AgentError as e:
-                    action_step.error = e
-
-                finally:
-                    self._finalize_step(action_step)
-                    self.memory.steps.append(action_step)
-                    yield action_step
-                    self.step_number += 1
-                    
-                    # Countdown warning for the last few steps
-                    # After incrementing, step_number is the NEXT step to run
-                    # steps_remaining = max_steps - (next_step - 1) = max_steps - step_number + 1
-                    steps_remaining = self.max_steps - self.step_number + 1
-                    
-                    # Debug logging
+                if action_step.is_final_answer:
+                    returned_final_answer = True
+                    final_answer = action_step.final_output
                     self.logger.log(
-                        f"[Planner] Step {self.step_number - 1} completed, {steps_remaining} steps remaining (max={self.max_steps})",
+                        Text(f"Final answer: {final_answer}", style=f"bold {YELLOW_HEX}"),
                         level=LogLevel.INFO,
                     )
-                    
-                    if 1 <= steps_remaining <= MAX_STEPS_WARNING_THRESHOLD:
-                        step_word = "step" if steps_remaining == 1 else "steps"
-                        warning_msg = (
-                            f"\n\n⚠️ Warning: You have {steps_remaining} {step_word} remaining. "
-                            f"Return your final answer with final_answer() soon."
-                        )
-                        # Modify the action step's observations directly
-                        action_step.observations = (action_step.observations or "") + warning_msg
-                        # Log that we're adding the warning
-                        self.logger.log(
-                            "[Planner] Added max_steps warning to observations",
-                            level=LogLevel.INFO,
-                        )
 
-            if not returned_final_answer:
-                final_answer = "The agent did not return a final answer within the maximum number of steps."
+            # Agent generation errors are not caused by a Model error but an implementation error: so we should raise them and exit.
+            except AgentGenerationError as e:
+                raise e
 
-            yield FinalAnswerStep(final_answer)
-        finally:
-            # restore original memory
-            self.memory = original_memory
+            # Other AgentError types are caused by the Model, so we should log them and iterate.
+            except AgentError as e:
+                if action_step is None:
+                    action_step = ActionStep(
+                        step_number=self.step_number,
+                        timing=Timing(start_time=time.time()),
+                    )
+                action_step.error = e
+
+            finally:
+                if action_step is None:
+                    action_step = ActionStep(
+                        step_number=self.step_number,
+                        timing=Timing(start_time=time.time()),
+                    )
+                # set the end time for the step and add to memory
+                action_step.timing.end_time = time.time()
+                memory.steps.append(action_step)
+                yield action_step
+                self.step_number += 1
+
+                # Countdown warning for the last few steps
+                # After incrementing, step_number is the NEXT step to run
+                # steps_remaining = max_steps - (next_step - 1) = max_steps - step_number + 1
+                steps_remaining = self.max_steps - self.step_number + 1
+
+                # Debug logging
+                self.logger.log(
+                    f"[Planner] Step {self.step_number - 1} completed, {steps_remaining} steps remaining (max={self.max_steps})",
+                    level=LogLevel.INFO,
+                )
+
+                if 1 <= steps_remaining <= MAX_STEPS_WARNING_THRESHOLD:
+                    step_word = "step" if steps_remaining == 1 else "steps"
+                    warning_msg = (
+                        f"\n\n⚠️ Warning: You have {steps_remaining} {step_word} remaining. "
+                        f"Return your final answer with final_answer() soon."
+                    )
+                    # Modify the action step's observations directly
+                    action_step.observations = (action_step.observations or "") + warning_msg
+                    # Log that we're adding the warning
+                    self.logger.log(
+                        "[Planner] Added max_steps warning to observations",
+                        level=LogLevel.INFO,
+                    )
+
+        if not returned_final_answer:
+            final_answer = "The agent did not return a final answer within the maximum number of steps."
+
+        yield FinalAnswerStep(final_answer)
 
     def _generate_model_output(
         self,
@@ -292,10 +341,10 @@ class Planner(BaseAgent):
             )
             memory_step.model_output_message = chat_message
             output_text = chat_message.content
-            
+
             # Truncate after first code block for models that don't support stop sequences
             output_text = self._truncate_after_first_code_block(output_text)
-            
+
             # Append the closing tag if it was used as a stop sequence
             # This helps subsequent LLM calls learn to close code blocks properly
             if (
@@ -304,10 +353,10 @@ class Planner(BaseAgent):
                 and not output_text.strip().endswith(self.code_block_tags[1].strip())
             ):
                 output_text += self.code_block_tags[1]
-            
+
             # Update memory with possibly truncated output
             memory_step.model_output_message.content = output_text
-            
+
             self.logger.log_markdown(
                 content=output_text,
                 title="Output message of the LLM:",
@@ -367,7 +416,7 @@ class Planner(BaseAgent):
         """
         try:
             final_answer = parse_plan(output_text, tags)
-            memory_step.action_output = final_answer
+            memory_step.code_action_output = final_answer
             return True, final_answer
         except Exception:
             return False, None
@@ -376,18 +425,20 @@ class Planner(BaseAgent):
         self,
         output_text: str,
         memory_step: ActionStep,
+        num_memory_steps: int,
         error_context: str = "code blobs"
-    ) -> tuple[str, ToolCall]:
+    ) -> str:
         """
-        Parse code from output text and create tool call.
-        
+        Parse code from output text and return it. This function also adds the corresponding tool call to the memory
+        step.
+
         Args:
             output_text: Raw LLM output
             memory_step: Current action step
             error_context: Context string for error messages
-            
+
         Returns:
-            (code_action, tool_call): Parsed code and corresponding tool call
+            code_action: Parsed code
         """
         try:
             code_action = parse_code_blobs(output_text, self.code_block_tags)
@@ -403,11 +454,11 @@ class Planner(BaseAgent):
         tool_call = ToolCall(
             name="python_interpreter",
             arguments=code_action,
-            id=f"call_{len(self.memory.steps)}",
+            id=f"call_{num_memory_steps}",
         )
         memory_step.tool_calls = [tool_call]
 
-        return code_action, tool_call
+        return code_action
 
     def _check_for_anti_patterns(self, code_action: str) -> None:
         """
@@ -499,7 +550,7 @@ class Planner(BaseAgent):
         execution_outputs_console: list,
         memory_step: ActionStep,
         is_final_answer: bool | None = None
-    ) -> ActionOutput:
+    ) -> ActionStep:
         """
         Finalize code execution step with observations and output.
         
@@ -511,7 +562,7 @@ class Planner(BaseAgent):
             is_final_answer: Override for is_final_answer. If None, use code_output.is_final_answer
         
         Returns:
-            ActionOutput for yielding
+            ActionStep for yielding
         """
         truncated_output = str(code_output.output)
         observation += "Last output from code snippet:\n" + truncated_output
@@ -530,20 +581,19 @@ class Planner(BaseAgent):
             ]
 
         self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
-        memory_step.action_output = code_output.output
+        memory_step.code_action_output = code_output.output
+        memory_step.final_output = code_output.output
+        memory_step.is_final_answer = use_final_answer
 
-        return ActionOutput(
-            output=code_output.output,
-            is_final_answer=use_final_answer
-        )
+        return memory_step
 
     def _step_with_code_and_final_answer(
         self,
-        memory_step: ActionStep,
+        step_num: int,
         final_answer_tags: list[str] | None = None,
         parse_code_only: bool = False,
         add_closing_tag: bool = False
-    ) -> Generator[ActionOutput | ToolCall]:
+    ) -> ActionStep:
         """
         Generic streaming step that supports:
         - Parsing final answer (plan/report) OR code
@@ -555,6 +605,8 @@ class Planner(BaseAgent):
             parse_code_only: If True, skip final answer parsing
             add_closing_tag: If True, add closing code tag to output
         """
+        memory_step = ActionStep(step_number=self.step_number, timing=Timing(start_time=time.time()))
+
         # Generate model output
         output_text = self._generate_model_output(memory_step)
 
@@ -572,17 +624,13 @@ class Planner(BaseAgent):
                 memory_step
             )
             if success:
-                yield ActionOutput(output=final_answer, is_final_answer=True)
-                return
+                memory_step.final_output = final_answer
+                memory_step.is_final_answer = True
+                return memory_step
 
         # Parse as code
         error_context = "correct code blobs" if parse_code_only else "either code blobs or a final answer"
-        code_action, tool_call = self._parse_and_prepare_code(
-            output_text,
-            memory_step,
-            error_context
-        )
-        yield tool_call
+        code_action = self._parse_and_prepare_code(output_text, memory_step, step_num, error_context)
 
         # Execute code
         code_output, observation, execution_outputs_console = self._execute_code_and_collect_output(
@@ -590,31 +638,31 @@ class Planner(BaseAgent):
             memory_step
         )
 
-        # Finalize and yield result
+        # Finalize and return result
         # Use explicit False for planning/discovery, use code_output.is_final_answer for compilation
         is_final_override = None if parse_code_only else False
-        action_output = self._finalize_code_execution_step(
+        memory_step = self._finalize_code_execution_step(
             code_output,
             observation,
             execution_outputs_console,
             memory_step,
-            is_final_answer=is_final_override
+            is_final_answer=is_final_override,
         )
-        yield action_output
+        return memory_step
 
-    def _step_generating_logical_plan_stream(self, memory_step: ActionStep) -> Generator[ActionOutput]:
+    def _step_generating_logical_plan_stream(self, step_num: int) -> ActionStep:
         """Handle logical plan generation with code execution and managed agent calls."""
-        yield from self._step_with_code_and_final_answer(
-            memory_step=memory_step,
+        return self._step_with_code_and_final_answer(
+            step_num=step_num,
             final_answer_tags=None,
             parse_code_only=True,
             add_closing_tag=True
         )
 
-    def _step_paraphrase_stream(self, memory_step: ActionStep) -> Generator[ActionOutput]:
+    def _step_paraphrase_stream(self, step_num: int) -> ActionStep:
         """Handle paraphrasing a logical plan to natural language."""
-        yield from self._step_with_code_and_final_answer(
-            memory_step=memory_step,
+        return self._step_with_code_and_final_answer(
+            step_num=step_num,
             final_answer_tags=self.plan_tags,
             parse_code_only=False,
             add_closing_tag=False
@@ -622,16 +670,13 @@ class Planner(BaseAgent):
 
     def _setup_phase_execution(
         self,
-        phase_type: str,
+        phase: str,
+        query: str,
         prompt_template_key: str,
         template_vars: dict,
-        task_step_class: type,
-        task_kwargs: dict,
         conversation: Conversation | None = None,
-        plan_type_for_history: str | None = None,
-        log_title: str | None = None,
-        log_content_key: str = "task"
-    ) -> AgentMemory:
+        plan: dict | None = None,
+    ) -> tuple[AgentMemory, PythonExecutor]:
         """Initialise system prompt, memory, and executor for a phase.
 
         Creates a fresh ``AgentMemory`` instance, populates it with the
@@ -639,12 +684,12 @@ class Planner(BaseAgent):
         the Python executor with datasets and tools.
 
         Requires:
+            - *phase* is either ``"planning"`` or ``"paraphrase"``.
             - *prompt_template_key* exists in ``self.prompt_templates``.
-            - *task_step_class* is a ``MemoryStep`` subclass whose
-              ``__init__`` accepts ``**task_kwargs``.
+            - When *phase* is ``"paraphrase"``, *plan* must be a non-empty dict.
 
         Returns:
-            A new ``AgentMemory`` instance ready for ``_run_stream``.
+            A new ``AgentMemory`` instance ready for ``_run_stream`` and a configured ``PythonExecutor``.
 
         Raises:
             KeyError: If *prompt_template_key* is missing.
@@ -658,85 +703,82 @@ class Planner(BaseAgent):
         # create fresh memory for this phase
         phase_memory = AgentMemory(system_prompt)
 
-        # store reference based on phase type
-        if phase_type == "data-discovery":
-            self.data_discovery_memory = phase_memory
-        elif phase_type == "planning":
-            self.planning_memory = phase_memory
-        elif phase_type == "paraphrase":
-            self.paraphrase_memory = phase_memory
-        elif phase_type == "compilation":
-            self.compilation_memory = phase_memory
-
         # add previous plan from conversation if applicable
-        if conversation and plan_type_for_history:
+        if conversation:
+            plan_type_for_history = "logical-plan" if phase == "planning" else "natural-language-plan"
             latest_plan = conversation.get_latest_agent_plan(plan_type_for_history)
             if latest_plan:
                 phase_memory.steps.append(latest_plan)
 
         # log task
-        log_content = task_kwargs.get(log_content_key, "")
         self.logger.log_task(
-            content=str(log_content).strip(),
+            content=query.strip(),
             subtitle=f"{type(self.model).__name__} - {(self.model.model_id if hasattr(self.model, 'model_id') else '')}",
             level=LogLevel.INFO,
-            title=log_title or (self.name if hasattr(self, "name") else None),
+            title="Logical Plan Generation" if phase == "planning" else "Logical Plan Paraphrasing",
         )
 
-        # add task step to phase memory
-        task_step = task_step_class(**task_kwargs)
+        # add the appropriate task step to phase memory
+        if phase == "paraphrase":
+            task_step = ParaphraseTaskStep(task=query, plan=plan)
+        else:
+            task_step = PlannerTaskStep(task=query, datasets=self._datasets)
         phase_memory.steps.append(task_step)
 
         # setup Python executor state
-        datasets_dict = {dataset.name: dataset for dataset in task_kwargs.get("datasets", [])}
+        datasets_dict = {dataset.name: dataset for dataset in self._datasets}
         conversation_list = conversation.to_dict_list() if conversation else []
         state = {
             "datasets": datasets_dict,
             "conversation": conversation_list,
             **self.state
         }
-        self.python_executor.send_variables(variables=state)
-        self.python_executor.send_tools({**self.tools, **self.managed_agents})
+        python_executor = self.create_python_executor()
+        python_executor.send_variables(variables=state)
+        python_executor.send_tools({**self.tools, **self.managed_agents})
 
-        return phase_memory
+        return phase_memory, python_executor
+
+    # ------------------------------------------------------------------
+    # Public interface — progress goes through the queue, results are
+    # returned directly.
+    # ------------------------------------------------------------------
 
     def generate_logical_plan(
-        self, 
-        query: str, 
-        datasets: list[Dataset], 
+        self,
+        query: str,
         conversation: Conversation | None = None,
-        cost_budget: float | None = None,
-    ) -> dict:
+        progress_queue: queue.Queue | None = None,
+    ) -> Dataset:
         """Generate a logical execution plan as code.
 
         Uses the managed ``DataDiscoveryAgent`` to explore datasets and then
         produces a code-based logical plan composed of semantic operators.
 
+        When *progress_queue* is provided, ``PlanningProgress`` events are
+        pushed to it in real time — both from the Planner's own steps and
+        from managed agents (e.g. data discovery).  The queue is scoped to
+        this call via :meth:`_progress_scope`.
+
         Requires:
             - *query* is a non-empty string.
-            - *datasets* is a non-empty list of ``Dataset`` objects.
+            - *self._datasets* is a non-empty list of ``Dataset`` objects.
+            - *progress_queue*, if provided, is a thread-safe ``queue.Queue``.
 
         Returns:
-            A dict (or structured object) representing the logical plan.
+            A Dataset object which captures the logical plan of the query execution.
 
         Raises:
             AgentGenerationError: If the LLM fails to produce valid output.
-            AssertionError: If the run stream does not terminate with a
-            ``FinalAnswerStep``.
+            AssertionError: If no ``FinalAnswerStep`` is found in the
+            underlying stream.
         """
-        # TODO: Use cost_budget to inform query optimization decisions
-        # For now, we accept the parameter but do not use it
-        _ = cost_budget
-        
-        # Update datasets if provided (also updates managed agent)
-        if datasets:
-            self._datasets = datasets
-            if hasattr(self, 'data_discovery_agent'):
-                self.data_discovery_agent._datasets = datasets
-        
-        # setup execution with phase-specific memory
-        planning_memory = self._setup_phase_execution(
-            phase_type="planning",
+        # TODO: execute basic data discovery and template into the prompt here
+
+        # setup planning memory and python executor
+        self.planning_memory, self.python_executor = self._setup_phase_execution(
+            phase="planning",
+            query=query,
             prompt_template_key="system_prompt",
             template_vars={
                 "logical_operators": {op: op.desc() for op in LOGICAL_OPERATORS},
@@ -747,246 +789,106 @@ class Planner(BaseAgent):
                 "has_conversation": conversation is not None,
                 "managed_agents": self.managed_agents,
             },
-            task_step_class=PlannerTaskStep,
-            task_kwargs={"task": query, "datasets": datasets},
             conversation=conversation,
-            plan_type_for_history="logical-plan"
         )
 
-        # run and return with isolated memory
-        steps = list(self._run_stream(phase="planning", memory=planning_memory))
-        assert isinstance(steps[-1], FinalAnswerStep)
-        return steps[-1].output
-
-    def paraphrase_logical_plan(
-        self, 
-        query: str, 
-        logical_plan: dict, 
-        datasets: list[Dataset],
-        conversation: Conversation | None = None,
-        cost_budget: float | None = None,
-    ) -> str:
-        """Translate a logical plan into a natural-language description.
-
-        Requires:
-            - *logical_plan* is a non-empty dict produced by
-              ``generate_logical_plan``.
-            - *datasets* lists the datasets referenced in the plan.
-
-        Returns:
-            A human-readable string summarising the plan.
-
-        Raises:
-            AgentGenerationError: If the LLM fails to produce valid output.
-            AssertionError: If the run stream does not terminate with a
-            ``FinalAnswerStep``.
-        """
-        # TODO: Use cost_budget to inform paraphrase content (e.g., estimated costs)
-        # For now, we accept the parameter but do not use it
-        _ = cost_budget
-        
-        # setup execution with phase-specific memory
-        paraphrase_memory = self._setup_phase_execution(
-            phase_type="paraphrase",
-            prompt_template_key="paraphrase_prompt",
-            template_vars={
-                "code_opening_tag": self.code_block_tags[0],
-                "code_closing_tag": self.code_block_tags[1],
-                "plan_opening_tag": self.plan_tags[0],
-                "plan_closing_tag": self.plan_tags[1],
-                "logical_plan": str(logical_plan),
-                "has_conversation": conversation is not None,
-            },
-            task_step_class=PlannerTaskStep,
-            task_kwargs={"task": query, "datasets": datasets},
-            conversation=conversation,
-            plan_type_for_history="natural-language-plan",
-            log_title="Plan Paraphrase"
-        )
-
-        # run and return with isolated memory
-        steps = list(self._run_stream(phase="paraphrase", memory=paraphrase_memory))
-        assert isinstance(steps[-1], FinalAnswerStep)
-        return steps[-1].output
-
-    # ------------------------------------------------------------------
-    # Streaming variants — yield PlanningProgress events between steps
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _code_calls_data_discovery(code_action: str | None) -> bool:
-        """Return ``True`` if *code_action* contains a ``data_discovery(`` call.
-
-        Requires:
-            - *code_action* may be ``None`` (returns ``False``).
-
-        Returns:
-            Whether the code text contains the pattern ``data_discovery(``.
-
-        Raises:
-            None.
-        """
-        if not code_action:
-            return False
-        return bool(re.search(r"\bdata_discovery\s*\(", code_action))
-
-    def generate_logical_plan_stream(
-        self,
-        query: str,
-        datasets: list[Dataset],
-        conversation: Conversation | None = None,
-        cost_budget: float | None = None,
-    ) -> Generator[PlanningProgress | dict, None, None]:
-        """Generate a logical plan, yielding progress events along the way.
-
-        This is the streaming counterpart of :meth:`generate_logical_plan`.
-        It performs exactly the same work but yields
-        :class:`PlanningProgress` objects between steps so that callers
-        can forward them to users.
-
-        The **last value** yielded is always the logical-plan ``dict``
-        (i.e. the same value that ``generate_logical_plan`` returns).
-
-        Requires:
-            - *query* is a non-empty string.
-            - *datasets* is a non-empty list of ``Dataset`` objects.
-
-        Returns:
-            A generator that yields zero or more ``PlanningProgress``
-            objects followed by exactly one ``dict`` (the logical plan).
-
-        Raises:
-            AgentGenerationError: If the LLM fails to produce valid output.
-            AssertionError: If the underlying stream does not end with a
-            ``FinalAnswerStep``.
-        """
-        _ = cost_budget  # reserved for future cost-aware planning
-
-        # Update datasets if provided (also updates managed agent)
-        if datasets:
-            self._datasets = datasets
-            if hasattr(self, "data_discovery_agent"):
-                self.data_discovery_agent._datasets = datasets
-
-        # Setup phase memory (identical to non-streaming variant)
-        planning_memory = self._setup_phase_execution(
-            phase_type="planning",
-            prompt_template_key="system_prompt",
-            template_vars={
-                "logical_operators": {op: op.desc() for op in LOGICAL_OPERATORS},
-                "code_opening_tag": self.code_block_tags[0],
-                "code_closing_tag": self.code_block_tags[1],
-                "plan_opening_tag": self.plan_tags[0],
-                "plan_closing_tag": self.plan_tags[1],
-                "has_conversation": conversation is not None,
-                "managed_agents": self.managed_agents,
-            },
-            task_step_class=PlannerTaskStep,
-            task_kwargs={"task": query, "datasets": datasets},
-            conversation=conversation,
-            plan_type_for_history="logical-plan",
-        )
-
-        yield PlanningProgress(
+        # push initial progress update before starting the planning phase
+        self._update_progress(
+            progress_queue,
             phase="logical_plan",
-            step=1,
-            total_steps=self.max_steps,
-            message="Starting to analyze query and plan execution…",
+            message="Starting to analyze query and plan execution...",
         )
 
-        logical_plan = None
-        for step in self._run_stream(phase="planning", memory=planning_memory):
-            if isinstance(step, ActionStep):
-                # Detect whether this step invoked the DataDiscoveryAgent
-                if self._code_calls_data_discovery(step.code_action):
-                    yield PlanningProgress(
-                        phase="data_discovery",
-                        step=step.step_number,
-                        total_steps=self.max_steps,
-                        message="Exploring datasets to understand their structure…",
-                    )
-                else:
-                    yield PlanningProgress(
+        with self._progress_scope(progress_queue):
+            logical_plan = None
+            for step in self._run_stream(phase="planning", memory=self.planning_memory):
+                if isinstance(step, FinalAnswerStep):
+                    logical_plan = step.output
+                elif isinstance(step, ActionStep):
+                    self._update_progress(
+                        progress_queue,
                         phase="logical_plan",
                         step=step.step_number,
                         total_steps=self.max_steps,
-                        message=f"Building execution plan (step {step.step_number})…",
+                        message=f"Building execution plan (step {step.step_number})...",
+                        code_action=step.code_action,
+                        observations=step.observations,
+                        step_cost_usd=self._get_step_cost_usd(step),
+                        error=str(step.error) if step.error else None,
                     )
 
-            elif isinstance(step, FinalAnswerStep):
-                logical_plan = step.output
+            assert logical_plan is not None, "Planner stream did not produce a FinalAnswerStep"
 
-        assert logical_plan is not None, "Planner stream did not produce a FinalAnswerStep"
-        # Yield the plan itself as the terminal value
-        yield logical_plan
+        return logical_plan
 
-    def paraphrase_logical_plan_stream(
+    def paraphrase_plan(
         self,
         query: str,
-        logical_plan: dict,
-        datasets: list[Dataset],
+        plan: dict,
         conversation: Conversation | None = None,
-        cost_budget: float | None = None,
-    ) -> Generator[PlanningProgress | str, None, None]:
-        """Translate a logical plan to natural language, yielding progress events.
+        progress_queue: queue.Queue | None = None,
+    ) -> str:
+        """Translate a logical or physical plan into a natural-language description.
 
-        This is the streaming counterpart of
-        :meth:`paraphrase_logical_plan`.  It yields
-        :class:`PlanningProgress` events followed by exactly one ``str``
-        (the natural-language plan).
+        When *progress_queue* is provided, ``PlanningProgress`` events are
+        pushed to it in real time.  The queue is scoped to this call via
+        :meth:`_progress_scope`.
 
         Requires:
-            - *logical_plan* is a non-empty dict.
-            - *datasets* lists the datasets referenced in the plan.
+            - *plan* is a non-empty dict with a serialized logical or physical plan
+            (produced by ``generate_logical_plan`` or Carnot's ``Optimizer``).
+            - *self._datasets* lists the datasets referenced in the plan.
+            - *progress_queue*, if provided, is a thread-safe ``queue.Queue``.
 
         Returns:
-            A generator that yields zero or more ``PlanningProgress``
-            objects followed by exactly one ``str``.
-
+            A human-readable string summarising the plan.
+6.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 
         Raises:
             AgentGenerationError: If the LLM fails to produce valid output.
-            AssertionError: If the underlying stream does not end with a
-            ``FinalAnswerStep``.
+            AssertionError: If no ``FinalAnswerStep`` is found in the
+            underlying stream.
         """
-        _ = cost_budget  # reserved for future cost-aware content
-
-        paraphrase_memory = self._setup_phase_execution(
-            phase_type="paraphrase",
+        # setup paraphrase memory and python executor
+        self.paraphrase_memory, self.python_executor = self._setup_phase_execution(
+            phase="paraphrase",
+            query=query,
             prompt_template_key="paraphrase_prompt",
             template_vars={
                 "code_opening_tag": self.code_block_tags[0],
                 "code_closing_tag": self.code_block_tags[1],
                 "plan_opening_tag": self.plan_tags[0],
                 "plan_closing_tag": self.plan_tags[1],
-                "logical_plan": str(logical_plan),
                 "has_conversation": conversation is not None,
             },
-            task_step_class=PlannerTaskStep,
-            task_kwargs={"task": query, "datasets": datasets},
             conversation=conversation,
-            plan_type_for_history="natural-language-plan",
-            log_title="Plan Paraphrase",
+            plan=plan,
         )
 
-        yield PlanningProgress(
+        # push initial progress update before starting the paraphrasing phase
+        self._update_progress(
+            progress_queue,
             phase="paraphrase",
-            step=1,
-            total_steps=self.max_steps,
-            message="Summarizing the execution plan in natural language…",
+            message="Summarizing the execution plan in natural language...",
         )
 
-        nl_plan = None
-        for step in self._run_stream(phase="paraphrase", memory=paraphrase_memory):
-            if isinstance(step, ActionStep):
-                yield PlanningProgress(
-                    phase="paraphrase",
-                    step=step.step_number,
-                    total_steps=self.max_steps,
-                    message=f"Generating plan summary (step {step.step_number})…",
-                )
-            elif isinstance(step, FinalAnswerStep):
-                nl_plan = step.output
+        with self._progress_scope(progress_queue):
+            nl_plan = None
+            for step in self._run_stream(phase="paraphrase", memory=self.paraphrase_memory):
+                if isinstance(step, FinalAnswerStep):
+                    nl_plan = step.output
+                elif isinstance(step, ActionStep):
+                    self._update_progress(
+                        progress_queue,
+                        phase="paraphrase",
+                        step=step.step_number,
+                        total_steps=self.max_steps,
+                        message=f"Generating plan summary (step {step.step_number})...",
+                        code_action=step.code_action,
+                        observations=step.observations,
+                        step_cost_usd=self._get_step_cost_usd(step),
+                        error=str(step.error) if step.error else None,
+                    )
 
-        assert nl_plan is not None, "Paraphrase stream did not produce a FinalAnswerStep"
-        # Yield the NL plan as the terminal value
-        yield nl_plan
+            assert nl_plan is not None, "Paraphrase stream did not produce a FinalAnswerStep"
+
+        return nl_plan

@@ -3,7 +3,7 @@ import concurrent.futures
 import json
 import logging
 import os
-import queue as _queue_mod
+import queue
 import re
 import sys
 import tempfile
@@ -31,6 +31,7 @@ from app.database import (
     DatasetFile,
     Message,
     Notebook,
+    QueryEvent,
     QueryStats,
     Workspace,
     get_db,
@@ -44,7 +45,6 @@ from app.services.llm import get_user_llm_config
 from app.services.serializer import jsonb_serializer
 from carnot.data.dataset import Dataset as CarnotDataset
 from carnot.data.item import DataItem
-from carnot.execution.progress import ExecutionProgress, PlanningProgress
 from carnot.plan import PhysicalPlan
 from carnot.storage.backend import LocalStorageBackend, S3StorageBackend
 from carnot.storage.tiered import TieredStorageManager
@@ -183,7 +183,7 @@ class NotebookState:
         - ``notebook_id`` is a non-empty UUID string.
         - ``physical_plan`` is a ``PhysicalPlan`` with at least one node.
         - ``datasets_store`` keys are a superset of all
-          ``output_dataset_id`` values for executed nodes.
+          ``dataset_id`` values for executed nodes.
         - ``cell_statuses`` maps ``node_id`` → ``"pending"`` |
           ``"running"`` | ``"success"`` | ``"error"``.  This is
           application-level state, not part of the plan itself.
@@ -426,14 +426,18 @@ class QueryExecutionStreamer:
             # NOTE: removing b/c I believe this adds a duplicate user query message to the conversation
             # await save_message(conversation_id, "user", self.query)
 
-            await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': 'Starting query execution...', 'session_id': session_id})}\n\n")
-            await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': 'Loading datasets...'})}\n\n")
+            # Mark the conversation as having an active query so the
+            # poll-based catch-up (Phase 5) reports it as in-flight.
+            await _set_query_active(conversation_id, active=True)
+
+            await self.queue.put(f"data: {json.dumps({'type': 'step_detail', 'source': 'execution', 'message': 'Starting query execution...', 'session_id': session_id})}\n\n")
+            await self.queue.put(f"data: {json.dumps({'type': 'step_detail', 'source': 'execution', 'message': 'Loading datasets...'})}\n\n")
 
             datasets = await _load_carnot_datasets(self.dataset_ids)
             for dataset in datasets:
                 logger.info(f"Dataset: {dataset.name}, Annotation: {dataset.annotation}, Items: {[item.path for item in dataset.items]}")
 
-            await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': f'Loaded {len(datasets)} dataset(s)'})}\n\n")
+            await self.queue.put(f"data: {json.dumps({'type': 'step_detail', 'source': 'execution', 'message': f'Loaded {len(datasets)} dataset(s)'})}\n\n")
 
             all_files = [
                 S3Path(item.path) if item.path.startswith("s3://") else Path(item.path)
@@ -444,7 +448,7 @@ class QueryExecutionStreamer:
                 await self.queue.put(f"data: {json.dumps({'type': 'error', 'message': 'No files found in selected datasets'})}\n\n")
                 return
 
-            await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': f'Processing {len(all_files)} files...'})}\n\n")
+            await self.queue.put(f"data: {json.dumps({'type': 'step_detail', 'source': 'execution', 'message': f'Processing {len(all_files)} files...'})}\n\n")
 
             session_exists = session_id in active_sessions
             if session_exists and set(active_sessions[session_id]["dataset_ids"]) != set(self.dataset_ids):
@@ -453,7 +457,7 @@ class QueryExecutionStreamer:
             session_dir = Path(BASE_DIR, ".sessions", session_id) if IS_LOCAL_ENV else S3Path(BASE_DIR, ".sessions", session_id)
             file_service.create_dir(str(session_dir))
 
-            await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': 'Preparing data context...'})}\n\n")
+            await self.queue.put(f"data: {json.dumps({'type': 'step_detail', 'source': 'execution', 'message': 'Preparing data context...'})}\n\n")
 
             # TODO: remove this and place file check into Carnot context
             if not session_exists:
@@ -467,11 +471,11 @@ class QueryExecutionStreamer:
                     await self.queue.put(f"data: {json.dumps({'type': 'error', 'message': 'No text files found in selected datasets'})}\n\n")
                     return
 
-                await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': f'Processing {text_file_count} text files...'})}\n\n")
+                await self.queue.put(f"data: {json.dumps({'type': 'step_detail', 'source': 'execution', 'message': f'Processing {text_file_count} text files...'})}\n\n")
             else:
-                await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': 'Continuing conversation...'})}\n\n")
+                await self.queue.put(f"data: {json.dumps({'type': 'step_detail', 'source': 'execution', 'message': 'Continuing conversation...'})}\n\n")
 
-            await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': f'Executing query: {self.query}'})}\n\n")
+            await self.queue.put(f"data: {json.dumps({'type': 'step_detail', 'source': 'execution', 'message': f'Executing query: {self.query}'})}\n\n")
 
             # setup progress logging and clear old progress log if it exists
             fs = fsspec.filesystem(FILESYSTEM)
@@ -486,12 +490,25 @@ class QueryExecutionStreamer:
             
             # Load existing conversation history from database
             conversation = await load_conversation_from_db(self.user_id, self.session_id)
-            
+
+            # Load planning-phase stats so the execution-phase Execution
+            # instance can include them in the final ExecutionStats.
+            # Prefer the in-memory cache (set by PlanningStreamer); fall
+            # back to the DB in case the server restarted between plan
+            # and execute.
+            cached_planning_stats = None
+            session_data = active_sessions.get(session_id)
+            if session_data:
+                cached_planning_stats = session_data.get("planning_stats")
+            if cached_planning_stats is None:
+                cached_planning_stats = await _load_planning_stats_from_db(session_id)
+
             # create execution and execute plan
             exec_instance = carnot.Execution(
                 query=self.query,
                 datasets=datasets,
                 plan=self.plan,
+                planning_stats=cached_planning_stats,
                 conversation=conversation,
                 tools=[],
                 memory=None,
@@ -502,7 +519,7 @@ class QueryExecutionStreamer:
                 storage=_build_storage(),
             )
 
-            await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': 'Running Carnot query processor...'})}\n\n")
+            await self.queue.put(f"data: {json.dumps({'type': 'step_detail', 'source': 'execution', 'message': 'Running Carnot query processor...'})}\n\n")
 
             output_log = str(Path(session_dir, "output.txt") if IS_LOCAL_ENV else str(S3Path(session_dir, "output.txt")))
             if fs.exists(output_log):
@@ -528,31 +545,19 @@ class QueryExecutionStreamer:
                 "local_output_path": current_local_output_path,
             }
 
-            # Use run_stream() to get operator-level progress events.
+            # Use run() with a progress queue to get operator-level progress events.
             # The generator is synchronous; we drive it in a background
             # thread and ferry ExecutionProgress events through a
             # thread-safe queue so we can push them to the SSE stream.
-            exec_progress_queue: _queue_mod.Queue = _queue_mod.Queue()
+            exec_progress_queue: queue.Queue = queue.Queue()
 
             def run_query_with_capture():
                 local_output_path = None
                 try:
                     sys.stdout = stdout_capture
                     sys.stderr = stderr_capture
-                    gen = exec_instance.run_stream()
-                    items = None
-                    answer = None
-                    stats = None
-                    try:
-                        while True:
-                            event = next(gen)
-                            if isinstance(event, ExecutionProgress):
-                                exec_progress_queue.put(event.to_dict())
-                    except StopIteration as exc:
-                        result = exc.value
-                        if result is not None:
-                            items, answer, stats = result
-                    return items, answer, stats
+                    return exec_instance.run(progress_queue=exec_progress_queue)
+
                 finally:
                     sys.stdout = original_stdout
                     sys.stderr = original_stderr
@@ -574,44 +579,56 @@ class QueryExecutionStreamer:
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             future = executor.submit(run_query_with_capture)
 
+            # Accumulate execution step dicts for persistence (§ 7 of design doc)
+            accumulated_exec_steps = []
+
             # Poll for execution progress events while the thread is working
             while not future.done():
                 try:
                     progress_dict = exec_progress_queue.get(timeout=0.25)
-                    event_payload = {
-                        'type': 'execution_status',
-                        'message': progress_dict.get('message', ''),
-                        'operator_name': progress_dict.get('operator_name', ''),
-                        'operator_index': progress_dict.get('operator_index'),
-                        'total_operators': progress_dict.get('total_operators'),
-                    }
-                    if progress_dict.get('operator_stats') is not None:
-                        event_payload['operator_stats'] = progress_dict['operator_stats']
-                    await self.queue.put(f"data: {json.dumps(event_payload)}\n\n")
-                except _queue_mod.Empty:
+                    step_dict = {'type': 'step_detail', 'source': 'execution', **progress_dict}
+                    accumulated_exec_steps.append(step_dict)
+                    await self.queue.put(f"data: {json.dumps(step_dict)}\n\n")
+                    await persist_query_event(
+                        conversation_id, session_id,
+                        event_type="step_detail", source="execution",
+                        payload=step_dict,
+                        step_cost_usd=progress_dict.get("step_cost_usd"),
+                    )
+                except queue.Empty:
                     await asyncio.sleep(0.1)
 
             # Drain any remaining progress events
             while not exec_progress_queue.empty():
                 try:
                     progress_dict = exec_progress_queue.get_nowait()
-                    event_payload = {
-                        'type': 'execution_status',
-                        'message': progress_dict.get('message', ''),
-                        'operator_name': progress_dict.get('operator_name', ''),
-                        'operator_index': progress_dict.get('operator_index'),
-                        'total_operators': progress_dict.get('total_operators'),
-                    }
-                    if progress_dict.get('operator_stats') is not None:
-                        event_payload['operator_stats'] = progress_dict['operator_stats']
-                    await self.queue.put(f"data: {json.dumps(event_payload)}\n\n")
-                except _queue_mod.Empty:
+                    step_dict = {'type': 'step_detail', 'source': 'execution', **progress_dict}
+                    accumulated_exec_steps.append(step_dict)
+                    await self.queue.put(f"data: {json.dumps(step_dict)}\n\n")
+                    await persist_query_event(
+                        conversation_id, session_id,
+                        event_type="step_detail", source="execution",
+                        payload=step_dict,
+                        step_cost_usd=progress_dict.get("step_cost_usd"),
+                    )
+                except queue.Empty:
                     break
 
             items, answer, execution_stats = future.result()
             executor.shutdown(wait=False)
 
-            await self.queue.put(f"data: {json.dumps({'type': 'execution_status', 'message': 'Processing results...'})}\n\n")
+            # --- persist execution step_group to DB ---------------------------
+            if accumulated_exec_steps:
+                try:
+                    await save_message(
+                        conversation_id, "agent",
+                        json.dumps(accumulated_exec_steps),
+                        message_type="step_group",
+                    )
+                except Exception:
+                    logger.exception("Failed to save execution step_group")
+
+            await self.queue.put(f"data: {json.dumps({'type': 'step_detail', 'source': 'execution', 'message': 'Processing results...'})}\n\n")
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             csv_filename = f"query_results_{timestamp}.csv"
@@ -670,6 +687,12 @@ class QueryExecutionStreamer:
                     await self.queue.put(
                         f"data: {json.dumps({'type': 'execution_stats', **stats_payload})}\n\n"
                     )
+                    await persist_query_event(
+                        conversation_id, session_id,
+                        event_type="execution_stats", source="execution",
+                        payload={'type': 'execution_stats', **stats_payload},
+                        step_cost_usd=stats_payload.get("total_cost_usd"),
+                    )
                 except Exception:
                     logger.exception("Failed to serialize execution stats")
 
@@ -686,7 +709,14 @@ class QueryExecutionStreamer:
                 except Exception:
                     logger.exception("Failed to save execution stats to DB")
 
-            await self.queue.put(f"data: {json.dumps({'type': 'done', 'message': 'Query execution complete'})}\n\n")
+            done_payload = {'type': 'done', 'message': 'Query execution complete'}
+            await self.queue.put(f"data: {json.dumps(done_payload)}\n\n")
+            if conversation_id is not None:
+                await persist_query_event(
+                    conversation_id, session_id,
+                    event_type="done", source="execution",
+                    payload=done_payload,
+                )
 
         except Exception as exc:
             logger.exception("Query execution failed")
@@ -696,8 +726,19 @@ class QueryExecutionStreamer:
                     await save_message(conversation_id, "agent", error_msg, "error")
                 except Exception:
                     logger.exception("Failed to save error message")
-            await self.queue.put(f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n")
+            error_payload = {'type': 'error', 'message': error_msg}
+            await self.queue.put(f"data: {json.dumps(error_payload)}\n\n")
+            if conversation_id is not None:
+                await persist_query_event(
+                    conversation_id, session_id,
+                    event_type="error", source="execution",
+                    payload=error_payload,
+                )
         finally:
+            # Clear the active flag so poll-based catch-up sees the
+            # query as complete regardless of success or failure.
+            if conversation_id is not None:
+                await _set_query_active(conversation_id, active=False)
             # Signal the consumer in stream_response_iterator to stop iterating
             await self.queue.put(None)
 
@@ -787,6 +828,11 @@ class PlanningStreamer:
             conversation_id = await get_or_create_conversation(
                 self.user_id, self.session_id, self.query, self.dataset_ids
             )
+
+            # Mark conversation as having an active query so the poll-based
+            # catch-up (Phase 5) knows the stream is still running.
+            await _set_query_active(conversation_id, active=True)
+
             conversation = await load_conversation_from_db(self.user_id, self.session_id)
             await save_message(conversation_id, "user", self.query, cost_budget=self.cost_budget)
 
@@ -795,7 +841,7 @@ class PlanningStreamer:
             await update_conversation_and_workspace_title(conversation_id, title)
 
             await self.queue.put(
-                f"data: {json.dumps({'type': 'planning_status', 'message': 'Starting plan generation…', 'session_id': self.session_id})}\n\n"
+                f"data: {json.dumps({'type': 'step_detail', 'source': 'planning', 'message': 'Starting plan generation…', 'phase': 'logical_plan', 'session_id': self.session_id})}\n\n"
             )
 
             # --- build Execution and run plan_stream in a thread ---------------
@@ -815,51 +861,72 @@ class PlanningStreamer:
             # background thread so the event loop stays free for heartbeats.
             # We use a thread-safe queue so progress events can be pushed to
             # the SSE stream in real time while the generator runs.
-            progress_sync_queue: _queue_mod.Queue = _queue_mod.Queue()
+            plan_progress_queue: queue.Queue = queue.Queue()
 
-            def _run_plan_stream_with_progress():
-                """Drive the plan_stream generator, posting progress to a sync queue."""
-                nl_plan = None
-                logical_plan = None
-                gen = exec_instance.plan_stream()
-                try:
-                    while True:
-                        event = next(gen)
-                        if isinstance(event, PlanningProgress):
-                            progress_sync_queue.put(event.to_dict())
-                except StopIteration as exc:
-                    result = exc.value
-                    if result is not None:
-                        nl_plan, logical_plan = result
+            def _run_plan_with_progress():
+                """Run plan, which pushes all progress to the sync queue."""
+                nl_plan, logical_plan = exec_instance.plan(
+                    progress_queue=plan_progress_queue,
+                )
                 # Retrieve planning stats set by plan_stream()
                 planning_stats = getattr(exec_instance, "_planning_stats", None)
                 return nl_plan, logical_plan, planning_stats
 
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            future = executor.submit(_run_plan_stream_with_progress)
+            future = executor.submit(_run_plan_with_progress)
+
+            # accumulate step dicts for persistence
+            accumulated_steps = []
 
             # Poll for progress events while the thread is working
             while not future.done():
                 try:
-                    progress_dict = progress_sync_queue.get(timeout=0.25)
+                    progress_dict = plan_progress_queue.get(timeout=0.25)
+                    step_dict = {'type': 'step_detail', 'source': 'planning', **progress_dict}
+                    accumulated_steps.append(step_dict)
                     await self.queue.put(
-                        f"data: {json.dumps({'type': 'planning_status', 'message': progress_dict.get('message', ''), 'phase': progress_dict.get('phase', ''), 'step': progress_dict.get('step'), 'total_steps': progress_dict.get('total_steps'), 'cumulative_cost_usd': progress_dict.get('cumulative_cost_usd')})}\n\n"
+                        f"data: {json.dumps(step_dict)}\n\n"
                     )
-                except _queue_mod.Empty:
+                    await persist_query_event(
+                        conversation_id, self.session_id,
+                        event_type="step_detail", source="planning",
+                        payload=step_dict,
+                        step_cost_usd=progress_dict.get("step_cost_usd"),
+                    )
+                except queue.Empty:
                     await asyncio.sleep(0.1)
 
             # Drain any remaining progress events
-            while not progress_sync_queue.empty():
+            while not plan_progress_queue.empty():
                 try:
-                    progress_dict = progress_sync_queue.get_nowait()
+                    progress_dict = plan_progress_queue.get_nowait()
+                    step_dict = {'type': 'step_detail', 'source': 'planning', **progress_dict}
+                    accumulated_steps.append(step_dict)
                     await self.queue.put(
-                        f"data: {json.dumps({'type': 'planning_status', 'message': progress_dict.get('message', ''), 'phase': progress_dict.get('phase', ''), 'step': progress_dict.get('step'), 'total_steps': progress_dict.get('total_steps'), 'cumulative_cost_usd': progress_dict.get('cumulative_cost_usd')})}\n\n"
+                        f"data: {json.dumps(step_dict)}\n\n"
                     )
-                except _queue_mod.Empty:
+                    await persist_query_event(
+                        conversation_id, self.session_id,
+                        event_type="step_detail", source="planning",
+                        payload=step_dict,
+                        step_cost_usd=progress_dict.get("step_cost_usd"),
+                    )
+                except queue.Empty:
                     break
 
             nl_plan, logical_plan, planning_stats = future.result()
             executor.shutdown(wait=False)
+
+            # --- persist planning step_group to DB ----------------------------
+            if accumulated_steps:
+                try:
+                    await save_message(
+                        conversation_id, "agent",
+                        json.dumps(accumulated_steps),
+                        message_type="step_group",
+                    )
+                except Exception:
+                    logger.exception("Failed to save planning step_group")
 
             # --- save plan messages to DB first (need message_id for stats) ----
             nl_plan_message_id = None
@@ -874,6 +941,19 @@ class PlanningStreamer:
                     conversation_id, "agent", plan_json,
                     message_type="logical-plan",
                 )
+
+            # --- cache planning_stats for the execution phase ----------------
+            # QueryExecutionStreamer runs on a separate Execution instance;
+            # stash the PhaseStats object so it can be threaded through.
+            if planning_stats is not None:
+                session_data = active_sessions.get(self.session_id)
+                if session_data is not None:
+                    session_data["planning_stats"] = planning_stats
+                else:
+                    active_sessions[self.session_id] = {
+                        "planning_stats": planning_stats,
+                        "last_access": datetime.now(),
+                    }
 
             # --- persist planning stats to DB ---------------------------------
             planning_stats_dict = None
@@ -906,16 +986,34 @@ class PlanningStreamer:
             # --- send planning_stats SSE event ---------------------------------
             if planning_stats_dict is not None:
                 try:
+                    planning_stats_event = {'type': 'planning_stats', **planning_stats_dict}
                     await self.queue.put(
-                        f"data: {json.dumps({'type': 'planning_stats', **planning_stats_dict})}\n\n"
+                        f"data: {json.dumps(planning_stats_event)}\n\n"
+                    )
+                    await persist_query_event(
+                        conversation_id, self.session_id,
+                        event_type="planning_stats", source="planning",
+                        payload=planning_stats_event,
+                        step_cost_usd=planning_stats_dict.get("total_cost_usd"),
                     )
                 except Exception:
                     logger.exception("Failed to emit planning_stats SSE event")
 
             # --- send final plan_complete event --------------------------------
+            plan_complete_payload = {'type': 'plan_complete', 'natural_language_plan': nl_plan, 'plan': logical_plan, 'session_id': self.session_id}
             await self.queue.put(
-                f"data: {json.dumps({'type': 'plan_complete', 'natural_language_plan': nl_plan, 'plan': logical_plan, 'session_id': self.session_id})}\n\n"
+                f"data: {json.dumps(plan_complete_payload)}\n\n"
             )
+            if conversation_id is not None:
+                await persist_query_event(
+                    conversation_id, self.session_id,
+                    event_type="plan_complete", source="planning",
+                    payload=plan_complete_payload,
+                )
+                # Planning stream is done; clear the active flag.  If the
+                # user approves the plan, QueryExecutionStreamer will re-set
+                # it to True when execution begins.
+                await _set_query_active(conversation_id, active=False)
 
         except Exception as exc:
             logger.exception("Plan generation failed")
@@ -925,9 +1023,19 @@ class PlanningStreamer:
                     await save_message(conversation_id, "agent", error_msg, "error")
                 except Exception:
                     logger.exception("Failed to save error message")
+            error_payload = {'type': 'error', 'message': error_msg}
             await self.queue.put(
-                f"data: {json.dumps({'type': 'error', 'message': error_msg})}\n\n"
+                f"data: {json.dumps(error_payload)}\n\n"
             )
+            if conversation_id is not None:
+                await persist_query_event(
+                    conversation_id, self.session_id,
+                    event_type="error", source="planning",
+                    payload=error_payload,
+                )
+                # Planning failed — no execution phase will follow, so clear
+                # the active flag so poll-based catch-up sees it as complete.
+                await _set_query_active(conversation_id, active=False)
         finally:
             await self.queue.put(None)
 
@@ -1095,6 +1203,51 @@ async def update_conversation_and_workspace_title(
         await db.commit()
 
 
+async def _load_planning_stats_from_db(session_id: str):
+    """Load planning ``PhaseStats`` from the most recent plan row for *session_id*.
+
+    Falls back to the DB when the in-memory ``active_sessions`` cache has
+    been evicted (e.g. after a server restart between plan and execute).
+
+    Requires:
+        - ``session_id`` is a non-empty string.
+
+    Returns:
+        A ``PhaseStats`` instance reconstructed from the persisted
+        ``stats_json``, or ``None`` if no plan row exists.
+
+    Raises:
+        None.  Database errors are logged and ``None`` is returned.
+    """
+    from carnot.core.models import OperatorStats, PhaseStats
+
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(QueryStats)
+                .where(QueryStats.session_id == session_id)
+                .where(QueryStats.step_type == "plan")
+                .order_by(QueryStats.id.desc())
+                .limit(1)
+            )
+            row = result.scalar_one_or_none()
+            if row is None or row.stats_json is None:
+                return None
+
+            planning_dict = row.stats_json.get("planning", {})
+            # Reconstruct PhaseStats from the persisted summary dict.
+            op_stats_dicts = planning_dict.get("operator_stats", [])
+            op_stats = [OperatorStats.model_validate(d) for d in op_stats_dicts]
+            return PhaseStats(
+                phase="planning",
+                wall_clock_secs=planning_dict.get("wall_clock_secs", 0.0),
+                operator_stats=op_stats,
+            )
+    except Exception:
+        logger.exception("Failed to load planning stats from DB for session %s", session_id)
+        return None
+
+
 async def save_step_stats(
     conversation_id: int,
     session_id: str,
@@ -1161,7 +1314,82 @@ async def save_step_stats(
         await db.commit()
         await db.refresh(row)
         return row.id
-        return row.id
+
+
+async def persist_query_event(
+    conversation_id: int,
+    session_id: str,
+    event_type: str,
+    payload: dict,
+    source: str | None = None,
+    step_cost_usd: float | None = None,
+) -> None:
+    """Append a single SSE event to the ``query_events`` table.
+
+    This is called from both ``PlanningStreamer`` and
+    ``QueryExecutionStreamer`` as events are emitted so that workspace
+    cost can be reconstructed after a page navigation.
+
+    Requires:
+        - ``conversation_id`` references a valid conversation.
+        - ``event_type`` is a non-empty string (e.g. ``"step_detail"``).
+        - ``payload`` is a JSON-serializable dict.
+
+    Returns:
+        None.
+
+    Raises:
+        None.  Database errors are logged but swallowed so they never
+        break the SSE stream.
+    """
+    try:
+        async with AsyncSessionLocal() as db:
+            row = QueryEvent(
+                conversation_id=conversation_id,
+                session_id=session_id,
+                event_type=event_type,
+                source=source,
+                payload=payload,
+                step_cost_usd=step_cost_usd,
+            )
+            db.add(row)
+            await db.commit()
+    except Exception:
+        logger.exception(
+            "Failed to persist query event (type=%s, conv=%s)",
+            event_type,
+            conversation_id,
+        )
+
+
+async def _set_query_active(conversation_id: int, *, active: bool) -> None:
+    """Toggle the ``is_query_active`` flag on a conversation.
+
+    Called at the start of ``PlanningStreamer`` (active=True) and in
+    both streamers' terminal paths (active=False) so the poll-based
+    catch-up endpoint can report whether a query is still running.
+
+    Requires:
+        - ``conversation_id`` references a valid conversation.
+
+    Returns:
+        None.
+
+    Raises:
+        None.  Database errors are logged but swallowed.
+    """
+    try:
+        async with AsyncSessionLocal() as db:
+            conv = await db.get(Conversation, conversation_id)
+            if conv:
+                conv.is_query_active = active
+                await db.commit()
+    except Exception:
+        logger.exception(
+            "Failed to set is_query_active=%s for conversation %s",
+            active,
+            conversation_id,
+        )
 
 
 async def load_conversation_from_db(
@@ -1234,7 +1462,7 @@ async def plan_query(
     """Generate a logical execution plan with streaming progress updates.
 
     Returns an SSE stream that emits:
-    - ``planning_status`` events as the planner/data-discovery agent work.
+    - ``step_detail`` events as the planner/data-discovery agent work.
     - A single ``plan_complete`` event with the final NL plan and logical plan.
     - An ``error`` event if anything goes wrong.
 
@@ -1312,6 +1540,63 @@ async def execute_query(
         streamer.stream_response_iterator(),
         media_type="text/event-stream"
     )
+
+
+@router.get("/events/{conversation_id}")
+async def get_query_events(
+    conversation_id: int,
+    since_id: int = 0,
+    limit: int = 200,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return query events persisted since ``since_id``.
+
+    Used by the frontend's poll-based catch-up hook to reconstruct
+    streaming state after navigating away and back to a workspace
+    whose query is still in-flight.
+
+    Requires:
+        - ``conversation_id`` references a conversation owned by the
+          authenticated user.
+        - ``since_id`` >= 0.
+
+    Returns:
+        ``{"events": [...], "is_complete": bool}`` where ``is_complete``
+        is ``True`` if the query has finished (``is_query_active`` is
+        ``False``).
+
+    Raises:
+        HTTPException(404) if the conversation does not exist or is not
+        owned by the authenticated user.
+    """
+    conv = await db.get(Conversation, conversation_id)
+    if not conv or conv.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+    result = await db.execute(
+        select(QueryEvent)
+        .where(QueryEvent.conversation_id == conversation_id)
+        .where(QueryEvent.id > since_id)
+        .order_by(QueryEvent.id)
+        .limit(limit)
+    )
+    rows = result.scalars().all()
+
+    events = [
+        {
+            "id": row.id,
+            "event_type": row.event_type,
+            "source": row.source,
+            "payload": row.payload,
+            "step_cost_usd": row.step_cost_usd,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+        for row in rows
+    ]
+
+    return {"events": events, "is_complete": not conv.is_query_active}
+
 
 @router.get("/progress/{session_id}")
 async def get_progress(session_id: str, since_timestamp: str | None = None):
@@ -1783,7 +2068,7 @@ async def execute_cell(
                 nb.cell_outputs.pop(inv_id, None)
                 # Evict cached output
                 inv_node = nb.physical_plan.get_node(inv_id)
-                nb.datasets_store.pop(inv_node.output_dataset_id, None)
+                nb.datasets_store.pop(inv_node.dataset_id, None)
 
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -1814,7 +2099,7 @@ async def execute_cell(
                 updated_store, op_stats = exec_instance.run_node(
                     node_id, nb.datasets_store
                 )
-                output_dataset = updated_store.get(node.output_dataset_id)
+                output_dataset = updated_store.get(node.dataset_id)
                 preview = (
                     exec_instance._build_output_preview(output_dataset)
                     if output_dataset
@@ -2037,9 +2322,9 @@ async def add_cell(
         counter += 1
     new_node_id = f"node-{counter}"
 
-    # Determine output_dataset_id
+    # Determine dataset_id
     op_type = request.operator_type or ""
-    output_dataset_id = f"{op_type or 'Custom'}Operation_{new_node_id}"
+    dataset_id = f"{op_type or 'Custom'}Operation_{new_node_id}"
 
     # Determine parent for code generation
     after_node_id = request.after_cell_id
@@ -2057,7 +2342,7 @@ async def add_cell(
         description=f"New {request.operator_type or 'custom'} cell",
         params={},
         parent_ids=[after_node_id] if after_node_id else [],
-        output_dataset_id=output_dataset_id,
+        dataset_id=dataset_id,
     )
 
     if after_node_id:
@@ -2072,7 +2357,7 @@ async def add_cell(
         nb.cell_statuses[inv_id] = "pending"
         nb.cell_outputs.pop(inv_id, None)
         inv_node = nb.physical_plan.get_node(inv_id)
-        nb.datasets_store.pop(inv_node.output_dataset_id, None)
+        nb.datasets_store.pop(inv_node.dataset_id, None)
 
     cells = nb.get_cells()
     new_cell = next((c for c in cells if c["cell_id"] == new_node_id), None)
@@ -2136,13 +2421,13 @@ async def delete_cell(
     # Clean up statuses and cached datasets
     nb.cell_statuses.pop(cell_id, None)
     nb.cell_outputs.pop(cell_id, None)
-    nb.datasets_store.pop(node.output_dataset_id, None)
+    nb.datasets_store.pop(node.dataset_id, None)
     for inv_id in invalidated:
         nb.cell_statuses[inv_id] = "pending"
         nb.cell_outputs.pop(inv_id, None)
         try:
             inv_node = nb.physical_plan.get_node(inv_id)
-            nb.datasets_store.pop(inv_node.output_dataset_id, None)
+            nb.datasets_store.pop(inv_node.dataset_id, None)
         except KeyError:
             pass
 
@@ -2254,7 +2539,7 @@ async def move_cell(
         nb.cell_outputs.pop(inv_id, None)
         try:
             inv_node = nb.physical_plan.get_node(inv_id)
-            nb.datasets_store.pop(inv_node.output_dataset_id, None)
+            nb.datasets_store.pop(inv_node.dataset_id, None)
         except KeyError:
             pass
 

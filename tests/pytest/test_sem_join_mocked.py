@@ -78,7 +78,7 @@ class TestSemJoinMocked:
             task="The animal makes the sound",
             model_id="mock-model",
             llm_config=mock_llm_config,
-            output_dataset_id="out",
+            dataset_id="out",
             max_workers=1,
         )
         result, _stats = op("left", "right", {"left": left_ds, "right": right_ds})
@@ -99,7 +99,7 @@ class TestSemJoinMocked:
             task="always",
             model_id="mock-model",
             llm_config=mock_llm_config,
-            output_dataset_id="out",
+            dataset_id="out",
             max_workers=1,
         )
         result, _stats = op("left", "right", {"left": left_ds, "right": right_ds})
@@ -116,7 +116,7 @@ class TestSemJoinMocked:
             task="never",
             model_id="mock-model",
             llm_config=mock_llm_config,
-            output_dataset_id="out",
+            dataset_id="out",
             max_workers=1,
         )
         result, _stats = op("left", "right", {"left": left_ds, "right": right_ds})
@@ -133,7 +133,7 @@ class TestSemJoinMocked:
             task="join",
             model_id="mock-model",
             llm_config=mock_llm_config,
-            output_dataset_id="out",
+            dataset_id="out",
             max_workers=1,
         )
         result, _stats = op("left", "right", {"left": left_ds, "right": right_ds})
@@ -154,7 +154,7 @@ class TestSemJoinMocked:
             task="join",
             model_id="mock-model",
             llm_config=mock_llm_config,
-            output_dataset_id="out",
+            dataset_id="out",
             max_workers=1,
         )
         result, _stats = op("left", "right", {"left": left_ds, "right": right_ds})
@@ -173,7 +173,7 @@ class TestSemJoinMocked:
             task="join",
             model_id="mock-model",
             llm_config=mock_llm_config,
-            output_dataset_id="out",
+            dataset_id="out",
             max_workers=1,
         )
         result, _stats = op("left", "right", {"left": left_ds, "right": right_ds})
@@ -193,7 +193,7 @@ class TestSemJoinMocked:
             task="join",
             model_id="mock-model",
             llm_config=mock_llm_config,
-            output_dataset_id="out",
+            dataset_id="out",
             max_workers=1,
         )
         op("left", "right", {"left": left_ds, "right": right_ds})

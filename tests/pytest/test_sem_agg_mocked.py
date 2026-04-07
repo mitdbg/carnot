@@ -66,7 +66,7 @@ class TestSemAggMocked:
         op = SemAggOperator(
             task="The largest animal",
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -90,7 +90,7 @@ class TestSemAggMocked:
         op = SemAggOperator(
             task="extremes",
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -113,7 +113,7 @@ class TestSemAggMocked:
         op = SemAggOperator(
             task="extremes",
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -133,7 +133,7 @@ class TestSemAggMocked:
         op = SemAggOperator(
             task="agg",
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -153,7 +153,7 @@ class TestSemAggMocked:
         op = SemAggOperator(
             task="agg",
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,

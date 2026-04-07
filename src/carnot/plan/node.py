@@ -22,15 +22,15 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 OPERATOR_DISPLAY_NAMES: dict[str, str] = {
-    "SemanticFilter": "Semantic Filter",
-    "SemanticMap": "Semantic Map",
-    "SemanticFlatMap": "Semantic Flat Map",
-    "SemanticGroupBy": "Semantic Group By",
-    "SemanticJoin": "Semantic Join",
-    "SemanticTopK": "Semantic Top-K",
-    "SemanticAgg": "Semantic Aggregation",
+    "Filter": "Semantic Filter",
+    "Map": "Semantic Map",
+    "FlatMap": "Semantic Flat Map",
+    "GroupBy": "Semantic Group By",
+    "Join": "Semantic Join",
+    "TopK": "Semantic Top-K",
+    "Aggregate": "Semantic Aggregation",
     "Code": "Code",
-    "Reasoning": "Reasoning",
+    "Reason": "Reasoning",
     "Limit": "Limit",
 }
 
@@ -57,15 +57,15 @@ class PlanNode:
         its corresponding operator, generate its display code, and
         serialise itself to a cell descriptor.
     """
-    def __init__(self, node_id: str, node_type: str, operator_type: str | None, name: str, description: str, params: dict | None = None, parent_ids: list[str] | None = None, output_dataset_id: str = ""):
+    def __init__(self, node_id: str, node_type: str, operator_type: str | None, name: str, description: str, params: dict | None = None, parent_ids: list[str] | None = None, dataset_id: str = ""):
          self.node_id = node_id
          self.node_type = node_type          # "dataset" | "operator" | "reasoning"
-         self.operator_type = operator_type  # "SemanticFilter", "Code", etc.; None for datasets
+         self.operator_type = operator_type  # "Filter", "Code", etc.; None for datasets
          self.name = name                    # Human-readable display name
          self.description = description
          self.params = params or {}
          self.parent_ids = parent_ids or []
-         self.output_dataset_id = output_dataset_id
+         self.dataset_id = dataset_id
 
     # ------------------------------------------------------------------
     # Display helpers
@@ -133,56 +133,59 @@ class PlanNode:
 
         op = self.operator_type
         params = self.params
-        out = self.output_dataset_id
+        out = self.dataset_id
 
         if op == "Code":
             return CodeOperator(
-                task=params["task"], output_dataset_id=out,
+                task=params["task"], dataset_id=out,
                 model_id="openai/gpt-5-mini", llm_config=llm_config,
             )
 
         if op == "Limit":
-            return LimitOperator(n=params["n"], output_dataset_id=out)
+            return LimitOperator(n=params["limit"], dataset_id=out)
 
-        if op == "SemanticAgg":
+        if op == "Aggregate":
+            agg_fields = params["agg_fields"]
+            field_names = [f["name"] for f in agg_fields]
+            task = f"Compute the following aggregation fields: {field_names}"
             return SemAggOperator(
-                task=params["task"], agg_fields=params["agg_fields"],
-                output_dataset_id=out, model_id="openai/gpt-5-mini",
-                llm_config=llm_config, max_workers=4,
+                task=task, agg_fields=agg_fields,
+                dataset_id=out, model_id="openai/gpt-5-mini",
+                llm_config=llm_config, max_workers=64,
             )
 
-        if op == "SemanticFilter":
+        if op == "Filter":
             return SemFilterOperator(
-                task=params["condition"], output_dataset_id=out,
+                task=params["filter"], dataset_id=out,
                 model_id="openai/gpt-5-mini", llm_config=llm_config,
-                max_workers=4,
+                max_workers=64,
             )
 
-        if op == "SemanticMap":
-            output_fields = [{
-                "name": params["field"], "type": params["type"],
-                "description": params["field_desc"],
-            }]
+        if op == "Map":
+            output_fields = [
+                {"name": f["field"], "type": f["type"], "description": f["description"]}
+                for f in params["fields"]
+            ]
             return SemMapOperator(
-                task="Execute the map operation to compute the following output field.",
-                output_fields=output_fields, output_dataset_id=out,
+                task="Execute the map operation to compute the following output field(s).",
+                output_fields=output_fields, dataset_id=out,
                 model_id="openai/gpt-5-mini", llm_config=llm_config,
-                max_workers=4,
+                max_workers=64,
             )
 
-        if op == "SemanticFlatMap":
-            output_fields = [{
-                "name": params["field"], "type": params["type"],
-                "description": params["field_desc"],
-            }]
+        if op == "FlatMap":
+            output_fields = [
+                {"name": f["field"], "type": f["type"], "description": f["description"]}
+                for f in params["fields"]
+            ]
             return SemFlatMapOperator(
-                task="Execute the flat map operation to compute the following output field.",
-                output_fields=output_fields, output_dataset_id=out,
+                task="Execute the flat map operation to compute the following output field(s).",
+                output_fields=output_fields, dataset_id=out,
                 model_id="openai/gpt-5-mini", llm_config=llm_config,
-                max_workers=4,
+                max_workers=64,
             )
 
-        if op == "SemanticGroupBy":
+        if op == "GroupBy":
             gby_field_names = [f["name"] for f in params["gby_fields"]]
             agg_field_names = [f["name"] for f in params["agg_fields"]]
             agg_funcs = [f["func"] for f in params["agg_fields"]]
@@ -193,31 +196,30 @@ class PlanNode:
             )
             return SemGroupByOperator(
                 task=task, group_by_fields=params["gby_fields"],
-                agg_fields=params["agg_fields"], output_dataset_id=out,
+                agg_fields=params["agg_fields"], dataset_id=out,
                 model_id="openai/gpt-5-mini", llm_config=llm_config,
-                max_workers=4,
+                max_workers=64,
             )
 
-        if op == "SemanticJoin":
+        if op == "Join":
             return SemJoinOperator(
-                task=params["condition"], output_dataset_id=out,
+                task=params["condition"], dataset_id=out,
                 model_id="openai/gpt-5-mini", llm_config=llm_config,
-                max_workers=4,
+                max_workers=64,
             )
 
-        if op == "SemanticTopK":
+        if op == "TopK":
             return SemTopKOperator(
-                task=params["search_str"], k=params["k"], output_dataset_id=out,
+                task=params["task"], k=params["k"], dataset_id=out,
                 model_id="openai/text-embedding-3-small",
-                llm_config=llm_config, max_workers=4,
+                llm_config=llm_config, max_workers=64,
                 index_name=params["index_name"], catalog=index_catalog,
             )
 
-        if op == "Reasoning" or self.node_type == "reasoning":
-            from carnot.operators.reasoning import ReasoningOperator
+        if op == "Reason" or self.node_type == "reasoning":
             return ReasoningOperator(
                 task=params.get("task", self.description),
-                output_dataset_id=out,
+                dataset_id=out,
                 model_id="openai/gpt-5-mini", llm_config=llm_config,
             )
 
@@ -237,7 +239,7 @@ class PlanNode:
             A dict with keys: ``node_id``, ``node_type``,
             ``operator_name``, ``operator_type``, ``description``,
             ``code``, ``original_code``, ``params``,
-            ``parent_dataset_ids``, ``output_dataset_id``.
+            ``parent_dataset_ids``, ``dataset_id``.
 
         Raises:
             None.
@@ -253,7 +255,7 @@ class PlanNode:
             "original_code": code,
             "params": self.params,
             "parent_dataset_ids": self.parent_ids,
-            "output_dataset_id": self.output_dataset_id,
+            "dataset_id": self.dataset_id,
         }
 
     # ------------------------------------------------------------------
@@ -294,7 +296,7 @@ class PlanNode:
             )
 
         op = self.operator_type or ""
-        out = self.output_dataset_id
+        out = self.dataset_id
         p = self.params
         parent_ids = self.parent_ids
         display = self.display_name()
@@ -311,39 +313,35 @@ class PlanNode:
                 f"n={p.get('n', '?')})"
             )
 
-        elif op == "SemanticFilter":
+        elif op == "Filter":
             parent = parent_ids[0] if parent_ids else "?"
-            lines.append(f"# Condition: {p.get('condition', '')}")
+            lines.append(f"# Condition: {p.get('filter', '')}")
             lines.append(f"datasets['{out}'] = sem_filter(")
             lines.append(f"    dataset=datasets['{parent}'],")
-            lines.append(f"    condition=\"{p.get('condition', '')}\"")
+            lines.append(f"    condition=\"{p.get('filter', '')}\"")
             lines.append(")")
 
-        elif op == "SemanticMap":
+        elif op == "Map":
             parent = parent_ids[0] if parent_ids else "?"
-            lines.append(
-                f"# Map field: {p.get('field', '')} ({p.get('type', '')})"
-            )
-            lines.append(f"# Description: {p.get('field_desc', '')}")
+            fields = p.get('fields', [])
+            field_names = [f.get('field', '') for f in fields]
+            lines.append(f"# Map fields: {field_names}")
             lines.append(f"datasets['{out}'] = sem_map(")
             lines.append(f"    dataset=datasets['{parent}'],")
-            lines.append(f"    field='{p.get('field', '')}',")
-            lines.append(f"    type='{p.get('type', '')}',")
-            lines.append(f"    description=\"{p.get('field_desc', '')}\"")
+            lines.append(f"    fields={fields}")
             lines.append(")")
 
-        elif op == "SemanticFlatMap":
+        elif op == "FlatMap":
             parent = parent_ids[0] if parent_ids else "?"
-            lines.append(
-                f"# Flat map field: {p.get('field', '')} ({p.get('type', '')})"
-            )
+            fields = p.get('fields', [])
+            field_names = [f.get('field', '') for f in fields]
+            lines.append(f"# Flat map fields: {field_names}")
             lines.append(f"datasets['{out}'] = sem_flat_map(")
             lines.append(f"    dataset=datasets['{parent}'],")
-            lines.append(f"    field='{p.get('field', '')}',")
-            lines.append(f"    type='{p.get('type', '')}'")
+            lines.append(f"    fields={fields}")
             lines.append(")")
 
-        elif op == "SemanticGroupBy":
+        elif op == "GroupBy":
             parent = parent_ids[0] if parent_ids else "?"
             gby = [f["name"] for f in p.get("gby_fields", [])]
             agg = [
@@ -356,7 +354,7 @@ class PlanNode:
             lines.append(f"    aggregations={agg}")
             lines.append(")")
 
-        elif op == "SemanticJoin":
+        elif op == "Join":
             left = parent_ids[0] if len(parent_ids) > 0 else "?"
             right = parent_ids[1] if len(parent_ids) > 1 else "?"
             lines.append(f"# Condition: {p.get('condition', '')}")
@@ -366,21 +364,22 @@ class PlanNode:
             lines.append(f"    condition=\"{p.get('condition', '')}\"")
             lines.append(")")
 
-        elif op == "SemanticTopK":
+        elif op == "TopK":
             parent = parent_ids[0] if parent_ids else "?"
-            lines.append(f"# Search: {p.get('search_str', '')}")
+            lines.append(f"# Search: {p.get('task', '')}")
             lines.append(f"datasets['{out}'] = sem_topk(")
             lines.append(f"    dataset=datasets['{parent}'],")
-            lines.append(f"    search=\"{p.get('search_str', '')}\",")
+            lines.append(f"    search=\"{p.get('task', '')}\",")
             lines.append(f"    k={p.get('k', '?')}")
             lines.append(")")
 
-        elif op == "SemanticAgg":
+        elif op == "Aggregate":
             parent = parent_ids[0] if parent_ids else "?"
-            lines.append(f"# Task: {p.get('task', '')}")
+            agg_fields = p.get('agg_fields', [])
+            lines.append(f"# Aggregation fields: {[f.get('name', '') for f in agg_fields]}")
             lines.append(f"datasets['{out}'] = sem_agg(")
             lines.append(f"    dataset=datasets['{parent}'],")
-            lines.append(f"    agg_fields={p.get('agg_fields', [])}")
+            lines.append(f"    agg_fields={agg_fields}")
             lines.append(")")
 
         else:
@@ -434,7 +433,7 @@ class PlanNode:
             materialized = ds.materialize(storage)
             return {
                 **datasets_store,
-                self.output_dataset_id: materialized,
+                self.dataset_id: materialized,
             }, None
 
         op = self.to_operator(llm_config, index_catalog=index_catalog)
@@ -446,7 +445,7 @@ class PlanNode:
             return {**datasets_store, **updated}, stats
 
         # SemJoinOperator takes two explicit parent IDs.
-        if self.operator_type == "SemanticJoin":
+        if self.operator_type == "Join":
             left_id = parent_output_ids[0] if len(parent_output_ids) > 0 else ""
             right_id = parent_output_ids[1] if len(parent_output_ids) > 1 else ""
             updated, stats = op(left_id, right_id, datasets_store)
