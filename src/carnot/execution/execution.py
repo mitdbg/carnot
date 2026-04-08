@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import logging
+import queue
 import time
-from collections.abc import Generator
 
 from smolagents.tools import Tool
 
@@ -14,6 +14,8 @@ from carnot.data.dataset import Dataset
 from carnot.execution.progress import ExecutionProgress, PlanningProgress
 from carnot.index.index import CarnotIndex
 from carnot.memory.memory import Memory
+from carnot.optimizer.model_ids import get_available_model_ids
+from carnot.optimizer.optimizer import Optimizer
 from carnot.plan import PhysicalPlan
 from carnot.plan.feedback import PlanFeedback
 from carnot.plan.node import PlanNode
@@ -22,6 +24,9 @@ from carnot.storage.config import StorageConfig
 from carnot.storage.tiered import TieredStorageManager
 
 logger = logging.getLogger('uvicorn.error')
+
+# Maximum number of items to include in ExecutionProgress preview
+_PREVIEW_ITEM_LIMIT = 5
 
 
 class Execution:
@@ -50,6 +55,7 @@ class Execution:
             query: str,
             datasets: list[Dataset],
             plan: dict | PhysicalPlan | None = None,
+            planning_stats: PhaseStats | None = None,
             tools: list[Tool] | None = None,
             conversation: Conversation | None = None,
             memory: Memory | None = None,
@@ -60,17 +66,28 @@ class Execution:
             storage: TieredStorageManager | None = None,
             index_catalog: IndexCatalog | None = None,
             storage_config: StorageConfig | None = None,
+            available_model_ids: list[str] | None = None,
+            max_workers: int = 64
         ):
         self.query = query
         self.datasets = datasets
         self.tools = tools or []
         self.conversation = conversation
+
+        # If the caller supplies planning stats (e.g. from a prior plan()
+        # call on a separate Execution instance), store them so that
+        # run() / run_stream() can include them in the final
+        # ExecutionStats.  When plan_stream() is called on *this*
+        # instance it will overwrite _planning_stats as before.
+        if planning_stats is not None:
+            self._planning_stats = planning_stats
         self.memory = memory or Memory()
         self.indices = indices or []
         self.llm_config = llm_config or {}
         self.progress_log_file = progress_log_file
         self.cost_budget = cost_budget
         self.storage_config = storage_config or StorageConfig()
+        self.max_workers = max_workers
 
         # Build the PhysicalPlan from whatever was passed in.
         # Uses the _plan property setter which handles dict->PhysicalPlan
@@ -93,21 +110,42 @@ class Execution:
             db_session_factory=db_factory,
         )
 
-        self.planner_model_id = "openai/gpt-5-2025-08-07"
+        # get model for the planner and optimizer based on llm_config
+        self.model_id = "openai/gpt-5-2025-08-07"
         self.api_key_name = "OPENAI_API_KEY"
         if "OPENAI_API_KEY" not in self.llm_config and "ANTHROPIC_API_KEY" in self.llm_config:
-            self.planner_model_id = "anthropic/claude-sonnet-4-5-20250929"
+            self.model_id = "anthropic/claude-sonnet-4-5-20250929"
             self.api_key_name = "ANTHROPIC_API_KEY"
         elif "OPENAI_API_KEY" not in self.llm_config and "GEMINI_API_KEY" in self.llm_config:
-            self.planner_model_id = "google/gemini-2.5-flash"
+            self.model_id = "google/gemini-2.5-flash"
             self.api_key_name = "GEMINI_API_KEY"
         elif "OPENAI_API_KEY" not in self.llm_config and "GOOGLE_API_KEY" in self.llm_config:
-            self.planner_model_id = "google/gemini-2.5-flash"
+            self.model_id = "google/gemini-2.5-flash"
             self.api_key_name = "GOOGLE_API_KEY"
+
+        # create instance of the planner with the appropriate model and API key based on llm_config
         self.planner = Planner(
             datasets=self.datasets,
-            tools=self.tools, 
-            model=LiteLLMModel(model_id=self.planner_model_id, api_key=llm_config.get(self.api_key_name))
+            tools=self.tools,
+            model=LiteLLMModel(model_id=self.model_id, api_key=llm_config.get(self.api_key_name))
+        )
+
+        # Resolve available model IDs for the optimizer.  If the caller
+        # supplied an explicit list, use it.  Otherwise auto-detect from
+        # the API keys present in llm_config (spanning cost/quality tiers
+        # per provider).  Fall back to just the planner model when no
+        # recognised keys are found.
+        if available_model_ids is not None:
+            self.available_model_ids = available_model_ids
+        else:
+            detected = get_available_model_ids(self.llm_config)
+            self.available_model_ids = detected if detected else [self.model_id]
+
+        self.optimizer = Optimizer(
+            model=LiteLLMModel(model_id=self.model_id, api_key=llm_config.get(self.api_key_name)),
+            available_model_ids=self.available_model_ids,
+            llm_config=self.llm_config,
+            max_workers=self.max_workers,
         )
 
     # -- _plan property (backward-compatible) --------------------------------
@@ -155,86 +193,44 @@ class Execution:
         else:
             self._physical_plan = None
 
-    # -- planning ------------------------------------------------------------
+    def _update_progress(self, progress_queue: queue.Queue | None, is_planning: bool = False, **kwargs) -> None:
+        """Helper to put a PlanningProgress or ExecutionProgress update on the queue if it exists."""
+        if progress_queue is None:
+            return
 
-    def plan(self) -> tuple[str, dict]:
-        """Generate a logical execution plan for the query.
+        if is_planning:
+            progress_event = PlanningProgress(**kwargs)
+            progress_queue.put(progress_event.to_dict())
 
-        This method uses a two-phase approach:
-        1. Generate a code-based logical plan (the Planner can call its managed 
-           DataDiscoveryAgent to explore datasets during planning)
-        2. Translate the logical plan into a natural language description for the user
+        else:
+            progress_event = ExecutionProgress(**kwargs)
+            progress_queue.put(progress_event.to_dict())
 
-        After both phases complete, LLM call statistics are collected
-        from the Planner's and DataDiscoveryAgent's memories and stored
-        in ``self._planning_stats`` for later assembly into
-        :class:`ExecutionStats`.
+    # ------------------------------------------------------------------
+    # Generate logical plan (and its natural language paraphrasing)
+    # ------------------------------------------------------------------
 
-        Returns:
-            A tuple of (natural_language_plan, logical_plan_dict)
-        """
-        plan_start = time.perf_counter()
+    def plan(
+        self,
+        progress_queue: queue.Queue | None = None,
+    ) -> tuple[str, dict]:
+        """Generate a logical execution plan for *self.query*.
 
-        # Phase 1: Generate the code-based logical plan
-        # The Planner can call its DataDiscoveryAgent as needed during planning
-        logical_plan = self.planner.generate_logical_plan(
-            self.query, 
-            self.datasets, 
-            conversation=self.conversation,
-            cost_budget=self.cost_budget,
-        )
-
-        # Phase 2: Translate the logical plan to natural language for the user
-        nl_plan = self.planner.paraphrase_logical_plan(
-            self.query, 
-            logical_plan, 
-            self.datasets,
-            conversation=self.conversation,
-            cost_budget=self.cost_budget,
-        )
-
-        plan_wall_clock = time.perf_counter() - plan_start
-
-        # Collect stats from planner memories
-        self._planning_stats = self._build_planning_stats(plan_wall_clock)
-
-        return nl_plan, logical_plan
-
-    def plan_stream(self) -> Generator[PlanningProgress, None, tuple[str, dict]]:
-        """Generate a logical execution plan, yielding progress events.
-
-        This is the streaming counterpart of :meth:`plan`.  It performs
-        the same two-phase approach (logical plan generation -> paraphrase)
-        but yields :class:`PlanningProgress` events between steps so
-        that callers can keep the user informed of progress.
+        The function performs two phases: first it generates a code-based logical plan,
+        then it paraphrases that plan into natural language.  If the caller provides a
+        *progress_queue*, intermediate progress updates (from both the Planner and its
+        managed agents) are pushed to the queue as serialized ``PlanningProgress`` dicts.
 
         After both phases complete, LLM call statistics are collected
         and stored in ``self._planning_stats``.
 
-        The **return value** (accessed via ``StopIteration.value`` or by
-        collecting the generator with a helper) is the same
-        ``(natural_language_plan, logical_plan_dict)`` tuple that
-        :meth:`plan` returns.
-
-        Typical usage from an async context::
-
-            gen = execution.plan_stream()
-            result = None
-            try:
-                while True:
-                    progress = next(gen)
-                    # forward ``progress`` to SSE / websocket
-            except StopIteration as exc:
-                result = exc.value  # (nl_plan, logical_plan)
-
         Requires:
             - ``self.query`` is a non-empty string.
             - ``self.datasets`` is a non-empty list.
+            - *progress_queue*, if provided, is a thread-safe ``queue.Queue``.
 
         Returns:
-            A generator that yields :class:`PlanningProgress` objects.
-            The generator's return value is
-            ``(natural_language_plan, logical_plan_dict)``.
+            The ``(natural_language_plan, logical_plan_dict)`` tuple.
 
         Raises:
             AgentGenerationError: If the LLM fails to produce valid
@@ -242,54 +238,48 @@ class Execution:
         """
         plan_start = time.perf_counter()
 
-        # ----------------------------------------------------------
-        # Phase 1: Generate the code-based logical plan
-        # ----------------------------------------------------------
-        logical_plan = None
-        for event in self.planner.generate_logical_plan_stream(
+        # generate the code-based logical plan
+        logical_plan = self.planner.generate_logical_plan(
             self.query,
-            self.datasets,
             conversation=self.conversation,
-            cost_budget=self.cost_budget,
-        ):
-            if isinstance(event, PlanningProgress):
-                yield event
-            else:
-                # Terminal value -- the logical plan dict
-                logical_plan = event
-
-        yield PlanningProgress(
+            progress_queue=progress_queue,
+        )
+        self._update_progress(
+            progress_queue,
+            is_planning=True,
             phase="logical_plan",
-            message="Logical plan generated. Preparing summary...",
+            message="Logical plan generated. Optimizing implementation...",
         )
 
-        # ----------------------------------------------------------
-        # Phase 2: Translate the logical plan to natural language
-        # ----------------------------------------------------------
-        nl_plan = None
-        for event in self.planner.paraphrase_logical_plan_stream(
+        # generate a physical plan which satisfies the cost budget
+        # import pdb; pdb.set_trace()
+        physical_plan = self.optimizer.optimize(logical_plan, self.cost_budget)
+        self._update_progress(
+            progress_queue,
+            is_planning=True,
+            phase="optimizing",
+            message="Physical plan generated. Preparing plan summary...",
+        )
+
+        # translate the logical plan to natural language
+        # import pdb; pdb.set_trace()
+        nl_plan = self.planner.paraphrase_plan(
             self.query,
-            logical_plan,
-            self.datasets,
+            physical_plan,
             conversation=self.conversation,
-            cost_budget=self.cost_budget,
-        ):
-            if isinstance(event, PlanningProgress):
-                yield event
-            else:
-                # Terminal value -- the NL plan string
-                nl_plan = event
+            progress_queue=progress_queue,
+        )
+        self._update_progress(
+            progress_queue,
+            is_planning=True,
+            phase="paraphrase",
+            message="Plan summary complete.",
+        )
 
         plan_wall_clock = time.perf_counter() - plan_start
         self._planning_stats = self._build_planning_stats(plan_wall_clock)
 
-        yield PlanningProgress(
-            phase="paraphrase",
-            message="Plan summary complete.",
-            cumulative_cost_usd=self._planning_stats.total_cost_usd,
-        )
-
-        return nl_plan, logical_plan
+        return nl_plan, physical_plan
 
     # -- stats helpers -------------------------------------------------------
 
@@ -402,9 +392,9 @@ class Execution:
         plan = self._physical_plan
         node = plan.get_node(node_id)
 
-        # Resolve parent output_dataset_ids for operator calling convention
+        # Resolve parent dataset_ids for operator calling convention
         parent_output_ids = [
-            plan.get_node(pid).output_dataset_id
+            plan.get_node(pid).dataset_id
             for pid in node.parent_ids
         ]
 
@@ -416,58 +406,6 @@ class Execution:
             index_catalog=self.index_catalog,
             parent_output_ids=parent_output_ids,
         )
-
-    def run(self) -> tuple[list[dict], str, ExecutionStats]:
-        """Execute the physical plan and return the result with stats.
-
-        Runs every node in topological order via :meth:`run_node`,
-        collects ``OperatorStats`` from each, and assembles an
-        ``ExecutionStats`` that combines planning and execution
-        phase statistics.
-
-        Requires:
-            - ``self._physical_plan`` is not None (either set via
-              constructor, ``_plan`` setter, or :meth:`plan`).
-
-        Returns:
-            A 3-tuple ``(items, answer_str, stats)`` where *items* is
-            the list of result dicts, *answer_str* is the final
-            answer text, and *stats* is the full ``ExecutionStats``.
-
-        Raises:
-            ValueError: If an operator fails.
-        """
-        exec_start = time.perf_counter()
-        datasets_store: dict[str, Dataset] = {}
-        all_operator_stats: list[OperatorStats] = []
-
-        for node in self._physical_plan.topo_order():
-            datasets_store, op_stats = self.run_node(
-                node.node_id, datasets_store,
-            )
-            if op_stats is not None:
-                all_operator_stats.append(op_stats)
-
-        final_dataset = datasets_store.get("final_dataset")
-
-        exec_wall_clock = time.perf_counter() - exec_start
-
-        execution_phase = PhaseStats(
-            phase="execution",
-            wall_clock_secs=exec_wall_clock,
-            operator_stats=all_operator_stats,
-        )
-
-        stats = ExecutionStats(
-            query=self.query,
-            planning=getattr(self, "_planning_stats", PhaseStats(phase="planning")),
-            execution=execution_phase,
-        )
-
-        items = final_dataset.items if final_dataset else []
-        answer_str = final_dataset.code_state.get("final_answer_str", "") if final_dataset else ""
-
-        return items, answer_str, stats
 
     # -- notebook / interactive plan helpers ---------------------------------
 
@@ -481,7 +419,7 @@ class Execution:
         ``node_type`` (``"dataset"`` | ``"operator"`` | ``"reasoning"``),
         ``operator_name``, ``operator_type``, ``description``, ``code``,
         ``original_code``, ``params``, ``parent_dataset_ids``, and
-        ``output_dataset_id``.
+        ``dataset_id``.
 
         Requires:
             - ``self._physical_plan`` is not None.
@@ -525,7 +463,7 @@ class Execution:
 
         updated, op_stats = self.run_node(node_id, input_datasets)
 
-        output_dataset = updated.get(node.output_dataset_id)
+        output_dataset = updated.get(node.dataset_id)
         preview = self._build_output_preview(output_dataset) if output_dataset else {}
 
         # Add answer text for reasoning nodes
@@ -644,7 +582,7 @@ class Execution:
         operator_type = params.get("operator", "")
         name = params.get("name", operator_type)
         description = params.get("description", name)
-        output_dataset_id = params.get("output_dataset_id", name)
+        dataset_id = params.get("dataset_id", name)
         node_type = "reasoning" if operator_type == "Reasoning" else "operator"
 
         return PlanNode(
@@ -655,45 +593,36 @@ class Execution:
             description=description,
             params=dict(params),
             parent_ids=[],  # Will be set by insert_node()
-            output_dataset_id=output_dataset_id,
+            dataset_id=dataset_id,
         )
 
-    # -- streaming run -------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Execute the physical plan and produce final results with stats
+    # ------------------------------------------------------------------
 
-    def run_stream(self) -> Generator[ExecutionProgress, None, tuple[list[dict], str, ExecutionStats]]:
-        """Execute the physical plan, yielding progress events.
+    def run(
+        self,
+        progress_queue: queue.Queue | None = None,
+    ) -> tuple[list[dict], str, ExecutionStats]:
+        """Execute the physical plan and return the result with stats.
 
-        This is the streaming counterpart of :meth:`run`.  It performs
-        the same node-by-node execution but yields
-        :class:`ExecutionProgress` events between nodes so that
-        callers can keep the user informed of progress.
+        Runs every node in topological order via :meth:`run_node`,
+        collects ``OperatorStats`` from each, and assembles an
+        ``ExecutionStats`` that combines planning and execution
+        phase statistics.
 
-        After each node completes, the ``"Completed step"`` progress
-        event includes the ``OperatorStats`` for that operator.
-
-        The **return value** (accessed via ``StopIteration.value``) is
-        the same ``(items, answer_str, stats)`` 3-tuple that :meth:`run`
-        returns.
-
-        Typical usage from an async context::
-
-            gen = execution.run_stream()
-            result = None
-            try:
-                while True:
-                    progress = next(gen)
-                    # forward ``progress`` to SSE / websocket
-            except StopIteration as exc:
-                result = exc.value  # (items, answer_str, stats)
+        If a *progress_queue* is provided, yields intermediate progress updates
+        as serialized ``ExecutionProgress`` dicts after each node completes,
+        including operator stats, item counts, and output previews when available.
 
         Requires:
             - ``self._physical_plan`` is not None.
             - ``self.datasets`` is a non-empty list.
 
         Returns:
-            A generator that yields :class:`ExecutionProgress` objects.
-            The generator's return value is
-            ``(items, answer_str, stats)``.
+            A 3-tuple ``(items, answer_str, stats)`` where *items* is
+            the list of result dicts, *answer_str* is the final
+            answer text, and *stats* is the full ``ExecutionStats``.
 
         Raises:
             ValueError: If the plan contains unrecognized operators.
@@ -704,7 +633,8 @@ class Execution:
         nodes = self._physical_plan.topo_order()
         total = len(nodes)
 
-        yield ExecutionProgress(
+        self._update_progress(
+            progress_queue,
             message=f"Starting execution -- {total} step(s) in plan.",
             total_operators=total,
         )
@@ -712,7 +642,8 @@ class Execution:
         for idx, node in enumerate(nodes):
             display = node.display_name()
 
-            yield ExecutionProgress(
+            self._update_progress(
+                progress_queue,
                 message=f"Running step {idx + 1}/{total}: {display}...",
                 operator_index=idx,
                 total_operators=total,
@@ -725,12 +656,31 @@ class Execution:
             if op_stats is not None:
                 all_operator_stats.append(op_stats)
 
-            yield ExecutionProgress(
+            # peek at the output dataset for item count / preview
+            output_ds = datasets_store.get(node.dataset_id)
+            item_count, preview = None, None
+            if output_ds is not None and hasattr(output_ds, "items"):
+                try:
+                    items_list = output_ds.items
+                    item_count = len(items_list)
+                    raw_preview = items_list[:_PREVIEW_ITEM_LIMIT]
+                    preview = [
+                        item if isinstance(item, dict) else {"value": str(item)}
+                        for item in raw_preview
+                    ]
+                except Exception:
+                    pass  # Non-critical — skip preview on error
+
+            self._update_progress(
+                progress_queue,
                 message=f"Completed step {idx + 1}/{total}: {display}.",
                 operator_index=idx,
                 total_operators=total,
                 operator_name=display,
+                step_cost_usd=op_stats.total_cost_usd if op_stats else None,
                 operator_stats=op_stats,
+                item_count=item_count,
+                preview_items=preview,
             )
 
         final_dataset = datasets_store.get("final_dataset")

@@ -18,7 +18,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
-from app.database import Conversation, Message, Notebook, Workspace, get_db
+from app.database import Conversation, Message, Notebook, QueryEvent, Workspace, get_db
 
 router = APIRouter()
 
@@ -40,6 +40,7 @@ class ConversationSummary(BaseModel):
     session_id: str
     title: str | None
     message_count: int
+    is_query_active: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -84,6 +85,7 @@ class WorkspaceDetailResponse(BaseModel):
     updated_at: datetime
     conversations: list[ConversationSummary]
     notebooks: list[NotebookSummary]
+    total_cost_usd: float | None = None
 
     class Config:
         from_attributes = True
@@ -161,6 +163,7 @@ async def get_workspace(
             session_id=conv.session_id,
             title=conv.title,
             message_count=msg_count,
+            is_query_active=conv.is_query_active,
             created_at=conv.created_at,
             updated_at=conv.updated_at,
         )
@@ -186,6 +189,17 @@ async def get_workspace(
         for nb in notebooks_rows
     ]
 
+    # Sum per-step costs from query_events across all conversations
+    # in this workspace to derive the total workspace cost.
+    conv_ids = [c.id for c in conversations]
+    total_cost: float | None = None
+    if conv_ids:
+        cost_result = await db.execute(
+            select(func.sum(QueryEvent.step_cost_usd))
+            .where(QueryEvent.conversation_id.in_(conv_ids))
+        )
+        total_cost = cost_result.scalar()
+
     return WorkspaceDetailResponse(
         id=workspace.id,
         session_id=workspace.session_id,
@@ -195,6 +209,7 @@ async def get_workspace(
         updated_at=workspace.updated_at,
         conversations=conversations,
         notebooks=notebooks,
+        total_cost_usd=total_cost,
     )
 
 

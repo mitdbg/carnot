@@ -1,10 +1,25 @@
 import { useRef, useEffect, useCallback } from 'react'
 import { Send, Database, AlertCircle, Loader2, XCircle, Play, Code } from 'lucide-react'
-import ProgressDisplay from './ProgressDisplay'
+import StepCard, { phaseToColor } from './StepCard'
 import CostBudgetPicker from './CostBudgetPicker'
 import QueryCostDisplay from './QueryCostDisplay'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api"
+
+/**
+ * Map an execution operator display name (e.g. "Semantic Filter") to a
+ * phase string that `phaseToColor` understands.
+ */
+function _operatorNameToPhase(operatorName) {
+  if (!operatorName) return 'gray'
+  const lower = operatorName.toLowerCase()
+  if (lower.includes('filter'))   return 'sem_filter'
+  if (lower.includes('map'))      return 'sem_map'
+  if (lower.includes('join'))     return 'sem_join'
+  if (lower.includes('agg'))      return 'sem_agg'
+  if (lower.startsWith('dataset')) return 'gray'
+  return 'gray'
+}
 
 /**
  * The chat message list, plan rendering, and input bar — extracted from
@@ -138,6 +153,43 @@ function ChatView({
           </div>
         )
 
+      case 'step_group':
+        return (
+          <div key={index} className="flex flex-col items-start mb-4 w-full max-w-[85%]">
+            {message.steps.map((step, i) => {
+              // Per-step cost is now provided directly by the backend.
+              const stepCost = step.step_cost_usd ?? null
+
+              // For execution steps, derive the phase from the operator_name
+              // so phaseToColor picks the right colour family.
+              const effectivePhase = step.phase || _operatorNameToPhase(step.operator_name)
+
+              return (
+                <StepCard
+                  key={i}
+                  phase={effectivePhase}
+                  step={step.step}
+                  totalSteps={step.total_steps}
+                  message={step.message}
+                  codeAction={step.code_action}
+                  observations={step.observations}
+                  error={step.error}
+                  stepCostUsd={stepCost}
+                  color={phaseToColor(effectivePhase)}
+                  defaultExpanded={i === message.steps.length - 1 && message.isActive}
+                  isActive={i === message.steps.length - 1 && message.isActive}
+                  operatorName={step.operator_name}
+                  operatorIndex={step.operator_index}
+                  totalOperators={step.total_operators}
+                  itemCount={step.item_count}
+                  previewItems={step.preview_items}
+                  operatorStats={step.operator_stats}
+                />
+              )
+            })}
+          </div>
+        )
+
       default:
         return null
     }
@@ -159,7 +211,6 @@ function ChatView({
 
         <div className="max-w-4xl mx-auto w-full">
           {messages.map((message, index) => renderMessage(message, index))}
-          {isLoading && isExecuting && sessionId && <ProgressDisplay sessionId={sessionId} isActive={isLoading} />}
           <div ref={messagesEndRef} />
         </div>
       </div>

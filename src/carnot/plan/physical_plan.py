@@ -60,16 +60,21 @@ class PhysicalPlan:
 
             {
                 "name": str,
-                "output_dataset_id": str,
-                "params": { "operator": str, ... },
+                "dataset_id": str,
+                "operator": {
+                    "logical_op_class_name": str,
+                    ...operator params...
+                },
                 "parents": [ <plan_dict>, ... ],
             }
 
         The method performs a post-order traversal, creating one
-        ``PlanNode`` per dict node.  Leaf nodes (empty ``params`` or
-        no ``"operator"`` key and matching a dataset name) become
-        ``"dataset"`` nodes; all others become ``"operator"`` nodes.
-        An optional trailing ``"reasoning"`` node is appended.
+        ``PlanNode`` per dict node.  Leaf nodes (empty ``operator``
+        dict and matching a dataset name) become ``"dataset"`` nodes;
+        ``Reason`` nodes become ``"reasoning"`` nodes; all others
+        become ``"operator"`` nodes.  An optional trailing
+        ``"reasoning"`` node is appended when the root is not already
+        a reasoning node.
 
         Requires:
             - *plan_dict* is a valid recursive plan dict.
@@ -99,20 +104,24 @@ class PhysicalPlan:
             node_id = f"node-{counter['n']}"
             counter["n"] += 1
 
-            op_params = d.get("params", {})
-            op_name = op_params.get("operator", "")
+            op_dict = d.get("operator", {})
+            op_class_name = op_dict.get("logical_op_class_name", "")
             name = d.get("name", "")
-            output_dataset_id = d.get("output_dataset_id", name)
+            dataset_id = d.get("dataset_id", name)
 
             # Determine node type.
-            if not op_name and name in dataset_names:
+            if not op_class_name and name in dataset_names:
                 node_type = "dataset"
                 operator_type = None
                 description = f"Load dataset: {name}"
+            elif op_class_name == "Reason":
+                node_type = "reasoning"
+                operator_type = "Reason"
+                description = op_dict.get("task", name)
             else:
                 node_type = "operator"
-                operator_type = op_name
-                description = op_params.get("description", name)
+                operator_type = op_class_name
+                description = op_dict.get("desc") or op_dict.get("task") or name
 
             node = PlanNode(
                 node_id=node_id,
@@ -120,9 +129,9 @@ class PhysicalPlan:
                 operator_type=operator_type,
                 name=name,
                 description=description,
-                params=dict(op_params),
+                params=dict(op_dict),
                 parent_ids=list(parent_node_ids),
-                output_dataset_id=output_dataset_id,
+                dataset_id=dataset_id,
             )
             nodes[node_id] = node
             return node_id
@@ -136,12 +145,12 @@ class PhysicalPlan:
             reasoning_node = PlanNode(
                 node_id=reasoning_id,
                 node_type="reasoning",
-                operator_type="Reasoning",
+                operator_type="Reason",
                 name="Reasoning",
                 description="Generate final answer",
                 params={"task": query} if query else {},
                 parent_ids=[root_id],
-                output_dataset_id="final_dataset",
+                dataset_id="final_dataset",
             )
             nodes[reasoning_id] = reasoning_node
 
@@ -467,7 +476,7 @@ class PhysicalPlan:
                     "description": n.description,
                     "params": n.params,
                     "parent_ids": n.parent_ids,
-                    "output_dataset_id": n.output_dataset_id,
+                    "dataset_id": n.dataset_id,
                 }
                 for n in self.topo_order()
             ],
@@ -498,7 +507,7 @@ class PhysicalPlan:
                 description=nd["description"],
                 params=nd.get("params", {}),
                 parent_ids=nd.get("parent_ids", []),
-                output_dataset_id=nd.get("output_dataset_id", ""),
+                dataset_id=nd.get("dataset_id", ""),
             )
             nodes[node.node_id] = node
         return cls(nodes=nodes, query=data.get("query", ""))
