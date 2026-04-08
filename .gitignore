@@ -214,6 +214,8 @@ __marimo__/
 *.tfstate
 *.tfstate.*
 .terraform.lock.hcl
+override.tf
+override.tf.json
 
 # test data files
 tests/pytest/data/movie-reviews
