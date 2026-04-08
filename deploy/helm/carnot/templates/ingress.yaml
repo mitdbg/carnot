@@ -9,7 +9,6 @@ metadata:
     app.kubernetes.io/managed-by: {{ .Release.Service }}
     helm.sh/chart: carnot-{{ .Chart.Version }}
   annotations:
-    kubernetes.io/ingress.class: alb
     # internet-facing: ALB is publicly accessible (behind Route53)
     alb.ingress.kubernetes.io/scheme: internet-facing
     # IngressGroup: all environments share one ALB, routing by hostname
@@ -23,6 +22,7 @@ metadata:
     # 300s idle timeout to support long-running LLM queries streamed via SSE
     alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300
 spec:
+  ingressClassName: alb
   rules:
     {{- if .Values.frontendHostname }}
     # Frontend: serve the React SPA via NGINX

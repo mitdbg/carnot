@@ -123,6 +123,56 @@ resource "helm_release" "cluster_autoscaler" {
 }
 
 # -----------------------------------------------------------------
+# ExternalDNS — Helm
+# Watches Ingress resources and automatically creates/updates
+# Route53 A-record aliases pointing to the ALB. This removes the
+# need to manually create DNS records for each environment.
+# -----------------------------------------------------------------
+resource "helm_release" "external_dns" {
+  name       = "external-dns"
+  repository = "https://kubernetes-sigs.github.io/external-dns"
+  chart      = "external-dns"
+  namespace  = "kube-system"
+
+  set {
+    name  = "provider.name"
+    value = "aws"
+  }
+
+  set {
+    name  = "domainFilters[0]"
+    value = "carnot-research.org"
+  }
+
+  set {
+    name  = "policy"
+    value = "upsert-only"
+  }
+
+  set {
+    name  = "registry"
+    value = "txt"
+  }
+
+  set {
+    name  = "txtOwnerId"
+    value = var.cluster_name
+  }
+
+  set {
+    name  = "serviceAccount.name"
+    value = "external-dns"
+  }
+
+  set {
+    name  = "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn"
+    value = aws_iam_role.external_dns.arn
+  }
+
+  depends_on = [helm_release.alb_controller]
+}
+
+# -----------------------------------------------------------------
 # Cluster Config — local Helm chart
 # Creates the ClusterSecretStore that tells ESO how to read from
 # AWS Secrets Manager. Uses a local Helm chart to avoid the

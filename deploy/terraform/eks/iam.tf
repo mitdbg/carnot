@@ -226,6 +226,55 @@ resource "aws_iam_role_policy" "cluster_autoscaler" {
 }
 
 # -----------------------------------------------------------------
+# ExternalDNS — IRSA role
+# Grants ExternalDNS permission to create/update/delete Route53
+# records so that Ingress hostnames are automatically resolvable.
+# -----------------------------------------------------------------
+resource "aws_iam_role" "external_dns" {
+  name = "carnot-external-dns-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Federated = local.oidc_arn }
+      Action    = "sts:AssumeRoleWithWebIdentity"
+      Condition = {
+        StringEquals = {
+          "${local.oidc_issuer}:aud" = "sts.amazonaws.com"
+          "${local.oidc_issuer}:sub" = "system:serviceaccount:kube-system:external-dns"
+        }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "external_dns" {
+  role = aws_iam_role.external_dns.id
+  name = "Route53Access"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["route53:ChangeResourceRecordSets"]
+        Resource = "arn:aws:route53:::hostedzone/${var.hosted_zone_id}"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "route53:ListHostedZones",
+          "route53:ListResourceRecordSets",
+          "route53:ListTagsForResource",
+        ]
+        Resource = "*"
+      },
+    ]
+  })
+}
+
+# -----------------------------------------------------------------
 # Per-environment backend ServiceAccount IRSA roles
 # Each environment's backend pod uses a dedicated role scoped to
 # its own S3 bucket and Secrets Manager path.

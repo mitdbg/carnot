@@ -39,6 +39,10 @@ resource "aws_eks_cluster" "carnot" {
     endpoint_private_access = true
     endpoint_public_access  = true
   }
+
+  access_config {
+    authentication_mode = "API_AND_CONFIG_MAP"
+  }
 }
 
 # -------------------------------
