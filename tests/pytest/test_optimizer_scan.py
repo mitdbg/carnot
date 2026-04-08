@@ -197,7 +197,9 @@ class TestCostModelScanBaseCase:
         """Cardinality matches num_items."""
         cm = CostModel()
         pc = cm(scan_physical_op)
-        assert pc.cardinality == float(scan_physical_op.num_items)
+        assert pc.output_cardinality == float(scan_physical_op.num_items)
+        assert pc.input_cardinality == float(scan_physical_op.num_items)
+        assert pc.selectivity == 1.0
 
     def test_scan_zero_items(self):
         """ScanOp with zero items returns quality=1.0 (safe division)."""
@@ -206,7 +208,7 @@ class TestCostModelScanBaseCase:
         pc = cm(op)
         assert pc.quality == 1.0
         assert pc.total_input_tokens == 0.0
-        assert pc.cardinality == 0.0
+        assert pc.output_cardinality == 0.0
 
     def test_non_scan_raises(self):
         """Base CostModel raises NotImplementedError for non-scan operators."""

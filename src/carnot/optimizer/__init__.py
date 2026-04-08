@@ -1,6 +1,7 @@
 from carnot.optimizer.rules import (
     BasicSubstitutionRule,
     CodeRule,
+    FilterToTopKFilter,
     ImplementationRule,
     PushDownFilter,
     ReasoningRule,
@@ -19,6 +20,7 @@ from carnot.optimizer.rules import (
 ALL_RULES = [
     BasicSubstitutionRule,
     CodeRule,
+    FilterToTopKFilter,
     ImplementationRule,
     PushDownFilter,
     ReasoningRule,

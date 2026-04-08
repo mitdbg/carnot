@@ -388,11 +388,13 @@ def _dominates(a: PlanCost, b: PlanCost) -> bool:
     cost_ok = a.cost <= b.cost
     time_ok = a.time <= b.time
     quality_ok = a.quality >= b.quality
-    cardinality_ok = a.cardinality <= b.cardinality
+    cardinality_ok = a.output_cardinality <= b.output_cardinality
     if not (cost_ok and time_ok and quality_ok and cardinality_ok):
         return False
     # Must be strictly better on at least one dimension.
-    return a.cost < b.cost or a.time < b.time or a.quality > b.quality or a.cardinality < b.cardinality
+    return (
+        a.cost < b.cost or a.time < b.time or a.quality > b.quality or a.output_cardinality < b.output_cardinality
+    )
 
 
 def _pareto_filter(entries: list[CostEntry]) -> list[CostEntry]:

@@ -283,6 +283,7 @@ class Optimizer:
         while len(self.tasks_stack) > 0 and task_count < self.max_tasks:
             task = self.tasks_stack.pop(-1)
             task_count += 1
+            # import pdb; pdb.set_trace()
 
             new_tasks = []
             if isinstance(task, (OptimizeGroup, ExploreGroup)):
@@ -295,6 +296,7 @@ class Optimizer:
                 )
             elif isinstance(task, OptimizePhysicalExpression):
                 new_tasks = task.perform(self.cost_model, self.groups, self)
+            # import pdb; pdb.set_trace()
 
             self.tasks_stack.extend(new_tasks)
 
@@ -324,6 +326,7 @@ class Optimizer:
 
         # select the best physical plan that satisfies the cost budget
         best_plan = self._select_best_plan(final_group_id, policy)
+        # import pdb; pdb.set_trace()
 
         return best_plan.to_dict()
 

@@ -14,6 +14,7 @@ from carnot.data.dataset import Dataset
 from carnot.execution.progress import ExecutionProgress, PlanningProgress
 from carnot.index.index import CarnotIndex
 from carnot.memory.memory import Memory
+from carnot.optimizer.model_ids import get_available_model_ids
 from carnot.optimizer.optimizer import Optimizer
 from carnot.plan import PhysicalPlan
 from carnot.plan.feedback import PlanFeedback
@@ -65,6 +66,7 @@ class Execution:
             storage: TieredStorageManager | None = None,
             index_catalog: IndexCatalog | None = None,
             storage_config: StorageConfig | None = None,
+            available_model_ids: list[str] | None = None,
             max_workers: int = 64
         ):
         self.query = query
@@ -124,12 +126,21 @@ class Execution:
         # create instance of the planner with the appropriate model and API key based on llm_config
         self.planner = Planner(
             datasets=self.datasets,
-            tools=self.tools, 
+            tools=self.tools,
             model=LiteLLMModel(model_id=self.model_id, api_key=llm_config.get(self.api_key_name))
         )
 
-        # create instance of the optimizer with the appropriate model and API key based on llm_config
-        self.available_model_ids = [self.model_id]
+        # Resolve available model IDs for the optimizer.  If the caller
+        # supplied an explicit list, use it.  Otherwise auto-detect from
+        # the API keys present in llm_config (spanning cost/quality tiers
+        # per provider).  Fall back to just the planner model when no
+        # recognised keys are found.
+        if available_model_ids is not None:
+            self.available_model_ids = available_model_ids
+        else:
+            detected = get_available_model_ids(self.llm_config)
+            self.available_model_ids = detected if detected else [self.model_id]
+
         self.optimizer = Optimizer(
             model=LiteLLMModel(model_id=self.model_id, api_key=llm_config.get(self.api_key_name)),
             available_model_ids=self.available_model_ids,
@@ -241,6 +252,7 @@ class Execution:
         )
 
         # generate a physical plan which satisfies the cost budget
+        # import pdb; pdb.set_trace()
         physical_plan = self.optimizer.optimize(logical_plan, self.cost_budget)
         self._update_progress(
             progress_queue,
@@ -250,6 +262,7 @@ class Execution:
         )
 
         # translate the logical plan to natural language
+        # import pdb; pdb.set_trace()
         nl_plan = self.planner.paraphrase_plan(
             self.query,
             physical_plan,

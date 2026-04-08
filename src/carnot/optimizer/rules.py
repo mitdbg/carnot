@@ -182,6 +182,124 @@ class PushDownFilter(TransformationRule):
         return new_logical_expressions, new_groups, next_group_id
 
 
+class FilterToTopKFilter(TransformationRule):
+    """Insert a TopK pre-filter below a Filter to trade quality for speed.
+
+    For each input group of a Filter expression, this rule creates
+    alternative plans of the form
+    ``Filter(TopK(k, task=filter_text))`` for each fixed *k* in
+    ``k_values``.  The TopK uses embedding similarity to cheaply
+    narrow the candidate set before the expensive LLM-based filter
+    runs.
+
+    Multiple *k* values are explored so the optimizer's Pareto search
+    can evaluate different quality-cost trade-offs.
+
+    Representation invariant:
+        - ``k_values`` is a non-empty list of positive integers,
+          sorted in ascending order.
+        - ``next_group_id`` is always ≥ the id of every group in
+          *groups* at the time of the call.
+
+    Abstraction function:
+        For a given ``Filter(input_group)`` expression, produces a set
+        of equivalent ``Filter(TopK_group)`` alternatives where
+        ``TopK_group`` contains a ``TopK`` operator reading from the
+        original ``input_group``.
+    """
+
+    k_values: list[int] = [10] # , 20, 50, 100, 1000]
+
+    @classmethod
+    def matches_pattern(cls, logical_expression: LogicalExpression) -> bool:
+        return isinstance(logical_expression.operator, Filter)
+
+    @classmethod
+    def substitute(
+        cls,
+        logical_expression: LogicalExpression,
+        groups: dict[int, Group],
+        expressions: dict[int, Expression],
+        next_group_id: int = 0,
+        **kwargs,
+    ) -> tuple[set[LogicalExpression], set[Group], int]:
+        """Create ``TopK → Filter`` alternatives at fixed *k* values.
+
+        For each input group of the Filter and for each *k* in
+        ``k_values``, creates:
+
+        1. A new ``TopK`` logical expression reading from the original
+           input group.
+        2. A new intermediate group containing that ``TopK``.
+        3. A copy of the ``Filter`` expression reading from the new
+           intermediate group.
+
+        Requires:
+            - ``logical_expression.operator`` is a ``Filter``.
+            - ``next_group_id`` > every group id currently in *groups*.
+
+        Returns:
+            A 3-tuple ``(new_logical_expressions, new_groups,
+            next_group_id)`` following the ``TransformationRule``
+            contract.
+
+        Raises:
+            None.
+        """
+        new_logical_expressions: set[LogicalExpression] = set()
+        new_groups: set[Group] = set()
+
+        filter_operator: Filter = logical_expression.operator
+
+        for input_group_id in logical_expression.input_group_ids:
+            for k in cls.k_values:
+                # Create a TopK logical operator that uses the filter
+                # text as the semantic search query
+                topk_op = TopK(
+                    name=f"{filter_operator.name}_topk_{k}",
+                    task=filter_operator.filter,
+                    k=k,
+                )
+
+                topk_expr = LogicalExpression(
+                    topk_op,
+                    input_group_ids=[input_group_id],
+                    group_id=None,
+                )
+
+                # If this TopK expression already exists, reuse its group
+                if topk_expr.expr_id in expressions:
+                    topk_group_id = expressions[topk_expr.expr_id].group_id
+                    topk_expr.set_group_id(topk_group_id)
+                else:
+                    topk_group_id = next_group_id
+                    next_group_id += 1
+
+                    topk_expr.set_group_id(topk_group_id)
+                    topk_group = Group(logical_expressions=[topk_expr], group_id=topk_group_id)
+
+                    groups[topk_group_id] = topk_group
+                    new_groups.add(topk_group)
+
+                new_logical_expressions.add(topk_expr)
+
+                # Create a Filter reading from the TopK group instead of
+                # the original input group; add this rule to the applied rules of the new Filter expression
+                # so that the optimizer does not apply this same transformation again on the new Filter expression
+                remaining_input_ids = [
+                    g_id for g_id in logical_expression.input_group_ids if g_id != input_group_id
+                ]
+                new_filter_expr = LogicalExpression(
+                    filter_operator.copy(),
+                    input_group_ids=[topk_group_id] + remaining_input_ids,
+                    group_id=logical_expression.group_id,
+                )
+                new_filter_expr.add_applied_rule(cls)
+                new_logical_expressions.add(new_filter_expr)
+
+        return new_logical_expressions, new_groups, next_group_id
+
+
 class ImplementationRule(Rule):
     """Base class for implementation rules which convert a logical expression to a physical expression.
 

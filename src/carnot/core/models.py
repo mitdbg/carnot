@@ -470,14 +470,13 @@ class PlanCost(BaseModel):
 
     Combines cumulative plan-level metrics (``cost``, ``time``,
     ``total_input_tokens``, ``total_scanned_input_tokens``) with
-    per-operator metrics (``cardinality``, ``cost_per_record``,
-    ``time_per_record``).  This replaces the previous two-class design
-    where ``OperatorCostEstimates`` was a separate model embedded inside
-    ``PlanCost`` via an ``op_estimates`` field.
+    per-operator metrics (``output_cardinality``, ``cost_per_record``,
+    ``time_per_record``).
 
     Representation invariant:
         - All numeric fields are non-negative.
         - ``total_scanned_input_tokens <= total_input_tokens``.
+        - ``selectivity`` is in ``[0, ∞)`` (may exceed 1 for fan-out operators).
 
     Abstraction function:
         Represents a point in the (cost, time, quality) space for a
@@ -492,9 +491,16 @@ class PlanCost(BaseModel):
     total_scanned_input_tokens: float
 
     # per-operator metrics (set by the cost model for the current operator)
-    cardinality: float = 0.0
     cost_per_record: float = 0.0
     time_per_record: float = 0.0
+
+    # cardinality fields
+    input_cardinality: float = 0.0
+    output_cardinality: float = 0.0
+    selectivity: float = 1.0
+
+    # per-record token estimate propagated to downstream operators
+    avg_tokens_per_record: float = 0.0
 
     @property
     def quality(self) -> float:
@@ -529,10 +535,10 @@ class PlanCost(BaseModel):
     def join_add(self, left_plan_cost: PlanCost, right_plan_cost: PlanCost) -> PlanCost:
         """Combine this operator's cost with two joined input plan costs.
 
-        Sums ``cost``, ``time``, ``total_input_tokens`, and ``total_scanned_input_tokens``
+        Sums ``cost``, ``time``, ``total_input_tokens``, and ``total_scanned_input_tokens``
         across all three ``PlanCost`` objects (operator + left + right).
 
-        Per-operator fields (``cardinality``, ``cost_per_record``,
+        Per-operator fields (``output_cardinality``, ``cost_per_record``,
         ``time_per_record``) are taken from *self* (the operator cost).
 
         Requires:
@@ -551,11 +557,16 @@ class PlanCost(BaseModel):
                 self.total_input_tokens + left_plan_cost.total_input_tokens + right_plan_cost.total_input_tokens
             ),
             total_scanned_input_tokens=(
-                self.total_scanned_input_tokens + left_plan_cost.total_scanned_input_tokens + right_plan_cost.total_scanned_input_tokens
+                self.total_scanned_input_tokens
+                + left_plan_cost.total_scanned_input_tokens
+                + right_plan_cost.total_scanned_input_tokens
             ),
-            cardinality=self.cardinality,
             cost_per_record=self.cost_per_record,
             time_per_record=self.time_per_record,
+            input_cardinality=self.input_cardinality,
+            output_cardinality=self.output_cardinality,
+            selectivity=self.selectivity,
+            avg_tokens_per_record=self.avg_tokens_per_record, # NOTE: should this be left + right?
         )
 
     def __iadd__(self, other: PlanCost) -> PlanCost:
@@ -600,9 +611,12 @@ class PlanCost(BaseModel):
             time=self.time + other.time,
             total_input_tokens=self.total_input_tokens + other.total_input_tokens,
             total_scanned_input_tokens=self.total_scanned_input_tokens + other.total_scanned_input_tokens,
-            cardinality=self.cardinality,
             cost_per_record=self.cost_per_record,
             time_per_record=self.time_per_record,
+            input_cardinality=self.input_cardinality,
+            output_cardinality=self.output_cardinality,
+            selectivity=self.selectivity,
+            avg_tokens_per_record=self.avg_tokens_per_record,
         )
 
 
