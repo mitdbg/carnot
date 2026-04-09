@@ -49,7 +49,7 @@ class Optimizer:
         self.available_model_ids = available_model_ids
         self.llm_config = llm_config or {}
         self.max_workers = max_workers
-        self.cost_model = cost_model or CostModel()
+        self.cost_model = cost_model or CostModel(llm_config=llm_config)
         self.max_tasks = max_tasks
 
         # track the expressions and groups created during optimization

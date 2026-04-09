@@ -11,6 +11,7 @@ on:
       - at-prod
       - lm-prod
       - wl-prod
+  workflow_dispatch:   # Manual trigger — required for Terraform steps
 
 permissions:
   id-token: write   # required for OIDC auth with AWS
@@ -78,17 +79,22 @@ jobs:
 
       ######################################################################
       # STEP 1 — PROVISION GLOBAL INFRASTRUCTURE
+      # Only runs on manual workflow_dispatch to avoid disrupting
+      # production environments that share this cluster.
       ######################################################################
 
       - name: Terraform Init (Global)
+        if: github.event_name == 'workflow_dispatch'
         working-directory: deploy/terraform/global
         run: terraform init
 
       - name: Terraform Validate (Global)
+        if: github.event_name == 'workflow_dispatch'
         working-directory: deploy/terraform/global
         run: terraform validate
 
       - name: Write Global vars.tfvars
+        if: github.event_name == 'workflow_dispatch'
         working-directory: deploy/terraform/global
         run: |
           cat > global-vars.tfvars <<EOF
@@ -97,16 +103,19 @@ jobs:
           EOF
 
       - name: Terraform Apply (Global)
+        if: github.event_name == 'workflow_dispatch'
         working-directory: deploy/terraform/global
         run: terraform apply -var-file="global-vars.tfvars" -auto-approve
 
       - name: Get Homepage EC2 Public IP
+        if: github.event_name == 'workflow_dispatch'
         working-directory: deploy/terraform/global
         run: |
           homepage_public_ip=$(terraform output -raw homepage_public_ip)
           echo "HOMEPAGE_PUBLIC_IP=$homepage_public_ip" >> $GITHUB_ENV
 
       - name: Start NGINX on Homepage EC2
+        if: github.event_name == 'workflow_dispatch'
         env:
           CARNOT_DEPLOY_KEY: ${{ secrets.CARNOT_DEPLOY_KEY }}
           MS_APP_ID: ${{ secrets.MICROSOFT_APPLICATION_ID }}
@@ -142,17 +151,22 @@ jobs:
 
       ######################################################################
       # STEP 2 — PROVISION EKS CLUSTER INFRASTRUCTURE
+      # Only runs on manual workflow_dispatch to avoid disrupting
+      # production environments that share this cluster.
       ######################################################################
 
       - name: Terraform Init (EKS)
+        if: github.event_name == 'workflow_dispatch'
         working-directory: deploy/terraform/eks
         run: terraform init
 
       - name: Terraform Validate (EKS)
+        if: github.event_name == 'workflow_dispatch'
         working-directory: deploy/terraform/eks
         run: terraform validate
 
       - name: Terraform Apply (EKS)
+        if: github.event_name == 'workflow_dispatch'
         working-directory: deploy/terraform/eks
         run: terraform apply -auto-approve
 

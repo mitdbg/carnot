@@ -1,5 +1,14 @@
+from __future__ import annotations
+
+import json
+import logging
+
+import litellm
+
 from carnot.core.models import PlanCost
+from carnot.operators.code import CodeOperator
 from carnot.operators.physical import PhysicalOperator
+from carnot.operators.reasoning import ReasoningOperator
 from carnot.operators.scan import ScanOp
 from carnot.operators.sem_agg import SemAggOperator
 from carnot.operators.sem_filter import SemFilterOperator
@@ -8,7 +17,15 @@ from carnot.operators.sem_groupby import SemGroupByOperator
 from carnot.operators.sem_join import SemJoinOperator
 from carnot.operators.sem_map import SemMapOperator
 from carnot.operators.sem_topk import SemTopKOperator
+from carnot.optimizer.model_ids import (
+    ModelSize,
+    get_api_key_for_model,
+    get_best_available_model_id,
+    get_model_size,
+)
 from carnot.optimizer.pricing import ModelPricing, ModelPricingLookup
+
+logger = logging.getLogger(__name__)
 
 # ── Selectivity defaults ──────────────────────────────────────────────
 DEFAULT_FILTER_SELECTIVITY = 0.5
@@ -30,6 +47,18 @@ DEFAULT_GROUPBY_NUM_GROUPS = 5
 DEFAULT_TIME_PER_RECORD = 0.5
 DEFAULT_EMBEDDING_TIME_PER_RECORD = 0.05
 
+# ── Agentic operator defaults (Code / Reasoning) ────────────────────
+DEFAULT_AGENTIC_OUTPUT_TOKENS_PER_STEP = 500
+DEFAULT_AGENTIC_SYSTEM_PROMPT_TOKENS = 1000
+DEFAULT_AGENTIC_OBSERVATION_TOKENS_PER_STEP = 200
+DEFAULT_AGENTIC_TIME_PER_STEP = 10.0
+DEFAULT_AGENTIC_NUM_STEPS = 3
+DEFAULT_AGENTIC_QUALITY: dict[str, float] = {
+    "small": 0.4,
+    "medium": 0.65,
+    "large": 0.85,
+}
+
 # ── Fallback pricing (gpt-4o-mini rates) ─────────────────────────────
 DEFAULT_PRICING = ModelPricing(
     input_cost_per_token=1.5e-07,
@@ -37,6 +66,23 @@ DEFAULT_PRICING = ModelPricing(
     max_input_tokens=128_000,
     max_output_tokens=16_384,
 )
+
+# ── Prompt for LLM-based agentic cost estimation ────────────────────
+_AGENTIC_ESTIMATE_PROMPT = """You are an expert software engineer assistant.
+You will be given a coding/reasoning task description. Estimate:
+
+1. **num_steps**: The number of iterative code-generation steps an AI
+   coding agent would need to complete this task (integer, 1-20).
+2. **quality_by_size**: A JSON object mapping model size to expected
+   quality (float 0.0-1.0) for that size of model completing this
+   task. The three sizes are "small", "medium", and "large".
+
+Respond with ONLY a JSON object (no markdown fences) like:
+{"num_steps": 3, "quality_by_size": {"small": 0.3, "medium": 0.6, "large": 0.9}}
+
+Task description:
+{task}
+"""
 
 
 class CostModel:
@@ -49,6 +95,8 @@ class CostModel:
 
     Representation invariant:
         - ``pricing`` is a ``ModelPricingLookup`` instance.
+        - ``_agentic_cache`` keys are task description strings;
+          values are ``(num_steps, quality_by_size)`` tuples.
 
     Abstraction function:
         Represents an analytical strategy for predicting the runtime,
@@ -56,11 +104,18 @@ class CostModel:
         input plan costs and model pricing data.
     """
 
-    def __init__(self, pricing: ModelPricingLookup | None = None):
+    def __init__(
+        self,
+        pricing: ModelPricingLookup | None = None,
+        llm_config: dict | None = None,
+    ):
         """Construct a ``CostModel``.
 
         Requires:
             - *pricing*, if provided, is a ``ModelPricingLookup``.
+            - *llm_config*, if provided, is a dict mapping API-key
+              names to their values (used to select a model for
+              agentic cost estimation).
 
         Returns:
             A new ``CostModel`` with the given (or default) pricing
@@ -70,6 +125,9 @@ class CostModel:
             None.
         """
         self.pricing = pricing or ModelPricingLookup(default_pricing=DEFAULT_PRICING)
+        self.llm_config = llm_config or {}
+        self._estimator_model_id: str | None = get_best_available_model_id(self.llm_config)
+        self._agentic_cache: dict[str, tuple[int, dict[str, float]]] = {}
 
     def __call__(
         self,
@@ -112,6 +170,10 @@ class CostModel:
             return self._estimate_groupby(operator, input_plan_cost)
         elif isinstance(operator, SemTopKOperator):
             return self._estimate_topk(operator, input_plan_cost)
+        elif isinstance(operator, CodeOperator):
+            return self._estimate_code(operator, input_plan_cost)
+        elif isinstance(operator, ReasoningOperator):
+            return self._estimate_reasoning(operator, input_plan_cost)
 
         raise NotImplementedError(f"CostModel does not handle {type(operator).__name__}")
 
@@ -439,3 +501,165 @@ class CostModel:
             cost_per_record=cost_per_record,
             time_per_record=time_per_record,
         )
+
+    # ── Code and reasoning operators ─────────────────────────────────
+
+    def _get_agentic_estimates(self, task: str) -> tuple[int, dict[str, float]]:
+        """Return ``(num_steps, quality_by_size)`` for *task*, using the cache or an LLM.
+
+        If the cache already contains an entry for *task*, the cached
+        value is returned immediately.  Otherwise an LLM call is made
+        to estimate the values, the result is cached, and then returned.
+
+        When no estimator model is available (no API keys configured),
+        the built-in defaults are used.
+
+        Requires:
+            - *task* is a non-empty string describing the agentic task.
+
+        Returns:
+            A tuple ``(num_steps, quality_by_size)`` where *num_steps*
+            is a positive integer and *quality_by_size* maps
+            ``"small"``, ``"medium"``, and ``"large"`` to floats in
+            ``[0.0, 1.0]``.
+
+        Raises:
+            None.  LLM or parsing errors are logged and fall back to
+            defaults.
+        """
+        if task in self._agentic_cache:
+            return self._agentic_cache[task]
+
+        num_steps = DEFAULT_AGENTIC_NUM_STEPS
+        quality_by_size = dict(DEFAULT_AGENTIC_QUALITY)
+
+        if self._estimator_model_id is not None:
+            try:
+                prompt = _AGENTIC_ESTIMATE_PROMPT.format(task=task)
+                api_key = get_api_key_for_model(self._estimator_model_id, self.llm_config)
+                response = litellm.completion(
+                    model=self._estimator_model_id,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    api_key=api_key,
+                )
+                raw = response.choices[0].message.content.strip()
+                parsed = json.loads(raw)
+                num_steps = max(1, min(int(parsed["num_steps"]), 20))
+                for size in ("small", "medium", "large"):
+                    if size in parsed.get("quality_by_size", {}):
+                        quality_by_size[size] = max(0.0, min(float(parsed["quality_by_size"][size]), 1.0))
+            except Exception:
+                logger.warning(
+                    "LLM estimation failed for agentic task '%s'; using defaults.",
+                    task[:80],
+                    exc_info=True,
+                )
+
+        self._agentic_cache[task] = (num_steps, quality_by_size)
+        return num_steps, quality_by_size
+
+    def _estimate_agentic(
+        self,
+        operator: CodeOperator | ReasoningOperator,
+        input_plan_cost: PlanCost,
+    ) -> PlanCost:
+        """Shared cost estimation for multi-step agentic operators.
+
+        Models the iterative generate/execute loop where each step
+        consumes all previous context (input + output tokens from prior
+        steps plus the latest observation) and produces one step's
+        worth of output tokens (code).
+
+        Requires:
+            - *operator* is a ``CodeOperator`` or ``ReasoningOperator``
+              with ``model_id`` and ``task`` attributes.
+            - *input_plan_cost* is a valid ``PlanCost``.
+
+        Returns:
+            A ``PlanCost`` reflecting the cumulative cost/time across
+            all estimated agentic steps, with selectivity 1.0 and a
+            quality-adjusted ``total_scanned_input_tokens``.
+
+        Raises:
+            None.
+        """
+        pricing = self.pricing.get(operator.model_id)
+        num_steps, quality_by_size = self._get_agentic_estimates(operator.task)
+        model_size: ModelSize = get_model_size(operator.model_id)
+        quality = quality_by_size.get(model_size.value, DEFAULT_AGENTIC_QUALITY["medium"])
+
+        n = input_plan_cost.output_cardinality
+        t_in = input_plan_cost.avg_tokens_per_record
+        input_data_tokens = n * t_in
+
+        # Accumulate cost across agentic steps.
+        #
+        # Step i (1-indexed) input context =
+        #   system_prompt
+        #   + input_data_tokens
+        #   + (i-1) * (output_tokens_per_step + observation_tokens_per_step)
+        total_input_tokens = 0.0
+        total_output_tokens = 0.0
+        for i in range(1, num_steps + 1):
+            step_input = (
+                DEFAULT_AGENTIC_SYSTEM_PROMPT_TOKENS
+                + input_data_tokens
+                + (i - 1) * (DEFAULT_AGENTIC_OUTPUT_TOKENS_PER_STEP + DEFAULT_AGENTIC_OBSERVATION_TOKENS_PER_STEP)
+            )
+            total_input_tokens += step_input
+            total_output_tokens += DEFAULT_AGENTIC_OUTPUT_TOKENS_PER_STEP
+
+        dollar_cost = (
+            total_input_tokens * pricing.input_cost_per_token
+            + total_output_tokens * pricing.output_cost_per_token
+        )
+        wall_time = num_steps * DEFAULT_AGENTIC_TIME_PER_STEP
+
+        # Quality: scale total_scanned_input_tokens by quality so that
+        # PlanCost.quality reflects the model's expected effectiveness.
+        total_plan_input = input_data_tokens + input_plan_cost.total_input_tokens
+        total_scanned = quality * total_plan_input + input_plan_cost.total_scanned_input_tokens
+
+        return PlanCost(
+            cost=dollar_cost + input_plan_cost.cost,
+            time=wall_time + input_plan_cost.time,
+            total_input_tokens=total_plan_input,
+            total_scanned_input_tokens=total_scanned,
+            input_cardinality=n,
+            output_cardinality=n,
+            selectivity=1.0,
+            avg_tokens_per_record=t_in + DEFAULT_AGENTIC_OUTPUT_TOKENS_PER_STEP,
+            cost_per_record=dollar_cost / n if n > 0 else dollar_cost,
+            time_per_record=wall_time / n if n > 0 else wall_time,
+        )
+
+    def _estimate_code(self, operator: CodeOperator, input_plan_cost: PlanCost) -> PlanCost:
+        """Estimate the cost of a code operator (multi-step agentic loop).
+
+        Requires:
+            - *operator* is a ``CodeOperator`` with ``model_id`` and ``task``.
+            - *input_plan_cost* is a valid ``PlanCost``.
+
+        Returns:
+            A ``PlanCost`` for the agentic code execution loop.
+
+        Raises:
+            None.
+        """
+        return self._estimate_agentic(operator, input_plan_cost)
+
+    def _estimate_reasoning(self, operator: ReasoningOperator, input_plan_cost: PlanCost) -> PlanCost:
+        """Estimate the cost of a reasoning operator (multi-step agentic loop).
+
+        Requires:
+            - *operator* is a ``ReasoningOperator`` with ``model_id`` and ``task``.
+            - *input_plan_cost* is a valid ``PlanCost``.
+
+        Returns:
+            A ``PlanCost`` for the agentic reasoning loop.
+
+        Raises:
+            None.
+        """
+        return self._estimate_agentic(operator, input_plan_cost)
