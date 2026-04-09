@@ -2,13 +2,9 @@
 # Must be one of: dev, wl-prod, lm-prod, at-prod
 env: ""
 
-# Public hostname for the backend API ingress rule.
-# e.g. api-dev.carnot-research.org
-apiHostname: ""
-
-# Public hostname for the frontend ingress rule.
+# Public hostname for the ingress rule.
 # e.g. dev.carnot-research.org
-frontendHostname: ""
+hostname: ""
 
 # Origin of the frontend. Passed to FastAPI as BASE_ORIGINS for CORS.
 # e.g. https://dev.carnot-research.org

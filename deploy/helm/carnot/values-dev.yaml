@@ -1,6 +1,5 @@
 env: dev
-apiHostname: api-dev.carnot-research.org
-frontendHostname: dev.carnot-research.org
+hostname: dev.carnot-research.org
 frontendOrigin: https://dev.carnot-research.org
 
 backend:

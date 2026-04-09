@@ -233,7 +233,7 @@ jobs:
             --build-arg VITE_AUTH0_AUDIENCE=${{ secrets.AUTH0_AUDIENCE }} \
             --build-arg VITE_AUTH0_CLIENT_ID=${{ env.VITE_AUTH0_CLIENT_ID }} \
             --build-arg VITE_AUTH0_ORGANIZATION_ID=${{ env.VITE_AUTH0_ORGANIZATION_ID }} \
-            --build-arg VITE_API_BASE_URL=https://api-${SUBDOMAIN}.carnot-research.org \
+            --build-arg VITE_API_BASE_URL=https://${SUBDOMAIN}.carnot-research.org/api \
             -t ${{ vars.DOCKERHUB_USERNAME }}/carnot:frontend-$ENV_NAME-$GITHUB_SHA \
             deploy/compose
           docker push ${{ vars.DOCKERHUB_USERNAME }}/carnot:frontend-$ENV_NAME-$GITHUB_SHA
@@ -256,8 +256,7 @@ jobs:
             --set backend.image.tag=backend-$ENV_NAME-$GITHUB_SHA \
             --set frontend.image.repository=${{ vars.DOCKERHUB_USERNAME }}/carnot \
             --set frontend.image.tag=frontend-$ENV_NAME-$GITHUB_SHA \
-            --set apiHostname=api-${SUBDOMAIN}.carnot-research.org \
-            --set frontendHostname=${SUBDOMAIN}.carnot-research.org \
+            --set hostname=${SUBDOMAIN}.carnot-research.org \
             --set frontendOrigin=https://${SUBDOMAIN}.carnot-research.org \
             --wait \
             --timeout 5m

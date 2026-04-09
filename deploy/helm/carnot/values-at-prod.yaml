@@ -1,7 +1,6 @@
 env: at-prod
-apiHostname: ""        # TODO: fill in when subdomain is known
-frontendHostname: ""   # TODO: fill in when subdomain is known
-frontendOrigin: ""     # TODO: fill in when subdomain is known
+hostname: ""         # Set at deploy time via --set from SUBDOMAIN secret
+frontendOrigin: ""   # Set at deploy time via --set from SUBDOMAIN secret
 
 backend:
   autoscaling:
