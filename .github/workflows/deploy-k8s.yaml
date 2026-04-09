@@ -1,7 +1,7 @@
-name: Deploy to EKS (k8s branch)
+name: Deploy to EKS
 
-# Triggers only on pushes to the k8s branch.
-# This is a parallel deploy path that does not touch the existing EC2/Docker Compose pipeline.
+# Deploys infrastructure (Global + EKS Terraform) and the application
+# (Docker images + Helm) on every push to a deployment branch.
 on:
   push:
     branches:
@@ -233,7 +233,7 @@ jobs:
             --build-arg VITE_AUTH0_AUDIENCE=${{ secrets.AUTH0_AUDIENCE }} \
             --build-arg VITE_AUTH0_CLIENT_ID=${{ env.VITE_AUTH0_CLIENT_ID }} \
             --build-arg VITE_AUTH0_ORGANIZATION_ID=${{ env.VITE_AUTH0_ORGANIZATION_ID }} \
-            --build-arg VITE_API_BASE_URL=https://${SUBDOMAIN}.carnot-research.org/api \
+            --build-arg VITE_API_BASE_URL=https://api-${SUBDOMAIN}.carnot-research.org \
             -t ${{ vars.DOCKERHUB_USERNAME }}/carnot:frontend-$ENV_NAME-$GITHUB_SHA \
             deploy/compose
           docker push ${{ vars.DOCKERHUB_USERNAME }}/carnot:frontend-$ENV_NAME-$GITHUB_SHA
@@ -256,6 +256,9 @@ jobs:
             --set backend.image.tag=backend-$ENV_NAME-$GITHUB_SHA \
             --set frontend.image.repository=${{ vars.DOCKERHUB_USERNAME }}/carnot \
             --set frontend.image.tag=frontend-$ENV_NAME-$GITHUB_SHA \
+            --set apiHostname=api-${SUBDOMAIN}.carnot-research.org \
+            --set frontendHostname=${SUBDOMAIN}.carnot-research.org \
+            --set frontendOrigin=https://${SUBDOMAIN}.carnot-research.org \
             --wait \
             --timeout 5m
 

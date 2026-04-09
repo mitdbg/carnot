@@ -1,7 +1,7 @@
 env: dev
-apiHostname: api-k8s-dev.carnot-research.org
-frontendHostname: k8s-dev.carnot-research.org
-frontendOrigin: https://k8s-dev.carnot-research.org
+apiHostname: api-dev.carnot-research.org
+frontendHostname: dev.carnot-research.org
+frontendOrigin: https://dev.carnot-research.org
 
 backend:
   autoscaling:

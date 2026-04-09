@@ -1,13 +1,9 @@
-name: Deploy to AWS
+name: Deploy to AWS (DEPRECATED — replaced by deploy-k8s.yaml)
 
+# Disabled: all branches now deploy via the EKS/Helm pipeline.
+# Kept for reference during migration. Safe to delete once migration is complete.
 on:
-  push:
-    branches:
-    - main
-    - at-prod
-    - lm-prod
-    - wl-prod
-    - dev
+  workflow_dispatch:  # manual-only trigger
 
 permissions:
   id-token: write
