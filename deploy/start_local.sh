@@ -16,20 +16,42 @@ export LOCAL_BASE_DIR="$LOCAL_BASE_DIR"
 export DOCKERHUB_USERNAME="carnotlocal"
 export SETTINGS_ENCRYPTION_KEY="12u1STDIIImTyKtTfkqwPDRCK4dCe65xHfXrPjrTeIU="
 
-# Frontend Build Arguments (Vite variables)
-# NOTE: if you want Auth0 to work locally, you will need to set the following variables:
-#  - VITE_AUTH0_DOMAIN
-#  - VITE_AUTH0_AUDIENCE
-#  - VITE_AUTH0_CLIENT_ID
-#  - VITE_AUTH0_ORGANIZATION_ID
-#  - AUTH0_CLAIMS_NAMESPACE
-# mdrusso has the local Auth0 setup for Carnot, ask him for details.
+# Auth0 configuration.
+# VITE_AUTH0_CLIENT_ID and VITE_AUTH0_ORGANIZATION_ID must be exported before
+# running this script — ask the team for the local dev app credentials.
+export VITE_AUTH0_DOMAIN="${VITE_AUTH0_DOMAIN:-login.carnot-research.org}"
+export VITE_AUTH0_AUDIENCE="${VITE_AUTH0_AUDIENCE:-https://carnot.api.com}"
+export AUTH0_CLAIMS_NAMESPACE="${AUTH0_CLAIMS_NAMESPACE:-https://carnot.api.com/claims}"
+
+# Frontend build arg — points the SPA at the NGINX-proxied API path
 export VITE_API_BASE_URL="http://localhost:8000/api"
 
 # Backend Runtime Environment
 export BASE_ORIGINS="http://localhost"
 
-# --- Database Secrets Defaults ---
+# --- Generate frontend .env.local ---
+FRONTEND_ENV="../app/frontend/.env.local"
+if [[ -z "$VITE_AUTH0_CLIENT_ID" || -z "$VITE_AUTH0_ORGANIZATION_ID" ]]; then
+  echo "❌ Missing required Auth0 credentials:"
+  [[ -z "$VITE_AUTH0_CLIENT_ID" ]] && echo "   VITE_AUTH0_CLIENT_ID is not set"
+  [[ -z "$VITE_AUTH0_ORGANIZATION_ID" ]] && echo "   VITE_AUTH0_ORGANIZATION_ID is not set"
+  echo ""
+  echo "   Export these variables before running this script:"
+  echo "     export VITE_AUTH0_CLIENT_ID=<client-id>"
+  echo "     export VITE_AUTH0_ORGANIZATION_ID=<org-id>"
+  echo "   Ask the team for the local dev app credentials."
+  exit 1
+fi
+
+echo "Writing Auth0 config to $FRONTEND_ENV..."
+cat > "$FRONTEND_ENV" <<EOF
+VITE_AUTH0_DOMAIN=${VITE_AUTH0_DOMAIN}
+VITE_AUTH0_CLIENT_ID=${VITE_AUTH0_CLIENT_ID}
+VITE_AUTH0_AUDIENCE=${VITE_AUTH0_AUDIENCE}
+VITE_AUTH0_ORGANIZATION_ID=${VITE_AUTH0_ORGANIZATION_ID}
+EOF
+
+# --- Database Defaults ---
 DB_PASSWORD_DEFAULT="supersecretpassword"
 DB_USER_DEFAULT="carnotuser"
 DB_NAME_DEFAULT="carnotdb"

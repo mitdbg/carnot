@@ -1,0 +1,4 @@
+apiVersion: v2
+name: cluster-config
+description: Cluster-level configuration resources (ClusterSecretStore, etc.)
+version: 0.1.0

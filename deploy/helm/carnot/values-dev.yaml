@@ -1,0 +1,23 @@
+env: dev
+hostname: dev.carnot-research.org
+frontendOrigin: https://dev.carnot-research.org
+
+backend:
+  autoscaling:
+    minReplicas: 1
+    maxReplicas: 3
+
+irsa:
+  roleArn: arn:aws:iam::422297141788:role/carnot-dev-sa-role
+
+auth0:
+  domain: "login.carnot-research.org"
+  audience: "https://carnot.api.com"
+  claimsNamespace: "https://carnot.api.com/claims"
+
+acmCertificateArn: "arn:aws:acm:us-east-1:422297141788:certificate/10be4bdb-461d-4dec-9ddf-501e2f157fab"
+
+secretsManager:
+  enabled: true
+  dbSecretName: carnot/dev/db
+  appSecretName: carnot/dev/app

@@ -1,0 +1,267 @@
+name: Deploy to EKS
+
+# Deploys infrastructure (Global + EKS Terraform) and the application
+# (Docker images + Helm) on every push to a deployment branch.
+on:
+  push:
+    branches:
+      - k8s
+      - main
+      - dev
+      - at-prod
+      - lm-prod
+      - wl-prod
+
+permissions:
+  id-token: write   # required for OIDC auth with AWS
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: carnot-unified-backend
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # Authenticate to AWS using OIDC — no long-lived credentials stored in GitHub.
+      # CarnotGithubRole must have an inline policy allowing eks:DescribeCluster on this cluster.
+      # The role must also be in the cluster's aws-auth ConfigMap so kubectl/Helm calls succeed.
+      - name: Determine subdomain
+        id: subdomain
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == "wl-prod" ]]; then
+            echo "SUBDOMAIN=${{ secrets.WL_PROD }}" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF_NAME}" == "lm-prod" ]]; then
+            echo "SUBDOMAIN=${{ secrets.LM_PROD }}" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF_NAME}" == "at-prod" ]]; then
+            echo "SUBDOMAIN=${{ secrets.AT_PROD }}" >> $GITHUB_ENV
+          else
+            echo "SUBDOMAIN=dev" >> $GITHUB_ENV
+          fi
+
+      - name: Determine environment
+        id: environment
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == "wl-prod" ]]; then
+            echo "ENV_NAME=wl-prod" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF_NAME}" == "lm-prod" ]]; then
+            echo "ENV_NAME=lm-prod" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF_NAME}" == "at-prod" ]]; then
+            echo "ENV_NAME=at-prod" >> $GITHUB_ENV
+          else
+            echo "ENV_NAME=dev" >> $GITHUB_ENV
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@main
+        with:
+          role-to-assume: arn:aws:iam::422297141788:role/CarnotGithubRole
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.13.5
+          terraform_wrapper: false
+
+      - name: Write Deployer Key to Files
+        env:
+          CARNOT_DEPLOY_KEY: ${{ secrets.CARNOT_DEPLOY_KEY }}
+        run: |
+          echo "$CARNOT_DEPLOY_KEY" > deployer_key.pem
+          chmod 400 deployer_key.pem
+
+      ######################################################################
+      # STEP 1 — PROVISION GLOBAL INFRASTRUCTURE
+      ######################################################################
+
+      - name: Terraform Init (Global)
+        working-directory: deploy/terraform/global
+        run: terraform init
+
+      - name: Terraform Validate (Global)
+        working-directory: deploy/terraform/global
+        run: terraform validate
+
+      - name: Write Global vars.tfvars
+        working-directory: deploy/terraform/global
+        run: |
+          cat > global-vars.tfvars <<EOF
+          auth0_custom_domain = "${{ secrets.AUTH0_CUSTOM_DOMAIN }}"
+          auth0_cname_target = "${{ secrets.AUTH0_CNAME_TARGET }}"
+          EOF
+
+      - name: Terraform Apply (Global)
+        working-directory: deploy/terraform/global
+        run: terraform apply -var-file="global-vars.tfvars" -auto-approve
+
+      - name: Get Homepage EC2 Public IP
+        working-directory: deploy/terraform/global
+        run: |
+          homepage_public_ip=$(terraform output -raw homepage_public_ip)
+          echo "HOMEPAGE_PUBLIC_IP=$homepage_public_ip" >> $GITHUB_ENV
+
+      - name: Start NGINX on Homepage EC2
+        env:
+          CARNOT_DEPLOY_KEY: ${{ secrets.CARNOT_DEPLOY_KEY }}
+          MS_APP_ID: ${{ secrets.MICROSOFT_APPLICATION_ID }}
+        run: |
+          echo "Preparing Entra ID association file..."
+          mkdir -p .well-known
+          echo "{\"associatedApplications\":[{\"applicationId\": \"$MS_APP_ID\"}]}" > .well-known/microsoft-identity-association.json
+
+          # sleep to ensure that the instance is ready to accept SSH connections
+          echo "Copying homepage files to $HOMEPAGE_PUBLIC_IP"
+          sleep 5
+
+          # copy files to EC2
+          scp -r -o StrictHostKeyChecking=no -i deployer_key.pem app/index.html app/terms-of-service.md app/privacy-statement.md .well-known ubuntu@$HOMEPAGE_PUBLIC_IP:~/
+
+          # Copy index.html to the NGINX default location inside the container's volume mount and (re)start container
+          ssh -o StrictHostKeyChecking=no -i deployer_key.pem ubuntu@$HOMEPAGE_PUBLIC_IP "
+            sudo docker start carnot-homepage-nginx
+            sleep 3
+
+            # Ensure the directory exists in the container and copy files
+            sudo docker exec carnot-homepage-nginx mkdir -p /usr/share/nginx/html/.well-known
+            sudo docker cp index.html carnot-homepage-nginx:/usr/share/nginx/html/index.html
+            sudo docker cp terms-of-service.md carnot-homepage-nginx:/usr/share/nginx/html/terms-of-service.md
+            sudo docker cp privacy-statement.md carnot-homepage-nginx:/usr/share/nginx/html/privacy-statement.md
+            sudo docker cp .well-known/microsoft-identity-association.json carnot-homepage-nginx:/usr/share/nginx/html/.well-known/microsoft-identity-association.json
+
+            # Clean up home directory
+            rm -rf index.html terms-of-service.md privacy-statement.md .well-known
+
+            sudo docker restart carnot-homepage-nginx
+          "
+
+      ######################################################################
+      # STEP 2 — PROVISION EKS CLUSTER INFRASTRUCTURE
+      ######################################################################
+
+      - name: Terraform Init (EKS)
+        working-directory: deploy/terraform/eks
+        run: terraform init
+
+      - name: Terraform Validate (EKS)
+        working-directory: deploy/terraform/eks
+        run: terraform validate
+
+      - name: Terraform Apply (EKS)
+        working-directory: deploy/terraform/eks
+        run: terraform apply -auto-approve
+
+      ######################################################################
+      # STEP 2.5 — SEED ORG-LEVEL DEFAULT API KEYS (if applicable)
+      ######################################################################
+
+      - name: Seed org-level default API keys
+        if: env.ENV_NAME == 'lm-prod' || env.ENV_NAME == 'at-prod'
+        run: |
+          SECRET_ID="carnot/${ENV_NAME}/__org_defaults__"
+
+          if [[ "${ENV_NAME}" == "lm-prod" ]]; then
+            OPENAI_API_KEY="${{ secrets.LM_PROD_OPENAI_API_KEY }}"
+          elif [[ "${ENV_NAME}" == "at-prod" ]]; then
+            OPENAI_API_KEY="${{ secrets.AT_PROD_OPENAI_API_KEY }}"
+          fi
+
+          SECRET_JSON=$(jq -n --arg key "$OPENAI_API_KEY" '{"openai_api_key": $key}')
+
+          aws secretsmanager create-secret \
+            --name "$SECRET_ID" \
+            --secret-string "$SECRET_JSON" \
+            --region us-east-1 2>/dev/null \
+          || aws secretsmanager put-secret-value \
+            --secret-id "$SECRET_ID" \
+            --secret-string "$SECRET_JSON" \
+            --region us-east-1
+
+      ######################################################################
+      # STEP 3 — BUILD & PUSH IMAGES TO DOCKER HUB
+      ######################################################################
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Mirror the file layout the Dockerfiles expect (same as existing workflow)
+      - name: Copy source files into build context
+        run: |
+          cp -r app/backend  deploy/compose/backend
+          cp -r app/frontend deploy/compose/frontend
+          cp -r src          deploy/compose/src
+          cp pyproject.toml  deploy/compose/pyproject.toml
+          cp README.md       deploy/compose/README.md
+
+      - name: Build and push backend image
+        run: |
+          docker build \
+            -f deploy/compose/Dockerfile-backend \
+            -t ${{ vars.DOCKERHUB_USERNAME }}/carnot:backend-$ENV_NAME-$GITHUB_SHA \
+            deploy/compose
+          docker push ${{ vars.DOCKERHUB_USERNAME }}/carnot:backend-$ENV_NAME-$GITHUB_SHA
+
+      - name: Determine Auth0 secrets
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == "wl-prod" ]]; then
+            echo "VITE_AUTH0_CLIENT_ID=${{ secrets.WL_PROD_AUTH0_CLIENT_ID }}" >> $GITHUB_ENV
+            echo "VITE_AUTH0_ORGANIZATION_ID=${{ secrets.WL_PROD_AUTH0_ORGANIZATION_ID }}" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF_NAME}" == "lm-prod" ]]; then
+            echo "VITE_AUTH0_CLIENT_ID=${{ secrets.LM_PROD_AUTH0_CLIENT_ID }}" >> $GITHUB_ENV
+            echo "VITE_AUTH0_ORGANIZATION_ID=${{ secrets.LM_PROD_AUTH0_ORGANIZATION_ID }}" >> $GITHUB_ENV
+          elif [[ "${GITHUB_REF_NAME}" == "at-prod" ]]; then
+            echo "VITE_AUTH0_CLIENT_ID=${{ secrets.AT_PROD_AUTH0_CLIENT_ID }}" >> $GITHUB_ENV
+            echo "VITE_AUTH0_ORGANIZATION_ID=${{ secrets.AT_PROD_AUTH0_ORGANIZATION_ID }}" >> $GITHUB_ENV
+          else
+            echo "VITE_AUTH0_CLIENT_ID=${{ secrets.DEV_AUTH0_CLIENT_ID }}" >> $GITHUB_ENV
+            echo "VITE_AUTH0_ORGANIZATION_ID=${{ secrets.DEV_AUTH0_ORGANIZATION_ID }}" >> $GITHUB_ENV
+          fi
+
+      - name: Build and push frontend image
+        run: |
+          docker build \
+            -f deploy/compose/Dockerfile-frontend \
+            --build-arg VITE_AUTH0_DOMAIN=${{ secrets.AUTH0_CUSTOM_DOMAIN }} \
+            --build-arg VITE_AUTH0_AUDIENCE=${{ secrets.AUTH0_AUDIENCE }} \
+            --build-arg VITE_AUTH0_CLIENT_ID=${{ env.VITE_AUTH0_CLIENT_ID }} \
+            --build-arg VITE_AUTH0_ORGANIZATION_ID=${{ env.VITE_AUTH0_ORGANIZATION_ID }} \
+            --build-arg VITE_API_BASE_URL=https://${SUBDOMAIN}.carnot-research.org/api \
+            -t ${{ vars.DOCKERHUB_USERNAME }}/carnot:frontend-$ENV_NAME-$GITHUB_SHA \
+            deploy/compose
+          docker push ${{ vars.DOCKERHUB_USERNAME }}/carnot:frontend-$ENV_NAME-$GITHUB_SHA
+
+      ######################################################################
+      # STEP 4 — DEPLOY VIA HELM
+      ######################################################################
+
+      - name: Connect kubectl to EKS cluster
+        run: |
+          aws eks update-kubeconfig --region $AWS_REGION --name $CLUSTER_NAME
+
+      - name: Helm deploy
+        run: |
+          helm upgrade --install carnot deploy/helm/carnot \
+            --namespace $ENV_NAME \
+            --create-namespace \
+            --values deploy/helm/carnot/values-$ENV_NAME.yaml \
+            --set backend.image.repository=${{ vars.DOCKERHUB_USERNAME }}/carnot \
+            --set backend.image.tag=backend-$ENV_NAME-$GITHUB_SHA \
+            --set frontend.image.repository=${{ vars.DOCKERHUB_USERNAME }}/carnot \
+            --set frontend.image.tag=frontend-$ENV_NAME-$GITHUB_SHA \
+            --set hostname=${SUBDOMAIN}.carnot-research.org \
+            --set frontendOrigin=https://${SUBDOMAIN}.carnot-research.org \
+            --wait \
+            --timeout 5m
+
+      - name: Verify rollout
+        run: |
+          kubectl rollout status deployment/carnot-backend -n $ENV_NAME
+          kubectl rollout status deployment/carnot-frontend -n $ENV_NAME
