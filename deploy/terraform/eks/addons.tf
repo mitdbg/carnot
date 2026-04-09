@@ -119,6 +119,27 @@ resource "helm_release" "cluster_autoscaler" {
     value = aws_iam_role.cluster_autoscaler.arn
   }
 
+  # ── OOM-resilience: guarantee scheduling and prevent eviction ──
+  set {
+    name  = "priorityClassName"
+    value = "system-cluster-critical"
+  }
+
+  set {
+    name  = "resources.requests.cpu"
+    value = "100m"
+  }
+
+  set {
+    name  = "resources.requests.memory"
+    value = "128Mi"
+  }
+
+  set {
+    name  = "resources.limits.memory"
+    value = "256Mi"
+  }
+
   depends_on = [helm_release.alb_controller]
 }
 
