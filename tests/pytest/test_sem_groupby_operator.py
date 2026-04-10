@@ -1,9 +1,11 @@
+import pytest
+
 from carnot.data.dataset import Dataset
 from carnot.operators.sem_groupby import SemGroupByOperator
 
-TEST_MODEL_ID = "openai/gpt-5-mini"
 
-def test_sem_groupby_operator_sem_group_relational_agg():
+@pytest.mark.llm
+def test_sem_groupby_operator_sem_group_relational_agg(test_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [
         {"animal": animal}
@@ -22,13 +24,13 @@ def test_sem_groupby_operator_sem_group_relational_agg():
     input_datasets = {animal_dataset.name: animal_dataset}
 
     # execute the operator
-    sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, TEST_MODEL_ID, max_workers=4)
-    output_datasets = sem_groupby_operator("Animal Dataset", input_datasets)
+    sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
+    output_datasets, _stats = sem_groupby_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 2
-    assert "SemGroupByOperatorOutput" in output_datasets
-    output_dataset = output_datasets["SemGroupByOperatorOutput"]
+    assert "output-dataset-id" in output_datasets
+    output_dataset = output_datasets["output-dataset-id"]
     assert len(output_dataset.items) == 4
     assert {"animal_group": "mammal", "count": 2} in output_dataset.items
     assert {"animal_group": "reptile", "count": 1} in output_dataset.items
@@ -36,7 +38,8 @@ def test_sem_groupby_operator_sem_group_relational_agg():
     assert {"animal_group": "bird", "count": 1} in output_dataset.items
 
 
-def test_sem_groupby_operator_sem_group_sem_agg():
+@pytest.mark.llm
+def test_sem_groupby_operator_sem_group_sem_agg(test_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [
         {"animal": animal, "name": name, "weight": weight}
@@ -64,13 +67,13 @@ def test_sem_groupby_operator_sem_group_sem_agg():
     input_datasets = {animal_dataset.name: animal_dataset}
 
     # execute the operator
-    sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, TEST_MODEL_ID, max_workers=4)
-    output_datasets = sem_groupby_operator("Animal Dataset", input_datasets)
+    sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
+    output_datasets, _stats = sem_groupby_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 2
-    assert "SemGroupByOperatorOutput" in output_datasets
-    output_dataset = output_datasets["SemGroupByOperatorOutput"]
+    assert "output-dataset-id" in output_datasets
+    output_dataset = output_datasets["output-dataset-id"]
     assert len(output_dataset.items) == 4
     assert {"animal_group": "mammal", "count": 2, "heaviest_animal": "dumbo"} in output_dataset.items
     assert {"animal_group": "reptile", "count": 1, "heaviest_animal": "annie"} in output_dataset.items
@@ -78,7 +81,8 @@ def test_sem_groupby_operator_sem_group_sem_agg():
     assert {"animal_group": "bird", "count": 1, "heaviest_animal": "sam"} in output_dataset.items
 
 
-def test_sem_groupby_operator_relational_group_sem_agg():
+@pytest.mark.llm
+def test_sem_groupby_operator_relational_group_sem_agg(test_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [
         {"animal": animal, "name": name, "weight": weight}
@@ -105,13 +109,13 @@ def test_sem_groupby_operator_relational_group_sem_agg():
     input_datasets = {animal_dataset.name: animal_dataset}
 
     # execute the operator
-    sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, TEST_MODEL_ID, max_workers=4)
-    output_datasets = sem_groupby_operator("Animal Dataset", input_datasets)
+    sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
+    output_datasets, _stats = sem_groupby_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 2
-    assert "SemGroupByOperatorOutput" in output_datasets
-    output_dataset = output_datasets["SemGroupByOperatorOutput"]
+    assert "output-dataset-id" in output_datasets
+    output_dataset = output_datasets["output-dataset-id"]
     assert len(output_dataset.items) == 4
     assert {"animal": "giraffe", "heaviest_weight": 1192.0} in output_dataset.items
     assert {"animal": "anaconda", "heaviest_weight": 7.0} in output_dataset.items
@@ -119,7 +123,8 @@ def test_sem_groupby_operator_relational_group_sem_agg():
     assert {"animal": "tucan", "heaviest_weight": 0.5} in output_dataset.items
 
 
-def test_sem_groupby_operator_relational_group_relational_agg():
+@pytest.mark.llm
+def test_sem_groupby_operator_relational_group_relational_agg(test_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [
         {"animal": animal, "name": name, "weight": weight}
@@ -146,13 +151,13 @@ def test_sem_groupby_operator_relational_group_relational_agg():
     input_datasets = {animal_dataset.name: animal_dataset}
 
     # execute the operator
-    sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, TEST_MODEL_ID, max_workers=4)
-    output_datasets = sem_groupby_operator("Animal Dataset", input_datasets)
+    sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
+    output_datasets, _stats = sem_groupby_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 2
-    assert "SemGroupByOperatorOutput" in output_datasets
-    output_dataset = output_datasets["SemGroupByOperatorOutput"]
+    assert "output-dataset-id" in output_datasets
+    output_dataset = output_datasets["output-dataset-id"]
     assert len(output_dataset.items) == 4
     assert {"animal": "giraffe", "weight": 1192.0} in output_dataset.items
     assert {"animal": "anaconda", "weight": 7.0} in output_dataset.items

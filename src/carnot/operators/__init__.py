@@ -1,18 +1,27 @@
 from carnot.operators.logical import (
     Aggregate,
     Code,
-    FilteredScan,
-    JoinOp,
-    MapScan,
+    Filter,
+    FlatMap,
+    GroupBy,
+    Join,
+    Limit,
+    LogicalOperator,
+    Map,
+    # Reason, --- IGNORE ---
     TopK,
 )
 
-LOGICAL_OPERATORS = [
+LOGICAL_OPERATORS: list[LogicalOperator] = [
     Aggregate,
     Code,
-    FilteredScan,
-    JoinOp,
-    MapScan,
+    Filter,
+    FlatMap,
+    GroupBy,
+    Join,
+    Limit,
+    Map,
+    # Reason, --- IGNORE ---
     TopK,
 ]
 

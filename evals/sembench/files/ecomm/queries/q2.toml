@@ -1,0 +1,38 @@
+[metadata]
+query_id = 2
+modalities = ["image"]
+required_operators = ["SEMANTIC_FILTER"]
+description = """
+Basic semantic filter on image data.
+
+Simple query with a single selective semantic filter that is relatively easy to evaluate.
+Used to test isolated performance of semantic filters on image data.
+"""
+
+
+[definition]
+# For systems that accept free-text queries
+natural_language = """
+Based on the image representation of the product,
+find the product ids of products where the image shows
+a pair of sports shoes that are predominantly yellow and silver.
+"""
+# Equivalent to the natural language query
+sql = """
+SELECT
+  image_id
+FROM images
+WHERE SEM_FILTER('The displayed product shows a (pair of) sports shoe(s) that have the colors yellow and silver', image);
+"""
+
+# Traditional SQL query to compute the exact result on the non-omitted data.
+ground_truth = """
+select id
+from read_parquet('styles_details.parquet')
+where true
+  and articleType.typeName = 'Sports Shoes'
+  and list_has_all([baseColour, colour1, colour2], ['Yellow', 'Silver']);
+"""
+
+# Which accuracy metric to use for evaluation
+accuracy_metric = "f1-score"

@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from carnot.core.models import PlanCost
-from carnot.optimizer.cost_model import BaseCostModel
-from carnot.optimizer.optimizer_strategy_type import OptimizationStrategyType
-from carnot.optimizer.primitives import Expression, Group
-from carnot.optimizer.rules import ImplementationRule, Rule, TransformationRule
-from carnot.policy import Policy
+from carnot.optimizer.cost_model import CostModel
 
-logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from carnot.optimizer.optimizer import Optimizer
+from carnot.optimizer.primitives import CostEntry, Expression, Group
+from carnot.optimizer.rules import ImplementationRule, Rule, TransformationRule
+
 
 class Task:
     """
@@ -43,10 +42,8 @@ class OptimizeGroup(Task):
         self.group_id = group_id
 
     def perform(self, groups: dict[int, Group], context: dict[str, Any] | None = None) -> list[Task]:
-        logger.debug(f"Optimizing group {self.group_id}")
         # get updated instance of the group to be optimized
-        if context is None:
-            context = {}
+        context = context or {}
         group = groups[self.group_id]
 
         # if this group has already been optimized, there's nothing more to do
@@ -69,8 +66,6 @@ class OptimizeGroup(Task):
             task = ExploreGroup(self.group_id)
             new_tasks.append(task)
 
-        logger.debug(f"Done optimizing group {self.group_id}")
-        logger.debug(f"New tasks: {len(new_tasks)}")
         return new_tasks
 
 
@@ -83,11 +78,8 @@ class ExploreGroup(Task):
         self.group_id = group_id
 
     def perform(self, groups: dict[int, Group], context: dict[str, Any] | None = None) -> list[Task]:
-        logger.debug(f"Expanding group {self.group_id}")
-
         # fetch group
-        if context is None:
-            context = {}
+        context = context or {}
         group = groups[self.group_id]
 
         # if the group has been explored before, return []
@@ -109,8 +101,6 @@ class ExploreGroup(Task):
         # mark the group as explored and return tasks
         group.set_explored()
 
-        logger.debug(f"Done expanding group {self.group_id}")
-        logger.debug(f"New tasks: {len(new_tasks)}")
         return new_tasks
 
 
@@ -132,11 +122,8 @@ class OptimizeLogicalExpression(Task):
         implementation_rules: list[type[ImplementationRule]],
         context: dict[str, Any] | None = None,
     ) -> list[Task]:
-        logger.debug(f"Optimizing logical expression {self.logical_expression}")
-        if context is None:
-            context = {}
-
-        # if we're exploring, only apply transformation rules
+        # if we're exploring, only apply transformation rules which are tagged for exploration
+        context = context or {}
         rules = (
             [rule for rule in transformation_rules if rule.is_exploration_rule()]
             if self.exploring
@@ -158,8 +145,6 @@ class OptimizeLogicalExpression(Task):
             apply_rule_task = ApplyRule(rule, self.logical_expression, self.exploring)
             new_tasks.append(apply_rule_task)
 
-        logger.debug(f"Done optimizing logical expression {self.logical_expression}")
-        logger.debug(f"New tasks: {len(new_tasks)}")
         return new_tasks
 
 
@@ -170,7 +155,7 @@ class ApplyRule(Task):
     For TransformationRules, this task will:
     - apply the substitution, receiving new expressions and groups
     - filter the new expressions for ones which may already exist
-      - NOTE: we don't filter new groups because this implicitly must be done by the
+      - NOTE: we don't filter new groups because this is already done by the
               transformation rule in order to assign the correct group_id to any
               new expressions.
     - add new expressions to their group's set of logical expressions
@@ -188,88 +173,93 @@ class ApplyRule(Task):
         self.logical_expression = logical_expression
         self.exploring = exploring
 
+    def _apply_transformation_rule(
+        self,
+        groups: dict[int, Group],
+        expressions: dict[int, Expression],
+        next_group_id: int,
+        physical_op_params: dict[str, Any],
+    ) -> tuple[list[Task], int]:
+        new_tasks = []
+
+        # apply transformation rule
+        new_expressions, new_groups, next_group_id = self.rule.substitute(
+            self.logical_expression, groups, expressions, next_group_id, **physical_op_params
+        )
+
+        # filter out any expressions which are duplicates (i.e. they've been previously computed)
+        new_expressions = [expr for expr in new_expressions if expr.expr_id not in expressions]
+        expressions.update({expr.expr_id: expr for expr in new_expressions})
+
+        # add all new groups to the groups mapping
+        for group in new_groups:
+            groups[group.group_id] = group
+            task = OptimizeGroup(group.group_id)
+
+        # add new expressions to their respective groups
+        for expr in new_expressions:
+            group = groups[expr.group_id]
+            group.logical_expressions.add(expr)
+
+        # create new tasks for optimizing new logical expressions
+        for expr in new_expressions:
+            task = OptimizeLogicalExpression(expr, self.exploring)
+            new_tasks.append(task)
+
+        # NOTE: we place new tasks for groups on the top of the stack so that they may be
+        #       optimized before we optimize expressions which take new groups as inputs
+        # create new tasks for optimizing new groups
+        for group in new_groups:
+            task = OptimizeGroup(group.group_id)
+            new_tasks.append(task)
+
+        return new_tasks, next_group_id
+
+    def _apply_implementation_rule(self, group: Group, expressions: dict[int, Expression], physical_op_params: dict[str, Any]) -> list[Task]:
+        new_tasks = []
+
+        # apply implementation rule
+        new_expressions = self.rule.substitute(self.logical_expression, **physical_op_params)
+        new_expressions = [expr for expr in new_expressions if expr.expr_id not in expressions]
+
+        # update expressions mapping and add new physical expressions to the group
+        expressions.update({expr.expr_id: expr for expr in new_expressions})
+        group.physical_expressions.update(new_expressions)
+
+        # create new task
+        for expr in new_expressions:
+            task = OptimizePhysicalExpression(expr)
+            new_tasks.append(task)
+
+        return new_tasks
+
     def perform(
         self,
         groups: dict[int, Group],
         expressions: dict[int, Expression],
-        context: dict[str, Any] | None = None,
+        next_group_id: int = 0,
         **physical_op_params,
     ) -> tuple[list[Task], int]:
-        logger.debug(f"Applying rule {self.rule} to logical expression {self.logical_expression}")
-        if context is None:
-            context = {}
-
         # check if rule has already been applied to this logical expression; return [] if so
         if self.rule.get_rule_id() in self.logical_expression.rules_applied:
-            return []
+            return [], next_group_id
 
         # get the group of the logical expression
         group_id = self.logical_expression.group_id
         group = groups[group_id]
 
         # process new expressions; update groups and create new tasks as needed
-        new_tasks = []
         if issubclass(self.rule, TransformationRule):
-            # apply transformation rule
-            new_expressions, new_groups = self.rule.substitute(
-                self.logical_expression, groups, expressions, **physical_op_params
+            new_tasks, next_group_id = self._apply_transformation_rule(
+                groups, expressions, next_group_id, physical_op_params
             )
-
-            # filter out any expressions which are duplicates (i.e. they've been previously computed)
-            new_expressions = [expr for expr in new_expressions if expr.expr_id not in expressions]
-            expressions.update({expr.expr_id: expr for expr in new_expressions})
-
-            # add all new groups to the groups mapping
-            for group in new_groups:
-                groups[group.group_id] = group
-                task = OptimizeGroup(group.group_id)
-
-            # add new expressions to their respective groups
-            for expr in new_expressions:
-                group = groups[expr.group_id]
-                group.logical_expressions.add(expr)
-
-            # NOTE: we place new tasks for groups on the top of the stack so that they may be
-            #       optimized before we optimize expressions which take new groups as inputs
-            # create new tasks for optimizing new logical expressions
-            for expr in new_expressions:
-                task = OptimizeLogicalExpression(expr, self.exploring)
-                new_tasks.append(task)
-
-            # create new tasks for optimizing new groups
-            for group in new_groups:
-                task = OptimizeGroup(group.group_id)
-                new_tasks.append(task)
-
         else:
-            # apply implementation rule
-            new_expressions = self.rule.substitute(self.logical_expression, **physical_op_params)
-            new_expressions = [expr for expr in new_expressions if expr.expr_id not in expressions]
-
-            # get the costed_full_op_ids from the context (if provided) and compute whether this
-            # logical expression has physical operators which have been costed
-            costed_full_op_ids = context['costed_full_op_ids']
-            logical_op_has_been_costed = costed_full_op_ids is not None and any([
-                op_id.split("-")[0] == self.logical_expression.operator.get_logical_op_id()
-                for op_id in costed_full_op_ids
-            ])
-
-            if logical_op_has_been_costed:
-                new_expressions = [expr for expr in new_expressions if expr.operator.get_full_op_id() in costed_full_op_ids]
-            expressions.update({expr.expr_id: expr for expr in new_expressions})
-            group.physical_expressions.update(new_expressions)
-
-            # create new task
-            for expr in new_expressions:
-                task = OptimizePhysicalExpression(expr)
-                new_tasks.append(task)
+            new_tasks = self._apply_implementation_rule(group, expressions, physical_op_params)
 
         # mark that the rule has been applied to the logical expression
         self.logical_expression.add_applied_rule(self.rule)
 
-        logger.debug(f"Done applying rule {self.rule} to logical expression {self.logical_expression}")
-        logger.debug(f"New tasks: {len(new_tasks)}")
-        return new_tasks
+        return new_tasks, next_group_id
 
 
 class OptimizePhysicalExpression(Task):
@@ -278,278 +268,190 @@ class OptimizePhysicalExpression(Task):
 
     This task computes the cost of input groups for the given physical expression (scheduling
     OptimizeGroup tasks if needed), computes the cost of the given expression, and then updates
-    the expression's group depending on whether this expression is its `best_physical_expression`
-    or in its `pareto_optimal_physical_expressions`.
+    the expression's group depending on whether this expression is in its `pareto_optimal_physical_expressions`.
     """
 
-    def __init__(self, physical_expression: Expression, exploring: bool = False):
+    def __init__(self, physical_expression: Expression):
         self.physical_expression = physical_expression
-        self.exploring = exploring
-
-    def update_best_physical_expression(self, group: Group, policy: Policy) -> Group:
-        """
-        Update the best physical expression for the given group and policy (if necessary).
-        """
-        # get the PlanCosts for the current best expression and this physical expression
-        best_plan_cost = (
-            group.best_physical_expression.plan_cost if group.best_physical_expression is not None else None
-        )
-        expr_plan_cost = self.physical_expression.plan_cost
-
-        # pre-compute whether or not this physical expression satisfies the policy constraint
-        expr_satisfies_constraint = policy.constraint(expr_plan_cost)
-
-        # if we do not have a best physical expression for the group, we set this to be the best expression
-        if group.best_physical_expression is None:
-            group.best_physical_expression = self.physical_expression
-            group.satisfies_constraint = expr_satisfies_constraint
-
-        # if the group currently satisfies the constraint, only update the best physical expression
-        # if this expression also satisfies the constraint and is more policy optimal
-        elif group.satisfies_constraint and expr_satisfies_constraint and policy.choose(expr_plan_cost, best_plan_cost):
-            group.best_physical_expression = self.physical_expression
-
-        # finally, if the group does not satisfy the constraint, update the best physical expression if
-        # this expression does satisfy the constraint, or if it is more policy optimal
-        elif not group.satisfies_constraint and (
-            expr_satisfies_constraint or policy.choose(expr_plan_cost, best_plan_cost)
-        ):
-            group.best_physical_expression = self.physical_expression
-            group.satisfies_constraint = expr_satisfies_constraint
-
-        return group
-
-    def _is_dominated(self, plan_cost: PlanCost, other_plan_cost: PlanCost, policy: Policy):
-        """
-        Return true if plan_cost is dominated by other_plan_cost and False otherwise.
-
-        If plan costs are perfectly tied on dimensions of interest, other dimensions
-        will be used as a tiebreaker.
-        """
-        # get the dictionary representation of this poicy
-        policy_dict = policy.get_dict()
-
-        # get the metrics which matter for this policy
-        metrics_of_interest = {metric for metric, weight in policy_dict.items() if weight > 0.0}
-        remaining_metrics = {metric for metric, weight in policy_dict.items() if weight == 0.0}
-
-        # corner case: if the two plan costs are perfectly tied on all dimensions of interest,
-        # use other dimensions as tiebreaker
-        if (
-            all([getattr(plan_cost, metric) == getattr(other_plan_cost, metric) for metric in metrics_of_interest])
-            and plan_cost.op_estimates.cardinality == other_plan_cost.op_estimates.cardinality
-        ):
-            for metric in remaining_metrics:
-                if metric == "cost" and plan_cost.cost < other_plan_cost.cost:  # noqa: SIM114
-                    return False
-                elif metric == "time" and plan_cost.time < other_plan_cost.time:  # noqa: SIM114
-                    return False
-                elif metric == "quality" and plan_cost.quality > other_plan_cost.quality:
-                    return False
-
-            # if plan_cost is dominated by other_plan_cost on remaining metrics, return True
-            return True
-
-        # normal case: identify whether plan_cost is dominated by other_plan_cost
-        cost_dominated = True if policy_dict["cost"] == 0.0 else other_plan_cost.cost <= plan_cost.cost
-        time_dominated = True if policy_dict["time"] == 0.0 else other_plan_cost.time <= plan_cost.time
-        quality_dominated = True if policy_dict["quality"] == 0.0 else other_plan_cost.quality >= plan_cost.quality
-        cardinality_dominated = other_plan_cost.op_estimates.cardinality <= plan_cost.op_estimates.cardinality
-
-        return cost_dominated and time_dominated and quality_dominated and cardinality_dominated
-
-    def _is_pareto_optimal(self, expr_plan_cost: PlanCost, pareto_optimal_physical_expressions: list[Expression], policy: Policy) -> bool:
-        """
-        Return True if expr_plan_cost is pareto optimal and False otherwise.
-        """
-        pareto_optimal = True
-        for pareto_phys_expr in pareto_optimal_physical_expressions:
-            for other_expr_plan_cost, _ in pareto_phys_expr.pareto_optimal_plan_costs:
-                if self._is_dominated(expr_plan_cost, other_expr_plan_cost, policy):
-                    pareto_optimal = False
-                    break
-
-        return pareto_optimal
-
-    def update_pareto_optimal_physical_expressions(self, group: Group, policy: Policy) -> Group:
-        """
-        Update the pareto optimal physical expressions for the given group and policy (if necessary).
-        """
-        for pareto_expr_plan_cost, _ in self.physical_expression.pareto_optimal_plan_costs:
-            # if the pareto optimal physical expressions are empty, set the pareto optimal
-            # physical expressions to be this expression
-            if group.pareto_optimal_physical_expressions is None:
-                group.pareto_optimal_physical_expressions = [self.physical_expression]
-
-            # otherwise, if this expression is pareto optimal, update the pareto frontier
-            elif self._is_pareto_optimal(pareto_expr_plan_cost, group.pareto_optimal_physical_expressions, policy):
-                all_physical_expressions = [self.physical_expression] + group.pareto_optimal_physical_expressions
-
-                # compute the pareto optimal set of expressions (or plan costs)
-                pareto_optimal_physical_expressions = []
-                for idx, expr in enumerate(all_physical_expressions):
-                    for plan_cost, _ in expr.pareto_optimal_plan_costs:
-                        pareto_optimal = True
-
-                        # check if any other_expr has a plan cost which dominates plan_cost
-                        for other_idx, other_expr in enumerate(all_physical_expressions):
-                            if idx == other_idx:
-                                continue
-
-                            # if plan is dominated by other_expr, set pareto_optimal = False and break
-                            for other_plan_cost, _ in other_expr.pareto_optimal_plan_costs:
-                                if self._is_dominated(plan_cost, other_plan_cost, policy):
-                                    pareto_optimal = False
-                                    break
-
-                            # break early if plan_cost is already dominated by another expression's plan_cost
-                            if not pareto_optimal:
-                                break
-
-                        # add expr to pareto frontier if it has at least one plan cost which is not dominated
-                        if pareto_optimal:
-                            pareto_optimal_physical_expressions.append(expr)
-
-                            # we can break now because we've identified that this expression has a plan on the pareto frontier
-                            break
-
-                # set pareto optimal physical expressions for the group
-                group.pareto_optimal_physical_expressions = pareto_optimal_physical_expressions
-
-        return group
 
     def perform(
         self,
-        cost_model: BaseCostModel,
+        cost_model: CostModel,
         groups: dict[int, Group],
-        policy: Policy,
+        optimizer: Optimizer,
         context: dict[str, Any] | None = None,
     ) -> list[Task]:
-        logger.debug(f"Optimizing physical expression {self.physical_expression}")
+        """Cost this physical expression using CostEntry-based bookkeeping.
 
-        if context is None:
-            context = {}
+        Computes costs for all pareto-optimal combinations of input
+        group entries, writes ``CostEntry`` objects into the optimizer's
+        global store, and updates the expression's and group's pareto
+        frontiers.
 
-        # get the optimizer strategy (type) and the execution strategy (type) from the context
-        optimizer_strategy: OptimizationStrategyType = context['optimizer_strategy']
-        execution_strategy = context['execution_strategy']  # Always parallel execution
+        Requires:
+            - ``cost_model`` is a callable ``CostModel``.
+            - ``groups`` maps group IDs to ``Group`` instances.
+            - ``optimizer`` exposes ``cost_entries: dict[int, CostEntry]``,
+              ``next_entry_id: int``.
 
-        # return if we've already computed the cost of this physical expression
-        if optimizer_strategy.is_pareto() and self.physical_expression.pareto_optimal_plan_costs is not None:
+        Returns:
+            A list of ``Task`` objects to push onto the task stack.
+            Empty when costing is complete; contains ``[self] + [OptimizeGroup(...)]``
+            when input groups still need optimization.
+
+        Raises:
+            None.
+        """
+        context = context or {}
+        expr = self.physical_expression
+
+        # return if we've already computed costs for this expression
+        if expr.pareto_entry_ids is not None:
             return []
 
-        if optimizer_strategy.is_not_pareto() and self.physical_expression.plan_cost is not None:
-            return []
+        # Collect pareto entries from input groups.
+        input_group_entries: list[list[CostEntry]] = []
+        new_tasks: list[Task] = []
+        for gid in expr.input_group_ids:
+            g = groups[gid]
+            if g.pareto_frontier is None:
+                new_tasks.append(OptimizeGroup(gid))
+            else:
+                entries = [optimizer.cost_entries[eid] for _, eid in g.pareto_frontier]
+                input_group_entries.append(entries)
 
-        # for expressions with input group(s), compute the input plan cost(s)
-        best_input_plan_costs = {}
-        pareto_optimal_input_plan_costs = {}
-        if len(self.physical_expression.input_group_ids) > 0:
-            new_tasks = []
-            for input_group_id in self.physical_expression.input_group_ids:
-                # get the input group
-                input_group = groups[input_group_id]
+        # If not all input groups have been costed, schedule them first then retry.
+        if new_tasks:
+            return [self] + new_tasks
 
-                # compute the input plan cost or list of input plan costs
-                if optimizer_strategy.is_not_pareto() and input_group.best_physical_expression is not None:
-                    # TODO: apply policy constraint here
-                    best_input_plan_costs[input_group_id] = input_group.best_physical_expression.plan_cost
-
-                elif optimizer_strategy.is_pareto() and input_group.pareto_optimal_physical_expressions is not None:
-                    # TODO: apply policy constraint here
-                    input_plan_costs = []
-                    for pareto_physical_expression in input_group.pareto_optimal_physical_expressions:
-                        plan_costs = list(map(lambda tup: tup[0], pareto_physical_expression.pareto_optimal_plan_costs))
-                        input_plan_costs.extend(plan_costs)
-
-                    # NOTE: this list will not necessarily be pareto-optimal, as a plan cost on the pareto frontier of
-                    # one pareto_optimal_physical_expression might be dominated by the plan cost on another physical
-                    # expression's pareto frontier; we handle this below by taking the pareto frontier of all_possible_plan_costs
-                    # de-duplicate equivalent plan costs; we will still reconstruct plans with equivalent cost in optimizer.py
-                    pareto_optimal_input_plan_costs[input_group_id] = list(set(input_plan_costs))
-
-                else:
-                    task = OptimizeGroup(input_group_id)
-                    new_tasks.append(task)
-
-            # if not all input groups have been costed, we need to compute these first and then retry this task
-            if len(new_tasks) > 0:
-                return [self] + new_tasks
-
-        # once all input groups have been costed, compute the cost of this physical expression
-        group = groups[self.physical_expression.group_id]
-        if optimizer_strategy.is_pareto():
-            # compute all possible plan costs for this physical expression given the pareto optimal input plan costs
-            all_possible_plan_costs = []
-
-            input_plan_costs = [PlanCost(cost=0, time=0, quality=1)]
-            if len(self.physical_expression.input_group_ids) == 1:
-                input_group_id = self.physical_expression.input_group_ids[0]
-                input_plan_costs = pareto_optimal_input_plan_costs[input_group_id]
-
-            # get the pareto-optimal input plan costs for the single input
-            for input_plan_cost in input_plan_costs:
-                op_plan_cost = cost_model(self.physical_expression.operator, input_plan_cost.op_estimates)
-
-                # compute the total cost for this physical expression by summing its operator's PlanCost
-                # with the input groups' total PlanCost; also set the op_estimates for this expression's operator
-                full_plan_cost = op_plan_cost + input_plan_cost
-                full_plan_cost.op_estimates = op_plan_cost.op_estimates
-                all_possible_plan_costs.append((full_plan_cost, (input_plan_cost, None)))
-
-            # reduce the set of possible plan costs to the subset which are pareto-optimal
-            pareto_optimal_plan_costs = []
-            for idx, (plan_cost, input_plan_cost_tuple) in enumerate(all_possible_plan_costs):
-                pareto_optimal = True
-
-                # check if any other_expr dominates expr
-                for other_idx, (other_plan_cost, _) in enumerate(all_possible_plan_costs):
-                    if idx == other_idx:
-                        continue
-
-                    # if plan is dominated by other_expr, set pareto_optimal = False and break
-                    if self._is_dominated(plan_cost, other_plan_cost, policy):
-                        pareto_optimal = False
-                        break
-
-                # add expr to pareto frontier if it's not dominated
-                if pareto_optimal:
-                    pareto_optimal_plan_costs.append((plan_cost, input_plan_cost_tuple))
-
-            # set the pareto frontier of plan costs which can be obtained by this physical expression
-            self.physical_expression.pareto_optimal_plan_costs = pareto_optimal_plan_costs
-
-            # update the group's pareto optimal costs
-            group = self.update_pareto_optimal_physical_expressions(group, policy)
-
+        # Compute cross-product of input pareto entries.
+        if len(input_group_entries) == 0:
+            combos: list[tuple[CostEntry, ...]] = [()]  # leaf (scan) — no inputs
+        elif len(input_group_entries) == 1:
+            combos = [(e,) for e in input_group_entries[0]]
         else:
+            # join: 2 inputs
+            combos = [
+                (le, ri) for le in input_group_entries[0] for ri in input_group_entries[1]
+            ]
 
-            # otherwise, compute the cost of this operator given the optimal input plan cost(s)
-            full_plan_cost = None
+        # Cost each combination.
+        candidate_entries: list[CostEntry] = []
+        for combo in combos:
+            if len(combo) == 0:
+                plan_cost = cost_model(expr.operator)
+            elif len(combo) == 1:
+                plan_cost = cost_model(expr.operator, combo[0].plan_cost)
+            else:
+                plan_cost = cost_model(expr.operator, combo[0].plan_cost, combo[1].plan_cost)
 
-            # get the best input plan cost for the single input
-            best_input_plan_cost = PlanCost(cost=0, time=0, quality=1)
-            if len(self.physical_expression.input_group_ids) == 1:
-                input_group_id = self.physical_expression.input_group_ids[0]
-                best_input_plan_cost = best_input_plan_costs[input_group_id]
+            entry = CostEntry(
+                entry_id=optimizer.next_entry_id,
+                plan_cost=plan_cost,
+                input_entry_ids=tuple(e.entry_id for e in combo),
+            )
+            optimizer.next_entry_id += 1
+            optimizer.cost_entries[entry.entry_id] = entry
+            candidate_entries.append(entry)
 
-            # compute the cost of this operator given the best input plan cost
-            op_plan_cost = cost_model(self.physical_expression.operator, best_input_plan_cost.op_estimates)
+        # Keep only pareto-optimal entries for this expression.
+        pareto = _pareto_filter(candidate_entries)
+        expr.pareto_entry_ids = [e.entry_id for e in pareto]
 
-            # compute the total cost for this physical expression by summing its operator's PlanCost
-            # with the input groups' total PlanCost; also set the op_estimates for this expression's operator
-            full_plan_cost = op_plan_cost + best_input_plan_cost
-            full_plan_cost.op_estimates = op_plan_cost.op_estimates
+        # Update group frontier.
+        group = groups[expr.group_id]
+        _update_group_frontier(group, expr, pareto, optimizer)
 
-            # set the plan cost for this physical expression
-            self.physical_expression.plan_cost = full_plan_cost
-
-            # update the best physical expression for the group
-            group = self.update_best_physical_expression(group, policy)
-
-        # set the group's optimized flag to True, store the updated group, and return
         group.optimized = True
-        groups[self.physical_expression.group_id] = group
-
-        logger.debug(f"Done optimizing physical expression {self.physical_expression}")
         return []
+
+
+# ── Module-level helpers for pareto bookkeeping ───────────────────────
+
+
+def _dominates(a: PlanCost, b: PlanCost) -> bool:
+    """Return ``True`` if *a* dominates *b* in (cost, time, quality) space.
+
+    *a* dominates *b* iff *a* is at least as good on every objective and
+    strictly better on at least one.  Lower cost and time are better;
+    higher quality is better.
+
+    Requires:
+        - *a* and *b* are valid ``PlanCost`` objects.
+
+    Returns:
+        ``True`` if *a* dominates *b*, ``False`` otherwise.
+
+    Raises:
+        None.
+    """
+    cost_ok = a.cost <= b.cost
+    time_ok = a.time <= b.time
+    quality_ok = a.quality >= b.quality
+    cardinality_ok = a.output_cardinality <= b.output_cardinality
+    if not (cost_ok and time_ok and quality_ok and cardinality_ok):
+        return False
+    # Must be strictly better on at least one dimension.
+    return (
+        a.cost < b.cost or a.time < b.time or a.quality > b.quality or a.output_cardinality < b.output_cardinality
+    )
+
+
+def _pareto_filter(entries: list[CostEntry]) -> list[CostEntry]:
+    """Return the subset of *entries* that are not dominated by any other entry.
+
+    Uses an $O(n^2)$ pairwise dominance check.  This is acceptable
+    because the number of entries per expression is small (bounded by
+    the cross-product of input pareto frontiers).
+
+    Requires:
+        - *entries* is a non-empty list of ``CostEntry`` objects.
+
+    Returns:
+        A list of ``CostEntry`` objects forming the pareto frontier.
+
+    Raises:
+        None.
+    """
+    result: list[CostEntry] = []
+    for e in entries:
+        if not any(_dominates(o.plan_cost, e.plan_cost) for o in entries if o is not e):
+            result.append(e)
+    return result
+
+
+def _update_group_frontier(
+    group: Group,
+    expr: Expression,
+    new_pareto_entries: list[CostEntry],
+    optimizer: Optimizer,
+) -> None:
+    """Merge *new_pareto_entries* into the group's pareto frontier.
+
+    Each entry becomes a ``(expr_id, entry_id)`` pair on the group.  If
+    the group already has a frontier, the old and new pairs are merged
+    and re-filtered for dominance.
+
+    Requires:
+        - *group* is the ``Group`` that owns *expr*.
+        - *new_pareto_entries* are the pareto-optimal ``CostEntry``
+          objects for *expr*.
+        - ``optimizer.cost_entries`` contains all referenced entries.
+
+    Returns:
+        None (mutates *group* in place).
+
+    Raises:
+        None.
+    """
+    new_pairs = [(expr.expr_id, e.entry_id) for e in new_pareto_entries]
+
+    if group.pareto_frontier is None:
+        group.pareto_frontier = new_pairs
+        return
+
+    # Merge existing frontier with new entries, then re-filter.
+    all_pairs = group.pareto_frontier + new_pairs
+    all_entries = [optimizer.cost_entries[eid] for _, eid in all_pairs]
+    pareto_set = {e.entry_id for e in _pareto_filter(all_entries)}
+    group.pareto_frontier = [(xid, eid) for xid, eid in all_pairs if eid in pareto_set]

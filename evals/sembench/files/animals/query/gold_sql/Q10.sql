@@ -1,0 +1,1 @@
+WITH zebra_station_counts AS (SELECT city, stationID, count(*) as cnt FROM ImageData WHERE Species LIKE '%ZEBRA%' GROUP BY city, stationID) SELECT city, stationID FROM zebra_station_counts WHERE cnt = (SELECT MAX(cnt) FROM zebra_station_counts);

@@ -15,6 +15,8 @@ const Settings = () => {
   const [selectedFile, setSelectedFile] = useState(null);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState({ type: '', text: '' });
+  const [hasOrgDefaults, setHasOrgDefaults] = useState(false);
+  const [keySources, setKeySources] = useState({});
 
   // fetch existing settings on load
   useEffect(() => {
@@ -26,7 +28,12 @@ const Settings = () => {
 
         // retrieve user-specific settings from the backend
         const response = await settingsApi.getSettings(token); 
-        if(response.data) setKeys(prev => ({ ...prev, ...response.data }));
+        if (response.data) {
+          const { has_org_defaults, key_sources, ...keyValues } = response.data;
+          setKeys(prev => ({ ...prev, ...keyValues }));
+          if (has_org_defaults !== undefined) setHasOrgDefaults(has_org_defaults);
+          if (key_sources) setKeySources(key_sources);
+        }
       } catch (error) {
         console.error("Could not fetch settings", error);
       }
@@ -114,6 +121,17 @@ const Settings = () => {
         </div>
       )}
 
+      {/* Org-level defaults banner */}
+      {hasOrgDefaults && (
+        <div className="p-4 mb-6 rounded bg-blue-50 border border-blue-200 text-blue-800">
+          <p className="text-sm">
+            <span className="font-semibold">ℹ️ Organization-managed keys available.</span>{' '}
+            Your organization has pre-configured API keys for this environment.
+            You can override them below, or simply use the defaults — no action needed.
+          </p>
+        </div>
+      )}
+
       <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
 
         {/* Section 1: Manual Key Entry */}
@@ -126,6 +144,16 @@ const Settings = () => {
               <div key={keyName} className="mb-4">
                 <label className="block text-gray-700 text-sm font-bold mb-2" htmlFor={keyName}>
                   {keyName.replace(/_/g, ' ')}
+                  {keySources[keyName] === 'organization' && (
+                    <span className="ml-2 inline-block text-xs font-medium text-blue-700 bg-blue-100 rounded-full px-2 py-0.5">
+                      Org. Default
+                    </span>
+                  )}
+                  {keySources[keyName] === 'user' && (
+                    <span className="ml-2 inline-block text-xs font-medium text-green-700 bg-green-100 rounded-full px-2 py-0.5">
+                      Your Key
+                    </span>
+                  )}
                 </label>
                 <input
                   type="password"

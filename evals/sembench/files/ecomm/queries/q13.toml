@@ -1,0 +1,49 @@
+[metadata]
+query_id = 13
+modalities = ["image", "text"]
+required_operators = ["SEMANTIC_FILTER"]
+description = """
+Complex semantic filter expressions on multiple modalities.
+
+It is expected that a prime use case for semantic operators will be filtering data based on user-provided criteria.
+Based on semantic understanding of the predicate, some parts might be evaluated on other columns or even as classical SQL predicates.
+
+Optimization ideas:
+* Adaptive model switching
+* Extract classical predicates from semantic predicates
+* Evaluate semantic predicates on a subset of columns that are cheaper to evaluate (e.g. image vs. text)
+* Remove superfluous tokens from the semantic predicate
+* Specialized semantic indexes
+* Additional metadata for pruning data partitions
+"""
+
+
+[definition]
+# For systems that accept free-text queries
+natural_language = """
+Based on product images and descriptions, find men's running shirts
+with round neck and short sleeves, in blue or black (not bright colors
+like white, and definitely not green), with a striped design,
+suitable for outdoor running in warm weather.
+"""
+# Equivalent to the natural language query
+sql = """
+"""
+
+# Traditional SQL query to compute the exact result on the non-omitted data.
+ground_truth = """
+SELECT id
+FROM read_parquet('styles_details.parquet')
+WHERE true
+  AND gender = 'Men'
+  AND usage = 'Sports'
+  AND articleType.typeName = 'Tshirts'
+  AND (baseColour = 'Blue' OR baseColour = 'Black')
+  AND 'Short Sleeves' IN articleAttributes['Sleeve Length']
+  AND 'Round Neck' IN articleAttributes['Neck']
+  AND 'Striped' IN articleAttributes['Pattern']
+  AND season <> 'Winter'
+;
+"""
+# Which accuracy metric to use for evaluation
+accuracy_metric = "f1-score"

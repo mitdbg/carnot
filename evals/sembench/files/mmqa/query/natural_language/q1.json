@@ -1,0 +1,5 @@
+{
+    "nl_question": "Who is the director of the movie that has Ben Piazza in the role of Bob Whitewood?",
+    "modalities": ["table", "text"],
+    "ground_truth": ["Michael Ritchie"]
+}

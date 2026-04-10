@@ -1,25 +1,19 @@
-from __future__ import annotations
-
 import logging
-from copy import deepcopy
+from collections.abc import Callable
 
-from pydantic.fields import FieldInfo
+import tiktoken
 
-from carnot.constants import Model
-from carnot.core.data.dataset import Dataset
-from carnot.core.lib.schemas import get_schema_field_names
-from carnot.operators.logical import (
-    ComputeOperator,
-    SearchOperator,
-)
+from carnot.agents.models import Model
+from carnot.core.models import PlanCost
+from carnot.data.dataset import Dataset
+from carnot.operators.logical import Scan
+from carnot.operators.scan import ScanOp
 from carnot.optimizer import (
     IMPLEMENTATION_RULES,
     TRANSFORMATION_RULES,
 )
-from carnot.optimizer.cost_model import BaseCostModel, SampleBasedCostModel
-from carnot.optimizer.optimizer_strategy_type import OptimizationStrategyType
-from carnot.optimizer.plan import PhysicalPlan
-from carnot.optimizer.primitives import Group, LogicalExpression
+from carnot.optimizer.cost_model import CostModel
+from carnot.optimizer.primitives import CostEntry, Expression, Group, LogicalExpression
 from carnot.optimizer.tasks import (
     ApplyRule,
     ExploreGroup,
@@ -27,59 +21,48 @@ from carnot.optimizer.tasks import (
     OptimizeLogicalExpression,
     OptimizePhysicalExpression,
 )
-from carnot.policy import Policy
+from carnot.plan import PhysicalPlan
+from carnot.plan.node import PlanNode
 
 logger = logging.getLogger(__name__)
 
+# Tokenizer used for estimating per-item token counts during scan creation.
+# cl100k_base is a good general-purpose encoding; absolute counts don't need
+# to match the downstream LLM's tokenizer — we only care about ratios.
+_TOKENIZER = tiktoken.get_encoding("cl100k_base")
+
+# Number of items to sample when estimating tokens-per-item for a dataset.
+_TOKEN_SAMPLE_SIZE = 20
+
+# Number of plans closest to the cost budget to keep when no plans satisfy the cost budget
+_CLOSEST_PLANS_TO_KEEP = 3
+
 
 class Optimizer:
-    """
-    The optimizer is responsible for searching the space of possible physical plans
-    for a user's initial (logical) plan and selecting the one which is closest to
-    optimizing the user's policy objective.
-
-    This optimizer is modeled after the Cascades framework for top-down query optimization:
-    - Thesis describing Cascades implementation (Chapters 1-3):
-      https://15721.courses.cs.cmu.edu/spring2023/papers/17-optimizer2/xu-columbia-thesis1998.pdf
-
-    - Andy Pavlo lecture with walkthrough example: https://www.youtube.com/watch?v=PXS49-tFLcI
-
-    - Original Paper: https://www.cse.iitb.ac.in/infolab/Data/Courses/CS632/2015/Papers/Cascades-graefe.pdf
-
-    Notably, this optimization framework has served as the backbone of Microsoft SQL Server, CockroachDB,
-    and a few other important DBMS systems.
-
-    NOTE: the optimizer currently assumes that field names are unique across schemas; we do try to enforce
-          this by rewriting field names underneath-the-hood to be "{schema_name}.{field_name}", but this still
-          does not solve a situation in which -- for example -- a user uses the pz.URL schema twice in the same
-          program. In order to address that situation, we will need to augment our renaming scheme.
-    """
-
     def __init__(
         self,
-        policy: Policy,
-        cost_model: BaseCostModel,
-        available_models: list[Model],
-        join_parallelism: int = 64,
-        reasoning_effort: str | None = None,
-        api_base: str | None = None,
-        verbose: bool = False,
-        optimizer_strategy: OptimizationStrategyType = OptimizationStrategyType.PARETO,
-        execution_strategy: str = "parallel",  # Always parallel execution
-        use_final_op_quality: bool = False, # TODO: make this func(plan) -> final_quality
-        **kwargs,
+        model: Model,
+        available_model_ids: list[str],
+        llm_config: dict | None = None,
+        max_workers: int = 64,
+        cost_model: CostModel | None = None,
+        max_tasks: int = 10_000,
     ):
-        # store the policy
-        self.policy = policy
+        self.model = model
+        self.available_model_ids = available_model_ids
+        self.llm_config = llm_config or {}
+        self.max_workers = max_workers
+        self.cost_model = cost_model or CostModel(llm_config=llm_config)
+        self.max_tasks = max_tasks
 
-        # store the cost model
-        self.cost_model = cost_model
+        # track the expressions and groups created during optimization
+        self.expressions: dict[int, Expression] = {}
+        self.groups: dict[int, Group] = {}
+        self.next_group_id: int = 0
 
-        # mapping from each group id to its Group object
-        self.groups = {}
-
-        # mapping from each expression to its Expression object
-        self.expressions = {}
+        # CostEntry storage for plan reconstruction (populated by OptimizePhysicalExpression._perform)
+        self.cost_entries: dict[int, CostEntry] = {}
+        self.next_entry_id: int = 0
 
         # the stack of tasks to perform during optimization
         self.tasks_stack = []
@@ -88,212 +71,240 @@ class Optimizer:
         self.implementation_rules = IMPLEMENTATION_RULES
         self.transformation_rules = TRANSFORMATION_RULES
 
-        # get the strategy class associated with the optimizer strategy
-        optimizer_strategy_cls = optimizer_strategy.value
-        self.strategy = optimizer_strategy_cls()
-
-        # remove transformation rules for optimization strategies which do not require them
-        if optimizer_strategy.no_transformation():
-            self.transformation_rules = []
-
-        # if we are not performing optimization, set available models to be single model
-        # and remove all optimizations (except for bonded queries)
-        if optimizer_strategy == OptimizationStrategyType.NONE:
-            self.available_models = [available_models[0]]
-
-        # store optimization hyperparameters
-        self.verbose = verbose
-        self.available_models = available_models
-        self.join_parallelism = join_parallelism
-        self.reasoning_effort = reasoning_effort
-        self.api_base = api_base
-        self.optimizer_strategy = optimizer_strategy
-        self.execution_strategy = execution_strategy
-        self.use_final_op_quality = use_final_op_quality
-
-        logger.info(f"Initialized Optimizer with verbose={self.verbose}")
-        logger.debug(f"Initialized Optimizer with params: {self.__dict__}")
-
-    def update_cost_model(self, cost_model: BaseCostModel):
+    def update_cost_model(self, cost_model: CostModel):
         self.cost_model = cost_model
 
     def get_physical_op_params(self):
         return {
-            "verbose": self.verbose,
-            "available_models": self.available_models,
-            "join_parallelism": self.join_parallelism,
-            "reasoning_effort": self.reasoning_effort,
-            "api_base": self.api_base,
+            "available_model_ids": self.available_model_ids,
+            "llm_config": self.llm_config,
+            "max_workers": self.max_workers,
         }
 
-    def deepcopy_clean(self):
-        optimizer = Optimizer(
-            policy=self.policy,
-            cost_model=SampleBasedCostModel(),
-            verbose=self.verbose,
-            available_models=self.available_models,
-            join_parallelism=self.join_parallelism,
-            reasoning_effort=self.reasoning_effort,
-            api_base=self.api_base,
-            optimizer_strategy=self.optimizer_strategy,
-            execution_strategy=self.execution_strategy,
-            use_final_op_quality=self.use_final_op_quality,
+    def _select_best_plan(self, final_group_id: int, cost_budget: float, policy: str = "max_quality") -> PhysicalPlan:
+        """Reconstruct the best physical plan from the optimized group tree,
+        subject to the given cost budget and selection policy.
+
+        Walks the pareto frontier of the final group, picks the best
+        ``(expr_id, cost_entry_id)`` pair according to *policy*, and
+        recursively builds a ``PhysicalPlan`` by following
+        ``CostEntry.input_entry_ids`` back-pointers.
+
+        Requires:
+            - Optimization has completed (all reachable groups have
+              ``pareto_frontier is not None``).
+            - *policy* is one of ``"min_cost"``, ``"min_time"``, or
+              ``"max_quality"``.
+
+        Returns:
+            A ``PhysicalPlan`` assembled from the pareto-optimal
+            expressions chosen by the given policy.
+
+        Raises:
+            ValueError: If the final group has no pareto frontier or
+            *policy* is unrecognised.
+        """
+        group = self.groups[final_group_id]
+        if not group.pareto_frontier:
+            raise ValueError(
+                f"Final group {final_group_id} has no pareto frontier — "
+                "was the optimisation search run?"
+            )
+
+        # filter for plans within the cost budget; if no plans are within the budget,
+        # filter for ones closest to the budget to allow for graceful degradation rather than failure
+        filtered_frontier = [
+            (expr_id, entry_id)
+            for expr_id, entry_id in group.pareto_frontier
+            if self.cost_entries[entry_id].plan_cost.cost <= cost_budget
+        ]
+        if not filtered_frontier:
+            logger.warning(
+                f"No plans found within cost budget {cost_budget:.2f}; relaxing budget constraint to select from closest plans",
+            )
+            # sort the frontier by absolute distance from the cost budget and take the closest plans
+            filtered_frontier = sorted(
+                group.pareto_frontier,
+                key=lambda pair: abs(self.cost_entries[pair[1]].plan_cost.cost - cost_budget),
+            )[:_CLOSEST_PLANS_TO_KEEP]
+
+        # retrieve the scorer function for the given policy
+        scorer = _get_scorer(policy)
+
+        # pick the best (expr_id, entry_id) from the final group
+        best_expr_id, best_entry_id = min(
+            filtered_frontier,
+            key=lambda pair: scorer(self.cost_entries[pair[1]].plan_cost),
         )
-        return optimizer
 
-    def update_strategy(self, optimizer_strategy: OptimizationStrategyType):
-        # set the optimizer_strategy
-        self.optimizer_strategy = optimizer_strategy
+        # Recursively build the PlanNode DAG.
+        nodes: dict[str, PlanNode] = {}
+        counter = {"n": 0}
+        self._build_plan_recursive(best_expr_id, best_entry_id, nodes, counter)
+        return PhysicalPlan(nodes=nodes)
 
-        # get the strategy class associated with the optimizer strategy
-        optimizer_strategy_cls = optimizer_strategy.value
-        self.strategy = optimizer_strategy_cls()
+    def _build_plan_recursive(
+        self,
+        expr_id: int,
+        entry_id: int,
+        nodes: dict[str, PlanNode],
+        counter: dict[str, int],
+    ) -> str:
+        """Recursively convert an expression + cost-entry pair into ``PlanNode`` objects.
 
-        # remove transformation rules for optimization strategies which do not require them
-        if optimizer_strategy.no_transformation():
-            self.transformation_rules = []
+        Requires:
+            - ``expr_id`` is a valid key in ``self.expressions``.
+            - ``entry_id`` is a valid key in ``self.cost_entries``.
+            - ``counter`` is a mutable dict with key ``"n"`` for unique node ID generation.
 
-    def construct_group_tree(self, dataset: Dataset) -> tuple[int, dict[str, FieldInfo], dict[str, set[str]]]:
-        logger.debug(f"Constructing group tree for dataset: {dataset}")
-        ### convert node --> Group ###
-        # create the op for the given node
-        op = dataset._operator
+        Returns:
+            The ``node_id`` of the newly created node.
 
-        # compute the input group id(s) and field(s) for this node
-        if len(dataset._sources) == 0:
-            input_group_ids, input_group_fields, input_group_properties = ([], {}, {})
-        elif len(dataset._sources) == 1:
-            input_group_id, input_group_fields, input_group_properties = self.construct_group_tree(dataset._sources[0])
-            input_group_ids = [input_group_id]
-        elif len(dataset._sources) == 2:
-            left_input_group_id, left_input_group_fields, left_input_group_properties = self.construct_group_tree(dataset._sources[0])
-            right_input_group_id, right_input_group_fields, right_input_group_properties = self.construct_group_tree(dataset._sources[1])
-            input_group_ids = [left_input_group_id, right_input_group_id]
-            input_group_fields = {**left_input_group_fields, **right_input_group_fields}
-            input_group_properties = deepcopy(left_input_group_properties)
-            for k, v in right_input_group_properties.items():
-                if k in input_group_properties:
-                    input_group_properties[k].update(v)
-                else:
-                    input_group_properties[k] = deepcopy(v)
+        Raises:
+            None.
+        """
+        expr = self.expressions[expr_id]
+        entry = self.cost_entries[entry_id]
+
+        # Recurse into input groups.
+        parent_node_ids: list[str] = []
+        for i, input_gid in enumerate(expr.input_group_ids):
+            input_entry_id = entry.input_entry_ids[i]
+
+            # Find which expression in the input group owns this entry.
+            input_group = self.groups[input_gid]
+            input_expr_id = next(
+                xid for xid, eid in input_group.pareto_frontier
+                if eid == input_entry_id
+            )
+            child_node_id = self._build_plan_recursive(
+                input_expr_id, input_entry_id, nodes, counter,
+            )
+            parent_node_ids.append(child_node_id)
+
+        # Create PlanNode for this expression.
+        node_id = f"node-{counter['n']}"
+        counter["n"] += 1
+
+        node = _expr_to_plan_node(expr, node_id, parent_node_ids)
+        nodes[node_id] = node
+        return node_id
+
+    def _construct_group_tree(self, logical_plan: Dataset) -> int:
+        """Recursively convert a Dataset DAG into a group tree for cascades optimization.
+
+        Leaf datasets (``operator is None``) are wrapped in a ``Scan``
+        logical operator so the optimizer has a concrete expression to
+        attach implementation rules and cost estimates to.
+
+        Requires:
+            - ``logical_plan`` is a valid ``Dataset`` node.
+            - Leaf datasets have ``operator is None`` and ``parents == []``.
+
+        Returns:
+            The group id of the newly created root group.
+
+        Raises:
+            None.
+        """
+        if logical_plan.operator is None:
+            # Leaf dataset — create a Scan logical operator.
+            num_items = len(logical_plan.items)
+            est_tokens_per_item = self._estimate_tokens_per_item(logical_plan)
+            op = Scan(
+                name=logical_plan.name,
+                dataset_id=logical_plan.dataset_id,
+                num_items=num_items,
+                est_tokens_per_item=est_tokens_per_item,
+            )
+            input_group_ids = []
         else:
-            raise NotImplementedError("Constructing group trees for datasets with more than 2 sources is not supported.")
+            op = logical_plan.operator
+            input_group_ids = [
+                self._construct_group_tree(parent) for parent in logical_plan.parents
+            ]
 
-        # compute the fields added by this operation and all fields
-        input_group_short_field_names = list(
-            map(lambda full_field: full_field.split(".")[-1], input_group_fields.keys())
-        )
-        new_fields = {
-            field_name: op.output_schema.model_fields[field_name.split(".")[-1]]
-            for field_name in get_schema_field_names(op.output_schema, id=dataset.id)
-            if (field_name not in input_group_short_field_names) or (hasattr(op, "udf") and op.udf is not None)
-        }
-        all_fields = {**input_group_fields, **new_fields}
-
-        # compute the set of (short) field names this operation depends on
-        depends_on_field_names = (
-            {} if dataset.is_root else {field_name.split(".")[-1] for field_name in op.depends_on}
-        )
-
-        # NOTE: group_id is computed as the unique (sorted) set of fields and properties;
-        #       If an operation does not modify the fields (or modifies them in a way that
-        #       can create an idential field set to an earlier group) then we must add an
-        #       id from the operator to disambiguate the two groups.
-        # compute all properties including this operations'
-        all_properties = deepcopy(input_group_properties)
-        if isinstance(op, ComputeOperator):
-            op_instruction = op.instruction
-            if "instructions" in all_properties:
-                all_properties["instructions"].add(op_instruction)
-            else:
-                all_properties["instructions"] = set([op_instruction])
-
-        elif isinstance(op, SearchOperator):
-            op_search_query = op.search_query
-            if "search_queries" in all_properties:
-                all_properties["search_queries"].add(op_search_query)
-            else:
-                all_properties["search_queries"] = set([op_search_query])
+        # assign a fresh monotonic group id
+        group_id = self.next_group_id
+        self.next_group_id += 1
 
         # construct the logical expression and group
         logical_expression = LogicalExpression(
             operator=op,
             input_group_ids=input_group_ids,
-            input_fields=input_group_fields,
-            depends_on_field_names=depends_on_field_names,
-            generated_fields=new_fields,
-            group_id=None,
+            group_id=group_id,
         )
-        group = Group(
-            logical_expressions=[logical_expression],
-            fields=all_fields,
-            properties=all_properties,
-        )
-        logical_expression.set_group_id(group.group_id)
+        group = Group(logical_expressions=[logical_expression], group_id=group_id)
 
         # add the expression and group to the optimizer's expressions and groups and return
         self.expressions[logical_expression.expr_id] = logical_expression
         self.groups[group.group_id] = group
-        logger.debug(f"Constructed group tree for dataset: {dataset}")
-        logger.debug(f"Group: {group.group_id}, {all_fields}, {all_properties}")
 
-        return group.group_id, all_fields, all_properties
+        return group.group_id
 
-    def convert_query_plan_to_group_tree(self, dataset: Dataset) -> str:
-        logger.debug(f"Converting query plan to group tree for dataset: {dataset}")
+    @staticmethod
+    def _estimate_tokens_per_item(dataset: Dataset) -> float:
+        """Estimate the average token count per item by sampling.
 
-        # compute depends_on field for every node
-        short_to_full_field_name = {}
-        for node in dataset:
-            # update mapping from short to full field names
-            short_field_names = get_schema_field_names(node.schema)
-            full_field_names = get_schema_field_names(node.schema, id=node.id)
-            for short_field_name, full_field_name in zip(short_field_names, full_field_names, strict=False):
-                # set mapping automatically if this is a new field
-                if short_field_name not in short_to_full_field_name or (hasattr(node._operator, "udf") and node._operator.udf is not None):
-                    short_to_full_field_name[short_field_name] = full_field_name
+        Materializes up to ``_TOKEN_SAMPLE_SIZE`` items, concatenates all
+        string values in each item dict, and counts tokens using the
+        module-level ``_TOKENIZER`` (``cl100k_base``).
 
-            # if the node is a root Dataset, then skip
-            if node.is_root:
-                continue
+        Requires:
+            - ``dataset`` is a ``Dataset`` with at least one item, **or**
+              an empty dataset (in which case the estimate is ``0.0``).
 
-            # If the node already has depends_on specified, then resolve each field name to a full (unique) field name
-            if len(node._operator.depends_on) > 0:
-                node._operator.depends_on = list(map(lambda field: short_to_full_field_name[field], node._operator.depends_on))
-                continue
+        Returns:
+            The mean token count across sampled items.  Returns ``0.0``
+            when the dataset is empty.
 
-            # otherwise, make the node depend on all upstream nodes
-            node._operator.depends_on = set()
-            upstream_nodes = node.get_upstream_datasets()
-            for upstream_node in upstream_nodes:
-                upstream_field_names = get_schema_field_names(upstream_node.schema, id=upstream_node.id)
-                node._operator.depends_on.update(upstream_field_names)
-            node._operator.depends_on = list(node._operator.depends_on)
+        Raises:
+            None.  Errors during sampling are logged and cause a
+            fallback return of ``0.0``.
+        """
+        if not dataset.items:
+            return 0.0
 
+        try:
+            sampled = dataset.sample(n=_TOKEN_SAMPLE_SIZE, random=True)
+        except Exception:
+            logger.warning(
+                "Failed to sample dataset '%s' for token estimation; defaulting to 0.0",
+                dataset.dataset_id,
+                exc_info=True,
+            )
+            return 0.0
+
+        if not sampled:
+            return 0.0
+
+        total_tokens = 0
+        for item in sampled:
+            # Concatenate all string-valued fields in the item dict.
+            text = " ".join(str(v) for v in item.values() if isinstance(v, str))
+            total_tokens += len(_TOKENIZER.encode(text))
+
+        return total_tokens / len(sampled)
+
+    def _convert_query_plan_to_group_tree(self, logical_plan: Dataset) -> int:
+        # NOTE: previously we computed each operator's entire set of upstream
+        # dependencies here; we may need to revisit this if we want to automatically
+        # be able to push filters down through e.g. map operations
         # construct tree of groups
-        final_group_id, _, _ = self.construct_group_tree(dataset)
-
-        logger.debug(f"Converted query plan to group tree for dataset: {dataset}")
-        logger.debug(f"Final group id: {final_group_id}")
+        final_group_id = self._construct_group_tree(logical_plan)
 
         return final_group_id
 
-    def heuristic_optimization(self, group_id: int) -> None:
-        """
-        Apply universally desirable transformations (e.g. filter/projection push-down).
-        """
-        pass
-
-    def search_optimization_space(self, group_id: int) -> None:
-        logger.debug(f"Searching optimization space for group_id: {group_id}")
-
+    def _search_optimization_space(self, group_id: int, cost_budget: float) -> None:
         # begin the search for an optimal plan with a task to optimize the final group
         initial_task = OptimizeGroup(group_id)
         self.tasks_stack.append(initial_task)
 
-        # TODO: conditionally stop when X number of tasks have been executed to limit exhaustive search
-        while len(self.tasks_stack) > 0:
+        # stop after exhaustive search or after reaching the max number of tasks, whichever comes first
+        task_count = 0
+        while len(self.tasks_stack) > 0 and task_count < self.max_tasks:
             task = self.tasks_stack.pop(-1)
+            task_count += 1
 
             new_tasks = []
             if isinstance(task, (OptimizeGroup, ExploreGroup)):
@@ -301,34 +312,123 @@ class Optimizer:
             elif isinstance(task, OptimizeLogicalExpression):
                 new_tasks = task.perform(self.transformation_rules, self.implementation_rules)
             elif isinstance(task, ApplyRule):
-                context = {"costed_full_op_ids": self.cost_model.get_costed_full_op_ids()}
-                new_tasks = task.perform(
-                    self.groups, self.expressions, context=context, **self.get_physical_op_params(),
+                new_tasks, self.next_group_id = task.perform(
+                    self.groups, self.expressions, self.next_group_id, **self.get_physical_op_params()
                 )
             elif isinstance(task, OptimizePhysicalExpression):
-                context = {"optimizer_strategy": self.optimizer_strategy, "execution_strategy": self.execution_strategy}
-                new_tasks = task.perform(self.cost_model, self.groups, self.policy, context=context)
+                new_tasks = task.perform(self.cost_model, self.groups, self)
 
             self.tasks_stack.extend(new_tasks)
 
-        logger.debug(f"Done searching optimization space for group_id: {group_id}")
+    def optimize(self, logical_plan: Dataset, cost_budget: float | None = None, policy: str = "max_quality") -> dict:
+        """Run cascades optimization and return the best physical plan.
 
-    def optimize(self, dataset: Dataset) -> list[PhysicalPlan]:
+        Requires:
+            - *logical_plan* is a valid ``Dataset`` DAG.
+            - *policy* is one of ``"min_cost"``, ``"min_time"``, ``"max_quality"``.
+
+        Returns:
+            A dict representation of the best ``PhysicalPlan`` (via
+            ``PhysicalPlan.to_dict()``).
+
+        Raises:
+            ValueError: If the final group has no pareto frontier after
+            the search completes.
         """
-        The optimize function takes in an initial query plan and searches the space of
-        logical and physical plans in order to cost and produce a (near) optimal physical plan.
-        """
-        logger.info(f"Optimizing query plan: {dataset}")
-        # compute the initial group tree for the user plan
-        dataset_copy = dataset.copy()
-        final_group_id = self.convert_query_plan_to_group_tree(dataset_copy)
+        # use unlimited budget if none is provided
+        cost_budget = cost_budget or float("inf")
 
-        # TODO
-        # # do heuristic based pre-optimization
-        # self.heuristic_optimization(final_group_id)
+        # create the initial group tree from the logical plan and get the final group id
+        final_group_id = self._convert_query_plan_to_group_tree(logical_plan)
 
-        # search the optimization space by applying logical and physical transformations to the initial group tree
-        self.search_optimization_space(final_group_id)
-        logger.info(f"Getting optimal plans for final group id: {final_group_id}")
+        # use a cascades-inspired approach to quickly enumerate a space of physical plans
+        self._search_optimization_space(final_group_id, cost_budget)
 
-        return self.strategy.get_optimal_plans(self.groups, final_group_id, self.policy, self.use_final_op_quality)
+        # select the best physical plan that satisfies the cost budget
+        best_plan = self._select_best_plan(final_group_id, cost_budget, policy)
+
+        return best_plan.to_dict()
+
+
+# ── Module-level helpers ─────────────────────────────────────────────
+
+
+# Scorer functions: return a float where *lower is better*.
+_SCORERS: dict[str, Callable[[PlanCost], float]] = {
+    "min_cost": lambda pc: pc.cost,
+    "min_time": lambda pc: pc.time,
+    "max_quality": lambda pc: -pc.quality,  # negate so min() picks highest quality
+}
+
+
+def _get_scorer(policy: str) -> Callable[[PlanCost], float]:
+    """Return a scorer function for *policy*.
+
+    Requires:
+        - *policy* is one of ``"min_cost"``, ``"min_time"``, or
+          ``"max_quality"``.
+
+    Returns:
+        A callable ``(PlanCost) -> float`` where lower is better.
+
+    Raises:
+        ValueError: If *policy* is not recognised.
+    """
+    if policy not in _SCORERS:
+        raise ValueError(
+            f"Unknown policy '{policy}'. Choose from: {sorted(_SCORERS)}"
+        )
+    return _SCORERS[policy]
+
+
+def _expr_to_plan_node(
+    expr: Expression,
+    node_id: str,
+    parent_node_ids: list[str],
+) -> PlanNode:
+    """Convert an optimizer ``Expression`` into a ``PlanNode``.
+
+    Scan expressions become ``node_type="dataset"``; all other physical
+    expressions become ``node_type="operator"``.
+
+    Requires:
+        - *expr* is a ``PhysicalExpression`` (has a ``PhysicalOperator``).
+
+    Returns:
+        A ``PlanNode`` with the given *node_id* and *parent_node_ids*.
+
+    Raises:
+        None.
+    """
+    op = expr.operator
+
+    if isinstance(op, ScanOp):
+        return PlanNode(
+            node_id=node_id,
+            node_type="dataset",
+            operator_type=None,
+            name=op.dataset_id,
+            description=f"Load dataset: {op.dataset_id}",
+            params={"est_total_tokens": op.est_total_tokens},
+            parent_ids=list(parent_node_ids),
+            dataset_id=op.dataset_id,
+        )
+
+    # Determine operator_type from the logical_op_class_name stored on the physical operator.
+    operator_type = getattr(op, "logical_op_class_name", None) or op.op_name()
+    description = getattr(op, "task", "") or op.op_name()
+
+    # Reasoning operators get a dedicated node type so that execution
+    # dispatch (PlanNode.execute) routes them correctly.
+    node_type = "reasoning" if operator_type == "Reason" else "operator"
+
+    return PlanNode(
+        node_id=node_id,
+        node_type=node_type,
+        operator_type=operator_type,
+        name=getattr(op, "dataset_id", ""),
+        description=description,
+        params=op.get_op_params(),
+        parent_ids=list(parent_node_ids),
+        dataset_id=getattr(op, "dataset_id", ""),
+    )

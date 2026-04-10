@@ -36,7 +36,10 @@ from carnot.agents.utils import (
     parse_code_blobs,
     truncate_content,
 )
+from carnot.core.models import LLMCallStats, OperatorStats
 from carnot.data.dataset import Dataset
+from carnot.operators.physical import PhysicalOperator
+from carnot.optimizer.model_ids import get_api_key_for_model
 
 
 @dataclass
@@ -52,14 +55,43 @@ class CodeActionOutput:
     execution_logs: str
     is_final_answer: bool
 
-class CodeOperator:
+class CodeOperator(PhysicalOperator):
+    """Multi-step agentic code execution operator.
+
+    The operator uses an LLM to generate Python code, executes it in a
+    sandboxed ``LocalPythonExecutor``, observes the output, and iterates
+    until the LLM calls ``final_answer()`` or ``max_steps`` is reached.
+
+    Representation invariant:
+        - ``tools`` always contains a ``"final_answer"`` key mapping to a
+          ``FinalAnswerTool`` instance.
+        - ``python_executor`` is a ``LocalPythonExecutor`` instance.
+        - ``max_steps >= 1``.
+
+    Abstraction function:
+        An instance of this class is a callable that, given input datasets, uses an LLM to
+        iteratively generate and execute Python code until a final answer is produced, then
+        returns the result wrapped in a new ``Dataset``.
     """
-    Represents a code execution operator.
-    """
-    def __init__(self, task: str, output_dataset_id: str, model_id: str, llm_config: dict, tools: list[Tool] | None = None, additional_authorized_imports: list[str] | None = None, max_steps: int = 20):
+    def __init__(
+            self,
+            task: str,
+            dataset_id: str,
+            model_id: str,
+            llm_config: dict,
+            tools: list[Tool] | None = None,
+            additional_authorized_imports: list[str] | None = None,
+            max_steps: int = 20,
+            logical_op_id: str | None = None,
+            logical_op_class_name: str | None = None,
+        ):
+        super().__init__(logical_op_id=logical_op_id, logical_op_class_name=logical_op_class_name)
         self.task = task
-        self.output_dataset_id = output_dataset_id
-        self.model = LiteLLMModel(model_id=model_id, api_key=llm_config.get("OPENAI_API_KEY"))
+        self.dataset_id = dataset_id
+        self.model_id = model_id
+        self.llm_config = llm_config
+        self._tools = tools or []
+        self.model = LiteLLMModel(model_id=model_id, api_key=get_api_key_for_model(model_id, llm_config))
         self.additional_authorized_imports = additional_authorized_imports if additional_authorized_imports else []
         self.authorized_imports = sorted(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
         self.code_block_tags = ["```python", "```"]
@@ -69,10 +101,35 @@ class CodeOperator:
         )
         self.memory = AgentMemory("")
         self.logger = AgentLogger(level=LogLevel.INFO)
-        tools = tools or []
-        self._setup_tools(tools)
-        self._validate_tools(tools)
+        self._setup_tools(self._tools)
+        self._validate_tools(self._tools)
         self.max_steps = max_steps
+
+    def get_id_params(self):
+        id_params = super().get_id_params()
+        id_params = {
+            "task": self.task,
+            "dataset_id": self.dataset_id,
+            "model_id": self.model_id,
+            **id_params,
+        }
+
+        return id_params
+
+    def get_op_params(self):
+        op_params = super().get_op_params()
+        op_params = {
+            "task": self.task,
+            "dataset_id": self.dataset_id,
+            "model_id": self.model_id,
+            "llm_config": self.llm_config,
+            "tools": self._tools,
+            "additional_authorized_imports": self.additional_authorized_imports,
+            "max_steps": self.max_steps,
+            **op_params,
+        }
+
+        return op_params
 
     def _setup_tools(self, tools: list[BaseTool]):
         assert all(isinstance(tool, BaseTool) for tool in tools), (
@@ -101,7 +158,10 @@ class CodeOperator:
         self.cleanup()
 
     def cleanup(self):
-        """Clean up resources used by the operator, such as the Python executor."""
+        """Release resources held by the Python executor.
+
+        Safe to call multiple times.
+        """
         if hasattr(self.python_executor, "cleanup"):
             self.python_executor.cleanup()
 
@@ -123,15 +183,20 @@ class CodeOperator:
         return messages
 
     def provide_final_answer(self, task: str) -> ChatMessage:
-        """
-        Provide the final answer to the task, based on the logs of the agent's interactions.
+        """Ask the LLM for a final answer based on the accumulated memory.
 
-        Args:
-            task (`str`): Task to perform.
-            images (`list[PIL.Image.Image]`, *optional*): Image(s) objects.
+        Called when ``max_steps`` is reached without an explicit
+        ``final_answer()`` call in generated code.
+
+        Requires:
+            - ``self.memory`` has at least one step recorded.
 
         Returns:
-            `str`: Final answer to the task.
+            A ``ChatMessage`` containing the LLM's final-answer response.
+
+        Raises:
+            None — generation errors are caught and returned as a
+            ``ChatMessage`` with the error text.
         """
         messages = [
             ChatMessage(
@@ -176,7 +241,7 @@ class CodeOperator:
             timing=Timing(start_time=action_step_start_time, end_time=time.time()),
             token_usage=final_answer.token_usage,
         )
-        final_memory_step.action_output = final_answer.content
+        final_memory_step.final_output = final_answer.content
         self._finalize_step(final_memory_step)
         self.memory.steps.append(final_memory_step)
         return final_answer.content
@@ -226,8 +291,20 @@ class CodeOperator:
         yield FinalAnswerStep(final_answer, final_execution_logs, final_code)
 
     def _step_generate_code(self, memory_step: ActionStep, input_datasets: dict[str, Dataset]) -> Generator[ToolCall | CodeActionOutput]:
-        """
-        Generate code to execute the given task on the input datasets.
+        """Run one generate → parse → execute cycle.
+
+        Requires:
+            - *memory_step* is a fresh ``ActionStep`` for this iteration.
+            - *input_datasets* is the current dataset dict.
+
+        Returns:
+            Yields a ``ToolCall`` (the parsed code) followed by a
+            ``CodeActionOutput`` (execution result).
+
+        Raises:
+            AgentGenerationError: If the LLM call fails.
+            AgentParsingError: If the output cannot be parsed as code.
+            AgentExecutionError: If the generated code raises at runtime.
         """
         system_prompt = populate_template(
             self.prompt_templates["code_gen_prompt"],
@@ -321,7 +398,7 @@ class CodeOperator:
                 ),
             ]
         self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
-        memory_step.action_output = code_output.output
+        memory_step.code_action_output = code_output.output
         yield CodeActionOutput(
             code=code_action,
             output=code_output.output,
@@ -329,13 +406,29 @@ class CodeOperator:
             is_final_answer=code_output.is_final_answer,
         )
 
-    def __call__(self, input_datasets: dict[str, Dataset]) -> dict[str, Dataset]:
+    def __call__(self, input_datasets: dict[str, Dataset]) -> tuple[dict[str, Dataset], OperatorStats]:
+        """Execute the agentic code loop and return the resulting datasets.
+
+        The operator injects *input_datasets* and its tools into the
+        sandboxed executor, then iterates through generate/execute steps
+        until the LLM calls ``final_answer()`` or ``max_steps`` is reached.
+
+        Requires:
+            - *input_datasets* is a non-empty ``dict[str, Dataset]``.
+
+        Returns:
+            A tuple ``(output_datasets, stats)`` where *output_datasets*
+            is a new ``dict[str, Dataset]`` with an additional entry keyed
+            by ``self.dataset_id``, and *stats* is an
+            :class:`OperatorStats` summarising all LLM calls made across
+            the agentic loop.
+
+        Raises:
+            AgentGenerationError: If the LLM fails on the first step.
+            AssertionError: If the run stream does not end with a
+            ``FinalAnswerStep``.
         """
-        Generate code to execute the given task on the input datasets.
-        The operator generates code and then immediately executes it using the PythonExecutor to observe the output.
-        The operator is then able to iterate on the code if needed until a satisfactory output is achieved or a
-        maximum number of iterations is reached.
-        """
+        op_start = time.perf_counter()
         
         self.python_executor.send_variables(variables={"input_datasets": input_datasets})
         self.python_executor.send_tools({**self.tools})
@@ -347,9 +440,28 @@ class CodeOperator:
         output_code = steps[-1].code
         # TODO: ? output_execution_logs = steps[-1].execution_logs
 
+        # Collect LLM call stats from all action steps
+        all_call_stats: list[LLMCallStats] = []
+        for step in steps:
+            if (
+                isinstance(step, ActionStep)
+                and step.model_output_message is not None
+                and hasattr(step.model_output_message, "llm_call_stats")
+                and step.model_output_message.llm_call_stats is not None
+            ):
+                all_call_stats.append(step.model_output_message.llm_call_stats)
 
         # create new dataset and return it with the input datasets
-        output_dataset = Dataset(name=self.output_dataset_id, annotation=f"Code operator output for task: {self.task}", code=output_code, code_state=output_state)
+        output_dataset = Dataset(name=self.dataset_id, annotation=f"Code operator output for task: {self.task}", code=output_code, code_state=output_state)
         output_datasets = {**input_datasets, output_dataset.name: output_dataset}
 
-        return output_datasets
+        op_stats = OperatorStats(
+            operator_name="Code",
+            operator_id=self.dataset_id,
+            wall_clock_secs=time.perf_counter() - op_start,
+            llm_calls=all_call_stats,
+            items_in=sum(len(ds.items) for ds in input_datasets.values()),
+            items_out=len(output_dataset.items) if output_dataset.items else 0,
+        )
+
+        return output_datasets, op_stats

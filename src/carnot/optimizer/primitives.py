@@ -1,60 +1,93 @@
 from __future__ import annotations
 
-from pydantic.fields import FieldInfo
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
+from carnot.core.models import PlanCost
 from carnot.operators.logical import LogicalOperator
 from carnot.operators.physical import PhysicalOperator
-from carnot.optimizer import rules
-from carnot.optimizer.plan import PlanCost
 from carnot.utils.hash_helpers import hash_for_id
+
+if TYPE_CHECKING:
+    from carnot.optimizer import rules
+
+
+@dataclass(frozen=True)
+class CostEntry:
+    """One costed configuration of a physical expression.
+
+    The optimizer allocates one ``CostEntry`` for every (physical-expression,
+    input-cost-combination) pair it evaluates.  Each entry stores the
+    cumulative ``PlanCost`` and back-pointers (as integer IDs) to the
+    ``CostEntry`` objects chosen for the input groups.  This decouples
+    pareto-frontier bookkeeping from plan reconstruction.
+
+    Representation invariant:
+        - ``entry_id`` is globally unique and non-negative.
+        - ``plan_cost`` is the cumulative cost of the sub-plan rooted
+          at the owning expression with the specific input choices
+          encoded in ``input_entry_ids``.
+        - ``len(input_entry_ids)`` equals the number of input groups
+          of the owning expression (0 for scans, 1 for unary, 2 for
+          joins).
+
+    Abstraction function:
+        Represents a single point in the (cost, time, quality) space
+        for a physical expression, together with the exact input
+        choices that produce that point.
+    """
+
+    entry_id: int
+    plan_cost: PlanCost
+    input_entry_ids: tuple[int, ...]
 
 
 class Expression:
-    """
-    An Expression (technically a "multi-expression") consists of either a logical operator
-    (if it's a logical expression) or a physical operator (if it's a physical expression)
-    and the group ids which are inputs to this expression
+    """A multi-expression in the optimizer's group tree.
+
+    An ``Expression`` wraps either a logical operator (if it's a
+    ``LogicalExpression``) or a physical operator (if it's a
+    ``PhysicalExpression``), together with the group IDs of its inputs.
+
+    After costing, ``pareto_entry_ids`` contains the IDs of this
+    expression's pareto-optimal ``CostEntry`` objects (stored in the
+    optimizer's global ``cost_entries`` dict).
+
+    Representation invariant:
+        - ``expr_id`` is deterministic given ``(operator, input_group_ids, class)``.
+        - ``pareto_entry_ids`` is ``None`` before costing and a non-empty
+          ``list[int]`` after costing.
+
+    Abstraction function:
+        Represents one way to compute the logical sub-query associated
+        with its owning ``Group``, using ``operator`` applied to the
+        sub-queries represented by ``input_group_ids``.
     """
 
     def __init__(
         self,
         operator: LogicalOperator | PhysicalOperator,
         input_group_ids: list[int],
-        input_fields: dict[str, FieldInfo],
-        depends_on_field_names: set[str],
-        generated_fields: dict[str, FieldInfo],
         group_id: int | None = None,
     ):
         self.operator = operator
         self.input_group_ids = input_group_ids
-        self.input_fields = input_fields
-        self.depends_on_field_names = depends_on_field_names
-        self.generated_fields = generated_fields
         self.group_id = group_id
         self.rules_applied = set()
 
-        # NOTE: this will be the best possible plan cost achieved by this expression for some
-        # greedy definition of "best"
-        self.plan_cost: PlanCost | None = None
-
-        # NOTE: this will be a list of tuples where each tuple has a (pareto-optimal) plan cost
-        # and the tuple of input plan cost(s) for which that pareto-optimal plan cost is attainable;
-        # the tuple of input plan cost(s) is (input_plan_cost, None) for non-join operators and
-        # (left_input_plan_cost, right_input_plan_cost) for join operators
-        self.pareto_optimal_plan_costs: list[tuple[PlanCost, tuple[PlanCost, PlanCost]]] | None = None
+        # IDs into the optimizer's global cost_entries dict; populated by
+        # OptimizePhysicalExpression after costing.
+        self.pareto_entry_ids: list[int] | None = None
 
         # compute the expression id
         self.expr_id = self._compute_expr_id()
 
-    def __eq__(self, other):
-        return self.expr_id == other.expr_id
+    def __eq__(self, other: Any) -> bool:
+        return isinstance(other, Expression) and self.expr_id == other.expr_id
 
     def __str__(self):
         expr_str = f"{self.__class__.__name__}(group_id={self.group_id}, expr_id={self.expr_id})"
         expr_str += f"\n  - input_group_ids: {self.input_group_ids}"
-        expr_str += f"\n  - input_fields: {self.input_fields}"
-        expr_str += f"\n  - depends_on_field_names: {self.depends_on_field_names}"
-        expr_str += f"\n  - generated_fields: {self.generated_fields}"
         expr_str += f"\n  - operator:\n{str(self.operator)}"
         return expr_str
 
@@ -86,48 +119,42 @@ class PhysicalExpression(Expression):
         return cls(
             operator=op,
             input_group_ids=logical_expression.input_group_ids,
-            input_fields=logical_expression.input_fields,
-            depends_on_field_names=logical_expression.depends_on_field_names,
-            generated_fields=logical_expression.generated_fields,
             group_id=logical_expression.group_id,
         )
 
 
 class Group:
-    """
-    A group is a set of logically equivalent expressions (both logical (query trees) and physical (execution plans)).
-    Represents the execution of an un-ordered set of logical operators.
-    Maintains a set of logical multi-expressions and physical multi-expressions.
+    """A group of logically equivalent expressions.
+
+    A group maintains sets of logical and physical multi-expressions that
+    are all semantically equivalent (they produce the same result set).
+    During optimization, the group accumulates a *pareto frontier* —
+    the set of (expression, cost-entry) pairs that are not dominated in
+    (cost, time, quality) space.
+
+    Representation invariant:
+        - ``group_id`` is unique within the optimizer.
+        - ``pareto_frontier`` is ``None`` before costing and a
+          ``list[tuple[int, int]]`` after at least one physical
+          expression has been costed, where each element is
+          ``(expr_id, cost_entry_id)``.
+
+    Abstraction function:
+        Represents all known ways (logical and physical) to compute a
+        particular sub-query, together with the pareto-optimal cost
+        points discovered so far.
     """
 
-    def __init__(self, logical_expressions: list[LogicalExpression], fields: dict[str, FieldInfo], properties: dict[str, set[str]]):
+    def __init__(self, logical_expressions: list[LogicalExpression], group_id: int):
         self.logical_expressions: set[LogicalExpression] = set(logical_expressions)
         self.physical_expressions: set[PhysicalExpression] = set()
-        self.fields = fields
         self.explored = False
-        self.best_physical_expression: PhysicalExpression | None = None
-        self.pareto_optimal_physical_expressions: list[PhysicalExpression] | None = None
         self.optimized = False
+        self.group_id = group_id
 
-        # properties of the Group which distinguish it from groups w/identical fields,
-        # e.g. which filters, limits have been applied; is the output sorted, etc.
-        self.properties = properties
-
-        # compute the group id
-        self.group_id = self._compute_group_id()
+        # Pareto frontier: list of (expr_id, cost_entry_id) pairs.
+        # None means "not yet costed"; an empty list is valid (no feasible plans).
+        self.pareto_frontier: list[tuple[int, int]] | None = None
 
     def set_explored(self):
         self.explored = True
-
-    def _compute_group_id(self) -> int:
-        # sort field names
-        sorted_fields = sorted(self.fields.keys())
-
-        # sort properties
-        sorted_properties = []
-        for key in sorted(self.properties.keys()):
-            sorted_properties.extend(sorted(self.properties[key]))
-
-        hash_str = str(tuple(sorted_fields + sorted_properties))
-        hash_id = int(hash_for_id(hash_str), 16)
-        return hash_id

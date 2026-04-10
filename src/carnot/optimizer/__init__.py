@@ -1,34 +1,53 @@
-from carnot.optimizer.rules import AddContextsBeforeComputeRule as _AddContextsBeforeComputeRule
 from carnot.optimizer.rules import (
-    BasicSubstitutionRule as _BasicSubstitutionRule,
-)
-from carnot.optimizer.rules import (
-    ImplementationRule as _ImplementationRule,
-)
-from carnot.optimizer.rules import (
-    Rule as _Rule,
-)
-from carnot.optimizer.rules import (
-    TransformationRule as _TransformationRule,
+    BasicSubstitutionRule,
+    CodeRule,
+    FilterToTopKFilter,
+    ImplementationRule,
+    PushDownFilter,
+    ReasoningRule,
+    Rule,
+    ScanRule,
+    SemAggRule,
+    SemFilterRule,
+    SemFlatMapRule,
+    SemGroupByRule,
+    SemJoinRule,
+    SemMapRule,
+    SemTopKRule,
+    TransformationRule,
 )
 
 ALL_RULES = [
-    _AddContextsBeforeComputeRule,
-    _BasicSubstitutionRule,
-    _ImplementationRule,
-    _Rule,
-    _TransformationRule,
+    BasicSubstitutionRule,
+    CodeRule,
+    FilterToTopKFilter,
+    ImplementationRule,
+    PushDownFilter,
+    ReasoningRule,
+    Rule,
+    ScanRule,
+    SemAggRule,
+    SemFilterRule,
+    SemFlatMapRule,
+    SemGroupByRule,
+    SemJoinRule,
+    SemMapRule,
+    SemTopKRule,
+    TransformationRule,
 ]
 
 IMPLEMENTATION_RULES = [
     rule
     for rule in ALL_RULES
-    if issubclass(rule, _ImplementationRule)
-    and rule not in [_ImplementationRule]
+    if issubclass(rule, ImplementationRule)
+    and rule not in [ImplementationRule]
 ]
 
 TRANSFORMATION_RULES = [
-    rule for rule in ALL_RULES if issubclass(rule, _TransformationRule) and rule not in [_TransformationRule]
+    rule
+    for rule in ALL_RULES
+    if issubclass(rule, TransformationRule)
+    and rule not in [TransformationRule]
 ]
 
 __all__ = [

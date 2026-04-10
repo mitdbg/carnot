@@ -1,0 +1,1 @@
+Rank the movies based on movie reviews. For each movie, score every review of it from 1 to 5, then calculate the average score of these reviews for each movie. Return movieId, movieScore.

@@ -1,0 +1,71 @@
+{
+    "nl_question": "Categorize the movies in the table by their genre. If a movie belongs to multiple genres, list it under each applicable genre.",
+    "modalities": ["table"],
+    "ground_truth": {
+        "comedy": [
+            "Orange County",
+            "Mean Girls",
+            "My Best Friend's Girl",
+            "Hot Tub Time Machine",
+            "High Road",
+            "Save the Date",
+            "Bachelorette",
+            "3, 2, 1... Frankie Go Boom",
+            "Queens of Country",
+            "The Interview",
+            "The Night Before",
+            "The Disaster Artist",
+            "The People We Hate at the Wedding"
+        ],
+        "drama": [
+            "Love Is the Drug",
+            "Crashing",
+            "Crossing Over",
+            "127 Hours",
+            "Save the Date",
+            "Allied",
+            "The Disaster Artist"
+        ],
+        "crime": [
+            "Crossing Over"
+        ],
+        "science fiction": [
+            "Hot Tub Time Machine",
+            "Item 47",
+            "Extinction"
+        ],
+        "romance": [
+            "My Best Friend's Girl",
+            "Save the Date",
+            "Allied",
+            "The People We Hate at the Wedding"
+        ],
+        "horror": [
+            "Cloverfield",
+            "Cobweb"
+        ],
+        "western": [
+            "The Last Rites of Ransom Pride"
+        ],
+        "heist": [
+            "Now You See Me 2"
+        ],
+        "biography": [
+            "127 Hours",
+            "The Disaster Artist"
+        ],
+        "action": [
+            "The Interview",
+            "Extinction"
+        ],
+        "satire": [
+            "The Interview"
+        ],
+        "war": [
+            "Allied"
+        ],
+        "thriller": [
+            "Allied"
+        ]
+    }
+}

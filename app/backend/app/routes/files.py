@@ -9,25 +9,46 @@ from app.auth import get_current_user
 from app.database import File as FileRecord
 from app.database import get_db
 from app.env import BASE_DIR, DATA_DIR, IS_LOCAL_ENV, SHARED_DATA_DIR
-from app.models.schemas import DirectoryCreate, FileBatchDelete, FileItem
-from app.services.file_service import LocalFileService, S3FileService, normalize_path
+from app.models.schemas import DirectoryCreate, FileBatchDelete, PaginatedFileList
+from app.services.file_service import DEFAULT_PAGE_SIZE, LocalFileService, S3FileService, normalize_path
 
 logger = logging.getLogger('uvicorn.error')
 
 router = APIRouter()
 file_service = LocalFileService() if IS_LOCAL_ENV else S3FileService()
 
+# Max items to return in a single page to prevent overload
+MAX_ITEMS_PER_REQUEST = 200
 
-@router.get("/browse", response_model=list[FileItem])
-async def browse_directory(path: str | None = None, user_id: str = Depends(get_current_user)):
+
+@router.get("/browse", response_model=PaginatedFileList)
+async def browse_directory(
+    path: str | None = None,
+    limit: int = DEFAULT_PAGE_SIZE,
+    continuation_token: str | None = None,
+    user_id: str = Depends(get_current_user)
+):
     """
-    Browse directory contents (uploaded files and user's data directory)
+    Browse directory contents with pagination support for large directories.
+    
+    Args:
+        path: Directory path to browse. If None, returns root level.
+        limit: Maximum number of items to return (default 50, max 200).
+        continuation_token: Token from previous response to fetch next page.
+        user_id: Current authenticated user (injected).
+    
+    Returns:
+        PaginatedFileList with items, next_token, and has_more flag.
     """
     try:
+        # Cap limit to prevent abuse
+        limit = min(limit, MAX_ITEMS_PER_REQUEST)
+        
         # return the root level (i.e. "data/") if no path is provided
         if path is None or path == "":
-            filepaths = file_service.list_directory(BASE_DIR)
-            return [fp for fp in filepaths if not fp.is_hidden]
+            result = file_service.list_directory_paginated(BASE_DIR, limit=limit, continuation_token=continuation_token)
+            result.items = [fp for fp in result.items if not fp.is_hidden]
+            return result
 
         # normalize the incoming path from the frontend
         normalized_path = normalize_path(path)
@@ -49,12 +70,18 @@ async def browse_directory(path: str | None = None, user_id: str = Depends(get_c
         if not file_service.is_dir(normalized_path):
             raise HTTPException(status_code=400, detail=f"Path {normalized_path} is not a directory or s3 prefix")
 
-        # get list of directory contents and then sort them so that directories come first
-        items = file_service.list_directory(normalized_path)
-        items = [item for item in items if not item.is_hidden]
-        items.sort(key=lambda file: (not file.is_directory, file.path.lower()))
+        # get paginated list of directory contents
+        result = file_service.list_directory_paginated(
+            normalized_path,
+            limit=limit,
+            continuation_token=continuation_token
+        )
+        
+        # Filter hidden files and sort (directories first, then alphabetically)
+        result.items = [item for item in result.items if not item.is_hidden]
+        result.items.sort(key=lambda file: (not file.is_directory, file.path.lower()))
 
-        return items
+        return result
 
     except HTTPException:
         raise
@@ -189,3 +216,38 @@ async def create_directory(data: DirectoryCreate, user_id: str = Depends(get_cur
         return {"message": "Success"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creating directory: {str(e)}") from e
+
+
+@router.post("/expand-paths")
+async def expand_paths(paths: list[str], user_id: str = Depends(get_current_user)):
+    """
+    Expand a list of paths (files and directories) into a flat list of file paths.
+    
+    This is used when creating datasets from selected folders - the frontend can
+    select folder paths, and this endpoint expands them to all contained files.
+    
+    Args:
+        paths: List of file and/or directory paths to expand.
+        user_id: Current authenticated user (injected).
+    
+    Returns:
+        List of file paths (directories are expanded to their contained files).
+    """
+    try:
+        expanded_files = set()
+        
+        for path in paths:
+            normalized_path = normalize_path(path)
+            
+            if file_service.is_dir(normalized_path):
+                # Expand directory to all subfiles
+                subfiles = file_service.list_all_subfiles(normalized_path)
+                expanded_files.update(subfiles)
+            elif file_service.exists(normalized_path):
+                # It's a regular file
+                expanded_files.add(normalized_path)
+            # Skip non-existent paths silently
+        
+        return {"files": list(expanded_files)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error expanding paths: {str(e)}") from e
