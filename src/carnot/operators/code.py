@@ -39,6 +39,7 @@ from carnot.agents.utils import (
 from carnot.core.models import LLMCallStats, OperatorStats
 from carnot.data.dataset import Dataset
 from carnot.operators.physical import PhysicalOperator
+from carnot.optimizer.model_ids import get_api_key_for_model
 
 
 @dataclass
@@ -90,7 +91,7 @@ class CodeOperator(PhysicalOperator):
         self.model_id = model_id
         self.llm_config = llm_config
         self._tools = tools or []
-        self.model = LiteLLMModel(model_id=model_id, api_key=llm_config.get("OPENAI_API_KEY"))
+        self.model = LiteLLMModel(model_id=model_id, api_key=get_api_key_for_model(model_id, llm_config))
         self.additional_authorized_imports = additional_authorized_imports if additional_authorized_imports else []
         self.authorized_imports = sorted(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
         self.code_block_tags = ["```python", "```"]

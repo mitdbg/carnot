@@ -117,10 +117,10 @@ class Execution:
             self.model_id = "anthropic/claude-sonnet-4-5-20250929"
             self.api_key_name = "ANTHROPIC_API_KEY"
         elif "OPENAI_API_KEY" not in self.llm_config and "GEMINI_API_KEY" in self.llm_config:
-            self.model_id = "google/gemini-2.5-flash"
+            self.model_id = "gemini/gemini-2.5-flash"
             self.api_key_name = "GEMINI_API_KEY"
         elif "OPENAI_API_KEY" not in self.llm_config and "GOOGLE_API_KEY" in self.llm_config:
-            self.model_id = "google/gemini-2.5-flash"
+            self.model_id = "gemini/gemini-2.5-flash"
             self.api_key_name = "GOOGLE_API_KEY"
 
         # create instance of the planner with the appropriate model and API key based on llm_config

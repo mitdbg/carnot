@@ -7,6 +7,7 @@ from carnot.data.dataset import Dataset
 from carnot.index import FlatCarnotIndex, HierarchicalCarnotIndex
 from carnot.index.index import ChromaIndex, FaissIndex
 from carnot.operators.physical import PhysicalOperator
+from carnot.optimizer.model_ids import get_api_key_for_model
 
 
 class SemTopKOperator(PhysicalOperator):
@@ -59,7 +60,7 @@ class SemTopKOperator(PhysicalOperator):
         self.max_workers = max_workers
         self.model_id = model_id
         self.llm_config = llm_config or {}
-        self.api_key = llm_config.get("OPENAI_API_KEY")
+        self.api_key = get_api_key_for_model(model_id, llm_config or {})
         self.index_name = index_name
         self.catalog = catalog
         index_map = {
