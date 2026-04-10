@@ -194,6 +194,37 @@ jobs:
             --secret-string "$SECRET_JSON" \
             --region us-east-1
 
+      - name: Seed DB credentials into AWS Secrets Manager
+        run: |
+          DB_SECRET_JSON=$(jq -n \
+            --arg user "${{ secrets.CARNOT_DB_USER }}" \
+            --arg pass "${{ secrets.CARNOT_DB_PASSWORD }}" \
+            '{"db_user": $user, "db_password": $pass}')
+
+          aws secretsmanager create-secret \
+            --name "carnot/${ENV_NAME}/db" \
+            --secret-string "$DB_SECRET_JSON" \
+            --region us-east-1 2>/dev/null \
+          || aws secretsmanager put-secret-value \
+            --secret-id "carnot/${ENV_NAME}/db" \
+            --secret-string "$DB_SECRET_JSON" \
+            --region us-east-1
+
+      - name: Seed app secrets into AWS Secrets Manager
+        run: |
+          APP_SECRET_JSON=$(jq -n \
+            --arg key "${{ secrets.SETTINGS_ENCRYPTION_KEY }}" \
+            '{"settings_encryption_key": $key}')
+
+          aws secretsmanager create-secret \
+            --name "carnot/${ENV_NAME}/app" \
+            --secret-string "$APP_SECRET_JSON" \
+            --region us-east-1 2>/dev/null \
+          || aws secretsmanager put-secret-value \
+            --secret-id "carnot/${ENV_NAME}/app" \
+            --secret-string "$APP_SECRET_JSON" \
+            --region us-east-1
+
       ######################################################################
       # STEP 3 — BUILD & PUSH IMAGES TO DOCKER HUB
       ######################################################################
