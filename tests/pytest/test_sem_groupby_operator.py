@@ -25,7 +25,7 @@ def test_sem_groupby_operator_sem_group_relational_agg(test_model_id, llm_config
 
     # execute the operator
     sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
-    output_datasets = sem_groupby_operator("Animal Dataset", input_datasets)
+    output_datasets, _stats = sem_groupby_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 2
@@ -68,7 +68,7 @@ def test_sem_groupby_operator_sem_group_sem_agg(test_model_id, llm_config):
 
     # execute the operator
     sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
-    output_datasets = sem_groupby_operator("Animal Dataset", input_datasets)
+    output_datasets, _stats = sem_groupby_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 2
@@ -110,7 +110,7 @@ def test_sem_groupby_operator_relational_group_sem_agg(test_model_id, llm_config
 
     # execute the operator
     sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
-    output_datasets = sem_groupby_operator("Animal Dataset", input_datasets)
+    output_datasets, _stats = sem_groupby_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 2
@@ -152,7 +152,7 @@ def test_sem_groupby_operator_relational_group_relational_agg(test_model_id, llm
 
     # execute the operator
     sem_groupby_operator = SemGroupByOperator(task, group_by_fields, agg_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
-    output_datasets = sem_groupby_operator("Animal Dataset", input_datasets)
+    output_datasets, _stats = sem_groupby_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 2

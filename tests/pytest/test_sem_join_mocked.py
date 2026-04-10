@@ -78,10 +78,10 @@ class TestSemJoinMocked:
             task="The animal makes the sound",
             model_id="mock-model",
             llm_config=mock_llm_config,
-            output_dataset_id="out",
+            dataset_id="out",
             max_workers=1,
         )
-        result = op("left", "right", {"left": left_ds, "right": right_ds})
+        result, _stats = op("left", "right", {"left": left_ds, "right": right_ds})
 
         assert "out" in result
         out_items = result["out"].items
@@ -99,10 +99,10 @@ class TestSemJoinMocked:
             task="always",
             model_id="mock-model",
             llm_config=mock_llm_config,
-            output_dataset_id="out",
+            dataset_id="out",
             max_workers=1,
         )
-        result = op("left", "right", {"left": left_ds, "right": right_ds})
+        result, _stats = op("left", "right", {"left": left_ds, "right": right_ds})
 
         assert len(result["out"].items) == len(_LEFT) * len(_RIGHT)
 
@@ -116,10 +116,10 @@ class TestSemJoinMocked:
             task="never",
             model_id="mock-model",
             llm_config=mock_llm_config,
-            output_dataset_id="out",
+            dataset_id="out",
             max_workers=1,
         )
-        result = op("left", "right", {"left": left_ds, "right": right_ds})
+        result, _stats = op("left", "right", {"left": left_ds, "right": right_ds})
 
         assert len(result["out"].items) == 0
 
@@ -133,10 +133,10 @@ class TestSemJoinMocked:
             task="join",
             model_id="mock-model",
             llm_config=mock_llm_config,
-            output_dataset_id="out",
+            dataset_id="out",
             max_workers=1,
         )
-        result = op("left", "right", {"left": left_ds, "right": right_ds})
+        result, _stats = op("left", "right", {"left": left_ds, "right": right_ds})
 
         item = result["out"].items[0]
         assert "left_name" in item
@@ -154,10 +154,10 @@ class TestSemJoinMocked:
             task="join",
             model_id="mock-model",
             llm_config=mock_llm_config,
-            output_dataset_id="out",
+            dataset_id="out",
             max_workers=1,
         )
-        result = op("left", "right", {"left": left_ds, "right": right_ds})
+        result, _stats = op("left", "right", {"left": left_ds, "right": right_ds})
 
         item = result["out"].items[0]
         assert "animal" in item
@@ -173,10 +173,10 @@ class TestSemJoinMocked:
             task="join",
             model_id="mock-model",
             llm_config=mock_llm_config,
-            output_dataset_id="out",
+            dataset_id="out",
             max_workers=1,
         )
-        result = op("left", "right", {"left": left_ds, "right": right_ds})
+        result, _stats = op("left", "right", {"left": left_ds, "right": right_ds})
 
         assert "left" in result
         assert "right" in result
@@ -193,7 +193,7 @@ class TestSemJoinMocked:
             task="join",
             model_id="mock-model",
             llm_config=mock_llm_config,
-            output_dataset_id="out",
+            dataset_id="out",
             max_workers=1,
         )
         op("left", "right", {"left": left_ds, "right": right_ds})

@@ -17,6 +17,7 @@ from helpers.assertions import (
 from carnot.agents.data_discovery import DataDiscoveryAgent
 from carnot.agents.models import LiteLLMModel
 from carnot.agents.planner import Planner
+from carnot.data.dataset import Dataset
 
 pytestmark = pytest.mark.llm
 
@@ -115,7 +116,6 @@ class TestLogicalPlanGeneration:
         # Generate logical plan (code-based)
         logical_plan = planner.generate_logical_plan(
             query=query,
-            datasets=[simple_movie_dataset],
             conversation=None,
         )
         
@@ -123,9 +123,10 @@ class TestLogicalPlanGeneration:
         assert_planner_did_not_hit_max_steps(planner, logical_plan)
         
         # Verify plan structure
-        assert isinstance(logical_plan, dict)
+        assert isinstance(logical_plan, Dataset)
+        logical_plan = logical_plan.serialize()
         assert "name" in logical_plan
-        assert "output_dataset_id" in logical_plan
+        assert "dataset_id" in logical_plan
         assert "params" in logical_plan
         assert "parents" in logical_plan
         
@@ -154,7 +155,6 @@ class TestLogicalPlanGeneration:
         # Generate logical plan - the planner can use its managed agent internally
         logical_plan = planner.generate_logical_plan(
             query=query,
-            datasets=[movies_dataset, reviews_dataset],
             conversation=None,
         )
         
@@ -162,7 +162,8 @@ class TestLogicalPlanGeneration:
         assert_planner_did_not_hit_max_steps(planner, logical_plan)
         
         # Verify plan structure
-        assert isinstance(logical_plan, dict)
+        assert isinstance(logical_plan, Dataset)
+        logical_plan = logical_plan.serialize()
         assert "name" in logical_plan
         assert "params" in logical_plan
         
@@ -187,7 +188,6 @@ class TestPlanParaphrasing:
         # Generate logical plan
         logical_plan = planner.generate_logical_plan(
             query=query,
-            datasets=[simple_movie_dataset],
             conversation=None,
         )
         
@@ -195,10 +195,9 @@ class TestPlanParaphrasing:
         assert_planner_did_not_hit_max_steps(planner, logical_plan)
         
         # Paraphrase to natural language
-        nl_plan = planner.paraphrase_logical_plan(
+        nl_plan = planner.paraphrase_plan(
             query=query,
-            logical_plan=logical_plan,
-            datasets=[simple_movie_dataset],
+            plan=logical_plan.serialize(),
             conversation=None,
         )
         
@@ -230,7 +229,6 @@ class TestPlanParaphrasing:
         
         logical_plan = planner.generate_logical_plan(
             query=query,
-            datasets=[simple_movie_dataset],
             conversation=None,
         )
         
@@ -238,9 +236,10 @@ class TestPlanParaphrasing:
         assert_planner_did_not_hit_max_steps(planner, logical_plan)
         
         # Verify structure
-        assert isinstance(logical_plan, dict)
+        assert isinstance(logical_plan, Dataset)
         
         # Should be JSON-serializable
+        logical_plan = logical_plan.serialize()
         json_str = json.dumps(logical_plan)
         assert len(json_str) > 0
         
@@ -254,7 +253,7 @@ class TestPlanParaphrasing:
         # Recursively verify all parents have the same structure
         def validate_plan_node(node):
             assert "name" in node
-            assert "output_dataset_id" in node
+            assert "dataset_id" in node
             assert "params" in node
             assert "parents" in node
             for parent in node["parents"]:
@@ -284,7 +283,6 @@ class TestPlanParaphrasing:
         # Generate plan - the planner can use its managed agent to discover schema
         logical_plan = planner.generate_logical_plan(
             query=query,
-            datasets=[movies_dataset, reviews_dataset],
             conversation=None,
         )
         
@@ -292,7 +290,8 @@ class TestPlanParaphrasing:
         assert_planner_did_not_hit_max_steps(planner, logical_plan)
         
         # Verify it's a valid plan structure
-        assert isinstance(logical_plan, dict)
+        assert isinstance(logical_plan, Dataset)
+        logical_plan = logical_plan.serialize()
         assert "name" in logical_plan
         assert "params" in logical_plan
         
@@ -333,7 +332,6 @@ class TestEndToEndPlanning:
         # The planner can call its managed DataDiscoveryAgent during this phase
         logical_plan = planner.generate_logical_plan(
             query=query,
-            datasets=[movies_dataset, reviews_dataset],
             conversation=None,
         )
         
@@ -341,7 +339,8 @@ class TestEndToEndPlanning:
         assert_planner_did_not_hit_max_steps(planner, logical_plan)
         
         # Verify logical plan
-        assert isinstance(logical_plan, dict)
+        assert isinstance(logical_plan, Dataset)
+        logical_plan = logical_plan.serialize()
         assert "name" in logical_plan
         assert "params" in logical_plan
         assert "operator" in logical_plan["params"]
@@ -358,13 +357,12 @@ class TestEndToEndPlanning:
         assert total_ops >= 2, f"Expected multi-step plan but got {total_ops} operators"
         
         # Step 2: Paraphrase to natural language
-        nl_plan = planner.paraphrase_logical_plan(
+        nl_plan = planner.paraphrase_plan(
             query=query,
-            logical_plan=logical_plan,
-            datasets=[movies_dataset, reviews_dataset],
+            plan=logical_plan,
             conversation=None,
         )
-        
+
         # Verify planner didn't hit max_steps for paraphrase
         assert_planner_did_not_hit_max_steps(planner, nl_plan)
         
@@ -394,7 +392,6 @@ class TestEndToEndPlanning:
         # Generate logical plan - planner can use managed agent to discover schema
         logical_plan = planner.generate_logical_plan(
             query=query,
-            datasets=[movies_dataset, reviews_dataset],
             conversation=None,
         )
         
@@ -408,7 +405,7 @@ class TestEndToEndPlanning:
                 operators.extend(extract_operators(parent))
             return operators
         
-        operators = extract_operators(logical_plan)
+        operators = extract_operators(logical_plan.serialize())
         
         # For a simple field lookup query, we expect Code operator
         # (possibly with a filter first to find the right movie)

@@ -1,13 +1,9 @@
-name: Deploy to AWS
+name: Deploy to AWS (DEPRECATED — replaced by deploy-k8s.yaml)
 
+# Disabled: all branches now deploy via the EKS/Helm pipeline.
+# Kept for reference during migration. Safe to delete once migration is complete.
 on:
-  push:
-    branches:
-    - main
-    - at-prod
-    - lm-prod
-    - wl-prod
-    - dev
+  workflow_dispatch:  # manual-only trigger
 
 permissions:
   id-token: write
@@ -220,12 +216,10 @@ jobs:
           SECRET_ID="carnot/${ENV_NAME}/__org_defaults__"
 
           if [[ "${ENV_NAME}" == "lm-prod" ]]; then
-            OPENAI_API_KEY="${{ secrets.LM_PROD_OPENAI_API_KEY }}"
+            SECRET_JSON=$(jq -n --arg key "${{ secrets.LM_PROD_OPENAI_API_KEY }}" '{"openai_api_key": $key}')
           elif [[ "${ENV_NAME}" == "at-prod" ]]; then
-            OPENAI_API_KEY="${{ secrets.AT_PROD_OPENAI_API_KEY }}"
+            SECRET_JSON=$(jq -n --arg key "${{ secrets.AT_PROD_GEMINI_API_KEY }}" '{"gemini_api_key": $key}')
           fi
-
-          SECRET_JSON=$(jq -n --arg key "$OPENAI_API_KEY" '{"openai_api_key": $key}')
 
           aws secretsmanager create-secret \
             --name "$SECRET_ID" \

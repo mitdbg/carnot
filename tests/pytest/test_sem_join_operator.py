@@ -32,7 +32,7 @@ def test_sem_join_operator_basic(test_model_id, llm_config):
 
     # execute the operator
     sem_join_operator = SemJoinOperator(task, test_model_id, llm_config, "output-dataset-id", max_workers=4)
-    output_datasets = sem_join_operator("Animal Dataset", "Sound Dataset", input_datasets)
+    output_datasets, _stats = sem_join_operator("Animal Dataset", "Sound Dataset", input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 3
@@ -68,7 +68,7 @@ def test_sem_join_operator_papers(test_model_id, llm_config, research_papers_dat
 
     # execute the operator
     sem_join_operator = SemJoinOperator(task, test_model_id, llm_config, "output-dataset-id", max_workers=4)
-    output_datasets = sem_join_operator(papers_left_dataset.name, papers_right_dataset.name, input_datasets)
+    output_datasets, _stats = sem_join_operator(papers_left_dataset.name, papers_right_dataset.name, input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 3

@@ -66,12 +66,12 @@ class TestSemAggMocked:
         op = SemAggOperator(
             task="The largest animal",
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
         )
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         assert "out" in result
         out_items = result["out"].items
@@ -90,12 +90,12 @@ class TestSemAggMocked:
         op = SemAggOperator(
             task="extremes",
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
         )
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         item = result["out"].items[0]
         assert item["largest"] == "elephant"
@@ -113,12 +113,12 @@ class TestSemAggMocked:
         op = SemAggOperator(
             task="extremes",
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
         )
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         item = result["out"].items[0]
         assert item["largest"] == "elephant"
@@ -133,12 +133,12 @@ class TestSemAggMocked:
         op = SemAggOperator(
             task="agg",
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
         )
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         assert "animals" in result
         assert "out" in result
@@ -153,7 +153,7 @@ class TestSemAggMocked:
         op = SemAggOperator(
             task="agg",
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,

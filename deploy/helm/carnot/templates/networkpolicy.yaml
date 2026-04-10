@@ -1,0 +1,101 @@
+---
+# Default-deny all ingress and egress within the namespace,
+# then carve out exactly the traffic that should be allowed.
+
+# Backend pods: accept traffic from the ALB, send traffic to postgres and AWS APIs.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: carnot-backend
+  namespace: {{ .Values.env }}
+  labels:
+    app.kubernetes.io/name: carnot
+    app.kubernetes.io/instance: {{ .Values.env }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: carnot-{{ .Chart.Version }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: carnot
+      app.kubernetes.io/instance: {{ .Values.env }}
+      app.kubernetes.io/component: backend
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Allow traffic from the ALB (routed via the AWS Load Balancer Controller,
+    # which lives in kube-system)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+  egress:
+    # Allow backend → postgres on port 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: carnot
+              app.kubernetes.io/instance: {{ .Values.env }}
+              app.kubernetes.io/component: postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Allow DNS resolution via CoreDNS
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow outbound HTTPS to AWS APIs (S3, Secrets Manager) and Auth0 JWKS endpoint
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# Postgres pods: only accept traffic from backend pods on port 5432.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: carnot-postgres
+  namespace: {{ .Values.env }}
+  labels:
+    app.kubernetes.io/name: carnot
+    app.kubernetes.io/instance: {{ .Values.env }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: carnot-{{ .Chart.Version }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: carnot
+      app.kubernetes.io/instance: {{ .Values.env }}
+      app.kubernetes.io/component: postgres
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: carnot
+              app.kubernetes.io/instance: {{ .Values.env }}
+              app.kubernetes.io/component: backend
+      ports:
+        - protocol: TCP
+          port: 5432
+  egress:
+    # Allow DNS resolution
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
