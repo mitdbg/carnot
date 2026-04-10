@@ -451,7 +451,10 @@ class QueryExecutionStreamer:
             await self.queue.put(f"data: {json.dumps({'type': 'step_detail', 'source': 'execution', 'message': f'Processing {len(all_files)} files...'})}\n\n")
 
             session_exists = session_id in active_sessions
-            if session_exists and set(active_sessions[session_id]["dataset_ids"]) != set(self.dataset_ids):
+            cached_dataset_ids = active_sessions.get(session_id, {}).get("dataset_ids")
+            if session_exists and (
+                cached_dataset_ids is None or set(cached_dataset_ids) != set(self.dataset_ids)
+            ):
                 session_exists = False
 
             session_dir = Path(BASE_DIR, ".sessions", session_id) if IS_LOCAL_ENV else S3Path(BASE_DIR, ".sessions", session_id)
