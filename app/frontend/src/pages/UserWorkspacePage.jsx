@@ -10,29 +10,24 @@ import NotebookView from '../components/NotebookView'
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000/api"
 const DEFAULT_COST_BUDGET = 5.00
 
-/* ─── Plan Visualizer (unchanged) ──────────────────────────────────── */
+/* ─── Plan Visualizer ──────────────────────────────────────────────── */
 
 function PlanVisualizer({ plan }) {
-  const flattenPlan = (node, acc = new Map()) => {
-    if (!node) return acc
-    if (node.parents && node.parents.length > 0) {
-      node.parents.forEach(parent => flattenPlan(parent, acc))
-    }
-    const nodeKey = JSON.stringify({ name: node.name, params: node.params })
-    if (!acc.has(nodeKey)) {
-      acc.set(nodeKey, {
-        name: node.name,
-        operator: node.params?.operator || 'Source',
-        description: node.params?.description || `Load dataset: ${node.name}`,
-        parents: node.parents?.map(p => p.name) || [],
-        details: node.params || {}
-      })
-    }
-    return acc
+  const buildSteps = (plan) => {
+    const nodes = plan?.nodes
+    if (!nodes || nodes.length === 0) return []
+
+    const nodeById = new Map(nodes.map(n => [n.node_id, n]))
+    return nodes.map(n => ({
+      name: n.name,
+      operator: n.operator_type || (n.node_type === 'dataset' ? 'SOURCE' : 'OPERATOR'),
+      description: n.description || `Load dataset: ${n.name}`,
+      parents: (n.parent_ids || []).map(pid => nodeById.get(pid)?.name).filter(Boolean),
+      details: n.params || {}
+    }))
   }
 
-  const stepsMap = plan ? flattenPlan(plan) : new Map()
-  const steps = Array.from(stepsMap.values())
+  const steps = plan ? buildSteps(plan) : []
 
   if (steps.length === 0) return (
     <div className="flex flex-col items-center justify-center h-full text-gray-400 p-4 text-center">
