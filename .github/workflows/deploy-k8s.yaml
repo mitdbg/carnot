@@ -302,7 +302,7 @@ jobs:
             --set hostname=${SUBDOMAIN}.carnot-research.org \
             --set frontendOrigin=https://${SUBDOMAIN}.carnot-research.org \
             --wait \
-            --timeout 5m
+            --timeout 10m
 
       - name: Verify rollout
         run: |
