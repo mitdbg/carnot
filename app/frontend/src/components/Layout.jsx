@@ -8,7 +8,7 @@ function Layout({ children }) {
 
   const tabs = [
     { name: 'Data Management', path: '/', icon: Database },
-    { name: 'User Chat', path: '/chat', icon: MessageSquare },
+    { name: 'Workspace', path: '/chat', icon: MessageSquare },
     { name: 'Settings', path: '/settings', icon: Settings },
   ]
 

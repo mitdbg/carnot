@@ -7,7 +7,7 @@ system_prompt: |-
   1. Understand what data you need by using available data discovery capabilities
   2. Identify which datasets and fields are relevant to the query
   3. Build a logical plan using the available semantic and non-semantic operators
-  4. Return the final plan using `final_answer(ds.serialize())`
+  4. Return the final plan using `final_answer(<dataset>)` where `<dataset>` is the resulting dataset after applying all operators
 
   **Accessing Datasets:**
   The datasets available to you are provided in the `datasets` variable. You can retrieve a dataset by indexing with its name:
@@ -58,7 +58,7 @@ system_prompt: |-
   **Rules:**
   1. Always provide a 'Thought:' sequence explaining your reasoning, then code in '{{code_opening_tag}}' ... '{{code_closing_tag}}'.
   2. Use `print()` to observe intermediate results before the final answer.
-  3. Return the final logical plan using `final_answer(ds.serialize())`.
+  3. Return the final logical plan using `final_answer(<dataset>)`.
   4. Use only the datasets provided to you.
   5. Use the data discovery agent to understand the input datasets before building your plan.
   6. Never call `data_discovery()` and `final_answer()` in the same code block. Data discovery must complete in a separate step so you can observe its results before building your final plan.
@@ -83,7 +83,7 @@ system_prompt: |-
   ds = datasets["Legal Contracts"]
   ds = ds.sem_filter("the document is a legal contract")
   ds = ds.sem_filter("the document contains a 'Key Man' provision")
-  final_answer(ds.serialize())
+  final_answer(ds)
   {{code_closing_tag}}
 
   **Index-Aware Planning:**
@@ -109,7 +109,7 @@ system_prompt: |-
   ds = datasets["Legal Contracts"]
   ds = ds.sem_topk(index_name="flat", search_str="Find all legal contracts which contain a 'Key Man' provision.", k=50)
   ds = ds.sem_filter("The document contains a 'Key Man' provision")
-  final_answer(ds.serialize())
+  final_answer(ds)
   {{code_closing_tag}}
 
   **Index Tips:**
@@ -118,14 +118,14 @@ system_prompt: |-
 
   Now Begin!
 paraphrase_prompt: |-
-  You are an expert assistant. Your job is to translate a logical execution plan into a clear, human-readable natural language description.
+  You are an expert assistant. Your job is to translate an execution plan into a clear, human-readable natural language description.
   
   You will be given:
   1. The user's original query
-  2. A logical plan (as a serialized data structure)
+  2. A logical or physical plan (as a serialized data structure)
   3. Information about the available datasets
   
-  Your task is to describe what the logical plan does in plain language, step by step, so that a non-technical user can understand it.
+  Your task is to describe what the logical or physical plan does in plain language, step by step, so that a non-technical user can understand it.
   
   **Guidelines:**
   - Be concise but complete
@@ -139,7 +139,7 @@ paraphrase_prompt: |-
   
   Query: "Find all legal contracts with Key Man provisions"
   
-  Logical Plan:
+  Plan:
   ```json
   {
     "name": "FilterOperation2",
@@ -160,7 +160,7 @@ paraphrase_prompt: |-
   3. Return all contracts matching both criteria.
   {{plan_closing_tag}}
 
-  Now translate the following logical plan:
+  Now translate the following plan:
 physical_compiler_prompt: |-
   empty
 planning:

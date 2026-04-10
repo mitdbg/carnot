@@ -69,6 +69,7 @@ def _make_completion_response(content: str) -> MagicMock:
         response.choices[0].message.model_dump(include={"role", "content", "tool_calls"})
         response.usage.prompt_tokens
         response.usage.completion_tokens
+        response._hidden_params["response_cost"]
     """
     message = MagicMock()
     message.content = content
@@ -86,10 +87,15 @@ def _make_completion_response(content: str) -> MagicMock:
     usage = MagicMock()
     usage.prompt_tokens = 10
     usage.completion_tokens = 5
+    usage.prompt_tokens_details = None
+    usage.completion_tokens_details = None
+    usage.cache_read_input_tokens = 0
+    usage.cache_creation_input_tokens = 0
 
     response = MagicMock()
     response.choices = [choice]
     response.usage = usage
+    response._hidden_params = {"response_cost": 0.001}
     return response
 
 
@@ -100,8 +106,13 @@ def _make_embedding_response(texts: list[str]) -> MagicMock:
         item = {"embedding": _deterministic_embedding(text)}
         data.append(item)
 
+    usage = MagicMock()
+    usage.total_tokens = len(texts) * 10  # deterministic token count
+
     response = MagicMock()
     response.data = data
+    response.usage = usage
+    response._hidden_params = {"response_cost": 0.0001 * len(texts)}
     return response
 
 

@@ -11,12 +11,14 @@ import json
 import logging
 import os
 from pathlib import Path
-
-import litellm
+from typing import TYPE_CHECKING
 
 from carnot.index.models import FileSummaryEntry, HierarchicalIndexConfig
 from carnot.index.sem_indices_cache import FileSummaryCache
 from carnot.storage.config import StorageConfig
+
+if TYPE_CHECKING:
+    from carnot.agents.models import LiteLLMModel
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +43,9 @@ class SummaryLayer:
 
     Construction parameters:
 
+    - *model* (``LiteLLMModel | None``): the model instance used for
+      LLM completion and embedding calls.  When ``None``, a default
+      ``LiteLLMModel`` is created using ``config.summary_model``.
     - *config* (``HierarchicalIndexConfig | None``): controls which
       embedding and summary models to use.  Defaults to
       ``HierarchicalIndexConfig()`` when ``None``.
@@ -52,6 +57,7 @@ class SummaryLayer:
     Representation invariant:
         - ``_cache`` is a :class:`FileSummaryCache` instance.
         - ``_config`` is a non-``None`` :class:`HierarchicalIndexConfig`.
+        - ``_model`` is a :class:`LiteLLMModel` instance.
 
     Abstraction function:
         Represents a service that, given a list of dictionaries, produces corresponding
@@ -61,6 +67,7 @@ class SummaryLayer:
 
     def __init__(
         self,
+        model: LiteLLMModel | None = None,
         config: HierarchicalIndexConfig | None = None,
         api_key: str | None = None,
         storage_dir: Path | None = None,
@@ -69,6 +76,16 @@ class SummaryLayer:
         self._api_key = api_key or os.getenv("OPENAI_API_KEY")
         cache_dir = storage_dir or StorageConfig().summaries_dir
         self._cache = FileSummaryCache(storage_dir=cache_dir)
+
+        if model is not None:
+            self._model = model
+        else:
+            from carnot.agents.models import LiteLLMModel as _LiteLLMModel
+
+            self._model = _LiteLLMModel(
+                model_id=self._config.summary_model,
+                api_key=self._api_key,
+            )
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -93,14 +110,14 @@ class SummaryLayer:
             None.  Errors for individual items are logged and skipped.
         """
         paths = [
-            i['path']
+            i.get("path")
             for i in items
-            if i['path'] and Path(i['path']).suffix.lower() not in _SKIP_SUFFIXES
+            if i.get("path") and Path(i["path"]).suffix.lower() not in _SKIP_SUFFIXES
         ]
 
         loaded, missing_paths = self._cache.load_many(paths)
         items_to_compute = [
-            i for i in items if i['path'] in missing_paths
+            i for i in items if i.get("path") in missing_paths
         ]
 
         if items_to_compute:
@@ -215,13 +232,14 @@ The summary should be rich enough to enable accurate routing when users search f
 Summary:"""
 
         try:
-            response = litellm.completion(
-                model=self._config.summary_model,
-                messages=[{"role": "user", "content": prompt}],
+            from carnot.agents.models import ChatMessage
+
+            message = ChatMessage(role="user", content=prompt)
+            response = self._model.generate(
+                messages=[message],
                 temperature=_SUMMARY_TEMPERATURE,
-                api_key=self._api_key,
             )
-            return response.choices[0].message.content.strip()
+            return response.content.strip()
         except Exception as e:
             logger.warning(
                 f"LLM summarization failed for {file_path}: {e}, using preview fallback",
@@ -243,12 +261,11 @@ Summary:"""
             None.  Errors are logged.
         """
         try:
-            response = litellm.embedding(
+            embeddings, _embed_stats = self._model.embed(
+                texts=[text],
                 model=self._config.embedding_model,
-                input=[text],
-                api_key=self._api_key,
             )
-            return response.data[0]["embedding"]
+            return embeddings[0]
         except Exception as e:
             logger.warning(f"Embedding generation failed: {e}")
             return None

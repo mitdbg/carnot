@@ -1,15 +1,14 @@
 """Unit tests for index construction and structure (no LLM required).
 
 Tests cover:
-1. CarnotIndex base class — attribute storage, ``_build_uri_to_idx``,
-   ``_items_to_data_items``
-2. FlatFileIndex — construction from pre-built summaries, embedding
+1. CarnotIndex base class -- attribute storage, ``_build_uri_to_idx``
+2. FlatFileIndex -- construction from pre-built summaries, embedding
    pre-filter logic with synthetic embeddings
-3. HierarchicalFileIndex._build() — flat mode for small file counts,
+3. HierarchicalFileIndex._build() -- flat mode for small file counts,
    hierarchical mode with mock/fallback clustering
 4. HierarchicalIndexConfig defaults
 5. FileSummaryEntry / InternalNode dataclass construction
-6. FileSummaryCache — save/load round-trip
+6. FileSummaryCache -- save/load round-trip
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ import numpy as np
 import pytest
 
 from carnot.data.item import DataItem
-from carnot.index.index import CarnotIndex, _build_uri_to_idx, _items_to_data_items
+from carnot.index.index import CarnotIndex, _build_uri_to_idx
 from carnot.index.models import (
     FileSummaryEntry,
     HierarchicalIndexConfig,
@@ -403,48 +402,3 @@ class TestBuildUriToIdx:
         mapping = _build_uri_to_idx(items)
         assert mapping["dup"] == 1
 
-
-class TestItemsToDataItems:
-    """``_items_to_data_items`` conversion helper."""
-
-    def test_empty_list(self):
-        """Empty input returns an empty list."""
-        assert _items_to_data_items([]) == []
-
-    def test_dataitems_pass_through(self):
-        """DataItem instances with non-empty URI are returned as-is."""
-        di = DataItem(uri="s3://a")
-        result = _items_to_data_items([di])
-        assert result == [di]
-
-    def test_dicts_converted(self):
-        """Dict items with a ``"uri"`` key are wrapped in DataItem."""
-        result = _items_to_data_items([{"uri": "/a.txt", "name": "a"}])
-        assert len(result) == 1
-        assert isinstance(result[0], DataItem)
-        assert result[0].uri == "/a.txt"
-
-    def test_skips_dataitems_without_uri(self):
-        """DataItem with empty URI is skipped."""
-        result = _items_to_data_items([DataItem(uri=""), DataItem(uri="ok")])
-        assert len(result) == 1
-        assert result[0].uri == "ok"
-
-    def test_skips_dicts_without_uri(self):
-        """Dict without a ``"uri"`` key is skipped."""
-        result = _items_to_data_items([{"name": "no-uri"}, {"uri": "/b.txt"}])
-        assert len(result) == 1
-        assert result[0].uri == "/b.txt"
-
-    def test_mixed_input(self):
-        """Handles a mix of DataItems, dicts, and items without URIs."""
-        items = [
-            DataItem(uri="s3://a"),
-            {"uri": "/b.txt"},
-            DataItem(uri=""),
-            {"name": "no-uri"},
-        ]
-        result = _items_to_data_items(items)
-        assert len(result) == 2
-        assert result[0].uri == "s3://a"
-        assert result[1].uri == "/b.txt"

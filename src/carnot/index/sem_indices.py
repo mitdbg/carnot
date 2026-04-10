@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -13,6 +14,9 @@ from carnot.index.models import (
 )
 from carnot.storage.config import StorageConfig
 from carnot.utils.hash_helpers import hash_for_id
+
+if TYPE_CHECKING:
+    from carnot.agents.models import LiteLLMModel
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +41,14 @@ class FlatFileIndex:
     Representation invariant:
         - ``_embeddings`` is ``None`` iff ``file_summaries`` is empty.
         - When not ``None``, ``_embeddings.shape == (len(file_summaries), embedding_dim)``.
+        - ``_model`` is a :class:`LiteLLMModel` instance.
     """
 
     def __init__(
         self,
         name: str,
         file_summaries: list[FileSummaryEntry],
+        model: LiteLLMModel | None = None,
         config: HierarchicalIndexConfig | None = None,
         api_key: str | None = None,
         max_llm_items: int = FLAT_INDEX_MAX_LLM_ITEMS,
@@ -56,11 +62,23 @@ class FlatFileIndex:
             np.array([e.embedding for e in file_summaries], dtype="float32") if file_summaries else None
         )
 
+        if model is not None:
+            self._model = model
+        else:
+            from carnot.agents.models import LiteLLMModel as _LiteLLMModel
+
+            self._model = _LiteLLMModel(
+                model_id=self.config.llm_routing_model,
+                api_key=self.api_key,
+            )
+        self._llm_call_stats: list = []
+
     @classmethod
     def from_items(
         cls,
         name: str,
         items: list[dict],
+        model: LiteLLMModel | None = None,
         config: HierarchicalIndexConfig | None = None,
         api_key: str | None = None,
         storage_dir: Path | None = None,
@@ -88,23 +106,21 @@ class FlatFileIndex:
         from carnot.index.summary_layer import SummaryLayer
 
         layer = summary_layer or SummaryLayer(
-            config=config, api_key=api_key, storage_dir=storage_dir,
+            model=model, config=config, api_key=api_key, storage_dir=storage_dir,
         )
         summaries = layer.get_or_build_summaries(items)
         if not summaries:
             logger.warning("No file summaries could be generated for FlatFileIndex")
             return None
-        return cls(name=name, file_summaries=summaries, config=config, api_key=api_key)
+        return cls(name=name, file_summaries=summaries, model=model, config=config, api_key=api_key)
 
     def _embed_texts(self, texts: list[str]) -> list[list[float]]:
-        import litellm
-
-        response = litellm.embedding(
+        embeddings, embed_stats = self._model.embed(
+            texts=texts,
             model=self.config.embedding_model,
-            input=texts,
-            api_key=self.api_key,
         )
-        return [item["embedding"] for item in response.data]
+        self._llm_call_stats.append(embed_stats)
+        return embeddings
 
     def _llm_select_indices(self, query: str, entries: list[FileSummaryEntry], top_k: int) -> list[int]:
         """Send summaries to LLM; return indices of top-k most relevant."""
@@ -114,8 +130,6 @@ class FlatFileIndex:
             return list(range(len(entries)))
 
         import re
-
-        import litellm
 
         max_chars = 1200
         numbered = "\n".join(
@@ -132,13 +146,14 @@ File summaries:
 Return only the comma-separated numbers, nothing else:"""
 
         try:
-            response = litellm.completion(
-                model=self.config.llm_routing_model,
-                messages=[{"role": "user", "content": prompt}],
+            from carnot.agents.models import ChatMessage
+
+            message = ChatMessage(role="user", content=prompt)
+            response = self._model.generate(
+                messages=[message],
                 temperature=0.1,
-                api_key=self.api_key,
             )
-            text = response.choices[0].message.content.strip()
+            text = response.content.strip()
             numbers = re.findall(r"\b(\d+)\b", text)
             indices = []
             for n in numbers:
@@ -214,6 +229,7 @@ class HierarchicalFileIndex:
         self,
         name: str,
         file_summaries: list[FileSummaryEntry],
+        model: LiteLLMModel | None = None,
         config: HierarchicalIndexConfig | None = None,
         api_key: str | None = None,
         build: bool = True,
@@ -224,6 +240,16 @@ class HierarchicalFileIndex:
         self.config = config or HierarchicalIndexConfig()
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
 
+        if model is not None:
+            self._model = model
+        else:
+            from carnot.agents.models import LiteLLMModel as _LiteLLMModel
+
+            self._model = _LiteLLMModel(
+                model_id=self.config.llm_routing_model,
+                api_key=self.api_key,
+            )
+
         # path -> FileSummaryEntry
         self._path_to_summary: dict[str, FileSummaryEntry] = {e.path: e for e in file_summaries}
         # node_id -> InternalNode (for non-root levels)
@@ -231,6 +257,7 @@ class HierarchicalFileIndex:
         # Root level: list of InternalNodes (or FileSummaryEntry if flat)
         self._root_level: list[InternalNode | FileSummaryEntry] = []
         self._embeddings: np.ndarray | None = None  # for flat or root-level search
+        self._llm_call_stats: list = []
 
         if build:
             self._build()
@@ -240,6 +267,7 @@ class HierarchicalFileIndex:
         cls,
         name: str,
         items: list[dict],
+        model: LiteLLMModel | None = None,
         config: HierarchicalIndexConfig | None = None,
         api_key: str | None = None,
         storage_dir: Path | None = None,
@@ -282,7 +310,7 @@ class HierarchicalFileIndex:
             return index
 
         layer = summary_layer or SummaryLayer(
-            config=config, api_key=api_key, storage_dir=storage_dir,
+            model=model, config=config, api_key=api_key, storage_dir=storage_dir,
         )
         summaries = layer.get_or_build_summaries(items)
         if not summaries:
@@ -292,6 +320,7 @@ class HierarchicalFileIndex:
         index = cls(
             name=cache_key,
             file_summaries=summaries,
+            model=model,
             config=config,
             api_key=api_key,
         )
@@ -418,8 +447,6 @@ class HierarchicalFileIndex:
         if len(members) == 1:
             return members[0].summary
 
-        import litellm
-
         combined = "\n".join(f"- {m.summary}" for m in members[:20])  # cap for context
         if len(members) > 20:
             combined += f"\n... and {len(members) - 20} more files"
@@ -432,13 +459,14 @@ File summaries:
 Concise cluster summary:"""
 
         try:
-            response = litellm.completion(
-                model=self.config.summary_model,
-                messages=[{"role": "user", "content": prompt}],
+            from carnot.agents.models import ChatMessage
+
+            message = ChatMessage(role="user", content=prompt)
+            response = self._model.generate(
+                messages=[message],
                 temperature=0.2,
-                api_key=self.api_key,
             )
-            return response.choices[0].message.content.strip()
+            return response.content.strip()
         except Exception as e:
             logger.warning(f"LLM summarization failed: {e}, using first summary")
             return members[0].summary
@@ -447,8 +475,6 @@ Concise cluster summary:"""
         """Summarize a cluster of internal node summaries (higher-level aggregation)."""
         if len(members) == 1:
             return members[0].summary
-
-        import litellm
 
         combined = "\n".join(f"- {m.summary}" for m in members[:20])
         if len(members) > 20:
@@ -462,27 +488,26 @@ Cluster summaries:
 Concise meta-cluster summary:"""
 
         try:
-            response = litellm.completion(
-                model=self.config.summary_model,
-                messages=[{"role": "user", "content": prompt}],
+            from carnot.agents.models import ChatMessage
+
+            message = ChatMessage(role="user", content=prompt)
+            response = self._model.generate(
+                messages=[message],
                 temperature=0.2,
-                api_key=self.api_key,
             )
-            return response.choices[0].message.content.strip()
+            return response.content.strip()
         except Exception as e:
             logger.warning(f"LLM summarization failed: {e}, using first summary")
             return members[0].summary
 
     def _embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed texts using the configured model."""
-        import litellm
-
-        response = litellm.embedding(
+        embeddings, embed_stats = self._model.embed(
+            texts=texts,
             model=self.config.embedding_model,
-            input=texts,
-            api_key=self.api_key,
         )
-        return [item["embedding"] for item in response.data]
+        self._llm_call_stats.append(embed_stats)
+        return embeddings
 
     def _llm_select_node_indices(
         self,
@@ -502,8 +527,6 @@ Concise meta-cluster summary:"""
 
         import re
 
-        import litellm
-
         numbered = "\n".join(
             f"{i + 1}. {self._get_node_summary(n)}"
             for i, n in enumerate(nodes)
@@ -518,13 +541,14 @@ Items:
 Return only the comma-separated numbers, nothing else:"""
 
         try:
-            response = litellm.completion(
-                model=self.config.llm_routing_model,
-                messages=[{"role": "user", "content": prompt}],
+            from carnot.agents.models import ChatMessage
+
+            message = ChatMessage(role="user", content=prompt)
+            response = self._model.generate(
+                messages=[message],
                 temperature=0.1,
-                api_key=self.api_key,
             )
-            text = response.choices[0].message.content.strip()
+            text = response.content.strip()
             # Parse "3, 1, 7" or "3,1,7" or "1. 3 2. 1" etc
             numbers = re.findall(r"\b(\d+)\b", text)
             indices = []

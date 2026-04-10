@@ -1,34 +1,27 @@
-"""
-Data Discovery Agent for Carnot.
+"""Data Discovery Agent for Carnot.
 
 This agent specializes in analyzing datasets to discover relevant data,
 inspect schemas, and provide information about dataset structure.
 It can be used as a managed agent by the Planner.
 
-This agent inherits directly from BaseAgent (not CodeAgent) to minimize
-dependency on the SmolAgents library code.
+This agent inherits from ``CarnotBaseAgent``, a minimal base class that
+contains only the machinery needed by the Planner and DataDiscoveryAgent.
 """
 
+import queue
 from collections.abc import Generator
 from importlib import resources
 from typing import Any
 
 import yaml
 
-from carnot.agents.base import (
-    ActionOutput,
-    ActionStep,
-    BaseAgent,
-    FinalAnswerStep,
-    PlanningStep,
-    populate_template,
-)
+from carnot.agents.base import ActionOutput, BaseAgent, populate_template
 from carnot.agents.local_python_executor import (
     BASE_BUILTIN_MODULES,
     LocalPythonExecutor,
     PythonExecutor,
 )
-from carnot.agents.memory import ToolCall
+from carnot.agents.memory import ActionStep, FinalAnswerStep, PlanningStep, ToolCall
 from carnot.agents.models import Model
 from carnot.agents.monitoring import LogLevel
 from carnot.agents.tools import Tool
@@ -62,7 +55,7 @@ class DataDiscoveryAgent(BaseAgent):
         max_print_outputs_length: Maximum length of print outputs in code execution.
         **kwargs: Additional keyword arguments passed to BaseAgent.
     """
-    
+
     def __init__(
         self,
         datasets: list[Dataset],
@@ -101,7 +94,7 @@ class DataDiscoveryAgent(BaseAgent):
         prompt_templates = yaml.safe_load(
             resources.files("carnot.agents.prompts").joinpath("data_discovery_agent.yaml").read_text()
         )
-        
+
         # Initialize BaseAgent
         super().__init__(
             tools=tools or [],
@@ -112,10 +105,15 @@ class DataDiscoveryAgent(BaseAgent):
             max_steps=max_steps,
             **kwargs
         )
-        
+
+        # optional progress queue for streaming updates to external consumers.
+        # Set per-call by the Planner's _progress_scope context manager;
+        # None when not being observed.
+        self.progress_queue: queue.Queue | None = None
+
         # Create the Python executor for code execution
         self.python_executor = self.create_python_executor()
-    
+
     def __enter__(self):
         """Context manager entry."""
         return self
@@ -128,7 +126,15 @@ class DataDiscoveryAgent(BaseAgent):
         """Clean up resources used by the agent, such as the Python executor."""
         if hasattr(self, "python_executor") and hasattr(self.python_executor, "cleanup"):
             self.python_executor.cleanup()
-    
+
+    def _get_step_cost_usd(self, step: ActionStep) -> float:
+        """Helper to extract USD cost from an ActionStep's model output message."""
+        # NOTE: I think we can safely assume model_output_message is always present
+        msg = getattr(step, "model_output_message", None)
+        if msg is not None and getattr(msg, "llm_call_stats", None) is not None:
+            return msg.llm_call_stats.cost_usd
+        return 0.0
+
     def _build_description(self) -> str:
         """
         Build the description that tells the Planner how to use this agent.
@@ -140,7 +146,7 @@ class DataDiscoveryAgent(BaseAgent):
         datasets_str = ", ".join(f'"{name}"' for name in dataset_names[:MAX_PRINT_DATASETS])
         if len(dataset_names) > MAX_PRINT_DATASETS:
             datasets_str += f", ... ({len(dataset_names)} total)"
-        
+
         return f"""Data Discovery Agent: Analyzes datasets to find relevant data for queries.
 
 **Capabilities:**
@@ -163,7 +169,7 @@ class DataDiscoveryAgent(BaseAgent):
 - Schema queries return ONLY the keys from items in a Dataset, which are the fields that can be accessed programmatically
 - If document contents contain additional information (titles, authors, etc.), this will be noted but not included in the schema
 """
-    
+
     def create_python_executor(self) -> PythonExecutor:
         """Create a Python executor with datasets available in the local scope."""
         executor = LocalPythonExecutor(
@@ -223,41 +229,36 @@ class DataDiscoveryAgent(BaseAgent):
     def run(
         self,
         task: str,
-        stream: bool = False,
         reset: bool = True,
-        images: list | None = None,
         additional_args: dict | None = None,
         max_steps: int | None = None,
     ):
-        """
-        Run the data discovery agent on a task.
-        
-        Injects datasets into the executor state before running.
-        
-        Args:
-            task: The task to perform (e.g., "Which datasets have research papers?")
-            stream: Whether to stream outputs.
-            reset: Whether to reset conversation state.
-            images: Optional images to include.
-            additional_args: Additional arguments to pass.
-            max_steps: Maximum number of steps.
-            
+        """Run the data discovery agent on a task.
+
+        Injects datasets into the executor state before delegating to the
+        parent ``CarnotBaseAgent.run``.
+
+        Requires:
+            - *task* is a non-empty string.
+            - ``self._datasets`` is populated.
+
         Returns:
-            The result of the data discovery task.
+            The result of the data discovery task (a string report).
+
+        Raises:
+            Whatever the parent ``run`` raises.
         """
         # Inject datasets into the executor state
         self.python_executor.state.update(self._get_executor_state())
-        
+
         # Merge any additional args
         if additional_args:
             self.python_executor.state.update(additional_args)
-        
+
         # Run the parent class implementation
         return super().run(
             task=task,
-            stream=stream,
             reset=reset,
-            images=images,
             additional_args=additional_args,
             max_steps=max_steps,
         )
@@ -506,34 +507,40 @@ class DataDiscoveryAgent(BaseAgent):
                 Text(f"Out: {truncated_output}"),
             ]
         self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
-        memory_step.action_output = code_output.output
+        memory_step.code_action_output = code_output.output
         yield ActionOutput(output=code_output.output, is_final_answer=code_output.is_final_answer)
 
     def _run_stream(
         self, task: str, max_steps: int, images: list | None = None
     ) -> Generator[ActionStep | PlanningStep | FinalAnswerStep, None, None]:
-        """
-        Override _run_stream to add a warning message when approaching max_steps.
-        
-        When the agent has MAX_STEPS_WARNING_THRESHOLD steps remaining,
+        """Override ``_run_stream`` to add countdown warnings and push
+        progress events to the progress queue.
+
+        When the agent has ``MAX_STEPS_WARNING_THRESHOLD`` steps remaining,
         injects a message into the conversation prompting the agent to
         return its final answer soon.
+
+        If ``self.progress_queue`` is set (by the Planner's
+        ``_progress_scope``), each completed ``ActionStep`` is converted
+        to a ``PlanningProgress`` event and pushed to the queue.
         """
-        for output in super()._run_stream(task, max_steps, images):
-            yield output
-            
+        from carnot.execution.progress import PlanningProgress
+
+        for step in super()._run_stream(task, max_steps, images=images):
+            yield step
+
             # After yielding an ActionStep, check if we should warn the agent
-            if isinstance(output, ActionStep):
+            if isinstance(step, ActionStep):
                 # step_number is the step that just completed (before parent increments)
                 # steps_remaining = max_steps - current_step
                 steps_remaining = max_steps - self.step_number
-                
+
                 # Debug logging
                 self.logger.log(
                     f"[DataDiscoveryAgent] Step {self.step_number} completed, {steps_remaining} steps remaining (max={max_steps})",
                     level=LogLevel.INFO,
                 )
-                
+
                 # Countdown warning for the last few steps
                 if 1 <= steps_remaining <= MAX_STEPS_WARNING_THRESHOLD:
                     step_word = "step" if steps_remaining == 1 else "steps"
@@ -542,9 +549,22 @@ class DataDiscoveryAgent(BaseAgent):
                         f"Return your final answer with final_answer() soon."
                     )
                     # Modify the action step's observations
-                    output.observations = (output.observations or "") + warning_msg
+                    step.observations = (step.observations or "") + warning_msg
                     # Log that we're adding the warning
                     self.logger.log(
                         "[DataDiscoveryAgent] Added max_steps warning to observations",
                         level=LogLevel.INFO,
                     )
+
+                # push progress to external consumer
+                if self.progress_queue is not None:
+                    event = PlanningProgress(
+                        phase="data_discovery",
+                        step=step.step_number,
+                        message=f"Data discovery step {step.step_number}...",
+                        code_action=step.code_action,
+                        observations=step.observations,
+                        step_cost_usd=self._get_step_cost_usd(step),
+                        error=str(step.error) if step.error else None,
+                    )
+                    self.progress_queue.put(event.to_dict())

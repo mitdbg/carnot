@@ -20,10 +20,13 @@ from carnot.agents.utils import (
     AgentParsingError,
     parse_boolean_output,
 )
+from carnot.core.models import LLMCallStats, OperatorStats
 from carnot.data.dataset import Dataset
+from carnot.operators.physical import PhysicalOperator
+from carnot.optimizer.model_ids import get_api_key_for_model
 
 
-class SemFilterOperator:
+class SemFilterOperator(PhysicalOperator):
     """Semantic filter operator — retains or discards items via an LLM boolean judgement.
 
     For every item in the input dataset the operator asks the LLM whether the
@@ -41,10 +44,23 @@ class SemFilterOperator:
         a new dataset containing only the items for which the LLM answers ``True``
         to the natural-language predicate ``task``.
     """
-    def __init__(self, task: str, output_dataset_id: str, model_id: str, llm_config: dict, max_workers: int, max_steps: int = 3):
+    def __init__(
+            self,
+            task: str,
+            dataset_id: str,
+            model_id: str,
+            llm_config: dict,
+            max_workers: int,
+            max_steps: int = 3,
+            logical_op_id: str | None = None,
+            logical_op_class_name: str | None = None,
+        ):
+        super().__init__(logical_op_id=logical_op_id, logical_op_class_name=logical_op_class_name)
         self.task = task
-        self.output_dataset_id = output_dataset_id
-        self.model = LiteLLMModel(model_id=model_id, api_key=llm_config.get("OPENAI_API_KEY"))
+        self.dataset_id = dataset_id
+        self.model_id = model_id
+        self.llm_config = llm_config
+        self.model = LiteLLMModel(model_id=model_id, api_key=get_api_key_for_model(model_id, llm_config))
         self.max_workers = max_workers
         self.prompt_templates = yaml.safe_load(
             resources.files("carnot.agents.prompts").joinpath("sem_filter.yaml").read_text()
@@ -53,6 +69,31 @@ class SemFilterOperator:
         self.logger = AgentLogger(level=LogLevel.INFO)
         self.output_tags = ["```text", "```"]
         self.max_steps = max_steps
+
+    def get_id_params(self):
+        id_params = super().get_id_params()
+        id_params = {
+            "task": self.task,
+            "dataset_id": self.dataset_id,
+            "model_id": self.model_id,
+            **id_params,
+        }
+
+        return id_params
+
+    def get_op_params(self):
+        op_params = super().get_op_params()
+        op_params = {
+            "task": self.task,
+            "dataset_id": self.dataset_id,
+            "model_id": self.model_id,
+            "llm_config": self.llm_config,
+            "max_workers": self.max_workers,
+            "max_steps": self.max_steps,
+            **op_params,
+        }
+
+        return op_params
 
     def _finalize_step(self, memory_step: ActionStep):
         memory_step.timing.end_time = time.time()
@@ -72,7 +113,7 @@ class SemFilterOperator:
             messages.extend(memory_step.to_messages(summary_mode=summary_mode))
         return messages
 
-    def _sem_filter(self, item: dict, system_prompt: str) -> dict | None:
+    def _sem_filter(self, item: dict, system_prompt: str) -> tuple[dict | None, list[LLMCallStats]]:
         """Apply the semantic filter to a single item.
 
         Requires:
@@ -80,8 +121,10 @@ class SemFilterOperator:
             - *system_prompt* is a pre-populated prompt string.
 
         Returns:
-            The original *item* if the LLM judges it passes the filter,
-            otherwise ``None``.
+            A tuple ``(result, llm_call_stats_list)`` where *result* is the
+            original *item* if the LLM judges it passes the filter, otherwise
+            ``None``, and *llm_call_stats_list* is a list of
+            :class:`LLMCallStats` from each LLM call made (including retries).
 
         Raises:
             AgentGenerationError: If the LLM call itself fails.
@@ -90,6 +133,7 @@ class SemFilterOperator:
         memory.system_prompt = SystemPromptStep(system_prompt=system_prompt)
         memory.steps.append(SemFilterOperatorStep(task=self.task, item=item))
         passes_filter, step_number = None, 0
+        call_stats: list[LLMCallStats] = []
         while passes_filter is None and step_number < self.max_steps:
             memory_step = ActionStep(step_number=1, timing=Timing(start_time=time.time()))
             try:
@@ -105,6 +149,8 @@ class SemFilterOperator:
                     memory_step.model_output_message = chat_message
                     memory_step.token_usage = chat_message.token_usage
                     memory_step.model_output = chat_message.content
+                    if chat_message.llm_call_stats is not None:
+                        call_stats.append(chat_message.llm_call_stats)
                 except Exception as e:
                     raise AgentGenerationError(f"Error in generating model output:\n{e}", self.logger) from e
 
@@ -123,9 +169,9 @@ class SemFilterOperator:
                 memory.steps.append(memory_step)
                 step_number += 1
 
-        return item if passes_filter else None
+        return (item if passes_filter else None), call_stats
 
-    def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> dict[str, Dataset]:
+    def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> tuple[dict[str, Dataset], OperatorStats]:
         """Execute the semantic filter over every item in the input dataset.
 
         Requires:
@@ -133,14 +179,18 @@ class SemFilterOperator:
             - ``input_datasets[dataset_id].items`` is an iterable of dicts.
 
         Returns:
-            A **new** ``dict[str, Dataset]`` that is a copy of
+            A tuple ``(output_datasets, stats)`` where *output_datasets* is
+            a **new** ``dict[str, Dataset]`` that is a copy of
             *input_datasets* with an additional entry keyed by
-            ``self.output_dataset_id`` containing only the items that
-            passed the filter.
+            ``self.dataset_id`` containing only the items that
+            passed the filter, and *stats* is an :class:`OperatorStats`
+            summarising the LLM calls made.
 
         Raises:
             KeyError: If *dataset_id* is not in *input_datasets*.
         """
+        op_start = time.perf_counter()
+
         # retrieve items from the input dataset
         items = input_datasets[dataset_id].items
 
@@ -162,11 +212,25 @@ class SemFilterOperator:
 
         # block until futures complete
         done_futures, _ = wait(futures)
-        results = [fut.result() for fut in done_futures]
-        results = list(filter(None, results))
+        all_call_stats: list[LLMCallStats] = []
+        results = []
+        for fut in done_futures:
+            result_item, item_stats = fut.result()
+            all_call_stats.extend(item_stats)
+            if result_item is not None:
+                results.append(result_item)
 
         # create new dataset and return it with the input datasets
-        output_dataset = Dataset(name=self.output_dataset_id, annotation=f"Sem filter operator output for task: {self.task}", items=results)
+        output_dataset = Dataset(name=self.dataset_id, annotation=f"Sem filter operator output for task: {self.task}", items=results)
         output_datasets = {**input_datasets, output_dataset.name: output_dataset}
 
-        return output_datasets
+        op_stats = OperatorStats(
+            operator_name="SemFilter",
+            operator_id=self.dataset_id,
+            wall_clock_secs=time.perf_counter() - op_start,
+            llm_calls=all_call_stats,
+            items_in=len(items),
+            items_out=len(results),
+        )
+
+        return output_datasets, op_stats

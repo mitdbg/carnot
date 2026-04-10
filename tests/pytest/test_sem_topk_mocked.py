@@ -63,7 +63,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find mammals"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 2
             op.model_id = "mock-embedding"
             op.api_key = "fake"
@@ -72,7 +72,7 @@ class TestSemTopKMocked:
             op.index_cls = _FakeIndex
 
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         assert "out" in result
         assert len(result["out"].items) == 2
@@ -82,7 +82,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find mammals"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 3
             op.model_id = "mock-embedding"
             op.api_key = "fake"
@@ -93,7 +93,7 @@ class TestSemTopKMocked:
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
         assert "test_idx" not in ds.list_indices()
 
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         # The index should now be registered on the dataset
         assert "test_idx" in ds.list_indices()
@@ -110,7 +110,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find mammals"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 1
             op.model_id = "mock-embedding"
             op.api_key = "fake"
@@ -118,7 +118,7 @@ class TestSemTopKMocked:
             op.catalog = None
             op.index_cls = _FakeIndex
 
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         # Should have used the existing index
         existing_index.search.assert_called_once_with("find mammals", k=1)
@@ -130,7 +130,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 1
             op.model_id = "mock"
             op.api_key = "fake"
@@ -139,7 +139,7 @@ class TestSemTopKMocked:
             op.index_cls = _FakeIndex
 
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         assert "animals" in result
         assert "out" in result
@@ -150,7 +150,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 100
             op.model_id = "mock"
             op.api_key = "fake"
@@ -159,7 +159,7 @@ class TestSemTopKMocked:
             op.index_cls = _FakeIndex
 
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         # _FakeIndex returns min(k, len(items))
         assert len(result["out"].items) == len(_ANIMALS)
@@ -175,7 +175,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 2
             op.model_id = "mock"
             op.api_key = "fake"
@@ -203,7 +203,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 2
             op.model_id = "mock"
             op.api_key = "fake"
@@ -236,7 +236,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find mammals"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 2
             op.model_id = "mock-embedding"
             op.api_key = "fake"
@@ -247,7 +247,7 @@ class TestSemTopKMocked:
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
         ds.dataset_id = 7
 
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         # Catalog was queried
         catalog.get_index_by_name.assert_called_once_with(7, "flat")
@@ -270,7 +270,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 2
             op.model_id = "mock"
             op.api_key = "fake"
@@ -297,7 +297,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 2
             op.model_id = "mock"
             op.api_key = "fake"
@@ -328,7 +328,7 @@ class TestSemTopKMocked:
         with patch.object(SemTopKOperator, "__init__", lambda self, **kw: None):
             op = SemTopKOperator.__new__(SemTopKOperator)
             op.task = "find"
-            op.output_dataset_id = "out"
+            op.dataset_id = "out"
             op.k = 2
             op.model_id = "mock"
             op.api_key = "fake"

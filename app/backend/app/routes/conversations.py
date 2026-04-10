@@ -17,8 +17,8 @@ router = APIRouter()
 
 class ConversationCreate(BaseModel):
     session_id: str
+    workspace_id: int
     title: str | None = None
-    dataset_ids: str | None = None
 
 class ConversationUpdate(BaseModel):
     title: str | None = None
@@ -34,6 +34,7 @@ class MessageResponse(BaseModel):
     id: int
     role: str
     content: str
+    type: str | None = None
     csv_file: str | None = None
     row_count: int | None = None
     created_at: datetime
@@ -45,7 +46,6 @@ class ConversationResponse(BaseModel):
     id: int
     session_id: str
     title: str | None
-    dataset_ids: str | None
     message_count: int
     created_at: datetime
     updated_at: datetime
@@ -57,7 +57,6 @@ class ConversationDetailResponse(BaseModel):
     id: int
     session_id: str
     title: str | None
-    dataset_ids: str | None
     created_at: datetime
     updated_at: datetime
     messages: list[MessageResponse]
@@ -89,7 +88,6 @@ async def list_conversations(
             id=conversation.id,
             session_id=conversation.session_id,
             title=conversation.title,
-            dataset_ids=conversation.dataset_ids,
             message_count=message_count,
             created_at=conversation.created_at,
             updated_at=conversation.updated_at
@@ -125,7 +123,6 @@ async def get_conversation(
         id=conversation.id,
         session_id=conversation.session_id,
         title=conversation.title,
-        dataset_ids=conversation.dataset_ids,
         created_at=conversation.created_at,
         updated_at=conversation.updated_at,
         messages=[MessageResponse.model_validate(msg) for msg in messages]
@@ -149,18 +146,17 @@ async def create_conversation(
             id=existing.id,
             session_id=existing.session_id,
             title=existing.title,
-            dataset_ids=existing.dataset_ids,
             message_count=0,
             created_at=existing.created_at,
             updated_at=existing.updated_at
         )
 
-    # Create new conversation
+    # Create new conversation — requires workspace_id
     new_conversation = Conversation(
+        workspace_id=conversation.workspace_id,
         user_id=user_id,
         session_id=conversation.session_id,
         title=conversation.title,
-        dataset_ids=conversation.dataset_ids
     )
     db.add(new_conversation)
     await db.commit()
@@ -170,7 +166,6 @@ async def create_conversation(
         id=new_conversation.id,
         session_id=new_conversation.session_id,
         title=new_conversation.title,
-        dataset_ids=new_conversation.dataset_ids,
         message_count=0,
         created_at=new_conversation.created_at,
         updated_at=new_conversation.updated_at
@@ -195,7 +190,7 @@ async def update_conversation(
     if update.title is not None:
         conversation.title = update.title
 
-    conversation.updated_at = datetime.now(timezone.utc)
+    conversation.updated_at = datetime.now(timezone.utc)  # noqa: UP017
     await db.commit()
     await db.refresh(conversation)
 
@@ -209,7 +204,6 @@ async def update_conversation(
         id=conversation.id,
         session_id=conversation.session_id,
         title=conversation.title,
-        dataset_ids=conversation.dataset_ids,
         message_count=message_count,
         created_at=conversation.created_at,
         updated_at=conversation.updated_at
@@ -261,7 +255,7 @@ async def create_message(
     db.add(new_message)
 
     # Update conversation timestamp
-    conversation.updated_at = datetime.now(timezone.utc)
+    conversation.updated_at = datetime.now(timezone.utc)  # noqa: UP017
 
     await db.commit()
     await db.refresh(new_message)

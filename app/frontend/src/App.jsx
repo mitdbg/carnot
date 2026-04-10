@@ -2,7 +2,7 @@ import { Routes, Route } from 'react-router-dom'
 import Layout from './components/Layout'
 import ProtectedRoute from './components/ProtectedRoute'
 import DataManagementPage from './pages/DataManagementPage'
-import UserChatPage from './pages/UserChatPage'
+import UserWorkspacePage from './pages/UserWorkspacePage'
 import Settings from './pages/Settings'
 
 
@@ -34,7 +34,7 @@ function App() {
         />
         <Route
           path="/chat"
-          element={<ProtectedRoute component={UserChatPage} />}
+          element={<ProtectedRoute component={UserWorkspacePage} />}
         />
         <Route
           path="/settings"

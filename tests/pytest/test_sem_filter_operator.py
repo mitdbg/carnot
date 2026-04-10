@@ -23,7 +23,7 @@ def test_sem_filter_operator_basic(test_model_id, llm_config):
 
     # execute the operator
     sem_filter_operator = SemFilterOperator(task, "output-dataset-id", test_model_id, llm_config, max_workers=4)
-    output_datasets = sem_filter_operator("Animal Dataset", input_datasets)
+    output_datasets, _stats = sem_filter_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 2
@@ -55,7 +55,7 @@ def test_sem_filter_operator_movie_reviews(test_model_id, llm_config, movie_revi
 
     # generate output
     sem_filter_operator = SemFilterOperator(task, "output-dataset-id", test_model_id, llm_config, max_workers=4)
-    output_datasets = sem_filter_operator("Reviews Dataset", input_datasets)
+    output_datasets, _stats = sem_filter_operator("Reviews Dataset", input_datasets)
 
     assert len(output_datasets) == 2
     assert "output-dataset-id" in output_datasets

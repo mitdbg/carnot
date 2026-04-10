@@ -88,12 +88,12 @@ class TestSemGroupByMocked:
             task="Count animals per group",
             group_by_fields=group_by_fields,
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
         )
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         assert "out" in result
         out_items = result["out"].items
@@ -116,12 +116,12 @@ class TestSemGroupByMocked:
             task="Total weight per group",
             group_by_fields=group_by_fields,
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
         )
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         out_items = result["out"].items
         sums = {item["animal_group"]: item["weight"] for item in out_items}
@@ -142,12 +142,12 @@ class TestSemGroupByMocked:
             task="Weight range per group",
             group_by_fields=group_by_fields,
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
         )
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         out_items = result["out"].items
         mammal = next(i for i in out_items if i["animal_group"] == "mammal")
@@ -168,12 +168,12 @@ class TestSemGroupByMocked:
             task="Average weight per group",
             group_by_fields=group_by_fields,
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
         )
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         out_items = result["out"].items
         mammal = next(i for i in out_items if i["animal_group"] == "mammal")
@@ -193,12 +193,12 @@ class TestSemGroupByMocked:
             task="Count and find heaviest per group",
             group_by_fields=group_by_fields,
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
         )
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         out_items = result["out"].items
         assert len(out_items) == 4
@@ -218,12 +218,12 @@ class TestSemGroupByMocked:
             task="Count",
             group_by_fields=group_by_fields,
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
         )
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         assert "animals" in result
         assert "out" in result
@@ -239,7 +239,7 @@ class TestSemGroupByMocked:
             task="Count",
             group_by_fields=group_by_fields,
             agg_fields=agg_fields,
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,

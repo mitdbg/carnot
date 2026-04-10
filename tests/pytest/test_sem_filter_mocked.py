@@ -64,12 +64,12 @@ class TestSemFilterMocked:
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
         op = SemFilterOperator(
             task="The animal is a mammal",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
         )
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         assert "out" in result
         out_items = result["out"].items
@@ -84,12 +84,12 @@ class TestSemFilterMocked:
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
         op = SemFilterOperator(
             task="always true",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
         )
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         assert len(result["out"].items) == len(_ANIMALS)
 
@@ -100,12 +100,12 @@ class TestSemFilterMocked:
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
         op = SemFilterOperator(
             task="always false",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
         )
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         assert len(result["out"].items) == 0
 
@@ -116,12 +116,12 @@ class TestSemFilterMocked:
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
         op = SemFilterOperator(
             task="pass",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
         )
-        result = op("animals", {"animals": ds})
+        result, _stats = op("animals", {"animals": ds})
 
         assert "animals" in result
         assert "out" in result
@@ -134,7 +134,7 @@ class TestSemFilterMocked:
         ds = Dataset(name="animals", annotation="test", items=list(_ANIMALS))
         op = SemFilterOperator(
             task="pass",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
@@ -162,13 +162,13 @@ class TestSemFilterMocked:
         ds = Dataset(name="d", annotation="test", items=[{"x": 1}])
         op = SemFilterOperator(
             task="pass",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
             max_steps=3,
         )
-        result = op("d", {"d": ds})
+        result, _stats = op("d", {"d": ds})
 
         # Should succeed after retry
         assert len(result["out"].items) == 1
@@ -182,12 +182,12 @@ class TestSemFilterMocked:
         ds = Dataset(name="empty", annotation="test", items=[])
         op = SemFilterOperator(
             task="irrelevant",
-            output_dataset_id="out",
+            dataset_id="out",
             model_id="mock-model",
             llm_config=mock_llm_config,
             max_workers=1,
         )
-        result = op("empty", {"empty": ds})
+        result, _stats = op("empty", {"empty": ds})
 
         assert len(result["out"].items) == 0
         assert len(mock_litellm.completion_calls) == 0

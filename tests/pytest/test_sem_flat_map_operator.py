@@ -26,7 +26,7 @@ def test_sem_flat_map_operator_basic(test_model_id, llm_config):
 
     # execute the operator
     sem_flat_map_operator = SemFlatMapOperator(task, output_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
-    output_datasets = sem_flat_map_operator("Fruit Dataset", input_datasets)
+    output_datasets, _stats = sem_flat_map_operator("Fruit Dataset", input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 2
@@ -66,7 +66,7 @@ def test_sem_flat_map_operator_movie_reviews(test_model_id, llm_config, research
 
     # generate output
     sem_flat_map_operator = SemFlatMapOperator(task, output_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
-    output_datasets = sem_flat_map_operator("Research Papers Dataset", input_datasets)
+    output_datasets, _stats = sem_flat_map_operator("Research Papers Dataset", input_datasets)
 
     assert len(output_datasets) == 2
     assert "output-dataset-id" in output_datasets

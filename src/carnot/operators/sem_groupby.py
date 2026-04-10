@@ -21,10 +21,13 @@ from carnot.agents.utils import (
     AgentParsingError,
     parse_json_output,
 )
+from carnot.core.models import LLMCallStats, OperatorStats
 from carnot.data.dataset import Dataset
+from carnot.operators.physical import PhysicalOperator
+from carnot.optimizer.model_ids import get_api_key_for_model
 
 
-class SemGroupByOperator:
+class SemGroupByOperator(PhysicalOperator):
     """Semantic group-by operator — groups items then aggregates per group.
 
     Execution proceeds in two phases:
@@ -50,13 +53,28 @@ class SemGroupByOperator:
         a new dataset with one row per group, each containing the computed
         aggregation values.
     """
-    def __init__(self, task: str, group_by_fields: list[dict], agg_fields: list[dict], output_dataset_id: str, model_id: str, llm_config: dict, max_workers: int, max_steps: int = 3):
+    def __init__(
+            self,
+            task: str,
+            group_by_fields: list[dict],
+            agg_fields: list[dict],
+            dataset_id: str,
+            model_id: str,
+            llm_config: dict,
+            max_workers: int,
+            max_steps: int = 3,
+            logical_op_id: str | None = None,
+            logical_op_class_name: str | None = None,
+        ):
+        super().__init__(logical_op_id=logical_op_id, logical_op_class_name=logical_op_class_name)
         self.task = task
-        self.output_dataset_id = output_dataset_id
+        self.dataset_id = dataset_id
         self.group_by_fields = group_by_fields
         self.agg_fields = agg_fields
+        self.model_id = model_id
+        self.llm_config = llm_config
         self._sem_agg_fields = [field for field in agg_fields if field['func'] not in ["min", "max", "count", "sum", "mean"]]
-        self.model = LiteLLMModel(model_id=model_id, api_key=llm_config.get("OPENAI_API_KEY"))
+        self.model = LiteLLMModel(model_id=model_id, api_key=get_api_key_for_model(model_id, llm_config))
         self.max_workers = max_workers
         self.group_by_prompt_templates = yaml.safe_load(
             resources.files("carnot.agents.prompts").joinpath("sem_groupby.yaml").read_text()
@@ -68,6 +86,35 @@ class SemGroupByOperator:
         self.logger = AgentLogger(level=LogLevel.INFO)
         self.output_tags = ["```json", "```"]
         self.max_steps = max_steps
+
+    def get_id_params(self):
+        id_params = super().get_id_params()
+        id_params = {
+            "task": self.task,
+            "group_by_fields": self.group_by_fields,
+            "agg_fields": self.agg_fields,
+            "dataset_id": self.dataset_id,
+            "model_id": self.model_id,
+            **id_params,
+        }
+
+        return id_params
+
+    def get_op_params(self):
+        op_params = super().get_op_params()
+        op_params = {
+            "task": self.task,
+            "group_by_fields": self.group_by_fields,
+            "agg_fields": self.agg_fields,
+            "dataset_id": self.dataset_id,
+            "model_id": self.model_id,
+            "llm_config": self.llm_config,
+            "max_workers": self.max_workers,
+            "max_steps": self.max_steps,
+            **op_params,
+        }
+
+        return op_params
 
     def _finalize_step(self, memory_step: ActionStep):
         memory_step.timing.end_time = time.time()
@@ -87,15 +134,17 @@ class SemGroupByOperator:
             messages.extend(memory_step.to_messages(summary_mode=summary_mode))
         return messages
 
-    def _sem_group(self, item: dict, system_prompt: str) -> dict | None:
+    def _sem_group(self, item: dict, system_prompt: str) -> tuple[dict | None, list[LLMCallStats]]:
         """Compute the group-by field values for a single item via the LLM.
 
         Requires:
             - *item* is a dict representing one dataset row.
 
         Returns:
-            The *item* dict, mutated in-place with the group-by field values.
-            Missing fields are set to ``None``.
+            A tuple ``(item, llm_call_stats_list)`` where *item* is the
+            dict mutated in-place with the group-by field values (missing
+            fields are set to ``None``), and *llm_call_stats_list* is a
+            list of :class:`LLMCallStats` from each LLM call made.
 
         Raises:
             AgentGenerationError: If the LLM call itself fails.
@@ -109,6 +158,7 @@ class SemGroupByOperator:
         memory.steps.append(SemGroupByGroupOperatorStep(group_by_fields=self.group_by_fields, item=item))
 
         output_json, step_number = None, 0
+        call_stats: list[LLMCallStats] = []
         while output_json is None and step_number < self.max_steps:
             memory_step = ActionStep(step_number=1, timing=Timing(start_time=time.time()))
             try:
@@ -124,6 +174,8 @@ class SemGroupByOperator:
                     memory_step.model_output_message = chat_message
                     memory_step.token_usage = chat_message.token_usage
                     memory_step.model_output = chat_message.content
+                    if chat_message.llm_call_stats is not None:
+                        call_stats.append(chat_message.llm_call_stats)
                 except Exception as e:
                     raise AgentGenerationError(f"Error in generating model output:\n{e}", self.logger) from e
 
@@ -151,9 +203,9 @@ class SemGroupByOperator:
             if field_name not in item:
                 item[field_name] = None
 
-        return item
+        return item, call_stats
 
-    def _sem_agg(self, items: list[dict], system_prompt: str, group_key: tuple[str]) -> dict | None:
+    def _sem_agg(self, items: list[dict], system_prompt: str, group_key: tuple[str]) -> tuple[tuple[str], dict | None, list[LLMCallStats]]:
         """Aggregate items within a single group via the LLM.
 
         Only the fields in ``_sem_agg_fields`` are aggregated here; built-in
@@ -164,8 +216,9 @@ class SemGroupByOperator:
             - *group_key* identifies the group.
 
         Returns:
-            ``(group_key, output_dict)`` where *output_dict* contains the
-            aggregated field values.
+            A tuple ``(group_key, output_dict, llm_call_stats_list)`` where
+            *output_dict* contains the aggregated field values and
+            *llm_call_stats_list* is a list of :class:`LLMCallStats`.
 
         Raises:
             AgentGenerationError: If the LLM call itself fails.
@@ -175,6 +228,7 @@ class SemGroupByOperator:
         memory.steps.append(SemAggOperatorStep(task="Apply the aggregation(s) specified in Output Fields over the Input.", agg_fields=self._sem_agg_fields, items=items))
 
         output_json, step_number = None, 0
+        call_stats: list[LLMCallStats] = []
         while output_json is None and step_number < self.max_steps:
             memory_step = ActionStep(step_number=1, timing=Timing(start_time=time.time()))
             try:
@@ -190,6 +244,8 @@ class SemGroupByOperator:
                     memory_step.model_output_message = chat_message
                     memory_step.token_usage = chat_message.token_usage
                     memory_step.model_output = chat_message.content
+                    if chat_message.llm_call_stats is not None:
+                        call_stats.append(chat_message.llm_call_stats)
                 except Exception as e:
                     raise AgentGenerationError(f"Error in generating model output:\n{e}", self.logger) from e
 
@@ -214,9 +270,9 @@ class SemGroupByOperator:
             if field_name not in output_json:
                 output_json[field_name] = None
 
-        return group_key, output_json
+        return group_key, output_json, call_stats
 
-    def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> dict[str, Dataset]:
+    def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> tuple[dict[str, Dataset], OperatorStats]:
         """Execute the two-phase semantic group-by over the input dataset.
 
         Phase 1 computes group-by field values (potentially via LLM).
@@ -227,13 +283,18 @@ class SemGroupByOperator:
             - *dataset_id* is a key in *input_datasets*.
 
         Returns:
-            A new ``dict[str, Dataset]`` that is a copy of *input_datasets*
-            with an additional entry keyed by ``self.output_dataset_id``
-            containing one row per group.
+            A tuple ``(output_datasets, stats)`` where *output_datasets*
+            is a new ``dict[str, Dataset]`` with an additional entry keyed
+            by ``self.dataset_id`` containing one row per group,
+            and *stats* is an :class:`OperatorStats` summarising all LLM
+            calls made across both phases.
 
         Raises:
             KeyError: If *dataset_id* is not in *input_datasets*.
         """
+        op_start = time.perf_counter()
+        all_call_stats: list[LLMCallStats] = []
+
         # retrieve items from the input dataset
         items = input_datasets[dataset_id].items
 
@@ -255,7 +316,11 @@ class SemGroupByOperator:
 
         # block until futures complete
         done_futures, _ = wait(futures)
-        items: list[dict] = [fut.result() for fut in done_futures]
+        items: list[dict] = []
+        for fut in done_futures:
+            result_item, item_stats = fut.result()
+            all_call_stats.extend(item_stats)
+            items.append(result_item)
 
         # compute the non-semantic agregations for each group
         agg_state = {}
@@ -320,10 +385,11 @@ class SemGroupByOperator:
 
             # block until futures complete
             done_futures, _ = wait(futures)
-            group_sem_agg_outputs: list[dict] = [fut.result() for fut in done_futures]
+            group_sem_agg_outputs = [fut.result() for fut in done_futures]
 
             # update aggregation state with semantic aggregation results
-            for group_key, sem_agg_output in group_sem_agg_outputs:
+            for group_key, sem_agg_output, agg_stats in group_sem_agg_outputs:
+                all_call_stats.extend(agg_stats)
                 for agg_field in self._sem_agg_fields:
                     agg_name = agg_field['name']
                     agg_func = agg_field['func']
@@ -355,7 +421,16 @@ class SemGroupByOperator:
             results.append(result)
 
         # create new dataset and return it with the input datasets
-        output_dataset = Dataset(name=self.output_dataset_id, annotation=f"Sem group by operator output for task: {self.task}", items=results)
+        output_dataset = Dataset(name=self.dataset_id, annotation=f"Sem group by operator output for task: {self.task}", items=results)
         output_datasets = {**input_datasets, output_dataset.name: output_dataset}
 
-        return output_datasets
+        op_stats = OperatorStats(
+            operator_name="SemGroupBy",
+            operator_id=self.dataset_id,
+            wall_clock_secs=time.perf_counter() - op_start,
+            llm_calls=all_call_stats,
+            items_in=len(input_datasets[dataset_id].items),
+            items_out=len(results),
+        )
+
+        return output_datasets, op_stats

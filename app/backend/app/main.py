@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import init_db
-from app.routes import config, conversations, datasets, files, query, search, settings
+from app.routes import config, conversations, datasets, files, query, search, settings, workspaces
 
 # compute allowed origins for CORS
 allowed_origins = ["http://localhost", "http://localhost:80"]
@@ -38,6 +38,7 @@ app.include_router(datasets.router, prefix="/api/datasets", tags=["datasets"])
 app.include_router(search.router, prefix="/api/search", tags=["search"])
 app.include_router(query.router, prefix="/api/query", tags=["query"])
 app.include_router(conversations.router, prefix="/api/conversations", tags=["conversations"])
+app.include_router(workspaces.router, prefix="/api/workspaces", tags=["workspaces"])
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 
 @app.get("/")

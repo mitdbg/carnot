@@ -9,7 +9,7 @@ def test_code_operator_no_inputs(test_model_id, llm_config):
     task = "what is 2 + 2?"
     code_operator = CodeOperator(task, "output-dataset-id", test_model_id, llm_config)
     input_datasets = {}
-    output_datasets = code_operator(input_datasets)
+    output_datasets, _stats = code_operator(input_datasets)
 
     # check that there is one output dataset
     assert len(output_datasets) == 1
@@ -37,7 +37,7 @@ def test_code_operator_one_dataset(test_model_id, llm_config, movie_reviews_data
 
     # generate output
     code_operator = CodeOperator(task, "output-dataset-id", test_model_id, llm_config)
-    output_datasets = code_operator(input_datasets)
+    output_datasets, _stats = code_operator(input_datasets)
 
     assert len(output_datasets) == 2
     assert "output-dataset-id" in output_datasets
@@ -73,7 +73,7 @@ def test_code_operator_two_datasets(test_model_id, llm_config, movie_reviews_dat
 
     # generate output
     code_operator = CodeOperator(task, "output-dataset-id", test_model_id, llm_config)
-    output_datasets = code_operator(input_datasets)
+    output_datasets, _stats = code_operator(input_datasets)
 
     assert len(output_datasets) == 3
     assert "output-dataset-id" in output_datasets
