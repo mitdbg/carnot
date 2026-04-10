@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 import chromadb
 import faiss
+import litellm
 import numpy as np
 
 from carnot.index.sem_indices import FlatFileIndex, HierarchicalFileIndex
@@ -17,7 +18,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-INDEX_BATCH_SIZE = 1000
+MAX_BATCH_TOKENS = 250_000
+MAX_BATCH_ITEMS = 2048
 
 
 def _resolve_model(model, api_key) -> LiteLLMModel:
@@ -418,15 +420,16 @@ class ChromaIndex(CarnotIndex):
             else:
                 raise ValueError("ChromaIndex currently only supports items of type: [dict].")
 
-        for start in range(0, len(item_strs), INDEX_BATCH_SIZE):
-            batch = item_strs[start : start + INDEX_BATCH_SIZE]
+        batches = _build_token_aware_batches(item_strs, self.model)
+        for batch_indices in batches:
+            batch = [item_strs[i] for i in batch_indices]
             embeddings, embed_stats = self._llm_model.embed(texts=batch, model=self.model)
             self._llm_call_stats.append(embed_stats)
 
             collection.add(
-                documents=item_strs[start : start + INDEX_BATCH_SIZE],
+                documents=batch,
                 embeddings=embeddings,
-                ids=self.ids[start : start + INDEX_BATCH_SIZE],
+                ids=[self.ids[i] for i in batch_indices],
             )
 
         return collection
@@ -519,8 +522,10 @@ class FaissIndex(CarnotIndex):
             return faiss.read_index(str(index_path))
 
         vectors = []
-        for start in range(0, len(self.items), INDEX_BATCH_SIZE):
-            batch = self.items[start : start + INDEX_BATCH_SIZE]
+        item_strs = [json.dumps(item) if isinstance(item, dict) else str(item) for item in self.items]
+        batches = _build_token_aware_batches(item_strs, self.model)
+        for batch_indices in batches:
+            batch = [item_strs[i] for i in batch_indices]
             batch_embeddings, embed_stats = self._llm_model.embed(texts=batch, model=self.model)
             self._llm_call_stats.append(embed_stats)
             vectors.extend(batch_embeddings)
@@ -606,6 +611,60 @@ class SemanticIndex(CarnotIndex):
 
 
 # ── Module-private helpers ──────────────────────────────────────────────
+
+
+def _build_token_aware_batches(texts: list[str], model: str) -> list[list[int]]:
+    """Partition *texts* into batches that fit within the embedding model's per-request token limit.
+
+    Uses ``litellm.token_counter`` to count the tokens in each text for the given *model*.
+    Batches are filled greedily: texts are added to the current batch until adding the next text
+    would exceed ``MAX_BATCH_TOKENS`` or the batch already contains ``MAX_BATCH_ITEMS`` texts.
+
+    Requires:
+        - *texts* is a list of strings.
+        - *model* is a model identifier recognised by ``litellm.token_counter``.
+
+    Returns:
+        A list of batches, where each batch is a list of integer indices into *texts*.
+        Every index in ``range(len(texts))`` appears in exactly one batch.
+        Returns a single batch containing all indices when *texts* is empty.
+
+    Raises:
+        None.  Falls back to fixed-size batching (``MAX_BATCH_ITEMS`` per batch)
+        if token counting fails.
+    """
+    if not texts:
+        return [[]]
+
+    # Pre-compute per-text token counts; fall back to fixed-size batching on failure.
+    try:
+        token_counts = [litellm.token_counter(model=model, text=t) for t in texts]
+    except Exception:
+        logger.warning(
+            "Token counting failed for model '%s'; falling back to fixed-size batches of %d items.",
+            model,
+            MAX_BATCH_ITEMS,
+        )
+        return [list(range(start, min(start + MAX_BATCH_ITEMS, len(texts)))) for start in range(0, len(texts), MAX_BATCH_ITEMS)]
+
+    batches: list[list[int]] = []
+    current_batch: list[int] = []
+    current_tokens = 0
+
+    for idx, count in enumerate(token_counts):
+        # If a single text exceeds the limit, it must go in its own batch
+        # (the API will reject it, but splitting it here isn't our job).
+        if current_batch and (current_tokens + count > MAX_BATCH_TOKENS or len(current_batch) >= MAX_BATCH_ITEMS):
+            batches.append(current_batch)
+            current_batch = []
+            current_tokens = 0
+        current_batch.append(idx)
+        current_tokens += count
+
+    if current_batch:
+        batches.append(current_batch)
+
+    return batches
 
 
 def _build_uri_to_idx(items: list) -> dict[str, int]:

@@ -187,9 +187,14 @@ class Execution:
         elif isinstance(value, PhysicalPlan):
             self._physical_plan = value
         elif isinstance(value, dict):
-            self._physical_plan = PhysicalPlan.from_plan_dict(
-                value, self.datasets, query=self.query,
-            )
+            if "nodes" in value:
+                # Flat format produced by PhysicalPlan.to_dict()
+                self._physical_plan = PhysicalPlan.from_dict(value)
+            else:
+                # Recursive format produced by Dataset.serialize()
+                self._physical_plan = PhysicalPlan.from_plan_dict(
+                    value, self.datasets, query=self.query,
+                )
         else:
             self._physical_plan = None
 
@@ -252,7 +257,6 @@ class Execution:
         )
 
         # generate a physical plan which satisfies the cost budget
-        # import pdb; pdb.set_trace()
         physical_plan = self.optimizer.optimize(logical_plan, self.cost_budget)
         self._update_progress(
             progress_queue,
@@ -262,7 +266,6 @@ class Execution:
         )
 
         # translate the logical plan to natural language
-        # import pdb; pdb.set_trace()
         nl_plan = self.planner.paraphrase_plan(
             self.query,
             physical_plan,
@@ -278,6 +281,11 @@ class Execution:
 
         plan_wall_clock = time.perf_counter() - plan_start
         self._planning_stats = self._build_planning_stats(plan_wall_clock)
+
+        # Store the physical plan so that callers who use the same
+        # Execution instance for both plan() and run() don't need to
+        # set _plan manually.
+        self._plan = physical_plan
 
         return nl_plan, physical_plan
 
@@ -374,6 +382,11 @@ class Execution:
         This is the primitive that :meth:`run` composes and which external
         callers may use directly for node-by-node execution.
 
+        After execution, the output ``Dataset`` is enriched with
+        ``parents`` (resolved from the plan's parent node IDs) so
+        that callers can inspect the lineage of any dataset in the
+        store.
+
         Requires:
             - ``self._physical_plan`` is not None.
             - *node_id* exists in the plan.
@@ -398,7 +411,7 @@ class Execution:
             for pid in node.parent_ids
         ]
 
-        return node.execute(
+        updated_store, op_stats = node.execute(
             datasets_store,
             self.llm_config,
             leaf_datasets={ds.name: ds for ds in self.datasets},
@@ -406,6 +419,18 @@ class Execution:
             index_catalog=self.index_catalog,
             parent_output_ids=parent_output_ids,
         )
+
+        # Enrich the output dataset with parent references so callers
+        # can inspect lineage (e.g. during debugging).
+        output_ds = updated_store.get(node.dataset_id)
+        if output_ds is not None and not output_ds.parents:
+            output_ds.parents = [
+                updated_store[pid]
+                for pid in parent_output_ids
+                if pid in updated_store
+            ]
+
+        return updated_store, op_stats
 
     # -- notebook / interactive plan helpers ---------------------------------
 
@@ -490,6 +515,54 @@ class Execution:
             "preview": items[:10],
             "schema": schema,
         }
+
+    def _resolve_final_dataset(self, datasets_store: dict[str, Dataset]) -> Dataset | None:
+        """Identify the final output dataset from the executed plan.
+
+        Locates the terminal nodes of the physical plan (nodes with no
+        children) and returns their merged output.  When a single
+        terminal node exists its output dataset is returned directly.
+        When multiple terminal nodes exist their items are concatenated
+        into a new ``Dataset``.
+
+        Requires:
+            - ``self._physical_plan`` is not None.
+
+        Returns:
+            The final ``Dataset``, or ``None`` if no terminal node
+            produced output in *datasets_store*.
+
+        Raises:
+            None.
+        """
+        terminal = self._physical_plan.terminal_nodes
+        final_datasets = [
+            datasets_store[n.dataset_id]
+            for n in terminal
+            if n.dataset_id in datasets_store
+        ]
+
+        if not final_datasets:
+            return None
+
+        if len(final_datasets) == 1:
+            return final_datasets[0]
+
+        # Merge items from multiple terminal datasets.
+        merged_items: list[dict] = []
+        merged_code_state: dict = {}
+        for ds in final_datasets:
+            merged_items.extend(ds.items)
+            # Preserve code_state from reasoning nodes if present.
+            if ds.code_state:
+                merged_code_state.update(ds.code_state)
+
+        return Dataset(
+            name="final_result",
+            annotation="Merged output from terminal plan nodes",
+            items=merged_items,
+            code_state=merged_code_state,
+        )
 
     # -- re-optimisation -------------------------------------------------------
 
@@ -683,7 +756,7 @@ class Execution:
                 preview_items=preview,
             )
 
-        final_dataset = datasets_store.get("final_dataset")
+        final_dataset = self._resolve_final_dataset(datasets_store)
 
         exec_wall_clock = time.perf_counter() - exec_start
 
@@ -701,5 +774,4 @@ class Execution:
 
         items = final_dataset.items if final_dataset else []
         answer_str = final_dataset.code_state.get("final_answer_str", "") if final_dataset else ""
-
         return items, answer_str, stats

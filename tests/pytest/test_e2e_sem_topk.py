@@ -7,8 +7,15 @@ pytestmark = pytest.mark.llm
 
 
 def _plan_contains_sem_topk(logical_plan) -> bool:
-    """Recursively check if plan contains SemanticTopK/sem_topk."""
+    """Check if plan contains a TopK operator node."""
     if isinstance(logical_plan, dict):
+        # Flat format from optimizer (PhysicalPlan.to_dict())
+        if "nodes" in logical_plan:
+            return any(
+                n.get("operator_type") == "TopK"
+                for n in logical_plan["nodes"]
+            )
+        # Legacy recursive format
         params = logical_plan.get("params", {})
         if params.get("operator") == "SemanticTopK":
             return True

@@ -34,6 +34,9 @@ _TOKENIZER = tiktoken.get_encoding("cl100k_base")
 # Number of items to sample when estimating tokens-per-item for a dataset.
 _TOKEN_SAMPLE_SIZE = 20
 
+# Number of plans closest to the cost budget to keep when no plans satisfy the cost budget
+_CLOSEST_PLANS_TO_KEEP = 3
+
 
 class Optimizer:
     def __init__(
@@ -78,8 +81,9 @@ class Optimizer:
             "max_workers": self.max_workers,
         }
 
-    def _select_best_plan(self, final_group_id: int, policy: str = "min_cost") -> PhysicalPlan:
-        """Reconstruct the best physical plan from the optimized group tree.
+    def _select_best_plan(self, final_group_id: int, cost_budget: float, policy: str = "max_quality") -> PhysicalPlan:
+        """Reconstruct the best physical plan from the optimized group tree,
+        subject to the given cost budget and selection policy.
 
         Walks the pareto frontier of the final group, picks the best
         ``(expr_id, cost_entry_id)`` pair according to *policy*, and
@@ -107,11 +111,29 @@ class Optimizer:
                 "was the optimisation search run?"
             )
 
+        # filter for plans within the cost budget; if no plans are within the budget,
+        # filter for ones closest to the budget to allow for graceful degradation rather than failure
+        filtered_frontier = [
+            (expr_id, entry_id)
+            for expr_id, entry_id in group.pareto_frontier
+            if self.cost_entries[entry_id].plan_cost.cost <= cost_budget
+        ]
+        if not filtered_frontier:
+            logger.warning(
+                f"No plans found within cost budget {cost_budget:.2f}; relaxing budget constraint to select from closest plans",
+            )
+            # sort the frontier by absolute distance from the cost budget and take the closest plans
+            filtered_frontier = sorted(
+                group.pareto_frontier,
+                key=lambda pair: abs(self.cost_entries[pair[1]].plan_cost.cost - cost_budget),
+            )[:_CLOSEST_PLANS_TO_KEEP]
+
+        # retrieve the scorer function for the given policy
         scorer = _get_scorer(policy)
 
-        # Pick the best (expr_id, entry_id) from the final group.
+        # pick the best (expr_id, entry_id) from the final group
         best_expr_id, best_entry_id = min(
-            group.pareto_frontier,
+            filtered_frontier,
             key=lambda pair: scorer(self.cost_entries[pair[1]].plan_cost),
         )
 
@@ -283,7 +305,6 @@ class Optimizer:
         while len(self.tasks_stack) > 0 and task_count < self.max_tasks:
             task = self.tasks_stack.pop(-1)
             task_count += 1
-            # import pdb; pdb.set_trace()
 
             new_tasks = []
             if isinstance(task, (OptimizeGroup, ExploreGroup)):
@@ -296,11 +317,10 @@ class Optimizer:
                 )
             elif isinstance(task, OptimizePhysicalExpression):
                 new_tasks = task.perform(self.cost_model, self.groups, self)
-            # import pdb; pdb.set_trace()
 
             self.tasks_stack.extend(new_tasks)
 
-    def optimize(self, logical_plan: Dataset, cost_budget: float | None = None, policy: str = "min_cost") -> dict:
+    def optimize(self, logical_plan: Dataset, cost_budget: float | None = None, policy: str = "max_quality") -> dict:
         """Run cascades optimization and return the best physical plan.
 
         Requires:
@@ -325,8 +345,7 @@ class Optimizer:
         self._search_optimization_space(final_group_id, cost_budget)
 
         # select the best physical plan that satisfies the cost budget
-        best_plan = self._select_best_plan(final_group_id, policy)
-        # import pdb; pdb.set_trace()
+        best_plan = self._select_best_plan(final_group_id, cost_budget, policy)
 
         return best_plan.to_dict()
 
@@ -399,9 +418,13 @@ def _expr_to_plan_node(
     operator_type = getattr(op, "logical_op_class_name", None) or op.op_name()
     description = getattr(op, "task", "") or op.op_name()
 
+    # Reasoning operators get a dedicated node type so that execution
+    # dispatch (PlanNode.execute) routes them correctly.
+    node_type = "reasoning" if operator_type == "Reason" else "operator"
+
     return PlanNode(
         node_id=node_id,
-        node_type="operator",
+        node_type=node_type,
         operator_type=operator_type,
         name=getattr(op, "dataset_id", ""),
         description=description,

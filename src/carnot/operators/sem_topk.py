@@ -134,7 +134,7 @@ class SemTopKOperator(PhysicalOperator):
 
             if not loaded:
                 # Build a new index from scratch
-                disk_name = f"ds{input_dataset.dataset_id}_{self.index_name}"
+                disk_name = f"ds{input_dataset.dataset_id.replace(' ', '')}_{self.index_name}"
 
                 # NOTE: I believe that input_dataset.items will be materialized here;
                 #   in the future we may want to add support for lazy materialization within the index classes themselves
@@ -212,7 +212,7 @@ class SemTopKOperator(PhysicalOperator):
 
             # Wrap the loaded inner index in the appropriate CarnotIndex
             # subclass, passing items for URI→item mapping.
-            disk_name = f"ds{dataset.dataset_id}_{self.index_name}"
+            disk_name = f"ds{dataset.dataset_id.replace(' ', '')}_{self.index_name}"
             wrapped = self.index_cls(
                 name=disk_name,
                 items=dataset.items,

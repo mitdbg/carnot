@@ -39,38 +39,26 @@ class ModelSize(enum.Enum):
 # the Pareto search to explore the quality–cost trade-off.
 
 _OPENAI_MODELS: list[str] = [
-    # large
     "gpt-5-2025-08-07",
-    # medium
-    "gpt-5-mini-2025-08-07",
-    # small
-    "gpt-5-nano-2025-08-07"
+    # "gpt-5-mini-2025-08-07",
+    # "gpt-5-nano-2025-08-07"
 ]
 
 _ANTHROPIC_MODELS: list[str] = [
-    # large
     "anthropic/claude-sonnet-4-5-20250929",
-    # medium
     "anthropic/claude-sonnet-4-20250514",
-    # small
     "anthropic/claude-haiku-4-5-20250929",
 ]
 
 _GEMINI_MODELS: list[str] = [
-    # large
     "gemini/gemini-3-pro",
-    # medium
     "gemini/gemini-3-flash",
-    # small
     "gemini/gemini-2.5-flash",
-    # small
     "gemini-2.5-flash-lite",
 ]
 
 _TOGETHER_AI_MODELS: list[str] = [
-    # large
     "together_ai/meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
-    # small
     "together_ai/Qwen/Qwen2.5-7B-Instruct-Turbo",
 ]
 

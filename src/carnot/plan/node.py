@@ -142,7 +142,7 @@ class PlanNode:
             )
 
         if op == "Limit":
-            return LimitOperator(n=params["limit"], dataset_id=out)
+            return LimitOperator(n=params.get("n") or params["limit"], dataset_id=out)
 
         if op == "Aggregate":
             agg_fields = params["agg_fields"]
@@ -156,15 +156,16 @@ class PlanNode:
 
         if op == "Filter":
             return SemFilterOperator(
-                task=params["filter"], dataset_id=out,
+                task=params.get("task") or params["filter"], dataset_id=out,
                 model_id="openai/gpt-5-mini", llm_config=llm_config,
                 max_workers=64,
             )
 
         if op == "Map":
+            fields = params.get("output_fields") or params["fields"]
             output_fields = [
-                {"name": f["field"], "type": f["type"], "description": f["description"]}
-                for f in params["fields"]
+                {"name": f.get("name") or f["field"], "type": f["type"], "description": f["description"]}
+                for f in fields
             ]
             return SemMapOperator(
                 task="Execute the map operation to compute the following output field(s).",
@@ -174,9 +175,10 @@ class PlanNode:
             )
 
         if op == "FlatMap":
+            fields = params.get("output_fields") or params["fields"]
             output_fields = [
-                {"name": f["field"], "type": f["type"], "description": f["description"]}
-                for f in params["fields"]
+                {"name": f.get("name") or f["field"], "type": f["type"], "description": f["description"]}
+                for f in fields
             ]
             return SemFlatMapOperator(
                 task="Execute the flat map operation to compute the following output field(s).",
@@ -186,24 +188,26 @@ class PlanNode:
             )
 
         if op == "GroupBy":
-            gby_field_names = [f["name"] for f in params["gby_fields"]]
-            agg_field_names = [f["name"] for f in params["agg_fields"]]
-            agg_funcs = [f["func"] for f in params["agg_fields"]]
+            gby_fields = params.get("group_by_fields") or params["gby_fields"]
+            agg_fields = params["agg_fields"]
+            gby_field_names = [f["name"] for f in gby_fields]
+            agg_field_names = [f["name"] for f in agg_fields]
+            agg_funcs = [f["func"] for f in agg_fields]
             task = (
                 f"Group by fields {gby_field_names} with aggregations on "
                 f"{agg_field_names} using {agg_funcs} for each aggregation "
                 f"field, respectively."
             )
             return SemGroupByOperator(
-                task=task, group_by_fields=params["gby_fields"],
-                agg_fields=params["agg_fields"], dataset_id=out,
+                task=task, group_by_fields=gby_fields,
+                agg_fields=agg_fields, dataset_id=out,
                 model_id="openai/gpt-5-mini", llm_config=llm_config,
                 max_workers=64,
             )
 
         if op == "Join":
             return SemJoinOperator(
-                task=params["condition"], dataset_id=out,
+                task=params.get("task") or params["condition"], dataset_id=out,
                 model_id="openai/gpt-5-mini", llm_config=llm_config,
                 max_workers=64,
             )
@@ -440,7 +444,7 @@ class PlanNode:
         parent_output_ids = parent_output_ids or []
 
         # CodeOperator and ReasoningOperator take the full store.
-        if self.operator_type == "Code" or self.node_type == "reasoning":
+        if self.operator_type in ("Code", "Reason") or self.node_type == "reasoning":
             updated, stats = op(datasets_store)
             return {**datasets_store, **updated}, stats
 

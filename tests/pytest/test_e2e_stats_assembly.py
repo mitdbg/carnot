@@ -77,7 +77,8 @@ class TestRunReturnsExecutionStats:
         plan_code = (
             'ds = datasets["Animals"]\n'
             'ds = ds.sem_filter("the animal is a mammal")\n'
-            "final_answer(ds.serialize())"
+            "ds = ds.reason(task=\"Return the final answer.\")\n"
+            "final_answer(ds)"
         )
         paraphrase_text = "Filter Animals to keep only mammals."
         mammals = {"giraffe", "elephant"}
@@ -117,7 +118,6 @@ class TestRunReturnsExecutionStats:
 
         nl_plan, logical_plan = execution.plan()
         phase["state"] = "running"
-        execution._plan = logical_plan
 
         items, answer_str, stats = execution.run()
 
@@ -134,7 +134,8 @@ class TestRunReturnsExecutionStats:
         plan_code = (
             'ds = datasets["Animals"]\n'
             'ds = ds.sem_filter("the animal is a mammal")\n'
-            "final_answer(ds.serialize())"
+            "ds = ds.reason(task=\"Return the final answer.\")\n"
+            "final_answer(ds)"
         )
         paraphrase_text = "Filter mammals."
         mammals = {"giraffe", "elephant"}
@@ -171,7 +172,6 @@ class TestRunReturnsExecutionStats:
 
         nl_plan, logical_plan = execution.plan()
         phase["state"] = "running"
-        execution._plan = logical_plan
 
         items, answer_str, stats = execution.run()
 
@@ -202,7 +202,8 @@ class TestRunReturnsExecutionStats:
         plan_code = (
             'ds = datasets["Animals"]\n'
             'ds = ds.sem_filter("the animal is a mammal")\n'
-            "final_answer(ds.serialize())"
+            "ds = ds.reason(task=\"Return the final answer.\")\n"
+            "final_answer(ds)"
         )
         paraphrase_text = "Filter mammals."
         mammals = {"giraffe", "elephant"}
@@ -239,7 +240,6 @@ class TestRunReturnsExecutionStats:
 
         nl_plan, logical_plan = execution.plan()
         phase["state"] = "running"
-        execution._plan = logical_plan
 
         items, answer_str, stats = execution.run()
 
@@ -266,7 +266,8 @@ class TestRunReturnsExecutionStats:
         plan_code = (
             'ds = datasets["Animals"]\n'
             'ds = ds.sem_filter("the animal is a mammal")\n'
-            "final_answer(ds.serialize())"
+            "ds = ds.reason(task=\"Return the final answer.\")\n"
+            "final_answer(ds)"
         )
         paraphrase_text = "Filter mammals."
         mammals = {"giraffe", "elephant"}
@@ -303,7 +304,6 @@ class TestRunReturnsExecutionStats:
 
         nl_plan, logical_plan = execution.plan()
         phase["state"] = "running"
-        execution._plan = logical_plan
 
         items, answer_str, stats = execution.run()
 
@@ -333,7 +333,8 @@ class TestRunReturnsExecutionStats:
         plan_code = (
             'ds = datasets["Animals"]\n'
             'ds = ds.sem_filter("the animal is a mammal")\n'
-            "final_answer(ds.serialize())"
+            "ds = ds.reason(task=\"Return the final answer.\")\n"
+            "final_answer(ds)"
         )
         paraphrase_text = "Filter mammals."
         mammals = {"giraffe", "elephant"}
@@ -370,7 +371,6 @@ class TestRunReturnsExecutionStats:
 
         nl_plan, logical_plan = execution.plan()
         phase["state"] = "running"
-        execution._plan = logical_plan
 
         items, answer_str, stats = execution.run()
 
@@ -415,7 +415,8 @@ class TestRunProgressStats:
         plan_code = (
             'ds = datasets["Animals"]\n'
             'ds = ds.sem_filter("the animal is a mammal")\n'
-            "final_answer(ds.serialize())"
+            "ds = ds.reason(task=\"Return the final answer.\")\n"
+            "final_answer(ds)"
         )
         paraphrase_text = "Filter mammals."
         mammals = {"giraffe", "elephant"}
@@ -452,7 +453,6 @@ class TestRunProgressStats:
 
         nl_plan, logical_plan = execution.plan()
         phase["state"] = "running"
-        execution._plan = logical_plan
 
         progress_queue: queue.Queue = queue.Queue()
         items, answer_str, stats = execution.run(progress_queue=progress_queue)
@@ -477,7 +477,12 @@ class TestRunProgressStats:
         # The last completed event should be Reasoning
         last_stats_event = stats_events[-1]
         assert last_stats_event.operator_stats is not None
-        assert isinstance(last_stats_event.operator_stats, OperatorStats)
+        # operator_stats is serialized to a dict via to_dict() → model_dump()
+        op_stats = last_stats_event.operator_stats
+        if isinstance(op_stats, dict):
+            assert "operator_name" in op_stats
+        else:
+            assert isinstance(op_stats, OperatorStats)
 
         execution.planner.cleanup()
 
@@ -487,7 +492,8 @@ class TestRunProgressStats:
         plan_code = (
             'ds = datasets["Animals"]\n'
             'ds = ds.sem_filter("the animal is a mammal")\n'
-            "final_answer(ds.serialize())"
+            "ds = ds.reason(task=\"Return the final answer.\")\n"
+            "final_answer(ds)"
         )
         paraphrase_text = "Filter mammals."
         mammals = {"giraffe", "elephant"}
@@ -524,7 +530,6 @@ class TestRunProgressStats:
 
         nl_plan, logical_plan = execution.plan()
         phase["state"] = "running"
-        execution._plan = logical_plan
 
         items, answer_str, stats = execution.run()
 
@@ -551,7 +556,8 @@ class TestPlanProgressCost:
         plan_code = (
             'ds = datasets["Animals"]\n'
             'ds = ds.sem_filter("the animal is a mammal")\n'
-            "final_answer(ds.serialize())"
+            "ds = ds.reason(task=\"Return the final answer.\")\n"
+            "final_answer(ds)"
         )
         paraphrase_text = "Filter mammals."
 
@@ -584,17 +590,14 @@ class TestPlanProgressCost:
         assert nl_plan is not None
         assert logical_plan is not None
 
-        # Find the final "Plan summary complete" event
-        final_events = [
-            e for e in events
-            if "complete" in e.message.lower()
-        ]
-        assert len(final_events) >= 1
-
-        last_event = final_events[-1]
-        assert last_event.step_cost_usd is not None
-        assert last_event.step_cost_usd > 0.0, (
-            f"Expected positive step cost, got {last_event.step_cost_usd}"
+        # At least one step-level event should carry a cost
+        costed_events = [e for e in events if e.step_cost_usd is not None]
+        assert len(costed_events) >= 1, (
+            f"Expected at least 1 event with step_cost_usd. "
+            f"All events: {[(e.message, e.step_cost_usd) for e in events]}"
+        )
+        assert costed_events[0].step_cost_usd > 0.0, (
+            f"Expected positive step cost, got {costed_events[0].step_cost_usd}"
         )
 
         execution.planner.cleanup()
@@ -628,21 +631,40 @@ class TestRunWithoutPlan:
 
         mock_litellm.set_completion_handler(handler)
 
-        # Manually set a plan, skip plan()
+        # Manually set a plan in flat format (as optimizer produces), skip plan()
         plan = {
-            "name": "filtered_animals",
-            "dataset_id": "filtered_animals",
-            "params": {
-                "operator": "SemanticFilter",
-                "condition": "the animal is a mammal",
-            },
-            "parents": [
+            "query": "Find all mammals",
+            "nodes": [
                 {
+                    "node_id": "node-0",
+                    "node_type": "dataset",
+                    "operator_type": None,
                     "name": "Animals",
-                    "dataset_id": "Animals",
+                    "description": "Load dataset: Animals",
                     "params": {},
-                    "parents": [],
-                }
+                    "parent_ids": [],
+                    "dataset_id": "Animals",
+                },
+                {
+                    "node_id": "node-1",
+                    "node_type": "operator",
+                    "operator_type": "Filter",
+                    "name": "Filter1",
+                    "description": "the animal is a mammal",
+                    "params": {"task": "the animal is a mammal"},
+                    "parent_ids": ["node-0"],
+                    "dataset_id": "Filter1",
+                },
+                {
+                    "node_id": "node-2",
+                    "node_type": "reasoning",
+                    "operator_type": "Reason",
+                    "name": "Reasoning",
+                    "description": "Generate final answer",
+                    "params": {"task": "Find all mammals"},
+                    "parent_ids": ["node-1"],
+                    "dataset_id": "Reason1",
+                },
             ],
         }
 

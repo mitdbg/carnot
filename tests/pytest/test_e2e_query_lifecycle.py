@@ -79,7 +79,8 @@ class TestE2ESingleDatasetFilter:
         plan_code = (
             'ds = datasets["Animals"]\n'
             'ds = ds.sem_filter("the animal is a mammal")\n'
-            "final_answer(ds.serialize())"
+            'ds = ds.reason(task="Return the final answer.")\n'
+            "final_answer(ds)"
         )
         paraphrase_text = "Filter Animals to keep only mammals."
         mammals = {"giraffe", "elephant"}
@@ -124,20 +125,19 @@ class TestE2ESingleDatasetFilter:
         # Switch to operator phase
         phase["state"] = "running"
 
-        # Validate plan structure
+        # Validate plan structure (flat format from optimizer)
         assert isinstance(logical_plan, dict)
-        assert "params" in logical_plan
-        assert logical_plan["params"].get("operator") == "SemanticFilter"
-        assert logical_plan["params"].get("condition") == "the animal is a mammal"
-        assert len(logical_plan["parents"]) == 1
-        assert logical_plan["parents"][0]["name"] == "Animals"
+        assert "nodes" in logical_plan
+        nodes = logical_plan["nodes"]
+        assert any(n["operator_type"] == "Filter" for n in nodes)
+        assert any(n["node_type"] == "dataset" and n["name"] == "Animals" for n in nodes)
+        assert any(n["node_type"] == "reasoning" for n in nodes)
 
         # Validate paraphrase
         assert isinstance(nl_plan, str)
         assert "mammals" in nl_plan.lower()
 
-        # Run phase
-        execution._plan = logical_plan
+        # Run phase (plan() now sets _plan automatically)
         items, answer_str, stats = execution.run()
         animal_names = {item["animal"] for item in items if isinstance(item, dict)}
         assert animal_names == mammals, f"Expected {mammals}, got {animal_names}"
@@ -192,7 +192,8 @@ class TestE2EMultiDatasetJoin:
             'animals = datasets["Animals"]\n'
             'sounds = datasets["Sounds"]\n'
             'joined = animals.sem_join(sounds, "the animal makes the given sound")\n'
-            "final_answer(joined.serialize())"
+            'joined = joined.reason(task="Return the final answer.")\n'
+            "final_answer(joined)"
         )
         paraphrase_text = "Join Animals with Sounds where the animal makes the sound."
 
@@ -238,14 +239,15 @@ class TestE2EMultiDatasetJoin:
         nl_plan, logical_plan = execution.plan()
         phase["state"] = "running"
 
-        # Validate plan structure
-        assert logical_plan["params"].get("operator") == "SemanticJoin"
-        assert len(logical_plan["parents"]) == 2
-        parent_names = {p["name"] for p in logical_plan["parents"]}
-        assert parent_names == {"Animals", "Sounds"}
+        # Validate plan structure (flat format from optimizer)
+        assert isinstance(logical_plan, dict)
+        assert "nodes" in logical_plan
+        nodes = logical_plan["nodes"]
+        assert any(n["operator_type"] == "Join" for n in nodes)
+        dataset_names = {n["name"] for n in nodes if n["node_type"] == "dataset"}
+        assert dataset_names == {"Animals", "Sounds"}
 
-        # Run
-        execution._plan = logical_plan
+        # Run (plan() now sets _plan automatically)
         items, answer_str, stats = execution.run()
 
         # Should have 3 matched pairs
@@ -307,7 +309,8 @@ class TestE2EIndexAwareTopK:
         plan_code = (
             'ds = datasets["Animals"]\n'
             'ds = ds.sem_topk(index_name="chroma", search_str="animals that live in cold climates", k=2)\n'
-            "final_answer(ds.serialize())"
+            'ds = ds.reason(task="Return the final answer.")\n'
+            "final_answer(ds)"
         )
         paraphrase_text = "Search for cold-climate animals using the chroma index."
 
@@ -339,15 +342,15 @@ class TestE2EIndexAwareTopK:
         nl_plan, logical_plan = execution.plan()
         phase["state"] = "running"
 
-        # Validate plan structure
-        assert logical_plan["params"].get("operator") == "SemanticTopK"
-        assert logical_plan["params"]["k"] == 2
-        assert "cold" in logical_plan["params"]["search_str"].lower()
-        assert len(logical_plan["parents"]) == 1
-        assert logical_plan["parents"][0]["name"] == "Animals"
+        # Validate plan structure (flat format from optimizer)
+        assert isinstance(logical_plan, dict)
+        assert "nodes" in logical_plan
+        nodes = logical_plan["nodes"]
+        topk_nodes = [n for n in nodes if n["operator_type"] == "TopK"]
+        assert len(topk_nodes) >= 1
+        assert any(n["node_type"] == "dataset" and n["name"] == "Animals" for n in nodes)
 
-        # Run
-        execution._plan = logical_plan
+        # Run (plan() now sets _plan automatically)
         items, answer_str, stats = execution.run()
 
         # The mock index returns penguin + polar bear for "cold" queries

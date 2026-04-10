@@ -148,6 +148,10 @@ class PushDownFilter(TransformationRule):
                     input_group_ids=new_input_group_ids,
                     group_id=None,
                 )
+                # Propagate applied rules from the original expression so that
+                # rules like FilterToTopKFilter are not re-applied to reorderings.
+                for rule_id in logical_expression.rules_applied:
+                    new_filter_expr.rules_applied.add(rule_id)
 
                 new_logical_expressions.add(new_filter_expr)
 
@@ -177,6 +181,9 @@ class PushDownFilter(TransformationRule):
                     input_group_ids=[group_id] + remaining_input_ids,
                     group_id=logical_expression.group_id,
                 )
+                # Propagate applied rules from the sibling expression.
+                for rule_id in expr.rules_applied:
+                    new_expr.rules_applied.add(rule_id)
                 new_logical_expressions.add(new_expr)
 
         return new_logical_expressions, new_groups, next_group_id

@@ -276,6 +276,31 @@ class PhysicalPlan:
             None,
         )
 
+    @property
+    def terminal_nodes(self) -> list[PlanNode]:
+        """Nodes with no children (sinks of the DAG).
+
+        A terminal node is one whose ``node_id`` does not appear in
+        any other node's ``parent_ids``.
+
+        Requires:
+            None.
+
+        Returns:
+            A list of ``PlanNode`` objects that have no downstream
+            dependents.
+
+        Raises:
+            None.
+        """
+        all_parent_ids: set[str] = set()
+        for n in self._nodes.values():
+            all_parent_ids.update(n.parent_ids)
+        return [
+            n for n in self._nodes.values()
+            if n.node_id not in all_parent_ids
+        ]
+
     def children_of(self, node_id: str) -> list[PlanNode]:
         """Return direct children of a node.
 
