@@ -150,7 +150,7 @@ function DataManagementPage() {
   }
 
   return (
-    <div className="max-w-6xl mx-auto w-full px-6 py-10 space-y-8">
+    <div className="max-w-6xl mx-auto w-full px-6 py-10 pb-20 space-y-8">
 
       {/* Dynamic Header */}
       <div className="flex items-center justify-between">

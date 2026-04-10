@@ -1,250 +1,665 @@
 from __future__ import annotations
 
+import json
 import logging
-import warnings
 
-import pandas as pd
+import litellm
 
-from carnot.constants import NAIVE_BYTES_PER_RECORD
-from carnot.core.models import OperatorCostEstimates, PlanCost, SentinelPlanStats
+from carnot.core.models import PlanCost
+from carnot.operators.code import CodeOperator
 from carnot.operators.physical import PhysicalOperator
-from carnot.operators.scan import ContextScanOp, MarshalAndScanDataOp, ScanPhysicalOp
-
-warnings.simplefilter(action='ignore', category=UserWarning)
+from carnot.operators.reasoning import ReasoningOperator
+from carnot.operators.scan import ScanOp
+from carnot.operators.sem_agg import SemAggOperator
+from carnot.operators.sem_filter import SemFilterOperator
+from carnot.operators.sem_flat_map import SemFlatMapOperator
+from carnot.operators.sem_groupby import SemGroupByOperator
+from carnot.operators.sem_join import SemJoinOperator
+from carnot.operators.sem_map import SemMapOperator
+from carnot.operators.sem_topk import SemTopKOperator
+from carnot.optimizer.model_ids import (
+    ModelSize,
+    get_api_key_for_model,
+    get_best_available_model_id,
+    get_model_size,
+)
+from carnot.optimizer.pricing import ModelPricing, ModelPricingLookup
 
 logger = logging.getLogger(__name__)
 
-class BaseCostModel:
-    """
-    This base class contains the interface/abstraction that every CostModel must implement
-    in order to work with the Optimizer. In brief, the Optimizer expects the CostModel to
-    make a prediction about the runtime, cost, and quality of a physical operator.
-    """
-    def __init__(self):
-        """
-        CostModel constructor; the arguments for individual CostModels may vary depending
-        on the assumptions they make about the prevalance of historical execution data
-        and online vs. batch execution settings.
-        """
-        pass
+# ── Selectivity defaults ──────────────────────────────────────────────
+DEFAULT_FILTER_SELECTIVITY = 0.5
+DEFAULT_JOIN_SELECTIVITY = 0.1
+DEFAULT_FLATMAP_FAN_OUT = 3.0
 
-    def get_costed_full_op_ids(self) -> set[str]:
-        """
-        Return the set of full op ids which the cost model has cost estimates for.
-        """
-        raise NotImplementedError("Calling get_costed_full_op_ids from abstract method")
+# ── Output token estimates (per LLM call) ─────────────────────────────
+DEFAULT_FILTER_OUTPUT_TOKENS = 10
+DEFAULT_MAP_OUTPUT_TOKENS = 100
+DEFAULT_FLATMAP_OUTPUT_TOKENS = 200
+DEFAULT_AGG_OUTPUT_TOKENS = 200
+DEFAULT_GROUPBY_OUTPUT_TOKENS = 100
+DEFAULT_JOIN_OUTPUT_TOKENS = 10
 
-    def __call__(self, operator: PhysicalOperator) -> PlanCost:
-        """
-        The interface exposed by the CostModel to the Optimizer. Subclasses may require
-        additional arguments in order to make their predictions.
-        """
-        raise NotImplementedError("Calling __call__ from abstract method")
+# ── GroupBy-specific ──────────────────────────────────────────────────
+DEFAULT_GROUPBY_NUM_GROUPS = 5
+
+# ── Time-per-record (seconds) ────────────────────────────────────────
+DEFAULT_TIME_PER_RECORD = 0.5
+DEFAULT_EMBEDDING_TIME_PER_RECORD = 0.05
+
+# ── Agentic operator defaults (Code / Reasoning) ────────────────────
+DEFAULT_AGENTIC_OUTPUT_TOKENS_PER_STEP = 500
+DEFAULT_AGENTIC_SYSTEM_PROMPT_TOKENS = 1000
+DEFAULT_AGENTIC_OBSERVATION_TOKENS_PER_STEP = 200
+DEFAULT_AGENTIC_TIME_PER_STEP = 10.0
+DEFAULT_AGENTIC_NUM_STEPS = 3
+DEFAULT_AGENTIC_QUALITY: dict[str, float] = {
+    "small": 0.4,
+    "medium": 0.65,
+    "large": 0.85,
+}
+
+# ── Fallback pricing (gpt-4o-mini rates) ─────────────────────────────
+DEFAULT_PRICING = ModelPricing(
+    input_cost_per_token=1.5e-07,
+    output_cost_per_token=6e-07,
+    max_input_tokens=128_000,
+    max_output_tokens=16_384,
+)
+
+# ── Prompt for LLM-based agentic cost estimation ────────────────────
+_AGENTIC_ESTIMATE_PROMPT = """You are an expert software engineer assistant.
+You will be given a coding/reasoning task description. Estimate:
+
+1. **num_steps**: The number of iterative code-generation steps an AI
+   coding agent would need to complete this task (integer, 1-20).
+2. **quality_by_size**: A JSON object mapping model size to expected
+   quality (float 0.0-1.0) for that size of model completing this
+   task. The three sizes are "small", "medium", and "large".
+
+Respond with ONLY a JSON object (no markdown fences) like:
+{"num_steps": 3, "quality_by_size": {"small": 0.3, "medium": 0.6, "large": 0.9}}
+
+Task description:
+{task}
+"""
 
 
-class SampleBasedCostModel:
+class CostModel:
+    """Analytical cost model for Carnot's cascades-style optimizer.
+
+    Estimates dollar cost, wall-clock time, and token-quality metrics
+    for every physical operator.  Uses ``ModelPricingLookup`` to
+    resolve per-token prices and applies operator-specific formulas
+    to produce a cumulative ``PlanCost`` for each sub-plan.
+
+    Representation invariant:
+        - ``pricing`` is a ``ModelPricingLookup`` instance.
+        - ``_agentic_cache`` keys are task description strings;
+          values are ``(num_steps, quality_by_size)`` tuples.
+
+    Abstraction function:
+        Represents an analytical strategy for predicting the runtime,
+        dollar cost, and quality of a physical operator given its
+        input plan costs and model pricing data.
     """
-    """
+
     def __init__(
         self,
-        sentinel_plan_stats: SentinelPlanStats | None = None,
-        verbose: bool = False,
-        exp_name: str | None = None,
+        pricing: ModelPricingLookup | None = None,
+        llm_config: dict | None = None,
     ):
-        # store verbose argument
-        self.verbose = verbose
+        """Construct a ``CostModel``.
 
-        # store experiment name if one is provided
-        self.exp_name = exp_name
+        Requires:
+            - *pricing*, if provided, is a ``ModelPricingLookup``.
+            - *llm_config*, if provided, is a dict mapping API-key
+              names to their values (used to select a model for
+              agentic cost estimation).
 
-        # construct cost, time, quality, and selectivity matrices for each operator set;
-        self.operator_to_stats = self._compute_operator_stats(sentinel_plan_stats)
-        self.costed_full_op_ids = None if self.operator_to_stats is None else set([
-            full_op_id
-            for _, full_op_id_to_stats in self.operator_to_stats.items()
-            for full_op_id in full_op_id_to_stats
-        ])
+        Returns:
+            A new ``CostModel`` with the given (or default) pricing
+            lookup.
 
-        # if there is a logical operator with no samples; add all of its op ids to costed_full_op_ids;
-        # this will lead to the cost model applying the naive cost estimates for all physical op ids
-        # in this logical operator (I think?)
-        # TODO
+        Raises:
+            None.
+        """
+        self.pricing = pricing or ModelPricingLookup(default_pricing=DEFAULT_PRICING)
+        self.llm_config = llm_config or {}
+        self._estimator_model_id: str | None = get_best_available_model_id(self.llm_config)
+        self._agentic_cache: dict[str, tuple[int, dict[str, float]]] = {}
 
-        logger.info(f"Initialized SampleBasedCostModel with verbose={self.verbose}")
-        logger.debug(f"Initialized SampleBasedCostModel with params: {self.__dict__}")
+    def __call__(
+        self,
+        operator: PhysicalOperator,
+        input_plan_cost: PlanCost | None = None,
+        right_input_plan_cost: PlanCost | None = None,
+    ) -> PlanCost:
+        """Estimate the cost of *operator* given its input plan cost(s).
 
-    def get_costed_full_op_ids(self):
-        return self.costed_full_op_ids
+        Dispatches to the appropriate ``_estimate_*`` method based on
+        operator type.
 
-    def _compute_operator_stats(self, sentinel_plan_stats: SentinelPlanStats | None) -> dict:
-        logger.debug("Computing operator statistics")
-        # if no stats are provided, simply return None
-        if sentinel_plan_stats is None:
-            return None
+        Requires:
+            - *operator* is a concrete ``PhysicalOperator``.
+            - For unary operators, *input_plan_cost* is a ``PlanCost``.
+            - For binary (join) operators, both *input_plan_cost* and
+              *right_input_plan_cost* are ``PlanCost`` objects.
+            - For leaf (scan) operators, both may be ``None``.
 
-        # flatten the nested dictionary of execution data and pull out fields relevant to cost estimation
-        execution_record_op_stats = []
-        for unique_logical_op_id, full_op_id_to_op_stats in sentinel_plan_stats.operator_stats.items():
-            logger.debug(f"Computing operator statistics for logical_op_id: {unique_logical_op_id}")
-            # flatten the execution data into a list of RecordOpStats
-            op_set_execution_data = [
-                record_op_stats
-                for _, op_stats in full_op_id_to_op_stats.items()
-                for record_op_stats in op_stats.record_op_stats_lst
-            ]
+        Returns:
+            A ``PlanCost`` representing the cumulative cost of the
+            sub-plan rooted at *operator*.
 
-            # add entries from execution data into matrices
-            for record_op_stats in op_set_execution_data:
-                record_op_stats_dict = {
-                    "unique_logical_op_id": unique_logical_op_id,
-                    "full_op_id": record_op_stats.full_op_id,
-                    "record_id": record_op_stats.record_id,
-                    "record_parent_ids": record_op_stats.record_parent_ids,
-                    "cost_per_record": record_op_stats.cost_per_record,
-                    "time_per_record": record_op_stats.time_per_record,
-                    "quality": record_op_stats.quality,
-                    "passed_operator": record_op_stats.passed_operator,
-                    "source_indices": record_op_stats.record_source_indices,  # TODO: remove
-                    "op_details": record_op_stats.op_details,                 # TODO: remove
-                    "answer": record_op_stats.answer,                         # TODO: remove
-                }
-                execution_record_op_stats.append(record_op_stats_dict)
+        Raises:
+            NotImplementedError: If the operator type is not recognized.
+        """
+        if isinstance(operator, ScanOp):
+            return self._estimate_scan(operator)
+        elif isinstance(operator, SemFilterOperator):
+            return self._estimate_filter(operator, input_plan_cost)
+        elif isinstance(operator, SemMapOperator):
+            return self._estimate_map(operator, input_plan_cost)
+        elif isinstance(operator, SemFlatMapOperator):
+            return self._estimate_flatmap(operator, input_plan_cost)
+        elif isinstance(operator, SemJoinOperator):
+            return self._estimate_join(operator, input_plan_cost, right_input_plan_cost)
+        elif isinstance(operator, SemAggOperator):
+            return self._estimate_agg(operator, input_plan_cost)
+        elif isinstance(operator, SemGroupByOperator):
+            return self._estimate_groupby(operator, input_plan_cost)
+        elif isinstance(operator, SemTopKOperator):
+            return self._estimate_topk(operator, input_plan_cost)
+        elif isinstance(operator, CodeOperator):
+            return self._estimate_code(operator, input_plan_cost)
+        elif isinstance(operator, ReasoningOperator):
+            return self._estimate_reasoning(operator, input_plan_cost)
 
-        # convert flattened execution data into dataframe
-        operator_stats_df = pd.DataFrame(execution_record_op_stats)
+        raise NotImplementedError(f"CostModel does not handle {type(operator).__name__}")
 
-        # for each full_op_id, compute its average cost_per_record, time_per_record, selectivity, and quality
-        operator_to_stats = {}
-        for unique_logical_op_id, logical_op_df in operator_stats_df.groupby("unique_logical_op_id"):
-            logger.debug(f"Computing operator statistics for unique_logical_op_id: {unique_logical_op_id}")
-            operator_to_stats[unique_logical_op_id] = {}
+    # ── Leaf operator ─────────────────────────────────────────────────
 
-            for full_op_id, physical_op_df in logical_op_df.groupby("full_op_id"):
-                # compute the number of input records processed by this operator; use source_indices for scan operator(s)
-                num_source_records = (
-                    physical_op_df.record_parent_ids.apply(tuple).nunique()
-                    if not physical_op_df.record_parent_ids.isna().all()
-                    else physical_op_df.source_indices.apply(tuple).nunique()
+    @staticmethod
+    def _estimate_scan(operator: ScanOp) -> PlanCost:
+        """Return the base-case ``PlanCost`` for a scan operator.
+
+        A scan is lazy — zero dollar cost and zero execution time.
+        Its token fields seed the quality metric for downstream
+        operators.
+
+        Requires:
+            - *operator* is a ``ScanOp``.
+
+        Returns:
+            A ``PlanCost`` with ``cost=0``, ``time=0``, cardinality
+            seeded from the scan's item count, and token fields from
+            ``est_tokens_per_item``.
+
+        Raises:
+            None.
+        """
+        n = float(operator.num_items)
+        est_tpr = float(operator.est_tokens_per_item)
+        total_tokens = n * est_tpr
+        return PlanCost(
+            cost=0.0,
+            time=0.0,
+            total_input_tokens=total_tokens,
+            total_scanned_input_tokens=total_tokens,
+            input_cardinality=n,
+            output_cardinality=n,
+            selectivity=1.0,
+            avg_tokens_per_record=est_tpr,
+            cost_per_record=0.0,
+            time_per_record=0.0,
+        )
+
+    # ── Unary semantic operators ──────────────────────────────────────
+
+    def _estimate_filter(self, operator: SemFilterOperator, input_plan_cost: PlanCost) -> PlanCost:
+        """Estimate the cost of a semantic filter (one LLM call per record).
+
+        Requires:
+            - *operator* is a ``SemFilterOperator`` with a ``model_id``.
+            - *input_plan_cost* is a valid ``PlanCost``.
+
+        Returns:
+            A ``PlanCost`` with selectivity ``DEFAULT_FILTER_SELECTIVITY``,
+            unchanged ``avg_tokens_per_record``, and cumulative cost/time/tokens.
+
+        Raises:
+            None.
+        """
+        pricing = self.pricing.get(operator.model_id)
+        n = input_plan_cost.output_cardinality
+        t_in = input_plan_cost.avg_tokens_per_record
+
+        cost_per_record = t_in * pricing.input_cost_per_token + DEFAULT_FILTER_OUTPUT_TOKENS * pricing.output_cost_per_token
+        time_per_record = DEFAULT_TIME_PER_RECORD
+        selectivity = DEFAULT_FILTER_SELECTIVITY
+
+        return PlanCost(
+            cost=cost_per_record * n + input_plan_cost.cost,
+            time=time_per_record * n + input_plan_cost.time,
+            total_input_tokens=n * t_in + input_plan_cost.total_input_tokens,
+            total_scanned_input_tokens=n * t_in + input_plan_cost.total_scanned_input_tokens,
+            input_cardinality=n,
+            output_cardinality=n * selectivity,
+            selectivity=selectivity,
+            avg_tokens_per_record=t_in,
+            cost_per_record=cost_per_record,
+            time_per_record=time_per_record,
+        )
+
+    def _estimate_map(self, operator: SemMapOperator, input_plan_cost: PlanCost) -> PlanCost:
+        """Estimate the cost of a semantic map (one LLM call per record).
+
+        Requires:
+            - *operator* is a ``SemMapOperator`` with a ``model_id``.
+            - *input_plan_cost* is a valid ``PlanCost``.
+
+        Returns:
+            A ``PlanCost`` with selectivity 1.0, enriched
+            ``avg_tokens_per_record``, and cumulative cost/time/tokens.
+
+        Raises:
+            None.
+        """
+        pricing = self.pricing.get(operator.model_id)
+        n = input_plan_cost.output_cardinality
+        t_in = input_plan_cost.avg_tokens_per_record
+
+        cost_per_record = t_in * pricing.input_cost_per_token + DEFAULT_MAP_OUTPUT_TOKENS * pricing.output_cost_per_token
+        time_per_record = DEFAULT_TIME_PER_RECORD
+
+        return PlanCost(
+            cost=cost_per_record * n + input_plan_cost.cost,
+            time=time_per_record * n + input_plan_cost.time,
+            total_input_tokens=n * t_in + input_plan_cost.total_input_tokens,
+            total_scanned_input_tokens=n * t_in + input_plan_cost.total_scanned_input_tokens,
+            input_cardinality=n,
+            output_cardinality=n,
+            selectivity=1.0,
+            avg_tokens_per_record=t_in + DEFAULT_MAP_OUTPUT_TOKENS,
+            cost_per_record=cost_per_record,
+            time_per_record=time_per_record,
+        )
+
+    def _estimate_flatmap(self, operator: SemFlatMapOperator, input_plan_cost: PlanCost) -> PlanCost:
+        """Estimate the cost of a semantic flat-map (one LLM call per record, fan-out output).
+
+        Requires:
+            - *operator* is a ``SemFlatMapOperator`` with a ``model_id``.
+            - *input_plan_cost* is a valid ``PlanCost``.
+
+        Returns:
+            A ``PlanCost`` with selectivity ``DEFAULT_FLATMAP_FAN_OUT``,
+            output-only ``avg_tokens_per_record``, and cumulative cost/time/tokens.
+
+        Raises:
+            None.
+        """
+        pricing = self.pricing.get(operator.model_id)
+        n = input_plan_cost.output_cardinality
+        t_in = input_plan_cost.avg_tokens_per_record
+
+        cost_per_record = (
+            t_in * pricing.input_cost_per_token + DEFAULT_FLATMAP_OUTPUT_TOKENS * pricing.output_cost_per_token
+        )
+        time_per_record = DEFAULT_TIME_PER_RECORD
+
+        return PlanCost(
+            cost=cost_per_record * n + input_plan_cost.cost,
+            time=time_per_record * n + input_plan_cost.time,
+            total_input_tokens=n * t_in + input_plan_cost.total_input_tokens,
+            total_scanned_input_tokens=n * t_in + input_plan_cost.total_scanned_input_tokens,
+            input_cardinality=n,
+            output_cardinality=n * DEFAULT_FLATMAP_FAN_OUT,
+            selectivity=DEFAULT_FLATMAP_FAN_OUT,
+            avg_tokens_per_record=DEFAULT_FLATMAP_OUTPUT_TOKENS,
+            cost_per_record=cost_per_record,
+            time_per_record=time_per_record,
+        )
+
+    # ── Binary operator ───────────────────────────────────────────────
+
+    def _estimate_join(
+        self,
+        operator: SemJoinOperator,
+        left_plan_cost: PlanCost,
+        right_plan_cost: PlanCost,
+    ) -> PlanCost:
+        """Estimate the cost of a semantic join (one LLM call per cross-product pair).
+
+        Requires:
+            - *operator* is a ``SemJoinOperator`` with a ``model_id``.
+            - *left_plan_cost* and *right_plan_cost* are valid ``PlanCost`` objects.
+
+        Returns:
+            A ``PlanCost`` with input cardinality ``N_L × N_R``, selectivity
+            ``DEFAULT_JOIN_SELECTIVITY``, and cumulative cost/time/tokens from both inputs.
+
+        Raises:
+            None.
+        """
+        pricing = self.pricing.get(operator.model_id)
+        n_l = left_plan_cost.output_cardinality
+        n_r = right_plan_cost.output_cardinality
+        t_l = left_plan_cost.avg_tokens_per_record
+        t_r = right_plan_cost.avg_tokens_per_record
+
+        cross = n_l * n_r
+        t_pair = t_l + t_r
+        cost_per_record = t_pair * pricing.input_cost_per_token + DEFAULT_JOIN_OUTPUT_TOKENS * pricing.output_cost_per_token
+        time_per_record = DEFAULT_TIME_PER_RECORD
+        selectivity = DEFAULT_JOIN_SELECTIVITY
+
+        return PlanCost(
+            cost=cost_per_record * cross + left_plan_cost.cost + right_plan_cost.cost,
+            time=time_per_record * cross + left_plan_cost.time + right_plan_cost.time,
+            total_input_tokens=(
+                cross * t_pair + left_plan_cost.total_input_tokens + right_plan_cost.total_input_tokens
+            ),
+            total_scanned_input_tokens=(
+                cross * t_pair
+                + left_plan_cost.total_scanned_input_tokens
+                + right_plan_cost.total_scanned_input_tokens
+            ),
+            input_cardinality=cross,
+            output_cardinality=cross * selectivity,
+            selectivity=selectivity,
+            avg_tokens_per_record=t_pair,
+            cost_per_record=cost_per_record,
+            time_per_record=time_per_record,
+        )
+
+    # ── Aggregation operators ─────────────────────────────────────────
+
+    def _estimate_agg(self, operator: SemAggOperator, input_plan_cost: PlanCost) -> PlanCost:
+        """Estimate the cost of a semantic aggregation (single LLM call over all items).
+
+        Requires:
+            - *operator* is a ``SemAggOperator`` with a ``model_id``.
+            - *input_plan_cost* is a valid ``PlanCost``.
+
+        Returns:
+            A ``PlanCost`` with ``output_cardinality=1``, and cost reflecting
+            a single LLM call that reads all input tokens.
+
+        Raises:
+            None.
+        """
+        pricing = self.pricing.get(operator.model_id)
+        n = input_plan_cost.output_cardinality
+        t_in = input_plan_cost.avg_tokens_per_record
+
+        # Single LLM call that reads all N records
+        cost_per_record = n * t_in * pricing.input_cost_per_token + DEFAULT_AGG_OUTPUT_TOKENS * pricing.output_cost_per_token
+        time_per_record = DEFAULT_TIME_PER_RECORD
+
+        return PlanCost(
+            cost=cost_per_record + input_plan_cost.cost,
+            time=time_per_record + input_plan_cost.time,
+            total_input_tokens=n * t_in + input_plan_cost.total_input_tokens,
+            total_scanned_input_tokens=n * t_in + input_plan_cost.total_scanned_input_tokens,
+            input_cardinality=n,
+            output_cardinality=1.0,
+            selectivity=1.0 / n if n > 0 else 1.0,
+            avg_tokens_per_record=DEFAULT_AGG_OUTPUT_TOKENS,
+            cost_per_record=cost_per_record,
+            time_per_record=time_per_record,
+        )
+
+    def _estimate_groupby(self, operator: SemGroupByOperator, input_plan_cost: PlanCost) -> PlanCost:
+        """Estimate the cost of a semantic group-by (N grouping calls + G aggregation calls).
+
+        Requires:
+            - *operator* is a ``SemGroupByOperator`` with a ``model_id``.
+            - *input_plan_cost* is a valid ``PlanCost``.
+
+        Returns:
+            A ``PlanCost`` with ``output_cardinality=G`` (estimated groups),
+            and cost reflecting two phases: grouping (N calls) and
+            per-group aggregation (G calls).
+
+        Raises:
+            None.
+        """
+        pricing = self.pricing.get(operator.model_id)
+        n = input_plan_cost.output_cardinality
+        t_in = input_plan_cost.avg_tokens_per_record
+        g = float(DEFAULT_GROUPBY_NUM_GROUPS)
+
+        # Phase 1: N grouping calls (one per record)
+        grouping_cost = n * (t_in * pricing.input_cost_per_token + DEFAULT_GROUPBY_OUTPUT_TOKENS * pricing.output_cost_per_token)
+
+        # Phase 2: G aggregation calls (each reads ~N/G records)
+        records_per_group = n / g if g > 0 else n
+        agg_cost = g * (
+            records_per_group * t_in * pricing.input_cost_per_token
+            + DEFAULT_GROUPBY_OUTPUT_TOKENS * pricing.output_cost_per_token
+        )
+        total_cost = grouping_cost + agg_cost + input_plan_cost.cost
+        total_time = (n + g) * DEFAULT_TIME_PER_RECORD + input_plan_cost.time
+
+        # cost_per_record is the average cost per LLM call across both phases
+        total_calls = n + g
+        cost_per_record = (grouping_cost + agg_cost) / total_calls if total_calls > 0 else 0.0
+
+        return PlanCost(
+            cost=total_cost,
+            time=total_time,
+            total_input_tokens=n * t_in + input_plan_cost.total_input_tokens,
+            total_scanned_input_tokens=n * t_in + input_plan_cost.total_scanned_input_tokens,
+            input_cardinality=n,
+            output_cardinality=g,
+            selectivity=g / n if n > 0 else 1.0,
+            avg_tokens_per_record=DEFAULT_GROUPBY_OUTPUT_TOKENS,
+            cost_per_record=cost_per_record,
+            time_per_record=DEFAULT_TIME_PER_RECORD,
+        )
+
+    # ── Embedding-based operator ──────────────────────────────────────
+
+    def _estimate_topk(self, operator: SemTopKOperator, input_plan_cost: PlanCost) -> PlanCost:
+        """Estimate the cost of a semantic top-k (embedding-based ranking).
+
+        Uses the embedding model price (not completion price).  Only
+        ``k`` out of ``N`` records are "attended to", so
+        ``total_scanned_input_tokens`` grows by ``k × T_in`` while
+        ``total_input_tokens`` grows by ``N × T_in``.
+
+        Requires:
+            - *operator* is a ``SemTopKOperator`` with ``model_id`` and ``k``.
+            - *input_plan_cost* is a valid ``PlanCost``.
+
+        Returns:
+            A ``PlanCost`` with ``output_cardinality=k``, embedding-based
+            cost, and reduced ``total_scanned_input_tokens``.
+
+        Raises:
+            None.
+        """
+        pricing = self.pricing.get(operator.model_id)
+        n = input_plan_cost.output_cardinality
+        t_in = input_plan_cost.avg_tokens_per_record
+        k = float(operator.k)
+
+        # Embedding cost: all N records are embedded
+        cost_per_record = t_in * pricing.input_cost_per_token
+        time_per_record = DEFAULT_EMBEDDING_TIME_PER_RECORD
+
+        return PlanCost(
+            cost=cost_per_record * n + input_plan_cost.cost,
+            time=time_per_record * n + input_plan_cost.time,
+            total_input_tokens=n * t_in + input_plan_cost.total_input_tokens,
+            total_scanned_input_tokens=k * t_in + input_plan_cost.total_scanned_input_tokens,
+            input_cardinality=n,
+            output_cardinality=k,
+            selectivity=k / n if n > 0 else 1.0,
+            avg_tokens_per_record=t_in,
+            cost_per_record=cost_per_record,
+            time_per_record=time_per_record,
+        )
+
+    # ── Code and reasoning operators ─────────────────────────────────
+
+    def _get_agentic_estimates(self, task: str) -> tuple[int, dict[str, float]]:
+        """Return ``(num_steps, quality_by_size)`` for *task*, using the cache or an LLM.
+
+        If the cache already contains an entry for *task*, the cached
+        value is returned immediately.  Otherwise an LLM call is made
+        to estimate the values, the result is cached, and then returned.
+
+        When no estimator model is available (no API keys configured),
+        the built-in defaults are used.
+
+        Requires:
+            - *task* is a non-empty string describing the agentic task.
+
+        Returns:
+            A tuple ``(num_steps, quality_by_size)`` where *num_steps*
+            is a positive integer and *quality_by_size* maps
+            ``"small"``, ``"medium"``, and ``"large"`` to floats in
+            ``[0.0, 1.0]``.
+
+        Raises:
+            None.  LLM or parsing errors are logged and fall back to
+            defaults.
+        """
+        if task in self._agentic_cache:
+            return self._agentic_cache[task]
+
+        num_steps = DEFAULT_AGENTIC_NUM_STEPS
+        quality_by_size = dict(DEFAULT_AGENTIC_QUALITY)
+
+        if self._estimator_model_id is not None:
+            try:
+                prompt = _AGENTIC_ESTIMATE_PROMPT.format(task=task)
+                api_key = get_api_key_for_model(self._estimator_model_id, self.llm_config)
+                response = litellm.completion(
+                    model=self._estimator_model_id,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    api_key=api_key,
+                )
+                raw = response.choices[0].message.content.strip()
+                parsed = json.loads(raw)
+                num_steps = max(1, min(int(parsed["num_steps"]), 20))
+                for size in ("small", "medium", "large"):
+                    if size in parsed.get("quality_by_size", {}):
+                        quality_by_size[size] = max(0.0, min(float(parsed["quality_by_size"][size]), 1.0))
+            except Exception:
+                logger.warning(
+                    "LLM estimation failed for agentic task '%s'; using defaults.",
+                    task[:80],
+                    exc_info=True,
                 )
 
-                # compute selectivity
-                selectivity = physical_op_df.passed_operator.sum() / num_source_records
+        self._agentic_cache[task] = (num_steps, quality_by_size)
+        return num_steps, quality_by_size
 
-                operator_to_stats[unique_logical_op_id][full_op_id] = {
-                    "cost": physical_op_df.cost_per_record.mean(),
-                    "time": physical_op_df.time_per_record.mean(),
-                    "quality": physical_op_df.quality.mean(),
-                    "selectivity": selectivity,
-                }
+    def _estimate_agentic(
+        self,
+        operator: CodeOperator | ReasoningOperator,
+        input_plan_cost: PlanCost,
+    ) -> PlanCost:
+        """Shared cost estimation for multi-step agentic operators.
 
-        # if this is an experiment, log the dataframe and operator_to_stats dictionary
-        if self.exp_name is not None:
-            operator_stats_df.to_csv(f"opt-profiling-data/{self.exp_name}-operator-stats.csv", index=False)
+        Models the iterative generate/execute loop where each step
+        consumes all previous context (input + output tokens from prior
+        steps plus the latest observation) and produces one step's
+        worth of output tokens (code).
 
-        logger.debug(f"Done computing operator statistics for {len(operator_to_stats)} operators!")
-        return operator_to_stats
+        Requires:
+            - *operator* is a ``CodeOperator`` or ``ReasoningOperator``
+              with ``model_id`` and ``task`` attributes.
+            - *input_plan_cost* is a valid ``PlanCost``.
 
-    def _compute_naive_plan_cost(self, operator: PhysicalOperator, source_op_estimates: OperatorCostEstimates | None = None, right_source_op_estimates: OperatorCostEstimates | None = None) -> PlanCost:
-        # get identifier for operator which is unique within sentinel plan but consistent across sentinels
-        full_op_id = operator.get_full_op_id()
-        logger.debug(f"Calling __call__ for {str(operator)} with full_op_id: {full_op_id}")
+        Returns:
+            A ``PlanCost`` reflecting the cumulative cost/time across
+            all estimated agentic steps, with selectivity 1.0 and a
+            quality-adjusted ``total_scanned_input_tokens``.
 
-        # initialize estimates of operator metrics based on naive (but sometimes precise) logic
-        if isinstance(operator, MarshalAndScanDataOp):
-            # get handle to scan operator and pre-compute its size (number of records)
-            datasource_len = len(operator.datasource)
+        Raises:
+            None.
+        """
+        pricing = self.pricing.get(operator.model_id)
+        num_steps, quality_by_size = self._get_agentic_estimates(operator.task)
+        model_size: ModelSize = get_model_size(operator.model_id)
+        quality = quality_by_size.get(model_size.value, DEFAULT_AGENTIC_QUALITY["medium"])
 
-            source_op_estimates = OperatorCostEstimates(
-                cardinality=datasource_len,
-                time_per_record=0.0,
-                cost_per_record=0.0,
-                quality=1.0,
+        n = input_plan_cost.output_cardinality
+        t_in = input_plan_cost.avg_tokens_per_record
+        input_data_tokens = n * t_in
+
+        # Accumulate cost across agentic steps.
+        #
+        # Step i (1-indexed) input context =
+        #   system_prompt
+        #   + input_data_tokens
+        #   + (i-1) * (output_tokens_per_step + observation_tokens_per_step)
+        total_input_tokens = 0.0
+        total_output_tokens = 0.0
+        for i in range(1, num_steps + 1):
+            step_input = (
+                DEFAULT_AGENTIC_SYSTEM_PROMPT_TOKENS
+                + input_data_tokens
+                + (i - 1) * (DEFAULT_AGENTIC_OUTPUT_TOKENS_PER_STEP + DEFAULT_AGENTIC_OBSERVATION_TOKENS_PER_STEP)
             )
+            total_input_tokens += step_input
+            total_output_tokens += DEFAULT_AGENTIC_OUTPUT_TOKENS_PER_STEP
 
-            op_estimates = operator.naive_cost_estimates(source_op_estimates, input_record_size_in_bytes=NAIVE_BYTES_PER_RECORD)
-
-        elif isinstance(operator, ContextScanOp):
-            source_op_estimates = OperatorCostEstimates(
-                cardinality=1.0,
-                time_per_record=0.0,
-                cost_per_record=0.0,
-                quality=1.0,
-            )
-
-            op_estimates = operator.naive_cost_estimates(source_op_estimates)
-
-        else:
-            op_estimates = operator.naive_cost_estimates(source_op_estimates)
-
-        # compute estimates for this operator
-        est_input_cardinality = source_op_estimates.cardinality
-        op_time = op_estimates.time_per_record * est_input_cardinality
-        op_cost = op_estimates.cost_per_record * est_input_cardinality
-        op_quality = op_estimates.quality
-
-        # create and return PlanCost object for this op's statistics
-        op_plan_cost = PlanCost(
-            cost=op_cost,
-            time=op_time,
-            quality=op_quality,
-            op_estimates=op_estimates,
+        dollar_cost = (
+            total_input_tokens * pricing.input_cost_per_token
+            + total_output_tokens * pricing.output_cost_per_token
         )
-        logger.debug(f"Done calling __call__ for {str(operator)} with full_op_id: {full_op_id}")
-        logger.debug(f"Plan cost: {op_plan_cost}")
+        wall_time = num_steps * DEFAULT_AGENTIC_TIME_PER_STEP
 
-        return op_plan_cost
+        # Quality: scale total_scanned_input_tokens by quality so that
+        # PlanCost.quality reflects the model's expected effectiveness.
+        total_plan_input = input_data_tokens + input_plan_cost.total_input_tokens
+        total_scanned = quality * total_plan_input + input_plan_cost.total_scanned_input_tokens
 
-    def __call__(self, operator: PhysicalOperator, source_op_estimates: OperatorCostEstimates | None = None, right_source_op_estimates: OperatorCostEstimates | None = None) -> PlanCost:
-        # for non-sentinel execution, we use naive estimates
-        full_op_id = operator.get_full_op_id()
-        unique_logical_op_id = operator.unique_logical_op_id
-        if self.operator_to_stats is None or unique_logical_op_id not in self.operator_to_stats:
-            return self._compute_naive_plan_cost(operator, source_op_estimates, right_source_op_estimates)
-
-        # NOTE: some physical operators may not have any sample execution data in this cost model;
-        #       these physical operators are filtered out of the Optimizer, thus we can assume that
-        #       we will have execution data for each operator passed into __call__; nevertheless, we
-        #       still perform a sanity check
-        # look up physical and logical op ids associated with this physical operator
-        physical_op_to_stats = self.operator_to_stats.get(unique_logical_op_id)
-        assert physical_op_to_stats is not None, f"No execution data for logical operator: {str(operator)}"
-        assert physical_op_to_stats.get(full_op_id) is not None, f"No execution data for physical operator: {str(operator)}"
-        logger.debug(f"Calling __call__ for {str(operator)}")
-
-        # look up stats for this operation
-        est_cost_per_record = self.operator_to_stats[unique_logical_op_id][full_op_id]["cost"]
-        est_time_per_record = self.operator_to_stats[unique_logical_op_id][full_op_id]["time"]
-        est_quality = self.operator_to_stats[unique_logical_op_id][full_op_id]["quality"]
-        est_selectivity = self.operator_to_stats[unique_logical_op_id][full_op_id]["selectivity"]
-
-        # create source_op_estimates for scan operators if they are not provided
-        if isinstance(operator, ScanPhysicalOp):
-            # get handle to scan operator and pre-compute its size (number of records)
-            datasource_len = len(operator.datasource)
-
-            source_op_estimates = OperatorCostEstimates(
-                cardinality=datasource_len,
-                time_per_record=0.0,
-                cost_per_record=0.0,
-                quality=1.0,
-            )
-
-        # generate new set of OperatorCostEstimates
-        est_input_cardinality = source_op_estimates.cardinality
-        op_estimates = OperatorCostEstimates(
-            cardinality=est_selectivity * est_input_cardinality,
-            time_per_record=est_time_per_record,
-            cost_per_record=est_cost_per_record,
-            quality=est_quality,
+        return PlanCost(
+            cost=dollar_cost + input_plan_cost.cost,
+            time=wall_time + input_plan_cost.time,
+            total_input_tokens=total_plan_input,
+            total_scanned_input_tokens=total_scanned,
+            input_cardinality=n,
+            output_cardinality=n,
+            selectivity=1.0,
+            avg_tokens_per_record=t_in + DEFAULT_AGENTIC_OUTPUT_TOKENS_PER_STEP,
+            cost_per_record=dollar_cost / n if n > 0 else dollar_cost,
+            time_per_record=wall_time / n if n > 0 else wall_time,
         )
 
-        # compute estimates for this operator
-        op_time = op_estimates.time_per_record * est_input_cardinality
-        op_cost = op_estimates.cost_per_record * est_input_cardinality
-        op_quality = op_estimates.quality
+    def _estimate_code(self, operator: CodeOperator, input_plan_cost: PlanCost) -> PlanCost:
+        """Estimate the cost of a code operator (multi-step agentic loop).
 
-        # construct and return op estimates
-        plan_cost = PlanCost(cost=op_cost, time=op_time, quality=op_quality, op_estimates=op_estimates)
-        logger.debug(f"Done calling __call__ for {str(operator)}")
-        logger.debug(f"Plan cost: {plan_cost}")
-        return plan_cost
+        Requires:
+            - *operator* is a ``CodeOperator`` with ``model_id`` and ``task``.
+            - *input_plan_cost* is a valid ``PlanCost``.
+
+        Returns:
+            A ``PlanCost`` for the agentic code execution loop.
+
+        Raises:
+            None.
+        """
+        return self._estimate_agentic(operator, input_plan_cost)
+
+    def _estimate_reasoning(self, operator: ReasoningOperator, input_plan_cost: PlanCost) -> PlanCost:
+        """Estimate the cost of a reasoning operator (multi-step agentic loop).
+
+        Requires:
+            - *operator* is a ``ReasoningOperator`` with ``model_id`` and ``task``.
+            - *input_plan_cost* is a valid ``PlanCost``.
+
+        Returns:
+            A ``PlanCost`` for the agentic reasoning loop.
+
+        Raises:
+            None.
+        """
+        return self._estimate_agentic(operator, input_plan_cost)

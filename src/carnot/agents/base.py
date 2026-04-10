@@ -566,7 +566,7 @@ You have been provided with these additional arguments, that you can access dire
             timing=Timing(start_time=action_step_start_time, end_time=time.time()),
             token_usage=final_answer.token_usage,
         )
-        final_memory_step.action_output = final_answer.content
+        final_memory_step.final_output = final_answer.content
         self._finalize_step(final_memory_step)
         self.memory.steps.append(final_memory_step)
         return final_answer.content
@@ -1442,7 +1442,7 @@ class CodeAgent(BaseAgent):
                 ),
             ]
         self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
-        memory_step.action_output = code_output.output
+        memory_step.code_action_output = code_output.output
         yield ActionOutput(output=code_output.output, is_final_answer=code_output.is_final_answer)
 
     def to_dict(self) -> dict[str, Any]:

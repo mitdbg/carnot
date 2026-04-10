@@ -18,7 +18,7 @@ dependencies = [
     "fastapi>=0.115.0",
     "fsspec>=2025.10.0",
     "google-cloud-aiplatform>=1.38",
-    "litellm>=1.76.1",
+    "litellm>=1.76.1, <1.82.7",
     "palimpzest>=1.2.0",
     "pandas>=2.3.1",
     "pydantic>=2.11.7",
@@ -53,6 +53,12 @@ tests = [
     "mock",
     "kagglehub",
 ]
+evals = [
+    "duckdb",
+    "cdlib",
+    "gdown",
+    "tomli",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
@@ -68,6 +74,12 @@ namespaces = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests/pytest"]
+markers = [
+    "llm: test requires a live LLM API call (deselect with '-m not llm')",
+    "s3: test requires S3 credentials (deselect with '-m not s3')",
+    "slow: test takes > 10 seconds",
+    "integration: test requires a running docker-compose stack (deselect with '-m not integration')",
+]
 filterwarnings = [
     "error",
     "ignore::DeprecationWarning",

@@ -1,0 +1,7 @@
+{
+    "nl_question": "Which movies are heist movies?",
+    "modalities": ["table"],
+    "ground_truth": [
+        "Now You See Me 2"
+    ]
+}

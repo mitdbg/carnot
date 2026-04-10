@@ -1,9 +1,11 @@
+import pytest
+
 from carnot.data.dataset import Dataset
 from carnot.operators.sem_join import SemJoinOperator
 
-TEST_MODEL_ID = "openai/gpt-5-mini"
 
-def test_sem_join_operator_basic():
+@pytest.mark.llm
+def test_sem_join_operator_basic(test_model_id, llm_config):
     # construct two datasets with various animals and sounds
     animal_data = [
         {"animal": animal}
@@ -29,13 +31,13 @@ def test_sem_join_operator_basic():
     input_datasets = {animal_dataset.name: animal_dataset, sound_dataset.name: sound_dataset}
 
     # execute the operator
-    sem_join_operator = SemJoinOperator(task, TEST_MODEL_ID, max_workers=4)
-    output_datasets = sem_join_operator("Animal Dataset", "Sound Dataset", input_datasets)
+    sem_join_operator = SemJoinOperator(task, test_model_id, llm_config, "output-dataset-id", max_workers=4)
+    output_datasets, _stats = sem_join_operator("Animal Dataset", "Sound Dataset", input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 3
-    assert "SemJoinOperatorOutput" in output_datasets
-    output_dataset = output_datasets["SemJoinOperatorOutput"]
+    assert "output-dataset-id" in output_datasets
+    output_dataset = output_datasets["output-dataset-id"]
     assert len(output_dataset.items) == 5
     assert {"animal": "cow", "sound": "moo"} in output_dataset.items
     assert {"animal": "dog", "sound": "woof"} in output_dataset.items
@@ -43,7 +45,8 @@ def test_sem_join_operator_basic():
     assert {"animal": "sheep", "sound": "baaa"} in output_dataset.items
     assert {"animal": "pig", "sound": "oink"} in output_dataset.items
 
-def test_sem_join_operator_papers(research_papers_data):
+@pytest.mark.llm
+def test_sem_join_operator_papers(test_model_id, llm_config, research_papers_data):
     # load research papers data
     papers = research_papers_data
 
@@ -64,11 +67,11 @@ def test_sem_join_operator_papers(research_papers_data):
     input_datasets = {papers_left_dataset.name: papers_left_dataset, papers_right_dataset.name: papers_right_dataset}
 
     # execute the operator
-    sem_join_operator = SemJoinOperator(task, TEST_MODEL_ID, max_workers=4)
-    output_datasets = sem_join_operator(papers_left_dataset.name, papers_right_dataset.name, input_datasets)
+    sem_join_operator = SemJoinOperator(task, test_model_id, llm_config, "output-dataset-id", max_workers=4)
+    output_datasets, _stats = sem_join_operator(papers_left_dataset.name, papers_right_dataset.name, input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 3
-    assert "SemJoinOperatorOutput" in output_datasets
-    output_dataset = output_datasets["SemJoinOperatorOutput"]
+    assert "output-dataset-id" in output_datasets
+    output_dataset = output_datasets["output-dataset-id"]
     assert len(output_dataset.items) == 2

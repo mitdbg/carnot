@@ -1,0 +1,23 @@
+env: wl-prod
+hostname: ""         # Set at deploy time via --set from SUBDOMAIN secret
+frontendOrigin: ""   # Set at deploy time via --set from SUBDOMAIN secret
+
+backend:
+  autoscaling:
+    minReplicas: 1
+    maxReplicas: 5
+
+irsa:
+  roleArn: arn:aws:iam::422297141788:role/carnot-wl-prod-sa-role
+
+auth0:
+  domain: ""        # TODO: fill in when AWS access is available
+  audience: ""      # TODO: fill in when AWS access is available
+  claimsNamespace: ""
+
+acmCertificateArn: "arn:aws:acm:us-east-1:422297141788:certificate/10be4bdb-461d-4dec-9ddf-501e2f157fab"
+
+secretsManager:
+  enabled: true
+  dbSecretName: carnot/wl-prod/db
+  appSecretName: carnot/wl-prod/app

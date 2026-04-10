@@ -1,0 +1,1 @@
+Find cars that are damaged according to one modality but not the other. For this query, for complaints, check if the car was on fire.

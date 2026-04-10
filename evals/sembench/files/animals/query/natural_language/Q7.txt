@@ -1,0 +1,1 @@
+What are the cities for which zebras and impala co-occur, i.e., we have at least one image of a zebra and at least one image of an impala?

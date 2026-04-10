@@ -1,912 +1,524 @@
 from __future__ import annotations
 
-import json
-import time
-from abc import abstractmethod
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 
-class GenerationStats(BaseModel):
+class LLMCallStats(BaseModel):
+    """Statistics from a single LLM API call.
+
+    Representation invariant:
+        - All token counts are >= 0.
+        - ``cost_usd >= 0.0``.
+        - ``duration_secs >= 0.0``.
+        - ``model_id`` is a non-empty string.
+        - Exactly one of ``is_embedding`` or ``is_completion`` is True
+          (determined by ``call_type``).
+        - For embedding calls: ``output_text_tokens == 0`` and
+          ``embedding_input_tokens > 0``.
+        - For completion calls: ``embedding_input_tokens == 0``.
+
+    Abstraction function:
+        Represents the resource consumption of exactly one call to
+        ``litellm.completion()`` or ``litellm.embedding()``.
     """
-    Model for storing statistics about the execution of an operator on a single record.
-    """
 
-    model_name: str | None = None
+    model_id: str
+    call_type: str = "completion"  # "completion" or "embedding"
 
-    # The raw answer as output from the generator (a list of strings, possibly of len 1)
-    # raw_answers: Optional[List[str]] = field(default_factory=list)
-
-    # the number of input audio tokens
-    input_audio_tokens: int = 0
-
-    # the number of input text tokens
+    # --- text tokens (standard for all completion calls) ---
     input_text_tokens: int = 0
+    output_text_tokens: int = 0
 
-    # the number of input image tokens
+    # --- multimodal tokens ---
+    input_audio_tokens: int = 0
+    output_audio_tokens: int = 0
     input_image_tokens: int = 0
 
-    # the total number of input tokens processed by this operator; None if this operation did not use an LLM
-    # typed as a float because GenerationStats may be amortized (i.e. divided) across a number of output records
-    total_input_tokens: float = 0.0
+    # --- prompt caching tokens ---
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
 
-    # the total number of output tokens processed by this operator; None if this operation did not use an LLM
-    # typed as a float because GenerationStats may be amortized (i.e. divided) across a number of output records
-    total_output_tokens: float = 0.0
+    # --- embedding tokens ---
+    embedding_input_tokens: int = 0
 
-    # the total cost of processing the input tokens; None if this operation did not use an LLM
-    total_input_cost: float = 0.0
+    # --- cost & timing ---
+    cost_usd: float = 0.0
+    duration_secs: float = 0.0
 
-    # the total cost of processing the output tokens; None if this operation did not use an LLM
-    total_output_cost: float = 0.0
+    # --- derived helpers ---
+    @property
+    def is_embedding(self) -> bool:
+        """True when this stats object represents an embedding call."""
+        return self.call_type == "embedding"
 
-    # the total cost of processing the input and output tokens; None if this operation did not use an LLM
-    cost_per_record: float = 0.0
+    @property
+    def is_completion(self) -> bool:
+        """True when this stats object represents a completion call."""
+        return self.call_type == "completion"
 
-    # (if applicable) the time (in seconds) spent executing a call to an LLM
-    llm_call_duration_secs: float = 0.0
+    @property
+    def total_input_tokens(self) -> int:
+        """Sum of all input token types (text + audio + image + embedding).
 
-    # (if applicable) the time (in seconds) spent executing a call to a function
-    fn_call_duration_secs: float = 0.0
+        Requires:
+            None.
 
-    # (if applicable) the total number of LLM calls made by this operator
-    total_llm_calls: int = 0
+        Returns:
+            Non-negative integer sum of ``input_text_tokens``,
+            ``input_audio_tokens``, ``input_image_tokens``, and
+            ``embedding_input_tokens``.
 
-    # (if applicable) the total number of embedding LLM calls made by this operator
-    total_embedding_llm_calls: int = 0
+        Raises:
+            None.
+        """
+        return (
+            self.input_text_tokens
+            + self.input_audio_tokens
+            + self.input_image_tokens
+            + self.embedding_input_tokens
+        )
 
-    def __iadd__(self, other: GenerationStats) -> GenerationStats:
-        # self.raw_answers.extend(other.raw_answers)
-        for model_field in [
-            "total_input_tokens",
-            "total_output_tokens",
-            "total_input_cost",
-            "total_output_cost",
-            "cost_per_record",
-            "llm_call_duration_secs",
-            "fn_call_duration_secs",
-            "total_llm_calls",
-            "total_embedding_llm_calls",
-        ]:
-            setattr(self, model_field, getattr(self, model_field) + getattr(other, model_field))
-        return self
+    @property
+    def total_output_tokens(self) -> int:
+        """Sum of all output token types (text + audio).
 
-    def __add__(self, other: GenerationStats) -> GenerationStats:
-        dct = {
-            field: getattr(self, field) + getattr(other, field)
-            for field in [
-                "total_input_tokens",
-                "total_output_tokens",
-                "total_input_cost",
-                "total_output_cost",
-                "llm_call_duration_secs",
-                "fn_call_duration_secs",
-                "cost_per_record",
-                "total_llm_calls",
-                "total_embedding_llm_calls",
-            ]
-        }
-        # dct['raw_answers'] = self.raw_answers + other.raw_answers
-        dct["model_name"] = self.model_name
-        return GenerationStats(**dct)
+        Requires:
+            None.
 
-    # Do the same as iadd and add but with division operator
-    def __itruediv__(self, quotient: float) -> GenerationStats:
-        if quotient == 0:
-            raise ZeroDivisionError("Cannot divide by zero")
-        if isinstance(quotient, int):
-            quotient = float(quotient)
-        for model_field in [
-            "total_input_tokens",
-            "total_output_tokens",
-            "total_input_cost",
-            "total_output_cost",
-            "cost_per_record",
-            "llm_call_duration_secs",
-            "fn_call_duration_secs",
-            "total_llm_calls",
-            "total_embedding_llm_calls",
-        ]:
-            setattr(self, model_field, getattr(self, model_field) / quotient)
-        return self
+        Returns:
+            Non-negative integer sum of ``output_text_tokens`` and
+            ``output_audio_tokens``.
 
-    def __truediv__(self, quotient: float) -> GenerationStats:
-        if quotient == 0:
-            raise ZeroDivisionError("Cannot divide by zero")
-        if isinstance(quotient, int):
-            quotient = float(quotient)
-        dct = {
-            field: getattr(self, field) / quotient
-            for field in [
-                "total_input_tokens",
-                "total_output_tokens",
-                "total_input_cost",
-                "total_output_cost",
-                "llm_call_duration_secs",
-                "fn_call_duration_secs",
-                "total_llm_calls",
-                "total_embedding_llm_calls",
-                "cost_per_record",
-            ]
-        }
-        dct["model_name"] = self.model_name
-        return GenerationStats(**dct)
-
-    def __radd__(self, other: int) -> GenerationStats:
-        assert not isinstance(other, GenerationStats), "This should not be called with a GenerationStats object"
-        return self
-
-    # NOTE: this is added temporarily to help track cost of compute agent writing PZ code;
-    #       once we find a long-term solution for tracking that cost, we can remove this
-    def to_json(self, filepath: str | None = None) -> dict | None:
-        if filepath is None:
-            return self.model_dump(mode="json")
-
-        with open(filepath, "w") as f:
-            json.dump(self.model_dump(mode="json"), f)
-
-
-class RecordOpStats(BaseModel):
-    """
-    Model for storing statistics about the execution of an operator on a single record.
-    """
-
-    ##### REQUIRED FIELDS #####
-    # record id; an identifier for this record
-    record_id: str | int
-
-    # identifier for the parent(s) of this record
-    record_parent_ids: list[str | int] | None
-
-    # idenifier for the source indices of this record
-    record_source_indices: list[str | int]
-
-    # a dictionary with the record state after being processed by the operator
-    record_state: dict[str, Any]
-
-    # operation id; an identifier for this operation's physical op id
-    full_op_id: str
-
-    # logical operation id; the logical op id for this physical op
-    logical_op_id: str
-
-    # operation name
-    op_name: str
-
-    # the time spent by the data record just in this operation
-    time_per_record: float
-
-    # the cost (in dollars) to generate this record at this operation
-    cost_per_record: float
-
-    ##### NOT-OPTIONAL, BUT FILLED BY EXECUTION CLASS AFTER CONSTRUCTOR CALL #####
-    # the ID(s) of the physical operation(s) which produced the input record(s) for this record at this operation
-    source_unique_full_op_ids: list[str] | None = None
-
-    # the ID(s) of the logical operation(s) which produced the input record(s) for this record at this operation
-    source_unique_logical_op_ids: list[str] | None = None
-
-    # the ID of the physical plan which produced this record at this operation
-    plan_id: str = ""
-
-    ##### OPTIONAL, BUT FILLED BY COST MODEL AFTER SAMPLE DATA EXECUTION #####
-    quality: float | None = None
-
-    ##### OPTIONAL FIELDS (I.E. ONLY MANDATORY FOR CERTAIN OPERATORS) #####
-    # (if applicable) the name of the model used to generate the output for this record
-    model_name: str | None = None
-
-    # (if applicable) the mapping from field-name to generated output for this record
-    answer: dict[str, Any] | None = None
-
-    # (if applicable) the mapping from field-name to generated output for this record
-    # raw_answers: Optional[List[str, Any]] = field(default_factory=list)
-
-    # (if applicable) the list of input fields for the generation for this record
-    input_fields: list[str] | None = None
-
-    # (if applicable) the list of generated fields for this record
-    generated_fields: list[str] | None = None
-
-    # the total number of input tokens processed by this operator; None if this operation did not use an LLM
-    # typed as a float because GenerationStats may be amortized (i.e. divided) across a number of output records
-    total_input_tokens: float = 0.0
-
-    # the total number of output tokens processed by this operator; None if this operation did not use an LLM
-    # typed as a float because GenerationStats may be amortized (i.e. divided) across a number of output records
-    total_output_tokens: float = 0.0
-
-    # the total cost of processing the input tokens; None if this operation did not use an LLM
-    total_input_cost: float = 0.0
-
-    # the total cost of processing the output tokens; None if this operation did not use an LLM
-    total_output_cost: float = 0.0
-
-    # the (possibly amortized) cost of generating embeddings for this record; None if this operation did not use an embedding LLM
-    total_embedding_cost: float = 0.0
-
-    # (if applicable) the filter text (or a string representation of the filter function) applied to this record
-    filter_str: str | None = None
-
-    # (if applicable) the join condition applied to this record
-    join_condition: str | None = None
-
-    # the True/False result of whether this record was output by the operator or not
-    # (can only be False if the operator is a Filter or Join)
-    passed_operator: bool = True
-
-    # (if applicable) the time (in seconds) spent executing a call to an LLM
-    llm_call_duration_secs: float = 0.0
-
-    # (if applicable) the time (in seconds) spent executing a UDF or calling an external api
-    fn_call_duration_secs: float = 0.0
-
-    # (if applicable) the total number of LLM calls made by this operator
-    total_llm_calls: int = 0
-
-    # (if applicable) the total number of embedding LLM calls made by this operator
-    total_embedding_llm_calls: int = 0
-
-    # (if applicable) a boolean indicating whether this is the statistics captured from a failed convert operation
-    failed_convert: bool | None = None
-
-    # an OPTIONAL dictionary with more detailed information about this operation;
-    op_details: dict[str, Any] = Field(default_factory=dict)
+        Raises:
+            None.
+        """
+        return self.output_text_tokens + self.output_audio_tokens
 
 
 class OperatorStats(BaseModel):
-    """
-    Model for storing statistics captured within a given operator.
-    """
+    """Statistics from the execution of a single operator.
 
-    # the full ID of the physical operation in which these stats were collected
-    full_op_id: str
+    Representation invariant:
+        - ``operator_name`` is a non-empty string.
+        - ``wall_clock_secs >= 0.0``.
+        - ``llm_calls`` is a list of ``LLMCallStats`` (possibly empty
+          for non-LLM operators like ``LimitOperator``).
 
-    # the name of the physical operation in which these stats were collected
-    op_name: str
-
-    # the total time spent in this operation
-    total_op_time: float = 0.0
-
-    # the total cost of this operation
-    total_op_cost: float = 0.0
-
-    # the total input tokens processed by this operation
-    total_input_tokens: int = 0
-
-    # the total output tokens processed by this operation
-    total_output_tokens: int = 0
-
-    # a list of RecordOpStats processed by the operation
-    record_op_stats_lst: list[RecordOpStats] = Field(default_factory=list)
-
-    # the unique full ID(s) of the physical operator(s) which precede this one (used by PlanStats)
-    source_unique_full_op_ids: list[str] | None = None
-
-    # the unique full ID(s) of the logical operator(s) which precede this one (used by SentinelPlanStats)
-    source_unique_logical_op_ids: list[str] | None = None
-
-    # the ID of the physical plan which this operator is part of
-    plan_id: str = ""
-
-    # an OPTIONAL dictionary with more detailed information about this operation;
-    op_details: dict[str, Any] = Field(default_factory=dict)
-
-    def __iadd__(self, stats: OperatorStats | RecordOpStats) -> OperatorStats:
-        """
-        Sum the given stats to this operator's stats. The given stats can be either:
-
-        1. an OperatorStats object
-        2. a RecordOpStats object
-
-        NOTE: in case (1.) we assume the execution layer guarantees that `stats` is
-              generated by the same operator in the same plan. Thus, we assume the
-              full_op_ids, op_name, source_op_id, etc. do not need to be updated.
-        """
-        if isinstance(stats, OperatorStats):
-            self.total_op_time += stats.total_op_time
-            self.total_op_cost += stats.total_op_cost
-            self.total_input_tokens += stats.total_input_tokens
-            self.total_output_tokens += stats.total_output_tokens
-            self.record_op_stats_lst.extend(stats.record_op_stats_lst)
-
-        elif isinstance(stats, RecordOpStats):
-            stats.source_unique_full_op_ids = self.source_unique_full_op_ids
-            stats.plan_id = self.plan_id
-            self.record_op_stats_lst.append(stats)
-            self.total_op_time += stats.time_per_record
-            self.total_op_cost += stats.cost_per_record
-            self.total_input_tokens += stats.total_input_tokens
-            self.total_output_tokens += stats.total_output_tokens
-
-        else:
-            raise TypeError(f"Cannot add {type(stats)} to OperatorStats")
-
-        return self
-
-
-class BasePlanStats(BaseModel):
-    """
-    Model for storing statistics captured for an entire plan.
-
-    This class is subclassed for tracking:
-    - PlanStats: the statistics for execution of a PhysicalPlan
-    - SentinelPlanStats: the statistics for execution of a SentinelPlan
-
-    The key difference between the two subclasses is that the `operator_stats`
-    field in the PlanStats maps from the physical operator ids to their corresponding
-    OperatorStats objects.
-
-    The `operator_stats` field in the SentinelPlanStats maps from a logical operator id
-    to another dictionary which maps from the physical operator ids to their corresponding
-    OperatorStats objects.
+    Abstraction function:
+        Represents the total resource consumption of one operator
+        invocation across all items it processed (including retries).
     """
 
-    # id for identifying the physical plan
-    plan_id: str
+    operator_name: str  # e.g. "SemFilter", "Planner", "DataDiscovery"
+    operator_id: str = ""  # the dataset_id or agent name
+    wall_clock_secs: float = 0.0
+    llm_calls: list[LLMCallStats] = Field(default_factory=list)
+    items_in: int = 0
+    items_out: int = 0
 
-    # string representation of the physical plan
-    plan_str: str | None = None
+    # ---- derived (computed) properties ----
+    @property
+    def total_input_tokens(self) -> int:
+        """Total input tokens across all LLM calls in this operator.
 
-    # dictionary whose values are OperatorStats objects;
-    # PlanStats maps {full_op_id -> OperatorStats}
-    # SentinelPlanStats maps {logical_op_id -> {full_op_id -> OperatorStats}}
-    operator_stats: dict = Field(default_factory=dict)
+        Requires:
+            None.
 
-    # dictionary whose values are GenerationStats objects for validation;
-    # only used by SentinelPlanStats
-    validation_gen_stats: dict[str, GenerationStats] = Field(default_factory=dict)
+        Returns:
+            Non-negative integer sum of ``total_input_tokens`` for every
+            call in ``llm_calls``.
 
-    # total runtime for the plan measured from the start to the end of PhysicalPlan.execute()
-    total_plan_time: float = 0.0
-
-    # total cost for plan
-    total_plan_cost: float = 0.0
-
-    # total input tokens processed by this plan
-    total_input_tokens: int = 0
-
-    # total output tokens processed by this plan
-    total_output_tokens: int = 0
-
-    # start time for the plan execution; should be set by calling PlanStats.start()
-    start_time: float | None = None
-
-    def start(self) -> None:
-        """Start the timer for this plan execution."""
-        self.start_time = time.time()
-
-    def finish(self) -> None:
-        """Finish the timer for this plan execution."""
-        if self.start_time is None:
-            raise RuntimeError("PlanStats.start() must be called before PlanStats.finish()")
-        self.total_plan_time = time.time() - self.start_time
-        self.total_plan_cost = self.sum_op_costs() + self.sum_validation_costs()
-        self.total_input_tokens = self.sum_input_tokens() + self.sum_validation_input_tokens()
-        self.total_output_tokens = self.sum_output_tokens() + self.sum_validation_output_tokens()
-
-    @staticmethod
-    @abstractmethod
-    def from_plan(plan) -> BasePlanStats:
+        Raises:
+            None.
         """
-        Initialize this PlanStats object from a PhysicalPlan or SentinelPlan object.
-        """
-        pass
+        return sum(c.total_input_tokens for c in self.llm_calls)
 
-    @abstractmethod
-    def sum_op_costs(self) -> float:
-        """
-        Sum the costs of all operators in this plan.
-        """
-        pass
+    @property
+    def total_output_tokens(self) -> int:
+        """Total output tokens across all LLM calls in this operator.
 
-    @abstractmethod
-    def sum_input_tokens(self) -> int:
-        """
-        Sum the input tokens processed by all operators in this plan.
-        """
-        pass
+        Requires:
+            None.
 
-    @abstractmethod
-    def sum_output_tokens(self) -> int:
-        """
-        Sum the output tokens processed by all operators in this plan.
-        """
-        pass
+        Returns:
+            Non-negative integer sum of ``total_output_tokens`` for every
+            call in ``llm_calls``.
 
-    @abstractmethod
-    def add_record_op_stats(self, unique_full_op_id: str, record_op_stats: RecordOpStats | list[RecordOpStats]) -> None:
+        Raises:
+            None.
         """
-        Add the given RecordOpStats to this plan's operator stats for the given operator id.
-        """
-        pass
+        return sum(c.total_output_tokens for c in self.llm_calls)
 
-    @abstractmethod
-    def __iadd__(self, plan_stats: BasePlanStats) -> None:
-        """
-        Add the given PlanStats to this plan's operator stats.
-        """
-        pass
+    @property
+    def total_input_text_tokens(self) -> int:
+        """Total input text tokens across all LLM calls.
 
-    @abstractmethod
-    def __str__(self) -> str:
-        """
-        Return a string representation of this plan's statistics.
-        """
-        pass
+        Requires:
+            None.
 
-    def sum_validation_costs(self) -> float:
-        """
-        Sum the costs of all validation generations in this plan.
-        """
-        return sum([gen_stats.cost_per_record for _, gen_stats in self.validation_gen_stats.items()])
+        Returns:
+            Non-negative integer.
 
-    def sum_validation_input_tokens(self) -> int:
+        Raises:
+            None.
         """
-        Sum the input tokens processed by all validation generations in this plan.
-        """
-        return sum([gen_stats.total_input_tokens for _, gen_stats in self.validation_gen_stats.items()])
+        return sum(c.input_text_tokens for c in self.llm_calls)
 
-    def sum_validation_output_tokens(self) -> int:
+    @property
+    def total_input_audio_tokens(self) -> int:
+        """Total input audio tokens across all LLM calls.
+
+        Requires:
+            None.
+
+        Returns:
+            Non-negative integer.
+
+        Raises:
+            None.
         """
-        Sum the output tokens processed by all validation generations in this plan.
+        return sum(c.input_audio_tokens for c in self.llm_calls)
+
+    @property
+    def total_input_image_tokens(self) -> int:
+        """Total input image tokens across all LLM calls.
+
+        Requires:
+            None.
+
+        Returns:
+            Non-negative integer.
+
+        Raises:
+            None.
         """
-        return sum([gen_stats.total_output_tokens for _, gen_stats in self.validation_gen_stats.items()])
+        return sum(c.input_image_tokens for c in self.llm_calls)
+
+    @property
+    def total_embedding_input_tokens(self) -> int:
+        """Total embedding input tokens across all LLM calls.
+
+        Requires:
+            None.
+
+        Returns:
+            Non-negative integer.
+
+        Raises:
+            None.
+        """
+        return sum(c.embedding_input_tokens for c in self.llm_calls)
+
+    @property
+    def total_cost_usd(self) -> float:
+        """Total dollar cost across all LLM calls.
+
+        Requires:
+            None.
+
+        Returns:
+            Non-negative float.
+
+        Raises:
+            None.
+        """
+        return sum(c.cost_usd for c in self.llm_calls)
+
+    @property
+    def total_llm_calls(self) -> int:
+        """Number of completion (non-embedding) calls.
+
+        Requires:
+            None.
+
+        Returns:
+            Non-negative integer.
+
+        Raises:
+            None.
+        """
+        return len([c for c in self.llm_calls if not c.is_embedding])
+
+    @property
+    def total_embedding_calls(self) -> int:
+        """Number of embedding calls.
+
+        Requires:
+            None.
+
+        Returns:
+            Non-negative integer.
+
+        Raises:
+            None.
+        """
+        return len([c for c in self.llm_calls if c.is_embedding])
+
+    @property
+    def total_llm_duration_secs(self) -> float:
+        """Total wall-clock time spent in LLM API calls.
+
+        Requires:
+            None.
+
+        Returns:
+            Non-negative float.
+
+        Raises:
+            None.
+        """
+        return sum(c.duration_secs for c in self.llm_calls)
 
 
-class PlanStats(BasePlanStats):
+class PhaseStats(BaseModel):
+    """Statistics from one execution phase (planning or execution).
+
+    Representation invariant:
+        - ``phase`` is one of ``"planning"`` or ``"execution"``.
+        - ``operator_stats`` is a list of ``OperatorStats``.
+
+    Abstraction function:
+        Represents the total resource consumption of one major
+        phase of query processing.
     """
-    Subclass of BasePlanStats which captures statistics from the execution of a single PhysicalPlan.
-    """
-    @staticmethod
-    def from_plan(plan) -> PlanStats:
-        """
-        Initialize this PlanStats object from a PhysicalPlan object.
-        """
-        # TODO?: have PhysicalPlan return PlanStats object
-        operator_stats = {}
-        for topo_idx, op in enumerate(plan):
-            unique_full_op_id = f"{topo_idx}-{op.get_full_op_id()}"
-            operator_stats[unique_full_op_id] = OperatorStats(
-                full_op_id=op.get_full_op_id(),
-                op_name=op.op_name(),
-                source_unique_full_op_ids=plan.get_source_unique_full_op_ids(topo_idx, op),
-                plan_id=plan.plan_id,
-                op_details={k: str(v) for k, v in op.get_id_params().items()},
-            )
 
-        return PlanStats(plan_id=plan.plan_id, plan_str=str(plan), operator_stats=operator_stats)
- 
-    def sum_op_costs(self) -> float:
-        """
-        Sum the costs of all operators in this plan.
-        """
-        return sum([op_stats.total_op_cost for _, op_stats in self.operator_stats.items()])
+    phase: str  # "planning" or "execution"
+    wall_clock_secs: float = 0.0
+    operator_stats: list[OperatorStats] = Field(default_factory=list)
 
-    def sum_input_tokens(self) -> int:
-        """
-        Sum the input tokens processed by all operators in this plan.
-        """
-        return sum([op_stats.total_input_tokens for _, op_stats in self.operator_stats.items()])
+    @property
+    def total_cost_usd(self) -> float:
+        """Total dollar cost across all operators in this phase.
 
-    def sum_output_tokens(self) -> int:
-        """
-        Sum the output tokens processed by all operators in this plan.
-        """
-        return sum([op_stats.total_output_tokens for _, op_stats in self.operator_stats.items()])
+        Requires:
+            None.
 
-    def add_record_op_stats(self, unique_full_op_id: str, record_op_stats: RecordOpStats | list[RecordOpStats]) -> None:
-        """
-        Add the given RecordOpStats to this plan's operator stats for the given operator id.
-        """
-        # normalize input type to be list[RecordOpStats]
-        record_op_stats_lst = record_op_stats if isinstance(record_op_stats, list) else [record_op_stats]
+        Returns:
+            Non-negative float.
 
-        # update operator stats
-        for record_op_stats in record_op_stats_lst:
-            if unique_full_op_id in self.operator_stats:
-                self.operator_stats[unique_full_op_id] += record_op_stats
-            else:
-                raise ValueError(f"RecordOpStats with unique_full_op_id {unique_full_op_id} not found in PlanStats")
-
-    def __iadd__(self, plan_stats: PlanStats) -> None:
+        Raises:
+            None.
         """
-        NOTE: we assume the execution layer guarantees:
-        1. these plan_stats belong to the same plan
-        2. these plan_stats come from sequential (non-overlapping) executions of the same plan
+        return sum(op.total_cost_usd for op in self.operator_stats)
 
-        The latter criteria implies it is okay for this method to sum the plan (and operator) runtimes.
+    @property
+    def total_input_tokens(self) -> int:
+        """Total input tokens across all operators in this phase.
+
+        Requires:
+            None.
+
+        Returns:
+            Non-negative integer.
+
+        Raises:
+            None.
         """
-        self.total_plan_time += plan_stats.total_plan_time
-        self.total_plan_cost += plan_stats.total_plan_cost
-        self.total_input_tokens += plan_stats.total_input_tokens
-        self.total_output_tokens += plan_stats.total_output_tokens
-        for unique_full_op_id, op_stats in plan_stats.operator_stats.items():
-            if unique_full_op_id in self.operator_stats:
-                self.operator_stats[unique_full_op_id] += op_stats
-            else:
-                self.operator_stats[unique_full_op_id] = op_stats
+        return sum(op.total_input_tokens for op in self.operator_stats)
 
-    def __str__(self) -> str:
-        stats = f"total_plan_time={self.total_plan_time} \n"
-        stats += f"total_plan_cost={self.total_plan_cost} \n"
-        stats += f"total_input_tokens={self.total_input_tokens} \n"
-        stats += f"total_output_tokens={self.total_output_tokens} \n"
-        for idx, op_stats in enumerate(self.operator_stats.values()):
-            stats += f"{idx}. {op_stats.op_name} time={op_stats.total_op_time} cost={op_stats.total_op_cost} \n"
-        return stats
+    @property
+    def total_output_tokens(self) -> int:
+        """Total output tokens across all operators in this phase.
 
+        Requires:
+            None.
 
-class SentinelPlanStats(BasePlanStats):
-    """
-    Subclass of BasePlanStats which captures statistics from the execution of a single SentinelPlan.
-    """
-    @staticmethod
-    def from_plan(plan) -> SentinelPlanStats:
+        Returns:
+            Non-negative integer.
+
+        Raises:
+            None.
         """
-        Initialize this PlanStats object from a Sentinel object.
-        """
-        operator_stats = {}
-        for topo_idx, (logical_op_id, op_set) in enumerate(plan):
-            unique_logical_op_id = f"{topo_idx}-{logical_op_id}"
-            operator_stats[unique_logical_op_id] = {}
-            for physical_op in op_set:
-                full_op_id = physical_op.get_full_op_id()
-                operator_stats[unique_logical_op_id][full_op_id] = OperatorStats(
-                    full_op_id=full_op_id,
-                    op_name=physical_op.op_name(),
-                    source_unique_logical_op_ids=plan.get_source_unique_logical_op_ids(unique_logical_op_id),
-                    plan_id=plan.plan_id,
-                    op_details={k: str(v) for k, v in physical_op.get_id_params().items()},
-                )
-
-        return SentinelPlanStats(plan_id=plan.plan_id, plan_str=str(plan), operator_stats=operator_stats)
-
-    def sum_op_costs(self) -> float:
-        """
-        Sum the costs of all operators in this plan.
-        """
-        return sum(sum([op_stats.total_op_cost for _, op_stats in phys_op_stats.items()]) for _, phys_op_stats in self.operator_stats.items())
-
-    def sum_input_tokens(self) -> int:
-        """
-        Sum the input tokens processed by all operators in this plan.
-        """
-        return sum(sum([op_stats.total_input_tokens for _, op_stats in phys_op_stats.items()]) for _, phys_op_stats in self.operator_stats.items())
-
-    def sum_output_tokens(self) -> int:
-        """
-        Sum the output tokens processed by all operators in this plan.
-        """
-        return sum(sum([op_stats.total_output_tokens for _, op_stats in phys_op_stats.items()]) for _, phys_op_stats in self.operator_stats.items())
-
-    def add_record_op_stats(self, unique_logical_op_id: str, record_op_stats: RecordOpStats | list[RecordOpStats]) -> None:
-        """
-        Add the given RecordOpStats to this plan's operator stats for the given operator set id.
-        """
-        # normalize input type to be list[RecordOpStats]
-        record_op_stats_lst = record_op_stats if isinstance(record_op_stats, list) else [record_op_stats]
-
-        # update operator stats
-        for record_op_stats in record_op_stats_lst:
-            full_op_id = record_op_stats.full_op_id
-            if unique_logical_op_id in self.operator_stats:
-                if full_op_id in self.operator_stats[unique_logical_op_id]:
-                    self.operator_stats[unique_logical_op_id][full_op_id] += record_op_stats
-                else:
-                    raise ValueError(f"RecordOpStats with full_op_id {full_op_id} not found in SentinelPlanStats")
-            else:
-                raise ValueError(f"RecordOpStats with unique_logical_op_id {unique_logical_op_id} not found in SentinelPlanStats")
-
-    def add_validation_gen_stats(self, unique_logical_op_id: str, gen_stats: GenerationStats) -> None:
-        """
-        Add the given GenerationStats to this plan's validation generation stats for the given logical operator id.
-        """
-        if unique_logical_op_id in self.validation_gen_stats:
-            self.validation_gen_stats[unique_logical_op_id] += gen_stats
-        else:
-            self.validation_gen_stats[unique_logical_op_id] = gen_stats
-
-
-    def __iadd__(self, plan_stats: SentinelPlanStats) -> None:
-        """
-        NOTE: we assume the execution layer guarantees:
-        1. these plan_stats belong to the same plan
-        2. these plan_stats come from sequential (non-overlapping) executions of the same plan
-
-        The latter criteria implies it is okay for this method to sum the plan (and operator) runtimes.
-        """
-        self.total_plan_time += plan_stats.total_plan_time
-        self.total_plan_cost += plan_stats.total_plan_cost
-        self.total_input_tokens += plan_stats.total_input_tokens
-        self.total_output_tokens += plan_stats.total_output_tokens
-        for unique_logical_op_id, physical_op_stats in plan_stats.operator_stats.items():
-            for full_op_id, op_stats in physical_op_stats.items():
-                if unique_logical_op_id in self.operator_stats:
-                    if full_op_id in self.operator_stats[unique_logical_op_id]:
-                        self.operator_stats[unique_logical_op_id][full_op_id] += op_stats
-                    else:
-                        self.operator_stats[unique_logical_op_id][full_op_id] = op_stats
-                else:
-                    self.operator_stats[unique_logical_op_id] = physical_op_stats
-
-        for unique_logical_op_id, gen_stats in plan_stats.validation_gen_stats.items():
-            if unique_logical_op_id in self.validation_gen_stats:
-                self.validation_gen_stats[unique_logical_op_id] += gen_stats
-            else:
-                self.validation_gen_stats[unique_logical_op_id] = gen_stats
-
-    def __str__(self) -> str:
-        stats = f"total_plan_time={self.total_plan_time} \n"
-        stats += f"total_plan_cost={self.total_plan_cost} \n"
-        stats += f"total_input_tokens={self.total_input_tokens} \n"
-        stats += f"total_output_tokens={self.total_output_tokens} \n"
-        for outer_idx, physical_op_stats in enumerate(self.operator_stats.values()):
-            total_time = sum([op_stats.total_op_time for op_stats in physical_op_stats.values()])
-            total_cost = sum([op_stats.total_op_cost for op_stats in physical_op_stats.values()])
-            stats += f"{outer_idx}. total_time={total_time} total_cost={total_cost} \n"
-            for inner_idx, op_stats in enumerate(physical_op_stats.values()):
-                stats += f"    {outer_idx}.{inner_idx}. {op_stats.op_name} time={op_stats.total_op_time} cost={op_stats.total_op_cost} \n"
-        return stats
+        return sum(op.total_output_tokens for op in self.operator_stats)
 
 
 class ExecutionStats(BaseModel):
-    """
-    Model for storing statistics captured for the entire execution of a workload.
-    """
+    """Statistics for an entire Carnot query execution.
 
-    # string for identifying this workload execution
-    execution_id: str | None = None
+    Representation invariant:
+        - ``planning`` and ``execution`` are ``PhaseStats`` objects
+          (possibly with empty operator lists if that phase was skipped).
 
-    # dictionary of SentinelPlanStats objects (one for each sentinel plan run during execution)
-    sentinel_plan_stats: dict[str, SentinelPlanStats] = Field(default_factory=dict)
-
-    # dictionary of PlanStats objects (one for each plan run during execution)
-    plan_stats: dict[str, PlanStats] = Field(default_factory=dict)
-
-    # total time spent optimizing
-    optimization_time: float = 0.0
-
-    # total cost of optimizing
-    optimization_cost: float = 0.0
-
-    # total time spent executing the optimized plan
-    plan_execution_time: float = 0.0
-
-    # total cost of executing the optimized plan
-    plan_execution_cost: float = 0.0
-
-    # total runtime for the entire execution
-    total_execution_time: float = 0.0
-
-    # total cost for the entire execution
-    total_execution_cost: float = 0.0
-
-    # total number of input tokens processed
-    total_input_tokens: int = 0
-
-    # total number of output tokens processed
-    total_output_tokens: int = 0
-
-    # total number of tokens processed
-    total_tokens: int = 0
-
-    # dictionary of sentinel plan strings; useful for printing executed sentinel plans in demos
-    sentinel_plan_strs: dict[str, str] = Field(default_factory=dict)
-
-    # dictionary of plan strings; useful for printing executed plans in demos
-    plan_strs: dict[str, str] = Field(default_factory=dict)
-
-    # start time for the execution; should be set by calling ExecutionStats.start()
-    start_time: float | None = None
-
-    # end time for the optimization;
-    optimization_end_time: float | None = None
-
-    def start(self) -> None:
-        """Start the timer for this execution."""
-        self.start_time = time.time()
-
-    def finish_optimization(self) -> None:
-        """Finish the timer for the optimization phase of this execution."""
-        if self.start_time is None:
-            raise RuntimeError("ExecutionStats.start() must be called before ExecutionStats.finish_optimization()")
-
-        # compute optimization time and cost
-        self.optimization_end_time = time.time()
-        self.optimization_time = self.optimization_end_time - self.start_time
-        self.optimization_cost = self.sum_sentinel_plan_costs()
-
-        # compute sentinel_plan_strs
-        self.sentinel_plan_strs = {plan_id: plan_stats.plan_str for plan_id, plan_stats in self.sentinel_plan_stats.items()}
-
-    def finish(self) -> None:
-        """Finish the timer for this execution."""
-        if self.start_time is None:
-            raise RuntimeError("ExecutionStats.start() must be called before ExecutionStats.finish()")
-
-        # compute time for plan and total execution
-        end_time = time.time()
-        self.plan_execution_time = (
-            end_time - self.optimization_end_time
-            if self.optimization_end_time is not None
-            else end_time - self.start_time
-        )
-        self.total_execution_time = end_time - self.start_time
-
-        # compute the cost for plan and total execution
-        self.plan_execution_cost = self.sum_plan_costs()
-        self.total_execution_cost = self.optimization_cost + self.plan_execution_cost
-
-        # compute the tokens for total execution
-        self.total_input_tokens = self.sum_input_tokens()
-        self.total_output_tokens = self.sum_output_tokens()
-        self.total_tokens = self.total_input_tokens + self.total_output_tokens
-
-        # compute plan_strs
-        self.plan_strs = {plan_id: plan_stats.plan_str for plan_id, plan_stats in self.plan_stats.items()}
-
-    def sum_sentinel_plan_costs(self) -> float:
-        """
-        Sum the costs of all SentinelPlans in this execution.
-        """
-        return sum([plan_stats.sum_op_costs() + plan_stats.sum_validation_costs() for _, plan_stats in self.sentinel_plan_stats.items()])
-
-    def sum_plan_costs(self) -> float:
-        """
-        Sum the costs of all PhysicalPlans in this execution.
-        """
-        return sum([plan_stats.sum_op_costs() for _, plan_stats in self.plan_stats.items()])
-
-    def sum_input_tokens(self) -> int:
-        """
-        Sum the input tokens processed in this execution
-        """
-        sentinel_plan_input_tokens = sum([plan_stats.sum_input_tokens() for _, plan_stats in self.sentinel_plan_stats.items()])
-        plan_input_tokens = sum([plan_stats.sum_input_tokens() for _, plan_stats in self.plan_stats.items()])
-        return plan_input_tokens + sentinel_plan_input_tokens
-
-    def sum_output_tokens(self) -> int:
-        """
-        Sum the output tokens processed in this execution
-        """
-        sentinel_plan_output_tokens = sum([plan_stats.sum_output_tokens() for _, plan_stats in self.sentinel_plan_stats.items()])
-        plan_output_tokens = sum([plan_stats.sum_output_tokens() for _, plan_stats in self.plan_stats.items()])
-        return plan_output_tokens + sentinel_plan_output_tokens
-
-    def add_plan_stats(self, plan_stats: PlanStats | SentinelPlanStats | list[PlanStats] | list[SentinelPlanStats]) -> None:
-        """
-        Add the given PlanStats (or SentinelPlanStats) to this execution's plan stats.
-
-        NOTE: we make the assumption that the same plan cannot be run more than once in parallel,
-        i.e. each plan stats object for an individual plan comes from two different (sequential)
-        periods in time. Thus, PlanStats objects can be summed.
-        """
-        # normalize input type to be list[PlanStats] or list[SentinelPlanStats]
-        if isinstance(plan_stats, (PlanStats, SentinelPlanStats)):
-            plan_stats = [plan_stats]
-
-        for plan_stats_obj in plan_stats:
-            if isinstance(plan_stats_obj, PlanStats) and plan_stats_obj.plan_id not in self.plan_stats:
-                self.plan_stats[plan_stats_obj.plan_id] = plan_stats_obj
-            elif isinstance(plan_stats_obj, PlanStats):
-                self.plan_stats[plan_stats_obj.plan_id] += plan_stats_obj
-            elif isinstance(plan_stats_obj, SentinelPlanStats) and plan_stats_obj.plan_id not in self.sentinel_plan_stats:
-                self.sentinel_plan_stats[plan_stats_obj.plan_id] = plan_stats_obj
-            elif isinstance(plan_stats_obj, SentinelPlanStats):
-                self.sentinel_plan_stats[plan_stats_obj.plan_id] += plan_stats_obj
-            else:
-                raise TypeError(f"Cannot add {type(plan_stats)} to ExecutionStats")
-
-    def to_json(self, filepath: str | None = None) -> dict | None:
-        if filepath is None:
-            return self.model_dump(mode="json")
-
-        with open(filepath, "w") as f:
-            json.dump(self.model_dump(mode="json"), f)
-
-
-class OperatorCostEstimates(BaseModel):
-    """
-    Model for storing estimates of key metrics of interest for each operator.
+    Abstraction function:
+        Represents the full cost/latency breakdown of a Carnot query,
+        from planning through final answer generation.
     """
 
-    # (estimated) number of records output by this operator
-    cardinality: float
+    execution_id: str = ""
+    query: str = ""
+    planning: PhaseStats = Field(default_factory=lambda: PhaseStats(phase="planning"))
+    execution: PhaseStats = Field(default_factory=lambda: PhaseStats(phase="execution"))
 
-    # (estimated) avg. time spent in this operator per-record
-    time_per_record: float
+    @property
+    def total_cost_usd(self) -> float:
+        """Total dollar cost across both phases.
 
-    # (estimated) dollars spent per-record by this operator
-    cost_per_record: float
+        Requires:
+            None.
 
-    # (estimated) quality of the output from this operator
-    quality: float
+        Returns:
+            Non-negative float.
 
-    # lower bound on cardinality
-    cardinality_lower_bound: float | None = None
-
-    # upper bound on cardinality
-    cardinality_upper_bound: float | None = None
-
-    # lower bound on time_per_record
-    time_per_record_lower_bound: float | None = None
-
-    # upper bound on time_per_record
-    time_per_record_upper_bound: float | None = None
-
-    # lower bound on cost_per_record
-    cost_per_record_lower_bound: float | None = None
-
-    # upper bound on cost_per_record
-    cost_per_record_upper_bound: float | None = None
-
-    # lower bound on quality
-    quality_lower_bound: float | None = None
-
-    # upper bound on quality
-    quality_upper_bound: float | None = None
-
-    def __rmul__(self, multiplier: float) -> OperatorCostEstimates:
+        Raises:
+            None.
         """
-        Multiply all fields by a scalar.
+        return self.planning.total_cost_usd + self.execution.total_cost_usd
+
+    @property
+    def total_wall_clock_secs(self) -> float:
+        """Total wall-clock time across both phases.
+
+        Requires:
+            None.
+
+        Returns:
+            Non-negative float.
+
+        Raises:
+            None.
         """
-        dct = {field_name: getattr(self, field_name) * multiplier for field_name in self.model_fields}
-        return OperatorCostEstimates(**dct)
+        return self.planning.wall_clock_secs + self.execution.wall_clock_secs
 
-    def model_post_init(self, __context: Any) -> None:
-        if self.cardinality_lower_bound is None and self.cardinality_upper_bound is None:
-            self.cardinality_lower_bound = self.cardinality
-            self.cardinality_upper_bound = self.cardinality
+    @property
+    def total_input_tokens(self) -> int:
+        """Total input tokens across both phases.
 
-        if self.time_per_record_lower_bound is None and self.time_per_record_upper_bound is None:
-            self.time_per_record_lower_bound = self.time_per_record
-            self.time_per_record_upper_bound = self.time_per_record
+        Requires:
+            None.
 
-        if self.cost_per_record_lower_bound is None and self.cost_per_record_upper_bound is None:
-            self.cost_per_record_lower_bound = self.cost_per_record
-            self.cost_per_record_upper_bound = self.cost_per_record
+        Returns:
+            Non-negative integer.
 
-        if self.quality_lower_bound is None and self.quality_upper_bound is None:
-            self.quality_lower_bound = self.quality
-            self.quality_upper_bound = self.quality
+        Raises:
+            None.
+        """
+        return self.planning.total_input_tokens + self.execution.total_input_tokens
+
+    @property
+    def total_output_tokens(self) -> int:
+        """Total output tokens across both phases.
+
+        Requires:
+            None.
+
+        Returns:
+            Non-negative integer.
+
+        Raises:
+            None.
+        """
+        return self.planning.total_output_tokens + self.execution.total_output_tokens
+
+    def to_summary_dict(self) -> dict:
+        """Flat summary suitable for logging or API responses.
+
+        Requires:
+            None.
+
+        Returns:
+            A dictionary with top-level cost/token/timing totals and
+            nested ``planning`` and ``execution`` sub-dicts, each
+            containing per-operator breakdowns.
+
+        Raises:
+            None.
+        """
+        def _phase_dict(phase: PhaseStats) -> dict:
+            return {
+                "phase": phase.phase,
+                "wall_clock_secs": phase.wall_clock_secs,
+                "total_cost_usd": phase.total_cost_usd,
+                "total_input_tokens": phase.total_input_tokens,
+                "total_output_tokens": phase.total_output_tokens,
+                "operator_stats": [
+                    {
+                        "operator_name": op.operator_name,
+                        "operator_id": op.operator_id,
+                        "wall_clock_secs": op.wall_clock_secs,
+                        "total_cost_usd": op.total_cost_usd,
+                        "total_llm_calls": op.total_llm_calls,
+                        "total_embedding_calls": op.total_embedding_calls,
+                        "total_input_tokens": op.total_input_tokens,
+                        "total_output_tokens": op.total_output_tokens,
+                        "total_input_text_tokens": op.total_input_text_tokens,
+                        "total_input_audio_tokens": op.total_input_audio_tokens,
+                        "total_input_image_tokens": op.total_input_image_tokens,
+                        "total_embedding_input_tokens": op.total_embedding_input_tokens,
+                        "items_in": op.items_in,
+                        "items_out": op.items_out,
+                    }
+                    for op in phase.operator_stats
+                ],
+            }
+
+        return {
+            "execution_id": self.execution_id,
+            "query": self.query,
+            "total_cost_usd": self.total_cost_usd,
+            "total_wall_clock_secs": self.total_wall_clock_secs,
+            "total_input_tokens": self.total_input_tokens,
+            "total_output_tokens": self.total_output_tokens,
+            "planning": _phase_dict(self.planning),
+            "execution": _phase_dict(self.execution),
+        }
 
 
 class PlanCost(BaseModel):
-    """
-    Model for storing the (cost, time, quality) estimates of (sub)-plans and their upper and lower bounds.
+    """Unified cost estimate for a (sub-)plan.
+
+    Combines cumulative plan-level metrics (``cost``, ``time``,
+    ``total_input_tokens``, ``total_scanned_input_tokens``) with
+    per-operator metrics (``output_cardinality``, ``cost_per_record``,
+    ``time_per_record``).
+
+    Representation invariant:
+        - All numeric fields are non-negative.
+        - ``total_scanned_input_tokens <= total_input_tokens``.
+        - ``selectivity`` is in ``[0, ∞)`` (may exceed 1 for fan-out operators).
+
+    Abstraction function:
+        Represents a point in the (cost, time, quality) space for a
+        plan or sub-plan, where *quality* is the ratio of scanned
+        input tokens to total input tokens.
     """
 
-    # the expression cost
+    # cumulative plan metrics
     cost: float
-
-    # the expression runtime
     time: float
+    total_input_tokens: float
+    total_scanned_input_tokens: float
 
-    # the expression quality
-    quality: float
+    # per-operator metrics (set by the cost model for the current operator)
+    cost_per_record: float = 0.0
+    time_per_record: float = 0.0
 
-    # operator-specific cost estimates
-    op_estimates: OperatorCostEstimates | None = None
+    # cardinality fields
+    input_cardinality: float = 0.0
+    output_cardinality: float = 0.0
+    selectivity: float = 1.0
 
-    # lower bound on the expression cost
-    cost_lower_bound: float | None = None
+    # per-record token estimate propagated to downstream operators
+    avg_tokens_per_record: float = 0.0
 
-    # upper bound on the expression cost
-    cost_upper_bound: float | None = None
+    @property
+    def quality(self) -> float:
+        """Ratio of scanned input tokens to total input tokens.
 
-    # lower bound on the expression time
-    time_lower_bound: float | None = None
+        Requires:
+            None.
 
-    # upper bound on the expression time
-    time_upper_bound: float | None = None
+        Returns:
+            ``total_scanned_input_tokens / total_input_tokens`` when
+            ``total_input_tokens > 0``, otherwise ``1.0``.
 
-    # lower bound on the expression quality
-    quality_lower_bound: float | None = None
-
-    # upper bound on the expression quality
-    quality_upper_bound: float | None = None
+        Raises:
+            None.
+        """
+        if self.total_input_tokens == 0:
+            return 1.0
+        return self.total_scanned_input_tokens / self.total_input_tokens
 
     def __hash__(self):
         return hash(f"{self.cost}-{self.time}-{self.quality}")
@@ -920,97 +532,93 @@ class PlanCost(BaseModel):
             and self.quality == other.quality
         )
 
-    def model_post_init(self, __context: Any) -> None:
-        if self.time_lower_bound is None and self.time_upper_bound is None:
-            self.time_lower_bound = self.time
-            self.time_upper_bound = self.time
+    def join_add(self, left_plan_cost: PlanCost, right_plan_cost: PlanCost) -> PlanCost:
+        """Combine this operator's cost with two joined input plan costs.
 
-        if self.cost_lower_bound is None and self.cost_upper_bound is None:
-            self.cost_lower_bound = self.cost
-            self.cost_upper_bound = self.cost
+        Sums ``cost``, ``time``, ``total_input_tokens``, and ``total_scanned_input_tokens``
+        across all three ``PlanCost`` objects (operator + left + right).
 
-        if self.quality_lower_bound is None and self.quality_upper_bound is None:
-            self.quality_lower_bound = self.quality
-            self.quality_upper_bound = self.quality
+        Per-operator fields (``output_cardinality``, ``cost_per_record``,
+        ``time_per_record``) are taken from *self* (the operator cost).
 
-    def join_add(self, left_plan_cost: PlanCost, right_plan_cost: PlanCost, execution_strategy: str = "parallel") -> PlanCost:
+        Requires:
+            - *left_plan_cost* and *right_plan_cost* are valid ``PlanCost`` objects.
+
+        Returns:
+            A new ``PlanCost`` combining all three.
+
+        Raises:
+            None.
         """
-        Add the PlanCost objects for two joined plans (left_plan_cost and right_plan_cost)
-        to the PlanCost object for the join operator. The execution strategy determines how
-        the input times are combined. If the execution strategy is "parallel", the input time
-        is the maximum of the two times. If the execution strategy is "sequential" (which is
-        currently anything else), the input time is the sum of the two times.
-
-        For quality, we compute the produce of the operator quality with the average of the
-        two input qualities.
-
-        NOTE: we currently assume the updating of the op_estimates are handled by the caller
-        as there is not a universally correct meaning of addition of op_estimates.
-        """
-        dct = {}
-        for model_field in ["cost", "cost_lower_bound", "cost_upper_bound"]:
-            op_field_value = getattr(self, model_field)
-            left_plan_field_value = getattr(left_plan_cost, model_field)
-            right_plan_field_value = getattr(right_plan_cost, model_field)
-            if op_field_value is not None and left_plan_field_value is not None and right_plan_field_value is not None:
-                dct[model_field] = op_field_value + left_plan_field_value + right_plan_field_value
-
-        for model_field in ["time", "time_lower_bound", "time_upper_bound"]:
-            op_field_value = getattr(self, model_field)
-            left_plan_field_value = getattr(left_plan_cost, model_field)
-            right_plan_field_value = getattr(right_plan_cost, model_field)
-            if op_field_value is not None and left_plan_field_value is not None and right_plan_field_value is not None:
-                if execution_strategy == "parallel":
-                    dct[model_field] = op_field_value + max(left_plan_field_value, right_plan_field_value)
-                else:
-                    dct[model_field] = op_field_value + left_plan_field_value + right_plan_field_value
-
-        for model_field in ["quality", "quality_lower_bound", "quality_upper_bound"]:
-            op_field_value = getattr(self, model_field)
-            left_plan_field_value = getattr(left_plan_cost, model_field)
-            right_plan_field_value = getattr(right_plan_cost, model_field)
-            if op_field_value is not None and left_plan_field_value is not None and right_plan_field_value is not None:
-                dct[model_field] = op_field_value * ((left_plan_field_value + right_plan_field_value) / 2.0)
-
-        return PlanCost(**dct)
+        return PlanCost(
+            cost=self.cost + left_plan_cost.cost + right_plan_cost.cost,
+            time=self.time + left_plan_cost.time + right_plan_cost.time,
+            total_input_tokens=(
+                self.total_input_tokens + left_plan_cost.total_input_tokens + right_plan_cost.total_input_tokens
+            ),
+            total_scanned_input_tokens=(
+                self.total_scanned_input_tokens
+                + left_plan_cost.total_scanned_input_tokens
+                + right_plan_cost.total_scanned_input_tokens
+            ),
+            cost_per_record=self.cost_per_record,
+            time_per_record=self.time_per_record,
+            input_cardinality=self.input_cardinality,
+            output_cardinality=self.output_cardinality,
+            selectivity=self.selectivity,
+            avg_tokens_per_record=self.avg_tokens_per_record, # NOTE: should this be left + right?
+        )
 
     def __iadd__(self, other: PlanCost) -> PlanCost:
-        """
-        NOTE: we currently assume the updating of the op_estimates are handled by the caller
-        as there is not a universally correct meaning of addition of op_estimates.
+        """In-place addition of another ``PlanCost`` (non-join).
+
+        Sums the cumulative fields.  Per-operator fields are left
+        unchanged (caller should set them explicitly if needed).
+
+        Requires:
+            - *other* is a valid ``PlanCost``.
+
+        Returns:
+            *self*, mutated in place.
+
+        Raises:
+            None.
         """
         self.cost += other.cost
         self.time += other.time
-        self.quality *= other.quality
-        for model_field in ["cost_lower_bound", "cost_upper_bound", "time_lower_bound", "time_upper_bound"]:
-            if getattr(self, model_field) is not None and getattr(other, model_field) is not None:
-                summation = getattr(self, model_field) + getattr(other, model_field)
-                setattr(self, model_field, summation)
-
-        for model_field in ["quality_lower_bound", "quality_upper_bound"]:
-            if getattr(self, model_field) is not None and getattr(other, model_field) is not None:
-                product = getattr(self, model_field) * getattr(other, model_field)
-                setattr(self, model_field, product)
+        self.total_input_tokens += other.total_input_tokens
+        self.total_scanned_input_tokens += other.total_scanned_input_tokens
 
         return self
 
     def __add__(self, other: PlanCost) -> PlanCost:
-        """
-        NOTE: we currently assume the updating of the op_estimates are handled by the caller
-        as there is not a universally correct meaning of addition of op_estimates.
-        """
-        dct = {
-            field: getattr(self, field) + getattr(other, field)
-            for field in [
-                "cost",
-                "cost_lower_bound",
-                "cost_upper_bound",
-                "time",
-                "time_lower_bound",
-                "time_upper_bound",
-            ]
-        }
-        for model_field in ["quality", "quality_lower_bound", "quality_upper_bound"]:
-            dct[model_field] = getattr(self, model_field) * getattr(other, model_field)
+        """Add two ``PlanCost`` objects (non-join).
 
-        return PlanCost(**dct)
+        Sums the cumulative fields.  Per-operator fields are taken from
+        *self*.
+
+        Requires:
+            - *other* is a valid ``PlanCost``.
+
+        Returns:
+            A new ``PlanCost`` with summed cumulative fields.
+
+        Raises:
+            None.
+        """
+        return PlanCost(
+            cost=self.cost + other.cost,
+            time=self.time + other.time,
+            total_input_tokens=self.total_input_tokens + other.total_input_tokens,
+            total_scanned_input_tokens=self.total_scanned_input_tokens + other.total_scanned_input_tokens,
+            cost_per_record=self.cost_per_record,
+            time_per_record=self.time_per_record,
+            input_cardinality=self.input_cardinality,
+            output_cardinality=self.output_cardinality,
+            selectivity=self.selectivity,
+            avg_tokens_per_record=self.avg_tokens_per_record,
+        )
+
+
+# Backward-compatibility alias — deprecated.
+OperatorCostEstimates = PlanCost

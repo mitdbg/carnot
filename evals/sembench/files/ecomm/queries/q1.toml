@@ -1,0 +1,38 @@
+[metadata]
+query_id = 1
+modalities = ["text"]
+required_operators = ["SEMANTIC_FILTER"]
+description = """
+Basic semantic filter on textual data.
+
+Simple query with a single selective semantic filter that is relatively easy to evaluate.
+Used to test isolated performance of semantic filters on textual data.
+
+Note: parts of the predicate should be intantiated to prevent over-optimization.
+"""
+
+
+[definition]
+# For systems that accept free-text queries
+natural_language = """
+Based on the textual description and the title of the product,
+find the product ids of products that are backpacks from Reebok.
+"""
+# Equivalent to the natural language query
+sql = """
+SELECT id
+FROM styles_details
+WHERE SEM_FILTER('The product is a backpack from Reebok', productDescriptors:description);
+"""
+
+# Traditional SQL query to compute the exact result on the non-omitted data.
+ground_truth = """
+select id
+from read_parquet('styles_details.parquet')
+where true
+  and articleType.typeName = 'Backpacks'
+  and brandName = 'Reebok';
+"""
+
+# Which accuracy metric to use for evaluation
+accuracy_metric = "f1-score"

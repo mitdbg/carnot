@@ -1,9 +1,11 @@
+import pytest
+
 from carnot.data.dataset import Dataset
 from carnot.operators.sem_map import SemMapOperator
 
-TEST_MODEL_ID = "openai/gpt-5-mini"
 
-def test_sem_map_operator_basic():
+@pytest.mark.llm
+def test_sem_map_operator_basic(test_model_id, llm_config):
     # construct dataset of various animals
     animal_data = [
         {"animal": animal}
@@ -21,13 +23,13 @@ def test_sem_map_operator_basic():
     input_datasets = {animal_dataset.name: animal_dataset}
 
     # execute the operator
-    sem_map_operator = SemMapOperator(task, output_fields, TEST_MODEL_ID, max_workers=4)
-    output_datasets = sem_map_operator("Animal Dataset", input_datasets)
+    sem_map_operator = SemMapOperator(task, output_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
+    output_datasets, _stats = sem_map_operator("Animal Dataset", input_datasets)
 
     # assert the output is as expected
     assert len(output_datasets) == 2
-    assert "SemMapOperatorOutput" in output_datasets
-    output_dataset = output_datasets["SemMapOperatorOutput"]
+    assert "output-dataset-id" in output_datasets
+    output_dataset = output_datasets["output-dataset-id"]
     assert len(output_dataset.items) == 5
     assert {"animal": "giraffe", "animal_group": "mammal"} in output_dataset.items
     assert {"animal": "anaconda", "animal_group": "reptile"} in output_dataset.items
@@ -36,7 +38,8 @@ def test_sem_map_operator_basic():
     assert {"animal": "tucan", "animal_group": "bird"} in output_dataset.items
 
 
-def test_sem_map_operator_movie_reviews(movie_reviews_data):
+@pytest.mark.llm
+def test_sem_map_operator_movie_reviews(test_model_id, llm_config, movie_reviews_data):
     # load movie reviews data
     _, reviews_df = movie_reviews_data
 
@@ -56,12 +59,12 @@ def test_sem_map_operator_movie_reviews(movie_reviews_data):
     input_datasets = {"Reviews Dataset": reviews_dataset}
 
     # generate output
-    sem_map_operator = SemMapOperator(task, output_fields, TEST_MODEL_ID, max_workers=4)
-    output_datasets = sem_map_operator("Reviews Dataset", input_datasets)
+    sem_map_operator = SemMapOperator(task, output_fields, "output-dataset-id", test_model_id, llm_config, max_workers=4)
+    output_datasets, _stats = sem_map_operator("Reviews Dataset", input_datasets)
 
     assert len(output_datasets) == 2
-    assert "SemMapOperatorOutput" in output_datasets
-    output_dataset = output_datasets["SemMapOperatorOutput"]
+    assert "output-dataset-id" in output_datasets
+    output_dataset = output_datasets["output-dataset-id"]
     assert len(output_dataset.items) == 15
     total_correct, total = 0, 0
     for review in filtered_reviews_df.to_dict(orient="records"):

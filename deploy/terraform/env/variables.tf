@@ -47,7 +47,7 @@ variable "availability_zone" {
 variable "ebs_volume_size" {
   description = "The size of the EBS volume in GB."
   type        = number
-  default     = 10
+  default     = 50
 }
 
 variable "public_subnet_ids" {

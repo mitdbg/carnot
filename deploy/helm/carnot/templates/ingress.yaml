@@ -1,0 +1,47 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: carnot
+  namespace: {{ .Values.env }}
+  labels:
+    app.kubernetes.io/name: carnot
+    app.kubernetes.io/instance: {{ .Values.env }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    helm.sh/chart: carnot-{{ .Chart.Version }}
+  annotations:
+    # internet-facing: ALB is publicly accessible (behind Route53)
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    # IngressGroup: all environments share one ALB, routing by hostname
+    alb.ingress.kubernetes.io/group.name: carnot
+    # ip mode: routes directly to pod IPs (required for Fargate and preferred for EKS)
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/certificate-arn: {{ .Values.acmCertificateArn }}
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443},{"HTTP":80}]'
+    # Redirect all HTTP traffic to HTTPS
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    # 300s idle timeout to support long-running LLM queries streamed via SSE
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300
+spec:
+  ingressClassName: alb
+  rules:
+    {{- if .Values.hostname }}
+    - host: {{ .Values.hostname }}
+      http:
+        paths:
+          # Backend: FastAPI — all /api/* traffic routes to the backend
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: carnot-backend
+                port:
+                  number: 8000
+          # Frontend: serve the React SPA via NGINX for everything else
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: carnot-frontend
+                port:
+                  number: 80
+    {{- end }}

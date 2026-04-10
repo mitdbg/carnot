@@ -8,7 +8,7 @@ function Layout({ children }) {
 
   const tabs = [
     { name: 'Data Management', path: '/', icon: Database },
-    { name: 'User Chat', path: '/chat', icon: MessageSquare },
+    { name: 'Workspace', path: '/chat', icon: MessageSquare },
     { name: 'Settings', path: '/settings', icon: Settings },
   ]
 
@@ -67,7 +67,7 @@ function Layout({ children }) {
 
       {/* Main Content: flex-1 takes up all remaining vertical space.
           Removed py-8 and max-w-7xl so children can be flush. */}
-      <main className="flex-1 min-h-0 relative">
+      <main className="flex-1 min-h-0 relative overflow-y-auto">
         {children}
       </main>
     </div>

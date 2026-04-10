@@ -1,0 +1,57 @@
+[metadata]
+query_id = 5
+modalities = ["text"]
+required_operators = ["SEMANTIC_CLASSIFICATION"]
+description = """
+Basic semantic classification on text data.
+
+Simple query with a single semantic classification that is relatively easy to evaluate.
+Used to test isolated performance of semantic classification on text data.
+
+Pre-filter for `masterCategory.typeName = 'Apparel' AND subCategory.typeName
+ NOT IN ('Saree', 'Apparel Set', 'Loungewear and Nightwear')` to avoid overly
+complicated categories.
+"""
+
+[definition]
+# For systems that accept free-text queries
+natural_language = """
+Based solely on the title and description of the product, classify each product into one of the following categories:
+
+Dress: A dress is a one-piece outer garment that is worn on the torso, hangs down over the legs, and often consist of a bodice attached to a skirt.
+Bottomwear: Bottomwear refers to clothing worn on the lower part of the body, such as trousers, jeans, skirts, shorts, and leggings.
+Socks: Socks are a type of clothing worn on the feet, typically made of soft fabric, designed to provide comfort and warmth.
+Topwear: Topwear refers to clothing worn on the upper part of the body, such as shirts, blouses, t-shirts, and jackets.
+Innerwear: Innerwear refers to clothing worn beneath outer garments, typically close to the skin, such as underwear, bras, and undershirts.
+
+Each product can only have one category.
+Return the id of the product as well as its category.
+"""
+# Equivalent to the natural language query
+sql = """
+SELECT
+  id,
+  SEM_CLASSIFY('You are given an image a product. Your task is to classify the product into the following categories. Each product can only belong to a single category.',
+    productDescriptors:description, productDisplayName,
+    [
+        {'Dress', 'A dress is a one-piece outer garment that is worn on the torso, hangs down over the legs, and often consist of a bodice attached to a skirt.'},
+        {'Bottomwear', 'Bottomwear refers to clothing worn on the lower part of the body, such as trousers, jeans, skirts, shorts, and leggings.'},
+        {'Socks', 'Socks are a type of clothing worn on the feet, typically made of soft fabric, designed to provide comfort and warmth.'},
+        {'Topwear', 'Topwear refers to clothing worn on the upper part of the body, such as shirts, blouses, t-shirts, and jackets.'},
+        {'Innerwear', 'Innerwear refers to clothing worn beneath outer garments, typically close to the skin, such as underwear, bras, and undershirts.'}
+    ]
+  ) AS category
+FROM images
+"""
+
+# Traditional SQL query to compute the exact result on the non-omitted data.
+ground_truth = """
+SELECT id, subCategory.typeName AS category
+FROM read_parquet('styles_details.parquet')
+WHERE true
+  AND masterCategory.typeName = 'Apparel'
+  AND subCategory.typeName NOT IN ('Saree', 'Apparel Set', 'Loungewear and Nightwear')
+"""
+
+# Which accuracy metric to use for evaluation
+accuracy_metric = "adjusted-rand-index"

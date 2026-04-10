@@ -14,6 +14,7 @@
 import json
 import logging
 import re
+import time
 import uuid
 import warnings
 from collections.abc import Generator
@@ -21,6 +22,8 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Any
+
+from carnot.core.models import LLMCallStats
 
 from .monitoring import TokenUsage
 from .tools import Tool
@@ -101,12 +104,19 @@ class ChatMessage:
     tool_calls: list[ChatMessageToolCall] | None = None
     raw: Any | None = None  # Stores the raw output from the API
     token_usage: TokenUsage | None = None
+    llm_call_stats: LLMCallStats | None = None
 
     def model_dump_json(self):
         return json.dumps(get_dict_from_nested_dataclasses(self, ignore_key="raw"))
 
     @classmethod
-    def from_dict(cls, data: dict, raw: Any | None = None, token_usage: TokenUsage | None = None) -> "ChatMessage":
+    def from_dict(
+        cls,
+        data: dict,
+        raw: Any | None = None,
+        token_usage: TokenUsage | None = None,
+        llm_call_stats: LLMCallStats | None = None,
+    ) -> "ChatMessage":
         if data.get("tool_calls"):
             tool_calls = [
                 ChatMessageToolCall(
@@ -121,6 +131,7 @@ class ChatMessage:
             tool_calls=data.get("tool_calls"),
             raw=raw,
             token_usage=token_usage,
+            llm_call_stats=llm_call_stats,
         )
 
     def dict(self):
@@ -163,6 +174,7 @@ class ChatMessageStreamDelta:
     content: str | None = None
     tool_calls: list[ChatMessageToolCallStreamDelta] | None = None
     token_usage: TokenUsage | None = None
+    llm_call_stats: LLMCallStats | None = None
 
 
 def agglomerate_stream_deltas(
@@ -175,10 +187,13 @@ def agglomerate_stream_deltas(
     accumulated_content = ""
     total_input_tokens = 0
     total_output_tokens = 0
+    accumulated_llm_call_stats: LLMCallStats | None = None
     for stream_delta in stream_deltas:
         if stream_delta.token_usage:
             total_input_tokens += stream_delta.token_usage.input_tokens
             total_output_tokens += stream_delta.token_usage.output_tokens
+        if stream_delta.llm_call_stats is not None:
+            accumulated_llm_call_stats = stream_delta.llm_call_stats
         if stream_delta.content:
             accumulated_content += stream_delta.content
         if stream_delta.tool_calls:
@@ -224,6 +239,7 @@ def agglomerate_stream_deltas(
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
         ),
+        llm_call_stats=accumulated_llm_call_stats,
     )
 
 
@@ -264,7 +280,7 @@ def remove_stop_sequences(content: str, stop_sequences: list[str]) -> str:
 
 def get_clean_message_list(
     message_list: list[ChatMessage | dict],
-    role_conversions: dict[MessageRole, MessageRole] | dict[str, str] = {},
+    role_conversions: dict[MessageRole, MessageRole] | dict[str, str] | None = None,
     convert_images_to_image_urls: bool = False,
     flatten_messages_as_text: bool = False,
 ) -> list[dict[str, Any]]:
@@ -278,6 +294,7 @@ def get_clean_message_list(
         convert_images_to_image_urls (`bool`, default `False`): Whether to convert images to image URLs.
         flatten_messages_as_text (`bool`, default `False`): Whether to flatten messages as text.
     """
+    role_conversions = role_conversions or {}
     output_message_list: list[dict[str, Any]] = []
     message_list = deepcopy(message_list)  # Avoid modifying the original list
     for message in message_list:
@@ -317,10 +334,7 @@ def get_clean_message_list(
                     else:
                         output_message_list[-1]["content"].append(el)
         else:
-            if flatten_messages_as_text:
-                content = message.content[0]["text"]
-            else:
-                content = message.content
+            content = message.content[0]["text"] if flatten_messages_as_text else message.content
             output_message_list.append(
                 {
                     "role": message.role,
@@ -415,7 +429,7 @@ class Model:
         }
 
         # Handle specific parameters
-        if stop_sequences is not None:
+        if stop_sequences is not None:  # noqa: SIM102
             # Some models do not support stop parameter
             if supports_stop_parameter(self.model_id or ""):
                 completion_kwargs["stop"] = stop_sequences
@@ -696,7 +710,7 @@ class LiteLLMModel(ApiModel):
                 "The 'model_id' parameter will be required in version 2.0.0. "
                 "Please update your code to pass this parameter to avoid future errors. "
                 "For now, it defaults to 'anthropic/claude-3-5-sonnet-20240620'.",
-                FutureWarning,
+                FutureWarning, stacklevel=2,
             )
             model_id = "anthropic/claude-3-5-sonnet-20240620"
         self.api_base = api_base
@@ -724,6 +738,53 @@ class LiteLLMModel(ApiModel):
 
         return litellm
 
+    def embed(
+        self,
+        texts: list[str],
+        model: str | None = None,
+    ) -> tuple[list[list[float]], LLMCallStats]:
+        """Generate embeddings for a list of texts via ``litellm.embedding``.
+
+        Thin wrapper around the underlying ``litellm.embedding`` call so
+        that all LLM-provider traffic flows through ``LiteLLMModel``.
+        This is the single chokepoint for embedding calls, with cost and
+        latency instrumentation.
+
+        Requires:
+            - *texts* is a non-empty list of strings.
+
+        Returns:
+            A tuple of (embeddings, ``LLMCallStats``) where embeddings is
+            a list of float vectors in the same order as *texts*, and the
+            stats object captures token usage, cost, and duration.
+
+        Raises:
+            Whatever ``litellm.embedding`` raises on failure (network
+            errors, auth errors, etc.).
+        """
+        embed_model = model or self.model_id
+
+        start = time.perf_counter()
+        response = self.client.embedding(
+            model=embed_model,
+            input=texts,
+            api_key=self.api_key,
+        )
+        duration = time.perf_counter() - start
+
+        cost = getattr(response, "_hidden_params", {}).get("response_cost", 0.0) or 0.0
+        total_tokens = getattr(response.usage, "total_tokens", 0) or 0
+
+        embeddings = [item["embedding"] for item in response.data]
+        stats = LLMCallStats(
+            model_id=embed_model or "",
+            call_type="embedding",
+            embedding_input_tokens=total_tokens,
+            cost_usd=cost,
+            duration_secs=duration,
+        )
+        return embeddings, stats
+
     def generate(
         self,
         messages: list[ChatMessage | dict],
@@ -745,14 +806,48 @@ class LiteLLMModel(ApiModel):
             **kwargs,
         )
         self._apply_rate_limit()
+
+        start = time.perf_counter()
         response = self.client.completion(**completion_kwargs)
+        duration = time.perf_counter() - start
+
+        usage = response.usage
+        cost = getattr(response, "_hidden_params", {}).get("response_cost", 0.0) or 0.0
+
+        # Extract multimodal token details when available.
+        prompt_details = getattr(usage, "prompt_tokens_details", None) or {}
+        completion_details = getattr(usage, "completion_tokens_details", None) or {}
+
+        input_audio = getattr(prompt_details, "audio_tokens", 0) or 0
+        output_audio = getattr(completion_details, "audio_tokens", 0) or 0
+        input_image = getattr(prompt_details, "image_tokens", 0) or 0
+
+        # Text tokens = total minus audio minus image (the remainder).
+        input_text = usage.prompt_tokens - input_audio - input_image
+        output_text = usage.completion_tokens - output_audio
+
+        llm_call_stats = LLMCallStats(
+            model_id=self.model_id or "",
+            call_type="completion",
+            input_text_tokens=input_text,
+            output_text_tokens=output_text,
+            input_audio_tokens=input_audio,
+            output_audio_tokens=output_audio,
+            input_image_tokens=input_image,
+            cost_usd=cost,
+            duration_secs=duration,
+            cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+            cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        )
+
         return ChatMessage.from_dict(
             response.choices[0].message.model_dump(include={"role", "content", "tool_calls"}),
             raw=response,
             token_usage=TokenUsage(
-                input_tokens=response.usage.prompt_tokens,
-                output_tokens=response.usage.completion_tokens,
+                input_tokens=usage.prompt_tokens,
+                output_tokens=usage.completion_tokens,
             ),
+            llm_call_stats=llm_call_stats,
         )
 
     def generate_stream(
@@ -776,14 +871,44 @@ class LiteLLMModel(ApiModel):
             **kwargs,
         )
         self._apply_rate_limit()
+        start = time.perf_counter()
         for event in self.client.completion(**completion_kwargs, stream=True, stream_options={"include_usage": True}):
             if getattr(event, "usage", None):
+                duration = time.perf_counter() - start
+                usage = event.usage
+                cost = getattr(event, "_hidden_params", {}).get("response_cost", 0.0) or 0.0
+
+                prompt_details = getattr(usage, "prompt_tokens_details", None) or {}
+                completion_details = getattr(usage, "completion_tokens_details", None) or {}
+
+                input_audio = getattr(prompt_details, "audio_tokens", 0) or 0
+                output_audio = getattr(completion_details, "audio_tokens", 0) or 0
+                input_image = getattr(prompt_details, "image_tokens", 0) or 0
+
+                input_text = usage.prompt_tokens - input_audio - input_image
+                output_text = usage.completion_tokens - output_audio
+
+                llm_call_stats = LLMCallStats(
+                    model_id=self.model_id or "",
+                    call_type="completion",
+                    input_text_tokens=input_text,
+                    output_text_tokens=output_text,
+                    input_audio_tokens=input_audio,
+                    output_audio_tokens=output_audio,
+                    input_image_tokens=input_image,
+                    cost_usd=cost,
+                    duration_secs=duration,
+                    cache_read_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+                    cache_creation_tokens=getattr(usage, "cache_creation_input_tokens", 0) or 0,
+                )
+
                 yield ChatMessageStreamDelta(
                     content="",
                     token_usage=TokenUsage(
-                        input_tokens=event.usage.prompt_tokens,
-                        output_tokens=event.usage.completion_tokens,
+                        input_tokens=usage.prompt_tokens,
+                        output_tokens=usage.completion_tokens,
                     ),
+                    llm_call_stats=llm_call_stats,
                 )
             if event.choices:
                 choice = event.choices[0]
@@ -808,6 +933,7 @@ class LiteLLMModel(ApiModel):
 
 
 __all__ = [
+    "LLMCallStats",
     "MessageRole",
     "tool_role_conversions",
     "get_clean_message_list",

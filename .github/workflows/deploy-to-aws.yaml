@@ -1,13 +1,9 @@
-name: Deploy to AWS
+name: Deploy to AWS (DEPRECATED — replaced by deploy-k8s.yaml)
 
+# Disabled: all branches now deploy via the EKS/Helm pipeline.
+# Kept for reference during migration. Safe to delete once migration is complete.
 on:
-  push:
-    branches:
-    - main
-    - at-prod
-    - lm-prod
-    - wl-prod
-    - dev
+  workflow_dispatch:  # manual-only trigger
 
 permissions:
   id-token: write
@@ -190,6 +186,49 @@ jobs:
         run: |
           ec2_public_ip=$(terraform output -raw ec2_public_ip)
           echo "EC2_PUBLIC_IP=$ec2_public_ip" >> $GITHUB_ENV
+
+      - name: Wait for user_data bootstrap to complete on EC2
+        run: |
+          echo "Waiting for user_data bootstrap to complete on $EC2_PUBLIC_IP..."
+          for i in $(seq 1 20); do
+            # Check if user-data finished successfully (last line written by our script)
+            STATUS=$(ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i deployer_key.pem ubuntu@$EC2_PUBLIC_IP \
+              "tail -1 /var/log/user-data.log 2>/dev/null || true")
+            if [[ "$STATUS" == "user-data: done" ]]; then
+              echo "Bootstrap complete after ~$((i * 15)) seconds."
+              exit 0
+            fi
+            echo "Attempt $i/20: bootstrap not done yet (last line: '${STATUS:-<no output yet>}'), waiting 15s..."
+            sleep 15
+          done
+          echo "ERROR: user_data did not complete within 5 minutes. Last log output:" >&2
+          ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 -i deployer_key.pem ubuntu@$EC2_PUBLIC_IP \
+            "tail -20 /var/log/user-data.log 2>/dev/null || echo '<no log found>'" >&2
+          exit 1
+
+      ######################################################################
+      # STEP 2.5 — SEED ORG-LEVEL DEFAULT API KEYS (if applicable)
+      ######################################################################
+
+      - name: Seed org-level default API keys
+        if: env.ENV_NAME == 'lm-prod' || env.ENV_NAME == 'at-prod'
+        run: |
+          SECRET_ID="carnot/${ENV_NAME}/__org_defaults__"
+
+          if [[ "${ENV_NAME}" == "lm-prod" ]]; then
+            SECRET_JSON=$(jq -n --arg key "${{ secrets.LM_PROD_OPENAI_API_KEY }}" '{"openai_api_key": $key}')
+          elif [[ "${ENV_NAME}" == "at-prod" ]]; then
+            SECRET_JSON=$(jq -n --arg key "${{ secrets.AT_PROD_GEMINI_API_KEY }}" '{"gemini_api_key": $key}')
+          fi
+
+          aws secretsmanager create-secret \
+            --name "$SECRET_ID" \
+            --secret-string "$SECRET_JSON" \
+            --region us-east-1 2>/dev/null \
+          || aws secretsmanager put-secret-value \
+            --secret-id "$SECRET_ID" \
+            --secret-string "$SECRET_JSON" \
+            --region us-east-1
 
       ######################################################################
       # STEP 3 — BUILD & DEPLOY APPLICATION

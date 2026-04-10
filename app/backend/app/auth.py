@@ -2,7 +2,7 @@ import os
 
 import requests
 from fastapi import Header, HTTPException
-from jose import jwt
+from jose import jwt  # type: ignore
 
 AUTH0_ISSUER = f"https://{os.getenv('AUTH0_DOMAIN')}/"
 AUTH0_AUDIENCE = os.getenv("AUTH0_AUDIENCE", "")
