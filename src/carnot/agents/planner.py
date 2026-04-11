@@ -93,7 +93,7 @@ class Planner(BaseAgent):
             resources.files("carnot.agents.prompts").joinpath("planner_agent.yaml").read_text()
         )
 
-        self.plan_tags = ["<begin_plan>", "<end_plan>"]
+        self.plan_tags = ["<plan>", "</plan>"]
         self.code_block_tags = ["```python", "\n```"]
         self.additional_authorized_imports = ["carnot"]
         self.authorized_imports = sorted(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
