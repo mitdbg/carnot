@@ -134,7 +134,7 @@ class OptimizeLogicalExpression(Task):
         rules = list(filter(lambda rule: rule.get_rule_id() not in self.logical_expression.rules_applied, rules))
 
         # filter for rules that match on this logical expression
-        rules = list(filter(lambda rule: rule.matches_pattern(self.logical_expression), rules))
+        rules = list(filter(lambda rule: rule.matches_pattern(self.logical_expression, **context), rules))
 
         # TODO compute priority (i.e. "promise") of the rules and sort in order of priority
 

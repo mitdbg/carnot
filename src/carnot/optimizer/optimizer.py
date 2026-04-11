@@ -310,7 +310,9 @@ class Optimizer:
             if isinstance(task, (OptimizeGroup, ExploreGroup)):
                 new_tasks = task.perform(self.groups)
             elif isinstance(task, OptimizeLogicalExpression):
-                new_tasks = task.perform(self.transformation_rules, self.implementation_rules)
+                new_tasks = task.perform(
+                    self.transformation_rules, self.implementation_rules, context=self.get_physical_op_params()
+                )
             elif isinstance(task, ApplyRule):
                 new_tasks, self.next_group_id = task.perform(
                     self.groups, self.expressions, self.next_group_id, **self.get_physical_op_params()
