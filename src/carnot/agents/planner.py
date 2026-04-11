@@ -94,8 +94,6 @@ class Planner(BaseAgent):
         )
 
         self.plan_tags = ["<begin_plan>", "<end_plan>"]
-        # Use code block tags where closing tag is NOT contained in opening tag
-        # This allows us to use the closing tag as a stop sequence
         self.code_block_tags = ["```python", "\n```"]
         self.additional_authorized_imports = ["carnot"]
         self.authorized_imports = sorted(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
@@ -328,11 +326,14 @@ class Planner(BaseAgent):
         memory_messages = self.write_memory_to_messages()
         memory_step.model_input_messages = memory_messages.copy()
 
-        # Build stop sequences - include the code block closing tag
-        # since it's not contained in the opening tag
+        # Stop sequences prevent the model from simulating the full
+        # conversation loop (generating fake Observations or tool calls).
+        # NOTE: we intentionally do NOT include the code-block closing tag
+        # ("\n```") here because it is a prefix of the opening sequence
+        # "\n```python" — the stop would fire before the model can emit
+        # "python", killing every code block.  Instead we rely on
+        # _truncate_after_first_code_block() to trim extra output.
         default_stop_sequences = ["Observation:", "Calling tools:"]
-        if self.code_block_tags[1] not in self.code_block_tags[0]:
-            default_stop_sequences.append(self.code_block_tags[1])
 
         try:
             chat_message = self.model.generate(
@@ -345,11 +346,12 @@ class Planner(BaseAgent):
             # Truncate after first code block for models that don't support stop sequences
             output_text = self._truncate_after_first_code_block(output_text)
 
-            # Append the closing tag if it was used as a stop sequence
-            # This helps subsequent LLM calls learn to close code blocks properly
+            # If the model produced an incomplete code block (opened but
+            # never closed), append the closing tag so downstream parsing
+            # can still extract the code.
             if (
                 output_text
-                and self.code_block_tags[1] not in self.code_block_tags[0]
+                and self.code_block_tags[0] in output_text
                 and not output_text.strip().endswith(self.code_block_tags[1].strip())
             ):
                 output_text += self.code_block_tags[1]
