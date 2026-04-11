@@ -58,22 +58,30 @@ class TestFilterToTopKFilterMatchesPattern:
     """Tests for ``FilterToTopKFilter.matches_pattern``."""
 
     def test_matches_filter(self):
-        """Should match on Filter expressions."""
+        """Should match on Filter expressions when OpenAI key is present."""
         filter_op = Filter(name="f", filter="keep mammals")
         expr = LogicalExpression(filter_op, input_group_ids=[0], group_id=1)
-        assert FilterToTopKFilter.matches_pattern(expr)
+        assert FilterToTopKFilter.matches_pattern(expr, llm_config={"OPENAI_API_KEY": "sk-test"})
 
     def test_does_not_match_map(self):
         """Should not match on non-Filter expressions."""
         map_op = Map(name="m", fields=[{"name": "x", "type": "str", "description": "test"}])
         expr = LogicalExpression(map_op, input_group_ids=[0], group_id=1)
-        assert not FilterToTopKFilter.matches_pattern(expr)
+        assert not FilterToTopKFilter.matches_pattern(expr, llm_config={"OPENAI_API_KEY": "sk-test"})
 
     def test_does_not_match_topk(self):
         """Should not match on TopK expressions."""
         topk_op = TopK(name="t", task="find best", k=5)
         expr = LogicalExpression(topk_op, input_group_ids=[0], group_id=1)
+        assert not FilterToTopKFilter.matches_pattern(expr, llm_config={"OPENAI_API_KEY": "sk-test"})
+
+    def test_does_not_match_filter_without_openai_key(self):
+        """Should not match a Filter when no OpenAI key is provided."""
+        filter_op = Filter(name="f", filter="keep mammals")
+        expr = LogicalExpression(filter_op, input_group_ids=[0], group_id=1)
         assert not FilterToTopKFilter.matches_pattern(expr)
+        assert not FilterToTopKFilter.matches_pattern(expr, llm_config={})
+        assert not FilterToTopKFilter.matches_pattern(expr, llm_config={"ANTHROPIC_API_KEY": "sk-ant"})
 
 
 class TestFilterToTopKFilterSubstitute:
