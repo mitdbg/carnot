@@ -37,7 +37,7 @@ class Rule:
         return cls.__name__
 
     @classmethod
-    def matches_pattern(cls, logical_expression: LogicalExpression) -> bool:
+    def matches_pattern(cls, logical_expression: LogicalExpression, **kwargs) -> bool:
         raise NotImplementedError("Calling this method from an abstract base class.")
 
     @classmethod
@@ -99,7 +99,7 @@ class PushDownFilter(TransformationRule):
     """
 
     @classmethod
-    def matches_pattern(cls, logical_expression: Expression) -> bool:
+    def matches_pattern(cls, logical_expression: Expression, **kwargs) -> bool:
         return isinstance(logical_expression.operator, Filter)
 
     @classmethod
@@ -218,8 +218,15 @@ class FilterToTopKFilter(TransformationRule):
     k_values: list[int] = [10] # , 20, 50, 100, 1000]
 
     @classmethod
-    def matches_pattern(cls, logical_expression: LogicalExpression) -> bool:
-        return isinstance(logical_expression.operator, Filter)
+    def _has_openai_key(cls, llm_config: dict | None) -> bool:
+        return bool(llm_config and llm_config.get("OPENAI_API_KEY"))
+
+    @classmethod
+    def matches_pattern(cls, logical_expression: LogicalExpression, **kwargs) -> bool:
+        if not isinstance(logical_expression.operator, Filter):
+            return False
+        llm_config = kwargs.get("llm_config")
+        return cls._has_openai_key(llm_config)
 
     @classmethod
     def substitute(
@@ -364,7 +371,7 @@ class CodeRule(ImplementationRule):
     """Substitute a logical ``Code`` expression with a ``CodeOperator`` physical implementation."""
 
     @classmethod
-    def matches_pattern(cls, logical_expression: LogicalExpression) -> bool:
+    def matches_pattern(cls, logical_expression: LogicalExpression, **kwargs) -> bool:
         return isinstance(logical_expression.operator, Code)
 
     @classmethod
@@ -385,7 +392,7 @@ class ReasoningRule(ImplementationRule):
     """Substitute a logical ``Reason`` expression with a ``ReasoningOperator`` physical implementation."""
 
     @classmethod
-    def matches_pattern(cls, logical_expression: LogicalExpression) -> bool:
+    def matches_pattern(cls, logical_expression: LogicalExpression, **kwargs) -> bool:
         return isinstance(logical_expression.operator, Reason)
 
     @classmethod
@@ -423,7 +430,7 @@ class SemMapRule(ImplementationRule):
     """
 
     @classmethod
-    def matches_pattern(cls, logical_expression: LogicalExpression) -> bool:
+    def matches_pattern(cls, logical_expression: LogicalExpression, **kwargs) -> bool:
         return isinstance(logical_expression.operator, Map) # and logical_expression.operator.udf is None
 
     @classmethod
@@ -448,7 +455,7 @@ class SemFlatMapRule(ImplementationRule):
     """
 
     @classmethod
-    def matches_pattern(cls, logical_expression: LogicalExpression) -> bool:
+    def matches_pattern(cls, logical_expression: LogicalExpression, **kwargs) -> bool:
         return isinstance(logical_expression.operator, FlatMap) # and logical_expression.operator.udf is None
 
     @classmethod
@@ -473,8 +480,11 @@ class SemTopKRule(ImplementationRule):
     k_budgets = [1, 3, 5, 10, 15, 20, 25]
 
     @classmethod
-    def matches_pattern(cls, logical_expression: LogicalExpression) -> bool:
-        return isinstance(logical_expression.operator, TopK)
+    def matches_pattern(cls, logical_expression: LogicalExpression, **kwargs) -> bool:
+        if not isinstance(logical_expression.operator, TopK):
+            return False
+        llm_config = kwargs.get("llm_config")
+        return bool(llm_config and llm_config.get("OPENAI_API_KEY"))
 
     @classmethod
     def substitute(cls, logical_expression: LogicalExpression, **runtime_kwargs) -> set[PhysicalExpression]:
@@ -512,7 +522,7 @@ class SemFilterRule(ImplementationRule):
     """Substitute a logical ``Filter`` expression with a ``SemFilterOperator`` physical implementation."""
 
     @classmethod
-    def matches_pattern(cls, logical_expression: LogicalExpression) -> bool:
+    def matches_pattern(cls, logical_expression: LogicalExpression, **kwargs) -> bool:
         return isinstance(logical_expression.operator, Filter)
 
     @classmethod
@@ -550,7 +560,7 @@ class SemJoinRule(ImplementationRule):
     """
 
     @classmethod
-    def matches_pattern(cls, logical_expression: LogicalExpression) -> bool:
+    def matches_pattern(cls, logical_expression: LogicalExpression, **kwargs) -> bool:
         return isinstance(logical_expression.operator, Join)
 
     @classmethod
@@ -610,7 +620,7 @@ class SemAggRule(ImplementationRule):
     """
 
     @classmethod
-    def matches_pattern(cls, logical_expression: LogicalExpression) -> bool:
+    def matches_pattern(cls, logical_expression: LogicalExpression, **kwargs) -> bool:
         return isinstance(logical_expression.operator, Aggregate)
 
     @classmethod
@@ -636,7 +646,7 @@ class SemGroupByRule(ImplementationRule):
     """
 
     @classmethod
-    def matches_pattern(cls, logical_expression: LogicalExpression) -> bool:
+    def matches_pattern(cls, logical_expression: LogicalExpression, **kwargs) -> bool:
         return isinstance(logical_expression.operator, GroupBy)
 
     @classmethod
@@ -712,7 +722,7 @@ class ScanRule(ImplementationRule):
     """
 
     @classmethod
-    def matches_pattern(cls, logical_expression: LogicalExpression) -> bool:
+    def matches_pattern(cls, logical_expression: LogicalExpression, **kwargs) -> bool:
         return isinstance(logical_expression.operator, Scan)
 
     @classmethod
@@ -755,7 +765,7 @@ class BasicSubstitutionRule(ImplementationRule):
     }
 
     @classmethod
-    def matches_pattern(cls, logical_expression: LogicalExpression) -> bool:
+    def matches_pattern(cls, logical_expression: LogicalExpression, **kwargs) -> bool:
         logical_op_class = logical_expression.operator.__class__
         return logical_op_class in cls.LOGICAL_OP_CLASS_TO_PHYSICAL_OP_CLASS_MAP
 
