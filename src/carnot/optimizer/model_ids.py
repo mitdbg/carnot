@@ -51,8 +51,6 @@ _ANTHROPIC_MODELS: list[str] = [
 ]
 
 _GEMINI_MODELS: list[str] = [
-    "gemini/gemini-3-pro",
-    "gemini/gemini-3-flash",
     "gemini/gemini-2.5-flash",
     "gemini-2.5-flash-lite",
 ]
@@ -89,9 +87,7 @@ _MODEL_SIZE: dict[str, ModelSize] = {
     "anthropic/claude-sonnet-4-20250514": ModelSize.MEDIUM,
     "anthropic/claude-haiku-4-5-20250929": ModelSize.SMALL,
     # Gemini
-    "gemini/gemini-3-pro": ModelSize.LARGE,
-    "gemini/gemini-3-flash": ModelSize.MEDIUM,
-    "gemini/gemini-2.5-flash": ModelSize.SMALL,
+    "gemini/gemini-2.5-flash": ModelSize.MEDIUM,
     "gemini-2.5-flash-lite": ModelSize.SMALL,
     # Together AI
     "together_ai/meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8": ModelSize.LARGE,
