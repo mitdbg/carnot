@@ -11,9 +11,9 @@ irsa:
   roleArn: arn:aws:iam::422297141788:role/carnot-lm-prod-sa-role
 
 auth0:
-  domain: ""        # TODO: fill in when AWS access is available
-  audience: ""      # TODO: fill in when AWS access is available
-  claimsNamespace: ""
+  domain: "login.carnot-research.org"
+  audience: "https://carnot.api.com"
+  claimsNamespace: "https://carnot.api.com/claims"
 
 acmCertificateArn: "arn:aws:acm:us-east-1:422297141788:certificate/10be4bdb-461d-4dec-9ddf-501e2f157fab"
 
