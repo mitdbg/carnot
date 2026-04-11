@@ -218,7 +218,7 @@ jobs:
           if [[ "${ENV_NAME}" == "lm-prod" ]]; then
             SECRET_JSON=$(jq -n --arg key "${{ secrets.LM_PROD_OPENAI_API_KEY }}" '{"openai_api_key": $key}')
           elif [[ "${ENV_NAME}" == "at-prod" ]]; then
-            SECRET_JSON=$(jq -n --arg key "${{ secrets.AT_PROD_GEMINI_API_KEY }}" '{"gemini_api_key": $key}')
+            SECRET_JSON=$(jq -n --arg key "${{ secrets.AT_PROD_ANTHROPIC_API_KEY }}" '{"anthropic_api_key": $key}')
           fi
 
           aws secretsmanager create-secret \
