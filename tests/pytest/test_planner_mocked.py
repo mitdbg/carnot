@@ -373,10 +373,10 @@ class TestPlannerMocked:
         )
         # Text that the paraphrase phase LLM returns (inside plan tags)
         paraphrase_text = (
-            "<begin_plan>\n"
+            "<plan>\n"
             "1. Load the Movies dataset.\n"
             "2. Filter to keep only science fiction films.\n"
-            "<end_plan>"
+            "</plan>"
         )
 
         def handler(model, messages, **kw):

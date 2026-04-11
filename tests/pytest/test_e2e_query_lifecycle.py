@@ -40,7 +40,7 @@ def _wrap_planner_code(code: str) -> str:
 
 def _wrap_paraphrase(text: str) -> str:
     """Wrap *text* in the plan-tags the Planner expects for paraphrasing."""
-    return f"<begin_plan>\n{text}\n<end_plan>"
+    return f"<plan>\n{text}\n</plan>"
 
 
 def _make_completion_response(content: str) -> MagicMock:
