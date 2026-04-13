@@ -72,7 +72,7 @@ class Aggregate(LogicalOperator):
                     in a set of product reviews, or summarizing a set of legal contracts. Takes in a `task` string that
                     describes the aggregation(s) to be performed in natural language, as well as a list of the aggregation
                     fields to be computed (provide the "name", "type", and "description", and always set `"func": "sem_agg"`).
-                Syntax: ds.sem_aggregate(agg_fields: list[dict])
+                Syntax: ds.sem_aggregate(task: str, agg_fields: list[dict])
                 Example: ds.sem_aggregate(
                   task="Summarize the legal contracts and identify the most problematic clauses.",
                   agg_fields=[
@@ -256,8 +256,8 @@ class Join(LogicalOperator):
             """
             Join Operator:
                 Description: Semantically joins two input sets based on a provided natural language condition.
-                Syntax: ds.sem_join(other_ds: Dataset, condition: str)
-                Example: ds.sem_join(other_ds=orders_ds, condition="customer_id matches id in the order PDF")
+                Syntax: ds.sem_join(other: Dataset, condition: str)
+                Example: ds.sem_join(other=orders_ds, condition="customer_id matches id in the order PDF")
             """
         )
 
