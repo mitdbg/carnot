@@ -83,9 +83,8 @@ _MODEL_SIZE: dict[str, ModelSize] = {
     "gpt-5-mini-2025-08-07": ModelSize.MEDIUM,
     "gpt-5-nano-2025-08-07": ModelSize.SMALL,
     # Anthropic
-    "anthropic/claude-sonnet-4-5-20250929": ModelSize.LARGE,
-    "anthropic/claude-sonnet-4-20250514": ModelSize.MEDIUM,
-    "anthropic/claude-haiku-4-5-20250929": ModelSize.SMALL,
+    "anthropic/claude-opus-4-6-20260205": ModelSize.LARGE,
+    "anthropic/claude-sonnet-4-5-20250929": ModelSize.MEDIUM,
     # Gemini
     "gemini/gemini-2.5-flash": ModelSize.MEDIUM,
     "gemini-2.5-flash-lite": ModelSize.SMALL,
