@@ -124,6 +124,7 @@ class PlanNode:
         from carnot.operators.sem_join import SemJoinOperator
         from carnot.operators.sem_map import SemMapOperator
         from carnot.operators.sem_topk import SemTopKOperator
+        from carnot.optimizer.model_ids import get_best_available_model_id
 
         if self.node_type == "dataset":
             raise ValueError(
@@ -135,10 +136,14 @@ class PlanNode:
         params = self.params
         out = self.dataset_id
 
+        # Use the model_id the optimizer stored in params; fall back to
+        # the best model available for the provided API keys.
+        model_id = params.get("model_id") or get_best_available_model_id(llm_config)
+
         if op == "Code":
             return CodeOperator(
                 task=params["task"], dataset_id=out,
-                model_id="openai/gpt-5-mini", llm_config=llm_config,
+                model_id=model_id, llm_config=llm_config,
             )
 
         if op == "Limit":
@@ -150,14 +155,14 @@ class PlanNode:
             task = f"Compute the following aggregation fields: {field_names}"
             return SemAggOperator(
                 task=task, agg_fields=agg_fields,
-                dataset_id=out, model_id="openai/gpt-5-mini",
+                dataset_id=out, model_id=model_id,
                 llm_config=llm_config, max_workers=64,
             )
 
         if op == "Filter":
             return SemFilterOperator(
                 task=params.get("task") or params["filter"], dataset_id=out,
-                model_id="openai/gpt-5-mini", llm_config=llm_config,
+                model_id=model_id, llm_config=llm_config,
                 max_workers=64,
             )
 
@@ -170,7 +175,7 @@ class PlanNode:
             return SemMapOperator(
                 task="Execute the map operation to compute the following output field(s).",
                 output_fields=output_fields, dataset_id=out,
-                model_id="openai/gpt-5-mini", llm_config=llm_config,
+                model_id=model_id, llm_config=llm_config,
                 max_workers=64,
             )
 
@@ -183,7 +188,7 @@ class PlanNode:
             return SemFlatMapOperator(
                 task="Execute the flat map operation to compute the following output field(s).",
                 output_fields=output_fields, dataset_id=out,
-                model_id="openai/gpt-5-mini", llm_config=llm_config,
+                model_id=model_id, llm_config=llm_config,
                 max_workers=64,
             )
 
@@ -201,21 +206,21 @@ class PlanNode:
             return SemGroupByOperator(
                 task=task, group_by_fields=gby_fields,
                 agg_fields=agg_fields, dataset_id=out,
-                model_id="openai/gpt-5-mini", llm_config=llm_config,
+                model_id=model_id, llm_config=llm_config,
                 max_workers=64,
             )
 
         if op == "Join":
             return SemJoinOperator(
                 task=params.get("task") or params["condition"], dataset_id=out,
-                model_id="openai/gpt-5-mini", llm_config=llm_config,
+                model_id=model_id, llm_config=llm_config,
                 max_workers=64,
             )
 
         if op == "TopK":
             return SemTopKOperator(
                 task=params["task"], k=params["k"], dataset_id=out,
-                model_id="openai/text-embedding-3-small",
+                model_id=params.get("model_id", "openai/text-embedding-3-small"),
                 llm_config=llm_config, max_workers=64,
                 index_name=params["index_name"], catalog=index_catalog,
             )
@@ -224,7 +229,7 @@ class PlanNode:
             return ReasoningOperator(
                 task=params.get("task", self.description),
                 dataset_id=out,
-                model_id="openai/gpt-5-mini", llm_config=llm_config,
+                model_id=model_id, llm_config=llm_config,
             )
 
         raise ValueError(f"Unknown operator type: {op}")
