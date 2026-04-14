@@ -40,14 +40,13 @@ class ModelSize(enum.Enum):
 
 _OPENAI_MODELS: list[str] = [
     "gpt-5-2025-08-07",
-    # "gpt-5-mini-2025-08-07",
-    # "gpt-5-nano-2025-08-07"
+    "gpt-5-mini-2025-08-07",
+    "gpt-5-nano-2025-08-07",
 ]
 
 _ANTHROPIC_MODELS: list[str] = [
+    "anthropic/claude-opus-4-6-20260205",
     "anthropic/claude-sonnet-4-5-20250929",
-    "anthropic/claude-sonnet-4-20250514",
-    "anthropic/claude-haiku-4-5-20250929",
 ]
 
 _GEMINI_MODELS: list[str] = [
