@@ -9,6 +9,7 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000
 const OPERATOR_TYPES = [
   { label: 'Semantic Filter', value: 'SemanticFilter' },
   { label: 'Semantic Map', value: 'SemanticMap' },
+  { label: 'Semantic Flat Map', value: 'SemanticFlatMap' },
   { label: 'Semantic Join', value: 'SemanticJoin' },
   { label: 'Semantic Top-K', value: 'SemanticTopK' },
   { label: 'Semantic GroupBy', value: 'SemanticGroupBy' },

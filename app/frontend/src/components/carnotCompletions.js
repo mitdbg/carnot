@@ -74,7 +74,7 @@ const CARNOT_FUNCTIONS = [
   {
     label: 'code_operator',
     type: 'function',
-    detail: '(datasets)',
+    detail: '(task, datasets)',
     info: 'Code operator — executes arbitrary Python on all datasets.',
     boost: 8,
   },

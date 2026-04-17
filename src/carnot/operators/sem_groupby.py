@@ -166,7 +166,9 @@ class SemGroupByOperator(PhysicalOperator):
         """
         # Truncate item if it would exceed the model's context window.
         group_by_fields_str = "\n".join([
-            f"- {field['name']}" + (f" ({field['type']})" if 'type' in field else "") + f": {field['description']}"
+            f"- {field['name']}"
+            + (f" ({field['type']})" if 'type' in field else "")
+            + (f": {field['description']}" if 'description' in field else "")
             for field in self.group_by_fields
         ])
         overhead = count_tokens(system_prompt, self.model_id) + count_tokens(group_by_fields_str, self.model_id) + _GROUP_BY_PROMPT_OVERHEAD_TOKENS
@@ -249,7 +251,9 @@ class SemGroupByOperator(PhysicalOperator):
         # Truncate items if combined input would exceed the model's context window.
         agg_task = "Apply the aggregation(s) specified in Aggregation Output Fields over the Input."
         agg_fields_str = "\n".join([
-            f"- {field['name']}" + (f" ({field['type']})" if 'type' in field else "") + f": {field['description']}"
+            f"- {field['name']}"
+            + (f" ({field['type']})" if 'type' in field else "")
+            + (f": {field['description']}" if 'description' in field else "")
             for field in self.agg_fields
         ])
         overhead = (
@@ -363,12 +367,16 @@ class SemGroupByOperator(PhysicalOperator):
                 on_item_complete()
 
         # compute the non-semantic agregations for each group
+        # agg_state is keyed as: agg_state[group_key][(agg_name, agg_func)] = state_dict
+        # Using (name, func) as the key avoids collisions when two fields
+        # share the same name but different funcs (e.g., weight/min + weight/max).
         agg_state = {}
         for item in items:
             group_key = tuple(item[field['name']] for field in self.group_by_fields)
             if group_key not in agg_state:
                 agg_state[group_key] = {}
                 for agg_field in self.agg_fields:
+                    agg_key = (agg_field['name'], agg_field['func'])
                     agg_func = agg_field['func']
                     state = {}
                     if agg_func == "min":
@@ -381,14 +389,15 @@ class SemGroupByOperator(PhysicalOperator):
                         state = {"total": 0.0}
                     elif agg_func == "mean":
                         state = {"count": 0, "total": 0.0}
-                    agg_state[group_key][agg_func] = state
+                    agg_state[group_key][agg_key] = state
 
             # update aggregation state for each agg field
             for agg_field in self.agg_fields:
                 agg_field_name = agg_field['name']
                 agg_func = agg_field['func']
+                agg_key = (agg_field_name, agg_func)
                 value = item.get(agg_field_name, None)
-                state = agg_state[group_key][agg_func]
+                state = agg_state[group_key][agg_key]
 
                 if agg_func == "min":
                     if state["min"] is None or (value is not None and value < state["min"]):
@@ -435,9 +444,8 @@ class SemGroupByOperator(PhysicalOperator):
                 all_call_stats.extend(agg_stats)
                 for agg_field in self._sem_agg_fields:
                     agg_name = agg_field['name']
-                    agg_func = agg_field['func']
-                    if agg_func not in ["min", "max", "count", "sum", "mean"]:
-                        agg_state[group_key][agg_name] = sem_agg_output.get(agg_name, None)
+                    agg_key = (agg_name, agg_field['func'])
+                    agg_state[group_key][agg_key] = sem_agg_output.get(agg_name, None)
 
         # construct final results
         results = []
@@ -447,20 +455,23 @@ class SemGroupByOperator(PhysicalOperator):
                 result[field['name']] = group_key[i]
             for agg_field in self.agg_fields:
                 agg_func = agg_field['func']
-                state = aggs[agg_func]
-                if agg_func == "min":
-                    result[agg_field['name']] = state["min"]
-                elif agg_func == "max":
-                    result[agg_field['name']] = state["max"]
-                elif agg_func == "count":
-                    result[agg_field['name']] = state["count"]
-                elif agg_func == "sum":
-                    result[agg_field['name']] = state["total"]
-                elif agg_func == "mean":
-                    mean_value = state["total"] / state["count"] if state["count"] > 0 else None
-                    result[agg_field['name']] = mean_value
+                agg_name = agg_field['name']
+                agg_key = (agg_name, agg_func)
+                if agg_func in ("min", "max", "count", "sum", "mean"):
+                    state = aggs[agg_key]
+                    if agg_func == "min":
+                        result[agg_name] = state["min"]
+                    elif agg_func == "max":
+                        result[agg_name] = state["max"]
+                    elif agg_func == "count":
+                        result[agg_name] = state["count"]
+                    elif agg_func == "sum":
+                        result[agg_name] = state["total"]
+                    elif agg_func == "mean":
+                        result[agg_name] = state["total"] / state["count"] if state["count"] > 0 else None
                 else:
-                    result[agg_field['name']] = state
+                    # Semantic aggregation results are stored directly
+                    result[agg_name] = aggs.get(agg_key)
             results.append(result)
 
         # create new dataset and return it with the input datasets

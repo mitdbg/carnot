@@ -19,6 +19,7 @@ code_gen_prompt: |-
   - Not every dataset will have an indexing method; only use it if it is mentioned in the dataset description.
   - Place your code within the tags: {{code_block_opening_tag}} and {{code_block_closing_tag}}.
   - In the end you have to return the output state you wish to expose to downstream operators using the `final_answer` tool.
+  - If your task produces a filtered or transformed list of items (i.e. a list of dictionaries), you MUST include that list under the key `"final_items"` in the dictionary you pass to `final_answer`. This allows downstream operators to consume the items directly. For example: `final_answer({"final_items": filtered_items})`.
 
   Here are a few examples:
   -----
@@ -59,7 +60,7 @@ code_gen_prompt: |-
   for contract in contracts:
       if "John Doe" in contract['text']:
           matching_contracts.append(contract)
-  final_answer({"matching_contracts": matching_contracts})
+  final_answer({"final_items": matching_contracts})
   {{code_block_closing_tag}}
 
   -----
@@ -111,17 +112,18 @@ code_gen_prompt: |-
   [{'id': 101, 'movie_title': 'Inception', 'review_text': 'Leonardo DiCaprio delivers a stellar performance in this mind-bending thriller.'}, {'id': 102, 'movie_title': 'The Dark Knight', 'review_text': 'Christian Bale is outstanding as Batman in this dark and gripping film.'}, {'id': 103, 'movie_title': 'Interstellar', 'review_text': "Matthew McConaughey shines in this epic sci-fi adventure."}]
 
   {{code_block_opening_tag}}
-  lead_actor_reviews = {}
+  result_items = []
   movies = input_datasets["Movies"].items
   reviews = input_datasets["Reviews"].items
   for movie in movies:
       lead_actor = movie['lead_actor']
       movie_title = movie['title']
-      lead_actor_reviews[movie_title] = []
+      matching_reviews = []
       for review in reviews:
           if lead_actor.lower() in review['review_text'].lower():
-              lead_actor_reviews[movie_title].append(review)
-  final_answer({"lead_actor_reviews": lead_actor_reviews})
+              matching_reviews.append(review)
+      result_items.append({"movie_title": movie_title, "lead_actor": lead_actor, "reviews": matching_reviews})
+  final_answer({"final_items": result_items})
   {{code_block_closing_tag}}
 
   -----
@@ -205,6 +207,11 @@ code_gen_prompt: |-
   2. Only use the input datasets (and tools) that you are provided with below! (The ones above are for examples and may not be available to you.)
   3. Don't give up! You're in charge of writing the code to implement the task, not providing directions to generate it.
   4. Return the final output state (a dictionary mapping variable names to Python objects) using the `final_answer` tool.
+  5. When multiple input datasets are available and some are the result of filter or transformation operations on others, prefer using the most-filtered (downstream) dataset — the one with the fewest items that still satisfies the task. Upstream datasets often contain a superset of the same items, so iterating over all of them would cause duplicate processing.
+  6. Common data-science libraries such as `pandas`, `numpy`, `json`, `csv`, and `io` are available for import. Use them when they simplify the task.
+  7. Before writing processing logic, inspect the items in your input dataset(s) by printing a small sample (e.g., `print(input_datasets["MyDataset"].items[:3])`). This lets you see the actual field names and value formats, avoiding errors from guessing at key names.
+  8. Do NOT call `print()` and `final_answer()` in the same code block. First print to explore the data, observe the output, then call `final_answer()` in a separate step.
+  9. When your output is a filtered or transformed list of items (list of dicts), always use `"final_items"` as the key in the state dictionary passed to `final_answer`. This makes the items available to downstream operators. For scalar results (counts, averages, etc.) use any descriptive key name.
 
   Now Begin!
 final_answer:

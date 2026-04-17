@@ -52,6 +52,7 @@ class PhysicalPlan:
         *,
         include_reasoning: bool = True,
         query: str = "",
+        original_query: str = "",
     ) -> PhysicalPlan:
         """Construct a ``PhysicalPlan`` from a serialised plan dict.
 
@@ -142,13 +143,25 @@ class PhysicalPlan:
         if include_reasoning and nodes[root_id].node_type != "reasoning":
             reasoning_id = f"node-{counter['n']}"
             counter["n"] += 1
+
+            # Build reasoning task: if original_query is provided and
+            # differs from query (i.e. a follow-up modified the plan),
+            # include the original query for full context.
+            if original_query and original_query != query:
+                reasoning_task = (
+                    f"Original question: {original_query}\n"
+                    f"Follow-up instruction: {query}"
+                )
+            else:
+                reasoning_task = query
+
             reasoning_node = PlanNode(
                 node_id=reasoning_id,
                 node_type="reasoning",
                 operator_type="Reason",
                 name="Reasoning",
                 description="Generate final answer",
-                params={"task": query} if query else {},
+                params={"task": reasoning_task} if reasoning_task else {},
                 parent_ids=[root_id],
                 dataset_id="final_dataset",
             )
@@ -466,6 +479,10 @@ class PhysicalPlan:
     def to_node_dicts(self) -> list[dict]:
         """Serialise all nodes to a list of dict descriptors.
 
+        Builds a ``parent_output_map`` (``node_id → output_dataset_id``)
+        so that pseudocode references parent datasets by their
+        human-readable output name instead of internal node IDs.
+
         Requires:
             None.
 
@@ -475,7 +492,14 @@ class PhysicalPlan:
         Raises:
             None.
         """
-        return [node.to_dict() for node in self.topo_order()]
+        parent_output_map = {
+            nid: node.output_dataset_id
+            for nid, node in self._nodes.items()
+        }
+        return [
+            node.to_dict(parent_output_map=parent_output_map)
+            for node in self.topo_order()
+        ]
 
     def to_dict(self) -> dict:
         """Flat JSON-serialisable representation (for API transport).

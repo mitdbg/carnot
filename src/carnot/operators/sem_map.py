@@ -145,7 +145,9 @@ class SemMapOperator(PhysicalOperator):
         """
         # Truncate item if it would exceed the model's context window.
         output_fields_str = "\n".join([
-            f"- {field['name']}" + (f" ({field['type']})" if 'type' in field else "") + f": {field['description']}"
+            f"- {field['name']}"
+            + (f" ({field['type']})" if 'type' in field else "")
+            + (f": {field['description']}" if 'description' in field else "")
             for field in self.output_fields
         ])
         overhead = (

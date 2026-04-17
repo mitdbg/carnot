@@ -239,7 +239,7 @@ class PlanNode:
     # Serialization to dict
     # ------------------------------------------------------------------
 
-    def to_dict(self) -> dict:
+    def to_dict(self, *, parent_output_map: dict[str, str] | None = None) -> dict:
         """Serialise to a dict
 
         Requires:
@@ -254,7 +254,7 @@ class PlanNode:
         Raises:
             None.
         """
-        code = self.to_code()
+        code = self.to_code(parent_output_map=parent_output_map)
         return {
             "node_id": self.node_id,
             "node_type": self.node_type,
@@ -272,7 +272,29 @@ class PlanNode:
     # Code generation (pseudocode for display)
     # ------------------------------------------------------------------
 
-    def to_code(self) -> str:
+    @staticmethod
+    def _smart_quote(value: str) -> str:
+        """Wrap *value* in quotes, choosing a delimiter that avoids conflicts.
+
+        Requires:
+            None.
+
+        Returns:
+            A quoted string using single quotes if *value* contains no
+            single quotes, double quotes if it contains single but not
+            double, or escaped-single-quote form otherwise.
+
+        Raises:
+            None.
+        """
+        if "'" not in value:
+            return f"'{value}'"
+        if '"' not in value:
+            return f'"{value}"'
+        escaped = value.replace("'", "\\'")
+        return f"'{escaped}'"
+
+    def to_code(self, *, parent_output_map: dict[str, str] | None = None) -> str:
         """Generate readable pseudocode for this node.
 
         Requires:
@@ -284,6 +306,11 @@ class PlanNode:
         Raises:
             None.
         """
+        def _resolve_parent(pid: str) -> str:
+            """Map a parent node ID to the parent's output_dataset_id."""
+            if parent_output_map:
+                return parent_output_map.get(pid, pid)
+            return pid
         if self.node_type == "dataset":
             safe_name = self.name.replace("'", "\\'")
             return (
@@ -313,26 +340,40 @@ class PlanNode:
         lines: list[str] = [f"# {display}"]
 
         if op == "Code":
-            lines.append(f"# Task: {p.get('task', '')}")
-            lines.append(f"datasets['{out}'] = code_operator(datasets)")
+            task = p.get('task', '')
+            # Format comment: prefix each line with #
+            for task_line in task.splitlines():
+                lines.append(f"# Task: {task_line}" if task_line == task.splitlines()[0] else f"#   {task_line}")
+            # Use triple-quotes for the task parameter to handle newlines
+            if '\n' in task:
+                lines.append(f"datasets['{out}'] = code_operator(")
+                lines.append(f'    task="""\n{task}\n""",')  
+                lines.append("    datasets=datasets")
+                lines.append(")")
+            else:
+                safe_task = task.replace('"', '\\"')
+                lines.append(f"datasets['{out}'] = code_operator(")
+                lines.append(f"    task=\"{safe_task}\",")
+                lines.append("    datasets=datasets")
+                lines.append(")")
 
         elif op == "Limit":
-            parent = parent_ids[0] if parent_ids else "?"
+            parent = _resolve_parent(parent_ids[0]) if parent_ids else "?"
             lines.append(
                 f"datasets['{out}'] = limit(datasets['{parent}'], "
                 f"n={p.get('n', '?')})"
             )
 
         elif op == "Filter":
-            parent = parent_ids[0] if parent_ids else "?"
+            parent = _resolve_parent(parent_ids[0]) if parent_ids else "?"
             lines.append(f"# Condition: {p.get('filter', '')}")
             lines.append(f"datasets['{out}'] = sem_filter(")
             lines.append(f"    dataset=datasets['{parent}'],")
-            lines.append(f"    condition=\"{p.get('filter', '')}\"")
+            lines.append(f"    condition={self._smart_quote(p.get('filter', ''))}")
             lines.append(")")
 
         elif op == "Map":
-            parent = parent_ids[0] if parent_ids else "?"
+            parent = _resolve_parent(parent_ids[0]) if parent_ids else "?"
             fields = p.get('fields', [])
             field_names = [f.get('field', '') for f in fields]
             lines.append(f"# Map fields: {field_names}")
@@ -342,7 +383,7 @@ class PlanNode:
             lines.append(")")
 
         elif op == "FlatMap":
-            parent = parent_ids[0] if parent_ids else "?"
+            parent = _resolve_parent(parent_ids[0]) if parent_ids else "?"
             fields = p.get('fields', [])
             field_names = [f.get('field', '') for f in fields]
             lines.append(f"# Flat map fields: {field_names}")
@@ -352,7 +393,7 @@ class PlanNode:
             lines.append(")")
 
         elif op == "GroupBy":
-            parent = parent_ids[0] if parent_ids else "?"
+            parent = _resolve_parent(parent_ids[0]) if parent_ids else "?"
             gby = [f["name"] for f in p.get("gby_fields", [])]
             agg = [
                 f"{f['name']}({f.get('func', '?')})"
@@ -365,26 +406,26 @@ class PlanNode:
             lines.append(")")
 
         elif op == "Join":
-            left = parent_ids[0] if len(parent_ids) > 0 else "?"
-            right = parent_ids[1] if len(parent_ids) > 1 else "?"
+            left = _resolve_parent(parent_ids[0]) if len(parent_ids) > 0 else "?"
+            right = _resolve_parent(parent_ids[1]) if len(parent_ids) > 0 else "?"
             lines.append(f"# Condition: {p.get('condition', '')}")
             lines.append(f"datasets['{out}'] = sem_join(")
             lines.append(f"    left=datasets['{left}'],")
             lines.append(f"    right=datasets['{right}'],")
-            lines.append(f"    condition=\"{p.get('condition', '')}\"")
+            lines.append(f"    condition={self._smart_quote(p.get('condition', ''))}")
             lines.append(")")
 
         elif op == "TopK":
-            parent = parent_ids[0] if parent_ids else "?"
+            parent = _resolve_parent(parent_ids[0]) if parent_ids else "?"
             lines.append(f"# Search: {p.get('task', '')}")
             lines.append(f"datasets['{out}'] = sem_topk(")
             lines.append(f"    dataset=datasets['{parent}'],")
-            lines.append(f"    search=\"{p.get('task', '')}\",")
+            lines.append(f"    search={self._smart_quote(p.get('task', ''))},")
             lines.append(f"    k={p.get('k', '?')}")
             lines.append(")")
 
         elif op == "Aggregate":
-            parent = parent_ids[0] if parent_ids else "?"
+            parent = _resolve_parent(parent_ids[0]) if parent_ids else "?"
             agg_fields = p.get('agg_fields', [])
             lines.append(f"# Aggregation fields: {[f.get('name', '') for f in agg_fields]}")
             lines.append(f"datasets['{out}'] = sem_agg(")

@@ -144,7 +144,9 @@ class SemAggOperator(PhysicalOperator):
         """
         # Truncate items if combined input would exceed the model's context window.
         agg_fields_str = "\n".join([
-            f"- {field['name']}" + (f" ({field['type']})" if 'type' in field else "") + f": {field['description']}"
+            f"- {field['name']}"
+            + (f" ({field['type']})" if 'type' in field else "")
+            + (f": {field['description']}" if 'description' in field else "")
             for field in self.agg_fields
         ])
         overhead = (

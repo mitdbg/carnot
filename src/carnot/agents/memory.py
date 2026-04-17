@@ -304,14 +304,86 @@ class CodeOperatorStep(MemoryStep):
     input_datasets: dict[str, Dataset]
     code_block_tags: tuple[str, str]
 
+    MAX_SAMPLE_ITEMS = 5
+    MAX_FIELD_VALUE_LENGTH = 100
+
+    @staticmethod
+    def _truncate_value(value: Any, max_len: int = 100) -> str:
+        """Truncate a field value to at most *max_len* characters.
+
+        Requires:
+            - *max_len* >= 10.
+
+        Returns:
+            A string representation of *value*, trimmed to *max_len*
+            characters with a trailing ``"..."`` when truncated.
+
+        Raises:
+            None.
+        """
+        s = str(value)
+        if len(s) <= max_len:
+            return s
+        return s[:max_len] + "..."
+
+    @staticmethod
+    def _format_item_sample(items: list, max_items: int = 5, max_field_len: int = 100) -> str:
+        """Format a sample of dataset items with truncated field values.
+
+        Requires:
+            - *max_items* >= 1.
+            - *max_field_len* >= 10.
+
+        Returns:
+            A human-readable string showing up to *max_items* items with
+            each field value truncated to *max_field_len* characters.
+            Returns ``"(no items)"`` when *items* is empty.
+
+        Raises:
+            None.
+        """
+        if not items:
+            return "(no items)"
+        sample = items[:max_items]
+        lines = []
+        for i, item in enumerate(sample):
+            if isinstance(item, dict):
+                truncated = {
+                    k: CodeOperatorStep._truncate_value(v, max_field_len)
+                    for k, v in item.items()
+                }
+                lines.append(f"  [{i}] {truncated}")
+            else:
+                lines.append(f"  [{i}] {CodeOperatorStep._truncate_value(item, max_field_len)}")
+        if len(items) > max_items:
+            lines.append(f"  ... ({len(items) - max_items} more items)")
+        return "\n".join(lines)
+
     def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
-        datasets_list = "\n\n".join([dataset.format_description(self.code_block_tags) for dataset in self.input_datasets.values()])
+        datasets_list = "\n\n".join(
+            [dataset.format_description(self.code_block_tags) for dataset in self.input_datasets.values()]
+        )
         datasets_str = "---\n" + datasets_list.strip() if len(datasets_list) > 0 else str(None) + "\n---"
+
+        # Build a sample preview of items for each dataset
+        sample_parts = []
+        for ds_name, dataset in self.input_datasets.items():
+            items = dataset.items if dataset.items else []
+            preview = self._format_item_sample(
+                items, max_items=self.MAX_SAMPLE_ITEMS, max_field_len=self.MAX_FIELD_VALUE_LENGTH
+            )
+            sample_parts.append(f"Dataset \"{ds_name}\" (sample of up to {self.MAX_SAMPLE_ITEMS} items):\n{preview}")
+        sample_str = "\n\n".join(sample_parts)
 
         tool_list = "\n\n".join([tool.to_code_prompt() for tool in self.tools.values()])
         tool_str = f"{self.code_block_tags[0]}\n" + tool_list.strip() + f"\n{self.code_block_tags[1]}"
 
-        content = f"Task: \"{self.task}\"\n\nTools:\n{tool_str}\n\nInput Datasets:\n{datasets_str}"
+        content = (
+            f"Task: \"{self.task}\"\n\n"
+            f"Tools:\n{tool_str}\n\n"
+            f"Input Datasets:\n{datasets_str}\n\n"
+            f"Item Samples (for quick inspection — use print() to see full values):\n{sample_str}"
+        )
         return [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": content}])]
 
 
@@ -334,7 +406,9 @@ class SemMapOperatorStep(MemoryStep):
 
     def to_messages(self, summary_mode = False) -> list[ChatMessage]:
         output_fields_str = "\n".join([
-            f"- {field['name']}" + (f" ({field['type']})" if 'type' in field else "") + f": {field['description']}"
+            f"- {field['name']}"
+            + (f" ({field['type']})" if 'type' in field else "")
+            + (f": {field['description']}" if 'description' in field else "")
             for field in self.output_fields
         ])
         input_str = json.dumps(self.item, indent=2)
@@ -350,7 +424,9 @@ class SemFlatMapOperatorStep(MemoryStep):
 
     def to_messages(self, summary_mode = False) -> list[ChatMessage]:
         output_fields_str = "\n".join([
-            f"- {field['name']}" + (f" ({field['type']})" if 'type' in field else "") + f": {field['description']}"
+            f"- {field['name']}"
+            + (f" ({field['type']})" if 'type' in field else "")
+            + (f": {field['description']}" if 'description' in field else "")
             for field in self.output_fields
         ])
         input_str = json.dumps(self.item, indent=2)
@@ -378,7 +454,9 @@ class SemAggOperatorStep(MemoryStep):
 
     def to_messages(self, summary_mode = False) -> list[ChatMessage]:
         agg_fields_str = "\n".join([
-            f"- {field['name']}" + (f" ({field['type']})" if 'type' in field else "") + f": {field['description']}"
+            f"- {field['name']}"
+            + (f" ({field['type']})" if 'type' in field else "")
+            + (f": {field['description']}" if 'description' in field else "")
             for field in self.agg_fields
         ])
         input_str = json.dumps(self.items, indent=2)
@@ -393,7 +471,9 @@ class SemGroupByGroupOperatorStep(MemoryStep):
 
     def to_messages(self, summary_mode = False) -> list[ChatMessage]:
         group_by_fields_str = "\n".join([
-            f"- {field['name']}" + (f" ({field['type']})" if 'type' in field else "") + f": {field['description']}"
+            f"- {field['name']}"
+            + (f" ({field['type']})" if 'type' in field else "")
+            + (f": {field['description']}" if 'description' in field else "")
             for field in self.group_by_fields
         ])
         input_str = json.dumps(self.item, indent=2)

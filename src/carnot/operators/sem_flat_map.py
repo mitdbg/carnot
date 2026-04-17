@@ -145,7 +145,9 @@ class SemFlatMapOperator(PhysicalOperator):
         """
         # Truncate item if it would exceed the model's context window.
         output_fields_str = "\n".join([
-            f"- {field['name']}" + (f" ({field['type']})" if 'type' in field else "") + f": {field['description']}"
+            f"- {field['name']}"
+            + (f" ({field['type']})" if 'type' in field else "")
+            + (f": {field['description']}" if 'description' in field else "")
             for field in self.output_fields
         ])
         overhead = (
@@ -236,20 +238,24 @@ class SemFlatMapOperator(PhysicalOperator):
             },
         )
 
-        # construct futures
-        futures = []
+        # construct futures — preserve (item, future) pairing so we can
+        # merge input fields into each expanded output row.
+        futures_to_input: dict = {}
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             for item in items:
                 future = executor.submit(self._sem_flat_map, item, system_prompt)
-                futures.append(future)
+                futures_to_input[future] = item
 
-        # collect results as futures complete
+        # collect results as futures complete, merging input fields into each expanded row
         all_call_stats: list[LLMCallStats] = []
         results = []
-        for fut in as_completed(futures):
+        for fut in as_completed(futures_to_input):
+            input_item = futures_to_input[fut]
             expanded_items, item_stats = fut.result()
             all_call_stats.extend(item_stats)
-            results.extend(expanded_items)
+            for expanded in expanded_items:
+                merged = {**input_item, **expanded}
+                results.append(merged)
             if on_item_complete is not None:
                 on_item_complete()
 
