@@ -215,7 +215,7 @@ class FilterToTopKFilter(TransformationRule):
         original ``input_group``.
     """
 
-    k_values: list[int] = [10] # , 20, 50, 100, 1000]
+    k_values: list[int] = [10, 50, 100, 500, 1000]
 
     @classmethod
     def _has_openai_key(cls, llm_config: dict | None) -> bool:
@@ -477,7 +477,7 @@ class SemFlatMapRule(ImplementationRule):
 class SemTopKRule(ImplementationRule):
     """Substitute a logical ``TopK`` expression with a ``SemTopKOperator`` physical implementation."""
 
-    k_budgets = [1, 3, 5, 10, 15, 20, 25]
+    k_budgets = [1, 5, 10, 25, 100]
 
     @classmethod
     def matches_pattern(cls, logical_expression: LogicalExpression, **kwargs) -> bool:

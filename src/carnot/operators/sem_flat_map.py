@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from importlib import resources
 
 import yaml
@@ -24,7 +27,13 @@ from carnot.core.models import LLMCallStats, OperatorStats
 from carnot.data.dataset import Dataset
 from carnot.operators.physical import PhysicalOperator
 from carnot.optimizer.model_ids import get_api_key_for_model
+from carnot.utils.model_helpers import count_tokens, truncate_item_to_fit
 
+# SemFlatMapOperatorStep templates prompt as:
+# - f"Map Instruction: \"{self.task}\"\n\nOutput Fields:\n{output_fields_str}\n\nInput:\n{input_str}"
+# this means the overhead tokens needs to cover the text excluding the task, output_fields_str, and input_str,
+# which we estimate to be around 50 tokens just to be safe
+_FLAT_MAP_PROMPT_OVERHEAD_TOKENS = 50
 
 class SemFlatMapOperator(PhysicalOperator):
     """Semantic flat-map operator — expands each item into zero or more output items.
@@ -134,12 +143,25 @@ class SemFlatMapOperator(PhysicalOperator):
         Raises:
             AgentGenerationError: If the LLM call itself fails.
         """
+        # Truncate item if it would exceed the model's context window.
+        output_fields_str = "\n".join([
+            f"- {field['name']}" + (f" ({field['type']})" if 'type' in field else "") + f": {field['description']}"
+            for field in self.output_fields
+        ])
+        overhead = (
+            count_tokens(system_prompt, self.model_id)
+            + count_tokens(self.task, self.model_id)
+            + count_tokens(output_fields_str, self.model_id)
+            + _FLAT_MAP_PROMPT_OVERHEAD_TOKENS
+        )
+        item, embed_stats = truncate_item_to_fit(item, self.task, self.model_id, self.llm_config, overhead_tokens=overhead)
+
         memory = AgentMemory("")
         memory.system_prompt = SystemPromptStep(system_prompt=system_prompt)
         memory.steps.append(SemFlatMapOperatorStep(task=self.task, output_fields=self.output_fields, item=item))
 
         output_json, step_number = None, 0
-        call_stats: list[LLMCallStats] = []
+        call_stats: list[LLMCallStats] = list(embed_stats)
         while output_json is None and step_number < self.max_steps:
             memory_step = ActionStep(step_number=1, timing=Timing(start_time=time.time()))
             try:
@@ -184,7 +206,7 @@ class SemFlatMapOperator(PhysicalOperator):
 
         return output_json, call_stats
 
-    def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> tuple[dict[str, Dataset], OperatorStats]:
+    def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset], on_item_complete: Callable[[], None] | None = None) -> tuple[dict[str, Dataset], OperatorStats]:
         """Execute the semantic flat-map over every item in the input dataset.
 
         Requires:
@@ -221,14 +243,15 @@ class SemFlatMapOperator(PhysicalOperator):
                 future = executor.submit(self._sem_flat_map, item, system_prompt)
                 futures.append(future)
 
-        # block until futures complete
-        done_futures, _ = wait(futures)
+        # collect results as futures complete
         all_call_stats: list[LLMCallStats] = []
         results = []
-        for fut in done_futures:
+        for fut in as_completed(futures):
             expanded_items, item_stats = fut.result()
             all_call_stats.extend(item_stats)
             results.extend(expanded_items)
+            if on_item_complete is not None:
+                on_item_complete()
 
         # create new dataset and return it with the input datasets
         output_dataset = Dataset(name=self.dataset_id, annotation=f"Sem flat map operator output for task: {self.task}", items=results)

@@ -62,15 +62,18 @@ class FlatFileIndex:
             np.array([e.embedding for e in file_summaries], dtype="float32") if file_summaries else None
         )
 
+        from carnot.agents.models import LiteLLMModel as _LiteLLMModel
         if model is not None:
             self._model = model
         else:
-            from carnot.agents.models import LiteLLMModel as _LiteLLMModel
-
             self._model = _LiteLLMModel(
                 model_id=self.config.llm_routing_model,
                 api_key=self.api_key,
             )
+        self._embedding_model = _LiteLLMModel(
+            model_id=self.config.embedding_model,
+            api_key=self.api_key,
+        )
         self._llm_call_stats: list = []
 
     @classmethod
@@ -115,10 +118,7 @@ class FlatFileIndex:
         return cls(name=name, file_summaries=summaries, model=model, config=config, api_key=api_key)
 
     def _embed_texts(self, texts: list[str]) -> list[list[float]]:
-        embeddings, embed_stats = self._model.embed(
-            texts=texts,
-            model=self.config.embedding_model,
-        )
+        embeddings, embed_stats = self._embedding_model.embed(texts=texts)
         self._llm_call_stats.append(embed_stats)
         return embeddings
 
@@ -240,15 +240,18 @@ class HierarchicalFileIndex:
         self.config = config or HierarchicalIndexConfig()
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
 
+        from carnot.agents.models import LiteLLMModel as _LiteLLMModel
         if model is not None:
             self._model = model
         else:
-            from carnot.agents.models import LiteLLMModel as _LiteLLMModel
-
             self._model = _LiteLLMModel(
                 model_id=self.config.llm_routing_model,
                 api_key=self.api_key,
             )
+        self._embedding_model = _LiteLLMModel(
+            model_id=self.config.embedding_model,
+            api_key=self.api_key,
+        )
 
         # path -> FileSummaryEntry
         self._path_to_summary: dict[str, FileSummaryEntry] = {e.path: e for e in file_summaries}
@@ -502,10 +505,7 @@ Concise meta-cluster summary:"""
 
     def _embed_texts(self, texts: list[str]) -> list[list[float]]:
         """Embed texts using the configured model."""
-        embeddings, embed_stats = self._model.embed(
-            texts=texts,
-            model=self.config.embedding_model,
-        )
+        embeddings, embed_stats = self._embedding_model.embed(texts=texts)
         self._llm_call_stats.append(embed_stats)
         return embeddings
 

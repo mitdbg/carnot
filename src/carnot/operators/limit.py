@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import time
+from collections.abc import Callable
 
 from carnot.core.models import OperatorStats
 from carnot.data.dataset import Dataset
@@ -42,7 +45,7 @@ class LimitOperator(PhysicalOperator):
 
         return op_params
 
-    def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> tuple[dict[str, Dataset], OperatorStats]:
+    def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset], on_item_complete: Callable[[], None] | None = None) -> tuple[dict[str, Dataset], OperatorStats]:
         """Truncate the input dataset to the first *n* items.
 
         Requires:

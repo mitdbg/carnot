@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from importlib import resources
 
 import yaml
@@ -24,7 +27,13 @@ from carnot.core.models import LLMCallStats, OperatorStats
 from carnot.data.dataset import Dataset
 from carnot.operators.physical import PhysicalOperator
 from carnot.optimizer.model_ids import get_api_key_for_model
+from carnot.utils.model_helpers import count_tokens, truncate_join_inputs_to_fit
 
+# SemJoinOperatorStep templates prompt as:
+# - f"Join Condition: \"{self.task}\"\n\nLeft Input:\n{left_input_str}\n\nRight Input:\n{right_input_str}"
+# this means the overhead tokens needs to cover the text excluding the task, left_input_str, and right_input_str,
+# which we estimate to be around 50 tokens just to be safe
+_JOIN_PROMPT_OVERHEAD_TOKENS = 50
 
 class SemJoinOperator(PhysicalOperator):
     """Semantic join operator — cross-product join filtered by an LLM boolean predicate.
@@ -129,12 +138,18 @@ class SemJoinOperator(PhysicalOperator):
         Raises:
             AgentGenerationError: If the LLM call itself fails.
         """
+        # Truncate join inputs if they would exceed the model's context window.
+        overhead = count_tokens(system_prompt, self.model_id) + count_tokens(self.task, self.model_id) + _JOIN_PROMPT_OVERHEAD_TOKENS
+        left_item, right_item, embed_stats = truncate_join_inputs_to_fit(
+            left_item, right_item, self.task, self.model_id, self.llm_config, overhead_tokens=overhead,
+        )
+
         memory = AgentMemory("")
         memory.system_prompt = SystemPromptStep(system_prompt=system_prompt)
         memory.steps.append(SemJoinOperatorStep(task=self.task, left_item=left_item, right_item=right_item))
 
         is_joined, step_number = None, 0
-        call_stats: list[LLMCallStats] = []
+        call_stats: list[LLMCallStats] = list(embed_stats)
         while is_joined is None and step_number < self.max_steps:
             memory_step = ActionStep(step_number=1, timing=Timing(start_time=time.time()))
             try:
@@ -188,7 +203,7 @@ class SemJoinOperator(PhysicalOperator):
 
         return output_dict, call_stats
 
-    def __call__(self, left_dataset_id: str, right_dataset_id: str, input_datasets: dict[str, Dataset]) -> tuple[dict[str, Dataset], OperatorStats]:
+    def __call__(self, left_dataset_id: str, right_dataset_id: str, input_datasets: dict[str, Dataset], on_item_complete: Callable[[], None] | None = None) -> tuple[dict[str, Dataset], OperatorStats]:
         """Execute the semantic join over the cross-product of two datasets.
 
         Requires:
@@ -228,15 +243,16 @@ class SemJoinOperator(PhysicalOperator):
                     future = executor.submit(self._sem_join, left_item, right_item, system_prompt)
                     futures.append(future)
 
-        # block until futures complete
-        done_futures, _ = wait(futures)
+        # collect results as futures complete
         all_call_stats: list[LLMCallStats] = []
         results = []
-        for fut in done_futures:
+        for fut in as_completed(futures):
             result_item, item_stats = fut.result()
             all_call_stats.extend(item_stats)
             if result_item is not None:
                 results.append(result_item)
+            if on_item_complete is not None:
+                on_item_complete()
 
         # create new dataset and return it with the input datasets
         output_dataset = Dataset(name=self.dataset_id, annotation=f"Sem join operator output for task: {self.task}", items=results)

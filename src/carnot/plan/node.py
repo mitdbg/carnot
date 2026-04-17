@@ -9,6 +9,7 @@ serialise itself to a cell descriptor for the notebook frontend.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -409,6 +410,7 @@ class PlanNode:
         storage: TieredStorageManager | None = None,
         index_catalog: IndexCatalog | None = None,
         parent_output_ids: list[str] | None = None,
+        on_item_complete: Callable[[], None] | None = None,
     ) -> tuple[dict[str, Dataset], OperatorStats | None]:
         """Execute this node against the datasets store.
 
@@ -457,10 +459,10 @@ class PlanNode:
         if self.operator_type == "Join":
             left_id = parent_output_ids[0] if len(parent_output_ids) > 0 else ""
             right_id = parent_output_ids[1] if len(parent_output_ids) > 1 else ""
-            updated, stats = op(left_id, right_id, datasets_store)
+            updated, stats = op(left_id, right_id, datasets_store, on_item_complete=on_item_complete)
             return {**datasets_store, **updated}, stats
 
         # All other operators take a single parent ID.
         dataset_id = parent_output_ids[0] if parent_output_ids else ""
-        updated, stats = op(dataset_id, datasets_store)
+        updated, stats = op(dataset_id, datasets_store, on_item_complete=on_item_complete)
         return {**datasets_store, **updated}, stats

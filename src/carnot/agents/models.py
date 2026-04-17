@@ -738,17 +738,19 @@ class LiteLLMModel(ApiModel):
 
         return litellm
 
-    def embed(
-        self,
-        texts: list[str],
-        model: str | None = None,
-    ) -> tuple[list[list[float]], LLMCallStats]:
+    _EMBED_MAX_RETRIES = 10
+
+    def embed(self, texts: list[str]) -> tuple[list[list[float]], LLMCallStats]:
         """Generate embeddings for a list of texts via ``litellm.embedding``.
 
         Thin wrapper around the underlying ``litellm.embedding`` call so
         that all LLM-provider traffic flows through ``LiteLLMModel``.
         This is the single chokepoint for embedding calls, with cost and
         latency instrumentation.
+
+        The call is configured with ``max_retries`` so the underlying
+        OpenAI client automatically retries on 429 rate-limit errors
+        with exponential backoff.
 
         Requires:
             - *texts* is a non-empty list of strings.
@@ -762,13 +764,12 @@ class LiteLLMModel(ApiModel):
             Whatever ``litellm.embedding`` raises on failure (network
             errors, auth errors, etc.).
         """
-        embed_model = model or self.model_id
-
         start = time.perf_counter()
         response = self.client.embedding(
-            model=embed_model,
+            model=self.model_id,
             input=texts,
             api_key=self.api_key,
+            max_retries=self._EMBED_MAX_RETRIES,
         )
         duration = time.perf_counter() - start
 
@@ -777,7 +778,7 @@ class LiteLLMModel(ApiModel):
 
         embeddings = [item["embedding"] for item in response.data]
         stats = LLMCallStats(
-            model_id=embed_model or "",
+            model_id=self.model_id,
             call_type="embedding",
             embedding_input_tokens=total_tokens,
             cost_usd=cost,

@@ -93,6 +93,43 @@ _MODEL_SIZE: dict[str, ModelSize] = {
 }
 
 
+# ── Embedding model max-input-token limits ──────────────────────────────
+#
+# Per-input token limits for embedding models used in Carnot.
+# The API rejects any single input that exceeds this limit.
+# NOTE: the authoritative copy lives in carnot.index.index (to avoid a
+# circular import).  This re-export exists for callers outside the
+# index package that need the lookup.
+
+_EMBEDDING_MAX_INPUT_TOKENS: dict[str, int] = {
+    "text-embedding-3-small": 8191,
+    "openai/text-embedding-3-small": 8191,
+    "text-embedding-3-large": 8191,
+    "openai/text-embedding-3-large": 8191,
+    "text-embedding-ada-002": 8191,
+    "openai/text-embedding-ada-002": 8191,
+}
+
+_DEFAULT_EMBEDDING_MAX_INPUT_TOKENS = 8191
+
+
+def get_embedding_max_input_tokens(model_id: str) -> int:
+    """Return the maximum number of input tokens for *model_id*.
+
+    Requires:
+        - *model_id* is a non-empty string.
+
+    Returns:
+        The per-input token limit for the embedding model.  Falls back
+        to ``_DEFAULT_EMBEDDING_MAX_INPUT_TOKENS`` (8191) when the
+        model is not in the known mapping.
+
+    Raises:
+        None.
+    """
+    return _EMBEDDING_MAX_INPUT_TOKENS.get(model_id, _DEFAULT_EMBEDDING_MAX_INPUT_TOKENS)
+
+
 def get_model_size(model_id: str) -> ModelSize:
     """Return the capability tier for *model_id*.
 

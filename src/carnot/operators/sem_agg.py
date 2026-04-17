@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from importlib import resources
 
 import yaml
@@ -24,7 +27,13 @@ from carnot.core.models import LLMCallStats, OperatorStats
 from carnot.data.dataset import Dataset
 from carnot.operators.physical import PhysicalOperator
 from carnot.optimizer.model_ids import get_api_key_for_model
+from carnot.utils.model_helpers import count_tokens, truncate_agg_items_to_fit
 
+# SemAggOperatorStep templates prompt as:
+#  - f"Aggregation Instruction: \"{self.task}\"\n\nAggregation Output Fields:\n{agg_fields_str}\n\nInput:\n{input_str}"
+# this means the overhead tokens needs to cover the text excluding the task, agg_fields_str, and input_str,
+# which we estimate to be around 50 tokens just to be safe
+_AGG_PROMPT_OVERHEAD_TOKENS = 50
 
 class SemAggOperator(PhysicalOperator):
     """Semantic aggregation operator — reduces a dataset to a single output row.
@@ -133,12 +142,27 @@ class SemAggOperator(PhysicalOperator):
         Raises:
             AgentGenerationError: If the LLM call itself fails.
         """
+        # Truncate items if combined input would exceed the model's context window.
+        agg_fields_str = "\n".join([
+            f"- {field['name']}" + (f" ({field['type']})" if 'type' in field else "") + f": {field['description']}"
+            for field in self.agg_fields
+        ])
+        overhead = (
+            count_tokens(system_prompt, self.model_id)
+            + count_tokens(self.task, self.model_id)
+            + count_tokens(agg_fields_str, self.model_id)
+            + _AGG_PROMPT_OVERHEAD_TOKENS
+        )
+        items, embed_stats = truncate_agg_items_to_fit(
+            items, self.task, self.model_id, self.llm_config, overhead_tokens=overhead,
+        )
+
         memory = AgentMemory("")
         memory.system_prompt = SystemPromptStep(system_prompt=system_prompt)
         memory.steps.append(SemAggOperatorStep(task=self.task, agg_fields=self.agg_fields, items=items))
 
         output_json, step_number = None, 0
-        call_stats: list[LLMCallStats] = []
+        call_stats: list[LLMCallStats] = list(embed_stats)
         while output_json is None and step_number < self.max_steps:
             memory_step = ActionStep(step_number=1, timing=Timing(start_time=time.time()))
             try:
@@ -182,7 +206,7 @@ class SemAggOperator(PhysicalOperator):
 
         return output_json, call_stats
 
-    def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> tuple[dict[str, Dataset], OperatorStats]:
+    def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset], on_item_complete: Callable[[], None] | None = None) -> tuple[dict[str, Dataset], OperatorStats]:
         """Execute the semantic aggregation over the input dataset.
 
         Requires:
@@ -218,14 +242,15 @@ class SemAggOperator(PhysicalOperator):
             future = executor.submit(self._sem_agg, items, system_prompt)
             futures.append(future)
 
-        # block until futures complete
-        done_futures, _ = wait(futures)
+        # collect results as futures complete
         all_call_stats: list[LLMCallStats] = []
         results = []
-        for fut in done_futures:
+        for fut in as_completed(futures):
             result_item, item_stats = fut.result()
             all_call_stats.extend(item_stats)
             results.append(result_item)
+            if on_item_complete is not None:
+                on_item_complete()
 
         # create new dataset and return it with the input datasets
         output_dataset = Dataset(name=self.dataset_id, annotation=f"Sem agg operator output for task: {self.task}", items=results)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
 from carnot.core.models import LLMCallStats, OperatorStats
 from carnot.data.dataset import Dataset
@@ -100,7 +101,7 @@ class SemTopKOperator(PhysicalOperator):
 
         return op_params
 
-    def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> tuple[dict[str, Dataset], OperatorStats]:
+    def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset], on_item_complete: Callable[[], None] | None = None) -> tuple[dict[str, Dataset], OperatorStats]:
         """Retrieve the top-k items from the input dataset via index search.
 
         If the dataset does not already have an index of the configured

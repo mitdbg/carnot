@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from importlib import resources
 
 import yaml
@@ -25,7 +28,19 @@ from carnot.core.models import LLMCallStats, OperatorStats
 from carnot.data.dataset import Dataset
 from carnot.operators.physical import PhysicalOperator
 from carnot.optimizer.model_ids import get_api_key_for_model
+from carnot.utils.model_helpers import count_tokens, truncate_agg_items_to_fit, truncate_item_to_fit
 
+# SemGroupByGroupOperatorStep templates prompt as:
+# - f"Group By Fields:\n{group_by_fields_str}\n\nInput:\n{input_str}"
+# this means the overhead tokens needs to cover the text excluding the group_by_fields_str and input_str,
+# which we estimate to be around 50 tokens just to be safe
+_GROUP_BY_PROMPT_OVERHEAD_TOKENS = 50
+
+# SemAggOperatorStep templates prompt as:
+#  - f"Aggregation Instruction: \"{self.task}\"\n\nAggregation Output Fields:\n{agg_fields_str}\n\nInput:\n{input_str}"
+# this means the overhead tokens needs to cover the text excluding the task, agg_fields_str, and input_str,
+# which we estimate to be around 50 tokens just to be safe
+_AGG_PROMPT_OVERHEAD_TOKENS = 50
 
 class SemGroupByOperator(PhysicalOperator):
     """Semantic group-by operator — groups items then aggregates per group.
@@ -149,6 +164,14 @@ class SemGroupByOperator(PhysicalOperator):
         Raises:
             AgentGenerationError: If the LLM call itself fails.
         """
+        # Truncate item if it would exceed the model's context window.
+        group_by_fields_str = "\n".join([
+            f"- {field['name']}" + (f" ({field['type']})" if 'type' in field else "") + f": {field['description']}"
+            for field in self.group_by_fields
+        ])
+        overhead = count_tokens(system_prompt, self.model_id) + count_tokens(group_by_fields_str, self.model_id) + _GROUP_BY_PROMPT_OVERHEAD_TOKENS
+        item, embed_stats = truncate_item_to_fit(item, self.task, self.model_id, self.llm_config, overhead_tokens=overhead)
+
         memory = AgentMemory("")
         memory.system_prompt = SystemPromptStep(system_prompt=system_prompt)
 
@@ -158,7 +181,7 @@ class SemGroupByOperator(PhysicalOperator):
         memory.steps.append(SemGroupByGroupOperatorStep(group_by_fields=self.group_by_fields, item=item))
 
         output_json, step_number = None, 0
-        call_stats: list[LLMCallStats] = []
+        call_stats: list[LLMCallStats] = list(embed_stats)
         while output_json is None and step_number < self.max_steps:
             memory_step = ActionStep(step_number=1, timing=Timing(start_time=time.time()))
             try:
@@ -223,12 +246,28 @@ class SemGroupByOperator(PhysicalOperator):
         Raises:
             AgentGenerationError: If the LLM call itself fails.
         """
+        # Truncate items if combined input would exceed the model's context window.
+        agg_task = "Apply the aggregation(s) specified in Aggregation Output Fields over the Input."
+        agg_fields_str = "\n".join([
+            f"- {field['name']}" + (f" ({field['type']})" if 'type' in field else "") + f": {field['description']}"
+            for field in self.agg_fields
+        ])
+        overhead = (
+            count_tokens(system_prompt, self.model_id)
+            + count_tokens(agg_task, self.model_id)
+            + count_tokens(agg_fields_str, self.model_id)
+            + _AGG_PROMPT_OVERHEAD_TOKENS
+        )
+        items, embed_stats = truncate_agg_items_to_fit(
+            items, agg_task, self.model_id, self.llm_config, overhead_tokens=overhead,
+        )
+
         memory = AgentMemory("")
         memory.system_prompt = SystemPromptStep(system_prompt=system_prompt)
-        memory.steps.append(SemAggOperatorStep(task="Apply the aggregation(s) specified in Output Fields over the Input.", agg_fields=self._sem_agg_fields, items=items))
+        memory.steps.append(SemAggOperatorStep(task=agg_task, agg_fields=self._sem_agg_fields, items=items))
 
         output_json, step_number = None, 0
-        call_stats: list[LLMCallStats] = []
+        call_stats: list[LLMCallStats] = list(embed_stats)
         while output_json is None and step_number < self.max_steps:
             memory_step = ActionStep(step_number=1, timing=Timing(start_time=time.time()))
             try:
@@ -272,7 +311,7 @@ class SemGroupByOperator(PhysicalOperator):
 
         return group_key, output_json, call_stats
 
-    def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> tuple[dict[str, Dataset], OperatorStats]:
+    def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset], on_item_complete: Callable[[], None] | None = None) -> tuple[dict[str, Dataset], OperatorStats]:
         """Execute the two-phase semantic group-by over the input dataset.
 
         Phase 1 computes group-by field values (potentially via LLM).
@@ -314,13 +353,14 @@ class SemGroupByOperator(PhysicalOperator):
                 future = executor.submit(self._sem_group, item, group_prompt)
                 futures.append(future)
 
-        # block until futures complete
-        done_futures, _ = wait(futures)
+        # collect results as futures complete (phase 1: grouping)
         items: list[dict] = []
-        for fut in done_futures:
+        for fut in as_completed(futures):
             result_item, item_stats = fut.result()
             all_call_stats.extend(item_stats)
             items.append(result_item)
+            if on_item_complete is not None:
+                on_item_complete()
 
         # compute the non-semantic agregations for each group
         agg_state = {}
@@ -383,9 +423,12 @@ class SemGroupByOperator(PhysicalOperator):
                     future = executor.submit(self._sem_agg, group_items, agg_prompt, group_key)
                     futures.append(future)
 
-            # block until futures complete
-            done_futures, _ = wait(futures)
-            group_sem_agg_outputs = [fut.result() for fut in done_futures]
+            # collect results as futures complete (phase 2: aggregation)
+            group_sem_agg_outputs = []
+            for fut in as_completed(futures):
+                group_sem_agg_outputs.append(fut.result())
+                if on_item_complete is not None:
+                    on_item_complete()
 
             # update aggregation state with semantic aggregation results
             for group_key, sem_agg_output, agg_stats in group_sem_agg_outputs:

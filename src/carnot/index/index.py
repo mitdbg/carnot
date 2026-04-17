@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import json
 import logging
+import random
+import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING
 
 import chromadb
 import faiss
 import litellm
 import numpy as np
+from tqdm import tqdm
 
 from carnot.index.sem_indices import FlatFileIndex, HierarchicalFileIndex
 from carnot.storage.config import StorageConfig
@@ -18,9 +22,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-MAX_BATCH_TOKENS = 250_000
-MAX_BATCH_ITEMS = 2048
-
+# ── Embedding model per-input token limits ──────────────────────────────
+# Duplicated from optimizer.model_ids to avoid a circular import
+# (index → optimizer → rules → … → index).
+_EMBEDDING_MAX_INPUT_TOKENS: dict[str, int] = {
+    "text-embedding-3-small": 8191,
+    "openai/text-embedding-3-small": 8191,
+    "text-embedding-3-large": 8191,
+    "openai/text-embedding-3-large": 8191,
+    "text-embedding-ada-002": 8191,
+    "openai/text-embedding-ada-002": 8191,
+}
+_DEFAULT_EMBEDDING_MAX_INPUT_TOKENS = 8191
+_MAX_TOKENS_PER_REQUEST = 300_000
+_CHROMA_INSERT_BATCH_SIZE = 2048
 
 def _resolve_model(model, api_key) -> LiteLLMModel:
     """Resolve *model* to a :class:`LiteLLMModel` instance.
@@ -420,16 +435,16 @@ class ChromaIndex(CarnotIndex):
             else:
                 raise ValueError("ChromaIndex currently only supports items of type: [dict].")
 
-        batches = _build_token_aware_batches(item_strs, self.model)
-        for batch_indices in batches:
-            batch = [item_strs[i] for i in batch_indices]
-            embeddings, embed_stats = self._llm_model.embed(texts=batch, model=self.model)
-            self._llm_call_stats.append(embed_stats)
+        all_embeddings, stats = _embed_with_chunking(item_strs, self._llm_model)
+        self._llm_call_stats.extend(stats)
 
+        # Add in batches to avoid oversized ChromaDB inserts.
+        for start in range(0, len(item_strs), _CHROMA_INSERT_BATCH_SIZE):
+            end = min(start + _CHROMA_INSERT_BATCH_SIZE, len(item_strs))
             collection.add(
-                documents=batch,
-                embeddings=embeddings,
-                ids=[self.ids[i] for i in batch_indices],
+                documents=item_strs[start:end],
+                embeddings=all_embeddings[start:end],
+                ids=self.ids[start:end],
             )
 
         return collection
@@ -450,7 +465,7 @@ class ChromaIndex(CarnotIndex):
         Raises:
             None.
         """
-        query_embedding, embed_stats = self._llm_model.embed(texts=[query], model=self.model)
+        query_embedding, embed_stats = self._llm_model.embed(texts=[query])
         self._llm_call_stats.append(embed_stats)
         query_embedding = query_embedding[0]
 
@@ -521,14 +536,9 @@ class FaissIndex(CarnotIndex):
         if index_path.exists():
             return faiss.read_index(str(index_path))
 
-        vectors = []
         item_strs = [json.dumps(item) if isinstance(item, dict) else str(item) for item in self.items]
-        batches = _build_token_aware_batches(item_strs, self.model)
-        for batch_indices in batches:
-            batch = [item_strs[i] for i in batch_indices]
-            batch_embeddings, embed_stats = self._llm_model.embed(texts=batch, model=self.model)
-            self._llm_call_stats.append(embed_stats)
-            vectors.extend(batch_embeddings)
+        vectors, stats = _embed_with_chunking(item_strs, self._llm_model)
+        self._llm_call_stats.extend(stats)
 
         matrix = np.asarray(vectors, dtype="float32")
         index = faiss.IndexFlatL2(matrix.shape[1])
@@ -554,7 +564,7 @@ class FaissIndex(CarnotIndex):
         Raises:
             None.
         """
-        query_embedding, embed_stats = self._llm_model.embed(texts=[query], model=self.model)
+        query_embedding, embed_stats = self._llm_model.embed(texts=[query])
         self._llm_call_stats.append(embed_stats)
         query_embedding = query_embedding[0]
 
@@ -613,48 +623,34 @@ class SemanticIndex(CarnotIndex):
 # ── Module-private helpers ──────────────────────────────────────────────
 
 
-def _build_token_aware_batches(texts: list[str], model: str) -> list[list[int]]:
-    """Partition *texts* into batches that fit within the embedding model's per-request token limit.
+def _build_token_aware_batches(
+    token_counts: list[int],
+    max_tokens_per_input: int,
+    max_tokens_per_request: int = _MAX_TOKENS_PER_REQUEST,
+) -> list[list[int]]:
+    """Create batches that respect both per-input and per-request token limits.
 
-    Uses ``litellm.token_counter`` to count the tokens in each text for the given *model*.
-    Batches are filled greedily: texts are added to the current batch until adding the next text
-    would exceed ``MAX_BATCH_TOKENS`` or the batch already contains ``MAX_BATCH_ITEMS`` texts.
+    Batches are filled greedily: texts are added to the current batch until
+    adding the next text would exceed either limit.
 
     Requires:
-        - *texts* is a list of strings.
-        - *model* is a model identifier recognised by ``litellm.token_counter``.
+        - *token_counts* is a non-empty list of non-negative integers.
+        - *max_tokens_per_input* > 0.
+        - *max_tokens_per_request* > 0.
 
     Returns:
-        A list of batches, where each batch is a list of integer indices into *texts*.
-        Every index in ``range(len(texts))`` appears in exactly one batch.
-        Returns a single batch containing all indices when *texts* is empty.
+        A list of batches, where each batch is a list of integer indices.
+        Every index in ``range(len(token_counts))`` appears in exactly one batch.
 
     Raises:
-        None.  Falls back to fixed-size batching (``MAX_BATCH_ITEMS`` per batch)
-        if token counting fails.
+        None.
     """
-    if not texts:
-        return [[]]
-
-    # Pre-compute per-text token counts; fall back to fixed-size batching on failure.
-    try:
-        token_counts = [litellm.token_counter(model=model, text=t) for t in texts]
-    except Exception:
-        logger.warning(
-            "Token counting failed for model '%s'; falling back to fixed-size batches of %d items.",
-            model,
-            MAX_BATCH_ITEMS,
-        )
-        return [list(range(start, min(start + MAX_BATCH_ITEMS, len(texts)))) for start in range(0, len(texts), MAX_BATCH_ITEMS)]
-
     batches: list[list[int]] = []
     current_batch: list[int] = []
     current_tokens = 0
 
     for idx, count in enumerate(token_counts):
-        # If a single text exceeds the limit, it must go in its own batch
-        # (the API will reject it, but splitting it here isn't our job).
-        if current_batch and (current_tokens + count > MAX_BATCH_TOKENS or len(current_batch) >= MAX_BATCH_ITEMS):
+        if current_batch and (current_tokens + count > max_tokens_per_request or count > max_tokens_per_input):
             batches.append(current_batch)
             current_batch = []
             current_tokens = 0
@@ -665,6 +661,149 @@ def _build_token_aware_batches(texts: list[str], model: str) -> list[list[int]]:
         batches.append(current_batch)
 
     return batches
+
+
+def _embed_with_chunking(
+    texts: list[str],
+    llm_model: LiteLLMModel,
+    max_workers: int = 16,
+) -> tuple[list[list[float]], list]:
+    """Embed *texts*, chunking any that exceed the model's per-input token limit.
+
+    Texts that fit within the limit are batched together in a single
+    embedding call.  Texts that exceed the limit are split into
+    token-safe chunks, each chunk is embedded separately, and the
+    resulting vectors are averaged to produce one embedding per
+    original text.
+
+    Requires:
+        - *texts* is a list of strings (may be empty).
+        - *llm_model* exposes an ``embed(texts, model)`` method and ``model_id``.
+
+    Returns:
+        A tuple ``(embeddings, stats)`` where *embeddings* is a list
+        of float vectors (one per input text, in the same order) and
+        *stats* is a list of ``LLMCallStats`` objects from all
+        embedding calls made.
+
+    Raises:
+        Whatever ``llm_model.embed`` raises on unrecoverable failure.
+    """
+    if not texts:
+        return [], []
+
+    # Suppress litellm / openai / httpx log output during bulk embedding.
+    litellm.suppress_debug_info = True
+
+    # Maximum tokens the embedding model accepts per call.
+    max_tokens = _EMBEDDING_MAX_INPUT_TOKENS.get(llm_model.model_id, _DEFAULT_EMBEDDING_MAX_INPUT_TOKENS)
+
+    # Optimistic token estimates — used only for batching, not for correctness.
+    from carnot.utils.model_helpers import _CHARS_PER_TOKEN
+    est_token_counts = [len(t) // _CHARS_PER_TOKEN + 1 for t in texts]
+
+    # Build batches from the estimates.  If any batch ends up exceeding the
+    # real token limit the _process_batch fallback will handle it.
+    batches = _build_token_aware_batches(est_token_counts, max_tokens)
+    print(f"Embedding {len(texts)} texts in {len(batches)} batches (max_workers={max_workers})")
+
+    # Pre-allocate result list.
+    embeddings: list[list[float] | None] = [None] * len(texts)
+    all_stats: list = []
+
+    def _embed_with_retry(embed_texts: list[str], max_attempts: int = 10) -> tuple[list[list[float]], object]:
+        """Call llm_model.embed with exponential backoff on rate-limit errors."""
+        for attempt in range(max_attempts):
+            try:
+                return llm_model.embed(texts=embed_texts)
+            except Exception as exc:
+                if "rate_limit" in str(exc).lower() or "429" in str(exc):
+                    delay = min(2 ** attempt + random.random(), 60.0)
+                    time.sleep(delay)
+                    continue
+                raise
+        # Final attempt — let it raise if it fails.
+        return llm_model.embed(texts=embed_texts)
+
+    def _process_batch(batch_indices: list[int]) -> tuple[list[tuple[int, list[float]]], list]:
+        batch = [texts[i] for i in batch_indices]
+        try:
+            batch_embeddings, stats = _embed_with_retry(batch)
+            return [(bi, emb) for bi, emb in zip(batch_indices, batch_embeddings, strict=True)], [stats]
+        except Exception as exc:
+            exc_str = str(exc).lower()
+            if "maximum input length" not in exc_str and "max_tokens_per_request" not in exc_str:
+                raise
+            # Fallback: embed one-by-one, chunking any that still exceed the limit.
+            results: list[tuple[int, list[float]]] = []
+            stats_list: list = []
+            for bi in batch_indices:
+                try:
+                    emb_list, stats = _embed_with_retry([texts[bi]])
+                    results.append((bi, emb_list[0]))
+                    stats_list.append(stats)
+                except Exception:
+                    chunks = _split_text_to_token_limit(texts[bi], max_tokens, llm_model.model_id)
+                    chunk_embs: list[list[float]] = []
+                    for chunk in chunks:
+                        emb_list, stats = _embed_with_retry([chunk])
+                        chunk_embs.append(emb_list[0])
+                        stats_list.append(stats)
+                    results.append((bi, np.mean(chunk_embs, axis=0).tolist()))
+            return results, stats_list
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_process_batch, bi): bi for bi in batches}
+        try:
+            with tqdm(total=len(batches), desc="Embedding texts", unit="batch") as pbar:
+                for fut in as_completed(futures):
+                    pairs, batch_stats = fut.result()
+                    all_stats.extend(batch_stats)
+                    for bi, emb in pairs:
+                        embeddings[bi] = emb
+                    pbar.update(1)
+        except Exception:
+            # Cancel remaining futures so shutdown doesn't block.
+            for f in futures:
+                f.cancel()
+            raise
+
+    return embeddings, all_stats
+
+
+def _split_text_to_token_limit(text: str, max_tokens: int, model: str) -> list[str]:
+    """Split *text* into chunks each within *max_tokens*.
+
+    Iteratively halves the character budget until each chunk fits.
+
+    Requires:
+        - *text* is a non-empty string.
+        - *max_tokens* >= 1.
+
+    Returns:
+        A list of non-empty string chunks whose token counts are
+        each <= *max_tokens*.
+
+    Raises:
+        None.
+    """
+    # Start with a character budget estimated from the token limit.
+    # ~4 chars per token is a rough estimate; we validate and shrink.
+    from carnot.utils.model_helpers import _CHARS_PER_TOKEN
+    chunk_chars = max_tokens * _CHARS_PER_TOKEN
+    while chunk_chars > 0:
+        chunks = [text[i:i + chunk_chars] for i in range(0, len(text), chunk_chars)]
+        try:
+            counts = [litellm.token_counter(model=model, text=c) for c in chunks]
+        except Exception:
+            counts = [len(c) // _CHARS_PER_TOKEN + 1 for c in chunks]
+
+        if all(c <= max_tokens for c in counts):
+            return chunks
+        chunk_chars //= 2
+
+    # Last resort: return one-character chunks (should never happen).
+    return list(text)
 
 
 def _build_uri_to_idx(items: list) -> dict[str, int]:

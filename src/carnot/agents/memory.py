@@ -354,7 +354,7 @@ class SemFlatMapOperatorStep(MemoryStep):
             for field in self.output_fields
         ])
         input_str = json.dumps(self.item, indent=2)
-        content = f"Join Condition: \"{self.task}\"\n\nOutput Fields:\n{output_fields_str}\n\nInput:\n{input_str}"
+        content = f"Map Instruction: \"{self.task}\"\n\nOutput Fields:\n{output_fields_str}\n\nInput:\n{input_str}"
         return [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": content}])]
 
 @dataclass

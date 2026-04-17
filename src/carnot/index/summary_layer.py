@@ -77,15 +77,19 @@ class SummaryLayer:
         cache_dir = storage_dir or StorageConfig().summaries_dir
         self._cache = FileSummaryCache(storage_dir=cache_dir)
 
+        from carnot.agents.models import LiteLLMModel as _LiteLLMModel
         if model is not None:
             self._model = model
         else:
-            from carnot.agents.models import LiteLLMModel as _LiteLLMModel
-
             self._model = _LiteLLMModel(
                 model_id=self._config.summary_model,
                 api_key=self._api_key,
             )
+
+        self._embedding_model = _LiteLLMModel(
+            model_id=self._config.embedding_model,
+            api_key=self._api_key,
+        )
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -261,10 +265,7 @@ Summary:"""
             None.  Errors are logged.
         """
         try:
-            embeddings, _embed_stats = self._model.embed(
-                texts=[text],
-                model=self._config.embedding_model,
-            )
+            embeddings, _embed_stats = self._embedding_model.embed(texts=[text])
             return embeddings[0]
         except Exception as e:
             logger.warning(f"Embedding generation failed: {e}")

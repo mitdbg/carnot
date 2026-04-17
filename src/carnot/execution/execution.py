@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import queue
 import time
+from collections.abc import Callable
 
 from smolagents.tools import Tool
 
@@ -376,6 +377,7 @@ class Execution:
         self,
         node_id: str,
         datasets_store: dict[str, Dataset],
+        on_item_complete: Callable[[], None] | None = None,
     ) -> tuple[dict[str, Dataset], OperatorStats | None]:
         """Execute a single plan node.
 
@@ -418,6 +420,7 @@ class Execution:
             storage=self.storage,
             index_catalog=self.index_catalog,
             parent_output_ids=parent_output_ids,
+            on_item_complete=on_item_complete,
         )
 
         # Enrich the output dataset with parent references so callers
@@ -673,9 +676,46 @@ class Execution:
     # Execute the physical plan and produce final results with stats
     # ------------------------------------------------------------------
 
+    def _estimate_items_total(
+        self, node: PlanNode, datasets_store: dict[str, Dataset],
+    ) -> int:
+        """Estimate the number of work items for progress tracking.
+
+        For joins this is left * right; for other operators it is the
+        input item count. Returns 0 when the count cannot be determined
+        (e.g. for code / reasoning operator).
+        """
+        plan = self._physical_plan
+        parent_ids = [plan.get_node(pid).dataset_id for pid in node.parent_ids]
+
+        if node.operator_type == "Join" and len(parent_ids) >= 2:
+            left_ds = datasets_store.get(parent_ids[0])
+            right_ds = datasets_store.get(parent_ids[1])
+            left_n = len(left_ds.items) if left_ds else 0
+            right_n = len(right_ds.items) if right_ds else 0
+            return left_n * right_n
+
+        if node.operator_type == "GroupBy" and parent_ids:
+            # Phase 1 has one future per item; phase 2 has one per group
+            # (unknown ahead of time).  Use input size as a lower bound.
+            ds = datasets_store.get(parent_ids[0])
+            return len(ds.items) if ds else 0
+
+        if parent_ids:
+            ds = datasets_store.get(parent_ids[0])
+            return len(ds.items) if ds else 0
+
+        # for leaf nodes with no parents return the number of items in the dataset
+        if node.node_type == "dataset":
+            ds = datasets_store.get(node.dataset_id)
+            return len(ds.items) if ds else 0
+
+        return 0
+
     def run(
         self,
         progress_queue: queue.Queue | None = None,
+        show_progress: bool = False,
     ) -> tuple[list[dict], str, ExecutionStats]:
         """Execute the physical plan and return the result with stats.
 
@@ -687,6 +727,10 @@ class Execution:
         If a *progress_queue* is provided, yields intermediate progress updates
         as serialized ``ExecutionProgress`` dicts after each node completes,
         including operator stats, item counts, and output previews when available.
+
+        When *show_progress* is ``True``, a Rich live table is rendered
+        in the terminal showing operator status, item progress, latency,
+        and running cost.
 
         Requires:
             - ``self._physical_plan`` is not None.
@@ -706,55 +750,86 @@ class Execution:
         nodes = self._physical_plan.topo_order()
         total = len(nodes)
 
+        # Set up Rich progress display if requested.
+        progress_display = None
+        if show_progress:
+            from carnot.execution.rich_progress import RichProgressDisplay
+            progress_display = RichProgressDisplay()
+            for node in nodes:
+                progress_display.register_node(node.node_id, node.display_name())
+            progress_display.start()
+
         self._update_progress(
             progress_queue,
             message=f"Starting execution -- {total} step(s) in plan.",
             total_operators=total,
         )
 
-        for idx, node in enumerate(nodes):
-            display = node.display_name()
+        try:
+            for idx, node in enumerate(nodes):
+                display = node.display_name()
 
-            self._update_progress(
-                progress_queue,
-                message=f"Running step {idx + 1}/{total}: {display}...",
-                operator_index=idx,
-                total_operators=total,
-                operator_name=display,
-            )
+                self._update_progress(
+                    progress_queue,
+                    message=f"Running step {idx + 1}/{total}: {display}...",
+                    operator_index=idx,
+                    total_operators=total,
+                    operator_name=display,
+                )
 
-            datasets_store, op_stats = self.run_node(
-                node.node_id, datasets_store,
-            )
-            if op_stats is not None:
-                all_operator_stats.append(op_stats)
+                # Determine input item count for progress tracking.
+                item_callback = None
+                items_total = 0
+                if progress_display is not None:
+                    items_total = self._estimate_items_total(node, datasets_store)
+                    progress_display.mark_running(node.node_id, items_total)
+                    item_callback = progress_display.make_item_callback(node.node_id)
 
-            # peek at the output dataset for item count / preview
-            output_ds = datasets_store.get(node.dataset_id)
-            item_count, preview = None, None
-            if output_ds is not None and hasattr(output_ds, "items"):
-                try:
-                    items_list = output_ds.items
-                    item_count = len(items_list)
-                    raw_preview = items_list[:_PREVIEW_ITEM_LIMIT]
-                    preview = [
-                        item if isinstance(item, dict) else {"value": str(item)}
-                        for item in raw_preview
-                    ]
-                except Exception:
-                    pass  # Non-critical — skip preview on error
+                datasets_store, op_stats = self.run_node(
+                    node.node_id, datasets_store, on_item_complete=item_callback,
+                )
+                if op_stats is not None:
+                    all_operator_stats.append(op_stats)
 
-            self._update_progress(
-                progress_queue,
-                message=f"Completed step {idx + 1}/{total}: {display}.",
-                operator_index=idx,
-                total_operators=total,
-                operator_name=display,
-                step_cost_usd=op_stats.total_cost_usd if op_stats else None,
-                operator_stats=op_stats,
-                item_count=item_count,
-                preview_items=preview,
-            )
+                if progress_display is not None:
+                    if op_stats is not None:
+                        progress_display.mark_done(
+                            node.node_id,
+                            cost_usd=op_stats.total_cost_usd,
+                            items_out=op_stats.items_out,
+                        )
+                    else:
+                        progress_display.mark_skipped(node.node_id)
+
+                # peek at the output dataset for item count / preview
+                output_ds = datasets_store.get(node.dataset_id)
+                item_count, preview = None, None
+                if output_ds is not None and hasattr(output_ds, "items"):
+                    try:
+                        items_list = output_ds.items
+                        item_count = len(items_list)
+                        raw_preview = items_list[:_PREVIEW_ITEM_LIMIT]
+                        preview = [
+                            item if isinstance(item, dict) else {"value": str(item)}
+                            for item in raw_preview
+                        ]
+                    except Exception:
+                        pass  # Non-critical — skip preview on error
+
+                self._update_progress(
+                    progress_queue,
+                    message=f"Completed step {idx + 1}/{total}: {display}.",
+                    operator_index=idx,
+                    total_operators=total,
+                    operator_name=display,
+                    step_cost_usd=op_stats.total_cost_usd if op_stats else None,
+                    operator_stats=op_stats,
+                    item_count=item_count,
+                    preview_items=preview,
+                )
+        finally:
+            if progress_display is not None:
+                progress_display.stop()
 
         final_dataset = self._resolve_final_dataset(datasets_store)
 

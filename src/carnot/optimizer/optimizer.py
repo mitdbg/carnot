@@ -197,6 +197,12 @@ class Optimizer:
         logical operator so the optimizer has a concrete expression to
         attach implementation rules and cost estimates to.
 
+        When the same ``Dataset`` object appears in multiple branches of
+        the DAG (e.g. two filters reading the same base dataset), the
+        resulting ``LogicalExpression`` will have an identical ``expr_id``.
+        In that case the existing group is reused instead of creating a
+        duplicate.
+
         Requires:
             - ``logical_plan`` is a valid ``Dataset`` node.
             - Leaf datasets have ``operator is None`` and ``parents == []``.
@@ -224,16 +230,22 @@ class Optimizer:
                 self._construct_group_tree(parent) for parent in logical_plan.parents
             ]
 
+        # Build a tentative LogicalExpression to compute its expr_id.
+        # If an expression with the same id already exists, reuse its group
+        # instead of creating a duplicate (handles DAG fan-in).
+        logical_expression = LogicalExpression(
+            operator=op,
+            input_group_ids=input_group_ids,
+            group_id=None,
+        )
+        if logical_expression.expr_id in self.expressions:
+            return self.expressions[logical_expression.expr_id].group_id
+
         # assign a fresh monotonic group id
         group_id = self.next_group_id
         self.next_group_id += 1
 
-        # construct the logical expression and group
-        logical_expression = LogicalExpression(
-            operator=op,
-            input_group_ids=input_group_ids,
-            group_id=group_id,
-        )
+        logical_expression.set_group_id(group_id)
         group = Group(logical_expressions=[logical_expression], group_id=group_id)
 
         # add the expression and group to the optimizer's expressions and groups and return

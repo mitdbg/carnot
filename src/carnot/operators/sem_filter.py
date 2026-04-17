@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from importlib import resources
 
 import yaml
@@ -24,7 +27,13 @@ from carnot.core.models import LLMCallStats, OperatorStats
 from carnot.data.dataset import Dataset
 from carnot.operators.physical import PhysicalOperator
 from carnot.optimizer.model_ids import get_api_key_for_model
+from carnot.utils.model_helpers import count_tokens, truncate_item_to_fit
 
+# SemFilterOperatorStep templates prompt as:
+# - f"Filter Condition: \"{self.task}\"\n\nInput:\n{input_str}"
+# this means the overhead tokens needs to cover the text excluding the task and input_str,
+# which we estimate to be around 50 tokens just to be safe
+_FILTER_PROMPT_OVERHEAD_TOKENS = 50
 
 class SemFilterOperator(PhysicalOperator):
     """Semantic filter operator — retains or discards items via an LLM boolean judgement.
@@ -129,11 +138,15 @@ class SemFilterOperator(PhysicalOperator):
         Raises:
             AgentGenerationError: If the LLM call itself fails.
         """
+        # truncate item if it would exceed the model's context window.
+        overhead = count_tokens(system_prompt, self.model_id) + count_tokens(self.task, self.model_id) + _FILTER_PROMPT_OVERHEAD_TOKENS
+        item, embed_stats = truncate_item_to_fit(item, self.task, self.model_id, self.llm_config, overhead_tokens=overhead)
+
         memory = AgentMemory("")
         memory.system_prompt = SystemPromptStep(system_prompt=system_prompt)
         memory.steps.append(SemFilterOperatorStep(task=self.task, item=item))
         passes_filter, step_number = None, 0
-        call_stats: list[LLMCallStats] = []
+        call_stats: list[LLMCallStats] = list(embed_stats)
         while passes_filter is None and step_number < self.max_steps:
             memory_step = ActionStep(step_number=1, timing=Timing(start_time=time.time()))
             try:
@@ -171,7 +184,7 @@ class SemFilterOperator(PhysicalOperator):
 
         return (item if passes_filter else None), call_stats
 
-    def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset]) -> tuple[dict[str, Dataset], OperatorStats]:
+    def __call__(self, dataset_id: str, input_datasets: dict[str, Dataset], on_item_complete: Callable[[], None] | None = None) -> tuple[dict[str, Dataset], OperatorStats]:
         """Execute the semantic filter over every item in the input dataset.
 
         Requires:
@@ -210,15 +223,16 @@ class SemFilterOperator(PhysicalOperator):
                 future = executor.submit(self._sem_filter, item, system_prompt)
                 futures.append(future)
 
-        # block until futures complete
-        done_futures, _ = wait(futures)
+        # collect results as futures complete
         all_call_stats: list[LLMCallStats] = []
         results = []
-        for fut in done_futures:
+        for fut in as_completed(futures):
             result_item, item_stats = fut.result()
             all_call_stats.extend(item_stats)
             if result_item is not None:
                 results.append(result_item)
+            if on_item_complete is not None:
+                on_item_complete()
 
         # create new dataset and return it with the input datasets
         output_dataset = Dataset(name=self.dataset_id, annotation=f"Sem filter operator output for task: {self.task}", items=results)
