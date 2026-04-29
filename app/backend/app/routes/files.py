@@ -4,6 +4,7 @@ import os
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from starlette.concurrency import run_in_threadpool
 
 from app.auth import get_current_user
 from app.database import File as FileRecord
@@ -106,8 +107,9 @@ async def upload_file(file: UploadFile = File(...), path: str = Form(""), user_i
         if normalized_path.rstrip("/") == normalize_path(BASE_DIR).rstrip("/"):
             raise HTTPException(status_code=400, detail="Cannot upload files directly to the base directory.")
 
-        # save file to file system
-        file_paths = file_service.save_uploaded_file(file, normalized_path)
+        # save file to file system — run in thread pool to avoid blocking the asyncio
+        # event loop with synchronous boto3 / disk I/O, which would starve ALB health checks
+        file_paths = await run_in_threadpool(file_service.save_uploaded_file, file, normalized_path)
 
         # determine if the file is shared based on the provided path
         shared = (
