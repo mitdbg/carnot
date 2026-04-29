@@ -327,8 +327,13 @@ resource "aws_iam_role_policy" "backend_sa" {
         ]
       },
       {
-        Effect   = "Allow"
-        Action   = ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"]
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret",
+          "secretsmanager:CreateSecret",
+          "secretsmanager:PutSecretValue",
+        ]
         Resource = "arn:aws:secretsmanager:${var.aws_region}:${var.account_id}:secret:carnot/${each.key}/*"
       },
     ]
