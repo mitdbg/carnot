@@ -60,7 +60,11 @@ resource "aws_eks_node_group" "carnot_nodes" {
   scaling_config {
     desired_size = 1
     min_size     = 1
-    max_size     = 3
+    # Headroom is required so the Cluster Autoscaler can always add a node in
+    # whichever AZ has a Pending pod (e.g. an AZ-pinned EBS-backed StatefulSet
+    # like carnot-postgres). With this set too low, CA emits
+    # "max node group size reached" and AZ-pinned pods stay Pending.
+    max_size     = 6
   }
 
   lifecycle {
