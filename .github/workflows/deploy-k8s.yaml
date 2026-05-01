@@ -12,6 +12,16 @@ on:
       - lm-prod
       - wl-prod
   workflow_dispatch:   # Manual trigger — required for Terraform steps
+    inputs:
+      apply_target:
+        description: 'Which Terraform stack(s) to apply on this manual run'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - global
+          - eks
+          - both
 
 permissions:
   id-token: write   # required for OIDC auth with AWS
@@ -80,21 +90,22 @@ jobs:
       ######################################################################
       # STEP 1 — PROVISION GLOBAL INFRASTRUCTURE
       # Only runs on manual workflow_dispatch to avoid disrupting
-      # production environments that share this cluster.
+      # production environments that share this cluster. Gated further
+      # by the `apply_target` input so EKS-only runs can skip this block.
       ######################################################################
 
       - name: Terraform Init (Global)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && (inputs.apply_target == 'global' || inputs.apply_target == 'both')
         working-directory: deploy/terraform/global
         run: terraform init
 
       - name: Terraform Validate (Global)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && (inputs.apply_target == 'global' || inputs.apply_target == 'both')
         working-directory: deploy/terraform/global
         run: terraform validate
 
       - name: Write Global vars.tfvars
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && (inputs.apply_target == 'global' || inputs.apply_target == 'both')
         working-directory: deploy/terraform/global
         run: |
           cat > global-vars.tfvars <<EOF
@@ -103,19 +114,19 @@ jobs:
           EOF
 
       - name: Terraform Apply (Global)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && (inputs.apply_target == 'global' || inputs.apply_target == 'both')
         working-directory: deploy/terraform/global
         run: terraform apply -var-file="global-vars.tfvars" -auto-approve
 
       - name: Get Homepage EC2 Public IP
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && (inputs.apply_target == 'global' || inputs.apply_target == 'both')
         working-directory: deploy/terraform/global
         run: |
           homepage_public_ip=$(terraform output -raw homepage_public_ip)
           echo "HOMEPAGE_PUBLIC_IP=$homepage_public_ip" >> $GITHUB_ENV
 
       - name: Start NGINX on Homepage EC2
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && (inputs.apply_target == 'global' || inputs.apply_target == 'both')
         env:
           CARNOT_DEPLOY_KEY: ${{ secrets.CARNOT_DEPLOY_KEY }}
           MS_APP_ID: ${{ secrets.MICROSOFT_APPLICATION_ID }}
@@ -124,10 +135,35 @@ jobs:
           mkdir -p .well-known
           echo "{\"associatedApplications\":[{\"applicationId\": \"$MS_APP_ID\"}]}" > .well-known/microsoft-identity-association.json
 
-          # sleep to ensure that the instance is ready to accept SSH connections
-          echo "Copying homepage files to $HOMEPAGE_PUBLIC_IP"
-          sleep 5
+          echo "Waiting for $HOMEPAGE_PUBLIC_IP to accept SSH..."
+          # Poll for sshd. On a freshly-provisioned EC2, port 22 may not be open
+          # for a minute or so after Terraform apply returns.
+          for i in $(seq 1 60); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
+                   -i deployer_key.pem ubuntu@$HOMEPAGE_PUBLIC_IP true 2>/dev/null; then
+              echo "SSH is up."
+              break
+            fi
+            echo "  ssh not ready yet (attempt $i/60), retrying in 10s..."
+            sleep 10
+          done
 
+          echo "Waiting for cloud-init to finish and the nginx container to exist..."
+          # cloud-init installs Docker and runs `docker run ... carnot-homepage-nginx`.
+          # Until that finishes, /var/run/docker.sock may not exist or the container
+          # may not yet be created.
+          for i in $(seq 1 60); do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -o BatchMode=yes \
+                   -i deployer_key.pem ubuntu@$HOMEPAGE_PUBLIC_IP \
+                   "sudo cloud-init status --wait >/dev/null 2>&1 && sudo docker inspect carnot-homepage-nginx >/dev/null 2>&1"; then
+              echo "cloud-init finished and carnot-homepage-nginx exists."
+              break
+            fi
+            echo "  host not ready yet (attempt $i/60), retrying in 10s..."
+            sleep 10
+          done
+
+          echo "Copying homepage files to $HOMEPAGE_PUBLIC_IP"
           # copy files to EC2
           scp -r -o StrictHostKeyChecking=no -i deployer_key.pem app/index.html app/terms-of-service.md app/privacy-statement.md .well-known ubuntu@$HOMEPAGE_PUBLIC_IP:~/
 
@@ -152,21 +188,22 @@ jobs:
       ######################################################################
       # STEP 2 — PROVISION EKS CLUSTER INFRASTRUCTURE
       # Only runs on manual workflow_dispatch to avoid disrupting
-      # production environments that share this cluster.
+      # production environments that share this cluster. Gated further
+      # by the `apply_target` input so global-only runs can skip this block.
       ######################################################################
 
       - name: Terraform Init (EKS)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && (inputs.apply_target == 'eks' || inputs.apply_target == 'both')
         working-directory: deploy/terraform/eks
         run: terraform init
 
       - name: Terraform Validate (EKS)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && (inputs.apply_target == 'eks' || inputs.apply_target == 'both')
         working-directory: deploy/terraform/eks
         run: terraform validate
 
       - name: Terraform Apply (EKS)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && (inputs.apply_target == 'eks' || inputs.apply_target == 'both')
         working-directory: deploy/terraform/eks
         run: terraform apply -auto-approve
 
