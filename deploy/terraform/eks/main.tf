@@ -63,6 +63,10 @@ resource "aws_eks_node_group" "carnot_nodes" {
     max_size     = 3
   }
 
+  lifecycle {
+    ignore_changes = [scaling_config[0].desired_size]
+  }
+
   tags = {
     # Required for Cluster Autoscaler auto-discovery (see addons.tf)
     "k8s.io/cluster-autoscaler/${var.cluster_name}" = "owned"
