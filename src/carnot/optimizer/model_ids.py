@@ -146,8 +146,31 @@ def get_model_size(model_id: str) -> ModelSize:
     return _MODEL_SIZE.get(model_id, ModelSize.MEDIUM)
 
 
+# Maps a litellm provider prefix (e.g. ``"openai/"``) to the
+# ``llm_config`` API-key name for that provider.  Used as a fallback
+# in ``get_api_key_for_model`` so that model IDs not present in the
+# tiered completion-model lists above (e.g. embedding models like
+# ``"openai/text-embedding-3-small"``) still resolve to the correct
+# API key.
+_PROVIDER_PREFIX_TO_KEY: dict[str, str] = {
+    "openai/": "OPENAI_API_KEY",
+    "gemini/": "GEMINI_API_KEY",
+    "anthropic/": "ANTHROPIC_API_KEY",
+    "together_ai/": "TOGETHER_API_KEY",
+}
+
+
 def get_api_key_for_model(model_id: str, llm_config: dict) -> str | None:
     """Return the API key from *llm_config* for the provider of *model_id*.
+
+    Resolution order:
+        1. Exact match against the per-provider tiered model lists
+           (``_API_KEY_TO_MODELS``).
+        2. Provider-prefix match against ``_PROVIDER_PREFIX_TO_KEY``
+           (e.g. ``"openai/text-embedding-3-small"`` →
+           ``OPENAI_API_KEY``).  This covers embedding models and any
+           other provider-prefixed model IDs not enumerated in the
+           completion-model lists.
 
     Requires:
         - *model_id* is a non-empty string.
@@ -155,8 +178,8 @@ def get_api_key_for_model(model_id: str, llm_config: dict) -> str | None:
 
     Returns:
         The API-key string for the provider that owns *model_id*, or
-        ``None`` if *model_id* is not found in any provider's model
-        list or the corresponding key is absent/empty in *llm_config*.
+        ``None`` if no provider can be resolved or the corresponding
+        key is absent/empty in *llm_config*.
 
     Raises:
         None.
@@ -166,6 +189,13 @@ def get_api_key_for_model(model_id: str, llm_config: dict) -> str | None:
             value = llm_config.get(key_name)
             if value:
                 return value
+
+    for prefix, key_name in _PROVIDER_PREFIX_TO_KEY.items():
+        if model_id.startswith(prefix):
+            value = llm_config.get(key_name)
+            if value:
+                return value
+
     return None
 
 

@@ -483,7 +483,7 @@ class CostModel:
         pricing = self.pricing.get(operator.model_id)
         n = input_plan_cost.output_cardinality
         t_in = input_plan_cost.avg_tokens_per_record
-        k = float(operator.k)
+        k = float(min(operator.k, int(n))) if n > 0 else 0.0
 
         # Embedding cost: all N records are embedded
         cost_per_record = t_in * pricing.input_cost_per_token

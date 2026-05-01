@@ -1352,7 +1352,7 @@ async def persist_query_event(
                 session_id=session_id,
                 event_type=event_type,
                 source=source,
-                payload=payload,
+                payload=jsonb_serializer.sanitize(payload),
                 step_cost_usd=step_cost_usd,
             )
             db.add(row)
