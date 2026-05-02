@@ -2086,8 +2086,8 @@ async def execute_jupyter(
             notebook_uuid=notebook_id,
             label=label,
             query=request.query,
-            plan_json=request.plan,
-            cells_json=cells,
+            plan_json=jsonb_serializer.sanitize(request.plan),
+            cells_json=jsonb_serializer.sanitize(cells),
         )
         db.add(notebook_row)
         await db.commit()
@@ -2146,9 +2146,9 @@ async def execute_cell(
     invalidated_cells: list[str] = []
     if request.code is not None:
         # Build parent_output_map so original_code uses the same format
-        # the frontend received (output_dataset_ids, not node IDs).
+        # the frontend received (dataset_ids, not node IDs).
         parent_output_map = {
-            n.node_id: n.output_dataset_id
+            n.node_id: n.dataset_id
             for n in nb.physical_plan.nodes
         }
         original_code = node.to_code(parent_output_map=parent_output_map)
@@ -2158,15 +2158,15 @@ async def execute_cell(
             if parsed:
                 # Handle output dataset renaming
                 new_out = parsed.pop("_output_dataset_id", None)
-                if new_out and new_out != node.output_dataset_id:
-                    node.output_dataset_id = new_out
+                if new_out and new_out != node.dataset_id:
+                    node.dataset_id = new_out
 
                 # Handle input dataset rewiring
                 new_inputs = parsed.pop("_input_dataset_ids", None)
                 if new_inputs:
-                    # Map output_dataset_id → node_id for reverse lookup
+                    # Map dataset_id → node_id for reverse lookup
                     out_to_node = {
-                        n.output_dataset_id: n.node_id
+                        n.dataset_id: n.node_id
                         for n in nb.physical_plan.nodes
                     }
                     new_parent_ids = [

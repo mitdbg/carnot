@@ -307,7 +307,7 @@ class PlanNode:
             None.
         """
         def _resolve_parent(pid: str) -> str:
-            """Map a parent node ID to the parent's output_dataset_id."""
+            """Map a parent node ID to the parent's dataset_id."""
             if parent_output_map:
                 return parent_output_map.get(pid, pid)
             return pid

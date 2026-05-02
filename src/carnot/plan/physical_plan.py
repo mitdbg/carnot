@@ -479,7 +479,7 @@ class PhysicalPlan:
     def to_node_dicts(self) -> list[dict]:
         """Serialise all nodes to a list of dict descriptors.
 
-        Builds a ``parent_output_map`` (``node_id → output_dataset_id``)
+        Builds a ``parent_output_map`` (``node_id → dataset_id``)
         so that pseudocode references parent datasets by their
         human-readable output name instead of internal node IDs.
 
@@ -493,7 +493,7 @@ class PhysicalPlan:
             None.
         """
         parent_output_map = {
-            nid: node.output_dataset_id
+            nid: node.dataset_id
             for nid, node in self._nodes.items()
         }
         return [
