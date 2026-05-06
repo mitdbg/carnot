@@ -1,3 +1,6 @@
+# Large data folder
+data/officeqa/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
