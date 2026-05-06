@@ -1,0 +1,61 @@
+#!/home/gerardo/.local/share/mamba/envs/carnot/bin/python
+"""Delegate bulk reading to DeepSeek V4"""
+import argparse, os, pathlib
+from openai import OpenAI
+import sys
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--paths", nargs="+", required=True)
+parser.add_argument("--question", required=True)
+parser.add_argument("--max-tokens", type=int, default=8192,
+               help="Total token budget (reasoning + answer)")
+parser.add_argument("--model", default="deepseek/deepseek-v4-flash")
+args = parser.parse_args()
+
+client = OpenAI(
+    api_key=os.environ["WORKER_API_KEY"],
+    base_url="https://openrouter.ai/api/v1"
+  )
+
+
+
+# Build a stable prefix for cache hits (book/corpus first, question last)
+docs = []
+for path in args.paths:
+    content = pathlib.Path(path).read_text(errors="replace")
+    docs.append(f"<file path='{path}'>\n{content}\n</file>")
+corpus = "\n\n".join(docs)
+
+
+
+
+resp = client.chat.completions.create(
+    model=args.model,
+    messages=[
+        {"role": "system", "content": (
+            "You are a precise code/document analyst. Read the provided files "
+            "and answer the question concisely. Quote file paths and line "
+            "numbers when relevant. Output structured bullets, not prose. "
+            "Keep your answer under 800 words."
+        )},
+        {"role": "user", "content": f"<corpus>\n{corpus}\n</corpus>"},
+        {"role": "user", "content": args.question},
+    ],
+    max_tokens=args.max_tokens,
+)
+
+answer = resp.choices[0].message.content
+if answer:
+    print(answer)
+else:
+    # Fallback: if content is empty but reasoning exists, model hit token limit
+    print("[ERROR: LLM ran out of tokens during reasoning. "
+          "Try --max-tokens 16384]", file=sys.stderr)
+    sys.exit(1)
+
+# Cost report to stderr
+u = resp.usage
+cached = getattr(getattr(u, 'prompt_tokens_details', None), 'cached_tokens', 0) or 0
+print(f"\n[llm: {u.prompt_tokens} in ({cached} cached) / "
+      f"{u.completion_tokens} out | finish: {resp.choices[0].finish_reason}]",
+      file=sys.stderr)

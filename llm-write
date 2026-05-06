@@ -1,0 +1,59 @@
+#!/home/gerardo/.local/share/mamba/envs/carnot/bin/python
+"""Delegate boilerplate generation to DeepSeek.
+
+DeepSeek is a thinking model — it uses reasoning tokens internally.
+max-tokens must be high enough to cover both reasoning + output code.
+"""
+import argparse, os, sys, pathlib
+from openai import OpenAI
+
+client = OpenAI(
+    api_key=os.environ.get("WORKER_API_KEY", os.environ.get("WORKER_API_KEY", "")),
+    base_url="https://openrouter.ai/api/v1"
+)
+
+p = argparse.ArgumentParser(description="Ask and LLM to generate code/docs")
+p.add_argument("--spec", required=True, help="What to write")
+p.add_argument("--context", help="Optional reference file for style/imports")
+p.add_argument("--target", required=True, help="Output file path")
+p.add_argument("--max-tokens", type=int, default=16384,
+               help="Total token budget (reasoning + output)")
+p.add_argument("--model", default="deepseek/deepseek-v4-flash")
+args = p.parse_args()
+
+ctx = ""
+if args.context:
+    ctx = f"<reference>\n{pathlib.Path(args.context).read_text()}\n</reference>\n"
+
+resp = client.chat.completions.create(
+    model=args.model,
+    messages=[
+        {"role": "system", "content": (
+            "Generate clean, idiomatic code matching the style of any "
+            "reference provided. No explanations, no markdown fences — "
+            "output ONLY the file contents."
+        )},
+        {"role": "user", "content": f"{ctx}Write: {args.spec}"},
+    ],
+    max_tokens=args.max_tokens,
+)
+
+content = resp.choices[0].message.content
+if not content:
+    print("[ERROR: LLM ran out of tokens during reasoning. "
+          "Try --max-tokens 32768]", file=sys.stderr)
+    sys.exit(1)
+
+# Strip accidental markdown fences if DeepSeek adds them
+if content.startswith("```"):
+    content = content.split("\n", 1)[1].rsplit("```", 1)[0]
+
+with open(args.target, "w") as f:
+    f.write(content)
+
+print(f"Wrote {args.target} ({len(content)} chars)")
+u = resp.usage
+cached = getattr(getattr(u, 'prompt_tokens_details', None), 'cached_tokens', 0) or 0
+print(f"[llm: {u.prompt_tokens} in ({cached} cached) / "
+      f"{u.completion_tokens} out | finish: {resp.choices[0].finish_reason}]",
+      file=sys.stderr)
