@@ -1822,31 +1822,41 @@ def _parse_code_to_params(
             result["_input_dataset_ids"] = input_ids
 
         # -- operator-specific params ------------------------------
-        if operator_type == "SemanticFilter":
+        if operator_type == "Filter":
             val = _extract_quoted(code, "condition", dotall=True)
             if val:
-                result["condition"] = val
+                result["task"] = val
 
-        elif operator_type == "SemanticMap":
-            for key in ("field", "type", "description"):
-                val = _extract_quoted(code, key)
-                if val is not None:
-                    k = "field_desc" if key == "description" else key
-                    result[k] = val
+        elif operator_type == "Map":
+            # Parse fields=[{...}, ...] as a JSON array (best-effort)
+            fields_m = re.search(r'fields\s*=\s*(\[.*?\])', code, re.DOTALL)
+            if fields_m:
+                try:
+                    import json as _json
+                    parsed_fields = _json.loads(fields_m.group(1))
+                    if isinstance(parsed_fields, list):
+                        result["output_fields"] = parsed_fields
+                except Exception:
+                    pass
 
-        elif operator_type == "SemanticJoin":
+        elif operator_type == "Join":
             val = _extract_quoted(code, "condition", dotall=True)
             if val:
-                result["condition"] = val
+                result["task"] = val
 
-        elif operator_type == "SemanticFlatMap":
-            for key in ("field", "type", "description"):
-                val = _extract_quoted(code, key)
-                if val is not None:
-                    k = "field_desc" if key == "description" else key
-                    result[k] = val
+        elif operator_type == "FlatMap":
+            # Parse fields=[{...}, ...] as a JSON array (best-effort)
+            fields_m = re.search(r'fields\s*=\s*(\[.*?\])', code, re.DOTALL)
+            if fields_m:
+                try:
+                    import json as _json
+                    parsed_fields = _json.loads(fields_m.group(1))
+                    if isinstance(parsed_fields, list):
+                        result["output_fields"] = parsed_fields
+                except Exception:
+                    pass
 
-        elif operator_type == "SemanticGroupBy":
+        elif operator_type == "GroupBy":
             # Parse group_by=['field1', 'field2']
             gby_m = re.search(r'group_by\s*=\s*\[(.+?)\]', code)
             if gby_m:
@@ -1866,18 +1876,25 @@ def _parse_code_to_params(
                 if agg_fields:
                     result["agg_fields"] = agg_fields
 
-        elif operator_type == "SemanticTopK":
+        elif operator_type == "TopK":
             val = _extract_quoted(code, "search", dotall=True)
             if val:
-                result["search_str"] = val
+                result["task"] = val
             m = re.search(r'k\s*=\s*(\d+)', code)
             if m:
                 result["k"] = int(m.group(1))
 
-        elif operator_type == "SemanticAgg":
-            val = _extract_quoted(code, "task", dotall=True)
-            if val:
-                result["task"] = val
+        elif operator_type == "Aggregate":
+            # Parse agg_fields=[{...}, ...] as a JSON array (best-effort)
+            fields_m = re.search(r'agg_fields\s*=\s*(\[.*?\])', code, re.DOTALL)
+            if fields_m:
+                try:
+                    import json as _json
+                    parsed_fields = _json.loads(fields_m.group(1))
+                    if isinstance(parsed_fields, list):
+                        result["agg_fields"] = parsed_fields
+                except Exception:
+                    pass
 
         elif operator_type == "Code":
             val = _extract_quoted(code, "task", dotall=True)

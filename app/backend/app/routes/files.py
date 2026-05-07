@@ -1,17 +1,26 @@
 import logging
 import os
+import uuid
+from io import BytesIO
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from starlette.concurrency import run_in_threadpool
 
 from app.auth import get_current_user
+from app.database import AsyncSessionLocal, UploadJob, get_db
 from app.database import File as FileRecord
-from app.database import get_db
 from app.env import BASE_DIR, DATA_DIR, IS_LOCAL_ENV, SHARED_DATA_DIR
 from app.models.schemas import DirectoryCreate, FileBatchDelete, PaginatedFileList
-from app.services.file_service import DEFAULT_PAGE_SIZE, LocalFileService, S3FileService, normalize_path
+from app.services.file_service import (
+    ARCHIVE_EXTENSIONS,
+    DEFAULT_PAGE_SIZE,
+    LocalFileService,
+    S3FileService,
+    _extract_archive,
+    normalize_path,
+)
 
 logger = logging.getLogger('uvicorn.error')
 
@@ -20,6 +29,90 @@ file_service = LocalFileService() if IS_LOCAL_ENV else S3FileService()
 
 # Max items to return in a single page to prevent overload
 MAX_ITEMS_PER_REQUEST = 200
+
+# In-memory progress tracker: job_id -> number of files uploaded so far.
+# Updated by the background thread; read by the status endpoint for live progress.
+_job_progress: dict[str, int] = {}
+
+
+class _UploadFileLike:
+    """Minimal shim so raw bytes can be passed to file_service methods that expect an UploadFile."""
+    def __init__(self, filename: str, data: bytes) -> None:
+        self.filename = filename
+        self.file = BytesIO(data)
+
+
+def _sync_upload_job(job_id: str, file_bytes: bytes, filename: str, upload_dir: str) -> list[str]:
+    """
+    Synchronous work that runs inside a threadpool so it never blocks the event loop.
+    Extracts the archive (if applicable), writes every file to storage, and returns
+    the list of uploaded destination paths.
+    """
+    mock_file = _UploadFileLike(filename, file_bytes)
+    if any(filename.lower().endswith(ext) for ext in ARCHIVE_EXTENSIONS):
+        streams, paths = _extract_archive(mock_file, upload_dir)
+    else:
+        streams = [BytesIO(file_bytes)]
+        paths = [os.path.join(upload_dir, filename)]
+
+    _job_progress[job_id] = 0
+    uploaded_paths: list[str] = []
+    for stream, path in zip(streams, paths, strict=True):
+        dir_path = os.path.dirname(path)
+        if not file_service.exists(dir_path):
+            file_service.create_dir(dir_path)
+        file_service._write_file_to_path(stream, path)
+        uploaded_paths.append(path)
+        _job_progress[job_id] = len(uploaded_paths)
+
+    return uploaded_paths
+
+
+async def _run_upload_job(
+    job_id: str,
+    file_bytes: bytes,
+    filename: str,
+    upload_dir: str,
+    user_id: str,
+    shared: bool,
+) -> None:
+    """
+    Background coroutine — runs after the 202 response is sent to the client.
+    Performs the actual file extraction + storage upload, then records
+    the resulting file paths in the database.
+    """
+    async with AsyncSessionLocal() as db:
+        job = await db.get(UploadJob, job_id)
+        job.status = "running"
+        await db.commit()
+
+        try:
+            uploaded_paths = await run_in_threadpool(
+                _sync_upload_job, job_id, file_bytes, filename, upload_dir
+            )
+
+            # Bulk-insert FileRecord rows in batches to avoid a single huge transaction.
+            db_batch_size = 500
+            for i in range(0, len(uploaded_paths), db_batch_size):
+                batch = uploaded_paths[i : i + db_batch_size]
+                db.add_all([FileRecord(user_id=user_id, file_path=p, shared=shared) for p in batch])
+                await db.flush()
+
+            job.status = "completed"
+            job.total_files = len(uploaded_paths)
+            job.processed_files = len(uploaded_paths)
+            await db.commit()
+
+        except Exception as exc:
+            logger.error("Upload job %s failed: %s", job_id, exc, exc_info=True)
+            await db.rollback()
+            job = await db.get(UploadJob, job_id)
+            job.status = "failed"
+            job.error = str(exc)
+            await db.commit()
+
+        finally:
+            _job_progress.pop(job_id, None)
 
 
 @router.get("/browse", response_model=PaginatedFileList)
@@ -90,43 +183,89 @@ async def browse_directory(
         raise HTTPException(status_code=500, detail=f"Error browsing directory: {str(e)}") from e
 
 
-@router.post("/upload")
-async def upload_file(file: UploadFile = File(...), path: str = Form(""), user_id: str = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+@router.post("/upload", status_code=202)
+async def upload_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    path: str = Form(""),
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """
-    Upload a file to the server.
+    Accept a file (including archives) and immediately return a job ID.
+    The actual extraction and storage upload happens as a background task so the
+    HTTP connection is never held open long enough to trigger the ALB idle timeout.
+    Poll GET /upload/status/{job_id} to track progress.
     """
-    try:
-        # normalize the incoming path from the frontend
-        normalized_path = normalize_path(path)
+    # Validate and resolve the destination path before reading the file bytes.
+    normalized_path = normalize_path(path)
 
-        # if this path is {DATA_DIR}, then upload the file under the user's data directory
-        if normalized_path.rstrip("/") == normalize_path(DATA_DIR).rstrip("/"):
-            normalized_path = os.path.join(DATA_DIR, user_id)
+    if normalized_path.rstrip("/") == normalize_path(DATA_DIR).rstrip("/"):
+        normalized_path = os.path.join(DATA_DIR, user_id)
 
-        # do not upload files within the BASE_DIR directly
-        if normalized_path.rstrip("/") == normalize_path(BASE_DIR).rstrip("/"):
-            raise HTTPException(status_code=400, detail="Cannot upload files directly to the base directory.")
+    if normalized_path.rstrip("/") == normalize_path(BASE_DIR).rstrip("/"):
+        raise HTTPException(status_code=400, detail="Cannot upload files directly to the base directory.")
 
-        # save file to file system — run in thread pool to avoid blocking the asyncio
-        # event loop with synchronous boto3 / disk I/O, which would starve ALB health checks
-        file_paths = await run_in_threadpool(file_service.save_uploaded_file, file, normalized_path)
+    shared = (
+        normalized_path.rstrip("/") == normalize_path(SHARED_DATA_DIR).rstrip("/")
+        or normalized_path.startswith(SHARED_DATA_DIR)
+    )
 
-        # determine if the file is shared based on the provided path
-        shared = (
-            normalized_path.rstrip("/") == normalize_path(SHARED_DATA_DIR).rstrip("/")
-            or normalized_path.startswith(SHARED_DATA_DIR)
-        )
+    # Read all bytes now, while the request is still open.
+    file_bytes = await file.read()
+    filename = file.filename
 
-        # store file metadata in database
-        uploaded_files = [
-            FileRecord(user_id=user_id, file_path=file_path, shared=shared)
-            for file_path in file_paths
-        ]
-        db.add_all(uploaded_files)
-        await db.commit()
+    # Persist the job record so the client can poll for status immediately.
+    job_id = str(uuid.uuid4())
+    db.add(UploadJob(id=job_id, user_id=user_id, status="pending"))
+    await db.commit()
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error uploading file: {str(e)}") from e
+    # Kick off the upload after the response is sent — the connection is now free.
+    background_tasks.add_task(
+        _run_upload_job,
+        job_id,
+        file_bytes,
+        filename,
+        normalized_path,
+        user_id,
+        shared,
+    )
+
+    return {"job_id": job_id, "status": "pending"}
+
+
+@router.get("/upload/status/{job_id}")
+async def get_upload_status(
+    job_id: str,
+    user_id: str = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return the current status of an async upload job.
+
+    Fields:
+        status        — pending | running | completed | failed
+        total_files   — total number of files to upload (null until extraction finishes)
+        processed_files — number of files successfully written to storage so far
+        error         — error message if status is 'failed'
+    """
+    job = await db.get(UploadJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Upload job not found.")
+    if job.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Not authorized to view this upload job.")
+
+    # Use the in-memory counter for live progress while the job is running;
+    # fall back to the DB value once the job is finished.
+    live_processed = _job_progress.get(job_id, job.processed_files)
+
+    return {
+        "job_id": job.id,
+        "status": job.status,
+        "total_files": job.total_files,
+        "processed_files": live_processed,
+        "error": job.error,
+    }
 
 
 @router.post("/delete")

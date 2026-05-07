@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import textwrap
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from random import sample as random_sample
 
 from carnot.data.item import DataItem
@@ -229,16 +230,27 @@ class Dataset:
 
         storage = storage or self._storage
 
-        # leaf dataset: materialize items directly
+        # leaf dataset: materialize items in parallel
         if not self.parents:
-            materialized: list[dict] = []
-            for item_ref in self._item_refs:
+            item_refs = self._item_refs
+
+            def _materialize_one(item_ref: DataItem | dict) -> dict:
                 if isinstance(item_ref, DataItem):
-                    materialized.append(item_ref.materialize(storage))
-                elif isinstance(item_ref, dict):
-                    materialized.append(item_ref)
-                else:
-                    materialized.append(item_ref)
+                    return item_ref.materialize(storage)
+                return item_ref
+
+            # TODO: make max_workers configurable
+            # parallelize materialization with a thread pool
+            max_workers = min(64, len(item_refs)) if item_refs else 1
+            materialized: list[dict] = [None] * len(item_refs)  # preserve order
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                future_to_idx = {
+                    pool.submit(_materialize_one, ref): i
+                    for i, ref in enumerate(item_refs)
+                }
+                for future in as_completed(future_to_idx):
+                    materialized[future_to_idx[future]] = future.result()
+
             self._materialized_items = materialized
             self._is_materialized = True
         else:

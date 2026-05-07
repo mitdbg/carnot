@@ -366,16 +366,17 @@ class PlanNode:
 
         elif op == "Filter":
             parent = _resolve_parent(parent_ids[0]) if parent_ids else "?"
-            lines.append(f"# Condition: {p.get('filter', '')}")
+            condition = p.get('task', p.get('filter', ''))
+            lines.append(f"# Condition: {condition}")
             lines.append(f"datasets['{out}'] = sem_filter(")
             lines.append(f"    dataset=datasets['{parent}'],")
-            lines.append(f"    condition={self._smart_quote(p.get('filter', ''))}")
+            lines.append(f"    condition={self._smart_quote(condition)}")
             lines.append(")")
 
         elif op == "Map":
             parent = _resolve_parent(parent_ids[0]) if parent_ids else "?"
-            fields = p.get('fields', [])
-            field_names = [f.get('field', '') for f in fields]
+            fields = p.get('output_fields', p.get('fields', []))
+            field_names = [f.get('name', f.get('field', '')) for f in fields]
             lines.append(f"# Map fields: {field_names}")
             lines.append(f"datasets['{out}'] = sem_map(")
             lines.append(f"    dataset=datasets['{parent}'],")
@@ -384,8 +385,8 @@ class PlanNode:
 
         elif op == "FlatMap":
             parent = _resolve_parent(parent_ids[0]) if parent_ids else "?"
-            fields = p.get('fields', [])
-            field_names = [f.get('field', '') for f in fields]
+            fields = p.get('output_fields', p.get('fields', []))
+            field_names = [f.get('name', f.get('field', '')) for f in fields]
             lines.append(f"# Flat map fields: {field_names}")
             lines.append(f"datasets['{out}'] = sem_flat_map(")
             lines.append(f"    dataset=datasets['{parent}'],")
@@ -394,7 +395,7 @@ class PlanNode:
 
         elif op == "GroupBy":
             parent = _resolve_parent(parent_ids[0]) if parent_ids else "?"
-            gby = [f["name"] for f in p.get("gby_fields", [])]
+            gby = [f["name"] for f in p.get("group_by_fields", p.get("gby_fields", []))]
             agg = [
                 f"{f['name']}({f.get('func', '?')})"
                 for f in p.get("agg_fields", [])
@@ -407,12 +408,13 @@ class PlanNode:
 
         elif op == "Join":
             left = _resolve_parent(parent_ids[0]) if len(parent_ids) > 0 else "?"
-            right = _resolve_parent(parent_ids[1]) if len(parent_ids) > 0 else "?"
-            lines.append(f"# Condition: {p.get('condition', '')}")
+            right = _resolve_parent(parent_ids[1]) if len(parent_ids) > 1 else "?"
+            condition = p.get('task', p.get('condition', ''))
+            lines.append(f"# Condition: {condition}")
             lines.append(f"datasets['{out}'] = sem_join(")
             lines.append(f"    left=datasets['{left}'],")
             lines.append(f"    right=datasets['{right}'],")
-            lines.append(f"    condition={self._smart_quote(p.get('condition', ''))}")
+            lines.append(f"    condition={self._smart_quote(condition)}")
             lines.append(")")
 
         elif op == "TopK":

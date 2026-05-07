@@ -43,6 +43,9 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
   const [isCreating, setIsCreating] = useState(false)
   const [isDragging, setIsDragging] = useState(false)
   
+  // Active upload jobs: [{jobId, filename, status, processedFiles, totalFiles, error}]
+  const [uploadJobs, setUploadJobs] = useState([])
+  
   // Pagination state
   const [nextToken, setNextToken] = useState(null)
   const [hasMore, setHasMore] = useState(false)
@@ -128,32 +131,54 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
     }
   }
 
-  const handleFileUpload = async (files, event = null) => {
-    if (!files || files.length === 0) return;
-    
+  const pollUploadJob = async (jobId) => {
     try {
-      setLoading(true);
-      setError(null);
       const token = await getValidToken();
       if (!token) return;
+      const res = await filesApi.uploadStatus(jobId, token);
+      const job = res.data;
 
-      // support multiple files if dragged/selected at once
-      const uploadPromises = Array.from(files).map(file => 
-        filesApi.upload(file, token, currentPath)
+      setUploadJobs(prev =>
+        prev.map(j => j.jobId === jobId ? { ...j, ...job } : j)
       );
-      await Promise.all(uploadPromises);
 
-      // refresh the current directory to show the new files
-      loadDirectory(currentPath);
-
-      // reset the event value to allow re-uploading the same file if needed
-      if (event && event.target) {
-        event.target.value = '';
+      if (job.status === 'pending' || job.status === 'running') {
+        setTimeout(() => pollUploadJob(jobId), 2000);
+      } else if (job.status === 'completed') {
+        loadDirectory(currentPath);
+        setTimeout(() => {
+          setUploadJobs(prev => prev.filter(j => j.jobId !== jobId));
+        }, 3000);
       }
+      // 'failed' jobs remain visible so the user can see the error message.
     } catch (err) {
-      setError('Upload failed: ' + err.message);
-    } finally {
-      setLoading(false);
+      // Polling hiccup — retry in a few seconds rather than surfacing as a hard error.
+      setTimeout(() => pollUploadJob(jobId), 4000);
+    }
+  };
+
+  const handleFileUpload = async (files, event = null) => {
+    if (!files || files.length === 0) return;
+
+    const token = await getValidToken();
+    if (!token) return;
+
+    for (const file of Array.from(files)) {
+      try {
+        const res = await filesApi.upload(file, token, currentPath);
+        const { job_id } = res.data;
+        setUploadJobs(prev => [
+          ...prev,
+          { jobId: job_id, filename: file.name, status: 'pending', processedFiles: 0, totalFiles: null, error: null },
+        ]);
+        pollUploadJob(job_id);
+      } catch (err) {
+        setError('Upload failed for ' + file.name + ': ' + (err.response?.data?.detail || err.message));
+      }
+    }
+
+    if (event && event.target) {
+      event.target.value = '';
     }
   };
 
@@ -523,6 +548,55 @@ function FileBrowser({ selectedFiles, onFileToggle }) {
           )
         })}
       </div>
+
+      {/* Upload Job Progress */}
+      {uploadJobs.length > 0 && (
+        <div className="mb-4 space-y-2">
+          {uploadJobs.map(job => {
+            const pct = job.totalFiles ? Math.round((job.processedFiles / job.totalFiles) * 100) : null;
+            const isDone = job.status === 'completed';
+            const isFailed = job.status === 'failed';
+            return (
+              <div
+                key={job.jobId}
+                className={`rounded-lg border px-3 py-2 text-sm ${
+                  isFailed
+                    ? 'bg-red-50 border-red-200 text-red-700'
+                    : isDone
+                    ? 'bg-green-50 border-green-200 text-green-700'
+                    : 'bg-blue-50 border-blue-200 text-blue-700'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="truncate font-medium">{job.filename}</span>
+                  <span className="shrink-0">
+                    {isFailed
+                      ? 'Failed'
+                      : isDone
+                      ? `Done \u2014 ${job.processedFiles} file${job.processedFiles !== 1 ? 's' : ''}`
+                      : pct !== null
+                      ? `${pct}% (${job.processedFiles} / ${job.totalFiles})`
+                      : job.processedFiles > 0
+                      ? `${job.processedFiles} files uploaded\u2026`
+                      : 'Uploading\u2026'}
+                  </span>
+                </div>
+                {!isFailed && !isDone && (
+                  <div className="mt-1.5 h-1.5 w-full rounded-full bg-blue-200">
+                    <div
+                      className="h-1.5 rounded-full bg-blue-500 transition-all"
+                      style={{ width: pct !== null ? `${pct}%` : '100%', opacity: pct !== null ? 1 : 0.4 }}
+                    />
+                  </div>
+                )}
+                {isFailed && job.error && (
+                  <p className="mt-1 text-xs text-red-600">{job.error}</p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       {/* Error Display */}
       {error && (

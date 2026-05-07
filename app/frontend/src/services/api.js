@@ -105,6 +105,10 @@ export const filesApi = {
       },
     })
   },
+  uploadStatus: (jobId, token) =>
+    api.get(`/files/upload/status/${jobId}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    }),
   delete: (filePaths) => api.post('/files/delete', { files: filePaths }),
   expandPaths: (paths, token) => 
     api.post('/files/expand-paths', paths, {

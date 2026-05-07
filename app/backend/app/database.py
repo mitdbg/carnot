@@ -1,4 +1,5 @@
 import os
+import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import Boolean, Column, Float, ForeignKey, Index, Integer, String, Text
@@ -73,6 +74,21 @@ class File(Base):
     file_path = Column(String, unique=True, nullable=False)
     shared = Column(Boolean, default=False)
     upload_date = Column(TIMESTAMP(timezone=True), default=lambda: datetime.now(timezone.utc))  # noqa: UP017
+
+class UploadJob(Base):
+    """Tracks the progress of an asynchronous file-upload job."""
+    __tablename__ = "upload_jobs"
+
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, index=True, nullable=False)
+    # pending → running → completed | failed
+    status = Column(String, nullable=False, default="pending")
+    total_files = Column(Integer, nullable=True)
+    processed_files = Column(Integer, nullable=False, default=0)
+    error = Column(Text, nullable=True)
+    created_at = Column(TIMESTAMP(timezone=True), server_default=func.now())
+    updated_at = Column(TIMESTAMP(timezone=True), onupdate=func.now())
+
 
 class DatasetFile(Base):
     __tablename__ = "dataset_files"
