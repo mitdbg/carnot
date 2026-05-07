@@ -190,7 +190,7 @@ class TestSemTopKMocked:
         catalog.register_index.assert_called_once()
         call_kwargs = catalog.register_index.call_args[1]
         assert call_kwargs["dataset_id"] == 123
-        assert call_kwargs["name"] == "test_idx"
+        assert call_kwargs["name"] == "test_idx_mock"
         assert call_kwargs["index_type"] == "_FakeIndex"
         assert call_kwargs["index_obj"] is ds.indices["test_idx"]
 
@@ -216,7 +216,7 @@ class TestSemTopKMocked:
         op("animals", {"animals": ds})
 
         created_index = ds.indices["chroma"]
-        assert created_index.name == "ds42_chroma"
+        assert created_index.name == "ds42_chroma_mock"
 
     def test_catalog_lookup_before_build(self, mock_llm_config):
         """When a catalog has a matching non-stale index, the operator reuses
@@ -250,7 +250,7 @@ class TestSemTopKMocked:
         result, _stats = op("animals", {"animals": ds})
 
         # Catalog was queried
-        catalog.get_index_by_name.assert_called_once_with(7, "flat")
+        catalog.get_index_by_name.assert_called_once_with(7, "flat_mock-embedding")
         catalog.load_index.assert_called_once_with(99)
 
         # No new index registration (reused existing)
@@ -283,7 +283,7 @@ class TestSemTopKMocked:
         op("animals", {"animals": ds})
 
         # Catalog was checked but stale → should NOT call load_index
-        catalog.get_index_by_name.assert_called_once_with(8, "flat")
+        catalog.get_index_by_name.assert_called_once_with(8, "flat_mock")
         catalog.load_index.assert_not_called()
 
         # A new index was built and registered
@@ -310,7 +310,7 @@ class TestSemTopKMocked:
         op("animals", {"animals": ds})
 
         # Catalog was checked
-        catalog.get_index_by_name.assert_called_once_with(9, "flat")
+        catalog.get_index_by_name.assert_called_once_with(9, "flat_mock")
         # No load_index call since get_index_by_name returned None
         catalog.load_index.assert_not_called()
         # A new index was built and registered
@@ -341,7 +341,7 @@ class TestSemTopKMocked:
         op("animals", {"animals": ds})
 
         # Catalog was queried
-        catalog.get_index_by_name.assert_called_once_with(10, "flat")
+        catalog.get_index_by_name.assert_called_once_with(10, "flat_mock")
         catalog.load_index.assert_called_once_with(77)
         # Fell back to building a new index
         catalog.register_index.assert_called_once()

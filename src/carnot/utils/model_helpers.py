@@ -20,7 +20,7 @@ from carnot.optimizer.model_ids import get_api_key_for_model
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small"
+_DEFAULT_EMBEDDING_MODEL = "gemini/gemini-embedding-2"
 _CHARS_PER_TOKEN = 4
 
 # we determine the chunk size to be the minimum of (input_tokens / 32) and (token_budget / 10)

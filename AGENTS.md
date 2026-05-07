@@ -43,16 +43,11 @@ DO NOT delegate:
 ## Code Generation Style
 
 - No tiny one-use helper functions.
-- Scripts are linear, readable narratives. Keep setup, data loading, execution, and output in visible order. 
-
-## Example Script Guidelines
-When writing example scripts, smoke tests, or single-use experimental code:
-
-- Write linearly: setup -> data loading -> execution -> output, in visible order.
-- Avoid tiny one-use helper functions; inline simple operations.
-- Avoid argparse and `if __name__ == "__main__":` wrappers unless building a real reusable CLI.
-- Use top-level editable constants (e.g., `DATA_DIR = "data"`) for paths and parameters.
-- Prefer plain readable path strings over dense `pathlib` slash syntax when clarity improves.
-- For output, just compute and print; no need for CLI-style main entry points.
-- Preserve behavior while removing ceremony: fewer abstractions, straight-line logic.
-
+- No tiny one-use helper functions; inline simple operations instead.
+- Code is linear, readable narratives. Keep setup, data loading, execution, and output in visible order.
+- Use plain readable path strings for simple local repo paths (e.g., `DATA_DIR = "data"`) rather than `pathlib.Path(...)` when clarity improves. Reserve `pathlib` for cases involving complex path manipulation or cross-platform needs.
+- Avoid creating single-use helper functions that obfuscate straightforward logic.
+- Prefer top-level editable constants for paths and parameters.
+- For scripts, avoid `argparse` and `if __name__ == "__main__":` wrappers unless building a real reusable CLI.
+- For notebooks, maintain the same linear, ceremony-light structure: setup -> data loading -> computation -> output/visualization.
+- When asked for changes, design a plan first, then ask the user to review the plan before generating code. This ensures alignment and avoids wasted tokens on unwanted code.

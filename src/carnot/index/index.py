@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING
 
+import tiktoken
 import chromadb
 import faiss
 import litellm
@@ -36,6 +37,11 @@ _EMBEDDING_MAX_INPUT_TOKENS: dict[str, int] = {
 _DEFAULT_EMBEDDING_MAX_INPUT_TOKENS = 8191
 _MAX_TOKENS_PER_REQUEST = 300_000
 _CHROMA_INSERT_BATCH_SIZE = 2048
+# TODO fix the circular import between index and optimizer 
+# (for embedding model token limits) by moving the shared constants to a third module.
+# from carnot.utils.model_helpers import _DEFAULT_EMBEDDING_MODEL
+# The current fix is simply to duplicate the constant here
+_DEFAULT_EMBEDDING_MODEL = "gemini/gemini-embedding-2"
 
 def _resolve_model(model, api_key) -> LiteLLMModel:
     """Resolve *model* to a :class:`LiteLLMModel` instance.
@@ -57,7 +63,7 @@ def _resolve_model(model, api_key) -> LiteLLMModel:
 
     if isinstance(model, _LiteLLMModel):
         return model
-    model_id = model if isinstance(model, str) else "openai/text-embedding-3-small"
+    model_id = model if isinstance(model, str) else _DEFAULT_EMBEDDING_MODEL
     return _LiteLLMModel(model_id=model_id, api_key=api_key)
 
 
@@ -389,13 +395,13 @@ class ChromaIndex(CarnotIndex):
         self,
         name: str,
         items: list[dict] | None = None,
-        model: LiteLLMModel | str | None = "openai/text-embedding-3-small",
+        model: LiteLLMModel | str | None = _DEFAULT_EMBEDDING_MODEL,
         api_key: str = None,
         index = None,
     ):
         super().__init__(name=name, items=items, index=index)
         self.ids = [f"{idx}" for idx in range(len(self.items))]
-        self.model = model if isinstance(model, str) else (model.model_id if model else "openai/text-embedding-3-small")
+        self.model = model if isinstance(model, str) else (model.model_id if model else _DEFAULT_EMBEDDING_MODEL)
         self.api_key = api_key
         self._llm_model = _resolve_model(model, api_key)
         self._llm_call_stats: list = []
@@ -499,13 +505,13 @@ class FaissIndex(CarnotIndex):
         self,
         name: str,
         items: list[dict] | None = None,
-        model: LiteLLMModel | str | None = "openai/text-embedding-3-small",
+        model: LiteLLMModel | str | None = _DEFAULT_EMBEDDING_MODEL,
         api_key: str = None,
         index = None,
     ):
         super().__init__(name=name, items=items, index=index)
         self.ids = [f"{idx}" for idx in range(len(self.items))]
-        self.model = model if isinstance(model, str) else (model.model_id if model else "openai/text-embedding-3-small")
+        self.model = model if isinstance(model, str) else (model.model_id if model else _DEFAULT_EMBEDDING_MODEL)
         self.api_key = api_key
         self._llm_model = _resolve_model(model, api_key)
         self._llm_call_stats: list = []
@@ -698,9 +704,13 @@ def _embed_with_chunking(
     # Maximum tokens the embedding model accepts per call.
     max_tokens = _EMBEDDING_MAX_INPUT_TOKENS.get(llm_model.model_id, _DEFAULT_EMBEDDING_MAX_INPUT_TOKENS)
 
-    # Optimistic token estimates — used only for batching, not for correctness.
-    from carnot.utils.model_helpers import _CHARS_PER_TOKEN
-    est_token_counts = [len(t) // _CHARS_PER_TOKEN + 1 for t in texts]
+    # Use tiktoken for better token estimates (used for batching).
+    try:
+        encoding = tiktoken.encoding_for_model(llm_model.model_id)
+    except (KeyError, ValueError):
+        # Fallback to cl100k_base if model not found in tiktoken.
+        encoding = tiktoken.get_encoding("cl100k_base")
+    est_token_counts = [len(tokens) for tokens in encoding.encode_batch(texts, disallowed_special=())]
 
     # Build batches from the estimates.  If any batch ends up exceeding the
     # real token limit the _process_batch fallback will handle it.

@@ -5,6 +5,7 @@ import glob
 import os
 from dotenv import load_dotenv
 
+import carnot
 from carnot.data.dataset import Dataset
 from carnot.operators.sem_topk import SemTopKOperator
 
@@ -59,18 +60,31 @@ dataset = Dataset(
     items=items,
     dataset_id="officeqa_documents",
 )
-operator = SemTopKOperator(
-    task=query["question"],
-    k=K,
-    dataset_id="RetrievedOfficeQADocuments",
-    max_workers=1,
-    index_name=INDEX,
-    llm_config={"GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY")},
-)
 
-output_datasets, stats = operator(dataset.name, {dataset.name: dataset})
-retrieved = output_datasets["RetrievedOfficeQADocuments"].items
-predicted_files = [item.get("source_file") for item in retrieved]
+
+# execution = carnot.Execution(
+#     query = "Find documents that are necessary to answer the question: " + query["question"],
+#     datasets=[dataset.name],
+#     llm_config={
+#         "model": "gemini/gemini-embedding-2",
+#         "api_key": os.getenv("GEMINI_API_KEY"),
+#     }
+# )
+
+# operator = SemTopKOperator(
+#     task=query["question"],
+#     k=K,
+#     dataset_id="RetrievedOfficeQADocuments",
+#     max_workers=1,
+#     index_name=INDEX,
+#     model_id='openai/text-embedding-3-large',
+#     llm_config={"GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY"),
+#                 "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY")},
+# )
+
+# output_datasets, stats = operator(dataset.name, {dataset.name: dataset})
+# retrieved = output_datasets["RetrievedOfficeQADocuments"].items
+# predicted_files = [item.get("source_file") for item in retrieved]
 
 print(f"uid: {query['uid']}")
 print(f"question: {query['question']}")

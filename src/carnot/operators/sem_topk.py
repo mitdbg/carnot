@@ -130,13 +130,26 @@ class SemTopKOperator(PhysicalOperator):
 
         input_dataset = input_datasets[dataset_id]
 
-        if self.index_name not in input_dataset.list_indices():
+        # Check if a previously existing index was built with a different model; if so, we discard it and build a new one
+        existing_index = input_dataset.indices.get(self.index_name)
+        existing_model = getattr(existing_index, "model", None)
+        if (
+            existing_index is not None
+            and isinstance(existing_model, str)
+            and existing_model != self.model_id
+        ):
+            existing_index = None
+            del input_dataset.indices[self.index_name]
+
+        if existing_index is None:
             # Try to load a previously-built index from the catalog
             loaded = self._load_from_catalog(input_dataset)
 
             if not loaded:
                 # Build a new index from scratch
-                disk_name = f"ds{input_dataset.dataset_id.replace(' ', '')}_{self.index_name}"
+                model_key = self.model_id.replace("/", "_").replace(":", "_").replace(" ", "_")
+                dataset_key = str(input_dataset.dataset_id).replace(" ", "")
+                disk_name = f"ds{dataset_key}_{self.index_name}_{model_key}"
 
                 # NOTE: I believe that input_dataset.items will be materialized here;
                 #   in the future we may want to add support for lazy materialization within the index classes themselves
@@ -145,14 +158,16 @@ class SemTopKOperator(PhysicalOperator):
                     items=input_dataset.items,
                     model=self.model_id,
                     api_key=self.api_key,
+                    # max_workers=self.max_workers,
                 )
                 input_dataset.indices[self.index_name] = index
 
                 # Register with the catalog (operator's responsibility)
                 if self.catalog is not None and input_dataset.dataset_id is not None:
+                    catalog_name = f"{self.index_name}_{model_key}"
                     self.catalog.register_index(
                         dataset_id=input_dataset.dataset_id,
-                        name=self.index_name,
+                        name=catalog_name,
                         index_type=index.__class__.__name__,
                         index_obj=index,
                     )
@@ -202,8 +217,10 @@ class SemTopKOperator(PhysicalOperator):
             return False
 
         try:
+            model_key = self.model_id.replace("/", "_").replace(":", "_").replace(" ", "_")
+            catalog_name = f"{self.index_name}_{model_key}"
             meta = self.catalog.get_index_by_name(
-                dataset.dataset_id, self.index_name
+                dataset.dataset_id, catalog_name
             )
             if meta is None or meta.is_stale:
                 return False
@@ -214,12 +231,14 @@ class SemTopKOperator(PhysicalOperator):
 
             # Wrap the loaded inner index in the appropriate CarnotIndex
             # subclass, passing items for URI→item mapping.
-            disk_name = f"ds{dataset.dataset_id.replace(' ', '')}_{self.index_name}"
+            dataset_key = str(dataset.dataset_id).replace(" ", "")
+            disk_name = f"ds{dataset_key}_{self.index_name}_{model_key}"
             wrapped = self.index_cls(
                 name=disk_name,
                 items=dataset.items,
                 model=self.model_id,
                 api_key=self.api_key,
+                # max_workers=self.max_workers,
                 index=index_obj,
             )
             dataset.indices[self.index_name] = wrapped
