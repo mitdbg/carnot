@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "skunk"
+version = "0.1.0"
+description = "Declarative QA pipeline over the U.S. Treasury Bulletin corpus"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic",
+    "google-genai",
+    "pandas",
+    "pyarrow",
+    "pymupdf",
+    "pyyaml",
+    "numpy",
+    "statsmodels",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
