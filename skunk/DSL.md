@@ -96,24 +96,23 @@ First tier with a confident answer wins.
 
 Same I/O as `extract` minus `mode`. Always Tier 3 vision. Used for charts and figures.
 
-### `lookup_external(resource, **params) → TypedValue`  *(chain-head capable)*
+### `lookup_external(nl) → TypedValue`  *(chain-head capable)*
 
 | arg | type | req | description |
 |---|---|---|---|
-| `resource` | str | yes | `cpi_u` \| `fx_rate` \| `gdp` \| `event_year` \| `event_date` |
-| `**params` | per-resource kwargs | varies | e.g. `currency='JPY'`, `date='2025-03-31'`, `event='korean_war_start'` |
+| `nl` | str | yes | Natural language description of the external data to look up |
 
-Cache-first CSV read, falls back to live API (BLS / FRED / exchangerate.host) when `cache_only=False`. The `event_year` / `event_date` resources resolve knowledge-bound dates that the planner can't pin from the question text alone.
+Single Gemini call. Returns a typed value — the subagent infers the appropriate `dtype` (e.g. `scalar:year`, `scalar:fx_rate`, `scalar:cpi`, `list[scalar:fx_rate]`). Use for any factual data that can't be extracted from the bulletin corpus: CPI-U, exchange rates, event dates, economic indicators, etc.
 
-### `compute(code) → TypedValue`
+### `compute(nl) → TypedValue`
 
 | arg | type | req | description |
 |---|---|---|---|
-| `code` | str | yes | Python body that reads `prev` and sets `result = ...`. Sandboxed: numpy, pandas, statsmodels, math available. |
+| `nl` | str | yes | Natural language description of the computation to perform. The subagent generates and sandboxes Python internally. |
 
 **Pre.** `prev` is `TypedValue` or `list[TypedValue]` (from a parallel branch). **Post.** `TypedValue`.
 
-This is the only transformation op. Reducers (sum, mean, geo_mean, std, …) and named formulas (abs_diff, cagr, …) are all one-liners in `code`. Sandboxed exec, retried up to 2× on exception.
+This is the only transformation op. Describe reducers (sum, mean, geo_mean, std, …) and formulas (abs_diff, cagr, …) in plain English. The subagent handles code generation; sandbox has numpy, pandas, statsmodels, math.
 
 ### `format(precision?, unit?, layout?) → FormattedString`  *(chain terminator)*
 
@@ -125,7 +124,7 @@ Flat keyword args (no nested dict — keeps the surface JSON-safe). At most 3 ke
 | `unit` | str | no | `'usd'` \| `'usd_millions'` \| `'pct'` \| `'count'` \| `'decimal'` — implies suffix and comma rules |
 | `layout` | str | no | `'scalar'` (default) \| `'bracket_list'` for `[a, b]` answers |
 
-Deterministic — no LLM call.
+Uses a Gemini call (temperature=0) to generate and execute the formatting code; effectively deterministic for a fixed model.
 
 ## Composition rules
 
@@ -134,7 +133,7 @@ Deterministic — no LLM call.
 3. **Chain head.** Must be `retrieve` or `lookup_external` (the only ops that take no input).
 4. **Chain tail.** Must be `format` for an answer-producing chain. Sub-chains feeding a parallel may end in any type.
 5. **Concepts/constraints scope.** `OpNode.constraints` apply to that op only; `ChainNode.global_constraints` apply to every op in the chain.
-6. **Determinism budget.** `format` is fully deterministic. `compute` is deterministic per-call but its `code` is LLM-generated. `retrieve` / `extract` / `read_visual` / `lookup_external` involve LLMs at runtime.
+6. **Determinism budget.** `format` and `compute` both call Gemini at temperature=0 to generate Python; all other ops (`retrieve`, `extract`, `read_visual`, `lookup_external`) also involve LLM calls at runtime.
 
 ## Worked examples
 
@@ -152,12 +151,12 @@ retrieve(concept='national_defense_expenditure', period='CY1940')
 [
   retrieve(concept='national_defense_expenditure', period='CY1940')
     --> extract(concept='monthly national defense expenditures', mode='list')
-    --> compute(code='result = sum(prev.value)');
+    --> compute(nl='sum all values in the list');
   retrieve(concept='national_defense_expenditure', period='CY1953')
     --> extract(concept='monthly national defense expenditures', mode='list')
-    --> compute(code='result = sum(prev.value)')
+    --> compute(nl='sum all values in the list')
 ]
-  --> compute(code='a, b = prev[0].value, prev[1].value; result = abs((b - a) / a) * 100')
+  --> compute(nl='absolute percent change between the two branch values')
   --> format(unit='pct', precision=2)
 ```
 
@@ -165,7 +164,7 @@ retrieve(concept='national_defense_expenditure', period='CY1940')
 ```
 retrieve(concept='bond_yields', period='CY1960..CY1969', source_bulletin='1970-06')
   --> extract(concept='Aa corporate vs Treasury yield spread, monthly', mode='list')
-  --> compute(code='vs = prev.value; result = sum(vs) / len(vs)')
+  --> compute(nl='arithmetic mean of the list of yield spread values')
   --> format(precision=5)
 ```
 
@@ -180,23 +179,19 @@ retrieve(concept='line_plots_on_page', period='1990-09', source_bulletin='1990-0
 ```
 retrieve(concept='receipts_table', period='1980-05', source_bulletin='1980-05')
   --> extract(concept='receipts data table on page 41', mode='table')
-  --> compute(code='df = prev.value; result = sum(1 for v in df.values.flatten() if str(v).startswith("1"))')
+  --> compute(nl='count values in the DataFrame whose string representation starts with "1" (Benford first-digit count)')
   --> format(unit='count')
 ```
 
-**UID0055** — WWII end → Korean War start (event_year resolution):
+**UID0055** — Year WWII ended and Korean War started:
 ```
 [
-  lookup_external(resource='event_year', event='wwii_end');
-  lookup_external(resource='event_year', event='korean_war_start')
+  lookup_external(nl='year that WWII ended');
+  lookup_external(nl='year the Korean War started')
 ]
-  --> compute(code='y1, y2 = prev[0].value, prev[1].value; result = (f"CY{y1}", f"CY{y2}")')
-  --> retrieve(concept='moody_aaa_corporate_bond_yield', period='prev')
-  --> extract(concept='annual avg Moody Aaa bond yield, both years', mode='list')
-  --> compute(code='vs = prev.value; result = abs(vs[1] - vs[0])')
-  --> format(unit='pct', precision=1)
+  --> compute(nl='return a list [wwii_end_year, korean_war_start_year] from the two branch values')
+  --> format(unit='count', precision=0, layout='bracket_list')
 ```
-`period='prev'` is a sentinel: the period is bound from the upstream value at execution time.
 
 ## Validation
 

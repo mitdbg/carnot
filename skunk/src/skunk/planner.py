@@ -24,8 +24,8 @@ _DSL_SPEC = """\
 | retrieve(...)        | () → DocHandle      | concept (str), period (str), source_bulletin? (YYYY-MM) |
 | extract(...)         | Handle → TypedValue | concept (str), mode? ('value'\\|'list'\\|'table') |
 | read_visual(...)     | Handle → TypedValue | concept (str) — vision read of charts/figures |
-| lookup_external(...) | () → TypedValue     | resource (str), **params — CPI-U, FX, BLS, event dates |
-| compute(...)         | Value(s) → Value    | code (Python str) — sets `result`; `prev` is the input |
+| lookup_external(...) | () → TypedValue     | nl (str) — natural language description of the data to look up |
+| compute(...)         | Value(s) → Value    | nl (natural language description of the computation) |
 | format(...)          | Value → String      | precision? (int), unit? (str), layout? (str) |
 
 ### Period string conventions
@@ -38,7 +38,7 @@ _DSL_SPEC = """\
 ### Key rules
 - retrieve and lookup_external are chain heads (no prev input).
 - For parallel-branch results, prev is a list; use prev[0], prev[1], etc. in compute code.
-- compute code must assign `result`; it runs in a sandbox with numpy (np), pandas (pd), math.
+- compute nl is a natural language description; the subagent generates and runs Python internally.
 - format is always the chain terminator.
 - Use single-quoted string args only.
 """
@@ -104,7 +104,7 @@ _FEW_SHOTS = [
                 },
                 {
                     "type": "op", "op": "compute",
-                    "args": {"code": "a, b = prev[0].value, prev[1].value; result = abs((b - a) / a * 100)"},
+                    "args": {"nl": "absolute percent change between the two values: abs((b - a) / a * 100)"},
                     "concepts": [], "constraints": ["absolute value of percent change"]
                 },
                 {
@@ -134,7 +134,7 @@ _FEW_SHOTS = [
                 },
                 {
                     "type": "op", "op": "compute",
-                    "args": {"code": "import math; vals = [v for v in prev.value if v is not None]; result = math.exp(sum(math.log(v) for v in vals) / len(vals))"},
+                    "args": {"nl": "geometric mean of the list of values (filter None, use math.log/math.exp)"},
                     "concepts": [], "constraints": ["geometric mean, not arithmetic"]
                 },
                 {
@@ -170,7 +170,7 @@ _FEW_SHOTS = [
                             "type": "chain", "global_constraints": [],
                             "steps": [
                                 {"type": "op", "op": "lookup_external",
-                                 "args": {"resource": "fx_rate", "pair": "USD/JPY", "date": "2025-03-31"},
+                                 "args": {"nl": "USD/JPY exchange rate on 2025-03-31"},
                                  "concepts": ["Macrotrends FX data"], "constraints": []},
                             ]
                         }
@@ -178,7 +178,7 @@ _FEW_SHOTS = [
                 },
                 {
                     "type": "op", "op": "compute",
-                    "args": {"code": "result = prev[0].value * prev[1].value"},
+                    "args": {"nl": "multiply the USD value (prev[0]) by the USD/JPY exchange rate (prev[1]) to get the JPY amount"},
                     "concepts": [], "constraints": []
                 },
                 {

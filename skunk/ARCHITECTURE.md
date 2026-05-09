@@ -76,9 +76,9 @@ The load-bearing insight is that `periods_covered` (what period a page *reports 
 - **`retrieve(concept, period, source_bulletin?)`** — only chain head. Looks up relevant pages via the retrieve subagent's internal page index, returns a `DocHandle` whose `PageRef`s have `(file_path, year, month, page, pdf_page)` fully specified (`page` = bulletin printed page number, `pdf_page` = PDF index).
 - **`extract(concept, mode?)`** — reads value(s) from the located pages via tier dispatch. `mode='value'|'list'|'table'` controls scalar / list / DataFrame output.
 - **`read_visual(concept)`** — same input as extract but always uses Tier 3 vision; reserved for charts and figures.
-- **`lookup_external(resource, **params)`** — chain-head capable. Fetches CPI-U, FX rates, GDP from cached CSV (or live API). The `event_year` / `event_date` resources resolve knowledge-bound dates ("Korean War start", "Black Monday") — these feed retrieve when a question's period is implicit.
-- **`compute(code)`** — the only transformation op. LLM writes a Python body that reads `prev` and sets `result`, runs in a sandbox with numpy/pandas/statsmodels. Covers everything from `result = sum(prev.value)` to OLS, Hodrick-Prescott, Box-Cox.
-- **`format(precision?, unit?, layout?)`** — chain terminator. Deterministic application of presentation rules; no LLM call.
+- **`lookup_external(nl)`** — chain-head capable. Single Gemini call: takes a natural-language description of external factual data (`nl`) and returns a `TypedValue`. Use for CPI-U, FX rates, event dates ("Korean War start"), and any fact not in the bulletin corpus. The subagent infers the appropriate `dtype` and `unit`.
+- **`compute(nl)`** — the only transformation op. Takes a natural-language description of the computation (`nl`); the subagent generates Python internally and runs it in a sandbox with numpy/pandas/statsmodels. Covers everything from `sum(prev.value)` to OLS, Hodrick-Prescott, Box-Cox. Up to 3 self-correcting attempts on exec failure.
+- **`format(precision?, unit?, layout?)`** — chain terminator. Generates a Python formatting snippet via a Gemini call (temperature=0) and execs it in the sandbox; effectively deterministic for a fixed model.
 
 ## Per-page tier dispatch in extract
 

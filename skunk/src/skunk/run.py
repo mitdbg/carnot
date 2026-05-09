@@ -2,40 +2,34 @@
 
 Usage examples:
 
-  # Run a single question (calls LLM planner)
+  # Run a single question (calls LLM planner, updates plan cache)
   python -m skunk.run \\
       --question "Total US National Defense expenditure in CY 1940, millions nominal USD" \\
       --verbose
 
-  # Run by UID from the annotated CSV
+  # Run by UID from the annotated CSV (calls planner, updates cache)
   python -m skunk.run \\
       --uid UID0001 \\
       --csv data/officeqa_pro.csv
 
-  # Use pre-computed plan (skips LLM planner call)
+  # Run by UID using cached plan (skips LLM planner call)
   python -m skunk.run \\
       --uid UID0001 \\
       --csv data/officeqa_pro.csv \\
       --cached-plan --verbose
 
-  # Use pre-computed plan + golden pages (skips both planner and retrieve)
+  # Use golden pages (skips retrieve subagent)
   python -m skunk.run \\
       --uid UID0001 \\
       --csv data/officeqa_pro.csv \\
-      --cached-plan --golden --verbose
+      --golden --verbose
 
-  # Smoke test with cached plans and golden pages
-  python -m skunk.run --smoke \\
-      --csv data/officeqa_pro.csv \\
-      --cached-plan --golden --verbose
-
-  # Cache-only (no live network requests)
-  python -m skunk.run --uid UID0001 --csv data/officeqa_pro.csv --cache-only
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from pathlib import Path
@@ -44,15 +38,52 @@ SMOKE_UIDS = ["UID0001", "UID0030", "UID0010", "UID0022"]
 DEFAULT_PLAN_CSV = "data/dsl_planning_pass.csv"
 
 
+# ---------------------------------------------------------------------------
+# Plan cache helpers
+# ---------------------------------------------------------------------------
+
+def load_plan_cache(plan_csv: str) -> dict[str, str]:
+    """Return {uid: plan_text} from the plan cache CSV."""
+    p = Path(plan_csv)
+    if not p.exists():
+        return {}
+    with p.open(newline="", encoding="utf-8") as f:
+        return {row["uid"]: row["plan_text"] for row in csv.DictReader(f) if row.get("plan_text")}
+
+
+def save_plan_to_cache(uid: str, question: str, plan_text: str, plan_csv: str) -> None:
+    """Upsert (uid, plan_text) into the plan cache CSV."""
+    p = Path(plan_csv)
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+    rows: dict[str, dict] = {}
+    if p.exists():
+        with p.open(newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                rows[row["uid"]] = row
+
+    rows[uid] = {"uid": uid, "question": question, "plan_text": plan_text}
+
+    with p.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["uid", "question", "plan_text"])
+        writer.writeheader()
+        writer.writerows(rows.values())
+
+
+# ---------------------------------------------------------------------------
+# Core runner
+# ---------------------------------------------------------------------------
+
 def run_question(
     question: str,
     manifest_path: str | None,
     cache_dir: str,
     model: str,
-    cache_only: bool,
     verbose: bool,
     golden_pages: list | None = None,
     cached_plan_text: str | None = None,
+    uid: str | None = None,
+    plan_csv: str = DEFAULT_PLAN_CSV,
 ) -> dict:
     from skunk.subagents.base import HarnessContext, LLMConfig
     from skunk.planner import plan
@@ -71,13 +102,12 @@ def run_question(
         manifest_path=manifest_path,
         cache_dir=cache_dir,
         llm_config=LLMConfig(model=model),
-        cache_only=cache_only,
         golden_handle=golden_handle,
     )
 
     if cached_plan_text is not None:
         if verbose:
-            print(f"\n[run] Using cached plan (skipping LLM planner)...")
+            print(f"\n[run] Using cached plan...")
         try:
             from skunk.dsl import parse, serialize, validate
             chain = parse(cached_plan_text)
@@ -92,10 +122,15 @@ def run_question(
         if verbose:
             print(f"\n[run] Planning: {question[:80]}...")
         try:
+            from skunk.dsl import serialize
             chain = plan(question, ctx)
+            plan_text = serialize(chain)
             if verbose:
-                from skunk.dsl import serialize
-                print(f"[run] Plan: {serialize(chain)}")
+                print(f"[run] Plan: {plan_text}")
+            if uid is not None:
+                save_plan_to_cache(uid, question, plan_text, plan_csv)
+                if verbose:
+                    print(f"[run] Plan cached for {uid}")
         except Exception as e:
             return {"question": question, "answer": None, "failed": True, "reason": f"planning: {e}"}
 
@@ -123,17 +158,6 @@ def load_question_from_csv(csv_path: str, uid: str) -> str:
     return str(rows.iloc[0]["question"])
 
 
-def load_plan_lookup(plan_csv: str) -> dict[str, str]:
-    """Return uid → plan_text from dsl_planning_pass.csv."""
-    import pandas as pd
-    df = pd.read_csv(plan_csv)
-    return {
-        str(row["uid"]): str(row["plan_text"])
-        for _, row in df.iterrows()
-        if str(row.get("plan_text", "")).strip()
-    }
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="OfficeQA agentic harness")
     group = parser.add_mutually_exclusive_group(required=True)
@@ -146,7 +170,6 @@ def main() -> None:
     parser.add_argument("--manifest", help="Path to manifest.csv", default=None)
     parser.add_argument("--cache-dir", default="cache")
     parser.add_argument("--model", default="claude-sonnet-4-6")
-    parser.add_argument("--cache-only", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--output", help="Write results to JSON file")
     parser.add_argument(
@@ -156,12 +179,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--cached-plan", action="store_true",
-        help="Use pre-computed plan from --plan-csv instead of calling the LLM planner. "
-             "Requires --uid/--uids/--smoke."
+        help="Use cached plan from --plan-csv instead of calling the LLM planner."
     )
     parser.add_argument(
         "--plan-csv", default=DEFAULT_PLAN_CSV,
-        help=f"Path to plan cache CSV (default: {DEFAULT_PLAN_CSV}). Used with --cached-plan."
+        help=f"Path to plan cache CSV (default: {DEFAULT_PLAN_CSV})."
     )
     args = parser.parse_args()
 
@@ -169,10 +191,7 @@ def main() -> None:
         parser.error("--golden requires --uid/--uids/--smoke (cannot use with --question)")
     if args.golden and not args.csv:
         parser.error("--golden requires --csv to load golden pages")
-    if args.cached_plan and args.question:
-        parser.error("--cached-plan requires --uid/--uids/--smoke (no UID to look up a cached plan)")
 
-    # Load lookup tables once up front
     golden_lookup: dict | None = None
     if args.golden:
         try:
@@ -182,13 +201,11 @@ def main() -> None:
             print(f"[run] ERROR loading golden pages: {e}", file=sys.stderr)
             sys.exit(1)
 
-    plan_lookup: dict | None = None
+    plan_cache: dict[str, str] = {}
     if args.cached_plan:
-        try:
-            plan_lookup = load_plan_lookup(args.plan_csv)
-        except Exception as e:
-            print(f"[run] ERROR loading plan cache {args.plan_csv!r}: {e}", file=sys.stderr)
-            sys.exit(1)
+        plan_cache = load_plan_cache(args.plan_csv)
+        if not plan_cache:
+            print(f"[run] WARNING: plan cache {args.plan_csv!r} is empty or missing", file=sys.stderr)
 
     # Build question list
     questions: list[tuple[str | None, str]] = []  # (uid, question_text)
@@ -222,20 +239,21 @@ def main() -> None:
                 print(f"[run] WARNING: no golden pages found for {uid!r}")
 
         cached_plan_text = None
-        if plan_lookup is not None and uid is not None:
-            cached_plan_text = plan_lookup.get(uid)
+        if args.cached_plan and uid is not None:
+            cached_plan_text = plan_cache.get(uid)
             if cached_plan_text is None:
-                print(f"[run] WARNING: no cached plan found for {uid!r}, falling back to LLM planner")
+                print(f"[run] WARNING: no cached plan for {uid!r}, falling back to LLM planner")
 
         result = run_question(
             question=question,
             manifest_path=args.manifest,
             cache_dir=args.cache_dir,
             model=args.model,
-            cache_only=args.cache_only,
             verbose=args.verbose,
             golden_pages=golden_pages,
             cached_plan_text=cached_plan_text,
+            uid=uid,
+            plan_csv=args.plan_csv,
         )
         if uid:
             result["uid"] = uid

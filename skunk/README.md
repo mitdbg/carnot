@@ -27,4 +27,4 @@ python tools/plan_dsl_with_gemini.py --smoke   # generate plans for 7 sample que
 
 ## Status
 
-The 6-op DSL is finalized; all 133 benchmark questions have validated plans. The runtime subagents are stubs — see the TODO comments in each subagent file for what needs implementing before retrieval/extraction quality can be measured.
+The 6-op DSL is finalized; all 133 benchmark questions have validated plans. Four subagents are implemented (`compute`, `format`, `lookup_external`, `read_visual`); `extract` remains a stub — see its TODO comment for the tier-dispatch work needed before extraction quality can be measured. The `retrieve` subagent is also pending its page-index implementation.

@@ -26,15 +26,15 @@ VALID_TEMPLATES = [
     # simple chain
     "retrieve(concept='national_defense', period='CY1940') --> extract(concept='total_expenditure', mode='value') --> format(precision=0)",
     # parallel retrieve → compute → format
-    "[ retrieve(concept='national_defense', period='CY1940') --> extract(concept='total', mode='value') ; retrieve(concept='national_defense', period='CY1953') --> extract(concept='total', mode='value') ] --> compute(code='abs_pct_change') --> format(precision=2)",
+    "[ retrieve(concept='national_defense', period='CY1940') --> extract(concept='total', mode='value') ; retrieve(concept='national_defense', period='CY1953') --> extract(concept='total', mode='value') ] --> compute(nl='abs_pct_change') --> format(precision=2)",
     # read_visual
     "retrieve(concept='debt_chart', period='FY1975') --> read_visual(concept='total_debt_by_type') --> format(precision=1)",
     # lookup_external + retrieve parallel
-    "[ retrieve(concept='fx_investments', period='2025-03') --> extract(concept='japanese_yen_holdings', mode='value') ; lookup_external(resource='fx_rate', pair='USD/JPY', date='2025-03-31') ] --> compute(code='currency_conversion') --> format(precision=1)",
+    "[ retrieve(concept='fx_investments', period='2025-03') --> extract(concept='japanese_yen_holdings', mode='value') ; lookup_external(nl='USD/JPY exchange rate on 2025-03-31') ] --> compute(nl='currency_conversion') --> format(precision=1)",
     # nested brackets
-    "[ [ retrieve(concept='national_defense', period='CY1940') --> extract(concept='monthly_total', mode='list') ; retrieve(concept='national_defense', period='CY1953') --> extract(concept='monthly_total', mode='list') ] --> compute(code='abs_diff') ; lookup_external(resource='fx_rate', pair='USD/CAD') ] --> compute(code='currency_conversion') --> format(precision=2)",
+    "[ [ retrieve(concept='national_defense', period='CY1940') --> extract(concept='monthly_total', mode='list') ; retrieve(concept='national_defense', period='CY1953') --> extract(concept='monthly_total', mode='list') ] --> compute(nl='abs_diff') ; lookup_external(nl='USD/CAD exchange rate') ] --> compute(nl='currency_conversion') --> format(precision=2)",
     # list extract → compute → format
-    "retrieve(concept='interest_rates', period='1953..1955') --> extract(concept='91day_bill_rate', mode='list') --> compute(code='geo_mean') --> format(precision=3)",
+    "retrieve(concept='interest_rates', period='1953..1955') --> extract(concept='91day_bill_rate', mode='list') --> compute(nl='geo_mean') --> format(precision=3)",
     # source_bulletin pin
     "retrieve(concept='expenditure_table', period='FY1940', source_bulletin='1941-06') --> extract(concept='national_defense_total', mode='value') --> format(precision=0)",
 ]

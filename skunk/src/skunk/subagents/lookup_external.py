@@ -1,9 +1,34 @@
-"""lookup_external subagent — stub."""
+"""lookup_external subagent — single Gemini call, typed Python value output."""
 
 from __future__ import annotations
 
 from skunk.dsl import OpNode, TypedValue
-from skunk.subagents.base import HarnessContext, Subagent
+from skunk.subagents.base import HarnessContext, Subagent, StepFailed, call_gemini, parse_llm_value
+
+_SYSTEM = """\
+You are a precise data assistant with knowledge of economic indicators, historical FX rates,
+world history dates, and other factual data. Your training data covers through mid-2025,
+so treat any date before July 2025 as historical — never refuse on grounds that a date is "future."
+
+Return exactly two lines — no labels, no JSON, no prose:
+  Line 1: the value as a Python literal (int, float, or list of numbers)
+  Line 2: the unit as a single lowercase word
+
+Unit vocabulary:
+  year         — integer calendar year
+  cpi          — CPI-U index value (base 1982-84=100)
+  fx_rate      — exchange rate (always a positive float)
+  usd_millions — dollar amount in millions
+  usd_billions — dollar amount in billions
+  pct          — percentage
+  count        — integer count
+  rate         — generic rate or yield
+
+Rules:
+- FX rates are always positive floats. Never return 0 or -1.
+- Event years are plain integers.
+- For multiple dates: line 1 is a Python list in request order.
+"""
 
 
 class LookupExternalSubagent(Subagent):
@@ -15,8 +40,18 @@ class LookupExternalSubagent(Subagent):
         prev: None,
         ctx: HarnessContext,
     ) -> TypedValue:
-        # TODO: cache-first CSV read for CPI-U, FX, BLS; live API fallback when cache_only=False.
-        # event_year/event_date resources for knowledge-bound period questions.
-        resource = op.args.get("resource") or op.args.get("source", "?")
-        print(f"[STUB lookup_external] resource={resource!r} args={op.args}")
-        return TypedValue(value=None, dtype="external", desc=f"[stub: {resource}]")
+        nl = op.args.get("nl", "")
+        if not nl:
+            raise StepFailed("lookup_external", "Missing 'nl' arg")
+
+        raw = call_gemini(_SYSTEM, nl)
+
+        try:
+            value, dtype, unit = parse_llm_value(raw)
+        except ValueError as e:
+            raise StepFailed(
+                "lookup_external",
+                f"Cannot parse LLM response: {e}\nRaw: {raw[:200]}",
+            ) from e
+
+        return TypedValue(value=value, dtype=dtype, unit=unit, desc=nl)

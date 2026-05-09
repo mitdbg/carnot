@@ -60,8 +60,9 @@ class DocHandle:
 
 @dataclass
 class TypedValue:
-    value: Any
-    dtype: str = "unknown"          # e.g. "scalar:usd_millions", "list[scalar]", "tuple[scalar,scalar]"
+    value: Any              # never None; subagent must raise StepFailed instead
+    dtype: str = "scalar"   # "scalar" | "list[scalar]" | "text" | "df"
+    unit: str = ""          # semantic unit: "usd_millions", "pct", "fx_rate", "year", "cpi", etc.
     desc: str = ""
 
 

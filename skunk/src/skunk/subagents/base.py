@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import json
 import os
 import re
 import textwrap
@@ -50,49 +49,40 @@ class Subagent:
 # LLM backend (pluggable)
 # ---------------------------------------------------------------------------
 
-@dataclass
-class LLMConfig:
-    model: str = "claude-sonnet-4-6"
-    max_tokens: int = 4096
-    temperature: float = 0.0
+_GEMINI_MODEL = "gemini-2.5-flash"
 
 
-def _get_client() -> Any:
-    """Return an Anthropic client (lazy import)."""
-    try:
-        import anthropic
-        return anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-    except ImportError as e:
-        raise RuntimeError("anthropic package not installed. Run: pip install anthropic") from e
-
-
-def call_llm(
+def call_gemini(
     system: str,
     user: str,
-    config: LLMConfig | None = None,
     images: list[tuple[str, str]] | None = None,  # list of (mime_type, base64_data)
 ) -> str:
-    """Call Claude and return the text response."""
-    cfg = config or LLMConfig()
-    client = _get_client()
+    """Call Gemini and return the text response."""
+    from google import genai
+    from google.genai import types
 
-    content: list[Any] = []
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY environment variable is not set")
+    client = genai.Client(api_key=api_key)
+
+    parts: list[Any] = []
     if images:
         for mime_type, b64_data in images:
-            content.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": mime_type, "data": b64_data},
-            })
-    content.append({"type": "text", "text": user})
+            image_bytes = base64.b64decode(b64_data)
+            parts.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
+    parts.append(types.Part.from_text(text=user))
 
-    resp = client.messages.create(
-        model=cfg.model,
-        max_tokens=cfg.max_tokens,
-        temperature=cfg.temperature,
-        system=system,
-        messages=[{"role": "user", "content": content}],
+    resp = client.models.generate_content(
+        model=_GEMINI_MODEL,
+        contents=parts,
+        config=types.GenerateContentConfig(
+            system_instruction=system,
+            max_output_tokens=8192,
+            temperature=0.0,
+        ),
     )
-    return resp.content[0].text
+    return (resp.text or "").strip()
 
 
 def load_image_b64(path: str | Path) -> tuple[str, str]:
@@ -172,20 +162,73 @@ def exec_python(code: str, local_vars: dict[str, Any] | None = None) -> Any:
 
 
 # ---------------------------------------------------------------------------
-# JSON extraction from LLM responses
+# Typed value parsing from LLM output strings
 # ---------------------------------------------------------------------------
 
-def extract_json(text: str) -> Any:
-    """Extract the first JSON block from an LLM response."""
-    # Try ```json ... ``` block first
-    m = re.search(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", text, re.DOTALL)
-    if m:
-        return json.loads(m.group(1))
-    # Try bare JSON object/array
-    m = re.search(r"(\{.*\}|\[.*\])", text, re.DOTALL)
-    if m:
-        return json.loads(m.group(1))
-    raise ValueError(f"No JSON found in: {text[:200]!r}")
+def parse_llm_value(raw: str) -> tuple[Any, str, str]:
+    """Parse a two-line LLM response into (value, dtype, unit).
+
+    Expected format — no JSON, no labels:
+      Line 1: Python literal  — int, float, list of numbers, or "quoted string"
+      Line 2: unit string     — e.g. 'fx_rate', 'year', 'usd_millions', 'count'
+              (optional; defaults to '')
+
+    dtype is inferred from the Python type of the parsed value.
+    """
+    import ast as _ast
+
+    lines = [
+        l.strip() for l in raw.strip().splitlines()
+        if l.strip() and not l.strip().startswith("```")
+    ]
+    if not lines:
+        raise ValueError(f"Empty LLM response")
+
+    value_str = lines[0]
+    try:
+        value = _ast.literal_eval(value_str)
+    except (ValueError, SyntaxError):
+        # Fallback 1: bare float (possibly with commas)
+        try:
+            value = float(value_str.replace(",", ""))
+        except ValueError:
+            # Fallback 2: comma-separated numbers → list
+            try:
+                parts = [float(p.strip()) for p in value_str.split(",") if p.strip()]
+                value = parts[0] if len(parts) == 1 else parts
+            except ValueError:
+                value = value_str  # treat as text
+
+    unit = lines[1] if len(lines) > 1 else ""
+
+    if isinstance(value, list):
+        dtype = "list[scalar]"
+    elif isinstance(value, str):
+        dtype = "text"
+    else:
+        dtype = "scalar"
+
+    return value, dtype, unit
+
+
+# ---------------------------------------------------------------------------
+# LLM config and generic call_llm wrapper
+# ---------------------------------------------------------------------------
+
+@dataclass
+class LLMConfig:
+    model: str = "gemini-2.5-flash"
+    api_key: str | None = None
+
+
+def call_llm(
+    system: str,
+    user: str,
+    llm_config: "LLMConfig | None" = None,
+    images: list[tuple[str, str]] | None = None,
+) -> str:
+    """Route an LLM call through the configured backend (currently Gemini)."""
+    return call_gemini(system, user, images=images)
 
 
 # ---------------------------------------------------------------------------
@@ -196,11 +239,11 @@ def extract_json(text: str) -> Any:
 class HarnessContext:
     question: str
     manifest_path: str | None = None   # path to manifest.csv
-    cache_dir: str = "cache"
+    cache_dir: str = "cache"           # page render cache (PNG/TXT files)
     concept_dict_path: str | None = None
     llm_config: LLMConfig = None
-    cache_only: bool = False           # True → never hit live sources
     golden_handle: "DocHandle | None" = None  # injected by --golden; bypasses retrieve
+    cache_only: bool = False           # if True, never make LLM calls
 
     def __post_init__(self) -> None:
         if self.llm_config is None:
