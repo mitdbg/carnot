@@ -22,6 +22,7 @@ ROW = 0
 K = 5
 INDEX = "faiss"
 MAX_DOCS = None
+RUN_AGENT = True
 
 with open(QUERIES_CSV, newline="") as queries_file:
     queries = list(csv.DictReader(queries_file))
@@ -61,30 +62,42 @@ dataset = Dataset(
     dataset_id="officeqa_documents",
 )
 
+if RUN_AGENT:
+    execution = carnot.Execution(
+        query=(
+            "Find documents that are necessary to answer the question: "
+            f"{query['question']}\n\n"
+            f"Return the relevant documents as final items. Each item should include source_file."
+        ),
+        datasets=[dataset],
+        llm_config={
+            "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY"),
+            "GEMINI_API_KEY": os.getenv("GEMINI_API_KEY"),
+            "GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY"),
+        },
+    )
 
-# execution = carnot.Execution(
-#     query = "Find documents that are necessary to answer the question: " + query["question"],
-#     datasets=[dataset.name],
-#     llm_config={
-#         "model": "gemini/gemini-embedding-2",
-#         "api_key": os.getenv("GEMINI_API_KEY"),
-#     }
-# )
+    nl_plan, physical_plan = execution.plan()
+    execution._plan = physical_plan
+    print(nl_plan)
+    items, answer_str, stats = execution.run()
+    predicted_files = [item.get("source_file") for item in items]
 
-# operator = SemTopKOperator(
-#     task=query["question"],
-#     k=K,
-#     dataset_id="RetrievedOfficeQADocuments",
-#     max_workers=1,
-#     index_name=INDEX,
-#     model_id='openai/text-embedding-3-large',
-#     llm_config={"GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY"),
-#                 "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY")},
-# )
+else:
+    operator = SemTopKOperator(
+        task=query["question"],
+        k=K,
+        dataset_id="RetrievedOfficeQADocuments",
+        max_workers=1,
+        index_name=INDEX,
+        model_id='openai/text-embedding-3-large',
+        llm_config={"GOOGLE_API_KEY": os.getenv("GOOGLE_API_KEY"),
+                    "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY")},
+    )
 
-# output_datasets, stats = operator(dataset.name, {dataset.name: dataset})
-# retrieved = output_datasets["RetrievedOfficeQADocuments"].items
-# predicted_files = [item.get("source_file") for item in retrieved]
+    output_datasets, stats = operator(dataset.name, {dataset.name: dataset})
+    retrieved = output_datasets["RetrievedOfficeQADocuments"].items
+    predicted_files = [item.get("source_file") for item in retrieved]
 
 print(f"uid: {query['uid']}")
 print(f"question: {query['question']}")
