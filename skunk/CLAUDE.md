@@ -12,9 +12,20 @@ The benchmark is `data/officeqa_pro.csv` (133 questions). An initial pass of DSL
 
 - Question → planner emits DSL plan (text) → orchestrator walks AST → 6 subagents.
 - 6 ops: `retrieve`, `extract`, `read_visual`, `lookup_external`, `compute`, `format`.
-- Retrieval is **page-level**: the retrieve subagent maintains its own page index over the corpus. `PageRef.page` = bulletin printed page number (canonical); `PageRef.pdf_page` = PDF index. See `prep/page_map.py` for translation.
+- Retrieval is **page-level**: the retrieve subagent maintains its own page index over the corpus. `PageRef.page` = bulletin printed page number (canonical); `PageRef.pdf_page` = PDF index. See `common/page_map.py` for translation.
 - Extract is per-page tier dispatch: CSV tables → OCR text → vision render. No cross-page search.
 - See `ARCHITECTURE.md` for design intent, `DSL.md` for grammar.
+
+## Layout
+
+- `src/skunk/dsl.py` — DSL parser, serializer, validator, AST types
+- `src/skunk/planner.py` — LLM planner: question → DSL AST
+- `src/skunk/orchestrator.py` — AST executor; dispatches subagent functions
+- `src/skunk/subagents/` — one module per op (`retrieve`, `extract`, `read_visual`, `lookup_external`, `compute`, `format`); each exposes a bare `run(op, prev, ctx)` function
+- `src/skunk/subagents/base.py` — shared utilities: `StepFailed`, `call_gemini`, `exec_python`, `parse_llm_value`, `HarnessContext`
+- `src/skunk/common/` — shared utilities used by more than one subagent (e.g. `page_map.py`)
+- `eval/` — independent eval harnesses (`golden.py`, `eval_retrieval.py`, `eval_extraction.py`, `eval_e2e.py`)
+- `tools/` — standalone CLI utilities (planner smoke test, drift analysis)
 
 ## Conventions
 
@@ -26,7 +37,7 @@ The benchmark is `data/officeqa_pro.csv` (133 questions). An initial pass of DSL
 ## API keys (.env at repo root)
 
 - `ANTHROPIC_API_KEY` — reserved for future use; not currently wired into any runtime call
-- `GEMINI_API_KEY` — Gemini 2.5 Flash; used by the planner (`call_llm` → `call_gemini`), all subagents, and `tools/plan_dsl_with_gemini.py`
+- `GEMINI_API_KEY` — Gemini 2.5 Flash; used by the planner and all subagents via `call_gemini` in `subagents/base.py`, and `tools/plan_dsl_with_gemini.py`
 
 `.env.example` is committed; copy it to `.env` and fill in keys.
 
@@ -34,7 +45,7 @@ The benchmark is `data/officeqa_pro.csv` (133 questions). An initial pass of DSL
 
 - Treasury Bulletin PDFs live at `~/Desktop/officeqa/treasury_bulletin_pdfs/` (~20 GB, 696 files).
 - Path is configurable via `OFFICEQA_PDF_DIR` env var; default is the path above.
-- Pre-extracted tables and rendered pages live under `cache/` (gitignored), populated by `prep/` modules on first use.
+- Pre-extracted tables and rendered pages live under `cache/` (gitignored), populated on first use.
 
 ## Pointers
 

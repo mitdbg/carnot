@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from skunk.dsl import FormattedString, OpNode, TypedValue
-from skunk.subagents.base import HarnessContext, Subagent, StepFailed, call_gemini, exec_python
+from skunk.subagents.base import HarnessContext, StepFailed, call_gemini, exec_python
 
 _SYSTEM = """\
 You are a Python code generation assistant. Write a short Python block that formats \
@@ -24,56 +24,24 @@ Rules:
 """
 
 
-def _build_prompt(op: OpNode, prev_value: object, unit: str = "") -> str:
+def run(op: OpNode, prev: object, ctx: HarnessContext) -> FormattedString:
+    if isinstance(prev, TypedValue):
+        value, unit, desc = prev.value, prev.unit, prev.desc
+    elif isinstance(prev, FormattedString):
+        return prev
+    else:
+        value, unit, desc = prev, "", ""
+
     args_desc = ", ".join(f"{k}={v!r}" for k, v in op.args.items())
-    value_repr = repr(prev_value)[:200]
     unit_hint = f"\nInput unit: {unit}" if unit else ""
-    return (
+    prompt = (
         f"Format the value into a string.\n\n"
         f"Formatting spec (DSL args): {args_desc}{unit_hint}\n"
-        f"value = {value_repr}\n\n"
+        f"value = {repr(value)[:200]}\n\n"
         f"Write Python code that sets `result`."
     )
-
-
-class FormatSubagent(Subagent):
-    op_name = "format"
-
-    def run(
-        self,
-        op: OpNode,
-        prev: object,
-        ctx: HarnessContext,
-    ) -> FormattedString:
-        if isinstance(prev, TypedValue):
-            value = prev.value
-            unit = prev.unit
-            desc = prev.desc
-        elif isinstance(prev, FormattedString):
-            return prev
-        else:
-            value = prev
-            unit = ""
-            desc = ""
-
-        prompt = _build_prompt(op, value, unit=unit)
-        code = call_gemini(_SYSTEM, prompt)
-
-        # Strip any accidental markdown fences the model adds
-        code = code.strip()
-        if code.startswith("```"):
-            lines = code.splitlines()
-            code = "\n".join(
-                line for line in lines
-                if not line.strip().startswith("```")
-            ).strip()
-
-        try:
-            result_str = exec_python(code, {"value": value})
-        except StepFailed as e:
-            raise StepFailed("format", f"Generated code failed: {e}\nCode:\n{code}") from e
-
-        if not isinstance(result_str, str):
-            result_str = str(result_str)
-
-        return FormattedString(text=result_str, desc=desc)
+    code = call_gemini(_SYSTEM, prompt)
+    result_str = exec_python(code, {"value": value})
+    if not isinstance(result_str, str):
+        result_str = str(result_str)
+    return FormattedString(text=result_str, desc=desc)

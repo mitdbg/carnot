@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from skunk.dsl import OpNode, TypedValue
-from skunk.subagents.base import HarnessContext, Subagent, StepFailed, call_gemini, parse_llm_value
+from skunk.subagents.base import HarnessContext, StepFailed, call_gemini, parse_llm_value
 
 _SYSTEM = """\
 You are a precise data assistant with knowledge of economic indicators, historical FX rates,
@@ -31,27 +31,16 @@ Rules:
 """
 
 
-class LookupExternalSubagent(Subagent):
-    op_name = "lookup_external"
+def run(op: OpNode, prev: None, ctx: HarnessContext) -> TypedValue:
+    nl = op.args.get("nl", "")
+    if not nl:
+        raise StepFailed("lookup_external", "Missing 'nl' arg")
 
-    def run(
-        self,
-        op: OpNode,
-        prev: None,
-        ctx: HarnessContext,
-    ) -> TypedValue:
-        nl = op.args.get("nl", "")
-        if not nl:
-            raise StepFailed("lookup_external", "Missing 'nl' arg")
+    raw = call_gemini(_SYSTEM, nl)
 
-        raw = call_gemini(_SYSTEM, nl)
+    try:
+        value, dtype, unit = parse_llm_value(raw)
+    except ValueError as e:
+        raise StepFailed("lookup_external", f"Cannot parse LLM response: {e}\nRaw: {raw[:200]}") from e
 
-        try:
-            value, dtype, unit = parse_llm_value(raw)
-        except ValueError as e:
-            raise StepFailed(
-                "lookup_external",
-                f"Cannot parse LLM response: {e}\nRaw: {raw[:200]}",
-            ) from e
-
-        return TypedValue(value=value, dtype=dtype, unit=unit, desc=nl)
+    return TypedValue(value=value, dtype=dtype, unit=unit, desc=nl)

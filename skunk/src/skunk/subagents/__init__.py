@@ -1,22 +1,10 @@
-from skunk.subagents.retrieve import RetrieveSubagent
-from skunk.subagents.extract import ExtractSubagent
-from skunk.subagents.read_visual import ReadVisualSubagent
-from skunk.subagents.lookup_external import LookupExternalSubagent
-from skunk.subagents.compute import ComputeSubagent
-from skunk.subagents.format import FormatSubagent
+from skunk.subagents import retrieve, extract, read_visual, lookup_external, compute, format as fmt
 
 SUBAGENT_REGISTRY = {
-    "retrieve": RetrieveSubagent,
-    "extract": ExtractSubagent,
-    "read_visual": ReadVisualSubagent,
-    "lookup_external": LookupExternalSubagent,
-    "compute": ComputeSubagent,
-    "format": FormatSubagent,
+    "retrieve": retrieve.run,
+    "extract": extract.run,
+    "read_visual": read_visual.run,
+    "lookup_external": lookup_external.run,
+    "compute": compute.run,
+    "format": fmt.run,
 }
-
-__all__ = [
-    "RetrieveSubagent", "ExtractSubagent",
-    "ReadVisualSubagent", "LookupExternalSubagent",
-    "ComputeSubagent", "FormatSubagent",
-    "SUBAGENT_REGISTRY",
-]

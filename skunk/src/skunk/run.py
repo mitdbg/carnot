@@ -78,16 +78,15 @@ def run_question(
     question: str,
     manifest_path: str | None,
     cache_dir: str,
-    model: str,
     verbose: bool,
     golden_pages: list | None = None,
     cached_plan_text: str | None = None,
     uid: str | None = None,
     plan_csv: str = DEFAULT_PLAN_CSV,
 ) -> dict:
-    from skunk.subagents.base import HarnessContext, LLMConfig
+    from skunk.subagents.base import HarnessContext
     from skunk.planner import plan
-    from skunk.orchestrator import Orchestrator
+    from skunk.orchestrator import execute
 
     golden_handle = None
     if golden_pages:
@@ -101,7 +100,6 @@ def run_question(
         question=question,
         manifest_path=manifest_path,
         cache_dir=cache_dir,
-        llm_config=LLMConfig(model=model),
         golden_handle=golden_handle,
     )
 
@@ -134,8 +132,7 @@ def run_question(
         except Exception as e:
             return {"question": question, "answer": None, "failed": True, "reason": f"planning: {e}"}
 
-    orchestrator = Orchestrator()
-    trace = orchestrator.execute(chain, ctx)
+    trace = execute(chain, ctx)
 
     if verbose:
         print(trace.pretty())
@@ -169,7 +166,6 @@ def main() -> None:
     parser.add_argument("--csv", help="Path to annotated OfficeQA CSV (needed for --uid/--uids/--smoke)")
     parser.add_argument("--manifest", help="Path to manifest.csv", default=None)
     parser.add_argument("--cache-dir", default="cache")
-    parser.add_argument("--model", default="claude-sonnet-4-6")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--output", help="Write results to JSON file")
     parser.add_argument(
@@ -248,7 +244,6 @@ def main() -> None:
             question=question,
             manifest_path=args.manifest,
             cache_dir=args.cache_dir,
-            model=args.model,
             verbose=args.verbose,
             golden_pages=golden_pages,
             cached_plan_text=cached_plan_text,
