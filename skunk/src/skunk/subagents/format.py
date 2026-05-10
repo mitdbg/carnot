@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from skunk.common.context import HarnessContext
 from skunk.dsl import FormattedString, OpNode, TypedValue
-from skunk.subagents.base import HarnessContext, StepFailed, call_gemini, exec_python
+from skunk.subagents.base import call_gemini, exec_python
 
 _SYSTEM = """\
 You are a Python code generation assistant. Write a short Python block that formats \

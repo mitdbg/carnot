@@ -17,7 +17,6 @@ Page number convention:
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -33,6 +32,13 @@ class PageRef:
     page: int | None = None         # bulletin printed page number (canonical)
     pdf_page: int | None = None     # 1-based PDF page index (for cache/render access)
     file_path: str | None = None    # resolved by manifest
+
+    def __post_init__(self) -> None:
+        # page-map resolution requires month; catch missing month at construction time.
+        if self.page is not None and self.pdf_page is None and self.month is None:
+            raise ValueError(
+                f"PageRef with page={self.page} requires month for page-map resolution"
+            )
 
     def __repr__(self) -> str:
         parts = []
@@ -90,8 +96,6 @@ VALID_OPS = frozenset({
 class OpNode:
     op: str
     args: dict[str, Any] = field(default_factory=dict)
-    concepts: list[str] = field(default_factory=list)
-    constraints: list[str] = field(default_factory=list)
     node_type: str = field(default="op", init=False)
 
     def __post_init__(self) -> None:
@@ -120,6 +124,13 @@ Pipeline = ChainNode
 # Text DSL parser
 # ---------------------------------------------------------------------------
 
+# Single source of truth for positional arg key order (parse and serialize must agree).
+_POSITIONAL_KEYS = [
+    "source", "concept", "locator", "resource", "formula",
+    "reducer", "spec", "element", "criterion",
+]
+
+
 def _split_chain(text: str) -> list[str]:
     """Split `text` on '-->' respecting bracket depth."""
     tokens: list[str] = []
@@ -142,6 +153,8 @@ def _split_chain(text: str) -> list[str]:
         else:
             current.append(ch)
         i += 1
+    if depth != 0:
+        raise ParseError(f"Unbalanced brackets in DSL: depth={depth} at end of input")
     if current:
         tokens.append("".join(current).strip())
     return [t for t in tokens if t]
@@ -164,6 +177,8 @@ def _split_branches(text: str) -> list[str]:
             current = []
         else:
             current.append(ch)
+    if depth != 0:
+        raise ParseError(f"Unbalanced brackets in parallel branches: depth={depth} at end of input")
     if current:
         branches.append("".join(current).strip())
     return [b for b in branches if b]
@@ -179,12 +194,22 @@ def _parse_args(raw: str) -> dict[str, Any]:
     if not raw:
         return {}
     args: dict[str, Any] = {}
-    # split on commas not inside brackets or parens
+    # Split on commas not inside brackets, parens, or quoted strings.
     parts: list[str] = []
     depth = 0
     current: list[str] = []
+    in_quote = False
+    quote_char = ""
     for ch in raw:
-        if ch in "([":
+        if in_quote:
+            current.append(ch)
+            if ch == quote_char:
+                in_quote = False
+        elif ch in ("'", '"'):
+            in_quote = True
+            quote_char = ch
+            current.append(ch)
+        elif ch in "([":
             depth += 1
             current.append(ch)
         elif ch in ")]":
@@ -199,18 +224,14 @@ def _parse_args(raw: str) -> dict[str, Any]:
         parts.append("".join(current).strip())
 
     positional_idx = 0
-    positional_keys = ["source", "concept", "locator", "resource", "formula",
-                       "reducer", "spec", "element", "criterion"]
     for part in parts:
         part = part.strip()
         m = _KV_RE.match(part)
         if m:
             k, v = m.group(1).strip(), m.group(2).strip()
-            # Try to parse value as int, then float, else keep as string
             args[k] = _coerce(v)
         else:
-            # positional
-            key = positional_keys[positional_idx] if positional_idx < len(positional_keys) else f"arg{positional_idx}"
+            key = _POSITIONAL_KEYS[positional_idx] if positional_idx < len(_POSITIONAL_KEYS) else f"arg{positional_idx}"
             args[key] = _coerce(part)
             positional_idx += 1
     return args
@@ -276,9 +297,7 @@ class ParseError(ValueError):
 def _args_to_str(args: dict[str, Any]) -> str:
     parts = []
     for k, v in args.items():
-        if k in ("source", "concept", "locator", "resource", "formula",
-                 "reducer", "spec", "element", "criterion"):
-            # positional
+        if k in _POSITIONAL_KEYS:
             parts.append(str(v))
         else:
             parts.append(f"{k}={v}")
@@ -315,8 +334,6 @@ def to_dict(node: ChainNode | OpNode | ParallelNode) -> dict:
             "type": "op",
             "op": node.op,
             "args": node.args,
-            "concepts": node.concepts,
-            "constraints": node.constraints,
         }
     elif isinstance(node, ParallelNode):
         return {
@@ -329,25 +346,54 @@ def to_dict(node: ChainNode | OpNode | ParallelNode) -> dict:
 def from_dict(d: dict) -> ChainNode | OpNode | ParallelNode:
     t = d.get("type")
     if t == "chain":
+        if "steps" not in d:
+            raise ValueError(f"ChainNode dict missing required field 'steps': {d!r}")
         return ChainNode(
-            steps=[from_dict(s) for s in d.get("steps", [])],
+            steps=[from_dict(s) for s in d["steps"]],
             global_constraints=d.get("global_constraints", []),
         )
     elif t == "op":
+        if "op" not in d:
+            raise ValueError(f"OpNode dict missing required field 'op': {d!r}")
         return OpNode(
             op=d["op"],
             args=d.get("args", {}),
-            concepts=d.get("concepts", []),
-            constraints=d.get("constraints", []),
+            # Extra keys (e.g. 'concepts', 'constraints') from LLM output are silently ignored.
         )
     elif t == "parallel":
-        return ParallelNode(branches=[from_dict(b) for b in d.get("branches", [])])
+        if "branches" not in d:
+            raise ValueError(f"ParallelNode dict missing required field 'branches': {d!r}")
+        return ParallelNode(branches=[from_dict(b) for b in d["branches"]])
     raise ValueError(f"Unknown node type: {t!r}")
 
 
 # ---------------------------------------------------------------------------
 # Validator
 # ---------------------------------------------------------------------------
+
+_CHAIN_HEAD_OPS = frozenset({"retrieve", "lookup_external"})
+
+# Required args per op; checked at validation time.
+_REQUIRED_ARGS: dict[str, list[str]] = {
+    "retrieve": ["concept", "period"],
+    "extract": ["concept"],
+    "compute": ["nl"],
+    "lookup_external": ["nl"],
+    "read_visual": ["concept"],
+    "format": [],
+}
+
+# Period grammar: point | range (point..point) | enumeration (point,point,...)
+# point: CY/FY year, Qn quarter, YYYY-MM-DD, YYYY-MM, plain YYYY
+_PERIOD_POINT = r"(?:CY\d{4}|FY\d{4}|Q[1-4]-\d{4}|\d{4}-\d{2}-\d{2}|\d{4}-\d{2}|\d{4})"
+_PERIOD_RE = re.compile(
+    r"^(?:"
+    + _PERIOD_POINT + r"\.\." + _PERIOD_POINT   # range: point..point
+    + r"|" + _PERIOD_POINT + r"(?:," + _PERIOD_POINT + r")+"  # enumeration: point,point,...
+    + r"|" + _PERIOD_POINT                       # single point
+    + r")$"
+)
+
 
 @dataclass
 class ValidationResult:
@@ -357,23 +403,63 @@ class ValidationResult:
 
 def validate(chain: ChainNode) -> ValidationResult:
     errors: list[str] = []
-    _validate_node(chain, errors, path="root")
+    _validate_node(chain, errors, path="root", is_root=True)
     return ValidationResult(ok=len(errors) == 0, errors=errors)
 
 
-def _validate_node(node: ChainNode | OpNode | ParallelNode, errors: list[str], path: str) -> None:
+def _validate_node(
+    node: ChainNode | OpNode | ParallelNode,
+    errors: list[str],
+    path: str,
+    is_root: bool = False,
+) -> None:
     if isinstance(node, ChainNode):
         if not node.steps:
             errors.append(f"{path}: empty chain")
+            return
+
+        # Chain head: if the first step is an OpNode it must be a chain-head op.
+        # ParallelNode heads are allowed (each branch head is checked recursively).
+        first_step = node.steps[0]
+        if isinstance(first_step, OpNode) and first_step.op not in _CHAIN_HEAD_OPS:
+            errors.append(
+                f"{path}: chain must start with retrieve or lookup_external, got {first_step.op!r}"
+            )
+
+        # Chain tail: answer-producing (root) chain must end with format.
+        if is_root:
+            last_step = node.steps[-1]
+            if not isinstance(last_step, OpNode) or last_step.op != "format":
+                tail_desc = last_step.op if isinstance(last_step, OpNode) else type(last_step).__name__
+                errors.append(
+                    f"{path}: answer chain must end with format, got {tail_desc!r}"
+                )
+
         for i, step in enumerate(node.steps):
             _validate_node(step, errors, path=f"{path}.steps[{i}]")
+
     elif isinstance(node, OpNode):
         if node.op not in VALID_OPS:
             errors.append(f"{path}: unknown op {node.op!r}")
+        else:
+            # Required args
+            for arg in _REQUIRED_ARGS.get(node.op, []):
+                if arg not in node.args:
+                    errors.append(f"{path}: op {node.op!r} missing required arg {arg!r}")
+            # Period grammar for retrieve
+            if node.op == "retrieve" and "period" in node.args:
+                period_str = str(node.args["period"])
+                if not _PERIOD_RE.match(period_str):
+                    errors.append(
+                        f"{path}: retrieve period {period_str!r} does not match expected format "
+                        r"(CY/FY year, Qn-YYYY, YYYY-MM, YYYY-MM-DD, YYYY, range X..Y, enumeration X,Y)"
+                    )
+
     elif isinstance(node, ParallelNode):
         if len(node.branches) < 2:
             errors.append(f"{path}: parallel must have ≥2 branches, got {len(node.branches)}")
         for i, b in enumerate(node.branches):
             _validate_node(b, errors, path=f"{path}.branches[{i}]")
+
     else:
         errors.append(f"{path}: unknown node type {type(node).__name__}")

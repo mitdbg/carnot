@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import ast
 import base64
+import math
 import os
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import numpy as np
+import pandas as pd
+from google import genai
+from google.genai import types
 
 
 class StepFailed(Exception):
@@ -29,9 +34,6 @@ def call_gemini(
     user: str,
     images: list[tuple[str, str]] | None = None,
 ) -> str:
-    from google import genai
-    from google.genai import types
-
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not set")
@@ -68,17 +70,12 @@ def load_image_b64(path: str | Path) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 
 def exec_python(code: str, local_vars: dict[str, Any] | None = None) -> Any:
-    import math
-    import numpy as np
-    import pandas as pd
-
     code = code.strip()
     if code.startswith("```"):
         code = "\n".join(l for l in code.splitlines() if not l.strip().startswith("```")).strip()
 
     env: dict[str, Any] = {"math": math, "np": np, "numpy": np, "pd": pd, "pandas": pd}
-    if local_vars:
-        env.update(local_vars)
+    env.update(local_vars or {})
     exec(compile(code, "<sandbox>", "exec"), env)  # noqa: S102
     if "result" not in env:
         raise StepFailed("sandbox", f"Code did not set `result`:\n{code}")
@@ -102,19 +99,3 @@ def parse_llm_value(raw: str) -> tuple[Any, str, str]:
     else:
         dtype = "scalar"
     return value, dtype, unit
-
-
-# ---------------------------------------------------------------------------
-# Harness context
-# ---------------------------------------------------------------------------
-
-@dataclass
-class HarnessContext:
-    question: str
-    manifest_path: str | None = None
-    cache_dir: str = "cache"
-    golden_handle: "DocHandle | None" = None  # noqa: F821
-    cache_only: bool = False
-
-    def __post_init__(self) -> None:
-        Path(self.cache_dir).mkdir(parents=True, exist_ok=True)

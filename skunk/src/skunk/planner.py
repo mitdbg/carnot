@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
-from typing import Any
 
+from skunk.common.context import HarnessContext
 from skunk.dsl import ChainNode, from_dict, validate
-from skunk.subagents.base import HarnessContext, LLMConfig, StepFailed, call_llm
+from skunk.subagents.base import StepFailed, call_gemini
 
 # ---------------------------------------------------------------------------
 # DSL spec (6-op grammar embedded in the system prompt)
@@ -278,32 +279,59 @@ def plan(question: str, ctx: HarnessContext) -> ChainNode:
     system = _build_system(ctx)
     user = _build_user(question, ctx)
 
-    last_err: Exception | None = None
+    attempt_errors: list[str] = []
     for attempt in range(2):
-        raw = call_llm(system, user, ctx.llm_config)
+        raw = call_gemini(system, user)
         try:
             ast_dict = _extract_ast_json(raw)
             chain = from_dict(ast_dict)
             if not isinstance(chain, ChainNode):
-                chain = ChainNode(steps=[chain] if hasattr(chain, "op") else [])
+                raise ValueError(
+                    f"from_dict returned {type(chain).__name__}, expected ChainNode"
+                )
             result = validate(chain)
             if not result.ok:
                 raise ValueError(f"AST validation errors: {result.errors}")
             return chain
         except Exception as e:
-            last_err = e
+            attempt_errors.append(f"Attempt {attempt + 1}: {e}")
             if attempt == 0:
-                user += f"\n\nYour previous output had errors: {e}\nFix and return valid JSON."
+                user += (
+                    f"\n\nYour previous output had errors:\n{e}\n"
+                    "Fix and return valid JSON only."
+                )
 
-    raise StepFailed("planner", f"Failed to produce valid AST: {last_err}")
+    raise StepFailed(
+        "planner",
+        f"Failed to produce valid AST after {len(attempt_errors)} attempts: "
+        + "; ".join(attempt_errors),
+    )
 
 
 def _extract_ast_json(text: str) -> dict:
-    import re
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    """Extract the outermost JSON object from planner output.
+
+    Tries a fenced code block first, then falls back to scanning for balanced braces.
+    The old single-regex approach truncated multi-line nested JSON at the first '}'.
+    """
+    # Fenced code block: grab everything between the fences, then parse as JSON.
+    m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
     if m:
         return json.loads(m.group(1))
-    m = re.search(r"(\{.*\})", text, re.DOTALL)
-    if m:
-        return json.loads(m.group(1))
-    raise ValueError(f"No JSON object found in planner response:\n{text[:400]}")
+    # Balanced-brace scan: find the outermost { ... } regardless of line breaks.
+    start = text.find("{")
+    if start == -1:
+        raise ValueError(f"No JSON object found in planner response:\n{text[:400]}")
+    depth = 0
+    end = -1
+    for i, ch in enumerate(text[start:], start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end == -1:
+        raise ValueError(f"Unbalanced braces in planner response:\n{text[:400]}")
+    return json.loads(text[start:end])

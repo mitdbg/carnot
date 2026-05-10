@@ -10,15 +10,6 @@ The map for each bulletin is stored at:
     "bulletin_to_pdf": {"1": 3, "2": 4, ...},
     "pdf_to_bulletin": {"1": null, "2": null, "3": 1, "4": 2, ...}
   }
-
-Building a map (called once per bulletin by prep/catalog.py):
-  - Primary: parse printed page numbers from per-page OCR text (.txt files).
-  - Fallback: scan the PDF directly with PyMuPDF for header/footer text.
-  - Last resort: store null for all PDF pages (translation not available).
-
-Public helpers used by extract.py, tables.py, read_visual.py:
-  pdf_page_for_ref(ref, cache_dir)  → int | None
-  bulletin_page_for_ref(ref, cache_dir) → int | None
 """
 
 from __future__ import annotations
@@ -26,10 +17,8 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from skunk.dsl import PageRef
+from skunk.dsl import PageRef
 
 # regex: one or more digits as the only content on a line (common footer format)
 _PAGE_RE = re.compile(r"^\s*(\d{1,4})\s*$", re.MULTILINE)
@@ -100,7 +89,7 @@ def build_page_map_from_ocr(
     return result
 
 
-def pdf_page_for_ref(ref: "PageRef", cache_dir: str) -> int | None:
+def pdf_page_for_ref(ref: PageRef, cache_dir: str) -> int | None:
     """Return the PDF page index for a PageRef.
 
     Uses ref.pdf_page directly if set; otherwise looks up ref.page (bulletin page)
@@ -108,7 +97,11 @@ def pdf_page_for_ref(ref: "PageRef", cache_dir: str) -> int | None:
     """
     if ref.pdf_page is not None:
         return ref.pdf_page
-    if ref.page is not None and ref.month is not None:
+    if ref.page is not None:
+        if ref.month is None:
+            raise ValueError(
+                f"PageRef.page={ref.page} requires PageRef.month to be set for page-map lookup"
+            )
         mapping = load_page_map(ref.month, cache_dir)
         pdf_idx = mapping.get("bulletin_to_pdf", {}).get(str(ref.page))
         if pdf_idx is not None:
@@ -116,16 +109,3 @@ def pdf_page_for_ref(ref: "PageRef", cache_dir: str) -> int | None:
     return None
 
 
-def bulletin_page_for_ref(ref: "PageRef", cache_dir: str) -> int | None:
-    """Return the bulletin printed page number for a PageRef.
-
-    Uses ref.page directly if set; otherwise looks up ref.pdf_page in the page map.
-    """
-    if ref.page is not None:
-        return ref.page
-    if ref.pdf_page is not None and ref.month is not None:
-        mapping = load_page_map(ref.month, cache_dir)
-        bnum = mapping.get("pdf_to_bulletin", {}).get(str(ref.pdf_page))
-        if bnum is not None:
-            return int(bnum)
-    return None

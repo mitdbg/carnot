@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from skunk.common.context import HarnessContext
 from skunk.dsl import DocHandle, OpNode
-from skunk.subagents.base import HarnessContext
+from skunk.subagents.base import StepFailed
 
 
 def run(op: OpNode, prev: None, ctx: HarnessContext) -> DocHandle:
@@ -13,5 +14,8 @@ def run(op: OpNode, prev: None, ctx: HarnessContext) -> DocHandle:
         return ctx.golden_handle
     concept = op.args.get("concept") or op.args.get("source", "?")
     period = op.args.get("period", "?")
-    print(f"[STUB retrieve] concept={concept!r} period={period!r}")
-    return DocHandle(refs=[], desc=f"[stub: {concept} / {period}]")
+    raise StepFailed(
+        "retrieve",
+        f"[STUB] no page index built — cannot retrieve concept={concept!r} period={period!r}. "
+        "Provide --golden or implement the page index.",
+    )

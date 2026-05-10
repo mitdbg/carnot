@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from skunk.common.context import HarnessContext
 from skunk.dsl import OpNode, TypedValue
-from skunk.subagents.base import HarnessContext, StepFailed, call_gemini, parse_llm_value
+from skunk.subagents.base import StepFailed, call_gemini, parse_llm_value
 
 _SYSTEM = """\
 You are a precise data assistant with knowledge of economic indicators, historical FX rates,
@@ -35,6 +36,8 @@ def run(op: OpNode, prev: None, ctx: HarnessContext) -> TypedValue:
     nl = op.args.get("nl", "")
     if not nl:
         raise StepFailed("lookup_external", "Missing 'nl' arg")
+    if ctx.cache_only:
+        raise StepFailed("lookup_external", "cache_only mode: live external calls disabled")
 
     raw = call_gemini(_SYSTEM, nl)
 

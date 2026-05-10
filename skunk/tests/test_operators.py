@@ -1,4 +1,4 @@
-"""Integration tests for format, lookup_external, compute, and read_visual operators.
+"""Integration tests for format, lookup_external, compute, read_visual, and extract operators.
 
 Each test makes real LLM calls (no mocks).
 
@@ -20,14 +20,24 @@ import pytest
 sys.path.insert(0, os.path.expanduser("~/Desktop/officeqa"))
 
 from skunk.dsl import DocHandle, FormattedString, OpNode, PageRef, TypedValue
-from skunk.subagents.base import HarnessContext
+
+
+def _rel_err(got, expected):
+    return abs(got - expected) / abs(expected) if expected != 0 else abs(got)
+import skunk.subagents.compute as compute
+import skunk.subagents.extract as extract
 import skunk.subagents.format as fmt
 import skunk.subagents.lookup_external as lookup_external
-import skunk.subagents.compute as compute
 import skunk.subagents.read_visual as read_visual
+from skunk.common.context import HarnessContext
 
 PDF_DIR = os.path.expanduser("~/Desktop/officeqa/treasury_bulletin_pdfs")
+PARSED_DIR = os.path.expanduser(
+    "~/Desktop/officeqa/treasury_bulletins_parsed/transformed/treasury_bulletins_transformed"
+)
 SEPT_1990_PDF = os.path.join(PDF_DIR, "treasury_bulletin_1990_09.pdf")
+JAN_1941_PDF = os.path.join(PDF_DIR, "treasury_bulletin_1941_01.pdf")
+JAN_1941_PARSED = os.path.join(PARSED_DIR, "treasury_bulletin_1941_01.txt")
 
 
 @pytest.fixture()
@@ -118,9 +128,6 @@ class TestFormat:
 
 class TestLookupExternal:
 
-    def _rel_err(self, got, expected):
-        return abs(got - expected) / abs(expected) if expected != 0 else abs(got)
-
     def test_uid0055_wwii_end(self, ctx):
         op = OpNode(op="lookup_external", args={"nl": "year that WWII ended"})
         result = lookup_external.run(op, None, ctx)
@@ -153,9 +160,6 @@ class TestLookupExternal:
 
 class TestCompute:
 
-    def _rel_err(self, got, expected):
-        return abs(got - expected) / abs(expected) if expected != 0 else abs(got)
-
     def test_uid0003_sum_of_list(self, ctx):
         op = OpNode(op="compute", args={"nl": "sum all values in the list"})
         prev = TypedValue(value=[10.0, 20.0, 30.0], dtype="list[scalar]", desc="monthly values")
@@ -172,7 +176,7 @@ class TestCompute:
         result = compute.run(op, prev, ctx)
         expected = abs((44463.0 - 2602.0) / 2602.0) * 100
         assert isinstance(result, TypedValue)
-        assert self._rel_err(float(result.value), expected) < 0.001, (
+        assert _rel_err(float(result.value), expected) < 0.001, (
             f"Expected ≈{expected:.4f}, got {result.value}"
         )
 
@@ -182,7 +186,7 @@ class TestCompute:
         result = compute.run(op, prev, ctx)
         expected = (1.0 * 4.0 * 16.0) ** (1.0 / 3.0)
         assert isinstance(result, TypedValue)
-        assert self._rel_err(float(result.value), expected) < 0.001, (
+        assert _rel_err(float(result.value), expected) < 0.001, (
             f"Expected ≈{expected:.6f}, got {result.value}"
         )
 
@@ -201,8 +205,8 @@ class TestCompute:
         vals = result.value
         assert isinstance(vals, list) and len(vals) == 2, f"Expected [slope, intercept], got {vals!r}"
         slope, intercept = float(vals[0]), float(vals[1])
-        assert self._rel_err(slope, 2.0) < 0.001, f"Expected slope≈2.0, got {slope}"
-        assert self._rel_err(intercept, 3.0) < 0.001, f"Expected intercept≈3.0, got {intercept}"
+        assert _rel_err(slope, 2.0) < 0.001, f"Expected slope≈2.0, got {slope}"
+        assert _rel_err(intercept, 3.0) < 0.001, f"Expected intercept≈3.0, got {intercept}"
 
 
 # ---------------------------------------------------------------------------
@@ -226,3 +230,61 @@ class TestReadVisual:
         assert result.value is not None
         assert result.dtype not in ("", "unknown"), f"dtype should be set, got {result.dtype!r}"
         assert len(result.desc) > 0
+
+
+# ---------------------------------------------------------------------------
+# extract
+# ---------------------------------------------------------------------------
+
+class TestExtract:
+
+    # UID0001: total national defense expenditures CY1940 = 2602 (usd_millions)
+    # source: treasury_bulletin_1941_01.txt, page 15
+    @pytest.mark.skipif(
+        not os.path.exists(JAN_1941_PARSED),
+        reason="Parsed corpus not present",
+    )
+    def test_uid0001_tier1_scalar(self, ctx):
+        op = OpNode(op="extract", args={"concept": "total national defense expenditures calendar year 1940", "mode": "value"})
+        ref = PageRef(month="1941-01", page=15)
+        prev = DocHandle(refs=[ref])
+        result = extract.run(op, prev, ctx)
+        assert isinstance(result, TypedValue)
+        assert result.value is not None
+        got = float(result.value)
+        assert _rel_err(got, 2602.0) <= 0.001, f"Expected ≈2602, got {got}"
+
+    @pytest.mark.skipif(
+        not os.path.exists(JAN_1941_PARSED),
+        reason="Parsed corpus not present",
+    )
+    def test_tier_escalation_absent_concept(self, ctx):
+        from skunk.subagents.base import StepFailed as SF
+
+        op = OpNode(op="extract", args={"concept": "nonexistent_concept_xyz_12345", "mode": "value"})
+        # Use page 1 (likely a cover page with no tables)
+        ref = PageRef(month="1941-01", page=1)
+        prev = DocHandle(refs=[ref])
+        # tier3 vision requires pdf_page; without it, vision also misses → StepFailed is expected
+        try:
+            result = extract.run(op, prev, ctx)
+            assert result.value is not None
+        except SF as e:
+            assert "extract" in e.op
+
+    @pytest.mark.skipif(
+        not os.path.exists(JAN_1941_PDF),
+        reason="PDF corpus not present",
+    )
+    def test_tier2_cache_created(self, ctx):
+        from pathlib import Path
+
+        from skunk.common.pdf_text import get_ocr_text_for_pdf_page
+
+        ref = PageRef(month="1941-01", page=15, file_path=JAN_1941_PDF)
+        text = get_ocr_text_for_pdf_page(ref, ctx)
+        pages_dir = Path(ctx.cache_dir) / "pages" / "1941-01"
+        txt_files = list(pages_dir.glob("p*.txt")) if pages_dir.exists() else []
+        assert txt_files, "Cache .txt file should have been written"
+        text2 = get_ocr_text_for_pdf_page(ref, ctx)
+        assert text == text2

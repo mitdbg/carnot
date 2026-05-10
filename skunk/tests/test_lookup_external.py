@@ -6,10 +6,10 @@ All tests make real Gemini calls (no mocks, no cache).
 from __future__ import annotations
 
 import pytest
-
-from skunk.dsl import OpNode, TypedValue
-from skunk.subagents.base import HarnessContext, StepFailed
 import skunk.subagents.lookup_external as lookup_external
+from skunk.common.context import HarnessContext
+from skunk.dsl import OpNode, TypedValue
+from skunk.subagents.base import StepFailed
 
 
 @pytest.fixture()

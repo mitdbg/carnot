@@ -84,9 +84,9 @@ def run_question(
     uid: str | None = None,
     plan_csv: str = DEFAULT_PLAN_CSV,
 ) -> dict:
-    from skunk.subagents.base import HarnessContext
-    from skunk.planner import plan
+    from skunk.common.context import HarnessContext
     from skunk.orchestrator import execute
+    from skunk.planner import plan
 
     golden_handle = None
     if golden_pages:

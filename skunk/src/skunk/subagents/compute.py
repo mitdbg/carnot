@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from skunk.common.context import HarnessContext
 from skunk.dsl import OpNode, TypedValue
-from skunk.subagents.base import HarnessContext, StepFailed, call_gemini, exec_python
+from skunk.subagents.base import StepFailed, call_gemini, exec_python
 
 _SYSTEM = """\
 You are a Python code generation assistant for a financial data pipeline.
@@ -32,18 +33,32 @@ def _prev_desc(prev: object) -> str:
     return repr(prev)[:300]
 
 
+def _build_user(nl: str, prev: object, prev_error: str | None = None) -> str:
+    msg = (
+        f"Computation: {nl}\n\n"
+        f"prev =\n{_prev_desc(prev)}\n\n"
+        f"Write Python that assigns the answer to `result`."
+    )
+    if prev_error:
+        msg += f"\n\nPrevious attempt failed — fix the code:\n{prev_error}"
+    return msg
+
+
 def run(op: OpNode, prev: object, ctx: HarnessContext) -> TypedValue:
     nl = op.args.get("nl") or op.args.get("description", "")
     if not nl:
         raise StepFailed("compute", "Missing 'nl' arg describing the computation")
 
-    user = (
-        f"Computation: {nl}\n\n"
-        f"prev =\n{_prev_desc(prev)}\n\n"
-        f"Write Python that assigns the answer to `result`."
-    )
-    code = call_gemini(_SYSTEM, user)
-    value = exec_python(code, {"prev": prev})
+    last_err: str | None = None
+    for attempt in range(3):
+        code = call_gemini(_SYSTEM, _build_user(nl, prev, last_err))
+        try:
+            value = exec_python(code, {"prev": prev})
+            break
+        except Exception as e:
+            last_err = f"Attempt {attempt + 1} code:\n```python\n{code}\n```\nError: {e}"
+    else:
+        raise StepFailed("compute", f"3 attempts failed. Last error: {last_err}")
 
     if isinstance(prev, TypedValue):
         unit = prev.unit

@@ -7,9 +7,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
+from skunk.common.context import HarnessContext
 from skunk.dsl import ChainNode, DocHandle, FormattedString, OpNode, ParallelNode, TypedValue
 from skunk.subagents import SUBAGENT_REGISTRY
-from skunk.subagents.base import HarnessContext, StepFailed
+from skunk.subagents.base import StepFailed
 
 _MAX_WORKERS = 4
 
@@ -120,9 +121,12 @@ def _describe_value(v: Any) -> str:
     if isinstance(v, DocHandle):
         return f"DocHandle({len(v.refs)} refs): {v.desc}"
     if isinstance(v, TypedValue):
-        return f"TypedValue({v.dtype}): {repr(v.value)[:100]} — {v.desc}"
+        raw = repr(v.value)
+        truncated = raw[:100] + ("..." if len(raw) > 100 else "")
+        return f"TypedValue({v.dtype}): {truncated} — {v.desc}"
     if isinstance(v, FormattedString):
         return f"FormattedString: {v.text!r}"
     if isinstance(v, list):
         return f"list({len(v)} branches)"
-    return repr(v)[:100]
+    s = repr(v)
+    return s[:100] + ("..." if len(s) > 100 else "")

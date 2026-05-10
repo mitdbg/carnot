@@ -143,13 +143,3 @@ def test_validate_valid_templates_ok(template: str) -> None:
     assert result.ok, f"Validation failed for template:\n{template}\nErrors: {result.errors}"
 
 
-def test_opnode_concepts_constraints_preserved() -> None:
-    """Check that per-op metadata survives JSON round-trip."""
-    chain = parse("retrieve(treasury_bulletin, year=1940) --> format(millions_usd)")
-    chain.steps[0].concepts = ["calendar year (Treasury)"]
-    chain.steps[0].constraints = ["calendar year not fiscal"]
-
-    d = to_dict(chain)
-    chain2 = from_dict(d)
-    assert chain2.steps[0].concepts == ["calendar year (Treasury)"]
-    assert chain2.steps[0].constraints == ["calendar year not fiscal"]
