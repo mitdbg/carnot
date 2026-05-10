@@ -10,7 +10,9 @@ from skunk.subagents.base import StepFailed
 def run(op: OpNode, prev: None, ctx: HarnessContext) -> DocHandle:
     # TODO: build page index over corpus; map (concept, period) → ranked PageRef list.
     if ctx.golden_handle is not None:
-        print(f"[STUB retrieve] golden bypass → {len(ctx.golden_handle.refs)} pages")
+        ctx.emit("retrieve", "golden bypass",
+                 n_pages=len(ctx.golden_handle.refs),
+                 refs=[str(r) for r in ctx.golden_handle.refs])
         return ctx.golden_handle
     concept = op.args.get("concept") or op.args.get("source", "?")
     period = op.args.get("period", "?")

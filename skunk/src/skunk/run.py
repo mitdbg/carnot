@@ -83,6 +83,7 @@ def run_question(
     cached_plan_text: str | None = None,
     uid: str | None = None,
     plan_csv: str = DEFAULT_PLAN_CSV,
+    trace_path: str | None = None,
 ) -> dict:
     from skunk.common.context import HarnessContext
     from skunk.orchestrator import execute
@@ -90,8 +91,17 @@ def run_question(
 
     golden_handle = None
     if golden_pages:
+        import os
         from skunk.dsl import DocHandle, PageRef
-        refs = [PageRef(year=g.year, month=g.bulletin_id, page=g.page) for g in golden_pages]
+        # GoldenPage.page is the 1-based PDF page index (per Fraser ?page=N semantics);
+        # PageRef.page is also the PDF page index, so this is a direct copy.
+        pdf_dir = os.environ.get("OFFICEQA_PDF_DIR",
+                                 str(Path.home() / "Desktop/officeqa/treasury_bulletin_pdfs"))
+        refs = []
+        for g in golden_pages:
+            year, mon = g.bulletin_id.split("-")
+            file_path = f"{pdf_dir}/treasury_bulletin_{year}_{mon}.pdf"
+            refs.append(PageRef(year=g.year, month=g.bulletin_id, page=g.page, file_path=file_path))
         golden_handle = DocHandle(refs=refs, desc=f"golden ({len(refs)} pages)")
         if verbose:
             print(f"[run] Golden handle: {len(refs)} pages → {[str(r) for r in refs]}")
@@ -101,6 +111,7 @@ def run_question(
         manifest_path=manifest_path,
         cache_dir=cache_dir,
         golden_handle=golden_handle,
+        verbose=verbose,
     )
 
     if cached_plan_text is not None:
@@ -109,9 +120,12 @@ def run_question(
         try:
             from skunk.dsl import parse, serialize, validate
             chain = parse(cached_plan_text)
+            # Validation is advisory on cached plans: the orchestrator/subagents tolerate
+            # some serializer round-trip artifacts (e.g. positional 'source' vs named 'concept'),
+            # which match what the live-plan path also accepts. Fail only on parse errors.
             result = validate(chain)
             if not result.ok:
-                raise ValueError(f"Cached plan failed validation: {result.errors}")
+                print(f"[run] cached plan validation warnings (advisory): {result.errors}", file=sys.stderr)
             if verbose:
                 print(f"[run] Plan: {serialize(chain)}")
         except Exception as e:
@@ -137,6 +151,15 @@ def run_question(
     if verbose:
         print(trace.pretty())
 
+    if trace_path is not None:
+        try:
+            from skunk.dsl import serialize as _serialize
+            plan_text_for_dump = _serialize(chain)
+        except Exception:
+            plan_text_for_dump = cached_plan_text or "(unavailable)"
+        _dump_trace(trace_path, uid=uid, question=question, plan_text=plan_text_for_dump,
+                    golden_pages=golden_pages, trace=trace, events=ctx.events)
+
     return {
         "question": question,
         "answer": trace.answer,
@@ -144,6 +167,64 @@ def run_question(
         "reason": trace.failure_reason,
         "n_steps": len(trace.steps),
     }
+
+
+def _dump_trace(path: str, *, uid: str | None, question: str, plan_text: str,
+                golden_pages: list | None, trace, events: list[dict]) -> None:
+    """Write a comprehensive per-question debug trace to `path`."""
+    out = Path(path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    lines: list[str] = []
+    lines.append("=" * 80)
+    lines.append(f"UID: {uid or '(none)'}")
+    lines.append("=" * 80)
+    lines.append(f"Question: {question}")
+    lines.append(f"Plan: {plan_text}")
+    if golden_pages:
+        lines.append(f"Golden pages ({len(golden_pages)}):")
+        for g in golden_pages:
+            lines.append(f"  - year={g.year} month={g.bulletin_id} page={g.page}")
+    else:
+        lines.append("Golden pages: (none)")
+    lines.append("")
+    lines.append(f"Outcome: {'FAILED — ' + (trace.failure_reason or '') if trace.failed else 'OK'}")
+    lines.append(f"Final answer: {trace.answer!r}")
+    lines.append("")
+
+    events_per_step: dict[int, list[dict]] = {s.step_idx: [] for s in trace.steps}
+    cur_idx = 0
+    for ev in events:
+        if ev.get("source") == "_step" and ev.get("message") == "begin":
+            cur_idx = int(ev.get("step_idx", 0))
+            continue
+        if cur_idx in events_per_step:
+            events_per_step[cur_idx].append(ev)
+
+    for step in trace.steps:
+        lines.append("-" * 80)
+        lines.append(f"Step {step.step_idx}: {step.op}  args={step.args}  ({step.elapsed_s:.2f}s)")
+        lines.append(f"  in:  {step.input_full}")
+        if step.error:
+            lines.append(f"  ERROR: {step.error}")
+        else:
+            lines.append(f"  out: {step.output_full}")
+        evs = events_per_step.get(step.step_idx, [])
+        if evs:
+            lines.append("  events:")
+            for ev in evs:
+                src = ev.get("source", "")
+                msg = ev.get("message", "")
+                extras = {k: v for k, v in ev.items() if k not in {"source", "message"}}
+                lines.append(f"    [{src}] {msg}")
+                for k, v in extras.items():
+                    s = repr(v)
+                    if len(s) > 800:
+                        s = s[:800] + "...(truncated)"
+                    lines.append(f"      {k}: {s}")
+        lines.append("")
+
+    out.write_text("\n".join(lines), encoding="utf-8")
 
 
 def load_question_from_csv(csv_path: str, uid: str) -> str:

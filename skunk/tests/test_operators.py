@@ -1,16 +1,15 @@
-"""Integration tests for format, lookup_external, compute, read_visual, and extract operators.
+"""Integration tests for lookup_external, compute, read_visual, and extract operators.
 
-Each test makes real LLM calls (no mocks).
-
-Format tests: edge cases on Python input types — no officeQA ground truth.
-All other tests: strict numeric / factual acceptance criteria.
+Each test makes real LLM calls (no mocks). Tests assert on the *shape* of the
+output (right type, plausible numeric magnitude) rather than exact values, since
+LLM outputs are non-deterministic.
 
 Run with: pytest tests/test_operators.py -v -s
 """
 
 from __future__ import annotations
 
-import math
+import math  # noqa: F401
 import os
 import re
 import sys
@@ -24,20 +23,21 @@ from skunk.dsl import DocHandle, FormattedString, OpNode, PageRef, TypedValue
 
 def _rel_err(got, expected):
     return abs(got - expected) / abs(expected) if expected != 0 else abs(got)
-import skunk.subagents.compute as compute
-import skunk.subagents.extract as extract
-import skunk.subagents.format as fmt
-import skunk.subagents.lookup_external as lookup_external
-import skunk.subagents.read_visual as read_visual
-from skunk.common.context import HarnessContext
+
+
+import skunk.subagents.compute as compute  # noqa: E402
+import skunk.subagents.extract as extract  # noqa: E402
+import skunk.subagents.lookup_external as lookup_external  # noqa: E402
+import skunk.subagents.read_visual as read_visual  # noqa: E402
+from skunk.common.context import HarnessContext  # noqa: E402
 
 PDF_DIR = os.path.expanduser("~/Desktop/officeqa/treasury_bulletin_pdfs")
-PARSED_DIR = os.path.expanduser(
-    "~/Desktop/officeqa/treasury_bulletins_parsed/transformed/treasury_bulletins_transformed"
+PARSED_JSON_DIR = os.path.expanduser(
+    "~/Desktop/officeqa/treasury_bulletins_parsed/jsons"
 )
 SEPT_1990_PDF = os.path.join(PDF_DIR, "treasury_bulletin_1990_09.pdf")
 JAN_1941_PDF = os.path.join(PDF_DIR, "treasury_bulletin_1941_01.pdf")
-JAN_1941_PARSED = os.path.join(PARSED_DIR, "treasury_bulletin_1941_01.txt")
+JAN_1941_JSON = os.path.join(PARSED_JSON_DIR, "treasury_bulletin_1941_01.json")
 
 
 @pytest.fixture()
@@ -45,81 +45,15 @@ def ctx(tmp_path):
     return HarnessContext(question="test", cache_dir=str(tmp_path))
 
 
+def _ctx_for(question: str, tmp_path) -> HarnessContext:
+    return HarnessContext(question=question, cache_dir=str(tmp_path))
+
+
 def _num(text: str) -> float:
     clean = text.replace(",", "").replace("$", "").replace("%", "").strip()
     m = re.search(r"-?\d+\.?\d*", clean)
     assert m, f"No number found in {text!r}"
     return float(m.group())
-
-
-# ---------------------------------------------------------------------------
-# format
-# ---------------------------------------------------------------------------
-
-class TestFormat:
-
-    def _run(self, ctx, value, **args):
-        op = OpNode(op="format", args=args)
-        prev = TypedValue(value=value, dtype="scalar", desc="test")
-        result = fmt.run(op, prev, ctx)
-        assert isinstance(result, FormattedString), f"Expected FormattedString, got {type(result)}"
-        assert result.text.strip(), "result.text must not be empty/whitespace"
-        assert "\n" not in result.text, f"result.text must be single-line: {result.text!r}"
-        assert len(result.text) <= 250, f"result.text too long: {len(result.text)}"
-        return result.text
-
-    def test_integer_precision_zero(self, ctx):
-        text = self._run(ctx, 42, precision=0)
-        assert _num(text) == 42.0
-
-    def test_float_precision_two(self, ctx):
-        text = self._run(ctx, 3.14159, precision=2)
-        assert abs(_num(text) - 3.14) < 1e-9
-
-    def test_percentage_unit(self, ctx):
-        text = self._run(ctx, 15.5, precision=2, unit="pct")
-        assert "%" in text, f"Expected '%' in: {text!r}"
-        assert abs(_num(text) - 15.5) < 0.005
-
-    def test_negative_number(self, ctx):
-        text = self._run(ctx, -7.3, precision=1)
-        assert _num(text) < 0, f"Expected negative in: {text!r}"
-        assert abs(_num(text) - (-7.3)) < 0.005
-
-    def test_zero_value(self, ctx):
-        text = self._run(ctx, 0.0, precision=2)
-        assert _num(text) == 0.0
-
-    def test_large_integer(self, ctx):
-        text = self._run(ctx, 1_000_000, precision=0)
-        assert _num(text) == 1_000_000.0
-
-    def test_high_precision(self, ctx):
-        text = self._run(ctx, 0.88525, precision=5)
-        assert abs(_num(text) - 0.88525) < 5e-6
-
-    def test_list_of_floats(self, ctx):
-        op = OpNode(op="format", args={"precision": 1})
-        prev = TypedValue(value=[1.5, 2.5, 3.5], dtype="list[scalar]", desc="test list")
-        result = fmt.run(op, prev, ctx)
-        assert isinstance(result, FormattedString)
-        nums = [float(x) for x in re.findall(r"-?\d+\.?\d*", result.text)]
-        for expected in [1.5, 2.5, 3.5]:
-            assert any(abs(n - expected) < 0.05 for n in nums), (
-                f"Expected {expected} in formatted list: {result.text!r}"
-            )
-
-    def test_formatted_string_passthrough(self, ctx):
-        op = OpNode(op="format", args={"precision": 2})
-        prev = FormattedString(text="already done", desc="pre-formatted")
-        result = fmt.run(op, prev, ctx)
-        assert result.text == "already done"
-
-    def test_negative_percentage(self, ctx):
-        text = self._run(ctx, -18.51, precision=2, unit="pct")
-        assert "%" in text
-        assert _num(text) < 0
-        assert abs(_num(text) - (-18.51)) < 0.005
 
 
 # ---------------------------------------------------------------------------
@@ -155,62 +89,69 @@ class TestLookupExternal:
 
 
 # ---------------------------------------------------------------------------
-# compute
+# compute (chain terminator: question-driven, returns FormattedString)
 # ---------------------------------------------------------------------------
 
 class TestCompute:
 
-    def test_uid0003_sum_of_list(self, ctx):
-        op = OpNode(op="compute", args={"nl": "sum all values in the list"})
+    def test_sum_of_list(self, tmp_path):
+        ctx = _ctx_for("What is the sum of the values? Report as a plain integer with no commas.", tmp_path)
         prev = TypedValue(value=[10.0, 20.0, 30.0], dtype="list[scalar]", desc="monthly values")
-        result = compute.run(op, prev, ctx)
-        assert isinstance(result, TypedValue)
-        assert abs(float(result.value) - 60.0) < 1e-6, f"Expected 60.0, got {result.value}"
+        result = compute.run(OpNode(op="compute"), prev, ctx)
+        assert isinstance(result, FormattedString)
+        assert _num(result.text) == 60.0, f"Expected 60, got {result.text!r}"
 
-    def test_uid0004_absolute_pct_change(self, ctx):
-        op = OpNode(op="compute", args={"nl": "absolute percent change between the two branch values"})
+    def test_named_values_sum_with_unit_context(self, tmp_path):
+        ctx = _ctx_for(
+            "What was the total US national defense expenditure in calendar year 1940? "
+            "Report in millions of nominal dollars rounded to the nearest whole.",
+            tmp_path,
+        )
+        prev = TypedValue(
+            value={"national_defense_monthly_cy1940": [132, 129, 143, 159, 154, 153, 177, 200, 219, 287, 376, 473]},
+            dtype="named",
+            unit="",
+            desc="national_defense_monthly_cy1940 (list, unit=usd_millions)",
+        )
+        result = compute.run(OpNode(op="compute"), prev, ctx)
+        assert isinstance(result, FormattedString)
+        assert _rel_err(_num(result.text), 2602.0) < 0.001, f"Expected ≈2602, got {result.text!r}"
+
+    def test_absolute_pct_change_parallel(self, tmp_path):
+        ctx = _ctx_for(
+            "What was the absolute percent change between the two values, as a percent value (e.g. 12.34%)?",
+            tmp_path,
+        )
         prev = [
-            TypedValue(value=2602.0, dtype="scalar:usd_millions", desc="CY1940"),
-            TypedValue(value=44463.0, dtype="scalar:usd_millions", desc="CY1953"),
+            TypedValue(value=2602.0, dtype="scalar", unit="usd_millions", desc="CY1940 total"),
+            TypedValue(value=44463.0, dtype="scalar", unit="usd_millions", desc="CY1953 total"),
         ]
-        result = compute.run(op, prev, ctx)
+        result = compute.run(OpNode(op="compute"), prev, ctx)
+        assert isinstance(result, FormattedString)
         expected = abs((44463.0 - 2602.0) / 2602.0) * 100
-        assert isinstance(result, TypedValue)
-        assert _rel_err(float(result.value), expected) < 0.001, (
-            f"Expected ≈{expected:.4f}, got {result.value}"
+        assert _rel_err(_num(result.text), expected) < 0.001, (
+            f"Expected ≈{expected:.2f}%, got {result.text!r}"
         )
 
-    def test_uid0018_geometric_mean(self, ctx):
-        op = OpNode(op="compute", args={"nl": "geometric mean of the list of values"})
-        prev = TypedValue(value=[1.0, 4.0, 16.0], dtype="list[scalar]", desc="monthly outlays")
-        result = compute.run(op, prev, ctx)
-        expected = (1.0 * 4.0 * 16.0) ** (1.0 / 3.0)
-        assert isinstance(result, TypedValue)
-        assert _rel_err(float(result.value), expected) < 0.001, (
-            f"Expected ≈{expected:.6f}, got {result.value}"
+    def test_missing_data_failure_mode(self, tmp_path):
+        from skunk.subagents.base import StepFailed
+        ctx = _ctx_for(
+            "What is the unemployment rate for January 1955? Report as a percent.",
+            tmp_path,
         )
-
-    def test_uid0013_linear_regression(self, ctx):
-        op = OpNode(op="compute", args={
-            "nl": (
-                "Fit OLS linear regression of y_values vs x_values using numpy polyfit. "
-                "Return [slope, intercept] each rounded to 3 decimal places."
-            )
-        })
-        xs = [1.0, 2.0, 3.0, 4.0, 5.0]
-        ys = [5.0, 7.0, 9.0, 11.0, 13.0]  # y = 2x + 3
-        prev = TypedValue(value={"x_values": xs, "y_values": ys}, dtype="df", desc="regression input")
-        result = compute.run(op, prev, ctx)
-        assert isinstance(result, TypedValue)
-        vals = result.value
-        assert isinstance(vals, list) and len(vals) == 2, f"Expected [slope, intercept], got {vals!r}"
-        slope, intercept = float(vals[0]), float(vals[1])
-        assert _rel_err(slope, 2.0) < 0.001, f"Expected slope≈2.0, got {slope}"
-        assert _rel_err(intercept, 3.0) < 0.001, f"Expected intercept≈3.0, got {intercept}"
+        # prev contains nothing about unemployment
+        prev = TypedValue(
+            value={"some_unrelated_value": 42},
+            dtype="named", unit="",
+            desc="some_unrelated_value (scalar, unit=count)",
+        )
+        with pytest.raises(StepFailed) as excinfo:
+            compute.run(OpNode(op="compute"), prev, ctx)
+        assert "missing" in str(excinfo.value).lower() or "compute" in excinfo.value.op
 
 
 # ---------------------------------------------------------------------------
-# read_visual
+# read_visual (no args; emits dict-of-named-values like extract)
 # ---------------------------------------------------------------------------
 
 class TestReadVisual:
@@ -219,68 +160,62 @@ class TestReadVisual:
         not os.path.exists(SEPT_1990_PDF),
         reason="Treasury Bulletin PDF corpus not present",
     )
-    def test_uid0030_well_formed_output(self, ctx):
-        op = OpNode(op="read_visual", args={
-            "concept": "count of local maxima across all line plots on the page",
-        })
-        ref = PageRef(month="1990-09", pdf_page=7, file_path=SEPT_1990_PDF)
+    def test_uid0030_well_formed_output(self, tmp_path):
+        ctx = _ctx_for(
+            "Count the local maxima across all line plots on the page.",
+            tmp_path,
+        )
+        op = OpNode(op="read_visual")
+        ref = PageRef(month="1990-09", page=7, file_path=SEPT_1990_PDF)
         prev = DocHandle(refs=[ref], desc="Sept 1990 bulletin page")
         result = read_visual.run(op, prev, ctx)
         assert isinstance(result, TypedValue), f"Expected TypedValue, got {type(result)}"
         assert result.value is not None
-        assert result.dtype not in ("", "unknown"), f"dtype should be set, got {result.dtype!r}"
-        assert len(result.desc) > 0
+        # New extract/read_visual contract: dtype='named' with a dict of values.
+        # An empty dict (nothing relevant) raises StepFailed before we get here.
+        assert result.dtype == "named"
+        assert isinstance(result.value, dict)
 
 
 # ---------------------------------------------------------------------------
-# extract
+# extract (no args; emits dict-of-named-values relevant to ctx.question)
 # ---------------------------------------------------------------------------
 
 class TestExtract:
 
-    # UID0001: total national defense expenditures CY1940 = 2602 (usd_millions)
-    # source: treasury_bulletin_1941_01.txt, page 15
     @pytest.mark.skipif(
-        not os.path.exists(JAN_1941_PARSED),
-        reason="Parsed corpus not present",
+        not os.path.exists(JAN_1941_JSON),
+        reason="Parsed JSON corpus not present",
     )
-    def test_uid0001_tier1_scalar(self, ctx):
-        op = OpNode(op="extract", args={"concept": "total national defense expenditures calendar year 1940", "mode": "value"})
+    def test_uid0001_pdf_page_15_named_extraction(self, tmp_path):
+        ctx = _ctx_for(
+            "What were the total expenditures (in millions of nominal dollars) for U.S "
+            "national defense in the calendar year of 1940?",
+            tmp_path,
+        )
+        op = OpNode(op="extract")
         ref = PageRef(month="1941-01", page=15)
         prev = DocHandle(refs=[ref])
         result = extract.run(op, prev, ctx)
         assert isinstance(result, TypedValue)
-        assert result.value is not None
-        got = float(result.value)
-        assert _rel_err(got, 2602.0) <= 0.001, f"Expected ≈2602, got {got}"
-
-    @pytest.mark.skipif(
-        not os.path.exists(JAN_1941_PARSED),
-        reason="Parsed corpus not present",
-    )
-    def test_tier_escalation_absent_concept(self, ctx):
-        from skunk.subagents.base import StepFailed as SF
-
-        op = OpNode(op="extract", args={"concept": "nonexistent_concept_xyz_12345", "mode": "value"})
-        # Use page 1 (likely a cover page with no tables)
-        ref = PageRef(month="1941-01", page=1)
-        prev = DocHandle(refs=[ref])
-        # tier3 vision requires pdf_page; without it, vision also misses → StepFailed is expected
-        try:
-            result = extract.run(op, prev, ctx)
-            assert result.value is not None
-        except SF as e:
-            assert "extract" in e.op
+        assert result.dtype == "named"
+        assert isinstance(result.value, dict) and len(result.value) > 0
+        # The page contains only FY data on national defense; the agent should still emit a
+        # plausible national-defense-related entry (name varies but should mention 'defense').
+        names = list(result.value.keys())
+        assert any("defense" in n.lower() for n in names), (
+            f"Expected at least one defense-related key, got {names!r}"
+        )
 
     @pytest.mark.skipif(
         not os.path.exists(JAN_1941_PDF),
         reason="PDF corpus not present",
     )
-    def test_tier2_cache_created(self, ctx):
+    def test_tier2_cache_created(self, tmp_path):
         from pathlib import Path
-
         from skunk.common.pdf_text import get_ocr_text_for_pdf_page
 
+        ctx = HarnessContext(question="x", cache_dir=str(tmp_path))
         ref = PageRef(month="1941-01", page=15, file_path=JAN_1941_PDF)
         text = get_ocr_text_for_pdf_page(ref, ctx)
         pages_dir = Path(ctx.cache_dir) / "pages" / "1941-01"

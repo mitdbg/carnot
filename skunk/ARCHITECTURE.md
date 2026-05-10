@@ -30,13 +30,14 @@ This decoupling means retrieval and extraction can be evaluated independently �
   └─────────┘        └─────────┘        └─────────┘
        │                  │                  │
        ▼                  ▼                  ▼
-                    ┌─────────────┐
-                    │   compute   │
-                    │ format/text │
-                    └──────┬──────┘
-                           │
-                           ▼
-                       answer
+                    ┌──────────────────┐
+                    │     compute      │   chain terminator:
+                    │ plan → code →    │   self-plans, codegens,
+                    │ exec → verify    │   execs, verifies output
+                    └────────┬─────────┘   format/unit
+                             │
+                             ▼
+                          answer
 
    ┌────────────────── eval harnesses ─────────────────────┐
    │  eval_retrieval     retrieve only vs golden pages     │
@@ -47,23 +48,11 @@ This decoupling means retrieval and extraction can be evaluated independently �
 
 ## Page number convention
 
-Two distinct "page numbers" exist for every bulletin page. The codebase always uses bulletin page as the canonical reference:
+The codebase uses a single canonical page-number meaning everywhere: **`PageRef.page` is the 1-based PDF page index**. PyMuPDF, cache filenames, the JSON-backed Tier 1 index, and the Fraser benchmark URLs (`source_docs?page=N`) all agree on this convention.
 
-| field | meaning | where |
-|---|---|---|
-| `page` | bulletin **printed** page number — what appears on the physical page | `PageRef.page`, catalog, eval golden |
-| `pdf_page` | 1-based PDF page **index** — what PyMuPDF and cache filenames use | `PageRef.pdf_page`, cache filenames |
+The bulletin's *printed* page-number footer (e.g. "69" stamped at the bottom of PDF page 76) is recoverable when needed via `skunk.common.parsed_json.get_printed_page(ref, ctx)`, which reads the `page_number`-typed element the JSON parser preserves per page. We surface it for trace enrichment and Gemini prompt headers (`--- PDF page 76 (bulletin printed page "69") ---`), but never use it as a lookup key.
 
-`cache/page_maps/{YYYY-MM}.json` provides the bidirectional translation per bulletin:
-```json
-{
-  "bulletin_to_pdf": {"1": 3, "2": 4, ...},
-  "pdf_to_bulletin": {"1": null, "2": null, "3": 1, "4": 2, ...}
-}
-```
-Built by `prep/page_map.py:build_page_map_from_ocr`. The helper `pdf_page_for_ref(ref, cache_dir)` resolves a `PageRef` to the correct PDF page index for cache/render access.
-
-The benchmark's `source_docs?page=N` parameter is a bulletin page number, so `eval/golden.py:GoldenPage.page` maps directly to `PageRef.page`.
+The benchmark's `source_docs?page=N` parameter is the PDF page index in Fraser's viewer (verified against the June 2025 issue: `?page=76` lands on the ESF-1 table on PDF page 76, whose printed footer reads "69"). `eval/golden.py:GoldenPage.page` therefore maps directly to `PageRef.page`.
 
 ## The page index lives in retrieve
 
@@ -71,25 +60,24 @@ The retrieve subagent owns its page index — the format, schema, and build proc
 
 The load-bearing insight is that `periods_covered` (what period a page *reports on*) is distinct from the bulletin's publication date. A page in the January 1941 bulletin that contains the CY1940 annual summary should be returned for a query on `period='CY1940'` — not the January 1941 bulletins. Any index the retrieve subagent builds must capture this distinction.
 
-## The 6 operators
+## The 5 operators
 
-- **`retrieve(concept, period, source_bulletin?)`** — only chain head. Looks up relevant pages via the retrieve subagent's internal page index, returns a `DocHandle` whose `PageRef`s have `(file_path, year, month, page, pdf_page)` fully specified (`page` = bulletin printed page number, `pdf_page` = PDF index).
-- **`extract(concept, mode?)`** — reads value(s) from the located pages via tier dispatch. `mode='value'|'list'|'table'` controls scalar / list / DataFrame output.
-- **`read_visual(concept)`** — same input as extract but always uses Tier 3 vision; reserved for charts and figures.
-- **`lookup_external(nl)`** — chain-head capable. Single Gemini call: takes a natural-language description of external factual data (`nl`) and returns a `TypedValue`. Use for CPI-U, FX rates, event dates ("Korean War start"), and any fact not in the bulletin corpus. The subagent infers the appropriate `dtype` and `unit`.
-- **`compute(nl)`** — the only transformation op. Takes a natural-language description of the computation (`nl`); the subagent generates Python internally and runs it in a sandbox with numpy/pandas/statsmodels. Covers everything from `sum(prev.value)` to OLS, Hodrick-Prescott, Box-Cox. Up to 3 self-correcting attempts on exec failure.
-- **`format(precision?, unit?, layout?)`** — chain terminator. Generates a Python formatting snippet via a Gemini call (temperature=0) and execs it in the sandbox; effectively deterministic for a fixed model.
+- **`retrieve(concept, period, source_bulletin?)`** — only chain head. Looks up relevant pages via the retrieve subagent's internal page index, returns a `DocHandle` whose `PageRef`s have `(file_path, year, month, page)` fully specified (where `page` is the 1-based PDF page index).
+- **`extract()`** — reads `ctx.question` and the located pages via tier dispatch (parsed JSON → PyMuPDF text → vision). Emits a `TypedValue` with `dtype='named'` whose `.value` is a dict mapping snake_case names to scalars/lists/tables relevant to the question. The agent decides what's worth extracting; no `concept`/`mode` args.
+- **`read_visual()`** — same output shape as extract, but always uses vision; reserved for charts and figures.
+- **`lookup_external(nl)`** — chain-head capable. Single Gemini call: takes a natural-language description of external factual data (`nl`) and returns a `TypedValue`. Use for CPI-U, FX rates, event dates, named entities (bureau names), and any fact not in the bulletin corpus. The subagent infers the appropriate `dtype` and `unit` (including `text` for strings).
+- **`compute()`** — chain terminator that subsumes formatting. Reads `ctx.question` plus the upstream extracted/looked-up values; runs a plan-then-codegen LLM call (`CODE\n<python>` or `MISSING:<reason>`), execs the code, then a verifier LLM checks the output's *form* (precision, unit, percent vs decimal, comma rules, list bracketing) against the question. Up to 3 attempts; each retry receives feedback from the prior failure. Returns a `FormattedString`. Fails with `StepFailed("compute", "missing data: …")` when extracted values are insufficient.
 
 ## Per-page tier dispatch in extract
 
 Once retrieve has named specific pages, extract chooses how to read each one:
 
 ```
-Tier 1  cache/tables/{YYYY-MM}/p{NNN}-*.csv       — pre-extracted DataFrames, cheap
-Tier 2  cache/pages/{YYYY-MM}/p{NNN}.txt          — per-page OCR text, free, may be noisy
-Tier 3  cache/pages/{YYYY-MM}/p{NNN}.png          — PNG render + vision LLM, always works
+Tier 1  parsed-JSON elements bucketed by page_id   — structured text + HTML tables (common/parsed_json.py)
+Tier 2  cache/pages/{YYYY-MM}/p{NNN}.txt           — per-page PyMuPDF text, on-demand cache
+Tier 3  cache/pages/{YYYY-MM}/p{NNN}.png           — PNG render + vision LLM, always works
 ```
-(NNN = PDF page index, resolved from PageRef.page via `prep/page_map.pdf_page_for_ref`)
+(NNN = `PageRef.page` = 1-based PDF page index)
 
 The choice is per-page and deterministic. Tier escalation only happens when the chosen tier reports "value not present". There is no cross-page search — if retrieve picked the wrong pages, the bug is in retrieve, not extract. This is what makes the eval decomposition work.
 

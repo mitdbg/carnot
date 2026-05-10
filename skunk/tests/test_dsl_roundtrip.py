@@ -24,26 +24,27 @@ from skunk.dsl import (
 
 VALID_TEMPLATES = [
     # simple chain
-    "retrieve(concept='national_defense', period='CY1940') --> extract(concept='total_expenditure', mode='value') --> format(precision=0)",
-    # parallel retrieve → compute → format
-    "[ retrieve(concept='national_defense', period='CY1940') --> extract(concept='total', mode='value') ; retrieve(concept='national_defense', period='CY1953') --> extract(concept='total', mode='value') ] --> compute(nl='abs_pct_change') --> format(precision=2)",
+    "retrieve(concept='national_defense', period='CY1940') --> extract() --> compute()",
+    # parallel retrieve → compute terminator
+    "[ retrieve(concept='national_defense', period='CY1940') --> extract() ; retrieve(concept='national_defense', period='CY1953') --> extract() ] --> compute()",
     # read_visual
-    "retrieve(concept='debt_chart', period='FY1975') --> read_visual(concept='total_debt_by_type') --> format(precision=1)",
+    "retrieve(concept='debt_chart', period='FY1975') --> read_visual(concept='total_debt_by_type') --> compute()",
     # lookup_external + retrieve parallel
-    "[ retrieve(concept='fx_investments', period='2025-03') --> extract(concept='japanese_yen_holdings', mode='value') ; lookup_external(nl='USD/JPY exchange rate on 2025-03-31') ] --> compute(nl='currency_conversion') --> format(precision=1)",
+    "[ retrieve(concept='fx_investments', period='2025-03') --> extract() ; lookup_external(nl='USD/JPY exchange rate on 2025-03-31') ] --> compute()",
     # nested brackets
-    "[ [ retrieve(concept='national_defense', period='CY1940') --> extract(concept='monthly_total', mode='list') ; retrieve(concept='national_defense', period='CY1953') --> extract(concept='monthly_total', mode='list') ] --> compute(nl='abs_diff') ; lookup_external(nl='USD/CAD exchange rate') ] --> compute(nl='currency_conversion') --> format(precision=2)",
-    # list extract → compute → format
-    "retrieve(concept='interest_rates', period='1953..1955') --> extract(concept='91day_bill_rate', mode='list') --> compute(nl='geo_mean') --> format(precision=3)",
+    "[ [ retrieve(concept='national_defense', period='CY1940') --> extract() ; retrieve(concept='national_defense', period='CY1953') --> extract() ] --> compute() ; lookup_external(nl='USD/CAD exchange rate') ] --> compute()",
+    # list extract → compute terminator
+    "retrieve(concept='interest_rates', period='1953..1955') --> extract() --> compute()",
     # source_bulletin pin
-    "retrieve(concept='expenditure_table', period='FY1940', source_bulletin='1941-06') --> extract(concept='national_defense_total', mode='value') --> format(precision=0)",
+    "retrieve(concept='expenditure_table', period='FY1940', source_bulletin='1941-06') --> extract() --> compute()",
 ]
 
 INVALID_TEMPLATES = [
     "",                                            # empty
-    "unknownop(foo) --> format(x)",                # bad op
-    "filter(concept='x') --> format(x)",           # filter is not a DSL op
-    "aggregate(reducer='sum') --> format(x)",      # aggregate is not a DSL op
+    "unknownop(foo) --> compute()",                # bad op
+    "filter(concept='x') --> compute()",           # filter is not a DSL op
+    "aggregate(reducer='sum') --> compute()",      # aggregate is not a DSL op
+    "format(precision=2)",                         # format is no longer an op
     "[ A --> B ]",                                 # single branch parallel fails validation
 ]
 
@@ -108,7 +109,7 @@ def test_validate_single_branch_parallel() -> None:
         ParallelNode(branches=[
             ChainNode(steps=[OpNode(op="retrieve", args={"source": "x"})])
         ]),
-        OpNode(op="format", args={"spec": "x"}),
+        OpNode(op="compute"),
     ])
     result = validate(chain)
     assert not result.ok
@@ -121,7 +122,7 @@ def test_validate_empty_chain() -> None:
 
 
 def test_parallel_branches_parse() -> None:
-    template = "[ retrieve(x, year=1940) --> extract(y) ; retrieve(x, year=1950) --> extract(y) ] --> format(x)"
+    template = "[ retrieve(x, year=1940) --> extract() ; retrieve(x, year=1950) --> extract() ] --> compute()"
     chain = parse(template)
     assert isinstance(chain.steps[0], ParallelNode)
     assert len(chain.steps[0].branches) == 2

@@ -4,15 +4,15 @@ Guide for Claude Code sessions on this repo.
 
 ## What this is
 
-OfficeQA — a declarative QA pipeline over the U.S. Treasury Bulletin corpus (696 monthly PDFs, 1939–2025). Questions are answered by composing 6 operators into a typed DSL plan; an orchestrator walks the plan and dispatches subagents.
+OfficeQA — a declarative QA pipeline over the U.S. Treasury Bulletin corpus (696 monthly PDFs, 1939–2025). Questions are answered by composing 5 operators into a typed DSL plan; an orchestrator walks the plan and dispatches subagents.
 
 The benchmark is `data/officeqa_pro.csv` (133 questions). An initial pass of DSL plan for each question is in `data/dsl_planning_pass.csv`.
 
 ## Architecture in one screen
 
 - Question → planner emits DSL plan (text) → orchestrator walks AST → 6 subagents.
-- 6 ops: `retrieve`, `extract`, `read_visual`, `lookup_external`, `compute`, `format`.
-- Retrieval is **page-level**: the retrieve subagent maintains its own page index over the corpus. `PageRef.page` = bulletin printed page number (canonical); `PageRef.pdf_page` = PDF index. See `common/page_map.py` for translation.
+- 5 ops: `retrieve`, `extract`, `read_visual`, `lookup_external`, `compute`. `compute` is the chain terminator and subsumes formatting (it self-plans, codegens, execs, then a verifier LLM checks the output's format/unit fits the question).
+- Retrieval is **page-level**: the retrieve subagent maintains its own page index over the corpus. `PageRef.page` is the **1-based PDF page index** — the only page-number convention used in the codebase. The bulletin's printed-page footer is recoverable via `common/parsed_json.get_printed_page` for trace/prompt enrichment.
 - Extract is per-page tier dispatch: CSV tables → OCR text → vision render. No cross-page search.
 - See `ARCHITECTURE.md` for design intent, `DSL.md` for grammar.
 
@@ -21,9 +21,9 @@ The benchmark is `data/officeqa_pro.csv` (133 questions). An initial pass of DSL
 - `src/skunk/dsl.py` — DSL parser, serializer, validator, AST types
 - `src/skunk/planner.py` — LLM planner: question → DSL AST
 - `src/skunk/orchestrator.py` — AST executor; dispatches subagent functions
-- `src/skunk/subagents/` — one module per op (`retrieve`, `extract`, `read_visual`, `lookup_external`, `compute`, `format`); each exposes a bare `run(op, prev, ctx)` function
+- `src/skunk/subagents/` — one module per op (`retrieve`, `extract`, `read_visual`, `lookup_external`, `compute`); each exposes a bare `run(op, prev, ctx)` function
 - `src/skunk/subagents/base.py` — shared utilities: `StepFailed`, `call_gemini`, `exec_python`, `parse_llm_value`, `HarnessContext`
-- `src/skunk/common/` — shared utilities used by more than one subagent (e.g. `page_map.py`)
+- `src/skunk/common/` — shared utilities used by more than one subagent (`parsed_json.py` for JSON-backed Tier 1 lookup, `pdf_text.py` and `vision.py` for Tiers 2/3)
 - `eval/` — independent eval harnesses (`golden.py`, `eval_retrieval.py`, `eval_extraction.py`, `eval_e2e.py`)
 - `tools/` — standalone CLI utilities (planner smoke test, drift analysis)
 

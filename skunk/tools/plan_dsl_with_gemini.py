@@ -29,9 +29,9 @@ OUT_CSV = REPO_ROOT / "data" / "dsl_planning_pass.csv"
 
 SMOKE_UIDS = ["UID0001", "UID0004", "UID0029", "UID0030", "UID0035", "UID0055", "UID0010"]
 
-VALID_OPS = {"retrieve", "extract", "read_visual", "lookup_external", "compute", "format"}
+VALID_OPS = {"retrieve", "extract", "read_visual", "lookup_external", "compute"}
 HEAD_OPS = {"retrieve", "lookup_external"}
-TAIL_OP = "format"
+TAIL_OP = "compute"
 
 
 def _load_env(path: Path) -> None:
@@ -52,19 +52,17 @@ _load_env(ENV_PATH)
 # ─────────────────────────────────────────────────────────────────────────────
 
 DSL_SPEC = """\
-DSL — exactly 6 operators. Compose left-to-right with `-->`. Parallel branches: `[c1 ; c2 ; ...] --> next_op`.
+DSL — exactly 5 operators. Compose left-to-right with `-->`. Parallel branches: `[c1 ; c2 ; ...] --> next_op`.
 
 QUOTING RULE — IMPORTANT
   All string argument values use SINGLE quotes ('...'), NEVER double quotes.
   This keeps plans JSON-safe when the planner output is wrapped in JSON.
   Example: retrieve(concept='national_defense', period='CY1940')
-  In compute(code='...') the Python body uses single quotes too; for an inner
-  literal use a different style: compute(code='result = "hello"').
 
 TYPES
-  DocHandle       — list of pages (file_path, year, month, page).
-  TypedValue      — value + dtype tag (scalar:..., list[...], df).
-  FormattedString — final answer text.
+  DocHandle         — list of pages (file_path, year, month, page).
+  TypedValue        — value + dtype + unit + desc; for extract output, dtype='named' and value is a dict.
+  FormattedString   — final answer text (only compute returns this).
 
 OPERATORS
 
@@ -73,33 +71,23 @@ retrieve(concept, period, source_bulletin?) → DocHandle    [chain head only]
   period:          period string     CY1940, FY1981, Q3-1982, 1940-09, 2025-03-31, CY1940..CY1949, or comma-list
   source_bulletin: 'YYYY-MM'         optional; pin to one issue when the question explicitly names a bulletin
 
-extract(concept, mode?) → TypedValue
-  concept: str   what to read from the located pages
-  mode:    'value' (default) | 'list' | 'table'
+extract() → TypedValue
+  No args. Reads ctx.question + the page text and returns a TypedValue with dtype='named' whose
+  .value is a dict mapping snake_case names to scalars/lists/tables relevant to the question.
+  The agent decides what's worth extracting; do NOT specify a 'concept' or 'mode'.
 
-read_visual(concept) → TypedValue
-  concept: str   what to read from a chart/figure (always uses vision)
+read_visual() → TypedValue
+  No args. Same output shape as extract, but always uses vision (for charts/figures).
 
-lookup_external(resource, **params) → TypedValue          [chain head capable]
-  resource: cpi_u | fx_rate | gdp | event_year | event_date
-  params:   per-resource kwargs (currency='JPY', date='2025-03-31', event='korean_war_start', ...)
+lookup_external(nl) → TypedValue                           [chain head capable]
+  nl: str   natural-language description of the external data to look up
+            (FX rate, CPI, event year, named entity, etc.).
 
-compute(code) → TypedValue
-  code: str  Python body that reads `prev` and sets `result = ...`. Sandboxed: numpy, pandas, statsmodels, math.
-              Used for ALL transformations: sum, mean, geo_mean, std, OLS, Hodrick-Prescott, Box-Cox,
-              abs_diff, abs_pct_change, currency_conversion, etc.
-              Examples (note single outer quotes):
-                compute(code='result = sum(prev.value)')
-                compute(code='result = sum(prev.value) / len(prev.value)')
-                compute(code='a, b = prev[0].value, prev[1].value; result = abs((b - a) / a) * 100')
-                compute(code='import numpy as np; result = float(np.std(prev.value, ddof=0))')
-
-format(precision?, unit?, layout?) → FormattedString      [chain terminator]
-  Flat keyword args (no nested dict). At most 3 keys:
-    precision: int   decimal places
-    unit:      str   'usd' | 'usd_millions' | 'pct' | 'count' | 'decimal'
-    layout:    str   'scalar' (default) | 'bracket_list' for [a, b] answers
-  Example: format(precision=2, unit='pct')
+compute() → FormattedString                                [chain terminator]
+  No args. Receives ctx.question + the upstream extracted/looked-up values, plans the
+  computation, generates Python, runs it, and a verifier LLM checks the output's format/unit
+  matches what the question asks for. Returns the answer as a string. Fails with StepFailed if
+  values are missing or all attempts fail.
 
 PERIOD GRAMMAR
   Point:        CY1940, FY1981, Q3-1982, 1940-09, 2025-03-31
@@ -108,69 +96,60 @@ PERIOD GRAMMAR
 
 COMPOSITION RULES
   Chain head MUST be retrieve or lookup_external.
-  Chain tail MUST be format if the chain produces the final answer.
+  Chain tail MUST be compute (it produces the final answer string).
   In `a --> b`: output_type(a) ∈ accepted_inputs(b).
-  In `[c1; c2; ...] --> next`: every c_i ends in the same type T; next accepts list[T].
+  In `[c1; c2; ...] --> next`: every c_i ends in the same type; next accepts list[that_type].
 
-Valid ops: retrieve, extract, read_visual, lookup_external, compute, format. No others.
+Valid ops: retrieve, extract, read_visual, lookup_external, compute. No others.
 """
 
 FEW_SHOT = """\
 EXAMPLES — match this style precisely. Note SINGLE quotes around all string values.
+extract() and compute() take NO arguments. compute is always the chain terminator.
 
 UID0001 — Total US national defense expenditures for CY1940
   retrieve(concept='national_defense_expenditure', period='CY1940')
-    --> extract(concept='total national defense expenditures, annual', mode='value')
-    --> format(unit='usd_millions', precision=0)
+    --> extract()
+    --> compute()
 
 UID0004 — Absolute pct change in CY1953 vs CY1940 monthly national defense
   [
-    retrieve(concept='national_defense_expenditure', period='CY1940')
-      --> extract(concept='monthly national defense expenditures', mode='list')
-      --> compute(code='result = sum(prev.value)');
-    retrieve(concept='national_defense_expenditure', period='CY1953')
-      --> extract(concept='monthly national defense expenditures', mode='list')
-      --> compute(code='result = sum(prev.value)')
+    retrieve(concept='national_defense_expenditure', period='CY1940') --> extract();
+    retrieve(concept='national_defense_expenditure', period='CY1953') --> extract()
   ]
-    --> compute(code='a, b = prev[0].value, prev[1].value; result = abs((b - a) / a) * 100')
-    --> format(unit='pct', precision=2)
+    --> compute()
 
 UID0029 — Bulletin published in June 1970, average yield spread CY1960-69
   retrieve(concept='bond_yields', period='CY1960..CY1969', source_bulletin='1970-06')
-    --> extract(concept='Aa corporate vs Treasury yield spread, monthly', mode='list')
-    --> compute(code='vs = prev.value; result = sum(vs) / len(vs)')
-    --> format(precision=5)
+    --> extract()
+    --> compute()
 
 UID0030 — Local maxima on line plots, page 5 of Sept 1990 bulletin
   retrieve(concept='line_plots_on_page', period='1990-09', source_bulletin='1990-09')
-    --> read_visual(concept='count of local maxima across all line plots on the page')
-    --> format(unit='count')
+    --> read_visual()
+    --> compute()
 
-UID0035 — Benford first-digit count on a whole table (mode='table')
+UID0035 — Benford first-digit count on a whole table
   retrieve(concept='receipts_table', period='1980-05', source_bulletin='1980-05')
-    --> extract(concept='receipts data table on PDF page 41', mode='table')
-    --> compute(code='df = prev.value; result = sum(1 for v in df.values.flatten() if str(v).startswith("1"))')
-    --> format(unit='count')
+    --> extract()
+    --> compute()
 
 UID0010 — USD->JPY conversion of Treasury investment as of 2025-03-31
   [
     retrieve(concept='foreign_exchange_securities_investments_japanese_yen', period='2025-03-31')
-      --> extract(concept='Japanese Yen investment, USD value', mode='value');
-    lookup_external(resource='fx_rate', pair='USD/JPY', date='2025-03-31', source='macrotrends')
+      --> extract();
+    lookup_external(nl='USD/JPY exchange rate on 2025-03-31, Macrotrends')
   ]
-    --> compute(code='usd, rate = prev[0].value, prev[1].value; result = usd * rate')
-    --> format(unit='decimal', precision=0)
+    --> compute()
 
-UID0055 — WWII end to Korean War start: change in Moody Aaa yield (event_year)
+UID0055 — WWII end to Korean War start: change in Moody Aaa yield
   [
-    lookup_external(resource='event_year', event='wwii_end');
-    lookup_external(resource='event_year', event='korean_war_start')
+    lookup_external(nl='year WWII ended');
+    lookup_external(nl='year Korean War started')
   ]
-    --> compute(code='y1, y2 = prev[0].value, prev[1].value; result = (f"CY{y1}", f"CY{y2}")')
     --> retrieve(concept='moody_aaa_corporate_bond_yield', period='prev')
-    --> extract(concept='annual avg Moody Aaa bond yield, both years', mode='list')
-    --> compute(code='vs = prev.value; result = abs(vs[1] - vs[0])')
-    --> format(unit='pct', precision=1)
+    --> extract()
+    --> compute()
 NOTE: period='prev' means the period is bound from the previous step's value at execution time.
 """
 
@@ -236,8 +215,8 @@ def plan_with_retry(question: str, max_attempts: int = 3) -> tuple[str, dict]:
                     "Regenerate with strict adherence to the DSL grammar:\n"
                     "  • all `[`/`]` and `(`/`)` MUST be balanced\n"
                     "  • single-quoted strings only — never triple-quotes (`'''`) or double-quotes\n"
-                    "  • the OUTER chain MUST start with `retrieve(...)` or `lookup_external(...)` and end with `format(...)`\n"
-                    "  • only the 6 ops: retrieve, extract, read_visual, lookup_external, compute, format"
+                    "  • the OUTER chain MUST start with `retrieve(...)` or `lookup_external(...)` and end with `compute()`\n"
+                    "  • only the 5 ops: retrieve, extract, read_visual, lookup_external, compute"
                 )
                 plan = plan_via_gemini(question, repair_context=repair)
         except Exception as e:
@@ -379,7 +358,7 @@ def analyze_plan(text: str) -> dict:
     if head is not None and head not in HEAD_OPS:
         problems.append(f"head_not_retrieve_or_lookup_external:{head}")
     if tail is not None and tail != TAIL_OP:
-        problems.append(f"tail_not_format:{tail}")
+        problems.append(f"tail_not_compute:{tail}")
 
     parse_ok = "unbalanced_brackets" not in problems and "unbalanced_parens" not in problems
     validate_ok = parse_ok and not problems

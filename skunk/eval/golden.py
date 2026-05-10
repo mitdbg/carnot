@@ -3,8 +3,10 @@
 The benchmark CSV's `source_docs` column contains URLs of the form:
   https://fraser.stlouisfed.org/title/treasury-bulletin-407/january-1941-6529?page=15
 
-The ?page=N query parameter is the **bulletin printed page number** (canonical),
-not the PDF page index. GoldenPage.page therefore matches PageRef.page directly.
+The ?page=N query parameter is the **1-based PDF page index** in Fraser's
+viewer (verified against the June 2025 issue: ?page=76 lands on PDF page 76,
+whose printed footer reads "69"). GoldenPage.page therefore maps directly to
+PageRef.page, which is also the PDF page index throughout this codebase.
 
 For each question, we extract the (year, month, page) tuple from the URL.
 A question may have multiple URLs separated by whitespace/newlines.

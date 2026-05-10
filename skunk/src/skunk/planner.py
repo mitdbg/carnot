@@ -17,17 +17,16 @@ from skunk.subagents.base import StepFailed, call_gemini
 _DSL_SPEC = """\
 ## DSL Op Grammar
 
-6 operations. Steps composed left-to-right with `-->`. Parallel branches with
+5 operations. Steps composed left-to-right with `-->`. Parallel branches with
 `[ chain1 ; chain2 ]` feeding the next op. Nesting allowed.
 
-| op                   | in → out            | purpose / args |
-|----------------------|---------------------|----------------|
-| retrieve(...)        | () → DocHandle      | concept (str), period (str), source_bulletin? (YYYY-MM) |
-| extract(...)         | Handle → TypedValue | concept (str), mode? ('value'\\|'list'\\|'table') |
-| read_visual(...)     | Handle → TypedValue | concept (str) — vision read of charts/figures |
-| lookup_external(...) | () → TypedValue     | nl (str) — natural language description of the data to look up |
-| compute(...)         | Value(s) → Value    | nl (natural language description of the computation) |
-| format(...)          | Value → String      | precision? (int), unit? (str), layout? (str) |
+| op                   | in → out                | purpose / args |
+|----------------------|-------------------------|----------------|
+| retrieve(...)        | () → DocHandle          | concept (str), period (str), source_bulletin? (YYYY-MM) |
+| extract(...)         | DocHandle → TypedValue  | (no args) — emits a dict of named typed values relevant to the question |
+| read_visual(...)     | DocHandle → TypedValue  | (no args) — vision read of charts/figures, same output shape |
+| lookup_external(...) | () → TypedValue         | nl (str) — natural language description of the data to look up |
+| compute(...)         | Value(s) → FormattedString | (no args) — chain terminator. Self-plans, generates Python, verifies output format/unit. |
 
 ### Period string conventions
   'CY1940'         → calendar year 1940
@@ -38,9 +37,12 @@ _DSL_SPEC = """\
 
 ### Key rules
 - retrieve and lookup_external are chain heads (no prev input).
-- For parallel-branch results, prev is a list; use prev[0], prev[1], etc. in compute code.
-- compute nl is a natural language description; the subagent generates and runs Python internally.
-- format is always the chain terminator.
+- extract / read_visual emit a TypedValue with .dtype='named' whose .value is a dict mapping
+  snake_case names to scalars/lists/tables. Names disambiguate (e.g. national_defense_cy1940).
+- compute is ALWAYS the chain terminator. It receives the question + extracted values, plans the
+  computation itself, generates Python, and a verifier LLM checks the output format/unit. Plans
+  do NOT need to spell out the computation — compute figures it out from the question.
+- For parallel-branch chains, the value flowing into compute is a list[TypedValue].
 - Use single-quoted string args only.
 """
 
@@ -57,16 +59,8 @@ _FEW_SHOTS = [
                     "concepts": ["U.S. National Defense (Treasury budget category)"],
                     "constraints": ["calendar year, not fiscal year"]
                 },
-                {
-                    "type": "op", "op": "extract",
-                    "args": {"concept": "total_expenditure", "mode": "value"},
-                    "concepts": [], "constraints": []
-                },
-                {
-                    "type": "op", "op": "format",
-                    "args": {"precision": 0, "unit": "millions_usd"},
-                    "concepts": [], "constraints": []
-                },
+                {"type": "op", "op": "extract", "args": {}},
+                {"type": "op", "op": "compute", "args": {}},
             ]
         }
     },
@@ -83,36 +77,21 @@ _FEW_SHOTS = [
                             "type": "chain", "global_constraints": [],
                             "steps": [
                                 {"type": "op", "op": "retrieve",
-                                 "args": {"concept": "national_defense", "period": "CY1940"},
-                                 "concepts": [], "constraints": []},
-                                {"type": "op", "op": "extract",
-                                 "args": {"concept": "total_expenditure", "mode": "value"},
-                                 "concepts": [], "constraints": []},
+                                 "args": {"concept": "national_defense", "period": "CY1940"}},
+                                {"type": "op", "op": "extract", "args": {}},
                             ]
                         },
                         {
                             "type": "chain", "global_constraints": [],
                             "steps": [
                                 {"type": "op", "op": "retrieve",
-                                 "args": {"concept": "national_defense", "period": "CY1953"},
-                                 "concepts": [], "constraints": []},
-                                {"type": "op", "op": "extract",
-                                 "args": {"concept": "total_expenditure", "mode": "value"},
-                                 "concepts": [], "constraints": []},
+                                 "args": {"concept": "national_defense", "period": "CY1953"}},
+                                {"type": "op", "op": "extract", "args": {}},
                             ]
                         }
                     ]
                 },
-                {
-                    "type": "op", "op": "compute",
-                    "args": {"nl": "absolute percent change between the two values: abs((b - a) / a * 100)"},
-                    "concepts": [], "constraints": ["absolute value of percent change"]
-                },
-                {
-                    "type": "op", "op": "format",
-                    "args": {"precision": 2, "unit": "percent"},
-                    "concepts": [], "constraints": []
-                },
+                {"type": "op", "op": "compute", "args": {}},
             ]
         }
     },
@@ -128,21 +107,8 @@ _FEW_SHOTS = [
                     "concepts": ["91-day Treasury bill weekly issuance", "average discount rate (Thursday quote convention)"],
                     "constraints": ["September months only"]
                 },
-                {
-                    "type": "op", "op": "extract",
-                    "args": {"concept": "weekly_discount_rate", "mode": "list"},
-                    "concepts": [], "constraints": []
-                },
-                {
-                    "type": "op", "op": "compute",
-                    "args": {"nl": "geometric mean of the list of values (filter None, use math.log/math.exp)"},
-                    "concepts": [], "constraints": ["geometric mean, not arithmetic"]
-                },
-                {
-                    "type": "op", "op": "format",
-                    "args": {"precision": 3},
-                    "concepts": [], "constraints": []
-                },
+                {"type": "op", "op": "extract", "args": {}},
+                {"type": "op", "op": "compute", "args": {}},
             ]
         }
     },
@@ -160,11 +126,8 @@ _FEW_SHOTS = [
                             "steps": [
                                 {"type": "op", "op": "retrieve",
                                  "args": {"concept": "fx_investments", "period": "2025-03", "source_bulletin": "2025-03"},
-                                 "concepts": ["Treasury Foreign Exchange and Securities investments"],
-                                 "constraints": []},
-                                {"type": "op", "op": "extract",
-                                 "args": {"concept": "japanese_yen_holdings", "mode": "value"},
-                                 "concepts": [], "constraints": []},
+                                 "concepts": ["Treasury Foreign Exchange and Securities investments"]},
+                                {"type": "op", "op": "extract", "args": {}},
                             ]
                         },
                         {
@@ -172,21 +135,12 @@ _FEW_SHOTS = [
                             "steps": [
                                 {"type": "op", "op": "lookup_external",
                                  "args": {"nl": "USD/JPY exchange rate on 2025-03-31"},
-                                 "concepts": ["Macrotrends FX data"], "constraints": []},
+                                 "concepts": ["Macrotrends FX data"]},
                             ]
                         }
                     ]
                 },
-                {
-                    "type": "op", "op": "compute",
-                    "args": {"nl": "multiply the USD value (prev[0]) by the USD/JPY exchange rate (prev[1]) to get the JPY amount"},
-                    "concepts": [], "constraints": []
-                },
-                {
-                    "type": "op", "op": "format",
-                    "args": {"precision": 0, "layout": "no_commas"},
-                    "concepts": [], "constraints": ["no commas", "round to nearest whole yen"]
-                },
+                {"type": "op", "op": "compute", "args": {}},
             ]
         }
     },
@@ -199,19 +153,10 @@ _FEW_SHOTS = [
                 {
                     "type": "op", "op": "retrieve",
                     "args": {"concept": "public_debt_chart", "period": "1990-09", "source_bulletin": "1990-09"},
-                    "concepts": ["debt held by the public (chart/figure)"],
-                    "constraints": []
+                    "concepts": ["debt held by the public (chart/figure)"]
                 },
-                {
-                    "type": "op", "op": "read_visual",
-                    "args": {"concept": "total_debt_held_by_public"},
-                    "concepts": [], "constraints": []
-                },
-                {
-                    "type": "op", "op": "format",
-                    "args": {"precision": 1, "unit": "billions_usd"},
-                    "concepts": [], "constraints": []
-                },
+                {"type": "op", "op": "read_visual", "args": {"concept": "total_debt_held_by_public"}},
+                {"type": "op", "op": "compute", "args": {}},
             ]
         }
     },
@@ -275,7 +220,7 @@ ChainNode AST — no prose, no explanation.
 # ---------------------------------------------------------------------------
 
 def plan(question: str, ctx: HarnessContext) -> ChainNode:
-    """Generate a 6-op AST ChainNode from a natural-language question."""
+    """Generate a 5-op AST ChainNode from a natural-language question."""
     system = _build_system(ctx)
     user = _build_user(question, ctx)
 

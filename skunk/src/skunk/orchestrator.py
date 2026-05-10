@@ -23,6 +23,9 @@ class StepTrace:
     output_desc: str
     elapsed_s: float
     error: str | None = None
+    input_full: str = ""   # full repr (no truncation), for trace dump
+    output_full: str = ""  # full repr (no truncation), for trace dump
+    step_idx: int = 0
 
 
 @dataclass
@@ -83,18 +86,33 @@ def _run_op(op: OpNode, prev: Any, ctx: HarnessContext, trace: QuestionTrace) ->
     if fn is None:
         raise StepFailed(op.op, f"No subagent registered for '{op.op}'")
 
+    step_idx = len(trace.steps) + 1
     input_desc = _describe_value(prev)
+    input_full = _full_repr(prev)
+    ctx.events.append({"source": "_step", "message": "begin", "step_idx": step_idx, "op": op.op})
+    if ctx.verbose:
+        print(f"\n[step {step_idx} | {op.op}] args={op.args}")
+        print(f"  in:  {input_desc}")
+
     t0 = time.perf_counter()
     try:
         result = fn(op, prev, ctx)
     except StepFailed as e:
         elapsed = time.perf_counter() - t0
+        if ctx.verbose:
+            print(f"  ERROR: {e} ({elapsed:.2f}s)")
         trace.steps.append(StepTrace(op=op.op, args=op.args, input_desc=input_desc,
-                                     output_desc="(failed)", elapsed_s=elapsed, error=str(e)))
+                                     output_desc="(failed)", elapsed_s=elapsed, error=str(e),
+                                     input_full=input_full, output_full="(failed)", step_idx=step_idx))
         raise
     elapsed = time.perf_counter() - t0
+    output_desc = _describe_value(result)
+    output_full = _full_repr(result)
+    if ctx.verbose:
+        print(f"  out: {output_desc} ({elapsed:.2f}s)")
     trace.steps.append(StepTrace(op=op.op, args=op.args, input_desc=input_desc,
-                                 output_desc=_describe_value(result), elapsed_s=elapsed))
+                                 output_desc=output_desc, elapsed_s=elapsed,
+                                 input_full=input_full, output_full=output_full, step_idx=step_idx))
     return result
 
 
@@ -130,3 +148,20 @@ def _describe_value(v: Any) -> str:
         return f"list({len(v)} branches)"
     s = repr(v)
     return s[:100] + ("..." if len(s) > 100 else "")
+
+
+def _full_repr(v: Any) -> str:
+    """Untruncated repr for trace dumps. Mirrors _describe_value but keeps full payloads."""
+    if v is None:
+        return "(none)"
+    if isinstance(v, DocHandle):
+        refs = "\n    ".join(repr(r) for r in v.refs)
+        return f"DocHandle(desc={v.desc!r}, {len(v.refs)} refs):\n    {refs}" if v.refs else f"DocHandle(empty, desc={v.desc!r})"
+    if isinstance(v, TypedValue):
+        return f"TypedValue(dtype={v.dtype!r}, unit={v.unit!r}, desc={v.desc!r}, value={v.value!r})"
+    if isinstance(v, FormattedString):
+        return f"FormattedString(text={v.text!r}, desc={v.desc!r})"
+    if isinstance(v, list):
+        parts = [f"  [{i}] {_full_repr(x)}" for i, x in enumerate(v)]
+        return "list:\n" + "\n".join(parts)
+    return repr(v)

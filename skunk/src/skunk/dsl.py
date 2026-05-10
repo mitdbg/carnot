@@ -10,9 +10,10 @@ Nested:
     [ [ A ; B ] --> compute(code='...') ; lookup_external(resource='cpi_u') ] --> compute(code='...')
 
 Page number convention:
-    PageRef.page      = bulletin printed page number (canonical; matches source_docs?page=N)
-    PageRef.pdf_page  = 1-based PDF page index (for cache file access and rendering)
-    Translation between the two lives in prep/page_map.py.
+    PageRef.page = 1-based PDF page index (canonical throughout the codebase).
+    The bulletin's printed-page footer (e.g. "69") is recoverable via
+    skunk.common.parsed_json.get_printed_page() for trace/prompt enrichment,
+    but is never used as a lookup key.
 """
 
 from __future__ import annotations
@@ -29,15 +30,14 @@ from typing import Any
 class PageRef:
     year: int | None = None
     month: str | None = None        # "YYYY-MM"
-    page: int | None = None         # bulletin printed page number (canonical)
-    pdf_page: int | None = None     # 1-based PDF page index (for cache/render access)
+    page: int | None = None         # 1-based PDF page index (canonical)
     file_path: str | None = None    # resolved by manifest
 
     def __post_init__(self) -> None:
-        # page-map resolution requires month; catch missing month at construction time.
-        if self.page is not None and self.pdf_page is None and self.month is None:
+        # parsed-JSON lookup requires month; catch missing month at construction time.
+        if self.page is not None and self.month is None:
             raise ValueError(
-                f"PageRef with page={self.page} requires month for page-map resolution"
+                f"PageRef with page={self.page} requires month for parsed-JSON lookup"
             )
 
     def __repr__(self) -> str:
@@ -48,8 +48,6 @@ class PageRef:
             parts.append(f"month={self.month}")
         if self.page is not None:
             parts.append(f"page={self.page}")
-        if self.pdf_page is not None:
-            parts.append(f"pdf_page={self.pdf_page}")
         if self.file_path:
             parts.append(f"file={self.file_path!r}")
         return f"PageRef({', '.join(parts)})"
@@ -88,7 +86,7 @@ OpOutput = DocHandle | TypedValue | FormattedString
 
 VALID_OPS = frozenset({
     "retrieve", "extract", "read_visual",
-    "lookup_external", "compute", "format",
+    "lookup_external", "compute",
 })
 
 
@@ -376,11 +374,10 @@ _CHAIN_HEAD_OPS = frozenset({"retrieve", "lookup_external"})
 # Required args per op; checked at validation time.
 _REQUIRED_ARGS: dict[str, list[str]] = {
     "retrieve": ["concept", "period"],
-    "extract": ["concept"],
-    "compute": ["nl"],
+    "extract": [],
+    "compute": [],
     "lookup_external": ["nl"],
     "read_visual": ["concept"],
-    "format": [],
 }
 
 # Period grammar: point | range (point..point) | enumeration (point,point,...)
@@ -426,13 +423,13 @@ def _validate_node(
                 f"{path}: chain must start with retrieve or lookup_external, got {first_step.op!r}"
             )
 
-        # Chain tail: answer-producing (root) chain must end with format.
+        # Chain tail: answer-producing (root) chain must end with compute.
         if is_root:
             last_step = node.steps[-1]
-            if not isinstance(last_step, OpNode) or last_step.op != "format":
+            if not isinstance(last_step, OpNode) or last_step.op != "compute":
                 tail_desc = last_step.op if isinstance(last_step, OpNode) else type(last_step).__name__
                 errors.append(
-                    f"{path}: answer chain must end with format, got {tail_desc!r}"
+                    f"{path}: answer chain must end with compute, got {tail_desc!r}"
                 )
 
         for i, step in enumerate(node.steps):
