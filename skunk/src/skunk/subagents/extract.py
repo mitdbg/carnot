@@ -116,8 +116,8 @@ def _text_tier(
     texts = []
     for ref in refs[:_MAX_PAGES]:
         text = get_text_fn(ref, ctx)
-        printed = get_printed_page(ref, ctx)
         if text:
+            printed = get_printed_page(ref, ctx)
             ctx.emit("extract", f"tier={tier_name} got text",
                      page=str(ref), chars=len(text), printed_page=printed)
             header = f"--- PDF page {ref.page}"
@@ -127,7 +127,7 @@ def _text_tier(
             texts.append(f"{header}\n{text}")
         else:
             ctx.emit("extract", f"tier={tier_name} no text",
-                     page=str(ref), file_path=ref.file_path, printed_page=printed)
+                     page=str(ref), file_path=ref.file_path)
     if not texts:
         ctx.emit("extract", f"tier={tier_name} skipped (no text from any ref)")
         return None

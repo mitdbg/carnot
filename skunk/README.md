@@ -1,6 +1,6 @@
 # skunk — OfficeQA pipeline
 
-A declarative QA pipeline over the U.S. Treasury Bulletin corpus. Questions are decomposed into 6-operator DSL plans; an orchestrator walks the plan and dispatches subagents that retrieve specific PDF pages, extract values, run sandboxed Python, and format the answer.
+A declarative QA pipeline over the U.S. Treasury Bulletin corpus. Questions are decomposed into 5-operator DSL plans; an orchestrator walks the plan and dispatches subagents that retrieve specific PDF pages, extract values, look up external facts, and produce the final answer via a sandboxed-Python compute terminator with an LLM-based output-format verifier.
 
 ## Quick start
 
@@ -27,4 +27,10 @@ python tools/plan_dsl_with_gemini.py --smoke   # generate plans for 7 sample que
 
 ## Status
 
-The 6-op DSL is finalized; all 133 benchmark questions have validated plans. Four subagents are implemented (`compute`, `format`, `lookup_external`, `read_visual`); `extract` remains a stub — see its TODO comment for the tier-dispatch work needed before extraction quality can be measured. The `retrieve` subagent is also pending its page-index implementation.
+The 5-op DSL is finalized. All five subagents are implemented:
+- `retrieve` short-circuits on golden page injection (full corpus index is future work);
+- `extract` and `read_visual` emit a question-driven dict of named typed values via JSON-backed Tier 1, PyMuPDF Tier 2, and vision Tier 3;
+- `lookup_external` does a single Gemini call for facts (numeric, dates, named entities);
+- `compute` terminates the chain with plan→code→exec→verify.
+
+Plans are produced live by the planner; `data/dsl_planning_pass.csv` is rebuilt lazily as questions run, or eagerly via `tools/plan_dsl_with_gemini.py`.

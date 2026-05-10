@@ -16,7 +16,7 @@ from skunk.dsl import PageRef
 
 def get_ocr_text_for_pdf_page(ref: PageRef, ctx: HarnessContext) -> str | None:
     """Return PyMuPDF-extracted text for ref's PDF page; cache by PDF index."""
-    if ref.month is None or ref.page is None:
+    if ref.month is None or ref.page is None or ref.page <= 0:
         return None
 
     txt_path = Path(ctx.cache_dir) / "pages" / ref.month / f"p{ref.page:03d}.txt"

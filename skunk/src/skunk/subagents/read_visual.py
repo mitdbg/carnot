@@ -8,4 +8,5 @@ from skunk.dsl import DocHandle, OpNode, TypedValue
 
 
 def run(op: OpNode, prev: DocHandle | None, ctx: HarnessContext) -> TypedValue:
-    return _extract.run(OpNode(op="extract", args={**op.args, "visual_only": True}), prev, ctx)
+    # read_visual takes no args; force the extract path through Tier 3 (vision).
+    return _extract.run(OpNode(op="extract", args={"visual_only": True}), prev, ctx)

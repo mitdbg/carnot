@@ -193,12 +193,12 @@ def _dump_trace(path: str, *, uid: str | None, question: str, plan_text: str,
     lines.append("")
 
     events_per_step: dict[int, list[dict]] = {s.step_idx: [] for s in trace.steps}
-    cur_idx = 0
+    cur_idx: int | None = None
     for ev in events:
         if ev.get("source") == "_step" and ev.get("message") == "begin":
             cur_idx = int(ev.get("step_idx", 0))
             continue
-        if cur_idx in events_per_step:
+        if cur_idx is not None and cur_idx in events_per_step:
             events_per_step[cur_idx].append(ev)
 
     for step in trace.steps:

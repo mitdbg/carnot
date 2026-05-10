@@ -15,7 +15,7 @@ _dpi_scale = 300 / 72
 
 def get_png(ref: PageRef, ctx: HarnessContext) -> str | None:
     """Render ref's PDF page to PNG, caching at cache/pages/{month}/p{NNN}.png."""
-    if ref.month is None or ref.page is None:
+    if ref.month is None or ref.page is None or ref.page <= 0:
         return None
 
     png_path = Path(ctx.cache_dir) / "pages" / ref.month / f"p{ref.page:03d}.png"

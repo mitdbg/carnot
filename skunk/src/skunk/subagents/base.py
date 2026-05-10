@@ -6,11 +6,13 @@ import ast
 import base64
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+import statsmodels.api as sm
 from google import genai
 from google.genai import types
 
@@ -69,12 +71,28 @@ def load_image_b64(path: str | Path) -> tuple[str, str]:
 # Python execution
 # ---------------------------------------------------------------------------
 
-def exec_python(code: str, local_vars: dict[str, Any] | None = None) -> Any:
-    code = code.strip()
-    if code.startswith("```"):
-        code = "\n".join(l for l in code.splitlines() if not l.strip().startswith("```")).strip()
+# Strip only a leading ```[lang] fence and a trailing ``` fence. Never strips
+# inline-string lines, even if they happen to start with ```.
+_LEADING_FENCE_RE = re.compile(r"\A```[a-zA-Z]*[ \t]*\n")
+_TRAILING_FENCE_RE = re.compile(r"\n```[ \t]*\Z")
 
-    env: dict[str, Any] = {"math": math, "np": np, "numpy": np, "pd": pd, "pandas": pd}
+
+def strip_code_fences(code: str) -> str:
+    s = code.strip()
+    s = _LEADING_FENCE_RE.sub("", s)
+    s = _TRAILING_FENCE_RE.sub("", s)
+    return s.strip()
+
+
+def exec_python(code: str, local_vars: dict[str, Any] | None = None) -> Any:
+    code = strip_code_fences(code)
+
+    env: dict[str, Any] = {
+        "math": math,
+        "np": np, "numpy": np,
+        "pd": pd, "pandas": pd,
+        "sm": sm, "statsmodels": sm,
+    }
     env.update(local_vars or {})
     exec(compile(code, "<sandbox>", "exec"), env)  # noqa: S102
     if "result" not in env:

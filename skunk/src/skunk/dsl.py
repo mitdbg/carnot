@@ -1,13 +1,13 @@
 """DSL — AST types, text<->AST parser, validator, serializer.
 
-Text surface form:
-    retrieve(concept='national_defense', period='CY1940') --> extract(concept='total', mode='value')
+Text surface form (extract/compute take no args; compute is the chain terminator):
+    retrieve(concept='national_defense', period='CY1940') --> extract() --> compute()
 
 Parallel branches via brackets + semicolons:
-    [ A --> B ; C --> D ] --> compute(code='...')
+    [ A --> B ; C --> D ] --> compute()
 
 Nested:
-    [ [ A ; B ] --> compute(code='...') ; lookup_external(resource='cpi_u') ] --> compute(code='...')
+    [ [ A ; B ] --> compute() ; lookup_external(nl='CPI-U for 1953') ] --> compute()
 
 Page number convention:
     PageRef.page = 1-based PDF page index (canonical throughout the codebase).
@@ -65,9 +65,9 @@ class DocHandle:
 @dataclass
 class TypedValue:
     value: Any              # never None; subagent must raise StepFailed instead
-    dtype: str = "scalar"   # "scalar" | "list[scalar]" | "text" | "df"
+    dtype: str = "scalar"   # "scalar" | "list[scalar]" | "text" | "df" | "named"
     unit: str = ""          # semantic unit: "usd_millions", "pct", "fx_rate", "year", "cpi", etc.
-    desc: str = ""
+    desc: str = ""          # human-readable; for dtype='named', summarises each key's unit/type.
 
 
 @dataclass
@@ -377,7 +377,7 @@ _REQUIRED_ARGS: dict[str, list[str]] = {
     "extract": [],
     "compute": [],
     "lookup_external": ["nl"],
-    "read_visual": ["concept"],
+    "read_visual": [],
 }
 
 # Period grammar: point | range (point..point) | enumeration (point,point,...)

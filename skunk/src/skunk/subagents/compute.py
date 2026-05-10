@@ -17,7 +17,7 @@ import re
 
 from skunk.common.context import HarnessContext
 from skunk.dsl import FormattedString, OpNode, TypedValue
-from skunk.subagents.base import StepFailed, call_gemini, exec_python
+from skunk.subagents.base import StepFailed, call_gemini, exec_python, strip_code_fences
 
 _MAX_ATTEMPTS = 3
 
@@ -73,8 +73,10 @@ Examples:
 - Question asks rounded integer and answer is "8998" → PASS
 """
 
-_CODE_RE = re.compile(r"^\s*CODE\s*\n(.*)$", re.DOTALL)
-_MISSING_RE = re.compile(r"^\s*MISSING:\s*(.*)$", re.DOTALL)
+# Match CODE / MISSING anywhere (after fence-stripping + light prose). Use re.search,
+# not re.match, so leading commentary or whitespace doesn't break classification.
+_CODE_RE = re.compile(r"\bCODE\s*\n(.*)\Z", re.DOTALL)
+_MISSING_RE = re.compile(r"\bMISSING:\s*([^\n]*)", re.IGNORECASE)
 
 
 def _prev_desc(prev: object) -> str:
@@ -112,21 +114,33 @@ def _build_user(question: str, prev: object, prior_failure: str | None) -> str:
 
 
 def _verify(question: str, answer_text: str, ctx: HarnessContext) -> tuple[bool, str]:
+    """Ask the verifier LLM whether `answer_text` is in the right format/unit.
+
+    Returns (passed, reason). Conservative when ambiguous: if both PASS and FAIL
+    appear in the reply, FAIL wins. If neither appears, treat as FAIL with a
+    diagnostic reason rather than silently accepting.
+    """
     user = (
         f"Question:\n{question}\n\n"
         f"Computed answer:\n{answer_text}\n\n"
-        f"Reply PASS or FAIL: <reason>."
+        f"Reply on a single line: PASS, or FAIL: <reason>."
     )
     raw = call_gemini(_VERIFIER_SYSTEM, user)
     ctx.emit("compute", "verifier response", raw=raw[:300])
-    head = raw.strip().splitlines()[0].strip() if raw.strip() else ""
-    if head.upper().startswith("PASS"):
+
+    text = raw.strip()
+    upper = text.upper()
+    has_fail = "FAIL" in upper
+    has_pass = "PASS" in upper
+
+    if has_fail:
+        # Extract a reason — text after the first FAIL token, up to a newline.
+        m = re.search(r"FAIL[: ]?\s*([^\n]*)", text, re.IGNORECASE)
+        reason = m.group(1).strip() if m and m.group(1).strip() else "verifier rejected (no reason)"
+        return False, reason
+    if has_pass:
         return True, ""
-    if head.upper().startswith("FAIL"):
-        # Strip "FAIL:" prefix
-        return False, head.split(":", 1)[1].strip() if ":" in head else head
-    # Malformed verifier reply — treat as PASS rather than blocking the chain
-    return True, ""
+    return False, f"verifier produced malformed reply: {text[:120]!r}"
 
 
 def run(op: OpNode, prev: object, ctx: HarnessContext) -> FormattedString:
@@ -140,15 +154,18 @@ def run(op: OpNode, prev: object, ctx: HarnessContext) -> FormattedString:
         raw = call_gemini(_CODEGEN_SYSTEM, _build_user(ctx.question, prev, prior))
         ctx.emit("compute", f"attempt {attempt + 1} codegen response", raw=raw[:600])
 
-        m_missing = _MISSING_RE.match(raw.strip())
+        # Strip outer markdown fences before scanning for CODE / MISSING tokens.
+        cleaned = strip_code_fences(raw)
+
+        m_missing = _MISSING_RE.search(cleaned)
         if m_missing:
             reason = m_missing.group(1).strip()
             ctx.emit("compute", f"attempt {attempt + 1} reported MISSING", reason=reason)
             raise StepFailed("compute", f"missing data to answer: {reason}")
 
-        m_code = _CODE_RE.match(raw.strip())
+        m_code = _CODE_RE.search(cleaned)
         if not m_code:
-            prior = f"Response did not start with CODE or MISSING:. Raw: {raw[:300]}"
+            prior = f"Response had neither CODE nor MISSING:. Raw: {raw[:300]}"
             ctx.emit("compute", f"attempt {attempt + 1} malformed response", prior=prior[:300])
             continue
 

@@ -4,9 +4,12 @@ Standalone Python package. No Palimpzest dependency.
 
 Architecture:
   question -> planner (LLM, single shot)
-            -> ChainNode AST (DSL, 6 ops)
+            -> ChainNode AST (DSL, 5 ops)
             -> orchestrator
-            -> {retrieve, extract, read_visual, lookup_external, compute, format}
+            -> {retrieve, extract, read_visual, lookup_external, compute}
+
+`compute` is the chain terminator and subsumes formatting (it self-plans, codegens,
+execs, then a verifier LLM checks the output's format/unit fits the question).
 
 See ARCHITECTURE.md for design intent and DSL.md for the formal grammar.
 """

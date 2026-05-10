@@ -155,7 +155,7 @@ _FEW_SHOTS = [
                     "args": {"concept": "public_debt_chart", "period": "1990-09", "source_bulletin": "1990-09"},
                     "concepts": ["debt held by the public (chart/figure)"]
                 },
-                {"type": "op", "op": "read_visual", "args": {"concept": "total_debt_held_by_public"}},
+                {"type": "op", "op": "read_visual", "args": {}},
                 {"type": "op", "op": "compute", "args": {}},
             ]
         }

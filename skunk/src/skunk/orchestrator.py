@@ -118,7 +118,7 @@ def _run_op(op: OpNode, prev: Any, ctx: HarnessContext, trace: QuestionTrace) ->
 
 def _run_parallel(node: ParallelNode, prev: Any, ctx: HarnessContext, trace: QuestionTrace) -> list[Any]:
     results: list[Any] = [None] * len(node.branches)
-    errors: list[StepFailed] = []
+    errors: list[tuple[int, StepFailed]] = []
     with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
         futures = {pool.submit(_execute_chain, branch, prev, ctx, trace): i
                    for i, branch in enumerate(node.branches)}
@@ -127,9 +127,13 @@ def _run_parallel(node: ParallelNode, prev: Any, ctx: HarnessContext, trace: Que
             try:
                 results[i] = future.result()
             except StepFailed as e:
-                errors.append(e)
+                errors.append((i, e))
     if errors:
-        raise errors[0]
+        # Surface every branch failure to the trace so triage can see all of them,
+        # then re-raise the first one (preserves existing single-error semantics for callers).
+        for i, e in errors:
+            ctx.emit("orchestrator", "parallel branch failed", branch_idx=i, error=str(e))
+        raise errors[0][1]
     return results
 
 
@@ -139,6 +143,9 @@ def _describe_value(v: Any) -> str:
     if isinstance(v, DocHandle):
         return f"DocHandle({len(v.refs)} refs): {v.desc}"
     if isinstance(v, TypedValue):
+        if v.dtype == "named" and isinstance(v.value, dict):
+            keys = list(v.value.keys())
+            return f"TypedValue(named, {len(keys)} keys={keys}) — {v.desc}"
         raw = repr(v.value)
         truncated = raw[:100] + ("..." if len(raw) > 100 else "")
         return f"TypedValue({v.dtype}): {truncated} — {v.desc}"
