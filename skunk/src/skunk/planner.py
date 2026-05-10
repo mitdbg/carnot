@@ -11,7 +11,7 @@ from skunk.dsl import ChainNode, from_dict, validate
 from skunk.subagents.base import StepFailed, call_gemini
 
 # ---------------------------------------------------------------------------
-# DSL spec (6-op grammar embedded in the system prompt)
+# DSL spec (5-op grammar embedded in the system prompt)
 # ---------------------------------------------------------------------------
 
 _DSL_SPEC = """\

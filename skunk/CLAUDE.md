@@ -36,7 +36,6 @@ The benchmark is `data/officeqa_pro.csv` (133 questions). An initial pass of DSL
 
 ## API keys (.env at repo root)
 
-- `ANTHROPIC_API_KEY` — reserved for future use; not currently wired into any runtime call
 - `GEMINI_API_KEY` — Gemini 2.5 Flash; used by the planner and all subagents via `call_gemini` in `subagents/base.py`, and `tools/plan_dsl_with_gemini.py`
 
 `.env.example` is committed; copy it to `.env` and fill in keys.

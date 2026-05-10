@@ -10,7 +10,7 @@ Outcome: OK
 Final answer: '36080'
 
 --------------------------------------------------------------------------------
-Step 1: retrieve  args={'concept': 'federal_department_expenditures', 'period': 'FY1955'}  (0.00s)
+Step 1: retrieve  args={'source': 'federal_department_expenditures', 'period': 'FY1955'}  (0.00s)
   in:  (none)
   out: DocHandle(desc='golden (1 pages)', 1 refs):
     PageRef(year=1958, month=1958-10, page=16, file='/Users/Tianyu/Desktop/officeqa/treasury_bulletin_pdfs/treasury_bulletin_1958_10.pdf')
@@ -20,7 +20,7 @@ Step 1: retrieve  args={'concept': 'federal_department_expenditures', 'period': 
       refs: ["PageRef(year=1958, month=1958-10, page=16, file='/Users/Tianyu/Desktop/officeqa/treasury_bulletin_pdfs/treasury_bulletin_1958_10.pdf')"]
 
 --------------------------------------------------------------------------------
-Step 2: extract  args={}  (9.13s)
+Step 2: extract  args={}  (9.46s)
   in:  DocHandle(desc='golden (1 pages)', 1 refs):
     PageRef(year=1958, month=1958-10, page=16, file='/Users/Tianyu/Desktop/officeqa/treasury_bulletin_pdfs/treasury_bulletin_1958_10.pdf')
   out: TypedValue(dtype='named', unit='', desc='highest_spending_department_fy1955 (scalar, unit=text); defense_department_expenditures_fy1955 (scalar, unit=usd_millions)', value={'highest_spending_department_fy1955': 'Defense Department', 'defense_department_expenditures_fy1955': 36080})
@@ -43,7 +43,7 @@ Step 2: extract  args={}  (9.13s)
       names: ['highest_spending_department_fy1955', 'defense_department_expenditures_fy1955']
 
 --------------------------------------------------------------------------------
-Step 3: compute  args={}  (4.79s)
+Step 3: compute  args={}  (4.75s)
   in:  TypedValue(dtype='named', unit='', desc='highest_spending_department_fy1955 (scalar, unit=text); defense_department_expenditures_fy1955 (scalar, unit=usd_millions)', value={'highest_spending_department_fy1955': 'Defense Department', 'defense_department_expenditures_fy1955': 36080})
   out: FormattedString(text='36080', desc='What was the amount spent in millions of nominal dollars by the highest spending U.S Federal Department in the fiscal ye')
   events:

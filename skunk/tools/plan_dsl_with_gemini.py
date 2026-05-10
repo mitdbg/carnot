@@ -1,7 +1,7 @@
 """DSL planning tool — direct google.genai, no Palimpzest.
 
 Generates a DSL plan for every question in the benchmark CSV using Gemini 2.5
-Flash. The 6-op DSL is described in DSL.md; this script's system prompt is the
+Flash. The 5-op DSL is described in DSL.md; this script's system prompt is the
 same content. Output is data/dsl_planning_pass.csv with columns:
   uid, question, plan_text, parse_ok, validate_ok, head_op, tail_op, ops_used, problems
 

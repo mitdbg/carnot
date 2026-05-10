@@ -10,7 +10,7 @@ Outcome: OK
 Final answer: 'Financial Management Service and the weighted average denomination was $1.000'
 
 --------------------------------------------------------------------------------
-Step 1: retrieve  args={'concept': 'currency_circulation', 'period': '2011-06-30', 'source_bulletin': '2011-06'}  (0.00s)
+Step 1: retrieve  args={'source': 'currency_circulation', 'period': '2011-06-30', 'source_bulletin': '2011-06'}  (0.00s)
   in:  (none)
   out: DocHandle(desc='golden (1 pages)', 1 refs):
     PageRef(year=2011, month=2011-09, page=50, file='/Users/Tianyu/Desktop/officeqa/treasury_bulletin_pdfs/treasury_bulletin_2011_09.pdf')
@@ -22,7 +22,7 @@ Step 1: retrieve  args={'concept': 'currency_circulation', 'period': '2011-06-30
       refs: ["PageRef(year=2011, month=2011-09, page=50, file='/Users/Tianyu/Desktop/officeqa/treasury_bulletin_pdfs/treasury_bulletin_2011_09.pdf')"]
 
 --------------------------------------------------------------------------------
-Step 1: lookup_external  args={'nl': 'Bureau of the US Treasury merged with Public Debt Bureau to form Bureau of Fiscal Service'}  (1.20s)
+Step 1: lookup_external  args={'nl': 'Bureau of the US Treasury merged with Public Debt Bureau to form Bureau of Fiscal Service'}  (1.22s)
   in:  (none)
   out: TypedValue(dtype='text', unit='text', desc='Bureau of the US Treasury merged with Public Debt Bureau to form Bureau of Fiscal Service', value='Bureau of the Fiscal Service')
   events:
@@ -33,7 +33,7 @@ Step 1: lookup_external  args={'nl': 'Bureau of the US Treasury merged with Publ
       refs: ["PageRef(year=2011, month=2011-09, page=50, file='/Users/Tianyu/Desktop/officeqa/treasury_bulletin_pdfs/treasury_bulletin_2011_09.pdf')"]
 
 --------------------------------------------------------------------------------
-Step 2: extract  args={}  (29.48s)
+Step 2: extract  args={}  (28.36s)
   in:  DocHandle(desc='golden (1 pages)', 1 refs):
     PageRef(year=2011, month=2011-09, page=50, file='/Users/Tianyu/Desktop/officeqa/treasury_bulletin_pdfs/treasury_bulletin_2011_09.pdf')
   out: TypedValue(dtype='named', unit='', desc='bureau_merged_with_public_debt_bureau (scalar, unit=text); currency_in_circulation_by_denomination_june_30_2011 (table, unit=usd); footnotes_for_table_uscc_2 (list, unit=text)', value={'bureau_merged_with_public_debt_bureau': 'Financial Management Service', 'currency_in_circulation_by_denomination_june_30_2011': [['Currency in circulation by denomination', 'Total (1)', 'Federal Reserve notes 1 (2)', 'U.S. notes (3)', 'Currency no longer issued (4)'], ['$1', 9813612968, 9671610324, 143503, 141859141], ['$2', 1834819666, 1702826476, 131980618, 12572], ['$5', 11348207260, 11213973940, 108442610, 25790710], ['$10', 16444843570, 16424166020, 6300, 20671250], ['$20', 134976537960, 134956433100, 3840, 20101020], ['$50', 67796754100, 67785258000, 500, 11495600], ['$100', 745181164800, 745159184400, -5, 21980400], ['$500', 142177500, 141987500, 5500, 184500], ['$1,000', 165495000, 165286000, 5000, 204000], ['$5,000', 1765000, 1710000, None, 55000], ['$10,000', 3450000, 3360000, None, 90000], ['Fractional notes 4', 600, None, 90, 510], ['Total currency', 987708828424, 987225795760, 240587961, 242444703]], 'footnotes_for_table_uscc_2': ['1 Issued on or after July 1, 1929.', '2 Excludes coins sold to collectors at premium prices.', '3 Includes $481,781,898 in standard silver dollars.', '4 Represents value of certain partial denominations not presented for redemption.', '5 Represents current FRB adjustment.', "6 Based on Bureau of the Census' estimates of population."]})
@@ -62,7 +62,7 @@ Step 2: extract  args={}  (29.48s)
       names: ['bureau_merged_with_public_debt_bureau', 'currency_in_circulation_by_denomination_june_30_2011', 'footnotes_for_table_uscc_2']
 
 --------------------------------------------------------------------------------
-Step 4: compute  args={}  (24.66s)
+Step 4: compute  args={}  (24.44s)
   in:  list:
   [0] TypedValue(dtype='text', unit='text', desc='Bureau of the US Treasury merged with Public Debt Bureau to form Bureau of Fiscal Service', value='Bureau of the Fiscal Service')
   [1] TypedValue(dtype='named', unit='', desc='bureau_merged_with_public_debt_bureau (scalar, unit=text); currency_in_circulation_by_denomination_june_30_2011 (table, unit=usd); footnotes_for_table_uscc_2 (list, unit=text)', value={'bureau_merged_with_public_debt_bureau': 'Financial Management Service', 'currency_in_circulation_by_denomination_june_30_2011': [['Currency in circulation by denomination', 'Total (1)', 'Federal Reserve notes 1 (2)', 'U.S. notes (3)', 'Currency no longer issued (4)'], ['$1', 9813612968, 9671610324, 143503, 141859141], ['$2', 1834819666, 1702826476, 131980618, 12572], ['$5', 11348207260, 11213973940, 108442610, 25790710], ['$10', 16444843570, 16424166020, 6300, 20671250], ['$20', 134976537960, 134956433100, 3840, 20101020], ['$50', 67796754100, 67785258000, 500, 11495600], ['$100', 745181164800, 745159184400, -5, 21980400], ['$500', 142177500, 141987500, 5500, 184500], ['$1,000', 165495000, 165286000, 5000, 204000], ['$5,000', 1765000, 1710000, None, 55000], ['$10,000', 3450000, 3360000, None, 90000], ['Fractional notes 4', 600, None, 90, 510], ['Total currency', 987708828424, 987225795760, 240587961, 242444703]], 'footnotes_for_table_uscc_2': ['1 Issued on or after July 1, 1929.', '2 Excludes coins sold to collectors at premium prices.', '3 Includes $481,781,898 in standard silver dollars.', '4 Represents value of certain partial denominations not presented for redemption.', '5 Represents current FRB adjustment.', "6 Based on Bureau of the Census' estimates of population."]})

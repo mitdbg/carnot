@@ -10,7 +10,7 @@ Outcome: OK
 Final answer: '4977.55'
 
 --------------------------------------------------------------------------------
-Step 1: retrieve  args={'concept': 'budget_expenditures', 'period': '1942-03..1948-10'}  (0.00s)
+Step 1: retrieve  args={'source': 'budget_expenditures', 'period': '1942-03..1948-10'}  (0.00s)
   in:  (none)
   out: DocHandle(desc='golden (1 pages)', 1 refs):
     PageRef(year=1950, month=1950-02, page=15, file='/Users/Tianyu/Desktop/officeqa/treasury_bulletin_pdfs/treasury_bulletin_1950_02.pdf')
@@ -20,7 +20,7 @@ Step 1: retrieve  args={'concept': 'budget_expenditures', 'period': '1942-03..19
       refs: ["PageRef(year=1950, month=1950-02, page=15, file='/Users/Tianyu/Desktop/officeqa/treasury_bulletin_pdfs/treasury_bulletin_1950_02.pdf')"]
 
 --------------------------------------------------------------------------------
-Step 2: extract  args={}  (11.56s)
+Step 2: extract  args={}  (11.61s)
   in:  DocHandle(desc='golden (1 pages)', 1 refs):
     PageRef(year=1950, month=1950-02, page=15, file='/Users/Tianyu/Desktop/officeqa/treasury_bulletin_pdfs/treasury_bulletin_1950_02.pdf')
   out: TypedValue(dtype='named', unit='', desc='budget_expenditures_mar1942_oct1948 (list, unit=usd_millions)', value={'budget_expenditures_mar1942_oct1948': [3515, 3939, 4100, 4810, 5257, 5456, 5921, 6184, 7746, 7300, 7475, 8260, 7499, 7831, 7667, 7619, 10412, 7337, 6879, 8631, 8014, 8208, 7779, 8034, 9034, 7758, 8927, 9540, 8561, 6949, 6372, 5619, 3598, 3750, 3374, 4836, 3287, 2745, 2663, 2860, 3239, 3407, 3284, 4996, 3553, 2962, 2673, 2394, 3086, 2541, 2222, 7018, 3558, 2143, 2869, 2685]})
@@ -43,7 +43,7 @@ Step 2: extract  args={}  (11.56s)
       names: ['budget_expenditures_mar1942_oct1948']
 
 --------------------------------------------------------------------------------
-Step 3: compute  args={}  (3.34s)
+Step 3: compute  args={}  (3.07s)
   in:  TypedValue(dtype='named', unit='', desc='budget_expenditures_mar1942_oct1948 (list, unit=usd_millions)', value={'budget_expenditures_mar1942_oct1948': [3515, 3939, 4100, 4810, 5257, 5456, 5921, 6184, 7746, 7300, 7475, 8260, 7499, 7831, 7667, 7619, 10412, 7337, 6879, 8631, 8014, 8208, 7779, 8034, 9034, 7758, 8927, 9540, 8561, 6949, 6372, 5619, 3598, 3750, 3374, 4836, 3287, 2745, 2663, 2860, 3239, 3407, 3284, 4996, 3553, 2962, 2673, 2394, 3086, 2541, 2222, 7018, 3558, 2143, 2869, 2685]})
   out: FormattedString(text='4977.55', desc="According to the US Treasury's breakdown of budget expenditures for just the calendar years 1940 - 1949 (inclusive), wha")
   events:
