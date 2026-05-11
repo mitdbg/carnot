@@ -168,12 +168,24 @@ PLANNER_SYSTEM = (
 _gemini_client = None
 
 
+def _use_vertex() -> bool:
+    return os.environ.get("SKUNK_USE_VERTEX", "").lower() in ("1", "true", "yes") \
+        or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in ("1", "true", "yes")
+
+
 def plan_via_gemini(question: str, repair_context: str | None = None) -> str:
     """Direct google.genai call. Plain-text plan output, no JSON wrapping."""
     global _gemini_client
     if _gemini_client is None:
         from google import genai  # noqa: PLC0415
-        _gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        if _use_vertex():
+            project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+            if not project:
+                raise RuntimeError("SKUNK_USE_VERTEX is set but GOOGLE_CLOUD_PROJECT is not")
+            location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+            _gemini_client = genai.Client(vertexai=True, project=project, location=location)
+        else:
+            _gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     from google.genai import types  # noqa: PLC0415
 
@@ -181,8 +193,9 @@ def plan_via_gemini(question: str, repair_context: str | None = None) -> str:
     if repair_context:
         user += "\n\n" + repair_context
 
+    model = os.environ.get("SKUNK_GEMINI_MODEL", "gemini-2.5-flash")
     resp = _gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=model,
         contents=user,
         config=types.GenerateContentConfig(
             system_instruction=PLANNER_SYSTEM,

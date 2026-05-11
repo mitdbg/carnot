@@ -31,7 +31,7 @@ class StepFailed(Exception):
 # LLM backend
 # ---------------------------------------------------------------------------
 
-_GEMINI_MODEL = "gemini-2.5-flash"
+_DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 # Transient-failure retry tunables. Gemini 2.5 Flash returns 503 under load and 429
 # under per-minute quota; both are recoverable by waiting. Retries are bounded so a
@@ -39,10 +39,111 @@ _GEMINI_MODEL = "gemini-2.5-flash"
 _RETRY_DELAY_S = float(os.environ.get("SKUNK_GEMINI_RETRY_DELAY", "30"))
 _MAX_RETRIES = int(os.environ.get("SKUNK_GEMINI_MAX_RETRIES", "5"))
 
+_gemini_client: "genai.Client | None" = None
+_vertex_credentials_json: str | None = None
+
+
+def _use_vertex() -> bool:
+    return os.environ.get("SKUNK_USE_VERTEX", "").lower() in ("1", "true", "yes") \
+        or os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in ("1", "true", "yes")
+
+
+def _get_gemini_client() -> "genai.Client":
+    global _gemini_client
+    if _gemini_client is not None:
+        return _gemini_client
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not set (and SKUNK_USE_VERTEX not enabled)")
+    _gemini_client = genai.Client(api_key=api_key)
+    return _gemini_client
+
+
+def _get_vertex_credentials_json() -> str | None:
+    """Load the ADC / service-account JSON file from GOOGLE_APPLICATION_CREDENTIALS
+    once, and return its contents as a JSON string for litellm. Returns None to
+    let litellm fall back to ambient ADC if no file path is set."""
+    global _vertex_credentials_json
+    if _vertex_credentials_json is not None:
+        return _vertex_credentials_json
+    cred_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if not cred_path:
+        return None
+    import json as _json  # noqa: PLC0415
+    with open(cred_path) as f:
+        _vertex_credentials_json = _json.dumps(_json.load(f))
+    return _vertex_credentials_json
+
+
+def _is_transient_litellm(exc: Exception) -> bool:
+    code = getattr(exc, "status_code", None)
+    return code in (429, 500, 503, 504)
+
 
 def _is_transient(exc: genai_errors.APIError) -> bool:
     code = getattr(exc, "code", None)
     return code in (429, 500, 503, 504)
+
+
+def _call_via_litellm(system: str, user: str, images: list[tuple[str, str]] | None,
+                      temperature: float, model: str) -> str:
+    """Vertex backend via litellm. Model id should be prefixed with `vertex_ai/`
+    if not already (e.g. `vertex_ai/gemini-2.5-flash-preview-09-2025`)."""
+    from litellm import completion  # noqa: PLC0415
+    import litellm.exceptions as _lexc  # noqa: PLC0415
+
+    if not model.startswith("vertex_ai/"):
+        model = f"vertex_ai/{model}"
+
+    user_content: list[dict[str, Any]] | str
+    if images:
+        user_content = []
+        for mime_type, b64_data in images:
+            user_content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{b64_data}"},
+            })
+        user_content.append({"type": "text", "text": user})
+    else:
+        user_content = user
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user_content},
+    ]
+
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": 8192,
+    }
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    location = os.environ.get("GOOGLE_CLOUD_LOCATION")
+    if project:
+        kwargs["vertex_project"] = project
+    if location:
+        kwargs["vertex_location"] = location
+    creds_json = _get_vertex_credentials_json()
+    if creds_json is not None:
+        kwargs["vertex_credentials"] = creds_json
+
+    for attempt in range(1, _MAX_RETRIES + 2):
+        try:
+            resp = completion(**kwargs)
+            return (resp.choices[0].message.content or "").strip()
+        except _lexc.APIError as e:
+            if not _is_transient_litellm(e) or attempt > _MAX_RETRIES:
+                raise
+            print(
+                f"[call_gemini/vertex] {getattr(e, 'status_code', '?')} from Vertex, "
+                f"sleeping {_RETRY_DELAY_S}s then retrying (attempt {attempt}/{_MAX_RETRIES})",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(_RETRY_DELAY_S)
+
+    raise RuntimeError("unreachable: retry loop fell through")
 
 
 def call_gemini(
@@ -51,10 +152,12 @@ def call_gemini(
     images: list[tuple[str, str]] | None = None,
     temperature: float = 0.0,
 ) -> str:
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY not set")
-    client = genai.Client(api_key=api_key)
+    model = os.environ.get("SKUNK_GEMINI_MODEL", _DEFAULT_GEMINI_MODEL)
+
+    if _use_vertex():
+        return _call_via_litellm(system, user, images, temperature, model)
+
+    client = _get_gemini_client()
 
     parts: list[Any] = []
     if images:
@@ -70,7 +173,7 @@ def call_gemini(
 
     for attempt in range(1, _MAX_RETRIES + 2):
         try:
-            resp = client.models.generate_content(model=_GEMINI_MODEL, contents=parts, config=config)
+            resp = client.models.generate_content(model=model, contents=parts, config=config)
             return (resp.text or "").strip()
         except genai_errors.APIError as e:
             if not _is_transient(e) or attempt > _MAX_RETRIES:

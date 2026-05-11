@@ -16,6 +16,7 @@ dependencies = [
     "pyyaml",
     "numpy",
     "statsmodels",
+    "litellm>=1.83.14",
 ]
 
 [project.optional-dependencies]
