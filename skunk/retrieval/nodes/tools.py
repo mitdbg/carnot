@@ -1,11 +1,44 @@
 import base64
+import hashlib
+import json
 import os
+import pickle
+import re
+import untruncate_json
+
 
 import requests
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "google/gemini-3.1-pro-preview"
 OPENROUTER_VISION_MODEL = "google/gemini-3.1-pro-preview"
+LLM_CACHE_PATH = os.environ.get(
+    "SKUNK_LLM_CACHE_PATH",
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "cache", "llm_call_cache.pckl")),
+)
+OPENROUTER_TEXT_SYSTEM_PROMPT = "You extract compact metadata for a semantic document index. Return only the requested text."
+OPENROUTER_VISION_SYSTEM_PROMPT = "You match rendered PDF pages to spans of OCR text. Return only valid JSON."
+
+
+def load_llm_cache() -> dict:
+    if not os.path.exists(LLM_CACHE_PATH):
+        return {}
+
+    with open(LLM_CACHE_PATH, "rb") as cache_file:
+        return pickle.load(cache_file)
+
+
+def save_llm_cache(cache: dict) -> None:
+    os.makedirs(os.path.dirname(LLM_CACHE_PATH), exist_ok=True)
+    tmp_cache_path = f"{LLM_CACHE_PATH}.tmp"
+    with open(tmp_cache_path, "wb") as cache_file:
+        pickle.dump(cache, cache_file)
+    os.replace(tmp_cache_path, LLM_CACHE_PATH)
+
+
+def llm_cache_key(request_inputs: dict) -> str:
+    request_json = json.dumps(request_inputs, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(request_json.encode("utf-8")).hexdigest()
 
 
 def extract_openrouter_text(response: requests.Response) -> str:
@@ -37,7 +70,32 @@ def extract_openrouter_text(response: requests.Response) -> str:
     raise ValueError(f"No text content in OpenRouter response choice: {choice}")
 
 
+def parse_json_response(text: str) -> dict:
+    cleaned_text = text.strip()
+    if cleaned_text.startswith("```"):
+        cleaned_text = re.sub(r"^```(?:json)?\s*", "", cleaned_text)
+        cleaned_text = re.sub(r"\s*```$", "", cleaned_text)
+
+    try:
+        return json.loads(cleaned_text)
+    except json.JSONDecodeError:
+        return json.loads(untruncate_json.complete(cleaned_text))
+
+
 def call_openrouter(prompt: str, max_tokens: int = 2048, model: str = OPENROUTER_MODEL) -> str:
+    request_inputs = {
+        "call_type": "openrouter_text",
+        "model": model,
+        "system_prompt": OPENROUTER_TEXT_SYSTEM_PROMPT,
+        "prompt": prompt,
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    }
+    cache_key = llm_cache_key(request_inputs)
+    cache = load_llm_cache()
+    if cache_key in cache:
+        return cache[cache_key]
+
     response = requests.post(
         OPENROUTER_URL,
         headers={
@@ -49,7 +107,7 @@ def call_openrouter(prompt: str, max_tokens: int = 2048, model: str = OPENROUTER
             "messages": [
                 {
                     "role": "system",
-                    "content": "You extract compact metadata for a semantic document index. Return only the requested text.",
+                    "content": OPENROUTER_TEXT_SYSTEM_PROMPT,
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -58,7 +116,10 @@ def call_openrouter(prompt: str, max_tokens: int = 2048, model: str = OPENROUTER
         },
         timeout=60,
     )
-    return extract_openrouter_text(response)
+    response_text = extract_openrouter_text(response)
+    cache[cache_key] = response_text
+    save_llm_cache(cache)
+    return response_text
 
 
 def call_openrouter_vision(
@@ -67,6 +128,20 @@ def call_openrouter_vision(
     max_tokens: int = 4096,
     model: str = OPENROUTER_VISION_MODEL,
 ) -> str:
+    request_inputs = {
+        "call_type": "openrouter_vision",
+        "model": model,
+        "system_prompt": OPENROUTER_VISION_SYSTEM_PROMPT,
+        "prompt": prompt,
+        "image_sha256": hashlib.sha256(image_bytes).hexdigest(),
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    }
+    cache_key = llm_cache_key(request_inputs)
+    cache = load_llm_cache()
+    if cache_key in cache:
+        return cache[cache_key]
+
     image_base64 = base64.b64encode(image_bytes).decode("ascii")
     response = requests.post(
         OPENROUTER_URL,
@@ -79,7 +154,7 @@ def call_openrouter_vision(
             "messages": [
                 {
                     "role": "system",
-                    "content": "You match rendered PDF pages to spans of OCR text. Return only valid JSON.",
+                    "content": OPENROUTER_VISION_SYSTEM_PROMPT,
                 },
                 {
                     "role": "user",
@@ -99,4 +174,7 @@ def call_openrouter_vision(
         },
         timeout=120,
     )
-    return extract_openrouter_text(response)
+    response_text = extract_openrouter_text(response)
+    cache[cache_key] = response_text
+    save_llm_cache(cache)
+    return response_text

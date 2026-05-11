@@ -12,8 +12,6 @@ from skunk.retrieval.nodes import *
 
 ContentType = Literal["text", "plot", "table"]
 
-DEFAULT_PDF_DIR = "data/officeqa/treasury_bulletin_pdfs"
-DEFAULT_OCR_TEXT_DIR = "data/officeqa/treasury_bulletins_parsed/transformed"
 SKUNK_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CACHE_DIR = os.path.join(SKUNK_DIR, "cache")
 DEFAULT_CACHE_PATH = os.path.join(DEFAULT_CACHE_DIR, "semantic_document_index.pckl")
@@ -21,8 +19,8 @@ DEFAULT_CACHE_PATH = os.path.join(DEFAULT_CACHE_DIR, "semantic_document_index.pc
 class SemanticDocumentIndex:
     def __init__(
         self,
-        pdf_dir: str = DEFAULT_PDF_DIR,
-        ocr_text_dir: str = DEFAULT_OCR_TEXT_DIR,
+        pdf_dir: str,
+        ocr_text_dir: str,
         render_binary: bool = True,
         render_zoom: float = 1.0,
         cache_path: str = DEFAULT_CACHE_PATH,
@@ -187,7 +185,7 @@ class SemanticDocumentIndex:
                 output.append(
                     (
                         f"{document_prefix}{page_branch}page {page.page_id} "
-                        f"[pdf={page.page_pdf_number}; doc={page.page_doc_number}]"
+                        f"[pdf={page.page_pdf_number}; doc={page.page_number}]"
                     )
                 )
                 if page_desc:
@@ -237,7 +235,7 @@ class SemanticDocumentIndex:
                         if node_title:
                             node_line = f"{node_line} [{node_title}]"
                         if node_desc:
-                            node_line = f"{node_line}: {node_desc}"
+                            node_line = f"{node_line}\n{document_prefix}{page_prefix}{group_prefix}|-- description: {node_desc}"
                         output.append(node_line)
 
         rendered = "\n".join(output)

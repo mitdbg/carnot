@@ -1,5 +1,9 @@
 from dataclasses import dataclass, field
 
+from .tools import call_openrouter, call_openrouter_vision, parse_json_response
+
+MAX_PAGE_PROMPT_CHARS = 4000
+
 
 @dataclass
 class PlotNode:
@@ -28,7 +32,7 @@ class TextNode:
 class PageNode:
     page_id: str
     page_pdf_number: int
-    page_doc_number: int
+    page_number: str
     text_nodes: list[TextNode] = field(default_factory=list)
     table_nodes: list[TableNode] = field(default_factory=list)
     plot_nodes: list[PlotNode] = field(default_factory=list)
@@ -41,43 +45,150 @@ class PageNode:
         page_raw: bytes,
         page_text: str,
         page_image: bytes,
-        page_num: str = "",
+        page_number: str = "",
     ):
         self.page_id = f"{document_id}_page:{page_pdf_number}"
         self.page_pdf_number = page_pdf_number
         self.page_image = page_image
-        self.page_num = page_num
-        if self.is_page_empty(page_text):
-            return None
-        self.page_doc_number = self.extract_page_number(page_text)
-        self.description = self.describe_text(page_text)
+        self.page_number = page_number
+        self.description = self.describe_text(page_image, page_text)
 
-        self.table_nodes = self.parse_tables(page_raw, page_text)
-        self.plot_nodes = self.parse_plots(page_raw, page_text)
-        self.text_nodes = self.parse_text_blocks(page_raw, page_text)
+        self.table_nodes = self.parse_tables(page_image, page_text)
+        self.plot_nodes = self.parse_plots(page_image, page_text)
+        self.text_nodes = self.parse_text_blocks(page_image, page_text)
 
-    def is_page_empty(self, text: str) -> bool:
-        # TODO implement a function that checks if the page is empty based on the OCR text or on an LLM analysis of the page content, to avoid creating page nodes for empty pages
-        return len(text.strip()) == 0
+    def describe_text(self, page_image: bytes, text: str) -> str:
+        if not text.strip():
+            return "Blank or image-only page with no readable OCR text."
 
-    def extract_page_number(self, text: str) -> int:
-        # TODO implement a function that extracts the page number from the OCR text, to be used as the page_doc_number for the page node
-        # This could be implemented with an LLM that looks at the OCR text and extracts a page number if present, or returns None if no page number is found
-        return -1
+        prompt = f"""
+Write a concise semantic index description for this page.
 
-    def describe_text(self, text: str) -> str:
-        # TODO implement a function that generates a concise description of the page content based on the OCR text, to be used as the page node description
-        # This could be implemented with an LLM that takes the OCR text and generates a short summary or description of the page content
-        return ""
+Rules:
+- Return exactly one sentence.
+- Maximum 180 characters.
+- Describe the page's subject matter and the kinds of information it contains.
+- Do not include labels, quotes, markdown, or explanation.
+- Do not mention OCR or that you are reading extracted text.
+
+Page text:
+{text[:MAX_PAGE_PROMPT_CHARS]}
+""".strip()
+
+        return call_openrouter(prompt)
 
     def parse_text_blocks(self, page: bytes, page_text: str) -> list[TextNode]:
-        # TODO implement a function that parses the OCR text of the page and extracts text blocks to create TextNode objects, with the text_id being a combination of the page_id and a block index, the text being the block text, and the description being a concise summary of the block content
-        return []
+        if not page_text.strip():
+            return []
+
+        prompt = f"""
+Split this page text into semantic text blocks for retrieval.
+
+Rules:
+- Return only valid JSON.
+- Do not include markdown or explanation.
+- Exclude tables, chart data, page numbers, repeated headers, and repeated footers when they are identifiable.
+- Preserve the original wording of each text block.
+- Keep each description to one concise sentence.
+- If there are no narrative text blocks, return an empty "text_blocks" list.
+
+JSON shape:
+{{
+  "text_blocks": [
+    {{    
+      "text": "verbatim text block from the page",
+      "description": "concise semantic description of the block"
+    }}
+  ]
+}}
+
+Page text:
+{page_text[:MAX_PAGE_PROMPT_CHARS]}
+""".strip()
+
+        parsed = parse_json_response(call_openrouter(prompt))
+        return [
+            TextNode(
+                text_id=f"{self.page_id}_text:{block_idx}",
+                text=block.get("text", ""),
+                description=block.get("description", ""),
+            )
+            for block_idx, block in enumerate(parsed.get("text_blocks", []))
+            if block.get("text", "").strip()
+        ]
 
     def parse_tables(self, page: bytes, page_text: str) -> list[TableNode]:
-        # TODO implement a function that parses the OCR text of the page and extracts tables to create TableNode objects, with the table_id being a combination of the page_id and a table index, the table_data being a string representation of the table content (e.g. in CSV format), and the description being a concise summary of the table content
-        return []
+        prompt = f"""
+Analyze this rendered PDF page and its extracted page text. Extract any tables visible on the page.
+
+Rules:
+- Return only valid JSON.
+- Do not include markdown or explanation.
+- Include only real tables, not paragraphs, headings, or chart labels.
+- Store table_data as CSV text when possible.
+- Keep each description to one concise sentence.
+- If there are no tables, return an empty "tables" list.
+
+JSON shape:
+{{
+  "tables": [
+    {{
+      "table_title": "visible title or concise invented title",
+      "table_data": "CSV representation of the table",
+      "description": "concise semantic description of the table"
+    }}
+  ]
+}}
+
+Page text:
+{page_text[:MAX_PAGE_PROMPT_CHARS]}
+""".strip()
+
+        parsed = parse_json_response(call_openrouter_vision(prompt, page))
+        return [
+            TableNode(
+                table_id=f"{self.page_id}_table:{table_idx}",
+                table_title=table.get("table_title", ""),
+                table_data=table.get("table_data", ""),
+                description=table.get("description", ""),
+            )
+            for table_idx, table in enumerate(parsed.get("tables", []))
+            if table.get("table_data", "").strip()
+        ]
 
     def parse_plots(self, page: bytes, page_text: str) -> list[PlotNode]:
-        # TODO implement a function that analyzes the raw PDF page content and extracts plots to create PlotNode objects, with the plot_id being a combination of the page_id and a plot index, the plot_data being a bytes representation of the plot image (e.g. in PNG format), and the description being a concise summary of the plot content
-        return []
+        prompt = f"""
+Analyze this rendered PDF page and its extracted page text. Identify any plots, charts, graphs, or figure visualizations visible on the page.
+
+Rules:
+- Return only valid JSON.
+- Do not include markdown or explanation.
+- Include only plots, charts, graphs, or figure visualizations, not tables or decorative images.
+- Keep each description to one concise sentence.
+- If there are no plots, return an empty "plots" list.
+
+JSON shape:
+{{
+  "plots": [
+    {{
+      "plot_title": "visible title or concise invented title",
+      "description": "concise semantic description of the plot"
+    }}
+  ]
+}}
+
+Page text:
+{page_text[:MAX_PAGE_PROMPT_CHARS]}
+""".strip()
+
+        parsed = parse_json_response(call_openrouter_vision(prompt, page))
+        return [
+            PlotNode(
+                plot_id=f"{self.page_id}_plot:{plot_idx}",
+                plot_title=plot.get("plot_title", ""),
+                plot_data=page,
+                description=plot.get("description", ""),
+            )
+            for plot_idx, plot in enumerate(parsed.get("plots", []))
+            if plot.get("plot_title", "").strip() or plot.get("description", "").strip()
+        ]

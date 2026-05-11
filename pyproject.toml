@@ -34,6 +34,7 @@ dependencies = [
     "setuptools>=70.1.1",
     "smolagents[toolkit]>=1.21.3",
     "tiktoken>=0.8.0",
+    "untruncate-json>=1.1.0",
 ]
 classifiers=[
     "Development Status :: 4 - Beta",  # Change as appropriate
