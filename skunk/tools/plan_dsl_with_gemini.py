@@ -29,10 +29,6 @@ OUT_CSV = REPO_ROOT / "data" / "dsl_planning_pass.csv"
 
 SMOKE_UIDS = ["UID0001", "UID0004", "UID0029", "UID0030", "UID0035", "UID0055", "UID0010"]
 
-VALID_OPS = {"retrieve", "extract", "read_visual", "lookup_external", "compute"}
-HEAD_OPS = {"retrieve", "lookup_external"}
-TAIL_OP = "compute"
-
 
 def _load_env(path: Path) -> None:
     if not path.exists():
@@ -52,7 +48,16 @@ _load_env(ENV_PATH)
 # ─────────────────────────────────────────────────────────────────────────────
 
 DSL_SPEC = """\
-DSL — exactly 5 operators. Compose left-to-right with `-->`. Parallel branches: `[c1 ; c2 ; ...] --> next_op`.
+DSL — 4 operators, flat plan shape. Compose left-to-right with `-->`.
+
+PLAN SHAPE — every plan is one of:
+  retrieve(concept='...', period='...'[, source_bulletin='...']) --> extract([visual_only=True]) --> compute()
+  lookup_external(nl='...') --> compute()
+  [ branch_1 ; branch_2 ; ... ] --> compute()
+
+Each branch in a parallel is itself either `retrieve(...) --> extract(...)` or `lookup_external(...)`.
+compute() is always the implicit terminator, always takes no args.
+NO nested parallels, NO chains that skip extract after retrieve, NO compute anywhere except at the end.
 
 QUOTING RULE — IMPORTANT
   All string argument values use SINGLE quotes ('...'), NEVER double quotes.
@@ -60,52 +65,40 @@ QUOTING RULE — IMPORTANT
   Example: retrieve(concept='national_defense', period='CY1940')
 
 TYPES
-  DocHandle         — list of pages (file_path, year, month, page).
-  TypedValue        — value + dtype + unit + desc; for extract output, dtype='named' and value is a dict.
+  DocHandle         — list of pages (file_path, month, page).
+  TypedValue        — keyed dict of values + per-entry meta (unit, quote, dims).
   FormattedString   — final answer text (only compute returns this).
 
 OPERATORS
 
-retrieve(concept, period, source_bulletin?) → DocHandle    [chain head only]
+retrieve(concept, period, source_bulletin?) → DocHandle
   concept:         str               domain tag(s) the page must report on
   period:          period string     CY1940, FY1981, Q3-1982, 1940-09, 2025-03-31, CY1940..CY1949, or comma-list
   source_bulletin: 'YYYY-MM'         optional; pin to one issue when the question explicitly names a bulletin
 
-extract() → TypedValue
-  No args. Reads ctx.question + the page text and returns a TypedValue with dtype='named' whose
-  .value is a dict mapping snake_case names to scalars/lists/tables relevant to the question.
-  The agent decides what's worth extracting; do NOT specify a 'concept' or 'mode'.
+extract(visual_only?) → TypedValue
+  visual_only: bool (optional, default False). Set True for charts/figures.
+  Returns a keyed dict of values relevant to the question; the agent decides what to extract.
 
-read_visual() → TypedValue
-  No args. Same output shape as extract, but always uses vision (for charts/figures).
-
-lookup_external(nl) → TypedValue                           [chain head capable]
+lookup_external(nl) → TypedValue
   nl: str   natural-language description of the external data to look up
             (FX rate, CPI, event year, named entity, etc.).
 
-compute() → FormattedString                                [chain terminator]
-  No args. Receives ctx.question + the upstream extracted/looked-up values, plans the
-  computation, generates Python, runs it, and a verifier LLM checks the output's format/unit
-  matches what the question asks for. Returns the answer as a string. Fails with StepFailed if
-  values are missing or all attempts fail.
+compute() → FormattedString
+  No args. Receives ctx.question + upstream values, plans the computation, generates Python,
+  runs it, and a verifier LLM checks the output's format/unit. Returns the answer string.
 
 PERIOD GRAMMAR
   Point:        CY1940, FY1981, Q3-1982, 1940-09, 2025-03-31
   Range:        CY1940..CY1949
   Enumeration:  1991-06,1996-06,2001-06
 
-COMPOSITION RULES
-  Chain head MUST be retrieve or lookup_external.
-  Chain tail MUST be compute (it produces the final answer string).
-  In `a --> b`: output_type(a) ∈ accepted_inputs(b).
-  In `[c1; c2; ...] --> next`: every c_i ends in the same type; next accepts list[that_type].
-
-Valid ops: retrieve, extract, read_visual, lookup_external, compute. No others.
+Valid ops: retrieve, extract, lookup_external, compute. No others.
 """
 
 FEW_SHOT = """\
 EXAMPLES — match this style precisely. Note SINGLE quotes around all string values.
-extract() and compute() take NO arguments. compute is always the chain terminator.
+extract() and compute() take NO mandatory arguments. compute is always the implicit chain terminator.
 
 UID0001 — Total US national defense expenditures for CY1940
   retrieve(concept='national_defense_expenditure', period='CY1940')
@@ -126,7 +119,7 @@ UID0029 — Bulletin published in June 1970, average yield spread CY1960-69
 
 UID0030 — Local maxima on line plots, page 5 of Sept 1990 bulletin
   retrieve(concept='line_plots_on_page', period='1990-09', source_bulletin='1990-09')
-    --> read_visual()
+    --> extract(visual_only=True)
     --> compute()
 
 UID0035 — Benford first-digit count on a whole table
@@ -142,15 +135,12 @@ UID0010 — USD->JPY conversion of Treasury investment as of 2025-03-31
   ]
     --> compute()
 
-UID0055 — WWII end to Korean War start: change in Moody Aaa yield
+UID0055 — Year WWII ended and year Korean War started (parallel external lookups)
   [
     lookup_external(nl='year WWII ended');
     lookup_external(nl='year Korean War started')
   ]
-    --> retrieve(concept='moody_aaa_corporate_bond_yield', period='prev')
-    --> extract()
     --> compute()
-NOTE: period='prev' means the period is bound from the previous step's value at execution time.
 """
 
 PLANNER_SYSTEM = (
@@ -166,14 +156,30 @@ PLANNER_SYSTEM = (
 # ─────────────────────────────────────────────────────────────────────────────
 
 _gemini_client = None
+_gemini_model: str = "gemini-2.5-flash"
 
 
 def plan_via_gemini(question: str, repair_context: str | None = None) -> str:
     """Direct google.genai call. Plain-text plan output, no JSON wrapping."""
-    global _gemini_client
+    global _gemini_client, _gemini_model
     if _gemini_client is None:
+        import sys  # noqa: PLC0415
+        sys.path.insert(0, str(REPO_ROOT / "src"))
+        from skunk.config import SkunkConfig  # noqa: PLC0415
         from google import genai  # noqa: PLC0415
-        _gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        cfg = SkunkConfig.from_env()
+        _gemini_model = cfg.gemini_model
+        if cfg.use_vertex:
+            project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+            if not project:
+                raise RuntimeError("GOOGLE_CLOUD_PROJECT not set (required for Vertex AI)")
+            _gemini_client = genai.Client(
+                vertexai=True,
+                project=project,
+                location=os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"),
+            )
+        else:
+            _gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     from google.genai import types  # noqa: PLC0415
 
@@ -182,7 +188,7 @@ def plan_via_gemini(question: str, repair_context: str | None = None) -> str:
         user += "\n\n" + repair_context
 
     resp = _gemini_client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=_gemini_model,
         contents=user,
         config=types.GenerateContentConfig(
             system_instruction=PLANNER_SYSTEM,
@@ -216,7 +222,7 @@ def plan_with_retry(question: str, max_attempts: int = 3) -> tuple[str, dict]:
                     "  • all `[`/`]` and `(`/`)` MUST be balanced\n"
                     "  • single-quoted strings only — never triple-quotes (`'''`) or double-quotes\n"
                     "  • the OUTER chain MUST start with `retrieve(...)` or `lookup_external(...)` and end with `compute()`\n"
-                    "  • only the 5 ops: retrieve, extract, read_visual, lookup_external, compute"
+                    "  • only the 4 ops: retrieve, extract, lookup_external, compute"
                 )
                 plan = plan_via_gemini(question, repair_context=repair)
         except Exception as e:
@@ -231,139 +237,50 @@ def plan_with_retry(question: str, max_attempts: int = 3) -> tuple[str, dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DSL parser & validator (lightweight — for grammar checks only)
+# Plan analysis — uses the real dsl.parse() / dsl.validate()
 # ─────────────────────────────────────────────────────────────────────────────
-
-OP_NAME_RE = re.compile(r"\b([a-z_][a-z_0-9]*)\s*\(")
-
-
-def _strip_string_literals(text: str) -> str:
-    """Replace contents of '...' / \"...\" with spaces.
-
-    Prevents Python builtins inside compute(code='result = sum(...)') from
-    being misidentified as DSL ops by OP_NAME_RE.
-    """
-    out: list[str] = []
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if ch in ('"', "'"):
-            quote = ch
-            out.append(quote)
-            i += 1
-            while i < len(text) and text[i] != quote:
-                if text[i] == "\\" and i + 1 < len(text):
-                    out.append(" "); out.append(" "); i += 2
-                else:
-                    out.append(" "); i += 1
-            if i < len(text):
-                out.append(quote); i += 1
-        else:
-            out.append(ch); i += 1
-    return "".join(out)
-
-
-def _strip_for_parse(text: str) -> str:
-    text = re.sub(r"#.*", "", text)
-    text = re.sub(r"\bNOTE:.*$", "", text, flags=re.MULTILINE)
-    return text.strip()
-
-
-def _balanced(text: str, open_ch: str, close_ch: str) -> bool:
-    depth = 0
-    for ch in text:
-        if ch == open_ch:
-            depth += 1
-        elif ch == close_ch:
-            depth -= 1
-            if depth < 0:
-                return False
-    return depth == 0
-
-
-def _outer_chain_head(text: str) -> str | None:
-    s = text.lstrip()
-    while s.startswith("["):
-        s = s[1:].lstrip()
-    m = OP_NAME_RE.match(s)
-    return m.group(1) if m else None
-
-
-def _outer_chain_tail(text: str) -> str | None:
-    depth_b = depth_p = 0
-    last_arrow_end = 0
-    i = 0
-    while i < len(text):
-        ch = text[i]
-        if ch == "[":
-            depth_b += 1
-        elif ch == "]":
-            depth_b -= 1
-        elif ch == "(":
-            depth_p += 1
-        elif ch == ")":
-            depth_p -= 1
-        elif depth_b == 0 and depth_p == 0 and text[i:i+3] == "-->":
-            last_arrow_end = i + 3
-            i += 3
-            continue
-        i += 1
-    s = text[last_arrow_end:].lstrip()
-    while s.startswith("["):
-        depth = 1
-        j = 1
-        while j < len(s) and depth > 0:
-            if s[j] == "[":
-                depth += 1
-            elif s[j] == "]":
-                depth -= 1
-            j += 1
-        inner = s[1:j-1]
-        d = 0
-        last_semi = -1
-        for k, c in enumerate(inner):
-            if c == "[":
-                d += 1
-            elif c == "]":
-                d -= 1
-            elif c == ";" and d == 0:
-                last_semi = k
-        s = (inner[last_semi+1:] if last_semi >= 0 else inner).lstrip()
-    m = OP_NAME_RE.match(s)
-    return m.group(1) if m else None
 
 
 def analyze_plan(text: str) -> dict:
+    """Return a dict summarising whether the plan parses and validates."""
     if not isinstance(text, str) or not text.strip():
         return {"parse_ok": False, "validate_ok": False, "ops": [],
                 "head": None, "tail": None, "problems": ["empty_plan"]}
 
-    cleaned = _strip_for_parse(text)
-    op_scan = _strip_string_literals(cleaned)
-    problems: list[str] = []
+    # Import lazily so the tool can run from anywhere with the package installed.
+    import sys
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    from skunk.dsl import LookupBranch, ParseError, RetrieveBranch, parse, validate
 
-    if not _balanced(cleaned, "[", "]"):
-        problems.append("unbalanced_brackets")
-    if not _balanced(cleaned, "(", ")"):
-        problems.append("unbalanced_parens")
+    try:
+        plan = parse(text)
+    except ParseError as e:
+        return {"parse_ok": False, "validate_ok": False, "ops": [],
+                "head": None, "tail": None, "problems": [f"parse_error:{e}"]}
 
-    ops = OP_NAME_RE.findall(op_scan)
-    for op in ops:
-        if op not in VALID_OPS:
-            problems.append(f"invalid_op:{op}")
+    v = validate(plan)
+    ops: list[str] = []
+    for b in plan.branches:
+        if isinstance(b, RetrieveBranch):
+            ops.extend(["retrieve", "extract"])
+        elif isinstance(b, LookupBranch):
+            ops.append("lookup_external")
+    ops.append("compute")
 
-    head = _outer_chain_head(op_scan) if not problems else None
-    tail = _outer_chain_tail(op_scan) if not problems else None
+    # head/tail are now structural facts; report them for back-compat with the CSV.
+    head = "retrieve" if plan.branches and isinstance(plan.branches[0], RetrieveBranch) \
+        else "lookup_external" if plan.branches else None
+    tail = "compute"
 
-    if head is not None and head not in HEAD_OPS:
-        problems.append(f"head_not_retrieve_or_lookup_external:{head}")
-    if tail is not None and tail != TAIL_OP:
-        problems.append(f"tail_not_compute:{tail}")
-
-    parse_ok = "unbalanced_brackets" not in problems and "unbalanced_parens" not in problems
-    validate_ok = parse_ok and not problems
-    return {"parse_ok": parse_ok, "validate_ok": validate_ok,
-            "ops": ops, "head": head, "tail": tail, "problems": problems}
+    problems = [f"validate:{e}" for e in v.errors]
+    return {
+        "parse_ok": True,
+        "validate_ok": v.ok,
+        "ops": ops,
+        "head": head,
+        "tail": tail,
+        "problems": problems,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

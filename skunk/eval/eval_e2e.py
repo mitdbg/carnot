@@ -44,7 +44,7 @@ the events to stdout during the run.
 
 Gemini transient failures
 -------------------------
-`call_gemini` (src/skunk/subagents/base.py) retries 429/5xx errors with a
+`LLMClient` (src/skunk/common/llm.py) retries 429/5xx errors with a
 fixed delay. Tune via env: `SKUNK_GEMINI_RETRY_DELAY` (default 30s),
 `SKUNK_GEMINI_MAX_RETRIES` (default 5). After exhaustion the step fails
 cleanly and the trace records the final exception.
@@ -76,7 +76,8 @@ def _load_env(path: Path) -> None:
 _load_env(REPO_ROOT / ".env")
 
 from eval.golden import load_golden  # noqa: E402
-from skunk.run import DEFAULT_PLAN_CSV, SMOKE_UIDS, load_plan_cache, run_question  # noqa: E402
+from skunk.config import SkunkConfig  # noqa: E402
+from skunk.run import SMOKE_UIDS, load_plan_cache, run_question  # noqa: E402
 
 REPORT_FIELDS = ["uid", "question", "predicted", "gold_answer", "failed", "reason", "n_steps"]
 
@@ -93,8 +94,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="End-to-end OfficeQA eval (smoke by default)")
     parser.add_argument("--csv", required=True, help="Path to officeqa_pro.csv")
     parser.add_argument("--report", required=True, help="Output CSV report path")
-    parser.add_argument("--plan-csv", default=DEFAULT_PLAN_CSV, help="Plan cache CSV (default: %(default)s)")
-    parser.add_argument("--cache-dir", default="cache", help="Cache directory for per-page OCR text and PNG renders")
+    parser.add_argument("--plan-cache-csv", default=SkunkConfig.from_env().plan_cache_csv,
+                        help="Plan cache CSV (default: %(default)s)")
     parser.add_argument("--all", action="store_true", help="Run every UID in --csv (default: smoke set only)")
     parser.add_argument("--uids", help="Comma-separated UIDs (overrides --smoke / --all)")
     parser.add_argument("--golden", action="store_true",
@@ -112,9 +113,9 @@ def main() -> None:
     print(f"[e2e] Running {len(uids)} UID(s){' (smoke)' if not args.all else ''}")
 
     golden_lookup = load_golden(args.csv) if args.golden else None
-    plan_cache = load_plan_cache(args.plan_csv)
+    plan_cache = load_plan_cache(args.plan_cache_csv)
     if not plan_cache:
-        print(f"[e2e] WARNING: plan cache {args.plan_csv!r} is empty or missing — "
+        print(f"[e2e] WARNING: plan cache {args.plan_cache_csv!r} is empty or missing — "
               f"will fall back to live LLM planner per question", file=sys.stderr)
 
     rows: list[dict] = []
@@ -146,13 +147,11 @@ def main() -> None:
         try:
             result = run_question(
                 question=question,
-                manifest_path=None,
-                cache_dir=args.cache_dir,
                 verbose=args.verbose,
                 golden_pages=golden_pages,
                 cached_plan_text=cached_plan_text,
                 uid=uid,
-                plan_csv=args.plan_csv,
+                plan_cache_csv=args.plan_cache_csv,
                 trace_path=trace_path,
             )
         except Exception as e:

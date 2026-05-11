@@ -1,4 +1,13 @@
-"""Orchestrator — walks the DSL AST, dispatches per-op subagent functions."""
+"""Orchestrator — walks a flat Plan, dispatches per-op subagent functions.
+
+Subagents keep their `(op: OpNode, prev, ctx)` interface; the orchestrator
+translates Branch → OpNode at dispatch time. OpNode is just a dispatch
+envelope, not an AST node.
+
+On a MissingData exception from compute, the orchestrator runs one recovery
+round: it calls plan_recovery() for a supplemental Branch, executes that
+branch, and retries compute with the augmented prev.
+"""
 
 from __future__ import annotations
 
@@ -8,11 +17,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from skunk.common.context import HarnessContext
-from skunk.dsl import ChainNode, DocHandle, FormattedString, OpNode, ParallelNode, TypedValue
+from skunk.dsl import (
+    Branch,
+    DocHandle,
+    FormattedString,
+    LookupBranch,
+    OpNode,
+    Plan,
+    RetrieveBranch,
+    TypedValue,
+)
 from skunk.subagents import SUBAGENT_REGISTRY
-from skunk.subagents.base import StepFailed
-
-_MAX_WORKERS = 4
+from skunk.subagents.base import MissingData, StepFailed
 
 
 @dataclass
@@ -51,18 +67,13 @@ class QuestionTrace:
         return "\n".join(lines)
 
 
-def execute(chain: ChainNode, ctx: HarnessContext) -> QuestionTrace:
+def execute(plan: Plan, ctx: HarnessContext) -> QuestionTrace:
+    """Walk the plan: data phase (branches in parallel or single) → compute (with recovery)."""
     trace = QuestionTrace(question=ctx.question)
     try:
-        result = _execute_chain(chain, prev=None, ctx=ctx, trace=trace)
-        if isinstance(result, FormattedString):
-            trace.answer = result.text
-        elif isinstance(result, TypedValue):
-            trace.answer = str(result.value)
-        elif isinstance(result, DocHandle):
-            trace.answer = result.desc
-        else:
-            trace.answer = str(result)
+        prev = _run_data_phase(plan.branches, ctx, trace)
+        result = _run_compute_with_recovery(prev, plan, ctx, trace)
+        trace.answer = result.text
     except StepFailed as e:
         trace.failed = True
         trace.failure_reason = str(e)
@@ -72,16 +83,81 @@ def execute(chain: ChainNode, ctx: HarnessContext) -> QuestionTrace:
     return trace
 
 
-def _execute_chain(chain: ChainNode, prev: Any, ctx: HarnessContext, trace: QuestionTrace) -> Any:
-    current = prev
-    for step in chain.steps:
-        if isinstance(step, OpNode):
-            current = _run_op(step, current, ctx, trace)
-        elif isinstance(step, ParallelNode):
-            current = _run_parallel(step, current, ctx, trace)
-        else:
-            raise ValueError(f"Unknown step type: {type(step).__name__}")
-    return current
+def _run_data_phase(branches: list[Branch], ctx: HarnessContext, trace: QuestionTrace) -> Any:
+    if not branches:
+        raise StepFailed("orchestrator", "plan has no branches")
+    if len(branches) == 1:
+        return _run_branch(branches[0], ctx, trace)
+    return _run_parallel(branches, ctx, trace)
+
+
+def _run_branch(branch: Branch, ctx: HarnessContext, trace: QuestionTrace) -> TypedValue:
+    """Execute a single branch and return its TypedValue."""
+    if isinstance(branch, RetrieveBranch):
+        ret_args: dict[str, Any] = {"concept": branch.concept, "period": branch.period}
+        if branch.source_bulletin:
+            ret_args["source_bulletin"] = branch.source_bulletin
+        doc = _run_op(OpNode(op="retrieve", args=ret_args), None, ctx, trace)
+        ext_args: dict[str, Any] = {"visual_only": True} if branch.visual_only else {}
+        return _run_op(OpNode(op="extract", args=ext_args), doc, ctx, trace)
+    if isinstance(branch, LookupBranch):
+        return _run_op(OpNode(op="lookup_external", args={"nl": branch.nl}), None, ctx, trace)
+    raise TypeError(f"Unknown branch type: {type(branch).__name__}")
+
+
+def _run_parallel(branches: list[Branch], ctx: HarnessContext, trace: QuestionTrace) -> list[TypedValue]:
+    """Best-effort: drop failed branches, return survivors in original order.
+
+    Only re-raises if every branch failed; then the first error propagates.
+    Downstream compute() decides whether the survivors are sufficient (and may
+    raise MissingData to trigger the orchestrator's recovery path).
+    """
+    results: list[Any] = [None] * len(branches)
+    errors: list[tuple[int, StepFailed]] = []
+    with ThreadPoolExecutor(max_workers=ctx.config.max_parallel_workers) as pool:
+        futures = {pool.submit(_run_branch, b, ctx, trace): i for i, b in enumerate(branches)}
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                results[i] = future.result()
+            except StepFailed as e:
+                errors.append((i, e))
+    for i, e in errors:
+        ctx.emit("orchestrator", "parallel branch failed", branch_idx=i, error=str(e))
+    if len(errors) == len(branches):
+        raise errors[0][1]
+    return [r for r in results if r is not None]
+
+
+def _run_compute_with_recovery(
+    prev: Any, plan: Plan, ctx: HarnessContext, trace: QuestionTrace
+) -> FormattedString:
+    """Run compute(); if it reports MissingData, run one recovery branch and retry once."""
+    compute_op = OpNode(op="compute", args={})
+    try:
+        return _run_op(compute_op, prev, ctx, trace)
+    except MissingData as e:
+        ctx.emit("orchestrator", "compute reported MISSING; attempting recovery", reason=e.reason)
+        from skunk.planner import plan_recovery
+        try:
+            extra = plan_recovery(ctx.question, plan, e.reason, ctx)
+        except Exception as planner_err:
+            raise StepFailed(
+                "compute",
+                f"missing data and recovery planner failed: {e.reason}; planner: {planner_err}",
+            ) from planner_err
+        if extra is None:
+            raise StepFailed("compute", f"missing data and recovery declined: {e.reason}")
+
+        ctx.emit("orchestrator", "running recovery branch", branch=repr(extra))
+        extra_value = _run_branch(extra, ctx, trace)
+        augmented = list(prev) if isinstance(prev, list) else [prev]
+        augmented.append(extra_value)
+
+        try:
+            return _run_op(compute_op, augmented, ctx, trace)
+        except MissingData as e2:
+            raise StepFailed("compute", f"still missing after recovery: {e2.reason}") from e2
 
 
 def _run_op(op: OpNode, prev: Any, ctx: HarnessContext, trace: QuestionTrace) -> Any:
@@ -92,52 +168,27 @@ def _run_op(op: OpNode, prev: Any, ctx: HarnessContext, trace: QuestionTrace) ->
     step_idx = len(trace.steps) + 1
     input_desc = _describe_value(prev)
     input_full = _full_repr(prev)
-    ctx.events.append({"source": "_step", "message": "begin", "step_idx": step_idx, "op": op.op})
-    if ctx.verbose:
-        print(f"\n[step {step_idx} | {op.op}] args={op.args}")
-        print(f"  in:  {input_desc}")
+    ctx.emit("_step", "begin", step_idx=step_idx, op=op.op, args=op.args, input=input_desc)
 
     t0 = time.perf_counter()
     try:
         result = fn(op, prev, ctx)
-    except StepFailed as e:
+    except (StepFailed, MissingData) as e:
         elapsed = time.perf_counter() - t0
-        if ctx.verbose:
-            print(f"  ERROR: {e} ({elapsed:.2f}s)")
+        err_str = f"MissingData: {e.reason}" if isinstance(e, MissingData) else str(e)
+        ctx.emit("_step", "error", step_idx=step_idx, error=err_str, elapsed_s=round(elapsed, 2))
         trace.steps.append(StepTrace(op=op.op, args=op.args, input_desc=input_desc,
-                                     output_desc="(failed)", elapsed_s=elapsed, error=str(e),
+                                     output_desc="(failed)", elapsed_s=elapsed, error=err_str,
                                      input_full=input_full, output_full="(failed)", step_idx=step_idx))
         raise
     elapsed = time.perf_counter() - t0
     output_desc = _describe_value(result)
     output_full = _full_repr(result)
-    if ctx.verbose:
-        print(f"  out: {output_desc} ({elapsed:.2f}s)")
+    ctx.emit("_step", "done", step_idx=step_idx, output=output_desc, elapsed_s=round(elapsed, 2))
     trace.steps.append(StepTrace(op=op.op, args=op.args, input_desc=input_desc,
                                  output_desc=output_desc, elapsed_s=elapsed,
                                  input_full=input_full, output_full=output_full, step_idx=step_idx))
     return result
-
-
-def _run_parallel(node: ParallelNode, prev: Any, ctx: HarnessContext, trace: QuestionTrace) -> list[Any]:
-    results: list[Any] = [None] * len(node.branches)
-    errors: list[tuple[int, StepFailed]] = []
-    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
-        futures = {pool.submit(_execute_chain, branch, prev, ctx, trace): i
-                   for i, branch in enumerate(node.branches)}
-        for future in as_completed(futures):
-            i = futures[future]
-            try:
-                results[i] = future.result()
-            except StepFailed as e:
-                errors.append((i, e))
-    if errors:
-        # Surface every branch failure to the trace so triage can see all of them,
-        # then re-raise the first one (preserves existing single-error semantics for callers).
-        for i, e in errors:
-            ctx.emit("orchestrator", "parallel branch failed", branch_idx=i, error=str(e))
-        raise errors[0][1]
-    return results
 
 
 def _describe_value(v: Any) -> str:
@@ -146,12 +197,8 @@ def _describe_value(v: Any) -> str:
     if isinstance(v, DocHandle):
         return f"DocHandle({len(v.refs)} refs): {v.desc}"
     if isinstance(v, TypedValue):
-        if v.dtype == "named" and isinstance(v.value, dict):
-            keys = list(v.value.keys())
-            return f"TypedValue(named, {len(keys)} keys={keys}) — {v.desc}"
-        raw = repr(v.value)
-        truncated = raw[:100] + ("..." if len(raw) > 100 else "")
-        return f"TypedValue({v.dtype}): {truncated} — {v.desc}"
+        keys = list(v.value.keys())
+        return f"TypedValue({len(keys)} keys={keys}) — {v.desc}"
     if isinstance(v, FormattedString):
         return f"FormattedString: {v.text!r}"
     if isinstance(v, list):
@@ -161,17 +208,16 @@ def _describe_value(v: Any) -> str:
 
 
 def _full_repr(v: Any) -> str:
-    """Untruncated repr for trace dumps. Mirrors _describe_value but keeps full payloads."""
+    """Untruncated repr for trace dumps."""
     if v is None:
         return "(none)"
     if isinstance(v, DocHandle):
         refs = "\n    ".join(repr(r) for r in v.refs)
         return f"DocHandle(desc={v.desc!r}, {len(v.refs)} refs):\n    {refs}" if v.refs else f"DocHandle(empty, desc={v.desc!r})"
     if isinstance(v, TypedValue):
-        meta_part = f", meta={v.meta!r}" if v.meta else ""
-        return f"TypedValue(dtype={v.dtype!r}, unit={v.unit!r}, desc={v.desc!r}, value={v.value!r}{meta_part})"
+        return f"TypedValue(desc={v.desc!r}, value={v.value!r}, meta={v.meta!r})"
     if isinstance(v, FormattedString):
-        return f"FormattedString(text={v.text!r}, desc={v.desc!r})"
+        return f"FormattedString(text={v.text!r})"
     if isinstance(v, list):
         parts = [f"  [{i}] {_full_repr(x)}" for i, x in enumerate(v)]
         return "list:\n" + "\n".join(parts)

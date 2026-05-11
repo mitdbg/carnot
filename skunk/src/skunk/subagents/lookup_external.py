@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from skunk.common.context import HarnessContext
-from skunk.dsl import OpNode, TypedValue
-from skunk.subagents.base import StepFailed, call_gemini, parse_llm_value
+from skunk.dsl import NamedEntry, OpNode, TypedValue
+from skunk.subagents.base import StepFailed, parse_llm_value
 
 _SYSTEM = """\
 You are a precise data assistant with knowledge of economic indicators, historical FX rates,
@@ -42,17 +42,14 @@ def run(op: OpNode, prev: None, ctx: HarnessContext) -> TypedValue:
     nl = op.args.get("nl", "")
     if not nl:
         raise StepFailed("lookup_external", "Missing 'nl' arg")
-    if ctx.cache_only:
-        raise StepFailed("lookup_external", "cache_only mode: live external calls disabled")
-
     ctx.emit("lookup_external", "calling gemini", nl=nl)
-    raw = call_gemini(_SYSTEM, nl)
+    raw = ctx.llm_client.call(_SYSTEM, nl)
     ctx.emit("lookup_external", "gemini response", raw=raw[:500])
 
     try:
-        value, dtype, unit = parse_llm_value(raw)
+        value, unit = parse_llm_value(raw)
     except ValueError as e:
         raise StepFailed("lookup_external", f"Cannot parse LLM response: {e}\nRaw: {raw[:200]}") from e
 
-    ctx.emit("lookup_external", "parsed", value=repr(value)[:200], dtype=dtype, unit=unit)
-    return TypedValue(value=value, dtype=dtype, unit=unit, desc=nl)
+    ctx.emit("lookup_external", "parsed", value=repr(value)[:200], unit=unit)
+    return TypedValue(value={"": value}, meta={"": NamedEntry(unit=unit)}, desc=nl)

@@ -1,6 +1,6 @@
 # skunk — OfficeQA pipeline
 
-A declarative QA pipeline over the U.S. Treasury Bulletin corpus. Questions are decomposed into 5-operator DSL plans; an orchestrator walks the plan and dispatches subagents that retrieve specific PDF pages, extract values, look up external facts, and produce the final answer via a sandboxed-Python compute terminator with an LLM-based output-format verifier.
+A declarative QA pipeline over the U.S. Treasury Bulletin corpus. Questions are decomposed into 4-operator DSL plans; an orchestrator walks the plan and dispatches subagents that retrieve specific PDF pages, extract values, look up external facts, and produce the final answer via a sandboxed-Python compute terminator with an LLM-based output-format verifier.
 
 ## Quick start
 
@@ -27,9 +27,9 @@ python tools/plan_dsl_with_gemini.py --smoke   # generate plans for 7 sample que
 
 ## Status
 
-The 5-op DSL is finalized. All five subagents are implemented:
+The 4-op DSL is finalized. All four subagents are implemented:
 - `retrieve` short-circuits on golden page injection (full corpus index is future work);
-- `extract` and `read_visual` emit a question-driven dict of named typed values via JSON-backed Tier 1, PyMuPDF Tier 2, and vision Tier 3;
+- `extract` emits a question-driven dict of named entries (each a `scalar`, `vector`, or `table` — no nesting beyond those shapes) via JSON-backed Tier 1, PyMuPDF Tier 2, and vision Tier 3; pass `visual_only=True` to go straight to vision for charts/figures;
 - `lookup_external` does a single Gemini call for facts (numeric, dates, named entities);
 - `compute` terminates the chain with plan→code→exec→verify.
 

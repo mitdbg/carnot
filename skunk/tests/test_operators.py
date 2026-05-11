@@ -1,4 +1,4 @@
-"""Integration tests for lookup_external, compute, read_visual, and extract operators.
+"""Integration tests for lookup_external, compute, and extract operators.
 
 Each test makes real LLM calls (no mocks). Tests assert on the *shape* of the
 output (right type, plausible numeric magnitude) rather than exact values, since
@@ -28,7 +28,6 @@ def _rel_err(got, expected):
 import skunk.subagents.compute as compute  # noqa: E402
 import skunk.subagents.extract as extract  # noqa: E402
 import skunk.subagents.lookup_external as lookup_external  # noqa: E402
-import skunk.subagents.read_visual as read_visual  # noqa: E402
 from skunk.common.context import HarnessContext  # noqa: E402
 
 PDF_DIR = os.path.expanduser("~/Desktop/officeqa/treasury_bulletin_pdfs")
@@ -66,25 +65,25 @@ class TestLookupExternal:
         op = OpNode(op="lookup_external", args={"nl": "year that WWII ended"})
         result = lookup_external.run(op, None, ctx)
         assert isinstance(result, TypedValue)
-        assert result.value == 1945, f"Expected 1945, got {result.value}"
+        assert result.value[""] == 1945, f"Expected 1945, got {result.value['']}"
 
     def test_uid0055_korean_war_start(self, ctx):
         op = OpNode(op="lookup_external", args={"nl": "year the Korean War started"})
         result = lookup_external.run(op, None, ctx)
         assert isinstance(result, TypedValue)
-        assert result.value == 1950, f"Expected 1950, got {result.value}"
+        assert result.value[""] == 1950, f"Expected 1950, got {result.value['']}"
 
     def test_uid0055_germany_invaded_poland(self, ctx):
         op = OpNode(op="lookup_external", args={"nl": "year Germany invaded Poland"})
         result = lookup_external.run(op, None, ctx)
         assert isinstance(result, TypedValue)
-        assert result.value == 1939, f"Expected 1939, got {result.value}"
+        assert result.value[""] == 1939, f"Expected 1939, got {result.value['']}"
 
     def test_uid0010_usd_jpy_rate_2025(self, ctx):
         op = OpNode(op="lookup_external", args={"nl": "USD/JPY exchange rate on 2025-03-31"})
         result = lookup_external.run(op, None, ctx)
         assert isinstance(result, TypedValue)
-        rate = float(result.value)
+        rate = float(result.value[""])
         assert 147 <= rate <= 153, f"USD/JPY on 2025-03-31 should be ≈149-151, got {rate}"
 
 
@@ -96,7 +95,7 @@ class TestCompute:
 
     def test_sum_of_list(self, tmp_path):
         ctx = _ctx_for("What is the sum of the values? Report as a plain integer with no commas.", tmp_path)
-        prev = TypedValue(value=[10.0, 20.0, 30.0], dtype="list[scalar]", desc="monthly values")
+        prev = TypedValue(value={"": [10.0, 20.0, 30.0]}, meta={"": NamedEntry()}, desc="monthly values")
         result = compute.run(OpNode(op="compute"), prev, ctx)
         assert isinstance(result, FormattedString)
         assert _num(result.text) == 60.0, f"Expected 60, got {result.text!r}"
@@ -120,7 +119,7 @@ class TestCompute:
                 quote=f"1940 month {i}",
                 dims={"year": 1940, "month": f"1940-{i:02d}", "sub_category": "national_defense"},
             )
-        prev = TypedValue(value=value, dtype="named", unit="", desc="", meta=meta)
+        prev = TypedValue(value=value, desc="", meta=meta)
         result = compute.run(OpNode(op="compute"), prev, ctx)
         assert isinstance(result, FormattedString)
         assert _rel_err(_num(result.text), 2602.0) < 0.001, f"Expected ≈2602, got {result.text!r}"
@@ -131,8 +130,8 @@ class TestCompute:
             tmp_path,
         )
         prev = [
-            TypedValue(value=2602.0, dtype="scalar", unit="usd_millions", desc="CY1940 total"),
-            TypedValue(value=44463.0, dtype="scalar", unit="usd_millions", desc="CY1953 total"),
+            TypedValue(value={"": 2602.0}, meta={"": NamedEntry(unit="usd_millions")}, desc="CY1940 total"),
+            TypedValue(value={"": 44463.0}, meta={"": NamedEntry(unit="usd_millions")}, desc="CY1953 total"),
         ]
         result = compute.run(OpNode(op="compute"), prev, ctx)
         assert isinstance(result, FormattedString)
@@ -150,7 +149,6 @@ class TestCompute:
         # prev contains nothing about unemployment
         prev = TypedValue(
             value={"some_unrelated_value": 42},
-            dtype="named", unit="",
             desc="",
             meta={"some_unrelated_value": NamedEntry(unit="count", quote="something else entirely")},
         )
@@ -160,10 +158,10 @@ class TestCompute:
 
 
 # ---------------------------------------------------------------------------
-# read_visual (no args; emits dict-of-named-values like extract)
+# extract(visual_only=True) — vision-only path for charts/figures
 # ---------------------------------------------------------------------------
 
-class TestReadVisual:
+class TestExtractVisualOnly:
 
     @pytest.mark.skipif(
         not os.path.exists(SEPT_1990_PDF),
@@ -174,16 +172,12 @@ class TestReadVisual:
             "Count the local maxima across all line plots on the page.",
             tmp_path,
         )
-        op = OpNode(op="read_visual")
+        op = OpNode(op="extract", args={"visual_only": True})
         ref = PageRef(month="1990-09", page=7, file_path=SEPT_1990_PDF)
         prev = DocHandle(refs=[ref], desc="Sept 1990 bulletin page")
-        result = read_visual.run(op, prev, ctx)
+        result = extract.run(op, prev, ctx)
         assert isinstance(result, TypedValue), f"Expected TypedValue, got {type(result)}"
-        assert result.value is not None
-        # New extract/read_visual contract: dtype='named' with a dict of values.
-        # An empty dict (nothing relevant) raises StepFailed before we get here.
-        assert result.dtype == "named"
-        assert isinstance(result.value, dict)
+        assert isinstance(result.value, dict) and len(result.value) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +201,6 @@ class TestExtract:
         prev = DocHandle(refs=[ref])
         result = extract.run(op, prev, ctx)
         assert isinstance(result, TypedValue)
-        assert result.dtype == "named"
         assert isinstance(result.value, dict) and len(result.value) > 0
         # The page contains only FY data on national defense; the agent should still emit a
         # plausible national-defense-related entry (name varies but should mention 'defense').
@@ -216,19 +209,3 @@ class TestExtract:
             f"Expected at least one defense-related key, got {names!r}"
         )
 
-    @pytest.mark.skipif(
-        not os.path.exists(JAN_1941_PDF),
-        reason="PDF corpus not present",
-    )
-    def test_tier2_cache_created(self, tmp_path):
-        from pathlib import Path
-        from skunk.common.pdf_text import get_ocr_text_for_pdf_page
-
-        ctx = HarnessContext(question="x", cache_dir=str(tmp_path))
-        ref = PageRef(month="1941-01", page=15, file_path=JAN_1941_PDF)
-        text = get_ocr_text_for_pdf_page(ref, ctx)
-        pages_dir = Path(ctx.cache_dir) / "pages" / "1941-01"
-        txt_files = list(pages_dir.glob("p*.txt")) if pages_dir.exists() else []
-        assert txt_files, "Cache .txt file should have been written"
-        text2 = get_ocr_text_for_pdf_page(ref, ctx)
-        assert text == text2

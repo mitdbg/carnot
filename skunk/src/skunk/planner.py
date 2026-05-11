@@ -1,4 +1,8 @@
-"""Top-level planner — single LLM call to generate a DSL AST from a question."""
+"""Top-level planner — single LLM call to generate a flat Plan from a question.
+
+Also exposes plan_recovery(): a small LLM call to propose ONE additional Branch
+when compute reports MissingData mid-execution.
+"""
 
 from __future__ import annotations
 
@@ -7,158 +11,113 @@ import re
 from pathlib import Path
 
 from skunk.common.context import HarnessContext
-from skunk.dsl import ChainNode, from_dict, validate
-from skunk.subagents.base import StepFailed, call_gemini
+from skunk.dsl import Branch, Plan, from_dict, validate
+from skunk.subagents.base import StepFailed
 
 # ---------------------------------------------------------------------------
-# DSL spec (5-op grammar embedded in the system prompt)
+# DSL spec for the planner system prompt
 # ---------------------------------------------------------------------------
 
 _DSL_SPEC = """\
-## DSL Op Grammar
+## Plan shape
 
-5 operations. Steps composed left-to-right with `-->`. Parallel branches with
-`[ chain1 ; chain2 ]` feeding the next op. Nesting allowed.
+A plan is a flat list of data-gathering branches that feed an implicit compute()
+at the end. Every plan is exactly one of:
 
-| op                   | in → out                | purpose / args |
-|----------------------|-------------------------|----------------|
-| retrieve(...)        | () → DocHandle          | concept (str), period (str), source_bulletin? (YYYY-MM) |
-| extract(...)         | DocHandle → TypedValue  | (no args) — emits a dict of named typed values relevant to the question |
-| read_visual(...)     | DocHandle → TypedValue  | (no args) — vision read of charts/figures, same output shape |
-| lookup_external(...) | () → TypedValue         | nl (str) — natural language description of the data to look up |
-| compute(...)         | Value(s) → FormattedString | (no args) — chain terminator. Self-plans, generates Python, verifies output format/unit. |
+  - Single branch:
+      retrieve(concept, period[, source_bulletin, visual_only]) --> compute()
+      lookup_external(nl) --> compute()
+  - Multiple branches in parallel:
+      [ branch_1 ; branch_2 ; ... ] --> compute()
 
-### Period string conventions
-  'CY1940'         → calendar year 1940
-  'FY1939'         → fiscal year 1939
-  '1953..1955'     → range 1953 to 1955 inclusive
-  '2025-03'        → single bulletin month (YYYY-MM)
-  '2025-03-31'     → specific date
+Each branch is either a `retrieve` (always followed by `extract`) or a `lookup_external`.
+compute() is always the terminator, always implicit, always takes no args.
 
-### Key rules
-- retrieve and lookup_external are chain heads (no prev input).
-- extract / read_visual emit a TypedValue with .dtype='named' whose .value is a dict mapping
-  snake_case names to scalars/lists/tables. Names disambiguate (e.g. national_defense_cy1940).
-- compute is ALWAYS the chain terminator. It receives the question + extracted values, plans the
-  computation itself, generates Python, and a verifier LLM checks the output format/unit. Plans
-  do NOT need to spell out the computation — compute figures it out from the question.
-- For parallel-branch chains, the value flowing into compute is a list[TypedValue].
-- Use single-quoted string args only.
+## Branch types
+
+| kind            | fields                                               |
+|-----------------|------------------------------------------------------|
+| retrieve        | concept (str), period (str), source_bulletin? (YYYY-MM), visual_only? (bool) |
+| lookup_external | nl (str) — natural-language description of external data to look up |
+
+Set visual_only=true for questions about charts/figures/scanned images.
+
+## Period strings (retrieve.period)
+
+  'CY1940'         calendar year 1940
+  'FY1939'         fiscal year 1939
+  'CY1953..CY1955' range, inclusive
+  '2025-03'        single bulletin month
+  '2025-03-31'     specific date
+
+## JSON shape
+
+Emit a single JSON object:
+
+  {
+    "branches": [
+      {"kind": "retrieve", "concept": "...", "period": "..."},
+      {"kind": "lookup_external", "nl": "..."}
+    ],
+    "global_constraints": []
+  }
+
+A simple chain has one element in `branches`. A parallel has 2+.
 """
 
 _FEW_SHOTS = [
     {
         "question": "What were total U.S. national defense expenditures (millions, nominal) in calendar year 1940?",
-        "ast": {
-            "type": "chain",
+        "plan": {
+            "branches": [
+                {"kind": "retrieve", "concept": "national_defense_expenditures", "period": "CY1940"},
+            ],
             "global_constraints": ["nominal dollars (not inflation-adjusted)"],
-            "steps": [
-                {
-                    "type": "op", "op": "retrieve",
-                    "args": {"concept": "national_defense", "period": "CY1940"},
-                    "concepts": ["U.S. National Defense (Treasury budget category)"],
-                    "constraints": ["calendar year, not fiscal year"]
-                },
-                {"type": "op", "op": "extract", "args": {}},
-                {"type": "op", "op": "compute", "args": {}},
-            ]
-        }
+        },
     },
     {
         "question": "Absolute percent change in national defense expenditures between CY1940 and CY1953, rounded to hundredths.",
-        "ast": {
-            "type": "chain",
+        "plan": {
+            "branches": [
+                {"kind": "retrieve", "concept": "national_defense_expenditures", "period": "CY1940"},
+                {"kind": "retrieve", "concept": "national_defense_expenditures", "period": "CY1953"},
+            ],
             "global_constraints": [],
-            "steps": [
-                {
-                    "type": "parallel",
-                    "branches": [
-                        {
-                            "type": "chain", "global_constraints": [],
-                            "steps": [
-                                {"type": "op", "op": "retrieve",
-                                 "args": {"concept": "national_defense", "period": "CY1940"}},
-                                {"type": "op", "op": "extract", "args": {}},
-                            ]
-                        },
-                        {
-                            "type": "chain", "global_constraints": [],
-                            "steps": [
-                                {"type": "op", "op": "retrieve",
-                                 "args": {"concept": "national_defense", "period": "CY1953"}},
-                                {"type": "op", "op": "extract", "args": {}},
-                            ]
-                        }
-                    ]
-                },
-                {"type": "op", "op": "compute", "args": {}},
-            ]
-        }
+        },
     },
     {
-        "question": "Geometric mean of weekly average discount rates for new 91-day bills, September 1953–1955, rounded to nearest thousandths.",
-        "ast": {
-            "type": "chain",
-            "global_constraints": [],
-            "steps": [
-                {
-                    "type": "op", "op": "retrieve",
-                    "args": {"concept": "91day_bill_discount_rate", "period": "1953..1955"},
-                    "concepts": ["91-day Treasury bill weekly issuance", "average discount rate (Thursday quote convention)"],
-                    "constraints": ["September months only"]
-                },
-                {"type": "op", "op": "extract", "args": {}},
-                {"type": "op", "op": "compute", "args": {}},
-            ]
-        }
+        "question": "Geometric mean of weekly average discount rates for new 91-day bills, September 1953–1955.",
+        "plan": {
+            "branches": [
+                {"kind": "retrieve", "concept": "91day_bill_discount_rate", "period": "1953..1955"},
+            ],
+            "global_constraints": ["September months only"],
+        },
     },
     {
-        "question": "How much does the U.S. Treasury have invested in Japanese Yen as of March 31 2025? Convert to actual JPY using Macrotrends FX data. No commas, round to nearest whole yen.",
-        "ast": {
-            "type": "chain",
+        "question": "How much does the U.S. Treasury have invested in Japanese Yen as of March 31 2025? Convert to JPY using Macrotrends FX data.",
+        "plan": {
+            "branches": [
+                {"kind": "retrieve", "concept": "fx_investments", "period": "2025-03", "source_bulletin": "2025-03"},
+                {"kind": "lookup_external", "nl": "USD/JPY exchange rate on 2025-03-31"},
+            ],
             "global_constraints": [],
-            "steps": [
-                {
-                    "type": "parallel",
-                    "branches": [
-                        {
-                            "type": "chain", "global_constraints": [],
-                            "steps": [
-                                {"type": "op", "op": "retrieve",
-                                 "args": {"concept": "fx_investments", "period": "2025-03", "source_bulletin": "2025-03"},
-                                 "concepts": ["Treasury Foreign Exchange and Securities investments"]},
-                                {"type": "op", "op": "extract", "args": {}},
-                            ]
-                        },
-                        {
-                            "type": "chain", "global_constraints": [],
-                            "steps": [
-                                {"type": "op", "op": "lookup_external",
-                                 "args": {"nl": "USD/JPY exchange rate on 2025-03-31"},
-                                 "concepts": ["Macrotrends FX data"]},
-                            ]
-                        }
-                    ]
-                },
-                {"type": "op", "op": "compute", "args": {}},
-            ]
-        }
+        },
     },
     {
-        "question": "Read the total debt held by the public figure from the September 1990 Treasury Bulletin chart on page 5.",
-        "ast": {
-            "type": "chain",
-            "global_constraints": [],
-            "steps": [
+        "question": "Read the total debt held by the public from the September 1990 Treasury Bulletin chart on page 5.",
+        "plan": {
+            "branches": [
                 {
-                    "type": "op", "op": "retrieve",
-                    "args": {"concept": "public_debt_chart", "period": "1990-09", "source_bulletin": "1990-09"},
-                    "concepts": ["debt held by the public (chart/figure)"]
+                    "kind": "retrieve",
+                    "concept": "public_debt_chart",
+                    "period": "1990-09",
+                    "source_bulletin": "1990-09",
+                    "visual_only": True,
                 },
-                {"type": "op", "op": "read_visual", "args": {}},
-                {"type": "op", "op": "compute", "args": {}},
-            ]
-        }
+            ],
+            "global_constraints": [],
+        },
     },
 ]
 
@@ -172,7 +131,7 @@ _CAPABILITY_VOCAB = [
 
 _SYSTEM = f"""\
 You are the planner for the OfficeQA harness. Given a question about U.S. \
-Treasury Monthly Bulletins, produce a DSL JSON pipeline that, when executed, \
+Treasury Monthly Bulletins, produce a flat Plan JSON that, when executed, \
 will produce the correct answer.
 
 {_DSL_SPEC}
@@ -187,16 +146,16 @@ will produce the correct answer.
 def _build_system(ctx: HarnessContext) -> str:
     system = _SYSTEM
     for ex in _FEW_SHOTS:
-        system += f"\n### Example\nQ: {ex['question']}\nAST:\n```json\n{json.dumps(ex['ast'], indent=2)}\n```\n"
+        system += f"\n### Example\nQ: {ex['question']}\nPlan:\n```json\n{json.dumps(ex['plan'], indent=2)}\n```\n"
     return system
 
 
 def _build_user(question: str, ctx: HarnessContext) -> str:
     manifest_summary = ""
-    if ctx.manifest_path and Path(ctx.manifest_path).exists():
+    if ctx.config.manifest_path and Path(ctx.config.manifest_path).exists():
         try:
             import pandas as pd
-            df = pd.read_csv(ctx.manifest_path)
+            df = pd.read_csv(ctx.config.manifest_path)
             years = sorted(df["year"].dropna().unique().astype(int))
             if years:
                 manifest_summary = (
@@ -210,8 +169,7 @@ def _build_user(question: str, ctx: HarnessContext) -> str:
 Question: {question}
 {manifest_summary}
 
-Produce the DSL JSON pipeline. Output ONLY a JSON code block with the \
-ChainNode AST — no prose, no explanation.
+Produce the Plan JSON. Output ONLY a JSON code block — no prose, no explanation.
 """
 
 
@@ -219,25 +177,23 @@ ChainNode AST — no prose, no explanation.
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def plan(question: str, ctx: HarnessContext) -> ChainNode:
-    """Generate a 5-op AST ChainNode from a natural-language question."""
+def plan(question: str, ctx: HarnessContext) -> Plan:
+    """Generate a flat Plan from a natural-language question."""
     system = _build_system(ctx)
     user = _build_user(question, ctx)
 
     attempt_errors: list[str] = []
     for attempt in range(2):
-        raw = call_gemini(system, user)
+        raw = ctx.llm_client.call(system, user)
         try:
-            ast_dict = _extract_ast_json(raw)
-            chain = from_dict(ast_dict)
-            if not isinstance(chain, ChainNode):
-                raise ValueError(
-                    f"from_dict returned {type(chain).__name__}, expected ChainNode"
-                )
-            result = validate(chain)
+            plan_dict = _extract_plan_json(raw)
+            p = from_dict(plan_dict)
+            if not isinstance(p, Plan):
+                raise ValueError(f"from_dict returned {type(p).__name__}, expected Plan")
+            result = validate(p)
             if not result.ok:
-                raise ValueError(f"AST validation errors: {result.errors}")
-            return chain
+                raise ValueError(f"Plan validation errors: {result.errors}")
+            return p
         except Exception as e:
             attempt_errors.append(f"Attempt {attempt + 1}: {e}")
             if attempt == 0:
@@ -248,22 +204,16 @@ def plan(question: str, ctx: HarnessContext) -> ChainNode:
 
     raise StepFailed(
         "planner",
-        f"Failed to produce valid AST after {len(attempt_errors)} attempts: "
+        f"Failed to produce valid Plan after {len(attempt_errors)} attempts: "
         + "; ".join(attempt_errors),
     )
 
 
-def _extract_ast_json(text: str) -> dict:
-    """Extract the outermost JSON object from planner output.
-
-    Tries a fenced code block first, then falls back to scanning for balanced braces.
-    The old single-regex approach truncated multi-line nested JSON at the first '}'.
-    """
-    # Fenced code block: grab everything between the fences, then parse as JSON.
+def _extract_plan_json(text: str) -> dict:
+    """Extract the outermost JSON object from planner output."""
     m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
     if m:
         return json.loads(m.group(1))
-    # Balanced-brace scan: find the outermost { ... } regardless of line breaks.
     start = text.find("{")
     if start == -1:
         raise ValueError(f"No JSON object found in planner response:\n{text[:400]}")
@@ -280,3 +230,86 @@ def _extract_ast_json(text: str) -> dict:
     if end == -1:
         raise ValueError(f"Unbalanced braces in planner response:\n{text[:400]}")
     return json.loads(text[start:end])
+
+
+# ---------------------------------------------------------------------------
+# Recovery planner — called when compute reports MissingData
+# ---------------------------------------------------------------------------
+
+_RECOVERY_SYSTEM = """\
+You diagnose a compute failure and propose ONE additional data-gathering branch.
+
+Compute ran on the plan's existing branches and reported MISSING:<reason> — it
+needs one more piece of information to answer the question. Your job: emit one
+JSON object describing the supplemental branch.
+
+Two valid branch shapes:
+
+  {"kind": "lookup_external", "nl": "<natural-language description>"}
+      Use when the missing data is an external fact (CPI, FX rate, event year,
+      named entity) NOT typically found in Treasury Bulletins.
+
+  {"kind": "retrieve", "concept": "<snake_case>", "period": "<period>",
+   "source_bulletin": "<YYYY-MM>"?, "visual_only": <bool>?}
+      Use when an existing retrieve missed the right bulletin or a related
+      bulletin row is needed (e.g., a comparison year was overlooked).
+
+If recovery is not feasible (the question is genuinely unanswerable from
+available sources), output exactly:
+  {"kind": "decline", "reason": "<short reason>"}
+
+Output ONLY the JSON object. No prose.
+"""
+
+
+def plan_recovery(
+    question: str, plan_obj: Plan, missing_reason: str, ctx: HarnessContext
+) -> Branch | None:
+    """Propose one supplemental Branch given a MissingData reason. Returns None if recovery declines."""
+    existing = json.dumps(
+        {"branches": [_branch_summary(b) for b in plan_obj.branches]},
+        indent=2,
+    )
+    user = (
+        f"Question: {question}\n\n"
+        f"Existing plan:\n```json\n{existing}\n```\n\n"
+        f"Compute reported MISSING: {missing_reason}\n\n"
+        "Propose ONE supplemental branch, or decline."
+    )
+
+    raw = ctx.llm_client.call(_RECOVERY_SYSTEM, user)
+    ctx.emit("planner", "recovery response", raw=raw[:400])
+
+    try:
+        d = _extract_plan_json(raw)
+    except Exception as e:
+        raise StepFailed("planner", f"recovery JSON parse failed: {e}") from e
+
+    kind = d.get("kind")
+    if kind == "decline":
+        ctx.emit("planner", "recovery declined", reason=d.get("reason", "(no reason)"))
+        return None
+    if kind in ("retrieve", "lookup_external"):
+        from skunk.dsl import _branch_from_dict
+        try:
+            return _branch_from_dict(d)
+        except Exception as e:
+            raise StepFailed("planner", f"recovery branch construction failed: {e}") from e
+    raise StepFailed("planner", f"recovery emitted unknown kind {kind!r}: {d!r}")
+
+
+def _branch_summary(b: Branch) -> dict:
+    """Compact dict describing a branch for the recovery prompt."""
+    from skunk.dsl import LookupBranch as _Lookup
+    from skunk.dsl import RetrieveBranch as _Retrieve
+
+    if isinstance(b, _Retrieve):
+        d = {"kind": "retrieve", "concept": b.concept, "period": b.period}
+        if b.source_bulletin:
+            d["source_bulletin"] = b.source_bulletin
+        if b.visual_only:
+            d["visual_only"] = True
+        return d
+    if isinstance(b, _Lookup):
+        return {"kind": "lookup_external", "nl": b.nl}
+    raise TypeError(f"Unknown branch type: {type(b)}")

@@ -24,10 +24,10 @@ This decoupling means retrieval and extraction can be evaluated independently �
        ┌──────────────────┼──────────────────┐
        │                  │                  │
        ▼                  ▼                  ▼
-  ┌─────────┐        ┌─────────┐        ┌─────────┐
-  │retrieve │        │ extract │        │read_visu│   per-op subagents
-  │ catalog │        │ tier 1-3│        │  vision │
-  └─────────┘        └─────────┘        └─────────┘
+  ┌─────────┐        ┌─────────┐        ┌─────────────┐
+  │retrieve │        │ extract │        │lookup_extern│   per-op subagents
+  │ catalog │        │ tier 1-3│        │   gemini    │
+  └─────────┘        └─────────┘        └─────────────┘
        │                  │                  │
        ▼                  ▼                  ▼
                     ┌──────────────────┐
@@ -60,12 +60,11 @@ The retrieve subagent owns its page index — the format, schema, and build proc
 
 The load-bearing insight is that `periods_covered` (what period a page *reports on*) is distinct from the bulletin's publication date. A page in the January 1941 bulletin that contains the CY1940 annual summary should be returned for a query on `period='CY1940'` — not the January 1941 bulletins. Any index the retrieve subagent builds must capture this distinction.
 
-## The 5 operators
+## The 4 operators
 
 - **`retrieve(concept, period, source_bulletin?)`** — only chain head. Looks up relevant pages via the retrieve subagent's internal page index, returns a `DocHandle` whose `PageRef`s have `(file_path, year, month, page)` fully specified (where `page` is the 1-based PDF page index).
-- **`extract()`** — reads `ctx.question` and the located pages via tier dispatch (parsed JSON → PyMuPDF text → vision). Emits a `TypedValue` with `dtype='named'` whose `.value` is a dict mapping snake_case names to scalars/lists/tables relevant to the question. The agent decides what's worth extracting; no `concept`/`mode` args.
-- **`read_visual()`** — same output shape as extract, but always uses vision; reserved for charts and figures.
-- **`lookup_external(nl)`** — chain-head capable. Single Gemini call: takes a natural-language description of external factual data (`nl`) and returns a `TypedValue`. Use for CPI-U, FX rates, event dates, named entities (bureau names), and any fact not in the bulletin corpus. The subagent infers the appropriate `dtype` and `unit` (including `text` for strings).
+- **`extract(visual_only?)`** — reads `ctx.question` and the located pages via tier dispatch (parsed JSON → PyMuPDF text → vision). Emits a `TypedValue` whose `.value` is a dict mapping snake_case names to entries. Each entry is one of three **kinds** — `scalar`, `vector` (1-D series with one varying dim), or `table` (2-D grid with row/col dims) — picked to match the question's aggregation axis. Vector/table cells are always primitive scalars; nesting beyond those shapes is forbidden (enforced both in the extract prompt and structurally in the parser + `TypedValue.__post_init__`). Pass `visual_only=True` to skip Tiers 1–2 and go straight to vision (use for charts/figures).
+- **`lookup_external(nl)`** — chain-head capable. Single Gemini call: takes a natural-language description of external factual data (`nl`) and returns a `TypedValue`. Use for CPI-U, FX rates, event dates, named entities (bureau names), and any fact not in the bulletin corpus. The subagent infers the appropriate `kind` and `unit` (including `text` for strings).
 - **`compute()`** — chain terminator that subsumes formatting. Reads `ctx.question` plus the upstream extracted/looked-up values; runs a plan-then-codegen LLM call (`CODE\n<python>` or `MISSING:<reason>`), execs the code, then a verifier LLM checks the output's *form* (precision, unit, percent vs decimal, comma rules, list bracketing) against the question. Up to 3 attempts; each retry receives feedback from the prior failure. Returns a `FormattedString`. Fails with `StepFailed("compute", "missing data: …")` when extracted values are insufficient.
 
 ## Per-page tier dispatch in extract
@@ -103,9 +102,9 @@ Each subagent therefore exposes a standalone callable function (not just `Subage
 Per-step cache key: `(question_uid, op_index, args_hash)`. Cached values:
 - retrieve results (page rankings)
 - per-page CSV table loads (already cached by `prep/tables.py`)
-- LLM completions for extract / read_visual / compute (the Python body and result)
+- LLM completions for extract / compute (the Python body and result)
 
-`HarnessContext.cache_only=True` blocks live API calls (BLS, FRED, FX, vision LLM) — useful for deterministic eval re-runs against a frozen snapshot.
+Caching is opportunistic: pdf page text and rendered PNGs are written on first access and reused on subsequent runs. LLM calls (extract, compute, lookup_external) are not cached.
 
 ## What is intentionally NOT in this design
 

@@ -1,9 +1,9 @@
-from skunk.subagents import retrieve, extract, read_visual, lookup_external, compute
+from skunk.subagents import compute, extract, lookup_external, retrieve
+from skunk.subagents.base import SubagentFn
 
-SUBAGENT_REGISTRY = {
+SUBAGENT_REGISTRY: dict[str, SubagentFn] = {
     "retrieve": retrieve.run,
     "extract": extract.run,
-    "read_visual": read_visual.run,
     "lookup_external": lookup_external.run,
     "compute": compute.run,
 }

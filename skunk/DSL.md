@@ -1,49 +1,105 @@
 # DSL — formal specification
 
-The OfficeQA pipeline is encoded as a **DSL plan**: a left-to-right chain of operators with optional parallel branches. The planner emits this as text; the orchestrator parses it into an AST and walks it.
+The OfficeQA pipeline is encoded as a **flat Plan** of data-gathering branches that feed an implicit `compute()` step at the end. The planner emits this as text (or JSON); the orchestrator walks the branches and dispatches subagent calls.
 
-## Surface grammar
+## Plan shape
 
-```
-chain      ::= step ("-->" step)*
-step       ::= op_call | parallel
-parallel   ::= "[" chain (";" chain)+ "]"
-op_call    ::= name "(" args? ")"
-args       ::= kv ("," kv)*
-kv         ::= ident "=" value
-value      ::= literal | list | string         # strings ALWAYS use single quotes
-list       ::= "[" value ("," value)* "]"
-```
-
-### Quoting rule (load-bearing)
-
-All string argument values use **single quotes** (`'...'`). This keeps plans JSON-safe when the planner output is wrapped in JSON. When a Python literal inside `compute(code='...')` itself needs a quoted string, use `"..."` for the inner literal — the outer single quotes never collide.
-
-### Per-op annotations
-
-Each `op_call` may carry two pieces of metadata orthogonal to its `args`:
-- `concepts` — natural-language tags for the domain entities involved
-- `constraints` — natural-language rules the subagent must obey ("use nominal dollars", "round to nearest hundredth")
-
-JSON serialization is the canonical interchange format; the text grammar is sugar for human authoring and few-shots.
-
-## Types
+Every plan is exactly one of:
 
 ```
-PageRef         { file_path: str, year: int, month: "YYYY-MM", page: int }
-DocHandle       { refs: [PageRef], desc: str }                # non-empty refs invariant
-TypedValue      { value: Any, dtype: str, desc: str }         # dtype: scalar:<unit>, list[<inner>], df, …
-FormattedString { text: str, desc: str }
-Output          = DocHandle | TypedValue | FormattedString
+single retrieve branch:    retrieve(...) --> extract(...) --> compute()
+single lookup branch:      lookup_external(...) --> compute()
+parallel of branches:      [ branch ; branch ; ... ] --> compute()
 ```
 
-`PageRef.page` is the **1-based PDF page index** — the only page-number meaning used in the codebase. It matches `source_docs?page=N` from the Fraser benchmark URLs. The bulletin's printed-page footer is recoverable via `skunk.common.parsed_json.get_printed_page(ref, ctx)` for trace/prompt enrichment but is never used as a lookup key.
+`compute()` is always at the end. It's a structural part of every plan, but takes no arguments. The grammar does not support nested parallels, chains that skip `extract` after `retrieve`, or `compute` anywhere other than the terminator — the type system makes those unrepresentable.
 
-`dtype` is advisory but inspected by `compute` and `format` for unit-checking. Reserved tags: `scalar:<unit>`, `list[<inner>]`, `tuple[<inner>,...]`, `df`, `unknown`.
+## Branches
+
+A branch is one of two shapes:
+
+```
+RetrieveBranch = retrieve(concept, period[, source_bulletin]) --> extract([visual_only])
+LookupBranch   = lookup_external(nl)
+```
+
+### `RetrieveBranch`
+
+| field | type | required | description |
+|---|---|---|---|
+| `concept` | str | yes | domain tag(s) the page must report on |
+| `period` | period string | yes | date span the question targets (see grammar below) |
+| `source_bulletin` | `'YYYY-MM'` | no | pin to one specific issue |
+| `visual_only` | bool | no | set on the trailing `extract(...)`; skips Tiers 1-2 and goes directly to vision |
+
+The `visual_only` flag is part of the branch (it threads through to the extract step) and is only meaningful when the question targets charts/figures/scanned images.
+
+### `LookupBranch`
+
+| field | type | required | description |
+|---|---|---|---|
+| `nl` | str | yes | natural-language description of the external data to look up |
+
+Use for any factual data that can't be extracted from the bulletin corpus: CPI-U, exchange rates, event dates, bureau names, etc.
+
+## Surface forms
+
+Both text DSL and JSON are accepted.
+
+### Text DSL
+
+```
+retrieve(concept='national_defense', period='CY1940') --> extract() --> compute()
+[ retrieve(concept='a', period='CY1940') --> extract() ; lookup_external(nl='CPI-U for 1953') ] --> compute()
+```
+
+String arguments use **single quotes** (`'...'`) — keeps plans JSON-safe when wrapped.
+
+### JSON
+
+```json
+{
+  "branches": [
+    {"kind": "retrieve", "concept": "national_defense", "period": "CY1940"},
+    {"kind": "lookup_external", "nl": "USD/JPY exchange rate on 2025-03-31"}
+  ],
+  "global_constraints": []
+}
+```
+
+A simple chain has one element in `branches`. A parallel has two or more.
+
+## Inter-op types
+
+```
+PageRef         { month: 'YYYY-MM', page: int, file_path: str }
+DocHandle       { refs: [PageRef], desc: str }
+NamedEntry      { unit: str, quote: str, dims: {...},
+                  kind: 'scalar' | 'vector' | 'table',
+                  index_name?: str,         # vector only
+                  row_name?: str, col_name?: str  # table only
+                }
+TypedValue      { value: dict[str, Any], desc: str, meta: dict[str, NamedEntry] }
+FormattedString { text: str }
+```
+
+`PageRef.page` is the **1-based PDF page index** — the only page-number meaning used in the codebase. It matches `source_docs?page=N` from the Fraser benchmark URLs.
+
+`TypedValue.value` is always a dict. For results from `lookup_external`, the single unnamed value lives under key `""`. For results from `extract`, keys are snake_case names disambiguating the extracted entries (e.g. `national_defense_cy1940`). The `meta` dict is keyed identically.
+
+Each entry has one of three **kinds**, with payload shapes enforced by `TypedValue.__post_init__`:
+
+- `kind='scalar'` — `value[k]` is `int | float | str`. Single facts, sibling cells distinguished by `dims`.
+- `kind='vector'` — `value[k]` is a flat dict `{index_label: scalar}`, with `meta[k].index_name` naming the varying dim (e.g. `'month'`). Used for 1-D series; `dims` is shared across all cells.
+- `kind='table'` — `value[k]` is a 2-level dict `{row_label: {col_label: scalar}}` with consistent column keys across rows, and `meta[k].row_name` / `meta[k].col_name` naming the two varying dims.
+
+**No nesting beyond these shapes.** Vector cells and table cells must be primitive scalars (int/float/str). A vector-of-vectors, table-with-list-cells, or 3-level dict is forbidden and will be dropped by the extract parser; if it ever reaches `TypedValue.__post_init__` (a bug in extract), construction fails loudly with `ValueError` rather than corrupting compute downstream.
+
+**Quorum is all-or-nothing per entry.** When extract runs N samples, samples are bucketed by the canonical form of the *whole* entry (name + kind + axis names + every cell value + unit + dims). Only buckets meeting `extract_quorum` survive. There is no per-cell voting — a single-cell disagreement keeps both variants in separate buckets, and neither is kept unless quorum is hit on the exact match.
 
 ## Period grammar
 
-Used by `retrieve.period`.
+Used by `RetrieveBranch.period`.
 
 ```
 period      ::= point | range | enumeration
@@ -56,72 +112,50 @@ Examples: `CY1940`, `FY1981`, `Q3-1982`, `2025-03-31`, `CY1940..CY1949`, `1991-0
 
 ## Operators
 
-### `retrieve(concept, period, source_bulletin?) → DocHandle`  *(chain-head only)*
+### `retrieve(concept, period, source_bulletin?) → DocHandle`
 
-| arg | type | req | description |
-|---|---|---|---|
-| `concept` | str \| list[str] | yes | domain tag(s) the page must report on |
-| `period` | period-string | yes | date span the question targets |
-| `source_bulletin` | `'YYYY-MM'` | no | pin to one specific issue when the question explicitly names a bulletin |
-
-**Behavior.** Looks up matching pages via the retrieve subagent's internal page index (filtered by concept + period + optional source_bulletin pin), returns a `DocHandle` whose `PageRef`s are fully specified (`page` is the 1-based PDF page index).
+Looks up matching pages via the retrieve subagent's internal page index (filtered by concept + period + optional source_bulletin pin), returns a `DocHandle` whose `PageRef`s are fully specified.
 
 **Failure.** `StepFailed("retrieve", "no candidates after pre-filter")`.
 
-### `extract() → TypedValue`
-
-No arguments.
-
-**Pre.** `prev` is `DocHandle`. **Post.** `TypedValue` with `dtype='named'` whose `.value` is a dict mapping snake_case names to scalars/lists/tables relevant to `ctx.question`.
-
-**Behavior.** Per-page tier dispatch — first tier that returns a non-empty dict wins:
-1. Tier 1 — JSON-parsed page elements via `skunk.common.parsed_json.get_text_for_pdf_page`.
-2. Tier 2 — PyMuPDF native text per PDF page (`cache/pages/{month}/p{NNN}.txt`).
-3. Tier 3 — PNG render (PyMuPDF, 300 dpi) sent to vision LLM.
-
-The agent reads the page and the user's question, then emits every value/list/table that could plausibly be needed to answer it, with disambiguating names (e.g. `national_defense_cy1940`, `national_defense_fy1940`, `jpy_holdings_mar_2025`). It does not pre-compute or aggregate.
-
-**Failure.** `StepFailed("extract", "no relevant values found across tiers")`.
-
-### `read_visual() → TypedValue`
-
-No arguments. Same output shape as `extract`, but always Tier 3 vision. Used for charts and figures.
-
-### `lookup_external(nl) → TypedValue`  *(chain-head capable)*
+### `extract(visual_only?) → TypedValue`
 
 | arg | type | req | description |
 |---|---|---|---|
-| `nl` | str | yes | Natural language description of the external data to look up |
+| `visual_only` | bool | no | Skip Tiers 1-2; vision-only |
 
-Single Gemini call. Returns a typed value — the subagent infers the appropriate `dtype` (e.g. `scalar:year`, `scalar:fx_rate`, `scalar:cpi`, `list[scalar:fx_rate]`). Strings are also supported (named entities, place names) with `dtype='text'`. Use for any factual data that can't be extracted from the bulletin corpus: CPI-U, exchange rates, event dates, bureau names, etc.
+Per-page tier dispatch:
+1. Tier 1 — JSON-parsed page elements via `skunk.common.parsed_json.get_text_for_pdf_page`.
+2. Tier 2 — PyMuPDF native text per PDF page (`cache/pages/{month}/p{NNN}.txt`).
+3. Tier 3 — PNG render at 300 dpi sent to vision LLM.
 
-### `compute() → FormattedString`  *(chain terminator)*
+Returns a `TypedValue` whose `.value` is a dict of named entries — each one a `scalar`, `vector`, or `table` per the kind contract above, anchored by a verbatim quote on the page.
 
-No arguments. Compute is the only chain terminator and produces the final answer string.
+**Failure.** `StepFailed("extract", "no relevant values found across tiers")`.
 
-**Pre.** `prev` is `TypedValue` (typically `dtype='named'`) or `list[TypedValue]` (parallel branches). **Post.** `FormattedString`.
+### `lookup_external(nl) → TypedValue`
 
-**Behavior.** Reads `ctx.question` and `prev`, then runs:
-1. **Plan + codegen** (Gemini): emits either `CODE\n<python>` that assigns a string to `result`, OR `MISSING:<reason>` if extracted values are insufficient.
-2. **Exec** (sandbox): runs the code with `prev` in scope; sandbox imports are numpy/pandas/statsmodels/math.
-3. **Verifier** (Gemini): checks the output's *form* (precision, unit, percent vs decimal, comma rules, list bracketing) against the question. PASS → return; FAIL with reason → retry.
+Single Gemini call. Returns a `TypedValue` with `value={"": <result>}` and a single `meta[""]` entry carrying the inferred unit.
 
-Up to 3 attempts; each retry sees feedback from the prior failure (exec exception or verifier rejection). Compute owns formatting in addition to derivation — there is no separate format op.
+### `compute() → FormattedString`  *(implicit terminator)*
 
-**Failure.** `StepFailed("compute", ...)` for `MISSING:<reason>` (insufficient input) or after all attempts fail.
+No arguments. Reads `ctx.question` and `prev` (the data-phase output: either one `TypedValue` for a single-branch plan or `list[TypedValue]` for a parallel), then runs:
 
-## Composition rules
+1. **Plan + codegen** (Gemini): emits `CODE\n<python>` or `MISSING:<reason>`.
+2. **Exec** (sandbox): runs the code with `prev` in scope; available imports are numpy, pandas, statsmodels, math.
+3. **Verifier** (Gemini): checks the output's *form* (precision, unit, percent vs decimal, comma rules, list bracketing) against the question.
 
-1. **Chain typing.** In `op_a --> op_b`, `OutputType(op_a) ∈ AcceptedInputs(op_b)`. Validator checks this statically.
-2. **Parallel typing.** `[c1; c2; ...] --> op_next` requires each `c_i` to terminate in the same `Output` type `T`, and `op_next` to accept `list[T]`.
-3. **Chain head.** Must be `retrieve` or `lookup_external` (the only ops that take no input).
-4. **Chain tail.** Must be `compute` for an answer-producing chain — it produces the final string. Sub-chains feeding a parallel may end in any type.
-5. **Concepts/constraints scope.** `OpNode.constraints` apply to that op only; `ChainNode.global_constraints` apply to every op in the chain.
-6. **Determinism budget.** `compute` makes 2–3 Gemini calls per attempt (codegen + verifier); all other ops (`retrieve`, `extract`, `read_visual`, `lookup_external`) also involve LLM calls at runtime. Temperature is 0 throughout.
+Up to 3 attempts per question; each retry sees the complete history of prior failures.
+
+**MissingData recovery.** If compute reports `MISSING:<reason>`, the orchestrator catches it as a `MissingData` exception and runs a single recovery round: the recovery planner emits one supplemental `Branch` (typically a `LookupBranch`), the orchestrator executes it, augments `prev`, and retries compute. If compute still reports MISSING after recovery, the question fails.
+
+**Failure modes.** `StepFailed("compute", ...)` after all attempts fail or recovery declines/exhausts.
+
+## Validation
+
+The type system enforces plan shape (head/tail/branch composition). The validator only checks period strings against the period grammar.
 
 ## Worked examples
-
-`extract()` and `compute()` take no arguments. The agent reads `ctx.question` and decides what to do.
 
 **UID0001** — Total US national defense expenditures for CY1940:
 ```
@@ -130,7 +164,7 @@ retrieve(concept='national_defense_expenditure', period='CY1940')
   --> compute()
 ```
 
-**UID0004** — Absolute pct change in CY1953 vs CY1940 monthly national defense:
+**UID0004** — Absolute pct change between CY1940 and CY1953:
 ```
 [
   retrieve(concept='national_defense_expenditure', period='CY1940') --> extract();
@@ -139,36 +173,36 @@ retrieve(concept='national_defense_expenditure', period='CY1940')
   --> compute()
 ```
 
-**UID0029** — "According to the bulletin published in June 1970, average yield spread CY1960-69":
+**UID0029** — Bulletin pinning:
 ```
 retrieve(concept='bond_yields', period='CY1960..CY1969', source_bulletin='1970-06')
   --> extract()
   --> compute()
 ```
 
-**UID0030** — Local maxima on line plots, page 5 of Sept 1990 bulletin:
+**UID0030** — Visual-only extraction on a chart page:
 ```
 retrieve(concept='line_plots_on_page', period='1990-09', source_bulletin='1990-09')
-  --> read_visual()
+  --> extract(visual_only=True)
   --> compute()
 ```
 
-**UID0035** — Benford first-digit count on a whole table:
-```
-retrieve(concept='receipts_table', period='1980-05', source_bulletin='1980-05')
-  --> extract()
-  --> compute()
-```
-
-**UID0055** — Year WWII ended and Korean War started:
+**UID0055** — Parallel external lookups:
 ```
 [
-  lookup_external(nl='year that WWII ended');
-  lookup_external(nl='year the Korean War started')
+  lookup_external(nl='year WWII ended');
+  lookup_external(nl='year Korean War started')
 ]
   --> compute()
 ```
 
-## Validation
+**UID0010** — Mixed parallel (retrieve + external lookup):
+```
+[
+  retrieve(concept='fx_investments', period='2025-03', source_bulletin='2025-03') --> extract();
+  lookup_external(nl='USD/JPY exchange rate on 2025-03-31')
+]
+  --> compute()
+```
 
 The plan cache lives at `data/dsl_planning_pass.csv` and is regenerated by `tools/plan_dsl_with_gemini.py` (or lazily by `skunk.run` on first execution per UID). Each row is `uid, question, plan_text` and is loaded via `skunk.run.load_plan_cache`.

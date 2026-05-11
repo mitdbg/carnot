@@ -34,26 +34,27 @@ import json
 import sys
 from pathlib import Path
 
+from skunk.config import SkunkConfig
+
 SMOKE_UIDS = ["UID0001", "UID0030", "UID0010", "UID0022"]
-DEFAULT_PLAN_CSV = "data/dsl_planning_pass.csv"
 
 
 # ---------------------------------------------------------------------------
 # Plan cache helpers
 # ---------------------------------------------------------------------------
 
-def load_plan_cache(plan_csv: str) -> dict[str, str]:
+def load_plan_cache(plan_cache_csv: str) -> dict[str, str]:
     """Return {uid: plan_text} from the plan cache CSV."""
-    p = Path(plan_csv)
+    p = Path(plan_cache_csv)
     if not p.exists():
         return {}
     with p.open(newline="", encoding="utf-8") as f:
         return {row["uid"]: row["plan_text"] for row in csv.DictReader(f) if row.get("plan_text")}
 
 
-def save_plan_to_cache(uid: str, question: str, plan_text: str, plan_csv: str) -> None:
+def save_plan_to_cache(uid: str, question: str, plan_text: str, plan_cache_csv: str) -> None:
     """Upsert (uid, plan_text) into the plan cache CSV."""
-    p = Path(plan_csv)
+    p = Path(plan_cache_csv)
     p.parent.mkdir(parents=True, exist_ok=True)
 
     rows: dict[str, dict] = {}
@@ -76,22 +77,22 @@ def save_plan_to_cache(uid: str, question: str, plan_text: str, plan_csv: str) -
 
 def run_question(
     question: str,
-    manifest_path: str | None,
-    cache_dir: str,
     verbose: bool,
+    manifest_path: str | None = None,
     golden_pages: list | None = None,
     cached_plan_text: str | None = None,
     uid: str | None = None,
-    plan_csv: str = DEFAULT_PLAN_CSV,
+    plan_cache_csv: str | None = None,
     trace_path: str | None = None,
 ) -> dict:
+    import os
+
     from skunk.common.context import HarnessContext
     from skunk.orchestrator import execute
     from skunk.planner import plan
 
     golden_handle = None
     if golden_pages:
-        import os
         from skunk.dsl import DocHandle, PageRef
         # GoldenPage.page is the 1-based PDF page index (per Fraser ?page=N semantics);
         # PageRef.page is also the PDF page index, so this is a direct copy.
@@ -101,17 +102,20 @@ def run_question(
         for g in golden_pages:
             year, mon = g.bulletin_id.split("-")
             file_path = f"{pdf_dir}/treasury_bulletin_{year}_{mon}.pdf"
-            refs.append(PageRef(year=g.year, month=g.bulletin_id, page=g.page, file_path=file_path))
+            refs.append(PageRef(month=g.bulletin_id, page=g.page, file_path=file_path))
         golden_handle = DocHandle(refs=refs, desc=f"golden ({len(refs)} pages)")
         if verbose:
             print(f"[run] Golden handle: {len(refs)} pages → {[str(r) for r in refs]}")
 
+    config = SkunkConfig.from_env()
+    config.manifest_path = manifest_path
+    config.golden_handle = golden_handle
+    csv_path = plan_cache_csv or config.plan_cache_csv
+
     ctx = HarnessContext(
         question=question,
-        manifest_path=manifest_path,
-        cache_dir=cache_dir,
-        golden_handle=golden_handle,
         verbose=verbose,
+        config=config,
     )
 
     if cached_plan_text is not None:
@@ -119,15 +123,13 @@ def run_question(
             print("\n[run] Using cached plan...")
         try:
             from skunk.dsl import parse, serialize, validate
-            chain = parse(cached_plan_text)
-            # Validation is advisory on cached plans: the orchestrator/subagents tolerate
-            # some serializer round-trip artifacts (e.g. positional 'source' vs named 'concept'),
-            # which match what the live-plan path also accepts. Fail only on parse errors.
-            result = validate(chain)
+            plan_obj = parse(cached_plan_text)
+            result = validate(plan_obj)
             if not result.ok:
-                print(f"[run] cached plan validation warnings (advisory): {result.errors}", file=sys.stderr)
+                return {"question": question, "answer": None, "failed": True,
+                        "reason": f"cached plan validation failed: {result.errors}"}
             if verbose:
-                print(f"[run] Plan: {serialize(chain)}")
+                print(f"[run] Plan: {serialize(plan_obj)}")
         except Exception as e:
             return {"question": question, "answer": None, "failed": True, "reason": f"cached plan error: {e}"}
     else:
@@ -135,18 +137,18 @@ def run_question(
             print(f"\n[run] Planning: {question[:80]}...")
         try:
             from skunk.dsl import serialize
-            chain = plan(question, ctx)
-            plan_text = serialize(chain)
+            plan_obj = plan(question, ctx)
+            plan_text = serialize(plan_obj)
             if verbose:
                 print(f"[run] Plan: {plan_text}")
             if uid is not None:
-                save_plan_to_cache(uid, question, plan_text, plan_csv)
+                save_plan_to_cache(uid, question, plan_text, csv_path)
                 if verbose:
                     print(f"[run] Plan cached for {uid}")
         except Exception as e:
             return {"question": question, "answer": None, "failed": True, "reason": f"planning: {e}"}
 
-    trace = execute(chain, ctx)
+    trace = execute(plan_obj, ctx)
 
     if verbose:
         print(trace.pretty())
@@ -154,7 +156,7 @@ def run_question(
     if trace_path is not None:
         try:
             from skunk.dsl import serialize as _serialize
-            plan_text_for_dump = _serialize(chain)
+            plan_text_for_dump = _serialize(plan_obj)
         except Exception:
             plan_text_for_dump = cached_plan_text or "(unavailable)"
         _dump_trace(trace_path, uid=uid, question=question, plan_text=plan_text_for_dump,
@@ -246,7 +248,6 @@ def main() -> None:
 
     parser.add_argument("--csv", help="Path to annotated OfficeQA CSV (needed for --uid/--uids/--smoke)")
     parser.add_argument("--manifest", help="Path to manifest.csv", default=None)
-    parser.add_argument("--cache-dir", default="cache")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--output", help="Write results to JSON file")
     parser.add_argument(
@@ -256,11 +257,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--cached-plan", action="store_true",
-        help="Use cached plan from --plan-csv instead of calling the LLM planner."
+        help="Use cached plan from --plan-cache-csv instead of calling the LLM planner."
     )
+    _default_plan_cache_csv = SkunkConfig.from_env().plan_cache_csv
     parser.add_argument(
-        "--plan-csv", default=DEFAULT_PLAN_CSV,
-        help=f"Path to plan cache CSV (default: {DEFAULT_PLAN_CSV})."
+        "--plan-cache-csv", default=_default_plan_cache_csv,
+        help=f"Path to plan cache CSV (default: {_default_plan_cache_csv})."
     )
     args = parser.parse_args()
 
@@ -280,9 +282,9 @@ def main() -> None:
 
     plan_cache: dict[str, str] = {}
     if args.cached_plan:
-        plan_cache = load_plan_cache(args.plan_csv)
+        plan_cache = load_plan_cache(args.plan_cache_csv)
         if not plan_cache:
-            print(f"[run] WARNING: plan cache {args.plan_csv!r} is empty or missing", file=sys.stderr)
+            print(f"[run] WARNING: plan cache {args.plan_cache_csv!r} is empty or missing", file=sys.stderr)
 
     # Build question list
     questions: list[tuple[str | None, str]] = []  # (uid, question_text)
@@ -323,13 +325,12 @@ def main() -> None:
 
         result = run_question(
             question=question,
-            manifest_path=args.manifest,
-            cache_dir=args.cache_dir,
             verbose=args.verbose,
+            manifest_path=args.manifest,
             golden_pages=golden_pages,
             cached_plan_text=cached_plan_text,
             uid=uid,
-            plan_csv=args.plan_csv,
+            plan_cache_csv=args.plan_cache_csv,
         )
         if uid:
             result["uid"] = uid

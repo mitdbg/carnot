@@ -31,22 +31,23 @@ def parsed_json_dir() -> Path:
 
 
 @lru_cache(maxsize=64)
-def _load_doc(month_str: str) -> dict | None:
+def _load_doc(month_str: str) -> dict:
+    # Lazy import: skunk.subagents.base triggers subagents/__init__.py, which
+    # imports extract.py, which imports this module — module-level import cycles.
+    from skunk.subagents.base import StepFailed
     year, mon = month_str.split("-")
     p = parsed_json_dir() / f"treasury_bulletin_{year}_{mon}.json"
     if not p.exists():
-        return None
+        raise StepFailed("extract", f"parsed-JSON source not found: {p}")
     try:
         return json.loads(p.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
+    except (OSError, json.JSONDecodeError) as e:
+        raise StepFailed("extract", f"corrupt parsed-JSON for {month_str}: {e}") from e
 
 
 @lru_cache(maxsize=64)
-def _page_index(month_str: str) -> dict[int, list[dict]] | None:
+def _page_index(month_str: str) -> dict[int, list[dict]]:
     doc = _load_doc(month_str)
-    if doc is None:
-        return None
     by_page: dict[int, list[dict]] = {}
     for el in doc.get("document", {}).get("elements", []):
         bbox = el.get("bbox") or []
@@ -60,12 +61,14 @@ def _page_index(month_str: str) -> dict[int, list[dict]] | None:
 
 
 def get_text_for_pdf_page(ref: PageRef, ctx: HarnessContext) -> str | None:
-    """Concatenated content for ref's PDF page. HTML tables pass through verbatim."""
+    """Concatenated content for ref's PDF page. HTML tables pass through verbatim.
+
+    Raises StepFailed if the parsed-JSON source is missing or corrupt. Returns
+    None when the source is healthy but this PDF page has no parsed elements.
+    """
     if ref.month is None or ref.page is None:
         return None
     idx = _page_index(ref.month)
-    if idx is None:
-        return None
     elements = idx.get(int(ref.page))
     if not elements:
         return None
@@ -74,12 +77,13 @@ def get_text_for_pdf_page(ref: PageRef, ctx: HarnessContext) -> str | None:
 
 
 def get_printed_page(ref: PageRef, ctx: HarnessContext) -> str | None:
-    """Reverse lookup: bulletin printed-page footer text on ref's PDF page, or None."""
+    """Reverse lookup: bulletin printed-page footer text on ref's PDF page, or None.
+
+    Raises StepFailed if the parsed-JSON source is missing or corrupt.
+    """
     if ref.month is None or ref.page is None:
         return None
     idx = _page_index(ref.month)
-    if idx is None:
-        return None
     for el in idx.get(int(ref.page), []):
         if el.get("type") == "page_number" and el.get("content"):
             return str(el["content"])
