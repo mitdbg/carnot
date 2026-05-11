@@ -40,6 +40,10 @@ DO NOT delegate:
 - Debugging complex logic
 - Refactoring plans
 
+## Implementation rules 
+- Do not reuse modules and implemented from the main repository src/ folder. It is okay to copy and paste code snippets from the main repository, but do not import or reuse code directly. This is to ensure that the agent's code is self-contained and does not rely on external modules that may change over time.
+- Do not write or change code in the main repository src/ folder. All code should be written and live in the 'skunk' folder. This is to ensure that the agent's code is separate and does not interfere with the main repository's codebase.
+
 ## Code Generation Style
 
 - No tiny one-use helper functions.
