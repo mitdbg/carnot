@@ -1,17 +1,18 @@
 from __future__ import annotations
 
 import csv
-import glob
 import os
+import sys
+
 from dotenv import load_dotenv
 
-import carnot
-from carnot.data.dataset import Dataset
-from carnot.operators.sem_topk import SemTopKOperator
+REPO_ROOT = "/home/gerardo/carnot"
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from skunk.retrieval.retriever import Retriever
 from skunk.retrieval.semantic_document_index import SemanticDocumentIndex
 
-
-REPO_ROOT = '/home/gerardo/carnot'
 ENV_FILE = f"{REPO_ROOT}/.env"
 DATASET = 'officeqa-tiny'
 
@@ -66,13 +67,16 @@ document_ids = []
 for pdf_path in pdf_paths:
     document_ids.append(index.add(pdf_path))
 
-retrieved = index.retrieve(query["question"])
+index.initialize()
+retriever = Retriever(index)
+documents = retriever.retrieve(query["question"])
 counts = index.counts()
 
 print(f"uid: {query['uid']}")
 print(f"question: {query['question']}")
 print(f"answer: {query['answer']}")
 print(f"gold_source_files: {gold_files}")
-print(f"retrieved results: {retrieved}")
-
-print(f"index contents:\n{index}")
+print(f"retrieved results")
+for doc in documents:
+    print(f"Filename: {doc.filename}")
+# print(f"index contents:\n{index}")

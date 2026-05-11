@@ -1,18 +1,21 @@
-from dataclasses import dataclass, field
 import hashlib
+import json
+import numbers
 import os
-from typing import Dict, Tuple
+from dataclasses import dataclass, field
+from io import StringIO
 
 import fitz
+import pandas as pd
 import pymupdf
-from pymupdf.extra import page_count
+from markdownify import markdownify
 from tqdm import tqdm
+
 from .page_node import PageNode
-from .tools import call_openrouter, call_openrouter_vision, parse_json_response
+from .tools import call_openrouter
 
 DEFAULT_OCR_TEXT_DIR = "data/officeqa/treasury_bulletins_parsed/transformed"
 MAX_DOCUMENT_PROMPT_CHARS = 2000
-OCR_MATCH_CHARS_PER_CHUNK = 4000
 
 @dataclass
 class DocumentNode:
@@ -25,12 +28,13 @@ class DocumentNode:
     description: str = ""
     ocr_text_dir: str = DEFAULT_OCR_TEXT_DIR
 
-    def __init__(self, filename: str, content: bytes):
+    def __init__(self, filename: str, content: bytes, ocr_text_dir: str = DEFAULT_OCR_TEXT_DIR):
 
         sha256 = hashlib.sha256(content).hexdigest()
         self.document_id = f"doc:{sha256[:16]}"
         pdf_name = os.path.basename(filename)
         self.filename = pdf_name
+        self.ocr_text_dir = ocr_text_dir
 
         stem = os.path.splitext(pdf_name)[0]
         ocr_text_uri = os.path.join(self.ocr_text_dir, f"{stem}.txt")
@@ -45,7 +49,7 @@ class DocumentNode:
         self.page_count = len(pdf)
         self.document_title = self.extract_document_title(ocr_text)
         self.document_date = self.extract_document_date(ocr_text)
-        self.description=self.describe_text(ocr_text)
+        self.description = self.describe_text(ocr_text)
 
         self.page_nodes = []
         page_texts, page_nums = self.match_page_text(pdf, ocr_text)
@@ -137,92 +141,105 @@ Document OCR text:
         desc = call_openrouter(prompt)
         return desc
 
-    def match_page_text(self, pdf: pymupdf.Document, doc_text: str) -> Tuple[Dict[int, str], Dict[int, str]]:
-        if not doc_text.strip():
+    def source_json_path(self) -> str | None:
+        stem = os.path.splitext(self.filename)[0]
+        candidate_dirs = [
+            os.path.join(os.path.dirname(self.ocr_text_dir), "jsons"),
+            DEFAULT_OCR_TEXT_DIR.replace("/transformed", "/jsons"),
+        ]
+        for json_dir in candidate_dirs:
+            json_path = os.path.join(json_dir, f"{stem}.json")
+            if os.path.exists(json_path):
+                return json_path
+        return None
+
+    def convert_json_content_to_text(self, content: str) -> str:
+        if "<table" not in content.lower():
+            if "<" in content and ">" in content:
+                return markdownify(content).strip()
+            return content
+
+        converted_tables = []
+        for dataframe in pd.read_html(StringIO(content)):
+            if isinstance(dataframe.columns, pd.MultiIndex):
+                headers = [
+                    " > ".join(str(part) for part in column if str(part) != "nan")
+                    for column in dataframe.columns
+                ]
+            else:
+                headers = [str(column) for column in dataframe.columns]
+
+            non_null_values = []
+            for row in dataframe.itertuples(index=False, name=None):
+                for value in row:
+                    if not pd.isna(value):
+                        non_null_values.append(value)
+
+            force_float_values = (
+                all(isinstance(column, int) for column in dataframe.columns)
+                and dataframe.isna().any().any()
+                and non_null_values
+                and all(isinstance(value, numbers.Number) for value in non_null_values)
+            )
+
+            rows = []
+            rows.append("| " + " | ".join(headers) + " |")
+            rows.append("| " + " | ".join(["---"] * len(headers)) + " |")
+
+            for row in dataframe.itertuples(index=False, name=None):
+                cells = []
+                for value in row:
+                    if force_float_values and not pd.isna(value):
+                        cells.append(f"{float(value):.1f}")
+                    else:
+                        cells.append(str(value))
+                rows.append("| " + " | ".join(cells) + " |")
+
+            converted_tables.append("\n".join(rows))
+
+        return "\n\n".join(converted_tables)
+
+    def match_page_text(self, pdf: pymupdf.Document, doc_text: str) -> tuple[dict[int, str], dict[int, str]]:
+        source_json_path = self.source_json_path()
+        if source_json_path is None:
             return {page_idx: "" for page_idx in range(len(pdf))}, {}
 
-        page_texts = {}
+        with open(source_json_path, encoding="utf-8") as source_json_file:
+            source_json = json.load(source_json_file)
+
+        page_blocks = {page_idx: [] for page_idx in range(len(pdf))}
         page_nums = {}
-        last_matched_index = 0
-        for page_idx, page in enumerate(
-            tqdm(
-                pdf,
-                total=len(pdf),
-                desc=f"Matching page text in {self.filename}",
-                unit="page",
-            )
+
+        for element in tqdm(
+            source_json["document"]["elements"],
+            total=len(source_json["document"]["elements"]),
+            desc=f"Parsing page text from JSON in {self.filename}",
+            unit="element",
         ):
-            blank_page_image = page.get_pixmap(dpi=35, alpha=False).tobytes("png")
-            blank_prompt = """
-The image is a very low-resolution render of a PDF page.
-
-Determine whether the page is blank.
-
-Rules:
-- Return only valid JSON.
-- Do not include markdown or explanation.
-- A page is blank only if it has no meaningful visible content.
-- Very faint scanner noise, small specks, or page shadows do not count as meaningful content.
-- Text, tables, plots, page numbers, headers, footers, stamps, or images mean the page is not blank.
-
-JSON shape:
-{
-  "blank": true
-}
-""".strip()
-
-            raw_blank_match = call_openrouter_vision(blank_prompt, blank_page_image, model='google/gemini-2.5-flash-lite')
-            blank_match = parse_json_response(raw_blank_match)
-            if blank_match["blank"]:
-                page_texts[page_idx] = ""
+            content = element.get("content")
+            if not content:
                 continue
 
-            old_index = last_matched_index
-            search_end = min(len(doc_text), old_index + OCR_MATCH_CHARS_PER_CHUNK)
-            ocr_chunk = doc_text[old_index:search_end]
+            converted_content = self.convert_json_content_to_text(content)
+            page_ids = []
+            for bbox in element.get("bbox") or []:
+                page_id = bbox.get("page_id")
+                if isinstance(page_id, int):
+                    page_ids.append(page_id)
 
-            page_image = page.get_pixmap(dpi=120, alpha=False).tobytes("png")
-            prompt = f"""
-The image is a rendered page from a PDF. The OCR chunk below starts exactly where the previous page match ended.
+            for page_id in dict.fromkeys(page_ids):
+                page_idx = page_id - 1
+                if page_idx not in page_blocks:
+                    continue
+                page_blocks[page_idx].append(converted_content)
+                if element.get("type") == "page_number" and page_idx not in page_nums:
+                    page_nums[page_idx] = converted_content.strip()
 
-Find and match this page's content ends inside the OCR chunk.
-You can help yourself using extraction of the page number if it's visible on the page. Often the page number occurs in the OCR text as an single word per line, so it can be a useful anchor for matching. Be mindful that page numbers can be in different formats (e.g. "Page 5", "5", "p. 5") and can sometimes be mistaken for other numbers on the page, so use it as a hint but not a definitive signal.
-
-Rules:
-- Match the visible page image to the right OCR chunk text.
-- Return only valid JSON.
-- Do not include markdown or explanation.
-- The matched page text will be OCR chunk characters that match the characters in the OCR text.
-- Store the matched page text in the "page_text" field of the JSON.
-- Confidence should be "high" if you are sure the match is correct, and "low" if you are uncertain.
-- Detect the page number if it is visible and include it in the description, but do not rely on it for matching.
-
-JSON shape:
-{{
-  "page_text": "the exact text from the OCR chunk that matches the page content",
-  "page_number": str,
-  "confidence": "high"
-}}
-
-OCR chunk:
-{ocr_chunk}
-""".strip()
-
-            raw_match = call_openrouter_vision(prompt, page_image)
-            match = parse_json_response(raw_match)
-            if match.get("empty"):
-                page_texts[page_idx] = ""
-                continue
-
-            page_texts[page_idx] = match.get("page_text", "")
-            page_nums[page_idx] = match.get("page_number", "")
-            # Find the next match starting point by looking for the matched text in the OCR chunk, and if not found, just move forward by the max chars per chunk
-            if page_texts[page_idx]:
-                found_index = ocr_chunk.find(page_texts[page_idx])
-                if found_index != -1:
-                    last_matched_index = old_index + found_index + len(page_texts[page_idx])
-                else:
-                    last_matched_index = max(last_matched_index, old_index + len(page_texts[page_idx]))
+        page_texts = {}
+        for page_idx, blocks in page_blocks.items():
+            if blocks:
+                page_texts[page_idx] = "\n\n".join(blocks) + "\n\n"
             else:
-                last_matched_index = max(last_matched_index, old_index + len(page_texts[page_idx]))
+                page_texts[page_idx] = ""
+
         return page_texts, page_nums

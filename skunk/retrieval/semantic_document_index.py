@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import os
 import pickle
 import re
-import sys
-from collections.abc import Iterator
-from typing import Literal, TextIO
-from skunk.retrieval.nodes.document_node import DocumentNode
-from skunk.retrieval.nodes import *
 
-ContentType = Literal["text", "plot", "table"]
+import faiss
+import numpy as np
+
+from skunk.retrieval.nodes import PageNode, PlotNode, TableNode, TextNode
+from skunk.retrieval.nodes.document_node import DocumentNode
+from skunk.retrieval.nodes.tools import DEFAULT_EMBEDDING_MODEL, embed_texts
 
 SKUNK_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CACHE_DIR = os.path.join(SKUNK_DIR, "cache")
 DEFAULT_CACHE_PATH = os.path.join(DEFAULT_CACHE_DIR, "semantic_document_index.pckl")
+EMBEDDING_CACHE_VERSION = 1
 
 class SemanticDocumentIndex:
     def __init__(
@@ -28,15 +30,32 @@ class SemanticDocumentIndex:
         self.cache_path = cache_path
         self.documents: dict[str, DocumentNode] = {}
         self._sha_to_document_id: dict[str, str] = {}
-        if os.path.exists(self.cache_path) and False:
+        self.initialized = False
+        self.embedding_idx_map: dict[str, int] = {}
+        self.embedding_node_ids: list[str] = []
+        self.embedding_matrix: np.ndarray | None = None
+        self.embedding_model: str | None = None
+        self.embedding_faiss_index: faiss.IndexFlatIP | None = None
+        if os.path.exists(self.cache_path):
             try:
                 with open(self.cache_path, "rb") as cache_file:
                     cached_data = pickle.load(cache_file)
                     self.documents = cached_data["documents"]
                     self._sha_to_document_id = cached_data.get("sha_to_document_id", {})
+                    self.embedding_idx_map = cached_data.get("embedding_idx_map", {})
+                    self.embedding_node_ids = cached_data.get("embedding_node_ids", [])
+                    self.embedding_matrix = cached_data.get("embedding_matrix")
+                    self.embedding_model = cached_data.get("embedding_model")
+                    if self.embedding_matrix is not None:
+                        self._rebuild_faiss_index()
             except (EOFError, OSError, pickle.PickleError, TypeError, AttributeError, KeyError):
                 self.documents: dict[str, DocumentNode] = {}
                 self._sha_to_document_id: dict[str, str] = {}
+                self.embedding_idx_map = {}
+                self.embedding_node_ids = []
+                self.embedding_matrix = None
+                self.embedding_model = None
+                self.embedding_faiss_index = None
 
         self.pdf_dir = pdf_dir
         self.ocr_text_dir = ocr_text_dir
@@ -52,16 +71,19 @@ class SemanticDocumentIndex:
                 {
                     "documents": self.documents,
                     "sha_to_document_id": self._sha_to_document_id,
+                    "embedding_cache_version": EMBEDDING_CACHE_VERSION,
+                    "embedding_idx_map": self.embedding_idx_map,
+                    "embedding_node_ids": self.embedding_node_ids,
+                    "embedding_matrix": self.embedding_matrix,
+                    "embedding_model": self.embedding_model,
                 },
                 cache_file,
             )
         os.replace(temp_cache_path, self.cache_path)
 
     def add(self, document: str | bytes) -> str:
-        try:
-            import fitz
-        except ImportError as exc:
-            raise ImportError("SemanticDocumentIndex requires PyMuPDF; install the project dependencies.") from exc
+        if importlib.util.find_spec("fitz") is None:
+            raise ImportError("SemanticDocumentIndex requires PyMuPDF; install the project dependencies.")
 
         source_uri = "in_memory.pdf"
         if isinstance(document, str):
@@ -77,16 +99,93 @@ class SemanticDocumentIndex:
         if sha256 in self._sha_to_document_id:
             return self._sha_to_document_id[sha256]
 
-        document_node = DocumentNode(filename=source_uri, content=raw_pdf)
+        document_node = DocumentNode(filename=source_uri, content=raw_pdf, ocr_text_dir=self.ocr_text_dir)
         self.documents[document_node.document_id] = document_node
         self._sha_to_document_id[sha256] = document_node.document_id
+        self.initialized = False
         self._save_cache()
         return document_node.document_id
 
-    def retrieve(self, keyword: str) -> list[TextNode | TableNode | PlotNode]:
-        if not isinstance(keyword, str) or not keyword.strip():
-            raise ValueError("keyword must be a non-empty string")
-        return []
+    def initialize(self, embedding_model: str = DEFAULT_EMBEDDING_MODEL) -> None:
+        node_ids = []
+        descriptions = []
+        for document in self.documents.values():
+            document_description = document.description or f"{document.document_title} {document.document_date} {document.filename}".strip()
+            node_ids.append(document.document_id)
+            descriptions.append(document_description)
+
+            for page in document.page_nodes:
+                page_description = page.description or f"Page {page.page_number}".strip()
+                node_ids.append(page.page_id)
+                descriptions.append(page_description)
+
+                for text_node in page.text_nodes:
+                    node_ids.append(text_node.text_id)
+                    descriptions.append(text_node.description or text_node.text)
+                for table_node in page.table_nodes:
+                    node_ids.append(table_node.table_id)
+                    descriptions.append(table_node.description or f"{table_node.table_title}\n{table_node.table_data}".strip())
+                for plot_node in page.plot_nodes:
+                    node_ids.append(plot_node.plot_id)
+                    descriptions.append(plot_node.description or plot_node.plot_title)
+
+        if not node_ids:
+            self.initialized = True
+            self.embedding_idx_map = {}
+            self.embedding_node_ids = []
+            self.embedding_matrix = None
+            self.embedding_model = embedding_model
+            self.embedding_faiss_index = None
+            self._save_cache()
+            return
+
+        matrix = np.array(embed_texts(descriptions, model=embedding_model), dtype="float32")
+        faiss.normalize_L2(matrix)
+        self.embedding_idx_map = {node_id: node_idx for node_idx, node_id in enumerate(node_ids)}
+        self.embedding_node_ids = node_ids
+        self.embedding_matrix = matrix
+        self.embedding_model = embedding_model
+        self._rebuild_faiss_index()
+        self._save_cache()
+        self.initialized = True
+
+    def _rebuild_faiss_index(self) -> None:
+        if self.embedding_matrix is None or len(self.embedding_matrix) == 0:
+            self.embedding_faiss_index = None
+            self.initialized = False
+            return
+
+        matrix = np.array(self.embedding_matrix, dtype="float32")
+        faiss.normalize_L2(matrix)
+        self.embedding_matrix = matrix
+        self.embedding_faiss_index = faiss.IndexFlatIP(matrix.shape[1])
+        self.embedding_faiss_index.add(matrix)
+        self.initialized = True
+
+    def get_node_id(self, node: DocumentNode | PageNode | TextNode | TableNode | PlotNode) -> str:
+        if isinstance(node, DocumentNode):
+            return node.document_id
+        if isinstance(node, PageNode):
+            return node.page_id
+        if isinstance(node, TextNode):
+            return node.text_id
+        if isinstance(node, TableNode):
+            return node.table_id
+        return node.plot_id
+
+    def search_description_embeddings(self, query_embedding: list[float], k: int) -> list[tuple[str, float]]:
+        if self.embedding_faiss_index is None:
+            raise RuntimeError("SemanticDocumentIndex must be initialized before retrieval.")
+
+        query_matrix = np.array([query_embedding], dtype="float32")
+        faiss.normalize_L2(query_matrix)
+        scores, indexes = self.embedding_faiss_index.search(query_matrix, min(k, len(self.embedding_node_ids)))
+        results = []
+        for score, node_idx in zip(scores[0], indexes[0], strict=True):
+            if node_idx == -1:
+                continue
+            results.append((self.embedding_node_ids[node_idx], float(score)))
+        return results
 
     def get_node(self, node_id: str) -> DocumentNode | PageNode | TextNode | TableNode | PlotNode:
         for document in self.documents.values():
@@ -108,16 +207,6 @@ class SemanticDocumentIndex:
 
     def get_document_tree(self, document_id: str) -> DocumentNode:
         return self.documents[document_id]
-
-    def iter_content(self, document_id: str, content_type: ContentType | None = None) -> Iterator[TextNode | TableNode | PlotNode]:
-        document = self.get_document_tree(document_id)
-        for page in document.page_nodes:
-            if content_type in (None, "text"):
-                yield from page.text_nodes
-            if content_type in (None, "table"):
-                yield from page.table_nodes
-            if content_type in (None, "plot"):
-                yield from page.plot_nodes
 
     def counts(self) -> dict[str, int]:
         output = {
@@ -162,10 +251,8 @@ class SemanticDocumentIndex:
             document_desc = re.sub(r"\s+", " ", document_desc)
 
             output.append(
-                (
-                    f"{document_branch}doc {document.document_id} "
-                    f"[{document_title}; date={document.document_date}; pages={document.page_count}]"
-                )
+                f"{document_branch}doc {document.document_id} "
+                f"[{document_title}; date={document.document_date}; pages={document.page_count}]"
             )
             if document_desc:
                 output.append(f"{document_prefix}|-- description: {document_desc}")
@@ -183,10 +270,8 @@ class SemanticDocumentIndex:
                 page_desc = re.sub(r"\s+", " ", page_desc)
 
                 output.append(
-                    (
-                        f"{document_prefix}{page_branch}page {page.page_id} "
-                        f"[pdf={page.page_pdf_number}; doc={page.page_number}]"
-                    )
+                    f"{document_prefix}{page_branch}page {page.page_id} "
+                    f"[pdf={page.page_pdf_number}; doc={page.page_number}]"
                 )
                 if page_desc:
                     output.append(f"{document_prefix}{page_prefix}|-- description: {page_desc}")
@@ -240,4 +325,3 @@ class SemanticDocumentIndex:
 
         rendered = "\n".join(output)
         return rendered
-

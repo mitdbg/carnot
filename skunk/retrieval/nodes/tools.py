@@ -4,14 +4,14 @@ import json
 import os
 import pickle
 import re
-import untruncate_json
-
 
 import requests
+import untruncate_json
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "google/gemini-3.1-pro-preview"
 OPENROUTER_VISION_MODEL = "google/gemini-3.1-pro-preview"
+DEFAULT_EMBEDDING_MODEL = "gemini/gemini-embedding-001"
 LLM_CACHE_PATH = os.environ.get(
     "SKUNK_LLM_CACHE_PATH",
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "cache", "llm_call_cache.pckl")),
@@ -178,3 +178,37 @@ def call_openrouter_vision(
     cache[cache_key] = response_text
     save_llm_cache(cache)
     return response_text
+
+
+def embed_texts(texts: list[str], model: str = DEFAULT_EMBEDDING_MODEL) -> list[list[float]]:
+    cleaned_texts = [text.strip() or "empty semantic description" for text in texts]
+    cache = load_llm_cache()
+    embeddings: list[list[float] | None] = [None] * len(cleaned_texts)
+    uncached_texts = []
+    uncached_positions = []
+
+    for text_idx, text in enumerate(cleaned_texts):
+        request_inputs = {
+            "call_type": "embedding",
+            "model": model,
+            "text": text,
+        }
+        cache_key = llm_cache_key(request_inputs)
+        if cache_key in cache:
+            embeddings[text_idx] = cache[cache_key]
+        else:
+            uncached_texts.append(text)
+            uncached_positions.append((text_idx, cache_key))
+
+    if uncached_texts:
+        import litellm
+
+        response = litellm.embedding(model=model, input=uncached_texts)
+        for response_idx, item in enumerate(response.data):
+            embedding = item["embedding"] if isinstance(item, dict) else item.embedding
+            text_idx, cache_key = uncached_positions[response_idx]
+            cache[cache_key] = embedding
+            embeddings[text_idx] = embedding
+        save_llm_cache(cache)
+
+    return [embedding for embedding in embeddings if embedding is not None]
