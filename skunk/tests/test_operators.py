@@ -18,7 +18,7 @@ import pytest
 
 sys.path.insert(0, os.path.expanduser("~/Desktop/officeqa"))
 
-from skunk.dsl import DocHandle, FormattedString, OpNode, PageRef, TypedValue
+from skunk.dsl import DocHandle, FormattedString, NamedEntry, OpNode, PageRef, TypedValue
 
 
 def _rel_err(got, expected):
@@ -107,12 +107,20 @@ class TestCompute:
             "Report in millions of nominal dollars rounded to the nearest whole.",
             tmp_path,
         )
-        prev = TypedValue(
-            value={"national_defense_monthly_cy1940": [132, 129, 143, 159, 154, 153, 177, 200, 219, 287, 376, 473]},
-            dtype="named",
-            unit="",
-            desc="national_defense_monthly_cy1940 (list, unit=usd_millions)",
-        )
+        monthly = [132, 129, 143, 159, 154, 153, 177, 200, 219, 287, 376, 473]
+        # New contract: flat scalars with dims. One named scalar per month;
+        # dims={'month': 'YYYY-MM'} disambiguates siblings.
+        value: dict = {}
+        meta: dict = {}
+        for i, v in enumerate(monthly, start=1):
+            name = f"national_defense_cy1940_m{i:02d}"
+            value[name] = v
+            meta[name] = NamedEntry(
+                unit="usd_millions",
+                quote=f"1940 month {i}",
+                dims={"year": 1940, "month": f"1940-{i:02d}", "sub_category": "national_defense"},
+            )
+        prev = TypedValue(value=value, dtype="named", unit="", desc="", meta=meta)
         result = compute.run(OpNode(op="compute"), prev, ctx)
         assert isinstance(result, FormattedString)
         assert _rel_err(_num(result.text), 2602.0) < 0.001, f"Expected ≈2602, got {result.text!r}"
@@ -143,7 +151,8 @@ class TestCompute:
         prev = TypedValue(
             value={"some_unrelated_value": 42},
             dtype="named", unit="",
-            desc="some_unrelated_value (scalar, unit=count)",
+            desc="",
+            meta={"some_unrelated_value": NamedEntry(unit="count", quote="something else entirely")},
         )
         with pytest.raises(StepFailed) as excinfo:
             compute.run(OpNode(op="compute"), prev, ctx)

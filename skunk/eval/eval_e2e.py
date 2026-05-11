@@ -5,7 +5,8 @@ Scoring is intentionally out of scope here — the report is the artifact a down
 scorer consumes. The gap between this report and eval_extraction quantifies retrieval
 cost; the gap to the gold answer floor quantifies extraction cost.
 
-Usage:
+Usage
+-----
   # Smoke set (4 UIDs) — default
   python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv
 
@@ -14,6 +15,39 @@ Usage:
 
   # Inject golden pages (skip retrieve subagent) — recommended for isolating retrieval cost
   python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv --golden
+
+  # Run only specific UIDs
+  python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv \\
+      --uids UID0001,UID0030 --golden --verbose
+
+Golden mode (`--golden`)
+------------------------
+Bypasses the retrieve subagent. For each question, `source_docs?page=N` URLs in
+data/officeqa_pro.csv are parsed (eval/golden.py) and injected as a DocHandle
+directly into the operator chain. extract/compute/etc. then run on exactly the
+pages the benchmark deems relevant. This is the right mode for measuring the
+extract+compute ceiling — any failure here is a downstream-of-retrieval bug.
+
+Use the default (live retrieve) mode to see the end-to-end number including
+retrieval cost. The delta between the two reports is the retrieval contribution.
+
+Traces (`--trace-dir`, default `eval/traces`)
+---------------------------------------------
+Every question writes a `{uid}.txt` trace file containing, per operator step:
+op name, args, input/output (full repr), elapsed_s (which naturally absorbs
+Gemini retry wait time), and any error. Per-step subagent events (tier dispatch
+in extract, codegen attempts in compute, verifier responses, etc.) are grouped
+under each step. Use these for post-hoc auditability of every run.
+
+Pass `--trace-dir ''` to disable. Pass `--verbose` to additionally live-stream
+the events to stdout during the run.
+
+Gemini transient failures
+-------------------------
+`call_gemini` (src/skunk/subagents/base.py) retries 429/5xx errors with a
+fixed delay. Tune via env: `SKUNK_GEMINI_RETRY_DELAY` (default 30s),
+`SKUNK_GEMINI_MAX_RETRIES` (default 5). After exhaustion the step fails
+cleanly and the trace records the final exception.
 """
 
 from __future__ import annotations
@@ -109,17 +143,21 @@ def main() -> None:
         if args.trace_dir:
             trace_path = str(Path(args.trace_dir) / f"{uid}.txt")
 
-        result = run_question(
-            question=question,
-            manifest_path=None,
-            cache_dir=args.cache_dir,
-            verbose=args.verbose,
-            golden_pages=golden_pages,
-            cached_plan_text=cached_plan_text,
-            uid=uid,
-            plan_csv=args.plan_csv,
-            trace_path=trace_path,
-        )
+        try:
+            result = run_question(
+                question=question,
+                manifest_path=None,
+                cache_dir=args.cache_dir,
+                verbose=args.verbose,
+                golden_pages=golden_pages,
+                cached_plan_text=cached_plan_text,
+                uid=uid,
+                plan_csv=args.plan_csv,
+                trace_path=trace_path,
+            )
+        except Exception as e:
+            result = {"question": question, "answer": None, "failed": True,
+                      "reason": f"harness crash: {type(e).__name__}: {e}", "n_steps": 0}
 
         if result["failed"]:
             print(f"FAILED: {result['reason']}")

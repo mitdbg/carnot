@@ -63,11 +63,28 @@ class DocHandle:
 
 
 @dataclass
+class NamedEntry:
+    """Sidecar metadata for one named scalar in a TypedValue(dtype='named').
+
+    The scalar itself lives in `TypedValue.value[name]`. This record carries the
+    per-entry unit, the verbatim page phrase that anchors it, and an optional
+    `dims` dict of categorical labels that lets compute group / filter siblings
+    (e.g. {"denomination": 1, "series": "Total"}).
+    """
+    unit: str = ""
+    quote: str = ""
+    dims: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class TypedValue:
     value: Any              # never None; subagent must raise StepFailed instead
     dtype: str = "scalar"   # "scalar" | "list[scalar]" | "text" | "df" | "named"
     unit: str = ""          # semantic unit: "usd_millions", "pct", "fx_rate", "year", "cpi", etc.
     desc: str = ""          # human-readable; for dtype='named', summarises each key's unit/type.
+    meta: dict[str, NamedEntry] | None = None
+    # For dtype='named': parallel dict keyed identically to value, holding per-entry
+    # unit/quote/dims metadata. None for other dtypes.
 
 
 @dataclass

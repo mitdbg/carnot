@@ -116,7 +116,7 @@ def run_question(
 
     if cached_plan_text is not None:
         if verbose:
-            print(f"\n[run] Using cached plan...")
+            print("\n[run] Using cached plan...")
         try:
             from skunk.dsl import parse, serialize, validate
             chain = parse(cached_plan_text)

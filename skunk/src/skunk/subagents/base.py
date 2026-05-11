@@ -7,6 +7,8 @@ import base64
 import math
 import os
 import re
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +16,7 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 
@@ -30,11 +33,23 @@ class StepFailed(Exception):
 
 _GEMINI_MODEL = "gemini-2.5-flash"
 
+# Transient-failure retry tunables. Gemini 2.5 Flash returns 503 under load and 429
+# under per-minute quota; both are recoverable by waiting. Retries are bounded so a
+# fully-down API still fails the step cleanly (orchestrator records it in the trace).
+_RETRY_DELAY_S = float(os.environ.get("SKUNK_GEMINI_RETRY_DELAY", "30"))
+_MAX_RETRIES = int(os.environ.get("SKUNK_GEMINI_MAX_RETRIES", "5"))
+
+
+def _is_transient(exc: genai_errors.APIError) -> bool:
+    code = getattr(exc, "code", None)
+    return code in (429, 500, 503, 504)
+
 
 def call_gemini(
     system: str,
     user: str,
     images: list[tuple[str, str]] | None = None,
+    temperature: float = 0.0,
 ) -> str:
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -47,16 +62,28 @@ def call_gemini(
             parts.append(types.Part.from_bytes(data=base64.b64decode(b64_data), mime_type=mime_type))
     parts.append(types.Part.from_text(text=user))
 
-    resp = client.models.generate_content(
-        model=_GEMINI_MODEL,
-        contents=parts,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            max_output_tokens=8192,
-            temperature=0.0,
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=system,
+        max_output_tokens=8192,
+        temperature=temperature,
     )
-    return (resp.text or "").strip()
+
+    for attempt in range(1, _MAX_RETRIES + 2):
+        try:
+            resp = client.models.generate_content(model=_GEMINI_MODEL, contents=parts, config=config)
+            return (resp.text or "").strip()
+        except genai_errors.APIError as e:
+            if not _is_transient(e) or attempt > _MAX_RETRIES:
+                raise
+            print(
+                f"[call_gemini] {e.code} from Gemini ({e.status or 'transient'}), "
+                f"sleeping {_RETRY_DELAY_S}s then retrying (attempt {attempt}/{_MAX_RETRIES})",
+                file=sys.stderr,
+                flush=True,
+            )
+            time.sleep(_RETRY_DELAY_S)
+
+    raise RuntimeError("unreachable: retry loop fell through")
 
 
 def load_image_b64(path: str | Path) -> tuple[str, str]:
@@ -105,7 +132,7 @@ def exec_python(code: str, local_vars: dict[str, Any] | None = None) -> Any:
 # ---------------------------------------------------------------------------
 
 def parse_llm_value(raw: str) -> tuple[Any, str, str]:
-    lines = [l.strip() for l in raw.strip().splitlines() if l.strip() and not l.strip().startswith("```")]
+    lines = [ln.strip() for ln in raw.strip().splitlines() if ln.strip() and not ln.strip().startswith("```")]
     if not lines:
         raise ValueError("Empty LLM response")
     value = ast.literal_eval(lines[0])

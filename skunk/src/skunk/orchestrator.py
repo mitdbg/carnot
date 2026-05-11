@@ -66,6 +66,9 @@ def execute(chain: ChainNode, ctx: HarnessContext) -> QuestionTrace:
     except StepFailed as e:
         trace.failed = True
         trace.failure_reason = str(e)
+    except Exception as e:
+        trace.failed = True
+        trace.failure_reason = f"unexpected error: {type(e).__name__}: {e}"
     return trace
 
 
@@ -165,7 +168,8 @@ def _full_repr(v: Any) -> str:
         refs = "\n    ".join(repr(r) for r in v.refs)
         return f"DocHandle(desc={v.desc!r}, {len(v.refs)} refs):\n    {refs}" if v.refs else f"DocHandle(empty, desc={v.desc!r})"
     if isinstance(v, TypedValue):
-        return f"TypedValue(dtype={v.dtype!r}, unit={v.unit!r}, desc={v.desc!r}, value={v.value!r})"
+        meta_part = f", meta={v.meta!r}" if v.meta else ""
+        return f"TypedValue(dtype={v.dtype!r}, unit={v.unit!r}, desc={v.desc!r}, value={v.value!r}{meta_part})"
     if isinstance(v, FormattedString):
         return f"FormattedString(text={v.text!r}, desc={v.desc!r})"
     if isinstance(v, list):

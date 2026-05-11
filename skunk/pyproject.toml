@@ -28,3 +28,8 @@ where = ["src"]
 
 [tool.setuptools.package-dir]
 "" = "src"
+
+[tool.ruff.lint]
+# StepFailed is a deliberate name (read as a tagged failure mode, not a fatal
+# error); we intentionally don't follow PEP 8's "Error" suffix convention here.
+extend-ignore = ["N818"]

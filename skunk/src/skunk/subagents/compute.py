@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 
 from skunk.common.context import HarnessContext
-from skunk.dsl import FormattedString, OpNode, TypedValue
+from skunk.dsl import FormattedString, NamedEntry, OpNode, TypedValue
 from skunk.subagents.base import StepFailed, call_gemini, exec_python, strip_code_fences
 
 _MAX_ATTEMPTS = 3
@@ -27,11 +27,27 @@ You are the chain terminator for a financial QA pipeline.
 You receive:
 - The user's original question (free text).
 - `prev`: extracted bulletin data, available in the sandbox. Shapes:
-    * TypedValue with .dtype == 'named': .value is a dict {snake_case_name: scalar/list/table};
-      the printed unit of each name is described in .desc.
+    * TypedValue with .dtype == 'named':
+        .value is dict[str, scalar]   (each value is a number or string)
+        .meta  is dict[str, NamedEntry] keyed identically, with:
+              .unit  — semantic unit (usd, usd_millions, pct, count, year, text, ...)
+              .quote — verbatim phrase from the page that anchors the value
+              .dims  — small dict of categorical labels distinguishing siblings
+                       (e.g. {"denomination": 1, "series": "Total"})
     * TypedValue with another dtype: a single scalar/list/df; .unit gives the unit.
-    * list[TypedValue]: parallel branches; index in question order.
+    * list[TypedValue]: parallel branches indexed in question order; use prev[i].
 - `lookup` (alias for prev when prev is a list-of-TypedValue): use prev[i].value.
+
+Working with named entries:
+- Every named scalar carries its unit in prev[i].meta[name].unit — trust that, never
+  guess units from the key name.
+- When the same kind of measurement was extracted for many siblings (e.g. one scalar
+  per row of a table), the `dims` dict tells you what each scalar represents. To iterate
+  the siblings, filter prev[i].value.items() by prev[i].meta[k].dims. Example:
+      vals = [v for k, v in prev[i].value.items()
+              if prev[i].meta[k].dims.get("series") == "Total"]
+- Numeric `dims` labels (e.g. dims["denomination"] = 1) are the actual numeric facts —
+  use them in arithmetic, not the key name.
 
 Your job: produce the answer string the question asks for. This means
 (a) plan the computation, (b) write Python that assigns the final answer
@@ -79,27 +95,44 @@ _CODE_RE = re.compile(r"\bCODE\s*\n(.*)\Z", re.DOTALL)
 _MISSING_RE = re.compile(r"\bMISSING:\s*([^\n]*)", re.IGNORECASE)
 
 
+def _render_named_entry(prefix: str, name: str, value: object, entry: NamedEntry | None) -> list[str]:
+    """Render one named scalar with its metadata (untruncated)."""
+    unit = entry.unit if entry is not None else ""
+    quote = entry.quote if entry is not None else ""
+    dims = entry.dims if entry is not None else {}
+    out = [f"{prefix}{name} = {value!r}  (unit={unit!r}, dims={dims!r})"]
+    if quote:
+        out.append(f"{prefix}  quote: {quote!r}")
+    return out
+
+
+def _render_typed_value(tv: TypedValue, prefix: str) -> str:
+    if tv.dtype == "named" and isinstance(tv.value, dict):
+        lines = [f"{prefix}TypedValue(dtype='named', {len(tv.value)} entries)"]
+        for k, v in tv.value.items():
+            entry = (tv.meta or {}).get(k)
+            lines.extend(_render_named_entry(prefix + "  ", k, v, entry))
+        return "\n".join(lines)
+    return (
+        f"{prefix}TypedValue(dtype={tv.dtype!r}, unit={tv.unit!r}, "
+        f"value={tv.value!r}, desc={tv.desc!r})"
+    )
+
+
 def _prev_desc(prev: object) -> str:
     if isinstance(prev, TypedValue):
-        if prev.dtype == "named" and isinstance(prev.value, dict):
-            lines = [f"TypedValue(dtype='named', desc={prev.desc!r})", "  prev.value is a dict with keys:"]
-            for k, v in prev.value.items():
-                lines.append(f"    {k!r}: {repr(v)[:160]}")
-            return "\n".join(lines)
-        return f"TypedValue(dtype={prev.dtype!r}, value={repr(prev.value)[:200]}, desc={prev.desc!r})"
+        return _render_typed_value(prev, "")
     if isinstance(prev, list):
-        parts = []
+        parts = ["["]
         for i, p in enumerate(prev):
-            if isinstance(p, TypedValue) and p.dtype == "named" and isinstance(p.value, dict):
-                parts.append(f"  prev[{i}] = TypedValue(dtype='named', desc={p.desc!r})")
-                for k, v in p.value.items():
-                    parts.append(f"    prev[{i}].value[{k!r}] = {repr(v)[:120]}")
-            elif isinstance(p, TypedValue):
-                parts.append(f"  prev[{i}] = TypedValue(dtype={p.dtype!r}, value={repr(p.value)[:120]})")
+            parts.append(f"  prev[{i}] =")
+            if isinstance(p, TypedValue):
+                parts.append(_render_typed_value(p, "    "))
             else:
-                parts.append(f"  prev[{i}] = {repr(p)[:120]}")
-        return "[\n" + "\n".join(parts) + "\n]"
-    return repr(prev)[:300]
+                parts.append(f"    {p!r}")
+        parts.append("]")
+        return "\n".join(parts)
+    return repr(prev)
 
 
 def _build_user(question: str, prev: object, prior_failure: str | None) -> str:
