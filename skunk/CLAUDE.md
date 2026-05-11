@@ -24,9 +24,8 @@ The benchmark is `data/officeqa_pro.csv` (133 questions). An initial pass of DSL
 - `src/skunk/orchestrator.py` — AST executor; dispatches subagent functions
 - `src/skunk/subagents/` — one module per op (`retrieve`, `extract`, `lookup_external`, `compute`); each exposes a bare `run(op, prev, ctx)` function
 - `src/skunk/subagents/base.py` — shared utilities: `StepFailed`, `exec_python`, `parse_llm_value`, `HarnessContext`
-- `src/skunk/common/` — shared utilities used by more than one subagent (`parsed_json.py` for JSON-backed Tier 1 lookup, `pdf_text.py` and `vision.py` for Tiers 2/3)
+- `src/skunk/common/` — shared utilities used by more than one subagent (`parsed_json.py` for JSON-backed Tier 1 lookup, `pdf_text.py` and `vision.py` for Tiers 2/3, `llm.py` for the shared Gemini client)
 - `eval/` — independent eval harnesses (`golden.py`, `eval_retrieval.py`, `eval_extraction.py`, `eval_e2e.py`)
-- `tools/` — standalone CLI utilities (planner smoke test, drift analysis)
 
 ## Conventions
 
@@ -37,7 +36,7 @@ The benchmark is `data/officeqa_pro.csv` (133 questions). An initial pass of DSL
 
 ## API keys (.env at repo root)
 
-- `GEMINI_API_KEY` — Gemini 2.5 Flash; used by the planner and all subagents via `call_gemini` in `subagents/base.py`, and `tools/plan_dsl_with_gemini.py`
+- `GEMINI_API_KEY` — Gemini 2.5 Flash; used by the planner and all subagents via `ctx.llm_client.call(...)` in `src/skunk/common/llm.py`
 
 `.env.example` is committed; copy it to `.env` and fill in keys.
 
@@ -56,6 +55,6 @@ The benchmark is `data/officeqa_pro.csv` (133 questions). An initial pass of DSL
 
 ## Things to verify before claiming a feature is "done"
 
-- DSL changes: `pytest tests/test_dsl_roundtrip.py` passes; `tools/plan_dsl_with_gemini.py --smoke` produces 7/7 validate_ok.
+- DSL changes: `pytest tests/test_dsl_roundtrip.py` passes.
 - Subagent changes: the standalone callable still has its signature; the eval harness for that subagent passes its acceptance bar (see the acceptance criteria in the subagent's TODO comment).
-- New ops or new args: documented in `DSL.md`, exemplified in `tools/plan_dsl_with_gemini.py`'s `FEW_SHOT`, and the planner few-shots in `src/skunk/planner.py` are updated.
+- New ops or new args: documented in `DSL.md`, and the planner few-shots in `src/skunk/planner.py` are updated.

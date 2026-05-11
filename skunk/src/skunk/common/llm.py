@@ -105,6 +105,8 @@ class LLMClient:
         user: str,
         images: list[tuple[str, str]] | None = None,
         temperature: float = 0.0,
+        thinking_budget: int = 0,
+        use_google_search: bool = False,
     ) -> str:
         client = self._get_client()
         parts: list[Any] = []
@@ -115,18 +117,30 @@ class LLMClient:
                 )
         parts.append(types.Part.from_text(text=user))
 
-        cache_name = self._resolve_cache(client, system) if system else None
+        thinking_config = types.ThinkingConfig(thinking_budget=thinking_budget)
+        tools = (
+            [types.Tool(google_search=types.GoogleSearch())] if use_google_search else None
+        )
+
+        # Gemini explicit caching is incompatible with tool use; skip the cache path when
+        # grounding is on so the call doesn't fail with a server-side validation error.
+        cache_name = (
+            self._resolve_cache(client, system) if system and not use_google_search else None
+        )
         if cache_name:
             gen_config = types.GenerateContentConfig(
                 cached_content=cache_name,
                 max_output_tokens=65535,
                 temperature=temperature,
+                thinking_config=thinking_config,
             )
         else:
             gen_config = types.GenerateContentConfig(
                 system_instruction=system,
                 max_output_tokens=65535,
                 temperature=temperature,
+                thinking_config=thinking_config,
+                tools=tools,
             )
 
         model = self._config.gemini_model

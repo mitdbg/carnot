@@ -8,7 +8,6 @@ A declarative QA pipeline over the U.S. Treasury Bulletin corpus. Questions are 
 pip install -e ".[dev]"
 cp .env.example .env   # then fill in ANTHROPIC_API_KEY and GEMINI_API_KEY
 pytest -v tests/
-python tools/plan_dsl_with_gemini.py --smoke   # generate plans for 7 sample questions
 ```
 
 ## What's where
@@ -22,8 +21,6 @@ python tools/plan_dsl_with_gemini.py --smoke   # generate plans for 7 sample que
 | `data/dsl_planning_pass.csv` | 133 validated DSL plans (use as planner few-shots) |
 | `src/skunk/` | Runtime: planner, orchestrator, subagents, prep |
 | `eval/` | Independent retrieval / extraction / e2e harnesses |
-| `tools/plan_dsl_with_gemini.py` | Regenerates `dsl_planning_pass.csv` (Gemini 2.5 Flash, no PZ) |
-| `tools/measure_retrieval_drift.py` | Drift study that motivated the catalog-first design |
 
 ## Status
 
@@ -33,4 +30,4 @@ The 4-op DSL is finalized. All four subagents are implemented:
 - `lookup_external` does a single Gemini call for facts (numeric, dates, named entities);
 - `compute` terminates the chain with plan→code→exec→verify.
 
-Plans are produced live by the planner; `data/dsl_planning_pass.csv` is rebuilt lazily as questions run, or eagerly via `tools/plan_dsl_with_gemini.py`.
+Plans are produced live by the planner; `data/dsl_planning_pass.csv` is rebuilt lazily by `skunk.run` on first execution per UID.

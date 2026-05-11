@@ -599,7 +599,7 @@ def _resolve_disagreement(
         n_candidates=sum(len(r) for r in verified_runs),
         user_message=user_msg[:3000],
     )
-    raw = ctx.llm_client.call(_RESOLVER_SYSTEM, user_msg, temperature=0.0)
+    raw = ctx.llm_client.call(_RESOLVER_SYSTEM, user_msg, temperature=0.0, thinking_budget=-1)
     try:
         parsed = _parse_response_raw(raw, ctx)
     except StepFailed as e:
@@ -628,7 +628,7 @@ def _single_call(
     images: list[tuple[str, str]] | None = None,
 ) -> list[_Sample]:
     """One deterministic Gemini call (T=0). Returns parsed samples; [] if LLM emitted {}."""
-    raw = ctx.llm_client.call(system, user, images=images, temperature=0.0)
+    raw = ctx.llm_client.call(system, user, images=images, temperature=0.0, thinking_budget=-1)
     try:
         parsed = _parse_response_raw(raw, ctx)
     except StepFailed:
@@ -696,7 +696,7 @@ def _sample_n(
     temperature = ctx.config.extract_sample_temperature
 
     def _one(_i: int) -> tuple[str, list[_Sample] | None, StepFailed | None]:
-        raw = ctx.llm_client.call(system, user, images=images, temperature=temperature)
+        raw = ctx.llm_client.call(system, user, images=images, temperature=temperature, thinking_budget=0)
         try:
             parsed = _parse_response_raw(raw, ctx)
         except StepFailed as e:

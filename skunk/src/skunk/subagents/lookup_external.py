@@ -43,7 +43,7 @@ def run(op: OpNode, prev: None, ctx: HarnessContext) -> TypedValue:
     if not nl:
         raise StepFailed("lookup_external", "Missing 'nl' arg")
     ctx.emit("lookup_external", "calling gemini", nl=nl)
-    raw = ctx.llm_client.call(_SYSTEM, nl)
+    raw = ctx.llm_client.call(_SYSTEM, nl, thinking_budget=-1, use_google_search=True)
     ctx.emit("lookup_external", "gemini response", raw=raw[:500])
 
     try:

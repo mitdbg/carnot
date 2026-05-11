@@ -262,7 +262,7 @@ def run(op: OpNode, prev: object, ctx: HarnessContext) -> FormattedString:
     last_result_text: str = ""
 
     for attempt in range(ctx.config.compute_max_attempts):
-        raw = ctx.llm_client.call(_CODEGEN_SYSTEM, _build_user(ctx.question, prev, priors))
+        raw = ctx.llm_client.call(_CODEGEN_SYSTEM, _build_user(ctx.question, prev, priors), thinking_budget=-1)
         ctx.emit("compute", f"attempt {attempt + 1} codegen response", raw=raw[:600])
 
         # Strip outer markdown fences before scanning for CODE / MISSING tokens.
