@@ -1,6 +1,6 @@
 # cache and data folder 
-data/
-skunk/cache/
+data/*
+skunk/cache/*
 
 # local deployments
 .chats
