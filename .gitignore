@@ -2,6 +2,12 @@
 data/
 skunk/cache/
 
+# local deployments
+.chats
+.claude
+.codex
+.github
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
