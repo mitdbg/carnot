@@ -1,0 +1,5 @@
+# Keep this directory in git.
+# Add ignore rules for generated/local skunk files below.
+
+*
+!.gitignore
