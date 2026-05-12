@@ -63,9 +63,6 @@ class DocHandle:
     refs: list[PageRef] = field(default_factory=list)
     desc: str = ""
 
-    def is_empty(self) -> bool:
-        return len(self.refs) == 0
-
 
 VALID_KINDS = frozenset({"scalar", "vector", "table"})
 
@@ -231,7 +228,6 @@ Branch = RetrieveBranch | LookupBranch
 @dataclass
 class Plan:
     branches: list[Branch] = field(default_factory=list)   # len 1 = simple; len > 1 = parallel
-    global_constraints: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -398,7 +394,10 @@ def parse(text: str) -> Plan:
     parts = _split_chain(text)
     if not parts:
         raise ParseError(f"Empty plan text: {text!r}")
-    last_name, last_args = _parse_op_or_parallel(parts[-1])
+    last = parts[-1].strip()
+    if last.startswith("[") and last.endswith("]"):
+        raise ParseError(f"Plan must end with compute(), got parallel block: {last!r}")
+    last_name, last_args = _parse_op(last)
     if last_name != "compute":
         raise ParseError(f"Plan must end with compute(), got {parts[-1]!r}")
     if last_args:
@@ -418,14 +417,6 @@ def parse(text: str) -> Plan:
         branches = [_parse_branch(" --> ".join(body))]
 
     return Plan(branches=branches)
-
-
-def _parse_op_or_parallel(token: str) -> tuple[str, dict[str, Any]]:
-    """Returns (op_name, args). For parallel blocks returns ("[parallel]", {})."""
-    token = token.strip()
-    if token.startswith("[") and token.endswith("]"):
-        return "[parallel]", {}
-    return _parse_op(token)
 
 
 def _parse_branch(text: str) -> Branch:
@@ -521,17 +512,13 @@ def _branch_from_dict(d: dict) -> Branch:
 def to_dict(plan: Plan) -> dict:
     return {
         "branches": [_branch_to_dict(b) for b in plan.branches],
-        "global_constraints": list(plan.global_constraints),
     }
 
 
 def from_dict(d: dict) -> Plan:
     if "branches" not in d:
         raise ValueError(f"Plan dict missing required field 'branches': {d!r}")
-    return Plan(
-        branches=[_branch_from_dict(b) for b in d["branches"]],
-        global_constraints=list(d.get("global_constraints", [])),
-    )
+    return Plan(branches=[_branch_from_dict(b) for b in d["branches"]])
 
 
 # ---------------------------------------------------------------------------

@@ -58,8 +58,7 @@ Emit a single JSON object:
     "branches": [
       {"kind": "retrieve", "concept": "...", "period": "..."},
       {"kind": "lookup_external", "nl": "..."}
-    ],
-    "global_constraints": []
+    ]
   }
 
 A simple chain has one element in `branches`. A parallel has 2+.
@@ -72,7 +71,6 @@ _FEW_SHOTS = [
             "branches": [
                 {"kind": "retrieve", "concept": "national_defense_expenditures", "period": "CY1940"},
             ],
-            "global_constraints": ["nominal dollars (not inflation-adjusted)"],
         },
     },
     {
@@ -82,7 +80,6 @@ _FEW_SHOTS = [
                 {"kind": "retrieve", "concept": "national_defense_expenditures", "period": "CY1940"},
                 {"kind": "retrieve", "concept": "national_defense_expenditures", "period": "CY1953"},
             ],
-            "global_constraints": [],
         },
     },
     {
@@ -91,7 +88,6 @@ _FEW_SHOTS = [
             "branches": [
                 {"kind": "retrieve", "concept": "91day_bill_discount_rate", "period": "1953..1955"},
             ],
-            "global_constraints": ["September months only"],
         },
     },
     {
@@ -101,7 +97,6 @@ _FEW_SHOTS = [
                 {"kind": "retrieve", "concept": "fx_investments", "period": "2025-03", "source_bulletin": "2025-03"},
                 {"kind": "lookup_external", "nl": "USD/JPY exchange rate on 2025-03-31"},
             ],
-            "global_constraints": [],
         },
     },
     {
@@ -116,7 +111,6 @@ _FEW_SHOTS = [
                     "visual_only": True,
                 },
             ],
-            "global_constraints": [],
         },
     },
 ]

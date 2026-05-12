@@ -7,11 +7,10 @@ HarnessContext(llm_client=MockLLMClient()).
 from __future__ import annotations
 
 import base64
-import hashlib
 import os
 import sys
 import time
-from typing import Any, ClassVar
+from typing import Any
 
 from google import genai
 from google.genai import errors as genai_errors
@@ -30,15 +29,7 @@ class LLMClient:
     A single genai.Client is reused across calls. Transient server errors
     (429, 500, 503, 504) are retried with a fixed sleep; all other errors
     propagate immediately.
-
-    Static system prompts are routed through Gemini's explicit cache. Cache
-    state is class-level so it survives across HarnessContext instances within
-    one process. If cache creation fails (too small, transient, unsupported
-    model), the call falls back to passing system_instruction directly.
     """
-
-    _system_caches: ClassVar[dict[str, str]] = {}     # sha256(system) -> cache_name
-    _cache_disabled: ClassVar[set[str]] = set()       # hashes that failed to cache
 
     def __init__(self, config: SkunkConfig) -> None:
         self._config = config
@@ -61,43 +52,6 @@ class LLMClient:
                     raise RuntimeError("GEMINI_API_KEY not set")
                 self._client = genai.Client(api_key=api_key)
         return self._client
-
-    def _resolve_cache(self, client: genai.Client, system: str) -> str | None:
-        """Return a cached_content name for `system`, creating one lazily.
-
-        Returns None if caching is unavailable for this system text (too small,
-        transient failure, model doesn't support it). Caller should then pass
-        system_instruction directly.
-        """
-        key = hashlib.sha256(system.encode()).hexdigest()
-        if key in self._cache_disabled:
-            return None
-        if key in self._system_caches:
-            return self._system_caches[key]
-        # Gemini explicit caching requires ≥1024 input tokens. Skip the round trip for
-        # short system prompts; ~4 chars/token is a safe English-text heuristic.
-        if len(system) < 4000:
-            self._cache_disabled.add(key)
-            return None
-        try:
-            cache = client.caches.create(
-                model=self._config.gemini_model,
-                config=types.CreateCachedContentConfig(
-                    system_instruction=system,
-                    ttl="3600s",
-                ),
-            )
-            self._system_caches[key] = cache.name
-            return cache.name
-        except Exception as e:
-            print(
-                f"[LLMClient] cache create failed ({type(e).__name__}: {e}); "
-                f"falling back to direct system_instruction",
-                file=sys.stderr,
-                flush=True,
-            )
-            self._cache_disabled.add(key)
-            return None
 
     def call(
         self,
@@ -122,26 +76,13 @@ class LLMClient:
             [types.Tool(google_search=types.GoogleSearch())] if use_google_search else None
         )
 
-        # Gemini explicit caching is incompatible with tool use; skip the cache path when
-        # grounding is on so the call doesn't fail with a server-side validation error.
-        cache_name = (
-            self._resolve_cache(client, system) if system and not use_google_search else None
+        gen_config = types.GenerateContentConfig(
+            system_instruction=system,
+            max_output_tokens=65535,
+            temperature=temperature,
+            thinking_config=thinking_config,
+            tools=tools,
         )
-        if cache_name:
-            gen_config = types.GenerateContentConfig(
-                cached_content=cache_name,
-                max_output_tokens=65535,
-                temperature=temperature,
-                thinking_config=thinking_config,
-            )
-        else:
-            gen_config = types.GenerateContentConfig(
-                system_instruction=system,
-                max_output_tokens=65535,
-                temperature=temperature,
-                thinking_config=thinking_config,
-                tools=tools,
-            )
 
         model = self._config.gemini_model
         max_retries = self._config.gemini_max_retries

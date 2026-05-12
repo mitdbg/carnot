@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 import pytest
 
 from skunk.common.context import HarnessContext
@@ -22,7 +19,7 @@ JAN_1941_JSON = parsed_json_dir() / "treasury_bulletin_1941_01.json"
 
 
 def _ctx() -> HarnessContext:
-    return HarnessContext(question="", cache_dir="cache")
+    return HarnessContext(question="")
 
 
 @pytest.fixture(autouse=True)

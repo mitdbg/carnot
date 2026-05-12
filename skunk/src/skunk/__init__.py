@@ -9,7 +9,7 @@ Architecture:
             -> {retrieve, extract, lookup_external, compute}
 
 `compute` is the chain terminator and subsumes formatting (it self-plans, codegens,
-execs, then a verifier LLM checks the output's format/unit fits the question).
+execs, then self-critiques the result against the question with full context).
 
 See ARCHITECTURE.md for design intent and DSL.md for the formal grammar.
 """

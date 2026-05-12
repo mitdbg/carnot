@@ -1,14 +1,14 @@
-"""compute subagent — chain terminator. Self-plans, codegens, execs, verifies.
+"""compute subagent — chain terminator. Self-plans, codegens, execs, self-critiques.
 
 Subsumes the old `format` op. Reads ctx.question and prev (extracted values),
-generates Python, runs it in the sandbox, then a verifier LLM checks that the
-output's form/unit/precision match what the question asks for. Returns
-FormattedString as the chain's final answer.
+generates Python, runs it in the sandbox, then a self-critique LLM call (same
+domain context as the producer) decides whether to ship the result or revise.
+Returns FormattedString as the chain's final answer.
 
 Failure modes (StepFailed):
-- All N codegen+exec attempts raised an exception
-- Verifier rejected all N attempts
-- Codegen reported "MISSING:" — extracted values insufficient to answer
+- Attempt 1 produced no result across all transient retries
+- Attempt 2 produced no result AND attempt 1 had no result either
+- Codegen reported "MISSING:" on attempt 1 — extracted values insufficient
 """
 
 from __future__ import annotations
@@ -98,30 +98,35 @@ Rules:
 - Output ONLY the format above — no markdown fences around the whole response.
 """
 
-# TODO: verifier currently checks format/unit only and will PASS clearly implausible magnitudes.
-# Witnessed: UID0009 produced "$1.000" for "weighted average denomination of U.S. currency in
-# circulation" (true value ≈ $32.66) because the compute LLM misread a column; the format was
-# right (3 decimals + $) so the verifier accepted it. Future enhancement: extend the prompt with
-# a common-sense magnitude clause — e.g. percent answers in [0%, 100%], years in plausible bounds,
-# "average U.S. bill denomination" in [$1, $100]. Frame as "when in doubt, PASS" to avoid
-# false-fail regressions on legitimate edge cases.
-_VERIFIER_SYSTEM = """\
-You verify whether a computed answer is in the correct FORMAT and UNIT to answer the user's question.
-You are NOT verifying numeric correctness — only that the *shape* of the answer matches what the
-question literally asks for: precision, units, percent vs decimal, comma vs no-comma, list vs scalar,
-required prefix/suffix symbols.
+_CRITIQUE_SYSTEM = """\
+You are reviewing code that you (the chain terminator) just wrote and the
+string it produced. Decide whether to ship the result as-is or revise.
 
-Reply with exactly one line:
-  PASS
-or
-  FAIL: <one short reason describing the format/unit mismatch>
+You receive the same context the producer had: the question, a summary of
+`prev` (the TypedValue input — including each entry's unit, kind, dims, and
+the originating quote), the python code that ran, and the produced
+`result` string.
 
-Examples:
-- Question asks "rounded to the nearest hundredths place" but answer is "1.234" → FAIL: needs 2 decimals
-- Question asks for percent value "12.34%" but answer is "0.1234" → FAIL: must be in percent form, not decimal
-- Question asks "no commas" but answer is "1,234,567" → FAIL: contains commas
-- Question asks "[a, b]" bracketed list but answer is "1.0 2.0" → FAIL: must be bracketed list
-- Question asks rounded integer and answer is "8998" → PASS
+Reply on a single line:
+  ACCEPT
+  REVISE: <one short reason a re-run should address>
+
+Bias toward ACCEPT. Only REVISE when the producer:
+  - applied the wrong unit conversion (e.g. shipped usd_thousands while the
+    question asked for usd_millions, or never converted),
+  - produced a result whose form clearly contradicts the question (asked
+    for "[a, b]" bracketed list, shipped "1.0 2.0"; asked for percent
+    form, shipped a decimal like "0.1234"),
+  - selected the wrong rows/columns from `prev` given the question's
+    explicit constraints (wrong year, wrong series, wrong dim filter).
+
+Do NOT REVISE on:
+  - cosmetic precision when the question doesn't pin precision,
+  - presence/absence of a trailing unit suffix when the magnitude is right
+    and the question doesn't explicitly demand the suffix,
+  - whitespace, capitalization, or punctuation nits.
+
+When in doubt, ACCEPT.
 """
 
 # Match CODE / MISSING anywhere (after fence-stripping + light prose). Use re.search,
@@ -210,10 +215,10 @@ def _prev_desc(prev: object) -> str:
     return repr(prev)
 
 
-def _build_user(question: str, prev: object, priors: list[str]) -> str:
+def _build_user(question: str, prev_desc: str, priors: list[str]) -> str:
     msg = (
         f"Question:\n{question}\n\n"
-        f"prev =\n{_prev_desc(prev)}\n\n"
+        f"prev =\n{prev_desc}\n\n"
         f"Produce CODE or MISSING:."
     )
     if priors:
@@ -224,93 +229,130 @@ def _build_user(question: str, prev: object, priors: list[str]) -> str:
     return msg
 
 
-def _verify(question: str, answer_text: str, ctx: HarnessContext) -> tuple[bool, str]:
-    """Ask the verifier LLM whether `answer_text` is in the right format/unit.
+def _self_critique(
+    question: str, prev_desc: str, code: str, result_text: str, ctx: HarnessContext,
+) -> tuple[bool, str]:
+    """Same-actor review of (code, result) against the question.
 
-    Returns (passed, reason). Conservative when ambiguous: if both PASS and FAIL
-    appear in the reply, FAIL wins. If neither appears, treat as FAIL with a
-    diagnostic reason rather than silently accepting.
+    Returns (accept, reason). Conservative when ambiguous: malformed reply or both
+    tokens present → REVISE with a diagnostic reason.
     """
     user = (
         f"Question:\n{question}\n\n"
-        f"Computed answer:\n{answer_text}\n\n"
-        f"Reply on a single line: PASS, or FAIL: <reason>."
+        f"prev =\n{prev_desc}\n\n"
+        f"Code that ran:\n```python\n{code}\n```\n\n"
+        f"Produced result:\n{result_text}\n\n"
+        f"Reply on a single line: ACCEPT, or REVISE: <reason>."
     )
-    raw = ctx.llm_client.call(_VERIFIER_SYSTEM, user)
-    ctx.emit("compute", "verifier response", raw=raw[:300])
+    raw = ctx.llm_client.call(_CRITIQUE_SYSTEM, user)
+    ctx.emit("compute", "self-critique response", raw=raw[:300])
 
     text = raw.strip()
     upper = text.upper()
-    has_fail = "FAIL" in upper
-    has_pass = "PASS" in upper
+    has_revise = "REVISE" in upper
+    has_accept = "ACCEPT" in upper
 
-    if has_fail:
-        # Extract a reason — text after the first FAIL token, up to a newline.
-        m = re.search(r"FAIL[: ]?\s*([^\n]*)", text, re.IGNORECASE)
-        reason = m.group(1).strip() if m and m.group(1).strip() else "verifier rejected (no reason)"
+    if has_revise:
+        m = re.search(r"REVISE[: ]?\s*([^\n]*)", text, re.IGNORECASE)
+        reason = m.group(1).strip() if m and m.group(1).strip() else "self-critique flagged revise (no reason)"
         return False, reason
-    if has_pass:
+    if has_accept:
         return True, ""
-    return False, f"verifier produced malformed reply: {text[:120]!r}"
+    return False, f"self-critique produced malformed reply: {text[:120]!r}"
 
 
-def run(op: OpNode, prev: object, ctx: HarnessContext) -> FormattedString:
-    ctx.emit("compute", "starting", question=ctx.question, prev_summary=_prev_desc(prev)[:500])
+def _try_codegen_and_exec(
+    ctx: HarnessContext,
+    prev: object,
+    prev_desc: str,
+    priors: list[str],
+    retry_budget: int,
+) -> tuple[str | None, str | None, list[str]]:
+    """One logical attempt: codegen → parse → exec, with `retry_budget` retries
+    for transient exec/parse failures (a malformed response or a code exception).
 
-    priors: list[str] = []
-    last_code: str = ""
-    last_result_text: str = ""
+    MISSING: from codegen propagates as MissingData. Returns
+    (result_text, code, accumulated_priors) on success, or
+    (None, None, accumulated_priors) when the retry budget is exhausted.
+    """
+    priors = list(priors)
+    # Total tries = 1 initial + retry_budget retries.
+    for try_idx in range(retry_budget + 1):
+        raw = ctx.llm_client.call(
+            _CODEGEN_SYSTEM, _build_user(ctx.question, prev_desc, priors), thinking_budget=-1,
+        )
+        ctx.emit("compute", f"codegen try {try_idx + 1} response", raw=raw[:600])
 
-    for attempt in range(ctx.config.compute_max_attempts):
-        raw = ctx.llm_client.call(_CODEGEN_SYSTEM, _build_user(ctx.question, prev, priors), thinking_budget=-1)
-        ctx.emit("compute", f"attempt {attempt + 1} codegen response", raw=raw[:600])
-
-        # Strip outer markdown fences before scanning for CODE / MISSING tokens.
         cleaned = strip_code_fences(raw)
-
-        # Check CODE first: per the prompt's "exactly one of" contract, a CODE response
-        # may legitimately contain the literal substring "MISSING:" inside Python string
-        # literals (e.g. a defensive `raise ValueError("MISSING: ...")`). Only treat the
-        # response as MISSING when no CODE block is present.
         m_code = _CODE_RE.search(cleaned)
         if not m_code:
             m_missing = _MISSING_RE.search(cleaned)
             if m_missing:
                 reason = m_missing.group(1).strip()
-                ctx.emit("compute", f"attempt {attempt + 1} reported MISSING", reason=reason)
+                ctx.emit("compute", f"codegen try {try_idx + 1} reported MISSING", reason=reason)
                 raise MissingData(reason)
             priors.append(f"Response had neither CODE nor MISSING:. Raw: {raw[:300]}")
-            ctx.emit("compute", f"attempt {attempt + 1} malformed response", prior=priors[-1][:300])
+            ctx.emit("compute", f"codegen try {try_idx + 1} malformed", prior=priors[-1][:300])
             continue
 
         code = m_code.group(1).strip()
-        last_code = code
-        ctx.emit("compute", f"attempt {attempt + 1} code", code=code)
+        ctx.emit("compute", f"codegen try {try_idx + 1} code", code=code)
 
         try:
             result_value = exec_python(code, {"prev": prev})
         except Exception as e:
             priors.append(f"Code:\n```python\n{code}\n```\nException: {e}")
-            ctx.emit("compute", f"attempt {attempt + 1} exec failed", error=str(e))
+            ctx.emit("compute", f"codegen try {try_idx + 1} exec failed", error=str(e))
             continue
 
-        result_text = result_value if isinstance(result_value, str) else str(result_value)
-        last_result_text = result_text
-        ctx.emit("compute", f"attempt {attempt + 1} produced result", text=result_text)
+        result_text = str(result_value)
+        ctx.emit("compute", f"codegen try {try_idx + 1} produced result", text=result_text)
+        return result_text, code, priors
 
-        passed, reason = _verify(ctx.question, result_text, ctx)
-        if passed:
-            ctx.emit("compute", f"attempt {attempt + 1} verified", text=result_text)
-            return FormattedString(text=result_text)
+    return None, None, priors
 
-        priors.append(
-            f"Produced result {result_text!r} but the verifier rejected it: {reason}\n"
-            f"Code was:\n```python\n{code}\n```"
-        )
-        ctx.emit("compute", f"attempt {attempt + 1} verifier rejected", reason=reason)
 
-    raise StepFailed(
-        "compute",
-        f"{ctx.config.compute_max_attempts} attempts failed. Last code: {last_code!r}. "
-        f"Last result: {last_result_text!r}. Priors: {priors}"
+def run(op: OpNode, prev: object, ctx: HarnessContext) -> FormattedString:
+    prev_desc = _prev_desc(prev)
+    ctx.emit("compute", "starting", question=ctx.question, prev_summary=prev_desc[:500])
+
+    # Attempt 1: codegen → exec → self-critique
+    a1_result, a1_code, a1_priors = _try_codegen_and_exec(
+        ctx, prev, prev_desc, priors=[], retry_budget=ctx.config.compute_max_attempts - 1,
     )
+    if a1_result is None:
+        raise StepFailed(
+            "compute",
+            f"could not produce a result on attempt 1: priors={a1_priors}",
+        )
+
+    accept, reason = _self_critique(ctx.question, prev_desc, a1_code, a1_result, ctx)
+    if accept:
+        ctx.emit("compute", "attempt 1 self-critique ACCEPT", text=a1_result)
+        return FormattedString(text=a1_result)
+    ctx.emit("compute", "attempt 1 self-critique REVISE", reason=reason)
+
+    # Attempt 2: codegen with critique as prior, ship unconditionally (no re-critique → no flap)
+    hint = (
+        f"Produced result {a1_result!r}. Self-critique flagged: {reason}\n"
+        f"Code was:\n```python\n{a1_code}\n```"
+    )
+    try:
+        a2_result, _, _ = _try_codegen_and_exec(
+            ctx, prev, prev_desc, priors=[hint], retry_budget=0,
+        )
+    except MissingData as e:
+        # Codegen had data on attempt 1; on attempt 2 it's reacting to critique
+        # feedback, not to a real absence. Fall back rather than mask the result.
+        ctx.emit("compute", "attempt 2 MISSING; falling back to attempt 1",
+                 reason=e.reason, fallback_text=a1_result)
+        return FormattedString(text=a1_result)
+    if a2_result is None:
+        ctx.emit(
+            "compute",
+            "attempt 2 produced no result; falling back to attempt 1",
+            fallback_text=a1_result,
+        )
+        return FormattedString(text=a1_result)
+    ctx.emit("compute", "attempt 2 returned (no re-critique)", text=a2_result)
+    return FormattedString(text=a2_result)

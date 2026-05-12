@@ -9,7 +9,6 @@ Run with: pytest tests/test_operators.py -v -s
 
 from __future__ import annotations
 
-import math  # noqa: F401
 import os
 import re
 import sys
@@ -40,12 +39,12 @@ JAN_1941_JSON = os.path.join(PARSED_JSON_DIR, "treasury_bulletin_1941_01.json")
 
 
 @pytest.fixture()
-def ctx(tmp_path):
-    return HarnessContext(question="test", cache_dir=str(tmp_path))
+def ctx():
+    return HarnessContext(question="test")
 
 
-def _ctx_for(question: str, tmp_path) -> HarnessContext:
-    return HarnessContext(question=question, cache_dir=str(tmp_path))
+def _ctx_for(question: str) -> HarnessContext:
+    return HarnessContext(question=question)
 
 
 def _num(text: str) -> float:
@@ -93,18 +92,17 @@ class TestLookupExternal:
 
 class TestCompute:
 
-    def test_sum_of_list(self, tmp_path):
-        ctx = _ctx_for("What is the sum of the values? Report as a plain integer with no commas.", tmp_path)
+    def test_sum_of_list(self):
+        ctx = _ctx_for("What is the sum of the values? Report as a plain integer with no commas.")
         prev = TypedValue(value={"": [10.0, 20.0, 30.0]}, meta={"": NamedEntry()}, desc="monthly values")
         result = compute.run(OpNode(op="compute"), prev, ctx)
         assert isinstance(result, FormattedString)
         assert _num(result.text) == 60.0, f"Expected 60, got {result.text!r}"
 
-    def test_named_values_sum_with_unit_context(self, tmp_path):
+    def test_named_values_sum_with_unit_context(self):
         ctx = _ctx_for(
             "What was the total US national defense expenditure in calendar year 1940? "
-            "Report in millions of nominal dollars rounded to the nearest whole.",
-            tmp_path,
+            "Report in millions of nominal dollars rounded to the nearest whole."
         )
         monthly = [132, 129, 143, 159, 154, 153, 177, 200, 219, 287, 376, 473]
         # New contract: flat scalars with dims. One named scalar per month;
@@ -124,10 +122,9 @@ class TestCompute:
         assert isinstance(result, FormattedString)
         assert _rel_err(_num(result.text), 2602.0) < 0.001, f"Expected ≈2602, got {result.text!r}"
 
-    def test_absolute_pct_change_parallel(self, tmp_path):
+    def test_absolute_pct_change_parallel(self):
         ctx = _ctx_for(
-            "What was the absolute percent change between the two values, as a percent value (e.g. 12.34%)?",
-            tmp_path,
+            "What was the absolute percent change between the two values, as a percent value (e.g. 12.34%)?"
         )
         prev = [
             TypedValue(value={"": 2602.0}, meta={"": NamedEntry(unit="usd_millions")}, desc="CY1940 total"),
@@ -140,11 +137,10 @@ class TestCompute:
             f"Expected ≈{expected:.2f}%, got {result.text!r}"
         )
 
-    def test_missing_data_failure_mode(self, tmp_path):
+    def test_missing_data_failure_mode(self):
         from skunk.subagents.base import StepFailed
         ctx = _ctx_for(
-            "What is the unemployment rate for January 1955? Report as a percent.",
-            tmp_path,
+            "What is the unemployment rate for January 1955? Report as a percent."
         )
         # prev contains nothing about unemployment
         prev = TypedValue(
@@ -167,10 +163,9 @@ class TestExtractVisualOnly:
         not os.path.exists(SEPT_1990_PDF),
         reason="Treasury Bulletin PDF corpus not present",
     )
-    def test_uid0030_well_formed_output(self, tmp_path):
+    def test_uid0030_well_formed_output(self):
         ctx = _ctx_for(
-            "Count the local maxima across all line plots on the page.",
-            tmp_path,
+            "Count the local maxima across all line plots on the page."
         )
         op = OpNode(op="extract", args={"visual_only": True})
         ref = PageRef(month="1990-09", page=7, file_path=SEPT_1990_PDF)
@@ -190,11 +185,10 @@ class TestExtract:
         not os.path.exists(JAN_1941_JSON),
         reason="Parsed JSON corpus not present",
     )
-    def test_uid0001_pdf_page_15_named_extraction(self, tmp_path):
+    def test_uid0001_pdf_page_15_named_extraction(self):
         ctx = _ctx_for(
             "What were the total expenditures (in millions of nominal dollars) for U.S "
-            "national defense in the calendar year of 1940?",
-            tmp_path,
+            "national defense in the calendar year of 1940?"
         )
         op = OpNode(op="extract")
         ref = PageRef(month="1941-01", page=15)

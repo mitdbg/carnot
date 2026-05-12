@@ -19,7 +19,6 @@ if TYPE_CHECKING:
 class SkunkConfig:
     # Orchestrator
     max_parallel_workers: int = 4
-    parallel_timeout_s: float = 120.0
 
     # Gemini LLM client (env: SKUNK_GEMINI_MAX_RETRIES, SKUNK_GEMINI_RETRY_DELAY, SKUNK_GEMINI_MODEL)
     gemini_model: str = "gemini-2.5-flash"
@@ -31,8 +30,7 @@ class SkunkConfig:
     use_vertex: bool = False
 
     # Extract subagent (env: SKUNK_EXTRACT_N_SAMPLES, SKUNK_EXTRACT_SAMPLE_TEMPERATURE)
-    extract_n_samples: int = 3       # Gemini calls per tier for consensus sampling
-    extract_quorum: int = 2          # minimum samples a bucket needs to pass consensus
+    extract_n_samples: int = 3       # Gemini calls per tier 1; all surviving entries are merged + deduped
     extract_sample_temperature: float = 0.7
     extract_max_pages: int = 5       # page cap per tier
 

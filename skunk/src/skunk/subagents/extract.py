@@ -16,14 +16,16 @@ payload (scalar / dict / dict-of-dict per kind) and `.meta[k]` is a NamedEntry
 carrying unit/quote/dims/kind/axis-names.
 
 Per-tier strategy:
-- parsed_json (Tier 1): rich JSON-table text → 5×T=0.7 sampling + consensus filter
-  (an entry is kept only if (canonical_value, unit, canonical_dims) appears in at
-  least ctx.config.extract_quorum samples).
+- parsed_json (Tier 1): rich JSON-table text → N×T=0.7 sampling → per-cell
+  verbatim verifier against the page text → merge all surviving entries from
+  all runs into one TypedValue → semantic dedup via a T=0 LLM call whose
+  output cells are structurally re-verified against the merged inputs (the
+  dedup LLM cannot invent values; it can only pick representatives).
 - ocr (Tier 2): sparse PyMuPDF text → single deterministic call (T=0) + verbatim
   verifier against the OCR text.
-- vision (Tier 3): rendered page images → single deterministic call (T=0). Sampling
-  at high temperature amplifies cross-run disagreement on noisy reads and makes
-  consensus structurally unreachable when multiple pages are batched together.
+- vision (Tier 3): rendered page images → single deterministic call (T=0). No
+  text corpus to verify against, so the only safeguard is the prompt's
+  verbatim-grounding instruction.
 """
 
 from __future__ import annotations
@@ -31,7 +33,6 @@ from __future__ import annotations
 import base64
 import json
 import re
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
@@ -178,30 +179,29 @@ _VISION_SYSTEM = (
     "be visibly printed on the page. Do not compute, derive, or aggregate values.\n"
 )
 
-_RESOLVER_SYSTEM = (
-    "You are a careful adjudicator for U.S. Treasury Bulletin data extraction.\n"
-    "Three independent sampling runs over the SAME page text disagreed on shape, axis "
-    "names, or cell values. Your job is to pick the single best answer.\n\n"
-    "You receive:\n"
-    "  - the user's question\n"
-    "  - the full page text\n"
-    "  - the candidate entries from each run (already filtered to values that appear "
-    "verbatim on the page)\n\n"
+_DEDUP_SYSTEM = (
+    "You consolidate redundant extraction entries from a financial QA pipeline.\n\n"
+    "Three independent sampling runs over the SAME source page produced overlapping "
+    "entries. Many describe the same datum with different naming, dim labels, or shapes. "
+    "Your job: produce a single consolidated set with one representative entry per "
+    "distinct datum.\n\n"
+    "Output the SAME JSON envelope as the inputs: a single object mapping snake_case "
+    "names to entries. Each entry has kind, value, unit, quote, and optionally "
+    "index_name (vector) or row_name+col_name (table) and dims.\n\n"
     "Rules:\n"
-    "- Output the SAME JSON envelope as the extractor: a single object mapping snake_case\n"
-    "  names to entries. Each entry has kind, value, unit, quote, and optionally\n"
-    "  index_name (vector) or row_name+col_name (table) and dims.\n"
-    "- Prefer the candidate whose shape (scalar / vector / table), index/row/col axes,\n"
-    "  unit, and dim labels are the best fit for the question — not whichever run had\n"
-    "  the most entries.\n"
-    "- For series questions (e.g. \"each month from X to Y\"), prefer kind=\"vector\"\n"
-    "  with a combined ISO index over kind=\"table\".\n"
-    "- Every numeric cell in your output MUST appear verbatim on the page (with or\n"
-    "  without comma separators). You may COPY values across candidates and fill gaps\n"
-    "  if a value is printed on the page but missing from a candidate. Do NOT compute\n"
-    "  or aggregate.\n"
-    "- The \"quote\" field MUST be a verbatim substring of the page text.\n"
-    "- If none of the candidates is salvageable, return {}.\n"
+    "- Keep ONE entry per distinct datum. Merge naming/decoration duplicates into a "
+    "single representative.\n"
+    "- DO NOT introduce new cell values. Every cell value in your output (scalar value, "
+    "vector cell, table cell) MUST come VERBATIM from an input entry. Pick a "
+    "representative; do not invent.\n"
+    "- DO NOT compute, aggregate, transform, derive, or rescale.\n"
+    "- DO NOT add cell keys not present in any input entry.\n"
+    "- For each output entry, all of its cells must come from a SINGLE input entry — "
+    "do not graft cells across inputs. If two inputs disagree on a cell value at the "
+    "same key, keep both inputs as separate output entries with disambiguating names.\n"
+    "- Prefer the entry with the most informative dims and a clear, specific name.\n"
+    "- If everything in the inputs is redundant duplicates of a single datum, output one "
+    "entry. If the inputs describe N genuinely distinct datums, output N entries.\n"
     "- Output ONLY the JSON object — no fences, no commentary.\n"
 )
 
@@ -226,7 +226,7 @@ class _Sample:
 
 
 def _canon_dims(dims: dict[str, Any] | None) -> dict[str, Any]:
-    """Canonicalize a `dims` dict so trivial cosmetic differences don't break quorum.
+    """Canonicalize a `dims` dict to a consistent shape.
 
     Lowercases keys, strips string labels, drops empty values. Keeps numeric labels
     as-is. Returns a fresh dict (preserves insertion order after lowercasing keys).
@@ -285,25 +285,41 @@ def _validate_table_payload(value: Any) -> bool:
 def _parse_response_raw(raw: str, ctx: HarnessContext | None = None) -> list[_Sample] | None:
     """Parse one Gemini response into a list of _Sample.
 
+    Uniform failure unit: when the LLM doesn't produce a well-formed envelope,
+    we drop the bad entries (or the whole sample) and emit a diagnostic — never
+    raise. Tier fallback is the only mechanism that escalates "this sample
+    yielded nothing" into a step failure.
+
     Returns None when the agent emitted an empty object {} (signal: nothing
-    relevant on the page). Drops entries whose payload doesn't match its declared
-    `kind`'s flat shape — second of the two no-nesting enforcement layers. Raises
-    StepFailed on malformed JSON or structurally-malformed entries.
+    relevant on the page) or when the response failed to parse / wasn't a dict.
+    Drops individual entries whose payload doesn't match its declared `kind`'s
+    flat shape, or whose top-level shape (must be a dict with a 'value' key)
+    is wrong.
     """
     cleaned = _strip_fences(raw)
     try:
         obj = json.loads(cleaned)
     except json.JSONDecodeError as e:
-        raise StepFailed("extract", f"Cannot parse JSON response: {e}\nRaw: {cleaned[:400]}") from e
+        if ctx is not None:
+            ctx.emit("extract", "rejected unparseable response",
+                     error=str(e), raw=cleaned[:400])
+        return None
     if not isinstance(obj, dict):
-        raise StepFailed("extract", f"Expected JSON object, got {type(obj).__name__}")
+        if ctx is not None:
+            ctx.emit("extract", "rejected non-object response",
+                     got=type(obj).__name__, raw=cleaned[:400])
+        return None
     if not obj:
         return None
 
     samples: list[_Sample] = []
     for name, entry in obj.items():
         if not isinstance(entry, dict) or "value" not in entry:
-            raise StepFailed("extract", f"Malformed entry {name!r}: {entry!r}")
+            if ctx is not None:
+                ctx.emit("extract", "rejected malformed entry",
+                         name=str(name),
+                         reason="entry must be a dict containing a 'value' key")
+            continue
         value = entry["value"]
         kind = str(entry.get("kind", "scalar")).strip().lower() or "scalar"
 
@@ -387,8 +403,8 @@ def _cell_in_text(value: int | float | str, text: str) -> bool:
 
 def _value_in_text(sample: "_Sample", text: str) -> bool:
     """Verbatim verifier: every primitive cell in `sample.value` must appear in
-    `text`. For vector/table samples, all cells must match (all-or-nothing). One
-    missing cell rejects the entry — matches the quorum philosophy."""
+    `text`. For vector/table samples, all cells must match (all-or-nothing).
+    One missing cell rejects the entry."""
     if sample.kind == "scalar":
         return _cell_in_text(sample.value, text)
     if sample.kind == "vector":
@@ -417,134 +433,10 @@ def _describe_kind(kind: str, index_name: str | None, row_name: str | None,
     return kind
 
 
-def _canon(v: Any) -> Any:
-    """Canonical form for a value, used as part of the consensus bucket key."""
-    if isinstance(v, bool):
-        return ("bool", v)
-    if isinstance(v, (int, float)):
-        return ("num", float(v))
-    if isinstance(v, str):
-        return ("str", v.strip().lower())
-    if isinstance(v, list):
-        return ("list", tuple(_canon(x) for x in v))
-    if isinstance(v, dict):
-        return ("dict", tuple(sorted((str(k), _canon(val)) for k, val in v.items())))
-    return ("raw", json.dumps(v, sort_keys=True, default=str))
-
-
-def _consensus_to_typed_value(
-    samples_per_run: list[list[_Sample]],
-    ctx: HarnessContext,
-    tier_name: str,
-) -> TypedValue | None:
-    """All-or-nothing consensus: bucket _Samples across runs by the canonical form
-    of the whole entry — (kind, index_name, row_name, col_name, canonical_value,
-    unit, canonical_dims) — and keep only buckets with count >= ctx.config.extract_quorum.
-    A single-cell disagreement between samples puts them in different buckets; neither
-    survives unless quorum is hit on the exact match. Emits one TypedValue with
-    parallel `.value` (payloads) and `.meta` (NamedEntry records).
-
-    Returns None when no bucket reaches quorum (so the caller can try the next tier).
-    """
-    buckets: dict[tuple, list[_Sample]] = {}
-    for run in samples_per_run:
-        for s in run:
-            # All-or-nothing match: kind + axis names + every cell value + unit + dims
-            # must match exactly across samples. _canon canonicalizes scalars,
-            # vector-dicts, and table-dict-of-dicts deterministically.
-            key = (
-                s.kind, s.index_name, s.row_name, s.col_name,
-                _canon(s.value), s.unit, _canon(s.dims),
-            )
-            buckets.setdefault(key, []).append(s)
-
-    quorum = ctx.config.extract_quorum
-    kept_keys = [k for k, bucket in buckets.items() if len(bucket) >= quorum]
-    dropped_keys = [k for k, bucket in buckets.items() if len(bucket) < quorum]
-
-    ctx.emit(
-        "extract",
-        f"tier={tier_name} consensus done",
-        n_runs=len(samples_per_run),
-        n_buckets=len(buckets),
-        n_kept=len(kept_keys),
-        n_dropped_singletons=len(dropped_keys),
-        quorum=quorum,
-    )
-
-    if not kept_keys:
-        return None
-
-    values: dict[str, Any] = {}
-    meta: dict[str, NamedEntry] = {}
-    desc_parts: list[str] = []
-
-    # Deterministic ordering: by descending bucket size, then by representative name.
-    def _bucket_sort_key(k: tuple) -> tuple:
-        bucket = buckets[k]
-        rep_name = Counter(s.name for s in bucket).most_common(1)[0][0]
-        return (-len(bucket), rep_name)
-
-    for key in sorted(kept_keys, key=_bucket_sort_key):
-        bucket = buckets[key]
-        rep_name = Counter(s.name for s in bucket).most_common(1)[0][0]
-        rep_unit = Counter(s.unit for s in bucket).most_common(1)[0][0]
-        rep_value = next(s.value for s in bucket if s.name == rep_name)
-        # All samples in a bucket share canonical_dims by construction; pull the
-        # representative dims from any bucket member.
-        rep_dims = dict(bucket[0].dims)
-
-        seen_quotes: list[str] = []
-        for s in bucket:
-            q = s.quote.strip()
-            if q and q not in seen_quotes:
-                seen_quotes.append(q)
-            if len(seen_quotes) >= _MAX_QUOTES_PER_ENTRY:
-                break
-
-        # If the LLM picked the same name twice across the bucket, disambiguate
-        # later occurrences so we don't silently overwrite.
-        out_name = rep_name
-        suffix = 1
-        while out_name in values:
-            suffix += 1
-            out_name = f"{rep_name}_{suffix}"
-
-        # Kind + axis names are part of the bucket key, so they're identical across
-        # samples in this bucket; safe to pull from any member.
-        rep_kind = bucket[0].kind
-        rep_index_name = bucket[0].index_name
-        rep_row_name = bucket[0].row_name
-        rep_col_name = bucket[0].col_name
-
-        values[out_name] = rep_value
-        rep_quote = seen_quotes[0] if seen_quotes else ""
-        meta[out_name] = NamedEntry(
-            unit=rep_unit, quote=rep_quote, dims=rep_dims,
-            kind=rep_kind,
-            index_name=rep_index_name,
-            row_name=rep_row_name,
-            col_name=rep_col_name,
-        )
-
-        dims_str = f", dims={rep_dims}" if rep_dims else ""
-        quote_str = " | ".join(f'"{q}"' for q in seen_quotes) if seen_quotes else "<no quote>"
-        kind_str = _describe_kind(rep_kind, rep_index_name, rep_row_name, rep_col_name, rep_value)
-        desc_parts.append(
-            f"{out_name} [{kind_str}] (unit={rep_unit}{dims_str}) — {quote_str}; {len(bucket)} runs"
-        )
-
-    return TypedValue(
-        value=values,
-        desc="; ".join(desc_parts),
-        meta=meta,
-    )
-
-
 def _sample_to_entry_dict(s: _Sample) -> dict[str, Any]:
     """Reverse of `_parse_response_raw`: serialize a parsed _Sample back to the JSON
-    envelope Gemini was originally asked to produce. Used to present candidates to
-    the resolver."""
+    envelope Gemini was originally asked to produce. Used to present the merged
+    candidates to the dedup LLM."""
     entry: dict[str, Any] = {"kind": s.kind, "value": s.value, "unit": s.unit, "quote": s.quote}
     if s.kind == "vector" and s.index_name:
         entry["index_name"] = s.index_name
@@ -558,66 +450,136 @@ def _sample_to_entry_dict(s: _Sample) -> dict[str, Any]:
     return entry
 
 
-def _resolve_disagreement(
-    verified_runs: list[list[_Sample]],
-    verify_text: str,
-    question: str,
-    ctx: HarnessContext,
-) -> TypedValue | None:
-    """Tier 1 fallback when consensus produces 0 buckets but at least one run
-    survived the verbatim verifier. Asks Gemini once (T=0) to pick the best entry
-    from the candidates, then runs the same verifier on its output.
+def _values_match(a: Any, b: Any) -> bool:
+    """Cell-level equivalence used by the dedup input-grounded verifier.
 
-    TODO: tighten the merge contract. Today the prompt allows cell-level grafting
-    across candidates ("you may COPY values across candidates and fill gaps"),
-    which the verbatim verifier cannot police — a Frankenstein vector with cells
-    from the right column for some months and the wrong column for others looks
-    self-consistent to it. Restrict to per-entry pick-wholesale (still allow
-    multi-entry merge across concepts) and re-evaluate.
+    Numeric a/b are compared as floats so 4 / 4.0 / "4" / "4.0" all match.
+    String/string is case-insensitive trimmed compare. Bool is not used as a
+    cell type (filtered by `_is_primitive_cell` at parse time).
     """
-    candidates_block_parts: list[str] = []
-    for i, run in enumerate(verified_runs):
-        if not run:
-            candidates_block_parts.append(f"--- Run {i + 1} (empty) ---")
-            continue
-        envelope = {s.name: _sample_to_entry_dict(s) for s in run}
-        candidates_block_parts.append(
-            f"--- Run {i + 1} ---\n{json.dumps(envelope, indent=2, default=str)}"
-        )
-    candidates_block = "\n\n".join(candidates_block_parts)
-    user_msg = (
-        f"Question:\n{question}\n\n"
-        f"Page text:\n{verify_text}\n\n"
-        f"Candidate entries from {len(verified_runs)} independent sampling runs over the "
-        f"same page text:\n\n{candidates_block}\n\n"
-        f"Pick the best answer and output it in the same envelope format."
-    )
-    ctx.emit(
-        "extract",
-        "tier=parsed_json resolver call (T=0)",
-        n_runs=len(verified_runs),
-        n_candidates=sum(len(r) for r in verified_runs),
-        user_message=user_msg[:3000],
-    )
-    raw = ctx.llm_client.call(_RESOLVER_SYSTEM, user_msg, temperature=0.0, thinking_budget=-1)
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a == b
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return float(a) == float(b)
     try:
-        parsed = _parse_response_raw(raw, ctx)
-    except StepFailed as e:
-        ctx.emit("extract", "tier=parsed_json resolver parse failed", raw=raw[:400], error=str(e))
-        return None
+        return float(a) == float(b)
+    except (TypeError, ValueError):
+        return str(a).strip().lower() == str(b).strip().lower()
+
+
+def _output_entry_in_inputs(output: _Sample, inputs: list[_Sample]) -> bool:
+    """Input-grounded verifier: every cell in `output` must come verbatim from
+    a SINGLE input entry.
+
+    Scalar: output's value must equal some input scalar's value.
+    Vector: there must exist some input vector whose value dict is a key-wise
+            superset of output's value dict (same keys → same values).
+    Table:  there must exist some input table whose value dict-of-dicts is a
+            (row, col)-wise superset of output's value dict-of-dicts.
+
+    No cross-entry grafting: the dedup LLM picks a representative wholesale; it
+    cannot stitch cells from different inputs together. If it wants to combine
+    inputs, it should emit them as separate output entries.
+    """
+    if output.kind == "scalar":
+        for s in inputs:
+            if s.kind == "scalar" and _values_match(output.value, s.value):
+                return True
+            # Also allow a scalar to be sourced from a single-cell vector/table —
+            # the LLM may have flattened on dedup. Match by value only.
+            if s.kind == "vector" and any(_values_match(output.value, v) for v in s.value.values()):
+                return True
+            if s.kind == "table":
+                for row in s.value.values():
+                    if any(_values_match(output.value, v) for v in row.values()):
+                        return True
+        return False
+    if output.kind == "vector":
+        for s in inputs:
+            if s.kind != "vector":
+                continue
+            ok = all(
+                k in s.value and _values_match(v, s.value[k])
+                for k, v in output.value.items()
+            )
+            if ok:
+                return True
+        return False
+    if output.kind == "table":
+        for s in inputs:
+            if s.kind != "table":
+                continue
+            ok = True
+            for row_key, row in output.value.items():
+                if row_key not in s.value:
+                    ok = False; break
+                for col_key, v in row.items():
+                    if col_key not in s.value[row_key] or not _values_match(v, s.value[row_key][col_key]):
+                        ok = False; break
+                if not ok:
+                    break
+            if ok:
+                return True
+        return False
+    return False
+
+
+def _dedup_semantically(
+    merged_samples: list[_Sample],
+    ctx: HarnessContext,
+) -> list[_Sample]:
+    """LLM-based semantic deduplication over the merged sample list.
+
+    Sends all merged entries to Gemini at T=0 with the contract: collapse
+    naming/decoration duplicates into one representative each, but every output
+    cell must be verbatim-derived from a single input entry. Output is then
+    structurally verified against `merged_samples`; entries that fail
+    verification are dropped.
+
+    Returns the deduped sample list, or the original `merged_samples` unchanged
+    if dedup produced nothing usable (best-effort fallback so a noisy LLM dedup
+    response can't lose us cells the per-sample verifier already grounded).
+    """
+    if len(merged_samples) <= 1:
+        return merged_samples
+    # Build a name-suffixed envelope (raw sample names can collide across runs;
+    # JSON object keys must be unique, so disambiguate before serializing).
+    envelope: dict[str, dict[str, Any]] = {}
+    for s in merged_samples:
+        nm = s.name
+        i = 1
+        while nm in envelope:
+            i += 1
+            nm = f"{s.name}_{i}"
+        envelope[nm] = _sample_to_entry_dict(s)
+    user_msg = (
+        f"Input entries from 3 independent extraction runs "
+        f"(consolidate near-duplicates):\n"
+        f"```json\n{json.dumps(envelope, indent=2, default=str)}\n```\n\n"
+        f"Output the consolidated set in the same JSON envelope."
+    )
     ctx.emit(
         "extract",
-        "tier=parsed_json resolver response",
+        "tier=parsed_json dedup call (T=0)",
+        n_input_entries=len(envelope),
+    )
+    raw = ctx.llm_client.call(_DEDUP_SYSTEM, user_msg, temperature=0.0, thinking_budget=0)
+    parsed = _parse_response_raw(raw, ctx)
+    ctx.emit(
+        "extract",
+        "tier=parsed_json dedup response",
         raw=raw[:400],
         n_entries=0 if parsed is None else len(parsed),
     )
     if not parsed:
-        return None
-    kept = [s for s in parsed if _value_in_text(s, verify_text)]
+        return merged_samples
+    kept = [s for s in parsed if _output_entry_in_inputs(s, merged_samples)]
     n_dropped = len(parsed) - len(kept)
     if n_dropped:
-        ctx.emit("extract", f"tier=parsed_json resolver verifier dropped {n_dropped}/{len(parsed)}")
-    return _samples_to_typed_value(kept, ctx, "parsed_json_resolver")
+        ctx.emit("extract", f"tier=parsed_json dedup verifier dropped {n_dropped}/{len(parsed)}")
+    if not kept:
+        return merged_samples
+    return kept
 
 
 def _single_call(
@@ -627,13 +589,11 @@ def _single_call(
     tier_name: str,
     images: list[tuple[str, str]] | None = None,
 ) -> list[_Sample]:
-    """One deterministic Gemini call (T=0). Returns parsed samples; [] if LLM emitted {}."""
+    """One deterministic Gemini call (T=0). Returns parsed samples; [] if LLM
+    emitted {} or response was malformed (drops are emitted as diagnostics by
+    `_parse_response_raw`)."""
     raw = ctx.llm_client.call(system, user, images=images, temperature=0.0, thinking_budget=-1)
-    try:
-        parsed = _parse_response_raw(raw, ctx)
-    except StepFailed:
-        ctx.emit("extract", f"tier={tier_name} single-call parse failed", raw=raw[:400])
-        raise
+    parsed = _parse_response_raw(raw, ctx)
     ctx.emit(
         "extract",
         f"tier={tier_name} single-call",
@@ -650,8 +610,8 @@ def _samples_to_typed_value(
 ) -> TypedValue | None:
     """Build a TypedValue from a flat sample list — no bucketing.
 
-    Disambiguates duplicate names with `_2`/`_3` suffixes (same scheme as
-    `_consensus_to_typed_value`). Returns None when `samples` is empty.
+    Disambiguates duplicate names with `_2`/`_3` suffixes. Returns None when
+    `samples` is empty.
     """
     if not samples:
         return None
@@ -695,31 +655,17 @@ def _sample_n(
     n_samples = ctx.config.extract_n_samples
     temperature = ctx.config.extract_sample_temperature
 
-    def _one(_i: int) -> tuple[str, list[_Sample] | None, StepFailed | None]:
+    def _one(_i: int) -> tuple[str, list[_Sample]]:
         raw = ctx.llm_client.call(system, user, images=images, temperature=temperature, thinking_budget=0)
-        try:
-            parsed = _parse_response_raw(raw, ctx)
-        except StepFailed as e:
-            return raw, None, e
-        return raw, (parsed if parsed is not None else []), None
+        parsed = _parse_response_raw(raw, ctx)
+        return raw, (parsed if parsed is not None else [])
 
     max_workers = max(1, min(n_samples, ctx.config.max_parallel_workers))
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         results = list(pool.map(_one, range(n_samples)))
 
     runs: list[list[_Sample]] = []
-    n_failed = 0
-    for i, (raw, parsed, err) in enumerate(results):
-        if err is not None:
-            n_failed += 1
-            ctx.emit(
-                "extract",
-                f"tier={tier_name} sample {i + 1}/{n_samples} failed",
-                raw=raw[:400],
-                error=str(err),
-            )
-            runs.append([])
-            continue
+    for i, (raw, parsed) in enumerate(results):
         ctx.emit(
             "extract",
             f"tier={tier_name} sample {i + 1}/{n_samples}",
@@ -727,8 +673,6 @@ def _sample_n(
             n_entries=len(parsed),
         )
         runs.append(parsed)
-    if n_failed == n_samples:
-        raise StepFailed("extract", f"all {n_samples} samples failed to parse")
     return runs
 
 
@@ -765,7 +709,15 @@ def _gather_text(
 
 
 def _parsed_json_tier(refs: list[PageRef], ctx: HarnessContext) -> TypedValue | None:
-    """Tier 1 — 5×T=0.7 sampling + consensus over rich JSON-derived page text."""
+    """Tier 1 — N×T=0.7 sampling → per-cell page-text verifier → merge across
+    samples → LLM-based semantic dedup grounded against the merged inputs.
+
+    Replaces the older all-or-nothing envelope consensus + resolver. The
+    per-sample verifier already grounds every cell to the page; merge gives
+    union recall; dedup collapses near-duplicate envelopes without inventing
+    values (each dedup output entry must match some single merged input entry
+    cell-for-cell).
+    """
     raw_texts, texts = _gather_text(refs, ctx, get_text_for_pdf_page, "parsed_json")
     if not texts:
         ctx.emit("extract", "tier=parsed_json skipped (no text from any ref)")
@@ -783,28 +735,28 @@ def _parsed_json_tier(refs: list[PageRef], ctx: HarnessContext) -> TypedValue | 
     )
     verify_text = "\n\n".join(raw_texts)
     runs = _sample_n(_TEXT_SYSTEM, user_msg, ctx, "parsed_json")
-    verified: list[list[_Sample]] = []
+    merged: list[_Sample] = []
     for i, run in enumerate(runs):
         kept = [s for s in run if _value_in_text(s, verify_text)]
         n_dropped = len(run) - len(kept)
         if n_dropped:
             ctx.emit("extract", f"tier=parsed_json verifier dropped {n_dropped}/{len(run)}",
                      sample_idx=i + 1)
-        verified.append(kept)
-    if not any(verified):
+        merged.extend(kept)
+    if not merged:
+        ctx.emit("extract", "tier=parsed_json all samples empty after verifier")
         return None
-    result = _consensus_to_typed_value(verified, ctx, "parsed_json")
-    if result is not None:
-        return result
-    ctx.emit("extract", "tier=parsed_json consensus empty — invoking resolver")
-    return _resolve_disagreement(verified, verify_text, ctx.question, ctx)
+    ctx.emit("extract", "tier=parsed_json merged",
+             n_samples=len(runs), n_entries=len(merged))
+    deduped = _dedup_semantically(merged, ctx)
+    return _samples_to_typed_value(deduped, ctx, "parsed_json")
 
 
 def _ocr_tier(refs: list[PageRef], ctx: HarnessContext) -> TypedValue | None:
     """Tier 2 — single deterministic call (T=0) over PyMuPDF text + verbatim verifier.
 
-    OCR text on old scans is sparse and noisy. Sampling 5× at T=0.7 amplifies
-    disagreement without earning consensus; a single T=0 call paired with the
+    OCR text on old scans is sparse and noisy. Sampling at T=0.7 amplifies
+    cross-run disagreement on noisy reads; a single T=0 call paired with the
     verbatim verifier is both cheaper and more reliable.
     """
     raw_texts, texts = _gather_text(refs, ctx, _extract_pdf_text, "ocr")

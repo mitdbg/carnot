@@ -11,7 +11,7 @@ The benchmark is `data/officeqa_pro.csv` (133 questions). An initial pass of DSL
 ## Architecture in one screen
 
 - Question → planner emits DSL plan (text) → orchestrator walks AST → 4 subagents.
-- 4 ops: `retrieve`, `extract`, `lookup_external`, `compute`. `compute` is the chain terminator and subsumes formatting (it self-plans, codegens, execs, then a verifier LLM checks the output's format/unit fits the question). `extract` accepts `visual_only=True` to skip text/OCR tiers for charts and figures.
+- 4 ops: `retrieve`, `extract`, `lookup_external`, `compute`. `compute` is the chain terminator and subsumes formatting (it self-plans, codegens, execs, then self-critiques the result against the question with full context — same domain prompt as the producer, no info asymmetry). `extract` accepts `visual_only=True` to skip text/OCR tiers for charts and figures.
 - Extract emits one of three **kinds** per entry: `scalar`, `vector` (1-D series indexed by one dim), or `table` (2-D grid). Vector/table cells are always primitive scalars — nesting is forbidden and enforced both in the prompt and structurally in the parser + `TypedValue.__post_init__`. See `DSL.md` for the contract.
 - Retrieval is **page-level**: the retrieve subagent maintains its own page index over the corpus. `PageRef.page` is the **1-based PDF page index** — the only page-number convention used in the codebase. The bulletin's printed-page footer is recoverable via `common/parsed_json.get_printed_page` for trace/prompt enrichment.
 - Extract is per-page tier dispatch: CSV tables → OCR text → vision render. No cross-page search.
@@ -25,7 +25,7 @@ The benchmark is `data/officeqa_pro.csv` (133 questions). An initial pass of DSL
 - `src/skunk/subagents/` — one module per op (`retrieve`, `extract`, `lookup_external`, `compute`); each exposes a bare `run(op, prev, ctx)` function
 - `src/skunk/subagents/base.py` — shared utilities: `StepFailed`, `exec_python`, `parse_llm_value`, `HarnessContext`
 - `src/skunk/common/` — shared utilities used by more than one subagent (`parsed_json.py` for JSON-backed Tier 1 lookup, `pdf_text.py` and `vision.py` for Tiers 2/3, `llm.py` for the shared Gemini client)
-- `eval/` — independent eval harnesses (`golden.py`, `eval_retrieval.py`, `eval_extraction.py`, `eval_e2e.py`)
+- `eval/` — independent eval harnesses (`golden.py`, `eval_e2e.py`)
 
 ## Conventions
 
