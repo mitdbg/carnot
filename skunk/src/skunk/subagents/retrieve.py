@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from skunk.common.context import HarnessContext
+from skunk.common import HarnessContext
 from skunk.dsl import DocHandle, OpNode
 from skunk.subagents.base import StepFailed
 

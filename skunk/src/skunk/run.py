@@ -79,7 +79,7 @@ def run_question(
     question: str,
     verbose: bool,
     manifest_path: str | None = None,
-    golden_pages: list | None = None,
+    golden_pages: list["PageRef"] | None = None,
     cached_plan_text: str | None = None,
     uid: str | None = None,
     plan_cache_csv: str | None = None,
@@ -87,22 +87,20 @@ def run_question(
 ) -> dict:
     import os
 
-    from skunk.common.context import HarnessContext
+    from skunk.common import HarnessContext
     from skunk.orchestrator import execute
     from skunk.planner import plan
 
     golden_handle = None
     if golden_pages:
         from skunk.dsl import DocHandle, PageRef
-        # GoldenPage.page is the 1-based PDF page index (per Fraser ?page=N semantics);
-        # PageRef.page is also the PDF page index, so this is a direct copy.
         pdf_dir = os.environ.get("OFFICEQA_PDF_DIR",
                                  str(Path.home() / "Desktop/officeqa/treasury_bulletin_pdfs"))
         refs = []
         for g in golden_pages:
-            year, mon = g.bulletin_id.split("-")
-            file_path = f"{pdf_dir}/treasury_bulletin_{year}_{mon}.pdf"
-            refs.append(PageRef(month=g.bulletin_id, page=g.page, file_path=file_path))
+            year, mon = g.month.split("-")
+            refs.append(PageRef(month=g.month, page=g.page,
+                                file_path=f"{pdf_dir}/treasury_bulletin_{year}_{mon}.pdf"))
         golden_handle = DocHandle(refs=refs, desc=f"golden ({len(refs)} pages)")
         if verbose:
             print(f"[run] Golden handle: {len(refs)} pages → {[str(r) for r in refs]}")
@@ -124,7 +122,7 @@ def run_question(
         try:
             from skunk.dsl import parse, serialize, validate
             plan_obj = parse(cached_plan_text)
-            result = validate(plan_obj)
+            result = validate(plan_obj, max_compute_depth=config.max_compute_depth)
             if not result.ok:
                 return {"question": question, "answer": None, "failed": True,
                         "reason": f"cached plan validation failed: {result.errors}"}
@@ -172,7 +170,7 @@ def run_question(
 
 
 def _dump_trace(path: str, *, uid: str | None, question: str, plan_text: str,
-                golden_pages: list | None, trace, events: list[dict]) -> None:
+                golden_pages: list["PageRef"] | None, trace, events: list[dict]) -> None:
     """Write a comprehensive per-question debug trace to `path`."""
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -186,7 +184,7 @@ def _dump_trace(path: str, *, uid: str | None, question: str, plan_text: str,
     if golden_pages:
         lines.append(f"Golden pages ({len(golden_pages)}):")
         for g in golden_pages:
-            lines.append(f"  - year={g.year} month={g.bulletin_id} page={g.page}")
+            lines.append(f"  - month={g.month} page={g.page}")
     else:
         lines.append("Golden pages: (none)")
     lines.append("")
@@ -274,7 +272,7 @@ def main() -> None:
     golden_lookup: dict | None = None
     if args.golden:
         try:
-            from eval.golden import load_golden
+            from eval.eval_e2e import load_golden
             golden_lookup = load_golden(args.csv)
         except Exception as e:
             print(f"[run] ERROR loading golden pages: {e}", file=sys.stderr)

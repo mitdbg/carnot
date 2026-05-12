@@ -40,9 +40,7 @@ This decoupling means retrieval and extraction can be evaluated independently �
                           answer
 
    ┌────────────────── eval harnesses ─────────────────────┐
-   │  eval_retrieval     retrieve only vs golden pages     │
-   │  eval_extraction    extract only on golden pages      │
-   │  eval_e2e           full pipeline; gap = retrieval cost│
+   │  eval_e2e           full pipeline end-to-end          │
    └───────────────────────────────────────────────────────┘
 ```
 
@@ -50,9 +48,9 @@ This decoupling means retrieval and extraction can be evaluated independently �
 
 The codebase uses a single canonical page-number meaning everywhere: **`PageRef.page` is the 1-based PDF page index**. PyMuPDF, cache filenames, the JSON-backed Tier 1 index, and the Fraser benchmark URLs (`source_docs?page=N`) all agree on this convention.
 
-The bulletin's *printed* page-number footer (e.g. "69" stamped at the bottom of PDF page 76) is recoverable when needed via `skunk.common.parsed_json.get_printed_page(ref, ctx)`, which reads the `page_number`-typed element the JSON parser preserves per page. We surface it for trace enrichment and Gemini prompt headers (`--- PDF page 76 (bulletin printed page "69") ---`), but never use it as a lookup key.
+The bulletin's *printed* page-number footer (e.g. "69" stamped at the bottom of PDF page 76) is recoverable when needed via `extract.get_printed_page(ref, ctx)`, which reads the `page_number`-typed element the JSON parser preserves per page. We surface it for trace enrichment and Gemini prompt headers (`--- PDF page 76 (bulletin printed page "69") ---`), but never use it as a lookup key.
 
-The benchmark's `source_docs?page=N` parameter is the PDF page index in Fraser's viewer (verified against the June 2025 issue: `?page=76` lands on the ESF-1 table on PDF page 76, whose printed footer reads "69"). `eval/golden.py:GoldenPage.page` therefore maps directly to `PageRef.page`.
+The benchmark's `source_docs?page=N` parameter is the PDF page index in Fraser's viewer (verified against the June 2025 issue: `?page=76` lands on the ESF-1 table on PDF page 76, whose printed footer reads "69"). This maps directly to `PageRef.page`.
 
 ## The page index lives in retrieve
 
@@ -63,8 +61,8 @@ The load-bearing insight is that `periods_covered` (what period a page *reports 
 ## The 4 operators
 
 - **`retrieve(concept, period, source_bulletin?)`** — only chain head. Looks up relevant pages via the retrieve subagent's internal page index, returns a `DocHandle` whose `PageRef`s have `(file_path, year, month, page)` fully specified (where `page` is the 1-based PDF page index).
-- **`extract(visual_only?)`** — reads `ctx.question` and the located pages via tier dispatch (parsed JSON → PyMuPDF text → vision). Emits a `TypedValue` whose `.value` is a dict mapping snake_case names to entries. Each entry is one of three **kinds** — `scalar`, `vector` (1-D series with one varying dim), or `table` (2-D grid with row/col dims) — picked to match the question's aggregation axis. Vector/table cells are always primitive scalars; nesting beyond those shapes is forbidden (enforced both in the extract prompt and structurally in the parser + `TypedValue.__post_init__`). Pass `visual_only=True` to skip Tiers 1–2 and go straight to vision (use for charts/figures).
-- **`lookup_external(nl)`** — chain-head capable. Single Gemini call: takes a natural-language description of external factual data (`nl`) and returns a `TypedValue`. Use for CPI-U, FX rates, event dates, named entities (bureau names), and any fact not in the bulletin corpus. The subagent infers the appropriate `kind` and `unit` (including `text` for strings).
+- **`extract(visual_only?)`** — reads `ctx.question` and the located pages via tier dispatch (parsed JSON → PyMuPDF text → vision). Returns `list[AnnotatedValue]` — each entry has a `description`, `value`, `unit`, and one of three **kinds**: `scalar`, `vector` (1-D series with one varying dim), or `table` (2-D grid with row/col dims). Vector/table cells are always primitive scalars; nesting beyond those shapes is rejected by the extract parser before an `AnnotatedValue` is constructed. Pass `visual_only=True` to skip Tiers 1–2 and go straight to vision (use for charts/figures).
+- **`lookup_external(nl)`** — chain-head capable. Single Gemini call: takes a natural-language description of external factual data (`nl`) and returns `list[AnnotatedValue]` (one entry). Use for CPI-U, FX rates, event dates, named entities (bureau names), and any fact not in the bulletin corpus. The subagent infers the appropriate `kind` and `unit` (including `text` for strings).
 - **`compute()`** — chain terminator that subsumes formatting. Reads `ctx.question` plus the upstream extracted/looked-up values; runs a plan-then-codegen LLM call (`CODE\n<python>` or `MISSING:<reason>`), execs the code, then a self-critique LLM call — same domain prompt as the producer, with full context (`question`, `prev`, code, result text) — decides ACCEPT or REVISE:`<reason>`. On REVISE, codegen runs once more with the critique as a prior and ships unconditionally (no second critique → no flap). Within attempt 1, transient codegen/exec failures consume a small retry budget (`compute_max_attempts - 1`). Returns a `FormattedString`. Fails with `StepFailed("compute", …)` when attempt 1 cannot produce a result, or with `MissingData` when codegen on attempt 1 reports `MISSING:`.
 
 ## Per-page tier dispatch in extract
@@ -72,7 +70,7 @@ The load-bearing insight is that `periods_covered` (what period a page *reports 
 Once retrieve has named specific pages, extract chooses how to read each one:
 
 ```
-Tier 1  parsed-JSON elements bucketed by page_id   — structured text + HTML tables (common/parsed_json.py)
+Tier 1  parsed-JSON elements bucketed by page_id   — structured text + HTML tables (common.py)
 Tier 2  cache/pages/{YYYY-MM}/p{NNN}.txt           — per-page PyMuPDF text, on-demand cache
 Tier 3  cache/pages/{YYYY-MM}/p{NNN}.png           — PNG render + vision LLM, always works
 ```
@@ -87,13 +85,11 @@ The benchmark CSV (`data/officeqa_pro.csv`) has both retrieval-level and answer-
 - `source_docs` — URLs containing `?page=N` for every question (verified 100% coverage on the 133-row pro split).
 - `answer` — fuzzy-matchable expected output.
 
-Three independent harnesses isolate the failure modes:
+One end-to-end harness covers the full pipeline:
 
 | harness | input | output metric |
 |---|---|---|
-| `eval/eval_retrieval.py` | question | bulletin-precision, page-precision-strict, page-precision-loose(±2) vs golden pages |
-| `eval/eval_extraction.py` | question + golden pages | answer accuracy (fuzzy match) — measures extraction quality assuming perfect retrieval |
-| `eval/eval_e2e.py` | question | answer accuracy — gap to extraction-only quantifies retrieval cost |
+| `eval/eval_e2e.py` | question | answer accuracy — covers retrieval + extraction + compute end-to-end |
 
 Each subagent therefore exposes a standalone callable function (not just `Subagent.run`), so the eval harnesses can invoke it without the orchestrator.
 
@@ -110,4 +106,4 @@ Caching is opportunistic: pdf page text and rendered PNGs are written on first a
 
 - **No agentic search loops.** Each subagent executes once per op; failure is recorded in the trace, not retried via re-planning.
 - **No per-table/per-figure catalog rows.** Page-level granularity matches the benchmark's `source_docs?page=N` labels and the existing `cache/tables/` structure. Going finer adds rows without improving recall.
-- **No PZ runtime dependency.** This repo is plain Python + Anthropic SDK; PZ stays out of the runtime path.
+- **No PZ runtime dependency.** This repo is plain Python + Gemini API (google-generativeai); PZ stays out of the runtime path.

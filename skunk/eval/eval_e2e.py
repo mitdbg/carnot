@@ -7,18 +7,21 @@ cost; the gap to the gold answer floor quantifies extraction cost.
 
 Usage
 -----
-  # Smoke set (4 UIDs) — default
+  # All UIDs in the CSV (default)
   python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv
 
-  # All UIDs in the CSV
-  python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv --all
+  # Sample 10 random UIDs
+  python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv --sample 10
 
-  # Inject golden pages (skip retrieve subagent) — recommended for isolating retrieval cost
-  python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv --golden
+  # Sample 10% of UIDs
+  python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv --sample 10%
 
   # Run only specific UIDs
   python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv \\
-      --uids UID0001,UID0030 --golden --verbose
+      --uids UID0001,UID0030 --golden
+
+  # Suppress verbose output
+  python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv --quiet
 
 Golden mode (`--golden`)
 ------------------------
@@ -39,15 +42,15 @@ Gemini retry wait time), and any error. Per-step subagent events (tier dispatch
 in extract, codegen attempts in compute, verifier responses, etc.) are grouped
 under each step. Use these for post-hoc auditability of every run.
 
-Pass `--trace-dir ''` to disable. Pass `--verbose` to additionally live-stream
-the events to stdout during the run.
+Pass `--trace-dir ''` to disable. Pass `--quiet` to suppress live stdout streaming.
 
-Gemini transient failures
--------------------------
-`LLMClient` (src/skunk/common/llm.py) retries 429/5xx errors with a
-fixed delay. Tune via env: `SKUNK_GEMINI_RETRY_DELAY` (default 30s),
-`SKUNK_GEMINI_MAX_RETRIES` (default 5). After exhaustion the step fails
-cleanly and the trace records the final exception.
+Gemini rate limiting + retries
+------------------------------
+`LLMClient` (src/skunk/common/llm.py) paces all Gemini calls through a
+process-wide token bucket sized by `SKUNK_GEMINI_RPM` (default 1000 to match
+the Flash 2.5 paid-tier quota). On any error from the SDK, the call retries
+with exponential backoff (start 50ms, doubling, capped at 1s, up to 10 retries)
+and logs each failure to stderr. If you see 429s persistently, lower the rpm.
 """
 
 from __future__ import annotations
@@ -55,6 +58,8 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import random
+import re
 import sys
 from pathlib import Path
 
@@ -75,42 +80,84 @@ def _load_env(path: Path) -> None:
 
 _load_env(REPO_ROOT / ".env")
 
-from eval.golden import load_golden  # noqa: E402
 from skunk.config import SkunkConfig  # noqa: E402
-from skunk.run import SMOKE_UIDS, load_plan_cache, run_question  # noqa: E402
+from skunk.dsl import PageRef  # noqa: E402
+from skunk.run import load_plan_cache, run_question  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# Golden page parsing (source_docs URLs → PageRefs)
+# ---------------------------------------------------------------------------
+
+_MONTH_MAP = {
+    "january": "01", "february": "02", "march": "03", "april": "04",
+    "may": "05", "june": "06", "july": "07", "august": "08",
+    "september": "09", "october": "10", "november": "11", "december": "12",
+}
+
+_URL_RE = re.compile(
+    r"/(?P<month>january|february|march|april|may|june|july|august|september|october|november|december)"
+    r"-(?P<year>\d{4})[^?]*\?page=(?P<page>\d+)",
+    re.IGNORECASE,
+)
+
+
+def _parse_source_docs(source_docs: str) -> list[PageRef]:
+    """Extract every (year, month, page) tuple from a source_docs cell."""
+    out: list[PageRef] = []
+    if not isinstance(source_docs, str):
+        return out
+    for m in _URL_RE.finditer(source_docs):
+        month_mm = _MONTH_MAP[m.group("month").lower()]
+        out.append(PageRef(month=f"{m.group('year')}-{month_mm}", page=int(m.group("page"))))
+    return out
+
+
+def load_golden(csv_path: str | Path) -> dict[str, list[PageRef]]:
+    """Map uid → list[PageRef] for every question in the benchmark CSV."""
+    df = pd.read_csv(csv_path)
+    return {row["uid"]: _parse_source_docs(str(row.get("source_docs", "")))
+            for _, row in df.iterrows()}
 
 REPORT_FIELDS = ["uid", "question", "predicted", "gold_answer", "failed", "reason", "n_steps"]
 
 
-def _pick_uids(df: pd.DataFrame, run_all: bool, uids_arg: str | None) -> list[str]:
+def _pick_uids(df: pd.DataFrame, sample: str | None, uids_arg: str | None) -> list[str]:
     if uids_arg:
         return [u.strip() for u in uids_arg.split(",") if u.strip()]
-    if run_all:
-        return [str(u) for u in df["uid"].tolist()]
-    return list(SMOKE_UIDS)
+    all_uids = [str(u) for u in df["uid"].tolist()]
+    if sample is None:
+        return all_uids
+    if sample.endswith("%"):
+        n = max(1, round(len(all_uids) * float(sample[:-1]) / 100))
+    else:
+        val = float(sample)
+        n = max(1, round(len(all_uids) * val)) if val < 1.0 else int(val)
+    return random.sample(all_uids, min(n, len(all_uids)))
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="End-to-end OfficeQA eval (smoke by default)")
+    parser = argparse.ArgumentParser(description="End-to-end OfficeQA eval (all UIDs by default)")
     parser.add_argument("--csv", required=True, help="Path to officeqa_pro.csv")
     parser.add_argument("--report", required=True, help="Output CSV report path")
     parser.add_argument("--plan-cache-csv", default=SkunkConfig.from_env().plan_cache_csv,
                         help="Plan cache CSV (default: %(default)s)")
-    parser.add_argument("--all", action="store_true", help="Run every UID in --csv (default: smoke set only)")
-    parser.add_argument("--uids", help="Comma-separated UIDs (overrides --smoke / --all)")
+    parser.add_argument("--sample",
+                        help="Run a random subset: integer count (e.g. '10') or percentage (e.g. '10%%')")
+    parser.add_argument("--uids", help="Comma-separated UIDs (overrides --sample)")
     parser.add_argument("--golden", action="store_true",
                         help="Inject golden pages from --csv instead of running retrieve")
     parser.add_argument("--trace-dir", default="eval/traces",
                         help="Per-question debug trace directory (default: %(default)s; '' to disable)")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Live-print orchestrator + subagent events to stdout per question")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Suppress live orchestrator + subagent events (verbose is on by default)")
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv)
     df_by_uid = df.set_index("uid")
 
-    uids = _pick_uids(df, args.all, args.uids)
-    print(f"[e2e] Running {len(uids)} UID(s){' (smoke)' if not args.all else ''}")
+    uids = _pick_uids(df, args.sample, args.uids)
+    sample_note = f" (sample: {args.sample})" if args.sample and not args.uids else ""
+    print(f"[e2e] Running {len(uids)} UID(s){sample_note}")
 
     golden_lookup = load_golden(args.csv) if args.golden else None
     plan_cache = load_plan_cache(args.plan_cache_csv)
@@ -118,6 +165,7 @@ def main() -> None:
         print(f"[e2e] WARNING: plan cache {args.plan_cache_csv!r} is empty or missing — "
               f"will fall back to live LLM planner per question", file=sys.stderr)
 
+    verbose = not args.quiet
     rows: list[dict] = []
     for uid in uids:
         if uid not in df_by_uid.index:
@@ -147,7 +195,7 @@ def main() -> None:
         try:
             result = run_question(
                 question=question,
-                verbose=args.verbose,
+                verbose=verbose,
                 golden_pages=golden_pages,
                 cached_plan_text=cached_plan_text,
                 uid=uid,

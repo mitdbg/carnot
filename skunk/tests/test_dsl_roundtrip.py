@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from skunk.dsl import (
+    ComputeNode,
     LookupBranch,
     ParseError,
     Plan,
@@ -49,6 +50,12 @@ VALID_TEMPLATES = [
     "lookup_external(nl='year WWII ended') --> compute()",
     # parallel of lookup_externals only
     "[ lookup_external(nl='year WWII ended') ; lookup_external(nl='year Korean War started') ] --> compute()",
+    # decomposed: two intermediates -> final aggregator
+    "[ [ retrieve(concept='a', period='CY1940') --> extract() ] --> compute(task='Compute 1940 total') ; "
+    "[ retrieve(concept='a', period='CY1953') --> extract() ] --> compute(task='Compute 1953 total') ] --> compute()",
+    # decomposed: lookup + retrieve sub-computes
+    "[ [ lookup_external(nl='year WWII ended') ] --> compute(task='Find WWII end year') ; "
+    "[ lookup_external(nl='year Korean War started') ] --> compute(task='Find Korean War start year') ] --> compute()",
 ]
 
 INVALID_TEMPLATES = [
@@ -59,8 +66,13 @@ INVALID_TEMPLATES = [
     "retrieve(concept='x', period='CY1940') --> compute()",          # retrieve without extract
     "extract() --> compute()",                                       # branch without head
     "[ retrieve(concept='x', period='CY1940') --> extract() ] --> compute()",  # parallel with 1 branch
-    "[ [ retrieve(concept='x', period='CY1940') --> extract() ; retrieve(concept='y', period='CY1941') --> extract() ] --> compute() ; lookup_external(nl='z') ] --> compute()",  # nested parallel
     "compute()",                                                     # only compute
+    # decomposed with mixed members (some sub-compute brackets, some plain branches)
+    "[ [ retrieve(concept='a', period='CY1940') --> extract() ] --> compute(task='X') ; "
+    "lookup_external(nl='y') ] --> compute()",
+    # intermediate compute with missing task
+    "[ [ retrieve(concept='a', period='CY1940') --> extract() ] --> compute() ; "
+    "[ retrieve(concept='a', period='CY1953') --> extract() ] --> compute(task='Y') ] --> compute()",
 ]
 
 
@@ -72,7 +84,8 @@ INVALID_TEMPLATES = [
 def test_parse_valid_templates(template: str) -> None:
     plan = parse(template)
     assert isinstance(plan, Plan)
-    assert len(plan.branches) >= 1
+    assert len(plan.computes) >= 1
+    assert plan.computes[-1].final
 
 
 @pytest.mark.parametrize("template", VALID_TEMPLATES)
@@ -102,7 +115,11 @@ def test_validate_valid_templates_ok(template: str) -> None:
 @pytest.mark.parametrize("template", INVALID_TEMPLATES)
 def test_invalid_templates_rejected(template: str) -> None:
     with pytest.raises((ParseError, ValueError)):
-        parse(template)
+        plan = parse(template)
+        # Some shapes parse but fail structural validation — surface that too.
+        result = validate(plan)
+        if not result.ok:
+            raise ValueError(result.errors)
 
 
 # ---------------------------------------------------------------------------
@@ -111,11 +128,14 @@ def test_invalid_templates_rejected(template: str) -> None:
 
 def test_simple_chain_yields_single_retrieve_branch() -> None:
     plan = parse("retrieve(concept='x', period='CY1940') --> extract() --> compute()")
-    assert len(plan.branches) == 1
-    assert isinstance(plan.branches[0], RetrieveBranch)
-    assert plan.branches[0].concept == "x"
-    assert plan.branches[0].period == "CY1940"
-    assert plan.branches[0].visual_only is False
+    assert len(plan.computes) == 1
+    final = plan.computes[0]
+    assert final.final and final.task == ""
+    assert len(final.branches) == 1
+    assert isinstance(final.branches[0], RetrieveBranch)
+    assert final.branches[0].concept == "x"
+    assert final.branches[0].period == "CY1940"
+    assert final.branches[0].visual_only is False
 
 
 def test_visual_only_flag_threads_through() -> None:
@@ -123,15 +143,17 @@ def test_visual_only_flag_threads_through() -> None:
         "retrieve(concept='chart', period='1990-09', source_bulletin='1990-09') "
         "--> extract(visual_only=True) --> compute()"
     )
-    assert plan.branches[0].visual_only is True
-    assert plan.branches[0].source_bulletin == "1990-09"
+    b = plan.computes[0].branches[0]
+    assert b.visual_only is True
+    assert b.source_bulletin == "1990-09"
 
 
 def test_lookup_only_chain() -> None:
     plan = parse("lookup_external(nl='CPI-U for 1953') --> compute()")
-    assert len(plan.branches) == 1
-    assert isinstance(plan.branches[0], LookupBranch)
-    assert plan.branches[0].nl == "CPI-U for 1953"
+    branches = plan.computes[0].branches
+    assert len(branches) == 1
+    assert isinstance(branches[0], LookupBranch)
+    assert branches[0].nl == "CPI-U for 1953"
 
 
 def test_parallel_branches() -> None:
@@ -139,13 +161,17 @@ def test_parallel_branches() -> None:
         "[ retrieve(concept='a', period='CY1940') --> extract() ; "
         "lookup_external(nl='b') ] --> compute()"
     )
-    assert len(plan.branches) == 2
-    assert isinstance(plan.branches[0], RetrieveBranch)
-    assert isinstance(plan.branches[1], LookupBranch)
+    branches = plan.computes[0].branches
+    assert len(branches) == 2
+    assert isinstance(branches[0], RetrieveBranch)
+    assert isinstance(branches[1], LookupBranch)
 
 
 def test_bad_period_caught_by_validator() -> None:
-    plan = Plan(branches=[RetrieveBranch(concept="x", period="not-a-period")])
+    plan = Plan(computes=[ComputeNode(
+        branches=[RetrieveBranch(concept="x", period="not-a-period")],
+        task="", final=True,
+    )])
     result = validate(plan)
     assert not result.ok
     assert any("period" in e for e in result.errors)
@@ -154,6 +180,62 @@ def test_bad_period_caught_by_validator() -> None:
 def test_period_range_accepted() -> None:
     plan = parse("retrieve(concept='x', period='CY1940..CY1949') --> extract() --> compute()")
     assert validate(plan).ok
+
+
+def test_decomposed_plan_shape() -> None:
+    text = (
+        "[ [ retrieve(concept='a', period='CY1940') --> extract() ] --> compute(task='one') ; "
+        "[ retrieve(concept='b', period='CY1953') --> extract() ] --> compute(task='two') ] "
+        "--> compute()"
+    )
+    plan = parse(text)
+    assert len(plan.computes) == 3
+    assert plan.computes[0].task == "one" and not plan.computes[0].final
+    assert plan.computes[1].task == "two" and not plan.computes[1].final
+    assert plan.computes[2].final and plan.computes[2].branches == []
+    # Depth = 2 (one intermediate layer + final aggregator), regardless of how
+    # many intermediates run in parallel.
+    assert validate(plan, max_compute_depth=2).ok
+
+
+def test_depth_limit_rejects_decomposed_when_max_depth_is_one() -> None:
+    text = (
+        "[ [ retrieve(concept='a', period='CY1940') --> extract() ] --> compute(task='one') ; "
+        "[ retrieve(concept='b', period='CY1953') --> extract() ] --> compute(task='two') ] "
+        "--> compute()"
+    )
+    plan = parse(text)
+    result = validate(plan, max_compute_depth=1)
+    assert not result.ok
+    assert any("depth" in e.lower() for e in result.errors)
+
+
+def test_legacy_branches_dict_accepted_by_from_dict() -> None:
+    d = {"branches": [{"kind": "retrieve", "concept": "x", "period": "CY1940"}]}
+    plan = from_dict(d)
+    assert len(plan.computes) == 1
+    assert plan.computes[0].final
+    assert plan.computes[0].task == ""
+    assert len(plan.computes[0].branches) == 1
+
+
+def test_legacy_to_dict_round_trip_preserves_branches_shape() -> None:
+    plan = parse("retrieve(concept='x', period='CY1940') --> extract() --> compute()")
+    d = to_dict(plan)
+    assert "branches" in d and "computes" not in d
+
+
+def test_decomposed_to_dict_uses_computes_shape() -> None:
+    text = (
+        "[ [ retrieve(concept='a', period='CY1940') --> extract() ] --> compute(task='one') ; "
+        "[ retrieve(concept='b', period='CY1953') --> extract() ] --> compute(task='two') ] "
+        "--> compute()"
+    )
+    plan = parse(text)
+    d = to_dict(plan)
+    assert "computes" in d and "branches" not in d
+    assert len(d["computes"]) == 3
+    assert d["computes"][-1].get("final") is True
 
 
 # ---------------------------------------------------------------------------

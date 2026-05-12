@@ -1,12 +1,16 @@
-"""Orchestrator — walks a flat Plan, dispatches per-op subagent functions.
+"""Orchestrator — walks a Plan's compute chain, dispatches per-op subagent functions.
 
 Subagents keep their `(op: OpNode, prev, ctx)` interface; the orchestrator
-translates Branch → OpNode at dispatch time. OpNode is just a dispatch
-envelope, not an AST node.
+translates Branch/ComputeNode → OpNode at dispatch time. OpNode is just a
+dispatch envelope, not an AST node.
 
-On a MissingData exception from compute, the orchestrator runs one recovery
-round: it calls plan_recovery() for a supplemental Branch, executes that
-branch, and retries compute with the augmented prev.
+A Plan is one or more ComputeNodes ending in a final aggregator (see dsl.py).
+- Single-compute (legacy flat): run the final compute's branches, then the
+  final compute. Recovery on MissingData fires once at the final compute.
+- Multi-compute: run each intermediate ComputeNode's branches + intermediate
+  compute in parallel (each producing list[AnnotatedValue]). Concatenate
+  intermediate outputs and feed them to the final aggregator. Intermediates
+  do NOT get recovery; only the final compute does.
 """
 
 from __future__ import annotations
@@ -16,19 +20,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Any
 
-from skunk.common.context import HarnessContext
+from skunk.common import HarnessContext
 from skunk.dsl import (
+    AnnotatedValue,
     Branch,
+    ComputeNode,
     DocHandle,
     FormattedString,
     LookupBranch,
     OpNode,
     Plan,
     RetrieveBranch,
-    TypedValue,
 )
-from skunk.subagents import SUBAGENT_REGISTRY
-from skunk.subagents.base import MissingData, StepFailed
+from skunk.subagents import compute, extract, lookup_external, retrieve
+from skunk.subagents.base import MissingData, StepFailed, SubagentFn
+
+_SUBAGENT_REGISTRY: dict[str, SubagentFn] = {
+    "retrieve": retrieve.run,
+    "extract": extract.run,
+    "lookup_external": lookup_external.run,
+    "compute": compute.run,
+}
 
 
 @dataclass
@@ -68,11 +80,20 @@ class QuestionTrace:
 
 
 def execute(plan: Plan, ctx: HarnessContext) -> QuestionTrace:
-    """Walk the plan: data phase (branches in parallel or single) → compute (with recovery)."""
+    """Walk the plan's compute chain. Legacy single-compute = data → final compute.
+    Decomposed = parallel intermediates → final aggregator compute."""
     trace = QuestionTrace(question=ctx.question)
     try:
-        prev = _run_data_phase(plan.branches, ctx, trace)
-        result = _run_compute_with_recovery(prev, plan, ctx, trace)
+        if not plan.computes:
+            raise StepFailed("orchestrator", "plan has no computes")
+        if len(plan.computes) == 1:
+            final = plan.computes[0]
+            prev = _run_data_phase(final.branches, ctx, trace)
+        else:
+            intermediates = plan.computes[:-1]
+            final = plan.computes[-1]
+            prev = _run_intermediates_parallel(intermediates, ctx, trace)
+        result = _run_compute_with_recovery(prev, plan, ctx, trace, final)
         trace.answer = result.text
     except StepFailed as e:
         trace.failed = True
@@ -91,8 +112,8 @@ def _run_data_phase(branches: list[Branch], ctx: HarnessContext, trace: Question
     return _run_parallel(branches, ctx, trace)
 
 
-def _run_branch(branch: Branch, ctx: HarnessContext, trace: QuestionTrace) -> TypedValue:
-    """Execute a single branch and return its TypedValue."""
+def _run_branch(branch: Branch, ctx: HarnessContext, trace: QuestionTrace) -> list[AnnotatedValue]:
+    """Execute a single branch and return its entries."""
     if isinstance(branch, RetrieveBranch):
         ret_args: dict[str, Any] = {"concept": branch.concept, "period": branch.period}
         if branch.source_bulletin:
@@ -105,8 +126,8 @@ def _run_branch(branch: Branch, ctx: HarnessContext, trace: QuestionTrace) -> Ty
     raise TypeError(f"Unknown branch type: {type(branch).__name__}")
 
 
-def _run_parallel(branches: list[Branch], ctx: HarnessContext, trace: QuestionTrace) -> list[TypedValue]:
-    """Best-effort: drop failed branches, return survivors in original order.
+def _run_parallel(branches: list[Branch], ctx: HarnessContext, trace: QuestionTrace) -> list[AnnotatedValue]:
+    """Best-effort: drop failed branches, flatten survivors into one entry list.
 
     Only re-raises if every branch failed; then the first error propagates.
     Downstream compute() decides whether the survivors are sufficient (and may
@@ -126,14 +147,60 @@ def _run_parallel(branches: list[Branch], ctx: HarnessContext, trace: QuestionTr
         ctx.emit("orchestrator", "parallel branch failed", branch_idx=i, error=str(e))
     if len(errors) == len(branches):
         raise errors[0][1]
-    return [r for r in results if r is not None]
+    return [entry for branch in results if branch is not None for entry in branch]
+
+
+def _run_intermediates_parallel(
+    nodes: list[ComputeNode], ctx: HarnessContext, trace: QuestionTrace,
+) -> list[AnnotatedValue]:
+    """For each non-final ComputeNode: run its data phase, then its intermediate
+    compute. Returns the concatenated list of AnnotatedValues across survivors.
+    Failed intermediates are skipped (best-effort), mirroring _run_parallel."""
+    results: list[list[AnnotatedValue] | None] = [None] * len(nodes)
+    errors: list[tuple[int, Exception]] = []
+    with ThreadPoolExecutor(max_workers=ctx.config.max_parallel_workers) as pool:
+        futures = {
+            pool.submit(_run_intermediate_node, node, ctx, trace): i
+            for i, node in enumerate(nodes)
+        }
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                results[i] = future.result()
+            except (StepFailed, MissingData) as e:
+                errors.append((i, e))
+    for i, e in errors:
+        ctx.emit("orchestrator", "intermediate compute failed",
+                 node_idx=i, task=nodes[i].task, error=str(e))
+    if len(errors) == len(nodes):
+        # All intermediates failed — surface the first.
+        first = errors[0][1]
+        if isinstance(first, MissingData):
+            raise StepFailed("compute", f"all intermediates missing data: {first.reason}")
+        raise first
+    return [entry for r in results if r is not None for entry in r]
+
+
+def _run_intermediate_node(
+    node: ComputeNode, ctx: HarnessContext, trace: QuestionTrace,
+) -> list[AnnotatedValue]:
+    """Run one intermediate ComputeNode's branches then its compute. No recovery."""
+    prev = _run_data_phase(node.branches, ctx, trace)
+    return _run_op(
+        OpNode(op="compute", args={"task": node.task, "final": False}),
+        prev, ctx, trace,
+    )
 
 
 def _run_compute_with_recovery(
-    prev: Any, plan: Plan, ctx: HarnessContext, trace: QuestionTrace
+    prev: Any, plan: Plan, ctx: HarnessContext, trace: QuestionTrace,
+    final_node: ComputeNode,
 ) -> FormattedString:
-    """Run compute(); if it reports MissingData, run one recovery branch and retry once."""
-    compute_op = OpNode(op="compute", args={})
+    """Run the final compute; if it reports MissingData, run one recovery branch and retry once."""
+    compute_args: dict[str, Any] = {"final": True}
+    if final_node.task:
+        compute_args["task"] = final_node.task
+    compute_op = OpNode(op="compute", args=compute_args)
     try:
         return _run_op(compute_op, prev, ctx, trace)
     except MissingData as e:
@@ -151,8 +218,7 @@ def _run_compute_with_recovery(
 
         ctx.emit("orchestrator", "running recovery branch", branch=repr(extra))
         extra_value = _run_branch(extra, ctx, trace)
-        augmented = list(prev) if isinstance(prev, list) else [prev]
-        augmented.append(extra_value)
+        augmented = list(prev) + extra_value
 
         try:
             return _run_op(compute_op, augmented, ctx, trace)
@@ -161,7 +227,7 @@ def _run_compute_with_recovery(
 
 
 def _run_op(op: OpNode, prev: Any, ctx: HarnessContext, trace: QuestionTrace) -> Any:
-    fn = SUBAGENT_REGISTRY.get(op.op)
+    fn = _SUBAGENT_REGISTRY.get(op.op)
     if fn is None:
         raise StepFailed(op.op, f"No subagent registered for '{op.op}'")
 
@@ -196,9 +262,9 @@ def _describe_value(v: Any) -> str:
         return "(none)"
     if isinstance(v, DocHandle):
         return f"DocHandle({len(v.refs)} refs): {v.desc}"
-    if isinstance(v, TypedValue):
-        keys = list(v.value.keys())
-        return f"TypedValue({len(keys)} keys={keys}) — {v.desc}"
+    if isinstance(v, list) and v and isinstance(v[0], AnnotatedValue):
+        descriptions = [e.description for e in v]
+        return f"[{len(descriptions)} entries: {descriptions}]"
     if isinstance(v, FormattedString):
         return f"FormattedString: {v.text!r}"
     if isinstance(v, list):
@@ -214,8 +280,8 @@ def _full_repr(v: Any) -> str:
     if isinstance(v, DocHandle):
         refs = "\n    ".join(repr(r) for r in v.refs)
         return f"DocHandle(desc={v.desc!r}, {len(v.refs)} refs):\n    {refs}" if v.refs else f"DocHandle(empty, desc={v.desc!r})"
-    if isinstance(v, TypedValue):
-        return f"TypedValue(desc={v.desc!r}, value={v.value!r}, meta={v.meta!r})"
+    if isinstance(v, list) and v and isinstance(v[0], AnnotatedValue):
+        return repr(v)
     if isinstance(v, FormattedString):
         return f"FormattedString(text={v.text!r})"
     if isinstance(v, list):

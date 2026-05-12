@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, os.path.expanduser("~/Desktop/officeqa"))
 
-from skunk.dsl import DocHandle, FormattedString, NamedEntry, OpNode, PageRef, TypedValue
+from skunk.dsl import AnnotatedValue, DocHandle, FormattedString, OpNode, PageRef
 
 
 def _rel_err(got, expected):
@@ -27,7 +27,7 @@ def _rel_err(got, expected):
 import skunk.subagents.compute as compute  # noqa: E402
 import skunk.subagents.extract as extract  # noqa: E402
 import skunk.subagents.lookup_external as lookup_external  # noqa: E402
-from skunk.common.context import HarnessContext  # noqa: E402
+from skunk.common import HarnessContext  # noqa: E402
 
 PDF_DIR = os.path.expanduser("~/Desktop/officeqa/treasury_bulletin_pdfs")
 PARSED_JSON_DIR = os.path.expanduser(
@@ -63,26 +63,26 @@ class TestLookupExternal:
     def test_uid0055_wwii_end(self, ctx):
         op = OpNode(op="lookup_external", args={"nl": "year that WWII ended"})
         result = lookup_external.run(op, None, ctx)
-        assert isinstance(result, TypedValue)
-        assert result.value[""] == 1945, f"Expected 1945, got {result.value['']}"
+        assert isinstance(result, list)
+        assert result[0].value == 1945, f"Expected 1945, got {result.value['']}"
 
     def test_uid0055_korean_war_start(self, ctx):
         op = OpNode(op="lookup_external", args={"nl": "year the Korean War started"})
         result = lookup_external.run(op, None, ctx)
-        assert isinstance(result, TypedValue)
-        assert result.value[""] == 1950, f"Expected 1950, got {result.value['']}"
+        assert isinstance(result, list)
+        assert result[0].value == 1950, f"Expected 1950, got {result.value['']}"
 
     def test_uid0055_germany_invaded_poland(self, ctx):
         op = OpNode(op="lookup_external", args={"nl": "year Germany invaded Poland"})
         result = lookup_external.run(op, None, ctx)
-        assert isinstance(result, TypedValue)
-        assert result.value[""] == 1939, f"Expected 1939, got {result.value['']}"
+        assert isinstance(result, list)
+        assert result[0].value == 1939, f"Expected 1939, got {result.value['']}"
 
     def test_uid0010_usd_jpy_rate_2025(self, ctx):
         op = OpNode(op="lookup_external", args={"nl": "USD/JPY exchange rate on 2025-03-31"})
         result = lookup_external.run(op, None, ctx)
-        assert isinstance(result, TypedValue)
-        rate = float(result.value[""])
+        assert isinstance(result, list)
+        rate = float(result[0].value)
         assert 147 <= rate <= 153, f"USD/JPY on 2025-03-31 should be ≈149-151, got {rate}"
 
 
@@ -94,7 +94,7 @@ class TestCompute:
 
     def test_sum_of_list(self):
         ctx = _ctx_for("What is the sum of the values? Report as a plain integer with no commas.")
-        prev = TypedValue(value={"": [10.0, 20.0, 30.0]}, meta={"": NamedEntry()}, desc="monthly values")
+        prev = [AnnotatedValue(description="three numbers", value=[10.0, 20.0, 30.0])]
         result = compute.run(OpNode(op="compute"), prev, ctx)
         assert isinstance(result, FormattedString)
         assert _num(result.text) == 60.0, f"Expected 60, got {result.text!r}"
@@ -105,19 +105,15 @@ class TestCompute:
             "Report in millions of nominal dollars rounded to the nearest whole."
         )
         monthly = [132, 129, 143, 159, 154, 153, 177, 200, 219, 287, 376, 473]
-        # New contract: flat scalars with dims. One named scalar per month;
-        # dims={'month': 'YYYY-MM'} disambiguates siblings.
-        value: dict = {}
-        meta: dict = {}
-        for i, v in enumerate(monthly, start=1):
-            name = f"national_defense_cy1940_m{i:02d}"
-            value[name] = v
-            meta[name] = NamedEntry(
+        entries = [
+            AnnotatedValue(
+                description=f"US national defense expenditures, 1940-{i:02d}, monthly",
+                value=v,
                 unit="usd_millions",
-                quote=f"1940 month {i}",
-                dims={"year": 1940, "month": f"1940-{i:02d}", "sub_category": "national_defense"},
             )
-        prev = TypedValue(value=value, desc="", meta=meta)
+            for i, v in enumerate(monthly, start=1)
+        ]
+        prev = entries
         result = compute.run(OpNode(op="compute"), prev, ctx)
         assert isinstance(result, FormattedString)
         assert _rel_err(_num(result.text), 2602.0) < 0.001, f"Expected ≈2602, got {result.text!r}"
@@ -127,8 +123,8 @@ class TestCompute:
             "What was the absolute percent change between the two values, as a percent value (e.g. 12.34%)?"
         )
         prev = [
-            TypedValue(value={"": 2602.0}, meta={"": NamedEntry(unit="usd_millions")}, desc="CY1940 total"),
-            TypedValue(value={"": 44463.0}, meta={"": NamedEntry(unit="usd_millions")}, desc="CY1953 total"),
+            AnnotatedValue(description="CY1940 total", value=2602.0, unit="usd_millions"),
+            AnnotatedValue(description="CY1953 total", value=44463.0, unit="usd_millions"),
         ]
         result = compute.run(OpNode(op="compute"), prev, ctx)
         assert isinstance(result, FormattedString)
@@ -142,12 +138,7 @@ class TestCompute:
         ctx = _ctx_for(
             "What is the unemployment rate for January 1955? Report as a percent."
         )
-        # prev contains nothing about unemployment
-        prev = TypedValue(
-            value={"some_unrelated_value": 42},
-            desc="",
-            meta={"some_unrelated_value": NamedEntry(unit="count", quote="something else entirely")},
-        )
+        prev = [AnnotatedValue(description="something else entirely", value=42, unit="count")]
         with pytest.raises(StepFailed) as excinfo:
             compute.run(OpNode(op="compute"), prev, ctx)
         assert "missing" in str(excinfo.value).lower() or "compute" in excinfo.value.op
@@ -171,8 +162,8 @@ class TestExtractVisualOnly:
         ref = PageRef(month="1990-09", page=7, file_path=SEPT_1990_PDF)
         prev = DocHandle(refs=[ref], desc="Sept 1990 bulletin page")
         result = extract.run(op, prev, ctx)
-        assert isinstance(result, TypedValue), f"Expected TypedValue, got {type(result)}"
-        assert isinstance(result.value, dict) and len(result.value) > 0
+        assert isinstance(result, list), f"Expected list[AnnotatedValue], got {type(result)}"
+        assert len(result) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -194,12 +185,12 @@ class TestExtract:
         ref = PageRef(month="1941-01", page=15)
         prev = DocHandle(refs=[ref])
         result = extract.run(op, prev, ctx)
-        assert isinstance(result, TypedValue)
-        assert isinstance(result.value, dict) and len(result.value) > 0
+        assert isinstance(result, list)
+        assert len(result) > 0
         # The page contains only FY data on national defense; the agent should still emit a
-        # plausible national-defense-related entry (name varies but should mention 'defense').
-        names = list(result.value.keys())
-        assert any("defense" in n.lower() for n in names), (
-            f"Expected at least one defense-related key, got {names!r}"
+        # plausible national-defense-related entry (description should mention 'defense').
+        descriptions = [e.description for e in result]
+        assert any("defense" in d.lower() for d in descriptions), (
+            f"Expected at least one defense-related description, got {descriptions!r}"
         )
 

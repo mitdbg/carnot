@@ -9,21 +9,27 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from skunk.dsl import DocHandle
+from skunk.dsl import DocHandle
 
 
 @dataclass
 class SkunkConfig:
-    # Orchestrator
-    max_parallel_workers: int = 4
+    # Orchestrator + extract fan-out. Sized so a typical question
+    # (≤3 branches × ≤5 pages × ≤3 samples) is bounded by the Gemini RPM
+    # limiter rather than the thread pool.
+    max_parallel_workers: int = 16
 
-    # Gemini LLM client (env: SKUNK_GEMINI_MAX_RETRIES, SKUNK_GEMINI_RETRY_DELAY, SKUNK_GEMINI_MODEL)
+    # Gemini LLM client (env: SKUNK_GEMINI_MODEL, SKUNK_GEMINI_RPM)
     gemini_model: str = "gemini-2.5-flash"
-    gemini_max_retries: int = 5
-    gemini_retry_delay_s: float = 30.0
+    # Token-bucket rate limit applied to every Gemini call (requests per minute).
+    # Default matches Gemini 2.5 Flash paid-tier 1k RPM quota.
+    gemini_rpm: float = 1000.0
+    # Per-call retry with exponential backoff. Re-tries any Gemini exception;
+    # delay doubles each attempt, capped at gemini_retry_max_delay_s.
+    gemini_max_retries: int = 10
+    gemini_retry_initial_delay_s: float = 0.05
+    gemini_retry_max_delay_s: float = 1.0
     # Vertex AI (env: SKUNK_USE_VERTEX). When True, uses Vertex AI instead of the direct Gemini API.
     # Requires GOOGLE_CLOUD_PROJECT; optionally GOOGLE_CLOUD_LOCATION (default: us-central1)
     # and GOOGLE_APPLICATION_CREDENTIALS for service-account auth.
@@ -36,6 +42,9 @@ class SkunkConfig:
 
     # Compute subagent
     compute_max_attempts: int = 3
+    # Max depth of the compute chain. 1 = legacy flat (data → single compute).
+    # 2 = one intermediate layer + one final aggregator (default).
+    max_compute_depth: int = 2
 
     # DSL plan cache (env: SKUNK_PLAN_CACHE_CSV)
     plan_cache_csv: str = "data/dsl_planning_pass.csv"
@@ -51,11 +60,14 @@ class SkunkConfig:
     def from_env(cls) -> SkunkConfig:
         return cls(
             gemini_model=os.environ.get("SKUNK_GEMINI_MODEL", "gemini-2.5-flash"),
-            gemini_max_retries=int(os.environ.get("SKUNK_GEMINI_MAX_RETRIES", "5")),
-            gemini_retry_delay_s=float(os.environ.get("SKUNK_GEMINI_RETRY_DELAY", "30")),
+            gemini_rpm=float(os.environ.get("SKUNK_GEMINI_RPM", "1000")),
+            gemini_max_retries=int(os.environ.get("SKUNK_GEMINI_MAX_RETRIES", "10")),
+            gemini_retry_initial_delay_s=float(os.environ.get("SKUNK_GEMINI_RETRY_INITIAL_DELAY", "0.05")),
+            gemini_retry_max_delay_s=float(os.environ.get("SKUNK_GEMINI_RETRY_MAX_DELAY", "1.0")),
             use_vertex=os.environ.get("SKUNK_USE_VERTEX", "").lower() in ("1", "true", "yes"),
             extract_n_samples=int(os.environ.get("SKUNK_EXTRACT_N_SAMPLES", "3")),
             extract_sample_temperature=float(os.environ.get("SKUNK_EXTRACT_SAMPLE_TEMPERATURE", "0.7")),
+            max_compute_depth=int(os.environ.get("SKUNK_MAX_COMPUTE_DEPTH", "2")),
             plan_cache_csv=os.environ.get("SKUNK_PLAN_CACHE_CSV", "data/dsl_planning_pass.csv"),
             manifest_path=os.environ.get("SKUNK_MANIFEST"),
         )

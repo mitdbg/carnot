@@ -14,7 +14,7 @@ import pandas as pd
 import statsmodels.api as sm
 
 if TYPE_CHECKING:
-    from skunk.common.context import HarnessContext
+    from skunk.common import HarnessContext
     from skunk.dsl import OpNode
 
 
@@ -68,19 +68,50 @@ def strip_code_fences(code: str) -> str:
 
 
 def exec_python(code: str, local_vars: dict[str, Any] | None = None) -> Any:
-    code = strip_code_fences(code)
+    """Exec `code` in a sandboxed env. Returns env["result"] or raises."""
+    _, result = exec_python_with_env(code, local_vars)
+    return result
 
+
+def _hp_filter(y: "np.ndarray | list", lamb: float = 1600) -> "tuple[np.ndarray, np.ndarray]":
+    """Hodrick-Prescott filter implemented in pure numpy.
+
+    Returns (cycle, trend). Use lamb=100 for annual data, 1600 for quarterly,
+    14400 for monthly.
+    """
+    y = np.asarray(y, dtype=float)
+    n = len(y)
+    D = np.zeros((n - 2, n))
+    for i in range(n - 2):
+        D[i, i] = 1.0
+        D[i, i + 1] = -2.0
+        D[i, i + 2] = 1.0
+    A = np.eye(n) + lamb * D.T @ D
+    trend = np.linalg.solve(A, y)
+    return y - trend, trend
+
+
+def exec_python_with_env(
+    code: str, local_vars: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], Any]:
+    """Exec `code` and return both the post-exec env and env["result"].
+
+    Useful when the caller needs auxiliary variables the code may have set
+    (e.g. `result_unit`, `result_kind`) alongside the primary `result`.
+    """
+    code = strip_code_fences(code)
     env: dict[str, Any] = {
         "math": math,
         "np": np, "numpy": np,
         "pd": pd, "pandas": pd,
         "sm": sm, "statsmodels": sm,
+        "hp_filter": _hp_filter,
     }
     env.update(local_vars or {})
     exec(compile(code, "<sandbox>", "exec"), env)  # noqa: S102
     if "result" not in env:
         raise StepFailed("sandbox", f"Code did not set `result`:\n{code}")
-    return env["result"]
+    return env, env["result"]
 
 
 # ---------------------------------------------------------------------------

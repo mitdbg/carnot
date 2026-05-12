@@ -4,18 +4,19 @@ from __future__ import annotations
 
 import pytest
 
-from skunk.common.context import HarnessContext
-from skunk.common.parsed_json import (
-    _load_doc,
-    _page_index,
+from skunk.common import HarnessContext
+from skunk.subagents.base import StepFailed
+from skunk.subagents.extract import (
+    _load_parsed_doc,
+    _parsed_json_dir,
+    _parsed_page_index,
     get_printed_page,
     get_text_for_pdf_page,
-    parsed_json_dir,
 )
 from skunk.dsl import PageRef
 
-JUNE_2025_JSON = parsed_json_dir() / "treasury_bulletin_2025_06.json"
-JAN_1941_JSON = parsed_json_dir() / "treasury_bulletin_1941_01.json"
+JUNE_2025_JSON = _parsed_json_dir() / "treasury_bulletin_2025_06.json"
+JAN_1941_JSON = _parsed_json_dir() / "treasury_bulletin_1941_01.json"
 
 
 def _ctx() -> HarnessContext:
@@ -25,8 +26,8 @@ def _ctx() -> HarnessContext:
 @pytest.fixture(autouse=True)
 def _clear_cache():
     # parsed_json caches via lru_cache on functions; clear so tests are deterministic.
-    _load_doc.cache_clear()
-    _page_index.cache_clear()
+    _load_parsed_doc.cache_clear()
+    _parsed_page_index.cache_clear()
 
 
 @pytest.mark.skipif(not JUNE_2025_JSON.exists(), reason="Parsed JSON corpus not present")
@@ -66,7 +67,10 @@ def test_old_bulletin_pdf_page_returns_rich_content():
     assert get_printed_page(PageRef(month="1941-01", page=15), _ctx()) == "5"
 
 
-def test_missing_month_returns_none():
-    # A month we don't have JSON for must yield None, not raise.
-    assert get_text_for_pdf_page(PageRef(month="1800-01", page=1), _ctx()) is None
-    assert get_printed_page(PageRef(month="1800-01", page=1), _ctx()) is None
+def test_missing_month_raises_step_failed():
+    # A month with no corpus file raises StepFailed (not a silent None).
+    with pytest.raises(StepFailed):
+        get_text_for_pdf_page(PageRef(month="1800-01", page=1), _ctx())
+    _load_parsed_doc.cache_clear()
+    with pytest.raises(StepFailed):
+        get_printed_page(PageRef(month="1800-01", page=1), _ctx())

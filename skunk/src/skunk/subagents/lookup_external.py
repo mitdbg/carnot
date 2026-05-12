@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from skunk.common.context import HarnessContext
-from skunk.dsl import NamedEntry, OpNode, TypedValue
+from skunk.common import HarnessContext
+from skunk.dsl import AnnotatedValue, OpNode
 from skunk.subagents.base import StepFailed, parse_llm_value
 
 _SYSTEM = """\
@@ -38,12 +38,13 @@ Rules:
 """
 
 
-def run(op: OpNode, prev: None, ctx: HarnessContext) -> TypedValue:
+def run(op: OpNode, prev: None, ctx: HarnessContext) -> list[AnnotatedValue]:
     nl = op.args.get("nl", "")
     if not nl:
         raise StepFailed("lookup_external", "Missing 'nl' arg")
     ctx.emit("lookup_external", "calling gemini", nl=nl)
-    raw = ctx.llm_client.call(_SYSTEM, nl, thinking_budget=-1, use_google_search=True)
+    resp = ctx.llm_client.call(_SYSTEM, nl, thinking_budget=-1, use_google_search=True)
+    raw = resp.text
     ctx.emit("lookup_external", "gemini response", raw=raw[:500])
 
     try:
@@ -52,4 +53,4 @@ def run(op: OpNode, prev: None, ctx: HarnessContext) -> TypedValue:
         raise StepFailed("lookup_external", f"Cannot parse LLM response: {e}\nRaw: {raw[:200]}") from e
 
     ctx.emit("lookup_external", "parsed", value=repr(value)[:200], unit=unit)
-    return TypedValue(value={"": value}, meta={"": NamedEntry(unit=unit)}, desc=nl)
+    return [AnnotatedValue(description=nl, value=value, unit=unit)]

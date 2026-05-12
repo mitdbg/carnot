@@ -14,8 +14,8 @@ from __future__ import annotations
 import pytest
 
 import skunk.subagents.compute as compute
-from skunk.common.context import HarnessContext
-from skunk.dsl import FormattedString, NamedEntry, OpNode, TypedValue
+from skunk.common import HarnessContext, LLMResponse
+from skunk.dsl import AnnotatedValue, FormattedString, OpNode
 from skunk.subagents.base import MissingData, StepFailed
 
 
@@ -38,17 +38,20 @@ class _MockLLM:
         self.codegen_calls = 0
         self.critique_calls = 0
 
-    def call(self, system: str, user: str, **kwargs) -> str:
+    def call(self, system: str, user: str, **kwargs) -> LLMResponse:
+        def _wrap(text: str) -> LLMResponse:
+            return LLMResponse(text=text, latency_s=0.0, input_tokens=None, output_tokens=None)
+
         if system is compute._CRITIQUE_SYSTEM:
             self.critique_calls += 1
             if not self.critique:
                 raise AssertionError(f"unexpected critique call #{self.critique_calls}; user={user[:200]}")
-            return self.critique.pop(0)
+            return _wrap(self.critique.pop(0))
         if system is compute._CODEGEN_SYSTEM:
             self.codegen_calls += 1
             if not self.codegen:
                 raise AssertionError(f"unexpected codegen call #{self.codegen_calls}; user={user[:200]}")
-            return self.codegen.pop(0)
+            return _wrap(self.codegen.pop(0))
         raise AssertionError(f"unknown system prompt: {system[:80]!r}")
 
 
@@ -56,11 +59,8 @@ def _ctx(llm: _MockLLM, question: str = "test question") -> HarnessContext:
     return HarnessContext(question=question, llm_client=llm)
 
 
-def _prev_scalar(value: float = 35532.0, unit: str = "usd_millions") -> TypedValue:
-    return TypedValue(
-        value={"x": value},
-        meta={"x": NamedEntry(unit=unit, quote="q", dims={}, kind="scalar")},
-    )
+def _prev_scalar(value: float = 35532.0, unit: str = "usd_millions") -> list[AnnotatedValue]:
+    return [AnnotatedValue(description="x", value=value, unit=unit, kind="scalar")]
 
 
 def _op() -> OpNode:

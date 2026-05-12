@@ -1,6 +1,6 @@
-"""DSL — flat Plan/Branch types, text<->AST parser, validator, serializer.
+"""DSL — Plan/Branch/ComputeNode types, text<->AST parser, validator, serializer.
 
-Surface forms accepted (compute is implicit at the end of every plan):
+Surface forms accepted:
 
   retrieve(concept='X', period='CY1940') --> extract() --> compute()
   retrieve(concept='X', period='1990-09') --> extract(visual_only=True) --> compute()
@@ -8,13 +8,20 @@ Surface forms accepted (compute is implicit at the end of every plan):
   [ retrieve(...) --> extract() ; retrieve(...) --> extract() ] --> compute()
   [ retrieve(...) --> extract() ; lookup_external(...) ] --> compute()
 
-These three shapes are the only ones any real plan uses. Sub-chains and nested
-parallels are not representable.
+  Decomposed (multi-compute):
+  [
+    [ branches_1 ] --> compute(task='...');
+    [ branches_2 ] --> compute(task='...')
+  ] --> compute()
+
+Inner `[branches] --> compute(task='...')` blocks are intermediate computes
+that emit list[AnnotatedValue] for the trailing aggregator `compute()` to
+consume. Depth is bounded by `SkunkConfig.max_compute_depth` (default 2).
 
 Page number convention:
   PageRef.page = 1-based PDF page index (canonical throughout the codebase).
   The bulletin's printed-page footer is recoverable via
-  skunk.common.parsed_json.get_printed_page() for trace/prompt enrichment,
+  skunk.subagents.extract.get_printed_page() for trace/prompt enrichment,
   but is never used as a lookup key.
 """
 
@@ -68,113 +75,34 @@ VALID_KINDS = frozenset({"scalar", "vector", "table"})
 
 
 @dataclass
-class NamedEntry:
-    """Sidecar metadata for one entry in a TypedValue.
+class AnnotatedValue:
+    """One described, annotated datum. Carries the payload + minimal metadata.
 
-    The payload itself lives in `TypedValue.value[name]`. This record carries the
-    per-entry unit, the verbatim page phrase that anchors it, the kind discriminator
-    that selects the payload shape, optional axis-name labels for vector/table, and
-    an optional `dims` dict of categorical labels that lets compute group / filter
-    siblings (e.g. {"denomination": 1, "series": "Total"}).
+    Fields:
+      - description: free-form natural-language label that uniquely distinguishes
+        this entry from siblings. Should include everything a reader needs to
+        know about what this value represents — series, period, sub-category,
+        unit hint, etc. There is no separate `dims` / `quote` field; rich
+        context goes here as prose.
+      - value: payload, shape determined by `kind`.
+      - unit: semantic unit token (e.g. "usd_millions", "pct", "year").
+      - kind: "scalar" | "vector" | "table".
+      - index_name: vector only — name of the varying dim (e.g. "month").
+      - row_name / col_name: table only — names of the two varying dims.
 
-    Payload shapes by kind (enforced in TypedValue.__post_init__):
+    Payload shapes by kind:
       - "scalar": value is int | float | str.
       - "vector": value is dict[str, int|float|str], keyed by index_name labels.
       - "table":  value is dict[str, dict[str, int|float|str]],
                   outer key = row_name label, inner key = col_name label.
-    No nesting beyond these shapes.
     """
+    description: str
+    value: Any
     unit: str = ""
-    quote: str = ""
-    dims: dict[str, Any] = field(default_factory=dict)
     kind: str = "scalar"                  # "scalar" | "vector" | "table"
-    index_name: str | None = None         # vector only — name of the varying dim
+    index_name: str | None = None         # vector only
     row_name: str | None = None           # table only
     col_name: str | None = None           # table only
-
-
-def _is_primitive_cell(v: Any) -> bool:
-    """A vector/table cell must be a non-bool number or a string."""
-    if isinstance(v, bool):
-        return False
-    return isinstance(v, (int, float, str))
-
-
-def _validate_payload(name: str, kind: str, value: Any) -> None:
-    """Walk a TypedValue.value[name] payload and reject anything that doesn't
-    match the declared `kind`'s flat shape. Raises ValueError on violation."""
-    if kind not in VALID_KINDS:
-        raise ValueError(f"NamedEntry {name!r}: invalid kind {kind!r}; must be one of {sorted(VALID_KINDS)}")
-
-    if kind == "scalar":
-        if not _is_primitive_cell(value):
-            raise ValueError(
-                f"NamedEntry {name!r}: kind='scalar' requires int|float|str, got {type(value).__name__}"
-            )
-        return
-
-    if kind == "vector":
-        if not isinstance(value, dict):
-            raise ValueError(
-                f"NamedEntry {name!r}: kind='vector' requires dict[str, scalar], got {type(value).__name__}"
-            )
-        for k, cell in value.items():
-            if not isinstance(k, str):
-                raise ValueError(
-                    f"NamedEntry {name!r}: vector index key must be str, got {type(k).__name__} for {k!r}"
-                )
-            if not _is_primitive_cell(cell):
-                raise ValueError(
-                    f"NamedEntry {name!r}: vector cell at {k!r} must be int|float|str (no nesting), "
-                    f"got {type(cell).__name__}"
-                )
-        return
-
-    # kind == "table" — 2-level dict-of-dict of primitive scalars. Ragged column
-    # sets are allowed (real bulletin tables often start/stop mid-year); the
-    # no-nesting invariant is enforced regardless of which columns each row has.
-    if not isinstance(value, dict):
-        raise ValueError(
-            f"NamedEntry {name!r}: kind='table' requires dict[str, dict[str, scalar]], "
-            f"got {type(value).__name__}"
-        )
-    for r, row in value.items():
-        if not isinstance(r, str):
-            raise ValueError(
-                f"NamedEntry {name!r}: table row key must be str, got {type(r).__name__} for {r!r}"
-            )
-        if not isinstance(row, dict):
-            raise ValueError(
-                f"NamedEntry {name!r}: table row {r!r} must be a dict[str, scalar], "
-                f"got {type(row).__name__}"
-            )
-        for c, cell in row.items():
-            if not isinstance(c, str):
-                raise ValueError(
-                    f"NamedEntry {name!r}: table col key in row {r!r} must be str, "
-                    f"got {type(c).__name__} for {c!r}"
-                )
-            if not _is_primitive_cell(cell):
-                raise ValueError(
-                    f"NamedEntry {name!r}: table cell at ({r!r}, {c!r}) must be int|float|str "
-                    f"(no nesting), got {type(cell).__name__}"
-                )
-
-
-@dataclass
-class TypedValue:
-    value: dict[str, Any]              # keyed by name; single unnamed results use key ""
-    desc: str = ""
-    meta: dict[str, NamedEntry] = field(default_factory=dict)
-    # meta is keyed identically to value; unit/quote/dims/kind live per-entry in NamedEntry.
-
-    def __post_init__(self) -> None:
-        # Validate every entry against its declared kind. A construction-time failure
-        # here is a bug in extract, not silent data corruption downstream.
-        for name, payload in self.value.items():
-            entry = self.meta.get(name)
-            kind = entry.kind if entry is not None else "scalar"
-            _validate_payload(name, kind, payload)
 
 
 @dataclass
@@ -183,7 +111,7 @@ class FormattedString:
 
 
 # Union type for inter-op values
-OpOutput = DocHandle | TypedValue | FormattedString
+OpOutput = DocHandle | list[AnnotatedValue] | FormattedString
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +154,46 @@ Branch = RetrieveBranch | LookupBranch
 
 
 @dataclass
+class ComputeNode:
+    """One compute step in a Plan's chain.
+
+    Intermediate nodes (final=False) have non-empty `branches` and a non-empty
+    `task`. They run their branches to produce a list[AnnotatedValue], then
+    invoke the compute subagent in intermediate mode to derive their own
+    list[AnnotatedValue] result for the downstream aggregator to consume.
+
+    The final node (final=True) has empty `branches` when it follows
+    intermediates (it aggregates their outputs), or non-empty `branches` in the
+    legacy single-compute shape (it consumes data directly).
+    """
+    branches: list[Branch] = field(default_factory=list)
+    task: str = ""
+    final: bool = False
+
+
+@dataclass
 class Plan:
-    branches: list[Branch] = field(default_factory=list)   # len 1 = simple; len > 1 = parallel
+    """Chain of one or more ComputeNodes terminating in a final aggregator.
+
+    Legacy flat plans = `Plan(computes=[ComputeNode(branches=[...], final=True)])`.
+    """
+    computes: list[ComputeNode] = field(default_factory=list)
+
+    # ---- Back-compat read accessor ----------------------------------------
+    # Older callers iterate plan.branches. For the legacy single-compute shape
+    # (len(computes) == 1, final=True), expose the branches directly so tests
+    # and external code that pre-date the chain change keep working without
+    # a wider refactor.
+    @property
+    def branches(self) -> list[Branch]:
+        if len(self.computes) == 1 and self.computes[0].final:
+            return self.computes[0].branches
+        # Otherwise: return all data branches across intermediates (the flat
+        # view doesn't capture chain structure, so this is best-effort).
+        out: list[Branch] = []
+        for c in self.computes:
+            out.extend(c.branches)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -385,10 +351,14 @@ def _coerce(v: str) -> Any:
 def parse(text: str) -> Plan:
     """Parse text DSL into a Plan.
 
-    Accepts only the three real shapes:
-      retrieve(...) --> extract(...) --> compute()
-      lookup_external(...) --> compute()
-      [ branch ; branch ; ... ] --> compute()
+    Accepts:
+      Flat (single compute):
+        retrieve(...) --> extract(...) --> compute()
+        lookup_external(...) --> compute()
+        [ branch ; branch ; ... ] --> compute()
+
+      Decomposed (chain of computes):
+        [ [branches] --> compute(task='...'); [branches] --> compute(task='...') ] --> compute()
     """
     text = text.strip()
     parts = _split_chain(text)
@@ -401,22 +371,66 @@ def parse(text: str) -> Plan:
     if last_name != "compute":
         raise ParseError(f"Plan must end with compute(), got {parts[-1]!r}")
     if last_args:
-        raise ParseError(f"compute() takes no args, got {last_args!r}")
+        raise ParseError(f"final compute() takes no args, got {last_args!r}")
 
     body = parts[:-1]
     if not body:
         raise ParseError(f"Plan must have at least one data-gathering step before compute(): {text!r}")
 
+    # Detect decomposed form: a single outer bracket block whose first inner
+    # member is itself bracketed (an inner [branches] --> compute(task=...)).
+    if len(body) == 1 and body[0].startswith("[") and body[0].endswith("]"):
+        inner = body[0][1:-1].strip()
+        raw_members = _split_branches(inner)
+        if len(raw_members) < 2:
+            raise ParseError(
+                f"Parallel block must have >=2 members, got {len(raw_members)}"
+            )
+        # Decomposed: every member starts with '['.
+        if all(m.lstrip().startswith("[") for m in raw_members):
+            intermediates = [_parse_intermediate_compute(m) for m in raw_members]
+            return Plan(
+                computes=[*intermediates, ComputeNode(branches=[], task="", final=True)],
+            )
+        # Otherwise legacy parallel-of-branches form.
+        if any(m.lstrip().startswith("[") for m in raw_members):
+            raise ParseError(
+                "Parallel block mixes plain branches with sub-compute brackets — "
+                "either all members are branches, or all are `[branches] --> compute(task='...')`"
+            )
+        branches = [_parse_branch(b) for b in raw_members]
+        return Plan(computes=[ComputeNode(branches=branches, task="", final=True)])
+
+    branches = [_parse_branch(" --> ".join(body))]
+    return Plan(computes=[ComputeNode(branches=branches, task="", final=True)])
+
+
+def _parse_intermediate_compute(text: str) -> ComputeNode:
+    """Parse a single `[branches] --> compute(task='...')` block."""
+    text = text.strip()
+    parts = _split_chain(text)
+    if len(parts) < 2:
+        raise ParseError(
+            f"Intermediate compute must be `[branches] --> compute(task='...')`, got: {text!r}"
+        )
+    last_name, last_args = _parse_op(parts[-1])
+    if last_name != "compute":
+        raise ParseError(f"Intermediate must end with compute(...), got {parts[-1]!r}")
+    task = str(last_args.get("task", "")).strip()
+    if not task:
+        raise ParseError(
+            f"Intermediate compute requires non-empty task='...': {text!r}"
+        )
+    body = parts[:-1]
     if len(body) == 1 and body[0].startswith("[") and body[0].endswith("]"):
         inner = body[0][1:-1].strip()
         raw_branches = _split_branches(inner)
-        if len(raw_branches) < 2:
-            raise ParseError(f"Parallel block must have >=2 branches, got {len(raw_branches)}")
+        if len(raw_branches) < 1:
+            raise ParseError(f"Intermediate compute has no branches: {text!r}")
         branches = [_parse_branch(b) for b in raw_branches]
     else:
         branches = [_parse_branch(" --> ".join(body))]
-
-    return Plan(branches=branches)
+    return ComputeNode(branches=branches, task=task, final=False)
 
 
 def _parse_branch(text: str) -> Branch:
@@ -467,15 +481,46 @@ def _serialize_branch(b: Branch) -> str:
     raise TypeError(f"Unknown branch type: {type(b)}")
 
 
+def _serialize_branches_block(branches: list[Branch]) -> str:
+    if len(branches) == 1:
+        return _serialize_branch(branches[0])
+    return "[ " + " ; ".join(_serialize_branch(b) for b in branches) + " ]"
+
+
 def serialize(plan: Plan) -> str:
-    """Serialize Plan back to text DSL."""
-    if not plan.branches:
+    """Serialize Plan back to text DSL.
+
+    Legacy flat shape (single final compute with branches):
+        [branches] --> compute()
+    Decomposed (intermediates + aggregator):
+        [ [branches] --> compute(task='...'); ... ] --> compute()
+    """
+    if not plan.computes:
         raise ValueError("Cannot serialize empty Plan")
-    if len(plan.branches) == 1:
-        body = _serialize_branch(plan.branches[0])
-    else:
-        body = "[ " + " ; ".join(_serialize_branch(b) for b in plan.branches) + " ]"
-    return f"{body} --> compute()"
+    if len(plan.computes) == 1:
+        c = plan.computes[0]
+        if not c.final:
+            raise ValueError("Single-compute Plan must have final=True")
+        if not c.branches:
+            raise ValueError("Single-compute Plan must have non-empty branches")
+        return f"{_serialize_branches_block(c.branches)} --> compute()"
+    # Decomposed: validate shape lightly, then emit.
+    intermediates = plan.computes[:-1]
+    final = plan.computes[-1]
+    if not final.final or final.branches:
+        raise ValueError("Decomposed Plan must end with a final aggregator with empty branches")
+    if any(c.final or not c.branches or not c.task for c in intermediates):
+        raise ValueError("Each intermediate compute needs non-empty branches and task, final=False")
+    members = []
+    for c in intermediates:
+        # Always bracket the inner branches block so re-parsing distinguishes
+        # decomposed members from a plain branch.
+        if len(c.branches) == 1:
+            inner = "[ " + _serialize_branch(c.branches[0]) + " ]"
+        else:
+            inner = _serialize_branches_block(c.branches)
+        members.append(f"{inner} --> compute(task='{c.task}')")
+    return "[ " + " ; ".join(members) + " ] --> compute()"
 
 
 # ---------------------------------------------------------------------------
@@ -509,16 +554,56 @@ def _branch_from_dict(d: dict) -> Branch:
     raise ValueError(f"Unknown branch kind: {kind!r}")
 
 
+def _is_legacy_flat(plan: Plan) -> bool:
+    return (
+        len(plan.computes) == 1
+        and plan.computes[0].final
+        and plan.computes[0].task == ""
+        and bool(plan.computes[0].branches)
+    )
+
+
 def to_dict(plan: Plan) -> dict:
-    return {
-        "branches": [_branch_to_dict(b) for b in plan.branches],
-    }
+    """Serialize to dict. Emits legacy `{"branches": [...]}` shape when the
+    plan is a single unnamed final compute (back-compat with cached CSVs);
+    otherwise emits the explicit `{"computes": [...]}` shape.
+    """
+    if _is_legacy_flat(plan):
+        return {"branches": [_branch_to_dict(b) for b in plan.computes[0].branches]}
+    out_computes = []
+    for c in plan.computes:
+        entry: dict = {"task": c.task, "branches": [_branch_to_dict(b) for b in c.branches]}
+        if c.final:
+            entry["final"] = True
+        out_computes.append(entry)
+    return {"computes": out_computes}
 
 
 def from_dict(d: dict) -> Plan:
-    if "branches" not in d:
-        raise ValueError(f"Plan dict missing required field 'branches': {d!r}")
-    return Plan(branches=[_branch_from_dict(b) for b in d["branches"]])
+    """Build a Plan from dict. Accepts both legacy and new shapes:
+
+    Legacy: `{"branches": [...]}` → single final compute with those branches.
+    New:    `{"computes": [{"task": "...", "branches": [...], "final"?: bool}, ...]}`
+            — if no entry has `final=True`, append an empty-branches final aggregator.
+    """
+    if "computes" in d:
+        raw = d["computes"]
+        if not isinstance(raw, list) or not raw:
+            raise ValueError(f"Plan 'computes' must be a non-empty list: {d!r}")
+        computes: list[ComputeNode] = []
+        for entry in raw:
+            computes.append(ComputeNode(
+                branches=[_branch_from_dict(b) for b in entry.get("branches", [])],
+                task=str(entry.get("task", "")),
+                final=bool(entry.get("final", False)),
+            ))
+        if not any(c.final for c in computes):
+            computes.append(ComputeNode(branches=[], task="", final=True))
+        return Plan(computes=computes)
+    if "branches" in d:
+        branches = [_branch_from_dict(b) for b in d["branches"]]
+        return Plan(computes=[ComputeNode(branches=branches, task="", final=True)])
+    raise ValueError(f"Plan dict missing required field 'branches' or 'computes': {d!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -543,16 +628,63 @@ class ValidationResult:
     errors: list[str] = field(default_factory=list)
 
 
-def validate(plan: Plan) -> ValidationResult:
-    """Validate the plan. Type system enforces shape; only period grammar is checked here."""
+def validate(plan: Plan, max_compute_depth: int = 2) -> ValidationResult:
+    """Validate Plan structure + period grammar.
+
+    Structural invariants:
+      - At least one ComputeNode.
+      - Exactly one final=True, and it is the last node.
+      - len(plan.computes) <= max_compute_depth.
+      - Single-compute (legacy) plan must have non-empty branches.
+      - Multi-compute plan: intermediates need non-empty branches AND non-empty
+        task; the final aggregator must have empty branches.
+      - Every RetrieveBranch period matches the period grammar.
+    """
     errors: list[str] = []
-    if not plan.branches:
-        errors.append("Plan has no branches")
-    for i, b in enumerate(plan.branches):
-        if isinstance(b, RetrieveBranch):
-            if not _PERIOD_RE.match(b.period):
-                errors.append(
-                    f"branches[{i}]: period {b.period!r} does not match expected format "
-                    "(CY/FY year, Qn-YYYY, YYYY-MM, YYYY-MM-DD, YYYY, range X..Y, enumeration X,Y)"
-                )
+    if not plan.computes:
+        errors.append("Plan has no computes")
+        return ValidationResult(ok=False, errors=errors)
+
+    final_idx = [i for i, c in enumerate(plan.computes) if c.final]
+    if len(final_idx) != 1:
+        errors.append(f"Plan must have exactly one final=True compute, got {len(final_idx)}")
+    elif final_idx[0] != len(plan.computes) - 1:
+        errors.append("Final compute must be the last in plan.computes")
+
+    # Depth = number of compute LAYERS, not node count. v1 supports at most one
+    # sub-compute layer feeding a final aggregator, so:
+    #   - depth 1 when there's only a final compute (legacy flat),
+    #   - depth 2 when there are intermediates + final.
+    # (Nested intermediates aren't representable in the current AST.)
+    depth = 1 if len(plan.computes) == 1 else 2
+    if depth > max_compute_depth:
+        errors.append(
+            f"Plan depth {depth} exceeds max_compute_depth={max_compute_depth}"
+        )
+
+    is_legacy = len(plan.computes) == 1
+    for i, c in enumerate(plan.computes):
+        if is_legacy:
+            if not c.branches:
+                errors.append(f"computes[{i}]: single-compute plan must have non-empty branches")
+        else:
+            if c.final:
+                if c.branches:
+                    errors.append(
+                        f"computes[{i}]: final aggregator must have empty branches in a decomposed plan"
+                    )
+            else:
+                if not c.branches:
+                    errors.append(f"computes[{i}]: intermediate compute must have non-empty branches")
+                if not c.task.strip():
+                    errors.append(f"computes[{i}]: intermediate compute must have non-empty task")
+
+        for j, b in enumerate(c.branches):
+            if isinstance(b, RetrieveBranch):
+                if not _PERIOD_RE.match(b.period):
+                    errors.append(
+                        f"computes[{i}].branches[{j}]: period {b.period!r} does not match expected "
+                        "format (CY/FY year, Qn-YYYY, YYYY-MM, YYYY-MM-DD, YYYY, range X..Y, "
+                        "enumeration X,Y)"
+                    )
     return ValidationResult(ok=not errors, errors=errors)

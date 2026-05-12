@@ -1,24 +1,22 @@
-"""extract subagent — question-driven named extraction over page text/images.
+"""extract subagent — question-driven extraction over page text/images.
 
 The agent receives the user's full question plus the rendered page(s) and returns
-a JSON object mapping snake_case names to entries. Each entry has one of three
-KINDS — `scalar`, `vector` (1-D series, one varying dim), or `table` (2-D grid,
-two varying dims) — picked to match the question's aggregation axis. Vector and
-table cells are always primitive scalars; nesting beyond those shapes is rejected.
+a JSON array of entries. Each entry has one of three KINDS — `scalar`, `vector`
+(1-D series, one varying dim), or `table` (2-D grid, two varying dims) — picked to
+match the question's aggregation axis. Vector and table cells are always primitive
+scalars; nesting beyond those shapes is rejected.
 
-Each entry carries `unit`, a verbatim page `quote`, kind-specific axis-name fields
-(`index_name` for vectors, `row_name`+`col_name` for tables), and an optional
-`dims` dict of categorical labels (e.g. {"series": "Budget expenditures"}). For
-vectors, `dims` is shared by all cells; the varying dim moves to `index_name`.
+Each entry carries `description` (free-form natural-language label that uniquely
+identifies the datum, including period/series/sub-category context), `unit`, and
+kind-specific axis-name fields (`index_name` for vectors, `row_name`+`col_name`
+for tables).
 
-Downstream `compute` consumes the resulting TypedValue whose `.value[k]` is the
-payload (scalar / dict / dict-of-dict per kind) and `.meta[k]` is a NamedEntry
-carrying unit/quote/dims/kind/axis-names.
+Downstream `compute` consumes the resulting list[AnnotatedValue].
 
 Per-tier strategy:
 - parsed_json (Tier 1): rich JSON-table text → N×T=0.7 sampling → per-cell
   verbatim verifier against the page text → merge all surviving entries from
-  all runs into one TypedValue → semantic dedup via a T=0 LLM call whose
+  all runs into one list[AnnotatedValue] → semantic dedup via a T=0 LLM call whose
   output cells are structurally re-verified against the merged inputs (the
   dedup LLM cannot invent values; it can only pick representatives).
 - ocr (Tier 2): sparse PyMuPDF text → single deterministic call (T=0) + verbatim
@@ -32,17 +30,83 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import fitz
 
-from skunk.common.context import HarnessContext
-from skunk.common.parsed_json import get_printed_page, get_text_for_pdf_page
-from skunk.dsl import DocHandle, NamedEntry, OpNode, PageRef, TypedValue
+from skunk.common import HarnessContext
+from skunk.dsl import AnnotatedValue, DocHandle, OpNode, PageRef
 from skunk.subagents.base import StepFailed
+
+_PARSED_JSON_DEFAULT_DIR = Path.home() / "Desktop/officeqa/treasury_bulletins_parsed/jsons"
+
+
+def _parsed_json_dir() -> Path:
+    d = os.environ.get("OFFICEQA_PARSED_JSON_DIR")
+    return Path(d) if d else _PARSED_JSON_DEFAULT_DIR
+
+
+@lru_cache(maxsize=64)
+def _load_parsed_doc(month_str: str) -> dict:
+    year, mon = month_str.split("-")
+    p = _parsed_json_dir() / f"treasury_bulletin_{year}_{mon}.json"
+    if not p.exists():
+        raise StepFailed("extract", f"parsed-JSON source not found: {p}")
+    try:
+        return json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise StepFailed("extract", f"corrupt parsed-JSON for {month_str}: {e}") from e
+
+
+@lru_cache(maxsize=64)
+def _parsed_page_index(month_str: str) -> dict[int, list[dict]]:
+    doc = _load_parsed_doc(month_str)
+    by_page: dict[int, list[dict]] = {}
+    for el in doc.get("document", {}).get("elements", []):
+        bbox = el.get("bbox") or []
+        if not bbox:
+            continue
+        pid = bbox[0].get("page_id")
+        if pid is None:
+            continue
+        by_page.setdefault(int(pid), []).append(el)
+    return by_page
+
+
+def get_text_for_pdf_page(ref: PageRef, ctx: HarnessContext) -> str | None:
+    """Concatenated content for ref's PDF page. HTML tables pass through verbatim.
+
+    Raises StepFailed if the parsed-JSON source is missing or corrupt. Returns
+    None when the source is healthy but this PDF page has no parsed elements.
+    """
+    if ref.month is None or ref.page is None:
+        return None
+    idx = _parsed_page_index(ref.month)
+    elements = idx.get(int(ref.page))
+    if not elements:
+        return None
+    parts = [el["content"] for el in elements if el.get("content") is not None]
+    return "\n\n".join(parts) if parts else None
+
+
+def get_printed_page(ref: PageRef, ctx: HarnessContext) -> str | None:
+    """Reverse lookup: bulletin printed-page footer text on ref's PDF page, or None.
+
+    Raises StepFailed if the parsed-JSON source is missing or corrupt.
+    """
+    if ref.month is None or ref.page is None:
+        return None
+    idx = _parsed_page_index(ref.month)
+    for el in idx.get(int(ref.page), []):
+        if el.get("type") == "page_number" and el.get("content"):
+            return str(el["content"])
+    return None
+
 
 _MAX_QUOTES_PER_ENTRY = 3
 _DPI_SCALE = 300 / 72  # PyMuPDF base is 72 DPI; render pages at 300 DPI for the vision tier
@@ -91,27 +155,31 @@ _TEXT_SYSTEM = (
     "combined dim. For year+month series, use combined ISO labels: index_name=\"month\",\n"
     "keys like \"1942-03\", \"1942-04\". Use kind=\"table\" only when the question literally asks\n"
     "to compare rows vs columns (e.g. \"compare Jan vs July across years\").\n\n"
-    "Output a single JSON object mapping snake_case names to entries.\n\n"
+    "Output a single JSON ARRAY of entries (one entry per distinct datum).\n\n"
     "Scalar entry:\n"
-    '  "name": {"kind": "scalar",\n'
-    '           "value": <number or string>,\n'
-    '           "unit": "<unit>",\n'
-    '           "quote": "<verbatim phrase from the page>",\n'
-    '           "dims": {"<dim>": <label>, ...}}              # optional\n\n'
+    "  {\n"
+    '    "description": "<short natural-language label uniquely identifying this datum>",\n'
+    '    "kind": "scalar",\n'
+    '    "value": <number or string>,\n'
+    '    "unit": "<unit>"\n'
+    "  }\n\n"
     "Vector entry:\n"
-    '  "name": {"kind": "vector",\n'
-    '           "index_name": "month",                          # the varying dim\n'
-    '           "value": {"1942-03": 3515, "1942-04": 3939, ...},  # flat dict, scalar cells\n'
-    '           "unit": "usd_millions",\n'
-    '           "quote": "<verbatim phrase>",\n'
-    '           "dims": {"series": "Budget expenditures"}}     # shared by all cells\n\n'
+    "  {\n"
+    '    "description": "...",\n'
+    '    "kind": "vector",\n'
+    '    "index_name": "month",                              # the varying dim\n'
+    '    "value": {"1942-03": 3515, "1942-04": 3939, ...},   # flat dict, scalar cells\n'
+    '    "unit": "usd_millions"\n'
+    "  }\n\n"
     "Table entry:\n"
-    '  "name": {"kind": "table",\n'
-    '           "row_name": "year", "col_name": "month",\n'
-    '           "value": {"1942": {"03": 3515, "04": 3939, ...},\n'
-    '                     "1943": {"03": 7746, "04": 7300, ...}},   # 2-level dict, scalar cells\n'
-    '           "unit": "usd_millions",\n'
-    '           "quote": "<verbatim phrase>"}\n\n'
+    "  {\n"
+    '    "description": "...",\n'
+    '    "kind": "table",\n'
+    '    "row_name": "year", "col_name": "month",\n'
+    '    "value": {"1942": {"03": 3515, "04": 3939, ...},\n'
+    '              "1943": {"03": 7746, "04": 7300, ...}},   # 2-level dict, scalar cells\n'
+    '    "unit": "usd_millions"\n'
+    "  }\n\n"
     "DO NOT NEST. Vector cells and table cells MUST be a single number or string. Examples\n"
     "of what is FORBIDDEN and will be rejected:\n"
     '  "value": [[3515, 3939], [4100, 4810]]            ← WRONG (nested list)\n'
@@ -122,24 +190,27 @@ _TEXT_SYSTEM = (
     '  "value": {"03": [3515, 3500]}                    ← WRONG (vector cell is a list)\n\n'
     "If you need a third axis, emit multiple separate vector/table entries — never nest.\n\n"
     "Field rules:\n"
-    '- "name" is a snake_case identifier uniquely describing the datum.\n'
+    '- "description" is a short natural-language label uniquely identifying the datum. It\n'
+    "  must include ALL context that distinguishes this entry from siblings — the series\n"
+    "  (e.g. \"New Aa corporate bonds\"), the period (e.g. \"CY1940\", \"January 1985\"), any\n"
+    "  sub-category, and any other categorical labels. Examples:\n"
+    "    \"Total US national defense expenditures, monthly, CY1940\"\n"
+    "    \"New Aa corporate bonds, January yield percentages, CY1990–CY1999\"\n"
+    "    \"Federal individual income tax receipts net of refunds, FY1929–FY1942\"\n"
+    "  Be specific enough that a downstream consumer can identify the entry from\n"
+    "  description alone. Where possible, prefer including the EXACT printed row label,\n"
+    "  column header, or caption phrase from the page (e.g. \"Net budget outlays\",\n"
+    "  \"Treasury 30-yr. bonds\") inside the description. This is a soft preference, not\n"
+    "  a requirement — paraphrase only when no concise printed phrase fits.\n"
     '- "unit" is a single lowercase token from:\n'
-    "    usd, usd_thousands, usd_millions, usd_billions, pct, count, year, rate, fx_rate, text, mixed\n"
-    '- "quote" MUST be a verbatim substring of the page text that anchors this datum (row\n'
-    "  label, column header, caption, or surrounding phrase). Copy character-for-character\n"
-    "  (preserving punctuation, capitalization, spacing). Do NOT paraphrase. If you cannot\n"
-    "  point to a concrete printed phrase, OMIT the entry — do not invent a quote.\n"
-    '- "dims" (OPTIONAL, scalar/vector) is a small dict of categorical labels distinguishing\n'
-    "  *this* entry among siblings. Canonical names: year (int), month (YYYY-MM),\n"
-    "  denomination (number), series (string), country (string), sub_category (string).\n"
-    "  For vectors, `dims` is shared by all cells (the varying dim moves to index_name).\n\n"
+    "    usd, usd_thousands, usd_millions, usd_billions, pct, count, year, rate, fx_rate, text, mixed\n\n"
     "Rules:\n"
     '- If the column/section header says "in thousands of dollars", report unit=usd_thousands\n'
     "  (do NOT silently rescale the printed numbers). Every cell in a vector/table shares one unit.\n"
     "- For named-entity / string answers, use kind=\"scalar\", unit=\"text\", value as a JSON string.\n"
     "- Numbers in `value` are bare (no commas, no $, no %).\n"
-    "- If the page contains nothing relevant to the question, return {} (empty object).\n"
-    "- Output ONLY the JSON object — no markdown fences, no commentary, no leading prose.\n"
+    "- If the page contains nothing relevant to the question, return [] (empty array).\n"
+    "- Output ONLY the JSON array — no markdown fences, no commentary, no leading prose.\n"
     "- CRITICAL — verbatim grounding: every numeric value you emit (every cell, in any kind)\n"
     "  MUST appear on the page (with or without comma separators). Do NOT compute, derive,\n"
     "  or aggregate values. A computed value will be rejected.\n"
@@ -155,54 +226,57 @@ _VISION_SYSTEM = (
     "  kind=\"scalar\"  — single number or string.\n"
     "  kind=\"vector\"  — 1-D series indexed by ONE varying dim. Provide `index_name`.\n"
     "  kind=\"table\"   — 2-D grid indexed by TWO varying dims. Provide `row_name`, `col_name`.\n\n"
-    "Shapes (same as the text-tier prompt):\n"
-    '  scalar: {"kind":"scalar","value":<num|str>,"unit":...,"quote":...,"dims":{...}}\n'
-    '  vector: {"kind":"vector","index_name":"month",\n'
-    '           "value":{"1942-03":3515,"1942-04":3939,...},\n'
-    '           "unit":...,"quote":...,"dims":{...}}\n'
-    '  table:  {"kind":"table","row_name":"year","col_name":"month",\n'
-    '           "value":{"1942":{"03":3515,...},...},\n'
-    '           "unit":...,"quote":...}\n\n'
+    "Output a single JSON ARRAY of entries. Each entry has this shape:\n"
+    '  scalar: {"description":"...","kind":"scalar","value":<num|str>,"unit":...}\n'
+    '  vector: {"description":"...","kind":"vector","index_name":"month",\n'
+    '           "value":{"1942-03":3515,"1942-04":3939,...},"unit":...}\n'
+    '  table:  {"description":"...","kind":"table","row_name":"year","col_name":"month",\n'
+    '           "value":{"1942":{"03":3515,...},...},"unit":...}\n\n'
     "DO NOT NEST. Vector and table cells MUST be a primitive (number or string). FORBIDDEN:\n"
     '  "value": [[3515, 3939], [4100, 4810]]            ← nested list\n'
     '  "value": {"1942": [3515, 3939]}                  ← vector cell is a list\n'
     '  "value": {"1942": {"q1": {"jan": 1043}}}         ← 3-level nest\n'
     "If you need a third axis, emit multiple separate entries — never nest.\n\n"
-    'The "quote" field MUST be verbatim text visible on the page image. Do NOT paraphrase.\n'
-    "If you cannot point to a concrete printed phrase, OMIT the entry — do not invent a quote.\n\n"
+    'The "description" field is a short natural-language label uniquely identifying the\n'
+    "datum — include series, period, sub-category, and any other distinguishing context.\n"
+    "Where possible, prefer including the EXACT visible row label, column header, or\n"
+    "caption phrase from the page inside the description (soft preference; paraphrase\n"
+    "only when no concise printed phrase fits).\n\n"
     "Unit vocabulary: usd, usd_thousands, usd_millions, usd_billions, pct, count, year, rate, fx_rate, text, mixed.\n"
-    'Dim vocabulary (scalar/vector only): "year", "month", "denomination", "series", "country", "sub_category".\n'
     "If the page header says values are in thousands/millions, use that as the unit; do not rescale.\n"
-    "If nothing relevant is on the page, return {}.\n"
-    "Output ONLY the JSON object — no fences, no prose.\n"
+    "If nothing relevant is visible, return [].\n"
+    "Output ONLY the JSON array — no fences, no prose.\n"
     "CRITICAL — verbatim grounding: every numeric value you emit (every cell, in any kind) must\n"
     "be visibly printed on the page. Do not compute, derive, or aggregate values.\n"
 )
 
 _DEDUP_SYSTEM = (
     "You consolidate redundant extraction entries from a financial QA pipeline.\n\n"
-    "Three independent sampling runs over the SAME source page produced overlapping "
-    "entries. Many describe the same datum with different naming, dim labels, or shapes. "
-    "Your job: produce a single consolidated set with one representative entry per "
-    "distinct datum.\n\n"
-    "Output the SAME JSON envelope as the inputs: a single object mapping snake_case "
-    "names to entries. Each entry has kind, value, unit, quote, and optionally "
-    "index_name (vector) or row_name+col_name (table) and dims.\n\n"
+    "Multiple independent extraction passes over the same set of source pages produced "
+    "overlapping entries. Many describe the same datum with different wording. Your job: "
+    "produce a single consolidated array with one representative entry per distinct datum.\n\n"
+    "YOU ARE A PICKER, NOT A CALCULATOR.\n"
+    "You may ONLY select a representative entry (or a subset of cells from a single input "
+    "entry) — you may NOT compute, average, sum, sort, scale, format, infer, or otherwise "
+    "create any new value. Every value, key, and cell in your output MUST appear verbatim "
+    "in some input entry. Any computed value will be rejected post-hoc.\n\n"
+    "Output the SAME JSON envelope as the inputs: a JSON ARRAY of entries. Each entry has\n"
+    "description, kind, value, unit, and optionally index_name (vector) or row_name+col_name\n"
+    "(table).\n\n"
     "Rules:\n"
-    "- Keep ONE entry per distinct datum. Merge naming/decoration duplicates into a "
-    "single representative.\n"
+    "- Keep ONE entry per distinct datum. Merge wording duplicates into a single representative.\n"
     "- DO NOT introduce new cell values. Every cell value in your output (scalar value, "
-    "vector cell, table cell) MUST come VERBATIM from an input entry. Pick a "
-    "representative; do not invent.\n"
-    "- DO NOT compute, aggregate, transform, derive, or rescale.\n"
+    "vector cell, table cell) MUST come VERBATIM from an input entry. Pick a representative; "
+    "do not invent. Do not pick the mean / median / sum / etc. as a representative.\n"
+    "- DO NOT compute, aggregate, transform, derive, rescale, round, or reformat.\n"
     "- DO NOT add cell keys not present in any input entry.\n"
     "- For each output entry, all of its cells must come from a SINGLE input entry — "
     "do not graft cells across inputs. If two inputs disagree on a cell value at the "
-    "same key, keep both inputs as separate output entries with disambiguating names.\n"
-    "- Prefer the entry with the most informative dims and a clear, specific name.\n"
+    "same key, keep both inputs as separate output entries with disambiguating descriptions.\n"
+    "- Prefer the entry with the clearest, most specific description.\n"
     "- If everything in the inputs is redundant duplicates of a single datum, output one "
     "entry. If the inputs describe N genuinely distinct datums, output N entries.\n"
-    "- Output ONLY the JSON object — no fences, no commentary.\n"
+    "- Output ONLY the JSON array — no fences, no commentary.\n"
 )
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
@@ -210,39 +284,6 @@ _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
 def _strip_fences(raw: str) -> str:
     return _FENCE_RE.sub("", raw.strip()).strip()
-
-
-@dataclass
-class _Sample:
-    name: str
-    value: Any           # scalar / vector dict / table dict-of-dict — shape validated at parse time
-    unit: str
-    quote: str
-    dims: dict[str, Any]
-    kind: str = "scalar"             # "scalar" | "vector" | "table"
-    index_name: str | None = None    # vector only
-    row_name: str | None = None      # table only
-    col_name: str | None = None      # table only
-
-
-def _canon_dims(dims: dict[str, Any] | None) -> dict[str, Any]:
-    """Canonicalize a `dims` dict to a consistent shape.
-
-    Lowercases keys, strips string labels, drops empty values. Keeps numeric labels
-    as-is. Returns a fresh dict (preserves insertion order after lowercasing keys).
-    """
-    if not dims:
-        return {}
-    out: dict[str, Any] = {}
-    for k, v in dims.items():
-        if v is None or v == "":
-            continue
-        key = str(k).strip().lower()
-        if isinstance(v, str):
-            out[key] = v.strip()
-        else:
-            out[key] = v
-    return out
 
 
 def _is_primitive_cell(v: Any) -> bool:
@@ -282,19 +323,17 @@ def _validate_table_payload(value: Any) -> bool:
     return True
 
 
-def _parse_response_raw(raw: str, ctx: HarnessContext | None = None) -> list[_Sample] | None:
-    """Parse one Gemini response into a list of _Sample.
+def _parse_response_raw(raw: str, ctx: HarnessContext | None = None) -> list[AnnotatedValue] | None:
+    """Parse one Gemini response into a list of AnnotatedValue.
 
-    Uniform failure unit: when the LLM doesn't produce a well-formed envelope,
-    we drop the bad entries (or the whole sample) and emit a diagnostic — never
-    raise. Tier fallback is the only mechanism that escalates "this sample
-    yielded nothing" into a step failure.
+    Expected envelope: a JSON array of entries, each shaped like:
+        {"description": str, "kind": "scalar"|"vector"|"table",
+         "value": <payload>, "unit": str, ...kind-specific axis-name fields}
 
-    Returns None when the agent emitted an empty object {} (signal: nothing
-    relevant on the page) or when the response failed to parse / wasn't a dict.
-    Drops individual entries whose payload doesn't match its declared `kind`'s
-    flat shape, or whose top-level shape (must be a dict with a 'value' key)
-    is wrong.
+    Returns None when the LLM emitted an empty array (signal: nothing relevant
+    on the page) or when the response failed to parse / wasn't an array. Drops
+    individual entries whose payload doesn't match the declared kind's flat
+    shape, emitting a diagnostic per drop.
     """
     cleaned = _strip_fences(raw)
     try:
@@ -304,22 +343,23 @@ def _parse_response_raw(raw: str, ctx: HarnessContext | None = None) -> list[_Sa
             ctx.emit("extract", "rejected unparseable response",
                      error=str(e), raw=cleaned[:400])
         return None
-    if not isinstance(obj, dict):
+    if not isinstance(obj, list):
         if ctx is not None:
-            ctx.emit("extract", "rejected non-object response",
+            ctx.emit("extract", "rejected non-array response",
                      got=type(obj).__name__, raw=cleaned[:400])
         return None
     if not obj:
         return None
 
-    samples: list[_Sample] = []
-    for name, entry in obj.items():
+    entries: list[AnnotatedValue] = []
+    for i, entry in enumerate(obj):
         if not isinstance(entry, dict) or "value" not in entry:
             if ctx is not None:
                 ctx.emit("extract", "rejected malformed entry",
-                         name=str(name),
+                         entry_idx=i,
                          reason="entry must be a dict containing a 'value' key")
             continue
+        description = str(entry.get("description", "")).strip()
         value = entry["value"]
         kind = str(entry.get("kind", "scalar")).strip().lower() or "scalar"
 
@@ -328,55 +368,56 @@ def _parse_response_raw(raw: str, ctx: HarnessContext | None = None) -> list[_Sa
         if kind == "scalar":
             if not _is_primitive_cell(value):
                 if ctx is not None:
-                    ctx.emit("extract", "rejected non-scalar entry", name=name,
+                    ctx.emit("extract", "rejected non-scalar entry", entry_idx=i,
+                             description=description,
                              reason=f"kind=scalar requires int|float|str, got {type(value).__name__}")
                 continue
             index_name = row_name = col_name = None
         elif kind == "vector":
             if not _validate_vector_payload(value):
                 if ctx is not None:
-                    ctx.emit("extract", "rejected nested vector entry", name=name,
+                    ctx.emit("extract", "rejected nested vector entry", entry_idx=i,
+                             description=description,
                              reason="vector value must be flat dict[str, scalar]")
                 continue
             index_name = entry.get("index_name")
             if not isinstance(index_name, str) or not index_name:
                 if ctx is not None:
-                    ctx.emit("extract", "rejected vector without index_name", name=name)
+                    ctx.emit("extract", "rejected vector without index_name",
+                             entry_idx=i, description=description)
                 continue
             row_name = col_name = None
         elif kind == "table":
             if not _validate_table_payload(value):
                 if ctx is not None:
-                    ctx.emit("extract", "rejected nested table entry", name=name,
+                    ctx.emit("extract", "rejected nested table entry", entry_idx=i,
+                             description=description,
                              reason="table value must be dict[str, dict[str, scalar]] (no nested containers)")
                 continue
             row_name = entry.get("row_name")
             col_name = entry.get("col_name")
             if not (isinstance(row_name, str) and row_name and isinstance(col_name, str) and col_name):
                 if ctx is not None:
-                    ctx.emit("extract", "rejected table missing row_name/col_name", name=name)
+                    ctx.emit("extract", "rejected table missing row_name/col_name",
+                             entry_idx=i, description=description)
                 continue
             index_name = None
         else:
             if ctx is not None:
-                ctx.emit("extract", "rejected entry with unknown kind", name=name, kind=kind)
+                ctx.emit("extract", "rejected entry with unknown kind",
+                         entry_idx=i, description=description, kind=kind)
             continue
 
-        dims_raw = entry.get("dims") or {}
-        if not isinstance(dims_raw, dict):
-            dims_raw = {}
-        samples.append(_Sample(
-            name=str(name),
+        entries.append(AnnotatedValue(
+            description=description,
             value=value,
             unit=str(entry.get("unit", "")),
-            quote=str(entry.get("quote", "")),
-            dims=_canon_dims(dims_raw),
             kind=kind,
             index_name=index_name,
             row_name=row_name,
             col_name=col_name,
         ))
-    return samples
+    return entries
 
 
 def _cell_in_text(value: int | float | str, text: str) -> bool:
@@ -401,16 +442,16 @@ def _cell_in_text(value: int | float | str, text: str) -> bool:
     return any(c in text for c in candidates)
 
 
-def _value_in_text(sample: "_Sample", text: str) -> bool:
-    """Verbatim verifier: every primitive cell in `sample.value` must appear in
-    `text`. For vector/table samples, all cells must match (all-or-nothing).
+def _value_in_text(entry: AnnotatedValue, text: str) -> bool:
+    """Verbatim verifier: every primitive cell in `entry.value` must appear in
+    `text`. For vector/table entries, all cells must match (all-or-nothing).
     One missing cell rejects the entry."""
-    if sample.kind == "scalar":
-        return _cell_in_text(sample.value, text)
-    if sample.kind == "vector":
-        return all(_cell_in_text(c, text) for c in sample.value.values())
-    if sample.kind == "table":
-        for row in sample.value.values():
+    if entry.kind == "scalar":
+        return _cell_in_text(entry.value, text)
+    if entry.kind == "vector":
+        return all(_cell_in_text(c, text) for c in entry.value.values())
+    if entry.kind == "table":
+        for row in entry.value.values():
             for cell in row.values():
                 if not _cell_in_text(cell, text):
                     return False
@@ -418,35 +459,22 @@ def _value_in_text(sample: "_Sample", text: str) -> bool:
     return False
 
 
-def _describe_kind(kind: str, index_name: str | None, row_name: str | None,
-                   col_name: str | None, value: Any) -> str:
-    """Short tag describing the entry's shape, used in extract's desc string."""
-    if kind == "scalar":
-        return "scalar"
-    if kind == "vector":
-        n = len(value) if isinstance(value, dict) else 0
-        return f"vector index={index_name} cells={n}"
-    if kind == "table":
-        n_rows = len(value) if isinstance(value, dict) else 0
-        n_cols = len(next(iter(value.values()))) if n_rows and isinstance(value, dict) else 0
-        return f"table rows={row_name}({n_rows}) cols={col_name}({n_cols})"
-    return kind
-
-
-def _sample_to_entry_dict(s: _Sample) -> dict[str, Any]:
-    """Reverse of `_parse_response_raw`: serialize a parsed _Sample back to the JSON
-    envelope Gemini was originally asked to produce. Used to present the merged
-    candidates to the dedup LLM."""
-    entry: dict[str, Any] = {"kind": s.kind, "value": s.value, "unit": s.unit, "quote": s.quote}
-    if s.kind == "vector" and s.index_name:
-        entry["index_name"] = s.index_name
-    elif s.kind == "table":
-        if s.row_name:
-            entry["row_name"] = s.row_name
-        if s.col_name:
-            entry["col_name"] = s.col_name
-    if s.dims:
-        entry["dims"] = s.dims
+def _entry_to_dict(e: AnnotatedValue) -> dict[str, Any]:
+    """Serialize an AnnotatedValue back to the JSON envelope shape Gemini emits.
+    Used to present merged candidates to the dedup LLM."""
+    entry: dict[str, Any] = {
+        "description": e.description,
+        "kind": e.kind,
+        "value": e.value,
+        "unit": e.unit,
+    }
+    if e.kind == "vector" and e.index_name:
+        entry["index_name"] = e.index_name
+    elif e.kind == "table":
+        if e.row_name:
+            entry["row_name"] = e.row_name
+        if e.col_name:
+            entry["col_name"] = e.col_name
     return entry
 
 
@@ -467,7 +495,7 @@ def _values_match(a: Any, b: Any) -> bool:
         return str(a).strip().lower() == str(b).strip().lower()
 
 
-def _output_entry_in_inputs(output: _Sample, inputs: list[_Sample]) -> bool:
+def _output_entry_in_inputs(output: AnnotatedValue, inputs: list[AnnotatedValue]) -> bool:
     """Input-grounded verifier: every cell in `output` must come verbatim from
     a SINGLE input entry.
 
@@ -524,46 +552,100 @@ def _output_entry_in_inputs(output: _Sample, inputs: list[_Sample]) -> bool:
     return False
 
 
+def _deep_values_match(a: Any, b: Any) -> bool:
+    """Recursive cell-level match for scalar / vector dict / table dict-of-dicts."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        if set(a.keys()) != set(b.keys()):
+            return False
+        return all(_deep_values_match(a[k], b[k]) for k in a)
+    return _values_match(a, b)
+
+
+_DESC_WS_RE = re.compile(r"\s+")
+
+
+def _norm_desc(s: str) -> str:
+    return _DESC_WS_RE.sub(" ", s.strip().lower()) if isinstance(s, str) else ""
+
+
+def _entries_structurally_equal(a: AnnotatedValue, b: AnnotatedValue) -> bool:
+    """True if two entries carry the same data: description (normalized), kind,
+    unit, axis names, and (deep) value. The description is normalized
+    (case-insensitive, whitespace-collapsed) before comparison since
+    independent LLM runs may word-vary the same intent."""
+    if _norm_desc(a.description) != _norm_desc(b.description):
+        return False
+    if a.kind != b.kind or a.unit != b.unit:
+        return False
+    if a.index_name != b.index_name or a.row_name != b.row_name or a.col_name != b.col_name:
+        return False
+    return _deep_values_match(a.value, b.value)
+
+
+def _run_quorum_split(
+    runs: list[list[AnnotatedValue]],
+    quorum: int = 2,
+) -> tuple[list[AnnotatedValue], list[AnnotatedValue]]:
+    """Bucket entries across runs by structural identity. Buckets contributed
+    to by `quorum`+ distinct runs are accepted (one representative each);
+    buckets unique to a single run land in the leftover.
+
+    Returns (accepted, leftover).
+    """
+    buckets: list[tuple[AnnotatedValue, set[int]]] = []
+    for run_idx, run in enumerate(runs):
+        for s in run:
+            matched = False
+            for rep, runs_seen in buckets:
+                if _entries_structurally_equal(rep, s):
+                    runs_seen.add(run_idx)
+                    matched = True
+                    break
+            if not matched:
+                buckets.append((s, {run_idx}))
+    accepted: list[AnnotatedValue] = []
+    leftover: list[AnnotatedValue] = []
+    for rep, runs_seen in buckets:
+        if len(runs_seen) >= quorum:
+            accepted.append(rep)
+        else:
+            leftover.append(rep)
+    return accepted, leftover
+
+
 def _dedup_semantically(
-    merged_samples: list[_Sample],
+    merged_entries: list[AnnotatedValue],
     ctx: HarnessContext,
-) -> list[_Sample]:
-    """LLM-based semantic deduplication over the merged sample list.
+) -> list[AnnotatedValue]:
+    """LLM-based semantic deduplication over a flat array of AnnotatedValue.
 
     Sends all merged entries to Gemini at T=0 with the contract: collapse
-    naming/decoration duplicates into one representative each, but every output
-    cell must be verbatim-derived from a single input entry. Output is then
-    structurally verified against `merged_samples`; entries that fail
+    wording duplicates into one representative each, but every output cell
+    must be verbatim-derived from a single input entry. Output is then
+    structurally verified against `merged_entries`; entries that fail
     verification are dropped.
 
-    Returns the deduped sample list, or the original `merged_samples` unchanged
-    if dedup produced nothing usable (best-effort fallback so a noisy LLM dedup
-    response can't lose us cells the per-sample verifier already grounded).
+    Failure mode: if the LLM response can't be parsed or every output entry
+    fails verification, returns `[]` after emitting a `dedup failed` event.
+    The caller's tier-fallback flow takes over from there — no silent
+    fallback to the un-deduped inputs.
     """
-    if len(merged_samples) <= 1:
-        return merged_samples
-    # Build a name-suffixed envelope (raw sample names can collide across runs;
-    # JSON object keys must be unique, so disambiguate before serializing).
-    envelope: dict[str, dict[str, Any]] = {}
-    for s in merged_samples:
-        nm = s.name
-        i = 1
-        while nm in envelope:
-            i += 1
-            nm = f"{s.name}_{i}"
-        envelope[nm] = _sample_to_entry_dict(s)
+    if len(merged_entries) <= 1:
+        return merged_entries
+    envelope = [_entry_to_dict(e) for e in merged_entries]
     user_msg = (
-        f"Input entries from 3 independent extraction runs "
+        f"Input entries from multiple independent extraction passes "
         f"(consolidate near-duplicates):\n"
         f"```json\n{json.dumps(envelope, indent=2, default=str)}\n```\n\n"
-        f"Output the consolidated set in the same JSON envelope."
+        f"Output the consolidated set as a JSON array in the same envelope."
     )
     ctx.emit(
         "extract",
         "tier=parsed_json dedup call (T=0)",
         n_input_entries=len(envelope),
     )
-    raw = ctx.llm_client.call(_DEDUP_SYSTEM, user_msg, temperature=0.0, thinking_budget=0)
+    resp = ctx.llm_client.call(_DEDUP_SYSTEM, user_msg, temperature=0.0, thinking_budget=0)
+    raw = resp.text
     parsed = _parse_response_raw(raw, ctx)
     ctx.emit(
         "extract",
@@ -572,13 +654,17 @@ def _dedup_semantically(
         n_entries=0 if parsed is None else len(parsed),
     )
     if not parsed:
-        return merged_samples
-    kept = [s for s in parsed if _output_entry_in_inputs(s, merged_samples)]
+        ctx.emit("extract", "tier=parsed_json dedup failed: empty or unparseable response",
+                 n_input_entries=len(merged_entries))
+        return []
+    kept = [e for e in parsed if _output_entry_in_inputs(e, merged_entries)]
     n_dropped = len(parsed) - len(kept)
     if n_dropped:
         ctx.emit("extract", f"tier=parsed_json dedup verifier dropped {n_dropped}/{len(parsed)}")
     if not kept:
-        return merged_samples
+        ctx.emit("extract", "tier=parsed_json dedup failed: every output entry rejected by verifier",
+                 n_input_entries=len(merged_entries), n_output_entries=len(parsed))
+        return []
     return kept
 
 
@@ -588,11 +674,12 @@ def _single_call(
     ctx: HarnessContext,
     tier_name: str,
     images: list[tuple[str, str]] | None = None,
-) -> list[_Sample]:
-    """One deterministic Gemini call (T=0). Returns parsed samples; [] if LLM
-    emitted {} or response was malformed (drops are emitted as diagnostics by
+) -> list[AnnotatedValue]:
+    """One deterministic Gemini call (T=0). Returns parsed entries; [] if LLM
+    emitted [] or response was malformed (drops are emitted as diagnostics by
     `_parse_response_raw`)."""
-    raw = ctx.llm_client.call(system, user, images=images, temperature=0.0, thinking_budget=-1)
+    resp = ctx.llm_client.call(system, user, images=images, temperature=0.0, thinking_budget=-1)
+    raw = resp.text
     parsed = _parse_response_raw(raw, ctx)
     ctx.emit(
         "extract",
@@ -603,41 +690,78 @@ def _single_call(
     return parsed if parsed is not None else []
 
 
-def _samples_to_typed_value(
-    samples: list[_Sample],
+def _finalize_entries(
+    entries: list[AnnotatedValue],
     ctx: HarnessContext,
     tier_name: str,
-) -> TypedValue | None:
-    """Build a TypedValue from a flat sample list — no bucketing.
-
-    Disambiguates duplicate names with `_2`/`_3` suffixes. Returns None when
-    `samples` is empty.
-    """
-    if not samples:
+) -> list[AnnotatedValue] | None:
+    """Emit-and-log helper. Returns None when `entries` is empty so the caller
+    can fall through to the next tier."""
+    if not entries:
         return None
-    values: dict[str, Any] = {}
-    meta: dict[str, NamedEntry] = {}
-    desc_parts: list[str] = []
-    for s in samples:
-        out_name = s.name
-        suffix = 1
-        while out_name in values:
-            suffix += 1
-            out_name = f"{s.name}_{suffix}"
-        values[out_name] = s.value
-        meta[out_name] = NamedEntry(
-            unit=s.unit, quote=s.quote, dims=dict(s.dims),
-            kind=s.kind,
-            index_name=s.index_name,
-            row_name=s.row_name,
-            col_name=s.col_name,
+    ctx.emit("extract", f"tier={tier_name} built entries", n_entries=len(entries))
+    return entries
+
+
+def _sample_groups_n(
+    system: str,
+    question: str,
+    groups: list[list[tuple[PageRef, str, str]]],
+    ctx: HarnessContext,
+    tier_name: str,
+) -> list[list[list[AnnotatedValue]]]:
+    """Per-group × per-sample fan-out. Each `group` is a list of
+    (ref, header, text) tuples already known to share a bulletin and to be
+    consecutive PDF pages — i.e. one continuation table. The group is sent
+    to the LLM as a single concatenated user message. Returns
+    `[group][sample] -> parsed entries list`.
+
+    Groups whose pages come from independent bulletins run as independent
+    prompts in parallel; consecutive same-bulletin pages stay together so
+    continuation tables aren't fragmented. All (n_groups × n_samples) tasks
+    fan out through the same ThreadPool, paced by the global token bucket.
+    """
+    n_samples = ctx.config.extract_n_samples
+    temperature = ctx.config.extract_sample_temperature
+
+    group_msgs: list[str] = []
+    for group in groups:
+        page_blocks = [f"{header}\n{text}" for _, header, text in group]
+        group_msgs.append(
+            f"Question:\n{question}\n\n"
+            f"Page text:\n\n" + "\n\n".join(page_blocks)
         )
-        dims_str = f", dims={s.dims}" if s.dims else ""
-        quote_str = f'"{s.quote}"' if s.quote else "<no quote>"
-        kind_str = _describe_kind(s.kind, s.index_name, s.row_name, s.col_name, s.value)
-        desc_parts.append(f"{out_name} [{kind_str}] (unit={s.unit}{dims_str}) — {quote_str}")
-    ctx.emit("extract", f"tier={tier_name} built TypedValue", n_entries=len(values))
-    return TypedValue(value=values, desc="; ".join(desc_parts), meta=meta)
+
+    def _one(task: tuple[int, int]) -> tuple[int, int, str, list[AnnotatedValue]]:
+        group_idx, sample_idx = task
+        resp = ctx.llm_client.call(
+            system, group_msgs[group_idx], temperature=temperature, thinking_budget=0
+        )
+        raw = resp.text
+        parsed = _parse_response_raw(raw, ctx)
+        return group_idx, sample_idx, raw, (parsed if parsed is not None else [])
+
+    tasks: list[tuple[int, int]] = [
+        (g, s) for g in range(len(groups)) for s in range(n_samples)
+    ]
+    max_workers = max(1, min(len(tasks), ctx.config.max_parallel_workers))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        results = list(pool.map(_one, tasks))
+
+    group_runs: list[list[list[AnnotatedValue]]] = [
+        [[] for _ in range(n_samples)] for _ in range(len(groups))
+    ]
+    for group_idx, sample_idx, raw, parsed in results:
+        group_runs[group_idx][sample_idx] = parsed
+        n_pages = len(groups[group_idx])
+        ctx.emit(
+            "extract",
+            f"tier={tier_name} group {group_idx + 1}/{len(groups)} "
+            f"(p={n_pages}) sample {sample_idx + 1}/{n_samples}",
+            raw=raw[:400],
+            n_entries=len(parsed),
+        )
+    return group_runs
 
 
 def _sample_n(
@@ -646,17 +770,17 @@ def _sample_n(
     ctx: HarnessContext,
     tier_name: str,
     images: list[tuple[str, str]] | None = None,
-) -> list[list[_Sample]]:
-    """Call Gemini n_samples times in parallel and return the parsed _Sample lists per run.
-
-    Per-sample event emission is deferred until after the fan-out completes so the
-    log order remains `1/n, 2/n, ...` regardless of which call returned first.
+) -> list[list[AnnotatedValue]]:
+    """Single-prompt sampling (used by tiers that don't split per page, e.g.
+    vision over rendered images). Call Gemini n_samples times in parallel and
+    return the parsed _Sample lists per run.
     """
     n_samples = ctx.config.extract_n_samples
     temperature = ctx.config.extract_sample_temperature
 
     def _one(_i: int) -> tuple[str, list[_Sample]]:
-        raw = ctx.llm_client.call(system, user, images=images, temperature=temperature, thinking_budget=0)
+        resp = ctx.llm_client.call(system, user, images=images, temperature=temperature, thinking_budget=0)
+        raw = resp.text
         parsed = _parse_response_raw(raw, ctx)
         return raw, (parsed if parsed is not None else [])
 
@@ -681,15 +805,13 @@ def _gather_text(
     ctx: HarnessContext,
     get_text_fn,
     tier_name: str,
-) -> tuple[list[str], list[str]]:
-    """Pull text for each ref via `get_text_fn`. Returns (raw_texts, texts).
-
-    raw_texts: per-page plain text (used by the verifier).
-    texts:     per-page text with a `--- PDF page N ---` header for the LLM.
-    Refs that yield no text are emitted as "no text" and skipped.
+) -> list[tuple[PageRef, str, str]]:
+    """Pull text for each ref via `get_text_fn`. Returns a per-page list of
+    (ref, header, raw text) — header is "--- PDF page N ---" (plus printed-page
+    hint when known). Refs that yield no text are emitted as "no text" and
+    skipped.
     """
-    raw_texts: list[str] = []
-    texts: list[str] = []
+    out: list[tuple[PageRef, str, str]] = []
     for ref in refs[:ctx.config.extract_max_pages]:
         text = get_text_fn(ref, ctx)
         if text:
@@ -700,89 +822,145 @@ def _gather_text(
             if printed:
                 header += f' (bulletin printed page "{printed}")'
             header += " ---"
-            raw_texts.append(text)
-            texts.append(f"{header}\n{text}")
+            out.append((ref, header, text))
         else:
             ctx.emit("extract", f"tier={tier_name} no text",
                      page=str(ref), file_path=ref.file_path)
-    return raw_texts, texts
+    return out
 
 
-def _parsed_json_tier(refs: list[PageRef], ctx: HarnessContext) -> TypedValue | None:
-    """Tier 1 — N×T=0.7 sampling → per-cell page-text verifier → merge across
-    samples → LLM-based semantic dedup grounded against the merged inputs.
-
-    Replaces the older all-or-nothing envelope consensus + resolver. The
-    per-sample verifier already grounds every cell to the page; merge gives
-    union recall; dedup collapses near-duplicate envelopes without inventing
-    values (each dedup output entry must match some single merged input entry
-    cell-for-cell).
+def _group_consecutive_pages(
+    pages: list[tuple[PageRef, str, str]],
+) -> list[list[tuple[PageRef, str, str]]]:
+    """Bucket pages into groups where consecutive entries share the same
+    bulletin (month) and adjacent 1-based page numbers. Each group is a
+    continuation table that should be sent to the LLM as one prompt; non-
+    adjacent or different-bulletin pages start a new group.
     """
-    raw_texts, texts = _gather_text(refs, ctx, get_text_for_pdf_page, "parsed_json")
-    if not texts:
+    groups: list[list[tuple[PageRef, str, str]]] = []
+    for item in pages:
+        ref, _, _ = item
+        if groups:
+            prev_ref = groups[-1][-1][0]
+            same_bulletin = ref.month is not None and ref.month == prev_ref.month
+            adjacent = (
+                ref.page is not None
+                and prev_ref.page is not None
+                and ref.page == prev_ref.page + 1
+            )
+            if same_bulletin and adjacent:
+                groups[-1].append(item)
+                continue
+        groups.append([item])
+    return groups
+
+
+def _parsed_json_tier(refs: list[PageRef], ctx: HarnessContext) -> list[AnnotatedValue] | None:
+    """Tier 1 — group-aware page fan-out → per-cell text verifier → run-quorum
+    split → LLM dedup on the leftover only.
+
+    Pages are grouped into runs of consecutive same-bulletin refs; each group
+    is one concatenated prompt (so continuation tables don't fragment). Per
+    sample, the LLM sees one group; the (n_groups × n_samples) calls run in
+    parallel through the shared ThreadPool, paced by the Gemini token bucket.
+
+    A structural bucket is "accepted" if ≥2 (group, sample) runs agree on its
+    identity (description + kind + value + unit + axis-names); only the
+    sole-run leftover hits the LLM dedup.
+    """
+    pages = _gather_text(refs, ctx, get_text_for_pdf_page, "parsed_json")
+    if not pages:
         ctx.emit("extract", "tier=parsed_json skipped (no text from any ref)")
         return None
-    user_msg = (
-        f"Question:\n{ctx.question}\n\n"
-        f"Page text:\n\n" + "\n\n".join(texts)
-    )
+    groups = _group_consecutive_pages(pages)
+    n_samples = ctx.config.extract_n_samples
     ctx.emit(
         "extract",
-        f"tier=parsed_json sampling gemini {ctx.config.extract_n_samples}x @ T={ctx.config.extract_sample_temperature}",
-        total_chars=sum(len(t) for t in texts),
+        f"tier=parsed_json fan-out {len(groups)}g × {n_samples}s @ T={ctx.config.extract_sample_temperature}",
+        n_groups=len(groups),
+        n_pages=len(pages),
+        group_sizes=[len(g) for g in groups],
+        total_chars=sum(len(t) for _, _, t in pages),
         system_prompt=_TEXT_SYSTEM[:1500],
-        user_message=user_msg[:3000],
     )
-    verify_text = "\n\n".join(raw_texts)
-    runs = _sample_n(_TEXT_SYSTEM, user_msg, ctx, "parsed_json")
-    merged: list[_Sample] = []
-    for i, run in enumerate(runs):
-        kept = [s for s in run if _value_in_text(s, verify_text)]
-        n_dropped = len(run) - len(kept)
-        if n_dropped:
-            ctx.emit("extract", f"tier=parsed_json verifier dropped {n_dropped}/{len(run)}",
-                     sample_idx=i + 1)
-        merged.extend(kept)
-    if not merged:
+    group_runs = _sample_groups_n(_TEXT_SYSTEM, ctx.question, groups, ctx, "parsed_json")
+
+    # Per-group verification: each entry's cell values must appear in the
+    # concatenated text of the group's pages.
+    kept_runs: list[list[AnnotatedValue]] = []
+    for group_idx, runs in enumerate(group_runs):
+        verify_text = "\n\n".join(text for _, _, text in groups[group_idx])
+        for sample_idx, run in enumerate(runs):
+            kept = [e for e in run if _value_in_text(e, verify_text)]
+            n_dropped = len(run) - len(kept)
+            if n_dropped:
+                ctx.emit(
+                    "extract",
+                    f"tier=parsed_json verifier dropped {n_dropped}/{len(run)}",
+                    group_idx=group_idx + 1,
+                    sample_idx=sample_idx + 1,
+                )
+            kept_runs.append(kept)
+
+    total_entries = sum(len(r) for r in kept_runs)
+    if total_entries == 0:
         ctx.emit("extract", "tier=parsed_json all samples empty after verifier")
         return None
     ctx.emit("extract", "tier=parsed_json merged",
-             n_samples=len(runs), n_entries=len(merged))
-    deduped = _dedup_semantically(merged, ctx)
-    return _samples_to_typed_value(deduped, ctx, "parsed_json")
+             n_runs=len(kept_runs), n_entries=total_entries)
+
+    # Two-stage consolidation:
+    # 1) Quorum: if EVERY entry reaches quorum (structurally agreed by ≥2 runs),
+    #    voting fully consolidates the set and we skip the LLM dedup.
+    # 2) Otherwise, voting can't cleanly partition — discard the quorum result
+    #    and pass the entire merged set to the LLM dedup. The dedup's
+    #    pick-only verifier (`_output_entry_in_inputs`) keeps it grounded.
+    accepted, leftover = _run_quorum_split(kept_runs, quorum=2)
+    ctx.emit("extract", "tier=parsed_json quorum split",
+             n_accepted=len(accepted), n_leftover=len(leftover))
+    if not leftover:
+        ctx.emit("extract", "tier=parsed_json quorum fully consolidated; skipping dedup")
+        return _finalize_entries(accepted, ctx, "parsed_json")
+
+    all_entries = [e for run in kept_runs for e in run]
+    ctx.emit("extract", "tier=parsed_json quorum incomplete; dedup over full input",
+             n_full_input=len(all_entries))
+    deduped = _dedup_semantically(all_entries, ctx)
+    return _finalize_entries(deduped, ctx, "parsed_json")
 
 
-def _ocr_tier(refs: list[PageRef], ctx: HarnessContext) -> TypedValue | None:
+def _ocr_tier(refs: list[PageRef], ctx: HarnessContext) -> list[AnnotatedValue] | None:
     """Tier 2 — single deterministic call (T=0) over PyMuPDF text + verbatim verifier.
 
     OCR text on old scans is sparse and noisy. Sampling at T=0.7 amplifies
     cross-run disagreement on noisy reads; a single T=0 call paired with the
     verbatim verifier is both cheaper and more reliable.
     """
-    raw_texts, texts = _gather_text(refs, ctx, _extract_pdf_text, "ocr")
-    if not texts:
+    pages = _gather_text(refs, ctx, _extract_pdf_text, "ocr")
+    if not pages:
         ctx.emit("extract", "tier=ocr skipped (no text from any ref)")
         return None
+    page_blocks = [f"{header}\n{text}" for _, header, text in pages]
     user_msg = (
         f"Question:\n{ctx.question}\n\n"
-        f"Page text:\n\n" + "\n\n".join(texts)
+        f"Page text:\n\n" + "\n\n".join(page_blocks)
     )
     ctx.emit(
         "extract",
         "tier=ocr single-call (T=0)",
-        total_chars=sum(len(t) for t in texts),
+        total_chars=sum(len(b) for b in page_blocks),
         user_message=user_msg[:3000],
     )
-    samples = _single_call(_TEXT_SYSTEM, user_msg, ctx, "ocr")
-    verify_text = "\n\n".join(raw_texts)
-    kept = [s for s in samples if _value_in_text(s, verify_text)]
-    n_dropped = len(samples) - len(kept)
+    entries = _single_call(_TEXT_SYSTEM, user_msg, ctx, "ocr")
+    verify_text = "\n\n".join(text for _, _, text in pages)
+    kept = [e for e in entries if _value_in_text(e, verify_text)]
+    n_dropped = len(entries) - len(kept)
     if n_dropped:
-        ctx.emit("extract", f"tier=ocr verifier dropped {n_dropped}/{len(samples)}")
-    return _samples_to_typed_value(kept, ctx, "ocr")
+        ctx.emit("extract", f"tier=ocr verifier dropped {n_dropped}/{len(entries)}")
+    return _finalize_entries(kept, ctx, "ocr")
 
 
-def _vision_tier(refs: list[PageRef], ctx: HarnessContext) -> TypedValue | None:
+def _vision_tier(refs: list[PageRef], ctx: HarnessContext) -> list[AnnotatedValue] | None:
     """Tier 3 — single deterministic call (T=0) over rendered page images, with
     per-image PageRef labels in the user message so the LLM can't conflate pages.
     """
@@ -812,15 +990,16 @@ def _vision_tier(refs: list[PageRef], ctx: HarnessContext) -> TypedValue | None:
     user_msg = (
         f"Question:\n{ctx.question}\n\n"
         f"Images provided in order:\n" + "\n".join(labels) + "\n\n"
-        f"Set dims.year and dims.month on each entry based on which image the cell came from."
+        f"Include the source bulletin and page in each entry's description so a downstream "
+        f"consumer can tell which image the value came from."
     )
 
     ctx.emit("extract", "tier=vision single-call (T=0)", n_images=len(images))
-    samples = _single_call(_VISION_SYSTEM, user_msg, ctx, "vision", images=images)
-    return _samples_to_typed_value(samples, ctx, "vision")
+    entries = _single_call(_VISION_SYSTEM, user_msg, ctx, "vision", images=images)
+    return _finalize_entries(entries, ctx, "vision")
 
 
-def run(op: OpNode, prev: DocHandle | None, ctx: HarnessContext) -> TypedValue:
+def run(op: OpNode, prev: DocHandle | None, ctx: HarnessContext) -> list[AnnotatedValue]:
     visual_only = bool(op.args.get("visual_only", False))
     refs = prev.refs if isinstance(prev, DocHandle) else []
     if not refs:
@@ -833,19 +1012,19 @@ def run(op: OpNode, prev: DocHandle | None, ctx: HarnessContext) -> TypedValue:
         result = _parsed_json_tier(refs, ctx)
         if result is not None:
             ctx.emit("extract", "tier=parsed_json produced values",
-                     names=list(result.value.keys()) if isinstance(result.value, dict) else None)
+                     descriptions=[e.description for e in result])
             return result
 
         result = _ocr_tier(refs, ctx)
         if result is not None:
             ctx.emit("extract", "tier=ocr produced values",
-                     names=list(result.value.keys()) if isinstance(result.value, dict) else None)
+                     descriptions=[e.description for e in result])
             return result
 
     result = _vision_tier(refs, ctx)
     if result is not None:
         ctx.emit("extract", "tier=vision produced values",
-                 names=list(result.value.keys()) if isinstance(result.value, dict) else None)
+                 descriptions=[e.description for e in result])
         return result
 
     raise StepFailed("extract", "no relevant values found across tiers")
