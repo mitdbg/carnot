@@ -269,8 +269,15 @@ _VISION_SYSTEM = (
     "Do not silently convert foreign currency to USD; leave it native and let compute apply FX.\n"
     "If nothing relevant is visible, return [].\n"
     "Output ONLY the JSON array — no fences, no prose.\n"
-    "CRITICAL — verbatim grounding: every numeric value you emit (every cell, in any kind) must\n"
-    "be visibly printed on the page. Do not compute, derive, or aggregate values.\n"
+    "CRITICAL — verbatim grounding for PRINTED numeric values: every numeric value you emit that\n"
+    "came from a printed cell, label, axis tick, or caption MUST be visibly printed on the page.\n"
+    "Do not compute, sum, average, or otherwise transform printed numbers.\n"
+    "EXCEPTION — visual chart-feature counts: when the question asks for the count of features on\n"
+    'a chart that are observable but not printed as a number (e.g., "how many local maxima",\n'
+    '"how many distinct lines", "how many labeled regions", "how many bars exceed the threshold\n'
+    'line"), you MAY emit that count as a kind="scalar" entry with unit="count". The description\n'
+    "should name what was counted and on which chart/page. This is the only category of derived\n"
+    "value that is permitted; everything else still must be verbatim.\n"
 )
 
 _DEDUP_SYSTEM = (
@@ -667,7 +674,7 @@ def _dedup_semantically(
         "tier=parsed_json dedup call (T=0)",
         n_input_entries=len(envelope),
     )
-    resp = ctx.llm_client.call(_DEDUP_SYSTEM, user_msg, temperature=0.0, thinking_budget=0)
+    resp = ctx.llm_client.call(_DEDUP_SYSTEM, user_msg, temperature=0.0, thinking_budget=0, ctx=ctx)
     raw = resp.text
     parsed = _parse_response_raw(raw, ctx)
     ctx.emit(
@@ -701,7 +708,7 @@ def _single_call(
     """One deterministic Gemini call (T=0). Returns parsed entries; [] if LLM
     emitted [] or response was malformed (drops are emitted as diagnostics by
     `_parse_response_raw`)."""
-    resp = ctx.llm_client.call(system, user, images=images, temperature=0.0, thinking_budget=-1)
+    resp = ctx.llm_client.call(system, user, images=images, temperature=0.0, thinking_budget=-1, ctx=ctx)
     raw = resp.text
     parsed = _parse_response_raw(raw, ctx)
     ctx.emit(
@@ -758,7 +765,7 @@ def _sample_groups_n(
     def _one(task: tuple[int, int]) -> tuple[int, int, str, list[AnnotatedValue]]:
         group_idx, sample_idx = task
         resp = ctx.llm_client.call(
-            system, group_msgs[group_idx], temperature=temperature, thinking_budget=0
+            system, group_msgs[group_idx], temperature=temperature, thinking_budget=0, ctx=ctx
         )
         raw = resp.text
         parsed = _parse_response_raw(raw, ctx)
@@ -802,7 +809,7 @@ def _sample_n(
     temperature = ctx.config.extract_sample_temperature
 
     def _one(_i: int) -> tuple[str, list[_Sample]]:
-        resp = ctx.llm_client.call(system, user, images=images, temperature=temperature, thinking_budget=0)
+        resp = ctx.llm_client.call(system, user, images=images, temperature=temperature, thinking_budget=0, ctx=ctx)
         raw = resp.text
         parsed = _parse_response_raw(raw, ctx)
         return raw, (parsed if parsed is not None else [])

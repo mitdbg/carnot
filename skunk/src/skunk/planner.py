@@ -315,7 +315,7 @@ def plan(question: str, ctx: HarnessContext) -> Plan:
 
     attempt_errors: list[str] = []
     for attempt in range(2):
-        resp = ctx.llm_client.call(system, user, thinking_budget=-1)
+        resp = ctx.llm_client.call(system, user, thinking_budget=-1, ctx=ctx)
         raw = resp.text
         try:
             plan_dict = _extract_plan_json(raw)
@@ -427,7 +427,7 @@ def plan_recovery(
         "Propose supplemental branches, or decline."
     )
 
-    resp = ctx.llm_client.call(_RECOVERY_SYSTEM, user, thinking_budget=-1)
+    resp = ctx.llm_client.call(_RECOVERY_SYSTEM, user, thinking_budget=-1, ctx=ctx)
     raw = resp.text
     ctx.emit("planner", "recovery response", raw=raw[:400])
 

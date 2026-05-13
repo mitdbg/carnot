@@ -146,11 +146,23 @@ def main() -> None:
     parser.add_argument("--uids", help="Comma-separated UIDs (overrides --sample)")
     parser.add_argument("--golden", action="store_true",
                         help="Inject golden pages from --csv instead of running retrieve")
+    parser.add_argument("--golden-noisy", action="store_true",
+                        help="Like --golden, but per-page Bernoulli(noise_prob) appends one confounder PageRef "
+                             "(same-bulletin drift or cross-year keyword match from --noise-pool)")
+    parser.add_argument("--noise-prob", type=float, default=0.5,
+                        help="Per-golden-page probability of appending a confounder (default: %(default)s)")
+    parser.add_argument("--noise-seed", type=int, default=42,
+                        help="Seed for deterministic confounder selection (default: %(default)s)")
+    parser.add_argument("--noise-pool", default="eval/noise_pool.json",
+                        help="Path to precomputed cross-year confounder pool (default: %(default)s)")
     parser.add_argument("--trace-dir", default="eval/traces",
                         help="Per-question debug trace directory (default: %(default)s; '' to disable)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress live orchestrator + subagent events (verbose is on by default)")
     args = parser.parse_args()
+
+    if args.golden and args.golden_noisy:
+        parser.error("--golden and --golden-noisy are mutually exclusive")
 
     df = pd.read_csv(args.csv)
     df_by_uid = df.set_index("uid")
@@ -159,7 +171,11 @@ def main() -> None:
     sample_note = f" (sample: {args.sample})" if args.sample and not args.uids else ""
     print(f"[e2e] Running {len(uids)} UID(s){sample_note}")
 
-    golden_lookup = load_golden(args.csv) if args.golden else None
+    golden_lookup = load_golden(args.csv) if (args.golden or args.golden_noisy) else None
+    noise_pool = None
+    if args.golden_noisy:
+        from eval.noise import load_noise_pool
+        noise_pool = load_noise_pool(args.noise_pool)
     plan_cache = load_plan_cache(args.plan_cache_csv)
     if not plan_cache:
         print(f"[e2e] WARNING: plan cache {args.plan_cache_csv!r} is empty or missing — "
@@ -183,6 +199,19 @@ def main() -> None:
             golden_pages = golden_lookup.get(uid, [])
             if not golden_pages:
                 print(f"[e2e] WARNING: no golden pages for {uid!r}")
+            elif args.golden_noisy:
+                from eval.noise import make_noisy_pages
+                pdf_dir = os.environ.get(
+                    "OFFICEQA_PDF_DIR",
+                    str(Path.home() / "Desktop/officeqa/treasury_bulletin_pdfs"),
+                )
+                golden_pages = make_noisy_pages(
+                    uid, golden_pages,
+                    noise_prob=args.noise_prob,
+                    seed=args.noise_seed,
+                    pdf_dir=pdf_dir,
+                    pool=noise_pool,
+                )
 
         cached_plan_text = plan_cache.get(uid)
         if cached_plan_text is None:

@@ -32,6 +32,7 @@ import argparse
 import csv
 import json
 import sys
+import time
 from pathlib import Path
 
 from skunk.config import SkunkConfig
@@ -115,6 +116,7 @@ def run_question(
         verbose=verbose,
         config=config,
     )
+    t0 = time.perf_counter()
 
     if cached_plan_text is not None:
         if verbose:
@@ -147,6 +149,8 @@ def run_question(
             return {"question": question, "answer": None, "failed": True, "reason": f"planning: {e}"}
 
     trace = execute(plan_obj, ctx)
+    wall_s = time.perf_counter() - t0
+    ctx.emit("run", "question done", wall_s=round(wall_s, 3))
 
     if verbose:
         print(trace.pretty())
@@ -158,7 +162,8 @@ def run_question(
         except Exception:
             plan_text_for_dump = cached_plan_text or "(unavailable)"
         _dump_trace(trace_path, uid=uid, question=question, plan_text=plan_text_for_dump,
-                    golden_pages=golden_pages, trace=trace, events=ctx.events)
+                    golden_pages=golden_pages, trace=trace, events=ctx.events,
+                    model=config.gemini_model)
 
     return {
         "question": question,
@@ -170,7 +175,8 @@ def run_question(
 
 
 def _dump_trace(path: str, *, uid: str | None, question: str, plan_text: str,
-                golden_pages: list["PageRef"] | None, trace, events: list[dict]) -> None:
+                golden_pages: list["PageRef"] | None, trace, events: list[dict],
+                model: str) -> None:
     """Write a comprehensive per-question debug trace to `path`."""
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -180,6 +186,7 @@ def _dump_trace(path: str, *, uid: str | None, question: str, plan_text: str,
     lines.append(f"UID: {uid or '(none)'}")
     lines.append("=" * 80)
     lines.append(f"Question: {question}")
+    lines.append(f"Model: {model}")
     lines.append(f"Plan: {plan_text}")
     if golden_pages:
         lines.append(f"Golden pages ({len(golden_pages)}):")
@@ -219,7 +226,8 @@ def _dump_trace(path: str, *, uid: str | None, question: str, plan_text: str,
                 lines.append(f"    [{src}] {msg}")
                 for k, v in extras.items():
                     s = repr(v)
-                    if len(s) > 800:
+                    # Keep full LLM I/O for performance/cost analysis; truncate everything else.
+                    if not (src == "llm" and k in ("input_text", "output_text")) and len(s) > 800:
                         s = s[:800] + "...(truncated)"
                     lines.append(f"      {k}: {s}")
         lines.append("")

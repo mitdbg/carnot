@@ -3,9 +3,11 @@
 Rate limiting
 -------------
 A single process-wide rate limiter paces all Gemini calls at
-`config.gemini_rpm` requests/minute. Request slots refill continuously at
-rpm/60 per second, capped at one minute's worth of capacity. `call()` blocks
-on `acquire()` until a slot is free, then issues the API call.
+`config.gemini_rpm` requests/minute. The configured rpm is converted to
+requests/second (rps = rpm/60); slots refill continuously at that rate and
+the bucket caps at one second's worth of capacity, so bursts are bounded to
+~1s of requests rather than a full minute. `call()` blocks on `acquire()`
+until a slot is free, then issues the API call.
 
 Retry
 -----
@@ -106,7 +108,7 @@ def _get_rate_limiter(rpm: float) -> _RateLimiter:
     with _RATE_LIMITER_LOCK:
         if _RATE_LIMITER is None or _RATE_LIMITER_RPM != rpm:
             rate = rpm / 60.0
-            _RATE_LIMITER = _RateLimiter(rate_per_sec=rate, capacity=rpm)
+            _RATE_LIMITER = _RateLimiter(rate_per_sec=rate, capacity=max(1.0, rate))
             _RATE_LIMITER_RPM = rpm
         return _RATE_LIMITER
 
@@ -154,6 +156,7 @@ class LLMClient:
         temperature: float = 0.0,
         thinking_budget: int = 0,
         use_google_search: bool = False,
+        ctx: "HarnessContext | None" = None,
     ) -> LLMResponse:
         client = self._get_client()
         parts: list[Any] = []
@@ -190,10 +193,26 @@ class LLMClient:
                 api_resp = client.models.generate_content(
                     model=model, contents=parts, config=gen_config
                 )
+                latency_s = time.monotonic() - t0
                 usage = api_resp.usage_metadata
+                output_text = (api_resp.text or "").strip()
+                if ctx is not None:
+                    ctx.emit(
+                        "llm", "call",
+                        model=model,
+                        temperature=temperature,
+                        thinking_budget=thinking_budget,
+                        latency_s=round(latency_s, 3),
+                        input_tokens=getattr(usage, "prompt_token_count", None),
+                        output_tokens=getattr(usage, "candidates_token_count", None),
+                        total_tokens=getattr(usage, "total_token_count", None),
+                        thinking_tokens=getattr(usage, "thoughts_token_count", None),
+                        input_text=system + "\n\n---\n\n" + user,
+                        output_text=output_text,
+                    )
                 return LLMResponse(
-                    text=(api_resp.text or "").strip(),
-                    latency_s=time.monotonic() - t0,
+                    text=output_text,
+                    latency_s=latency_s,
                     input_tokens=getattr(usage, "prompt_token_count", None),
                     output_tokens=getattr(usage, "candidates_token_count", None),
                     grounding_urls=extract_grounding_urls(api_resp),

@@ -320,7 +320,7 @@ def _self_critique(
         f"Produced result:\n{result_text}\n\n"
         f"Reply on a single line: ACCEPT, or REVISE: <reason>."
     )
-    resp = ctx.llm_client.call(_CRITIQUE_SYSTEM, user)
+    resp = ctx.llm_client.call(_CRITIQUE_SYSTEM, user, ctx=ctx)
     raw = resp.text
     ctx.emit("compute", "self-critique response", raw=raw[:300])
 
@@ -360,7 +360,7 @@ def _try_codegen_and_exec(
     # Total tries = 1 initial + retry_budget retries.
     for try_idx in range(retry_budget + 1):
         resp = ctx.llm_client.call(
-            system_prompt, _build_user(question, prev_desc, priors), thinking_budget=-1,
+            system_prompt, _build_user(question, prev_desc, priors), thinking_budget=-1, ctx=ctx,
         )
         raw = resp.text
         ctx.emit("compute", f"codegen try {try_idx + 1} response", raw=raw[:600])

@@ -42,9 +42,9 @@ class SkunkConfig:
 
     # Compute subagent
     compute_max_attempts: int = 3
-    # Max depth of the compute chain. 1 = legacy flat (data → single compute).
-    # 2 = one intermediate layer + one final aggregator (default).
-    max_compute_depth: int = 2
+    # Max depth of the compute chain. 1 = flat (data → single compute, default).
+    # 2 = one intermediate layer + one final aggregator.
+    max_compute_depth: int = 1
 
     # Recovery loop: number of re-plan rounds allowed after the final compute
     # raises MissingData. Each round calls plan_recovery (LLM) for a list of
@@ -73,7 +73,7 @@ class SkunkConfig:
             use_vertex=os.environ.get("SKUNK_USE_VERTEX", "").lower() in ("1", "true", "yes"),
             extract_n_samples=int(os.environ.get("SKUNK_EXTRACT_N_SAMPLES", "3")),
             extract_sample_temperature=float(os.environ.get("SKUNK_EXTRACT_SAMPLE_TEMPERATURE", "0.7")),
-            max_compute_depth=int(os.environ.get("SKUNK_MAX_COMPUTE_DEPTH", "2")),
+            max_compute_depth=int(os.environ.get("SKUNK_MAX_COMPUTE_DEPTH", "1")),
             plan_cache_csv=os.environ.get("SKUNK_PLAN_CACHE_CSV", "data/dsl_planning_pass.csv"),
             manifest_path=os.environ.get("SKUNK_MANIFEST"),
         )

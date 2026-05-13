@@ -232,7 +232,7 @@ def run(op: OpNode, prev: None, ctx: HarnessContext) -> list[AnnotatedValue]:
         raise StepFailed("lookup_external", "Missing 'nl' arg")
 
     ctx.emit("lookup_external", "calling gemini", nl=nl)
-    resp = ctx.llm_client.call(_SYSTEM, nl, thinking_budget=-1, use_google_search=True)
+    resp = ctx.llm_client.call(_SYSTEM, nl, thinking_budget=-1, use_google_search=True, ctx=ctx)
     raw = resp.text or ""
     ctx.emit("lookup_external", "gemini response",
              raw=raw[:500],
