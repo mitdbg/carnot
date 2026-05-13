@@ -192,38 +192,69 @@ def _run_intermediate_node(
     )
 
 
+def _summarize_prev(prev: Any) -> list[str]:
+    """Descriptions-only summary of an AnnotatedValue list for the recovery prompt.
+    Drops raw values/vectors/tables to keep the prompt bounded."""
+    if not isinstance(prev, list):
+        return []
+    out: list[str] = []
+    for av in prev:
+        if isinstance(av, AnnotatedValue):
+            out.append(f"{av.kind} | {av.unit} | {av.description}")
+    return out
+
+
 def _run_compute_with_recovery(
     prev: Any, plan: Plan, ctx: HarnessContext, trace: QuestionTrace,
     final_node: ComputeNode,
 ) -> FormattedString:
-    """Run the final compute; if it reports MissingData, run one recovery branch and retry once."""
+    """Run the final compute with a bounded recovery loop. On MissingData, ask
+    the recovery planner for one or more supplemental branches (given the
+    failure reason and a descriptions-only summary of current prev), run them
+    in parallel, append to prev, and retry compute. Bounded by
+    ctx.config.recovery_max_rounds (total compute calls ≤ max_rounds + 1)."""
     compute_args: dict[str, Any] = {"final": True}
     if final_node.task:
         compute_args["task"] = final_node.task
     compute_op = OpNode(op="compute", args=compute_args)
-    try:
-        return _run_op(compute_op, prev, ctx, trace)
-    except MissingData as e:
-        ctx.emit("orchestrator", "compute reported MISSING; attempting recovery", reason=e.reason)
-        from skunk.planner import plan_recovery
-        try:
-            extra = plan_recovery(ctx.question, plan, e.reason, ctx)
-        except Exception as planner_err:
-            raise StepFailed(
-                "compute",
-                f"missing data and recovery planner failed: {e.reason}; planner: {planner_err}",
-            ) from planner_err
-        if extra is None:
-            raise StepFailed("compute", f"missing data and recovery declined: {e.reason}")
 
-        ctx.emit("orchestrator", "running recovery branch", branch=repr(extra))
-        extra_value = _run_branch(extra, ctx, trace)
-        augmented = list(prev) + extra_value
+    from skunk.planner import plan_recovery
 
+    max_rounds = ctx.config.recovery_max_rounds
+    current_prev: list[Any] = list(prev) if isinstance(prev, list) else prev
+    for round_idx in range(max_rounds + 1):
         try:
-            return _run_op(compute_op, augmented, ctx, trace)
-        except MissingData as e2:
-            raise StepFailed("compute", f"still missing after recovery: {e2.reason}") from e2
+            return _run_op(compute_op, current_prev, ctx, trace)
+        except MissingData as e:
+            if round_idx == max_rounds:
+                raise StepFailed(
+                    "compute",
+                    f"still missing after {max_rounds} recovery round(s): {e.reason}",
+                ) from e
+            ctx.emit("orchestrator", "compute reported MISSING; attempting recovery",
+                     round=round_idx + 1, reason=e.reason)
+            prev_summary = _summarize_prev(current_prev)
+            try:
+                extra_branches = plan_recovery(
+                    ctx.question, plan, e.reason, prev_summary, ctx,
+                )
+            except Exception as planner_err:
+                raise StepFailed(
+                    "compute",
+                    f"missing data and recovery planner failed: {e.reason}; planner: {planner_err}",
+                ) from planner_err
+            if not extra_branches:
+                raise StepFailed(
+                    "compute", f"missing data and recovery declined: {e.reason}",
+                ) from e
+            ctx.emit("orchestrator", "running recovery branches",
+                     round=round_idx + 1, count=len(extra_branches),
+                     branches=[repr(b) for b in extra_branches])
+            if len(extra_branches) == 1:
+                extra_value = _run_branch(extra_branches[0], ctx, trace)
+            else:
+                extra_value = _run_parallel(extra_branches, ctx, trace)
+            current_prev = list(current_prev) + extra_value
 
 
 def _run_op(op: OpNode, prev: Any, ctx: HarnessContext, trace: QuestionTrace) -> Any:

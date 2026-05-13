@@ -33,11 +33,11 @@ from skunk.subagents.base import (
 )
 
 _CODEGEN_SYSTEM = """\
-You are the chain terminator for a financial QA pipeline.
+You are writing code for a financial data processing pipeline.
 
 You receive:
 - The user's original question (free text).
-- `prev`: extracted bulletin data, available in the sandbox. Always list[AnnotatedValue].
+- `prev`: extracted data, available in the sandbox. Always list[AnnotatedValue].
     AnnotatedValue fields:
           .description — natural-language label uniquely identifying this datum
                           (e.g. "Total US national defense expenditures, monthly, CY1940")
@@ -57,16 +57,10 @@ Payload shapes by kind:
            Cast with pd.DataFrame.from_dict(entry.value, orient="index") for normal
            table operations.
 
-Working with entries:
-- Iterate `prev` and select entries by reading `e.description` and `e.kind`.
-  For a single-entry prev, use `prev[0]`.
-- Substring-match on description (case-insensitive) to pick the entry you want, e.g.
-      e = next(e for e in prev if "national defense" in e.description.lower())
-- Every entry's unit is in .unit — trust that, never guess from the description.
-- For sibling scalars (same measurement type, different sub-category), pick by
-  description fragment, e.g.
-      vals = [e.value for e in prev
-              if e.kind == "scalar" and "total" in e.description.lower()]
+Pay special attention to the question's explicit constraints:
+  - year:  e.g. "1942-1948", fiscal year (FY) vs. calendar year (CY)
+  - series: e.g. "national defense expenditures"
+  - type of computation requested: e.g., geometric mean vs. arithmetic mean
 
 Worked example — geometric mean over a vector:
     e = next(e for e in prev
@@ -104,14 +98,22 @@ Rules:
 - Prefer a printed value already in `prev` over re-deriving it from components
   also in `prev`. If the page prints both a total/summary row and its component
   rows, use the total — don't re-aggregate the components to compute it yourself.
-- `result` MUST be a Python str. For numbers, format per the question's instructions
+- `result` MUST be a Python str containing ONLY the answer the question asks for —
+  no surrounding prose, no restatement of the question, no labels like "Answer:"
+  or "The bureau is...". For numbers, format per the question's instructions
   (precision, with/without commas, with/without unit symbols). For lists, use the
   bracket form the question requests. For percent answers, append "%" only if the
-  question asks for percent form.
+  question asks for percent form. If the question contains multiple sub-questions
+  (e.g. "name the bureau AND compute X"), only emit the final answer the question
+  ultimately asks for — typically the last quantity/identifier requested.
 - Convert units yourself when needed (e.g. usd_thousands → usd_millions: divide by 1000).
   Every cell in a vector or table shares one unit — convert once over the whole payload.
-- Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm). No other imports. No prints.
-- `hp_filter(series, lamb=…)` is also pre-defined in the sandbox (pure-numpy HP filter). Do not import it.
+- Units may follow the pattern <iso3>_<scale> for foreign currency (e.g. jpy_billions,
+  gbp_millions, cad_billions). When the question asks for an answer in USD but an input
+  is in foreign currency, locate the matching fx_rate entry in `prev` and apply it —
+  e.g. usd = value * rate when the rate's units are "USD per <iso>", or value / rate when
+  "<iso> per USD". Check the description of the fx_rate entry to determine direction.
+- Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm). `hp_filter(series, lamb=…)` is also pre-defined in the sandbox (pure-numpy HP filter). Do not import it.
 - Output ONLY the format above — no markdown fences around the whole response.
 """
 
@@ -169,6 +171,10 @@ Rules:
   use the total — don't re-aggregate components to compute it yourself.
 - Convert units yourself when needed (e.g. usd_thousands → usd_millions: divide by 1000)
   and set result_unit accordingly.
+- Units may follow <iso3>_<scale> for foreign currency (e.g. jpy_billions, gbp_millions).
+  When the sub-task requires a USD answer but an input is in foreign currency, find the
+  matching fx_rate entry in `prev` and apply it (read the fx_rate's description to
+  determine direction: "USD per <iso>" → multiply, "<iso> per USD" → divide).
 - If `prev` is missing a value you need, output MISSING:<reason>. Do NOT fabricate values.
 - Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm). No other imports. No prints.
 - `hp_filter(series, lamb=…)` is also pre-defined in the sandbox (pure-numpy HP filter). Do not import it.
@@ -195,33 +201,33 @@ Worked example — produce a 2-element dict for downstream pairwise math:
 
 
 _CRITIQUE_SYSTEM = """\
-You are reviewing code that you (the chain terminator) just wrote and the
+You are reviewing code that another coding agent wrote and the
 string it produced. Decide whether to ship the result as-is or revise.
 
-You receive the same context the producer had: the question, a summary of
-`prev` (the list[AnnotatedValue] input — including each entry's description,
+You receive the question, a summary of `prev` (the list[AnnotatedValue] input — including each entry's description,
 unit, and kind), the python code that ran, and the produced `result` string.
 
 Reply on a single line:
   ACCEPT
   REVISE: <one short reason a re-run should address>
 
-Bias toward ACCEPT. Only REVISE when the producer:
+REVISE when the producer:
   - applied the wrong unit conversion (e.g. shipped usd_thousands while the
     question asked for usd_millions, or never converted),
   - produced a result whose form clearly contradicts the question (asked
     for "[a, b]" bracketed list, shipped "1.0 2.0"; asked for percent
     form, shipped a decimal like "0.1234"),
   - selected the wrong rows/columns from `prev` given the question's
-    explicit constraints (wrong year, wrong series, wrong dim filter).
+    explicit constraints (wrong year, wrong series, wrong dim filter),
+  - wrapped the answer in narrative prose ("The bureau is X and the
+    average is Y") when the question asks for a single value — REVISE
+    and instruct the producer to return ONLY the requested value.
 
 Do NOT REVISE on:
   - cosmetic precision when the question doesn't pin precision,
   - presence/absence of a trailing unit suffix when the magnitude is right
     and the question doesn't explicitly demand the suffix,
   - whitespace, capitalization, or punctuation nits.
-
-When in doubt, ACCEPT.
 """
 
 # Match CODE / MISSING anywhere (after fence-stripping + light prose). Use re.search,

@@ -46,6 +46,12 @@ class SkunkConfig:
     # 2 = one intermediate layer + one final aggregator (default).
     max_compute_depth: int = 2
 
+    # Recovery loop: number of re-plan rounds allowed after the final compute
+    # raises MissingData. Each round calls plan_recovery (LLM) for a list of
+    # supplemental branches, runs them in parallel, appends to prev, and retries
+    # compute. The total compute call count is bounded by recovery_max_rounds + 1.
+    recovery_max_rounds: int = 1
+
     # DSL plan cache (env: SKUNK_PLAN_CACHE_CSV)
     plan_cache_csv: str = "data/dsl_planning_pass.csv"
 

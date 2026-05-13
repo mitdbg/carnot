@@ -153,7 +153,7 @@ _TEXT_SYSTEM = (
     "2-D year×month grid, if the question asks about a 1-D series (\"each month from X to Y\",\n"
     "\"every quarter\", \"all values in CY1940\"), emit ONE `vector` whose `index_name` is the\n"
     "combined dim. For year+month series, use combined ISO labels: index_name=\"month\",\n"
-    "keys like \"1942-03\", \"1942-04\". Use kind=\"table\" only when the question literally asks\n"
+    "keys like \"1942-03\", \"1942-04\". Use kind=\"table\"  when the question asks\n"
     "to compare rows vs columns (e.g. \"compare Jan vs July across years\").\n\n"
     "Output a single JSON ARRAY of entries (one entry per distinct datum).\n\n"
     "Scalar entry:\n"
@@ -202,9 +202,24 @@ _TEXT_SYSTEM = (
     "  column header, or caption phrase from the page (e.g. \"Net budget outlays\",\n"
     "  \"Treasury 30-yr. bonds\") inside the description. This is a soft preference, not\n"
     "  a requirement — paraphrase only when no concise printed phrase fits.\n"
-    '- "unit" is a single lowercase token from:\n'
-    "    usd, usd_thousands, usd_millions, usd_billions, pct, count, year, rate, fx_rate, text, mixed\n\n"
+    '- "unit" is a single lowercase token describing the printed scale + base. Build it\n'
+    '  from the page — common examples (not an exhaustive list):\n'
+    "    usd, usd_thousands, usd_millions, usd_billions,\n"
+    "    jpy_millions, jpy_billions, gbp_millions, eur_billions, cad_millions, (etc.),\n"
+    "    pct, count, year, rate, fx_rate, text, mixed.\n"
+    "  For foreign currency, follow the pattern <iso3>_<scale> (lowercase ISO code, e.g.\n"
+    '  "jpy_billions" for "in billions of yen"). For dimensionless / qualitative fields\n'
+    '  use pct, count, year, rate, fx_rate, or text. Use "mixed" only when a single cell\n'
+    "  genuinely combines incompatible units.\n\n"
     "Rules:\n"
+    "- The numeric scale AND currency MUST come from the printed page — a column header,\n"
+    "  table caption, parenthetical legend, or footnote like \"(In millions of dollars)\"\n"
+    "  or \"(In billions of yen)\". Use exactly the scale and currency the page prints;\n"
+    "  do NOT guess them from the magnitude of the numbers. If the page shows \"74\"\n"
+    '  under a header that says "billions of yen", emit value=74 and unit=jpy_billions —\n'
+    "  even if 74 \"feels\" small or large for the quantity. Likewise, do not silently\n"
+    "  convert foreign currency to USD; leave it in its native unit and let downstream\n"
+    "  compute apply the FX rate.\n"
     '- If the column/section header says "in thousands of dollars", report unit=usd_thousands\n'
     "  (do NOT silently rescale the printed numbers). Every cell in a vector/table shares one unit.\n"
     "- For named-entity / string answers, use kind=\"scalar\", unit=\"text\", value as a JSON string.\n"
@@ -242,8 +257,16 @@ _VISION_SYSTEM = (
     "Where possible, prefer including the EXACT visible row label, column header, or\n"
     "caption phrase from the page inside the description (soft preference; paraphrase\n"
     "only when no concise printed phrase fits).\n\n"
-    "Unit vocabulary: usd, usd_thousands, usd_millions, usd_billions, pct, count, year, rate, fx_rate, text, mixed.\n"
-    "If the page header says values are in thousands/millions, use that as the unit; do not rescale.\n"
+    "Unit token — single lowercase string describing the printed scale + base.\n"
+    "  Common examples (not exhaustive): usd, usd_thousands, usd_millions, usd_billions,\n"
+    "  jpy_millions, jpy_billions, gbp_millions, eur_billions, cad_millions,\n"
+    "  pct, count, year, rate, fx_rate, text, mixed.\n"
+    "  For foreign currency, follow the pattern <iso3>_<scale> (e.g. jpy_billions for\n"
+    '  "in billions of yen"). Use "mixed" only when one cell genuinely combines incompatible units.\n'
+    "The numeric scale AND currency MUST come from the printed page (column header, table\n"
+    "caption, parenthetical legend, or footnote). Never guess scale from value magnitude.\n"
+    'If "74" appears under a header that says "billions of yen", emit value=74 and unit=jpy_billions.\n'
+    "Do not silently convert foreign currency to USD; leave it native and let compute apply FX.\n"
     "If nothing relevant is visible, return [].\n"
     "Output ONLY the JSON array — no fences, no prose.\n"
     "CRITICAL — verbatim grounding: every numeric value you emit (every cell, in any kind) must\n"

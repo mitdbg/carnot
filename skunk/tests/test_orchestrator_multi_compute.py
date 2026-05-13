@@ -2,14 +2,17 @@
 
 Exercises the chain walker with a mocked LLM that knows how to respond to
 both _CODEGEN_SYSTEM (final compute) and _CODEGEN_SYSTEM_INTERMEDIATE
-prompts, plus the critique prompt. Uses LookupBranch + a stubbed
-lookup_external subagent so no Gemini calls and no PDF corpus are needed.
+prompts, plus the critique prompt. `lookup_external.run` is monkeypatched
+to read pre-canned values off `ctx.llm_client.lookup_external`, since the
+real subagent uses the genai SDK directly (function-calling loop) and
+doesn't go through `LLMClient.call`.
 """
 
 from __future__ import annotations
 
 import pytest
 
+import skunk.orchestrator as orchestrator
 import skunk.subagents.compute as compute
 import skunk.subagents.lookup_external as lookup_external
 from skunk.common import HarnessContext, LLMResponse
@@ -23,10 +26,33 @@ from skunk.dsl import (
     validate,
 )
 from skunk.orchestrator import execute
+from skunk.subagents.base import parse_llm_value
+
+
+@pytest.fixture(autouse=True)
+def _stub_lookup_external(monkeypatch):
+    """Replace lookup_external.run with a stub that pops pre-canned 2-line
+    responses off the test's mock LLM, bypassing the real function-calling loop."""
+
+    def fake_run(op, prev, ctx):
+        queue = getattr(ctx.llm_client, "lookup_external", None)
+        assert queue, f"unexpected lookup_external call; queue empty for nl={op.args.get('nl')!r}"
+        raw = queue.pop(0)
+        value, unit = parse_llm_value(raw)
+        return [AnnotatedValue(description=op.args.get("nl", ""), value=value, unit=unit)]
+
+    monkeypatch.setattr(lookup_external, "run", fake_run)
+    # The orchestrator captured `lookup_external.run` at import time; patch
+    # the dispatch table entry too so the stub actually runs.
+    monkeypatch.setitem(orchestrator._SUBAGENT_REGISTRY, "lookup_external", fake_run)
 
 
 class _MockLLM:
-    """Routes by system-prompt identity into codegen / intermediate / critique queues."""
+    """Routes by system-prompt identity into codegen / intermediate / critique queues.
+
+    `lookup_external` is a separate queue read by the autouse stub above; the
+    real subagent never reaches `.call()`.
+    """
 
     def __init__(
         self,
@@ -53,9 +79,7 @@ class _MockLLM:
         if system is compute._CODEGEN_SYSTEM_INTERMEDIATE:
             assert self.intermediate, f"unexpected intermediate codegen call; user={user[:200]}"
             return _wrap(self.intermediate.pop(0))
-        # lookup_external uses its own prompt — last queue.
-        assert self.lookup_external, f"unexpected lookup call: system={system[:80]!r}"
-        return _wrap(self.lookup_external.pop(0))
+        raise AssertionError(f"unexpected .call(): system={system[:80]!r}")
 
 
 def _code(body: str) -> str:
