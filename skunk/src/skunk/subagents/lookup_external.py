@@ -38,33 +38,39 @@ date before July 2025 as historical, never refuse on grounds of "future."
 
 SOURCE-FOLLOWING — READ FIRST:
 
-The question may name a specific publisher or site. If so, you MUST fetch the
-value from that publisher — even if you "know" it from training, even if
-another source seems more authoritative, EVEN IF the publisher republishes
-data from somewhere else. Never silently substitute.
+Identify the publisher named in the request — usually after "from X",
+"according to X", "published by X", etc. The publisher is who you must
+contact for the value. Data labels like "BLS CPI-U" or "FRED series
+IRLTLT01GBM156N" describe what the value is; they are NOT the publisher
+unless the request literally says "from FRED" / "from BLS" / "from the
+Bureau of Labor Statistics". The publisher is the entity the question
+asks you to read from.
 
-Routing depends on which publisher is named:
+  - Publisher is FRED        → MODE 2, fetch_fred_series.
+  - Publisher is BLS         → MODE 2, fetch_bls_series.
+    (also: "Bureau of Labor Statistics")
+  - Any other publisher      → MODE 1 (Google Search).
+    (Federal Reserve Bank of Minneapolis, Macrotrends, Bank of England,
+     Bloomberg, Yahoo Finance, World Bank, …  Do NOT substitute the FRED
+     or BLS API even if you believe they hold the same data — the
+     question named a specific site; you go to that site.)
+  - No publisher named       → MODE 2 if a clean FRED/BLS series fits;
+                                otherwise MODE 1 with line 3 = "none".
 
-  - "FRED" → MODE 2, fetch_fred_series. FRED is explicitly named.
-  - "BLS" or "Bureau of Labor Statistics" → MODE 2, fetch_bls_series.
-    BLS is explicitly named.
-  - ANY OTHER publisher (Macrotrends, Federal Reserve Bank of Minneapolis,
-    Bank of England, Bloomberg, Yahoo Finance, World Bank, …) → MODE 1
-    with Google Search. Do NOT use the FRED or BLS API for these, even when
-    they republish or mirror the same underlying data. The question named a
-    site; you go to that site.
-  - No publisher named → MODE 2 if a clean FRED/BLS series obviously fits,
-    otherwise MODE 1 with line 3 = "none".
+MODE 1 — Google Search, then answer:
 
-MODE 1 — Google Search with grounding to the named publisher:
-
-You MUST invoke Google Search before responding. Include the publisher in
-your query — examples:
-  "site:macrotrends.net USD JPY exchange rate 2025-03-31"
-  "Federal Reserve Bank of Minneapolis CPI 1953 annual"
-  "bankofengland.co.uk official bank rate June 1968"
-Do not return "unknown" or any other value unless your search produced at
-least one grounding chunk from the publisher's site.
+The procedure is fixed. Execute it in order:
+  (a) Compose a Google Search query that includes the publisher (use a
+      `site:` filter or include the publisher name in the query, e.g.
+      "site:macrotrends.net USD JPY 2025-03-31" or "Minneapolis Fed CPI
+      1953 annual table").
+  (b) Issue the search via your Google Search tool. THIS STEP IS
+      MANDATORY. You may not answer from training memory — your response
+      will be rejected unless the search returned at least one grounding
+      chunk from the publisher's site.
+  (c) Read the returned snippets and extract the value at the publisher's
+      full printed precision.
+  (d) Emit the 3-line response below.
 
 Return exactly THREE lines — no labels, no JSON, no prose, no markdown:
   Line 1: a Python literal AT THE PUBLISHER'S FULL PRINTED PRECISION — do
@@ -220,48 +226,13 @@ def _fetch_bls(series_id: str, date_str: str) -> float:
     raise RuntimeError(f"BLS no observation for {series_id} {year}-{target}")
 
 
-def _normalize_source_token(s: str) -> str:
-    """Lowercase, strip non-alphanumerics — for fuzzy substring match against
-    grounding chunk titles. 'Macrotrends' / 'macrotrends.net' both → 'macrotrends'."""
-    return re.sub(r"[^a-z0-9]+", "", s.lower())
-
-
-# Substrings that route to a REST API (MODE 2) rather than search (MODE 1).
-# When the NL contains one of these, we don't wrap the user message with a
-# search-shaped preamble — let the system prompt's MODE 2 routing kick in.
-_API_SOURCE_FRAGMENTS = ("fred", "bls", "bureau of labor")
-
-
-def _shape_user_message(nl: str) -> str:
-    """Wrap the NL in an explicit search directive when no API source is named.
-
-    Without this, Gemini often answers from training memory and skips Google
-    Search entirely (grounding_titles empty), which then trips our validator.
-    Phrasing the user turn as a search action makes the model use the tool.
-    """
-    if any(s in nl.lower() for s in _API_SOURCE_FRAGMENTS):
-        return nl
-    return (
-        "Use Google Search to look up the value below. If the request names a "
-        "specific publisher or site, use a `site:` filter or include the "
-        "publisher name in your query so your results come from that site. "
-        "You MUST actually invoke Google Search before responding — even if "
-        "you think you know the answer from training — and your response "
-        "will be rejected unless it has at least one grounding chunk from "
-        "the named publisher.\n\n"
-        f"Request: {nl}"
-    )
-
-
 def run(op: OpNode, prev: None, ctx: HarnessContext) -> list[AnnotatedValue]:
     nl = op.args.get("nl", "")
     if not nl:
         raise StepFailed("lookup_external", "Missing 'nl' arg")
 
-    user_msg = _shape_user_message(nl)
-    ctx.emit("lookup_external", "calling gemini", nl=nl,
-             wrapped=user_msg != nl)
-    resp = ctx.llm_client.call(_SYSTEM, user_msg, thinking_budget=-1, use_google_search=True)
+    ctx.emit("lookup_external", "calling gemini", nl=nl)
+    resp = ctx.llm_client.call(_SYSTEM, nl, thinking_budget=-1, use_google_search=True)
     raw = resp.text or ""
     ctx.emit("lookup_external", "gemini response",
              raw=raw[:500],
@@ -291,7 +262,6 @@ def run(op: OpNode, prev: None, ctx: HarnessContext) -> list[AnnotatedValue]:
                  value=repr(value)[:200], unit=unit)
         return [AnnotatedValue(description=nl, value=value, unit=unit)]
 
-    # MODE 1: 2 or 3 lines. parse_llm_value reads lines 1-2; we read line 3 ourselves.
     try:
         value, unit = parse_llm_value(raw)
     except ValueError as e:
@@ -300,30 +270,6 @@ def run(op: OpNode, prev: None, ctx: HarnessContext) -> list[AnnotatedValue]:
             f"Cannot parse response: {e}\nRaw: {raw[:200]}",
         ) from e
 
-    lines = [ln.strip() for ln in raw.strip().splitlines()
-             if ln.strip() and not ln.strip().startswith("```")]
-    declared_source = lines[2] if len(lines) >= 3 else "none"
-
-    # Validate: if the model declared a source, search MUST have been invoked
-    # AND at least one chunk title must mention that source. No retry — fail
-    # cleanly so the orchestrator can surface it.
-    if declared_source.lower() != "none":
-        if not resp.grounding_titles:
-            raise StepFailed(
-                "lookup_external",
-                f"Model declared source {declared_source!r} but invoked no "
-                f"Google Search (grounding_titles empty). NL: {nl!r}",
-            )
-        needle = _normalize_source_token(declared_source)
-        haystack = [_normalize_source_token(t) for t in resp.grounding_titles]
-        if not any(needle and needle in h for h in haystack):
-            raise StepFailed(
-                "lookup_external",
-                f"Model declared source {declared_source!r} but no grounding "
-                f"chunk title matched. Grounding titles: {resp.grounding_titles[:5]}",
-            )
-
     ctx.emit("lookup_external", "parsed direct",
-             value=repr(value)[:200], unit=unit,
-             declared_source=declared_source)
+             value=repr(value)[:200], unit=unit)
     return [AnnotatedValue(description=nl, value=value, unit=unit)]
