@@ -7,23 +7,28 @@ import json
 import os
 import pickle
 import re
+import threading
 import time
 
+import litellm
 import untruncate_json
 from tqdm import tqdm
-import litellm
+
 litellm.suppress_debug_info = True
 
-DEFAULT_LLM_MODEL = "openrouter/google/gemini-2.5-pro"
-DEFAULT_LLM_VISION_MODEL = "openrouter/google/gemini-2.5-pro"
+# DEFAULT_LLM_MODEL = "openai/gpt-4o-mini"
+# DEFAULT_LLM_VISION_MODEL = "openai/gpt-4o-mini"
+# DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small"
+DEFAULT_LLM_MODEL = "openrouter/google/gemini-2.5-flash"
+DEFAULT_LLM_VISION_MODEL = "openrouter/google/gemini-2.5-flash"
 DEFAULT_EMBEDDING_MODEL = "openrouter/google/gemini-embedding-001"
+
 EMBEDDING_BATCH_SIZE = 64
 
 LLM_CACHE_PATH = os.environ.get(
     "SKUNK_LLM_CACHE_PATH",
     os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "cache", "llm_call_cache.pckl")),
 )
-LLM_CACHE_LOCK_PATH = f"{LLM_CACHE_PATH}.lock"
 LLM_RATE_LIMIT_STATE_PATH = f"{LLM_CACHE_PATH}.rate_limit.json"
 LLM_RATE_LIMIT_LOCK_PATH = f"{LLM_RATE_LIMIT_STATE_PATH}.lock"
 LLM_TEXT_SYSTEM_PROMPT = "You extract compact metadata for a semantic document index. Return only the requested text."
@@ -35,49 +40,9 @@ DEFAULT_LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "10"))
 DEFAULT_LLM_RETRY_BACKOFF_SECONDS = int(os.environ.get("LLM_RETRY_BACKOFF_SECONDS", "10"))
 
 
-@contextlib.contextmanager
-def locked_llm_cache():
-    os.makedirs(os.path.dirname(LLM_CACHE_PATH), exist_ok=True)
-    with open(LLM_CACHE_LOCK_PATH, "w") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(lock_file, fcntl.LOCK_UN)
-
-
-def load_llm_cache() -> dict:
-    if not os.path.exists(LLM_CACHE_PATH):
-        return {}
-
-    with open(LLM_CACHE_PATH, "rb") as cache_file:
-        return pickle.load(cache_file)
-
-
-def save_llm_cache(cache: dict) -> None:
-    os.makedirs(os.path.dirname(LLM_CACHE_PATH), exist_ok=True)
-    tmp_cache_path = f"{LLM_CACHE_PATH}.tmp"
-    with open(tmp_cache_path, "wb") as cache_file:
-        pickle.dump(cache, cache_file)
-    os.replace(tmp_cache_path, LLM_CACHE_PATH)
-
-
 def llm_cache_key(request_inputs: dict) -> str:
     request_json = json.dumps(request_inputs, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(request_json.encode("utf-8")).hexdigest()
-
-
-def get_cached_llm_value(cache_key: str):
-    with locked_llm_cache():
-        cache = load_llm_cache()
-        return cache.get(cache_key)
-
-
-def store_cached_llm_value(cache_key: str, value) -> None:
-    with locked_llm_cache():
-        cache = load_llm_cache()
-        cache[cache_key] = value
-        save_llm_cache(cache)
 
 
 def extract_litellm_text(response) -> str:
@@ -117,6 +82,7 @@ def parse_json_response(text: str) -> dict:
             print(f"Failed to parse JSON response: {e}\nOriginal text: {text}")
             return {}
 
+
 class LLMWrapper:
     def __init__(
         self,
@@ -126,6 +92,8 @@ class LLMWrapper:
         retry_backoff_seconds: int = DEFAULT_LLM_RETRY_BACKOFF_SECONDS,
         text_timeout: int = 60,
         vision_timeout: int = 120,
+        cache_path: str = LLM_CACHE_PATH,
+        cache_enabled: bool = True,
     ):
         self.max_workers = max(1, max_workers)
         self.max_requests_per_minute = max(1, max_requests_per_minute)
@@ -133,6 +101,81 @@ class LLMWrapper:
         self.retry_backoff_seconds = max(1, retry_backoff_seconds)
         self.text_timeout = text_timeout
         self.vision_timeout = vision_timeout
+        self.cache_path = cache_path
+        self.cache_lock_path = f"{self.cache_path}.lock"
+        self.cache_enabled = cache_enabled
+        self.cache_lock = threading.RLock()
+        self.dirty_cache_entries = {}
+        if self.cache_enabled:
+            with self.locked_cache_file():
+                self.cache = self.load_cache_from_disk()
+        else:
+            self.cache = {}
+
+    @contextlib.contextmanager
+    def locked_cache_file(self):
+        os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
+        with open(self.cache_lock_path, "w") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+    def load_cache_from_disk(self) -> dict:
+        if not os.path.exists(self.cache_path):
+            return {}
+
+        with open(self.cache_path, "rb") as cache_file:
+            return pickle.load(cache_file)
+
+    def save_cache_to_disk(self, cache: dict) -> None:
+        os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
+        tmp_cache_path = f"{self.cache_path}.tmp"
+        with open(tmp_cache_path, "wb") as cache_file:
+            pickle.dump(cache, cache_file)
+        os.replace(tmp_cache_path, self.cache_path)
+
+    def get_cached_value(self, cache_key: str):
+        if not self.cache_enabled:
+            return None
+
+        with self.cache_lock:
+            return self.cache.get(cache_key)
+
+    def store_cached_value(self, cache_key: str, value) -> None:
+        if not self.cache_enabled:
+            return
+
+        with self.cache_lock:
+            self.cache[cache_key] = value
+            self.dirty_cache_entries[cache_key] = value
+
+        self.flush_cache()
+
+    def flush_cache(self) -> None:
+        if not self.cache_enabled:
+            return
+
+        with self.cache_lock:
+            if not self.dirty_cache_entries:
+                return
+            dirty_cache_entries = dict(self.dirty_cache_entries)
+
+        with self.locked_cache_file():
+            disk_cache = self.load_cache_from_disk()
+            disk_cache.update(dirty_cache_entries)
+            self.save_cache_to_disk(disk_cache)
+
+        with self.cache_lock:
+            for cache_key, value in disk_cache.items():
+                if cache_key not in self.dirty_cache_entries:
+                    self.cache[cache_key] = value
+                elif self.dirty_cache_entries[cache_key] == dirty_cache_entries.get(cache_key):
+                    self.cache[cache_key] = value
+            for cache_key in dirty_cache_entries:
+                if self.dirty_cache_entries.get(cache_key) == dirty_cache_entries[cache_key]:
+                    self.dirty_cache_entries.pop(cache_key, None)
 
     def is_rate_limit_error(self, error: Exception) -> bool:
         status_code = getattr(error, "status_code", None)
@@ -199,10 +242,9 @@ class LLMWrapper:
             "max_tokens": max_tokens,
         }
         cache_key = llm_cache_key(request_inputs)
-        cached_value = get_cached_llm_value(cache_key)
+        cached_value = self.get_cached_value(cache_key)
         if cached_value is not None:
             return cached_value
-
 
         response = self.run_with_rate_limit_retries(
             lambda: litellm.completion(
@@ -220,7 +262,7 @@ class LLMWrapper:
             )
         )
         response_text = extract_litellm_text(response)
-        store_cached_llm_value(cache_key, response_text)
+        self.store_cached_value(cache_key, response_text)
         return response_text
 
     def call_llm_vision(
@@ -240,10 +282,9 @@ class LLMWrapper:
             "max_tokens": max_tokens,
         }
         cache_key = llm_cache_key(request_inputs)
-        cached_value = get_cached_llm_value(cache_key)
+        cached_value = self.get_cached_value(cache_key)
         if cached_value is not None:
             return cached_value
-
 
         image_base64 = base64.b64encode(image_bytes).decode("ascii")
         response = self.run_with_rate_limit_retries(
@@ -273,7 +314,7 @@ class LLMWrapper:
             )
         )
         response_text = extract_litellm_text(response)
-        store_cached_llm_value(cache_key, response_text)
+        self.store_cached_value(cache_key, response_text)
         return response_text
 
     def batch_call_llm(
@@ -282,6 +323,7 @@ class LLMWrapper:
         max_tokens: int = 2048,
         model: str = DEFAULT_LLM_MODEL,
         desc: str = "LLM text batch",
+        show_progress: bool = True,
     ) -> list[str]:
         if not prompts:
             return []
@@ -292,12 +334,15 @@ class LLMWrapper:
                 executor.submit(self.call_llm, prompt, max_tokens, model): prompt_idx
                 for prompt_idx, prompt in enumerate(prompts)
             }
-            for future in tqdm(
-                concurrent.futures.as_completed(futures),
-                total=len(futures),
-                desc=desc,
-                unit="request",
-            ):
+            completed_futures = concurrent.futures.as_completed(futures)
+            if show_progress:
+                completed_futures = tqdm(
+                    completed_futures,
+                    total=len(futures),
+                    desc=desc,
+                    unit="request",
+                )
+            for future in completed_futures:
                 prompt_idx = futures[future]
                 results[prompt_idx] = future.result()
 
@@ -336,23 +381,21 @@ class LLMWrapper:
         uncached_texts = []
         uncached_positions = []
 
-        with locked_llm_cache():
-            cache = load_llm_cache()
-            for text_idx, text in enumerate(cleaned_texts):
-                request_inputs = {
-                    "call_type": "embedding",
-                    "model": model,
-                    "text": text,
-                }
-                cache_key = llm_cache_key(request_inputs)
-                if cache_key in cache:
-                    embeddings[text_idx] = cache[cache_key]
-                else:
-                    uncached_texts.append(text)
-                    uncached_positions.append((text_idx, cache_key))
+        for text_idx, text in enumerate(cleaned_texts):
+            request_inputs = {
+                "call_type": "embedding",
+                "model": model,
+                "text": text,
+            }
+            cache_key = llm_cache_key(request_inputs)
+            cached_value = self.get_cached_value(cache_key)
+            if cached_value is not None:
+                embeddings[text_idx] = cached_value
+            else:
+                uncached_texts.append(text)
+                uncached_positions.append((text_idx, cache_key))
 
         if uncached_texts:
-
             new_embeddings = {}
             for batch_start in range(0, len(uncached_texts), EMBEDDING_BATCH_SIZE):
                 batch_texts = uncached_texts[batch_start : batch_start + EMBEDDING_BATCH_SIZE]
@@ -363,10 +406,11 @@ class LLMWrapper:
                     text_idx, cache_key = batch_positions[response_idx]
                     new_embeddings[cache_key] = embedding
                     embeddings[text_idx] = embedding
-            with locked_llm_cache():
-                cache = load_llm_cache()
-                cache.update(new_embeddings)
-                save_llm_cache(cache)
+            if self.cache_enabled:
+                with self.cache_lock:
+                    self.cache.update(new_embeddings)
+                    self.dirty_cache_entries.update(new_embeddings)
+                self.flush_cache()
 
         return [embedding for embedding in embeddings if embedding is not None]
 

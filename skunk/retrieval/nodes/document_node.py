@@ -29,6 +29,7 @@ class DocumentNode:
     description: str = ""
     ocr_text_dir: str = DEFAULT_OCR_TEXT_DIR
     json_dir: str = DEFAULT_JSON_DIR
+    page_process_workers: int = PAGE_PROCESS_WORKERS
 
     def __init__(
         self,
@@ -36,6 +37,7 @@ class DocumentNode:
         pdf_bytes: bytes,
         ocr_text_dir: str = DEFAULT_OCR_TEXT_DIR,
         json_dir: str = DEFAULT_JSON_DIR,
+        page_process_workers: int = PAGE_PROCESS_WORKERS,
     ):
 
         sha256 = hashlib.sha256(pdf_bytes).hexdigest()
@@ -44,6 +46,7 @@ class DocumentNode:
         self.filename = pdf_name
         self.ocr_text_dir = ocr_text_dir
         self.json_dir = json_dir
+        self.page_process_workers = page_process_workers
 
         stem = os.path.splitext(pdf_name)[0]
         ocr_text_uri = os.path.join(self.ocr_text_dir, f"{stem}.txt")
@@ -60,7 +63,9 @@ class DocumentNode:
         self.document_date = self.extract_document_date(ocr_text)
         self.description = self.describe_text(ocr_text)
         page_images = parse_pdf_pages(
-            filename, n_workers=PAGE_PROCESS_WORKERS, dpi=PAGE_RENDER_DPI
+            filename,
+            n_workers=self.page_process_workers,
+            dpi=PAGE_RENDER_DPI,
         )
         page_images = [p for x in page_images for p in x]
         pdf.close()
@@ -83,9 +88,7 @@ class DocumentNode:
             page_id = page_ids[0] - 1 if page_ids else None
             if page_id is not None:
                 if page_id >= self.num_pdf_pages:
-                    print(
-                        f"Warning: element has page_id {page_id} which exceeds num_pdf_pages {self.num_pdf_pages}"
-                    )
+                    continue
                 else:
                     page_elements[page_id].append(e)
 
@@ -99,10 +102,12 @@ class DocumentNode:
             for idx in range(self.num_pdf_pages)
             if len(page_elements[idx]) > 0
         ]
+        self.page_nodes = [PageNode(*arg) for arg in args]
+
         self.page_nodes = pqdm(
             args,
             PageNode,
-            n_jobs=PAGE_PROCESS_WORKERS,
+            n_jobs=self.page_process_workers,
             argument_type="args",
             desc=f"Processing page nodes in {self.filename}",
         )

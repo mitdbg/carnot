@@ -63,11 +63,12 @@ evals = [
 ]
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = {"" = "src", "skunk" = "skunk"}
 include-package-data = true
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["src", "."]
+include = ["carnot*", "skunk*"]
 namespaces = false
 
 [tool.setuptools.package-data]
