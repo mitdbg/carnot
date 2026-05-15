@@ -38,6 +38,7 @@ class DocumentNode:
         ocr_text_dir: str = DEFAULT_OCR_TEXT_DIR,
         json_dir: str = DEFAULT_JSON_DIR,
         page_process_workers: int = PAGE_PROCESS_WORKERS,
+        use_cache: bool = True,
     ):
 
         sha256 = hashlib.sha256(pdf_bytes).hexdigest()
@@ -47,6 +48,7 @@ class DocumentNode:
         self.ocr_text_dir = ocr_text_dir
         self.json_dir = json_dir
         self.page_process_workers = page_process_workers
+        self.use_cache = use_cache
 
         stem = os.path.splitext(pdf_name)[0]
         ocr_text_uri = os.path.join(self.ocr_text_dir, f"{stem}.txt")
@@ -98,11 +100,12 @@ class DocumentNode:
                 idx,
                 page_elements.get(idx, []),
                 page_images[idx],
+                self.use_cache,
             )
             for idx in range(self.num_pdf_pages)
             if len(page_elements[idx]) > 0
         ]
-        self.page_nodes = [PageNode(*arg) for arg in args]
+        # self.page_nodes = [PageNode(*arg) for arg in args]
 
         self.page_nodes = pqdm(
             args,
@@ -129,7 +132,7 @@ Document OCR text:
 {text[:MAX_DOCUMENT_PROMPT_CHARS]}
 """.strip()
 
-        return DEFAULT_LLM_WRAPPER.call_llm(prompt)
+        return DEFAULT_LLM_WRAPPER.call_llm(prompt, use_cache=self.use_cache)
 
     def extract_document_date(self, text: str) -> str:
         if not text.strip():
@@ -149,7 +152,7 @@ Document OCR text:
 {text[:MAX_DOCUMENT_PROMPT_CHARS]}
 """.strip()
 
-        return DEFAULT_LLM_WRAPPER.call_llm(prompt)
+        return DEFAULT_LLM_WRAPPER.call_llm(prompt, use_cache=self.use_cache)
 
     def describe_text(self, text: str) -> str:
         fallback = f"{self.document_title} from {self.document_date} contains {self.num_pdf_pages} pages."
@@ -174,5 +177,5 @@ Document OCR text:
 {text[:MAX_DOCUMENT_PROMPT_CHARS]}
 """.strip()
 
-        desc = DEFAULT_LLM_WRAPPER.call_llm(prompt)
+        desc = DEFAULT_LLM_WRAPPER.call_llm(prompt, use_cache=self.use_cache)
         return desc

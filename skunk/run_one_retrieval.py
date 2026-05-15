@@ -21,6 +21,7 @@ OFFICEQA_PATH = f"{REPO_ROOT}/skunk/officeqa_pro.csv"
 PDF_DIR = f"{REPO_ROOT}/data/{DATASET}/treasury_bulletin_pdfs"
 DOCS_DIR = f"{REPO_ROOT}/data/{DATASET}/treasury_bulletins_parsed/transformed"
 RENDER_BINARY = True
+USE_CACHE = True
 
 load_dotenv(ENV_FILE)
 
@@ -59,6 +60,8 @@ input_files = [
 ]
 print(f"input_files from {cutoff_years[0]} to {cutoff_years[1]}: {len(input_files)}")
 
+input_files = ["treasury_bulletin_1987_12.pdf"]
+
 input_files = sorted(input_files)
 # indexed_files = pdf_files[:NUM_DOCUMENTS]
 pdf_paths = []
@@ -71,6 +74,7 @@ index = SemanticDocumentIndex(
     pdf_dir=PDF_DIR,
     ocr_text_dir=DOCS_DIR,
     render_binary=RENDER_BINARY,
+    use_cache=USE_CACHE,
 )
 
 document_ids = []

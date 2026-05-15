@@ -26,6 +26,7 @@ class SemanticDocumentIndex:
         render_binary: bool = True,
         render_zoom: float = 1.0,
         cache_path: str = DEFAULT_CACHE_PATH,
+        use_cache: bool = True,
     ):
         self.cache_path = cache_path
         self.documents: dict[str, DocumentNode] = {}
@@ -36,7 +37,7 @@ class SemanticDocumentIndex:
         self.embedding_matrix: np.ndarray | None = None
         self.embedding_model: str | None = None
         self.embedding_faiss_index: faiss.IndexFlatIP | None = None
-        if os.path.exists(self.cache_path):
+        if os.path.exists(self.cache_path) and use_cache:
             try:
                 with open(self.cache_path, "rb") as cache_file:
                     cached_data = pickle.load(cache_file)
@@ -62,8 +63,12 @@ class SemanticDocumentIndex:
         self.render_binary = render_binary
         self.render_zoom = render_zoom
         self.cache_path = cache_path
+        self.use_cache = use_cache
 
     def _save_cache(self) -> None:
+        if not self.use_cache:
+            return
+
         os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
         temp_cache_path = f"{self.cache_path}.tmp"
         with open(temp_cache_path, "wb") as cache_file:
@@ -100,7 +105,10 @@ class SemanticDocumentIndex:
             return self._sha_to_document_id[sha256]
 
         document_node = DocumentNode(
-            filename=source_uri, pdf_bytes=raw_pdf, ocr_text_dir=self.ocr_text_dir
+            filename=source_uri,
+            pdf_bytes=raw_pdf,
+            ocr_text_dir=self.ocr_text_dir,
+            use_cache=self.use_cache,
         )
         self.documents[document_node.document_id] = document_node
         self._sha_to_document_id[sha256] = document_node.document_id
@@ -115,9 +123,10 @@ class SemanticDocumentIndex:
             document_description = document.description or f"{document.document_title} {document.document_date} {document.filename}".strip()
             node_ids.append(document.document_id)
             descriptions.append(document_description)
-
             for page in document.page_nodes:
-                page_description = page.description or f"Page {page.page_number}".strip()
+                page.description
+
+                page_description = page.description or f"Page {page.page_pdf_number}".strip()
                 node_ids.append(page.page_id)
                 descriptions.append(page_description)
 
@@ -141,7 +150,14 @@ class SemanticDocumentIndex:
             self._save_cache()
             return
 
-        matrix = np.array(DEFAULT_LLM_WRAPPER.embed_texts(descriptions, model=embedding_model), dtype="float32")
+        matrix = np.array(
+            DEFAULT_LLM_WRAPPER.embed_texts(
+                descriptions,
+                model=embedding_model,
+                use_cache=self.use_cache,
+            ),
+            dtype="float32",
+        )
         faiss.normalize_L2(matrix)
         self.embedding_idx_map = {node_id: node_idx for node_idx, node_id in enumerate(node_ids)}
         self.embedding_node_ids = node_ids
@@ -273,7 +289,7 @@ class SemanticDocumentIndex:
 
                 output.append(
                     f"{document_prefix}{page_branch}page {page.page_id} "
-                    f"[pdf={page.page_pdf_number}; doc={page.page_number}]"
+                    f"[pdf={page.page_pdf_number}; doc={page.page_pdf_number}]"
                 )
                 if page_desc:
                     output.append(f"{document_prefix}{page_prefix}|-- description: {page_desc}")

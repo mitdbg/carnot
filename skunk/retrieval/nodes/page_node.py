@@ -52,9 +52,11 @@ class PageNode:
         page_pdf_number: int,
         page_elements: list[dict],
         page_image: bytes,
+        use_cache: bool = True,
     ):
         self.page_id = f"{document_id}_page:{page_pdf_number}"
         self.page_pdf_number = page_pdf_number
+        self.use_cache = use_cache
         # TODO: KEEP IT IN MEMORY? NAH
         # self.page_image = page_image
         self.page_elements = page_elements
@@ -94,12 +96,12 @@ class PageNode:
 
         # Batching all prompts together
         text_prompt = PageNode.description_prompt(page_text)
-        response = DEFAULT_LLM_WRAPPER.call_llm(text_prompt)
+        response = DEFAULT_LLM_WRAPPER.call_llm(text_prompt, use_cache=self.use_cache)
         self.description = response
 
         if len(text_blocks) > 0:
             prompts = PageNode.text_blocks_prompt(text_blocks)
-            response = DEFAULT_LLM_WRAPPER.call_llm(prompts)
+            response = DEFAULT_LLM_WRAPPER.call_llm(prompts, use_cache=self.use_cache)
             parsed = parse_json_response(response)
             for text_block in parsed.get("text_blocks", []):
                 block_idx = text_block["block_idx"]
@@ -114,7 +116,7 @@ class PageNode:
 
         if len(tables) > 0:
             prompt = PageNode.tables_prompt(tables)
-            response = DEFAULT_LLM_WRAPPER.call_llm(prompt)
+            response = DEFAULT_LLM_WRAPPER.call_llm(prompt, use_cache=self.use_cache)
             parsed = parse_json_response(response)
             for table_info in parsed.get("tables", []):
                 title = table_info.get("table_title", "")
@@ -137,6 +139,7 @@ class PageNode:
             visual_responses = DEFAULT_LLM_WRAPPER.call_llm_vision(
                 PageNode.plots_prompt(page_text, page_image),
                 page_image,
+                use_cache=self.use_cache,
             )
             parsed = parse_json_response(visual_responses)
             for plot_idx, plot in enumerate(parsed.get("plots", [])):
@@ -147,7 +150,6 @@ class PageNode:
                         description=plot.get("description", ""),
                     )
                 )
-
 
     @staticmethod
     def description_prompt(text: str) -> str:

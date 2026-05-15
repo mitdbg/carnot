@@ -232,7 +232,13 @@ class LLMWrapper:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
             time.sleep(sleep_seconds)
 
-    def call_llm(self, prompt: str, max_tokens: int = 2048, model: str = DEFAULT_LLM_MODEL) -> str:
+    def call_llm(
+        self,
+        prompt: str,
+        max_tokens: int = 2048,
+        model: str = DEFAULT_LLM_MODEL,
+        use_cache: bool = True,
+    ) -> str:
         request_inputs = {
             "call_type": "litellm_text",
             "model": model,
@@ -241,10 +247,11 @@ class LLMWrapper:
             "temperature": 0,
             "max_tokens": max_tokens,
         }
-        cache_key = llm_cache_key(request_inputs)
-        cached_value = self.get_cached_value(cache_key)
-        if cached_value is not None:
-            return cached_value
+        if use_cache:
+            cache_key = llm_cache_key(request_inputs)
+            cached_value = self.get_cached_value(cache_key)
+            if cached_value is not None:
+                return cached_value
 
         response = self.run_with_rate_limit_retries(
             lambda: litellm.completion(
@@ -262,7 +269,8 @@ class LLMWrapper:
             )
         )
         response_text = extract_litellm_text(response)
-        self.store_cached_value(cache_key, response_text)
+        if use_cache:
+            self.store_cached_value(cache_key, response_text)
         return response_text
 
     def call_llm_vision(
@@ -271,6 +279,7 @@ class LLMWrapper:
         image_bytes: bytes,
         max_tokens: int = 4096,
         model: str = DEFAULT_LLM_VISION_MODEL,
+        use_cache: bool = True,
     ) -> str:
         request_inputs = {
             "call_type": "litellm_vision",
@@ -281,10 +290,11 @@ class LLMWrapper:
             "temperature": 0,
             "max_tokens": max_tokens,
         }
-        cache_key = llm_cache_key(request_inputs)
-        cached_value = self.get_cached_value(cache_key)
-        if cached_value is not None:
-            return cached_value
+        if use_cache:
+            cache_key = llm_cache_key(request_inputs)
+            cached_value = self.get_cached_value(cache_key)
+            if cached_value is not None:
+                return cached_value
 
         image_base64 = base64.b64encode(image_bytes).decode("ascii")
         response = self.run_with_rate_limit_retries(
@@ -314,7 +324,8 @@ class LLMWrapper:
             )
         )
         response_text = extract_litellm_text(response)
-        self.store_cached_value(cache_key, response_text)
+        if use_cache:
+            self.store_cached_value(cache_key, response_text)
         return response_text
 
     def batch_call_llm(
@@ -324,6 +335,7 @@ class LLMWrapper:
         model: str = DEFAULT_LLM_MODEL,
         desc: str = "LLM text batch",
         show_progress: bool = True,
+        use_cache: bool = True,
     ) -> list[str]:
         if not prompts:
             return []
@@ -331,7 +343,13 @@ class LLMWrapper:
         results: list[str | None] = [None] * len(prompts)
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="llm-text") as executor:
             futures = {
-                executor.submit(self.call_llm, prompt, max_tokens, model): prompt_idx
+                executor.submit(
+                    self.call_llm,
+                    prompt,
+                    max_tokens=max_tokens,
+                    model=model,
+                    use_cache=use_cache,
+                ): prompt_idx
                 for prompt_idx, prompt in enumerate(prompts)
             }
             completed_futures = concurrent.futures.as_completed(futures)
@@ -354,6 +372,8 @@ class LLMWrapper:
         max_tokens: int = 4096,
         model: str = DEFAULT_LLM_VISION_MODEL,
         desc: str = "LLM vision batch",
+        show_progress: bool = True,
+        use_cache: bool = True,
     ) -> list[str]:
         if not requests:
             return []
@@ -361,21 +381,36 @@ class LLMWrapper:
         results: list[str | None] = [None] * len(requests)
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="llm-vision") as executor:
             futures = {
-                executor.submit(self.call_llm_vision, prompt, image_bytes, max_tokens, model): request_idx
+                executor.submit(
+                    self.call_llm_vision,
+                    prompt,
+                    image_bytes,
+                    max_tokens=max_tokens,
+                    model=model,
+                    use_cache=use_cache,
+                ): request_idx
                 for request_idx, (prompt, image_bytes) in enumerate(requests)
             }
-            for future in tqdm(
-                concurrent.futures.as_completed(futures),
-                total=len(futures),
-                desc=desc,
-                unit="request",
-            ):
+            completed_futures = concurrent.futures.as_completed(futures)
+            if show_progress:
+                completed_futures = tqdm(
+                    completed_futures,
+                    total=len(futures),
+                    desc=desc,
+                    unit="request",
+                )
+            for future in completed_futures:
                 request_idx = futures[future]
                 results[request_idx] = future.result()
 
         return [result or "" for result in results]
 
-    def embed_texts(self, texts: list[str], model: str = DEFAULT_EMBEDDING_MODEL) -> list[list[float]]:
+    def embed_texts(
+        self,
+        texts: list[str],
+        model: str = DEFAULT_EMBEDDING_MODEL,
+        use_cache: bool = True,
+    ) -> list[list[float]]:
         cleaned_texts = [text.strip() or "empty semantic description" for text in texts]
         embeddings: list[list[float] | None] = [None] * len(cleaned_texts)
         uncached_texts = []
@@ -388,8 +423,8 @@ class LLMWrapper:
                 "text": text,
             }
             cache_key = llm_cache_key(request_inputs)
-            cached_value = self.get_cached_value(cache_key)
-            if cached_value is not None:
+            cached_value = self.get_cached_value(cache_key) if use_cache else None
+            if use_cache and cached_value is not None:
                 embeddings[text_idx] = cached_value
             else:
                 uncached_texts.append(text)
@@ -406,7 +441,7 @@ class LLMWrapper:
                     text_idx, cache_key = batch_positions[response_idx]
                     new_embeddings[cache_key] = embedding
                     embeddings[text_idx] = embedding
-            if self.cache_enabled:
+            if use_cache and self.cache_enabled:
                 with self.cache_lock:
                     self.cache.update(new_embeddings)
                     self.dirty_cache_entries.update(new_embeddings)

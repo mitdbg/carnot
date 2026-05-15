@@ -24,6 +24,7 @@ class Retriever:
         relevant_nodes_k: int = 10,
         final_documents_k: int = 5,
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        use_cache: bool | None = None,
     ):
         if candidate_nodes_per_keyword <= 0:
             raise ValueError("candidate_nodes_per_keyword must be positive")
@@ -37,6 +38,7 @@ class Retriever:
         self.relevant_nodes_k = relevant_nodes_k
         self.final_documents_k = final_documents_k
         self.embedding_model = embedding_model
+        self.use_cache = getattr(index, "use_cache", True) if use_cache is None else use_cache
 
     def retrieve(self, question: str) -> list[DocumentNode]:
         if not isinstance(question, str) or not question.strip():
@@ -57,7 +59,11 @@ class Retriever:
                 query_terms.append(term.strip())
                 seen_terms.add(normalized)
 
-        term_embeddings = DEFAULT_LLM_WRAPPER.embed_texts(query_terms, model=self.embedding_model)
+        term_embeddings = DEFAULT_LLM_WRAPPER.embed_texts(
+            query_terms,
+            model=self.embedding_model,
+            use_cache=self.use_cache,
+        )
         candidates_by_id = {}
         for term, term_embedding in zip(query_terms, term_embeddings, strict=True):
             scored_records = []
@@ -140,7 +146,7 @@ Tree exploration context:
 {tree_context}
 """.strip()
         try:
-            parsed = parse_json_response(DEFAULT_LLM_WRAPPER.call_llm(prompt))
+            parsed = parse_json_response(DEFAULT_LLM_WRAPPER.call_llm(prompt, use_cache=self.use_cache))
         except Exception:
             parsed = {"keywords": []}
 
@@ -231,7 +237,13 @@ Candidate nodes:
 {json.dumps(prompt_candidates, indent=2)}
 """.strip()
         try:
-            parsed = parse_json_response(DEFAULT_LLM_WRAPPER.call_llm(prompt, max_tokens=4096))
+            parsed = parse_json_response(
+                DEFAULT_LLM_WRAPPER.call_llm(
+                    prompt,
+                    max_tokens=4096,
+                    use_cache=self.use_cache,
+                )
+            )
         except Exception:
             return []
 
