@@ -60,7 +60,7 @@ input_files = [
 ]
 print(f"input_files from {cutoff_years[0]} to {cutoff_years[1]}: {len(input_files)}")
 
-input_files = ["treasury_bulletin_1987_12.pdf"]
+# input_files = ["treasury_bulletin_1987_12.pdf"]
 
 input_files = sorted(input_files)
 # indexed_files = pdf_files[:NUM_DOCUMENTS]

@@ -47,9 +47,13 @@ class SemanticDocumentIndex:
                     self.embedding_node_ids = cached_data.get("embedding_node_ids", [])
                     self.embedding_matrix = cached_data.get("embedding_matrix")
                     self.embedding_model = cached_data.get("embedding_model")
+                    for document in self.documents.values():
+                        for page_node in document.page_nodes:
+                            if isinstance(page_node, Exception):
+                                raise ValueError("Cached semantic index contains a failed page node result.")
                     if self.embedding_matrix is not None:
                         self._rebuild_faiss_index()
-            except (EOFError, OSError, pickle.PickleError, TypeError, AttributeError, KeyError):
+            except (EOFError, OSError, pickle.PickleError, TypeError, AttributeError, KeyError, ValueError):
                 self.documents: dict[str, DocumentNode] = {}
                 self._sha_to_document_id: dict[str, str] = {}
                 self.embedding_idx_map = {}
@@ -113,6 +117,8 @@ class SemanticDocumentIndex:
         self.documents[document_node.document_id] = document_node
         self._sha_to_document_id[sha256] = document_node.document_id
         self.initialized = False
+        if self.use_cache:
+            DEFAULT_LLM_WRAPPER.flush_cache()
         self._save_cache()
         return document_node.document_id
 
@@ -124,8 +130,6 @@ class SemanticDocumentIndex:
             node_ids.append(document.document_id)
             descriptions.append(document_description)
             for page in document.page_nodes:
-                page.description
-
                 page_description = page.description or f"Page {page.page_pdf_number}".strip()
                 node_ids.append(page.page_id)
                 descriptions.append(page_description)
@@ -164,6 +168,8 @@ class SemanticDocumentIndex:
         self.embedding_matrix = matrix
         self.embedding_model = embedding_model
         self._rebuild_faiss_index()
+        if self.use_cache:
+            DEFAULT_LLM_WRAPPER.flush_cache()
         self._save_cache()
         self.initialized = True
 

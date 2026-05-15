@@ -71,25 +71,30 @@ class PageNode:
             content = element.get("content")
             if not content:
                 continue
+            if isinstance(content, list):
+                content_text = "\n\n".join(str(part) for part in content if part is not None)
+            else:
+                content_text = str(content)
 
-            page_text += f"\n\n {content}"
+            page_text += f"\n\n {content_text}"
             if element.get("type") == "page_number":
-                candidate_nums.append(content.strip())
+                candidate_nums.append(content_text.strip())
             elif element.get("type") in [
                 "page_header",
                 "page_footer",
                 "section_header",
                 "section_footer",
             ]:
-                metadata.append(content.strip())
+                metadata.append(content_text.strip())
             elif element.get("type") == "table":
-                tables.append(content.strip())
+                tables.append(content_text.strip())
             elif element.get("type") == "figure":
                 figures = True
             else:
-                text_blocks.append(content.strip())
+                text_blocks.append(content_text.strip())
 
         self.page_text = page_text
+        self.page_number = candidate_nums[0] if candidate_nums else str(page_pdf_number + 1)
         self.text_nodes = []
         self.table_nodes = []
         self.plot_nodes = []
@@ -103,6 +108,8 @@ class PageNode:
             prompts = PageNode.text_blocks_prompt(text_blocks)
             response = DEFAULT_LLM_WRAPPER.call_llm(prompts, use_cache=self.use_cache)
             parsed = parse_json_response(response)
+            if isinstance(parsed, list):
+                parsed = {"text_blocks": parsed}
             for text_block in parsed.get("text_blocks", []):
                 block_idx = text_block["block_idx"]
                 description = text_block["description"]
@@ -118,6 +125,9 @@ class PageNode:
             prompt = PageNode.tables_prompt(tables)
             response = DEFAULT_LLM_WRAPPER.call_llm(prompt, use_cache=self.use_cache)
             parsed = parse_json_response(response)
+            if isinstance(parsed, list):
+                parsed = {"tables": parsed}
+
             for table_info in parsed.get("tables", []):
                 title = table_info.get("table_title", "")
                 table_idx = int(table_info["table_idx"])

@@ -151,8 +151,6 @@ class LLMWrapper:
             self.cache[cache_key] = value
             self.dirty_cache_entries[cache_key] = value
 
-        self.flush_cache()
-
     def flush_cache(self) -> None:
         if not self.cache_enabled:
             return
@@ -445,7 +443,6 @@ class LLMWrapper:
                 with self.cache_lock:
                     self.cache.update(new_embeddings)
                     self.dirty_cache_entries.update(new_embeddings)
-                self.flush_cache()
 
         return [embedding for embedding in embeddings if embedding is not None]
 

@@ -112,8 +112,14 @@ class DocumentNode:
             PageNode,
             n_jobs=self.page_process_workers,
             argument_type="args",
+            exception_behaviour="immediate",
             desc=f"Processing page nodes in {self.filename}",
         )
+        for arg, page_node in zip(args, self.page_nodes, strict=True):
+            if isinstance(page_node, Exception):
+                raise RuntimeError(
+                    f"Failed to process page {arg[1]} in {self.filename}"
+                ) from page_node
 
     def extract_document_title(self, text: str) -> str:
         if not text.strip():
