@@ -9,24 +9,7 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
-PageKind = Literal["table", "text", "chart", "toc", "blank"]
-Granularity = Literal["monthly", "quarterly", "annual", "point", "mixed", "unknown"]
-
-
-@dataclass
-class PeriodSpec:
-    """One period that a page reports on, normalized to (start, end) ISO dates.
-
-    `kind` retains the original form for human inspection and tiebreaker rules
-    (e.g. prefer pages whose period kind matches the query's period kind).
-    """
-    kind: Literal["CY", "FY", "Q", "month", "day", "year", "range"]
-    start: str   # ISO date "YYYY-MM-DD" (first day of the span)
-    end: str     # ISO date "YYYY-MM-DD" (last day of the span, inclusive)
-    raw: str = ""  # original string as written by the page (e.g. "Calendar Year 1940")
-
-    def overlaps(self, other_start: str, other_end: str) -> bool:
-        return not (self.end < other_start or self.start > other_end)
+PageKind = Literal["table", "text", "chart", "prose", "toc", "blank"]
 
 
 @dataclass
@@ -37,17 +20,13 @@ class PageCatalogRow:
     page_kind: PageKind = "blank"
 
     # Populated only for page_kind ∈ {table, chart}:
-    section: str | None = None                      # from native TOC harvest
-    table_title: str | None = None                  # verbatim
+    section: str | None = None                      # ToC section label (None ⇒ Unsectioned)
+    printed_page: str | None = None                 # page-footer label (e.g. "9", "A-1")
+    table_title: str | None = None                  # verbatim caption/title
     column_headers: list[str] = field(default_factory=list)
     row_headers_sample: list[str] = field(default_factory=list)
-    keywords: list[str] = field(default_factory=list)  # verbatim noun phrases
-    periods_covered: list[PeriodSpec] = field(default_factory=list)
-    granularity: Granularity = "unknown"
-    is_retrospective: bool = False                  # max(periods.end) < bulletin month
-
-    # Filled in by Stage 4 clustering pass (later); None until then.
-    keyword_cluster_id: str | None = None
+    keywords: list[str] = field(default_factory=list)  # dateless concept phrases
+    dates: list[str] = field(default_factory=list)     # verbatim date strings on the page
 
     # Diagnostic — useful for debugging extraction quality without re-reading the PDF.
     char_count: int = 0
@@ -60,5 +39,8 @@ class PageCatalogRow:
     @classmethod
     def from_json(cls, line: str) -> "PageCatalogRow":
         d: dict[str, Any] = json.loads(line)
-        periods = [PeriodSpec(**p) for p in d.pop("periods_covered", [])]
-        return cls(periods_covered=periods, **d)
+        # Tolerate legacy fields written by v0.2/v0.3 catalogs.
+        for legacy in ("periods_covered", "granularity", "is_retrospective",
+                       "keyword_cluster_id", "page_summary"):
+            d.pop(legacy, None)
+        return cls(**d)

@@ -51,6 +51,7 @@ class LevelTrace:
     output_count: int = 0                 # number of items the LLM returned
     prompt_excerpt: str = ""              # first 800 chars of the user message
     response_excerpt: str = ""            # first 800 chars of the raw model response
+    steps: list[dict[str, Any]] = field(default_factory=list)  # per-round actions (agentic loops)
 
 
 @dataclass
@@ -59,7 +60,6 @@ class RetrieveTrace:
     retrieve_idx: int
     concept: str
     period: str
-    source_bulletin: str | None
     catalog_size: int
     prefilter_s: float = 0.0
     candidate_count: int = 0
@@ -83,16 +83,13 @@ def load_catalog(catalog_dir: Path) -> list[PageCatalogRow]:
 def period_prefilter(
     catalog: list[PageCatalogRow],
     period: str,
-    source_bulletin: str | None = None,
 ) -> list[PageCatalogRow]:
     """Keep rows whose periods_covered overlaps the query period.
-    Restricts to page_kind in {table, chart}. Optional source_bulletin pin."""
+    Restricts to page_kind in {table, chart}."""
     intervals = period_to_intervals(period)
     out: list[PageCatalogRow] = []
     for row in catalog:
         if row.page_kind not in ("table", "chart"):
-            continue
-        if source_bulletin is not None and row.bulletin != source_bulletin:
             continue
         for q_start, q_end in intervals:
             if any(intervals_overlap(p.start, p.end, q_start, q_end)
@@ -264,19 +261,20 @@ Rules:
 
 _CLUSTER_PICK_SYSTEM = """You pick which keyword clusters inside selected sections
 likely lead to the answer. You will see the user's question, the concept tag, the
-period, and a list of cluster labels (with their parent section). Each cluster
-groups related Treasury terms; by picking one you commit to ranking its terms.
+period, and a list of clusters (each with its parent section, a label, and a
+keyword count). Each cluster groups related Treasury keywords; by picking one
+you commit to ranking its keyword postings.
 
 Output a SINGLE JSON object (no prose, no fences):
   {"picked": [
-      {"section": "<section label>", "cluster_id": "<Cnn>"},
+      {"section": "<section label>", "cluster_label": "<cluster label>"},
       ...
     ]}
 
 Rules:
-  - Return AT MOST K (default 3) entries, best-to-worst. Use EXACT section labels
-    and cluster_ids as shown.
-  - Prefer clusters whose label or central_terms name the concept directly.
+  - Return AT MOST K (default 3) entries, best-to-worst. Use EXACT section
+    labels and cluster_labels as shown.
+  - Prefer clusters whose label names the concept directly.
 """
 
 
@@ -301,16 +299,68 @@ Rules:
 """
 
 
-_LEAF_RANK_HIER_SYSTEM = """You are given a flat list of candidate Treasury Bulletin
-pages reached via the concept walk. Each entry is `(description, bulletin, page)`
-where `description` is the page's verbatim table title — often including a date
-string like 'December 31, 1949' or 'February 20, 1952'.
+_LEAF_RANK_HIER_SYSTEM = """You are given a list of candidate Treasury Bulletin
+pages reached via the concept walk. Each candidate is a TEXT BLOB formatted as:
 
-Pick the top-K pages that best answer the user's question. The question's period
-(e.g. '1949-12', '1952-02-29', '1942-03..1948-10') needs to match against the
-date string inside each description. Treat day-of-month as fuzzy: a question
-about 'February 28, 1952' matches a description about 'February 20, 1952' —
-both denote the same monthly snapshot.
+  === YYYY-MM p<N> ===
+  [title]    <verbatim table caption, or "(no title)">
+  [columns]  <up to 50 column-header strings, joined by " | ">
+  [rows]     <up to 12 sample row-header strings, joined by " | ">
+  [dates]    <verbatim date strings on the page, joined by "; ">
+
+Prose pages substitute `[content]` for `[columns]`/`[rows]`, listing the page's
+dateless concept phrases.
+
+Pick the top-K pages that best answer the user's question. The blob shows
+exactly what each candidate page contains. Use the signals:
+  - `[title]` is the AUTHORITATIVE caption — e.g.
+      "Table 1.- Status under Limitation, December 31, 1949"
+      "Maturity Schedule of Interest-Bearing Public Marketable Securities ...
+       Outstanding January 31, 1950"
+      "Summary by Months and Calendar Years"
+    Any date inside the title is the page's SNAPSHOT date (what the table is
+    reporting on). Title wording distinguishes summary vs. detail tables
+    ("Summary by Months and Calendar Years" vs. "Detail of Expenditures by
+    Months and Years") — pages with identical concepts often differ ONLY in
+    their title.
+  - `[columns]` and `[rows]` show the table's actual schema — use them to
+    confirm the page has the right axes/breakdown for the question. A page
+    titled "Public Debt" with columns "Bills | Notes | Bonds | Total" is
+    very different from one with columns "December 31 | March 31 | June 30 |
+    September 30".
+  - `[dates]` is supplementary — ALL date strings on the page, including
+    bulletin month, column-header years, and footnote years. Only weight
+    entries that the title doesn't already cover.
+
+Ranking rules:
+  1. PERIOD: prefer pages whose `[title]` date matches the question's
+     period. If the title has no date, fall back to `[dates]`.
+  2. CONCEPT: among period-matching pages, prefer the one whose title most
+     specifically names what the question asks about ("Summary by Calendar
+     Years" > "Detail of Expenditures" for a calendar-year question).
+  3. Day-of-month is fuzzy: 'February 28, 1952' matches 'February 29, 1952'
+     or 'February 1952' — same monthly snapshot.
+  4. Publication lag is expected: a bulletin published months AFTER the
+     question's period is often the canonical retrospective home.
+  5. LITERAL TITLE WORDING: when the question uses phrases like "calendar
+     years" vs. "fiscal years" vs. "monthly", prefer titles that contain
+     those literal phrases. "Summary by Months and Calendar Years" is a
+     DISTINCT table from "Summary by Months and Years" or "Summary of
+     Budget Results by Months and Years" — they sit side-by-side in the
+     bulletin and report different things. Title wording is authoritative;
+     do not collapse near-synonyms.
+  6. EARLIEST CANONICAL RETROSPECTIVE: when multiple bulletins (e.g. 1950-02,
+     1952-02, 1953-02) carry the SAME or near-identical title and all cover
+     the question's period, prefer the EARLIEST one. Treasury publishes the
+     canonical year-end summary in the first bulletin after the period
+     closes; later bulletins republish the same table with extended columns.
+
+Source-bulletin hard pin: when the QUESTION TEXT literally names a bulletin
+issue (e.g., "page 5 of the September 1990 Treasury Bulletin", "the March
+1948 issue"), return ONLY matches from that bulletin and reject candidates
+from other bulletins. Otherwise consider all bulletins — the answer often
+lives in a retrospective bulletin published months after the question's
+period (e.g. "as of March 31, 2025" is often answered in the 2025-06 issue).
 
 Output a SINGLE JSON object (no prose, no fences):
   {"ranked": [
@@ -318,11 +368,14 @@ Output a SINGLE JSON object (no prose, no fences):
     ]}
 
 Rules:
-  - Return AT MOST 5 entries, best-to-worst.
-  - Match the description's date string to the question's period. Prefer
-    descriptions whose date falls inside (or at the closing month of) the period.
-  - A bulletin published months AFTER the question's period is the canonical
-    retrospective home — don't reject it for that reason; it's expected.
+  - Return AT LEAST 1 page even if no candidate is a perfect match. An
+    empty result is never useful — pick the best available candidate so
+    downstream extract has something to try. If many pages genuinely match
+    (multi-year question spanning multiple snapshots), return all of them
+    best-to-worst.
+  - Do not pad with obviously irrelevant matches when 1-2 pages clearly fit.
+  - Concept match comes first; among concept-matching pages, prefer the one
+    whose summary date falls inside (or at the closing month of) the period.
   - Dedupe by (bulletin, page).
 """
 
@@ -376,12 +429,17 @@ def section_pick(
         obj = json.loads(_strip_code_fence(resp.text))
     except json.JSONDecodeError:
         return [], trace
-    valid = {label for label, _ in sections}
-    picked = []
+    # Case-insensitive section-label lookup — the LLM sometimes lower-cases
+    # parts of titles, and we don't want to drop the right pick over casing.
+    valid = {label.lower(): label for label, _ in sections}
+    picked: list[str] = []
+    picked_lower: set[str] = set()
     for s in _picked_set(obj, "picked"):
-        s = str(s).strip()
-        if s in valid and s not in picked:
-            picked.append(s)
+        key = str(s).strip().lower()
+        canonical = valid.get(key)
+        if canonical and key not in picked_lower:
+            picked.append(canonical)
+            picked_lower.add(key)
         if len(picked) >= k:
             break
     trace.output_count = len(picked)
@@ -397,16 +455,17 @@ def cluster_pick(
     *,
     k: int = 3,
 ) -> tuple[list[tuple[str, str]], LevelTrace]:
-    """clusters = [(section_label, cluster_id, cluster_data)]. Return up to k (section, cluster_id) tuples."""
+    """clusters = [(section_label, cluster_label, cluster_data)].
+    Return up to k (section, cluster_label) tuples."""
     trace = LevelTrace(level="cluster_pick", input_count=len(clusters), input_chars=0)
     if not clusters:
         return [], trace
 
     listing = [
-        {"section": section, "cluster_id": cid, "label": cdata["label"],
-         "central_terms": cdata["central_terms"],
-         "n_terms": cdata["n_terms"], "n_pages": cdata["n_pages"]}
-        for section, cid, cdata in clusters
+        {"section": section, "cluster_label": cluster_label,
+         "n_keywords": cdata.get("n_keywords", 0),
+         "n_pages": cdata.get("n_pages", 0)}
+        for section, cluster_label, cdata in clusters
     ]
     user = (
         f"Question: {question}\n\n"
@@ -431,14 +490,18 @@ def cluster_pick(
         obj = json.loads(_strip_code_fence(resp.text))
     except json.JSONDecodeError:
         return [], trace
-    valid = {(s, c) for s, c, _ in clusters}
+    valid = {(s.lower(), c.lower()): (s, c) for s, c, _ in clusters}
     picked: list[tuple[str, str]] = []
+    picked_lower: set[tuple[str, str]] = set()
     for entry in _picked_set(obj, "picked"):
         if not isinstance(entry, dict):
             continue
-        key = (str(entry.get("section", "")), str(entry.get("cluster_id", "")))
-        if key in valid and key not in picked:
-            picked.append(key)
+        key = (str(entry.get("section", "")).strip().lower(),
+               str(entry.get("cluster_label", "")).strip().lower())
+        canonical = valid.get(key)
+        if canonical and key not in picked_lower:
+            picked.append(canonical)
+            picked_lower.add(key)
         if len(picked) >= k:
             break
     trace.output_count = len(picked)
@@ -502,27 +565,67 @@ def term_pick(
     return picked, trace
 
 
+def _build_leaf_blob(row: PageCatalogRow) -> str:
+    """Per-candidate text blob fed to the leaf-rank LLM.
+
+    Format is fixed and documented in `_LEAF_RANK_HIER_SYSTEM`. Prose pages
+    have no column/row headers, so we substitute the keyword list as content.
+    Field caps keep the per-candidate footprint bounded so a few-hundred-
+    candidate prompt stays well under the context window.
+    """
+    title = row.table_title or "(no title)"
+    lines = [f"=== {row.bulletin} p{row.page} ===",
+             f"[title]    {title}"]
+    if row.page_kind == "prose":
+        if row.keywords:
+            lines.append(f"[content]  {' | '.join(row.keywords[:20])}")
+    else:
+        cols = row.column_headers[:20]
+        rows_sample = row.row_headers_sample[:8]
+        lines.append(f"[columns]  {' | '.join(cols)}")
+        lines.append(f"[rows]     {' | '.join(rows_sample)}")
+    if row.dates:
+        lines.append(f"[dates]    {'; '.join(row.dates[:20])}")
+    return "\n".join(lines)
+
+
 def leaf_rank_postings(
     question: str,
     concept: str,
     period: str,
-    postings: list[dict[str, Any]],
+    candidates: list[tuple[str, int]],
+    catalog_index: dict[tuple[str, int], PageCatalogRow],
     llm: LLMClient,
     *,
-    k: int = 5,
+    k: int = 50,
 ) -> tuple[list[dict[str, Any]], LevelTrace]:
-    """postings = [{bulletin, page, description}]. Return top-K (bulletin, page, reason)."""
-    trace = LevelTrace(level="leaf_rank", input_count=len(postings), input_chars=0)
-    if not postings:
+    """Rank a flat list of (bulletin, page) candidates using rich text-blob
+    payloads built from the catalog. Return however many the LLM judges
+    relevant (best-to-worst).
+
+    `k` is a defensive cap on output parsing, NOT a directive to the LLM.
+    Source-bulletin hard pins (e.g. "page 5 of the September 1990 bulletin")
+    are extracted by the LLM directly from the question text."""
+    trace = LevelTrace(level="leaf_rank", input_count=len(candidates), input_chars=0)
+    if not candidates:
+        return [], trace
+
+    blobs: list[str] = []
+    for key in candidates:
+        row = catalog_index.get(key)
+        if row is None:
+            continue
+        blobs.append(_build_leaf_blob(row))
+    if not blobs:
         return [], trace
 
     user = (
         f"Question: {question}\n\n"
         f"Concept: {concept}\n"
-        f"Period:  {period}\n"
-        f"K (max picks): {k}\n\n"
-        f"Candidate pages ({len(postings)}):\n"
-        f"{json.dumps(postings, ensure_ascii=False, indent=1)}\n"
+        f"Period:  {period}\n\n"
+        f"Candidate pages ({len(blobs)}):\n\n"
+        + "\n\n".join(blobs)
+        + "\n"
     )
     trace.input_chars = len(user)
     trace.prompt_excerpt = user[:800]
@@ -559,29 +662,101 @@ def leaf_rank_postings(
     return out, trace
 
 
+def leaf_rank_batched(
+    question: str,
+    concept: str,
+    period: str,
+    candidates: list[tuple[str, int]],
+    catalog_index: dict[tuple[str, int], PageCatalogRow],
+    llm: LLMClient,
+    *,
+    batch_size: int = 100,
+    workers: int = 8,
+) -> tuple[list[dict[str, Any]], LevelTrace]:
+    """Run leaf_rank_postings in parallel batches of `batch_size`. Each batch
+    sees a small, focused candidate list (~100); the LLM picks the strong
+    matches within that batch. We then pool the per-batch picks, dedupe by
+    (bulletin, page), and return the merged list.
+
+    The returned LevelTrace aggregates input/output/latency across batches.
+    Per-batch response excerpts are concatenated for offline analysis.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    trace = LevelTrace(level="leaf_rank", input_count=len(candidates), input_chars=0)
+    if not candidates:
+        return [], trace
+
+    chunks: list[list[tuple[str, int]]] = [
+        candidates[i:i + batch_size] for i in range(0, len(candidates), batch_size)
+    ]
+
+    def _run(idx: int, chunk: list[tuple[str, int]]):
+        top, sub = leaf_rank_postings(question, concept, period, chunk,
+                                      catalog_index, llm)
+        return idx, top, sub
+
+    per_batch: list[tuple[int, list[dict[str, Any]], LevelTrace]] = []
+    if workers <= 1 or len(chunks) == 1:
+        for i, ch in enumerate(chunks):
+            per_batch.append(_run(i, ch))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(_run, i, ch) for i, ch in enumerate(chunks)]
+            for f in as_completed(futs):
+                per_batch.append(f.result())
+
+    per_batch.sort(key=lambda t: t[0])
+    out: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    excerpts: list[str] = []
+    for idx, top, sub in per_batch:
+        trace.input_chars += sub.input_chars
+        trace.output_chars += sub.output_chars
+        trace.input_tokens = (trace.input_tokens or 0) + (sub.input_tokens or 0)
+        trace.output_tokens = (trace.output_tokens or 0) + (sub.output_tokens or 0)
+        trace.latency_s += sub.latency_s
+        if sub.response_excerpt:
+            excerpts.append(f"[batch {idx}] {sub.response_excerpt[:200]}")
+        for r in top:
+            key = (r["bulletin"], r["page"])
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(r)
+    trace.response_excerpt = " || ".join(excerpts)[:800]
+    trace.prompt_excerpt = (
+        f"(batched: {len(chunks)} chunks × ≤{batch_size}) "
+        + per_batch[0][2].prompt_excerpt[:700]
+    )
+    trace.output_count = len(out)
+    return out, trace
+
+
 def retrieve_hierarchical(
     tree: dict[str, Any],
     question: str,
     concept: str,
     period: str,
-    source_bulletin: str | None,
     llm: LLMClient,
+    catalog_index: dict[tuple[str, int], PageCatalogRow],
     *,
     uid: str | None = None,
     retrieve_idx: int = 0,
     k1: int = 8,
     k2: int = 4,
-    k3: int = 5,
-    k4: int = 5,
+    max_leaf_candidates: int = 10000,
+    skip_leaf_rank: bool = False,
 ) -> tuple[list[dict[str, Any]], RetrieveTrace]:
-    """Four-level walker over `tree` (loaded concept_tree.json).
-    Returns (top_k, trace). `source_bulletin` is honored as a post-L4 filter
-    when set (we still walk the full tree to learn which clusters matter).
+    """Three-level walker over `tree` (loaded concept_tree.json).
+    L1=section_pick, L2=cluster_pick, L3=leaf_rank_postings (term_pick dropped
+    in v0.3 — postings under L2-picked clusters flatten directly into the
+    leaf rank). Returns (top_k, trace).
     """
     sections = tree.get("sections", {})
     trace = RetrieveTrace(
         uid=uid, retrieve_idx=retrieve_idx,
-        concept=concept, period=period, source_bulletin=source_bulletin,
+        concept=concept, period=period,
         catalog_size=sum(s["n_pages_in_section"] for s in sections.values()),
     )
 
@@ -598,49 +773,985 @@ def retrieve_hierarchical(
         trace.total_walk_s = time.monotonic() - t_walk
         return [], trace
 
-    # L2 — cluster_pick. Expand picked sections' clusters.
+    # L2 — cluster_pick. Expand picked sections' clusters (keyed by label in v0.4).
     cluster_listing: list[tuple[str, str, dict[str, Any]]] = []
     for sec in picked_sections:
-        for cid, cdata in sections[sec]["clusters"].items():
-            cluster_listing.append((sec, cid, cdata))
+        for label, cdata in sections[sec]["clusters"].items():
+            cluster_listing.append((sec, label, cdata))
     picked_clusters, t2 = cluster_pick(question, concept, period, cluster_listing, llm, k=k2)
     trace.levels.append(t2)
     if not picked_clusters:
         trace.total_walk_s = time.monotonic() - t_walk
         return [], trace
 
-    # L3 — term_pick. Expand picked clusters' terms.
-    term_listing: list[tuple[str, str, str, list[dict[str, Any]]]] = []
-    for sec, cid in picked_clusters:
-        cdata = sections[sec]["clusters"][cid]
-        for term, postings in cdata["terms"].items():
-            term_listing.append((sec, cid, term, postings))
-    picked_terms, t3 = term_pick(question, concept, period, term_listing, llm, k=k3)
-    trace.levels.append(t3)
-    if not picked_terms:
+    # L3 — leaf_rank. Collect the unique (bulletin, page) keys under the
+    # picked clusters. The catalog_index supplies the rich per-candidate
+    # blob inside leaf_rank_postings. Source-bulletin hard pins are picked
+    # up by the leaf-rank LLM directly from the question text.
+    candidate_keys: list[tuple[str, int]] = []
+    seen_keys: set[tuple[str, int]] = set()
+    for sec, cluster_label in picked_clusters:
+        cdata = sections[sec]["clusters"][cluster_label]
+        for posts in cdata.get("keywords", {}).values():
+            for p in posts:
+                key = (p["bulletin"], p["page"])
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                candidate_keys.append(key)
+    # Hard cap on total L3 work. Within the cap, candidates are batched
+    # into small chunks so each LLM call sees a focused set (~100) rather
+    # than thousands.
+    trace.candidate_count = len(candidate_keys)
+    if len(candidate_keys) > max_leaf_candidates:
+        candidate_keys = candidate_keys[:max_leaf_candidates]
+    if skip_leaf_rank:
+        # Recall-ceiling mode: return everything that survived L1+L2 as the
+        # prediction. No LLM call, no L3 LevelTrace. Precision will be ~0;
+        # the metric of interest is recall.
+        top = [{"bulletin": b, "page": p, "reason": "L1+L2 only"}
+               for (b, p) in candidate_keys]
+    else:
+        top, t3 = leaf_rank_batched(question, concept, period, candidate_keys,
+                                    catalog_index, llm)
+        trace.levels.append(t3)
+    trace.top_k = top
+    trace.total_walk_s = time.monotonic() - t_walk
+    return top, trace
+
+
+# ---------------------------------------------------------------------------
+# Single-bucket agentic retriever
+# ---------------------------------------------------------------------------
+#
+# Variant that commits to ONE (section, cluster) leaf instead of running a
+# full L3 leaf-rank. The LLM is given access to a `sample_bucket` tool: it
+# names a candidate bucket and the tool returns ≤20 random pages from that
+# bucket with their keywords/title for the LLM to inspect. The LLM iterates
+# until it commits to a single bucket; the prediction is then ALL pages in
+# that bucket.
+#
+# Recall ceiling = "single bucket's coverage of the question's gold pages".
+
+import random as _random
+
+
+def sample_bucket_pages(
+    tree: dict[str, Any],
+    section: str,
+    cluster: str,
+    catalog_index: dict[tuple[str, int], PageCatalogRow],
+    *,
+    n: int = 20,
+    seed: int | None = None,
+) -> list[dict[str, Any]]:
+    """Return up to `n` random pages from the (section, cluster) bucket
+    with their keywords and table titles, for the LLM to inspect.
+
+    Each entry: {bulletin, page, keywords (≤8), table_title, printed_page}.
+    Returns [] if the bucket doesn't exist.
+    """
+    sd = tree.get("sections", {}).get(section)
+    if not sd:
+        return []
+    cd = sd.get("clusters", {}).get(cluster)
+    if not cd:
+        return []
+
+    # Collect unique (bulletin, page) under this bucket.
+    seen: set[tuple[str, int]] = set()
+    keys: list[tuple[str, int]] = []
+    for posts in cd.get("keywords", {}).values():
+        for p in posts:
+            k = (p["bulletin"], p["page"])
+            if k in seen:
+                continue
+            seen.add(k)
+            keys.append(k)
+
+    if not keys:
+        return []
+    rng = _random.Random(seed)
+    sample = rng.sample(keys, min(n, len(keys)))
+
+    out: list[dict[str, Any]] = []
+    for bulletin, page in sample:
+        row = catalog_index.get((bulletin, page))
+        entry: dict[str, Any] = {"bulletin": bulletin, "page": page}
+        if row is not None:
+            entry["printed_page"] = row.printed_page
+            entry["keywords"] = list(row.keywords[:8])
+            entry["table_title"] = row.table_title
+        out.append(entry)
+    return out
+
+
+def _bucket_keys(tree: dict[str, Any], section: str, cluster: str) -> list[tuple[str, int]]:
+    """All unique (bulletin, page) pairs under one bucket — used to assemble
+    the prediction once the LLM commits."""
+    sd = tree.get("sections", {}).get(section)
+    if not sd:
+        return []
+    cd = sd.get("clusters", {}).get(cluster)
+    if not cd:
+        return []
+    seen: set[tuple[str, int]] = set()
+    out: list[tuple[str, int]] = []
+    for posts in cd.get("keywords", {}).values():
+        for p in posts:
+            k = (p["bulletin"], p["page"])
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+_BUCKET_PICK_SYSTEM = """You are choosing ONE (section, cluster) bucket of
+U.S. Treasury Bulletin pages that most likely contains the answer to the
+user's question. The bucket you commit to determines the entire retrieved
+page set — there is no later rerank, so you must verify what's inside a
+bucket before committing.
+
+You will see:
+  - The user's question (verbatim), the query concept tag, and the period.
+  - A list of candidate buckets — (section, cluster) pairs with their
+    page counts. The cluster labels are LLM-generated and often
+    misleading; treat them as hints only.
+  - Any bucket samples you have requested so far (≤20 random pages per
+    bucket, with each page's table_title, keywords, and printed_page).
+
+Per turn, output a SINGLE JSON object (no prose, no fences):
+  {"action": "open", "section": "<exact>", "cluster": "<exact>"}
+    → the next turn will include 20 random pages from that bucket.
+  {"action": "commit", "section": "<exact>", "cluster": "<exact>"}
+    → finalizes your choice; the entire bucket is returned.
+
+**REQUIRED PROCEDURE:**
+  1. You MUST `open` at least 2 candidate buckets BEFORE you `commit`.
+     Cluster labels alone are insufficient — always inspect samples.
+  2. Open the 2-4 buckets whose label or parent section best matches the
+     question's concept. Compare what their sample pages actually contain
+     (look at `table_title` first — that's the authoritative caption).
+  3. Commit to the bucket whose samples most directly correspond to what
+     the question asks about. Period dates that match the question's
+     period are a strong positive signal; consistent table titles
+     mentioning the question's specific concept beat parent-section name
+     matches.
+  4. If two buckets look equally plausible after opening, open a third
+     to break the tie.
+  5. You MUST commit by the final round listed in the prompt.
+"""
+
+
+def _safe_json(text: str) -> dict[str, Any] | None:
+    s = _strip_code_fence(text)
+    try:
+        obj = json.loads(s)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def single_bucket_retrieve(
+    tree: dict[str, Any],
+    question: str,
+    concept: str,
+    period: str,
+    llm: LLMClient,
+    catalog_index: dict[tuple[str, int], PageCatalogRow],
+    *,
+    uid: str | None = None,
+    retrieve_idx: int = 0,
+    k1: int = 8,
+    max_rounds: int = 6,
+    sample_n: int = 20,
+    sample_seed: int | None = 0,
+) -> tuple[list[dict[str, Any]], RetrieveTrace]:
+    """L1 section_pick → agentic bucket open/commit loop → return all pages
+    under the committed bucket.
+
+    `max_rounds` includes all open + commit turns. If the loop exits without
+    a commit (LLM keeps opening or errors out), we commit to the largest
+    bucket among those opened so far, or to the first cluster of the first
+    picked section as a last resort.
+    """
+    sections = tree.get("sections", {})
+    trace = RetrieveTrace(
+        uid=uid, retrieve_idx=retrieve_idx,
+        concept=concept, period=period,
+        catalog_size=sum(s["n_pages_in_section"] for s in sections.values()),
+    )
+
+    t_walk = time.monotonic()
+
+    # L1 — section_pick.
+    section_listing = [
+        (label, data) for label, data in sorted(sections.items())
+        if data.get("n_clusters", 0) > 0
+    ]
+    picked_sections, t1 = section_pick(question, concept, period,
+                                       section_listing, llm, k=k1)
+    trace.levels.append(t1)
+    if not picked_sections:
         trace.total_walk_s = time.monotonic() - t_walk
         return [], trace
 
-    # L4 — leaf_rank. Collect postings, dedupe, optional bulletin pin, rank.
-    postings_by_key: dict[tuple[str, int], dict[str, Any]] = {}
-    for sec, cid, term in picked_terms:
-        cdata = sections[sec]["clusters"][cid]
-        for p in cdata["terms"][term]:
-            key = (p["bulletin"], p["page"])
-            if key in postings_by_key:
-                continue  # first description wins (deterministic)
-            if source_bulletin is not None and p["bulletin"] != source_bulletin:
+    # Build the candidate-bucket listing the LLM will see each turn.
+    candidate_buckets: list[tuple[str, str, int]] = []  # (section, cluster, n_pages)
+    for sec in picked_sections:
+        for label, cdata in sections[sec].get("clusters", {}).items():
+            candidate_buckets.append((sec, label, cdata.get("n_pages", 0)))
+    # Sort by page count desc so the LLM sees big buckets first.
+    candidate_buckets.sort(key=lambda x: -x[2])
+
+    # Agentic loop.
+    opened: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    committed: tuple[str, str] | None = None
+    loop_trace = LevelTrace(level="bucket_loop", input_count=len(candidate_buckets),
+                            input_chars=0)
+    t_loop = time.monotonic()
+    last_user_excerpt: str = ""
+    last_resp_excerpt: str = ""
+
+    min_opens_before_commit = 2
+    for round_idx in range(max_rounds):
+        bucket_list = [
+            {"section": s, "cluster": c, "n_pages": n}
+            for s, c, n in candidate_buckets
+        ]
+        is_final = (round_idx == max_rounds - 1)
+        opens_so_far = len(opened)
+        opens_left = max(0, min_opens_before_commit - opens_so_far)
+        opened_section: list[dict[str, Any]] = []
+        for (s, c), pages in opened.items():
+            opened_section.append({
+                "section": s, "cluster": c, "n_pages_total":
+                    next((n for (ss, cc, n) in candidate_buckets
+                          if ss == s and cc == c), len(pages)),
+                "samples": pages,
+            })
+
+        user = (
+            f"Question: {question}\n\n"
+            f"Concept: {concept}\n"
+            f"Period:  {period}\n\n"
+            f"Round {round_idx + 1} of {max_rounds}. "
+            + ("YOU MUST COMMIT THIS TURN. " if is_final else "")
+            + (f"You must `open` at least {opens_left} more bucket(s) "
+               f"before you may commit. " if opens_left > 0 and not is_final
+               else "")
+            + "Pick an action below.\n\n"
+            f"Candidate buckets ({len(bucket_list)}):\n"
+            f"{json.dumps(bucket_list, ensure_ascii=False, indent=1)}\n\n"
+            + (f"Buckets you've opened so far:\n"
+               f"{json.dumps(opened_section, ensure_ascii=False, indent=1)}\n"
+               if opened else "(no buckets opened yet)\n")
+        )
+        last_user_excerpt = user[:800]
+
+        t0 = time.monotonic()
+        resp = llm.call(system=_BUCKET_PICK_SYSTEM, user=user, temperature=0.0)
+        loop_trace.latency_s += time.monotonic() - t0
+        loop_trace.input_tokens = (loop_trace.input_tokens or 0) + (resp.input_tokens or 0)
+        loop_trace.output_tokens = (loop_trace.output_tokens or 0) + (resp.output_tokens or 0)
+        loop_trace.input_chars += len(user)
+        loop_trace.output_chars += len(resp.text)
+        last_resp_excerpt = resp.text[:200]
+
+        obj = _safe_json(resp.text)
+        if not obj:
+            continue
+        action = str(obj.get("action", "")).strip().lower()
+        section = str(obj.get("section", "")).strip()
+        cluster = str(obj.get("cluster", "")).strip()
+
+        # Validate against tree.
+        if section not in sections or cluster not in sections[section].get("clusters", {}):
+            # Case-insensitive rescue.
+            sec_lower = {s.lower(): s for s in sections}
+            section = sec_lower.get(section.lower(), section)
+            if section in sections:
+                cl_lower = {c.lower(): c for c in sections[section].get("clusters", {})}
+                cluster = cl_lower.get(cluster.lower(), cluster)
+        if section not in sections or cluster not in sections[section].get("clusters", {}):
+            continue
+
+        if action == "open":
+            opened[(section, cluster)] = sample_bucket_pages(
+                tree, section, cluster, catalog_index,
+                n=sample_n, seed=sample_seed,
+            )
+            continue
+        if action == "commit":
+            # Enforce the minimum-opens rule server-side unless this is
+            # the final round (where we accept whatever they give us).
+            if opens_left > 0 and not is_final:
                 continue
-            postings_by_key[key] = {
-                "bulletin": p["bulletin"],
-                "page": p["page"],
-                "description": p["description"],
-            }
-    flat_postings = list(postings_by_key.values())
-    top, t4 = leaf_rank_postings(question, concept, period, flat_postings, llm, k=k4)
-    trace.levels.append(t4)
-    trace.candidate_count = len(flat_postings)
-    trace.top_k = top
+            committed = (section, cluster)
+            break
+
+    # Fallback: largest opened bucket, or first cluster of first picked section.
+    if committed is None:
+        if opened:
+            committed = max(
+                opened.keys(),
+                key=lambda k: next((n for (s, c, n) in candidate_buckets
+                                    if s == k[0] and c == k[1]), 0),
+            )
+        elif candidate_buckets:
+            s, c, _ = candidate_buckets[0]
+            committed = (s, c)
+
+    loop_trace.total_walk_s = time.monotonic() - t_loop
+    loop_trace.prompt_excerpt = last_user_excerpt
+    loop_trace.response_excerpt = last_resp_excerpt
+    if committed:
+        loop_trace.output_count = 1
+    trace.levels.append(loop_trace)
+
+    # Predicted set = every (bulletin, page) under the committed bucket.
+    top: list[dict[str, Any]] = []
+    if committed:
+        keys = _bucket_keys(tree, committed[0], committed[1])
+        top = [{"bulletin": b, "page": p,
+                "reason": f"bucket={committed[0]}|{committed[1]}"}
+               for (b, p) in keys]
+        trace.candidate_count = len(keys)
+
+    trace.top_k = top[:50]  # cap for trace storage
+    trace.total_walk_s = time.monotonic() - t_walk
+    return top, trace
+
+
+# ---------------------------------------------------------------------------
+# Agentic-traverse retriever — (time-bucket, section) cells
+# ---------------------------------------------------------------------------
+#
+# Flips L1 and L2: time-bucket becomes the outer dimension, canonical section
+# becomes the inner. Cells = `(time_bucket, section)` containing all pages
+# from that bulletin range under that section. The agent navigates the
+# 18 × 32 ≈ 200-400 non-empty cells via the same open/commit semantics as
+# single_bucket_retrieve. Predicted = every page in the committed cell.
+#
+# Smaller cells (mean ~170 pages vs single-bucket's ~1100) mean tighter
+# precision, at the cost of needing the agent to pick the right time +
+# section combo together.
+
+
+def _variable_bucket_label(bulletin: str) -> str | None:
+    """Floor a `YYYY-MM` bulletin to a variable-width time-bucket label.
+
+    Bucket width depends on era:
+      * <1980 → 10-year buckets (sparse, slow-changing data)
+      * 1980-2019 → 5-year
+      * 2020+ → 2-year (fast-moving recent data)
+    """
+    try:
+        year = int(bulletin.split("-", 1)[0])
+    except (ValueError, IndexError):
+        return None
+    if year < 1980:
+        n = 10
+    elif year < 2020:
+        n = 5
+    else:
+        n = 2
+    start = (year // n) * n
+    return f"{start}-{start + n - 1}"
+
+
+def build_bucket_section_index(
+    catalog: list[PageCatalogRow],
+    banner_rewrite: dict[str, str],
+) -> dict[tuple[str, str], list[tuple[str, int]]]:
+    """Index `{(time_bucket, canonical_section): [(bulletin, page), ...]}`.
+
+    Sections come from each row's `section` after `banner_rewrite`
+    canonicalization. Rows with no section land under `"Unsectioned"`.
+    Only `table/chart/prose` page_kinds are indexed. Bucket widths vary
+    by era (see `_variable_bucket_label`).
+    """
+    idx: dict[tuple[str, str], list[tuple[str, int]]] = {}
+    for r in catalog:
+        if r.page_kind not in ("table", "chart", "prose"):
+            continue
+        bucket = _variable_bucket_label(r.bulletin)
+        if bucket is None:
+            continue
+        raw = (r.section or "").strip()
+        if raw:
+            section = banner_rewrite.get(raw.lower(), raw)
+        else:
+            section = "Unsectioned"
+        idx.setdefault((bucket, section), []).append((r.bulletin, r.page))
+    return idx
+
+
+def sample_cell_pages(
+    cell_index: dict[tuple[str, str], list[tuple[str, int]]],
+    bucket: str,
+    section: str,
+    catalog_index: dict[tuple[str, int], PageCatalogRow],
+    *,
+    n: int = 20,
+    seed: int | None = None,
+) -> list[dict[str, Any]]:
+    """Return up to `n` random pages from a (bucket, section) cell with
+    table_title / keywords[:8] / printed_page for LLM inspection."""
+    keys = cell_index.get((bucket, section), [])
+    if not keys:
+        return []
+    rng = _random.Random(seed)
+    sample = rng.sample(keys, min(n, len(keys)))
+    out: list[dict[str, Any]] = []
+    for bulletin, page in sample:
+        row = catalog_index.get((bulletin, page))
+        entry: dict[str, Any] = {"bulletin": bulletin, "page": page}
+        if row is not None:
+            entry["printed_page"] = row.printed_page
+            entry["keywords"] = list(row.keywords[:8])
+            entry["table_title"] = row.table_title
+        out.append(entry)
+    return out
+
+
+_TRAVERSE_SYSTEM = """You navigate a U.S. Treasury Bulletin index whose
+cells are indexed by (time_bucket, section). Time buckets are
+variable-width spans of the bulletin's publication year — 10 years for
+pre-1980 buckets ("1940-1949"), 5 years for 1980-2019 ("1985-1989"),
+and 2 years for 2020+ ("2024-2025"). Sections are canonical Treasury
+chapter names (e.g. "Federal fiscal operations", "Capital movements").
+Each cell contains every page from that bulletin range under that
+section.
+
+Your job: commit to 1-3 (time_bucket, section) cells. The prediction is
+every page in those cells (union); there is no later rerank.
+
+You will see:
+  - The user's question (verbatim), the query concept tag, and the period.
+  - All non-empty cells with their (time_bucket, section, n_pages) — sorted
+    by page count descending.
+  - Any cells you have opened so far (≤20 random pages with table_title,
+    keywords, printed_page).
+
+Per turn, output a SINGLE JSON object (no prose, no fences):
+  {"action": "open", "time_bucket": "<YYYY-YYYY>", "section": "<exact>"}
+    → next turn includes 20 random pages from that cell.
+  {"action": "commit", "cells": [
+      {"time_bucket": "<YYYY-YYYY>", "section": "<exact>"},
+      ... (1-3 cells, all under the same section is the usual case)
+   ]}
+    → finalizes your choice; the union of cells' pages is returned.
+
+  Alternate single-cell commit shape (back-compat):
+  {"action": "commit", "time_bucket": "<YYYY-YYYY>", "section": "<exact>"}
+
+**REQUIRED PROCEDURE:**
+  1. The query period tells you the LIKELY time_bucket(s) to inspect first.
+     If period is "2025-03", explore "2024-2025". If period is
+     "FY1990..FY1998", that range crosses bucket boundaries — explore
+     "1990-1994" and "1995-1999". Bulletins often retrospectively
+     publish data in the following year, so the bucket AFTER the period
+     can also be relevant.
+  2. You MUST `open` at least 2 candidate cells BEFORE you `commit`.
+     Don't rely on section names alone — inspect the sampled pages.
+  3. Open cells whose time_bucket aligns with the period AND whose
+     section best matches the question's concept. The `table_title` and
+     `keywords` of the sampled pages are the authoritative signal.
+  4. When the period clearly stays inside ONE time_bucket, commit to 1
+     cell. When the period spans MULTIPLE buckets (e.g. "1972-1976",
+     "1996-2000"), commit to 2-3 cells under the SAME section covering
+     each relevant bucket. Cap at 3 cells.
+  5. You MUST commit by the final round listed in the prompt.
+"""
+
+
+def agentic_traverse_retrieve(
+    tree: dict[str, Any],
+    question: str,
+    concept: str,
+    period: str,
+    llm: LLMClient,
+    catalog_index: dict[tuple[str, int], PageCatalogRow],
+    cell_index: dict[tuple[str, str], list[tuple[str, int]]],
+    *,
+    uid: str | None = None,
+    retrieve_idx: int = 0,
+    max_rounds: int = 8,
+    sample_n: int = 20,
+    sample_seed: int | None = 0,
+) -> tuple[list[dict[str, Any]], RetrieveTrace]:
+    """Agentic open/commit traversal over (time_bucket, section) cells.
+
+    No `section_pick` prefix — the agent sees every non-empty cell from
+    the start and decides which to inspect. Predicted set = pages in the
+    committed cell.
+    """
+    sections = tree.get("sections", {})
+    trace = RetrieveTrace(
+        uid=uid, retrieve_idx=retrieve_idx,
+        concept=concept, period=period,
+        catalog_size=sum(s["n_pages_in_section"] for s in sections.values()),
+    )
+    t_walk = time.monotonic()
+
+    # Candidate cells sorted by page count desc.
+    cell_listing = sorted(
+        ((b, s, len(pages)) for (b, s), pages in cell_index.items()),
+        key=lambda x: -x[2],
+    )
+
+    opened: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    committed: list[tuple[str, str]] = []
+    loop_trace = LevelTrace(level="traverse_loop",
+                            input_count=len(cell_listing), input_chars=0)
+    t_loop = time.monotonic()
+    last_user_excerpt: str = ""
+    last_resp_excerpt: str = ""
+
+    min_opens_before_commit = 2
+    steps_log: list[dict[str, Any]] = []
+    for round_idx in range(max_rounds):
+        is_final = (round_idx == max_rounds - 1)
+        opens_so_far = len(opened)
+        opens_left = max(0, min_opens_before_commit - opens_so_far)
+
+        cell_list = [
+            {"time_bucket": b, "section": s, "n_pages": n}
+            for b, s, n in cell_listing
+        ]
+        opened_payload: list[dict[str, Any]] = []
+        for (b, s), pages in opened.items():
+            opened_payload.append({
+                "time_bucket": b, "section": s,
+                "n_pages_total": next((n for (bb, ss, n) in cell_listing
+                                       if bb == b and ss == s), len(pages)),
+                "samples": pages,
+            })
+
+        user = (
+            f"Question: {question}\n\n"
+            f"Concept: {concept}\n"
+            f"Period:  {period}\n\n"
+            f"Round {round_idx + 1} of {max_rounds}. "
+            + ("YOU MUST COMMIT THIS TURN. " if is_final else "")
+            + (f"You must `open` at least {opens_left} more cell(s) "
+               f"before you may commit. " if opens_left > 0 and not is_final
+               else "")
+            + "Pick an action below.\n\n"
+            f"All non-empty cells ({len(cell_list)}):\n"
+            f"{json.dumps(cell_list, ensure_ascii=False, indent=1)}\n\n"
+            + (f"Cells you've opened so far:\n"
+               f"{json.dumps(opened_payload, ensure_ascii=False, indent=1)}\n"
+               if opened else "(no cells opened yet)\n")
+        )
+        last_user_excerpt = user[:800]
+
+        t0 = time.monotonic()
+        resp = llm.call(system=_TRAVERSE_SYSTEM, user=user, temperature=0.0)
+        loop_trace.latency_s += time.monotonic() - t0
+        loop_trace.input_tokens = (loop_trace.input_tokens or 0) + (resp.input_tokens or 0)
+        loop_trace.output_tokens = (loop_trace.output_tokens or 0) + (resp.output_tokens or 0)
+        loop_trace.input_chars += len(user)
+        loop_trace.output_chars += len(resp.text)
+        last_resp_excerpt = resp.text[:200]
+
+        obj = _safe_json(resp.text)
+        if not obj:
+            steps_log.append({"round": round_idx + 1, "action": "invalid_json",
+                              "opens_so_far": opens_so_far,
+                              "rejected_reason": "could not parse JSON"})
+            continue
+        action = str(obj.get("action", "")).strip().lower()
+
+        def _validate(bucket: str, section: str) -> tuple[str, str] | None:
+            """Return (bucket, section) if it's a known cell, with a
+            case-insensitive rescue on section. None if not found."""
+            if (bucket, section) in cell_index:
+                return (bucket, section)
+            sec_lower = {s.lower(): s for (b, s) in cell_index if b == bucket}
+            section = sec_lower.get(section.lower(), section)
+            if (bucket, section) in cell_index:
+                return (bucket, section)
+            return None
+
+        if action == "open":
+            bucket = str(obj.get("time_bucket", "")).strip()
+            section = str(obj.get("section", "")).strip()
+            key = _validate(bucket, section)
+            if key is None:
+                steps_log.append({
+                    "round": round_idx + 1, "action": "open",
+                    "cells": [{"time_bucket": bucket, "section": section}],
+                    "opens_so_far": opens_so_far,
+                    "rejected_reason": "unknown cell",
+                })
+                continue
+            samples = sample_cell_pages(
+                cell_index, key[0], key[1], catalog_index,
+                n=sample_n, seed=sample_seed,
+            )
+            opened[key] = samples
+            steps_log.append({
+                "round": round_idx + 1, "action": "open",
+                "cells": [{"time_bucket": key[0], "section": key[1]}],
+                "opens_so_far": opens_so_far + 1,
+                "sample_titles": [s.get("table_title") for s in samples[:5]],
+                "rejected_reason": None,
+            })
+            continue
+
+        if action == "commit":
+            # Parse the cells array (preferred) or the single-cell shape.
+            raw_cells: list[dict[str, Any]] = []
+            cells_field = obj.get("cells")
+            if isinstance(cells_field, list) and cells_field:
+                raw_cells = [c for c in cells_field if isinstance(c, dict)]
+            else:
+                raw_cells = [{
+                    "time_bucket": obj.get("time_bucket"),
+                    "section": obj.get("section"),
+                }]
+
+            chosen: list[tuple[str, str]] = []
+            seen: set[tuple[str, str]] = set()
+            requested_cells: list[dict[str, Any]] = []
+            for c in raw_cells[:3]:  # hard cap at 3 cells
+                bucket = str(c.get("time_bucket", "")).strip()
+                section = str(c.get("section", "")).strip()
+                requested_cells.append({"time_bucket": bucket, "section": section})
+                key = _validate(bucket, section)
+                if key is None or key in seen:
+                    continue
+                seen.add(key)
+                chosen.append(key)
+
+            if opens_left > 0 and not is_final:
+                steps_log.append({
+                    "round": round_idx + 1, "action": "commit",
+                    "cells": requested_cells,
+                    "opens_so_far": opens_so_far,
+                    "rejected_reason": f"need {opens_left} more opens",
+                })
+                continue
+
+            if not chosen:
+                steps_log.append({
+                    "round": round_idx + 1, "action": "commit",
+                    "cells": requested_cells,
+                    "opens_so_far": opens_so_far,
+                    "rejected_reason": "no valid cells in commit",
+                })
+                continue
+
+            steps_log.append({
+                "round": round_idx + 1, "action": "commit",
+                "cells": [{"time_bucket": b, "section": s} for (b, s) in chosen],
+                "opens_so_far": opens_so_far,
+                "rejected_reason": None,
+            })
+            committed = chosen
+            break
+
+    if not committed:
+        if opened:
+            committed = [max(
+                opened.keys(),
+                key=lambda k: len(cell_index.get(k, [])),
+            )]
+        elif cell_listing:
+            committed = [(cell_listing[0][0], cell_listing[0][1])]
+
+    loop_trace.total_walk_s = time.monotonic() - t_loop
+    loop_trace.prompt_excerpt = last_user_excerpt
+    loop_trace.response_excerpt = last_resp_excerpt
+    loop_trace.output_count = len(committed)
+    loop_trace.steps = steps_log
+    trace.levels.append(loop_trace)
+
+    top: list[dict[str, Any]] = []
+    seen_pages: set[tuple[str, int]] = set()
+    candidate_total = 0
+    for cell in committed:
+        keys = cell_index.get(cell, [])
+        candidate_total += len(keys)
+        for (b, p) in keys:
+            if (b, p) in seen_pages:
+                continue
+            seen_pages.add((b, p))
+            top.append({"bulletin": b, "page": p,
+                        "reason": f"cell={cell[0]}|{cell[1]}"})
+    trace.candidate_count = candidate_total
+    trace.top_k = top[:50]
+    trace.total_walk_s = time.monotonic() - t_walk
+    return top, trace
+
+
+# ---------------------------------------------------------------------------
+# Parent-chapter rollup of the 32 canonical sections (E13)
+# ---------------------------------------------------------------------------
+#
+# Treasury Bulletin's actual ToC is hierarchical. The 32 canonical sections
+# from E7 are a flattened mix of parent chapters and their sub-headings. The
+# map below rolls each canonical section back up to its parent chapter so
+# section_pick has a tighter, less-ambiguous vocab.
+
+_PARENT_CHAPTER_MAP: dict[str, str] = {
+    # Federal Fiscal Operations chapter — budget, receipts, expenditures, gov
+    # accounts.
+    "Federal fiscal operations": "Federal Fiscal Operations",
+    "Budget receipts and expenditures": "Federal Fiscal Operations",
+    "Account of the U.S. Treasury": "Federal Fiscal Operations",
+    "Cash income and outgo": "Federal Fiscal Operations",
+    "Internal revenue collections": "Federal Fiscal Operations",
+    "Federal obligations": "Federal Fiscal Operations",
+
+    # Federal Debt chapter — issuance, outstanding, ownership, yields, savings
+    # bonds (all about who owns/issues Treasury debt).
+    "Federal debt": "Federal Debt",
+    "Public debt operations": "Federal Debt",
+    "Debt operations": "Federal Debt",
+    "Debt outstanding": "Federal Debt",
+    "Ownership of Federal securities": "Federal Debt",
+    "Treasury survey of ownership": "Federal Debt",
+    "Treasury survey of ownership of Federal securities": "Federal Debt",
+    "Market quotations on Treasury securities": "Federal Debt",
+    "Average yields of long-term bonds": "Federal Debt",
+    "United States savings bonds": "Federal Debt",
+
+    # Capital Movements chapter — foreign capital flows.
+    "Capital movements": "Capital Movements",
+    "CAPITAL MOVEMENTS BETWEEN U.S. AND FOREIGN COUNTRIES": "Capital Movements",
+
+    # Foreign Currency Positions chapter — currency holdings, ESF.
+    "Foreign currency positions": "Foreign Currency Positions",
+    "Exchange Stabilization Fund": "Foreign Currency Positions",
+
+    # International Financial Statistics chapter — int'l + monetary stats.
+    "International financial statistics": "International Financial Statistics",
+    "Monetary statistics": "International Financial Statistics",
+
+    # Trust Funds chapter.
+    "TRUST FUNDS": "Trust Funds",
+    "Trust account and other transactions": "Trust Funds",
+
+    # Government Corporations and Other Business-Type Activities chapter.
+    "Financial operations of Government agencies and funds": "Government Corporations and Business-Type Activities",
+    "GOVERNMENT CORPORATIONS AND OTHER BUSINESS-TYPE ACTIVITIES": "Government Corporations and Business-Type Activities",
+    "Corporations and certain other business-type activities - statements of financial condition": "Government Corporations and Business-Type Activities",
+    "Corporations and certain other business-type activities - income and expense, and source and application of funds": "Government Corporations and Business-Type Activities",
+
+    # Profile of the Economy chapter — meta/special articles.
+    "PROFILE OF THE ECONOMY": "Profile of the Economy",
+    "Special Article": "Profile of the Economy",
+
+    # Other / catch-all.
+    "Unsectioned": "Unsectioned",
+    "Cumulative Table of Contents": "Unsectioned",
+}
+
+
+def parent_chapter_index(tree: dict[str, Any]) -> dict[str, list[str]]:
+    """Group canonical sections by parent chapter.
+
+    Returns `{parent_chapter: [canonical_section, ...]}`. Any canonical
+    section not in `_PARENT_CHAPTER_MAP` falls through as its own parent
+    (no merge).
+    """
+    out: dict[str, list[str]] = {}
+    for section in tree.get("sections", {}):
+        parent = _PARENT_CHAPTER_MAP.get(section, section)
+        out.setdefault(parent, []).append(section)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# One-shot section retriever — diagnostic baseline
+# ---------------------------------------------------------------------------
+#
+# Strips everything except `section_pick(k=1)`: one LLM call, exactly one
+# canonical section returned, predicted set = every page in that section.
+# Used to measure how often the agent can correctly identify the gold's
+# canonical section in a single shot.
+
+
+def _section_pages(tree: dict[str, Any], section: str) -> list[tuple[str, int]]:
+    sd = tree.get("sections", {}).get(section)
+    if not sd:
+        return []
+    seen: set[tuple[str, int]] = set()
+    out: list[tuple[str, int]] = []
+    for cd in sd.get("clusters", {}).values():
+        for posts in cd.get("keywords", {}).values():
+            for p in posts:
+                k = (p["bulletin"], p["page"])
+                if k in seen:
+                    continue
+                seen.add(k)
+                out.append(k)
+    return out
+
+
+_PARENT_PICK_SYSTEM = """You pick which Treasury Bulletin parent chapter
+most likely contains the answer to the user's question.
+
+You will see the question, a concept tag, a period, and a list of parent
+chapters with their total page counts and the canonical sub-sections each
+chapter contains. Each chapter spans many sub-sections — picking a chapter
+returns every page under all of its sub-sections.
+
+Output a SINGLE JSON object (no prose, no fences):
+  {"picked": "<exact chapter label>"}
+
+Rules:
+  - Return exactly ONE chapter label, the best match.
+  - Use the EXACT chapter label as shown.
+"""
+
+
+def one_shot_parent_chapter_retrieve(
+    tree: dict[str, Any],
+    question: str,
+    concept: str,
+    period: str,
+    llm: LLMClient,
+    catalog_index: dict[tuple[str, int], PageCatalogRow],
+    *,
+    uid: str | None = None,
+    retrieve_idx: int = 0,
+) -> tuple[list[dict[str, Any]], RetrieveTrace]:
+    """One LLM call → one parent chapter → union of pages across all of its
+    sub-sections. Tests whether the agent can pick the right parent
+    chapter when the sub-section granularity is hidden."""
+    sections = tree.get("sections", {})
+    trace = RetrieveTrace(
+        uid=uid, retrieve_idx=retrieve_idx,
+        concept=concept, period=period,
+        catalog_size=sum(s["n_pages_in_section"] for s in sections.values()),
+    )
+    t_walk = time.monotonic()
+
+    chapters = parent_chapter_index(tree)
+    # Build the listing: {chapter: {n_pages, sub_sections}}.
+    listing: list[dict[str, Any]] = []
+    for chapter in sorted(chapters):
+        subs = chapters[chapter]
+        n_pages = sum(
+            sections[s]["n_pages_in_section"] for s in subs if s in sections
+        )
+        listing.append({
+            "chapter": chapter,
+            "n_pages": n_pages,
+            "sub_sections": subs,
+        })
+    listing.sort(key=lambda x: -x["n_pages"])
+
+    level_trace = LevelTrace(level="parent_pick",
+                             input_count=len(listing), input_chars=0)
+    user = (
+        f"Question: {question}\n\n"
+        f"Concept: {concept}\n"
+        f"Period:  {period}\n\n"
+        f"Parent chapters ({len(listing)}):\n"
+        f"{json.dumps(listing, ensure_ascii=False, indent=1)}\n"
+    )
+    level_trace.input_chars = len(user)
+    level_trace.prompt_excerpt = user[:800]
+
+    t0 = time.monotonic()
+    resp = llm.call(system=_PARENT_PICK_SYSTEM, user=user, temperature=0.0)
+    level_trace.latency_s = time.monotonic() - t0
+    level_trace.output_chars = len(resp.text)
+    level_trace.input_tokens = resp.input_tokens
+    level_trace.output_tokens = resp.output_tokens
+    level_trace.response_excerpt = resp.text[:800]
+
+    obj = _safe_json(resp.text) or {}
+    # Accept both shapes: {"picked": "X"} or {"picked": ["X", "Y"]}.
+    raw_picked = obj.get("picked", "")
+    if isinstance(raw_picked, str):
+        raw_picks = [raw_picked]
+    elif isinstance(raw_picked, list):
+        raw_picks = [str(x).strip() for x in raw_picked if str(x).strip()]
+    else:
+        raw_picks = []
+    # Cap to 2; case-insensitive rescue.
+    valid = {c.lower(): c for c in chapters}
+    # Also accept sub-section names (LLM sometimes returns the more specific
+    # label it saw in the listing); map them back to their parent chapter.
+    sub_to_chapter = {s.lower(): ch for ch, subs in chapters.items() for s in subs}
+    picked_chapters: list[str] = []
+    seen_picks: set[str] = set()
+    for raw in raw_picks[:2]:
+        key = raw.strip().lower()
+        ch = valid.get(key) or sub_to_chapter.get(key)
+        if ch and ch not in seen_picks:
+            picked_chapters.append(ch)
+            seen_picks.add(ch)
+    trace.levels.append(level_trace)
+
+    if not picked_chapters:
+        trace.total_walk_s = time.monotonic() - t_walk
+        return [], trace
+
+    # Union pages across all sub-sections of every picked chapter.
+    seen_pages: set[tuple[str, int]] = set()
+    top: list[dict[str, Any]] = []
+    for chapter in picked_chapters:
+        for sub in chapters[chapter]:
+            for (b, p) in _section_pages(tree, sub):
+                if (b, p) in seen_pages:
+                    continue
+                seen_pages.add((b, p))
+                top.append({"bulletin": b, "page": p,
+                            "reason": f"chapter={chapter}|sub={sub}"})
+    trace.candidate_count = len(top)
+    level_trace.output_count = len(picked_chapters)
+    trace.top_k = top[:50]
+    trace.total_walk_s = time.monotonic() - t_walk
+    return top, trace
+
+
+def one_shot_section_retrieve(
+    tree: dict[str, Any],
+    question: str,
+    concept: str,
+    period: str,
+    llm: LLMClient,
+    catalog_index: dict[tuple[str, int], PageCatalogRow],
+    *,
+    uid: str | None = None,
+    retrieve_idx: int = 0,
+) -> tuple[list[dict[str, Any]], RetrieveTrace]:
+    """One LLM call → one canonical section → all pages in that section.
+
+    Pure baseline measurement of section_pick accuracy.
+    """
+    sections = tree.get("sections", {})
+    trace = RetrieveTrace(
+        uid=uid, retrieve_idx=retrieve_idx,
+        concept=concept, period=period,
+        catalog_size=sum(s["n_pages_in_section"] for s in sections.values()),
+    )
+
+    t_walk = time.monotonic()
+    section_listing = [
+        (label, data) for label, data in sorted(sections.items())
+        if data.get("n_clusters", 0) > 0
+    ]
+    picked, t1 = section_pick(question, concept, period, section_listing, llm, k=1)
+    trace.levels.append(t1)
+    if not picked:
+        trace.total_walk_s = time.monotonic() - t_walk
+        return [], trace
+
+    section = picked[0]
+    keys = _section_pages(tree, section)
+    top = [{"bulletin": b, "page": p, "reason": f"section={section}"}
+           for (b, p) in keys]
+    trace.candidate_count = len(keys)
+    trace.top_k = top[:50]
     trace.total_walk_s = time.monotonic() - t_walk
     return top, trace
 
@@ -654,7 +1765,6 @@ def retrieve_for_op(
     question: str,
     concept: str,
     period: str,
-    source_bulletin: str | None,
     llm: LLMClient,
     *,
     uid: str | None = None,
@@ -668,12 +1778,11 @@ def retrieve_for_op(
         retrieve_idx=retrieve_idx,
         concept=concept,
         period=period,
-        source_bulletin=source_bulletin,
         catalog_size=len(catalog),
     )
 
     t0 = time.monotonic()
-    survivors = period_prefilter(catalog, period, source_bulletin)
+    survivors = period_prefilter(catalog, period)
     trace.prefilter_s = time.monotonic() - t0
     trace.candidate_count = len(survivors)
 

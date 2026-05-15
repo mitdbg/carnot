@@ -38,10 +38,23 @@ from pathlib import Path
 from typing import Any
 
 import fitz
+from dataclasses import dataclass
 
 from skunk.common import HarnessContext
 from skunk.dsl import AnnotatedValue, DocHandle, OpNode, PageRef
 from skunk.subagents.base import StepFailed
+
+
+@dataclass(frozen=True)
+class _BranchHints:
+    """Per-branch planner advisories threaded through the extract pipeline.
+    Built once in `run()` from op.args; passed as a single object to each tier
+    so adding a new advisory doesn't fan out as another kwarg on five functions."""
+    concept: str = ""
+    period: str = ""
+    period_type: str | None = None
+    value_kind: str | None = None
+    index_name: str | None = None
 
 _PARSED_JSON_DEFAULT_DIR = Path.home() / "Desktop/officeqa/treasury_bulletins_parsed/jsons"
 
@@ -159,6 +172,7 @@ _TEXT_SYSTEM = (
     "Scalar entry:\n"
     "  {\n"
     '    "description": "<short natural-language label uniquely identifying this datum>",\n'
+    '    "tag": "<short snake_case key, see tag rules below>",\n'
     '    "kind": "scalar",\n'
     '    "value": <number or string>,\n'
     '    "unit": "<unit>"\n'
@@ -166,14 +180,18 @@ _TEXT_SYSTEM = (
     "Vector entry:\n"
     "  {\n"
     '    "description": "...",\n'
+    '    "tag": "...",\n'
     '    "kind": "vector",\n'
     '    "index_name": "month",                              # the varying dim\n'
     '    "value": {"1942-03": 3515, "1942-04": 3939, ...},   # flat dict, scalar cells\n'
-    '    "unit": "usd_millions"\n'
+    '    "unit": "usd_millions",\n'
+    '    "expected_index_range": "1942-03..1948-10"           # FULL range the question asked\n'
+    "                                                         #  for; lets downstream detect gaps.\n"
     "  }\n\n"
     "Table entry:\n"
     "  {\n"
     '    "description": "...",\n'
+    '    "tag": "...",\n'
     '    "kind": "table",\n'
     '    "row_name": "year", "col_name": "month",\n'
     '    "value": {"1942": {"03": 3515, "04": 3939, ...},\n'
@@ -202,6 +220,22 @@ _TEXT_SYSTEM = (
     "  column header, or caption phrase from the page (e.g. \"Net budget outlays\",\n"
     "  \"Treasury 30-yr. bonds\") inside the description. This is a soft preference, not\n"
     "  a requirement — paraphrase only when no concise printed phrase fits.\n"
+    '- "tag" is a short snake_case selection key that downstream code uses to pick this\n'
+    "  entry unambiguously (instead of substring-matching the description). Build it\n"
+    "  as <series>:<period>. Examples:\n"
+    "    \"national_defense_expenditures:cy1940\"\n"
+    "    \"aa_corp_bonds_january_yield:cy1990-cy1999\"\n"
+    "    \"individual_income_tax_receipts:fy1929-fy1942\"\n"
+    "  Lowercase, ASCII, no spaces; use underscores within tokens and colons/hyphens\n"
+    "  between them. Two entries that describe the SAME underlying series + period\n"
+    "  MUST share the same tag (so dedup/quorum can identify duplicates).\n"
+    '- "expected_index_range" (VECTOR ONLY, optional): a short "<first>..<last>"\n'
+    "  string naming the FULL index range the QUESTION asked for, in the same key\n"
+    "  format as `value` (e.g., \"1969-01..1980-01\", \"1953..1955\"). Set this when\n"
+    "  the question implies a range but the printed page only contains a partial\n"
+    "  series — downstream gap detection uses this to flag missing keys. Leave\n"
+    "  empty/omit when the page's index range IS the question's range, or when\n"
+    "  the entry is a single scalar/table.\n"
     '- "unit" is a single lowercase token describing the printed scale + base. Build it\n'
     '  from the page — common examples (not an exhaustive list):\n'
     "    usd, usd_thousands, usd_millions, usd_billions,\n"
@@ -242,10 +276,10 @@ _VISION_SYSTEM = (
     "  kind=\"vector\"  — 1-D series indexed by ONE varying dim. Provide `index_name`.\n"
     "  kind=\"table\"   — 2-D grid indexed by TWO varying dims. Provide `row_name`, `col_name`.\n\n"
     "Output a single JSON ARRAY of entries. Each entry has this shape:\n"
-    '  scalar: {"description":"...","kind":"scalar","value":<num|str>,"unit":...}\n'
-    '  vector: {"description":"...","kind":"vector","index_name":"month",\n'
+    '  scalar: {"description":"...","tag":"...","kind":"scalar","value":<num|str>,"unit":...}\n'
+    '  vector: {"description":"...","tag":"...","kind":"vector","index_name":"month",\n'
     '           "value":{"1942-03":3515,"1942-04":3939,...},"unit":...}\n'
-    '  table:  {"description":"...","kind":"table","row_name":"year","col_name":"month",\n'
+    '  table:  {"description":"...","tag":"...","kind":"table","row_name":"year","col_name":"month",\n'
     '           "value":{"1942":{"03":3515,...},...},"unit":...}\n\n'
     "DO NOT NEST. Vector and table cells MUST be a primitive (number or string). FORBIDDEN:\n"
     '  "value": [[3515, 3939], [4100, 4810]]            ← nested list\n'
@@ -256,7 +290,10 @@ _VISION_SYSTEM = (
     "datum — include series, period, sub-category, and any other distinguishing context.\n"
     "Where possible, prefer including the EXACT visible row label, column header, or\n"
     "caption phrase from the page inside the description (soft preference; paraphrase\n"
-    "only when no concise printed phrase fits).\n\n"
+    "only when no concise printed phrase fits).\n"
+    'The "tag" field is a short snake_case selection key shaped as <series>:<period>\n'
+    "(e.g. national_defense_expenditures:cy1940, aa_corp_bonds_january_yield:cy1990-cy1999).\n"
+    "Two entries describing the same underlying series + period MUST share the same tag.\n\n"
     "Unit token — single lowercase string describing the printed scale + base.\n"
     "  Common examples (not exhaustive): usd, usd_thousands, usd_millions, usd_billions,\n"
     "  jpy_millions, jpy_billions, gbp_millions, eur_billions, cad_millions,\n"
@@ -446,6 +483,8 @@ def _parse_response_raw(raw: str, ctx: HarnessContext | None = None) -> list[Ann
             index_name=index_name,
             row_name=row_name,
             col_name=col_name,
+            tag=str(entry.get("tag", "")),
+            expected_index_range=str(entry.get("expected_index_range", "")),
         ))
     return entries
 
@@ -720,15 +759,79 @@ def _single_call(
     return parsed if parsed is not None else []
 
 
+def _reconcile_periods(entries: list[AnnotatedValue], ctx: HarnessContext) -> list[AnnotatedValue]:
+    """Merge same-series scalars across periods into one vector.
+
+    Groups kind=scalar entries by (tag_prefix, unit) where tag_prefix is the
+    series part of `tag` (everything before ':'). When a group has 2+ scalars
+    with distinct period suffixes, replace them with a single vector keyed by
+    period suffix. Entries without a tag or with non-scalar kind pass through
+    unchanged.
+
+    Reduces noise for long-vector questions where extract emitted per-bulletin
+    scalars (e.g., national defense FY1940..FY1951 as 12 separate scalars).
+    Downstream compute then sees one merged vector to iterate, not 12 selects.
+    """
+    if not entries:
+        return entries
+    by_group: dict[tuple[str, str], list[tuple[str, AnnotatedValue]]] = {}
+    pass_through: list[AnnotatedValue] = []
+    for e in entries:
+        if e.kind != "scalar" or not e.tag or ":" not in e.tag:
+            pass_through.append(e)
+            continue
+        prefix, _, period = e.tag.partition(":")
+        if not prefix or not period:
+            pass_through.append(e)
+            continue
+        by_group.setdefault((prefix, e.unit), []).append((period, e))
+
+    merged: list[AnnotatedValue] = []
+    for (prefix, unit), items in by_group.items():
+        if len(items) < 2:
+            for _, e in items:
+                pass_through.append(e)
+            continue
+        # Dedup by period suffix (last writer wins; quorum has already converged).
+        # Sort lexicographically — ISO-shaped period strings sort meaningfully
+        # (cy1940 < cy1941, 1942-03 < 1942-04, fy1939 < fy1940).
+        seen: dict[str, AnnotatedValue] = {}
+        for period, e in items:
+            seen[period] = e
+        sorted_periods = sorted(seen.keys())
+        value_dict = {p: seen[p].value for p in sorted_periods}
+        first_p, last_p = sorted_periods[0], sorted_periods[-1]
+        new_tag = f"{prefix}:{first_p}-{last_p}"
+        # Build a description that names the series and the range
+        sample_desc = seen[first_p].description or prefix
+        new_desc = f"{sample_desc} (reconciled vector across {len(seen)} periods: {first_p}..{last_p})"
+        merged.append(AnnotatedValue(
+            description=new_desc,
+            value=value_dict,
+            unit=unit,
+            kind="vector",
+            index_name="period",
+            tag=new_tag,
+            expected_index_range=f"{first_p}..{last_p}",
+        ))
+        ctx.emit("extract", "reconciled period-scalars into vector",
+                 tag_prefix=prefix, n_merged=len(seen),
+                 range=f"{first_p}..{last_p}")
+
+    return pass_through + merged
+
+
 def _finalize_entries(
     entries: list[AnnotatedValue],
     ctx: HarnessContext,
     tier_name: str,
 ) -> list[AnnotatedValue] | None:
     """Emit-and-log helper. Returns None when `entries` is empty so the caller
-    can fall through to the next tier."""
+    can fall through to the next tier. Applies period-reconciliation before
+    returning so downstream compute sees merged vectors when possible."""
     if not entries:
         return None
+    entries = _reconcile_periods(entries, ctx)
     ctx.emit("extract", f"tier={tier_name} built entries", n_entries=len(entries))
     return entries
 
@@ -739,6 +842,8 @@ def _sample_groups_n(
     groups: list[list[tuple[PageRef, str, str]]],
     ctx: HarnessContext,
     tier_name: str,
+    *,
+    hints: _BranchHints = _BranchHints(),
 ) -> list[list[list[AnnotatedValue]]]:
     """Per-group × per-sample fan-out. Each `group` is a list of
     (ref, header, text) tuples already known to share a bulletin and to be
@@ -754,11 +859,17 @@ def _sample_groups_n(
     n_samples = ctx.config.extract_n_samples
     temperature = ctx.config.extract_sample_temperature
 
+    spec_block = _constraints_block(ctx)
+    shape_block = _shape_block(hints.value_kind, hints.index_name)
+    focus_block = _focus_block(hints.concept, hints.period, hints.period_type)
     group_msgs: list[str] = []
     for group in groups:
         page_blocks = [f"{header}\n{text}" for _, header, text in group]
         group_msgs.append(
             f"Question:\n{question}\n\n"
+            f"{spec_block}"
+            f"{shape_block}"
+            f"{focus_block}"
             f"Page text:\n\n" + "\n\n".join(page_blocks)
         )
 
@@ -830,6 +941,74 @@ def _sample_n(
     return runs
 
 
+def _refs_for_tier(refs: list[PageRef], ctx: HarnessContext) -> list[PageRef]:
+    # Golden mode: every requested page is gold; don't apply the page cap.
+    if ctx.config.golden_handle is not None:
+        return refs
+    return refs[:ctx.config.extract_max_pages]
+
+
+def _constraints_block(ctx: HarnessContext) -> str:
+    """Render Plan-level answer-shape constraints (units_out, precision,
+    answer_form) as a bullet block. Empty when ctx.plan is None (tests) or
+    no constraints are set."""
+    plan = ctx.plan
+    if plan is None:
+        return ""
+    lines: list[str] = []
+    if plan.units_out:
+        lines.append(f"- units_out: {plan.units_out}")
+    if plan.precision is not None:
+        lines.append(f"- precision: {plan.precision} decimal places")
+    if plan.answer_form != "scalar":
+        lines.append(f"- answer_form: {plan.answer_form}")
+    if not lines:
+        return ""
+    return "Parsed question constraints (extract values aligned with these):\n" + "\n".join(lines) + "\n\n"
+
+
+def _shape_block(value_kind: str | None, index_name: str | None) -> str:
+    """Render the planner's expected-shape declaration. Advisory: the
+    extractor should aim for this shape but return what it actually finds
+    if the page is structured differently (a mismatch is logged downstream)."""
+    if not value_kind and not index_name:
+        return ""
+    lines: list[str] = []
+    if value_kind:
+        lines.append(f"- value_kind: {value_kind}")
+    if index_name:
+        lines.append(f"- index_name: {index_name}")
+    return (
+        "Expected shape (advisory — planner's declaration):\n"
+        + "\n".join(lines)
+        + "\nIf the page genuinely has a different shape, return what you "
+        "actually find and flag it in the entry description; downstream "
+        "compute will adapt.\n\n"
+    )
+
+
+def _focus_block(concept: str, period: str, period_type: str | None = None) -> str:
+    """Render the retrieve branch's concept/period (and optional period_type
+    hint) as a focus hint. These pages were selected because the planner
+    asked for this concept and period; surface that to the extractor so it
+    can prioritize matching entries (without refusing to emit related ones)."""
+    if not concept and not period and not period_type:
+        return ""
+    parts = []
+    if concept:
+        parts.append(f"concept={concept!r}")
+    if period:
+        parts.append(f"period={period!r}")
+    if period_type:
+        parts.append(f"period_type={period_type!r}")
+    return (
+        f"Retrieve context: these pages were selected because the planner asked for "
+        f"{', '.join(parts)}. Prefer emitting values matching this concept/period, "
+        f"but still emit related values that share the same series — downstream may "
+        f"need them.\n\n"
+    )
+
+
 def _gather_text(
     refs: list[PageRef],
     ctx: HarnessContext,
@@ -842,7 +1021,7 @@ def _gather_text(
     skipped.
     """
     out: list[tuple[PageRef, str, str]] = []
-    for ref in refs[:ctx.config.extract_max_pages]:
+    for ref in _refs_for_tier(refs, ctx):
         text = get_text_fn(ref, ctx)
         if text:
             printed = get_printed_page(ref, ctx)
@@ -885,7 +1064,8 @@ def _group_consecutive_pages(
     return groups
 
 
-def _parsed_json_tier(refs: list[PageRef], ctx: HarnessContext) -> list[AnnotatedValue] | None:
+def _parsed_json_tier(refs: list[PageRef], ctx: HarnessContext,
+                       hints: _BranchHints = _BranchHints()) -> list[AnnotatedValue] | None:
     """Tier 1 — group-aware page fan-out → per-cell text verifier → run-quorum
     split → LLM dedup on the leftover only.
 
@@ -902,7 +1082,13 @@ def _parsed_json_tier(refs: list[PageRef], ctx: HarnessContext) -> list[Annotate
     if not pages:
         ctx.emit("extract", "tier=parsed_json skipped (no text from any ref)")
         return None
-    groups = _group_consecutive_pages(pages)
+    # In golden mode, every page is required context. Skip the same-bulletin
+    # adjacency grouping so the LLM sees all pages in one prompt and can
+    # produce a coherent multi-month/multi-year extraction.
+    if ctx.config.golden_handle is not None:
+        groups = [pages]
+    else:
+        groups = _group_consecutive_pages(pages)
     n_samples = ctx.config.extract_n_samples
     ctx.emit(
         "extract",
@@ -913,7 +1099,8 @@ def _parsed_json_tier(refs: list[PageRef], ctx: HarnessContext) -> list[Annotate
         total_chars=sum(len(t) for _, _, t in pages),
         system_prompt=_TEXT_SYSTEM[:1500],
     )
-    group_runs = _sample_groups_n(_TEXT_SYSTEM, ctx.question, groups, ctx, "parsed_json")
+    group_runs = _sample_groups_n(_TEXT_SYSTEM, ctx.question, groups, ctx, "parsed_json",
+                                    hints=hints)
 
     # Per-group verification: each entry's cell values must appear in the
     # concatenated text of the group's pages.
@@ -959,7 +1146,8 @@ def _parsed_json_tier(refs: list[PageRef], ctx: HarnessContext) -> list[Annotate
     return _finalize_entries(deduped, ctx, "parsed_json")
 
 
-def _ocr_tier(refs: list[PageRef], ctx: HarnessContext) -> list[AnnotatedValue] | None:
+def _ocr_tier(refs: list[PageRef], ctx: HarnessContext,
+              hints: _BranchHints = _BranchHints()) -> list[AnnotatedValue] | None:
     """Tier 2 — single deterministic call (T=0) over PyMuPDF text + verbatim verifier.
 
     OCR text on old scans is sparse and noisy. Sampling at T=0.7 amplifies
@@ -973,6 +1161,9 @@ def _ocr_tier(refs: list[PageRef], ctx: HarnessContext) -> list[AnnotatedValue] 
     page_blocks = [f"{header}\n{text}" for _, header, text in pages]
     user_msg = (
         f"Question:\n{ctx.question}\n\n"
+        f"{_constraints_block(ctx)}"
+        f"{_shape_block(hints.value_kind, hints.index_name)}"
+        f"{_focus_block(hints.concept, hints.period, hints.period_type)}"
         f"Page text:\n\n" + "\n\n".join(page_blocks)
     )
     ctx.emit(
@@ -990,13 +1181,14 @@ def _ocr_tier(refs: list[PageRef], ctx: HarnessContext) -> list[AnnotatedValue] 
     return _finalize_entries(kept, ctx, "ocr")
 
 
-def _vision_tier(refs: list[PageRef], ctx: HarnessContext) -> list[AnnotatedValue] | None:
+def _vision_tier(refs: list[PageRef], ctx: HarnessContext,
+                 hints: _BranchHints = _BranchHints()) -> list[AnnotatedValue] | None:
     """Tier 3 — single deterministic call (T=0) over rendered page images, with
     per-image PageRef labels in the user message so the LLM can't conflate pages.
     """
     images: list[tuple[str, str]] = []
     rendered_refs: list[PageRef] = []
-    for ref in refs[:ctx.config.extract_max_pages]:
+    for ref in _refs_for_tier(refs, ctx):
         img = _render_pdf_page_b64(ref, ctx)
         if img:
             ctx.emit("extract", "tier=vision rendered png", page=str(ref))
@@ -1019,6 +1211,9 @@ def _vision_tier(refs: list[PageRef], ctx: HarnessContext) -> list[AnnotatedValu
         labels.append(line)
     user_msg = (
         f"Question:\n{ctx.question}\n\n"
+        f"{_constraints_block(ctx)}"
+        f"{_shape_block(hints.value_kind, hints.index_name)}"
+        f"{_focus_block(hints.concept, hints.period, hints.period_type)}"
         f"Images provided in order:\n" + "\n".join(labels) + "\n\n"
         f"Include the source bulletin and page in each entry's description so a downstream "
         f"consumer can tell which image the value came from."
@@ -1031,30 +1226,70 @@ def _vision_tier(refs: list[PageRef], ctx: HarnessContext) -> list[AnnotatedValu
 
 def run(op: OpNode, prev: DocHandle | None, ctx: HarnessContext) -> list[AnnotatedValue]:
     visual_only = bool(op.args.get("visual_only", False))
+    hints = _BranchHints(
+        concept=str(op.args.get("concept", "") or ""),
+        period=str(op.args.get("period", "") or ""),
+        period_type=op.args.get("period_type") or None,
+        value_kind=op.args.get("value_kind") or None,
+        index_name=op.args.get("index_name") or None,
+    )
     refs = prev.refs if isinstance(prev, DocHandle) else []
     if not refs:
         raise StepFailed("extract", "No page refs to extract from")
 
     ctx.emit("extract", "starting", visual_only=visual_only,
-             n_refs=len(refs), refs=[str(r) for r in refs])
+             n_refs=len(refs), refs=[str(r) for r in refs],
+             concept=hints.concept or None, period=hints.period or None,
+             period_type=hints.period_type,
+             value_kind=hints.value_kind, index_name=hints.index_name)
 
     if not visual_only:
-        result = _parsed_json_tier(refs, ctx)
+        result = _parsed_json_tier(refs, ctx, hints=hints)
         if result is not None:
             ctx.emit("extract", "tier=parsed_json produced values",
                      descriptions=[e.description for e in result])
+            _check_shape_match(result, hints, ctx)
             return result
 
-        result = _ocr_tier(refs, ctx)
+        result = _ocr_tier(refs, ctx, hints=hints)
         if result is not None:
             ctx.emit("extract", "tier=ocr produced values",
                      descriptions=[e.description for e in result])
+            _check_shape_match(result, hints, ctx)
             return result
 
-    result = _vision_tier(refs, ctx)
+    result = _vision_tier(refs, ctx, hints=hints)
     if result is not None:
         ctx.emit("extract", "tier=vision produced values",
                  descriptions=[e.description for e in result])
+        _check_shape_match(result, hints, ctx)
         return result
 
     raise StepFailed("extract", "no relevant values found across tiers")
+
+
+def _check_shape_match(
+    entries: list[AnnotatedValue],
+    hints: _BranchHints,
+    ctx: HarnessContext,
+) -> None:
+    """Advisory check: log a trace event when extract returned a different
+    shape than the planner declared. Never raises — compute will adapt."""
+    if hints.value_kind:
+        mismatched = [e.kind for e in entries if e.kind != hints.value_kind]
+        if mismatched:
+            ctx.emit(
+                "extract", "value_kind mismatch (advisory)",
+                expected=hints.value_kind, got=mismatched[:5],
+                n_mismatched=len(mismatched), n_total=len(entries),
+            )
+    if hints.index_name and hints.value_kind == "vector":
+        needle = hints.index_name.lower()
+        bad = [e.index_name for e in entries
+               if e.kind == "vector" and e.index_name
+               and needle not in e.index_name.lower()]
+        if bad:
+            ctx.emit(
+                "extract", "index_name mismatch (advisory)",
+                expected=hints.index_name, got=bad[:5],
+            )

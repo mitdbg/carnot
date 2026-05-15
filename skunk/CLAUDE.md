@@ -2,11 +2,39 @@
 
 Guide for Claude Code sessions on this repo.
 
+## 🚨 BEFORE RUNNING ANY EVALUATION SCRIPT — READ THIS FIRST 🚨
+
+**32 of the 133 dev UIDs are reserved as a HELD-OUT TEST SET** (see
+`eval/test_set_uids.json`). Tuning prompts/code against them, inspecting
+their traces, or including them in any benchmark run counts as
+contamination. The remaining **101 UIDs are the dev set**.
+
+Before running ANY `--n N`, `--uids UIDxxxx,...`, or "all-questions" sweep:
+
+1. **Verify the eval script excludes test UIDs by default.** Every eval
+   harness in this repo (`eval/eval_e2e.py`, `eval/eval_retrieve.py`,
+   any new one) MUST load `eval/test_set_uids.json` and filter them out
+   unless `--include-test-set` is explicitly passed.
+2. **If you're writing a new eval script**, add the test-set filter
+   BEFORE running anything. Don't sample-then-filter — that wastes calls.
+3. **If you're invoking with `--uids`**, intersect the requested UIDs
+   with `eval/test_set_uids.json["uids"]` and ABORT (not warn) if any
+   match. There is no legitimate reason to point at test UIDs from a
+   command line unless `--include-test-set` is set.
+4. **When reporting numbers**, always state whether they're on dev
+   (101 UIDs) or include the test set (133 UIDs). Numbers on the full
+   133 set are contaminated for any claim about generalization.
+
+If you find a script that doesn't enforce this filter, **fix the script
+before running** — otherwise everything you tune downstream is biased.
+
+See "Held-out test set" section below for the canonical list and seed.
+
 ## What this is
 
 OfficeQA — a declarative QA pipeline over the U.S. Treasury Bulletin corpus (696 monthly PDFs, 1939–2025). Questions are answered by composing 4 operators into a typed DSL plan; an orchestrator walks the plan and dispatches subagents.
 
-The benchmark is `data/officeqa_pro.csv` (133 questions; not tracked in git, keep locally). An initial pass of DSL plan for each question is in `data/dsl_planning_pass.csv`.
+The benchmark is `data/officeqa_pro.csv` (133 questions: **101 dev + 32 test**; not tracked in git, keep locally). An initial pass of DSL plan for each question is in `data/dsl_planning_pass.csv`.
 
 ## Architecture in one screen
 
@@ -53,8 +81,52 @@ The benchmark is `data/officeqa_pro.csv` (133 questions; not tracked in git, kee
 - `data/dsl_planning_pass.csv` — 133 validated plans; used at runtime via `--cached-plan` to skip the LLM planner
 - `data/officeqa_pro.csv` — benchmark (133 questions, with `source_docs?page=N` and `answer` golden truth; not tracked in git)
 
+## Held-out test set (CRITICAL — do not run on these during development)
+
+32 UIDs are reserved as a held-out test set. They were picked 2026-05-14 by random
+sample (seed 20260514) from the UIDs we had **never inspected** at that point —
+i.e. excluding the pre-existing curated 32, the 33 baseline-run problematic UIDs
+(failures + >5% wrongs), and the 5 moderate-error UIDs whose traces we examined
+in the failure catalog.
+
+**Rule**: development runs of ANY eval harness (`eval/eval_e2e.py`,
+`eval/eval_retrieve.py`, any new script under `eval/`) must NOT touch
+these UIDs. Looking at their traces, tuning prompts against them, or
+selecting them by `--uids` counts as contamination. They exist to give
+us a clean measurement of generalization when we want to publish a
+final number.
+
+The canonical list lives in `eval/test_set_uids.json` (machine-readable, with seed
+and rationale). **Every eval harness MUST load this file and filter out
+the test UIDs by default.** Pass `--include-test-set` to override only
+when you have a deliberate reason (e.g. running the final number for a
+writeup). If you add a new eval script, copy the filter logic from
+`eval/eval_e2e.py`.
+
+Verify the filter is wired before you run: search the script for
+`test_set_uids`. If absent, ADD it before running — don't run first
+and filter later. (See the 🚨 banner at the top of this file.)
+
+Test UIDs (32):
+```
+UID0035, UID0036, UID0039, UID0050, UID0065, UID0068, UID0073, UID0093,
+UID0094, UID0100, UID0108, UID0118, UID0120, UID0134, UID0147, UID0161,
+UID0168, UID0170, UID0179, UID0182, UID0183, UID0187, UID0196, UID0204,
+UID0211, UID0212, UID0216, UID0218, UID0227, UID0230, UID0238, UID0240
+```
+
+If you need to expand the test set later, do it by re-sampling — never by adding
+UIDs the model has already been tuned against.
+
 ## Things to verify before claiming a feature is "done"
 
 - DSL changes: `pytest tests/test_dsl_roundtrip.py` passes.
 - Subagent changes: the standalone callable still has its signature; the eval harness for that subagent passes its acceptance bar (see the acceptance criteria in the subagent's TODO comment).
 - New ops or new args: documented in `DSL.md`, and the planner few-shots in `src/skunk/planner.py` are updated.
+- **Eval/benchmark numbers**: confirmed the run was on **dev only** (101
+  UIDs after filtering `eval/test_set_uids.json`). Numbers on the full
+  133-UID set are contaminated; state explicitly in any writeup whether
+  the held-out 32 were included.
+- **New eval scripts**: implement the test-set filter before any LLM
+  call. Search the script for `test_set_uids` — if missing, it WILL
+  contaminate.

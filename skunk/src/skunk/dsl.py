@@ -89,6 +89,13 @@ class AnnotatedValue:
       - kind: "scalar" | "vector" | "table".
       - index_name: vector only — name of the varying dim (e.g. "month").
       - row_name / col_name: table only — names of the two varying dims.
+      - tag: short machine-readable key (snake_case, like "gross_federal_debt:fy1973-fy1980").
+        Used by downstream consumers to select entries unambiguously when
+        description substrings overlap. Two entries describing the same
+        underlying series + period MUST share the same tag.
+      - expected_index_range: vector only — short string like "1969-01..1980-01"
+        describing the FULL index range the question requested. Lets compute
+        flag gaps (actual vs expected). Default empty (no gap analysis).
 
     Payload shapes by kind:
       - "scalar": value is int | float | str.
@@ -103,6 +110,8 @@ class AnnotatedValue:
     index_name: str | None = None         # vector only
     row_name: str | None = None           # table only
     col_name: str | None = None           # table only
+    tag: str = ""                         # machine-readable selection key
+    expected_index_range: str = ""        # vector only — for gap-aware summary
 
 
 @dataclass
@@ -141,8 +150,12 @@ class OpNode:
 class RetrieveBranch:
     concept: str
     period: str
-    source_bulletin: str | None = None
     visual_only: bool = False       # passes through to the implicit extract step
+    period_type: str | None = None  # hint for the retriever: FY | CY | month | fiscal_quarter | calendar_quarter | specific_date | mixed
+    # Advisory hints for the extract subagent (planning-time decisions about
+    # the heavyweight stage):
+    value_kind: str | None = None   # scalar | vector | table — expected shape of extracted values
+    index_name: str | None = None   # axis label when value_kind="vector" (e.g. "fiscal_year", "bureau")
 
 
 @dataclass
@@ -169,6 +182,8 @@ class ComputeNode:
     branches: list[Branch] = field(default_factory=list)
     task: str = ""
     final: bool = False
+    method: str | None = None                # named method/growth key (cagr, yoy_growth, geometric_mean, ...)
+    transforms: list[str] = field(default_factory=list)  # orthogonal transforms (log_of, per_capita, midpoint_normalized, ...)
 
 
 @dataclass
@@ -176,8 +191,14 @@ class Plan:
     """Chain of one or more ComputeNodes terminating in a final aggregator.
 
     Legacy flat plans = `Plan(computes=[ComputeNode(branches=[...], final=True)])`.
+
+    Plan-level fields describe the FINAL answer's shape — they apply to the
+    terminal aggregator regardless of how many sub-computes precede it.
     """
     computes: list[ComputeNode] = field(default_factory=list)
+    units_out: str | None = None             # usd, usd_millions, pct, year, count, rate, ...
+    precision: int | None = None             # decimal places to round the final answer to
+    answer_form: str = "scalar"              # scalar | bracketed_list | labeled_pair | string
 
     # ---- Back-compat read accessor ----------------------------------------
     # Older callers iterate plan.branches. For the legacy single-compute shape
@@ -329,8 +350,46 @@ def _parse_args(raw: str, op_name: str = "") -> dict[str, Any]:
     return args
 
 
+def _split_top_level(raw: str, sep: str = ",") -> list[str]:
+    """Split `raw` on `sep` at bracket/quote depth 0 — used for list literals
+    and arg lists."""
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    in_quote = False
+    quote_char = ""
+    for ch in raw:
+        if in_quote:
+            current.append(ch)
+            if ch == quote_char:
+                in_quote = False
+        elif ch in ("'", '"'):
+            in_quote = True
+            quote_char = ch
+            current.append(ch)
+        elif ch in "([":
+            depth += 1
+            current.append(ch)
+        elif ch in ")]":
+            depth -= 1
+            current.append(ch)
+        elif depth == 0 and ch == sep:
+            parts.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        parts.append("".join(current).strip())
+    return parts
+
+
 def _coerce(v: str) -> Any:
     v = v.strip()
+    if v.startswith("[") and v.endswith("]"):
+        inner = v[1:-1].strip()
+        if not inner:
+            return []
+        return [_coerce(item) for item in _split_top_level(inner, ",")]
     if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
         return v[1:-1]
     if v == "True":
@@ -348,6 +407,10 @@ def _coerce(v: str) -> Any:
     return v
 
 
+_PLAN_LEVEL_KWARGS = frozenset({"units_out", "precision", "answer_form"})
+_FINAL_COMPUTE_KWARGS = frozenset({"method", "transforms"}) | _PLAN_LEVEL_KWARGS
+
+
 def parse(text: str) -> Plan:
     """Parse text DSL into a Plan.
 
@@ -359,6 +422,11 @@ def parse(text: str) -> Plan:
 
       Decomposed (chain of computes):
         [ [branches] --> compute(task='...'); [branches] --> compute(task='...') ] --> compute()
+
+    The final `compute(...)` may carry constraint kwargs:
+      - Plan-level (answer-shape): units_out, precision, answer_form
+      - Final-compute (computation): method, transforms
+    Intermediate `compute(task='...')` may additionally carry method, transforms.
     """
     text = text.strip()
     parts = _split_chain(text)
@@ -370,8 +438,26 @@ def parse(text: str) -> Plan:
     last_name, last_args = _parse_op(last)
     if last_name != "compute":
         raise ParseError(f"Plan must end with compute(), got {parts[-1]!r}")
-    if last_args:
-        raise ParseError(f"final compute() takes no args, got {last_args!r}")
+    unknown = set(last_args.keys()) - _FINAL_COMPUTE_KWARGS
+    if unknown:
+        raise ParseError(
+            f"final compute() got unexpected kwargs {sorted(unknown)}; "
+            f"allowed: {sorted(_FINAL_COMPUTE_KWARGS)}"
+        )
+    plan_units = last_args.get("units_out")
+    plan_precision = last_args.get("precision")
+    plan_answer_form = last_args.get("answer_form")
+    final_method, final_transforms, _ = _split_compute_kwargs(
+        last_args, allowed=_FINAL_COMPUTE_KWARGS,
+    )
+
+    def _wrap(computes: list[ComputeNode]) -> Plan:
+        return Plan(
+            computes=computes,
+            units_out=str(plan_units) if plan_units else None,
+            precision=int(plan_precision) if plan_precision is not None else None,
+            answer_form=str(plan_answer_form) if plan_answer_form else "scalar",
+        )
 
     body = parts[:-1]
     if not body:
@@ -389,8 +475,11 @@ def parse(text: str) -> Plan:
         # Decomposed: every member starts with '['.
         if all(m.lstrip().startswith("[") for m in raw_members):
             intermediates = [_parse_intermediate_compute(m) for m in raw_members]
-            return Plan(
-                computes=[*intermediates, ComputeNode(branches=[], task="", final=True)],
+            return _wrap(
+                [*intermediates, ComputeNode(
+                    branches=[], task="", final=True,
+                    method=final_method, transforms=final_transforms,
+                )],
             )
         # Otherwise legacy parallel-of-branches form.
         if any(m.lstrip().startswith("[") for m in raw_members):
@@ -399,14 +488,20 @@ def parse(text: str) -> Plan:
                 "either all members are branches, or all are `[branches] --> compute(task='...')`"
             )
         branches = [_parse_branch(b) for b in raw_members]
-        return Plan(computes=[ComputeNode(branches=branches, task="", final=True)])
+        return _wrap([ComputeNode(
+            branches=branches, task="", final=True,
+            method=final_method, transforms=final_transforms,
+        )])
 
     branches = [_parse_branch(" --> ".join(body))]
-    return Plan(computes=[ComputeNode(branches=branches, task="", final=True)])
+    return _wrap([ComputeNode(
+        branches=branches, task="", final=True,
+        method=final_method, transforms=final_transforms,
+    )])
 
 
 def _parse_intermediate_compute(text: str) -> ComputeNode:
-    """Parse a single `[branches] --> compute(task='...')` block."""
+    """Parse a single `[branches] --> compute(task='...', method?='...', transforms?=[...])` block."""
     text = text.strip()
     parts = _split_chain(text)
     if len(parts) < 2:
@@ -421,6 +516,12 @@ def _parse_intermediate_compute(text: str) -> ComputeNode:
         raise ParseError(
             f"Intermediate compute requires non-empty task='...': {text!r}"
         )
+    method, transforms, unknown = _split_compute_kwargs(last_args, allowed={"task", "method", "transforms"})
+    if unknown:
+        raise ParseError(
+            f"Intermediate compute got unexpected kwargs {sorted(unknown)}; "
+            "allowed: task, method, transforms"
+        )
     body = parts[:-1]
     if len(body) == 1 and body[0].startswith("[") and body[0].endswith("]"):
         inner = body[0][1:-1].strip()
@@ -430,7 +531,25 @@ def _parse_intermediate_compute(text: str) -> ComputeNode:
         branches = [_parse_branch(b) for b in raw_branches]
     else:
         branches = [_parse_branch(" --> ".join(body))]
-    return ComputeNode(branches=branches, task=task, final=False)
+    return ComputeNode(
+        branches=branches, task=task, final=False,
+        method=method, transforms=transforms,
+    )
+
+
+def _split_compute_kwargs(
+    args: dict[str, Any], allowed: set[str],
+) -> tuple[str | None, list[str], set[str]]:
+    """Pull `method` and `transforms` out of a compute() args dict.
+    Returns (method, transforms, unknown_keys_outside_allowed)."""
+    method = args.get("method")
+    method_val = str(method).strip() if method else None
+    raw_transforms = args.get("transforms") or []
+    if not isinstance(raw_transforms, list):
+        raise ParseError(f"compute.transforms must be a list, got {raw_transforms!r}")
+    transforms = [str(t) for t in raw_transforms]
+    unknown = set(args.keys()) - allowed
+    return method_val or None, transforms, unknown
 
 
 def _parse_branch(text: str) -> Branch:
@@ -455,11 +574,19 @@ def _parse_branch(text: str) -> Branch:
             raise ParseError(f"retrieve must be followed by extract, got {ext_name!r}: {text!r}")
         if "concept" not in head_args or "period" not in head_args:
             raise ParseError(f"retrieve requires 'concept' and 'period': {text!r}")
+        # Legacy plan caches may still include `source_bulletin='...'`; the
+        # parser accepts it (via the generic kwarg path) and we silently drop
+        # it here. v0.6 removed the field end-to-end.
+        pt = head_args.get("period_type")
+        vk = ext_args.get("value_kind")
+        ix = ext_args.get("index_name")
         return RetrieveBranch(
             concept=str(head_args["concept"]),
             period=str(head_args["period"]),
-            source_bulletin=str(head_args["source_bulletin"]) if "source_bulletin" in head_args else None,
             visual_only=bool(ext_args.get("visual_only", False)),
+            period_type=str(pt) if pt else None,
+            value_kind=str(vk) if vk else None,
+            index_name=str(ix) if ix else None,
         )
 
     raise ParseError(f"Branch must start with retrieve or lookup_external, got {head_name!r}: {text!r}")
@@ -469,12 +596,23 @@ def _parse_branch(text: str) -> Branch:
 # Serializer
 # ---------------------------------------------------------------------------
 
+def _fmt_string_list(items: list[str]) -> str:
+    return "[" + ", ".join(f"'{x}'" for x in items) + "]"
+
+
 def _serialize_branch(b: Branch) -> str:
     if isinstance(b, RetrieveBranch):
         args = [f"concept='{b.concept}'", f"period='{b.period}'"]
-        if b.source_bulletin:
-            args.append(f"source_bulletin='{b.source_bulletin}'")
-        ext = "extract(visual_only=True)" if b.visual_only else "extract()"
+        if b.period_type:
+            args.append(f"period_type='{b.period_type}'")
+        ext_args: list[str] = []
+        if b.value_kind:
+            ext_args.append(f"value_kind='{b.value_kind}'")
+        if b.index_name:
+            ext_args.append(f"index_name='{b.index_name}'")
+        if b.visual_only:
+            ext_args.append("visual_only=True")
+        ext = f"extract({', '.join(ext_args)})" if ext_args else "extract()"
         return f"retrieve({', '.join(args)}) --> {ext}"
     if isinstance(b, LookupBranch):
         return f"lookup_external(nl='{b.nl}')"
@@ -487,13 +625,40 @@ def _serialize_branches_block(branches: list[Branch]) -> str:
     return "[ " + " ; ".join(_serialize_branch(b) for b in branches) + " ]"
 
 
+def _serialize_final_compute(plan: Plan, final: ComputeNode) -> str:
+    """Render the trailing `compute(...)`. Plan-level constraints
+    (units_out/precision/answer_form) and final-compute fields
+    (method/transforms) live together on this op."""
+    args: list[str] = []
+    if plan.units_out:
+        args.append(f"units_out='{plan.units_out}'")
+    if plan.precision is not None:
+        args.append(f"precision={plan.precision}")
+    if plan.answer_form and plan.answer_form != "scalar":
+        args.append(f"answer_form='{plan.answer_form}'")
+    if final.method:
+        args.append(f"method='{final.method}'")
+    if final.transforms:
+        args.append(f"transforms={_fmt_string_list(final.transforms)}")
+    return f"compute({', '.join(args)})" if args else "compute()"
+
+
+def _serialize_intermediate_compute(c: ComputeNode) -> str:
+    args = [f"task='{c.task}'"]
+    if c.method:
+        args.append(f"method='{c.method}'")
+    if c.transforms:
+        args.append(f"transforms={_fmt_string_list(c.transforms)}")
+    return f"compute({', '.join(args)})"
+
+
 def serialize(plan: Plan) -> str:
     """Serialize Plan back to text DSL.
 
-    Legacy flat shape (single final compute with branches):
-        [branches] --> compute()
+    Flat shape (single final compute with branches):
+        [branches] --> compute([constraints])
     Decomposed (intermediates + aggregator):
-        [ [branches] --> compute(task='...'); ... ] --> compute()
+        [ [branches] --> compute(task='...'[, method=, transforms=]); ... ] --> compute([constraints])
     """
     if not plan.computes:
         raise ValueError("Cannot serialize empty Plan")
@@ -503,7 +668,7 @@ def serialize(plan: Plan) -> str:
             raise ValueError("Single-compute Plan must have final=True")
         if not c.branches:
             raise ValueError("Single-compute Plan must have non-empty branches")
-        return f"{_serialize_branches_block(c.branches)} --> compute()"
+        return f"{_serialize_branches_block(c.branches)} --> {_serialize_final_compute(plan, c)}"
     # Decomposed: validate shape lightly, then emit.
     intermediates = plan.computes[:-1]
     final = plan.computes[-1]
@@ -519,8 +684,8 @@ def serialize(plan: Plan) -> str:
             inner = "[ " + _serialize_branch(c.branches[0]) + " ]"
         else:
             inner = _serialize_branches_block(c.branches)
-        members.append(f"{inner} --> compute(task='{c.task}')")
-    return "[ " + " ; ".join(members) + " ] --> compute()"
+        members.append(f"{inner} --> {_serialize_intermediate_compute(c)}")
+    return "[ " + " ; ".join(members) + f" ] --> {_serialize_final_compute(plan, final)}"
 
 
 # ---------------------------------------------------------------------------
@@ -530,10 +695,14 @@ def serialize(plan: Plan) -> str:
 def _branch_to_dict(b: Branch) -> dict:
     if isinstance(b, RetrieveBranch):
         d: dict = {"kind": "retrieve", "concept": b.concept, "period": b.period}
-        if b.source_bulletin:
-            d["source_bulletin"] = b.source_bulletin
         if b.visual_only:
             d["visual_only"] = True
+        if b.period_type:
+            d["period_type"] = b.period_type
+        if b.value_kind:
+            d["value_kind"] = b.value_kind
+        if b.index_name:
+            d["index_name"] = b.index_name
         return d
     if isinstance(b, LookupBranch):
         return {"kind": "lookup_external", "nl": b.nl}
@@ -543,11 +712,15 @@ def _branch_to_dict(b: Branch) -> dict:
 def _branch_from_dict(d: dict) -> Branch:
     kind = d.get("kind")
     if kind == "retrieve":
+        # Legacy cached plans may still carry `source_bulletin`; silently
+        # ignore it — v0.6 removed the field end-to-end.
         return RetrieveBranch(
             concept=d["concept"],
             period=d["period"],
-            source_bulletin=d.get("source_bulletin"),
             visual_only=bool(d.get("visual_only", False)),
+            period_type=d.get("period_type") or None,
+            value_kind=d.get("value_kind") or None,
+            index_name=d.get("index_name") or None,
         )
     if kind == "lookup_external":
         return LookupBranch(nl=d["nl"])
@@ -559,50 +732,94 @@ def _is_legacy_flat(plan: Plan) -> bool:
         len(plan.computes) == 1
         and plan.computes[0].final
         and plan.computes[0].task == ""
+        and not plan.computes[0].method
+        and not plan.computes[0].transforms
         and bool(plan.computes[0].branches)
+    )
+
+
+def _plan_meta(plan: Plan) -> dict:
+    """Top-level constraint fields, emitted only when non-default."""
+    meta: dict = {}
+    if plan.units_out:
+        meta["units_out"] = plan.units_out
+    if plan.precision is not None:
+        meta["precision"] = plan.precision
+    if plan.answer_form != "scalar":
+        meta["answer_form"] = plan.answer_form
+    return meta
+
+
+def _compute_to_dict(c: ComputeNode) -> dict:
+    entry: dict = {"task": c.task, "branches": [_branch_to_dict(b) for b in c.branches]}
+    if c.final:
+        entry["final"] = True
+    if c.method:
+        entry["method"] = c.method
+    if c.transforms:
+        entry["transforms"] = list(c.transforms)
+    return entry
+
+
+def _compute_from_dict(entry: dict) -> ComputeNode:
+    return ComputeNode(
+        branches=[_branch_from_dict(b) for b in entry.get("branches", [])],
+        task=str(entry.get("task", "")),
+        final=bool(entry.get("final", False)),
+        method=entry.get("method") or None,
+        transforms=list(entry.get("transforms") or []),
     )
 
 
 def to_dict(plan: Plan) -> dict:
     """Serialize to dict. Emits legacy `{"branches": [...]}` shape when the
-    plan is a single unnamed final compute (back-compat with cached CSVs);
-    otherwise emits the explicit `{"computes": [...]}` shape.
+    plan is a single unnamed final compute with no constraints (back-compat
+    with cached CSVs); otherwise emits the explicit `{"computes": [...]}` shape.
     """
-    if _is_legacy_flat(plan):
+    meta = _plan_meta(plan)
+    if _is_legacy_flat(plan) and not meta:
         return {"branches": [_branch_to_dict(b) for b in plan.computes[0].branches]}
-    out_computes = []
-    for c in plan.computes:
-        entry: dict = {"task": c.task, "branches": [_branch_to_dict(b) for b in c.branches]}
-        if c.final:
-            entry["final"] = True
-        out_computes.append(entry)
-    return {"computes": out_computes}
+    out: dict = {"computes": [_compute_to_dict(c) for c in plan.computes]}
+    out.update(meta)
+    return out
 
 
 def from_dict(d: dict) -> Plan:
     """Build a Plan from dict. Accepts both legacy and new shapes:
 
     Legacy: `{"branches": [...]}` → single final compute with those branches.
-    New:    `{"computes": [{"task": "...", "branches": [...], "final"?: bool}, ...]}`
+    New:    `{"computes": [{"task": "...", "branches": [...], "final"?: bool,
+                            "method"?: str, "transforms"?: list[str]}, ...],
+             "units_out"?: str, "precision"?: int, "answer_form"?: str}`
             — if no entry has `final=True`, append an empty-branches final aggregator.
     """
     if "computes" in d:
         raw = d["computes"]
         if not isinstance(raw, list) or not raw:
             raise ValueError(f"Plan 'computes' must be a non-empty list: {d!r}")
-        computes: list[ComputeNode] = []
-        for entry in raw:
-            computes.append(ComputeNode(
-                branches=[_branch_from_dict(b) for b in entry.get("branches", [])],
-                task=str(entry.get("task", "")),
-                final=bool(entry.get("final", False)),
-            ))
+        computes = [_compute_from_dict(entry) for entry in raw]
         if not any(c.final for c in computes):
             computes.append(ComputeNode(branches=[], task="", final=True))
-        return Plan(computes=computes)
+        return Plan(
+            computes=computes,
+            units_out=d.get("units_out") or None,
+            precision=d.get("precision"),
+            answer_form=str(d.get("answer_form") or "scalar"),
+        )
     if "branches" in d:
         branches = [_branch_from_dict(b) for b in d["branches"]]
-        return Plan(computes=[ComputeNode(branches=branches, task="", final=True)])
+        return Plan(
+            computes=[ComputeNode(
+                branches=branches,
+                task="",
+                final=True,
+                method=d.get("method") or None,
+                transforms=list(d.get("transforms") or []),
+            )],
+            units_out=d.get("units_out") or None,
+            precision=d.get("precision"),
+            answer_form=str(d.get("answer_form") or "scalar"),
+        )
     raise ValueError(f"Plan dict missing required field 'branches' or 'computes': {d!r}")
 
 
@@ -620,6 +837,43 @@ _PERIOD_RE = re.compile(
     + r"|" + _PERIOD_POINT                          # single point
     + r")$"
 )
+
+# ---------------------------------------------------------------------------
+# Controlled vocabularies for the constraint fields (shared with the planner
+# prompt — keep these in sync with planner.py's DSL spec section).
+# ---------------------------------------------------------------------------
+
+UNITS_OUT_VOCAB: frozenset[str] = frozenset({
+    "usd", "usd_thousands", "usd_millions", "usd_billions",
+    "pct", "count", "year", "rate", "fx_rate", "ratio", "text",
+})
+
+ANSWER_FORM_VOCAB: frozenset[str] = frozenset({
+    "scalar", "bracketed_list", "labeled_pair", "string",
+})
+
+METHOD_VOCAB: frozenset[str] = frozenset({
+    "cagr", "yoy_growth", "mom_growth",
+    "geometric_mean", "arithmetic_mean",
+    "ols_regression",
+    "pearson_correlation", "partial_correlation", "spearman",
+    "mad", "gini", "theil", "cv", "iqr", "h_spread",
+    "expected_shortfall", "arc_elasticity", "point_elasticity",
+    "zipf", "hp_filter", "rolling_average",
+    "hazen_plotting_position",
+})
+
+TRANSFORMS_VOCAB: frozenset[str] = frozenset({
+    "log_of", "ratio_of", "per_capita", "midpoint_normalized",
+    "weighted", "inflation_adjusted", "absolute_value",
+})
+
+PERIOD_TYPE_VOCAB: frozenset[str] = frozenset({
+    "FY", "CY", "month", "fiscal_quarter", "calendar_quarter",
+    "specific_date", "mixed",
+})
+
+VALUE_KIND_VOCAB: frozenset[str] = frozenset({"scalar", "vector", "table"})
 
 
 @dataclass
@@ -662,6 +916,12 @@ def validate(plan: Plan, max_compute_depth: int = 2) -> ValidationResult:
             f"Plan depth {depth} exceeds max_compute_depth={max_compute_depth}"
         )
 
+    # Plan-level constraint fields against controlled vocab.
+    if plan.units_out and plan.units_out not in UNITS_OUT_VOCAB:
+        errors.append(f"Plan.units_out {plan.units_out!r} not in controlled vocab {sorted(UNITS_OUT_VOCAB)}")
+    if plan.answer_form not in ANSWER_FORM_VOCAB:
+        errors.append(f"Plan.answer_form {plan.answer_form!r} not in {sorted(ANSWER_FORM_VOCAB)}")
+
     is_legacy = len(plan.computes) == 1
     for i, c in enumerate(plan.computes):
         if is_legacy:
@@ -679,6 +939,20 @@ def validate(plan: Plan, max_compute_depth: int = 2) -> ValidationResult:
                 if not c.task.strip():
                     errors.append(f"computes[{i}]: intermediate compute must have non-empty task")
 
+        if c.method and c.method not in METHOD_VOCAB:
+            errors.append(
+                f"computes[{i}].method {c.method!r} not in controlled vocab {sorted(METHOD_VOCAB)}"
+            )
+        for t in c.transforms:
+            if t not in TRANSFORMS_VOCAB:
+                errors.append(
+                    f"computes[{i}].transforms contains {t!r}, not in {sorted(TRANSFORMS_VOCAB)}"
+                )
+            if t == c.method:
+                errors.append(
+                    f"computes[{i}]: transform {t!r} duplicates method; transforms must be orthogonal to method"
+                )
+
         for j, b in enumerate(c.branches):
             if isinstance(b, RetrieveBranch):
                 if not _PERIOD_RE.match(b.period):
@@ -686,5 +960,20 @@ def validate(plan: Plan, max_compute_depth: int = 2) -> ValidationResult:
                         f"computes[{i}].branches[{j}]: period {b.period!r} does not match expected "
                         "format (CY/FY year, Qn-YYYY, YYYY-MM, YYYY-MM-DD, YYYY, range X..Y, "
                         "enumeration X,Y)"
+                    )
+                if b.period_type and b.period_type not in PERIOD_TYPE_VOCAB:
+                    errors.append(
+                        f"computes[{i}].branches[{j}]: period_type {b.period_type!r} "
+                        f"not in {sorted(PERIOD_TYPE_VOCAB)}"
+                    )
+                if b.value_kind and b.value_kind not in VALUE_KIND_VOCAB:
+                    errors.append(
+                        f"computes[{i}].branches[{j}]: value_kind {b.value_kind!r} "
+                        f"not in {sorted(VALUE_KIND_VOCAB)}"
+                    )
+                if b.index_name and b.value_kind != "vector":
+                    errors.append(
+                        f"computes[{i}].branches[{j}]: index_name is only meaningful "
+                        f"when value_kind='vector' (got value_kind={b.value_kind!r})"
                     )
     return ValidationResult(ok=not errors, errors=errors)

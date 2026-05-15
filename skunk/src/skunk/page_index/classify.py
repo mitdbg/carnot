@@ -50,3 +50,48 @@ def cheap_classify(text: str, page_index: int) -> PageKind | None:
     if looks_like_toc(text, page_index):
         return "toc"
     return None
+
+
+_VISUAL_ELEMENT_TYPES = frozenset({
+    "table", "figure", "image", "chart", "plot", "diagram",
+})
+
+_HEADER_ELEMENT_TYPES = frozenset({"section_header", "title"})
+
+
+def has_visual_elements(elements: list[dict]) -> bool:
+    """True if the page's parsed-JSON element list contains any table/figure/image."""
+    for el in elements:
+        if (el.get("type") or "").lower() in _VISUAL_ELEMENT_TYPES:
+            return True
+    return False
+
+
+# Boilerplate section_header content that should NOT trigger prose indexing on
+# its own (every prose page has "Note", "Source", etc.). A page needs at least
+# one substantive header.
+_BOILERPLATE_HEADER_RE = __import__("re").compile(
+    r"^\s*(note|notes|source|sources|footnote|footnotes|legend|key|"
+    r"introduction|disclaimer|preface|index|table of contents|contents|"
+    r"references?)\s*[:.\-]?\s*$",
+    __import__("re").IGNORECASE,
+)
+
+
+def has_prose_content(elements: list[dict]) -> bool:
+    """True if the page has at least one substantive [section_header] or [title]
+    element — i.e. it's a narrative page with structural anchors we can index
+    (Treasury Financing Operations write-ups, Profile of the Economy notes,
+    etc.). Pure-boilerplate pages whose only headers are 'Note' / 'Source'
+    return False.
+    """
+    for el in elements:
+        if (el.get("type") or "").lower() not in _HEADER_ELEMENT_TYPES:
+            continue
+        content = (el.get("content") or "").strip()
+        if not content or len(content) < 4:
+            continue
+        if _BOILERPLATE_HEADER_RE.match(content):
+            continue
+        return True
+    return False

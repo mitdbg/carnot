@@ -21,7 +21,6 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
-
 _FILENAME_RE = re.compile(r"treasury_bulletin_(\d{4})_(\d{2})\.pdf$")
 
 _PARSED_JSON_DEFAULT_DIR = Path.home() / "Desktop/officeqa/treasury_bulletins_parsed/jsons"
@@ -51,73 +50,22 @@ def _load_parsed_doc(month_str: str, base_dir: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Per-page section banner extraction
+# Per-page section banner extraction (raw, no heuristics)
 # ---------------------------------------------------------------------------
-# The Treasury bulletins print a section banner at the top of every page
-# (e.g. "DEBT OUTSTANDING", "CAPITAL MOVEMENTS"). In the parsed JSON this
-# shows up as either:
-#   - a [title] element on the page where a new section begins
-#     (e.g. p30 of 1950-02 has [title]="STATUTORY DEBT LIMITATION"), or
-#   - a [page_header] element on every page of the section
-#     (e.g. p27-p29 have [page_header]=["February 1950", "DEBT OUTSTANDING"]).
-# Both are verbatim from the page itself — far more reliable than TOC-inferred
-# section spans, which mislabel pages when the printed page numbers are OCR'd
-# badly.
-
-import re as _re
-
-_NOISE_PATTERNS = (
-    _re.compile(r"^Treasury Bulletin\s*$", _re.IGNORECASE),
-    _re.compile(r"^Bulletin\b.*", _re.IGNORECASE),
-    _re.compile(r"^(January|February|March|April|May|June|July|August|"
-                r"September|October|November|December)\s+\d{4}\s*$",
-                _re.IGNORECASE),
-    _re.compile(r"^\d{4}\s*$"),                  # year alone
-    _re.compile(r"^[\s\d.,/]+$"),                 # digit/punct soup
-)
-
-# Treasury bulletins put table titles as [title] elements too. Reject anything
-# that looks like a table title — section banners never start with "Table N.-"
-# or "Chart N.-" or contain a 4-digit year.
-_NOT_A_BANNER_PATTERNS = (
-    _re.compile(r"^\s*(Table|Chart|Figure|Schedule)\s*\d", _re.IGNORECASE),
-    _re.compile(r"\b\d{4}\b"),                    # any 4-digit year — banners don't have these
-)
-
-
-def _is_section_banner(text: str) -> bool:
-    s = text.strip()
-    if len(s) < 3 or len(s) > 80:
-        return False
-    if any(p.match(s) for p in _NOISE_PATTERNS):
-        return False
-    if any(p.search(s) for p in _NOT_A_BANNER_PATTERNS):
-        return False
-    return True
-
-
-def _canonicalize_section(s: str) -> str:
-    """Strip trailing punctuation and collapse whitespace. Keep casing intact —
-    Title Case and ALL CAPS both show up across bulletins; we'll canonicalize
-    the case after."""
-    s = s.strip()
-    s = _re.sub(r"\s+", " ", s)
-    s = s.rstrip(".,;:- ")
-    # Normalize casing: prefer Title Case, but uppercase Roman acronyms stay.
-    if s.isupper():
-        s = s.title()
-    return s
+# Treasury bulletins print a section banner at the top of every page (e.g.
+# "DEBT OUTSTANDING") that the parsed JSON exposes as either a [title]
+# element (new-section page) or a [page_header] element (every page in the
+# section). We surface the verbatim string with no normalization — banner
+# canonicalization (em-dash/hyphen variants, ", con" suffixes, table-title
+# strings that should bucket under a real ToC section) is the concept-tree
+# stage's job via an LLM dedup step modeled on `dedup_labels`.
 
 
 def read_page_sections(pdf_path: str | Path,
                        parsed_dir: str | Path | None = None) -> dict[int, str | None]:
-    """{1-based PDF page index → canonical section banner} from parsed JSON.
+    """{1-based PDF page index → raw section banner string or None}.
 
-    Algorithm per page:
-      1. If any [title] element has section-banner-like content, use it.
-      2. Else, examine [page_header] elements; filter out noise (bulletin
-         name, month-year, year alone, digit-only); use the first survivor.
-      3. Else return None — caller falls back to TOC-inferred section.
+    Per page: first [title] element wins; else first [page_header]; else None.
     """
     base_dir = str(parsed_dir) if parsed_dir is not None else str(parsed_json_dir())
     month = parse_bulletin_filename(pdf_path)
@@ -141,28 +89,50 @@ def read_page_sections(pdf_path: str | Path,
     for pdf_page in range(1, max_page + 1):
         elements = by_page.get(pdf_page, [])
         section: str | None = None
-
-        # Prefer [title] (section start)
         for el in elements:
-            if el.get("type") != "title":
-                continue
-            content = (el.get("content") or "").strip()
-            if _is_section_banner(content):
-                section = _canonicalize_section(content)
-                break
-
-        # Else look at [page_header]
+            if el.get("type") == "title":
+                content = (el.get("content") or "").strip()
+                if content:
+                    section = content
+                    break
         if section is None:
             for el in elements:
-                if el.get("type") != "page_header":
-                    continue
-                content = (el.get("content") or "").strip()
-                if _is_section_banner(content):
-                    section = _canonicalize_section(content)
-                    break
-
+                if el.get("type") == "page_header":
+                    content = (el.get("content") or "").strip()
+                    if content:
+                        section = content
+                        break
         out[pdf_page] = section
     return out
+
+
+def read_page_elements(pdf_path: str | Path,
+                       parsed_dir: str | Path | None = None) -> dict[int, list[dict]]:
+    """{1-based PDF page index → list of parsed-JSON element dicts}.
+
+    Each element has at least `type` and `content` keys; this is the raw
+    structural view the build pipeline uses to detect tables/figures cheaply
+    (see `classify.has_visual_elements`).
+    """
+    base_dir = str(parsed_dir) if parsed_dir is not None else str(parsed_json_dir())
+    month = parse_bulletin_filename(pdf_path)
+    doc = _load_parsed_doc(month, base_dir)
+
+    by_page: dict[int, list[dict]] = {}
+    max_page = 0
+    for el in doc.get("document", {}).get("elements", []):
+        bbox = el.get("bbox") or []
+        if not bbox:
+            continue
+        pid = bbox[0].get("page_id")
+        if pid is None:
+            continue
+        pid = int(pid)
+        by_page.setdefault(pid, []).append(el)
+        if pid > max_page:
+            max_page = pid
+
+    return {pdf_page: by_page.get(pdf_page, []) for pdf_page in range(1, max_page + 1)}
 
 
 def read_pdf_pages(pdf_path: str | Path,

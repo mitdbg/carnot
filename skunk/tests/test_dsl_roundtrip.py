@@ -39,13 +39,11 @@ VALID_TEMPLATES = [
     # parallel of two retrieves
     "[ retrieve(concept='nd', period='CY1940') --> extract() ; retrieve(concept='nd', period='CY1953') --> extract() ] --> compute()",
     # visual_only flag
-    "retrieve(concept='debt_chart', period='1990-09', source_bulletin='1990-09') --> extract(visual_only=True) --> compute()",
+    "retrieve(concept='debt_chart', period='1990-09') --> extract(visual_only=True) --> compute()",
     # lookup_external + retrieve in parallel
     "[ retrieve(concept='fx_investments', period='2025-03') --> extract() ; lookup_external(nl='USD/JPY exchange rate on 2025-03-31') ] --> compute()",
     # range period
     "retrieve(concept='interest_rates', period='CY1953..CY1955') --> extract() --> compute()",
-    # source_bulletin pin
-    "retrieve(concept='expenditure_table', period='FY1940', source_bulletin='1941-06') --> extract() --> compute()",
     # single lookup_external
     "lookup_external(nl='year WWII ended') --> compute()",
     # parallel of lookup_externals only
@@ -56,6 +54,14 @@ VALID_TEMPLATES = [
     # decomposed: lookup + retrieve sub-computes
     "[ [ lookup_external(nl='year WWII ended') ] --> compute(task='Find WWII end year') ; "
     "[ lookup_external(nl='year Korean War started') ] --> compute(task='Find Korean War start year') ] --> compute()",
+    # extract.value_kind alone (scalar)
+    "retrieve(concept='y', period='CY1953') --> extract(value_kind='scalar') --> compute()",
+    # extract.value_kind + index_name (vector)
+    "retrieve(concept='x', period='FY2007..FY2013', period_type='FY') "
+    "--> extract(value_kind='vector', index_name='fiscal_year') --> compute(method='yoy_growth')",
+    # extract.value_kind + visual_only together
+    "retrieve(concept='debt_chart', period='1990-09', period_type='month') "
+    "--> extract(value_kind='scalar', visual_only=True) --> compute()",
 ]
 
 INVALID_TEMPLATES = [
@@ -140,12 +146,30 @@ def test_simple_chain_yields_single_retrieve_branch() -> None:
 
 def test_visual_only_flag_threads_through() -> None:
     plan = parse(
-        "retrieve(concept='chart', period='1990-09', source_bulletin='1990-09') "
+        "retrieve(concept='chart', period='1990-09') "
         "--> extract(visual_only=True) --> compute()"
     )
     b = plan.computes[0].branches[0]
     assert b.visual_only is True
-    assert b.source_bulletin == "1990-09"
+
+
+def test_legacy_source_bulletin_silently_dropped() -> None:
+    """v0.6 removed source_bulletin end-to-end. Legacy plan caches and
+    legacy JSON dicts that still carry it must parse without error — the
+    field is silently dropped at construction time."""
+    plan = parse(
+        "retrieve(concept='chart', period='1990-09', source_bulletin='1990-09') "
+        "--> extract(visual_only=True) --> compute()"
+    )
+    b = plan.computes[0].branches[0]
+    assert isinstance(b, RetrieveBranch)
+    assert b.visual_only is True
+    assert not hasattr(b, "source_bulletin")
+    # JSON shape too.
+    legacy = {"branches": [{"kind": "retrieve", "concept": "x",
+                            "period": "CY1940", "source_bulletin": "1940-06"}]}
+    plan2 = from_dict(legacy)
+    assert plan2.computes[0].branches[0].concept == "x"
 
 
 def test_lookup_only_chain() -> None:
@@ -175,6 +199,41 @@ def test_bad_period_caught_by_validator() -> None:
     result = validate(plan)
     assert not result.ok
     assert any("period" in e for e in result.errors)
+
+
+def test_value_kind_vocab_enforced() -> None:
+    plan = Plan(computes=[ComputeNode(
+        branches=[RetrieveBranch(concept="x", period="CY1940", value_kind="vec")],
+        task="", final=True,
+    )])
+    result = validate(plan)
+    assert not result.ok
+    assert any("value_kind" in e for e in result.errors)
+
+
+def test_index_name_only_valid_with_vector() -> None:
+    """index_name with value_kind='scalar' must be rejected (orthogonality)."""
+    plan = Plan(computes=[ComputeNode(
+        branches=[RetrieveBranch(
+            concept="x", period="CY1940",
+            value_kind="scalar", index_name="fiscal_year",
+        )],
+        task="", final=True,
+    )])
+    result = validate(plan)
+    assert not result.ok
+    assert any("index_name" in e for e in result.errors)
+
+
+def test_index_name_with_vector_ok() -> None:
+    plan = Plan(computes=[ComputeNode(
+        branches=[RetrieveBranch(
+            concept="x", period="FY2007..FY2013", period_type="FY",
+            value_kind="vector", index_name="fiscal_year",
+        )],
+        task="", final=True,
+    )])
+    assert validate(plan).ok
 
 
 def test_period_range_accepted() -> None:

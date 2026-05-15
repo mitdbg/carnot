@@ -1,12 +1,14 @@
 """Native TOC harvest — one Gemini call per bulletin.
 
 Input: concatenated text of the bulletin's TOC-candidate pages.
-Output: list of (section_label, start_page, end_page) covering the bulletin.
+Output: list of (section_label, start_page_printed, end_page_printed)
+spans covering the bulletin's printed-page range.
 
-Page numbers in the TOC are typically *printed* page numbers (a different
-convention from `PageRef.page` = 1-based PDF page). We pass the LLM both
-flavours so it can disambiguate; we ask it to return 1-based PDF pages
-that we can use to label `PageCatalogRow.section` directly.
+The TOC lists section headings against the bulletin's *printed* page
+numbers (the footer text like "9"). Each row of `PageCatalogRow` also
+carries its `printed_page` field extracted from the page's parsed-JSON
+`page_number` element. We match them directly — no PDF-page offset
+inference needed.
 """
 
 from __future__ import annotations
@@ -20,40 +22,45 @@ from skunk.common import LLMClient
 
 @dataclass(frozen=True)
 class SectionSpan:
-    section: str        # verbatim section label as printed
-    start_page: int     # 1-based PDF page index where the section begins
-    end_page: int       # 1-based PDF page index where the section ends (inclusive)
+    section: str               # verbatim section label as printed in the ToC
+    start_page_printed: str    # printed page label where the section begins
+    end_page_printed: str      # printed page label where the section ends (inclusive)
 
 
 _TOC_SYSTEM = """You map a U.S. Treasury Bulletin's Table of Contents into a list of section spans.
 
 You will receive:
   - The bulletin's publication month (YYYY-MM)
-  - Each candidate TOC page, with both its 1-based PDF page index and its raw text.
+  - Each candidate TOC page, with the raw text of that TOC page.
   - The total number of PDF pages in the bulletin.
 
-The bulletin's TOC pages list section headings and a page number per heading.
-These printed page numbers are NOT the same as the PDF page index — printed page 1
-often appears around PDF page 11 or 13 due to front matter (covers, copies, TOC
-itself). You must infer the printed-to-PDF offset by aligning a couple of section
-headings against the actual text on those PDF pages.
+The bulletin's TOC pages list section headings each followed by a printed
+page number — the same number you would see in the page footer of the
+body pages (e.g. "9", "27", "A-1"). Return those PRINTED page labels
+verbatim. Do NOT translate them to PDF page indices.
 
 Output a SINGLE JSON object with this shape (no prose, no markdown fences):
 
 {
-  "printed_to_pdf_offset": <int>,
   "sections": [
-    {"section": "<verbatim heading>", "start_page_pdf": <int>, "end_page_pdf": <int>}
+    {"section": "<verbatim heading>",
+     "start_page_printed": "<verbatim printed page>",
+     "end_page_printed":   "<verbatim printed page>"}
   ]
 }
 
 Rules:
   - Section labels are VERBATIM as printed in the TOC (preserve casing, hyphens).
-  - The sections must cover the body of the bulletin without overlap; sort by start_page_pdf.
-  - end_page_pdf for section i is start_page_pdf of section i+1 minus 1; the last
-    section's end_page_pdf is the total number of PDF pages.
+  - Page labels are also VERBATIM as printed in the TOC (preserve hyphenation
+    like "A-1", "F-12"; preserve leading zeros if present).
+  - Sort the array by the order the sections appear in the bulletin body.
+  - end_page_printed for section i should be the printed page immediately
+    before the start of section i+1 (or, for the last section, the last
+    printed page listed in the TOC).
+  - Skip ToC-front-matter entries that don't represent body sections
+    (e.g. "Cover", "Contents", "Treasury staff", "Subscription information").
   - If the TOC lists only top-level sections (not sub-sections), return just those.
-  - If the bulletin appears to have no TOC at all, return {"printed_to_pdf_offset": 0, "sections": []}.
+  - If the bulletin appears to have no TOC at all, return {"sections": []}.
 """
 
 
@@ -75,8 +82,9 @@ def harvest_toc(
     """One Gemini call → list of SectionSpan covering the bulletin body.
 
     `toc_candidate_pages` is [(pdf_page_index, text)] for each page flagged
-    as TOC-like by the heuristic in `classify.looks_like_toc`. If empty,
-    we still ask the LLM in case TOC detection missed (returns empty list).
+    as TOC-like by the heuristic in `classify.looks_like_toc`. The PDF
+    page index is shown to the LLM only for provenance; the LLM emits
+    printed page labels in its response.
     """
     if not toc_candidate_pages:
         return []
@@ -85,7 +93,7 @@ def harvest_toc(
                              f"Total PDF pages: {total_pdf_pages}",
                              ""]
     for pdf_idx, text in toc_candidate_pages:
-        user_parts.append(f"--- PDF page {pdf_idx} ---")
+        user_parts.append(f"--- TOC page (PDF page {pdf_idx}) ---")
         user_parts.append(text.strip())
         user_parts.append("")
 
@@ -99,21 +107,55 @@ def harvest_toc(
     for raw in obj.get("sections", []):
         try:
             label = str(raw["section"]).strip()
-            start = int(raw["start_page_pdf"])
-            end = int(raw["end_page_pdf"])
+            start = str(raw["start_page_printed"]).strip()
+            end = str(raw["end_page_printed"]).strip()
         except (KeyError, ValueError, TypeError):
             continue
-        if not label or start < 1 or end < start or end > total_pdf_pages:
+        if not label or not start or not end:
             continue
-        spans.append(SectionSpan(section=label, start_page=start, end_page=end))
+        spans.append(SectionSpan(section=label,
+                                 start_page_printed=start,
+                                 end_page_printed=end))
 
-    spans.sort(key=lambda s: s.start_page)
+    # Sort by numeric printed page when possible — handles plain integers
+    # which is the dominant case in this corpus. Non-numeric labels fall
+    # back to lexicographic order.
+    def _sort_key(sp: SectionSpan) -> tuple[int, str]:
+        n = _printed_to_int(sp.start_page_printed)
+        return (0 if n is None else 1, sp.start_page_printed if n is None else "") \
+            if n is None else (1, f"{n:08d}")
+
+    spans.sort(key=_sort_key)
     return spans
 
 
-def section_for_page(spans: list[SectionSpan], pdf_page: int) -> str | None:
-    """Look up the section label covering `pdf_page`, or None if outside any span."""
+_DIGIT_RE = re.compile(r"^\s*0*(\d+)\s*$")
+
+
+def _printed_to_int(s: str | None) -> int | None:
+    """Parse a printed page label to an int when it's a plain integer
+    (optionally with leading zeros). Returns None for hyphenated labels
+    like 'A-1' or any non-integer string."""
+    if not s:
+        return None
+    m = _DIGIT_RE.match(s)
+    return int(m.group(1)) if m else None
+
+
+def section_for_printed_page(
+    spans: list[SectionSpan], printed_page: str | None,
+) -> str | None:
+    """Look up the section label covering `printed_page`. Returns None
+    when the page falls outside every span, when `printed_page` is None,
+    or when neither side can be parsed numerically (no fallback)."""
+    n = _printed_to_int(printed_page)
+    if n is None:
+        return None
     for sp in spans:
-        if sp.start_page <= pdf_page <= sp.end_page:
+        lo = _printed_to_int(sp.start_page_printed)
+        hi = _printed_to_int(sp.end_page_printed)
+        if lo is None or hi is None:
+            continue
+        if lo <= n <= hi:
             return sp.section
     return None

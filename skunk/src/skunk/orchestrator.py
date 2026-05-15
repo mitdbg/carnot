@@ -83,6 +83,9 @@ def execute(plan: Plan, ctx: HarnessContext) -> QuestionTrace:
     """Walk the plan's compute chain. Legacy single-compute = data → final compute.
     Decomposed = parallel intermediates → final aggregator compute."""
     trace = QuestionTrace(question=ctx.question)
+    # Make Plan-level constraints (units_out, precision, answer_form) visible
+    # to subagents that read them off ctx.plan.
+    ctx.plan = plan
     try:
         if not plan.computes:
             raise StepFailed("orchestrator", "plan has no computes")
@@ -116,10 +119,18 @@ def _run_branch(branch: Branch, ctx: HarnessContext, trace: QuestionTrace) -> li
     """Execute a single branch and return its entries."""
     if isinstance(branch, RetrieveBranch):
         ret_args: dict[str, Any] = {"concept": branch.concept, "period": branch.period}
-        if branch.source_bulletin:
-            ret_args["source_bulletin"] = branch.source_bulletin
+        if branch.period_type:
+            ret_args["period_type"] = branch.period_type
         doc = _run_op(OpNode(op="retrieve", args=ret_args), None, ctx, trace)
-        ext_args: dict[str, Any] = {"visual_only": True} if branch.visual_only else {}
+        ext_args: dict[str, Any] = {"concept": branch.concept, "period": branch.period}
+        if branch.visual_only:
+            ext_args["visual_only"] = True
+        if branch.period_type:
+            ext_args["period_type"] = branch.period_type
+        if branch.value_kind:
+            ext_args["value_kind"] = branch.value_kind
+        if branch.index_name:
+            ext_args["index_name"] = branch.index_name
         return _run_op(OpNode(op="extract", args=ext_args), doc, ctx, trace)
     if isinstance(branch, LookupBranch):
         return _run_op(OpNode(op="lookup_external", args={"nl": branch.nl}), None, ctx, trace)
@@ -186,8 +197,13 @@ def _run_intermediate_node(
 ) -> list[AnnotatedValue]:
     """Run one intermediate ComputeNode's branches then its compute. No recovery."""
     prev = _run_data_phase(node.branches, ctx, trace)
+    compute_args: dict[str, Any] = {"task": node.task, "final": False}
+    if node.method:
+        compute_args["method"] = node.method
+    if node.transforms:
+        compute_args["transforms"] = list(node.transforms)
     return _run_op(
-        OpNode(op="compute", args={"task": node.task, "final": False}),
+        OpNode(op="compute", args=compute_args),
         prev, ctx, trace,
     )
 
@@ -216,6 +232,10 @@ def _run_compute_with_recovery(
     compute_args: dict[str, Any] = {"final": True}
     if final_node.task:
         compute_args["task"] = final_node.task
+    if final_node.method:
+        compute_args["method"] = final_node.method
+    if final_node.transforms:
+        compute_args["transforms"] = list(final_node.transforms)
     compute_op = OpNode(op="compute", args=compute_args)
 
     from skunk.planner import plan_recovery

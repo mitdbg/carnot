@@ -46,11 +46,11 @@ Pass `--trace-dir ''` to disable. Pass `--quiet` to suppress live stdout streami
 
 Gemini rate limiting + retries
 ------------------------------
-`LLMClient` (src/skunk/common/llm.py) paces all Gemini calls through a
-process-wide token bucket sized by `SKUNK_GEMINI_RPM` (default 1000 to match
-the Flash 2.5 paid-tier quota). On any error from the SDK, the call retries
-with exponential backoff (start 50ms, doubling, capped at 1s, up to 10 retries)
-and logs each failure to stderr. If you see 429s persistently, lower the rpm.
+`LLMClient` (src/skunk/common.py) paces all LLM calls through a process-wide
+token bucket sized by `SKUNK_LLM_RPM` (default 1000). On any error from the
+SDK, the call retries with exponential backoff (start 50ms, doubling, capped at
+1s, up to 10 retries) and logs each failure to stderr. If you see 429s
+persistently, lower the rpm.
 """
 
 from __future__ import annotations
@@ -120,6 +120,17 @@ def load_golden(csv_path: str | Path) -> dict[str, list[PageRef]]:
 
 REPORT_FIELDS = ["uid", "question", "predicted", "gold_answer", "failed", "reason", "n_steps"]
 
+# Held-out test set — see CLAUDE.md. Loaded lazily so the file is optional.
+_TEST_SET_PATH = REPO_ROOT / "eval" / "test_set_uids.json"
+
+
+def _load_test_set() -> set[str]:
+    if not _TEST_SET_PATH.exists():
+        return set()
+    import json
+    with _TEST_SET_PATH.open() as f:
+        return set(json.load(f).get("uids", []))
+
 
 def _pick_uids(df: pd.DataFrame, sample: str | None, uids_arg: str | None) -> list[str]:
     if uids_arg:
@@ -159,6 +170,9 @@ def main() -> None:
                         help="Per-question debug trace directory (default: %(default)s; '' to disable)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress live orchestrator + subagent events (verbose is on by default)")
+    parser.add_argument("--include-test-set", action="store_true",
+                        help="Include the held-out test-set UIDs (see CLAUDE.md). Default is to exclude "
+                             "them — only opt in for a deliberate final-number measurement.")
     args = parser.parse_args()
 
     if args.golden and args.golden_noisy:
@@ -168,6 +182,20 @@ def main() -> None:
     df_by_uid = df.set_index("uid")
 
     uids = _pick_uids(df, args.sample, args.uids)
+
+    test_set = _load_test_set()
+    if test_set and not args.include_test_set:
+        before = len(uids)
+        uids = [u for u in uids if u not in test_set]
+        n_excluded = before - len(uids)
+        if n_excluded:
+            print(f"[e2e] Excluded {n_excluded} held-out test-set UID(s). "
+                  f"Pass --include-test-set to override (see CLAUDE.md).", file=sys.stderr)
+    elif test_set and args.include_test_set:
+        print(f"[e2e] WARNING: --include-test-set is on; the held-out {len(test_set)}-UID test set "
+              f"is in play. Only use this for final-number measurement, not iterative tuning.",
+              file=sys.stderr)
+
     sample_note = f" (sample: {args.sample})" if args.sample and not args.uids else ""
     print(f"[e2e] Running {len(uids)} UID(s){sample_note}")
 

@@ -116,6 +116,7 @@ def run_question(
         verbose=verbose,
         config=config,
     )
+
     t0 = time.perf_counter()
 
     if cached_plan_text is not None:
@@ -163,7 +164,7 @@ def run_question(
             plan_text_for_dump = cached_plan_text or "(unavailable)"
         _dump_trace(trace_path, uid=uid, question=question, plan_text=plan_text_for_dump,
                     golden_pages=golden_pages, trace=trace, events=ctx.events,
-                    model=config.gemini_model)
+                    model=config.llm_model)
 
     return {
         "question": question,

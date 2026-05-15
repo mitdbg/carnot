@@ -1,10 +1,10 @@
-"""Build pipeline — sample bulletins → harvest TOC → per-page extract → persist.
+"""v0.4 build pipeline — fully deterministic per-page extract, no LLM here.
+
+Sample bulletins (default: ALL in the window) → per-page parse → persist.
 
 CLI:
     python -m skunk.page_index.build \\
         --window 1950-1954 \\
-        --n 20 \\
-        --seed 42 \\
         --out cache/page_index
 
 Output:
@@ -26,7 +26,6 @@ from pathlib import Path
 
 
 def _load_env(path: Path) -> None:
-    """Mirror of eval_e2e._load_env — picks up GEMINI_API_KEY etc. from .env."""
     if not path.exists():
         return
     for line in path.read_text().splitlines():
@@ -42,16 +41,92 @@ _load_env(_REPO_ROOT / ".env")
 from skunk.common import LLMClient  # noqa: E402
 from skunk.config import SkunkConfig  # noqa: E402
 
-from .classify import char_metrics, cheap_classify
-from .extract_fields import extract_page_fields
-from .pdf import (
-    parse_bulletin_filename, parsed_json_dir, read_page_sections, read_pdf_pages,
+from .classify import (
+    char_metrics, cheap_classify, has_prose_content, has_visual_elements,
+)  # noqa: E402
+from .extract_fields import parse_page_fields  # noqa: E402
+from .pdf import (  # noqa: E402
+    parse_bulletin_filename, parsed_json_dir, read_page_elements,
+    read_pdf_pages,
 )
-from .schema import PageCatalogRow
-from .toc import SectionSpan, harvest_toc, section_for_page
+from .schema import PageCatalogRow  # noqa: E402
+from .toc import harvest_toc, section_for_printed_page  # noqa: E402
+
+
+def _extract_printed_page(elements: list[dict]) -> str | None:
+    """Pull the printed-page footer label from a page's parsed-JSON
+    elements (`type == "page_number"`). Returns None when no such
+    element exists (front-matter / divider / blank pages typically).
+    """
+    for el in elements:
+        if el.get("type") == "page_number":
+            content = el.get("content")
+            if content is not None:
+                txt = str(content).strip()
+                if txt:
+                    return txt
+    return None
 
 
 _FILENAME_RE = re.compile(r"treasury_bulletin_(\d{4})_(\d{2})\.pdf$")
+
+_CONT_SUFFIX_RE = re.compile(
+    r"[,\s\-–—]+(?:con|cont|continued)\s*\.?\s*\)?\s*$", re.IGNORECASE,
+)
+
+
+def _merge_continuation_pages(rows: list[PageCatalogRow]) -> int:
+    """Forward-fill table identity across continuation pages.
+
+    A table/chart page is a continuation when EITHER:
+      (a) its section banner or table_title ends with `con / cont / continued`, OR
+      (b) page_kind ∈ {table, chart} but table_title is None AND the previous
+          table/chart page has a non-empty table_title (caption-less continuation,
+          ~9% of table pages — the layout parser drops the caption).
+
+    For matched pages, UNION the parent's keywords onto the current row and
+    replace `table_title` / `section` with the parent's. The page's own
+    column_headers / row_headers_sample / dates are preserved.
+
+    Returns the number of pages merged (for build-time stats).
+    """
+    rows.sort(key=lambda r: r.page)
+    parent: PageCatalogRow | None = None
+    merged = 0
+    for r in rows:
+        if r.page_kind not in ("table", "chart"):
+            parent = None
+            continue
+        is_explicit_cont = bool(
+            (r.table_title and _CONT_SUFFIX_RE.search(r.table_title)) or
+            (r.section and _CONT_SUFFIX_RE.search(r.section))
+        )
+        is_implicit_cont = (
+            r.table_title is None
+            and parent is not None
+            and parent.table_title is not None
+        )
+        if (is_explicit_cont or is_implicit_cont) and parent is not None:
+            r.table_title = parent.table_title
+            if parent.section:
+                r.section = parent.section
+            seen = {k.lower() for k in r.keywords}
+            for k in parent.keywords:
+                if k.lower() not in seen:
+                    r.keywords.append(k)
+                    seen.add(k.lower())
+            merged += 1
+            # Continuation pages also act as parents for further continuations
+            # (e.g. a 3-page table). The parent identity is unchanged; we just
+            # let the loop continue.
+        else:
+            # This page establishes a new identity if it has a table_title.
+            if r.table_title:
+                parent = r
+            # else keep existing parent — a captionless table page that fails
+            # the implicit-cont check (because there's no captioned parent yet)
+            # stays as-is and doesn't reset the chain.
+    return merged
 
 
 def _list_corpus_pdfs(pdf_dir: Path) -> list[Path]:
@@ -85,34 +160,17 @@ def _parse_window(s: str) -> tuple[int, int]:
     return lo, hi
 
 
-def _bulletin_month_str(bulletin: str) -> str:
-    """'1953-06' is already month-form; return as-is. Single source of truth."""
-    return bulletin
-
-
-def _is_retrospective(periods_covered, bulletin_month: str) -> bool:
-    """A page is 'retrospective' if every period it reports on ends before its
-    publication month (i.e. the page is summarizing already-completed periods,
-    not the bulletin's own publication month)."""
-    if not periods_covered:
-        return False
-    bulletin_end_iso = f"{bulletin_month}-28"  # conservative end-of-month proxy
-    return all(p.end < bulletin_end_iso for p in periods_covered)
-
-
 def _process_one_bulletin(
     pdf_path: Path,
-    llm: LLMClient,
-    n_workers: int,
     verbose: bool,
     parsed_dir: Path | None = None,
+    llm: LLMClient | None = None,
 ) -> list[PageCatalogRow]:
     bulletin_month = parse_bulletin_filename(pdf_path)
     pages = read_pdf_pages(pdf_path, parsed_dir=parsed_dir)
-    page_sections = read_page_sections(pdf_path, parsed_dir=parsed_dir)
-    n_pages = len(pages)
+    page_elements = read_page_elements(pdf_path, parsed_dir=parsed_dir)
 
-    # Stage 1: cheap classification.
+    # Stage 1: cheap classification (blank/toc) + char metrics.
     cheap_kinds: dict[int, str | None] = {}
     metrics: dict[int, tuple[int, float]] = {}
     for pdf_idx, text in pages.items():
@@ -120,61 +178,32 @@ def _process_one_bulletin(
         metrics[pdf_idx] = (cc, dr)
         cheap_kinds[pdf_idx] = cheap_classify(text, pdf_idx)
 
-    toc_candidates = [(idx, pages[idx]) for idx, k in cheap_kinds.items() if k == "toc"]
-
-    # Stage 2: TOC harvest (one LLM call per bulletin).
-    t0 = time.monotonic()
-    spans: list[SectionSpan] = harvest_toc(
-        bulletin_month=bulletin_month,
-        toc_candidate_pages=toc_candidates,
-        total_pdf_pages=n_pages,
-        llm=llm,
-    )
-    if verbose:
-        print(
-            f"  [toc] {bulletin_month}: {len(spans)} sections in "
-            f"{time.monotonic() - t0:.1f}s ({len(toc_candidates)} TOC candidate pages)"
-        )
-
-    # Stage 3: per-page LLM extract for pages that fell through the heuristic.
-    targets = [idx for idx, k in cheap_kinds.items() if k is None]
-
-    extracted_fields: dict[int, dict] = {}
-
-    def _worker(idx: int) -> tuple[int, dict]:
-        return idx, extract_page_fields(
-            bulletin_month=bulletin_month,
-            pdf_page=idx,
-            page_text=pages[idx],
-            llm=llm,
-        )
-
-    if targets:
-        t1 = time.monotonic()
-        with ThreadPoolExecutor(max_workers=n_workers) as ex:
-            futs = [ex.submit(_worker, idx) for idx in targets]
-            done = 0
-            for f in as_completed(futs):
-                idx, fields = f.result()
-                extracted_fields[idx] = fields
-                done += 1
-                if verbose and done % 25 == 0:
-                    print(
-                        f"  [extract] {bulletin_month}: {done}/{len(targets)} "
-                        f"pages in {time.monotonic() - t1:.1f}s"
-                    )
-        if verbose:
-            kinds_count: dict[str, int] = {}
-            for f in extracted_fields.values():
-                k = f.get("page_kind", "?")
-                kinds_count[k] = kinds_count.get(k, 0) + 1
-            print(
-                f"  [extract] {bulletin_month}: done {len(targets)} pages in "
-                f"{time.monotonic() - t1:.1f}s | kinds={kinds_count}"
+    # Stage 1.5: ToC harvest. One LLM call per bulletin → section spans in
+    # the bulletin's own printed-page numbering. Each page's `printed_page`
+    # is matched against these spans; pages outside every span (including
+    # bulletins where harvest_toc returns nothing) land in 'Unsectioned' at
+    # tree-build time. No per-page-banner fallback — the banner vocabulary
+    # was the dominant L1 noise source.
+    spans = []
+    if llm is not None:
+        toc_candidates = [
+            (idx, pages[idx]) for idx, k in cheap_kinds.items() if k == "toc"
+        ]
+        if toc_candidates:
+            spans = harvest_toc(
+                bulletin_month=bulletin_month,
+                toc_candidate_pages=toc_candidates,
+                total_pdf_pages=len(pages),
+                llm=llm,
             )
 
-    # Stage 4: assemble PageCatalogRows.
+    # Stage 2: assemble rows. For every page that fell through cheap classify
+    # AND has a visual element (table/figure/image), run the deterministic
+    # parser. Pure-text pages get a row with page_kind="text" and no fields.
     rows: list[PageCatalogRow] = []
+    n_table_or_chart = 0
+    n_text = 0
+    n_unsectioned = 0
     for pdf_idx, text in pages.items():
         cc, dr = metrics[pdf_idx]
         row = PageCatalogRow(
@@ -184,9 +213,12 @@ def _process_one_bulletin(
             char_count=cc,
             digit_ratio=round(dr, 3),
         )
-        # Section: prefer per-page banner from parsed JSON (ground truth);
-        # fall back to TOC-inferred span if the page has no banner.
-        row.section = page_sections.get(pdf_idx) or section_for_page(spans, pdf_idx)
+        elements = page_elements.get(pdf_idx, [])
+        row.printed_page = _extract_printed_page(elements)
+        row.section = (section_for_printed_page(spans, row.printed_page)
+                       if spans else None)
+        if row.section is None:
+            n_unsectioned += 1
 
         cheap_k = cheap_kinds[pdf_idx]
         if cheap_k is not None:
@@ -194,18 +226,35 @@ def _process_one_bulletin(
             rows.append(row)
             continue
 
-        fields = extracted_fields.get(pdf_idx) or {"page_kind": "text"}
+        if not (has_visual_elements(elements) or has_prose_content(elements)):
+            row.page_kind = "text"
+            n_text += 1
+            rows.append(row)
+            continue
+
+        fields = parse_page_fields(elements)
         row.page_kind = fields["page_kind"]
-        if row.page_kind in ("table", "chart"):
+        if row.page_kind in ("table", "chart", "prose"):
             row.table_title = fields.get("table_title")
             row.column_headers = fields.get("column_headers", [])
             row.row_headers_sample = fields.get("row_headers_sample", [])
             row.keywords = fields.get("keywords", [])
-            row.periods_covered = fields.get("periods_covered", [])
-            row.granularity = fields.get("granularity", "unknown")
-            row.is_retrospective = _is_retrospective(row.periods_covered, bulletin_month)
+            row.dates = fields.get("dates", [])
+            n_table_or_chart += 1
+        else:
+            n_text += 1
         rows.append(row)
 
+    # Forward-fill continuation pages so the parent table's keywords also
+    # point to its continuation pages (multi-page tables). This is a
+    # preprocessing-time fix; the merge changes are local to this bulletin.
+    n_merged = _merge_continuation_pages(rows)
+
+    if verbose:
+        print(f"  [{bulletin_month}] {n_table_or_chart} table/chart pages, "
+              f"{n_text} text pages, {len(rows)} total, "
+              f"{n_merged} continuation merges, {len(spans)} ToC spans, "
+              f"{n_unsectioned} unsectioned")
     return rows
 
 
@@ -222,13 +271,15 @@ def _persist_bulletin(rows: list[PageCatalogRow], out_dir: Path) -> Path:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Build page-index catalog for a sample of bulletins.")
+    ap = argparse.ArgumentParser(
+        description="v0.4 build page-index catalog for bulletins in a window.")
     ap.add_argument("--window", type=_parse_window, required=True,
                     help="Inclusive year window, e.g. 1950-1954.")
-    ap.add_argument("--n", type=int, default=20,
-                    help="Number of bulletins to sample from the window.")
+    ap.add_argument("--n", type=int, default=None,
+                    help="If set, sample this many bulletins from the window "
+                         "(debug). Default: index ALL bulletins in window.")
     ap.add_argument("--seed", type=int, default=42,
-                    help="RNG seed for the sample.")
+                    help="RNG seed for the --n sample (only used if --n set).")
     ap.add_argument("--pdf-dir", type=Path,
                     default=Path(os.environ.get(
                         "OFFICEQA_PDF_DIR",
@@ -241,9 +292,12 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=Path("cache/page_index"),
                     help="Output directory for the JSONL catalog.")
     ap.add_argument("--bulletins", type=str, default=None,
-                    help="Comma-separated list of YYYY-MM to override the random sample (debug).")
+                    help="Comma-separated list of YYYY-MM to override (debug).")
     ap.add_argument("--workers", type=int, default=8,
-                    help="Threadpool size per bulletin (extract stage).")
+                    help="Bulletin-level parallelism (each bulletin is processed independently).")
+    ap.add_argument("--no-toc", action="store_true",
+                    help="Skip the per-bulletin harvest_toc LLM call. "
+                         "Falls back to per-page banner sections only.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -266,10 +320,12 @@ def main() -> int:
         if missing:
             print(f"Requested bulletins not in window: {sorted(missing)}", file=sys.stderr)
             return 2
-    else:
+    elif args.n is not None:
         rng = random.Random(args.seed)
         n = min(args.n, len(windowed))
         chosen = sorted(rng.sample(windowed, n), key=lambda p: p.name)
+    else:
+        chosen = list(windowed)
 
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -280,57 +336,62 @@ def main() -> int:
         print(f"Parsed-JSON dir does not exist: {parsed_dir}", file=sys.stderr)
         return 2
 
-    cfg = SkunkConfig.from_env()
-    llm = LLMClient(cfg)
-
-    print(f"Building page index for {len(chosen)} bulletins → {args.out}")
-    print(f"  page text source: parsed-JSON @ {parsed_dir}")
-    for p in chosen:
-        print(f"  - {parse_bulletin_filename(p)}  ({p.name})")
-    print()
+    llm: LLMClient | None = None
+    if not args.no_toc:
+        cfg = SkunkConfig.from_env()
+        llm = LLMClient(cfg)
+        print(f"Building page index for {len(chosen)} bulletins → {args.out}")
+        print(f"  page text source: parsed-JSON @ {parsed_dir}")
+        print(f"  workers: {args.workers}    harvest_toc: on ({cfg.llm_model})\n")
+    else:
+        print(f"Building page index for {len(chosen)} bulletins → {args.out}")
+        print(f"  page text source: parsed-JSON @ {parsed_dir}")
+        print(f"  workers: {args.workers}    harvest_toc: off (--no-toc)\n")
 
     started = time.monotonic()
     summary: list[dict] = []
-    for pdf_path in chosen:
+
+    def _do_one(pdf_path: Path) -> tuple[Path, list[PageCatalogRow] | None, float, str | None]:
         bulletin = parse_bulletin_filename(pdf_path)
         t0 = time.monotonic()
         try:
             rows = _process_one_bulletin(
-                pdf_path=pdf_path,
+                pdf_path=pdf_path, verbose=args.verbose, parsed_dir=parsed_dir,
                 llm=llm,
-                n_workers=args.workers,
-                verbose=args.verbose,
-                parsed_dir=parsed_dir,
             )
-        except Exception as e:
-            print(f"[error] {bulletin}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
-            summary.append({"bulletin": bulletin, "status": "error", "error": str(e)})
-            continue
-        out_path = _persist_bulletin(rows, args.out)
-        kinds_count: dict[str, int] = {}
-        for r in rows:
-            kinds_count[r.page_kind] = kinds_count.get(r.page_kind, 0) + 1
-        dt = time.monotonic() - t0
-        print(f"[done] {bulletin}: {len(rows)} pages in {dt:.1f}s "
-              f"kinds={kinds_count} → {out_path}")
-        summary.append({
-            "bulletin": bulletin,
-            "status": "ok",
-            "n_pages": len(rows),
-            "kinds": kinds_count,
-            "duration_s": round(dt, 2),
-            "out_path": str(out_path),
-        })
+        except Exception as e:  # noqa: BLE001
+            return pdf_path, None, time.monotonic() - t0, f"{type(e).__name__}: {e}"
+        return pdf_path, rows, time.monotonic() - t0, None
+
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futs = {ex.submit(_do_one, p): p for p in chosen}
+        for f in as_completed(futs):
+            pdf_path, rows, dt, err = f.result()
+            bulletin = parse_bulletin_filename(pdf_path)
+            if err is not None or rows is None:
+                print(f"[error] {bulletin}: {err}", file=sys.stderr, flush=True)
+                summary.append({"bulletin": bulletin, "status": "error", "error": err})
+                continue
+            out_path = _persist_bulletin(rows, args.out)
+            kinds_count: dict[str, int] = {}
+            for r in rows:
+                kinds_count[r.page_kind] = kinds_count.get(r.page_kind, 0) + 1
+            print(f"[done] {bulletin}: {len(rows)} pages in {dt:.1f}s "
+                  f"kinds={kinds_count} → {out_path}")
+            summary.append({
+                "bulletin": bulletin, "status": "ok", "n_pages": len(rows),
+                "kinds": kinds_count, "duration_s": round(dt, 2),
+                "out_path": str(out_path),
+            })
 
     total_dt = time.monotonic() - started
     manifest = {
         "window": list(args.window),
         "n_requested": args.n,
         "n_built": sum(1 for s in summary if s["status"] == "ok"),
-        "seed": args.seed,
-        "bulletins": summary,
+        "bulletins": sorted(summary, key=lambda s: s["bulletin"]),
         "duration_s": round(total_dt, 2),
-        "gemini_model": cfg.gemini_model,
+        "extract_mode": "deterministic_v0.4",
     }
     manifest_path = args.out / "manifest.json"
     with manifest_path.open("w") as f:

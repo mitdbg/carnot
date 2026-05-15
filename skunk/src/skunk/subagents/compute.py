@@ -39,6 +39,8 @@ You receive:
 - The user's original question (free text).
 - `prev`: extracted data, available in the sandbox. Always list[AnnotatedValue].
     AnnotatedValue fields:
+          .tag         — short snake_case selection key (e.g. "national_defense_expenditures:cy1940").
+                          Two entries describing the same series + period share the same tag.
           .description — natural-language label uniquely identifying this datum
                           (e.g. "Total US national defense expenditures, monthly, CY1940")
           .value       — the payload (scalar, vector dict, or table dict-of-dict)
@@ -47,6 +49,13 @@ You receive:
           .index_name  — vector only: name of the varying dim (e.g. "month")
           .row_name    — table only: name of the row dim
           .col_name    — table only: name of the column dim
+
+Selecting from prev:
+  PREFER exact tag matching: `next(e for e in prev if e.tag == "national_defense_expenditures:cy1940")`.
+  When multiple entries match a substring, the first match wins — which is fragile.
+  Tags are the unambiguous handle; use them when available. Fall back to description
+  substring matching only when no tag is present (e.tag == "") or when you need to
+  scan multiple entries.
 
 Payload shapes by kind:
   scalar:  entry.value is the number or string itself.
@@ -62,9 +71,37 @@ Pay special attention to the question's explicit constraints:
   - series: e.g. "national defense expenditures"
   - type of computation requested: e.g., geometric mean vs. arithmetic mean
 
-Worked example — geometric mean over a vector:
-    e = next(e for e in prev
-             if e.kind == "vector" and "budget expenditures" in e.description.lower())
+You will also see a "Parsed constraints" block in the user message — a
+pre-parsed structured spec of the question. Treat it as ground truth: every
+transform listed there MUST appear as an explicit operation in your code.
+If method is set, implement that exact method's standard formula. If
+units_out is set, format/convert the answer to that unit. If precision is
+set, round the final answer to that many decimal places.
+
+NUMERIC TRANSFORMS — every transform present in the question MUST appear as
+an explicit operation in the code, NOT just acknowledged in a comment.
+Naming the transform without implementing it will be REVISEd downstream.
+Common ones to watch for:
+  - "normalized", "mid-point normalized" — apply the normalization (e.g.
+    midpoint: (V2-V1) / ((V1+V2)/2))
+  - "signed", "absolute" — preserve or strip the sign accordingly; never
+    silently `abs()` a value the question wants signed
+  - "log of", "ln(...)" — wrap in np.log; do not skip
+  - "ratio of A to B" — divide A by B; do not subtract
+  - "per capita" — divide by population
+  - "year-over-year", "month-over-month" — pct change between consecutive
+    periods, not raw diff
+  - "in percent form" vs "as a decimal" — multiply/divide by 100 accordingly
+    and format the result string to match
+  - "rounded to N decimal places" — round explicitly
+  - "in millions/billions of USD" — convert the .unit value to that scale
+  - "geometric mean" vs "arithmetic mean" — use np.exp(np.mean(np.log(...)))
+    vs np.mean
+  - "weighted" vs "unweighted" — apply weights or don't, per the question
+  - "compound" vs "simple" growth rate — use CAGR formula vs naive ratio
+
+Worked example — geometric mean over a vector (tag-matched):
+    e = next(e for e in prev if e.tag == "national_defense_expenditures:cy1940")
     vals = list(e.value.values())
     gm = float(np.exp(np.mean(np.log(vals))))
     result = f"{gm:.2f} millions of nominal dollars"
@@ -76,9 +113,8 @@ Worked example — date-range filter on a vector:
     gm = float(np.exp(np.mean(np.log(selected))))
     result = f"{gm:.2f}"
 
-Worked example — column sum on a table:
-    e = next(e for e in prev
-             if e.kind == "table" and "receipts" in e.description.lower())
+Worked example — column sum on a table (tag-matched):
+    e = next(e for e in prev if e.tag == "internal_revenue_collections:fy1943")
     df = pd.DataFrame.from_dict(e.value, orient="index")
     total_1943 = float(df.loc["1943"].sum())
     result = f"{total_1943:,.0f}"
@@ -126,6 +162,7 @@ You receive:
   original question).
 - `prev`: extracted bulletin data, available in the sandbox. Always list[AnnotatedValue].
     AnnotatedValue fields:
+          .tag         — short snake_case selection key (e.g. "national_defense_expenditures:cy1940")
           .description — natural-language label uniquely identifying this datum
           .value       — the payload (scalar, vector dict, or table dict-of-dict)
           .unit        — semantic unit (usd_millions, pct, count, year, text, fx_rate, ...)
@@ -140,8 +177,8 @@ Payload shapes by kind:
   table:   entry.value is a 2-level dict {row_label: {col_label: scalar}}.
 
 Working with entries:
-- Iterate `prev` and select entries by reading `e.description` and `e.kind`.
-- Substring-match on description (case-insensitive) to pick the entry you want.
+- PREFER exact tag matching: `next(e for e in prev if e.tag == "<tag>")`.
+- Fall back to description substring matching only when no tag is present.
 - Every entry's unit is in .unit — trust that, never guess.
 
 Your job: produce ONE raw value (or a small set) that answers the sub-task and
@@ -207,18 +244,76 @@ string it produced. Decide whether to ship the result as-is or revise.
 You receive the question, a summary of `prev` (the list[AnnotatedValue] input — including each entry's description,
 unit, and kind), the python code that ran, and the produced `result` string.
 
+You will also see a "Parsed constraints" block — a pre-parsed structured spec
+of the question (units_out, precision, answer_form, method, transforms,
+period_type). Treat it as ground truth and use it as your checklist: for
+each transform in the spec, verify the code applies it; for method, verify
+the formula matches the standard form; for units_out, verify the result is
+in that unit; for precision, verify rounding; for answer_form, verify the
+result's shape.
+
 Reply on a single line:
   ACCEPT
   REVISE: <one short reason a re-run should address>
 
+Before deciding, scan the question for NUMERIC MODIFIERS. Common ones:
+  "normalized", "mid-point normalized", "signed" (vs "absolute"), "log of",
+  "ln(...)", "ratio of A to B", "per capita", "year-over-year",
+  "month-over-month", "in percent form" vs "as a decimal", "rounded to N
+  decimal places", "in millions/billions of USD", "geometric mean" vs
+  "arithmetic mean", "weighted" vs "unweighted", "compound" vs "simple"
+  growth rate.
+For each modifier present in the question, verify the code applies it
+correctly as an explicit operation (not just a comment). If any modifier
+is omitted or misapplied, REVISE — even when the result "looks plausible"
+in shape. Magnitude/sign sanity check: if the result's order of magnitude
+or sign disagrees with the natural reading of the question under its
+modifiers, that is a STRONG REVISE signal.
+
+When the question NAMES A SPECIFIC METHOD, verify the code implements the
+standard formula for that method. Specific gotchas:
+  - "Expected shortfall" / ES on a return-or-yield series: ES is the
+    *signed* mean of the tail-loss observations. If yields are positive
+    on average but the question implies a "shortfall" / loss context,
+    expect a NEGATIVE answer. Code that returns the mean of the lowest
+    values without sign-handling is wrong.
+  - "Arc elasticity": standard form is
+    ((Q2-Q1)/((Q1+Q2)/2)) / ((P2-P1)/((P1+P2)/2)).
+    Do NOT substitute point elasticity, CAGR, or growth-rate-as-elasticity.
+  - "Zipf exponent": if the question pins a method (OLS log-rank vs log-size,
+    MLE, regression of frequency on rank), use exactly that method. If the
+    question doesn't pin one, MLE is the typical default for power-law fits.
+  - "Hazen plotting position": (i - 0.5) / n. NOT Weibull i/(n+1) and NOT
+    California i/n.
+  - "Gini coefficient" vs "Theil index" vs "coefficient of variation": these
+    are distinct; use the one named.
+  - "Pearson correlation" vs "partial correlation" vs "Spearman": distinct.
+  - "H-spread" / IQR: Q3 − Q1 using the percentile method named (default
+    "linear interpolation" / Tukey hinges if unspecified).
+  - "CAGR": (V_end/V_start)^(1/n) - 1, where n is the number of intervals
+    (NOT years inclusive).
+If a related-but-different formula was used, REVISE with: "code uses
+<short description> but question asks for <named method>".
+
 REVISE when the producer:
   - applied the wrong unit conversion (e.g. shipped usd_thousands while the
     question asked for usd_millions, or never converted),
+  - omitted or misapplied a numeric modifier from the question (see scan
+    above) — e.g. the question said "midpoint normalized" but the code
+    shipped a raw difference; said "signed" but the code wrapped abs(...);
+    said "log of" but the code skipped the log; said "per capita" but the
+    code didn't divide by population,
+  - used a formula that doesn't match a named statistical method (see
+    method-name list above),
   - produced a result whose form clearly contradicts the question (asked
     for "[a, b]" bracketed list, shipped "1.0 2.0"; asked for percent
     form, shipped a decimal like "0.1234"),
   - selected the wrong rows/columns from `prev` given the question's
     explicit constraints (wrong year, wrong series, wrong dim filter),
+  - used a description substring or tag that would match MULTIPLE entries
+    in `prev` — `next(e for e in prev if "X" in e.description)` is fragile
+    when several entries share that substring; REVISE and instruct the
+    producer to use exact tag matching (e.tag == "<tag>") to disambiguate,
   - wrapped the answer in narrative prose ("The bureau is X and the
     average is Y") when the question asks for a single value — REVISE
     and instruct the producer to return ONLY the requested value.
@@ -236,16 +331,36 @@ _CODE_RE = re.compile(r"\bCODE\s*\n(.*)\Z", re.DOTALL)
 _MISSING_RE = re.compile(r"\bMISSING:\s*([^\n]*)", re.IGNORECASE)
 
 
-def _summarize_vector(value: dict) -> str:
-    """Short, codegen-friendly summary of a vector payload. Shows index range + a sample of cells."""
+def _summarize_vector(value: dict, expected_index_range: str = "") -> str:
+    """Short, codegen-friendly summary of a vector payload. Shows index range + a sample of cells.
+    When `expected_index_range` is set (e.g., '1969-01..1980-01') and the actual key span
+    is narrower, the summary loudly flags the gap so compute can MISSING out of partial data."""
     if not isinstance(value, dict) or not value:
         return repr(value)
     keys = list(value.keys())
     n = len(keys)
     head = ", ".join(f"{k!r}: {value[k]!r}" for k in keys[:3])
+    base = f"{{{head}}}" if n <= 3 else f"{{{head}, ...}}"
+    actual_range = f"index range {keys[0]!r}..{keys[-1]!r}"
+
+    # Gap detection: if the question-implied full range is set AND the actual span doesn't cover it.
+    gap_note = ""
+    if expected_index_range and ".." in expected_index_range:
+        exp_first, _, exp_last = expected_index_range.partition("..")
+        exp_first = exp_first.strip()
+        exp_last = exp_last.strip()
+        actual_first = str(keys[0])
+        actual_last = str(keys[-1])
+        # String comparison works for ISO-shaped keys (1942-03, FY1942, etc.).
+        if exp_first < actual_first or exp_last > actual_last:
+            gap_note = (
+                f"; GAP: question asked for {exp_first!r}..{exp_last!r} "
+                f"but data only covers {actual_first!r}..{actual_last!r} — likely MISSING"
+            )
+
     if n <= 3:
-        return f"{{{head}}}"
-    return f"{{{head}, ...}} ({n} cells, index range {keys[0]!r}..{keys[-1]!r})"
+        return f"{base} ({actual_range}{gap_note})"
+    return f"{base} ({n} cells, {actual_range}{gap_note})"
 
 
 def _summarize_table(value: dict) -> str:
@@ -271,15 +386,17 @@ def _render_annotated_value(prefix: str, idx: int, e: AnnotatedValue) -> list[st
         value_str = repr(e.value)
     elif e.kind == "vector":
         shape_str = f"kind=vector, index_name={e.index_name!r}"
-        value_str = _summarize_vector(e.value) if isinstance(e.value, dict) else repr(e.value)
+        value_str = (_summarize_vector(e.value, e.expected_index_range)
+                     if isinstance(e.value, dict) else repr(e.value))
     elif e.kind == "table":
         shape_str = f"kind=table, row_name={e.row_name!r}, col_name={e.col_name!r}"
         value_str = _summarize_table(e.value) if isinstance(e.value, dict) else repr(e.value)
     else:
         shape_str = f"kind={e.kind!r}"
         value_str = repr(e.value)
+    tag_str = f"tag: {e.tag!r}  " if e.tag else ""
     return [
-        f"{prefix}prev[{idx}]  description: {label!r}",
+        f"{prefix}prev[{idx}]  {tag_str}description: {label!r}",
         f"{prefix}        value:       {value_str}  ({shape_str}, unit={e.unit!r})",
     ]
 
@@ -291,9 +408,35 @@ def _prev_desc(prev: list[AnnotatedValue]) -> str:
     return "\n".join(lines)
 
 
-def _build_user(question: str, prev_desc: str, priors: list[str]) -> str:
+def _constraints_block(
+    ctx: HarnessContext,
+    method: str | None = None,
+    transforms: list[str] | None = None,
+) -> str:
+    """Render constraint bullets for compute prompts. Plan-level fields come
+    from ctx.plan; per-compute fields are passed as kwargs by the caller."""
+    lines: list[str] = []
+    plan = ctx.plan
+    if plan is not None:
+        if plan.units_out:
+            lines.append(f"- units_out: {plan.units_out}")
+        if plan.precision is not None:
+            lines.append(f"- precision: {plan.precision} decimal places")
+        if plan.answer_form != "scalar":
+            lines.append(f"- answer_form: {plan.answer_form}")
+    if method:
+        lines.append(f"- method: {method}")
+    if transforms:
+        lines.append(f"- transforms (MUST apply each): {', '.join(transforms)}")
+    if not lines:
+        return ""
+    return "Parsed constraints (apply each):\n" + "\n".join(lines) + "\n\n"
+
+
+def _build_user(question: str, prev_desc: str, priors: list[str], spec_block: str = "") -> str:
     msg = (
         f"Question:\n{question}\n\n"
+        f"{spec_block}"
         f"prev =\n{prev_desc}\n\n"
         f"Produce CODE or MISSING:."
     )
@@ -307,6 +450,7 @@ def _build_user(question: str, prev_desc: str, priors: list[str]) -> str:
 
 def _self_critique(
     question: str, prev_desc: str, code: str, result_text: str, ctx: HarnessContext,
+    *, method: str | None = None, transforms: list[str] | None = None,
 ) -> tuple[bool, str]:
     """Same-actor review of (code, result) against the question.
 
@@ -315,6 +459,7 @@ def _self_critique(
     """
     user = (
         f"Question:\n{question}\n\n"
+        f"{_constraints_block(ctx, method=method, transforms=transforms)}"
         f"prev =\n{prev_desc}\n\n"
         f"Code that ran:\n```python\n{code}\n```\n\n"
         f"Produced result:\n{result_text}\n\n"
@@ -347,6 +492,8 @@ def _try_codegen_and_exec(
     *,
     system_prompt: str,
     question: str,
+    method: str | None = None,
+    transforms: list[str] | None = None,
 ) -> tuple[dict | None, str | None, list[str]]:
     """One logical attempt: codegen → parse → exec, with `retry_budget` retries
     for transient exec/parse failures (a malformed response or a code exception).
@@ -357,10 +504,13 @@ def _try_codegen_and_exec(
     (None, None, accumulated_priors) when the retry budget is exhausted.
     """
     priors = list(priors)
+    spec_block = _constraints_block(ctx, method=method, transforms=transforms)
     # Total tries = 1 initial + retry_budget retries.
     for try_idx in range(retry_budget + 1):
         resp = ctx.llm_client.call(
-            system_prompt, _build_user(question, prev_desc, priors), thinking_budget=-1, ctx=ctx,
+            system_prompt,
+            _build_user(question, prev_desc, priors, spec_block=spec_block),
+            thinking_budget=-1, ctx=ctx,
         )
         raw = resp.text
         ctx.emit("compute", f"codegen try {try_idx + 1} response", raw=raw[:600])
@@ -428,15 +578,21 @@ def _wrap_intermediate_result(task: str, env: dict) -> list[AnnotatedValue]:
     )]
 
 
-def _run_final(question: str, prev: object, ctx: HarnessContext) -> FormattedString:
+def _run_final(
+    question: str, prev: object, ctx: HarnessContext,
+    *, method: str | None = None, transforms: list[str] | None = None,
+) -> FormattedString:
     """Terminator path — produces a single answer string via codegen + self-critique."""
     prev_desc = _prev_desc(prev)
-    ctx.emit("compute", "starting", mode="final", question=question, prev_summary=prev_desc[:500])
+    ctx.emit("compute", "starting", mode="final", question=question,
+             method=method, transforms=transforms,
+             prev_summary=prev_desc[:500])
 
     a1_env, a1_code, a1_priors = _try_codegen_and_exec(
         ctx, prev, prev_desc, priors=[],
         retry_budget=ctx.config.compute_max_attempts - 1,
         system_prompt=_CODEGEN_SYSTEM, question=question,
+        method=method, transforms=transforms,
     )
     if a1_env is None:
         raise StepFailed(
@@ -445,7 +601,8 @@ def _run_final(question: str, prev: object, ctx: HarnessContext) -> FormattedStr
         )
     a1_result = str(a1_env["result"])
 
-    accept, reason = _self_critique(question, prev_desc, a1_code, a1_result, ctx)
+    accept, reason = _self_critique(question, prev_desc, a1_code, a1_result, ctx,
+                                    method=method, transforms=transforms)
     if accept:
         ctx.emit("compute", "attempt 1 self-critique ACCEPT", text=a1_result)
         return FormattedString(text=a1_result)
@@ -459,6 +616,7 @@ def _run_final(question: str, prev: object, ctx: HarnessContext) -> FormattedStr
         a2_env, _, _ = _try_codegen_and_exec(
             ctx, prev, prev_desc, priors=[hint], retry_budget=0,
             system_prompt=_CODEGEN_SYSTEM, question=question,
+            method=method, transforms=transforms,
         )
     except MissingData as e:
         ctx.emit("compute", "attempt 2 MISSING; falling back to attempt 1",
@@ -476,15 +634,21 @@ def _run_final(question: str, prev: object, ctx: HarnessContext) -> FormattedStr
     return FormattedString(text=a2_result)
 
 
-def _run_intermediate(task: str, prev: object, ctx: HarnessContext) -> list[AnnotatedValue]:
+def _run_intermediate(
+    task: str, prev: object, ctx: HarnessContext,
+    *, method: str | None = None, transforms: list[str] | None = None,
+) -> list[AnnotatedValue]:
     """Intermediate path — produces a list[AnnotatedValue] for the downstream aggregator."""
     prev_desc = _prev_desc(prev)
-    ctx.emit("compute", "starting", mode="intermediate", task=task, prev_summary=prev_desc[:500])
+    ctx.emit("compute", "starting", mode="intermediate", task=task,
+             method=method, transforms=transforms,
+             prev_summary=prev_desc[:500])
 
     env, _, priors = _try_codegen_and_exec(
         ctx, prev, prev_desc, priors=[],
         retry_budget=ctx.config.compute_max_attempts - 1,
         system_prompt=_CODEGEN_SYSTEM_INTERMEDIATE, question=task,
+        method=method, transforms=transforms,
     )
     if env is None:
         raise StepFailed(
@@ -501,9 +665,11 @@ def run(op: OpNode, prev: object, ctx: HarnessContext) -> FormattedString | list
     """Dispatch on op.args["final"]. Default is final=True (back-compat terminator)."""
     task = str(op.args.get("task") or "")
     is_final = bool(op.args.get("final", True))
+    method = op.args.get("method") or None
+    transforms = list(op.args.get("transforms") or []) or None
     if is_final:
         question = task or ctx.question
-        return _run_final(question, prev, ctx)
+        return _run_final(question, prev, ctx, method=method, transforms=transforms)
     if not task:
         raise StepFailed("compute", "intermediate compute requires a non-empty task")
-    return _run_intermediate(task, prev, ctx)
+    return _run_intermediate(task, prev, ctx, method=method, transforms=transforms)
