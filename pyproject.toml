@@ -21,6 +21,7 @@ dependencies = [
     "litellm>=1.76.1, <1.82.7",
     "palimpzest>=1.2.0",
     "pandas>=2.3.1",
+    "pqdm>=0.2.0",
     "pydantic>=2.11.7",
     "PyMuPDF>=1.26.7",
     "pypdf>=5.1.0",

@@ -99,7 +99,9 @@ class SemanticDocumentIndex:
         if sha256 in self._sha_to_document_id:
             return self._sha_to_document_id[sha256]
 
-        document_node = DocumentNode(filename=source_uri, content=raw_pdf, ocr_text_dir=self.ocr_text_dir)
+        document_node = DocumentNode(
+            filename=source_uri, pdf_bytes=raw_pdf, ocr_text_dir=self.ocr_text_dir
+        )
         self.documents[document_node.document_id] = document_node
         self._sha_to_document_id[sha256] = document_node.document_id
         self.initialized = False
@@ -252,7 +254,7 @@ class SemanticDocumentIndex:
 
             output.append(
                 f"{document_branch}doc {document.document_id} "
-                f"[{document_title}; date={document.document_date}; pages={document.page_count}]"
+                f"[{document_title}; date={document.document_date}; pages={document.num_pdf_pages}]"
             )
             if document_desc:
                 output.append(f"{document_prefix}|-- description: {document_desc}")
