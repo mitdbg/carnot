@@ -11,7 +11,7 @@ import numpy as np
 
 from skunk.retrieval.nodes import PageNode, PlotNode, TableNode, TextNode
 from skunk.retrieval.nodes.document_node import DocumentNode
-from skunk.retrieval.nodes.tools import DEFAULT_EMBEDDING_MODEL, embed_texts
+from skunk.retrieval.nodes.llm_wrapper import DEFAULT_EMBEDDING_MODEL, DEFAULT_LLM_WRAPPER
 
 SKUNK_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CACHE_DIR = os.path.join(SKUNK_DIR, "cache")
@@ -139,7 +139,7 @@ class SemanticDocumentIndex:
             self._save_cache()
             return
 
-        matrix = np.array(embed_texts(descriptions, model=embedding_model), dtype="float32")
+        matrix = np.array(DEFAULT_LLM_WRAPPER.embed_texts(descriptions, model=embedding_model), dtype="float32")
         faiss.normalize_L2(matrix)
         self.embedding_idx_map = {node_id: node_idx for node_idx, node_id in enumerate(node_ids)}
         self.embedding_node_ids = node_ids

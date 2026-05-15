@@ -5,7 +5,11 @@ import re
 
 from skunk.retrieval.nodes import PlotNode, TableNode, TextNode
 from skunk.retrieval.nodes.document_node import DocumentNode
-from skunk.retrieval.nodes.tools import DEFAULT_EMBEDDING_MODEL, call_openrouter, embed_texts, parse_json_response
+from skunk.retrieval.nodes.llm_wrapper import (
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_LLM_WRAPPER,
+    parse_json_response,
+)
 
 KEYWORD_EXTRACTION_LIMIT = 10
 KEYWORD_EXPANSION_LIMIT = 3
@@ -53,7 +57,7 @@ class Retriever:
                 query_terms.append(term.strip())
                 seen_terms.add(normalized)
 
-        term_embeddings = embed_texts(query_terms, model=self.embedding_model)
+        term_embeddings = DEFAULT_LLM_WRAPPER.embed_texts(query_terms, model=self.embedding_model)
         candidates_by_id = {}
         for term, term_embedding in zip(query_terms, term_embeddings, strict=True):
             scored_records = []
@@ -136,7 +140,7 @@ Tree exploration context:
 {tree_context}
 """.strip()
         try:
-            parsed = parse_json_response(call_openrouter(prompt))
+            parsed = parse_json_response(DEFAULT_LLM_WRAPPER.call_llm(prompt))
         except Exception:
             parsed = {"keywords": []}
 
@@ -227,7 +231,7 @@ Candidate nodes:
 {json.dumps(prompt_candidates, indent=2)}
 """.strip()
         try:
-            parsed = parse_json_response(call_openrouter(prompt, max_tokens=4096))
+            parsed = parse_json_response(DEFAULT_LLM_WRAPPER.call_llm(prompt, max_tokens=4096))
         except Exception:
             return []
 

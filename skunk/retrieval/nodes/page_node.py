@@ -1,8 +1,9 @@
 from dataclasses import dataclass, field
 
-from .tools import call_openrouter, call_openrouter_vision, parse_json_response
+from .llm_wrapper import parse_json_response
+from .llm_wrapper import DEFAULT_LLM_WRAPPER
 
-MAX_PAGE_PROMPT_CHARS = 4000
+MAX_PAGE_PROMPT_CHARS = 8000
 
 
 @dataclass
@@ -52,16 +53,36 @@ class PageNode:
         self.page_image = page_image
         self.page_number = page_number
         self.description = self.describe_text(page_image, page_text)
-
         self.table_nodes = self.parse_tables(page_image, page_text)
         self.plot_nodes = self.parse_plots(page_image, page_text)
         self.text_nodes = self.parse_text_blocks(page_image, page_text)
 
-    def describe_text(self, page_image: bytes, text: str) -> str:
-        if not text.strip():
-            return "Blank or image-only page with no readable OCR text."
+    @classmethod
+    def from_llm_outputs(
+        cls,
+        document_id: str,
+        page_pdf_number: int,
+        page_image: bytes,
+        page_number: str,
+        description: str,
+        text_blocks_response: str,
+        tables_response: str,
+        plots_response: str,
+    ):
+        page_node = cls.__new__(cls)
+        page_node.page_id = f"{document_id}_page:{page_pdf_number}"
+        page_node.page_pdf_number = page_pdf_number
+        page_node.page_image = page_image
+        page_node.page_number = page_number
+        page_node.description = description
+        page_node.text_nodes = page_node.text_nodes_from_response(text_blocks_response)
+        page_node.table_nodes = page_node.table_nodes_from_response(tables_response)
+        page_node.plot_nodes = page_node.plot_nodes_from_response(page_image, plots_response)
+        return page_node
 
-        prompt = f"""
+    @staticmethod
+    def description_prompt(text: str) -> str:
+        return f"""
 Write a concise semantic index description for this page.
 
 Rules:
@@ -75,13 +96,9 @@ Page text:
 {text[:MAX_PAGE_PROMPT_CHARS]}
 """.strip()
 
-        return call_openrouter(prompt)
-
-    def parse_text_blocks(self, page: bytes, page_text: str) -> list[TextNode]:
-        if not page_text.strip():
-            return []
-
-        prompt = f"""
+    @staticmethod
+    def text_blocks_prompt(page_text: str) -> str:
+        return f"""
 Split this page text into semantic text blocks for retrieval.
 
 Rules:
@@ -95,7 +112,7 @@ Rules:
 JSON shape:
 {{
   "text_blocks": [
-    {{    
+    {{
       "text": "verbatim text block from the page",
       "description": "concise semantic description of the block"
     }}
@@ -106,19 +123,9 @@ Page text:
 {page_text[:MAX_PAGE_PROMPT_CHARS]}
 """.strip()
 
-        parsed = parse_json_response(call_openrouter(prompt))
-        return [
-            TextNode(
-                text_id=f"{self.page_id}_text:{block_idx}",
-                text=block.get("text", ""),
-                description=block.get("description", ""),
-            )
-            for block_idx, block in enumerate(parsed.get("text_blocks", []))
-            if block.get("text", "").strip()
-        ]
-
-    def parse_tables(self, page: bytes, page_text: str) -> list[TableNode]:
-        prompt = f"""
+    @staticmethod
+    def tables_prompt(page_text: str) -> str:
+        return f"""
 Analyze this rendered PDF page and its extracted page text. Extract any tables visible on the page.
 
 Rules:
@@ -144,20 +151,9 @@ Page text:
 {page_text[:MAX_PAGE_PROMPT_CHARS]}
 """.strip()
 
-        parsed = parse_json_response(call_openrouter_vision(prompt, page))
-        return [
-            TableNode(
-                table_id=f"{self.page_id}_table:{table_idx}",
-                table_title=table.get("table_title", ""),
-                table_data=table.get("table_data", ""),
-                description=table.get("description", ""),
-            )
-            for table_idx, table in enumerate(parsed.get("tables", []))
-            if table.get("table_data", "").strip()
-        ]
-
-    def parse_plots(self, page: bytes, page_text: str) -> list[PlotNode]:
-        prompt = f"""
+    @staticmethod
+    def plots_prompt(page_text: str) -> str:
+        return f"""
 Analyze this rendered PDF page and its extracted page text. Identify any plots, charts, graphs, or figure visualizations visible on the page.
 
 Rules:
@@ -181,7 +177,38 @@ Page text:
 {page_text[:MAX_PAGE_PROMPT_CHARS]}
 """.strip()
 
-        parsed = parse_json_response(call_openrouter_vision(prompt, page))
+    def describe_text(self, page_image: bytes, text: str) -> str:
+        if not text.strip():
+            return "Blank or image-only page with no readable OCR text."
+        return DEFAULT_LLM_WRAPPER.call_llm(self.description_prompt(text))
+
+    def text_nodes_from_response(self, response_text: str) -> list[TextNode]:
+        parsed = parse_json_response(response_text)
+        return [
+            TextNode(
+                text_id=f"{self.page_id}_text:{block_idx}",
+                text=block.get("text", ""),
+                description=block.get("description", ""),
+            )
+            for block_idx, block in enumerate(parsed.get("text_blocks", []))
+            if block.get("text", "").strip()
+        ]
+
+    def table_nodes_from_response(self, response_text: str) -> list[TableNode]:
+        parsed = parse_json_response(response_text)
+        return [
+            TableNode(
+                table_id=f"{self.page_id}_table:{table_idx}",
+                table_title=table.get("table_title", ""),
+                table_data=table.get("table_data", ""),
+                description=table.get("description", ""),
+            )
+            for table_idx, table in enumerate(parsed.get("tables", []))
+            if table.get("table_data", "").strip()
+        ]
+
+    def plot_nodes_from_response(self, page: bytes, response_text: str) -> list[PlotNode]:
+        parsed = parse_json_response(response_text)
         return [
             PlotNode(
                 plot_id=f"{self.page_id}_plot:{plot_idx}",
@@ -192,3 +219,14 @@ Page text:
             for plot_idx, plot in enumerate(parsed.get("plots", []))
             if plot.get("plot_title", "").strip() or plot.get("description", "").strip()
         ]
+
+    def parse_text_blocks(self, page: bytes, page_text: str) -> list[TextNode]:
+        if not page_text.strip():
+            return []
+        return self.text_nodes_from_response(DEFAULT_LLM_WRAPPER.call_llm(self.text_blocks_prompt(page_text)))
+
+    def parse_tables(self, page: bytes, page_text: str) -> list[TableNode]:
+        return self.table_nodes_from_response(DEFAULT_LLM_WRAPPER.call_llm(self.tables_prompt(page_text)))
+
+    def parse_plots(self, page: bytes, page_text: str) -> list[PlotNode]:
+        return self.plot_nodes_from_response(page, DEFAULT_LLM_WRAPPER.call_llm_vision(self.plots_prompt(page_text), page))
