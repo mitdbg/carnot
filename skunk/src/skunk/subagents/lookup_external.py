@@ -1,16 +1,12 @@
 """lookup_external subagent — Gemini with Google Search; FRED/BLS via emitted Python.
 
-The model is told which authoritative APIs we have (FRED, BLS), and how to choose:
-  - Source named that has an API (FRED, BLS) → emit MODE 2 Python calling that API.
-  - Source named without an API (Macrotrends, Bank of England, Bloomberg, …)
-    → MODE 1 with a third line declaring the source; we verify the model's search
-      actually grounded to that source by checking the response's grounding-chunk
-      titles (which Gemini sets to the resolved domain, e.g. "macrotrends.net").
-  - No source named → model picks the best path; line 3 is "none"; no verification.
-
-We exec MODE 2 Python in a sandbox with `fetch_fred_series` and `fetch_bls_series`
-injected. MODE 1 is the 2/3-line literal contract; line 3 is validated against
-`resp.grounding_titles`.
+Two output modes. MODE 2 is a fenced Python block that calls
+`fetch_fred_series` or `fetch_bls_series` (injected into the sandbox); used
+when the request names FRED or BLS. MODE 1 is a 3-line literal: value,
+unit, publisher-token; used for every other named publisher (Macrotrends,
+Bank of England, Bloomberg, …) and for unsourced lookups. The publisher
+token on line 3 is validated against `resp.grounding_titles` (the resolved
+domain Gemini reports for each grounding chunk).
 """
 
 from __future__ import annotations
@@ -27,121 +23,109 @@ import certifi
 
 from skunk.common import HarnessContext
 from skunk.dsl import AnnotatedValue, OpNode
+from skunk.operator import SkunkOperator
 from skunk.subagents.base import StepFailed, parse_llm_value, strip_code_fences
 
-_SSL_CTX = ssl.create_default_context(cafile=certifi.where())
+
+# ---------------------------------------------------------------------------
+# Static system prompt block
+# ---------------------------------------------------------------------------
 
 _SYSTEM = """\
-You are a precise data assistant for economic indicators, FX rates, historical
-dates, and named entities. Your training covers through mid-2025 — treat any
-date before July 2025 as historical, never refuse on grounds of "future."
+You are a precise data assistant for economic indicators, FX rates,
+historical dates, and named entities. Your training covers through
+mid-2025 — treat any date before July 2025 as historical; never refuse
+on grounds of "future."
 
-SOURCE-FOLLOWING — READ FIRST:
+## Source routing
 
-Identify the publisher named in the request — usually after "from X",
-"according to X", "published by X", etc. The publisher is who you must
-contact for the value. Data labels like "BLS CPI-U" or "FRED series
-IRLTLT01GBM156N" describe what the value is; they are NOT the publisher
-unless the request literally says "from FRED" / "from BLS" / "from the
-Bureau of Labor Statistics". The publisher is the entity the question
-asks you to read from.
+Identify the publisher named in the request (usually after "from X",
+"according to X", "published by X"). Data labels like "BLS CPI-U" or
+"FRED series IRLTLT01GBM156N" describe what the value is; they are NOT
+the publisher unless the request literally says "from FRED" / "from BLS".
 
-  - Publisher is FRED        → MODE 2, fetch_fred_series.
-  - Publisher is BLS         → MODE 2, fetch_bls_series.
-    (also: "Bureau of Labor Statistics")
-  - Any other publisher      → MODE 1 (Google Search).
-    (Federal Reserve Bank of Minneapolis, Macrotrends, Bank of England,
-     Bloomberg, Yahoo Finance, World Bank, …  Do NOT substitute the FRED
-     or BLS API even if you believe they hold the same data — the
-     question named a specific site; you go to that site.)
-  - No publisher named       → MODE 2 if a clean FRED/BLS series fits;
-                                otherwise MODE 1 with line 3 = "none".
+  Publisher is FRED         → MODE 2, fetch_fred_series.
+  Publisher is BLS          → MODE 2, fetch_bls_series.
+    (also "Bureau of Labor Statistics")
+  Any other publisher       → MODE 1 (Google Search).
+    Examples: Federal Reserve Bank of Minneapolis, Macrotrends, Bank of
+    England, Bloomberg, Yahoo Finance, World Bank. Do NOT substitute the
+    FRED/BLS API even if they hold the same data — the question named a
+    specific site; go to that site.
+  No publisher named        → MODE 2 if a clean FRED/BLS series fits,
+                              otherwise MODE 1 with line 3 = "none".
 
-MODE 1 — Google Search, then answer:
+## MODE 1 — Google Search
 
-The procedure is fixed. Execute it in order:
+Procedure (mandatory):
   (a) Compose a Google Search query that includes the publisher (use a
-      `site:` filter or include the publisher name in the query, e.g.
-      "site:macrotrends.net USD JPY 2025-03-31" or "Minneapolis Fed CPI
-      1953 annual table").
-  (b) Issue the search via your Google Search tool. THIS STEP IS
-      MANDATORY. You may not answer from training memory — your response
-      will be rejected unless the search returned at least one grounding
-      chunk from the publisher's site.
-  (c) Read the returned snippets and extract the value at the publisher's
-      full printed precision.
-  (d) Emit the 3-line response below.
+      `site:` filter or the publisher name, e.g.
+      `site:macrotrends.net USD JPY 2025-03-31`).
+  (b) Issue the search via your Google Search tool. Answering from
+      training memory is rejected — your response is accepted only if
+      the search returned a grounding chunk from the publisher's site.
+  (c) Read the snippets and extract the value at the publisher's full
+      printed precision.
+  (d) Emit exactly three lines — no labels, no JSON, no prose, no markdown:
+        Line 1: Python literal at the publisher's full printed precision.
+                Use float for numeric, "double-quoted" for strings, a list
+                for multiple values in request order.
+        Line 2: snake_case unit token describing what the value
+                represents. Examples seen here: `year`, `cpi`, `fx_rate`,
+                `usd_millions`, `usd_billions`, `pct`, `count`, `rate`,
+                `text`. Invent a similar token when the request is for
+                something else.
+        Line 3: bare publisher token (e.g. `macrotrends`,
+                `minneapolisfed`, `bankofengland`, `bloomberg`,
+                `yahoofinance`), or "none" if no publisher was named.
 
-Return exactly THREE lines — no labels, no JSON, no prose, no markdown:
-  Line 1: a Python literal AT THE PUBLISHER'S FULL PRINTED PRECISION — do
-          NOT round, truncate, or drop trailing zeros. If the page shows
-          26.766, return 26.766 (not 26.77 or 26.8). If it shows 14.0,
-          return 14.0 (not 14). Use float for numeric, list for multiple,
-          "double-quoted" for strings.
-  Line 2: unit — one of: year, cpi, fx_rate, usd_millions, usd_billions,
-                          pct, count, rate, text
-  Line 3: the bare publisher token you searched (e.g. "macrotrends",
-          "minneapolisfed", "bankofengland", "bloomberg", "yahoofinance"),
-          or "none" if the question did not name a publisher.
+Example:
+  149.918
+  fx_rate
+  macrotrends
 
-MODE 2 — authoritative REST API (FRED or BLS only, only when explicitly named):
+## MODE 2 — FRED / BLS REST API
 
-Return ONLY a single fenced Python block (no prose). Assign `value` and
-`unit`. The helpers return floats at maximum API precision; pass them
-through — do not round.
+Output ONLY one fenced Python block (no prose). Assign `value` and `unit`.
+The helpers return floats at maximum API precision; do not round.
 
 `fetch_fred_series(series_id, date)` — St. Louis Fed FRED REST API.
-  Dates: 'YYYY' annual mean | 'YYYY-MM' first of month | 'YYYY-MM-DD' that day.
-  Common series:
-    DEXJPUS, DEXUSUK, DEXUSEU (daily FX);
-    CPIAUCNS (CPI-U monthly NSA);
-    DGS10 (US 10y Treasury daily);
-    IRLTLT01GBM156N (UK 10y Gilt monthly);
-    IRLTLT01JPM156N (Japan 10y monthly).
+  Accepts any valid FRED series ID. Date forms: 'YYYY' (annual mean) |
+  'YYYY-MM' (first of month) | 'YYYY-MM-DD' (that day).
+  Examples used here: DEXJPUS, DEXUSUK, DEXUSEU (daily FX); CPIAUCNS
+  (CPI-U monthly NSA); DGS10 (US 10y Treasury daily); IRLTLT01GBM156N
+  (UK 10y Gilt monthly); IRLTLT01JPM156N (Japan 10y monthly).
 
 `fetch_bls_series(series_id, date)` — Bureau of Labor Statistics REST API.
-  Same date semantics. Common series:
-    CUUR0000SA0 (CPI-U All Items NSA);
-    CUUR0000SA0L1E (Core CPI);
-    CES0000000001 (Total nonfarm payrolls).
+  Accepts any valid BLS series ID; same date semantics as FRED.
+  Examples used here: CUUR0000SA0 (CPI-U All Items NSA);
+  CUUR0000SA0L1E (Core CPI); CES0000000001 (Total nonfarm payrolls).
 
-Example MODE 1 (Macrotrends named):
-149.918
-fx_rate
-macrotrends
-
-Example MODE 1 (no source named, named-entity question):
-"Financial Management Service"
-text
-none
-
-Example MODE 2 (FRED named):
+Example:
 ```python
 value = fetch_fred_series("DEXJPUS", "2025-03-31")
 unit = "fx_rate"
 ```
 
-Example MODE 2 (BLS named, annual CPI):
-```python
-value = fetch_bls_series("CUUR0000SA0", "1953")
-unit = "cpi"
-```
+## Precision and other rules
 
-PRECISION RULE (applies to BOTH modes):
-- Return the value at the maximum precision the publisher reports or the API
-  returns. Do not round, format, or simplify. Rounding is the final output
-  agent's job, not yours. If the source prints 26.766, return 26.766; if it
-  prints 26.8, return 26.8 — match the source exactly.
-
-Rules:
+- Maximum precision the publisher reports or the API returns. Never
+  round, format, or simplify — that's the final output agent's job.
+  If the source prints 26.766, return 26.766; if 26.8, return 26.8.
 - FX rates are positive floats.
-- Multiple dates in MODE 1: line 1 is a Python list in request order.
 - Named-entity answers: double quotes on line 1, unit `text`.
 - Never return float('nan'), None, or non-literal expressions.
-- "unknown" is only acceptable in MODE 1 when your search returned grounding
-  chunks but the page did not contain the requested value. Even then, line 3
-  must name the source you searched.
+- "unknown" is acceptable only in MODE 1 when search returned grounding
+  chunks but the page lacked the value. Line 3 must still name the
+  source you searched.
 """
+
+
+class LookupExternalOperator(SkunkOperator):
+    name: str = "lookup_external"
+    system: str = _SYSTEM
+
+_SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 
 _PY_FENCE_RE = re.compile(r"```python\b[^\n]*\n(.*?)\n```", re.DOTALL)
 
@@ -232,7 +216,10 @@ def run(op: OpNode, prev: None, ctx: HarnessContext) -> list[AnnotatedValue]:
         raise StepFailed("lookup_external", "Missing 'nl' arg")
 
     ctx.emit("lookup_external", "calling gemini", nl=nl)
-    resp = ctx.llm_client.call(_SYSTEM, nl, thinking_budget=-1, use_google_search=True, ctx=ctx)
+    resp = ctx.llm_client.call(
+        LookupExternalOperator().build_system(ctx),
+        nl, thinking_budget=-1, use_google_search=True, ctx=ctx,
+    )
     raw = resp.text or ""
     ctx.emit("lookup_external", "gemini response",
              raw=raw[:500],

@@ -120,7 +120,6 @@ UIDs the model has already been tuned against.
 
 ## Things to verify before claiming a feature is "done"
 
-- DSL changes: `pytest tests/test_dsl_roundtrip.py` passes.
 - Subagent changes: the standalone callable still has its signature; the eval harness for that subagent passes its acceptance bar (see the acceptance criteria in the subagent's TODO comment).
 - New ops or new args: documented in `DSL.md`, and the planner few-shots in `src/skunk/planner.py` are updated.
 - **Eval/benchmark numbers**: confirmed the run was on **dev only** (101

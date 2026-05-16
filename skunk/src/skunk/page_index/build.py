@@ -25,32 +25,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 
-def _load_env(path: Path) -> None:
-    if not path.exists():
-        return
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, _, v = line.partition("=")
-            os.environ.setdefault(k.strip(), v.strip())
-
+from skunk.common import load_env_file  # noqa: E402
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_load_env(_REPO_ROOT / ".env")
-
-from skunk.common import LLMClient  # noqa: E402
-from skunk.config import SkunkConfig  # noqa: E402
+load_env_file(_REPO_ROOT / ".env")
 
 from .classify import (
     char_metrics, cheap_classify, has_prose_content, has_visual_elements,
 )  # noqa: E402
 from .extract_fields import parse_page_fields  # noqa: E402
 from .pdf import (  # noqa: E402
-    parse_bulletin_filename, parsed_json_dir, read_page_elements,
-    read_pdf_pages,
+    _FILENAME_RE, parse_bulletin_filename, parsed_json_dir,
+    read_page_elements, read_pdf_pages,
 )
 from .schema import PageCatalogRow  # noqa: E402
-from .toc import harvest_toc, section_for_printed_page  # noqa: E402
 
 
 def _extract_printed_page(elements: list[dict]) -> str | None:
@@ -68,25 +56,87 @@ def _extract_printed_page(elements: list[dict]) -> str | None:
     return None
 
 
-_FILENAME_RE = re.compile(r"treasury_bulletin_(\d{4})_(\d{2})\.pdf$")
+# Banners that are obviously not section labels: month-year cover headers
+# ("May 1972"), bare years, short fragments, and the recurring publication
+# masthead ("Treasury Bulletin") that appears as [page_header] on every
+# page. These would pollute the canonicalization pool if treated as
+# section banners.
+_NOISE_BANNER_RE = re.compile(
+    r"^\s*(?:jan|feb|mar|apr|may|jun|jul|aug|sept?|oct|nov|dec|"
+    r"january|february|march|april|may|june|july|august|"
+    r"september|october|november|december)\s+\d{4}\s*\.?\s*$",
+    re.IGNORECASE,
+)
+_BARE_YEAR_RE = re.compile(r"^\s*\d{4}\s*\.?\s*$")
+_MASTHEAD_RE = re.compile(
+    r"^\s*(?:treasury\s+bulletin|u\.?\s*s\.?\s+treasury(?:\s+department)?|"
+    r"department\s+of\s+the\s+treasury)\s*\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_section_banner(content: str) -> bool:
+    s = (content or "").strip()
+    if len(s) < 6:
+        return False
+    if _NOISE_BANNER_RE.match(s):
+        return False
+    if _BARE_YEAR_RE.match(s):
+        return False
+    if _MASTHEAD_RE.match(s):
+        return False
+    return True
+
+
+def _extract_page_banner(elements: list[dict]) -> str | None:
+    """The page's own section banner.
+
+    Walks every `[title]` and `[page_header]` element in document order
+    and returns the first one that passes the section-banner shape filter
+    (drops the bulletin masthead, month-year cover headers, bare years,
+    and very short fragments). Treasury bulletins place the section name
+    in either a title element (section-start pages) or as a second
+    page_header below the masthead, so checking both in order is correct.
+
+    This signal recovers section-affinity for pages whose bulletin-level
+    ToC harvest returned nothing (1949–1964 broken-ToC bulletins).
+    """
+    for el in elements:
+        if el.get("type") not in ("title", "page_header"):
+            continue
+        content = (el.get("content") or "").strip()
+        if content and _is_section_banner(content):
+            return content
+    return None
+
 
 _CONT_SUFFIX_RE = re.compile(
     r"[,\s\-–—]+(?:con|cont|continued)\s*\.?\s*\)?\s*$", re.IGNORECASE,
 )
 
 
+def _first_titled_block(r: PageCatalogRow):
+    """First non-prose ContentBlock that carries a title, or None."""
+    for b in r.content_blocks:
+        if b.kind == "prose":
+            continue
+        if b.title:
+            return b
+    return None
+
+
 def _merge_continuation_pages(rows: list[PageCatalogRow]) -> int:
     """Forward-fill table identity across continuation pages.
 
-    A table/chart page is a continuation when EITHER:
-      (a) its section banner or table_title ends with `con / cont / continued`, OR
-      (b) page_kind ∈ {table, chart} but table_title is None AND the previous
-          table/chart page has a non-empty table_title (caption-less continuation,
-          ~9% of table pages — the layout parser drops the caption).
+    A content page is a continuation when EITHER:
+      (a) its first table/chart block's title ends with `con / cont / continued`, OR
+      (b) the page has table/chart blocks with no title AND the previous content
+          page has a non-empty title (caption-less continuation, ~9% of table
+          pages — the layout parser drops the caption).
 
     For matched pages, UNION the parent's keywords onto the current row and
-    replace `table_title` / `section` with the parent's. The page's own
-    column_headers / row_headers_sample / dates are preserved.
+    copy the parent's first-block title onto the current row's first
+    table/chart block.
 
     Returns the number of pages merged (for build-time stats).
     """
@@ -94,22 +144,24 @@ def _merge_continuation_pages(rows: list[PageCatalogRow]) -> int:
     parent: PageCatalogRow | None = None
     merged = 0
     for r in rows:
-        if r.page_kind not in ("table", "chart"):
+        has_visual = any(b.kind != "prose" for b in r.content_blocks)
+        if not has_visual:
             parent = None
             continue
+
+        first_block = next((b for b in r.content_blocks if b.kind != "prose"), None)
         is_explicit_cont = bool(
-            (r.table_title and _CONT_SUFFIX_RE.search(r.table_title)) or
-            (r.section and _CONT_SUFFIX_RE.search(r.section))
+            first_block and first_block.title
+            and _CONT_SUFFIX_RE.search(first_block.title)
         )
+        parent_titled = _first_titled_block(parent) if parent else None
         is_implicit_cont = (
-            r.table_title is None
-            and parent is not None
-            and parent.table_title is not None
+            first_block is not None and not first_block.title
+            and parent_titled is not None
         )
-        if (is_explicit_cont or is_implicit_cont) and parent is not None:
-            r.table_title = parent.table_title
-            if parent.section:
-                r.section = parent.section
+        if (is_explicit_cont or is_implicit_cont) and parent is not None and parent_titled is not None:
+            if first_block is not None:
+                first_block.title = parent_titled.title
             seen = {k.lower() for k in r.keywords}
             for k in parent.keywords:
                 if k.lower() not in seen:
@@ -117,15 +169,11 @@ def _merge_continuation_pages(rows: list[PageCatalogRow]) -> int:
                     seen.add(k.lower())
             merged += 1
             # Continuation pages also act as parents for further continuations
-            # (e.g. a 3-page table). The parent identity is unchanged; we just
-            # let the loop continue.
+            # (e.g. a 3-page table). The parent identity is unchanged.
         else:
-            # This page establishes a new identity if it has a table_title.
-            if r.table_title:
+            # This page establishes a new identity if any block has a title.
+            if _first_titled_block(r):
                 parent = r
-            # else keep existing parent — a captionless table page that fails
-            # the implicit-cont check (because there's no captioned parent yet)
-            # stays as-is and doesn't reset the chain.
     return merged
 
 
@@ -164,7 +212,6 @@ def _process_one_bulletin(
     pdf_path: Path,
     verbose: bool,
     parsed_dir: Path | None = None,
-    llm: LLMClient | None = None,
 ) -> list[PageCatalogRow]:
     bulletin_month = parse_bulletin_filename(pdf_path)
     pages = read_pdf_pages(pdf_path, parsed_dir=parsed_dir)
@@ -178,71 +225,40 @@ def _process_one_bulletin(
         metrics[pdf_idx] = (cc, dr)
         cheap_kinds[pdf_idx] = cheap_classify(text, pdf_idx)
 
-    # Stage 1.5: ToC harvest. One LLM call per bulletin → section spans in
-    # the bulletin's own printed-page numbering. Each page's `printed_page`
-    # is matched against these spans; pages outside every span (including
-    # bulletins where harvest_toc returns nothing) land in 'Unsectioned' at
-    # tree-build time. No per-page-banner fallback — the banner vocabulary
-    # was the dominant L1 noise source.
-    spans = []
-    if llm is not None:
-        toc_candidates = [
-            (idx, pages[idx]) for idx, k in cheap_kinds.items() if k == "toc"
-        ]
-        if toc_candidates:
-            spans = harvest_toc(
-                bulletin_month=bulletin_month,
-                toc_candidate_pages=toc_candidates,
-                total_pdf_pages=len(pages),
-                llm=llm,
-            )
-
-    # Stage 2: assemble rows. For every page that fell through cheap classify
-    # AND has a visual element (table/figure/image), run the deterministic
-    # parser. Pure-text pages get a row with page_kind="text" and no fields.
+    # Stage 2: assemble rows. Pages flagged blank/toc by cheap_classify
+    # skip the parser and stay block-less. Pages without any visual or
+    # prose anchors also skip the parser. Everything else runs the
+    # deterministic parser; rows with non-empty content_blocks are the
+    # retrievable set.
     rows: list[PageCatalogRow] = []
-    n_table_or_chart = 0
-    n_text = 0
-    n_unsectioned = 0
+    n_content = 0
     for pdf_idx, text in pages.items():
         cc, dr = metrics[pdf_idx]
         row = PageCatalogRow(
             bulletin=bulletin_month,
             page=pdf_idx,
-            file_path=str(pdf_path.resolve()),
             char_count=cc,
             digit_ratio=round(dr, 3),
         )
         elements = page_elements.get(pdf_idx, [])
         row.printed_page = _extract_printed_page(elements)
-        row.section = (section_for_printed_page(spans, row.printed_page)
-                       if spans else None)
-        if row.section is None:
-            n_unsectioned += 1
+        row.banner_self = _extract_page_banner(elements)
 
-        cheap_k = cheap_kinds[pdf_idx]
-        if cheap_k is not None:
-            row.page_kind = cheap_k  # "blank" or "toc"
+        if cheap_kinds[pdf_idx] is not None:
+            # blank or toc — skip the parser, leave content_blocks empty.
             rows.append(row)
             continue
 
         if not (has_visual_elements(elements) or has_prose_content(elements)):
-            row.page_kind = "text"
-            n_text += 1
             rows.append(row)
             continue
 
         fields = parse_page_fields(elements)
-        row.page_kind = fields["page_kind"]
-        if row.page_kind in ("table", "chart", "prose"):
-            row.table_title = fields.get("table_title")
-            row.column_headers = fields.get("column_headers", [])
-            row.row_headers_sample = fields.get("row_headers_sample", [])
-            row.keywords = fields.get("keywords", [])
-            row.dates = fields.get("dates", [])
-            n_table_or_chart += 1
-        else:
-            n_text += 1
+        row.content_blocks = fields.get("content_blocks", [])
+        row.keywords = fields.get("keywords", [])
+        row.dates = fields.get("dates", [])
+        if row.content_blocks:
+            n_content += 1
         rows.append(row)
 
     # Forward-fill continuation pages so the parent table's keywords also
@@ -251,10 +267,9 @@ def _process_one_bulletin(
     n_merged = _merge_continuation_pages(rows)
 
     if verbose:
-        print(f"  [{bulletin_month}] {n_table_or_chart} table/chart pages, "
-              f"{n_text} text pages, {len(rows)} total, "
-              f"{n_merged} continuation merges, {len(spans)} ToC spans, "
-              f"{n_unsectioned} unsectioned")
+        print(f"  [{bulletin_month}] {n_content} content pages, "
+              f"{len(rows) - n_content} non-content pages, "
+              f"{len(rows)} total, {n_merged} continuation merges")
     return rows
 
 
@@ -295,9 +310,6 @@ def main() -> int:
                     help="Comma-separated list of YYYY-MM to override (debug).")
     ap.add_argument("--workers", type=int, default=8,
                     help="Bulletin-level parallelism (each bulletin is processed independently).")
-    ap.add_argument("--no-toc", action="store_true",
-                    help="Skip the per-bulletin harvest_toc LLM call. "
-                         "Falls back to per-page banner sections only.")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -336,17 +348,10 @@ def main() -> int:
         print(f"Parsed-JSON dir does not exist: {parsed_dir}", file=sys.stderr)
         return 2
 
-    llm: LLMClient | None = None
-    if not args.no_toc:
-        cfg = SkunkConfig.from_env()
-        llm = LLMClient(cfg)
-        print(f"Building page index for {len(chosen)} bulletins → {args.out}")
-        print(f"  page text source: parsed-JSON @ {parsed_dir}")
-        print(f"  workers: {args.workers}    harvest_toc: on ({cfg.llm_model})\n")
-    else:
-        print(f"Building page index for {len(chosen)} bulletins → {args.out}")
-        print(f"  page text source: parsed-JSON @ {parsed_dir}")
-        print(f"  workers: {args.workers}    harvest_toc: off (--no-toc)\n")
+    print(f"Building page index for {len(chosen)} bulletins → {args.out}")
+    print(f"  page text source: parsed-JSON @ {parsed_dir}")
+    print(f"  workers: {args.workers}    (no LLM at this stage; ToC harvest "
+          f"runs in pipeline.extract_l1)\n")
 
     started = time.monotonic()
     summary: list[dict] = []
@@ -357,7 +362,6 @@ def main() -> int:
         try:
             rows = _process_one_bulletin(
                 pdf_path=pdf_path, verbose=args.verbose, parsed_dir=parsed_dir,
-                llm=llm,
             )
         except Exception as e:  # noqa: BLE001
             return pdf_path, None, time.monotonic() - t0, f"{type(e).__name__}: {e}"
@@ -373,14 +377,12 @@ def main() -> int:
                 summary.append({"bulletin": bulletin, "status": "error", "error": err})
                 continue
             out_path = _persist_bulletin(rows, args.out)
-            kinds_count: dict[str, int] = {}
-            for r in rows:
-                kinds_count[r.page_kind] = kinds_count.get(r.page_kind, 0) + 1
-            print(f"[done] {bulletin}: {len(rows)} pages in {dt:.1f}s "
-                  f"kinds={kinds_count} → {out_path}")
+            n_content = sum(1 for r in rows if r.content_blocks)
+            print(f"[done] {bulletin}: {len(rows)} pages ({n_content} content) "
+                  f"in {dt:.1f}s → {out_path}")
             summary.append({
                 "bulletin": bulletin, "status": "ok", "n_pages": len(rows),
-                "kinds": kinds_count, "duration_s": round(dt, 2),
+                "n_content": n_content, "duration_s": round(dt, 2),
                 "out_path": str(out_path),
             })
 

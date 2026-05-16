@@ -55,9 +55,9 @@ class SkunkConfig:
     max_compute_depth: int = 1
 
     # Recovery loop: number of re-plan rounds allowed after the final compute
-    # raises MissingData. Each round calls plan_recovery (LLM) for a list of
-    # supplemental branches, runs them in parallel, appends to prev, and retries
-    # compute. The total compute call count is bounded by recovery_max_rounds + 1.
+    # raises MissingData. Each round calls the planner (LLM) again with a one-shot
+    # recovery lesson injected into ctx.prompt_overrides, then re-executes the
+    # whole returned plan from scratch. Total execute() rounds ≤ recovery_max_rounds + 1.
     recovery_max_rounds: int = 1
 
     # DSL plan cache (env: SKUNK_PLAN_CACHE_CSV)
@@ -65,6 +65,11 @@ class SkunkConfig:
 
     # Corpus paths (env: SKUNK_MANIFEST)
     manifest_path: str | None = None
+
+    # Prompt overrides YAML — corpus blurbs, few-shots, lessons. Loaded once
+    # at the top level and threaded onto HarnessContext.prompt_overrides.
+    # (env: SKUNK_PROMPT_OVERRIDES)
+    prompt_overrides_path: str = "config/prompts/treasury_bulletin.yaml"
 
     # Ablation: supply golden page refs to bypass the retrieve subagent.
     # Present for train/eval runs; None for production workloads.
@@ -86,4 +91,7 @@ class SkunkConfig:
             max_compute_depth=int(os.environ.get("SKUNK_MAX_COMPUTE_DEPTH", "1")),
             plan_cache_csv=os.environ.get("SKUNK_PLAN_CACHE_CSV", "data/dsl_planning_pass.csv"),
             manifest_path=os.environ.get("SKUNK_MANIFEST"),
+            prompt_overrides_path=os.environ.get(
+                "SKUNK_PROMPT_OVERRIDES", "config/prompts/treasury_bulletin.yaml"
+            ),
         )

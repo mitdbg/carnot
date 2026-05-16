@@ -3,7 +3,7 @@
 Builds one Matryoshka-truncated `gemini-embedding-001` vector per catalog row
 using the same blob text the hierarchical leaf-rank LLM trusts
 (`_build_leaf_blob` in `retrieve_probe.py`). Persists as a single `.npz` matrix
-plus a parallel JSONL of `{bulletin, page, file_path}` keys.
+plus a parallel JSONL of `{bulletin, page}` keys.
 
 Query time is brute-force masked cosine over an L2-normalized float32 matrix.
 At 89k pages × 768 dims (~270 MB) the matmul is faster than the setup cost of
@@ -41,7 +41,7 @@ from skunk.common import LLMClient
 from skunk.config import SkunkConfig
 
 from .period import intervals_overlap, period_to_intervals
-from .retrieve_probe import _build_leaf_blob, load_catalog
+from .retrieve_probe import build_vector_blob, load_catalog
 from .schema import PageCatalogRow
 
 
@@ -54,7 +54,7 @@ class VectorIndex:
     """Loaded vector index. `vectors` is L2-normalized float32 of shape
     [N, dim]; `keys[i]` is the catalog identity for row i."""
     vectors: np.ndarray                       # shape [N, dim], float32, L2-normalized
-    keys: list[tuple[str, int, str]]          # (bulletin, page, file_path) per row
+    keys: list[tuple[str, int]]               # (bulletin, page) per row
     dim: int
 
 
@@ -62,24 +62,22 @@ class VectorIndex:
 # Index build (offline, one-shot)
 # ---------------------------------------------------------------------------
 
-_INDEXABLE_KINDS = ("table", "chart", "prose", "text")
-
-
 def _row_is_indexable(row: PageCatalogRow) -> bool:
     """Skip pages that carry no useful text — blank/TOC pages would just
-    inject noise into the matmul.  page_kind=text rows with non-empty
-    keywords behave like short prose; include them too.
+    inject noise into the matmul. A row is indexable when it has a
+    table/chart block with metadata, a prose block backed by keywords,
+    or — for block-less rows — at least one keyword or date string.
     """
-    if row.page_kind not in _INDEXABLE_KINDS:
-        return False
-    if row.page_kind == "prose" and not row.keywords:
-        return False
-    if row.page_kind == "text" and not (row.keywords or row.dates):
-        return False
-    if row.page_kind in ("table", "chart"):
-        if not (row.table_title or row.column_headers or row.row_headers_sample):
-            return False
-    return True
+    if not row.content_blocks:
+        return bool(row.keywords or row.dates)
+    has_prose = False
+    for b in row.content_blocks:
+        if b.kind == "prose":
+            has_prose = True
+            continue
+        if b.title or b.column_headers or b.row_headers_sample:
+            return True
+    return has_prose and bool(row.keywords)
 
 
 def build_vector_index(
@@ -95,18 +93,23 @@ def build_vector_index(
     """Build and persist `vectors.npz` + `vectors_keys.jsonl` under `out_dir`.
 
     Reads every `*.jsonl` under `catalog_dir`, filters to indexable pages,
-    builds the same blob text the L3 LLM sees, batches embed calls (size
-    `batch_size`) and runs `workers` in parallel.
+    builds the same blob text the L3 LLM sees plus a corpus-framing
+    preamble (so the embedding model knows the page is a Treasury
+    Bulletin entry), batches embed calls and runs `workers` in parallel.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[vector_index] loading catalog from {catalog_dir}", flush=True)
     rows = load_catalog(catalog_dir)
     rows = [r for r in rows if _row_is_indexable(r)]
-    print(f"[vector_index] {len(rows)} indexable rows", flush=True)
+    print(f"[vector_index] {len(rows)} indexable rows  model={model}", flush=True)
 
-    blobs: list[str] = [_build_leaf_blob(r) for r in rows]
-    keys: list[tuple[str, int, str]] = [(r.bulletin, r.page, r.file_path) for r in rows]
+    # Minimal blob: title + keywords only. Drops column_headers,
+    # row_headers_sample, and dates — those fields are dominated by
+    # generic axis labels that dilute the pooled embedding without
+    # adding discriminating signal (see `build_vector_blob` docstring).
+    blobs: list[str] = [build_vector_blob(r) for r in rows]
+    keys: list[tuple[str, int]] = [(r.bulletin, r.page) for r in rows]
 
     # Split into batches and embed in parallel.
     chunks: list[tuple[int, list[str]]] = []
@@ -153,9 +156,9 @@ def build_vector_index(
     keys_path = out_dir / "vectors_keys.jsonl"
     np.savez_compressed(npz_path, vectors=vectors)
     with keys_path.open("w") as fh:
-        for bulletin, page, file_path in keys:
+        for bulletin, page in keys:
             fh.write(json.dumps(
-                {"bulletin": bulletin, "page": page, "file_path": file_path},
+                {"bulletin": bulletin, "page": page},
                 ensure_ascii=False,
             ))
             fh.write("\n")
@@ -183,11 +186,11 @@ def load_vector_index(out_dir: Path) -> VectorIndex:
         raise FileNotFoundError(f"vector index keys missing: {keys_path}")
     npz = np.load(npz_path, mmap_mode="r")
     vectors = npz["vectors"]
-    keys: list[tuple[str, int, str]] = []
+    keys: list[tuple[str, int]] = []
     with keys_path.open() as fh:
         for line in fh:
             d = json.loads(line)
-            keys.append((d["bulletin"], int(d["page"]), d["file_path"]))
+            keys.append((d["bulletin"], int(d["page"])))
     if vectors.shape[0] != len(keys):
         raise ValueError(
             f"vector index shape mismatch: {vectors.shape[0]} rows vs {len(keys)} keys"
@@ -220,7 +223,7 @@ def _add_months(iso: str, months: int) -> str:
 
 
 def period_mask(
-    keys: list[tuple[str, int, str]],
+    keys: list[tuple[str, int]],
     period: str,
     *,
     catalog_index: dict[tuple[str, int], PageCatalogRow] | None = None,
@@ -249,7 +252,7 @@ def period_mask(
             continue
 
     mask = np.zeros(len(keys), dtype=bool)
-    for i, (bulletin, page, _fp) in enumerate(keys):
+    for i, (bulletin, page) in enumerate(keys):
         b_iso = _bulletin_to_iso(bulletin)
         if b_iso is not None:
             for w_start, w_end in bulletin_windows:
@@ -280,7 +283,7 @@ def search(
     query_vec: np.ndarray,
     mask: np.ndarray | None,
     top_k: int,
-) -> list[tuple[float, tuple[str, int, str]]]:
+) -> list[tuple[float, tuple[str, int]]]:
     """Masked cosine top-K against `index.vectors`. Assumes `index.vectors`
     is L2-normalized; `query_vec` is L2-normalized inside. Returns
     `[(score, key), ...]` best-first."""
@@ -306,7 +309,7 @@ def search(
         part = np.argpartition(-scores, top_k - 1)[:top_k]
         order = part[np.argsort(-scores[part])]
 
-    out: list[tuple[float, tuple[str, int, str]]] = []
+    out: list[tuple[float, tuple[str, int]]] = []
     for j in order:
         gi = int(candidates[j])
         out.append((float(scores[j]), index.keys[gi]))
@@ -317,19 +320,10 @@ def search(
 # CLI
 # ---------------------------------------------------------------------------
 
-def _load_env(path: Path) -> None:
-    if not path.exists():
-        return
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            k, _, v = line.partition("=")
-            os.environ.setdefault(k.strip(), v.strip())
-
-
 def main(argv: list[str] | None = None) -> int:
+    from skunk.common import load_env_file
     repo_root = Path(__file__).resolve().parents[3]
-    _load_env(repo_root / ".env")
+    load_env_file(repo_root / ".env")
 
     ap = argparse.ArgumentParser(
         description="Build a dense vector index over a PageIndex catalog.",

@@ -92,13 +92,9 @@ def run(op: OpNode, prev: None, ctx: HarnessContext) -> DocHandle:
         levels=[asdict(lvl) for lvl in trace.levels],
     )
 
-    refs: list[PageRef] = []
-    for r in top:
-        bulletin = r["bulletin"]
-        page = int(r["page"])
-        row = catalog_index.get((bulletin, page))
-        file_path = row.file_path if row is not None else None
-        refs.append(PageRef(month=bulletin, page=page, file_path=file_path))
+    refs: list[PageRef] = [
+        PageRef(month=r["bulletin"], page=int(r["page"])) for r in top
+    ]
 
     if not refs:
         raise StepFailed(

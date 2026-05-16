@@ -29,12 +29,14 @@ Each failure is logged to stderr. After exhaustion the last exception propagates
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from google import genai
@@ -42,6 +44,7 @@ from google.genai import types
 from openai import OpenAI
 
 from skunk.config import SkunkConfig
+from skunk.prompt_overrides import PromptOverride
 
 if TYPE_CHECKING:
     from skunk.dsl import Plan
@@ -89,6 +92,65 @@ _RATE_LIMITER_RPM: float | None = None
 _EMBED_LIMITER_LOCK = threading.Lock()
 _EMBED_LIMITER: _RateLimiter | None = None
 _EMBED_LIMITER_RPM: float | None = None
+
+
+def load_env_file(path: Path) -> None:
+    """Read a KEY=VALUE .env file and set any unset env vars from it."""
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, _, v = line.partition("=")
+            os.environ.setdefault(k.strip(), v.strip())
+
+
+_CODE_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\n?")
+
+
+def strip_code_fence(s: str) -> str:
+    """Strip a leading/trailing ```lang fence from an LLM response body."""
+    s = s.strip()
+    if s.startswith("```"):
+        s = _CODE_FENCE_RE.sub("", s)
+        if s.endswith("```"):
+            s = s[:-3]
+    return s.strip()
+
+
+def parse_json_response(text: str) -> Any | None:
+    """Strip optional code fences and parse the body as JSON. Returns None
+    on parse failure rather than raising — LLM responses are noisy."""
+    try:
+        return json.loads(strip_code_fence(text))
+    except json.JSONDecodeError:
+        return None
+
+
+def extract_json_object(text: str) -> dict:
+    """Pull the outermost JSON object out of a noisy LLM response. Tolerates
+    a `` ```json ... ``` `` fence; falls back to brace-balanced scanning of
+    unfenced output. Raises ValueError on failure (no object found, or
+    unbalanced braces) so callers can surface the malformed payload."""
+    m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
+    if m:
+        return json.loads(m.group(1))
+    start = text.find("{")
+    if start == -1:
+        raise ValueError(f"No JSON object found in response:\n{text[:400]}")
+    depth = 0
+    end = -1
+    for i, ch in enumerate(text[start:], start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i + 1
+                break
+    if end == -1:
+        raise ValueError(f"Unbalanced braces in response:\n{text[:400]}")
+    return json.loads(text[start:end])
 
 
 def extract_grounding_urls(api_resp: Any) -> list[str]:
@@ -346,6 +408,18 @@ class LLMClient:
                     )
                     latency_s = time.monotonic() - t0
                     vecs = [list(e.values) for e in resp.embeddings]
+                    # Some Gemini embedding models silently return fewer
+                    # vectors than inputs when called with batched contents
+                    # (gemini-embedding-2 only accepts batch=1 per call;
+                    # multi-input requests return one vector and drop the
+                    # rest). Catch the mismatch loudly instead of letting
+                    # the caller carry on with missing rows.
+                    if len(vecs) != len(chunk):
+                        raise RuntimeError(
+                            f"embed model {model!r} returned "
+                            f"{len(vecs)} vectors for {len(chunk)} inputs; "
+                            f"this model likely requires batch_size=1"
+                        )
                     if ctx is not None:
                         ctx.emit(
                             "llm", "embed",
@@ -467,6 +541,7 @@ class HarnessContext:
     config: SkunkConfig = field(default_factory=SkunkConfig.from_env)
     llm_client: LLMClient | None = None  # inject a mock for tests; auto-created otherwise
     plan: Plan | None = None  # set by the orchestrator at execute() entry so subagents can read top-level constraints; None for tests / before planning
+    prompt_overrides: tuple[PromptOverride, ...] = ()  # corpus/few_shot/lesson overrides; subagents pick out their own entries by name
 
     def __post_init__(self) -> None:
         if self.llm_client is None:
@@ -487,3 +562,13 @@ class HarnessContext:
                     bits.append(f"{k}={s}")
                 extra = " | " + ", ".join(bits)
             print(f"  [{source}] {message}{extra}")
+
+    def with_extra_override(self, override: PromptOverride) -> HarnessContext:
+        """Return a shallow copy of this ctx with one extra `PromptOverride`
+        appended to `prompt_overrides`. Used by the orchestrator to scope a
+        recovery lesson to a single planner re-invocation without polluting
+        the ctx that subagents see."""
+        import dataclasses
+        return dataclasses.replace(
+            self, prompt_overrides=self.prompt_overrides + (override,)
+        )

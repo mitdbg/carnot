@@ -1,8 +1,12 @@
 """Per-page deterministic field extractor — NO LLM.
 
-Consumes the parsed-JSON element list for one page and returns the same
-schema fields the v0.3 LLM extractor used to:
-    page_kind, table_title, column_headers, row_headers_sample, keywords, dates
+Consumes the parsed-JSON element list for one page and returns the
+fields a `PageCatalogRow` carries:
+    content_blocks, keywords, dates
+
+`content_blocks` is one `ContentBlock` per detected table / chart /
+prose block on the page — multi-content pages (table at top, chart at
+bottom) emit multiple entries. A page with no blocks is non-retrievable.
 
 The parsed-JSON elements come from a layout parser and look like:
     {"type": "section_header", "content": "Table 1.- Status under Limitation, December 31, 1949", "bbox": [...]}
@@ -20,6 +24,8 @@ from __future__ import annotations
 import re
 from html.parser import HTMLParser
 from typing import Any
+
+from .schema import ContentBlock
 
 
 # ---------------------------------------------------------------------------
@@ -450,74 +456,115 @@ def _harvest_prose_keywords(elements: list[dict]) -> list[str]:
     return out[:15]
 
 
-def parse_page_fields(elements: list[dict]) -> dict[str, Any]:
-    """Deterministic per-page field extraction. No LLM.
+def _extract_content_blocks(
+    elements: list[dict],
+) -> tuple[list[ContentBlock], list[str], list[str]]:
+    """Walk elements in document order; emit a ContentBlock per
+    table / chart element, or one prose ContentBlock if neither is
+    present but the page has substantive headers.
 
-    Returns a dict with keys: page_kind, table_title, column_headers,
-    row_headers_sample, keywords, dates. `page_kind` is:
-      - "table" if any [table] element is present
-      - "chart" if any [figure]/[image]/etc.
-      - "prose" if there's a substantive [section_header] or [title]
-        (narrative page with extractable concepts in its headers)
-      - "text" otherwise (skipped from index)
+    Returns (content_blocks, all_column_headers, all_row_headers) — the
+    flattened header lists feed the page-level keyword harvest as a
+    backup signal when no caption is found.
     """
-    has_table = False
-    has_chart = False
-    column_headers: list[str] = []
-    row_headers: list[str] = []
-    extra_captions: list[str] = []
+    blocks: list[ContentBlock] = []
+    all_columns: list[str] = []
+    all_rows: list[str] = []
+
+    # Caption window state — accumulates [section_header]/[title]+text
+    # pieces until the next visual element closes it.
+    pieces: list[str] = []
+    in_window = False
+
+    def _flush_caption() -> str | None:
+        if not pieces:
+            return None
+        joined = " ".join(pieces)
+        joined = re.sub(r"\s+", " ", joined).strip().rstrip(". -")
+        return joined or None
 
     for el in elements:
         t = (el.get("type") or "").lower()
         content = el.get("content")
+        content_str = (content or "").strip() if isinstance(content, str) else ""
+
+        if t in _CAPTION_TYPES:
+            if content_str:
+                pieces = [content_str]
+                in_window = True
+            continue
+
+        if t == "text" and in_window:
+            if not content_str:
+                continue
+            if _UNIT_NOTE_RE.search(content_str):
+                continue
+            if len(content_str) > 200:
+                continue
+            pieces.append(content_str)
+            continue
+
         if t == "table" and content:
-            has_table = True
+            caption = _flush_caption()
             cols, rows, caps = _parse_table_html(str(content))
-            if not column_headers:
-                column_headers = cols
-            if not row_headers:
-                row_headers = rows
-            extra_captions.extend(caps)
-        elif t in ("figure", "image", "chart", "plot", "diagram"):
-            has_chart = True
+            if not caption and caps:
+                caption = caps[0]
+            blocks.append(ContentBlock(
+                kind="table",
+                title=caption,
+                column_headers=cols[:50],
+                row_headers_sample=rows[:12],
+            ))
+            all_columns.extend(cols)
+            all_rows.extend(rows)
+            pieces = []
+            in_window = False
+            continue
+
+        if t in ("figure", "image", "chart", "plot", "diagram"):
+            caption = _flush_caption()
+            blocks.append(ContentBlock(kind="chart", title=caption))
+            pieces = []
+            in_window = False
+            continue
+
+    return blocks, all_columns, all_rows
+
+
+def parse_page_fields(elements: list[dict]) -> dict[str, Any]:
+    """Deterministic per-page field extraction. No LLM.
+
+    Returns a dict with keys: content_blocks, keywords, dates. A page
+    with no blocks is non-retrievable; blank / toc are decided upstream
+    by `cheap_classify` and never reach this function.
+    """
+    blocks, all_columns, all_rows = _extract_content_blocks(elements)
 
     plain = _page_plain_text(elements)
     dates = _extract_dates(plain)
 
-    if has_table or has_chart:
-        caption = _resolve_caption(elements)
-        if not caption and extra_captions:
-            caption = extra_captions[0]
-        keywords = _harvest_keywords(caption, column_headers, row_headers[:8])
+    if blocks:
+        primary_caption = next((b.title for b in blocks if b.title), None)
+        keywords = _harvest_keywords(primary_caption, all_columns, all_rows[:8])
         return {
-            "page_kind": "table" if has_table else "chart",
-            "table_title": caption,
-            "column_headers": column_headers[:50],
-            "row_headers_sample": row_headers[:12],
+            "content_blocks": blocks,
             "keywords": keywords[:20],
             "dates": dates,
         }
 
-    # No table / chart: try prose. Index iff at least one substantive
-    # section_header survives boilerplate filtering.
+    # No table / chart: try prose. Emit one prose block iff at least
+    # one substantive section_header survives boilerplate filtering.
     from .classify import has_prose_content
     if has_prose_content(elements):
         prose_kw = _harvest_prose_keywords(elements)
         if prose_kw:
             return {
-                "page_kind": "prose",
-                "table_title": _resolve_prose_title(elements),
-                "column_headers": [],
-                "row_headers_sample": [],
+                "content_blocks": [ContentBlock(
+                    kind="prose",
+                    title=_resolve_prose_title(elements),
+                )],
                 "keywords": prose_kw,
                 "dates": dates,
             }
 
-    return {
-        "page_kind": "text",
-        "table_title": None,
-        "column_headers": [],
-        "row_headers_sample": [],
-        "keywords": [],
-        "dates": [],
-    }
+    return {"content_blocks": [], "keywords": [], "dates": []}

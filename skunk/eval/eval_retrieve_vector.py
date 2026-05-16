@@ -143,16 +143,21 @@ def _append_plan_cache(path: Path, uid: str, question: str, plan_text: str) -> N
 def _plan_question(uid: str, question: str, llm: LLMClient,
                    plan_cache: dict[str, str], cache_path: Path,
                    stats: TokenStats) -> str | None:
-    from skunk.planner import plan as planner_plan
+    from skunk.planner import PlannerOperator
     from skunk.dsl import serialize as dsl_serialize
 
     if uid in plan_cache:
         return plan_cache[uid]
 
     cfg = SkunkConfig.from_env()
-    ctx = HarnessContext(question=question, verbose=False, config=cfg, llm_client=llm)
+    from pathlib import Path as _Path
+    from skunk.prompt_overrides import load_prompt_overrides
+    overrides_path = _Path(cfg.prompt_overrides_path)
+    prompt_overrides = load_prompt_overrides(overrides_path) if overrides_path.exists() else ()
+    ctx = HarnessContext(question=question, verbose=False, config=cfg, llm_client=llm,
+                         prompt_overrides=prompt_overrides)
     try:
-        plan_obj = planner_plan(question, ctx)
+        plan_obj = PlannerOperator().plan(question, ctx)
     except Exception:
         return None
     finally:

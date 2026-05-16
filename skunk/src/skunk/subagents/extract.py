@@ -1,29 +1,23 @@
 """extract subagent — question-driven extraction over page text/images.
 
-The agent receives the user's full question plus the rendered page(s) and returns
-a JSON array of entries. Each entry has one of three KINDS — `scalar`, `vector`
-(1-D series, one varying dim), or `table` (2-D grid, two varying dims) — picked to
-match the question's aggregation axis. Vector and table cells are always primitive
-scalars; nesting beyond those shapes is rejected.
+Takes the user's question plus a set of retrieved pages, returns a
+`list[AnnotatedValue]` for the downstream compute step. Each entry has one
+of three shapes:
 
-Each entry carries `description` (free-form natural-language label that uniquely
-identifies the datum, including period/series/sub-category context), `unit`, and
-kind-specific axis-name fields (`index_name` for vectors, `row_name`+`col_name`
-for tables).
+  scalar  — a single number or string.
+  vector  — a 1-D series indexed by one varying dim.
+  table   — a 2-D grid indexed by two varying dims (row × col).
 
-Downstream `compute` consumes the resulting list[AnnotatedValue].
+Entries carry `description`, `unit`, `tag`, and shape-specific axis labels
+(`index_name` for vectors; `row_name` + `col_name` for tables). Cells are
+always primitive scalars — deeper nesting is rejected.
 
-Per-tier strategy:
-- parsed_json (Tier 1): rich JSON-table text → N×T=0.7 sampling → per-cell
-  verbatim verifier against the page text → merge all surviving entries from
-  all runs into one list[AnnotatedValue] → semantic dedup via a T=0 LLM call whose
-  output cells are structurally re-verified against the merged inputs (the
-  dedup LLM cannot invent values; it can only pick representatives).
-- ocr (Tier 2): sparse PyMuPDF text → single deterministic call (T=0) + verbatim
-  verifier against the OCR text.
-- vision (Tier 3): rendered page images → single deterministic call (T=0). No
-  text corpus to verify against, so the only safeguard is the prompt's
-  verbatim-grounding instruction.
+Three operators implement the three input modalities:
+  `ExtractTextOperator`   — parsed-table / OCR text.
+  `ExtractVisionOperator` — rendered page images.
+  `ExtractDedupOperator`  — consolidates redundant entries from multiple
+                            sampling passes; cannot invent values, only
+                            select representatives.
 """
 
 from __future__ import annotations
@@ -42,7 +36,178 @@ from dataclasses import dataclass
 
 from skunk.common import HarnessContext
 from skunk.dsl import AnnotatedValue, DocHandle, OpNode, PageRef
+from skunk.operator import SkunkOperator
 from skunk.subagents.base import StepFailed
+
+
+# ---------------------------------------------------------------------------
+# Static system prompt blocks
+# ---------------------------------------------------------------------------
+
+_TEXT_SYSTEM = """\
+You are a precise data extraction assistant. You receive a question and the
+text of one or more pages. Emit every value that could plausibly answer the
+question. Do not compute or transform — extract only what is printed.
+
+Output a single JSON ARRAY of entries (one per distinct datum). Each entry
+has one of three shapes — pick the smallest that fits:
+
+Scalar:
+  {"description": "...", "tag": "...", "kind": "scalar",
+   "value": <num|str>, "unit": "<unit>"}
+
+Vector (1-D series, one varying dim):
+  {"description": "...", "tag": "...", "kind": "vector",
+   "index_name": "month",
+   "value": {"1942-03": 3515, "1942-04": 3939, ...},
+   "unit": "usd_millions",
+   "expected_index_range": "1942-03..1948-10"}
+
+Table (2-D grid, two varying dims):
+  {"description": "...", "tag": "...", "kind": "table",
+   "row_name": "year", "col_name": "month",
+   "value": {"1942": {"03": 3515, ...}, "1943": {"03": 7746, ...}},
+   "unit": "usd_millions"}
+
+Bias toward vector for time series even when the page prints a 2-D
+year×month grid: if the question reads as a 1-D series ("every month from
+X to Y"), emit ONE vector with combined ISO keys like "1942-03". Use table
+only when the question genuinely compares rows vs columns.
+
+Cells MUST be primitive (number or string). Nesting is rejected. Example
+of what NOT to emit:
+  "value": {"1942": [3515, 3939]}   ← cell is a list; emit kind="table" instead.
+For a third axis, emit multiple separate entries.
+
+Field rules:
+- description: natural-language label that uniquely identifies this datum
+  (series + period + sub-category + any other distinguishing context).
+  Prefer the page's exact printed row label / column header / caption
+  phrase. Example: "Total US national defense expenditures, monthly, CY1940".
+- tag: short snake_case selection key shaped <series>:<period>, lowercase
+  ASCII, no spaces. Example: "national_defense_expenditures:cy1940".
+  Two entries describing the same underlying series + period MUST share
+  the same tag (dedup/quorum keys off this).
+- expected_index_range (vector only, optional): "<first>..<last>" naming
+  the FULL range the QUESTION asked for, in the same key format as `value`
+  (e.g. "1969-01..1980-01"). Set when the question implies a range but
+  the page only has a partial series; omit when page range == question range.
+- unit: single lowercase snake_case token describing the printed scale +
+  base. Match what the page prints; invent a similar token when the
+  page's unit doesn't fit a typical one. Examples seen in financial
+  corpora: `usd`, `usd_thousands`, `usd_millions`, `usd_billions`, `pct`,
+  `count`, `year`, `rate`, `fx_rate`, `text`. Foreign currency follows
+  `<iso3>_<scale>` (e.g. `jpy_billions`, `gbp_millions`). Use `mixed`
+  only when one cell genuinely combines incompatible units.
+
+Unit and scale MUST come from the printed page — a column header, caption,
+parenthetical legend, or footnote like "(In millions of dollars)" or
+"(In billions of yen)". Never guess from the magnitude of numbers: if the
+page shows "74" under a "billions of yen" header, emit value=74 and
+unit=jpy_billions. Do not silently rescale or convert foreign currency to
+USD — leave it native; let downstream compute apply the FX rate.
+
+Other rules:
+- Every cell in a vector/table shares one unit.
+- Named-entity / string answers: kind="scalar", unit="text".
+- Numbers in `value` are bare — no commas, no $, no %.
+- If the page has nothing relevant, return [].
+- Output ONLY the JSON array — no fences, no prose.
+- Verbatim grounding: every numeric value emitted MUST appear on the page
+  (with or without comma separators). Computed values are rejected.
+"""
+
+_VISION_SYSTEM = """\
+You are a precise data extraction assistant. You receive a question and one
+or more rendered page images. Emit every visible value that could answer the
+question. Do not compute or transform — extract only what is visible.
+
+Output a JSON ARRAY of entries. Each entry has one of three shapes:
+
+  scalar: {"description":"...","tag":"...","kind":"scalar","value":<num|str>,"unit":"..."}
+  vector: {"description":"...","tag":"...","kind":"vector","index_name":"month",
+           "value":{"1942-03":3515,...},"unit":"..."}
+  table:  {"description":"...","tag":"...","kind":"table","row_name":"year","col_name":"month",
+           "value":{"1942":{"03":3515,...},...},"unit":"..."}
+
+Cells MUST be primitive. Nesting beyond these shapes is rejected; for a
+third axis, emit multiple separate entries.
+
+description: natural-language label uniquely identifying the datum
+  (series + period + sub-category). Prefer the page's exact visible row
+  label / column header / caption phrase.
+tag: snake_case selection key shaped <series>:<period>
+  (e.g. national_defense_expenditures:cy1940). Two entries describing the
+  same series + period MUST share the same tag.
+
+unit: single lowercase snake_case token describing the printed scale +
+  base. Match what the page prints; invent a similar token when nothing
+  typical fits. Examples seen in financial corpora: `usd`,
+  `usd_thousands`, `usd_millions`, `usd_billions`, `pct`, `count`,
+  `year`, `rate`, `fx_rate`, `text`. Foreign currency follows
+  `<iso3>_<scale>` (e.g. `jpy_billions`, `gbp_millions`). Use `mixed`
+  only when one cell genuinely combines incompatible units.
+
+Unit and scale come from the page (column header, caption, parenthetical
+legend, footnote). Never guess from magnitude. If "74" appears under a
+"billions of yen" header, emit value=74 and unit=jpy_billions. Do not
+convert foreign currency to USD — leave it native.
+
+Other rules:
+- Every cell in a vector/table shares one unit.
+- Named-entity / string answers: kind="scalar", unit="text".
+- Numbers in `value` are bare (no commas, $, %).
+- If nothing relevant is visible, return [].
+- Output ONLY the JSON array — no fences, no prose.
+- Verbatim grounding: every printed numeric value emitted MUST be visibly
+  printed on the page. Do not compute, sum, average, or transform.
+- EXCEPTION — visual chart-feature counts: if the question asks for the
+  count of features observable but not printed as a number (local maxima,
+  distinct lines, labeled regions, bars exceeding a threshold), emit that
+  count as kind="scalar", unit="count", with a description naming what
+  was counted and on which chart/page. This is the only derived value
+  category permitted.
+"""
+
+_DEDUP_SYSTEM = """\
+You consolidate redundant extraction entries. Multiple independent passes
+over the same pages produced overlapping entries; collapse wording
+duplicates into one representative entry per distinct datum.
+
+You are a PICKER, not a calculator. Every value, key, and cell in your
+output MUST appear verbatim in some input entry. Do not compute,
+aggregate, average, derive, rescale, round, reformat, or invent values
+or keys. Computed values are rejected post-hoc.
+
+Output the same JSON envelope as the inputs: an array of entries
+(description, tag, kind, value, unit; index_name for vectors,
+row_name + col_name for tables).
+
+Rules:
+- One output entry per distinct datum. Wording duplicates → one
+  representative; prefer the clearest, most specific description.
+- All cells of an output entry come from a SINGLE input entry — do not
+  graft cells across inputs. If two inputs disagree on a value at the
+  same key, keep both as separate output entries with disambiguating
+  descriptions.
+- N genuinely distinct datums → N entries.
+- Output ONLY the JSON array — no fences, no commentary.
+"""
+
+
+class ExtractTextOperator(SkunkOperator):
+    name: str = "extract.text"
+    system: str = _TEXT_SYSTEM
+
+
+class ExtractVisionOperator(SkunkOperator):
+    name: str = "extract.vision"
+    system: str = _VISION_SYSTEM
+
+
+class ExtractDedupOperator(SkunkOperator):
+    name: str = "extract.dedup"
+    system: str = _DEDUP_SYSTEM
 
 
 @dataclass(frozen=True)
@@ -125,12 +290,21 @@ _MAX_QUOTES_PER_ENTRY = 3
 _DPI_SCALE = 300 / 72  # PyMuPDF base is 72 DPI; render pages at 300 DPI for the vision tier
 
 
+def _pdf_path_for_ref(ref: PageRef) -> Path | None:
+    """Resolve ref → PDF path via $OFFICEQA_PDF_DIR (skunk.page_index.pdf)."""
+    if ref.month is None or ref.page is None or ref.page <= 0:
+        return None
+    from skunk.page_index.pdf import pdf_path_for
+    return pdf_path_for(ref.month)
+
+
 def _extract_pdf_text(ref: PageRef, ctx: HarnessContext) -> str | None:
     """PyMuPDF text for ref's PDF page, or None when unavailable. No disk cache."""
-    if ref.month is None or ref.page is None or ref.page <= 0 or not ref.file_path:
+    pdf_path = _pdf_path_for_ref(ref)
+    if pdf_path is None:
         return None
     try:
-        with fitz.open(ref.file_path) as doc:
+        with fitz.open(pdf_path) as doc:
             return doc[ref.page - 1].get_text()
     except Exception as e:
         ctx.emit("extract", "tier=ocr extraction failed", page=str(ref), error=str(e))
@@ -139,212 +313,17 @@ def _extract_pdf_text(ref: PageRef, ctx: HarnessContext) -> str | None:
 
 def _render_pdf_page_b64(ref: PageRef, ctx: HarnessContext) -> tuple[str, str] | None:
     """Render ref's PDF page to in-memory PNG bytes and return (mime, base64). No disk cache."""
-    if ref.month is None or ref.page is None or ref.page <= 0 or not ref.file_path:
+    pdf_path = _pdf_path_for_ref(ref)
+    if pdf_path is None:
         return None
     try:
-        with fitz.open(ref.file_path) as doc:
+        with fitz.open(pdf_path) as doc:
             pix = doc[ref.page - 1].get_pixmap(matrix=fitz.Matrix(_DPI_SCALE, _DPI_SCALE))
         return "image/png", base64.standard_b64encode(pix.tobytes("png")).decode()
     except Exception as e:
         ctx.emit("extract", "tier=vision render failed", page=str(ref), error=str(e))
         return None
 
-
-_TEXT_SYSTEM = (
-    "You are a precise data extraction assistant for U.S. Treasury Bulletins.\n"
-    "You will be given the user's question and the text of one or more bulletin pages.\n\n"
-    "Read the page(s) carefully and emit EVERY value (number or string) that could plausibly\n"
-    "be needed to answer the question. Do NOT compute, sum, average, or otherwise transform —\n"
-    "only extract what is printed.\n\n"
-    "Each entry has one of three KINDS. Pick the smallest shape that fits the question.\n\n"
-    "  kind=\"scalar\"  — a single number or string. Use for lookup-one-value questions.\n"
-    "  kind=\"vector\"  — a 1-D series indexed by ONE varying dim (e.g. monthly series).\n"
-    "                    Use when the question aggregates/filters across one axis.\n"
-    "  kind=\"table\"   — a 2-D grid indexed by TWO varying dims (rows × cols).\n"
-    "                    Use only when both axes actively vary in the question.\n\n"
-    "STRONG bias toward `vector` for time series. Even if the page formats the data as a\n"
-    "2-D year×month grid, if the question asks about a 1-D series (\"each month from X to Y\",\n"
-    "\"every quarter\", \"all values in CY1940\"), emit ONE `vector` whose `index_name` is the\n"
-    "combined dim. For year+month series, use combined ISO labels: index_name=\"month\",\n"
-    "keys like \"1942-03\", \"1942-04\". Use kind=\"table\"  when the question asks\n"
-    "to compare rows vs columns (e.g. \"compare Jan vs July across years\").\n\n"
-    "Output a single JSON ARRAY of entries (one entry per distinct datum).\n\n"
-    "Scalar entry:\n"
-    "  {\n"
-    '    "description": "<short natural-language label uniquely identifying this datum>",\n'
-    '    "tag": "<short snake_case key, see tag rules below>",\n'
-    '    "kind": "scalar",\n'
-    '    "value": <number or string>,\n'
-    '    "unit": "<unit>"\n'
-    "  }\n\n"
-    "Vector entry:\n"
-    "  {\n"
-    '    "description": "...",\n'
-    '    "tag": "...",\n'
-    '    "kind": "vector",\n'
-    '    "index_name": "month",                              # the varying dim\n'
-    '    "value": {"1942-03": 3515, "1942-04": 3939, ...},   # flat dict, scalar cells\n'
-    '    "unit": "usd_millions",\n'
-    '    "expected_index_range": "1942-03..1948-10"           # FULL range the question asked\n'
-    "                                                         #  for; lets downstream detect gaps.\n"
-    "  }\n\n"
-    "Table entry:\n"
-    "  {\n"
-    '    "description": "...",\n'
-    '    "tag": "...",\n'
-    '    "kind": "table",\n'
-    '    "row_name": "year", "col_name": "month",\n'
-    '    "value": {"1942": {"03": 3515, "04": 3939, ...},\n'
-    '              "1943": {"03": 7746, "04": 7300, ...}},   # 2-level dict, scalar cells\n'
-    '    "unit": "usd_millions"\n'
-    "  }\n\n"
-    "DO NOT NEST. Vector cells and table cells MUST be a single number or string. Examples\n"
-    "of what is FORBIDDEN and will be rejected:\n"
-    '  "value": [[3515, 3939], [4100, 4810]]            ← WRONG (nested list)\n'
-    '  "value": {"1942": [3515, 3939, 4100]}            ← WRONG (vector cell is a list;\n'
-    "                                                     emit kind=\"table\" instead)\n"
-    '  "value": {"1942": {"q1": {"jan": 1043}}}         ← WRONG (3-level nest; tables are\n'
-    "                                                     exactly 2 levels)\n"
-    '  "value": {"03": [3515, 3500]}                    ← WRONG (vector cell is a list)\n\n'
-    "If you need a third axis, emit multiple separate vector/table entries — never nest.\n\n"
-    "Field rules:\n"
-    '- "description" is a short natural-language label uniquely identifying the datum. It\n'
-    "  must include ALL context that distinguishes this entry from siblings — the series\n"
-    "  (e.g. \"New Aa corporate bonds\"), the period (e.g. \"CY1940\", \"January 1985\"), any\n"
-    "  sub-category, and any other categorical labels. Examples:\n"
-    "    \"Total US national defense expenditures, monthly, CY1940\"\n"
-    "    \"New Aa corporate bonds, January yield percentages, CY1990–CY1999\"\n"
-    "    \"Federal individual income tax receipts net of refunds, FY1929–FY1942\"\n"
-    "  Be specific enough that a downstream consumer can identify the entry from\n"
-    "  description alone. Where possible, prefer including the EXACT printed row label,\n"
-    "  column header, or caption phrase from the page (e.g. \"Net budget outlays\",\n"
-    "  \"Treasury 30-yr. bonds\") inside the description. This is a soft preference, not\n"
-    "  a requirement — paraphrase only when no concise printed phrase fits.\n"
-    '- "tag" is a short snake_case selection key that downstream code uses to pick this\n'
-    "  entry unambiguously (instead of substring-matching the description). Build it\n"
-    "  as <series>:<period>. Examples:\n"
-    "    \"national_defense_expenditures:cy1940\"\n"
-    "    \"aa_corp_bonds_january_yield:cy1990-cy1999\"\n"
-    "    \"individual_income_tax_receipts:fy1929-fy1942\"\n"
-    "  Lowercase, ASCII, no spaces; use underscores within tokens and colons/hyphens\n"
-    "  between them. Two entries that describe the SAME underlying series + period\n"
-    "  MUST share the same tag (so dedup/quorum can identify duplicates).\n"
-    '- "expected_index_range" (VECTOR ONLY, optional): a short "<first>..<last>"\n'
-    "  string naming the FULL index range the QUESTION asked for, in the same key\n"
-    "  format as `value` (e.g., \"1969-01..1980-01\", \"1953..1955\"). Set this when\n"
-    "  the question implies a range but the printed page only contains a partial\n"
-    "  series — downstream gap detection uses this to flag missing keys. Leave\n"
-    "  empty/omit when the page's index range IS the question's range, or when\n"
-    "  the entry is a single scalar/table.\n"
-    '- "unit" is a single lowercase token describing the printed scale + base. Build it\n'
-    '  from the page — common examples (not an exhaustive list):\n'
-    "    usd, usd_thousands, usd_millions, usd_billions,\n"
-    "    jpy_millions, jpy_billions, gbp_millions, eur_billions, cad_millions, (etc.),\n"
-    "    pct, count, year, rate, fx_rate, text, mixed.\n"
-    "  For foreign currency, follow the pattern <iso3>_<scale> (lowercase ISO code, e.g.\n"
-    '  "jpy_billions" for "in billions of yen"). For dimensionless / qualitative fields\n'
-    '  use pct, count, year, rate, fx_rate, or text. Use "mixed" only when a single cell\n'
-    "  genuinely combines incompatible units.\n\n"
-    "Rules:\n"
-    "- The numeric scale AND currency MUST come from the printed page — a column header,\n"
-    "  table caption, parenthetical legend, or footnote like \"(In millions of dollars)\"\n"
-    "  or \"(In billions of yen)\". Use exactly the scale and currency the page prints;\n"
-    "  do NOT guess them from the magnitude of the numbers. If the page shows \"74\"\n"
-    '  under a header that says "billions of yen", emit value=74 and unit=jpy_billions —\n'
-    "  even if 74 \"feels\" small or large for the quantity. Likewise, do not silently\n"
-    "  convert foreign currency to USD; leave it in its native unit and let downstream\n"
-    "  compute apply the FX rate.\n"
-    '- If the column/section header says "in thousands of dollars", report unit=usd_thousands\n'
-    "  (do NOT silently rescale the printed numbers). Every cell in a vector/table shares one unit.\n"
-    "- For named-entity / string answers, use kind=\"scalar\", unit=\"text\", value as a JSON string.\n"
-    "- Numbers in `value` are bare (no commas, no $, no %).\n"
-    "- If the page contains nothing relevant to the question, return [] (empty array).\n"
-    "- Output ONLY the JSON array — no markdown fences, no commentary, no leading prose.\n"
-    "- CRITICAL — verbatim grounding: every numeric value you emit (every cell, in any kind)\n"
-    "  MUST appear on the page (with or without comma separators). Do NOT compute, derive,\n"
-    "  or aggregate values. A computed value will be rejected.\n"
-)
-
-_VISION_SYSTEM = (
-    "You are a precise data extraction assistant. The images show scanned pages from\n"
-    "U.S. Treasury Monthly Bulletins. You will be given the user's question and the\n"
-    "rendered page image(s).\n\n"
-    "Read the page(s) and emit every value that could plausibly answer the question.\n"
-    "Do not compute or transform — extract only what is visible.\n\n"
-    "Each entry has one of three KINDS — pick the smallest shape that fits:\n"
-    "  kind=\"scalar\"  — single number or string.\n"
-    "  kind=\"vector\"  — 1-D series indexed by ONE varying dim. Provide `index_name`.\n"
-    "  kind=\"table\"   — 2-D grid indexed by TWO varying dims. Provide `row_name`, `col_name`.\n\n"
-    "Output a single JSON ARRAY of entries. Each entry has this shape:\n"
-    '  scalar: {"description":"...","tag":"...","kind":"scalar","value":<num|str>,"unit":...}\n'
-    '  vector: {"description":"...","tag":"...","kind":"vector","index_name":"month",\n'
-    '           "value":{"1942-03":3515,"1942-04":3939,...},"unit":...}\n'
-    '  table:  {"description":"...","tag":"...","kind":"table","row_name":"year","col_name":"month",\n'
-    '           "value":{"1942":{"03":3515,...},...},"unit":...}\n\n'
-    "DO NOT NEST. Vector and table cells MUST be a primitive (number or string). FORBIDDEN:\n"
-    '  "value": [[3515, 3939], [4100, 4810]]            ← nested list\n'
-    '  "value": {"1942": [3515, 3939]}                  ← vector cell is a list\n'
-    '  "value": {"1942": {"q1": {"jan": 1043}}}         ← 3-level nest\n'
-    "If you need a third axis, emit multiple separate entries — never nest.\n\n"
-    'The "description" field is a short natural-language label uniquely identifying the\n'
-    "datum — include series, period, sub-category, and any other distinguishing context.\n"
-    "Where possible, prefer including the EXACT visible row label, column header, or\n"
-    "caption phrase from the page inside the description (soft preference; paraphrase\n"
-    "only when no concise printed phrase fits).\n"
-    'The "tag" field is a short snake_case selection key shaped as <series>:<period>\n'
-    "(e.g. national_defense_expenditures:cy1940, aa_corp_bonds_january_yield:cy1990-cy1999).\n"
-    "Two entries describing the same underlying series + period MUST share the same tag.\n\n"
-    "Unit token — single lowercase string describing the printed scale + base.\n"
-    "  Common examples (not exhaustive): usd, usd_thousands, usd_millions, usd_billions,\n"
-    "  jpy_millions, jpy_billions, gbp_millions, eur_billions, cad_millions,\n"
-    "  pct, count, year, rate, fx_rate, text, mixed.\n"
-    "  For foreign currency, follow the pattern <iso3>_<scale> (e.g. jpy_billions for\n"
-    '  "in billions of yen"). Use "mixed" only when one cell genuinely combines incompatible units.\n'
-    "The numeric scale AND currency MUST come from the printed page (column header, table\n"
-    "caption, parenthetical legend, or footnote). Never guess scale from value magnitude.\n"
-    'If "74" appears under a header that says "billions of yen", emit value=74 and unit=jpy_billions.\n'
-    "Do not silently convert foreign currency to USD; leave it native and let compute apply FX.\n"
-    "If nothing relevant is visible, return [].\n"
-    "Output ONLY the JSON array — no fences, no prose.\n"
-    "CRITICAL — verbatim grounding for PRINTED numeric values: every numeric value you emit that\n"
-    "came from a printed cell, label, axis tick, or caption MUST be visibly printed on the page.\n"
-    "Do not compute, sum, average, or otherwise transform printed numbers.\n"
-    "EXCEPTION — visual chart-feature counts: when the question asks for the count of features on\n"
-    'a chart that are observable but not printed as a number (e.g., "how many local maxima",\n'
-    '"how many distinct lines", "how many labeled regions", "how many bars exceed the threshold\n'
-    'line"), you MAY emit that count as a kind="scalar" entry with unit="count". The description\n'
-    "should name what was counted and on which chart/page. This is the only category of derived\n"
-    "value that is permitted; everything else still must be verbatim.\n"
-)
-
-_DEDUP_SYSTEM = (
-    "You consolidate redundant extraction entries from a financial QA pipeline.\n\n"
-    "Multiple independent extraction passes over the same set of source pages produced "
-    "overlapping entries. Many describe the same datum with different wording. Your job: "
-    "produce a single consolidated array with one representative entry per distinct datum.\n\n"
-    "YOU ARE A PICKER, NOT A CALCULATOR.\n"
-    "You may ONLY select a representative entry (or a subset of cells from a single input "
-    "entry) — you may NOT compute, average, sum, sort, scale, format, infer, or otherwise "
-    "create any new value. Every value, key, and cell in your output MUST appear verbatim "
-    "in some input entry. Any computed value will be rejected post-hoc.\n\n"
-    "Output the SAME JSON envelope as the inputs: a JSON ARRAY of entries. Each entry has\n"
-    "description, kind, value, unit, and optionally index_name (vector) or row_name+col_name\n"
-    "(table).\n\n"
-    "Rules:\n"
-    "- Keep ONE entry per distinct datum. Merge wording duplicates into a single representative.\n"
-    "- DO NOT introduce new cell values. Every cell value in your output (scalar value, "
-    "vector cell, table cell) MUST come VERBATIM from an input entry. Pick a representative; "
-    "do not invent. Do not pick the mean / median / sum / etc. as a representative.\n"
-    "- DO NOT compute, aggregate, transform, derive, rescale, round, or reformat.\n"
-    "- DO NOT add cell keys not present in any input entry.\n"
-    "- For each output entry, all of its cells must come from a SINGLE input entry — "
-    "do not graft cells across inputs. If two inputs disagree on a cell value at the "
-    "same key, keep both inputs as separate output entries with disambiguating descriptions.\n"
-    "- Prefer the entry with the clearest, most specific description.\n"
-    "- If everything in the inputs is redundant duplicates of a single datum, output one "
-    "entry. If the inputs describe N genuinely distinct datums, output N entries.\n"
-    "- Output ONLY the JSON array — no fences, no commentary.\n"
-)
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
@@ -713,7 +692,7 @@ def _dedup_semantically(
         "tier=parsed_json dedup call (T=0)",
         n_input_entries=len(envelope),
     )
-    resp = ctx.llm_client.call(_DEDUP_SYSTEM, user_msg, temperature=0.0, thinking_budget=0, ctx=ctx)
+    resp = ctx.llm_client.call(ExtractDedupOperator().build_system(ctx), user_msg, temperature=0.0, thinking_budget=0, ctx=ctx)
     raw = resp.text
     parsed = _parse_response_raw(raw, ctx)
     ctx.emit(
@@ -1033,8 +1012,7 @@ def _gather_text(
             header += " ---"
             out.append((ref, header, text))
         else:
-            ctx.emit("extract", f"tier={tier_name} no text",
-                     page=str(ref), file_path=ref.file_path)
+            ctx.emit("extract", f"tier={tier_name} no text", page=str(ref))
     return out
 
 
@@ -1090,6 +1068,7 @@ def _parsed_json_tier(refs: list[PageRef], ctx: HarnessContext,
     else:
         groups = _group_consecutive_pages(pages)
     n_samples = ctx.config.extract_n_samples
+    text_system = ExtractTextOperator().build_system(ctx)
     ctx.emit(
         "extract",
         f"tier=parsed_json fan-out {len(groups)}g × {n_samples}s @ T={ctx.config.extract_sample_temperature}",
@@ -1097,9 +1076,9 @@ def _parsed_json_tier(refs: list[PageRef], ctx: HarnessContext,
         n_pages=len(pages),
         group_sizes=[len(g) for g in groups],
         total_chars=sum(len(t) for _, _, t in pages),
-        system_prompt=_TEXT_SYSTEM[:1500],
+        system_prompt=text_system[:1500],
     )
-    group_runs = _sample_groups_n(_TEXT_SYSTEM, ctx.question, groups, ctx, "parsed_json",
+    group_runs = _sample_groups_n(text_system, ctx.question, groups, ctx, "parsed_json",
                                     hints=hints)
 
     # Per-group verification: each entry's cell values must appear in the
@@ -1172,7 +1151,7 @@ def _ocr_tier(refs: list[PageRef], ctx: HarnessContext,
         total_chars=sum(len(b) for b in page_blocks),
         user_message=user_msg[:3000],
     )
-    entries = _single_call(_TEXT_SYSTEM, user_msg, ctx, "ocr")
+    entries = _single_call(ExtractTextOperator().build_system(ctx), user_msg, ctx, "ocr")
     verify_text = "\n\n".join(text for _, _, text in pages)
     kept = [e for e in entries if _value_in_text(e, verify_text)]
     n_dropped = len(entries) - len(kept)
@@ -1195,8 +1174,7 @@ def _vision_tier(refs: list[PageRef], ctx: HarnessContext,
             images.append(img)
             rendered_refs.append(ref)
         else:
-            ctx.emit("extract", "tier=vision no png",
-                     page=str(ref), file_path=ref.file_path)
+            ctx.emit("extract", "tier=vision no png", page=str(ref))
 
     if not images:
         ctx.emit("extract", "tier=vision skipped (no images)")
@@ -1220,7 +1198,7 @@ def _vision_tier(refs: list[PageRef], ctx: HarnessContext,
     )
 
     ctx.emit("extract", "tier=vision single-call (T=0)", n_images=len(images))
-    entries = _single_call(_VISION_SYSTEM, user_msg, ctx, "vision", images=images)
+    entries = _single_call(ExtractVisionOperator().build_system(ctx), user_msg, ctx, "vision", images=images)
     return _finalize_entries(entries, ctx, "vision")
 
 

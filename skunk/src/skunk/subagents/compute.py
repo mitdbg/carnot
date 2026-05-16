@@ -1,22 +1,20 @@
-"""compute subagent — two modes, switched by op.args["final"]:
+"""compute subagent — codegen + execution over an extracted-value sandbox.
 
-  final=True  (default for back-compat): chain terminator. Reads ctx.question
-              (or op.args["task"] if planner-supplied) and prev. Codegens
-              Python that assigns `result` to the answer string, self-critiques,
-              and ships FormattedString. This is the historical behavior.
+Two operators cover two roles. The terminal compute (`CodegenFinalOperator`)
+takes the user's question plus `prev: list[AnnotatedValue]`, generates Python
+that assigns `result` to the formatted answer string, runs it in a sandbox,
+then self-critiques via `CritiqueOperator` and re-runs once on REVISE.
+Returns a `FormattedString`.
 
-  final=False: intermediate compute. Reads op.args["task"] and prev. Codegens
-              Python that assigns `result` to a raw value (scalar / dict /
-              dict-of-dict / list[AnnotatedValue]) plus optional metadata vars
-              (`result_unit`, `result_kind`, `result_name`, `result_dims`,
-              `result_index_name`, `result_row_name`, `result_col_name`).
-              No self-critique. Returns list[AnnotatedValue] for the
-              downstream aggregator to consume.
+The intermediate compute (`CodegenIntermediateOperator`) takes a sub-task
+plus `prev`, generates Python that assigns `result` to a raw value (scalar,
+vector dict, table dict-of-dict, or list[AnnotatedValue]) with optional
+`result_unit` / `result_kind` / `result_description` / `result_index_name` /
+`result_row_name` / `result_col_name` metadata vars. No critique. Returns
+a `list[AnnotatedValue]` for the downstream aggregator.
 
-Failure modes (StepFailed):
-- Attempt 1 produced no result across all transient retries
-- Attempt 2 (final mode only) produced no result AND attempt 1 had no result either
-- Codegen reported "MISSING:" on attempt 1 — extracted values insufficient
+Codegen reports `MISSING:<reason>` when `prev` lacks a needed value; the
+orchestrator catches that and triggers a replan round.
 """
 
 from __future__ import annotations
@@ -25,6 +23,7 @@ import re
 
 from skunk.common import HarnessContext
 from skunk.dsl import AnnotatedValue, FormattedString, OpNode
+from skunk.operator import SkunkOperator
 from skunk.subagents.base import (
     MissingData,
     StepFailed,
@@ -32,73 +31,53 @@ from skunk.subagents.base import (
     strip_code_fences,
 )
 
-_CODEGEN_SYSTEM = """\
-You are writing code for a financial data processing pipeline.
 
-You receive:
-- The user's original question (free text).
-- `prev`: extracted data, available in the sandbox. Always list[AnnotatedValue].
-    AnnotatedValue fields:
-          .tag         — short snake_case selection key (e.g. "national_defense_expenditures:cy1940").
-                          Two entries describing the same series + period share the same tag.
-          .description — natural-language label uniquely identifying this datum
-                          (e.g. "Total US national defense expenditures, monthly, CY1940")
-          .value       — the payload (scalar, vector dict, or table dict-of-dict)
-          .unit        — semantic unit (usd_millions, pct, count, year, text, fx_rate, ...)
-          .kind        — "scalar" | "vector" | "table"
-          .index_name  — vector only: name of the varying dim (e.g. "month")
-          .row_name    — table only: name of the row dim
-          .col_name    — table only: name of the column dim
+# ---------------------------------------------------------------------------
+# Static system prompt blocks
+# ---------------------------------------------------------------------------
 
-Selecting from prev:
-  PREFER exact tag matching: `next(e for e in prev if e.tag == "national_defense_expenditures:cy1940")`.
-  When multiple entries match a substring, the first match wins — which is fragile.
-  Tags are the unambiguous handle; use them when available. Fall back to description
-  substring matching only when no tag is present (e.tag == "") or when you need to
-  scan multiple entries.
+_CODEGEN_FINAL_SYSTEM = """\
+You write Python that produces the final answer string for a financial QA
+pipeline.
 
-Payload shapes by kind:
-  scalar:  entry.value is the number or string itself.
-  vector:  entry.value is an insertion-ordered dict {index_label: scalar}.
-           Use list(entry.value.values()) for whole-series ops, or .items() to filter
-           by index label (e.g. a date range).
-  table:   entry.value is a 2-level dict {row_label: {col_label: scalar}}.
-           Cast with pd.DataFrame.from_dict(entry.value, orient="index") for normal
-           table operations.
+Inputs:
+- The user's question.
+- A "Parsed constraints" block in the user message — structured spec of
+  the question (method, transforms, units_out, precision, answer_form,
+  period_type). Treat as ground truth: every listed transform MUST appear
+  as an explicit operation in your code; if method is set, implement its
+  standard formula; if units_out is set, convert; if precision is set,
+  round.
+- `prev`: list[AnnotatedValue] available in the sandbox.
 
-Pay special attention to the question's explicit constraints:
-  - year:  e.g. "1942-1948", fiscal year (FY) vs. calendar year (CY)
-  - series: e.g. "national defense expenditures"
-  - type of computation requested: e.g., geometric mean vs. arithmetic mean
+AnnotatedValue:
+  .tag         snake_case key, e.g. "national_defense_expenditures:cy1940"
+  .description natural-language label
+  .value       scalar | vector dict {index: scalar} | table dict-of-dict
+  .unit        usd_millions | pct | count | year | text | fx_rate | ...
+  .kind        "scalar" | "vector" | "table"
+  .index_name  vector only
+  .row_name / .col_name   table only
 
-You will also see a "Parsed constraints" block in the user message — a
-pre-parsed structured spec of the question. Treat it as ground truth: every
-transform listed there MUST appear as an explicit operation in your code.
-If method is set, implement that exact method's standard formula. If
-units_out is set, format/convert the answer to that unit. If precision is
-set, round the final answer to that many decimal places.
+Selecting from prev: PREFER exact tag matching:
+  next(e for e in prev if e.tag == "<tag>")
+Substring matching on description is fragile (first match wins); fall back
+to it only when no tag is present (e.tag == "").
 
-NUMERIC TRANSFORMS — every transform present in the question MUST appear as
-an explicit operation in the code, NOT just acknowledged in a comment.
-Naming the transform without implementing it will be REVISEd downstream.
-Common ones to watch for:
-  - "normalized", "mid-point normalized" — apply the normalization (e.g.
-    midpoint: (V2-V1) / ((V1+V2)/2))
-  - "signed", "absolute" — preserve or strip the sign accordingly; never
-    silently `abs()` a value the question wants signed
-  - "log of", "ln(...)" — wrap in np.log; do not skip
-  - "ratio of A to B" — divide A by B; do not subtract
-  - "per capita" — divide by population
-  - "year-over-year", "month-over-month" — pct change between consecutive
-    periods, not raw diff
-  - "in percent form" vs "as a decimal" — multiply/divide by 100 accordingly
-    and format the result string to match
-  - "rounded to N decimal places" — round explicitly
-  - "in millions/billions of USD" — convert the .unit value to that scale
-  - "geometric mean" vs "arithmetic mean" — use np.exp(np.mean(np.log(...)))
-    vs np.mean
-  - "weighted" vs "unweighted" — apply weights or don't, per the question
-  - "compound" vs "simple" growth rate — use CAGR formula vs naive ratio
+Payload access:
+  vector: list(e.value.values()) or .items() to filter by index.
+  table:  pd.DataFrame.from_dict(e.value, orient="index").
+
+NUMERIC TRANSFORMS — every transform from the question MUST appear as an
+explicit operation, not as a comment. The critic REVISEs on missing or
+mis-applied transforms even when the magnitude looks plausible. Watch for:
+  - "signed" vs "absolute" — never silently abs() a value meant signed.
+  - "normalized" / "midpoint normalized" — apply explicitly (midpoint:
+    (V2-V1)/((V1+V2)/2)).
+  - "log of" / "ln(...)" — wrap in np.log.
+  - "per capita" — divide by population.
+  - "in percent form" vs "as a decimal" — scale by 100 and format the
+    result string to match.
 
 Worked example — geometric mean over a vector (tag-matched):
     e = next(e for e in prev if e.tag == "national_defense_expenditures:cy1940")
@@ -106,224 +85,162 @@ Worked example — geometric mean over a vector (tag-matched):
     gm = float(np.exp(np.mean(np.log(vals))))
     result = f"{gm:.2f} millions of nominal dollars"
 
-Worked example — date-range filter on a vector:
-    series = next(e for e in prev
-                  if "budget expenditures" in e.description.lower()).value
-    selected = [v for k, v in series.items() if "1942-03" <= k <= "1948-10"]
-    gm = float(np.exp(np.mean(np.log(selected))))
-    result = f"{gm:.2f}"
-
 Worked example — column sum on a table (tag-matched):
     e = next(e for e in prev if e.tag == "internal_revenue_collections:fy1943")
     df = pd.DataFrame.from_dict(e.value, orient="index")
     total_1943 = float(df.loc["1943"].sum())
     result = f"{total_1943:,.0f}"
 
-Your job: produce the answer string the question asks for. This means
-(a) plan the computation, (b) write Python that assigns the final answer
-to `result` AS A STRING formatted exactly as the question requests.
-
 Output format — exactly one of:
-  CODE\\n<python code that sets `result` to a string>
-  MISSING:<short explanation of which datum is missing>
+  CODE\\n<python that sets `result` to a string>
+  MISSING:<short reason a needed datum is absent>
 
 Rules:
-- If you can answer from `prev`, output CODE then the Python block.
-- If `prev` is missing a value you need (e.g. only one of two periods present,
-  no FX rate, no CPI), output MISSING:<reason>. Do NOT fabricate values.
-- Prefer a printed value already in `prev` over re-deriving it from components
-  also in `prev`. If the page prints both a total/summary row and its component
-  rows, use the total — don't re-aggregate the components to compute it yourself.
-- `result` MUST be a Python str containing ONLY the answer the question asks for —
-  no surrounding prose, no restatement of the question, no labels like "Answer:"
-  or "The bureau is...". For numbers, format per the question's instructions
-  (precision, with/without commas, with/without unit symbols). For lists, use the
-  bracket form the question requests. For percent answers, append "%" only if the
-  question asks for percent form. If the question contains multiple sub-questions
-  (e.g. "name the bureau AND compute X"), only emit the final answer the question
-  ultimately asks for — typically the last quantity/identifier requested.
-- Convert units yourself when needed (e.g. usd_thousands → usd_millions: divide by 1000).
-  Every cell in a vector or table shares one unit — convert once over the whole payload.
-- Units may follow the pattern <iso3>_<scale> for foreign currency (e.g. jpy_billions,
-  gbp_millions, cad_billions). When the question asks for an answer in USD but an input
-  is in foreign currency, locate the matching fx_rate entry in `prev` and apply it —
-  e.g. usd = value * rate when the rate's units are "USD per <iso>", or value / rate when
-  "<iso> per USD". Check the description of the fx_rate entry to determine direction.
-- Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm). `hp_filter(series, lamb=…)` is also pre-defined in the sandbox (pure-numpy HP filter). Do not import it.
+- If a value you need isn't in `prev` (e.g. only one period present, no FX
+  rate, no CPI), output MISSING. Never fabricate.
+- Prefer a printed total/summary row over re-aggregating its components
+  when both are in `prev`.
+- `result` is a Python str containing ONLY the requested answer — no
+  prose, no "Answer:", no restatement of the question. Format numbers per
+  the question (precision, commas, % suffix per "percent form" requests).
+  For multi-part questions, emit only the ultimate quantity/identifier
+  the question asks for.
+- Every cell in a vector/table shares one unit — convert once over the
+  whole payload (e.g. usd_thousands → usd_millions: divide by 1000).
+- Foreign currency follows <iso3>_<scale> (jpy_billions, gbp_millions,
+  cad_billions). When the question wants USD and an input is foreign,
+  locate the matching fx_rate entry and apply it: value * rate if the
+  rate is "USD per <iso>", value / rate if "<iso> per USD" — read the
+  rate's description for direction.
+- Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
+  `hp_filter(series, lamb=…)` is pre-defined in the sandbox; don't import it.
 - Output ONLY the format above — no markdown fences around the whole response.
 """
 
-_CODEGEN_SYSTEM_INTERMEDIATE = """\
-You are an intermediate compute step in a financial QA pipeline. Your output
-feeds a downstream aggregator compute — emit raw values, not pretty strings.
+_CODEGEN_INTERMEDIATE_SYSTEM = """\
+You are an intermediate compute step. Your output feeds a downstream
+aggregator — emit a raw value, not a pretty string.
 
-You receive:
-- A natural-language sub-task (the question for THIS step, not the user's
-  original question).
-- `prev`: extracted bulletin data, available in the sandbox. Always list[AnnotatedValue].
-    AnnotatedValue fields:
-          .tag         — short snake_case selection key (e.g. "national_defense_expenditures:cy1940")
-          .description — natural-language label uniquely identifying this datum
-          .value       — the payload (scalar, vector dict, or table dict-of-dict)
-          .unit        — semantic unit (usd_millions, pct, count, year, text, fx_rate, ...)
-          .kind        — "scalar" | "vector" | "table"
-          .index_name  — vector only: name of the varying dim (e.g. "month")
-          .row_name    — table only: name of the row dim
-          .col_name    — table only: name of the column dim
+Inputs:
+- A natural-language sub-task (this step only, not the user's full question).
+- `prev`: list[AnnotatedValue] available in the sandbox.
+  Fields: .tag (snake_case key), .description, .value (scalar | vector dict
+  | table dict-of-dict), .unit, .kind, .index_name (vector), .row_name/.col_name (table).
 
-Payload shapes by kind:
-  scalar:  entry.value is the number or string itself.
-  vector:  entry.value is an insertion-ordered dict {index_label: scalar}.
-  table:   entry.value is a 2-level dict {row_label: {col_label: scalar}}.
-
-Working with entries:
-- PREFER exact tag matching: `next(e for e in prev if e.tag == "<tag>")`.
-- Fall back to description substring matching only when no tag is present.
-- Every entry's unit is in .unit — trust that, never guess.
-
-Your job: produce ONE raw value (or a small set) that answers the sub-task and
-will be wrapped as a downstream AnnotatedValue.
+PREFER exact tag matching: `next(e for e in prev if e.tag == "<tag>")`.
+Fall back to description substring matching only when no tag is present.
 
 Output format — exactly one of:
-  CODE\\n<python code that sets `result` (and optionally metadata vars)>
-  MISSING:<short explanation of which datum is missing>
+  CODE\\n<python that sets `result` (and optionally metadata vars)>
+  MISSING:<short reason a needed datum is absent>
 
-Rules:
-- Assign `result` to one of:
-    (a) a Python scalar (int / float / str)              → wrapped as kind=scalar
-    (b) a Python dict {index_label: scalar}              → wrapped as kind=vector
-    (c) a Python dict-of-dict {row: {col: scalar}}       → wrapped as kind=table
-    (d) a list[AnnotatedValue] you construct explicitly  → returned verbatim
-- Optionally set these metadata vars to refine the wrapping (sensible defaults
-  used when absent):
-    result_unit         — str, e.g. "usd_millions" or "pct"
-    result_kind         — "scalar" | "vector" | "table" (only if inference is wrong)
-    result_description  — natural-language label for this output
-    result_index_name   — vector only: name of the varying dim
-    result_row_name     — table only
-    result_col_name     — table only
-- Do NOT format `result` as a pretty string — emit the raw numeric/dict.
-- Prefer a printed value already in `prev` over re-deriving it from components
-  also in `prev`. If both a total/summary row and its component rows are present,
-  use the total — don't re-aggregate components to compute it yourself.
-- Convert units yourself when needed (e.g. usd_thousands → usd_millions: divide by 1000)
-  and set result_unit accordingly.
-- Units may follow <iso3>_<scale> for foreign currency (e.g. jpy_billions, gbp_millions).
-  When the sub-task requires a USD answer but an input is in foreign currency, find the
-  matching fx_rate entry in `prev` and apply it (read the fx_rate's description to
-  determine direction: "USD per <iso>" → multiply, "<iso> per USD" → divide).
-- If `prev` is missing a value you need, output MISSING:<reason>. Do NOT fabricate values.
-- Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm). No other imports. No prints.
-- `hp_filter(series, lamb=…)` is also pre-defined in the sandbox (pure-numpy HP filter). Do not import it.
-- Output ONLY the format above — no markdown fences around the whole response.
+Assign `result` to one of:
+  (a) Python scalar (int / float / str)           → wrapped as kind=scalar
+  (b) dict {index_label: scalar}                  → wrapped as kind=vector
+  (c) dict-of-dict {row: {col: scalar}}           → wrapped as kind=table
+  (d) list[AnnotatedValue] you construct explicitly → returned verbatim
 
-Worked example — find the year where a series is minimized:
-    series = next(e for e in prev
-                  if "yield spread" in e.description.lower()).value
-    min_year, min_val = min(series.items(), key=lambda kv: kv[1])
-    result = min_year
-    result_unit = 'year'
-    result_kind = 'scalar'
-    result_description = 'year of minimum yield spread'
+Optional metadata vars (sensible defaults used when absent):
+  result_unit, result_kind, result_description,
+  result_index_name (vector), result_row_name / result_col_name (table).
 
 Worked example — produce a 2-element dict for downstream pairwise math:
-    a = next(e for e in prev if "cy1940 total" in e.description.lower()).value
-    b = next(e for e in prev if "cy1953 total" in e.description.lower()).value
+    a = next(e for e in prev if e.tag == "national_defense:cy1940").value
+    b = next(e for e in prev if e.tag == "national_defense:cy1953").value
     result = {'1940': a, '1953': b}
     result_unit = 'usd_millions'
     result_kind = 'vector'
     result_index_name = 'year'
     result_description = 'national defense totals by year'
+
+Rules:
+- Do NOT format `result` as a pretty string — emit the raw numeric/dict.
+- Prefer a printed total/summary row over re-aggregating its components
+  when both are in `prev`.
+- Every cell in a vector/table shares one unit — convert once
+  (usd_thousands → usd_millions: divide by 1000) and set result_unit.
+- Foreign currency follows <iso3>_<scale>. To answer in USD when the
+  input is foreign, find the matching fx_rate entry and apply it: "USD
+  per <iso>" → multiply, "<iso> per USD" → divide. Check the fx_rate
+  description for direction.
+- If `prev` is missing a value you need, output MISSING. Never fabricate.
+- Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
+  No other imports. No prints. `hp_filter(series, lamb=…)` is pre-defined.
+- Output ONLY the format above — no markdown fences around the whole response.
 """
 
-
 _CRITIQUE_SYSTEM = """\
-You are reviewing code that another coding agent wrote and the
-string it produced. Decide whether to ship the result as-is or revise.
+You review code that another agent wrote and the string it produced.
+Decide ACCEPT or REVISE.
 
-You receive the question, a summary of `prev` (the list[AnnotatedValue] input — including each entry's description,
-unit, and kind), the python code that ran, and the produced `result` string.
-
-You will also see a "Parsed constraints" block — a pre-parsed structured spec
-of the question (units_out, precision, answer_form, method, transforms,
-period_type). Treat it as ground truth and use it as your checklist: for
-each transform in the spec, verify the code applies it; for method, verify
-the formula matches the standard form; for units_out, verify the result is
-in that unit; for precision, verify rounding; for answer_form, verify the
-result's shape.
+Inputs: the question, a summary of `prev` (descriptions + units + kinds),
+the Python that ran, the produced `result` string, and a "Parsed
+constraints" block (method, transforms, units_out, precision, answer_form,
+period_type). Treat the parsed constraints as a checklist.
 
 Reply on a single line:
   ACCEPT
   REVISE: <one short reason a re-run should address>
 
-Before deciding, scan the question for NUMERIC MODIFIERS. Common ones:
-  "normalized", "mid-point normalized", "signed" (vs "absolute"), "log of",
-  "ln(...)", "ratio of A to B", "per capita", "year-over-year",
-  "month-over-month", "in percent form" vs "as a decimal", "rounded to N
-  decimal places", "in millions/billions of USD", "geometric mean" vs
-  "arithmetic mean", "weighted" vs "unweighted", "compound" vs "simple"
-  growth rate.
-For each modifier present in the question, verify the code applies it
-correctly as an explicit operation (not just a comment). If any modifier
-is omitted or misapplied, REVISE — even when the result "looks plausible"
-in shape. Magnitude/sign sanity check: if the result's order of magnitude
-or sign disagrees with the natural reading of the question under its
-modifiers, that is a STRONG REVISE signal.
+Numeric modifiers to scan for in the question: signed vs absolute,
+normalized / midpoint-normalized, log_of, per_capita, year-over-year /
+month-over-month, percent form vs decimal, weighted vs unweighted,
+compound vs simple growth. Each modifier present in the question MUST
+appear as an explicit operation in the code, not as a comment. If the
+result's magnitude or sign disagrees with the natural reading of the
+question under its modifiers, that is a STRONG REVISE signal.
 
-When the question NAMES A SPECIFIC METHOD, verify the code implements the
-standard formula for that method. Specific gotchas:
-  - "Expected shortfall" / ES on a return-or-yield series: ES is the
-    *signed* mean of the tail-loss observations. If yields are positive
-    on average but the question implies a "shortfall" / loss context,
-    expect a NEGATIVE answer. Code that returns the mean of the lowest
-    values without sign-handling is wrong.
-  - "Arc elasticity": standard form is
-    ((Q2-Q1)/((Q1+Q2)/2)) / ((P2-P1)/((P1+P2)/2)).
-    Do NOT substitute point elasticity, CAGR, or growth-rate-as-elasticity.
-  - "Zipf exponent": if the question pins a method (OLS log-rank vs log-size,
-    MLE, regression of frequency on rank), use exactly that method. If the
-    question doesn't pin one, MLE is the typical default for power-law fits.
-  - "Hazen plotting position": (i - 0.5) / n. NOT Weibull i/(n+1) and NOT
+When the question names a specific method, verify the code implements its
+standard formula. Common gotchas:
+  - expected_shortfall on a return/yield series is the SIGNED mean of the
+    tail observations; expect a negative result in a loss context.
+  - arc_elasticity = ((Q2-Q1)/((Q1+Q2)/2)) / ((P2-P1)/((P1+P2)/2));
+    not point elasticity, not CAGR.
+  - zipf: MLE is the default unless the question pins OLS log-rank vs
+    log-size or regression of frequency on rank.
+  - hazen_plotting_position = (i - 0.5) / n; not Weibull i/(n+1) or
     California i/n.
-  - "Gini coefficient" vs "Theil index" vs "coefficient of variation": these
-    are distinct; use the one named.
-  - "Pearson correlation" vs "partial correlation" vs "Spearman": distinct.
-  - "H-spread" / IQR: Q3 − Q1 using the percentile method named (default
-    "linear interpolation" / Tukey hinges if unspecified).
-  - "CAGR": (V_end/V_start)^(1/n) - 1, where n is the number of intervals
-    (NOT years inclusive).
-If a related-but-different formula was used, REVISE with: "code uses
-<short description> but question asks for <named method>".
+  - gini / theil / cv are distinct — use the one named.
+  - pearson_correlation / partial_correlation / spearman are distinct.
+  - h_spread / iqr = Q3 − Q1 using the percentile method named (default
+    linear-interpolation / Tukey hinges).
+  - cagr = (V_end / V_start)^(1/n) - 1, where n is the number of intervals
+    (not years inclusive).
+If a related-but-different formula was used, REVISE: "code uses <X> but
+question asks for <named method>".
 
 REVISE when the producer:
-  - applied the wrong unit conversion (e.g. shipped usd_thousands while the
-    question asked for usd_millions, or never converted),
-  - omitted or misapplied a numeric modifier from the question (see scan
-    above) — e.g. the question said "midpoint normalized" but the code
-    shipped a raw difference; said "signed" but the code wrapped abs(...);
-    said "log of" but the code skipped the log; said "per capita" but the
-    code didn't divide by population,
-  - used a formula that doesn't match a named statistical method (see
-    method-name list above),
-  - produced a result whose form clearly contradicts the question (asked
-    for "[a, b]" bracketed list, shipped "1.0 2.0"; asked for percent
-    form, shipped a decimal like "0.1234"),
-  - selected the wrong rows/columns from `prev` given the question's
-    explicit constraints (wrong year, wrong series, wrong dim filter),
-  - used a description substring or tag that would match MULTIPLE entries
-    in `prev` — `next(e for e in prev if "X" in e.description)` is fragile
-    when several entries share that substring; REVISE and instruct the
-    producer to use exact tag matching (e.tag == "<tag>") to disambiguate,
-  - wrapped the answer in narrative prose ("The bureau is X and the
-    average is Y") when the question asks for a single value — REVISE
-    and instruct the producer to return ONLY the requested value.
+- shipped wrong / missing unit conversion;
+- omitted or mis-applied a numeric modifier from the scan;
+- used a formula that doesn't match the named statistical method;
+- produced a result whose form contradicts the question (wanted
+  "[a, b]" but shipped "1.0 2.0"; wanted percent but shipped 0.1234);
+- selected wrong rows/columns from `prev` for the question's constraints;
+- used a description substring that could match multiple entries —
+  instruct the producer to switch to exact tag matching;
+- wrapped the answer in narrative prose when a single value was asked
+  for.
 
 Do NOT REVISE on:
-  - cosmetic precision when the question doesn't pin precision,
-  - presence/absence of a trailing unit suffix when the magnitude is right
-    and the question doesn't explicitly demand the suffix,
-  - whitespace, capitalization, or punctuation nits.
+- cosmetic precision when the question doesn't pin precision;
+- missing/extra trailing unit suffix when the magnitude is right;
+- whitespace, capitalization, or punctuation nits.
 """
+
+
+class CodegenFinalOperator(SkunkOperator):
+    name: str = "compute.codegen.final"
+    system: str = _CODEGEN_FINAL_SYSTEM
+
+
+class CodegenIntermediateOperator(SkunkOperator):
+    name: str = "compute.codegen.intermediate"
+    system: str = _CODEGEN_INTERMEDIATE_SYSTEM
+
+
+class CritiqueOperator(SkunkOperator):
+    name: str = "compute.critique"
+    system: str = _CRITIQUE_SYSTEM
 
 # Match CODE / MISSING anywhere (after fence-stripping + light prose). Use re.search,
 # not re.match, so leading commentary or whitespace doesn't break classification.
@@ -465,7 +382,7 @@ def _self_critique(
         f"Produced result:\n{result_text}\n\n"
         f"Reply on a single line: ACCEPT, or REVISE: <reason>."
     )
-    resp = ctx.llm_client.call(_CRITIQUE_SYSTEM, user, ctx=ctx)
+    resp = ctx.llm_client.call(CritiqueOperator().build_system(ctx), user, ctx=ctx)
     raw = resp.text
     ctx.emit("compute", "self-critique response", raw=raw[:300])
 
@@ -588,10 +505,11 @@ def _run_final(
              method=method, transforms=transforms,
              prev_summary=prev_desc[:500])
 
+    codegen_system = CodegenFinalOperator().build_system(ctx)
     a1_env, a1_code, a1_priors = _try_codegen_and_exec(
         ctx, prev, prev_desc, priors=[],
         retry_budget=ctx.config.compute_max_attempts - 1,
-        system_prompt=_CODEGEN_SYSTEM, question=question,
+        system_prompt=codegen_system, question=question,
         method=method, transforms=transforms,
     )
     if a1_env is None:
@@ -615,7 +533,7 @@ def _run_final(
     try:
         a2_env, _, _ = _try_codegen_and_exec(
             ctx, prev, prev_desc, priors=[hint], retry_budget=0,
-            system_prompt=_CODEGEN_SYSTEM, question=question,
+            system_prompt=codegen_system, question=question,
             method=method, transforms=transforms,
         )
     except MissingData as e:
@@ -647,7 +565,7 @@ def _run_intermediate(
     env, _, priors = _try_codegen_and_exec(
         ctx, prev, prev_desc, priors=[],
         retry_budget=ctx.config.compute_max_attempts - 1,
-        system_prompt=_CODEGEN_SYSTEM_INTERMEDIATE, question=task,
+        system_prompt=CodegenIntermediateOperator().build_system(ctx), question=task,
         method=method, transforms=transforms,
     )
     if env is None:

@@ -39,7 +39,6 @@ from typing import Any
 class PageRef:
     month: str | None = None        # "YYYY-MM"
     page: int | None = None         # 1-based PDF page index (canonical)
-    file_path: str | None = None    # resolved by manifest
 
     @property
     def year(self) -> int | None:
@@ -60,8 +59,6 @@ class PageRef:
             parts.append(f"month={self.month}")
         if self.page is not None:
             parts.append(f"page={self.page}")
-        if self.file_path:
-            parts.append(f"file={self.file_path!r}")
         return f"PageRef({', '.join(parts)})"
 
 

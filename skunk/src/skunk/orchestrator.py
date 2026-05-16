@@ -6,11 +6,19 @@ dispatch envelope, not an AST node.
 
 A Plan is one or more ComputeNodes ending in a final aggregator (see dsl.py).
 - Single-compute (legacy flat): run the final compute's branches, then the
-  final compute. Recovery on MissingData fires once at the final compute.
+  final compute.
 - Multi-compute: run each intermediate ComputeNode's branches + intermediate
   compute in parallel (each producing list[AnnotatedValue]). Concatenate
-  intermediate outputs and feed them to the final aggregator. Intermediates
-  do NOT get recovery; only the final compute does.
+  intermediate outputs and feed them to the final aggregator.
+
+Recovery
+--------
+When the final compute reports MissingData, `execute()` builds a one-shot
+recovery lesson summarizing what was tried + what's missing, injects it
+into a copy of `ctx.prompt_overrides` (targeting the planner only), calls
+`planner.plan()` to produce a fresh Plan, and re-executes the whole plan
+from scratch. Bounded by `config.recovery_max_rounds`. Intermediate
+computes don't trigger recovery — only the final compute does.
 """
 
 from __future__ import annotations
@@ -32,6 +40,7 @@ from skunk.dsl import (
     Plan,
     RetrieveBranch,
 )
+from skunk.prompt_overrides import PromptOverride
 from skunk.subagents import compute, extract, lookup_external, retrieve
 from skunk.subagents.base import MissingData, StepFailed, SubagentFn
 
@@ -80,24 +89,52 @@ class QuestionTrace:
 
 
 def execute(plan: Plan, ctx: HarnessContext) -> QuestionTrace:
-    """Walk the plan's compute chain. Legacy single-compute = data → final compute.
-    Decomposed = parallel intermediates → final aggregator compute."""
+    """Walk the plan's compute chain. On MissingData from the final compute,
+    inject a recovery lesson into ctx and re-plan; re-execute up to
+    `ctx.config.recovery_max_rounds` times before failing."""
     trace = QuestionTrace(question=ctx.question)
-    # Make Plan-level constraints (units_out, precision, answer_form) visible
-    # to subagents that read them off ctx.plan.
-    ctx.plan = plan
+    max_rounds = ctx.config.recovery_max_rounds
+    current_plan = plan
+
     try:
-        if not plan.computes:
-            raise StepFailed("orchestrator", "plan has no computes")
-        if len(plan.computes) == 1:
-            final = plan.computes[0]
-            prev = _run_data_phase(final.branches, ctx, trace)
-        else:
-            intermediates = plan.computes[:-1]
-            final = plan.computes[-1]
-            prev = _run_intermediates_parallel(intermediates, ctx, trace)
-        result = _run_compute_with_recovery(prev, plan, ctx, trace, final)
-        trace.answer = result.text
+        for round_idx in range(max_rounds + 1):
+            # Subagents read top-level constraints (units_out, etc.) off ctx.plan;
+            # refresh per round so they see the current plan.
+            ctx.plan = current_plan
+            if not current_plan.computes:
+                raise StepFailed("orchestrator", "plan has no computes")
+            try:
+                if len(current_plan.computes) == 1:
+                    final = current_plan.computes[0]
+                    prev = _run_data_phase(final.branches, ctx, trace)
+                else:
+                    intermediates = current_plan.computes[:-1]
+                    final = current_plan.computes[-1]
+                    prev = _run_intermediates_parallel(intermediates, ctx, trace)
+                result = _run_final_compute(prev, ctx, trace, final)
+                trace.answer = result.text
+                return trace
+            except MissingData as e:
+                if round_idx == max_rounds:
+                    raise StepFailed(
+                        "compute",
+                        f"still missing after {max_rounds} recovery round(s): {e.reason}",
+                    ) from e
+                prev_summary = _summarize_prev(prev)
+                ctx.emit("orchestrator", "compute reported MISSING; replanning",
+                         round=round_idx + 1, reason=e.reason)
+                lesson = _build_recovery_lesson(current_plan, e.reason, prev_summary)
+                recovery_ctx = ctx.with_extra_override(PromptOverride(
+                    section="lessons", targets=("planner",), content=lesson,
+                ))
+                from skunk.planner import PlannerOperator
+                try:
+                    current_plan = PlannerOperator().plan(ctx.question, recovery_ctx)
+                except Exception as planner_err:
+                    raise StepFailed(
+                        "compute",
+                        f"missing data and replanning failed: {e.reason}; planner: {planner_err}",
+                    ) from planner_err
     except StepFailed as e:
         trace.failed = True
         trace.failure_reason = str(e)
@@ -220,15 +257,12 @@ def _summarize_prev(prev: Any) -> list[str]:
     return out
 
 
-def _run_compute_with_recovery(
-    prev: Any, plan: Plan, ctx: HarnessContext, trace: QuestionTrace,
+def _run_final_compute(
+    prev: Any, ctx: HarnessContext, trace: QuestionTrace,
     final_node: ComputeNode,
 ) -> FormattedString:
-    """Run the final compute with a bounded recovery loop. On MissingData, ask
-    the recovery planner for one or more supplemental branches (given the
-    failure reason and a descriptions-only summary of current prev), run them
-    in parallel, append to prev, and retry compute. Bounded by
-    ctx.config.recovery_max_rounds (total compute calls ≤ max_rounds + 1)."""
+    """Run the final compute. Lets MissingData propagate up to execute() for
+    recovery handling."""
     compute_args: dict[str, Any] = {"final": True}
     if final_node.task:
         compute_args["task"] = final_node.task
@@ -236,45 +270,43 @@ def _run_compute_with_recovery(
         compute_args["method"] = final_node.method
     if final_node.transforms:
         compute_args["transforms"] = list(final_node.transforms)
-    compute_op = OpNode(op="compute", args=compute_args)
+    return _run_op(OpNode(op="compute", args=compute_args), prev, ctx, trace)
 
-    from skunk.planner import plan_recovery
 
-    max_rounds = ctx.config.recovery_max_rounds
-    current_prev: list[Any] = list(prev) if isinstance(prev, list) else prev
-    for round_idx in range(max_rounds + 1):
-        try:
-            return _run_op(compute_op, current_prev, ctx, trace)
-        except MissingData as e:
-            if round_idx == max_rounds:
-                raise StepFailed(
-                    "compute",
-                    f"still missing after {max_rounds} recovery round(s): {e.reason}",
-                ) from e
-            ctx.emit("orchestrator", "compute reported MISSING; attempting recovery",
-                     round=round_idx + 1, reason=e.reason)
-            prev_summary = _summarize_prev(current_prev)
-            try:
-                extra_branches = plan_recovery(
-                    ctx.question, plan, e.reason, prev_summary, ctx,
-                )
-            except Exception as planner_err:
-                raise StepFailed(
-                    "compute",
-                    f"missing data and recovery planner failed: {e.reason}; planner: {planner_err}",
-                ) from planner_err
-            if not extra_branches:
-                raise StepFailed(
-                    "compute", f"missing data and recovery declined: {e.reason}",
-                ) from e
-            ctx.emit("orchestrator", "running recovery branches",
-                     round=round_idx + 1, count=len(extra_branches),
-                     branches=[repr(b) for b in extra_branches])
-            if len(extra_branches) == 1:
-                extra_value = _run_branch(extra_branches[0], ctx, trace)
-            else:
-                extra_value = _run_parallel(extra_branches, ctx, trace)
-            current_prev = list(current_prev) + extra_value
+def _branch_summary(b: Branch) -> str:
+    """One-line description of a branch for the recovery lesson."""
+    if isinstance(b, RetrieveBranch):
+        bits = [f"retrieve concept={b.concept!r} period={b.period!r}"]
+        if b.period_type:
+            bits.append(f"period_type={b.period_type!r}")
+        if b.visual_only:
+            bits.append("visual_only=True")
+        return " ".join(bits)
+    if isinstance(b, LookupBranch):
+        return f"lookup_external nl={b.nl!r}"
+    return f"<unknown branch type: {type(b).__name__}>"
+
+
+def _build_recovery_lesson(
+    prev_plan: Plan, missing_reason: str, prev_summary: list[str],
+) -> str:
+    """One-shot lesson appended to the planner's prompt when re-planning after
+    a MissingData failure. Targets `planner` only; built and injected by the
+    orchestrator at recovery time."""
+    branches: list[Branch] = []
+    for c in prev_plan.computes:
+        branches.extend(c.branches)
+    branches_block = "\n".join(f"  - {_branch_summary(b)}" for b in branches) or "  (none)"
+    prev_block = "\n".join(f"  - {line}" for line in prev_summary) or "  (empty)"
+    return (
+        "RECOVERY ROUND. A previous plan was generated for this question and "
+        "executed, but compute reported MISSING data. Use this round to produce "
+        "a NEW plan that addresses the gap. Consider different concepts, periods, "
+        "period_types, or visual_only flags than what was tried.\n"
+        f"Previous plan branches:\n{branches_block}\n"
+        f"What was retrieved (descriptions only):\n{prev_block}\n"
+        f"Compute reported MISSING: {missing_reason}"
+    )
 
 
 def _run_op(op: OpNode, prev: Any, ctx: HarnessContext, trace: QuestionTrace) -> Any:

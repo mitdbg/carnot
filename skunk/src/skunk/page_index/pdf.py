@@ -24,6 +24,7 @@ from pathlib import Path
 _FILENAME_RE = re.compile(r"treasury_bulletin_(\d{4})_(\d{2})\.pdf$")
 
 _PARSED_JSON_DEFAULT_DIR = Path.home() / "Desktop/officeqa/treasury_bulletins_parsed/jsons"
+_PDF_DEFAULT_DIR = Path.home() / "Desktop/officeqa/treasury_bulletin_pdfs"
 
 
 def parse_bulletin_filename(path: str | Path) -> str:
@@ -38,6 +39,19 @@ def parsed_json_dir() -> Path:
     """Resolve the parsed-JSON directory (env override, then default)."""
     d = os.environ.get("OFFICEQA_PARSED_JSON_DIR")
     return Path(d) if d else _PARSED_JSON_DEFAULT_DIR
+
+
+def pdf_dir_from_env() -> Path:
+    """Resolve the PDF corpus directory (env override, then default)."""
+    d = os.environ.get("OFFICEQA_PDF_DIR")
+    return Path(d) if d else _PDF_DEFAULT_DIR
+
+
+def pdf_path_for(bulletin: str, pdf_dir: Path | str | None = None) -> Path:
+    """Inverse of `parse_bulletin_filename`: '1953-06' -> <dir>/treasury_bulletin_1953_06.pdf."""
+    year, mon = bulletin.split("-")
+    base = Path(pdf_dir) if pdf_dir is not None else pdf_dir_from_env()
+    return base / f"treasury_bulletin_{int(year):04d}_{int(mon):02d}.pdf"
 
 
 @lru_cache(maxsize=64)

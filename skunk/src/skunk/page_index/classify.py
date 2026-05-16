@@ -1,17 +1,24 @@
 """Heuristic page classifier — runs before any LLM call.
 
-Cheap pass that filters out pages we can confidently skip (blank) or mark
-without an LLM (obvious TOC pages). Everything else falls through to the
-per-page LLM extractor in `extract_fields.py`, which assigns the final
-page_kind among {table, text, chart}.
+Cheap pass that filters out pages we can confidently skip (blank) or
+flag as obvious TOC pages so the deterministic per-page parser doesn't
+mistake a ToC entry list for a real table. Everything else falls
+through to the parser in `extract_fields.py`.
 """
 
 from __future__ import annotations
 
-from .schema import PageKind
+import re
 
 
 _TOC_HEAD_PATTERNS = ("table of contents", "contents", "tableofcontents")
+
+# A line that ends with a short integer (the printed-page reference of a ToC
+# entry, e.g. "Federal fiscal operations ........  9"). We count these per
+# page; pages with many such lines look like ToC pages even when their first
+# 200 chars don't include the literal word "contents" — the 1949–1964
+# bulletins routinely fall into this category.
+_TOC_LINE_RE = re.compile(r"\S.+?\s+\d{1,3}\s*$")
 
 
 def char_metrics(text: str) -> tuple[int, float]:
@@ -32,18 +39,34 @@ def looks_blank(text: str) -> bool:
 
 
 def looks_like_toc(text: str, page_index: int) -> bool:
-    """Heuristic: TOC pages live near the front of a bulletin and have the
-    string 'contents' near the top. We let the LLM confirm in the harvest pass.
+    """Heuristic: a ToC page lives near the front of a bulletin and either
+    advertises itself ("contents" near the top) OR has the structural shape
+    of a ToC — many lines ending in a printed-page reference.
+
+    The keyword check catches the modern era (1965+) where the ToC is a
+    titled page. The shape check catches mid-century bulletins (1949–1964)
+    where the ToC is buried inside front matter without a "contents"
+    header — those pages still look like a ToC because each entry ends in
+    a page number. The LLM harvest pass then confirms.
     """
-    if page_index > 15:
+    if page_index > 25:
         return False
-    head = text[:200].lower().replace(" ", "")
-    return any(p.replace(" ", "") in head for p in _TOC_HEAD_PATTERNS)
+    head = text[:400].lower().replace(" ", "")
+    if any(p.replace(" ", "") in head for p in _TOC_HEAD_PATTERNS):
+        return True
+    # Shape fallback: at least 6 lines of "<entry> ... <printed page>" form.
+    n_entry_lines = 0
+    for line in text.splitlines():
+        if _TOC_LINE_RE.match(line.strip()):
+            n_entry_lines += 1
+            if n_entry_lines >= 6:
+                return True
+    return False
 
 
-def cheap_classify(text: str, page_index: int) -> PageKind | None:
-    """Return a page_kind iff the heuristic is confident; otherwise None
-    (caller falls back to the LLM extractor).
+def cheap_classify(text: str, page_index: int) -> str | None:
+    """Return "blank" or "toc" iff the heuristic is confident (caller
+    skips the parser for those); otherwise None.
     """
     if looks_blank(text):
         return "blank"

@@ -90,18 +90,12 @@ def run_question(
 
     from skunk.common import HarnessContext
     from skunk.orchestrator import execute
-    from skunk.planner import plan
+    from skunk.planner import PlannerOperator
 
     golden_handle = None
     if golden_pages:
         from skunk.dsl import DocHandle, PageRef
-        pdf_dir = os.environ.get("OFFICEQA_PDF_DIR",
-                                 str(Path.home() / "Desktop/officeqa/treasury_bulletin_pdfs"))
-        refs = []
-        for g in golden_pages:
-            year, mon = g.month.split("-")
-            refs.append(PageRef(month=g.month, page=g.page,
-                                file_path=f"{pdf_dir}/treasury_bulletin_{year}_{mon}.pdf"))
+        refs = [PageRef(month=g.month, page=g.page) for g in golden_pages]
         golden_handle = DocHandle(refs=refs, desc=f"golden ({len(refs)} pages)")
         if verbose:
             print(f"[run] Golden handle: {len(refs)} pages → {[str(r) for r in refs]}")
@@ -111,10 +105,17 @@ def run_question(
     config.golden_handle = golden_handle
     csv_path = plan_cache_csv or config.plan_cache_csv
 
+    from pathlib import Path as _Path
+
+    from skunk.prompt_overrides import load_prompt_overrides
+    overrides_path = _Path(config.prompt_overrides_path)
+    prompt_overrides = load_prompt_overrides(overrides_path) if overrides_path.exists() else ()
+
     ctx = HarnessContext(
         question=question,
         verbose=verbose,
         config=config,
+        prompt_overrides=prompt_overrides,
     )
 
     t0 = time.perf_counter()
@@ -138,7 +139,7 @@ def run_question(
             print(f"\n[run] Planning: {question[:80]}...")
         try:
             from skunk.dsl import serialize
-            plan_obj = plan(question, ctx)
+            plan_obj = PlannerOperator().plan(question, ctx)
             plan_text = serialize(plan_obj)
             if verbose:
                 print(f"[run] Plan: {plan_text}")

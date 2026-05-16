@@ -101,7 +101,7 @@ def retrieve_vector(
         output_count=len(hits),
         prompt_excerpt=embed_text[:800],
         response_excerpt="; ".join(
-            f"{b}/p{p}:{score:.3f}" for score, (b, p, _) in hits[:10]
+            f"{b}/p{p}:{score:.3f}" for score, (b, p) in hits[:10]
         ),
     )
     trace.levels.append(ann_trace)
@@ -111,7 +111,7 @@ def retrieve_vector(
         return [], trace
 
     # 4. Single rerank call over the ANN candidates.
-    candidate_keys: list[tuple[str, int]] = [(b, p) for _score, (b, p, _fp) in hits]
+    candidate_keys: list[tuple[str, int]] = [(b, p) for _score, (b, p) in hits]
     top, rerank_trace = leaf_rank_postings(
         question, concept, period, candidate_keys, catalog_index, llm,
     )

@@ -1,4 +1,11 @@
-"""MCQ self-consistency chapter pick experiment.
+"""MCQ self-consistency chapter pick experiment — HISTORICAL DIAGNOSTIC.
+
+This script is retained for archival only. It depends on
+`_PARENT_CHAPTER_MAP` and `parent_chapter_index` which were retired
+when the page index moved from the nested-tree shape (v0.6) to the
+flat tree shape. The import line below will raise ImportError when
+the script is run; do not try to invoke it without first porting the
+chapter-list construction to read `tree["chapters"]` directly.
 
 Gemini via OpenRouter doesn't expose token logprobs (logprobs.content is
 None), so we approximate model confidence via **self-consistency
@@ -129,7 +136,7 @@ def _gold_chapter(gold: tuple[str, int],
     row = catalog_index.get(gold)
     if row is None:
         return None
-    raw = (row.section or "").strip()
+    raw = (row.l1_local or "").strip()
     if not raw:
         return None
     # Tree's banner_rewrite + parent map
@@ -191,7 +198,7 @@ def main() -> int:
         row = catalog_index.get((b, p))
         if row is None:
             return None
-        raw = (row.section or "").strip()
+        raw = (row.l1_local or "").strip()
         if raw:
             section = rewrite.get(raw.lower(), raw)
         else:

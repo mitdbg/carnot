@@ -27,40 +27,74 @@ class SectionSpan:
     end_page_printed: str      # printed page label where the section ends (inclusive)
 
 
-_TOC_SYSTEM = """You map a U.S. Treasury Bulletin's Table of Contents into a list of section spans.
+_TOC_SYSTEM = """You map a U.S. Treasury Bulletin's Table of Contents into a list of
+TOP-LEVEL chapter spans. Return ONLY chapter-level (L1) headings — never
+sub-sections.
 
 You will receive:
   - The bulletin's publication month (YYYY-MM)
   - Each candidate TOC page, with the raw text of that TOC page.
   - The total number of PDF pages in the bulletin.
 
-The bulletin's TOC pages list section headings each followed by a printed
-page number — the same number you would see in the page footer of the
-body pages (e.g. "9", "27", "A-1"). Return those PRINTED page labels
-verbatim. Do NOT translate them to PDF page indices.
+The bulletin's TOC pages list section headings at multiple nesting depths,
+each followed by a printed page number — the same number you would see
+in the page footer of the body pages (e.g. "9", "27", "A-1"). Return those
+PRINTED page labels verbatim. Do NOT translate them to PDF page indices.
+
+What COUNTS as a top-level chapter heading:
+  - Unindented, typically ALL-CAPS or bolded headings that name a recurring
+    body chapter. Treasury bulletins consistently use names like:
+      FEDERAL FISCAL OPERATIONS
+      FEDERAL DEBT
+      PUBLIC DEBT OPERATIONS
+      CAPITAL MOVEMENTS
+      FOREIGN CURRENCY POSITIONS
+      INTERNATIONAL FINANCIAL STATISTICS
+      TRUST FUNDS
+      GOVERNMENT CORPORATIONS AND OTHER BUSINESS-TYPE ACTIVITIES
+      PROFILE OF THE ECONOMY
+    In older bulletins (1940s-50s) the analogous chapter may be
+    roman-numeral prefixed ("I. PUBLIC DEBT AND GUARANTEED OBLIGATIONS")
+    or use longer phrasing — still count as L1.
+
+What you MUST SKIP:
+  - Indented sub-sections (e.g. "Budget Receipts and Expenditures",
+    "Ownership of Federal Securities", "Treasury Survey of Ownership") —
+    these are L2 under their parent chapter.
+  - Table or figure titles (e.g. "Table FFO-2. — Budget Receipts by
+    Principal Sources", "Table PDO-5. — Unmatured Marketable
+    Securities"). Anything starting with "Table N." or "Figure N." is NOT
+    a chapter.
+  - Front-matter entries that aren't body chapters: "Cover", "Contents",
+    "Treasury staff", "Subscription information", "Glossary".
+  - Any heading describing a single specific report or article (e.g. "The
+    Role of Saving in a Dynamic U.S. Economy") — those live under
+    PROFILE OF THE ECONOMY or similar; emit only the parent chapter.
 
 Output a SINGLE JSON object with this shape (no prose, no markdown fences):
 
 {
   "sections": [
-    {"section": "<verbatim heading>",
+    {"section": "<verbatim chapter heading>",
      "start_page_printed": "<verbatim printed page>",
      "end_page_printed":   "<verbatim printed page>"}
   ]
 }
 
 Rules:
-  - Section labels are VERBATIM as printed in the TOC (preserve casing, hyphens).
-  - Page labels are also VERBATIM as printed in the TOC (preserve hyphenation
-    like "A-1", "F-12"; preserve leading zeros if present).
-  - Sort the array by the order the sections appear in the bulletin body.
-  - end_page_printed for section i should be the printed page immediately
-    before the start of section i+1 (or, for the last section, the last
+  - Section labels are VERBATIM as printed in the TOC (preserve casing,
+    hyphens, ampersands).
+  - Page labels are also VERBATIM as printed in the TOC (preserve
+    hyphenation like "A-1", "F-12"; preserve leading zeros if present).
+  - Sort the array by the order the chapters appear in the bulletin body.
+  - end_page_printed for chapter i should be the printed page immediately
+    before the start of chapter i+1 (or, for the last chapter, the last
     printed page listed in the TOC).
-  - Skip ToC-front-matter entries that don't represent body sections
-    (e.g. "Cover", "Contents", "Treasury staff", "Subscription information").
-  - If the TOC lists only top-level sections (not sub-sections), return just those.
   - If the bulletin appears to have no TOC at all, return {"sections": []}.
+
+A typical bulletin yields 5–12 chapters. If you find yourself emitting
+more than 20, you are almost certainly including sub-sections — recheck
+and drop the L2 entries.
 """
 
 
