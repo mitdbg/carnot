@@ -26,15 +26,16 @@ Stages (each idempotent):
                   in place to set `l1_local` on every row.
 
   merge_chapters  Phase 3. Cross-bulletin merge of L1 names into a flat
-                  global chapter set. Deterministic normalize → one LLM
-                  clustering call → flat tree written to concept_tree.json.
+                  global chapter set. Deterministic normalize → cluster
+                  (LLM) → consolidate (LLM) → describe (LLM). Writes
+                  concept_tree.json.
 
   manifest        Build metadata.
 
 Typical invocation:
 
     python -m skunk.page_index.pipeline \\
-        --output-dir cache/page_index_v3/ \\
+        --output-dir cache/page_index_v4/ \\
         --workers 16
 
 Estimated cost ~$0.55 (extract_l1 $0.40 + place_pages ~$0.10 + merge ~$0.05).
@@ -54,7 +55,6 @@ import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
 
 from skunk.common import LLMClient, load_env_file
 from skunk.config import SkunkConfig

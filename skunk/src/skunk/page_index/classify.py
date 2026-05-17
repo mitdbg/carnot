@@ -93,11 +93,11 @@ def has_visual_elements(elements: list[dict]) -> bool:
 # Boilerplate section_header content that should NOT trigger prose indexing on
 # its own (every prose page has "Note", "Source", etc.). A page needs at least
 # one substantive header.
-_BOILERPLATE_HEADER_RE = __import__("re").compile(
+_BOILERPLATE_HEADER_RE = re.compile(
     r"^\s*(note|notes|source|sources|footnote|footnotes|legend|key|"
     r"introduction|disclaimer|preface|index|table of contents|contents|"
     r"references?)\s*[:.\-]?\s*$",
-    __import__("re").IGNORECASE,
+    re.IGNORECASE,
 )
 
 

@@ -1,8 +1,8 @@
 """Per-page text reader.
 
 Source: parsed-JSON cache at `~/Desktop/officeqa/treasury_bulletins_parsed/jsons/`
-(override via `OFFICEQA_PARSED_JSON_DIR`). Same source the extract subagent uses
-as Tier 1 — see `skunk/src/skunk/subagents/extract.py:81-94`. The parsed JSON
+(override via `OFFICEQA_PARSED_JSON_DIR`). Same source the extract operator uses
+as Tier 1 — see `skunk/src/skunk/extract.py:81-94`. The parsed JSON
 preserves verbatim section headers, titles, and HTML tables, where PyMuPDF on
 the scanned 1940s-50s pages produces noisy text that the LLM extractor
 faithfully transcribes (e.g. misreading "1949" as "1940" on UID0221's golden
@@ -61,63 +61,6 @@ def _load_parsed_doc(month_str: str, base_dir: str) -> dict:
     if not p.exists():
         raise FileNotFoundError(f"parsed-JSON not found: {p}")
     return json.loads(p.read_text())
-
-
-# ---------------------------------------------------------------------------
-# Per-page section banner extraction (raw, no heuristics)
-# ---------------------------------------------------------------------------
-# Treasury bulletins print a section banner at the top of every page (e.g.
-# "DEBT OUTSTANDING") that the parsed JSON exposes as either a [title]
-# element (new-section page) or a [page_header] element (every page in the
-# section). We surface the verbatim string with no normalization — banner
-# canonicalization (em-dash/hyphen variants, ", con" suffixes, table-title
-# strings that should bucket under a real ToC section) is the concept-tree
-# stage's job via an LLM dedup step modeled on `dedup_labels`.
-
-
-def read_page_sections(pdf_path: str | Path,
-                       parsed_dir: str | Path | None = None) -> dict[int, str | None]:
-    """{1-based PDF page index → raw section banner string or None}.
-
-    Per page: first [title] element wins; else first [page_header]; else None.
-    """
-    base_dir = str(parsed_dir) if parsed_dir is not None else str(parsed_json_dir())
-    month = parse_bulletin_filename(pdf_path)
-    doc = _load_parsed_doc(month, base_dir)
-
-    by_page: dict[int, list[dict]] = {}
-    max_page = 0
-    for el in doc.get("document", {}).get("elements", []):
-        bbox = el.get("bbox") or []
-        if not bbox:
-            continue
-        pid = bbox[0].get("page_id")
-        if pid is None:
-            continue
-        pid = int(pid)
-        by_page.setdefault(pid, []).append(el)
-        if pid > max_page:
-            max_page = pid
-
-    out: dict[int, str | None] = {}
-    for pdf_page in range(1, max_page + 1):
-        elements = by_page.get(pdf_page, [])
-        section: str | None = None
-        for el in elements:
-            if el.get("type") == "title":
-                content = (el.get("content") or "").strip()
-                if content:
-                    section = content
-                    break
-        if section is None:
-            for el in elements:
-                if el.get("type") == "page_header":
-                    content = (el.get("content") or "").strip()
-                    if content:
-                        section = content
-                        break
-        out[pdf_page] = section
-    return out
 
 
 def read_page_elements(pdf_path: str | Path,

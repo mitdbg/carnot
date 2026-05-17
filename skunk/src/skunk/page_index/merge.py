@@ -3,39 +3,42 @@
 After `extract_l1` (Phase 1) and `place_pages` (Phase 2), every content
 page in the catalog has an `l1_local` — the chapter name from its own
 bulletin's ToC. This module merges those per-bulletin L1 names into a
-clean global canonical chapter set; postings flow with each merge.
+flat global canonical chapter set; postings flow with each merge.
 
-Two passes:
+Four passes:
 
-  Pass 1 — Deterministic normalization
+  Pass 1 — Deterministic normalization (`_normalize_groups`)
       Apply `normalize_label` to every L1 name observed in the catalog.
-      Group names by their lowercased normalized form. This collapses
-      OCR variants ("FEERAL DEBT"), case-only differences ("Federal
-      Debt" vs "FEDERAL DEBT"), and trailing-punctuation noise.
+      Group names by their lowercased normalized form. Collapses OCR
+      variants ("FEERAL DEBT"), case-only differences, trailing
+      punctuation.
 
-  Pass 2 — LLM clustering (one call)
-      The deterministic groups still leave era-drift synonyms apart
-      ("PUBLIC DEBT OPERATIONS" vs "FEDERAL DEBT", or a 1942 "Receipts
-      and expenditures" against the 1985 "FEDERAL FISCAL OPERATIONS").
-      One LLM call clusters these into canonical chapters. The prompt
-      explicitly does NOT force a target count — the number of
-      canonical chapters emerges from the data.
+  Pass 2 — LLM clustering (`_llm_cluster`, one LLM call)
+      Cluster the normalized display forms into canonical chapters
+      across era-drift synonyms ("PUBLIC DEBT OPERATIONS" vs "FEDERAL
+      DEBT"; 1942 "Receipts and expenditures" vs modern "FEDERAL
+      FISCAL OPERATIONS"). No target count — emergent.
+
+  Pass 3 — Consolidation (`_llm_consolidate`, one LLM call)
+      Roll up Pass-2 canonicals into the eight recurring modern
+      Treasury Bulletin chapters (+ 1-3 era-specific overflow
+      chapters when justified). Prompt enumerates the target list.
+
+  Pass 4 — Description (`_llm_describe_chapters`, one LLM call)
+      Generate `{description, examples}` per final chapter for the
+      retriever's L1 picker.
 
 Output: a flat tree
 
     {
       "chapters": {
-        "<canonical>": {
+        "<canonical chapter>": {
           "n_pages": int,
-          "members": ["<l1_name>", ...],
-          "pages": [{bulletin, page, key_phrases}, ...]
+          "description": str,
+          "examples": list[str],
+          "pages": [{"bulletin", "page", "key_phrases"}, ...]
         },
         ...
-      },
-      "meta": {
-        "n_chapters": int,
-        "merge_log": [...],
-        "starting_l1_distinct": int,
       }
     }
 """

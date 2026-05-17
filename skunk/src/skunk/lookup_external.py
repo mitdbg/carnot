@@ -1,4 +1,4 @@
-"""lookup_external subagent — Gemini with Google Search; FRED/BLS via emitted Python.
+"""lookup_external operator — Gemini with Google Search; FRED/BLS via emitted Python.
 
 Two output modes. MODE 2 is a fenced Python block that calls
 `fetch_fred_series` or `fetch_bls_series` (injected into the sandbox); used
@@ -22,16 +22,15 @@ from datetime import date as _date, timedelta
 import certifi
 
 from skunk.common import HarnessContext
-from skunk.dsl import AnnotatedValue, OpNode
-from skunk.operator import SkunkOperator
-from skunk.subagents.base import StepFailed, parse_llm_value, strip_code_fences
-
+from skunk.plan import AnnotatedValue
+from skunk.executor import SkunkExecutor
+from skunk.operator import OpNode, StepFailed, parse_llm_value, strip_code_fences
 
 # ---------------------------------------------------------------------------
 # Static system prompt block
 # ---------------------------------------------------------------------------
 
-_SYSTEM = """\
+_SYSTEM_PROMPT = """\
 You are a precise data assistant for economic indicators, FX rates,
 historical dates, and named entities. Your training covers through
 mid-2025 — treat any date before July 2025 as historical; never refuse
@@ -120,15 +119,13 @@ unit = "fx_rate"
   source you searched.
 """
 
-
-class LookupExternalOperator(SkunkOperator):
+class LookupExternalExecutor(SkunkExecutor):
     name: str = "lookup_external"
-    system: str = _SYSTEM
+    system_prompt: str = _SYSTEM_PROMPT
 
 _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 
 _PY_FENCE_RE = re.compile(r"```python\b[^\n]*\n(.*?)\n```", re.DOTALL)
-
 
 def _fetch_fred(series_id: str, date_str: str) -> float:
     """Fetch a value from the FRED REST API. Raises on any failure."""
@@ -161,7 +158,6 @@ def _fetch_fred(series_id: str, date_str: str) -> float:
         raise RuntimeError(f"FRED returned no observations for {series_id} {date_str}")
     return sum(observations) / len(observations) if len(date_str) == 4 else observations[0]
 
-
 def _fetch_bls(series_id: str, date_str: str) -> float:
     """Fetch a value from the BLS public REST API. Raises on any failure.
 
@@ -172,9 +168,11 @@ def _fetch_bls(series_id: str, date_str: str) -> float:
     """
     try:
         if len(date_str) == 4:
-            year = int(date_str); month = None
+            year = int(date_str)
+            month = None
         else:
-            year = int(date_str[:4]); month = int(date_str[5:7])
+            year = int(date_str[:4])
+            month = int(date_str[5:7])
     except ValueError as e:
         raise RuntimeError(f"BLS bad date {date_str!r}: {e}") from e
 
@@ -209,16 +207,20 @@ def _fetch_bls(series_id: str, date_str: str) -> float:
             return float(d["value"])
     raise RuntimeError(f"BLS no observation for {series_id} {year}-{target}")
 
-
 def run(op: OpNode, prev: None, ctx: HarnessContext) -> list[AnnotatedValue]:
-    nl = op.args.get("nl", "")
-    if not nl:
-        raise StepFailed("lookup_external", "Missing 'nl' arg")
+    target = op.args.get("target", "")
+    if not target:
+        raise StepFailed("lookup_external", "Missing 'target' arg")
+    src = op.args.get("src") or None
 
-    ctx.emit("lookup_external", "calling gemini", nl=nl)
+    # If the planner provided a `src` hint, prepend a one-line directive so the
+    # operator's source-routing logic biases toward it.
+    user_msg = target if not src else f"Preferred source: {src}.\n{target}"
+
+    ctx.emit("lookup_external", "calling gemini", target=target, src=src)
     resp = ctx.llm_client.call(
-        LookupExternalOperator().build_system(ctx),
-        nl, thinking_budget=-1, use_google_search=True, ctx=ctx,
+        LookupExternalExecutor().assemble_system_prompt(ctx),
+        user_msg, thinking_budget=-1, use_google_search=True, ctx=ctx,
     )
     raw = resp.text or ""
     ctx.emit("lookup_external", "gemini response",
@@ -247,7 +249,7 @@ def run(op: OpNode, prev: None, ctx: HarnessContext) -> list[AnnotatedValue]:
         value, unit = env["value"], env["unit"]
         ctx.emit("lookup_external", "api executed",
                  value=repr(value)[:200], unit=unit)
-        return [AnnotatedValue(description=nl, value=value, unit=unit)]
+        return [AnnotatedValue(description=target, value=value, unit=unit)]
 
     try:
         value, unit = parse_llm_value(raw)
@@ -259,4 +261,4 @@ def run(op: OpNode, prev: None, ctx: HarnessContext) -> list[AnnotatedValue]:
 
     ctx.emit("lookup_external", "parsed direct",
              value=repr(value)[:200], unit=unit)
-    return [AnnotatedValue(description=nl, value=value, unit=unit)]
+    return [AnnotatedValue(description=target, value=value, unit=unit)]

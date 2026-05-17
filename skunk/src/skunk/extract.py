@@ -1,4 +1,4 @@
-"""extract subagent — question-driven extraction over page text/images.
+"""extract operator — question-driven extraction over page text/images.
 
 Takes the user's question plus a set of retrieved pages, returns a
 `list[AnnotatedValue]` for the downstream compute step. Each entry has one
@@ -12,10 +12,10 @@ Entries carry `description`, `unit`, `tag`, and shape-specific axis labels
 (`index_name` for vectors; `row_name` + `col_name` for tables). Cells are
 always primitive scalars — deeper nesting is rejected.
 
-Three operators implement the three input modalities:
-  `ExtractTextOperator`   — parsed-table / OCR text.
-  `ExtractVisionOperator` — rendered page images.
-  `ExtractDedupOperator`  — consolidates redundant entries from multiple
+Three executors implement the three input modalities:
+  `ExtractTextExecutor`   — parsed-table / OCR text.
+  `ExtractVisionExecutor` — rendered page images.
+  `ExtractDedupExecutor`  — consolidates redundant entries from multiple
                             sampling passes; cannot invent values, only
                             select representatives.
 """
@@ -35,10 +35,9 @@ import fitz
 from dataclasses import dataclass
 
 from skunk.common import HarnessContext
-from skunk.dsl import AnnotatedValue, DocHandle, OpNode, PageRef
-from skunk.operator import SkunkOperator
-from skunk.subagents.base import StepFailed
-
+from skunk.plan import AnnotatedValue, PageRef
+from skunk.executor import SkunkExecutor
+from skunk.operator import OpNode, StepFailed
 
 # ---------------------------------------------------------------------------
 # Static system prompt blocks
@@ -194,40 +193,32 @@ Rules:
 - Output ONLY the JSON array — no fences, no commentary.
 """
 
-
-class ExtractTextOperator(SkunkOperator):
+class ExtractTextExecutor(SkunkExecutor):
     name: str = "extract.text"
-    system: str = _TEXT_SYSTEM
+    system_prompt: str = _TEXT_SYSTEM
 
-
-class ExtractVisionOperator(SkunkOperator):
+class ExtractVisionExecutor(SkunkExecutor):
     name: str = "extract.vision"
-    system: str = _VISION_SYSTEM
+    system_prompt: str = _VISION_SYSTEM
 
-
-class ExtractDedupOperator(SkunkOperator):
+class ExtractDedupExecutor(SkunkExecutor):
     name: str = "extract.dedup"
-    system: str = _DEDUP_SYSTEM
-
+    system_prompt: str = _DEDUP_SYSTEM
 
 @dataclass(frozen=True)
 class _BranchHints:
     """Per-branch planner advisories threaded through the extract pipeline.
     Built once in `run()` from op.args; passed as a single object to each tier
     so adding a new advisory doesn't fan out as another kwarg on five functions."""
-    concept: str = ""
+    key: str = ""
     period: str = ""
-    period_type: str | None = None
     value_kind: str | None = None
-    index_name: str | None = None
 
 _PARSED_JSON_DEFAULT_DIR = Path.home() / "Desktop/officeqa/treasury_bulletins_parsed/jsons"
-
 
 def _parsed_json_dir() -> Path:
     d = os.environ.get("OFFICEQA_PARSED_JSON_DIR")
     return Path(d) if d else _PARSED_JSON_DEFAULT_DIR
-
 
 @lru_cache(maxsize=64)
 def _load_parsed_doc(month_str: str) -> dict:
@@ -239,7 +230,6 @@ def _load_parsed_doc(month_str: str) -> dict:
         return json.loads(p.read_text())
     except (OSError, json.JSONDecodeError) as e:
         raise StepFailed("extract", f"corrupt parsed-JSON for {month_str}: {e}") from e
-
 
 @lru_cache(maxsize=64)
 def _parsed_page_index(month_str: str) -> dict[int, list[dict]]:
@@ -254,7 +244,6 @@ def _parsed_page_index(month_str: str) -> dict[int, list[dict]]:
             continue
         by_page.setdefault(int(pid), []).append(el)
     return by_page
-
 
 def get_text_for_pdf_page(ref: PageRef, ctx: HarnessContext) -> str | None:
     """Concatenated content for ref's PDF page. HTML tables pass through verbatim.
@@ -271,7 +260,6 @@ def get_text_for_pdf_page(ref: PageRef, ctx: HarnessContext) -> str | None:
     parts = [el["content"] for el in elements if el.get("content") is not None]
     return "\n\n".join(parts) if parts else None
 
-
 def get_printed_page(ref: PageRef, ctx: HarnessContext) -> str | None:
     """Reverse lookup: bulletin printed-page footer text on ref's PDF page, or None.
 
@@ -285,10 +273,8 @@ def get_printed_page(ref: PageRef, ctx: HarnessContext) -> str | None:
             return str(el["content"])
     return None
 
-
 _MAX_QUOTES_PER_ENTRY = 3
 _DPI_SCALE = 300 / 72  # PyMuPDF base is 72 DPI; render pages at 300 DPI for the vision tier
-
 
 def _pdf_path_for_ref(ref: PageRef) -> Path | None:
     """Resolve ref → PDF path via $OFFICEQA_PDF_DIR (skunk.page_index.pdf)."""
@@ -296,7 +282,6 @@ def _pdf_path_for_ref(ref: PageRef) -> Path | None:
         return None
     from skunk.page_index.pdf import pdf_path_for
     return pdf_path_for(ref.month)
-
 
 def _extract_pdf_text(ref: PageRef, ctx: HarnessContext) -> str | None:
     """PyMuPDF text for ref's PDF page, or None when unavailable. No disk cache."""
@@ -309,7 +294,6 @@ def _extract_pdf_text(ref: PageRef, ctx: HarnessContext) -> str | None:
     except Exception as e:
         ctx.emit("extract", "tier=ocr extraction failed", page=str(ref), error=str(e))
         return None
-
 
 def _render_pdf_page_b64(ref: PageRef, ctx: HarnessContext) -> tuple[str, str] | None:
     """Render ref's PDF page to in-memory PNG bytes and return (mime, base64). No disk cache."""
@@ -324,13 +308,10 @@ def _render_pdf_page_b64(ref: PageRef, ctx: HarnessContext) -> tuple[str, str] |
         ctx.emit("extract", "tier=vision render failed", page=str(ref), error=str(e))
         return None
 
-
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
-
 
 def _strip_fences(raw: str) -> str:
     return _FENCE_RE.sub("", raw.strip()).strip()
-
 
 def _is_primitive_cell(v: Any) -> bool:
     """Vector/table cells (and scalar values) must be non-bool int/float/str.
@@ -338,7 +319,6 @@ def _is_primitive_cell(v: Any) -> bool:
     if isinstance(v, bool):
         return False
     return isinstance(v, (int, float, str))
-
 
 def _validate_vector_payload(value: Any) -> bool:
     """True iff `value` is a flat dict[str, primitive scalar] — no nesting."""
@@ -350,7 +330,6 @@ def _validate_vector_payload(value: Any) -> bool:
         if not _is_primitive_cell(cell):
             return False
     return True
-
 
 def _validate_table_payload(value: Any) -> bool:
     """True iff `value` is a 2-level dict[str, dict[str, primitive scalar]].
@@ -367,7 +346,6 @@ def _validate_table_payload(value: Any) -> bool:
             if not _is_primitive_cell(cell):
                 return False
     return True
-
 
 def _parse_response_raw(raw: str, ctx: HarnessContext | None = None) -> list[AnnotatedValue] | None:
     """Parse one Gemini response into a list of AnnotatedValue.
@@ -467,7 +445,6 @@ def _parse_response_raw(raw: str, ctx: HarnessContext | None = None) -> list[Ann
         ))
     return entries
 
-
 def _cell_in_text(value: int | float | str, text: str) -> bool:
     """Return True if a single primitive `value` appears verbatim in `text`.
 
@@ -489,7 +466,6 @@ def _cell_in_text(value: int | float | str, text: str) -> bool:
         candidates.add(f"{int_val:,}")
     return any(c in text for c in candidates)
 
-
 def _value_in_text(entry: AnnotatedValue, text: str) -> bool:
     """Verbatim verifier: every primitive cell in `entry.value` must appear in
     `text`. For vector/table entries, all cells must match (all-or-nothing).
@@ -505,7 +481,6 @@ def _value_in_text(entry: AnnotatedValue, text: str) -> bool:
                     return False
         return True
     return False
-
 
 def _entry_to_dict(e: AnnotatedValue) -> dict[str, Any]:
     """Serialize an AnnotatedValue back to the JSON envelope shape Gemini emits.
@@ -525,7 +500,6 @@ def _entry_to_dict(e: AnnotatedValue) -> dict[str, Any]:
             entry["col_name"] = e.col_name
     return entry
 
-
 def _values_match(a: Any, b: Any) -> bool:
     """Cell-level equivalence used by the dedup input-grounded verifier.
 
@@ -541,7 +515,6 @@ def _values_match(a: Any, b: Any) -> bool:
         return float(a) == float(b)
     except (TypeError, ValueError):
         return str(a).strip().lower() == str(b).strip().lower()
-
 
 def _output_entry_in_inputs(output: AnnotatedValue, inputs: list[AnnotatedValue]) -> bool:
     """Input-grounded verifier: every cell in `output` must come verbatim from
@@ -588,17 +561,18 @@ def _output_entry_in_inputs(output: AnnotatedValue, inputs: list[AnnotatedValue]
             ok = True
             for row_key, row in output.value.items():
                 if row_key not in s.value:
-                    ok = False; break
+                    ok = False
+                    break
                 for col_key, v in row.items():
                     if col_key not in s.value[row_key] or not _values_match(v, s.value[row_key][col_key]):
-                        ok = False; break
+                        ok = False
+                        break
                 if not ok:
                     break
             if ok:
                 return True
         return False
     return False
-
 
 def _deep_values_match(a: Any, b: Any) -> bool:
     """Recursive cell-level match for scalar / vector dict / table dict-of-dicts."""
@@ -608,13 +582,10 @@ def _deep_values_match(a: Any, b: Any) -> bool:
         return all(_deep_values_match(a[k], b[k]) for k in a)
     return _values_match(a, b)
 
-
 _DESC_WS_RE = re.compile(r"\s+")
-
 
 def _norm_desc(s: str) -> str:
     return _DESC_WS_RE.sub(" ", s.strip().lower()) if isinstance(s, str) else ""
-
 
 def _entries_structurally_equal(a: AnnotatedValue, b: AnnotatedValue) -> bool:
     """True if two entries carry the same data: description (normalized), kind,
@@ -628,7 +599,6 @@ def _entries_structurally_equal(a: AnnotatedValue, b: AnnotatedValue) -> bool:
     if a.index_name != b.index_name or a.row_name != b.row_name or a.col_name != b.col_name:
         return False
     return _deep_values_match(a.value, b.value)
-
 
 def _run_quorum_split(
     runs: list[list[AnnotatedValue]],
@@ -659,7 +629,6 @@ def _run_quorum_split(
         else:
             leftover.append(rep)
     return accepted, leftover
-
 
 def _dedup_semantically(
     merged_entries: list[AnnotatedValue],
@@ -692,7 +661,7 @@ def _dedup_semantically(
         "tier=parsed_json dedup call (T=0)",
         n_input_entries=len(envelope),
     )
-    resp = ctx.llm_client.call(ExtractDedupOperator().build_system(ctx), user_msg, temperature=0.0, thinking_budget=0, ctx=ctx)
+    resp = ctx.llm_client.call(ExtractDedupExecutor().assemble_system_prompt(ctx), user_msg, temperature=0.0, thinking_budget=0, ctx=ctx)
     raw = resp.text
     parsed = _parse_response_raw(raw, ctx)
     ctx.emit(
@@ -715,7 +684,6 @@ def _dedup_semantically(
         return []
     return kept
 
-
 def _single_call(
     system: str,
     user: str,
@@ -736,7 +704,6 @@ def _single_call(
         n_entries=0 if parsed is None else len(parsed),
     )
     return parsed if parsed is not None else []
-
 
 def _reconcile_periods(entries: list[AnnotatedValue], ctx: HarnessContext) -> list[AnnotatedValue]:
     """Merge same-series scalars across periods into one vector.
@@ -799,7 +766,6 @@ def _reconcile_periods(entries: list[AnnotatedValue], ctx: HarnessContext) -> li
 
     return pass_through + merged
 
-
 def _finalize_entries(
     entries: list[AnnotatedValue],
     ctx: HarnessContext,
@@ -813,7 +779,6 @@ def _finalize_entries(
     entries = _reconcile_periods(entries, ctx)
     ctx.emit("extract", f"tier={tier_name} built entries", n_entries=len(entries))
     return entries
-
 
 def _sample_groups_n(
     system: str,
@@ -839,8 +804,8 @@ def _sample_groups_n(
     temperature = ctx.config.extract_sample_temperature
 
     spec_block = _constraints_block(ctx)
-    shape_block = _shape_block(hints.value_kind, hints.index_name)
-    focus_block = _focus_block(hints.concept, hints.period, hints.period_type)
+    shape_block = _shape_block(hints.value_kind)
+    focus_block = _focus_block(hints.key, hints.period)
     group_msgs: list[str] = []
     for group in groups:
         page_blocks = [f"{header}\n{text}" for _, header, text in group]
@@ -883,7 +848,6 @@ def _sample_groups_n(
         )
     return group_runs
 
-
 def _sample_n(
     system: str,
     user: str,
@@ -893,12 +857,12 @@ def _sample_n(
 ) -> list[list[AnnotatedValue]]:
     """Single-prompt sampling (used by tiers that don't split per page, e.g.
     vision over rendered images). Call Gemini n_samples times in parallel and
-    return the parsed _Sample lists per run.
+    return the parsed AnnotatedValue lists per run.
     """
     n_samples = ctx.config.extract_n_samples
     temperature = ctx.config.extract_sample_temperature
 
-    def _one(_i: int) -> tuple[str, list[_Sample]]:
+    def _one(_i: int) -> tuple[str, list[AnnotatedValue]]:
         resp = ctx.llm_client.call(system, user, images=images, temperature=temperature, thinking_budget=0, ctx=ctx)
         raw = resp.text
         parsed = _parse_response_raw(raw, ctx)
@@ -908,7 +872,7 @@ def _sample_n(
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         results = list(pool.map(_one, range(n_samples)))
 
-    runs: list[list[_Sample]] = []
+    runs: list[list[AnnotatedValue]] = []
     for i, (raw, parsed) in enumerate(results):
         ctx.emit(
             "extract",
@@ -919,13 +883,11 @@ def _sample_n(
         runs.append(parsed)
     return runs
 
-
 def _refs_for_tier(refs: list[PageRef], ctx: HarnessContext) -> list[PageRef]:
     # Golden mode: every requested page is gold; don't apply the page cap.
-    if ctx.config.golden_handle is not None:
+    if ctx.config.golden_pages is not None:
         return refs
     return refs[:ctx.config.extract_max_pages]
-
 
 def _constraints_block(ctx: HarnessContext) -> str:
     """Render Plan-level answer-shape constraints (units_out, precision,
@@ -945,48 +907,38 @@ def _constraints_block(ctx: HarnessContext) -> str:
         return ""
     return "Parsed question constraints (extract values aligned with these):\n" + "\n".join(lines) + "\n\n"
 
-
-def _shape_block(value_kind: str | None, index_name: str | None) -> str:
+def _shape_block(value_kind: str | None) -> str:
     """Render the planner's expected-shape declaration. Advisory: the
     extractor should aim for this shape but return what it actually finds
     if the page is structured differently (a mismatch is logged downstream)."""
-    if not value_kind and not index_name:
+    if not value_kind:
         return ""
-    lines: list[str] = []
-    if value_kind:
-        lines.append(f"- value_kind: {value_kind}")
-    if index_name:
-        lines.append(f"- index_name: {index_name}")
     return (
         "Expected shape (advisory — planner's declaration):\n"
-        + "\n".join(lines)
-        + "\nIf the page genuinely has a different shape, return what you "
+        f"- value_kind: {value_kind}\n"
+        "If the page genuinely has a different shape, return what you "
         "actually find and flag it in the entry description; downstream "
         "compute will adapt.\n\n"
     )
 
-
-def _focus_block(concept: str, period: str, period_type: str | None = None) -> str:
-    """Render the retrieve branch's concept/period (and optional period_type
-    hint) as a focus hint. These pages were selected because the planner
-    asked for this concept and period; surface that to the extractor so it
-    can prioritize matching entries (without refusing to emit related ones)."""
-    if not concept and not period and not period_type:
+def _focus_block(key: str, period: str) -> str:
+    """Render the retrieve branch's key/period as a focus hint. These pages
+    were selected because the planner asked for this key and period;
+    surface that to the extractor so it can prioritize matching entries
+    (without refusing to emit related ones)."""
+    if not key and not period:
         return ""
     parts = []
-    if concept:
-        parts.append(f"concept={concept!r}")
+    if key:
+        parts.append(f"key={key!r}")
     if period:
         parts.append(f"period={period!r}")
-    if period_type:
-        parts.append(f"period_type={period_type!r}")
     return (
         f"Retrieve context: these pages were selected because the planner asked for "
-        f"{', '.join(parts)}. Prefer emitting values matching this concept/period, "
+        f"{', '.join(parts)}. Prefer emitting values matching this key/period, "
         f"but still emit related values that share the same series — downstream may "
         f"need them.\n\n"
     )
-
 
 def _gather_text(
     refs: list[PageRef],
@@ -1015,7 +967,6 @@ def _gather_text(
             ctx.emit("extract", f"tier={tier_name} no text", page=str(ref))
     return out
 
-
 def _group_consecutive_pages(
     pages: list[tuple[PageRef, str, str]],
 ) -> list[list[tuple[PageRef, str, str]]]:
@@ -1041,7 +992,6 @@ def _group_consecutive_pages(
         groups.append([item])
     return groups
 
-
 def _parsed_json_tier(refs: list[PageRef], ctx: HarnessContext,
                        hints: _BranchHints = _BranchHints()) -> list[AnnotatedValue] | None:
     """Tier 1 — group-aware page fan-out → per-cell text verifier → run-quorum
@@ -1063,12 +1013,12 @@ def _parsed_json_tier(refs: list[PageRef], ctx: HarnessContext,
     # In golden mode, every page is required context. Skip the same-bulletin
     # adjacency grouping so the LLM sees all pages in one prompt and can
     # produce a coherent multi-month/multi-year extraction.
-    if ctx.config.golden_handle is not None:
+    if ctx.config.golden_pages is not None:
         groups = [pages]
     else:
         groups = _group_consecutive_pages(pages)
     n_samples = ctx.config.extract_n_samples
-    text_system = ExtractTextOperator().build_system(ctx)
+    text_system = ExtractTextExecutor().assemble_system_prompt(ctx)
     ctx.emit(
         "extract",
         f"tier=parsed_json fan-out {len(groups)}g × {n_samples}s @ T={ctx.config.extract_sample_temperature}",
@@ -1124,7 +1074,6 @@ def _parsed_json_tier(refs: list[PageRef], ctx: HarnessContext,
     deduped = _dedup_semantically(all_entries, ctx)
     return _finalize_entries(deduped, ctx, "parsed_json")
 
-
 def _ocr_tier(refs: list[PageRef], ctx: HarnessContext,
               hints: _BranchHints = _BranchHints()) -> list[AnnotatedValue] | None:
     """Tier 2 — single deterministic call (T=0) over PyMuPDF text + verbatim verifier.
@@ -1141,8 +1090,8 @@ def _ocr_tier(refs: list[PageRef], ctx: HarnessContext,
     user_msg = (
         f"Question:\n{ctx.question}\n\n"
         f"{_constraints_block(ctx)}"
-        f"{_shape_block(hints.value_kind, hints.index_name)}"
-        f"{_focus_block(hints.concept, hints.period, hints.period_type)}"
+        f"{_shape_block(hints.value_kind)}"
+        f"{_focus_block(hints.key, hints.period)}"
         f"Page text:\n\n" + "\n\n".join(page_blocks)
     )
     ctx.emit(
@@ -1151,14 +1100,13 @@ def _ocr_tier(refs: list[PageRef], ctx: HarnessContext,
         total_chars=sum(len(b) for b in page_blocks),
         user_message=user_msg[:3000],
     )
-    entries = _single_call(ExtractTextOperator().build_system(ctx), user_msg, ctx, "ocr")
+    entries = _single_call(ExtractTextExecutor().assemble_system_prompt(ctx), user_msg, ctx, "ocr")
     verify_text = "\n\n".join(text for _, _, text in pages)
     kept = [e for e in entries if _value_in_text(e, verify_text)]
     n_dropped = len(entries) - len(kept)
     if n_dropped:
         ctx.emit("extract", f"tier=ocr verifier dropped {n_dropped}/{len(entries)}")
     return _finalize_entries(kept, ctx, "ocr")
-
 
 def _vision_tier(refs: list[PageRef], ctx: HarnessContext,
                  hints: _BranchHints = _BranchHints()) -> list[AnnotatedValue] | None:
@@ -1190,36 +1138,32 @@ def _vision_tier(refs: list[PageRef], ctx: HarnessContext,
     user_msg = (
         f"Question:\n{ctx.question}\n\n"
         f"{_constraints_block(ctx)}"
-        f"{_shape_block(hints.value_kind, hints.index_name)}"
-        f"{_focus_block(hints.concept, hints.period, hints.period_type)}"
-        f"Images provided in order:\n" + "\n".join(labels) + "\n\n"
-        f"Include the source bulletin and page in each entry's description so a downstream "
-        f"consumer can tell which image the value came from."
+        f"{_shape_block(hints.value_kind)}"
+        f"{_focus_block(hints.key, hints.period)}"
+        "Images provided in order:\n" + "\n".join(labels) + "\n\n"
+        "Include the source bulletin and page in each entry's description so a downstream "
+        "consumer can tell which image the value came from."
     )
 
     ctx.emit("extract", "tier=vision single-call (T=0)", n_images=len(images))
-    entries = _single_call(ExtractVisionOperator().build_system(ctx), user_msg, ctx, "vision", images=images)
+    entries = _single_call(ExtractVisionExecutor().assemble_system_prompt(ctx), user_msg, ctx, "vision", images=images)
     return _finalize_entries(entries, ctx, "vision")
 
-
-def run(op: OpNode, prev: DocHandle | None, ctx: HarnessContext) -> list[AnnotatedValue]:
+def run(op: OpNode, prev: list[PageRef] | None, ctx: HarnessContext) -> list[AnnotatedValue]:
     visual_only = bool(op.args.get("visual_only", False))
     hints = _BranchHints(
-        concept=str(op.args.get("concept", "") or ""),
+        key=str(op.args.get("key", "") or ""),
         period=str(op.args.get("period", "") or ""),
-        period_type=op.args.get("period_type") or None,
         value_kind=op.args.get("value_kind") or None,
-        index_name=op.args.get("index_name") or None,
     )
-    refs = prev.refs if isinstance(prev, DocHandle) else []
+    refs = prev if isinstance(prev, list) else []
     if not refs:
         raise StepFailed("extract", "No page refs to extract from")
 
     ctx.emit("extract", "starting", visual_only=visual_only,
              n_refs=len(refs), refs=[str(r) for r in refs],
-             concept=hints.concept or None, period=hints.period or None,
-             period_type=hints.period_type,
-             value_kind=hints.value_kind, index_name=hints.index_name)
+             key=hints.key or None, period=hints.period or None,
+             value_kind=hints.value_kind)
 
     if not visual_only:
         result = _parsed_json_tier(refs, ctx, hints=hints)
@@ -1245,7 +1189,6 @@ def run(op: OpNode, prev: DocHandle | None, ctx: HarnessContext) -> list[Annotat
 
     raise StepFailed("extract", "no relevant values found across tiers")
 
-
 def _check_shape_match(
     entries: list[AnnotatedValue],
     hints: _BranchHints,
@@ -1260,14 +1203,4 @@ def _check_shape_match(
                 "extract", "value_kind mismatch (advisory)",
                 expected=hints.value_kind, got=mismatched[:5],
                 n_mismatched=len(mismatched), n_total=len(entries),
-            )
-    if hints.index_name and hints.value_kind == "vector":
-        needle = hints.index_name.lower()
-        bad = [e.index_name for e in entries
-               if e.kind == "vector" and e.index_name
-               and needle not in e.index_name.lower()]
-        if bad:
-            ctx.emit(
-                "extract", "index_name mismatch (advisory)",
-                expected=hints.index_name, got=bad[:5],
             )

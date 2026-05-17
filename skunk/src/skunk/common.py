@@ -47,7 +47,7 @@ from skunk.config import SkunkConfig
 from skunk.prompt_overrides import PromptOverride
 
 if TYPE_CHECKING:
-    from skunk.dsl import Plan
+    from skunk.plan import Plan
 
 
 class _RateLimiter:
@@ -88,10 +88,6 @@ class _RateLimiter:
 _RATE_LIMITER_LOCK = threading.Lock()
 _RATE_LIMITER: _RateLimiter | None = None
 _RATE_LIMITER_RPM: float | None = None
-
-_EMBED_LIMITER_LOCK = threading.Lock()
-_EMBED_LIMITER: _RateLimiter | None = None
-_EMBED_LIMITER_RPM: float | None = None
 
 
 def load_env_file(path: Path) -> None:
@@ -190,20 +186,6 @@ def _get_rate_limiter(rpm: float) -> _RateLimiter:
             _RATE_LIMITER = _RateLimiter(rate_per_sec=rate, capacity=max(1.0, rate))
             _RATE_LIMITER_RPM = rpm
         return _RATE_LIMITER
-
-
-def _get_embed_limiter(rpm: float) -> _RateLimiter:
-    """Process-singleton rate limiter for the embed endpoint. The embed quota
-    sits on a different metric than chat; using a dedicated bucket lets us
-    pace embed calls (e.g. 3000 RPM = 50 req/s) without contending with the
-    chat limiter."""
-    global _EMBED_LIMITER, _EMBED_LIMITER_RPM
-    with _EMBED_LIMITER_LOCK:
-        if _EMBED_LIMITER is None or _EMBED_LIMITER_RPM != rpm:
-            rate = rpm / 60.0
-            _EMBED_LIMITER = _RateLimiter(rate_per_sec=rate, capacity=max(1.0, rate))
-            _EMBED_LIMITER_RPM = rpm
-        return _EMBED_LIMITER
 
 
 @dataclass
@@ -365,20 +347,21 @@ class LLMClient:
         self,
         texts: list[str],
         *,
-        task_type: str,
+        task_type: str = "CLUSTERING",
         dim: int = 768,
         model: str = "gemini-embedding-001",
         batch_size: int = 100,
-        ctx: "HarnessContext | None" = None,
     ) -> list[list[float]]:
-        """Embed a list of strings via the direct Gemini endpoint.
+        """Batched embedding via the direct Gemini endpoint. Build-time
+        only — used by `page_index.embed_cluster` for L1-bucket clustering
+        at corpus-build time. The retrieval path is embedding-free; do not
+        wire this into per-query code.
 
-        `task_type` must be one of Gemini's documented values (e.g.
-        "RETRIEVAL_DOCUMENT" for indexing, "RETRIEVAL_QUERY" for queries).
-        Output is L2-unnormalized; callers should normalize before cosine.
-        Inputs are split into chunks of `batch_size` (Gemini caps embed
-        requests at 100 contents). Each batch goes through the same rate
-        limiter and retry policy as `.call()`.
+        `task_type` defaults to "CLUSTERING" per Google's docs. Output is
+        L2-unnormalized; callers L2-normalize before cosine. Input is
+        chunked at `batch_size` because Gemini's embed endpoint caps
+        single requests at 100 contents. No retries / no rate limiter:
+        this is a one-shot build-time call, not a sustained workload.
         """
         if not texts:
             return []
@@ -386,68 +369,19 @@ class LLMClient:
         cfg = types.EmbedContentConfig(
             task_type=task_type, output_dimensionality=dim,
         )
-        limiter = _get_embed_limiter(self._config.embed_rpm)
-        max_retries = self._config.gemini_max_retries
-
-        # Embed endpoint has its own quota window (60 s buckets); the standard
-        # max-delay cap (~1 s) is too short to clear a `retryDelay: 56s` hint
-        # from a 429. Use a much higher cap here, and parse the server's hint
-        # when present so we sleep just past the cooldown.
-        EMBED_MAX_DELAY_S = 90.0
-
         out: list[list[float]] = []
         for start in range(0, len(texts), batch_size):
             chunk = texts[start:start + batch_size]
-            delay = self._config.gemini_retry_initial_delay_s
-            for attempt in range(max_retries + 1):
-                limiter.acquire()
-                t0 = time.monotonic()
-                try:
-                    resp = client.models.embed_content(
-                        model=model, contents=chunk, config=cfg,
-                    )
-                    latency_s = time.monotonic() - t0
-                    vecs = [list(e.values) for e in resp.embeddings]
-                    # Some Gemini embedding models silently return fewer
-                    # vectors than inputs when called with batched contents
-                    # (gemini-embedding-2 only accepts batch=1 per call;
-                    # multi-input requests return one vector and drop the
-                    # rest). Catch the mismatch loudly instead of letting
-                    # the caller carry on with missing rows.
-                    if len(vecs) != len(chunk):
-                        raise RuntimeError(
-                            f"embed model {model!r} returned "
-                            f"{len(vecs)} vectors for {len(chunk)} inputs; "
-                            f"this model likely requires batch_size=1"
-                        )
-                    if ctx is not None:
-                        ctx.emit(
-                            "llm", "embed",
-                            model=model, task_type=task_type, dim=dim,
-                            batch_size=len(chunk),
-                            latency_s=round(latency_s, 3),
-                        )
-                    out.extend(vecs)
-                    break
-                except Exception as e:
-                    if attempt == max_retries:
-                        raise
-                    msg = str(e)
-                    sleep_s = delay
-                    m = re.search(r"retryDelay'?\s*:\s*'?(\d+(?:\.\d+)?)s", msg)
-                    if m:
-                        sleep_s = float(m.group(1)) + 1.0
-                    elif "RESOURCE_EXHAUSTED" in msg or "429" in msg:
-                        sleep_s = max(sleep_s, 60.0)
-                    sleep_s = min(sleep_s, EMBED_MAX_DELAY_S)
-                    print(
-                        f"[LLMClient.embed] attempt {attempt + 1}/{max_retries + 1} "
-                        f"failed: {type(e).__name__}; sleeping {sleep_s:.1f}s",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    time.sleep(sleep_s)
-                    delay = min(delay * 2, EMBED_MAX_DELAY_S)
+            resp = client.models.embed_content(
+                model=model, contents=chunk, config=cfg,
+            )
+            vecs = [list(e.values) for e in resp.embeddings]
+            if len(vecs) != len(chunk):
+                raise RuntimeError(
+                    f"embed model {model!r} returned {len(vecs)} vectors "
+                    f"for {len(chunk)} inputs; model likely requires batch_size=1"
+                )
+            out.extend(vecs)
         return out
 
     def _call_gemini_search(
@@ -536,19 +470,19 @@ class LLMClient:
 @dataclass
 class HarnessContext:
     question: str
-    verbose: bool = False     # live-print orchestrator + subagent events to stdout
+    verbose: bool = False     # live-print orchestrator + operator events to stdout
     events: list[dict] = field(default_factory=list)  # per-question diagnostic events
     config: SkunkConfig = field(default_factory=SkunkConfig.from_env)
     llm_client: LLMClient | None = None  # inject a mock for tests; auto-created otherwise
-    plan: Plan | None = None  # set by the orchestrator at execute() entry so subagents can read top-level constraints; None for tests / before planning
-    prompt_overrides: tuple[PromptOverride, ...] = ()  # corpus/few_shot/lesson overrides; subagents pick out their own entries by name
+    plan: Plan | None = None  # set by the orchestrator at execute() entry so operators can read top-level constraints; None for tests / before planning
+    prompt_overrides: tuple[PromptOverride, ...] = ()  # corpus/few_shot/lesson overrides; operators pick out their own entries by name
 
     def __post_init__(self) -> None:
         if self.llm_client is None:
             self.llm_client = LLMClient(self.config)
 
     def emit(self, source: str, message: str, **fields: Any) -> None:
-        """Record a diagnostic event. Subagents call this with their op name as `source`."""
+        """Record a diagnostic event. Operators call this with their op name as `source`."""
         evt = {"source": source, "message": message, **fields}
         self.events.append(evt)
         if self.verbose:
@@ -567,7 +501,7 @@ class HarnessContext:
         """Return a shallow copy of this ctx with one extra `PromptOverride`
         appended to `prompt_overrides`. Used by the orchestrator to scope a
         recovery lesson to a single planner re-invocation without polluting
-        the ctx that subagents see."""
+        the ctx that operators see."""
         import dataclasses
         return dataclasses.replace(
             self, prompt_overrides=self.prompt_overrides + (override,)

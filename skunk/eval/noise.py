@@ -270,7 +270,7 @@ def _rng_for(seed: int, uid: str, idx: int) -> random.Random:
 
 
 def _drift_confounder(rng: random.Random, golden_ref, pdf_dir: str):
-    from skunk.dsl import PageRef
+    from skunk.plan import PageRef
 
     year, mon = int(golden_ref.month[:4]), int(golden_ref.month[5:7])
     fp = _file_path(pdf_dir, year, mon)
@@ -288,7 +288,7 @@ def _drift_confounder(rng: random.Random, golden_ref, pdf_dir: str):
 
 
 def _pool_confounder(rng: random.Random, uid: str, idx: int, pool, pdf_dir: str):
-    from skunk.dsl import PageRef
+    from skunk.plan import PageRef
 
     entries = pool.get(uid, {}).get(str(idx))
     if not entries:

@@ -1,6 +1,6 @@
 """Prompt overrides plumbing.
 
-Each subagent owns its core SYSTEM prompt in its own module. Three sections
+Each executor owns its core SYSTEM prompt in its own module. Three sections
 are appended at runtime from override entries collected on the
 HarnessContext:
 
@@ -78,7 +78,7 @@ def render_lessons_block(lessons: tuple[str, ...]) -> str:
     Returns "" if there are no lessons (so callers can join unconditionally)."""
     if not lessons:
         return ""
-    return "## Lessons learned\n" + "\n".join(f"- {l}" for l in lessons)
+    return "## Lessons learned\n" + "\n".join(f"- {lesson}" for lesson in lessons)
 
 
 def render_corpus_block(corpus: str) -> str:

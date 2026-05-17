@@ -1,4 +1,4 @@
-"""End-to-end eval. Runs the full pipeline (planner → orchestrator → 6 subagents)
+"""End-to-end eval. Runs the full pipeline (planner → orchestrator → 4 operators)
 per question and writes predicted vs gold answers to a CSV report.
 
 Scoring is intentionally out of scope here — the report is the artifact a downstream
@@ -25,9 +25,9 @@ Usage
 
 Golden mode (`--golden`)
 ------------------------
-Bypasses the retrieve subagent. For each question, `source_docs?page=N` URLs in
-data/officeqa_pro.csv are parsed (eval/golden.py) and injected as a DocHandle
-directly into the operator chain. extract/compute/etc. then run on exactly the
+Bypasses the retrieve operator. For each question, `source_docs?page=N` URLs in
+data/officeqa_pro.csv are parsed (eval/golden.py) and injected as a list of
+PageRefs directly into the operator chain. extract/compute/etc. then run on exactly the
 pages the benchmark deems relevant. This is the right mode for measuring the
 extract+compute ceiling — any failure here is a downstream-of-retrieval bug.
 
@@ -38,7 +38,7 @@ Traces (`--trace-dir`, default `eval/traces`)
 ---------------------------------------------
 Every question writes a `{uid}.txt` trace file containing, per operator step:
 op name, args, input/output (full repr), elapsed_s (which naturally absorbs
-Gemini retry wait time), and any error. Per-step subagent events (tier dispatch
+Gemini retry wait time), and any error. Per-step operator events (tier dispatch
 in extract, codegen attempts in compute, verifier responses, etc.) are grouped
 under each step. Use these for post-hoc auditability of every run.
 
@@ -81,7 +81,7 @@ def _load_env(path: Path) -> None:
 _load_env(REPO_ROOT / ".env")
 
 from skunk.config import SkunkConfig  # noqa: E402
-from skunk.dsl import PageRef  # noqa: E402
+from skunk.plan import PageRef  # noqa: E402
 from skunk.run import load_plan_cache, run_question  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -169,7 +169,7 @@ def main() -> None:
     parser.add_argument("--trace-dir", default="eval/traces",
                         help="Per-question debug trace directory (default: %(default)s; '' to disable)")
     parser.add_argument("--quiet", action="store_true",
-                        help="Suppress live orchestrator + subagent events (verbose is on by default)")
+                        help="Suppress live orchestrator + operator events (verbose is on by default)")
     parser.add_argument("--include-test-set", action="store_true",
                         help="Include the held-out test-set UIDs (see CLAUDE.md). Default is to exclude "
                              "them — only opt in for a deliberate final-number measurement.")
@@ -241,8 +241,8 @@ def main() -> None:
                     pool=noise_pool,
                 )
 
-        cached_plan_text = plan_cache.get(uid)
-        if cached_plan_text is None:
+        cached_plan_json = plan_cache.get(uid)
+        if cached_plan_json is None:
             print(f"[e2e] WARNING: no cached plan for {uid!r}, falling back to LLM planner")
 
         trace_path = None
@@ -254,7 +254,7 @@ def main() -> None:
                 question=question,
                 verbose=verbose,
                 golden_pages=golden_pages,
-                cached_plan_text=cached_plan_text,
+                cached_plan_json=cached_plan_json,
                 uid=uid,
                 plan_cache_csv=args.plan_cache_csv,
                 trace_path=trace_path,

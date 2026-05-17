@@ -18,7 +18,7 @@ Usage examples:
       --csv data/officeqa_pro.csv \\
       --cached-plan --verbose
 
-  # Use golden pages (skips retrieve subagent)
+  # Use golden pages (skips retrieve operator)
   python -m skunk.run \\
       --uid UID0001 \\
       --csv data/officeqa_pro.csv \\
@@ -34,8 +34,12 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from skunk.config import SkunkConfig
+
+if TYPE_CHECKING:
+    from skunk.plan import PageRef
 
 SMOKE_UIDS = ["UID0001", "UID0030", "UID0010", "UID0022"]
 
@@ -45,16 +49,16 @@ SMOKE_UIDS = ["UID0001", "UID0030", "UID0010", "UID0022"]
 # ---------------------------------------------------------------------------
 
 def load_plan_cache(plan_cache_csv: str) -> dict[str, str]:
-    """Return {uid: plan_text} from the plan cache CSV."""
+    """Return {uid: plan_json_string} from the plan cache CSV."""
     p = Path(plan_cache_csv)
     if not p.exists():
         return {}
     with p.open(newline="", encoding="utf-8") as f:
-        return {row["uid"]: row["plan_text"] for row in csv.DictReader(f) if row.get("plan_text")}
+        return {row["uid"]: row["plan_json"] for row in csv.DictReader(f) if row.get("plan_json")}
 
 
-def save_plan_to_cache(uid: str, question: str, plan_text: str, plan_cache_csv: str) -> None:
-    """Upsert (uid, plan_text) into the plan cache CSV."""
+def save_plan_to_cache(uid: str, question: str, plan_json: str, plan_cache_csv: str) -> None:
+    """Upsert (uid, plan_json) into the plan cache CSV."""
     p = Path(plan_cache_csv)
     p.parent.mkdir(parents=True, exist_ok=True)
 
@@ -64,10 +68,10 @@ def save_plan_to_cache(uid: str, question: str, plan_text: str, plan_cache_csv: 
             for row in csv.DictReader(f):
                 rows[row["uid"]] = row
 
-    rows[uid] = {"uid": uid, "question": question, "plan_text": plan_text}
+    rows[uid] = {"uid": uid, "question": question, "plan_json": plan_json}
 
     with p.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["uid", "question", "plan_text"])
+        writer = csv.DictWriter(f, fieldnames=["uid", "question", "plan_json"])
         writer.writeheader()
         writer.writerows(rows.values())
 
@@ -79,30 +83,26 @@ def save_plan_to_cache(uid: str, question: str, plan_text: str, plan_cache_csv: 
 def run_question(
     question: str,
     verbose: bool,
-    manifest_path: str | None = None,
     golden_pages: list["PageRef"] | None = None,
-    cached_plan_text: str | None = None,
+    cached_plan_json: str | None = None,
     uid: str | None = None,
     plan_cache_csv: str | None = None,
     trace_path: str | None = None,
 ) -> dict:
-    import os
-
     from skunk.common import HarnessContext
     from skunk.orchestrator import execute
-    from skunk.planner import PlannerOperator
+    from skunk.plan import PlannerExecutor, from_json, to_json, validate
 
-    golden_handle = None
     if golden_pages:
-        from skunk.dsl import DocHandle, PageRef
-        refs = [PageRef(month=g.month, page=g.page) for g in golden_pages]
-        golden_handle = DocHandle(refs=refs, desc=f"golden ({len(refs)} pages)")
+        from skunk.plan import PageRef
+        # Re-construct PageRef instances so callers can pass plain (month, page)
+        # tuple-shaped values without depending on the plan module themselves.
+        golden_pages = [PageRef(month=g.month, page=g.page) for g in golden_pages]
         if verbose:
-            print(f"[run] Golden handle: {len(refs)} pages → {[str(r) for r in refs]}")
+            print(f"[run] Golden pages: {len(golden_pages)} → {[str(r) for r in golden_pages]}")
 
     config = SkunkConfig.from_env()
-    config.manifest_path = manifest_path
-    config.golden_handle = golden_handle
+    config.golden_pages = golden_pages
     csv_path = plan_cache_csv or config.plan_cache_csv
 
     from pathlib import Path as _Path
@@ -120,31 +120,29 @@ def run_question(
 
     t0 = time.perf_counter()
 
-    if cached_plan_text is not None:
+    if cached_plan_json is not None:
         if verbose:
             print("\n[run] Using cached plan...")
         try:
-            from skunk.dsl import parse, serialize, validate
-            plan_obj = parse(cached_plan_text)
-            result = validate(plan_obj, max_compute_depth=config.max_compute_depth)
+            plan_obj = from_json(cached_plan_json)
+            result = validate(plan_obj)
             if not result.ok:
                 return {"question": question, "answer": None, "failed": True,
                         "reason": f"cached plan validation failed: {result.errors}"}
             if verbose:
-                print(f"[run] Plan: {serialize(plan_obj)}")
+                print(f"[run] Plan: {to_json(plan_obj)}")
         except Exception as e:
             return {"question": question, "answer": None, "failed": True, "reason": f"cached plan error: {e}"}
     else:
         if verbose:
             print(f"\n[run] Planning: {question[:80]}...")
         try:
-            from skunk.dsl import serialize
-            plan_obj = PlannerOperator().plan(question, ctx)
-            plan_text = serialize(plan_obj)
+            plan_obj = PlannerExecutor().plan(question, ctx)
+            plan_json = to_json(plan_obj)
             if verbose:
-                print(f"[run] Plan: {plan_text}")
+                print(f"[run] Plan: {plan_json}")
             if uid is not None:
-                save_plan_to_cache(uid, question, plan_text, csv_path)
+                save_plan_to_cache(uid, question, plan_json, csv_path)
                 if verbose:
                     print(f"[run] Plan cached for {uid}")
         except Exception as e:
@@ -159,11 +157,10 @@ def run_question(
 
     if trace_path is not None:
         try:
-            from skunk.dsl import serialize as _serialize
-            plan_text_for_dump = _serialize(plan_obj)
+            plan_dump = to_json(plan_obj)
         except Exception:
-            plan_text_for_dump = cached_plan_text or "(unavailable)"
-        _dump_trace(trace_path, uid=uid, question=question, plan_text=plan_text_for_dump,
+            plan_dump = cached_plan_json or "(unavailable)"
+        _dump_trace(trace_path, uid=uid, question=question, plan_text=plan_dump,
                     golden_pages=golden_pages, trace=trace, events=ctx.events,
                     model=config.llm_model)
 
@@ -255,12 +252,11 @@ def main() -> None:
     group.add_argument("--smoke", action="store_true", help=f"Run smoke UIDs: {SMOKE_UIDS}")
 
     parser.add_argument("--csv", help="Path to annotated OfficeQA CSV (needed for --uid/--uids/--smoke)")
-    parser.add_argument("--manifest", help="Path to manifest.csv", default=None)
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--output", help="Write results to JSON file")
     parser.add_argument(
         "--golden", action="store_true",
-        help="Inject golden pages from --csv instead of running retrieve subagent. "
+        help="Inject golden pages from --csv instead of running retrieve operator. "
              "Requires --uid/--uids/--smoke and --csv."
     )
     parser.add_argument(
@@ -325,18 +321,17 @@ def main() -> None:
             if not golden_pages:
                 print(f"[run] WARNING: no golden pages found for {uid!r}")
 
-        cached_plan_text = None
+        cached_plan_json = None
         if args.cached_plan and uid is not None:
-            cached_plan_text = plan_cache.get(uid)
-            if cached_plan_text is None:
+            cached_plan_json = plan_cache.get(uid)
+            if cached_plan_json is None:
                 print(f"[run] WARNING: no cached plan for {uid!r}, falling back to LLM planner")
 
         result = run_question(
             question=question,
             verbose=args.verbose,
-            manifest_path=args.manifest,
             golden_pages=golden_pages,
-            cached_plan_text=cached_plan_text,
+            cached_plan_json=cached_plan_json,
             uid=uid,
             plan_cache_csv=args.plan_cache_csv,
         )

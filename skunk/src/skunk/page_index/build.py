@@ -30,9 +30,9 @@ from skunk.common import load_env_file  # noqa: E402
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 load_env_file(_REPO_ROOT / ".env")
 
-from .classify import (
+from .classify import (  # noqa: E402
     char_metrics, cheap_classify, has_prose_content, has_visual_elements,
-)  # noqa: E402
+)
 from .extract_fields import parse_page_fields  # noqa: E402
 from .pdf import (  # noqa: E402
     _FILENAME_RE, parse_bulletin_filename, parsed_json_dir,
@@ -253,10 +253,11 @@ def _process_one_bulletin(
             rows.append(row)
             continue
 
-        fields = parse_page_fields(elements)
+        fields = parse_page_fields(elements, bulletin=row.bulletin)
         row.content_blocks = fields.get("content_blocks", [])
         row.keywords = fields.get("keywords", [])
-        row.dates = fields.get("dates", [])
+        row.min_year = fields.get("min_year")
+        row.max_year = fields.get("max_year")
         if row.content_blocks:
             n_content += 1
         rows.append(row)
@@ -357,7 +358,6 @@ def main() -> int:
     summary: list[dict] = []
 
     def _do_one(pdf_path: Path) -> tuple[Path, list[PageCatalogRow] | None, float, str | None]:
-        bulletin = parse_bulletin_filename(pdf_path)
         t0 = time.monotonic()
         try:
             rows = _process_one_bulletin(

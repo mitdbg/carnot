@@ -2,11 +2,15 @@
 
 Consumes the parsed-JSON element list for one page and returns the
 fields a `PageCatalogRow` carries:
-    content_blocks, keywords, dates
+    content_blocks, keywords, min_year, max_year
 
 `content_blocks` is one `ContentBlock` per detected table / chart /
 prose block on the page — multi-content pages (table at top, chart at
 bottom) emit multiple entries. A page with no blocks is non-retrievable.
+
+`min_year` / `max_year` is the canonical year envelope for the page —
+see `_canonicalize_year_envelope` for the bulletin-fallback and the
++1-to-end-year fiscal-vs-calendar straddle rule.
 
 The parsed-JSON elements come from a layout parser and look like:
     {"type": "section_header", "content": "Table 1.- Status under Limitation, December 31, 1949", "bbox": [...]}
@@ -97,50 +101,65 @@ def _accept_keyword(s: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Date extraction — verbatim strings, in order of appearance, deduped.
+# Year envelope extraction — every 4-digit year on the page, reduced to
+# (min, max). Year granularity is intentional: month/day precision on the
+# page side is noisy (footnotes, sequence numbers) and the lookup-side
+# period already collapses to year boundaries for FY/CY/Q.
 # ---------------------------------------------------------------------------
 
-_MONTH_FULL = (r"(?:January|February|March|April|May|June|July|August|"
-               r"September|October|November|December)")
-_MONTH_ABBR = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?"
-_MONTH_ANY = f"(?:{_MONTH_FULL}|{_MONTH_ABBR})"
-
-_DATE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # "December 31, 1949" / "Dec. 31, 1949"
-    re.compile(rf"\b{_MONTH_ANY}\s+\d{{1,2}},\s*\d{{4}}\b", re.IGNORECASE),
-    # "February 1952" / "Feb. 1952"
-    re.compile(rf"\b{_MONTH_ANY}\s+\d{{4}}\b", re.IGNORECASE),
-    # "Calendar Year 1940" / "Fiscal Year 1948" / "CY 1940" / "FY 1948"
-    re.compile(r"\b(?:Calendar Year|Fiscal Year|CY|FY)\s*\d{4}\b", re.IGNORECASE),
-    # "Q3 1953"
-    re.compile(r"\bQ[1-4]\s*\d{4}\b", re.IGNORECASE),
-    # "1932 through Mar 1939" / "1932-1939" range
-    re.compile(rf"\b\d{{4}}\s*(?:through|to|-)\s*(?:{_MONTH_ANY}\s*)?\d{{4}}\b",
-               re.IGNORECASE),
-    # bare 4-digit year — runs LAST so the longer patterns win first
-    re.compile(r"\b(19|20)\d{2}\b"),
-)
+# Plausible bulletin-era years. Treasury Bulletin runs 1939–present;
+# we widen the band slightly to admit retrospective references without
+# letting random 4-digit numerics (table IDs, footnote codes) leak in.
+_YEAR_RE = re.compile(r"\b(?:1[89]\d{2}|20\d{2}|21\d{2})\b")
 
 
-def _extract_dates(text: str) -> list[str]:
-    """Lift verbatim date strings from `text`, in order, deduped (case-insensitive)."""
-    spans: list[tuple[int, int, str]] = []  # (start, end, verbatim)
-    for pat in _DATE_PATTERNS:
-        for m in pat.finditer(text):
-            # Skip if this span overlaps an earlier (longer-pattern) match.
-            if any(not (m.end() <= s or m.start() >= e) for s, e, _ in spans):
-                continue
-            spans.append((m.start(), m.end(), m.group(0)))
-    spans.sort()
-    seen: set[str] = set()
-    out: list[str] = []
-    for _, _, s in spans:
-        key = s.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(s)
-    return out
+def _extract_year_envelope(text: str) -> tuple[int | None, int | None]:
+    """Return `(min_year, max_year)` across every 4-digit year occurrence in
+    `text`, or `(None, None)` when no year is found. RAW envelope — no
+    fiscal-year slack and no bulletin fallback; both are applied higher up
+    in `_canonicalize_year_envelope`.
+    """
+    years = [int(m.group(0)) for m in _YEAR_RE.finditer(text)]
+    if not years:
+        return None, None
+    return min(years), max(years)
+
+
+def _canonicalize_year_envelope(
+    raw: tuple[int | None, int | None],
+    bulletin: str,
+) -> tuple[int, int]:
+    """Turn the raw `(min, max)` year envelope into the on-disk canonical form.
+
+    Two adjustments applied in order:
+
+    1. **Bulletin fallback.** If the page has no 4-digit years on it
+       (raw == (None, None)), the page inherits the calendar year of its
+       parent bulletin. A page in the `1991-08` bulletin with no year
+       text gets `(1991, 1991)` before step 2. Rationale: most year-less
+       pages are TOC, snapshots without explicit year labels, or
+       continuation pages whose dated header sits on a sibling page —
+       all of which logically belong to the bulletin's CY. Dropping
+       them entirely was the previous behavior and cost recall on a
+       non-trivial slice.
+
+    2. **+1 to the end year.** After step 1 the envelope's upper bound
+       is bumped by one calendar year. Rationale: a page whose only
+       printed year is `1991` may legitimately be reporting CY1991
+       (Jan–Dec 1991), FY1991 (Oct 1990–Sep 1991), or FY1992 (Oct 1991–
+       Sep 1992). The two fiscal interpretations both straddle the
+       calendar boundary into the next year, so admitting one year of
+       forward slack on every page lets a query for any of those three
+       windows match a page that only prints `1991`. It costs precision
+       (a 1990–1992 page also matches CY1993 queries after +1) but the
+       trade-off is intentional: in this corpus, FY/CY ambiguity is the
+       dominant source of year-filter false negatives.
+    """
+    min_year, max_year = raw
+    if min_year is None or max_year is None:
+        bulletin_year = int(bulletin[:4])
+        min_year = max_year = bulletin_year
+    return min_year, max_year + 1
 
 
 # ---------------------------------------------------------------------------
@@ -363,10 +382,9 @@ def _harvest_keywords(caption: str | None,
     """Dateless concept phrases from the caption only, deduped order-preserving.
 
     column_headers and row_headers are intentionally NOT pushed in. They live
-    on PageCatalogRow as their own fields and remain usable as ranking context
-    at L3 leaf_rank, but they are not part of the conceptual index vocabulary.
-    Pushing them in was the source of vocab pollution like 'Country', 'Europe',
-    individual country names, 'Issue date', 'Maturity date', etc.
+    on PageCatalogRow as their own fields. Pushing them in was the source of
+    vocab pollution like 'Country', 'Europe', individual country names,
+    'Issue date', 'Maturity date', etc.
     """
     seen: set[str] = set()
     out: list[str] = []
@@ -531,25 +549,30 @@ def _extract_content_blocks(
     return blocks, all_columns, all_rows
 
 
-def parse_page_fields(elements: list[dict]) -> dict[str, Any]:
+def parse_page_fields(elements: list[dict], *, bulletin: str) -> dict[str, Any]:
     """Deterministic per-page field extraction. No LLM.
 
-    Returns a dict with keys: content_blocks, keywords, dates. A page
-    with no blocks is non-retrievable; blank / toc are decided upstream
-    by `cheap_classify` and never reach this function.
+    Returns a dict with keys: content_blocks, keywords, min_year, max_year.
+    `bulletin` is the page's parent bulletin in "YYYY-MM" form; it feeds
+    the year-envelope fallback for pages with no 4-digit year on them
+    (see `_canonicalize_year_envelope`). A page with no blocks is
+    non-retrievable; blank / toc are decided upstream by `cheap_classify`
+    and never reach this function.
     """
     blocks, all_columns, all_rows = _extract_content_blocks(elements)
 
     plain = _page_plain_text(elements)
-    dates = _extract_dates(plain)
+    raw_envelope = _extract_year_envelope(plain)
 
     if blocks:
         primary_caption = next((b.title for b in blocks if b.title), None)
         keywords = _harvest_keywords(primary_caption, all_columns, all_rows[:8])
+        min_year, max_year = _canonicalize_year_envelope(raw_envelope, bulletin)
         return {
             "content_blocks": blocks,
             "keywords": keywords[:20],
-            "dates": dates,
+            "min_year": min_year,
+            "max_year": max_year,
         }
 
     # No table / chart: try prose. Emit one prose block iff at least
@@ -558,13 +581,18 @@ def parse_page_fields(elements: list[dict]) -> dict[str, Any]:
     if has_prose_content(elements):
         prose_kw = _harvest_prose_keywords(elements)
         if prose_kw:
+            min_year, max_year = _canonicalize_year_envelope(raw_envelope, bulletin)
             return {
                 "content_blocks": [ContentBlock(
                     kind="prose",
                     title=_resolve_prose_title(elements),
                 )],
                 "keywords": prose_kw,
-                "dates": dates,
+                "min_year": min_year,
+                "max_year": max_year,
             }
 
-    return {"content_blocks": [], "keywords": [], "dates": []}
+    # Non-retrievable page: skip the year-envelope canonicalization
+    # entirely. There is nothing to retrieve, so a year window is moot.
+    return {"content_blocks": [], "keywords": [],
+            "min_year": None, "max_year": None}

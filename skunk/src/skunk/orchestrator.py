@@ -1,24 +1,22 @@
-"""Orchestrator — walks a Plan's compute chain, dispatches per-op subagent functions.
+"""Orchestrator — walks a Plan, dispatches per-op operator functions.
 
-Subagents keep their `(op: OpNode, prev, ctx)` interface; the orchestrator
-translates Branch/ComputeNode → OpNode at dispatch time. OpNode is just a
-dispatch envelope, not an AST node.
+Operators keep their `(op: OpNode, prev, ctx)` interface; the orchestrator
+translates Branch → OpNode at dispatch time. OpNode is just a dispatch
+envelope, not an AST node.
 
-A Plan is one or more ComputeNodes ending in a final aggregator (see dsl.py).
-- Single-compute (legacy flat): run the final compute's branches, then the
-  final compute.
-- Multi-compute: run each intermediate ComputeNode's branches + intermediate
-  compute in parallel (each producing list[AnnotatedValue]). Concatenate
-  intermediate outputs and feed them to the final aggregator.
+A Plan has a flat list of branches feeding a single compute step. The
+orchestrator:
+  1. Runs the data phase (each Branch in parallel via _run_branch).
+  2. Feeds the merged AnnotatedValues to compute, which returns the
+     final answer string.
 
 Recovery
 --------
-When the final compute reports MissingData, `execute()` builds a one-shot
-recovery lesson summarizing what was tried + what's missing, injects it
-into a copy of `ctx.prompt_overrides` (targeting the planner only), calls
-`planner.plan()` to produce a fresh Plan, and re-executes the whole plan
-from scratch. Bounded by `config.recovery_max_rounds`. Intermediate
-computes don't trigger recovery — only the final compute does.
+When compute reports MissingData, `execute()` builds a one-shot recovery
+lesson summarizing what was tried + what's missing, injects it into a
+copy of `ctx.prompt_overrides` (targeting the planner only), calls
+`planner.plan()` to produce a fresh Plan, and re-executes from scratch.
+Bounded by `config.recovery_max_rounds`.
 """
 
 from __future__ import annotations
@@ -29,22 +27,19 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from skunk.common import HarnessContext
-from skunk.dsl import (
+from skunk.plan import (
     AnnotatedValue,
     Branch,
-    ComputeNode,
-    DocHandle,
-    FormattedString,
     LookupBranch,
-    OpNode,
+    PageRef,
     Plan,
     RetrieveBranch,
 )
 from skunk.prompt_overrides import PromptOverride
-from skunk.subagents import compute, extract, lookup_external, retrieve
-from skunk.subagents.base import MissingData, StepFailed, SubagentFn
+from skunk import compute, extract, lookup_external, retrieve
+from skunk.operator import MissingData, OpNode, OperatorFn, StepFailed
 
-_SUBAGENT_REGISTRY: dict[str, SubagentFn] = {
+_OPERATOR_REGISTRY: dict[str, OperatorFn] = {
     "retrieve": retrieve.run,
     "extract": extract.run,
     "lookup_external": lookup_external.run,
@@ -89,7 +84,7 @@ class QuestionTrace:
 
 
 def execute(plan: Plan, ctx: HarnessContext) -> QuestionTrace:
-    """Walk the plan's compute chain. On MissingData from the final compute,
+    """Walk the plan: data phase → compute. On MissingData from compute,
     inject a recovery lesson into ctx and re-plan; re-execute up to
     `ctx.config.recovery_max_rounds` times before failing."""
     trace = QuestionTrace(question=ctx.question)
@@ -97,22 +92,17 @@ def execute(plan: Plan, ctx: HarnessContext) -> QuestionTrace:
     current_plan = plan
 
     try:
+        prev: Any = None
         for round_idx in range(max_rounds + 1):
             # Subagents read top-level constraints (units_out, etc.) off ctx.plan;
             # refresh per round so they see the current plan.
             ctx.plan = current_plan
-            if not current_plan.computes:
-                raise StepFailed("orchestrator", "plan has no computes")
+            if not current_plan.branches:
+                raise StepFailed("orchestrator", "plan has no branches")
             try:
-                if len(current_plan.computes) == 1:
-                    final = current_plan.computes[0]
-                    prev = _run_data_phase(final.branches, ctx, trace)
-                else:
-                    intermediates = current_plan.computes[:-1]
-                    final = current_plan.computes[-1]
-                    prev = _run_intermediates_parallel(intermediates, ctx, trace)
-                result = _run_final_compute(prev, ctx, trace, final)
-                trace.answer = result.text
+                prev = _run_data_phase(current_plan.branches, ctx, trace)
+                result = _run_compute(prev, ctx, trace, current_plan)
+                trace.answer = result
                 return trace
             except MissingData as e:
                 if round_idx == max_rounds:
@@ -127,9 +117,9 @@ def execute(plan: Plan, ctx: HarnessContext) -> QuestionTrace:
                 recovery_ctx = ctx.with_extra_override(PromptOverride(
                     section="lessons", targets=("planner",), content=lesson,
                 ))
-                from skunk.planner import PlannerOperator
+                from skunk.plan import PlannerExecutor
                 try:
-                    current_plan = PlannerOperator().plan(ctx.question, recovery_ctx)
+                    current_plan = PlannerExecutor().plan(ctx.question, recovery_ctx)
                 except Exception as planner_err:
                     raise StepFailed(
                         "compute",
@@ -155,22 +145,19 @@ def _run_data_phase(branches: list[Branch], ctx: HarnessContext, trace: Question
 def _run_branch(branch: Branch, ctx: HarnessContext, trace: QuestionTrace) -> list[AnnotatedValue]:
     """Execute a single branch and return its entries."""
     if isinstance(branch, RetrieveBranch):
-        ret_args: dict[str, Any] = {"concept": branch.concept, "period": branch.period}
-        if branch.period_type:
-            ret_args["period_type"] = branch.period_type
+        ret_args: dict[str, Any] = {"key": branch.key, "period": branch.period}
         doc = _run_op(OpNode(op="retrieve", args=ret_args), None, ctx, trace)
-        ext_args: dict[str, Any] = {"concept": branch.concept, "period": branch.period}
+        ext_args: dict[str, Any] = {"key": branch.key, "period": branch.period}
         if branch.visual_only:
             ext_args["visual_only"] = True
-        if branch.period_type:
-            ext_args["period_type"] = branch.period_type
         if branch.value_kind:
             ext_args["value_kind"] = branch.value_kind
-        if branch.index_name:
-            ext_args["index_name"] = branch.index_name
         return _run_op(OpNode(op="extract", args=ext_args), doc, ctx, trace)
     if isinstance(branch, LookupBranch):
-        return _run_op(OpNode(op="lookup_external", args={"nl": branch.nl}), None, ctx, trace)
+        lk_args: dict[str, Any] = {"target": branch.target}
+        if branch.src:
+            lk_args["src"] = branch.src
+        return _run_op(OpNode(op="lookup_external", args=lk_args), None, ctx, trace)
     raise TypeError(f"Unknown branch type: {type(branch).__name__}")
 
 
@@ -198,53 +185,6 @@ def _run_parallel(branches: list[Branch], ctx: HarnessContext, trace: QuestionTr
     return [entry for branch in results if branch is not None for entry in branch]
 
 
-def _run_intermediates_parallel(
-    nodes: list[ComputeNode], ctx: HarnessContext, trace: QuestionTrace,
-) -> list[AnnotatedValue]:
-    """For each non-final ComputeNode: run its data phase, then its intermediate
-    compute. Returns the concatenated list of AnnotatedValues across survivors.
-    Failed intermediates are skipped (best-effort), mirroring _run_parallel."""
-    results: list[list[AnnotatedValue] | None] = [None] * len(nodes)
-    errors: list[tuple[int, Exception]] = []
-    with ThreadPoolExecutor(max_workers=ctx.config.max_parallel_workers) as pool:
-        futures = {
-            pool.submit(_run_intermediate_node, node, ctx, trace): i
-            for i, node in enumerate(nodes)
-        }
-        for future in as_completed(futures):
-            i = futures[future]
-            try:
-                results[i] = future.result()
-            except (StepFailed, MissingData) as e:
-                errors.append((i, e))
-    for i, e in errors:
-        ctx.emit("orchestrator", "intermediate compute failed",
-                 node_idx=i, task=nodes[i].task, error=str(e))
-    if len(errors) == len(nodes):
-        # All intermediates failed — surface the first.
-        first = errors[0][1]
-        if isinstance(first, MissingData):
-            raise StepFailed("compute", f"all intermediates missing data: {first.reason}")
-        raise first
-    return [entry for r in results if r is not None for entry in r]
-
-
-def _run_intermediate_node(
-    node: ComputeNode, ctx: HarnessContext, trace: QuestionTrace,
-) -> list[AnnotatedValue]:
-    """Run one intermediate ComputeNode's branches then its compute. No recovery."""
-    prev = _run_data_phase(node.branches, ctx, trace)
-    compute_args: dict[str, Any] = {"task": node.task, "final": False}
-    if node.method:
-        compute_args["method"] = node.method
-    if node.transforms:
-        compute_args["transforms"] = list(node.transforms)
-    return _run_op(
-        OpNode(op="compute", args=compute_args),
-        prev, ctx, trace,
-    )
-
-
 def _summarize_prev(prev: Any) -> list[str]:
     """Descriptions-only summary of an AnnotatedValue list for the recovery prompt.
     Drops raw values/vectors/tables to keep the prompt bounded."""
@@ -257,33 +197,32 @@ def _summarize_prev(prev: Any) -> list[str]:
     return out
 
 
-def _run_final_compute(
-    prev: Any, ctx: HarnessContext, trace: QuestionTrace,
-    final_node: ComputeNode,
-) -> FormattedString:
-    """Run the final compute. Lets MissingData propagate up to execute() for
-    recovery handling."""
-    compute_args: dict[str, Any] = {"final": True}
-    if final_node.task:
-        compute_args["task"] = final_node.task
-    if final_node.method:
-        compute_args["method"] = final_node.method
-    if final_node.transforms:
-        compute_args["transforms"] = list(final_node.transforms)
+def _run_compute(prev: Any, ctx: HarnessContext, trace: QuestionTrace, plan: Plan) -> str:
+    """Run compute and return the final answer string. Lets MissingData
+    propagate up to execute() for recovery handling. `plan.task` is the
+    planner's `computation.task` (free-form NL; may be empty for direct
+    lookups). `plan.qualifiers` is `computation.qualifiers` — short
+    directives the compute operator must apply."""
+    compute_args: dict[str, Any] = {}
+    if plan.task:
+        compute_args["task"] = plan.task
+    if plan.qualifiers:
+        compute_args["qualifiers"] = list(plan.qualifiers)
     return _run_op(OpNode(op="compute", args=compute_args), prev, ctx, trace)
 
 
 def _branch_summary(b: Branch) -> str:
     """One-line description of a branch for the recovery lesson."""
+    if isinstance(b, LookupBranch):
+        s = f"lookup_external target={b.target!r}"
+        if b.src:
+            s += f" src={b.src!r}"
+        return s
     if isinstance(b, RetrieveBranch):
-        bits = [f"retrieve concept={b.concept!r} period={b.period!r}"]
-        if b.period_type:
-            bits.append(f"period_type={b.period_type!r}")
+        bits = [f"retrieve key={b.key!r} period={b.period!r}"]
         if b.visual_only:
             bits.append("visual_only=True")
         return " ".join(bits)
-    if isinstance(b, LookupBranch):
-        return f"lookup_external nl={b.nl!r}"
     return f"<unknown branch type: {type(b).__name__}>"
 
 
@@ -293,16 +232,13 @@ def _build_recovery_lesson(
     """One-shot lesson appended to the planner's prompt when re-planning after
     a MissingData failure. Targets `planner` only; built and injected by the
     orchestrator at recovery time."""
-    branches: list[Branch] = []
-    for c in prev_plan.computes:
-        branches.extend(c.branches)
-    branches_block = "\n".join(f"  - {_branch_summary(b)}" for b in branches) or "  (none)"
+    branches_block = "\n".join(f"  - {_branch_summary(b)}" for b in prev_plan.branches) or "  (none)"
     prev_block = "\n".join(f"  - {line}" for line in prev_summary) or "  (empty)"
     return (
         "RECOVERY ROUND. A previous plan was generated for this question and "
         "executed, but compute reported MISSING data. Use this round to produce "
-        "a NEW plan that addresses the gap. Consider different concepts, periods, "
-        "period_types, or visual_only flags than what was tried.\n"
+        "a NEW plan that addresses the gap. Consider different keys, periods, "
+        "or visual_only flags than what was tried.\n"
         f"Previous plan branches:\n{branches_block}\n"
         f"What was retrieved (descriptions only):\n{prev_block}\n"
         f"Compute reported MISSING: {missing_reason}"
@@ -310,9 +246,9 @@ def _build_recovery_lesson(
 
 
 def _run_op(op: OpNode, prev: Any, ctx: HarnessContext, trace: QuestionTrace) -> Any:
-    fn = _SUBAGENT_REGISTRY.get(op.op)
+    fn = _OPERATOR_REGISTRY.get(op.op)
     if fn is None:
-        raise StepFailed(op.op, f"No subagent registered for '{op.op}'")
+        raise StepFailed(op.op, f"No operator registered for '{op.op}'")
 
     step_idx = len(trace.steps) + 1
     input_desc = _describe_value(prev)
@@ -343,13 +279,13 @@ def _run_op(op: OpNode, prev: Any, ctx: HarnessContext, trace: QuestionTrace) ->
 def _describe_value(v: Any) -> str:
     if v is None:
         return "(none)"
-    if isinstance(v, DocHandle):
-        return f"DocHandle({len(v.refs)} refs): {v.desc}"
+    if isinstance(v, list) and v and isinstance(v[0], PageRef):
+        return f"[{len(v)} page refs]"
     if isinstance(v, list) and v and isinstance(v[0], AnnotatedValue):
         descriptions = [e.description for e in v]
         return f"[{len(descriptions)} entries: {descriptions}]"
-    if isinstance(v, FormattedString):
-        return f"FormattedString: {v.text!r}"
+    if isinstance(v, str):
+        return f"str: {v!r}"
     if isinstance(v, list):
         return f"list({len(v)} branches)"
     s = repr(v)
@@ -360,13 +296,13 @@ def _full_repr(v: Any) -> str:
     """Untruncated repr for trace dumps."""
     if v is None:
         return "(none)"
-    if isinstance(v, DocHandle):
-        refs = "\n    ".join(repr(r) for r in v.refs)
-        return f"DocHandle(desc={v.desc!r}, {len(v.refs)} refs):\n    {refs}" if v.refs else f"DocHandle(empty, desc={v.desc!r})"
+    if isinstance(v, list) and v and isinstance(v[0], PageRef):
+        refs = "\n    ".join(repr(r) for r in v)
+        return f"page refs ({len(v)}):\n    {refs}"
     if isinstance(v, list) and v and isinstance(v[0], AnnotatedValue):
         return repr(v)
-    if isinstance(v, FormattedString):
-        return f"FormattedString(text={v.text!r})"
+    if isinstance(v, str):
+        return f"str: {v!r}"
     if isinstance(v, list):
         parts = [f"  [{i}] {_full_repr(x)}" for i, x in enumerate(v)]
         return "list:\n" + "\n".join(parts)

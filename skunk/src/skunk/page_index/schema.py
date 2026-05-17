@@ -39,7 +39,10 @@ class PageCatalogRow:
 
     # Page-level signals.
     keywords: list[str] = field(default_factory=list)
-    dates: list[str] = field(default_factory=list)
+    # Year envelope across every 4-digit year occurrence on the page.
+    # None when the page has no recognizable year string.
+    min_year: int | None = None
+    max_year: int | None = None
     char_count: int = 0
     digit_ratio: float = 0.0
 
@@ -53,25 +56,11 @@ class PageCatalogRow:
         """First non-empty title across content_blocks, or None."""
         return next((b.title for b in self.content_blocks if b.title), None)
 
-    def all_titles(self) -> list[str]:
-        """Every non-empty title across content_blocks, in block order."""
-        return [b.title for b in self.content_blocks if b.title]
-
     def all_column_headers(self) -> list[str]:
         out: list[str] = []
         for b in self.content_blocks:
             out.extend(b.column_headers)
         return out
-
-    def all_row_headers_sample(self) -> list[str]:
-        out: list[str] = []
-        for b in self.content_blocks:
-            out.extend(b.row_headers_sample)
-        return out
-
-    def has_visual_block(self) -> bool:
-        """True iff at least one block is a table or chart."""
-        return any(b.kind != "prose" for b in self.content_blocks)
 
     def to_json(self, *, drop_banner_self: bool = False) -> str:
         """Serialize to one JSON line. `drop_banner_self=True` is used by

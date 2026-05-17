@@ -32,41 +32,46 @@ See "Held-out test set" section below for the canonical list and seed.
 
 ## What this is
 
-OfficeQA — a declarative QA pipeline over the U.S. Treasury Bulletin corpus (696 monthly PDFs, 1939–2025). Questions are answered by composing 4 operators into a typed DSL plan; an orchestrator walks the plan and dispatches subagents.
+OfficeQA — a declarative QA pipeline over the U.S. Treasury Bulletin corpus (696 monthly PDFs, 1939–2025). Questions are answered by composing 4 operators into a typed DSL plan; an orchestrator walks the plan and dispatches each operator.
 
 The benchmark is `data/officeqa_pro.csv` (133 questions: **101 dev + 32 test**; not tracked in git, keep locally). An initial pass of DSL plan for each question is in `data/dsl_planning_pass.csv`.
 
 ## Architecture in one screen
 
-- Question → planner emits DSL plan (text) → orchestrator walks AST → 4 subagents.
+- Question → planner emits DSL plan (text) → orchestrator walks AST → 4 operators.
 - 4 ops: `retrieve`, `extract`, `lookup_external`, `compute`. `compute` is the chain terminator and subsumes formatting (it self-plans, codegens, execs, then self-critiques the result against the question with full context — same domain prompt as the producer, no info asymmetry). `extract` accepts `visual_only=True` to skip text/OCR tiers for charts and figures.
-- Extract emits one of three **kinds** per entry: `scalar`, `vector` (1-D series indexed by one dim), or `table` (2-D grid). Vector/table cells are always primitive scalars — nesting is forbidden and enforced in the extract parser. See `DSL.md` for the contract.
-- Retrieval is **page-level**: the retrieve subagent maintains its own page index over the corpus. `PageRef.page` is the **1-based PDF page index** — the only page-number convention used in the codebase. The bulletin's printed-page footer is recoverable via `extract.get_printed_page` for trace/prompt enrichment.
+- Extract emits one of three **kinds** per entry: `scalar`, `vector` (1-D series indexed by one dim), or `table` (2-D grid). Vector/table cells are always primitive scalars — nesting is forbidden and enforced in the extract parser. See the "Plan shape" section in `ARCHITECTURE.md` for the contract.
+- Retrieval is **page-level**: the retrieve operator maintains its own page index over the corpus. `PageRef.page` is the **1-based PDF page index** — the only page-number convention used in the codebase. The bulletin's printed-page footer is recoverable via `extract.get_printed_page` for trace/prompt enrichment.
 - Extract is per-page tier dispatch: CSV tables → OCR text → vision render. No cross-page search.
-- See `ARCHITECTURE.md` for design intent, `DSL.md` for grammar.
+- See `ARCHITECTURE.md` for design intent + plan shape; the canonical JSON-schema spec for plans lives in `PlannerExecutor.system_prompt` in `src/skunk/plan.py`.
 
 ## Layout
 
-- `src/skunk/dsl.py` — DSL parser, serializer, validator, AST types
-- `src/skunk/planner.py` — LLM planner: question → DSL AST
-- `src/skunk/orchestrator.py` — AST executor; dispatches subagent functions
-- `src/skunk/subagents/` — one module per op (`retrieve`, `extract`, `lookup_external`, `compute`); each exposes a bare `run(op, prev, ctx)` function
-- `src/skunk/subagents/base.py` — shared utilities: `StepFailed`, `MissingData`, `exec_python`, `exec_python_with_env`, `parse_llm_value`
-- `src/skunk/common.py` — shared runtime: `LLMClient`, `HarnessContext`, `LLMResponse`
-- `eval/` — evaluation harness: `eval_e2e.py`
+- `src/skunk/plan.py` — `Plan` dataclass + runtime types (`PageRef`, `AnnotatedValue`) + JSON serde + validator + `PlannerExecutor` (question → Plan)
+- `src/skunk/orchestrator.py` — Plan executor; dispatches per-op operator functions
+- `src/skunk/{retrieve,extract,lookup_external,compute}.py` — one module per operator; each exposes a bare `run(op, prev, ctx)` function
+- `src/skunk/operator.py` — operator dispatch surface: `OpNode`, `OperatorFn`, `StepFailed`, `MissingData`, plus shared utilities (`exec_python`, `exec_python_with_env`, `parse_llm_value`)
+- `src/skunk/executor.py` — `SkunkExecutor` base: prompt-assembly for every LLM-prompted call-site inside an operator (planner, extract.text/vision/dedup, compute.codegen/critique, lookup_external)
+- `src/skunk/common.py` — shared runtime: `LLMClient` (OpenRouter + direct-Gemini), `HarnessContext`, `LLMResponse`
+- `src/skunk/config.py` — `SkunkConfig` (model, RPM, retry, extract/compute knobs)
+- `src/skunk/prompt_overrides.py` — `PromptOverride` YAML loader for corpus / few-shots / lessons
+- `src/skunk/page_index/` — page-index builder (`pipeline.py`) + runtime helpers (`retrieve_probe`, `period`, `pdf`) used by the retrieve operator
+- `eval/` — harnesses: `eval_e2e.py` (end-to-end), `eval_retrieve.py` (retrieval-only); `test_set_uids.json` for the held-out filter; `noise.py` for distractor pools
 
 ## Conventions
 
-- DSL string args use **single quotes**, always (JSON-safe). See `DSL.md` quoting rule.
-- No new ops without updating: `DSL.md`, the planner few-shots, the validator, AND the eval harnesses.
+- No new ops without updating: `ARCHITECTURE.md`, the planner system prompt in `src/skunk/plan.py`, the validator, AND the eval harnesses.
 - **No Palimpzest imports.** This repo is intentionally PZ-free at runtime. Annotation tooling at the OfficeQA-in-PZ stage is a separate project.
-- **No hand-rolled retry loops** inside subagents. The orchestrator records failures in the trace; it does not re-plan.
+- **No hand-rolled retry loops** inside operators. The orchestrator records failures in the trace; it does not re-plan.
 
 ## API keys (.env at repo root)
 
-- `GEMINI_API_KEY` — Gemini 2.5 Flash; used by the planner and all subagents via `ctx.llm_client.call(...)` in `src/skunk/common.py`
+Two LLM paths (see `src/skunk/common.py` docstring):
 
-`.env.example` is committed; copy it to `.env` and fill in keys.
+- `OPENROUTER_API_KEY` — default path for every non-search call (planner, extract, compute, codegen, critique). Model is `config.llm_model`, default `google/gemini-3-flash-preview`.
+- `GEMINI_API_KEY` — direct Gemini API; only used by `lookup_external` when `use_google_search=True` for native Google Search grounding. Model is `config.gemini_model`, default `gemini-3-flash-preview`.
+
+Optional: `FRED_API_KEY` for the FRED tier of `lookup_external`. `.env.example` is committed; copy to `.env` and fill in.
 
 ## Data corpus (NOT in this repo)
 
@@ -76,8 +81,8 @@ The benchmark is `data/officeqa_pro.csv` (133 questions: **101 dev + 32 test**; 
 
 ## Pointers
 
-- `ARCHITECTURE.md` — design intent, no iteration history
-- `DSL.md` — formal grammar, type system, worked examples
+- `ARCHITECTURE.md` — design intent + plan-shape spec; no iteration history
+- `src/skunk/plan.py` — canonical Plan dataclasses + `PlannerExecutor.system_prompt` (the JSON-schema spec for plans)
 - `data/dsl_planning_pass.csv` — 133 validated plans; used at runtime via `--cached-plan` to skip the LLM planner
 - `data/officeqa_pro.csv` — benchmark (133 questions, with `source_docs?page=N` and `answer` golden truth; not tracked in git)
 
@@ -120,8 +125,8 @@ UIDs the model has already been tuned against.
 
 ## Things to verify before claiming a feature is "done"
 
-- Subagent changes: the standalone callable still has its signature; the eval harness for that subagent passes its acceptance bar (see the acceptance criteria in the subagent's TODO comment).
-- New ops or new args: documented in `DSL.md`, and the planner few-shots in `src/skunk/planner.py` are updated.
+- Operator changes: the standalone `run(op, prev, ctx)` callable still has its signature; `eval/eval_e2e.py` still passes (and `eval/eval_retrieve.py` for retrieve-only changes).
+- New ops or new args: documented in the "Plan shape" section of `ARCHITECTURE.md`, and the planner system prompt in `src/skunk/plan.py` is updated.
 - **Eval/benchmark numbers**: confirmed the run was on **dev only** (101
   UIDs after filtering `eval/test_set_uids.json`). Numbers on the full
   133-UID set are contaminated; state explicitly in any writeup whether

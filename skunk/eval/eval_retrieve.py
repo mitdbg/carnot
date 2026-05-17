@@ -1,19 +1,19 @@
 """Retrieval-only benchmark over a dev sample of OfficeQA UIDs.
 
 For each sampled UID:
-  1. Plan the question via skunk.planner.plan (cached in --plan-cache JSONL).
-  2. Walk the plan's ComputeNodes → enumerate every RetrieveBranch.
+  1. Plan the question via skunk.plan.PlannerExecutor (cached in --plan-cache JSONL).
+  2. Walk the Plan's branches → enumerate every RetrieveBranch.
   3. Run the chosen `--retriever` on each branch (in parallel within a UID).
   4. Aggregate the union of returned (bulletin, page) pairs as the prediction.
   5. Compare to the golden set from officeqa_pro.csv → recall + precision.
 
 Retriever modes:
-  - `l1-vector` (default): L1 chapter pick + vector cosine top-K within
-    the chapter. Add `--use-period-mask`, `--pre-date-intersect`,
-    `--date-filter-mode`, `--l2-top-n`, `--use-llm-dates` to tune.
-  - `one-shot-parent-chapter`: L1 chapter pick only; returns every page
-    in the picked chapter. Useful as a recall ceiling probe.
+  - `one-shot-parent-chapter` (default): L1 chapter pick only; returns
+    every page in the picked chapter. Useful as a recall ceiling probe.
   - `one-shot-section`: alias for parent-chapter (back-compat).
+
+(Vector / embedding-based retrievers were removed once we established
+that they did not improve recall over LLM-only L1 + leaf-rank.)
 
 Outputs a JSONL of per-UID results plus a printed summary table.
 """
@@ -23,7 +23,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import random
 import re
 import sys
@@ -31,7 +30,6 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -40,13 +38,13 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 from skunk.common import HarnessContext, LLMClient, load_env_file  # noqa: E402
 load_env_file(_REPO_ROOT / ".env")
 from skunk.config import SkunkConfig  # noqa: E402
-from skunk.dsl import Plan, RetrieveBranch, serialize  # noqa: E402
+from skunk.plan import Plan, RetrieveBranch  # noqa: E402
+from skunk.page_index.period import period_year_window  # noqa: E402
 from skunk.page_index.retrieve_probe import (  # noqa: E402
-    l1_vector_retrieve, load_catalog, load_concept_tree,
+    load_catalog, load_concept_tree,
     one_shot_parent_chapter_retrieve, one_shot_section_retrieve,
     write_trace_jsonl,
 )
-from skunk.page_index.vector_index import load_vector_index  # noqa: E402
 
 
 _MONTHS = {"january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
@@ -128,6 +126,7 @@ class UIDResult:
 
 
 def _load_plan_cache(path: Path) -> dict[str, str]:
+    """Return {uid: plan_json_string}. One {uid, question, plan_json} per JSONL line."""
     if not path.exists():
         return {}
     out: dict[str, str] = {}
@@ -136,23 +135,22 @@ def _load_plan_cache(path: Path) -> dict[str, str]:
         if not line:
             continue
         d = json.loads(line)
-        out[d["uid"]] = d["plan_text"]
+        out[d["uid"]] = d["plan_json"]
     return out
 
 
-def _append_plan_cache(path: Path, uid: str, question: str, plan_text: str) -> None:
+def _append_plan_cache(path: Path, uid: str, question: str, plan_json: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as f:
-        f.write(json.dumps({"uid": uid, "question": question, "plan_text": plan_text}))
+        f.write(json.dumps({"uid": uid, "question": question, "plan_json": plan_json}))
         f.write("\n")
 
 
 def _plan_question(uid: str, question: str, llm: LLMClient,
                    plan_cache: dict[str, str], cache_path: Path,
                    stats: TokenStats) -> str | None:
-    """Return plan_text, caching new plans. Accumulate token stats."""
-    from skunk.planner import PlannerOperator
-    from skunk.dsl import serialize as dsl_serialize
+    """Return plan_json string, caching new plans. Accumulate token stats."""
+    from skunk.plan import PlannerExecutor, to_json
 
     if uid in plan_cache:
         return plan_cache[uid]
@@ -164,27 +162,22 @@ def _plan_question(uid: str, question: str, llm: LLMClient,
     ctx = HarnessContext(question=question, verbose=False, config=cfg, llm_client=llm,
                          prompt_overrides=prompt_overrides)
     try:
-        plan_obj = PlannerOperator().plan(question, ctx)
-    except Exception as e:
+        plan_obj = PlannerExecutor().plan(question, ctx)
+    except Exception:
         return None
     finally:
         for ev in ctx.events:
             if ev.get("source") == "llm" and ev.get("message") == "call":
                 stats.add(ev.get("input_tokens"), ev.get("output_tokens"),
                           ev.get("latency_s"))
-    plan_text = dsl_serialize(plan_obj)
-    _append_plan_cache(cache_path, uid, question, plan_text)
-    plan_cache[uid] = plan_text
-    return plan_text
+    plan_json = to_json(plan_obj)
+    _append_plan_cache(cache_path, uid, question, plan_json)
+    plan_cache[uid] = plan_json
+    return plan_json
 
 
 def _retrieve_branches(plan_obj: Plan) -> list[RetrieveBranch]:
-    branches: list[RetrieveBranch] = []
-    for compute in plan_obj.computes:
-        for b in compute.branches:
-            if isinstance(b, RetrieveBranch):
-                branches.append(b)
-    return branches
+    return [b for b in plan_obj.branches if isinstance(b, RetrieveBranch)]
 
 
 def _run_one_uid(
@@ -193,16 +186,9 @@ def _run_one_uid(
     plan_cache: dict[str, str], plan_cache_path: Path,
     tree: dict, catalog_index: dict, llm: LLMClient, retrieve_workers: int,
     trace_path: Path | None = None,
-    retriever: str = "l1-vector",
-    vector_index: Any | None = None,
-    top_k_vector: int = 100,
-    use_period_mask: bool = False,
-    date_filter_mode: str = "off",
-    l2_top_n: int | None = None,
-    pre_date_intersect: bool = False,
-    use_llm_dates: bool = False,
+    retriever: str = "one-shot-parent-chapter",
 ) -> UIDResult:
-    from skunk.dsl import parse as dsl_parse
+    from skunk.plan import from_json as dsl_from_json
 
     t0 = time.monotonic()
     result = UIDResult(uid=uid, question=question, plan_text="",
@@ -210,16 +196,16 @@ def _run_one_uid(
                        goldens_in_index=[g for g in goldens if g in indexed_pages],
                        predicted=[], n_retrieve_branches=0)
 
-    plan_text = _plan_question(uid, question, llm, plan_cache, plan_cache_path,
+    plan_json = _plan_question(uid, question, llm, plan_cache, plan_cache_path,
                                result.planner)
-    if plan_text is None:
+    if plan_json is None:
         result.error = "plan failed"
         result.wall_s = time.monotonic() - t0
         return result
-    result.plan_text = plan_text
+    result.plan_text = plan_json
 
     try:
-        plan_obj = dsl_parse(plan_text)
+        plan_obj = dsl_from_json(plan_json)
     except Exception as e:
         result.error = f"plan parse: {type(e).__name__}: {e}"
         result.wall_s = time.monotonic() - t0
@@ -233,32 +219,40 @@ def _run_one_uid(
     def _one_branch(idx: int, b: RetrieveBranch):
         if retriever == "one-shot-parent-chapter":
             top, trace = one_shot_parent_chapter_retrieve(
-                tree, question=question, concept=b.concept, period=b.period,
+                tree, question=question, concept=b.key, period=b.period,
                 llm=llm, catalog_index=catalog_index,
                 uid=uid, retrieve_idx=idx,
             )
         elif retriever == "one-shot-section":
             top, trace = one_shot_section_retrieve(
-                tree, question=question, concept=b.concept, period=b.period,
+                tree, question=question, concept=b.key, period=b.period,
                 llm=llm, catalog_index=catalog_index,
                 uid=uid, retrieve_idx=idx,
             )
-        elif retriever in ("l1-vector", "vector-only", "vector-period"):
-            top, trace = l1_vector_retrieve(
-                tree, question=question, concept=b.concept, period=b.period,
+        elif retriever == "chapter-year":
+            # Production pipeline (mirrors src/skunk/retrieve.py):
+            # L1 chapter pick → year-window filter. The survivors are the
+            # candidate set; no reranking, no caps.
+            chapter_top, trace = one_shot_parent_chapter_retrieve(
+                tree, question=question, concept=b.key, period=b.period,
                 llm=llm, catalog_index=catalog_index,
-                vector_index=vector_index,
-                top_k_vector=top_k_vector,
-                use_period_mask=(retriever == "vector-period"
-                                 or (retriever == "l1-vector"
-                                     and use_period_mask)),
-                pre_date_intersect=pre_date_intersect,
-                date_filter_mode=date_filter_mode,
-                use_llm_dates=use_llm_dates,
-                skip_l1=(retriever in ("vector-only", "vector-period")),
-                top_n=l2_top_n,
                 uid=uid, retrieve_idx=idx,
             )
+            window = period_year_window(b.period)
+            if window is None:
+                filtered = chapter_top
+            else:
+                q_lo, q_hi = window
+                filtered = []
+                for c in chapter_top:
+                    row = catalog_index.get((c["bulletin"], int(c["page"])))
+                    if row is None or row.min_year is None or row.max_year is None:
+                        filtered.append(c)
+                    elif row.max_year >= q_lo and row.min_year <= q_hi:
+                        filtered.append(c)
+            trace.candidate_count = len(filtered)
+            trace.top_k = filtered[:50]
+            top = filtered
         else:
             raise ValueError(f"unknown retriever: {retriever!r}")
         return top, trace
@@ -285,11 +279,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="32-UID retrieval-only benchmark.")
     ap.add_argument("--benchmark", type=Path, default=_REPO_ROOT / "data/officeqa_pro.csv")
     ap.add_argument("--catalog-dir", type=Path,
-                    default=_REPO_ROOT / "cache/page_index_v3/catalog",
-                    help="Catalog jsonl directory. The shipped artifact at "
-                         "data/page_index/ contains only the tree and prompt; "
-                         "the catalog is a build-time intermediate that lives "
-                         "under cache/page_index_v3/ after a rebuild.")
+                    default=_REPO_ROOT / "cache/page_index_v4/catalog",
+                    help="Catalog jsonl directory. Defaults to the latest "
+                         "build under cache/page_index_v4/.")
     ap.add_argument("--n", type=int, default=32, help="Number of UIDs to sample.")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--uids", type=str, default=None,
@@ -308,48 +300,18 @@ def main() -> int:
                          "is overridden).")
     ap.add_argument("--retriever",
                     choices=("one-shot-parent-chapter", "one-shot-section",
-                             "l1-vector", "vector-only", "vector-period"),
-                    default="l1-vector",
-                    help="one-shot-parent-chapter: L1 chapter pick only "
-                         "(returns every page in the picked chapter). "
+                             "chapter-year"),
+                    default="chapter-year",
+                    help="chapter-year (default): production pipeline — "
+                         "L1 chapter pick + year-window filter. Mirrors "
+                         "src/skunk/retrieve.py. "
+                         "one-shot-parent-chapter: L1 chapter pick only "
+                         "(returns every page in the picked chapter; recall "
+                         "ceiling probe). "
                          "one-shot-section: alias for parent-chapter under "
-                         "the flat-tree shape. l1-vector (default): "
-                         "L1 chapter pick + vector cosine top-K within "
-                         "the chapter, optionally with period mask + "
-                         "date envelope filter.")
+                         "the flat-tree shape.")
     ap.add_argument("--out", type=Path,
                     default=_REPO_ROOT / "cache/retrieve_bench_results.jsonl")
-    ap.add_argument("--vector-dir", type=Path,
-                    default=_REPO_ROOT / "cache/page_index_v3/vectors",
-                    help="Directory holding vectors.npz + vectors_keys.jsonl "
-                         "for the --retriever l1-vector mode.")
-    ap.add_argument("--top-k-vector", type=int, default=100,
-                    help="Top-K for the vector cosine pass under l1-vector.")
-    ap.add_argument("--use-period-mask", action="store_true",
-                    help="With --retriever l1-vector, AND the chapter mask "
-                         "with the symbolic period mask before cosine top-K.")
-    ap.add_argument("--date-filter-mode",
-                    choices=("off", "soft"), default="off",
-                    help="With --retriever l1-vector, post-filter the cosine "
-                         "top-K against the query period via the catalog's "
-                         "`dates` field. 'soft' keeps pages with overlapping "
-                         "dates AND falls back to bulletin-month-window for "
-                         "pages whose dates field is empty/unparseable.")
-    ap.add_argument("--use-llm-dates", action="store_true",
-                    help="With --retriever l1-vector, ask an LLM to propose "
-                         "query-side dates from the question text instead of "
-                         "parsing the planner's structured `period`. Adds one "
-                         "LLM call per retrieve branch.")
-    ap.add_argument("--pre-date-intersect", action="store_true",
-                    help="With --retriever l1-vector, apply the strict date-"
-                         "envelope intersect as a PRE-mask before cosine "
-                         "top-K. Pages with parsed dates must overlap the "
-                         "query period; pages with no parsed dates fall back "
-                         "to bulletin-month-window. Shrinks the pool the "
-                         "cosine ranks over.")
-    ap.add_argument("--l2-top-n", type=int, default=None,
-                    help="Cap the post-filter survivors at this many pages "
-                         "(highest cosine first). Default: no cap.")
     ap.add_argument("--include-test-set", action="store_true",
                     help="Include held-out test UIDs (see CLAUDE.md). Default "
                          "excludes them. Required for any --uids that names "
@@ -454,12 +416,6 @@ def main() -> int:
     print(f"Model: {cfg.llm_model}\n")
     llm = LLMClient(cfg)
 
-    vector_index = None
-    if args.retriever in ("l1-vector", "vector-only", "vector-period"):
-        vector_index = load_vector_index(args.vector_dir)
-        print(f"Vector index loaded: {vector_index.vectors.shape} "
-              f"from {args.vector_dir}    top_k_vector={args.top_k_vector}")
-
     results: list[UIDResult] = []
     t_bench = time.monotonic()
     with ThreadPoolExecutor(max_workers=max(1, args.uid_workers)) as ex:
@@ -468,10 +424,7 @@ def main() -> int:
                       indexed, plan_cache, args.plan_cache, tree,
                       catalog_index, llm,
                       args.retrieve_workers, args.trace_out,
-                      args.retriever, vector_index, args.top_k_vector,
-                      args.use_period_mask, args.date_filter_mode,
-                      args.l2_top_n, args.pre_date_intersect,
-                      args.use_llm_dates): r["uid"]
+                      args.retriever): r["uid"]
             for r in sampled
         }
         for f in as_completed(futs):
@@ -536,6 +489,22 @@ def main() -> int:
     macro_p = sum(r.precision for r in results) / max(1, len(results))
     print(f"Macro-recall (mean per-UID):                 {macro_r:.1%}")
     print(f"Macro-precision (mean per-UID):              {macro_p:.1%}")
+
+    # Elimination rate: fraction of the indexed corpus the retriever
+    # filtered out per query, averaged across UIDs. corpus_size is the
+    # number of retrievable pages in the index (the union of every
+    # chapter's `pages`). A retriever returning N pages eliminates
+    # 1 − N/corpus_size of the corpus for that query.
+    corpus_size = len(indexed)
+    per_uid_elim = [
+        1.0 - (len(r.predicted) / corpus_size) for r in results if r.predicted
+    ]
+    mean_elim = (sum(per_uid_elim) / len(per_uid_elim)) if per_uid_elim else 0.0
+    mean_pred = (sum(len(r.predicted) for r in results) /
+                 max(1, len(results)))
+    print(f"Indexed corpus size:                          {corpus_size}")
+    print(f"Mean predicted pages / UID:                   {mean_pred:.1f}")
+    print(f"Mean elimination rate:                        {mean_elim:.2%}")
     print()
     print("LLM cost breakdown:")
     print(f"  PLANNER:   calls={tot_planner.n_calls:>4}  "

@@ -1,17 +1,9 @@
-"""compute subagent — codegen + execution over an extracted-value sandbox.
+"""compute operator — codegen + execution over an extracted-value sandbox.
 
-Two operators cover two roles. The terminal compute (`CodegenFinalOperator`)
-takes the user's question plus `prev: list[AnnotatedValue]`, generates Python
+Takes the user's question plus `prev: list[AnnotatedValue]`, generates Python
 that assigns `result` to the formatted answer string, runs it in a sandbox,
-then self-critiques via `CritiqueOperator` and re-runs once on REVISE.
-Returns a `FormattedString`.
-
-The intermediate compute (`CodegenIntermediateOperator`) takes a sub-task
-plus `prev`, generates Python that assigns `result` to a raw value (scalar,
-vector dict, table dict-of-dict, or list[AnnotatedValue]) with optional
-`result_unit` / `result_kind` / `result_description` / `result_index_name` /
-`result_row_name` / `result_col_name` metadata vars. No critique. Returns
-a `list[AnnotatedValue]` for the downstream aggregator.
+then self-critiques via `CritiqueExecutor` and re-runs once on REVISE.
+Returns the answer as a plain `str`.
 
 Codegen reports `MISSING:<reason>` when `prev` lacks a needed value; the
 orchestrator catches that and triggers a replan round.
@@ -22,32 +14,31 @@ from __future__ import annotations
 import re
 
 from skunk.common import HarnessContext
-from skunk.dsl import AnnotatedValue, FormattedString, OpNode
-from skunk.operator import SkunkOperator
-from skunk.subagents.base import (
+from skunk.plan import AnnotatedValue
+from skunk.executor import SkunkExecutor
+from skunk.operator import (
     MissingData,
+    OpNode,
     StepFailed,
     exec_python_with_env,
     strip_code_fences,
 )
 
-
 # ---------------------------------------------------------------------------
 # Static system prompt blocks
 # ---------------------------------------------------------------------------
 
-_CODEGEN_FINAL_SYSTEM = """\
+_CODEGEN_SYSTEM = """\
 You write Python that produces the final answer string for a financial QA
 pipeline.
 
 Inputs:
 - The user's question.
-- A "Parsed constraints" block in the user message — structured spec of
-  the question (method, transforms, units_out, precision, answer_form,
-  period_type). Treat as ground truth: every listed transform MUST appear
-  as an explicit operation in your code; if method is set, implement its
-  standard formula; if units_out is set, convert; if precision is set,
-  round.
+- A "Parsed constraints" block in the user message — the planner's
+  `computation` description plus presentation fields (units_out,
+  precision, answer_form). Treat as ground truth: implement what the
+  computation says, convert to units_out if set, round to precision if
+  set, format to answer_form.
 - `prev`: list[AnnotatedValue] available in the sandbox.
 
 AnnotatedValue:
@@ -68,9 +59,10 @@ Payload access:
   vector: list(e.value.values()) or .items() to filter by index.
   table:  pd.DataFrame.from_dict(e.value, orient="index").
 
-NUMERIC TRANSFORMS — every transform from the question MUST appear as an
-explicit operation, not as a comment. The critic REVISEs on missing or
-mis-applied transforms even when the magnitude looks plausible. Watch for:
+NUMERIC MODIFIERS — every modifier present in the question (or echoed in
+the `computation` description) MUST appear as an explicit operation, not
+as a comment. The critic REVISEs on missing or mis-applied modifiers
+even when the magnitude looks plausible. Watch for:
   - "signed" vs "absolute" — never silently abs() a value meant signed.
   - "normalized" / "midpoint normalized" — apply explicitly (midpoint:
     (V2-V1)/((V1+V2)/2)).
@@ -117,66 +109,15 @@ Rules:
 - Output ONLY the format above — no markdown fences around the whole response.
 """
 
-_CODEGEN_INTERMEDIATE_SYSTEM = """\
-You are an intermediate compute step. Your output feeds a downstream
-aggregator — emit a raw value, not a pretty string.
-
-Inputs:
-- A natural-language sub-task (this step only, not the user's full question).
-- `prev`: list[AnnotatedValue] available in the sandbox.
-  Fields: .tag (snake_case key), .description, .value (scalar | vector dict
-  | table dict-of-dict), .unit, .kind, .index_name (vector), .row_name/.col_name (table).
-
-PREFER exact tag matching: `next(e for e in prev if e.tag == "<tag>")`.
-Fall back to description substring matching only when no tag is present.
-
-Output format — exactly one of:
-  CODE\\n<python that sets `result` (and optionally metadata vars)>
-  MISSING:<short reason a needed datum is absent>
-
-Assign `result` to one of:
-  (a) Python scalar (int / float / str)           → wrapped as kind=scalar
-  (b) dict {index_label: scalar}                  → wrapped as kind=vector
-  (c) dict-of-dict {row: {col: scalar}}           → wrapped as kind=table
-  (d) list[AnnotatedValue] you construct explicitly → returned verbatim
-
-Optional metadata vars (sensible defaults used when absent):
-  result_unit, result_kind, result_description,
-  result_index_name (vector), result_row_name / result_col_name (table).
-
-Worked example — produce a 2-element dict for downstream pairwise math:
-    a = next(e for e in prev if e.tag == "national_defense:cy1940").value
-    b = next(e for e in prev if e.tag == "national_defense:cy1953").value
-    result = {'1940': a, '1953': b}
-    result_unit = 'usd_millions'
-    result_kind = 'vector'
-    result_index_name = 'year'
-    result_description = 'national defense totals by year'
-
-Rules:
-- Do NOT format `result` as a pretty string — emit the raw numeric/dict.
-- Prefer a printed total/summary row over re-aggregating its components
-  when both are in `prev`.
-- Every cell in a vector/table shares one unit — convert once
-  (usd_thousands → usd_millions: divide by 1000) and set result_unit.
-- Foreign currency follows <iso3>_<scale>. To answer in USD when the
-  input is foreign, find the matching fx_rate entry and apply it: "USD
-  per <iso>" → multiply, "<iso> per USD" → divide. Check the fx_rate
-  description for direction.
-- If `prev` is missing a value you need, output MISSING. Never fabricate.
-- Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
-  No other imports. No prints. `hp_filter(series, lamb=…)` is pre-defined.
-- Output ONLY the format above — no markdown fences around the whole response.
-"""
-
 _CRITIQUE_SYSTEM = """\
 You review code that another agent wrote and the string it produced.
 Decide ACCEPT or REVISE.
 
 Inputs: the question, a summary of `prev` (descriptions + units + kinds),
 the Python that ran, the produced `result` string, and a "Parsed
-constraints" block (method, transforms, units_out, precision, answer_form,
-period_type). Treat the parsed constraints as a checklist.
+constraints" block (the planner's `computation` description plus
+units_out / precision / answer_form). Treat the parsed constraints as a
+checklist.
 
 Reply on a single line:
   ACCEPT
@@ -190,8 +131,8 @@ appear as an explicit operation in the code, not as a comment. If the
 result's magnitude or sign disagrees with the natural reading of the
 question under its modifiers, that is a STRONG REVISE signal.
 
-When the question names a specific method, verify the code implements its
-standard formula. Common gotchas:
+When the question names a specific named operation, verify the code
+implements its standard formula. Common gotchas:
   - expected_shortfall on a return/yield series is the SIGNED mean of the
     tail observations; expect a negative result in a loss context.
   - arc_elasticity = ((Q2-Q1)/((Q1+Q2)/2)) / ((P2-P1)/((P1+P2)/2));
@@ -207,12 +148,12 @@ standard formula. Common gotchas:
   - cagr = (V_end / V_start)^(1/n) - 1, where n is the number of intervals
     (not years inclusive).
 If a related-but-different formula was used, REVISE: "code uses <X> but
-question asks for <named method>".
+question asks for <named operation>".
 
 REVISE when the producer:
 - shipped wrong / missing unit conversion;
 - omitted or mis-applied a numeric modifier from the scan;
-- used a formula that doesn't match the named statistical method;
+- used a formula that doesn't match the named statistical operation;
 - produced a result whose form contradicts the question (wanted
   "[a, b]" but shipped "1.0 2.0"; wanted percent but shipped 0.1234);
 - selected wrong rows/columns from `prev` for the question's constraints;
@@ -228,19 +169,15 @@ Do NOT REVISE on:
 """
 
 
-class CodegenFinalOperator(SkunkOperator):
-    name: str = "compute.codegen.final"
-    system: str = _CODEGEN_FINAL_SYSTEM
+class CodegenExecutor(SkunkExecutor):
+    name: str = "compute.codegen"
+    system_prompt: str = _CODEGEN_SYSTEM
 
 
-class CodegenIntermediateOperator(SkunkOperator):
-    name: str = "compute.codegen.intermediate"
-    system: str = _CODEGEN_INTERMEDIATE_SYSTEM
-
-
-class CritiqueOperator(SkunkOperator):
+class CritiqueExecutor(SkunkExecutor):
     name: str = "compute.critique"
-    system: str = _CRITIQUE_SYSTEM
+    system_prompt: str = _CRITIQUE_SYSTEM
+
 
 # Match CODE / MISSING anywhere (after fence-stripping + light prose). Use re.search,
 # not re.match, so leading commentary or whitespace doesn't break classification.
@@ -327,11 +264,12 @@ def _prev_desc(prev: list[AnnotatedValue]) -> str:
 
 def _constraints_block(
     ctx: HarnessContext,
-    method: str | None = None,
-    transforms: list[str] | None = None,
+    computation: str = "",
+    qualifiers: list[str] | None = None,
 ) -> str:
-    """Render constraint bullets for compute prompts. Plan-level fields come
-    from ctx.plan; per-compute fields are passed as kwargs by the caller."""
+    """Render constraint bullets for compute prompts. Plan-level presentation
+    fields come from ctx.plan; the per-compute `computation` task and `qualifiers`
+    are passed by the caller."""
     lines: list[str] = []
     plan = ctx.plan
     if plan is not None:
@@ -341,10 +279,10 @@ def _constraints_block(
             lines.append(f"- precision: {plan.precision} decimal places")
         if plan.answer_form != "scalar":
             lines.append(f"- answer_form: {plan.answer_form}")
-    if method:
-        lines.append(f"- method: {method}")
-    if transforms:
-        lines.append(f"- transforms (MUST apply each): {', '.join(transforms)}")
+    if computation:
+        lines.append(f"- computation: {computation}")
+    for h in qualifiers or []:
+        lines.append(f"- qualifier (MUST apply): {h}")
     if not lines:
         return ""
     return "Parsed constraints (apply each):\n" + "\n".join(lines) + "\n\n"
@@ -367,7 +305,7 @@ def _build_user(question: str, prev_desc: str, priors: list[str], spec_block: st
 
 def _self_critique(
     question: str, prev_desc: str, code: str, result_text: str, ctx: HarnessContext,
-    *, method: str | None = None, transforms: list[str] | None = None,
+    *, computation: str = "", qualifiers: list[str] | None = None,
 ) -> tuple[bool, str]:
     """Same-actor review of (code, result) against the question.
 
@@ -376,13 +314,13 @@ def _self_critique(
     """
     user = (
         f"Question:\n{question}\n\n"
-        f"{_constraints_block(ctx, method=method, transforms=transforms)}"
+        f"{_constraints_block(ctx, computation=computation, qualifiers=qualifiers)}"
         f"prev =\n{prev_desc}\n\n"
         f"Code that ran:\n```python\n{code}\n```\n\n"
         f"Produced result:\n{result_text}\n\n"
         f"Reply on a single line: ACCEPT, or REVISE: <reason>."
     )
-    resp = ctx.llm_client.call(CritiqueOperator().build_system(ctx), user, ctx=ctx)
+    resp = ctx.llm_client.call(CritiqueExecutor().assemble_system_prompt(ctx), user, ctx=ctx)
     raw = resp.text
     ctx.emit("compute", "self-critique response", raw=raw[:300])
 
@@ -409,19 +347,19 @@ def _try_codegen_and_exec(
     *,
     system_prompt: str,
     question: str,
-    method: str | None = None,
-    transforms: list[str] | None = None,
+    computation: str = "",
+    qualifiers: list[str] | None = None,
 ) -> tuple[dict | None, str | None, list[str]]:
     """One logical attempt: codegen → parse → exec, with `retry_budget` retries
     for transient exec/parse failures (a malformed response or a code exception).
 
     MISSING: from codegen propagates as MissingData. Returns
     (env, code, accumulated_priors) on success — where `env` is the post-exec
-    sandbox dict (so callers can read `result`, `result_unit`, etc.) — or
+    sandbox dict (so callers can read `result`) — or
     (None, None, accumulated_priors) when the retry budget is exhausted.
     """
     priors = list(priors)
-    spec_block = _constraints_block(ctx, method=method, transforms=transforms)
+    spec_block = _constraints_block(ctx, computation=computation, qualifiers=qualifiers)
     # Total tries = 1 initial + retry_budget retries.
     for try_idx in range(retry_budget + 1):
         resp = ctx.llm_client.call(
@@ -461,56 +399,23 @@ def _try_codegen_and_exec(
     return None, None, priors
 
 
-def _infer_kind(value: object) -> str:
-    if isinstance(value, dict):
-        if value and isinstance(next(iter(value.values()), None), dict):
-            return "table"
-        return "vector"
-    return "scalar"
-
-
-_TASK_SLUG_RE = re.compile(r"[^a-z0-9]+")
-
-
-def _slug_from_task(task: str) -> str:
-    s = _TASK_SLUG_RE.sub("_", (task or "intermediate_result").lower()).strip("_")
-    return (s[:48] or "intermediate_result")
-
-
-def _wrap_intermediate_result(task: str, env: dict) -> list[AnnotatedValue]:
-    """Turn the sandbox env produced by an intermediate compute into list[AnnotatedValue]."""
-    result_value = env.get("result")
-    if isinstance(result_value, list) and all(isinstance(x, AnnotatedValue) for x in result_value):
-        return result_value
-    kind = env.get("result_kind") or _infer_kind(result_value)
-    description = env.get("result_description") or task or _slug_from_task(task)
-    return [AnnotatedValue(
-        description=str(description),
-        value=result_value,
-        unit=str(env.get("result_unit", "")),
-        kind=str(kind),
-        index_name=env.get("result_index_name"),
-        row_name=env.get("result_row_name"),
-        col_name=env.get("result_col_name"),
-    )]
-
-
-def _run_final(
+def _run_compute(
     question: str, prev: object, ctx: HarnessContext,
-    *, method: str | None = None, transforms: list[str] | None = None,
-) -> FormattedString:
-    """Terminator path — produces a single answer string via codegen + self-critique."""
+    *, computation: str = "", qualifiers: list[str] | None = None,
+) -> str:
+    """Codegen → exec → self-critique → optionally one revision pass.
+    Returns the final answer string."""
     prev_desc = _prev_desc(prev)
-    ctx.emit("compute", "starting", mode="final", question=question,
-             method=method, transforms=transforms,
+    ctx.emit("compute", "starting", question=question,
+             computation=computation, qualifiers=qualifiers or [],
              prev_summary=prev_desc[:500])
 
-    codegen_system = CodegenFinalOperator().build_system(ctx)
+    codegen_system = CodegenExecutor().assemble_system_prompt(ctx)
     a1_env, a1_code, a1_priors = _try_codegen_and_exec(
         ctx, prev, prev_desc, priors=[],
         retry_budget=ctx.config.compute_max_attempts - 1,
         system_prompt=codegen_system, question=question,
-        method=method, transforms=transforms,
+        computation=computation, qualifiers=qualifiers,
     )
     if a1_env is None:
         raise StepFailed(
@@ -520,74 +425,48 @@ def _run_final(
     a1_result = str(a1_env["result"])
 
     accept, reason = _self_critique(question, prev_desc, a1_code, a1_result, ctx,
-                                    method=method, transforms=transforms)
+                                    computation=computation, qualifiers=qualifiers)
     if accept:
         ctx.emit("compute", "attempt 1 self-critique ACCEPT", text=a1_result)
-        return FormattedString(text=a1_result)
+        return a1_result
     ctx.emit("compute", "attempt 1 self-critique REVISE", reason=reason)
 
-    hint = (
+    revise_prior = (
         f"Produced result {a1_result!r}. Self-critique flagged: {reason}\n"
         f"Code was:\n```python\n{a1_code}\n```"
     )
     try:
         a2_env, _, _ = _try_codegen_and_exec(
-            ctx, prev, prev_desc, priors=[hint], retry_budget=0,
+            ctx, prev, prev_desc, priors=[revise_prior], retry_budget=0,
             system_prompt=codegen_system, question=question,
-            method=method, transforms=transforms,
+            computation=computation, qualifiers=qualifiers,
         )
     except MissingData as e:
         ctx.emit("compute", "attempt 2 MISSING; falling back to attempt 1",
                  reason=e.reason, fallback_text=a1_result)
-        return FormattedString(text=a1_result)
+        return a1_result
     if a2_env is None:
         ctx.emit(
             "compute",
             "attempt 2 produced no result; falling back to attempt 1",
             fallback_text=a1_result,
         )
-        return FormattedString(text=a1_result)
+        return a1_result
     a2_result = str(a2_env["result"])
     ctx.emit("compute", "attempt 2 returned (no re-critique)", text=a2_result)
-    return FormattedString(text=a2_result)
+    return a2_result
 
 
-def _run_intermediate(
-    task: str, prev: object, ctx: HarnessContext,
-    *, method: str | None = None, transforms: list[str] | None = None,
-) -> list[AnnotatedValue]:
-    """Intermediate path — produces a list[AnnotatedValue] for the downstream aggregator."""
-    prev_desc = _prev_desc(prev)
-    ctx.emit("compute", "starting", mode="intermediate", task=task,
-             method=method, transforms=transforms,
-             prev_summary=prev_desc[:500])
-
-    env, _, priors = _try_codegen_and_exec(
-        ctx, prev, prev_desc, priors=[],
-        retry_budget=ctx.config.compute_max_attempts - 1,
-        system_prompt=CodegenIntermediateOperator().build_system(ctx), question=task,
-        method=method, transforms=transforms,
-    )
-    if env is None:
-        raise StepFailed(
-            "compute",
-            f"intermediate could not produce a result: priors={priors}",
-        )
-    wrapped = _wrap_intermediate_result(task, env)
-    ctx.emit("compute", "intermediate produced entries",
-             n=len(wrapped), descriptions=[e.description for e in wrapped])
-    return wrapped
-
-
-def run(op: OpNode, prev: object, ctx: HarnessContext) -> FormattedString | list[AnnotatedValue]:
-    """Dispatch on op.args["final"]. Default is final=True (back-compat terminator)."""
+def run(op: OpNode, prev: object, ctx: HarnessContext) -> str:
+    """Single compute mode: takes the user's question + extracted prev values,
+    returns the final answer string. `task` and `qualifiers` come from the
+    planner's `computation` block."""
     task = str(op.args.get("task") or "")
-    is_final = bool(op.args.get("final", True))
-    method = op.args.get("method") or None
-    transforms = list(op.args.get("transforms") or []) or None
-    if is_final:
-        question = task or ctx.question
-        return _run_final(question, prev, ctx, method=method, transforms=transforms)
-    if not task:
-        raise StepFailed("compute", "intermediate compute requires a non-empty task")
-    return _run_intermediate(task, prev, ctx, method=method, transforms=transforms)
+    raw_qualifiers = op.args.get("qualifiers") or []
+    if not isinstance(raw_qualifiers, list):
+        raise StepFailed("compute", f"qualifiers must be a list, got {raw_qualifiers!r}")
+    qualifiers = [str(h) for h in raw_qualifiers] or None
+    # `task` is the planner's `computation.task` (free-form NL describing the
+    # calculation). Empty string is fine — that means the answer is a direct
+    # value lookup with no extra calculation.
+    return _run_compute(ctx.question, prev, ctx, computation=task, qualifiers=qualifiers)

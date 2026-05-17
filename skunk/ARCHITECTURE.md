@@ -4,7 +4,7 @@
 
 OfficeQA questions ask about specific tables and figures inside a corpus of 696 monthly U.S. Treasury Bulletin PDFs (1939–2025). A naive date-driven retrieval agent — "the question mentions 1940, look in the 1940 bulletin" — fails on **81%** of the benchmark, because the answer-bearing table for period *P* often lives in a *later* bulletin (publication lag) or in a *retrospective summary* in a single mid-year issue. The median miss is +2 months; the long tail goes out to +9 years.
 
-The fix: retrieve at the **page** level, indexed by **what each page reports**, not by when its bulletin was published. A page-level catalog tells the planner where to look; the actual reading is a separate concern handled by the extract subagent.
+The fix: retrieve at the **page** level, indexed by **what each page reports**, not by when its bulletin was published. A page-level catalog tells the planner where to look; the actual reading is a separate concern handled by the extract operator.
 
 This decoupling means retrieval and extraction can be evaluated independently — both labels exist in the benchmark (`source_docs?page=N` for retrieval, `answer` for extraction) — so we can attribute errors cleanly.
 
@@ -25,7 +25,7 @@ This decoupling means retrieval and extraction can be evaluated independently �
        │                  │                  │
        ▼                  ▼                  ▼
   ┌─────────┐        ┌─────────┐        ┌─────────────┐
-  │retrieve │        │ extract │        │lookup_extern│   per-op subagents
+  │retrieve │        │ extract │        │lookup_extern│   per-op operators
   │ catalog │        │ tier 1-3│        │   gemini    │
   └─────────┘        └─────────┘        └─────────────┘
        │                  │                  │
@@ -54,29 +54,63 @@ The benchmark's `source_docs?page=N` parameter is the PDF page index in Fraser's
 
 ## The page index lives in retrieve
 
-The retrieve subagent owns its page index — the format, schema, and build process are implementation details of that subagent. The index must be able to answer: *given a concept and a period, which pages in the corpus report on that?*
+The retrieve operator owns its page index — the format, schema, and build process are implementation details of that operator. The index must be able to answer: *given a concept and a period, which pages in the corpus report on that?*
 
-The load-bearing insight is that `periods_covered` (what period a page *reports on*) is distinct from the bulletin's publication date. A page in the January 1941 bulletin that contains the CY1940 annual summary should be returned for a query on `period='CY1940'` — not the January 1941 bulletins. Any index the retrieve subagent builds must capture this distinction.
+The load-bearing insight is that `periods_covered` (what period a page *reports on*) is distinct from the bulletin's publication date. A page in the January 1941 bulletin that contains the CY1940 annual summary should be returned for a query on `period='CY1940'` — not the January 1941 bulletins. Any index the retrieve operator builds must capture this distinction.
 
 ## The 4 operators
 
-- **`retrieve(concept, period, source_bulletin?)`** — only chain head. Looks up relevant pages via the retrieve subagent's internal page index, returns a `DocHandle` whose `PageRef`s have `(file_path, year, month, page)` fully specified (where `page` is the 1-based PDF page index).
-- **`extract(visual_only?)`** — reads `ctx.question` and the located pages via tier dispatch (parsed JSON → PyMuPDF text → vision). Returns `list[AnnotatedValue]` — each entry has a `description`, `value`, `unit`, and one of three **kinds**: `scalar`, `vector` (1-D series with one varying dim), or `table` (2-D grid with row/col dims). Vector/table cells are always primitive scalars; nesting beyond those shapes is rejected by the extract parser before an `AnnotatedValue` is constructed. Pass `visual_only=True` to skip Tiers 1–2 and go straight to vision (use for charts/figures).
-- **`lookup_external(nl)`** — chain-head capable. Single Gemini call: takes a natural-language description of external factual data (`nl`) and returns `list[AnnotatedValue]` (one entry). Use for CPI-U, FX rates, event dates, named entities (bureau names), and any fact not in the bulletin corpus. The subagent infers the appropriate `kind` and `unit` (including `text` for strings).
-- **`compute()`** — chain terminator that subsumes formatting. Reads `ctx.question` plus the upstream extracted/looked-up values; runs a plan-then-codegen LLM call (`CODE\n<python>` or `MISSING:<reason>`), execs the code, then a self-critique LLM call — same domain prompt as the producer, with full context (`question`, `prev`, code, result text) — decides ACCEPT or REVISE:`<reason>`. On REVISE, codegen runs once more with the critique as a prior and ships unconditionally (no second critique → no flap). Within attempt 1, transient codegen/exec failures consume a small retry budget (`compute_max_attempts - 1`). Returns a `FormattedString`. Fails with `StepFailed("compute", …)` when attempt 1 cannot produce a result, or with `MissingData` when codegen on attempt 1 reports `MISSING:`.
+- **`retrieve(key, period)`** — only chain head. Looks up relevant pages via the retrieve operator's internal page index (L1 chapter pick + year-window filter; see `data/page_index/README.md`), returns `list[PageRef]` with `(month, page)` populated (where `page` is the 1-based PDF page index).
+- **`extract(key, period, visual_only?, value_kind?)`** — reads `ctx.question` and the located pages via tier dispatch (parsed JSON → PyMuPDF text → vision). Returns `list[AnnotatedValue]` — each entry has a `description`, `value`, `unit`, and one of three **kinds**: `scalar`, `vector` (1-D series with one varying dim), or `table` (2-D grid with row/col dims). Vector/table cells are always primitive scalars; nesting beyond those shapes is rejected by the extract parser before an `AnnotatedValue` is constructed. `extract` is invoked automatically by the orchestrator on every `RetrieveBranch` — `visual_only` / `value_kind` are set on the branch and threaded through. Pass `visual_only=True` to skip Tiers 1–2 and go straight to vision (use for charts/figures).
+- **`lookup_external(nl)`** — chain-head capable. Single Gemini call: takes a natural-language description of external factual data (`nl`) and returns `list[AnnotatedValue]` (one entry). Use for CPI-U, FX rates, event dates, named entities (bureau names), and any fact not in the bulletin corpus. The operator infers the appropriate `kind` and `unit` (including `text` for strings).
+- **`compute()`** — chain terminator that subsumes formatting. Reads `ctx.question` plus the upstream extracted/looked-up values; runs a plan-then-codegen LLM call (`CODE\n<python>` or `MISSING:<reason>`), execs the code in a sandbox, then a self-critique LLM call — same domain prompt as the producer, with full context (`question`, `prev`, code, result text) — decides ACCEPT or REVISE:`<reason>`. On REVISE, codegen runs once more with the critique as a prior and ships unconditionally (no second critique → no flap). Within attempt 1, transient codegen/exec failures consume a small retry budget (`compute_max_attempts - 1`). Returns the final answer as a plain `str`. Fails with `StepFailed("compute", …)` when attempt 1 cannot produce a result, or with `MissingData` when codegen on attempt 1 reports `MISSING:` — the orchestrator catches that and runs up to `recovery_max_rounds` re-planning rounds before giving up.
+
+## Plan shape
+
+A **Plan** is one flat dataclass: a list of data-fetch branches plus a `computation` block (free-form `task` + optional `qualifiers`) and a `presentation` block (`units_out`, `precision`, `answer_form`). There is no multi-step decomposition in the AST — every plan is exactly one terminal compute. `PlannerExecutor` (in `src/skunk/plan.py`) emits a `Plan` as JSON; the orchestrator parses it (`from_json`), runs every branch in parallel, then feeds the merged `list[AnnotatedValue]` to compute.
+
+Two branch shapes:
+
+- `RetrieveBranch(key, period, visual_only=False, value_kind=None)` — `retrieve` then `extract` are dispatched together by the orchestrator (extract reads `visual_only` / `value_kind` from the branch).
+- `LookupBranch(target, src=None)` — single `lookup_external` call.
+
+Canonical JSON shape (one branch + computation + presentation):
+
+```json
+{
+  "branches": [
+    {"kind": "retrieve", "key": "national defense expenditures", "period": "CY1940", "value_kind": "scalar"}
+  ],
+  "computation": {"task": "Report total CY1940 national defense expenditures."},
+  "presentation": {"units_out": "usd_millions", "precision": 1}
+}
+```
+
+Per-field semantics (units_out token vocabulary, when to use `null` vs `"text"`, etc.) live in `PlannerExecutor.system_prompt` in `src/skunk/plan.py` — that prompt is the canonical schema spec. Runtime contracts (`PageRef`, `AnnotatedValue`, the scalar / vector / table kind taxonomy with primitive-only cells) live in the dataclasses in the same file. Cached plans land in `data/dsl_planning_pass.csv` (one `(uid, question, plan_json)` row per question).
+
+The `AnnotatedValue.kind` taxonomy:
+
+- `scalar` — `value` is `int | float | str`. Single facts.
+- `vector` — `value` is `{index_label: scalar}`; `index_name` names the varying dim.
+- `table` — `value` is `{row_label: {col_label: scalar}}`; `row_name` / `col_name` name the two dims.
+
+Cells must be primitive scalars (`int` / `float` / `str`, no `bool`, no nesting beyond these shapes). The extract parser rejects deeper structures before constructing an `AnnotatedValue`.
 
 ## Per-page tier dispatch in extract
 
 Once retrieve has named specific pages, extract chooses how to read each one:
 
 ```
-Tier 1  parsed-JSON elements bucketed by page_id   — structured text + HTML tables (common.py)
-Tier 2  cache/pages/{YYYY-MM}/p{NNN}.txt           — per-page PyMuPDF text, on-demand cache
-Tier 3  cache/pages/{YYYY-MM}/p{NNN}.png           — PNG render + vision LLM, always works
+Tier 1  parsed-JSON elements bucketed by page_id   — structured text + HTML tables
+                                                     (treasury_bulletin_{YYYY}_{MM}.json
+                                                     under $OFFICEQA_PARSED_JSON_DIR;
+                                                     see skunk/page_index/pdf.py)
+Tier 2  PyMuPDF text per PDF page                   — live, no disk cache (_extract_pdf_text)
+Tier 3  PNG render at 300 dpi + vision LLM          — live, in-memory bytes (_render_pdf_page_b64)
 ```
-(NNN = `PageRef.page` = 1-based PDF page index)
+(`page` here = `PageRef.page` = 1-based PDF page index)
 
-The choice is per-page and deterministic. Tier escalation only happens when the chosen tier reports "value not present". There is no cross-page search — if retrieve picked the wrong pages, the bug is in retrieve, not extract. This is what makes the eval decomposition work.
+Tier escalation only happens when the chosen tier reports "value not present". There is no cross-page search — if retrieve picked the wrong pages, the bug is in retrieve, not extract. This is what makes the eval decomposition work.
 
 ## Eval decomposition
 
@@ -85,25 +119,26 @@ The benchmark CSV (`data/officeqa_pro.csv`) has both retrieval-level and answer-
 - `source_docs` — URLs containing `?page=N` for every question (verified 100% coverage on the 133-row pro split).
 - `answer` — fuzzy-matchable expected output.
 
-One end-to-end harness covers the full pipeline:
+Two harnesses cover the pipeline:
 
 | harness | input | output metric |
 |---|---|---|
-| `eval/eval_e2e.py` | question | answer accuracy — covers retrieval + extraction + compute end-to-end |
+| `eval/eval_e2e.py` | question | answer accuracy — full pipeline end-to-end |
+| `eval/eval_retrieve.py` | question | retrieval recall — retrieve-only, against `source_docs?page=N` golden |
 
-Each subagent therefore exposes a standalone callable function (not just `Subagent.run`), so the eval harnesses can invoke it without the orchestrator.
+Each operator exposes a standalone `run(op, prev, ctx)` callable so the harnesses can invoke it without the orchestrator (e.g. `eval_e2e --golden` injects golden pages and skips retrieve).
 
-## Caches and reproducibility
+## Caches
 
-Per-step cache key: `(question_uid, op_index, args_hash)`. Cached values:
-- retrieve results (page rankings)
-- per-page CSV table loads (already cached by `prep/tables.py`)
-- LLM completions for extract / compute (the Python body and result)
+The only on-disk caches in the runtime path are page-index artifacts:
 
-Caching is opportunistic: pdf page text and rendered PNGs are written on first access and reused on subsequent runs. LLM calls (extract, compute, lookup_external) are not cached.
+- `cache/page_index_v3/` — full build output (catalog rows, L1 spans, chapter tree); the shipped tree at `data/page_index/concept_tree.json` is promoted from here. See `src/skunk/page_index/pipeline.py`.
+- Parsed-JSON corpus at `$OFFICEQA_PARSED_JSON_DIR` (default `~/Desktop/officeqa/treasury_bulletins_parsed/jsons/`) — read by Tier 1 of extract and by the page-index builder.
+
+LLM completions are **not** cached. Tier 2 PyMuPDF text and Tier 3 PNG renders are computed live per call (no disk cache). The DSL plan cache at `data/dsl_planning_pass.csv` (used by `skunk.run --cached-plan`) is the only per-question cache.
 
 ## What is intentionally NOT in this design
 
-- **No agentic search loops.** Each subagent executes once per op; failure is recorded in the trace, not retried via re-planning.
+- **No agentic search loops.** Each operator executes once per call; failure is recorded in the trace, not retried via re-planning.
 - **No per-table/per-figure catalog rows.** Page-level granularity matches the benchmark's `source_docs?page=N` labels and the existing `cache/tables/` structure. Going finer adds rows without improving recall.
 - **No PZ runtime dependency.** This repo is plain Python + Gemini API (google-generativeai); PZ stays out of the runtime path.
