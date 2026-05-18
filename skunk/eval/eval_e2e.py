@@ -1,9 +1,8 @@
 """End-to-end eval. Runs the full pipeline (planner → orchestrator → 4 operators)
 per question and writes predicted vs gold answers to a CSV report.
 
-Scoring is intentionally out of scope here — the report is the artifact a downstream
-scorer consumes. The gap between this report and eval_extraction quantifies retrieval
-cost; the gap to the gold answer floor quantifies extraction cost.
+Scoring is intentionally out of scope here — the report is the artifact a
+downstream scorer consumes.
 
 Usage
 -----
@@ -13,44 +12,13 @@ Usage
   # Sample 10 random UIDs
   python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv --sample 10
 
-  # Sample 10% of UIDs
-  python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv --sample 10%
-
-  # Run only specific UIDs
+  # Run only specific UIDs, bypassing retrieve with golden pages
   python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv \\
       --uids UID0001,UID0030 --golden
 
-  # Suppress verbose output
-  python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv --quiet
-
-Golden mode (`--golden`)
-------------------------
-Bypasses the retrieve operator. For each question, `source_docs?page=N` URLs in
-data/officeqa_pro.csv are parsed (eval/golden.py) and injected as a list of
-PageRefs directly into the operator chain. extract/compute/etc. then run on exactly the
-pages the benchmark deems relevant. This is the right mode for measuring the
-extract+compute ceiling — any failure here is a downstream-of-retrieval bug.
-
-Use the default (live retrieve) mode to see the end-to-end number including
-retrieval cost. The delta between the two reports is the retrieval contribution.
-
-Traces (`--trace-dir`, default `eval/traces`)
----------------------------------------------
-Every question writes a `{uid}.txt` trace file containing, per operator step:
-op name, args, input/output (full repr), elapsed_s (which naturally absorbs
-Gemini retry wait time), and any error. Per-step operator events (tier dispatch
-in extract, codegen attempts in compute, verifier responses, etc.) are grouped
-under each step. Use these for post-hoc auditability of every run.
-
-Pass `--trace-dir ''` to disable. Pass `--quiet` to suppress live stdout streaming.
-
-Gemini rate limiting + retries
-------------------------------
-`LLMClient` (src/skunk/common.py) paces all LLM calls through a process-wide
-token bucket sized by `SKUNK_LLM_RPM` (default 1000). On any error from the
-SDK, the call retries with exponential backoff (start 50ms, doubling, capped at
-1s, up to 10 retries) and logs each failure to stderr. If you see 429s
-persistently, lower the rpm.
+`--golden` parses `source_docs?page=N` URLs from --csv and injects them as
+PageRefs, so extract/compute run on exactly the pages the benchmark deems
+relevant. Use it to measure the extract+compute ceiling without retrieval cost.
 """
 
 from __future__ import annotations
@@ -79,18 +47,19 @@ def _load_env(path: Path) -> None:
             os.environ.setdefault(k.strip(), v.strip())
 
 
+# .env must be loaded before importing skunk so LLMClient sees the API keys.
 _load_env(REPO_ROOT / ".env")
 
 from skunk import (  # noqa: E402
     HarnessContext,
+    MissingData,
     Orchestrator,
     PageRef,
-    Plan,
     SkunkConfig,
     load_prompt_overrides,
 )
 
-from eval.util import dump_trace, load_plan_cache, save_plan_to_cache  # noqa: E402
+from eval.util import dump_trace  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Golden page parsing (source_docs URLs → PageRefs)
@@ -137,8 +106,6 @@ def _run_one_question(
     verbose: bool,
     uid: str | None = None,
     golden_pages: list[PageRef] | None = None,
-    cached_plan_json: str | None = None,
-    plan_cache_csv: str | None = None,
     trace_path: str | None = None,
 ) -> dict:
     """Run one question through the Orchestrator and collect a result dict."""
@@ -150,7 +117,6 @@ def _run_one_question(
 
     config = SkunkConfig.from_env()
     config.golden_pages = golden_pages
-    csv_path = plan_cache_csv or config.plan_cache_csv
 
     overrides_path = Path(config.prompt_overrides_path)
     prompt_overrides = load_prompt_overrides(overrides_path) if overrides_path.exists() else ()
@@ -162,55 +128,37 @@ def _run_one_question(
         prompt_overrides=prompt_overrides,
     )
 
-    t0 = time.perf_counter()
-
-    plan_obj: Plan | None = None
-    if cached_plan_json is not None:
-        if verbose:
-            print("\n[e2e] Using cached plan...")
-        try:
-            plan_obj = Plan.model_validate_json(cached_plan_json)
-            if verbose:
-                print(f"[e2e] Plan: {plan_obj.model_dump_json()}")
-        except Exception as e:
-            return {"question": question, "answer": None, "failed": True,
-                    "reason": f"cached plan error: {e}", "n_steps": 0}
-    elif verbose:
+    if verbose:
         print(f"\n[e2e] Planning: {question[:80]}...")
 
-    orch = Orchestrator(ctx, plan=plan_obj)
+    t0 = time.perf_counter()
+    orch = Orchestrator(ctx)
+    missing: MissingData | None = None
     try:
         orch.execute()
-    except Exception as e:
-        return {"question": question, "answer": None, "failed": True,
-                "reason": f"execute: {type(e).__name__}: {e}", "n_steps": 0}
-    trace = orch.trace
-
-    plan_obj = orch.current_plan
-    if cached_plan_json is None and plan_obj is not None:
-        plan_json = plan_obj.model_dump_json()
-        if verbose:
-            print(f"[e2e] Plan: {plan_json}")
-        if uid is not None:
-            save_plan_to_cache(uid, question, plan_json, csv_path)
-            if verbose:
-                print(f"[e2e] Plan cached for {uid}")
-
+    except MissingData as e:
+        # compute reported insufficient data after the recovery budget; record
+        # as a failed row and keep the batch going. Anything else propagates.
+        missing = e
     wall_s = time.perf_counter() - t0
-    ctx.emit("run", "question done", wall_s=round(wall_s, 3))
+    trace = orch.trace
+    plan_obj = orch.current_plan
 
     if verbose:
+        if plan_obj is not None:
+            print(f"[e2e] Plan: {plan_obj.model_dump_json()}")
         print(trace.pretty())
+        print(f"[e2e] wall_s={wall_s:.3f}")
 
     if trace_path is not None:
-        try:
-            plan_dump = plan_obj.model_dump_json() if plan_obj is not None else (cached_plan_json or "(unavailable)")
-        except Exception:
-            plan_dump = cached_plan_json or "(unavailable)"
+        plan_dump = plan_obj.model_dump_json() if plan_obj else "(unavailable)"
         dump_trace(trace_path, uid=uid, question=question, plan_text=plan_dump,
                    golden_pages=golden_pages, trace=trace, events=ctx.events,
                    model=config.llm_model)
 
+    if missing is not None:
+        return {"question": question, "answer": None, "failed": True,
+                "reason": f"MissingData: {missing.reason}", "n_steps": len(trace.steps)}
     return {
         "question": question,
         "answer": trace.answer,
@@ -234,40 +182,24 @@ def _load_test_set() -> set[str]:
         return set(json.load(f).get("uids", []))
 
 
-def _pick_uids(df: pd.DataFrame, sample: str | None, uids_arg: str | None) -> list[str]:
+def _pick_uids(df: pd.DataFrame, sample: int | None, uids_arg: str | None) -> list[str]:
     if uids_arg:
         return [u.strip() for u in uids_arg.split(",") if u.strip()]
     all_uids = [str(u) for u in df["uid"].tolist()]
     if sample is None:
         return all_uids
-    if sample.endswith("%"):
-        n = max(1, round(len(all_uids) * float(sample[:-1]) / 100))
-    else:
-        val = float(sample)
-        n = max(1, round(len(all_uids) * val)) if val < 1.0 else int(val)
-    return random.sample(all_uids, min(n, len(all_uids)))
+    return random.sample(all_uids, min(sample, len(all_uids)))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="End-to-end OfficeQA eval (all UIDs by default)")
     parser.add_argument("--csv", required=True, help="Path to officeqa_pro.csv")
     parser.add_argument("--report", required=True, help="Output CSV report path")
-    parser.add_argument("--plan-cache-csv", default=SkunkConfig.from_env().plan_cache_csv,
-                        help="Plan cache CSV (default: %(default)s)")
-    parser.add_argument("--sample",
-                        help="Run a random subset: integer count (e.g. '10') or percentage (e.g. '10%%')")
+    parser.add_argument("--sample", type=int,
+                        help="Run a random subset of N UIDs")
     parser.add_argument("--uids", help="Comma-separated UIDs (overrides --sample)")
     parser.add_argument("--golden", action="store_true",
                         help="Inject golden pages from --csv instead of running retrieve")
-    parser.add_argument("--golden-noisy", action="store_true",
-                        help="Like --golden, but per-page Bernoulli(noise_prob) appends one confounder PageRef "
-                             "(same-bulletin drift or cross-year keyword match from --noise-pool)")
-    parser.add_argument("--noise-prob", type=float, default=0.5,
-                        help="Per-golden-page probability of appending a confounder (default: %(default)s)")
-    parser.add_argument("--noise-seed", type=int, default=42,
-                        help="Seed for deterministic confounder selection (default: %(default)s)")
-    parser.add_argument("--noise-pool", default="eval/noise_pool.json",
-                        help="Path to precomputed cross-year confounder pool (default: %(default)s)")
     parser.add_argument("--trace-dir", default="eval/traces",
                         help="Per-question debug trace directory (default: %(default)s; '' to disable)")
     parser.add_argument("--quiet", action="store_true",
@@ -277,15 +209,30 @@ def main() -> None:
                              "them — only opt in for a deliberate final-number measurement.")
     args = parser.parse_args()
 
-    if args.golden and args.golden_noisy:
-        parser.error("--golden and --golden-noisy are mutually exclusive")
-
     df = pd.read_csv(args.csv)
     df_by_uid = df.set_index("uid")
 
+    test_set = _load_test_set()
+
+    # ABORT (not warn) when --uids names test UIDs without --include-test-set.
+    # Per CLAUDE.md: there is no legitimate reason for an explicit UID list
+    # from the command line to hit the test set unless --include-test-set is
+    # set. Random samples are filtered silently below (the user didn't ask
+    # for those specific UIDs).
+    if args.uids and test_set and not args.include_test_set:
+        requested = {u.strip() for u in args.uids.split(",") if u.strip()}
+        collision = sorted(requested & test_set)
+        if collision:
+            print(
+                f"[e2e] ABORT: --uids names {len(collision)} held-out test-set UID(s): "
+                f"{', '.join(collision)}. "
+                f"Pass --include-test-set to override (see CLAUDE.md).",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
     uids = _pick_uids(df, args.sample, args.uids)
 
-    test_set = _load_test_set()
     if test_set and not args.include_test_set:
         before = len(uids)
         uids = [u for u in uids if u not in test_set]
@@ -301,15 +248,7 @@ def main() -> None:
     sample_note = f" (sample: {args.sample})" if args.sample and not args.uids else ""
     print(f"[e2e] Running {len(uids)} UID(s){sample_note}")
 
-    golden_lookup = load_golden(args.csv) if (args.golden or args.golden_noisy) else None
-    noise_pool = None
-    if args.golden_noisy:
-        from eval.noise import load_noise_pool
-        noise_pool = load_noise_pool(args.noise_pool)
-    plan_cache = load_plan_cache(args.plan_cache_csv)
-    if not plan_cache:
-        print(f"[e2e] WARNING: plan cache {args.plan_cache_csv!r} is empty or missing — "
-              f"will fall back to live LLM planner per question", file=sys.stderr)
+    golden_lookup = load_golden(args.csv) if args.golden else None
 
     verbose = not args.quiet
     rows: list[dict] = []
@@ -329,41 +268,18 @@ def main() -> None:
             golden_pages = golden_lookup.get(uid, [])
             if not golden_pages:
                 print(f"[e2e] WARNING: no golden pages for {uid!r}")
-            elif args.golden_noisy:
-                from eval.noise import make_noisy_pages
-                pdf_dir = os.environ.get(
-                    "OFFICEQA_PDF_DIR",
-                    str(Path.home() / "Desktop/officeqa/treasury_bulletin_pdfs"),
-                )
-                golden_pages = make_noisy_pages(
-                    uid, golden_pages,
-                    noise_prob=args.noise_prob,
-                    seed=args.noise_seed,
-                    pdf_dir=pdf_dir,
-                    pool=noise_pool,
-                )
-
-        cached_plan_json = plan_cache.get(uid)
-        if cached_plan_json is None:
-            print(f"[e2e] WARNING: no cached plan for {uid!r}, falling back to LLM planner")
 
         trace_path = None
         if args.trace_dir:
             trace_path = str(Path(args.trace_dir) / f"{uid}.txt")
 
-        try:
-            result = _run_one_question(
-                question=question,
-                verbose=verbose,
-                golden_pages=golden_pages,
-                cached_plan_json=cached_plan_json,
-                uid=uid,
-                plan_cache_csv=args.plan_cache_csv,
-                trace_path=trace_path,
-            )
-        except Exception as e:
-            result = {"question": question, "answer": None, "failed": True,
-                      "reason": f"harness crash: {type(e).__name__}: {e}", "n_steps": 0}
+        result = _run_one_question(
+            question=question,
+            verbose=verbose,
+            golden_pages=golden_pages,
+            uid=uid,
+            trace_path=trace_path,
+        )
 
         if result["failed"]:
             print(f"FAILED: {result['reason']}")

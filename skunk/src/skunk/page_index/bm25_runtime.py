@@ -1,9 +1,10 @@
 """Runtime helpers for the BM25 retrieve experiment.
 
 Builds per-chapter `Bm25Index` instances from the catalog and reranks a
-year-filtered candidate list. Shared by `RetrieveExecutor` (production
-operator path) and `eval/eval_retrieve.py` (`--retriever
-chapter-year-bm25`), so both stay in lockstep.
+year-filtered candidate list. Used by
+`page_index.retrieve_prototype.PageIndexRetrievePrototype`; not on the
+default `RetrieveExecutor` path (which is currently a placeholder while
+an external retriever is integrated).
 
 Scaffold — see the BM25 integration plan. Delete this file alongside
 `bm25.py` to remove the experiment.

@@ -16,7 +16,7 @@ class StepFailed(Exception):
 class MissingData(Exception):
     """Compute determined its input is insufficient to produce an answer.
 
-    `missing` is an optional list of short tag/key strings identifying the
+    `missing` is an optional list of short identifier strings naming the
     data the codegen step said it would need — populated when codegen
     returned the structured missing-JSON form; empty otherwise.
     """

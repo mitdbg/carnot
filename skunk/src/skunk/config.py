@@ -59,9 +59,6 @@ class SkunkConfig:
     # whole returned plan from scratch. Total execute() rounds ≤ recovery_max_rounds + 1.
     recovery_max_rounds: int = 1
 
-    # DSL plan cache (env: SKUNK_PLAN_CACHE_CSV)
-    plan_cache_csv: str = "data/dsl_planning_pass.csv"
-
     # Prompt overrides YAML — corpus blurbs, few-shots, lessons. Loaded once
     # at the top level and threaded onto HarnessContext.prompt_overrides.
     # (env: SKUNK_PROMPT_OVERRIDES)
@@ -95,7 +92,6 @@ class SkunkConfig:
             use_direct_gemini=os.environ.get("SKUNK_USE_DIRECT_GEMINI", "").lower() in ("1", "true", "yes"),
             extract_n_samples=int(os.environ.get("SKUNK_EXTRACT_N_SAMPLES", "3")),
             extract_sample_temperature=float(os.environ.get("SKUNK_EXTRACT_SAMPLE_TEMPERATURE", "0.7")),
-            plan_cache_csv=os.environ.get("SKUNK_PLAN_CACHE_CSV", "data/dsl_planning_pass.csv"),
             prompt_overrides_path=os.environ.get(
                 "SKUNK_PROMPT_OVERRIDES", "config/prompts/treasury_bulletin.yaml"
             ),

@@ -35,6 +35,7 @@ import re
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -224,6 +225,33 @@ class LLMClient:
             return self._call_gemini_direct(system, user, images, temperature, thinking_budget, ctx)
         return self._call_openrouter(system, user, images, temperature, thinking_budget, ctx)
 
+    def _retry_call(self, do_call: "Callable[[], LLMResponse]") -> LLMResponse:
+        """Run `do_call` under the rate limiter with exponential-backoff retry.
+        `do_call` owns API invocation, timing, response parsing, and the
+        ctx.emit on success; this helper only owns rate-limit acquire +
+        retry policy."""
+        limiter = _get_rate_limiter(self._config.llm_rpm)
+        max_retries = self._config.gemini_max_retries
+        delay = self._config.gemini_retry_initial_delay_s
+        max_delay = self._config.gemini_retry_max_delay_s
+
+        for attempt in range(max_retries + 1):
+            limiter.acquire()
+            try:
+                return do_call()
+            except Exception as e:
+                if attempt == max_retries:
+                    raise
+                print(
+                    f"[LLMClient] attempt {attempt + 1}/{max_retries + 1} failed: "
+                    f"{type(e).__name__}: {e}; sleeping {delay:.1f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, max_delay)
+        raise RuntimeError("unreachable: retry loop fell through")
+
     def _call_openrouter(
         self,
         system: str,
@@ -262,61 +290,44 @@ class LLMClient:
         extra_body: dict = {"reasoning": reasoning}
 
         client = self._get_openrouter_client()
-        limiter = _get_rate_limiter(self._config.llm_rpm)
-        max_retries = self._config.gemini_max_retries
-        delay = self._config.gemini_retry_initial_delay_s
-        max_delay = self._config.gemini_retry_max_delay_s
         model = self._config.llm_model
 
-        for attempt in range(max_retries + 1):
-            limiter.acquire()
+        def do() -> LLMResponse:
             t0 = time.monotonic()
-            try:
-                resp = client.chat.completions.create(
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=65535,
+                temperature=temperature,
+                extra_body=extra_body,
+            )
+            latency_s = time.monotonic() - t0
+            output_text = (resp.choices[0].message.content or "").strip()
+            usage = resp.usage
+            ctd = getattr(usage, "completion_tokens_details", None)
+            thinking_tokens = getattr(ctd, "reasoning_tokens", None) if ctd is not None else None
+            if ctx is not None:
+                ctx.emit(
+                    "llm", "call",
                     model=model,
-                    messages=messages,
-                    max_tokens=65535,
                     temperature=temperature,
-                    extra_body=extra_body,
-                )
-                latency_s = time.monotonic() - t0
-                output_text = (resp.choices[0].message.content or "").strip()
-                usage = resp.usage
-                ctd = getattr(usage, "completion_tokens_details", None)
-                thinking_tokens = getattr(ctd, "reasoning_tokens", None) if ctd is not None else None
-                if ctx is not None:
-                    ctx.emit(
-                        "llm", "call",
-                        model=model,
-                        temperature=temperature,
-                        thinking_budget=thinking_budget,
-                        latency_s=round(latency_s, 3),
-                        input_tokens=getattr(usage, "prompt_tokens", None),
-                        output_tokens=getattr(usage, "completion_tokens", None),
-                        total_tokens=getattr(usage, "total_tokens", None),
-                        thinking_tokens=thinking_tokens,
-                        input_text=system + "\n\n---\n\n" + user,
-                        output_text=output_text,
-                    )
-                return LLMResponse(
-                    text=output_text,
-                    latency_s=latency_s,
+                    thinking_budget=thinking_budget,
+                    latency_s=round(latency_s, 3),
                     input_tokens=getattr(usage, "prompt_tokens", None),
                     output_tokens=getattr(usage, "completion_tokens", None),
+                    total_tokens=getattr(usage, "total_tokens", None),
+                    thinking_tokens=thinking_tokens,
+                    input_text=system + "\n\n---\n\n" + user,
+                    output_text=output_text,
                 )
-            except Exception as e:
-                if attempt == max_retries:
-                    raise
-                print(
-                    f"[LLMClient] attempt {attempt + 1}/{max_retries + 1} failed: "
-                    f"{type(e).__name__}: {e}; sleeping {delay:.1f}s",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                time.sleep(delay)
-                delay = min(delay * 2, max_delay)
+            return LLMResponse(
+                text=output_text,
+                latency_s=latency_s,
+                input_tokens=getattr(usage, "prompt_tokens", None),
+                output_tokens=getattr(usage, "completion_tokens", None),
+            )
 
-        raise RuntimeError("unreachable: retry loop fell through")
+        return self._retry_call(do)
 
     def embed(
         self,
@@ -359,6 +370,88 @@ class LLMClient:
             out.extend(vecs)
         return out
 
+    @staticmethod
+    def _gemini_parts(user: str, images: list[tuple[str, str]] | None) -> list[Any]:
+        parts: list[Any] = []
+        if images:
+            for mime_type, b64_data in images:
+                parts.append(
+                    types.Part.from_bytes(data=base64.b64decode(b64_data), mime_type=mime_type)
+                )
+        parts.append(types.Part.from_text(text=user))
+        return parts
+
+    @staticmethod
+    def _gemini_config(
+        system: str,
+        temperature: float,
+        thinking_budget: int,
+        *,
+        with_search: bool,
+    ) -> "types.GenerateContentConfig":
+        return types.GenerateContentConfig(
+            system_instruction=system,
+            max_output_tokens=65535,
+            temperature=temperature,
+            thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
+            tools=[types.Tool(google_search=types.GoogleSearch())] if with_search else None,
+        )
+
+    def _call_gemini(
+        self,
+        system: str,
+        user: str,
+        images: list[tuple[str, str]] | None,
+        temperature: float,
+        thinking_budget: int,
+        ctx: "HarnessContext | None",
+        *,
+        with_search: bool,
+    ) -> LLMResponse:
+        """Direct Gemini API path. Used by `_call_gemini_direct` (no search)
+        and `_call_gemini_search` (with Google Search grounding tool).
+        Mirrors the OpenRouter path's emit + LLMResponse shape; the only
+        per-mode difference is the GoogleSearch tool + grounding fields."""
+        client = self._get_gemini_client()
+        parts = self._gemini_parts(user, images)
+        gen_config = self._gemini_config(
+            system, temperature, thinking_budget, with_search=with_search
+        )
+        model = self._config.gemini_model
+
+        def do() -> LLMResponse:
+            t0 = time.monotonic()
+            api_resp = client.models.generate_content(
+                model=model, contents=parts, config=gen_config,
+            )
+            latency_s = time.monotonic() - t0
+            usage = api_resp.usage_metadata
+            output_text = (api_resp.text or "").strip()
+            if ctx is not None:
+                ctx.emit(
+                    "llm", "call",
+                    model=model,
+                    temperature=temperature,
+                    thinking_budget=thinking_budget,
+                    latency_s=round(latency_s, 3),
+                    input_tokens=getattr(usage, "prompt_token_count", None),
+                    output_tokens=getattr(usage, "candidates_token_count", None),
+                    total_tokens=getattr(usage, "total_token_count", None),
+                    thinking_tokens=getattr(usage, "thoughts_token_count", None),
+                    input_text=system + "\n\n---\n\n" + user,
+                    output_text=output_text,
+                )
+            return LLMResponse(
+                text=output_text,
+                latency_s=latency_s,
+                input_tokens=getattr(usage, "prompt_token_count", None),
+                output_tokens=getattr(usage, "candidates_token_count", None),
+                grounding_urls=extract_grounding_urls(api_resp) if with_search else [],
+                grounding_titles=extract_grounding_titles(api_resp) if with_search else [],
+            )
+
+        return self._retry_call(do)
+
     def _call_gemini_direct(
         self,
         system: str,
@@ -368,75 +461,9 @@ class LLMClient:
         thinking_budget: int,
         ctx: "HarnessContext | None",
     ) -> LLMResponse:
-        """Direct Gemini API path — used when SkunkConfig.use_direct_gemini is set.
-        Mirrors _call_gemini_search but without the GoogleSearch tool, so the
-        same model serves the planner/retrieve/extract/compute calls."""
-        client = self._get_gemini_client()
-        parts: list[Any] = []
-        if images:
-            for mime_type, b64_data in images:
-                parts.append(
-                    types.Part.from_bytes(data=base64.b64decode(b64_data), mime_type=mime_type)
-                )
-        parts.append(types.Part.from_text(text=user))
-
-        thinking_config = types.ThinkingConfig(thinking_budget=thinking_budget)
-        gen_config = types.GenerateContentConfig(
-            system_instruction=system,
-            max_output_tokens=65535,
-            temperature=temperature,
-            thinking_config=thinking_config,
+        return self._call_gemini(
+            system, user, images, temperature, thinking_budget, ctx, with_search=False,
         )
-
-        limiter = _get_rate_limiter(self._config.llm_rpm)
-        max_retries = self._config.gemini_max_retries
-        delay = self._config.gemini_retry_initial_delay_s
-        max_delay = self._config.gemini_retry_max_delay_s
-        model = self._config.gemini_model
-
-        for attempt in range(max_retries + 1):
-            limiter.acquire()
-            t0 = time.monotonic()
-            try:
-                api_resp = client.models.generate_content(
-                    model=model, contents=parts, config=gen_config,
-                )
-                latency_s = time.monotonic() - t0
-                usage = api_resp.usage_metadata
-                output_text = (api_resp.text or "").strip()
-                if ctx is not None:
-                    ctx.emit(
-                        "llm", "call",
-                        model=model,
-                        temperature=temperature,
-                        thinking_budget=thinking_budget,
-                        latency_s=round(latency_s, 3),
-                        input_tokens=getattr(usage, "prompt_token_count", None),
-                        output_tokens=getattr(usage, "candidates_token_count", None),
-                        total_tokens=getattr(usage, "total_token_count", None),
-                        thinking_tokens=getattr(usage, "thoughts_token_count", None),
-                        input_text=system + "\n\n---\n\n" + user,
-                        output_text=output_text,
-                    )
-                return LLMResponse(
-                    text=output_text,
-                    latency_s=latency_s,
-                    input_tokens=getattr(usage, "prompt_token_count", None),
-                    output_tokens=getattr(usage, "candidates_token_count", None),
-                )
-            except Exception as e:
-                if attempt == max_retries:
-                    raise
-                print(
-                    f"[LLMClient] attempt {attempt + 1}/{max_retries + 1} failed: "
-                    f"{type(e).__name__}: {e}; sleeping {delay:.1f}s",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                time.sleep(delay)
-                delay = min(delay * 2, max_delay)
-
-        raise RuntimeError("unreachable: retry loop fell through")
 
     def _call_gemini_search(
         self,
@@ -449,73 +476,8 @@ class LLMClient:
     ) -> LLMResponse:
         # TECH DEBT: google-genai is kept alive only for Google Search grounding in
         # lookup_external. When OpenRouter supports a native web-search tool, delete
-        # this method and remove the google-genai dependency.
-        client = self._get_gemini_client()
-        parts: list[Any] = []
-        if images:
-            for mime_type, b64_data in images:
-                parts.append(
-                    types.Part.from_bytes(data=base64.b64decode(b64_data), mime_type=mime_type)
-                )
-        parts.append(types.Part.from_text(text=user))
-
-        thinking_config = types.ThinkingConfig(thinking_budget=thinking_budget)
-        gen_config = types.GenerateContentConfig(
-            system_instruction=system,
-            max_output_tokens=65535,
-            temperature=temperature,
-            thinking_config=thinking_config,
-            tools=[types.Tool(google_search=types.GoogleSearch())],
+        # this method and `_call_gemini` with-search branch, then drop the google-genai
+        # dependency.
+        return self._call_gemini(
+            system, user, images, temperature, thinking_budget, ctx, with_search=True,
         )
-
-        limiter = _get_rate_limiter(self._config.llm_rpm)
-        max_retries = self._config.gemini_max_retries
-        delay = self._config.gemini_retry_initial_delay_s
-        max_delay = self._config.gemini_retry_max_delay_s
-        model = self._config.gemini_model
-
-        for attempt in range(max_retries + 1):
-            limiter.acquire()
-            t0 = time.monotonic()
-            try:
-                api_resp = client.models.generate_content(
-                    model=model, contents=parts, config=gen_config
-                )
-                latency_s = time.monotonic() - t0
-                usage = api_resp.usage_metadata
-                output_text = (api_resp.text or "").strip()
-                if ctx is not None:
-                    ctx.emit(
-                        "llm", "call",
-                        model=model,
-                        temperature=temperature,
-                        thinking_budget=thinking_budget,
-                        latency_s=round(latency_s, 3),
-                        input_tokens=getattr(usage, "prompt_token_count", None),
-                        output_tokens=getattr(usage, "candidates_token_count", None),
-                        total_tokens=getattr(usage, "total_token_count", None),
-                        thinking_tokens=getattr(usage, "thoughts_token_count", None),
-                        input_text=system + "\n\n---\n\n" + user,
-                        output_text=output_text,
-                    )
-                return LLMResponse(
-                    text=output_text,
-                    latency_s=latency_s,
-                    input_tokens=getattr(usage, "prompt_token_count", None),
-                    output_tokens=getattr(usage, "candidates_token_count", None),
-                    grounding_urls=extract_grounding_urls(api_resp),
-                    grounding_titles=extract_grounding_titles(api_resp),
-                )
-            except Exception as e:
-                if attempt == max_retries:
-                    raise
-                print(
-                    f"[LLMClient] attempt {attempt + 1}/{max_retries + 1} failed: "
-                    f"{type(e).__name__}: {e}; sleeping {delay:.1f}s",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                time.sleep(delay)
-                delay = min(delay * 2, max_delay)
-
-        raise RuntimeError("unreachable: retry loop fell through")

@@ -3,7 +3,7 @@
 Standalone Python package. No Palimpzest dependency.
 
 Architecture:
-  question -> PlannerExecutor (LLM, single shot; src/skunk/plan.py)
+  question -> PlannerPromptedCall (LLM, single shot; src/skunk/plan.py)
             -> Plan (one branches list + computation + presentation)
             -> orchestrator
             -> {retrieve, extract, lookup_external, compute}

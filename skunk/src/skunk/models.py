@@ -8,7 +8,7 @@ consumes, and `HarnessContext` is the runtime context bag carrying
 config, the LLM client, prompt overrides, and the diagnostic event log.
 
 Operator-local result types stay with their operator (e.g.
-`MissingResult` / `CritiqueResult` in `compute.py`, `LookupResult` in
+`CritiqueResult` in `compute.py`, `LookupResult` in
 `lookup_external.py`). The planner's output contract (`Plan` and its
 branch / computation / presentation submodels) stays in `plan.py`.
 """
@@ -26,10 +26,6 @@ from skunk.prompt_overrides import PromptOverride
 if TYPE_CHECKING:
     from skunk.common import LLMClient
 
-
-# ---------------------------------------------------------------------------
-# Page coordinate
-# ---------------------------------------------------------------------------
 
 @dataclass
 class PageRef:
@@ -57,10 +53,6 @@ class PageRef:
         return f"PageRef({', '.join(parts)})"
 
 
-# ---------------------------------------------------------------------------
-# Annotated value — the data envelope every operator emits / consumes
-# ---------------------------------------------------------------------------
-
 VALUE_KIND_VOCAB: frozenset[str] = frozenset({"scalar", "vector", "table"})
 
 
@@ -73,19 +65,12 @@ class AnnotatedValue(BaseModel):
         reader needs to know about what this value represents — series,
         period, sub-category, unit qualifier, etc.
       - value: payload; shape determined by `kind`.
-      - unit: semantic unit token (e.g. "usd_millions", "pct", "year").
+      - unit: natural-language unit label (e.g. "millions of dollars",
+        "percent", "year"); empty string when the value is not a
+        measurement (e.g. a name or other string answer).
       - kind: "scalar" | "vector" | "table".
       - index_name: vector only — name of the varying dim (e.g. "month").
       - row_name / col_name: table only — names of the two varying dims.
-      - tag: short machine-readable key (snake_case, like
-        "gross_federal_debt:fy1973-fy1980"). Used by downstream consumers to
-        select entries unambiguously when description substrings overlap.
-        Two entries describing the same underlying series + period MUST
-        share the same tag.
-      - expected_index_range: vector only — short string like
-        "1969-01..1980-01" describing the FULL index range the question
-        requested. Lets compute flag gaps (actual vs expected). Default
-        empty (no gap analysis).
 
     Payload shapes by kind (enforced at construction):
       - "scalar": value is int|float|str (or list of those for
@@ -103,8 +88,6 @@ class AnnotatedValue(BaseModel):
     index_name: str | None = None
     row_name: str | None = None
     col_name: str | None = None
-    tag: str = ""
-    expected_index_range: str = ""
 
     @model_validator(mode="after")
     def _check_shape(self) -> AnnotatedValue:
@@ -147,15 +130,37 @@ class AnnotatedValue(BaseModel):
                 raise ValueError("table entry missing non-empty 'row_name'/'col_name'")
         return self
 
+    @property
+    def frame(self):
+        """Uniform pandas view of the payload, regardless of `kind`.
 
-# ---------------------------------------------------------------------------
-# Harness context — runtime envelope threaded through every operator
-# ---------------------------------------------------------------------------
+          scalar  →  1×1 DataFrame (or N×1 for list-form scalars from
+                     lookup_external). Single column named after the description.
+          vector  →  N×1 DataFrame; `index.name == self.index_name`,
+                     single column named after the description.
+          table   →  R×C DataFrame; `index.name == self.row_name`,
+                     `columns.name == self.col_name`.
 
-# `LLMClient` lives in `skunk.common`; the typing-only import above and the
-# deferred import inside `__post_init__` together avoid an import cycle
-# (common.py imports SkunkConfig from config.py, and we want config.py's
-# TYPE_CHECKING import of PageRef to point at this module).
+        Plain property, not cached — pydantic `frozen=True` blocks the
+        dict mutation `cached_property` needs, and `prev` lists are small
+        enough that rebuilding is cheap.
+        """
+        import pandas as pd
+        v = self.value
+        label = (self.description or "value").strip() or "value"
+        if self.kind == "scalar":
+            rows = list(v) if isinstance(v, list) else [v]
+            return pd.DataFrame({label: rows})
+        if self.kind == "vector":
+            s = pd.Series(v, name=label, dtype=object if not v else None)
+            df = s.to_frame()
+            df.index.name = self.index_name
+            return df
+        df = pd.DataFrame.from_dict(v, orient="index")
+        df.index.name = self.row_name
+        df.columns.name = self.col_name
+        return df
+
 
 @dataclass
 class HarnessContext:

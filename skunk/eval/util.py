@@ -1,14 +1,11 @@
-"""Eval-time helpers shared across harnesses.
+"""Eval-time helpers.
 
-Plan-cache CSV read/upsert and per-question trace dumping. These are
-benchmark-driven concerns (not part of the agent's public API) and live
-here so the `skunk` package stays focused on the Orchestrator + operator
-surface.
+Per-question trace dumping. Lives here (not in the `skunk` package) so the
+agent stays focused on the Orchestrator + operator surface.
 """
 
 from __future__ import annotations
 
-import csv
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -17,36 +14,10 @@ if TYPE_CHECKING:
     from skunk.trace import QuestionTrace
 
 
-# ---------------------------------------------------------------------------
-# Plan cache
-# ---------------------------------------------------------------------------
-
-def load_plan_cache(plan_cache_csv: str) -> dict[str, str]:
-    """Return {uid: plan_json_string} from the plan cache CSV."""
-    p = Path(plan_cache_csv)
-    if not p.exists():
-        return {}
-    with p.open(newline="", encoding="utf-8") as f:
-        return {row["uid"]: row["plan_json"] for row in csv.DictReader(f) if row.get("plan_json")}
-
-
-def save_plan_to_cache(uid: str, question: str, plan_json: str, plan_cache_csv: str) -> None:
-    """Upsert (uid, plan_json) into the plan cache CSV."""
-    p = Path(plan_cache_csv)
-    p.parent.mkdir(parents=True, exist_ok=True)
-
-    rows: dict[str, dict] = {}
-    if p.exists():
-        with p.open(newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                rows[row["uid"]] = row
-
-    rows[uid] = {"uid": uid, "question": question, "plan_json": plan_json}
-
-    with p.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["uid", "question", "plan_json"])
-        writer.writeheader()
-        writer.writerows(rows.values())
+# Per-field repr cap in trace dumps. LLM input/output text is kept full for
+# cost/latency post-mortems; everything else is capped so a single trace
+# stays human-scannable on stderr.
+_TRACE_FIELD_MAX_REPR = 800
 
 
 # ---------------------------------------------------------------------------
@@ -113,9 +84,8 @@ def dump_trace(
                 lines.append(f"    [{src}] {msg}")
                 for k, v in extras.items():
                     s = repr(v)
-                    # Keep full LLM I/O for performance/cost analysis; truncate everything else.
-                    if not (src == "llm" and k in ("input_text", "output_text")) and len(s) > 800:
-                        s = s[:800] + "...(truncated)"
+                    if not (src == "llm" and k in ("input_text", "output_text")) and len(s) > _TRACE_FIELD_MAX_REPR:
+                        s = s[:_TRACE_FIELD_MAX_REPR] + "...(truncated)"
                     lines.append(f"      {k}: {s}")
         lines.append("")
 

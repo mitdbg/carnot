@@ -21,6 +21,8 @@ import statsmodels.api as sm
 
 from skunk.errors import StepFailed
 
+# TODO: Should probably add a minimal sandbox / merge with search agent code execution sandbox
+
 # Strip only a leading ```[lang] fence and a trailing ``` fence. Never strips
 # inline-string lines, even if they happen to start with ```.
 _LEADING_FENCE_RE = re.compile(r"\A```[a-zA-Z]*[ \t]*\n")

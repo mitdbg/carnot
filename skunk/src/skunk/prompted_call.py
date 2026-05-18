@@ -1,10 +1,10 @@
-"""SkunkExecutor — shared prompt-assembly base for every LLM-prompted call.
+"""PromptedCall — shared prompt-assembly base for every LLM-prompted call.
 
 Operators (`retrieve`, `extract`, `lookup_external`, `compute`) are the query-plan
-nodes; an Executor is the runtime helper that handles one LLM call inside an
-operator. Each prompted call-site in the harness (planner, extract.text,
+nodes; a `PromptedCall` is the runtime helper that handles one LLM call inside
+an operator. Each prompted call-site in the harness (planner, extract.text,
 extract.vision, extract.dedup, compute.codegen, compute.critique,
-lookup_external) is one subclass of `SkunkExecutor`. The subclass sets two
+lookup_external) is one subclass of `PromptedCall`. The subclass sets two
 attributes — `name` (the override key used by the prompt-overrides YAML) and
 `system_prompt` (the static SYSTEM template) — and the base class composes
 the final prompt.
@@ -12,11 +12,11 @@ the final prompt.
 Final system prompt shape:
 
     [SYSTEM]      → subclass `system_prompt` (or `static_system_prompt(ctx)` when runtime-conditional)
-    [CORPUS]      → `corpus` overrides addressed to this executor
+    [CORPUS]      → `corpus` overrides addressed to this call-site
     [FEW-SHOTS]   → `few_shots` overrides, joined verbatim (YAML pre-formats them)
-    [LESSONS]     → `lessons` overrides addressed to this executor
+    [LESSONS]     → `lessons` overrides addressed to this call-site
 
-Adding a new section to the executor prompt = edit this one file.
+Adding a new section to the assembled prompt = edit this one file.
 """
 
 from __future__ import annotations
@@ -31,8 +31,8 @@ from skunk.prompt_overrides import (
 )
 
 
-class SkunkExecutor:
-    """One LLM-prompted executor. Subclasses set `name` and `system_prompt` as
+class PromptedCall:
+    """One LLM-prompted call-site. Subclasses set `name` and `system_prompt` as
     class attributes; `assemble_system_prompt(ctx)` composes [SYSTEM] [CORPUS]
     [FEW-SHOTS] [LESSONS] from `ctx.prompt_overrides`. Override
     `static_system_prompt(ctx)` when the static SYSTEM block itself is

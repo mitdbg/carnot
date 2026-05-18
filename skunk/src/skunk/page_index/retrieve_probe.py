@@ -17,7 +17,6 @@ Telemetry: each retrieve call emits one `RetrieveTrace` containing one
 from __future__ import annotations
 
 import json
-import re
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -26,6 +25,11 @@ from typing import Any
 from skunk.common import LLMClient
 
 from .schema import PageCatalogRow
+
+
+# Probe-trace excerpt cap. Long enough for a human reviewer to read the
+# prompt/response intent without flooding the trace.
+_EXCERPT_MAX_LEN = 800
 
 
 # ---------------------------------------------------------------------------
@@ -43,8 +47,8 @@ class LevelTrace:
     output_tokens: int | None = None
     latency_s: float = 0.0
     output_count: int = 0
-    prompt_excerpt: str = ""              # first 800 chars of user prompt
-    response_excerpt: str = ""            # first 800 chars of raw response
+    prompt_excerpt: str = ""              # truncated to _EXCERPT_MAX_LEN
+    response_excerpt: str = ""            # truncated to _EXCERPT_MAX_LEN
 
 
 @dataclass
@@ -52,7 +56,7 @@ class RetrieveTrace:
     uid: str | None
     retrieve_idx: int
     concept: str
-    period: str
+    period: str | None
     catalog_size: int
     candidate_count: int = 0
     levels: list[LevelTrace] = field(default_factory=list)
@@ -157,7 +161,7 @@ def one_shot_parent_chapter_retrieve(
     tree: dict[str, Any],
     question: str,
     concept: str,
-    period: str,
+    period: str | None,
     llm: LLMClient,
     catalog_index: dict[tuple[str, int], PageCatalogRow],
     *,
@@ -166,9 +170,9 @@ def one_shot_parent_chapter_retrieve(
 ) -> tuple[list[dict[str, Any]], RetrieveTrace]:
     """One LLM call → up to 2 canonical chapters → union of their pages.
 
-    The LLM is asked for exactly one chapter, but the validator accepts a
-    one-element list as well. Out-of-vocabulary picks are dropped; the
-    function returns whatever survives.
+    Accepting both a bare string and a one-element list absorbs LLM
+    output variance without re-prompting. Out-of-vocabulary picks are
+    dropped silently; whatever survives is returned.
     """
     chapters_data = tree.get("chapters", {})
     trace = RetrieveTrace(
@@ -197,7 +201,7 @@ def one_shot_parent_chapter_retrieve(
         ensure_ascii=False, indent=1,
     )
     level_trace.input_chars = len(user)
-    level_trace.prompt_excerpt = user[:800]
+    level_trace.prompt_excerpt = user[:_EXCERPT_MAX_LEN]
 
     t0 = time.monotonic()
     resp = llm.call(system=_PARENT_PICK_SYSTEM, user=user, temperature=0.0)
@@ -205,7 +209,7 @@ def one_shot_parent_chapter_retrieve(
     level_trace.output_chars = len(resp.text)
     level_trace.input_tokens = resp.input_tokens
     level_trace.output_tokens = resp.output_tokens
-    level_trace.response_excerpt = resp.text[:800]
+    level_trace.response_excerpt = resp.text[:_EXCERPT_MAX_LEN]
 
     obj = _safe_json(resp.text) or {}
     raw_picked = obj.get("picked", "")
@@ -244,10 +248,6 @@ def one_shot_parent_chapter_retrieve(
     trace.top_k = top[:50]
     trace.total_walk_s = time.monotonic() - t_walk
     return top, trace
-
-
-# Back-compat alias used by `eval/eval_retrieve.py --retriever one-shot-section`.
-one_shot_section_retrieve = one_shot_parent_chapter_retrieve
 
 
 def write_trace_jsonl(trace: RetrieveTrace, path: Path) -> None:

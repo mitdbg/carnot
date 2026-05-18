@@ -357,7 +357,7 @@ def stage_manifest(args: argparse.Namespace, profile: CorpusProfile) -> None:
     out = args.output_dir
     tree_path = out / "concept_tree.json"
     _require(tree_path.exists(),
-             f"concept_tree.json missing — run merge_chapters first.")
+             "concept_tree.json missing — run merge_chapters first.")
 
     tree = json.loads(tree_path.read_text())
     chapter_pages = {ch: data["n_pages"]

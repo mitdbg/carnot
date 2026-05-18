@@ -14,31 +14,31 @@ has been tightened and we're ready to put a typed wrapper around them.
 
 from __future__ import annotations
 
-import json
-from typing import Any
-
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from skunk.errors import StepFailed
-from skunk.executor import SkunkExecutor
+from skunk.errors import MissingData, StepFailed
+from skunk.prompted_call import PromptedCall
 from skunk.models import AnnotatedValue, HarnessContext
+from skunk.plan import LookupBranch
 
 
 class LookupResult(BaseModel):
     """One Gemini lookup reply. `value` is the publisher's printed figure
-    (number, entity string, or list for multi-value requests); `unit` is a
-    snake_case token; `source` is the publisher token (parsed-and-discarded
-    at the call site)."""
+    (number, entity string, or list for multi-value requests), or `None`
+    when the model could not find a value; `unit` is a short label;
+    `source` is the publisher token (parsed-and-discarded at the call
+    site)."""
+
     model_config = ConfigDict(frozen=True)
-    value: float | int | str | list[float | int | str]
+    value: float | int | str | list[float | int | str] | None
     unit: str = ""
     source: str = "none"
 
 
-class LookupExternalExecutor(SkunkExecutor):
+class LookupExternalPromptedCall(PromptedCall):
     name: str = "lookup_external"
     system_prompt: str = """\
-You find a single value from a reliable external source. You must
+You find data points from a reliable external source. You must
 ground every answer in a publisher's page returned by Google Search —
 never invent data.
 
@@ -47,13 +47,11 @@ never invent data.
 The user message is a single bare JSON object:
 
   {"target": "<natural-language request for a single value>",
-   "src":    "<natural-language description of preferred source | null>"}
+   "src":    "<natural-language description of required source | null>"}
 
 `target` is a natural-language request for a single value (or a small
-list of values in a fixed order). Do NOT re-parse `target` for
-"according to X" / "from X" phrases — the planner has already
-extracted any such hint into `src`. If `src` is null, the question
-did not pin a source; pick the most authoritative public site for the
+list of values in a fixed order). If 'src' is not null, you must strictly use data
+ from the named source; otherwise, pick the most authoritative public site for the
 figure — typically the issuing statistical agency.
 
 ## Output format
@@ -61,23 +59,21 @@ figure — typically the issuing statistical agency.
 A single bare JSON object. No markdown fences. No prose.
 
   {"value":  <number | string | array of those>,
-   "unit":   "<snake_case_token>",
-   "source": "<publisher_token>"}
+   "unit":   "<string>",
+   "source": "<string>"}
 
 ## Field semantics
 
 value     the publisher's full printed precision. JSON number for
           numeric answers, JSON string for entity names, JSON array
-          for multiple values in request order. NEVER `null`, NEVER
-          `NaN`, NEVER a string like "N/A". If the page lacked the
-          value, use the JSON string "unknown" (and `source` must
-          still name the site you searched).
-unit      lowercase snake_case token describing what the value
-          represents. Use `text` for named-entity answers. Invent a
-          similar token when no standard one fits.
-source    bare publisher token (the domain stem, e.g. `bls`,
-          `bankofengland`). Use "none" only when `src` was null and
-          no specific site applied.
+          for multiple values in request order. Return null if you are
+          unable to find such a value.
+unit      natural-language label for the value's scale and base,
+          e.g. "millions of dollars", "percent", "year". Leave blank
+          ("") if the value is not a measurement (e.g. a name or
+          other string answer).
+source    short token naming the publisher domain, e.g. "bls",
+          "bankofengland".
 
 ## Procedure
 
@@ -87,35 +83,38 @@ source    bare publisher token (the domain stem, e.g. `bls`,
 (b) If `src` is null, pick the most authoritative public site and
     search there.
 (c) Issue the search via your Google Search tool. Answering from
-    training memory alone is rejected — your response is accepted
+    training memory alone is not allowed — your response is accepted
     only if a grounding chunk from the publisher's site appears.
 (d) Read the snippets and extract the value at the publisher's full
-    printed precision. Never round, format, or simplify — that's the
-    final output agent's job. If the source prints 26.766, return
-    26.766; if 26.8, return 26.8. FX rates are positive floats.
+    printed precision. Never round, format, or simplify.
 """
 
-    def _build_user_message(self, target: str, src: str | None) -> str:
-        req: dict[str, Any] = {"target": target, "src": src}
-        return json.dumps(req, indent=2, ensure_ascii=False)
-
     def run(
-        self, prev: None, ctx: HarnessContext, *,
-        target: str = "", src: str | None = None,
+        self,
+        prev: None,
+        ctx: HarnessContext,
+        *,
+        branch: LookupBranch,
     ) -> list[AnnotatedValue]:
-        if not target:
-            raise StepFailed(self.name, "Missing 'target' arg")
+        user_msg = branch.model_dump_json(
+            include={"target", "src"}, indent=2, exclude_none=True
+        )
 
-        user_msg = self._build_user_message(target, src)
-
-        ctx.emit(self.name, "calling gemini", target=target, src=src)
+        ctx.emit(self.name, "calling gemini", target=branch.target, src=branch.src)
         resp = ctx.llm_client.call(
             self.assemble_system_prompt(ctx),
-            user_msg, thinking_budget=-1, use_google_search=True, ctx=ctx,
+            user_msg,
+            thinking_budget=-1,
+            use_google_search=True,
+            ctx=ctx,
         )
         raw = resp.text
-        ctx.emit(self.name, "gemini response",
-                 raw=raw, grounding_titles=resp.grounding_titles)
+        ctx.emit(
+            self.name,
+            "gemini response",
+            raw=raw,
+            grounding_titles=resp.grounding_titles,
+        )
 
         try:
             result = LookupResult.model_validate_json(raw.strip())
@@ -125,5 +124,32 @@ source    bare publisher token (the domain stem, e.g. `bls`,
                 f"Cannot parse response: {e}\nRaw: {raw}",
             ) from e
 
+        # System prompt forbids answering from training memory alone; an empty
+        # grounding-titles list means the model violated that contract.
+        if not resp.grounding_titles:
+            raise StepFailed(
+                self.name,
+                f"Ungrounded reply (no grounding_titles) for target: {branch.target}",
+            )
+
+        # Null or empty payload → the model looked and found nothing. Signal
+        # MissingData so compute can react, rather than passing a degenerate
+        # value downstream.
+        v = result.value
+        if v is None or (isinstance(v, (str, list)) and len(v) == 0):
+            raise MissingData(
+                f"lookup_external found no value for target: {branch.target}",
+                missing=[branch.target],
+            )
+
+        # TODO: when `src` is set, verify the reported `result.source` (and/or
+        # grounding-titles domains) plausibly overlaps with the requested `src`.
+        # Hard to do robustly on raw strings — defer until we have a domain
+        # normalizer (publisher → canonical domain stem).
+
         ctx.emit(self.name, "parsed", value=result.value, unit=result.unit)
-        return [AnnotatedValue(description=target, value=result.value, unit=result.unit)]
+        return [
+            AnnotatedValue(
+                description=branch.target, value=result.value, unit=result.unit
+            )
+        ]

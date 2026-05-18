@@ -1,10 +1,9 @@
 """PDF + parsed-JSON page accessors (stateless I/O glue).
 
-`PageRef` → text / image bytes / printed-page string. Three tiers:
-parsed-JSON (preferred when the bulletin has been parsed offline),
-PyMuPDF text extraction (OCR fallback), PyMuPDF page rendering (vision
-fallback). No LLM, no `AnnotatedValue`, no orchestrator state — pure
-file-system + `pymupdf`.
+`PageRef` → text / image bytes / printed-page string. Two tiers:
+parsed-JSON (preferred when the bulletin has been parsed offline) and
+PyMuPDF page rendering (vision fallback). No LLM, no `AnnotatedValue`,
+no orchestrator state — pure file-system + `pymupdf`.
 """
 
 from __future__ import annotations
@@ -21,7 +20,9 @@ from skunk.errors import StepFailed
 from skunk.models import HarnessContext, PageRef
 
 
-_PARSED_JSON_DEFAULT_DIR = Path.home() / "Desktop/officeqa/treasury_bulletins_parsed/jsons"
+_PARSED_JSON_DEFAULT_DIR = (
+    Path.home() / "Desktop/officeqa/treasury_bulletins_parsed/jsons"
+)
 _DPI_SCALE = 300 / 72  # PyMuPDF base is 72 DPI; render pages at 300 DPI for vision.
 
 
@@ -73,39 +74,13 @@ def get_text_for_pdf_page(ref: PageRef, ctx: HarnessContext) -> str | None:
     return "\n\n".join(parts) if parts else None
 
 
-def get_printed_page(ref: PageRef, ctx: HarnessContext) -> str | None:
-    """Reverse lookup: bulletin printed-page footer text on ref's PDF page, or None.
-
-    Raises StepFailed if the parsed-JSON source is missing or corrupt.
-    """
-    if ref.month is None or ref.page is None:
-        return None
-    idx = _parsed_page_index(ref.month)
-    for el in idx.get(int(ref.page), []):
-        if el.get("type") == "page_number" and el.get("content"):
-            return str(el["content"])
-    return None
-
-
 def _pdf_path_for_ref(ref: PageRef) -> Path | None:
     """Resolve ref → PDF path via $OFFICEQA_PDF_DIR (skunk.page_index.pdf)."""
     if ref.month is None or ref.page is None or ref.page <= 0:
         return None
     from skunk.page_index.pdf import pdf_path_for
+
     return pdf_path_for(ref.month)
-
-
-def extract_pdf_text(ref: PageRef, ctx: HarnessContext) -> str | None:
-    """PyMuPDF text for ref's PDF page, or None when unavailable. No disk cache."""
-    pdf_path = _pdf_path_for_ref(ref)
-    if pdf_path is None:
-        return None
-    try:
-        with fitz.open(pdf_path) as doc:
-            return doc[ref.page - 1].get_text()
-    except Exception as e:  # noqa: BLE001 — tier-fallback path; any fitz error → next tier
-        ctx.emit("extract", "tier=ocr extraction failed", page=str(ref), error=str(e))
-        return None
 
 
 def render_pdf_page_b64(ref: PageRef, ctx: HarnessContext) -> tuple[str, str] | None:
@@ -115,7 +90,9 @@ def render_pdf_page_b64(ref: PageRef, ctx: HarnessContext) -> tuple[str, str] | 
         return None
     try:
         with fitz.open(pdf_path) as doc:
-            pix = doc[ref.page - 1].get_pixmap(matrix=fitz.Matrix(_DPI_SCALE, _DPI_SCALE))
+            pix = doc[ref.page - 1].get_pixmap(
+                matrix=fitz.Matrix(_DPI_SCALE, _DPI_SCALE)
+            )
         return "image/png", base64.standard_b64encode(pix.tobytes("png")).decode()
     except Exception as e:  # noqa: BLE001 — tier-fallback path; any fitz error → next tier
         ctx.emit("extract", "tier=vision render failed", page=str(ref), error=str(e))
