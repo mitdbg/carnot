@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from skunk.plan import PageRef
+    from skunk.models import PageRef
 
 
 @dataclass
@@ -39,6 +39,11 @@ class SkunkConfig:
     # for the Google Search path. Requires GOOGLE_CLOUD_PROJECT; optionally GOOGLE_CLOUD_LOCATION
     # (default: us-central1) and GOOGLE_APPLICATION_CREDENTIALS for service-account auth.
     use_vertex: bool = False
+    # Route every non-search LLM call (planner, retrieve, extract, compute, …)
+    # through the direct Gemini API instead of OpenRouter. Uses `gemini_model`
+    # (default gemini-3-flash-preview) and GEMINI_API_KEY. Useful when
+    # OpenRouter credits are unavailable. (env: SKUNK_USE_DIRECT_GEMINI)
+    use_direct_gemini: bool = False
 
     # Extract operator (env: SKUNK_EXTRACT_N_SAMPLES, SKUNK_EXTRACT_SAMPLE_TEMPERATURE)
     extract_n_samples: int = 3       # LLM calls per tier 1; all surviving entries are merged + deduped
@@ -66,6 +71,17 @@ class SkunkConfig:
     # Present for train/eval runs; None for production workloads.
     golden_pages: list[PageRef] | None = field(default=None, repr=False)
 
+    # BM25 rerank scaffold for the page-index retriever. Default OFF —
+    # this is an opt-in experiment. When enabled, the retrieve operator
+    # scores year-filtered survivors with an in-memory BM25 index over
+    # title + headers + keywords; if the top score clearly dominates the
+    # field (top1/median20 ≥ bm25_dominance_threshold) it truncates to
+    # the top-K, otherwise it returns all survivors in BM25 order.
+    # (env: SKUNK_BM25_ENABLED, SKUNK_BM25_TOP_K, SKUNK_BM25_DOMINANCE)
+    bm25_enabled: bool = False
+    bm25_top_k: int = 20
+    bm25_dominance_threshold: float = 2.0
+
     @classmethod
     def from_env(cls) -> SkunkConfig:
         return cls(
@@ -76,10 +92,14 @@ class SkunkConfig:
             gemini_retry_max_delay_s=float(os.environ.get("SKUNK_GEMINI_RETRY_MAX_DELAY", "1.0")),
             gemini_model=os.environ.get("SKUNK_GEMINI_MODEL", "gemini-3-flash-preview"),
             use_vertex=os.environ.get("SKUNK_USE_VERTEX", "").lower() in ("1", "true", "yes"),
+            use_direct_gemini=os.environ.get("SKUNK_USE_DIRECT_GEMINI", "").lower() in ("1", "true", "yes"),
             extract_n_samples=int(os.environ.get("SKUNK_EXTRACT_N_SAMPLES", "3")),
             extract_sample_temperature=float(os.environ.get("SKUNK_EXTRACT_SAMPLE_TEMPERATURE", "0.7")),
             plan_cache_csv=os.environ.get("SKUNK_PLAN_CACHE_CSV", "data/dsl_planning_pass.csv"),
             prompt_overrides_path=os.environ.get(
                 "SKUNK_PROMPT_OVERRIDES", "config/prompts/treasury_bulletin.yaml"
             ),
+            bm25_enabled=os.environ.get("SKUNK_BM25_ENABLED", "").lower() in ("1", "true", "yes"),
+            bm25_top_k=int(os.environ.get("SKUNK_BM25_TOP_K", "20")),
+            bm25_dominance_threshold=float(os.environ.get("SKUNK_BM25_DOMINANCE", "2.0")),
         )

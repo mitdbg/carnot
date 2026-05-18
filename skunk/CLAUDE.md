@@ -47,16 +47,20 @@ The benchmark is `data/officeqa_pro.csv` (133 questions: **101 dev + 32 test**; 
 
 ## Layout
 
+The agent has no CLI of its own. Public API is `from skunk import Orchestrator, HarnessContext, SkunkConfig, Plan, PageRef, ...` (see `src/skunk/__init__.py`); CLI/UX layers (eval harnesses, future chat UI) live outside `skunk/` and build on top.
+
+- `src/skunk/__init__.py` — public API re-exports
 - `src/skunk/plan.py` — `Plan` dataclass + runtime types (`PageRef`, `AnnotatedValue`) + JSON serde + validator + `PlannerExecutor` (question → Plan)
-- `src/skunk/orchestrator.py` — Plan executor; dispatches per-op operator functions
-- `src/skunk/{retrieve,extract,lookup_external,compute}.py` — one module per operator; each exposes a bare `run(op, prev, ctx)` function
-- `src/skunk/operator.py` — operator dispatch surface: `OpNode`, `OperatorFn`, `StepFailed`, `MissingData`, plus shared utilities (`exec_python`, `exec_python_with_env`, `parse_llm_value`)
+- `src/skunk/orchestrator.py` — `Orchestrator(ctx[, plan]).execute()` — Plan executor; instantiates one of each operator class (`RetrieveExecutor` / `ExtractOperator` / `LookupExternalExecutor` / `ComputeOperator`) and dispatches through their `.run()` methods
+- `src/skunk/{retrieve,extract,lookup_external,compute}.py` — one module per operator; each exposes an operator-level class with a `run(prev, ctx, **kwargs)` method (call-site `SkunkExecutor` subclasses live alongside as instance attributes on the operator class)
+- `src/skunk/errors.py` — cross-module signals: `StepFailed`, `MissingData`
+- `src/skunk/pyexec.py` — in-process Python exec for operator-generated code (not a security boundary; real isolation is future work): `exec_python_with_env`, `strip_code_fences`
 - `src/skunk/executor.py` — `SkunkExecutor` base: prompt-assembly for every LLM-prompted call-site inside an operator (planner, extract.text/vision/dedup, compute.codegen/critique, lookup_external)
 - `src/skunk/common.py` — shared runtime: `LLMClient` (OpenRouter + direct-Gemini), `HarnessContext`, `LLMResponse`
 - `src/skunk/config.py` — `SkunkConfig` (model, RPM, retry, extract/compute knobs)
 - `src/skunk/prompt_overrides.py` — `PromptOverride` YAML loader for corpus / few-shots / lessons
 - `src/skunk/page_index/` — page-index builder (`pipeline.py`) + runtime helpers (`retrieve_probe`, `period`, `pdf`) used by the retrieve operator
-- `eval/` — harnesses: `eval_e2e.py` (end-to-end), `eval_retrieve.py` (retrieval-only); `test_set_uids.json` for the held-out filter; `noise.py` for distractor pools
+- `eval/` — harnesses: `eval_e2e.py` (end-to-end), `eval_retrieve.py` (retrieval-only); `util.py` for plan-cache + trace-dump helpers; `test_set_uids.json` for the held-out filter; `noise.py` for distractor pools
 
 ## Conventions
 

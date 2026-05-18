@@ -1,4 +1,4 @@
-"""Parse a DSL period string into year bounds for the chapter-year filter.
+"""Treasury Bulletin period parser.
 
 Period grammar (from DSL.md):
   point       ::= "CY"YYYY | "FY"YYYY | "Q"[1-4]"-"YYYY
@@ -6,14 +6,19 @@ Period grammar (from DSL.md):
   range       ::= point ".." point            (inclusive)
   enumeration ::= point ("," point)+
 
-Only `period_year_window` is part of the public surface; the other
-helpers are internal scaffolding.
+Treasury-specific rule: FY < 1977 ends June 30 (FYy = Jul (y-1) .. Jun y).
+1977 onward FY ends Sep 30 (FYy = Oct (y-1) .. Sep y). The U.S. federal
+fiscal year boundary moved in 1976 under PL 93-344; first full year
+under the new boundary was FY1977.
 """
 
 from __future__ import annotations
 
 import calendar
+import logging
 import re
+
+log = logging.getLogger(__name__)
 
 
 _POINT_RE = re.compile(
@@ -26,6 +31,9 @@ _POINT_RE = re.compile(
     r"|(?P<y>\d{4})"
     r")$"
 )
+
+# U.S. federal fiscal-year boundary change.
+_FY_BOUNDARY_YEAR = 1977
 
 
 def _last_day(year: int, month: int) -> int:
@@ -42,9 +50,7 @@ def _parse_point(p: str) -> tuple[str, str]:
         return f"{y:04d}-01-01", f"{y:04d}-12-31"
     if m.group("fy"):
         y = int(m.group("fy"))
-        # Pre-1977 FY ends June 30 (FYy = Jul (y-1) .. Jun y).
-        # 1977 onward FY ends Sep 30 (FYy = Oct (y-1) .. Sep y).
-        if y < 1977:
+        if y < _FY_BOUNDARY_YEAR:
             return f"{y - 1:04d}-07-01", f"{y:04d}-06-30"
         return f"{y - 1:04d}-10-01", f"{y:04d}-09-30"
     if m.group("q"):
@@ -67,12 +73,6 @@ def _parse_point(p: str) -> tuple[str, str]:
 
 
 def _period_to_intervals(period: str) -> list[tuple[str, str]]:
-    """Parse a period string into a list of (start_iso, end_iso) intervals.
-
-    - A point          → one interval
-    - A range a..b     → one interval spanning a.start to b.end
-    - An enumeration   → one interval per comma-separated point
-    """
     if ".." in period:
         a, b = period.split("..", 1)
         a_start, _ = _parse_point(a)
@@ -85,22 +85,19 @@ def _period_to_intervals(period: str) -> list[tuple[str, str]]:
     return [_parse_point(period)]
 
 
-def period_year_window(period: str | None) -> tuple[int, int] | None:
-    """Reduce a DSL period to its `(min_year, max_year)` envelope.
+class TreasuryPeriodParser:
+    """`PeriodParser` impl for Treasury Bulletin period strings."""
 
-    Used by the chapter-year retrieve filter to intersect against each
-    page's pre-computed year envelope (`PageCatalogRow.min_year` /
-    `max_year`). Returns `None` for an unparseable or empty period;
-    callers treat that as "no year filter".
-    """
-    if not period:
-        return None
-    try:
-        intervals = _period_to_intervals(period)
-    except (TypeError, ValueError):
-        return None
-    if not intervals:
-        return None
-    starts = [int(s[:4]) for s, _ in intervals]
-    ends = [int(e[:4]) for _, e in intervals]
-    return min(starts), max(ends)
+    def year_window(self, period: str | None) -> tuple[int, int] | None:
+        if not period:
+            return None
+        try:
+            intervals = _period_to_intervals(period)
+        except (TypeError, ValueError) as e:
+            log.warning("period %r unparseable: %s", period, e)
+            return None
+        if not intervals:
+            return None
+        starts = [int(s[:4]) for s, _ in intervals]
+        ends = [int(e[:4]) for _, e in intervals]
+        return min(starts), max(ends)

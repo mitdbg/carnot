@@ -1,44 +1,37 @@
-"""Per-page deterministic field extractor — NO LLM.
+"""Per-page deterministic field extractor for Treasury Bulletin pages.
 
-Consumes the parsed-JSON element list for one page and returns the
-fields a `PageCatalogRow` carries:
+Consumes the parsed-JSON element list for one page and returns:
     content_blocks, keywords, min_year, max_year
 
-`content_blocks` is one `ContentBlock` per detected table / chart /
-prose block on the page — multi-content pages (table at top, chart at
-bottom) emit multiple entries. A page with no blocks is non-retrievable.
+`content_blocks` is one `ContentBlock` per detected table / chart / prose
+block on the page — multi-content pages emit multiple entries. A page
+with no blocks is non-retrievable.
 
-`min_year` / `max_year` is the canonical year envelope for the page —
-see `_canonicalize_year_envelope` for the bulletin-fallback and the
-+1-to-end-year fiscal-vs-calendar straddle rule.
-
-The parsed-JSON elements come from a layout parser and look like:
-    {"type": "section_header", "content": "Table 1.- Status under Limitation, December 31, 1949", "bbox": [...]}
-    {"type": "table",          "content": "<table>...</table>",                                   "bbox": [...]}
-    {"type": "title",          "content": "STATUTORY DEBT LIMITATION",                            "bbox": [...]}
-    ...
-
-The HTML inside `[table]` elements is the verbatim layout parser output.
-We pull column headers, the first column of each row (as row-headers sample),
-and any caption-like rows from it using a small stdlib HTML parser.
+`min_year` / `max_year` is the canonical year envelope — see
+`_canonicalize_year_envelope` for the bulletin-fallback and the +1
+FY/CY-straddle rule.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from html.parser import HTMLParser
 from typing import Any
 
-from .schema import ContentBlock
+from ...schema import ContentBlock
+from ._classify import _BOILERPLATE_HEADER_RE, has_prose_content
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Dateless-keyword filter — keywords are conceptual, dates live in `dates`.
+# Dateless-keyword filter — keywords are conceptual, dates live elsewhere.
 # ---------------------------------------------------------------------------
 
 _DATE_RE = re.compile(
     r"\b("
-    r"(19|20)\d{2}"                                 # 4-digit year
+    r"(19|20)\d{2}"
     r"|January|February|March|April|May|June|July|August|September|October"
     r"|November|December"
     r"|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec"
@@ -53,25 +46,21 @@ def _is_dateful(s: str) -> bool:
     return bool(_DATE_RE.search(s))
 
 
-# Unit notes and other low-signal phrases we drop from keywords.
 _NOISE_KEYWORD_PATTERNS = (
     re.compile(r"^\s*\(?in\s+(thousands|millions|billions)\b", re.IGNORECASE),
     re.compile(r"^\s*\(in\s+", re.IGNORECASE),
     re.compile(r"^total$", re.IGNORECASE),
     re.compile(r"^class of security$", re.IGNORECASE),
-    re.compile(r"^\W+$"),                # pure punctuation/whitespace
-    re.compile(r"^[\d\s.,$%/-]+$"),      # numeric / units only
-    # Residual caption noise (the continuation suffix should already be stripped
-    # by _split_caption; these catch the leftovers and standalone fragments).
+    re.compile(r"^\W+$"),
+    re.compile(r"^[\d\s.,$%/-]+$"),
     re.compile(r"^\(?con(?:t|tinued)?\)?$", re.IGNORECASE),
     re.compile(r"^section\s+(?:i{1,4}|iv|v|vi)\b$", re.IGNORECASE),
     re.compile(r"^source$", re.IGNORECASE),
     re.compile(r"^dollars?\)?$", re.IGNORECASE),
-    # Page-ID artifacts like "I-1", "II-2", "III-1", "IV-3".
     re.compile(r"^[ivx]{1,4}-\d+$", re.IGNORECASE),
     re.compile(r"^fiscal\s+years$", re.IGNORECASE),
     re.compile(r"^by\s+type\s+and\s+country$", re.IGNORECASE),
-    re.compile(r"^europe$", re.IGNORECASE),                # caption leakage
+    re.compile(r"^europe$", re.IGNORECASE),
 )
 
 
@@ -85,7 +74,6 @@ _TRAILING_LEADER_RE = re.compile(r"[\s.·•:;,–—-]+$")
 
 
 def _clean_keyword(s: str) -> str:
-    """Strip trailing leader-line dots, punctuation, and whitespace."""
     return _TRAILING_LEADER_RE.sub("", s).strip()
 
 
@@ -101,24 +89,16 @@ def _accept_keyword(s: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Year envelope extraction — every 4-digit year on the page, reduced to
-# (min, max). Year granularity is intentional: month/day precision on the
-# page side is noisy (footnotes, sequence numbers) and the lookup-side
-# period already collapses to year boundaries for FY/CY/Q.
+# Year envelope.
 # ---------------------------------------------------------------------------
 
-# Plausible bulletin-era years. Treasury Bulletin runs 1939–present;
-# we widen the band slightly to admit retrospective references without
-# letting random 4-digit numerics (table IDs, footnote codes) leak in.
+# Plausible bulletin-era years. Treasury Bulletin runs 1939–present; widened
+# slightly to admit retrospective references without letting random 4-digit
+# numerics (table IDs, footnote codes) leak in.
 _YEAR_RE = re.compile(r"\b(?:1[89]\d{2}|20\d{2}|21\d{2})\b")
 
 
 def _extract_year_envelope(text: str) -> tuple[int | None, int | None]:
-    """Return `(min_year, max_year)` across every 4-digit year occurrence in
-    `text`, or `(None, None)` when no year is found. RAW envelope — no
-    fiscal-year slack and no bulletin fallback; both are applied higher up
-    in `_canonicalize_year_envelope`.
-    """
     years = [int(m.group(0)) for m in _YEAR_RE.finditer(text)]
     if not years:
         return None, None
@@ -129,31 +109,17 @@ def _canonicalize_year_envelope(
     raw: tuple[int | None, int | None],
     bulletin: str,
 ) -> tuple[int, int]:
-    """Turn the raw `(min, max)` year envelope into the on-disk canonical form.
+    """Turn the raw `(min, max)` envelope into the on-disk form.
 
-    Two adjustments applied in order:
-
-    1. **Bulletin fallback.** If the page has no 4-digit years on it
-       (raw == (None, None)), the page inherits the calendar year of its
-       parent bulletin. A page in the `1991-08` bulletin with no year
-       text gets `(1991, 1991)` before step 2. Rationale: most year-less
-       pages are TOC, snapshots without explicit year labels, or
-       continuation pages whose dated header sits on a sibling page —
-       all of which logically belong to the bulletin's CY. Dropping
-       them entirely was the previous behavior and cost recall on a
-       non-trivial slice.
-
-    2. **+1 to the end year.** After step 1 the envelope's upper bound
-       is bumped by one calendar year. Rationale: a page whose only
-       printed year is `1991` may legitimately be reporting CY1991
-       (Jan–Dec 1991), FY1991 (Oct 1990–Sep 1991), or FY1992 (Oct 1991–
-       Sep 1992). The two fiscal interpretations both straddle the
-       calendar boundary into the next year, so admitting one year of
-       forward slack on every page lets a query for any of those three
-       windows match a page that only prints `1991`. It costs precision
-       (a 1990–1992 page also matches CY1993 queries after +1) but the
-       trade-off is intentional: in this corpus, FY/CY ambiguity is the
-       dominant source of year-filter false negatives.
+    1. **Bulletin fallback.** No years on the page → inherit the parent
+       bulletin's calendar year (most year-less pages are TOC, snapshots,
+       or continuation pages that logically belong to the bulletin's CY).
+    2. **+1 to end year.** A page that only prints `1991` may be CY1991,
+       FY1991 (Oct 1990–Sep 1991), or FY1992 (Oct 1991–Sep 1992). Adding
+       one year of forward slack lets a query for any of those three
+       windows match a page that only prints `1991`. Costs precision; in
+       this corpus, FY/CY ambiguity is the dominant year-filter
+       false-negative source.
     """
     min_year, max_year = raw
     if min_year is None or max_year is None:
@@ -163,18 +129,11 @@ def _canonicalize_year_envelope(
 
 
 # ---------------------------------------------------------------------------
-# Tiny HTML parser for `[table]` elements. Pulls column headers, first-cell
-# of each row (row-headers sample), and any caption rows.
+# Tiny HTML parser for `[table]` elements.
 # ---------------------------------------------------------------------------
 
 class _TableParser(HTMLParser):
-    """Collects:
-       column_headers: text of every <th> cell (in document order), and as a
-         fallback the cells of the FIRST <tr> if no <th> exists.
-       row_first_cells: text of the first <td>/<th> in each <tr> (skipping
-         rows that are header-only).
-       captions: text inside <caption> elements.
-    """
+    """Collects column headers, first-cell of each row, and captions."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -238,89 +197,36 @@ class _TableParser(HTMLParser):
             self._cur_text.append(data)
 
     def finalize(self) -> None:
-        """If no <th> was seen, treat the first <tr>'s cells as column headers."""
         if not self.column_headers and self._first_row_cells:
             self.column_headers = list(self._first_row_cells)
 
 
 def _parse_table_html(html: str) -> tuple[list[str], list[str], list[str]]:
-    """Return (column_headers, row_first_cells, captions) from one table's HTML."""
     p = _TableParser()
     try:
         p.feed(html)
         p.close()
-    except Exception:
-        # Parser is tolerant; in the worst case we get nothing back.
-        pass
+    except Exception as e:  # noqa: BLE001
+        log.warning("table HTML parse failed: %s", e)
     p.finalize()
     return p.column_headers, p.row_first_cells, p.captions
 
 
 # ---------------------------------------------------------------------------
-# Caption resolution — pick the [section_header] (or [title]) most relevant
-# to the page's primary table/figure.
+# Caption resolution.
 # ---------------------------------------------------------------------------
 
 _TABLE_LIKE_TYPES = frozenset({"table", "figure", "image", "chart", "plot", "diagram"})
 _CAPTION_TYPES = frozenset({"section_header", "title"})
 
-
-# Reject "(In millions of dollars)"-style unit notes when joining caption text.
 _UNIT_NOTE_RE = re.compile(r"^\s*\(?in\s+(thousands|millions|billions)\b",
                            re.IGNORECASE)
 
 
-def _resolve_caption(elements: list[dict]) -> str | None:
-    """Resolve the caption of the page's first table/figure.
-
-    Walk elements in order. A `[section_header]` or `[title]` opens a caption
-    window. Inside the window, every `[text]` element is appended to the
-    caption (filtering unit-notes and very long paragraphs). The window
-    closes when we hit a `[table]`/`[figure]` (caption complete) or a new
-    `[section_header]`/`[title]` before any table (caption was for something
-    else; restart). The first completed caption wins.
-    """
-    in_window = False
-    pieces: list[str] = []
-    result: str | None = None
-
-    for el in elements:
-        t = (el.get("type") or "").lower()
-        content = (el.get("content") or "").strip()
-        if not content:
-            continue
-        if t in _CAPTION_TYPES:
-            # New caption block — drop any half-built one and restart.
-            pieces = [content]
-            in_window = True
-        elif t == "text" and in_window:
-            if _UNIT_NOTE_RE.search(content):
-                continue
-            if len(content) > 200:
-                continue
-            pieces.append(content)
-        elif t in _TABLE_LIKE_TYPES and in_window:
-            if result is None and pieces:
-                joined = " ".join(pieces)
-                joined = re.sub(r"\s+", " ", joined).strip().rstrip(". -")
-                if joined:
-                    result = joined
-            in_window = False
-            pieces = []
-    return result
-
-
 # ---------------------------------------------------------------------------
-# Keyword harvest — caption noun phrases + headers, dedupe + filter.
+# Keyword harvest.
 # ---------------------------------------------------------------------------
 
-# Split on punctuation / wide whitespace / inline " - " AND on date-introducer
-# phrases like "As of <date>", "For the Period <date>", "Ending <date>" — these
-# words attach a date tail to an otherwise-dateless concept phrase, and without
-# splitting there the conceptual prefix gets rejected as "dateful" downstream.
-# `through` and `covering` are intentionally NOT in this list: they often join
-# two concept parts (e.g. "New Money Financing through Regular Weekly Treasury
-# Bills") rather than introduce a date.
 _NOUN_SPLIT_RE = re.compile(
     r"[—–,;:.]+|\s{2,}|\s-\s|"
     r"\s+(?:as\s+of|for\s+the\s+period|"
@@ -332,44 +238,19 @@ _NOUN_SPLIT_RE = re.compile(
 _CAPTION_CONT_SUFFIX_RE = re.compile(
     r"[,\s\-–—]+(?:con|cont|continued)\s*\.?\s*\)?\s*$", re.IGNORECASE,
 )
-# Strip ALL parenthesized and bracketed content. Treasury caption parens almost
-# always carry annotations (unit notes "(in millions of dollars)", acronyms
-# "(OASI)", method notes "(Price decimals are 32nds)", source markers
-# "[Source: Treasury Foreign Currency Reporting]") rather than concept content
-# that retrieval needs. Removing them preserves meaning and eliminates the
-# paren-fragment leakage that survives splitting.
-# Both regexes tolerate unclosed brackets: the `\)?` / `\]?` makes the closing
-# bracket optional so unbalanced "(in millions of dollars" or "foo]" tails
-# also disappear.
 _CAPTION_PARENS_RE = re.compile(r"\([^)]*\)?")
 _CAPTION_BRACKETS_RE = re.compile(r"\[[^\]]*\]?")
 _CAPTION_ORPHAN_BRACKET_RE = re.compile(r"[\[\]\(\)]")
 
 
 def _split_caption(caption: str) -> list[str]:
-    """Break a caption into rough noun-phrase candidates.
-    Treasury captions look like 'Table 1.- Status under Limitation, December 31, 1949'.
-    We strip the leading 'Table N.-' prefix, any trailing '- Continued' / ', con'
-    suffix (continuation markers are page-merge signals, not keywords), ALL
-    parenthesized / bracketed annotations (units, acronyms, source markers —
-    these carry no concept content), any trailing footnote markers ('2/'), and
-    then split on punctuation and date-introducers."""
-    # "Table 1.- ...", "Table MQ-3. - ...", "Table FFO-2.—..." — the label
-    # may contain dashes (PDO-3, MQ-3, FFO-2, TSO-3), so allow `-` inside.
     s = re.sub(r"^\s*(?:Table|Chart|Figure|Schedule)\s+[A-Za-z0-9.\-]+\.?\s*[-–—]?\s*",
                "", caption, flags=re.IGNORECASE).strip()
     s = _CAPTION_CONT_SUFFIX_RE.sub("", s).strip()
-    # Strip parens / brackets uniformly (balanced or unbalanced). The orphan
-    # pass cleans up stray bracket characters left by a tail that ran off the
-    # end of the string with no closing partner that the previous regexes
-    # couldn't pair (e.g. a stray "]" at end after the matching "[" was
-    # already consumed earlier).
     s = _CAPTION_PARENS_RE.sub(" ", s)
     s = _CAPTION_BRACKETS_RE.sub(" ", s)
     s = _CAPTION_ORPHAN_BRACKET_RE.sub(" ", s)
-    # Strip trailing footnote markers like "2/" or "1/" at end of caption.
     s = re.sub(r"\s+\d+/\s*$", "", s)
-    # Collapse whitespace left by the bracket stripping.
     s = re.sub(r"\s{2,}", " ", s).strip()
     if not s:
         return []
@@ -379,13 +260,6 @@ def _split_caption(caption: str) -> list[str]:
 def _harvest_keywords(caption: str | None,
                       column_headers: list[str],
                       row_headers: list[str]) -> list[str]:
-    """Dateless concept phrases from the caption only, deduped order-preserving.
-
-    column_headers and row_headers are intentionally NOT pushed in. They live
-    on PageCatalogRow as their own fields. Pushing them in was the source of
-    vocab pollution like 'Country', 'Europe', individual country names,
-    'Issue date', 'Maturity date', etc.
-    """
     seen: set[str] = set()
     out: list[str] = []
 
@@ -406,7 +280,7 @@ def _harvest_keywords(caption: str | None,
 
 
 # ---------------------------------------------------------------------------
-# Page text reconstruction (for date regex) — concat element contents.
+# Page text reconstruction.
 # ---------------------------------------------------------------------------
 
 def _page_plain_text(elements: list[dict]) -> str:
@@ -418,7 +292,6 @@ def _page_plain_text(elements: list[dict]) -> str:
         content = el.get("content")
         if not content:
             continue
-        # For tables, strip HTML tags so the date regex sees clean text.
         if t == "table":
             content = re.sub(r"<[^>]+>", " ", str(content))
         parts.append(str(content))
@@ -426,15 +299,13 @@ def _page_plain_text(elements: list[dict]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Public entrypoint.
+# Prose helpers.
 # ---------------------------------------------------------------------------
 
 def _resolve_prose_title(elements: list[dict]) -> str | None:
-    """For prose pages: pick the [title] (if present) else the first
-    non-boilerplate [section_header] as the page's headline title."""
+    """First [title], else first non-boilerplate [section_header]."""
     title: str | None = None
     first_section_header: str | None = None
-    from .classify import _BOILERPLATE_HEADER_RE
     for el in elements:
         t = (el.get("type") or "").lower()
         content = (el.get("content") or "").strip()
@@ -450,10 +321,6 @@ def _resolve_prose_title(elements: list[dict]) -> str | None:
 
 
 def _harvest_prose_keywords(elements: list[dict]) -> list[str]:
-    """For prose pages: lift each non-boilerplate [section_header] (and the
-    [title], if any) as a candidate keyword phrase, then apply the standard
-    dateless + meaningless filter."""
-    from .classify import _BOILERPLATE_HEADER_RE
     seen: set[str] = set()
     out: list[str] = []
     for el in elements:
@@ -474,23 +341,20 @@ def _harvest_prose_keywords(elements: list[dict]) -> list[str]:
     return out[:15]
 
 
+# ---------------------------------------------------------------------------
+# Content-block extraction.
+# ---------------------------------------------------------------------------
+
 def _extract_content_blocks(
     elements: list[dict],
 ) -> tuple[list[ContentBlock], list[str], list[str]]:
-    """Walk elements in document order; emit a ContentBlock per
-    table / chart element, or one prose ContentBlock if neither is
-    present but the page has substantive headers.
-
-    Returns (content_blocks, all_column_headers, all_row_headers) — the
-    flattened header lists feed the page-level keyword harvest as a
-    backup signal when no caption is found.
+    """Walk elements; emit one ContentBlock per table/chart, or one prose
+    block if no visual but substantive headers exist.
     """
     blocks: list[ContentBlock] = []
     all_columns: list[str] = []
     all_rows: list[str] = []
 
-    # Caption window state — accumulates [section_header]/[title]+text
-    # pieces until the next visual element closes it.
     pieces: list[str] = []
     in_window = False
 
@@ -552,12 +416,9 @@ def _extract_content_blocks(
 def parse_page_fields(elements: list[dict], *, bulletin: str) -> dict[str, Any]:
     """Deterministic per-page field extraction. No LLM.
 
-    Returns a dict with keys: content_blocks, keywords, min_year, max_year.
-    `bulletin` is the page's parent bulletin in "YYYY-MM" form; it feeds
-    the year-envelope fallback for pages with no 4-digit year on them
-    (see `_canonicalize_year_envelope`). A page with no blocks is
-    non-retrievable; blank / toc are decided upstream by `cheap_classify`
-    and never reach this function.
+    Returns dict with keys: content_blocks, keywords, min_year, max_year.
+    `bulletin` is the page's parent bulletin in "YYYY-MM"; feeds the
+    year-envelope fallback for pages with no 4-digit year.
     """
     blocks, all_columns, all_rows = _extract_content_blocks(elements)
 
@@ -575,9 +436,6 @@ def parse_page_fields(elements: list[dict], *, bulletin: str) -> dict[str, Any]:
             "max_year": max_year,
         }
 
-    # No table / chart: try prose. Emit one prose block iff at least
-    # one substantive section_header survives boilerplate filtering.
-    from .classify import has_prose_content
     if has_prose_content(elements):
         prose_kw = _harvest_prose_keywords(elements)
         if prose_kw:
@@ -592,7 +450,5 @@ def parse_page_fields(elements: list[dict], *, bulletin: str) -> dict[str, Any]:
                 "max_year": max_year,
             }
 
-    # Non-retrievable page: skip the year-envelope canonicalization
-    # entirely. There is nothing to retrieve, so a year window is moot.
     return {"content_blocks": [], "keywords": [],
             "min_year": None, "max_year": None}

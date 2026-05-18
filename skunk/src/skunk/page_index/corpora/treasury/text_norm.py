@@ -1,22 +1,19 @@
 """Deterministic text normalization for Treasury Bulletin section labels.
 
-Owns the OCR-substitution table, year-suffix / roman-numeral / continuation
-stripping, and the final whitespace-collapsing normalize_label entrypoint.
-Pure deterministic, no LLM. Reused by:
+OCR-substitution table, year-suffix / roman-numeral / continuation
+stripping, and the final whitespace-collapsing `normalize_label`
+entrypoint. Pure deterministic, no LLM. Used by the Treasury placer and
+merger for cleaning labels before matching / clustering.
 
-  - place.py (Phase 2)        — cleaning page banners before matching the
-                                 bulletin's L1 list
-  - merge.py (Phase 3)         — cleaning per-bulletin L1 names before
-                                 cross-bulletin clustering
-
-The substitution table grew empirically from the OCR errors observed
-across the 1939-2025 corpus; keep entries focused on whole-word patterns
-where the replacement is unambiguous.
+The substitution table grew empirically from OCR errors observed across
+the 1939-2025 corpus. Keep entries focused on whole-word patterns where
+the replacement is unambiguous.
 """
 
 from __future__ import annotations
 
 import re
+
 
 # Letter-substitution + missing-whitespace + truncation OCR errors seen in
 # the parsed-JSON output on scanned mid-century bulletins.

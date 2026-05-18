@@ -58,6 +58,11 @@ class RetrieveTrace:
     levels: list[LevelTrace] = field(default_factory=list)
     top_k: list[dict[str, Any]] = field(default_factory=list)
     total_walk_s: float = 0.0
+    # The chapter(s) the LLM picked. Set by `one_shot_parent_chapter_retrieve`
+    # so downstream steps (e.g. BM25 rerank) can find the per-chapter index
+    # without re-running the LLM. Empty list when the LLM picked nothing
+    # valid; one or two chapter names otherwise.
+    picked_chapters: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -78,24 +83,10 @@ def load_concept_tree(path: Path) -> dict[str, Any]:
     return json.loads(Path(path).read_text())
 
 
-_CODE_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\n?")
-
-
-def _strip_code_fence(s: str) -> str:
-    s = s.strip()
-    if s.startswith("```"):
-        s = _CODE_FENCE_RE.sub("", s)
-        if s.endswith("```"):
-            s = s[:-3]
-    return s.strip()
-
-
 def _safe_json(text: str) -> dict[str, Any] | None:
     """Parse JSON object from a (possibly fenced) LLM response."""
-    try:
-        obj = json.loads(_strip_code_fence(text))
-    except json.JSONDecodeError:
-        return None
+    from .util import safe_json_loads
+    obj = safe_json_loads(text, context="retrieve_probe")
     return obj if isinstance(obj, dict) else None
 
 
@@ -122,8 +113,22 @@ def _chapter_pages(tree: dict[str, Any], chapter: str) -> list[tuple[str, int]]:
 _PARENT_PICK_SYSTEM = """You pick which Treasury Bulletin chapter most
 likely contains the answer to the user's question.
 
-You will see the question, a concept tag, a period, and a list of
-canonical chapters. Each entry has:
+## Input
+
+The user message is a single JSON object:
+
+  {"question": "<natural-language question>",
+   "concept":  "<concept tag>",
+   "period":   "<period>",
+   "chapters": [
+     {"chapter":     "<canonical chapter name>",
+      "n_pages":     <int>,
+      "description": "<scope statement>",
+      "examples":    ["<sub-area name>", ...]},
+     ...
+   ]}
+
+Each `chapters[]` entry has:
   - `chapter`: the canonical chapter name (your output MUST be this)
   - `n_pages`: total pages in the chapter
   - `description`: a scope statement of what the chapter covers
@@ -135,6 +140,8 @@ Use BOTH `description` and `examples` to match the question. The
 description gives the chapter's abstract framing; the examples surface
 specific sub-areas (e.g. era-specific programs, named tables) that the
 description may not mention.
+
+## Output
 
 Output a SINGLE JSON object (no prose, no fences):
   {"picked": "<exact chapter label>"}
@@ -184,12 +191,10 @@ def one_shot_parent_chapter_retrieve(
 
     level_trace = LevelTrace(level="parent_pick",
                              input_count=len(listing), input_chars=0)
-    user = (
-        f"Question: {question}\n\n"
-        f"Concept: {concept}\n"
-        f"Period:  {period}\n\n"
-        f"Chapters ({len(listing)}):\n"
-        f"{json.dumps(listing, ensure_ascii=False, indent=1)}\n"
+    user = json.dumps(
+        {"question": question, "concept": concept,
+         "period": period, "chapters": listing},
+        ensure_ascii=False, indent=1,
     )
     level_trace.input_chars = len(user)
     level_trace.prompt_excerpt = user[:800]
@@ -220,6 +225,7 @@ def one_shot_parent_chapter_retrieve(
             seen_picks.add(ch)
     trace.levels.append(level_trace)
 
+    trace.picked_chapters = list(picked_chapters)
     if not picked_chapters:
         trace.total_walk_s = time.monotonic() - t_walk
         return [], trace

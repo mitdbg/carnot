@@ -1,275 +1,131 @@
-"""Plan dataclass + runtime value types + planner.
+"""Plan + planner.
 
 `PlannerExecutor.plan(question, ctx)` emits a `Plan`; the orchestrator walks
-`Plan.branches` and threads `PageRef` / `AnnotatedValue` between operators.
-The compute operator's terminal output is a bare `str` (the final answer).
+`Plan.branches` and threads `PageRef` / `AnnotatedValue` (both defined in
+`skunk.models`) between operators. The compute operator's terminal output
+is a bare `str` (the final answer).
 
-The Plan AST is one flat dataclass:
+The Plan AST mirrors the wire JSON shape:
 
-    Plan(branches=[...], task=..., qualifiers=[...],
-         units_out=..., precision=..., answer_form=...)
+    Plan(branches=[...],
+         computation=Computation(task=..., qualifiers=[...]),
+         presentation=Presentation(units_out=..., precision=..., answer_form=...))
 
-Branches are `RetrieveBranch(key, period, visual_only, value_kind)` or
-`LookupBranch(target, src)`.
+Branches are a discriminated union keyed by `kind`:
+    RetrieveBranch(kind="retrieve", key, period, visual_only, value_kind)
+    LookupBranch(kind="lookup_external", target, src)
 
-Plans cross the wire as JSON. The canonical shape is:
-
-    {"branches": [...],
-     "computation": {"task": "...", "qualifiers": ["...", ...]},
-     "presentation": {"units_out": "...", "precision": ..., "answer_form": "..."}}
-
-`from_json` / `to_json` round-trip that shape. Cached plans live in
-`data/dsl_planning_pass.csv` as JSON strings in the `plan_json` column.
-
-Page number convention:
-  PageRef.page = 1-based PDF page index (canonical throughout the codebase).
-  The bulletin's printed-page footer is recoverable via
-  `skunk.extract.get_printed_page()` for trace/prompt enrichment,
-  but is never used as a lookup key.
+`Plan.model_validate_json(s)` / `plan.model_dump_json()` round-trip without
+any custom translation — model layout *is* the wire layout. Cached plans
+live in `data/dsl_planning_pass.csv` as JSON strings in the `plan_json`
+column.
 """
 
 from __future__ import annotations
 
-import json
-import sys
-from dataclasses import dataclass, field
-from typing import Any
+from typing import Annotated, Any, Literal, Union
 
-from skunk.common import HarnessContext, extract_json_object
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+)
+
+from skunk.errors import StepFailed
 from skunk.executor import SkunkExecutor
-from skunk.operator import StepFailed
-
-@dataclass
-class PageRef:
-    month: str | None = None        # "YYYY-MM"
-    page: int | None = None         # 1-based PDF page index (canonical)
-
-    @property
-    def year(self) -> int | None:
-        return int(self.month[:4]) if self.month else None
-
-    def __post_init__(self) -> None:
-        # parsed-JSON lookup requires month; catch missing month at construction time.
-        if self.page is not None and self.month is None:
-            raise ValueError(
-                f"PageRef with page={self.page} requires month for parsed-JSON lookup"
-            )
-
-    def __repr__(self) -> str:
-        parts = []
-        if self.year:
-            parts.append(f"year={self.year}")
-        if self.month:
-            parts.append(f"month={self.month}")
-        if self.page is not None:
-            parts.append(f"page={self.page}")
-        return f"PageRef({', '.join(parts)})"
+from skunk.models import HarnessContext
 
 
-@dataclass
-class AnnotatedValue:
-    """One described, annotated datum. Carries the payload + minimal metadata.
+class RetrieveBranch(BaseModel):
+    """A corpus-retrieval branch. The implicit extract step downstream uses
+    `value_kind` as a shape hint and `visual_only` to skip text/OCR tiers."""
+    model_config = ConfigDict(frozen=True)
 
-    Fields:
-      - description: free-form natural-language label that uniquely distinguishes
-        this entry from siblings. Should include everything a reader needs to
-        know about what this value represents — series, period, sub-category,
-        unit qualifier, etc. There is no separate `dims` / `quote` field; rich
-        context goes here as prose.
-      - value: payload, shape determined by `kind`.
-      - unit: semantic unit token (e.g. "usd_millions", "pct", "year").
-      - kind: "scalar" | "vector" | "table".
-      - index_name: vector only — name of the varying dim (e.g. "month").
-      - row_name / col_name: table only — names of the two varying dims.
-      - tag: short machine-readable key (snake_case, like "gross_federal_debt:fy1973-fy1980").
-        Used by downstream consumers to select entries unambiguously when
-        description substrings overlap. Two entries describing the same
-        underlying series + period MUST share the same tag.
-      - expected_index_range: vector only — short string like "1969-01..1980-01"
-        describing the FULL index range the question requested. Lets compute
-        flag gaps (actual vs expected). Default empty (no gap analysis).
-
-    Payload shapes by kind:
-      - "scalar": value is int | float | str.
-      - "vector": value is dict[str, int|float|str], keyed by index_name labels.
-      - "table":  value is dict[str, dict[str, int|float|str]],
-                  outer key = row_name label, inner key = col_name label.
-    """
-    description: str
-    value: Any
-    unit: str = ""
-    kind: str = "scalar"                  # "scalar" | "vector" | "table"
-    index_name: str | None = None         # vector only
-    row_name: str | None = None           # table only
-    col_name: str | None = None           # table only
-    tag: str = ""                         # machine-readable selection key
-    expected_index_range: str = ""        # vector only — for gap-aware summary
-
-VALUE_KIND_VOCAB: frozenset[str] = frozenset({"scalar", "vector", "table"})
-
-@dataclass
-class RetrieveBranch:
-    # Free-form natural-language phrase describing the data to find. Embedded
-    # into the corpus ANN query alongside the user's question.
+    kind: Literal["retrieve"] = "retrieve"
+    # Free-form NL phrase describing the data to find. Embedded into the
+    # corpus ANN query alongside the user's question.
     key: str
     # Free-form NL period — "FY 2023", "2023-01", "January 1940", etc.
-    # Operators parse it best-effort; no longer enforced against a regex.
-    period: str
-    visual_only: bool = False       # passes through to the implicit extract step
-    # Advisory shape qualifier for the extract operator. Validator pins to
-    # VALUE_KIND_VOCAB above.
-    value_kind: str | None = None
+    # Planner emits null when the question doesn't pin one; we coerce to "".
+    period: str = ""
+    visual_only: bool = False
+    # Advisory shape qualifier for the extract operator.
+    value_kind: Literal["scalar", "vector", "table"] | None = None
+
+    @field_validator("key")
+    @classmethod
+    def _key_non_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("retrieve.key is empty")
+        return v
+
+    @field_validator("period", mode="before")
+    @classmethod
+    def _period_none_to_empty(cls, v: Any) -> Any:
+        return "" if v is None else v
 
 
-@dataclass
-class LookupBranch:
-    # Free-form NL request for a single external value (e.g. "CPI-U for July 1953").
+class LookupBranch(BaseModel):
+    """A lookup_external branch — one external-source request."""
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["lookup_external"] = "lookup_external"
+    # Free-form NL request for a single external value.
     target: str
-    # Optional NL hint about the preferred source (e.g. "Bureau of Labor Statistics",
-    # "FRED", "Macrotrends"). Threaded into the operator's user prompt to bias
-    # source routing.
+    # Optional NL hint about the preferred source. Threaded into the
+    # operator's user prompt to bias source routing.
     src: str | None = None
 
-
-Branch = RetrieveBranch | LookupBranch
-
-@dataclass
-class Plan:
-    """The whole plan in one flat dataclass.
-
-    Mirrors the planner's JSON output:
-      - `branches` ← planner's `branches`
-      - `task` / `qualifiers` ← planner's `computation.task` / `computation.qualifiers`
-      - `units_out` / `precision` / `answer_form` ← planner's `presentation.*`
-    """
-    branches: list[Branch] = field(default_factory=list)
-    task: str = ""                                       # computation.task (free-form NL)
-    qualifiers: list[str] = field(default_factory=list)  # computation.qualifiers
-    units_out: str | None = None                         # presentation.units_out (free-form NL token)
-    precision: int | None = None                         # presentation.precision
-    answer_form: str = "scalar"                          # presentation.answer_form (free-form NL; "scalar" is the default)
-
-def to_json(plan: Plan, *, indent: int | None = None) -> str:
-    """Serialize a Plan to its canonical JSON string.
-
-    Shape:
-      {"branches": [...],
-       "computation": {"task": "...", "qualifiers": [...]},  # omitted when both empty
-       "presentation": {"units_out": "...", ...}}            # omitted when fully default
-
-    Pass `indent=N` for pretty-printing (e.g. trace dumps).
-    """
-    branch_dicts: list[dict] = []
-    for b in plan.branches:
-        if isinstance(b, RetrieveBranch):
-            bd: dict = {"kind": "retrieve", "key": b.key, "period": b.period}
-            if b.visual_only:
-                bd["visual_only"] = True
-            if b.value_kind:
-                bd["value_kind"] = b.value_kind
-        elif isinstance(b, LookupBranch):
-            bd = {"kind": "lookup_external", "target": b.target}
-            if b.src:
-                bd["src"] = b.src
-        else:
-            raise TypeError(f"Unknown branch type: {type(b)}")
-        branch_dicts.append(bd)
-
-    d: dict = {"branches": branch_dicts}
-    if plan.task or plan.qualifiers:
-        d["computation"] = {"task": plan.task, "qualifiers": list(plan.qualifiers)}
-    pres: dict = {}
-    if plan.units_out:
-        pres["units_out"] = plan.units_out
-    if plan.precision is not None:
-        pres["precision"] = plan.precision
-    if plan.answer_form != "scalar":
-        pres["answer_form"] = plan.answer_form
-    if pres:
-        d["presentation"] = pres
-    return json.dumps(d, indent=indent, ensure_ascii=False)
+    @field_validator("target")
+    @classmethod
+    def _target_non_empty(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("lookup_external.target is empty")
+        return v
 
 
-def from_json(data: str | dict) -> Plan:
-    """Build a Plan from a JSON string or a pre-parsed JSON dict.
-
-    The dict input is for callers that already parsed the JSON themselves
-    (e.g. `planner.py` uses `extract_json_object` to strip a code fence
-    and parse). Everyone else should pass the raw string.
-    """
-    d = json.loads(data) if isinstance(data, str) else data
-    if "branches" not in d:
-        raise ValueError(f"Plan dict missing 'branches': {d!r}")
-    branches: list[Branch] = []
-    for bd in d["branches"]:
-        kind = bd.get("kind")
-        if kind == "retrieve":
-            branches.append(RetrieveBranch(
-                key=bd["key"],
-                period=bd["period"],
-                visual_only=bool(bd.get("visual_only", False)),
-                value_kind=bd.get("value_kind") or None,
-            ))
-        elif kind == "lookup_external":
-            branches.append(LookupBranch(target=bd["target"], src=bd.get("src") or None))
-        else:
-            raise ValueError(f"Unknown branch kind: {kind!r}")
-    comp = d.get("computation") or {}
-    pres = d.get("presentation") or {}
-    raw_qualifiers = comp.get("qualifiers") or []
-    if not isinstance(raw_qualifiers, list):
-        raise ValueError(f"'computation.qualifiers' must be a list, got {raw_qualifiers!r}")
-    return Plan(
-        branches=branches,
-        task=str(comp.get("task") or ""),
-        qualifiers=[str(q) for q in raw_qualifiers if q is not None],
-        units_out=pres.get("units_out") or None,
-        precision=pres.get("precision"),
-        answer_form=str(pres.get("answer_form") or "scalar"),
-    )
-
-@dataclass
-class ValidationResult:
-    ok: bool
-    errors: list[str] = field(default_factory=list)
+Branch = Annotated[
+    Union[RetrieveBranch, LookupBranch],
+    Field(discriminator="kind"),
+]
 
 
-def validate(plan: Plan) -> ValidationResult:
-    """Validate the plan's structure + a handful of cheap field-level checks.
+class Computation(BaseModel):
+    """Computation envelope — natural-language spec for the implicit
+    terminal compute phase. `task` and any items of `qualifiers` may be
+    omitted or null in the wire; both default to empty."""
+    model_config = ConfigDict(frozen=True)
+    task: str | None = None
+    qualifiers: list[str] = Field(default_factory=list)
 
-    Catches semantic issues that survive parsing:
-      - at least one branch
-      - retrieve.key / lookup_external.target non-empty (after strip)
-      - retrieve.value_kind in {scalar, vector, table} when set
-      - precision >= 0 when set
-    """
-    errors: list[str] = []
-    if not plan.branches:
-        errors.append("Plan has no branches")
-    for j, b in enumerate(plan.branches):
-        if isinstance(b, RetrieveBranch):
-            if not b.key.strip():
-                errors.append(f"branches[{j}]: retrieve.key is empty")
-            if b.value_kind and b.value_kind not in VALUE_KIND_VOCAB:
-                errors.append(
-                    f"branches[{j}]: value_kind {b.value_kind!r} "
-                    f"not in {sorted(VALUE_KIND_VOCAB)}"
-                )
-        elif isinstance(b, LookupBranch):
-            if not b.target.strip():
-                errors.append(f"branches[{j}]: lookup_external.target is empty")
-    if plan.precision is not None and plan.precision < 0:
-        errors.append(f"precision must be >= 0, got {plan.precision}")
-    return ValidationResult(ok=not errors, errors=errors)
+    @field_validator("qualifiers", mode="before")
+    @classmethod
+    def _strip_null_items(cls, v: Any) -> Any:
+        # planner sometimes emits `[null]` when no qualifiers apply.
+        return [q for q in v if q is not None] if isinstance(v, list) else v
 
 
-# ---------------------------------------------------------------------------
-# Planner: Question → Plan via a single LLM call.
-#
-# When the orchestrator detects MissingData during execution, it appends a
-# one-shot recovery lesson to `ctx.prompt_overrides` (targeting "planner")
-# and re-invokes `PlannerExecutor.plan` for a fresh attempt.
-# ---------------------------------------------------------------------------
+class Presentation(BaseModel):
+    """Presentation envelope — output-format hints for the compute phase.
+    All fields may be omitted or null in the wire; consumers coerce."""
+    model_config = ConfigDict(frozen=True)
+    units_out: str | None = None
+    precision: int | None = Field(default=None, ge=0)
+    answer_form: str | None = None
+
+
+class Plan(BaseModel):
+    """The whole plan — model layout mirrors the wire JSON exactly, so
+    `model_validate_json` / `model_dump_json` round-trip with no custom
+    translation. See module docstring for the wire shape."""
+    model_config = ConfigDict(frozen=True)
+
+    branches: list[Branch] = Field(min_length=1)
+    computation: Computation = Field(default_factory=Computation)
+    presentation: Presentation = Field(default_factory=Presentation)
+
 
 class PlannerExecutor(SkunkExecutor):
     name: str = "planner"
@@ -328,48 +184,23 @@ lookup_external branch fields:
 
 computation fields:
   task        Natural language describing the calculation to carry out
-              once retrieval has returned relevant data. Preserve
-              qualifier words from the question VERBATIM — do not
-              paraphrase, simplify, or drop them. The compute step
-              relies on the exact wording to choose the right operation.
+              once retrieval has returned relevant data. 
 
-  qualifiers  Optional list of short phrases that nail down a calculation
-              choice the task sentence leaves underdetermined. Each
-              qualifier is one phrase; the compute operator treats every
-              qualifier as a MUST. Use only when the question explicitly
-              pins a choice. null or empty list when the task is
-              unambiguous.
+  qualifiers  Optional list of short phrases that nail down a specific qualifier. Each
+              qualifier is one phrase; the compute operator treats every qualifier as a MUST. Use only when
+              the question explicitly pins a choice. null or empty list when the task is
+              unambiguous. Preserve qualifier words from the question VERBATIM — do not
+              paraphrase, simplify, or otherwise modify them. The compute step
+              relies on the exact wording to choose the right operation.
 
 presentation fields:
   How the final answer is rendered. No semantic content about the calculation itself.
 
-  units_out    Unit of the final answer. Three rules, in order:
-
-               (1) If the question NAMES a unit anywhere ("in millions of
-                   dollars", "as a percent", "in DEM", "how many months"),
-                   use the matching unit token. Examples drawn from real
-                   questions:
-                     "in millions of dollars" / "millions of nominal dollars"
-                                                         → "usd_millions"
-                     "in billions of yen"                → "jpy_billions"
-                     "in 1962 dollars" / "in 2020 dollars"
-                                                         → "usd_millions" (or matching scale)
-                     "percentage points" / "as a percent" / "yield … in %"
-                                                         → "pct"
-                     "how many calendar months"          → "count"
-                     "ratio of X to Y"                   → "ratio"
-                     "spot exchange rate … in DEM per USD"
-                                                         → "dem_per_usd"
-                     "in Deutsche marks" / "in DEM"      → "dem"
-               (2) If the question does NOT name a unit, output `null`.
+  units_out    Unit of the final answer (e.g., "in millions of
+                   dollars", "as a percent", "in DEM"). Use exact matching strings from the question. 
+                   If the question does NOT name a unit, output `null`.
                    Do not guess; do not invent; do not fall back to
-                   "text" or any other placeholder. `null` is the right
-                   answer here.
-               (3) "text" is reserved STRICTLY for entity-name / string
-                   answers — e.g. "Which agency had the largest …" → an
-                   agency name. NEVER use "text" for a numeric answer or
-                   a list of numbers; if the answer is numeric, rules (1)
-                   and (2) apply (a unit token or `null`).
+                   "text" or any other placeholder.
   precision    decimal places of the final answer;
                null when not pinned.
   answer_form  examples: no commas, bracketed_list for
@@ -388,7 +219,7 @@ worked examples.
         base_user_message = f"""\
 Question: {question}
 
-Produce the Plan JSON. Output ONLY a JSON code block — no prose, no explanation.
+Produce the Plan JSON. Output a single bare JSON object. No markdown fences. No prose.
 """
 
         attempt_errors: list[str] = []
@@ -409,32 +240,21 @@ Produce the Plan JSON. Output ONLY a JSON code block — no prose, no explanatio
                     f"It failed with: {last_error}\n"
                     "Fix and return valid JSON only."
                 )
-            print(f"[planner] attempt {attempt + 1}/3", file=sys.stderr, flush=True)
+            ctx.emit("planner", "attempt", n=attempt + 1, of=3)
             resp = ctx.llm_client.call(system_prompt, user_message, thinking_budget=-1, ctx=ctx)
             raw = resp.text
             try:
-                plan_dict = extract_json_object(raw)
-                p = from_json(plan_dict)
-                if not isinstance(p, Plan):
-                    raise ValueError(f"from_json returned {type(p).__name__}, expected Plan")
-                result = validate(p)
-                if not result.ok:
-                    raise ValueError(f"Plan validation errors: {result.errors}")
-                return p
-            except Exception as e:
+                return Plan.model_validate_json(raw.strip())
+            except ValidationError as e:
                 attempt_errors.append(f"Attempt {attempt + 1}: {e}")
                 last_raw = raw
                 last_error = str(e)
-                print(
-                    f"[planner] attempt {attempt + 1} parse/validate failed: "
-                    f"{type(e).__name__}: {e}",
-                    file=sys.stderr, flush=True,
+                ctx.emit(
+                    "planner", "parse/validate failed",
+                    n=attempt + 1, error_type=type(e).__name__, error=str(e),
                 )
 
-        print(
-            f"[planner] FAILED after {len(attempt_errors)} attempts",
-            file=sys.stderr, flush=True,
-        )
+        ctx.emit("planner", "exhausted", attempts=len(attempt_errors))
         raise StepFailed(
             "planner",
             f"Failed to produce valid Plan after {len(attempt_errors)} attempts: "

@@ -39,12 +39,39 @@ from skunk.common import HarnessContext, LLMClient, load_env_file  # noqa: E402
 load_env_file(_REPO_ROOT / ".env")
 from skunk.config import SkunkConfig  # noqa: E402
 from skunk.plan import Plan, RetrieveBranch  # noqa: E402
-from skunk.page_index.period import period_year_window  # noqa: E402
+from skunk.page_index import default_profile  # noqa: E402
+_PERIOD_PARSER = default_profile().period_parser
+period_year_window = _PERIOD_PARSER.year_window
 from skunk.page_index.retrieve_probe import (  # noqa: E402
     load_catalog, load_concept_tree,
     one_shot_parent_chapter_retrieve, one_shot_section_retrieve,
     write_trace_jsonl,
 )
+from skunk.page_index.bm25 import Bm25Index  # noqa: E402
+from skunk.page_index.bm25_runtime import bm25_rerank, build_chapter_index  # noqa: E402
+import threading  # noqa: E402
+
+# Process-wide BM25 cache: shared across all UIDs in a run so each
+# chapter's index is built once. Built lazily under a per-chapter lock.
+_BM25_CACHE: dict[str, Bm25Index] = {}
+_BM25_CACHE_LOCK = threading.Lock()
+_BM25_CHAPTER_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _bm25_get(chapter: str, tree: dict, catalog_index: dict) -> Bm25Index:
+    cached = _BM25_CACHE.get(chapter)
+    if cached is not None:
+        return cached
+    with _BM25_CACHE_LOCK:
+        lock = _BM25_CHAPTER_LOCKS.setdefault(chapter, threading.Lock())
+    with lock:
+        cached = _BM25_CACHE.get(chapter)
+        if cached is not None:
+            return cached
+        pages = tree.get("chapters", {}).get(chapter, {}).get("pages", [])
+        idx = build_chapter_index(pages, catalog_index)
+        _BM25_CACHE[chapter] = idx
+        return idx
 
 
 _MONTHS = {"january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
@@ -150,7 +177,7 @@ def _plan_question(uid: str, question: str, llm: LLMClient,
                    plan_cache: dict[str, str], cache_path: Path,
                    stats: TokenStats) -> str | None:
     """Return plan_json string, caching new plans. Accumulate token stats."""
-    from skunk.plan import PlannerExecutor, to_json
+    from skunk.plan import PlannerExecutor
 
     if uid in plan_cache:
         return plan_cache[uid]
@@ -170,7 +197,7 @@ def _plan_question(uid: str, question: str, llm: LLMClient,
             if ev.get("source") == "llm" and ev.get("message") == "call":
                 stats.add(ev.get("input_tokens"), ev.get("output_tokens"),
                           ev.get("latency_s"))
-    plan_json = to_json(plan_obj)
+    plan_json = plan_obj.model_dump_json()
     _append_plan_cache(cache_path, uid, question, plan_json)
     plan_cache[uid] = plan_json
     return plan_json
@@ -187,9 +214,9 @@ def _run_one_uid(
     tree: dict, catalog_index: dict, llm: LLMClient, retrieve_workers: int,
     trace_path: Path | None = None,
     retriever: str = "one-shot-parent-chapter",
+    bm25_top_k: int = 20,
+    bm25_threshold: float = 2.0,
 ) -> UIDResult:
-    from skunk.plan import from_json as dsl_from_json
-
     t0 = time.monotonic()
     result = UIDResult(uid=uid, question=question, plan_text="",
                        goldens=goldens,
@@ -205,7 +232,7 @@ def _run_one_uid(
     result.plan_text = plan_json
 
     try:
-        plan_obj = dsl_from_json(plan_json)
+        plan_obj = Plan.model_validate_json(plan_json)
     except Exception as e:
         result.error = f"plan parse: {type(e).__name__}: {e}"
         result.wall_s = time.monotonic() - t0
@@ -229,10 +256,9 @@ def _run_one_uid(
                 llm=llm, catalog_index=catalog_index,
                 uid=uid, retrieve_idx=idx,
             )
-        elif retriever == "chapter-year":
-            # Production pipeline (mirrors src/skunk/retrieve.py):
-            # L1 chapter pick → year-window filter. The survivors are the
-            # candidate set; no reranking, no caps.
+        elif retriever in ("chapter-year", "chapter-year-bm25"):
+            # chapter-year: production pipeline (mirrors src/skunk/retrieve.py).
+            # chapter-year-bm25: same + experimental BM25 rerank scaffold.
             chapter_top, trace = one_shot_parent_chapter_retrieve(
                 tree, question=question, concept=b.key, period=b.period,
                 llm=llm, catalog_index=catalog_index,
@@ -250,6 +276,16 @@ def _run_one_uid(
                         filtered.append(c)
                     elif row.max_year >= q_lo and row.min_year <= q_hi:
                         filtered.append(c)
+            if retriever == "chapter-year-bm25" and filtered and trace.picked_chapters:
+                try:
+                    index = _bm25_get(trace.picked_chapters[0], tree, catalog_index)
+                    filtered, _bm25_meta = bm25_rerank(
+                        filtered, index, question=question, key=b.key,
+                        top_k=bm25_top_k, threshold=bm25_threshold,
+                    )
+                except Exception as e:  # scaffold safety: pass through on failure
+                    print(f"  [bm25 error uid={uid} branch={idx}] "
+                          f"{type(e).__name__}: {e}", flush=True)
             trace.candidate_count = len(filtered)
             trace.top_k = filtered[:50]
             top = filtered
@@ -300,11 +336,14 @@ def main() -> int:
                          "is overridden).")
     ap.add_argument("--retriever",
                     choices=("one-shot-parent-chapter", "one-shot-section",
-                             "chapter-year"),
+                             "chapter-year", "chapter-year-bm25"),
                     default="chapter-year",
                     help="chapter-year (default): production pipeline — "
                          "L1 chapter pick + year-window filter. Mirrors "
                          "src/skunk/retrieve.py. "
+                         "chapter-year-bm25: experimental scaffold — "
+                         "chapter-year + BM25 rerank with confidence-based "
+                         "bypass (see src/skunk/page_index/bm25_runtime.py). "
                          "one-shot-parent-chapter: L1 chapter pick only "
                          "(returns every page in the picked chapter; recall "
                          "ceiling probe). "
@@ -319,6 +358,14 @@ def main() -> int:
     ap.add_argument("--trace-out", type=Path,
                     default=_REPO_ROOT / "cache/retrieve_bench_traces.jsonl",
                     help="Per-retrieve-call trace JSONL for offline analysis.")
+    ap.add_argument("--bm25-top-k", type=int, default=20,
+                    help="(chapter-year-bm25 only) Truncate to this many pages "
+                         "when BM25's top score clearly dominates the field.")
+    ap.add_argument("--bm25-threshold", type=float, default=2.0,
+                    help="(chapter-year-bm25 only) Dominance ratio "
+                         "(top1 / median20) required to trigger truncation. "
+                         "Below this, return all year-filtered survivors in "
+                         "BM25 order without truncating.")
     args = ap.parse_args()
     # Clear prior trace from this benchmark file.
     if args.trace_out.exists():
@@ -424,7 +471,8 @@ def main() -> int:
                       indexed, plan_cache, args.plan_cache, tree,
                       catalog_index, llm,
                       args.retrieve_workers, args.trace_out,
-                      args.retriever): r["uid"]
+                      args.retriever,
+                      args.bm25_top_k, args.bm25_threshold): r["uid"]
             for r in sampled
         }
         for f in as_completed(futs):

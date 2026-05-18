@@ -3,11 +3,11 @@
 Operators (`retrieve`, `extract`, `lookup_external`, `compute`) are the query-plan
 nodes; an Executor is the runtime helper that handles one LLM call inside an
 operator. Each prompted call-site in the harness (planner, extract.text,
-extract.vision, extract.dedup, compute.codegen.final,
-compute.codegen.intermediate, compute.critique, lookup_external) is one
-subclass of `SkunkExecutor`. The subclass sets two attributes — `name` (the
-override key used by the prompt-overrides YAML) and `system_prompt` (the
-static SYSTEM template) — and the base class composes the final prompt.
+extract.vision, extract.dedup, compute.codegen, compute.critique,
+lookup_external) is one subclass of `SkunkExecutor`. The subclass sets two
+attributes — `name` (the override key used by the prompt-overrides YAML) and
+`system_prompt` (the static SYSTEM template) — and the base class composes
+the final prompt.
 
 Final system prompt shape:
 
@@ -21,7 +21,7 @@ Adding a new section to the executor prompt = edit this one file.
 
 from __future__ import annotations
 
-from skunk.common import HarnessContext
+from skunk.models import HarnessContext
 from skunk.prompt_overrides import (
     gather_corpus,
     gather_few_shots,

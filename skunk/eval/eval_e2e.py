@@ -61,6 +61,7 @@ import os
 import random
 import re
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -80,9 +81,16 @@ def _load_env(path: Path) -> None:
 
 _load_env(REPO_ROOT / ".env")
 
-from skunk.config import SkunkConfig  # noqa: E402
-from skunk.plan import PageRef  # noqa: E402
-from skunk.run import load_plan_cache, run_question  # noqa: E402
+from skunk import (  # noqa: E402
+    HarnessContext,
+    Orchestrator,
+    PageRef,
+    Plan,
+    SkunkConfig,
+    load_prompt_overrides,
+)
+
+from eval.util import dump_trace, load_plan_cache, save_plan_to_cache  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Golden page parsing (source_docs URLs → PageRefs)
@@ -117,6 +125,100 @@ def load_golden(csv_path: str | Path) -> dict[str, list[PageRef]]:
     df = pd.read_csv(csv_path)
     return {row["uid"]: _parse_source_docs(str(row.get("source_docs", "")))
             for _, row in df.iterrows()}
+
+
+# ---------------------------------------------------------------------------
+# Per-question runner
+# ---------------------------------------------------------------------------
+
+def _run_one_question(
+    question: str,
+    *,
+    verbose: bool,
+    uid: str | None = None,
+    golden_pages: list[PageRef] | None = None,
+    cached_plan_json: str | None = None,
+    plan_cache_csv: str | None = None,
+    trace_path: str | None = None,
+) -> dict:
+    """Run one question through the Orchestrator and collect a result dict."""
+    if golden_pages:
+        # Normalize to fresh PageRef instances regardless of input shape.
+        golden_pages = [PageRef(month=g.month, page=g.page) for g in golden_pages]
+        if verbose:
+            print(f"[e2e] Golden pages: {len(golden_pages)} → {[str(r) for r in golden_pages]}")
+
+    config = SkunkConfig.from_env()
+    config.golden_pages = golden_pages
+    csv_path = plan_cache_csv or config.plan_cache_csv
+
+    overrides_path = Path(config.prompt_overrides_path)
+    prompt_overrides = load_prompt_overrides(overrides_path) if overrides_path.exists() else ()
+
+    ctx = HarnessContext(
+        question=question,
+        verbose=verbose,
+        config=config,
+        prompt_overrides=prompt_overrides,
+    )
+
+    t0 = time.perf_counter()
+
+    plan_obj: Plan | None = None
+    if cached_plan_json is not None:
+        if verbose:
+            print("\n[e2e] Using cached plan...")
+        try:
+            plan_obj = Plan.model_validate_json(cached_plan_json)
+            if verbose:
+                print(f"[e2e] Plan: {plan_obj.model_dump_json()}")
+        except Exception as e:
+            return {"question": question, "answer": None, "failed": True,
+                    "reason": f"cached plan error: {e}", "n_steps": 0}
+    elif verbose:
+        print(f"\n[e2e] Planning: {question[:80]}...")
+
+    orch = Orchestrator(ctx, plan=plan_obj)
+    try:
+        orch.execute()
+    except Exception as e:
+        return {"question": question, "answer": None, "failed": True,
+                "reason": f"execute: {type(e).__name__}: {e}", "n_steps": 0}
+    trace = orch.trace
+
+    plan_obj = orch.current_plan
+    if cached_plan_json is None and plan_obj is not None:
+        plan_json = plan_obj.model_dump_json()
+        if verbose:
+            print(f"[e2e] Plan: {plan_json}")
+        if uid is not None:
+            save_plan_to_cache(uid, question, plan_json, csv_path)
+            if verbose:
+                print(f"[e2e] Plan cached for {uid}")
+
+    wall_s = time.perf_counter() - t0
+    ctx.emit("run", "question done", wall_s=round(wall_s, 3))
+
+    if verbose:
+        print(trace.pretty())
+
+    if trace_path is not None:
+        try:
+            plan_dump = plan_obj.model_dump_json() if plan_obj is not None else (cached_plan_json or "(unavailable)")
+        except Exception:
+            plan_dump = cached_plan_json or "(unavailable)"
+        dump_trace(trace_path, uid=uid, question=question, plan_text=plan_dump,
+                   golden_pages=golden_pages, trace=trace, events=ctx.events,
+                   model=config.llm_model)
+
+    return {
+        "question": question,
+        "answer": trace.answer,
+        "failed": trace.failed,
+        "reason": trace.failure_reason,
+        "n_steps": len(trace.steps),
+    }
+
 
 REPORT_FIELDS = ["uid", "question", "predicted", "gold_answer", "failed", "reason", "n_steps"]
 
@@ -250,7 +352,7 @@ def main() -> None:
             trace_path = str(Path(args.trace_dir) / f"{uid}.txt")
 
         try:
-            result = run_question(
+            result = _run_one_question(
                 question=question,
                 verbose=verbose,
                 golden_pages=golden_pages,

@@ -1,10 +1,10 @@
-"""Shared runtime: LLM clients with rate limiting/retry, and HarnessContext.
+"""Shared runtime: LLM clients with rate limiting and retry.
 
 Two LLM paths
 -------------
 - OpenRouter (default): all non-search calls go through the OpenAI-compatible
   OpenRouter API using the `openai` SDK. Configured via OPENROUTER_API_KEY and
-  `config.llm_model` (e.g. "google/gemini-2.5-flash").
+  `config.llm_model`.
 - Gemini direct (search only): `lookup_external` passes `use_google_search=True`
   to get native Google Search grounding. This path uses the `google-genai` SDK
   directly with GEMINI_API_KEY. All other callers use the OpenRouter path.
@@ -44,10 +44,9 @@ from google.genai import types
 from openai import OpenAI
 
 from skunk.config import SkunkConfig
-from skunk.prompt_overrides import PromptOverride
 
 if TYPE_CHECKING:
-    from skunk.plan import Plan
+    from skunk.models import HarnessContext
 
 
 class _RateLimiter:
@@ -121,32 +120,6 @@ def parse_json_response(text: str) -> Any | None:
         return json.loads(strip_code_fence(text))
     except json.JSONDecodeError:
         return None
-
-
-def extract_json_object(text: str) -> dict:
-    """Pull the outermost JSON object out of a noisy LLM response. Tolerates
-    a `` ```json ... ``` `` fence; falls back to brace-balanced scanning of
-    unfenced output. Raises ValueError on failure (no object found, or
-    unbalanced braces) so callers can surface the malformed payload."""
-    m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, re.DOTALL)
-    if m:
-        return json.loads(m.group(1))
-    start = text.find("{")
-    if start == -1:
-        raise ValueError(f"No JSON object found in response:\n{text[:400]}")
-    depth = 0
-    end = -1
-    for i, ch in enumerate(text[start:], start):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                end = i + 1
-                break
-    if end == -1:
-        raise ValueError(f"Unbalanced braces in response:\n{text[:400]}")
-    return json.loads(text[start:end])
 
 
 def extract_grounding_urls(api_resp: Any) -> list[str]:
@@ -247,6 +220,8 @@ class LLMClient:
     ) -> LLMResponse:
         if use_google_search:
             return self._call_gemini_search(system, user, images, temperature, thinking_budget, ctx)
+        if self._config.use_direct_gemini:
+            return self._call_gemini_direct(system, user, images, temperature, thinking_budget, ctx)
         return self._call_openrouter(system, user, images, temperature, thinking_budget, ctx)
 
     def _call_openrouter(
@@ -384,6 +359,85 @@ class LLMClient:
             out.extend(vecs)
         return out
 
+    def _call_gemini_direct(
+        self,
+        system: str,
+        user: str,
+        images: list[tuple[str, str]] | None,
+        temperature: float,
+        thinking_budget: int,
+        ctx: "HarnessContext | None",
+    ) -> LLMResponse:
+        """Direct Gemini API path — used when SkunkConfig.use_direct_gemini is set.
+        Mirrors _call_gemini_search but without the GoogleSearch tool, so the
+        same model serves the planner/retrieve/extract/compute calls."""
+        client = self._get_gemini_client()
+        parts: list[Any] = []
+        if images:
+            for mime_type, b64_data in images:
+                parts.append(
+                    types.Part.from_bytes(data=base64.b64decode(b64_data), mime_type=mime_type)
+                )
+        parts.append(types.Part.from_text(text=user))
+
+        thinking_config = types.ThinkingConfig(thinking_budget=thinking_budget)
+        gen_config = types.GenerateContentConfig(
+            system_instruction=system,
+            max_output_tokens=65535,
+            temperature=temperature,
+            thinking_config=thinking_config,
+        )
+
+        limiter = _get_rate_limiter(self._config.llm_rpm)
+        max_retries = self._config.gemini_max_retries
+        delay = self._config.gemini_retry_initial_delay_s
+        max_delay = self._config.gemini_retry_max_delay_s
+        model = self._config.gemini_model
+
+        for attempt in range(max_retries + 1):
+            limiter.acquire()
+            t0 = time.monotonic()
+            try:
+                api_resp = client.models.generate_content(
+                    model=model, contents=parts, config=gen_config,
+                )
+                latency_s = time.monotonic() - t0
+                usage = api_resp.usage_metadata
+                output_text = (api_resp.text or "").strip()
+                if ctx is not None:
+                    ctx.emit(
+                        "llm", "call",
+                        model=model,
+                        temperature=temperature,
+                        thinking_budget=thinking_budget,
+                        latency_s=round(latency_s, 3),
+                        input_tokens=getattr(usage, "prompt_token_count", None),
+                        output_tokens=getattr(usage, "candidates_token_count", None),
+                        total_tokens=getattr(usage, "total_token_count", None),
+                        thinking_tokens=getattr(usage, "thoughts_token_count", None),
+                        input_text=system + "\n\n---\n\n" + user,
+                        output_text=output_text,
+                    )
+                return LLMResponse(
+                    text=output_text,
+                    latency_s=latency_s,
+                    input_tokens=getattr(usage, "prompt_token_count", None),
+                    output_tokens=getattr(usage, "candidates_token_count", None),
+                )
+            except Exception as e:
+                if attempt == max_retries:
+                    raise
+                print(
+                    f"[LLMClient] attempt {attempt + 1}/{max_retries + 1} failed: "
+                    f"{type(e).__name__}: {e}; sleeping {delay:.1f}s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, max_delay)
+
+        raise RuntimeError("unreachable: retry loop fell through")
+
     def _call_gemini_search(
         self,
         system: str,
@@ -465,44 +519,3 @@ class LLMClient:
                 delay = min(delay * 2, max_delay)
 
         raise RuntimeError("unreachable: retry loop fell through")
-
-
-@dataclass
-class HarnessContext:
-    question: str
-    verbose: bool = False     # live-print orchestrator + operator events to stdout
-    events: list[dict] = field(default_factory=list)  # per-question diagnostic events
-    config: SkunkConfig = field(default_factory=SkunkConfig.from_env)
-    llm_client: LLMClient | None = None  # inject a mock for tests; auto-created otherwise
-    plan: Plan | None = None  # set by the orchestrator at execute() entry so operators can read top-level constraints; None for tests / before planning
-    prompt_overrides: tuple[PromptOverride, ...] = ()  # corpus/few_shot/lesson overrides; operators pick out their own entries by name
-
-    def __post_init__(self) -> None:
-        if self.llm_client is None:
-            self.llm_client = LLMClient(self.config)
-
-    def emit(self, source: str, message: str, **fields: Any) -> None:
-        """Record a diagnostic event. Operators call this with their op name as `source`."""
-        evt = {"source": source, "message": message, **fields}
-        self.events.append(evt)
-        if self.verbose:
-            extra = ""
-            if fields:
-                bits = []
-                for k, v in fields.items():
-                    s = repr(v)
-                    if len(s) > 200:
-                        s = s[:200] + "..."
-                    bits.append(f"{k}={s}")
-                extra = " | " + ", ".join(bits)
-            print(f"  [{source}] {message}{extra}")
-
-    def with_extra_override(self, override: PromptOverride) -> HarnessContext:
-        """Return a shallow copy of this ctx with one extra `PromptOverride`
-        appended to `prompt_overrides`. Used by the orchestrator to scope a
-        recovery lesson to a single planner re-invocation without polluting
-        the ctx that operators see."""
-        import dataclasses
-        return dataclasses.replace(
-            self, prompt_overrides=self.prompt_overrides + (override,)
-        )
