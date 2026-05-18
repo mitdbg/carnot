@@ -206,13 +206,13 @@ class LLMWrapper:
         attempt_idx = 0
         while True:
             try:
-                self.wait_for_rate_limit_slot()
                 return request_fn()
             except Exception as e:
                 if not self.is_rate_limit_error(e) or attempt_idx >= self.max_retries:
                     raise
                 sleep_seconds = self.retry_backoff_seconds * (attempt_idx + 1)
                 print(f"LLM rate limit hit; retrying in {sleep_seconds} seconds.")
+                self.wait_for_rate_limit_slot()
                 time.sleep(sleep_seconds)
                 attempt_idx += 1
 
@@ -462,4 +462,19 @@ class LLMWrapper:
         return [embedding for embedding in embeddings if embedding is not None]
 
 
-DEFAULT_LLM_WRAPPER = LLMWrapper()
+_PROCESS_LLM_WRAPPER = None
+
+
+def get_llm_wrapper() -> LLMWrapper:
+    global _PROCESS_LLM_WRAPPER
+    if _PROCESS_LLM_WRAPPER is None:
+        _PROCESS_LLM_WRAPPER = LLMWrapper()
+    return _PROCESS_LLM_WRAPPER
+
+
+class LazyLLMWrapper:
+    def __getattr__(self, name: str):
+        return getattr(get_llm_wrapper(), name)
+
+
+DEFAULT_LLM_WRAPPER = LazyLLMWrapper()

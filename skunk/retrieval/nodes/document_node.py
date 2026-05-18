@@ -9,7 +9,7 @@ from pqdm.threads import pqdm
 
 from skunk.retrieval.nodes.pdf_file import parse_pdf_pages
 
-from .llm_wrapper import DEFAULT_LLM_WRAPPER
+from .llm_wrapper import get_llm_wrapper
 from .page_node import PageNode
 
 DEFAULT_OCR_TEXT_DIR = "data/officeqa/treasury_bulletins_parsed/transformed"
@@ -118,7 +118,7 @@ class DocumentNode:
             args,
             PageNode,
             # n_jobs=self.page_process_workers,
-            n_jobs=32,
+            n_jobs=64,
             argument_type="args",
             exception_behaviour="immediate",
             desc=f"Processing page nodes in {self.filename}",
@@ -146,7 +146,7 @@ Document OCR text:
 {text[:MAX_DOCUMENT_PROMPT_CHARS]}
 """.strip()
 
-        return DEFAULT_LLM_WRAPPER.call_llm(prompt, use_cache=self.use_cache)
+        return get_llm_wrapper().call_llm(prompt, use_cache=self.use_cache)
 
     def extract_document_date(self, text: str) -> str:
         if not text.strip():
@@ -166,7 +166,7 @@ Document OCR text:
 {text[:MAX_DOCUMENT_PROMPT_CHARS]}
 """.strip()
 
-        return DEFAULT_LLM_WRAPPER.call_llm(prompt, use_cache=self.use_cache)
+        return get_llm_wrapper().call_llm(prompt, use_cache=self.use_cache)
 
     def describe_text(self, text: str) -> str:
         fallback = f"{self.document_title} from {self.document_date} contains {self.num_pdf_pages} pages."
@@ -191,5 +191,5 @@ Document OCR text:
 {text[:MAX_DOCUMENT_PROMPT_CHARS]}
 """.strip()
 
-        desc = DEFAULT_LLM_WRAPPER.call_llm(prompt, use_cache=self.use_cache)
+        desc = get_llm_wrapper().call_llm(prompt, use_cache=self.use_cache)
         return desc

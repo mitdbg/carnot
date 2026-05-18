@@ -5,7 +5,7 @@ from typing import List
 
 import pandas as pd
 import json
-from .llm_wrapper import DEFAULT_LLM_WRAPPER, parse_json_response
+from .llm_wrapper import get_llm_wrapper, parse_json_response
 
 MAX_PAGE_PROMPT_CHARS = 2000
 TABLE_FRACTION = 0.15
@@ -104,9 +104,10 @@ class PageNode:
         self.plot_nodes = []
 
         start_time = time.time()
+        llm_wrapper = get_llm_wrapper()
         text_prompt = PageNode.description_prompt(page_text)
         try:
-            response = DEFAULT_LLM_WRAPPER.call_llm(text_prompt, use_cache=self.use_cache)
+            response = llm_wrapper.call_llm(text_prompt, use_cache=self.use_cache)
         except Exception as e:
             raise RuntimeError(f"{type(e).__name__}: {e}") from None
         self.description = response
@@ -116,7 +117,7 @@ class PageNode:
         if len(text_blocks) > 0:
             prompts = PageNode.text_blocks_prompt(text_blocks)
             try:
-                response = DEFAULT_LLM_WRAPPER.call_llm(prompts, use_cache=self.use_cache)
+                response = llm_wrapper.call_llm(prompts, use_cache=self.use_cache)
             except Exception as e:
                 raise RuntimeError(f"{type(e).__name__}: {e}") from None
             parsed = parse_json_response(response)
@@ -147,7 +148,7 @@ class PageNode:
         if len(tables) > 0:
             prompt = PageNode.tables_prompt(tables)
             try:
-                response = DEFAULT_LLM_WRAPPER.call_llm(prompt, use_cache=self.use_cache)
+                response = llm_wrapper.call_llm(prompt, use_cache=self.use_cache)
             except Exception as e:
                 raise RuntimeError(f"{type(e).__name__}: {e}") from None
             parsed = parse_json_response(response)
@@ -176,7 +177,7 @@ class PageNode:
         if figures:
             t5 = time.time()
             try:
-                visual_responses = DEFAULT_LLM_WRAPPER.call_llm_vision(
+                visual_responses = llm_wrapper.call_llm_vision(
                     PageNode.plots_prompt(page_text, page_image),
                     page_image,
                     use_cache=self.use_cache,
