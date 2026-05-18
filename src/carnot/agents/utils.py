@@ -309,31 +309,19 @@ def parse_code_blobs(text: str, code_block_tags: tuple[str, str]) -> str:
 
     if "final" in text and "answer" in text:
         raise ValueError(
-            dedent(
-                f"""
-                Your code snippet is invalid, because the regex pattern {code_block_tags[0]}(.*?){code_block_tags[1]} was not found in it.
-                Here is your code snippet:
-                {text}
-                It seems like you're trying to return the final answer, you can do it as follows:
-                {code_block_tags[0]}
-                final_answer("YOUR FINAL ANSWER HERE")
-                {code_block_tags[1]}
-                """
-            ).strip()
+            f"Your code snippet is invalid, because the regex pattern "
+            f"{code_block_tags[0]}(.*?){code_block_tags[1]} was not found in it.\n"
+            f"Here is your code snippet:\n{text}\n"
+            f"It seems like you're trying to return the final answer, you can do it as follows:\n"
+            f"{code_block_tags[0]}\nfinal_answer(\"YOUR FINAL ANSWER HERE\")\n{code_block_tags[1]}"
         )
     raise ValueError(
-        dedent(
-            f"""
-            Your code snippet is invalid, because the regex pattern {code_block_tags[0]}(.*?){code_block_tags[1]} was not found in it.
-            Here is your code snippet:
-            {text}
-            Make sure to include code with the correct pattern, for instance:
-            Thoughts: Your thoughts
-            {code_block_tags[0]}
-            # Your python code here
-            {code_block_tags[1]}
-            """
-        ).strip()
+        f"Your code snippet is invalid, because the regex pattern "
+        f"{code_block_tags[0]}(.*?){code_block_tags[1]} was not found in it.\n"
+        f"Here is your code snippet:\n{text}\n"
+        f"Make sure to include code with the correct pattern, for instance:\n"
+        f"Thoughts: Your thoughts\n"
+        f"{code_block_tags[0]}\n# Your python code here\n{code_block_tags[1]}"
     )
 
 
