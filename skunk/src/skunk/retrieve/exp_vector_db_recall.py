@@ -15,7 +15,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,67 +22,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import chromadb
 import pandas as pd
 
+from skunk.utils.officeqa_eval import (
+    metadata_to_doc_key,
+    metadata_to_page_key,
+    source_docs_to_page_keys,
+    source_files_to_doc_keys,
+)
+
 K_VALUES = [1, 10, 100, 1000]
 COLLECTIONS = ["qwen", "qwen-strip-years", "gemini", "gemini-strip-years"]
 
 GEMINI_MODEL_ID = "gemini-embedding-2"
 QWEN_MODEL_ID = "Qwen/Qwen3-Embedding-8B"
-
-_MONTH_NAMES: dict[str, str] = {
-    "january": "01", "february": "02", "march": "03", "april": "04",
-    "may": "05", "june": "06", "july": "07", "august": "08",
-    "september": "09", "october": "10", "november": "11", "december": "12",
-}
-
-
-# ---------------------------------------------------------------------------
-# Ground truth parsing (copied from harness.py)
-# ---------------------------------------------------------------------------
-def source_docs_to_page_keys(source_docs: str) -> list[str]:
-    """Parse source_docs URLs like
-    ".../january-1941-6529?page=15" -> "1941_01_15"."""
-    keys: list[str] = []
-    for url in str(source_docs).splitlines():
-        url = url.strip()
-        if not url:
-            continue
-        m = re.search(r"/([a-zA-Z]+)-(\d{4})-\d+\?page=(\d+)", url)
-        if m:
-            month_num = _MONTH_NAMES.get(m.group(1).lower())
-            if month_num:
-                keys.append(f"{m.group(2)}_{month_num}_{m.group(3)}")
-    return keys
-
-
-def source_files_to_doc_keys(source_files: str) -> list[str]:
-    """Parse source_files like 'treasury_bulletin_1941_01.txt' -> '1941_01'."""
-    keys: list[str] = []
-    for fname in str(source_files).splitlines():
-        fname = fname.strip()
-        if not fname:
-            continue
-        m = re.search(r"_(\d{4})_(\d{2})", fname)
-        if m:
-            keys.append(f"{m.group(1)}_{m.group(2)}")
-    return keys
-
-
-def metadata_to_page_key(meta: dict) -> str:
-    page_key = meta.get("page_key")
-    if page_key:
-        return str(page_key)
-    # fallback: build from year/month/page_id
-    return f"{meta.get('year')}_{meta.get('month')}_{meta.get('page_id')}"
-
-
-def metadata_to_doc_key(meta: dict) -> str:
-    file_id = meta.get("file_id")
-    if file_id:
-        # file_id format: "treasury_bulletin_yyyy_mm"
-        m = re.search(r"_(\d{4})_(\d{2})", str(file_id))
-        if m:
-            return f"{m.group(1)}_{m.group(2)}"
-    return f"{meta.get('year')}_{meta.get('month')}"
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +55,7 @@ class GeminiEmbedder:
             res = self.client.models.embed_content(
                 model=self.model_id, contents=t, config=cfg
             )
-            return list(res.embeddings[0].values)
+            return list(res.embeddings[0].values)  # type: ignore
 
         out: list[list[float] | None] = [None] * len(texts)
         with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
@@ -190,8 +140,8 @@ def evaluate_collection(
             print(f"  [warn] query {i} failed: {e}", flush=True)
             continue
         metas = res["metadatas"][0]  # type: ignore[index]
-        retrieved_pages = [metadata_to_page_key(m) for m in metas]
-        retrieved_docs = [metadata_to_doc_key(m) for m in metas]
+        retrieved_pages = [metadata_to_page_key(m) for m in metas]  # type: ignore[assignment]
+        retrieved_docs = [metadata_to_doc_key(m) for m in metas]  # type: ignore[assignment]
 
         gp_set = set(gp)
         gd_set = set(gd)

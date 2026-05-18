@@ -34,7 +34,7 @@ from threading import Lock
 
 import numpy as np
 from google import genai
-from google.genai import types as genai_types
+from google.genai import types as genai_types  # noqa: F401
 from openrouter import OpenRouter
 
 # Gemini Embedding 2 Preview context limit (tokens).
@@ -114,17 +114,17 @@ def _embed_request(client: OpenRouter | genai.Client, inputs: list[str]) -> list
     delay = 1.0
     for attempt in range(MAX_ATTEMPTS):
         try:
-            # resp = client.embeddings.generate(input=inputs, model=MODEL_NAME)
-            # return [np.asarray(d.embedding, dtype=np.float32) for d in resp.data]  # type: ignore
-            assert isinstance(client, genai.Client)
-            result = client.models.embed_content(
-                model=GEMINI_MODEL_NAME,
-                contents=[
-                    genai_types.Content(parts=[genai_types.Part.from_text(text=s)])
-                    for s in inputs
-                ],
-            )
-            return [np.asarray(emb.values, dtype=np.float32) for emb in result.embeddings]  # type: ignore
+            resp = client.embeddings.generate(input=inputs, model=MODEL_NAME)  # type: ignore
+            return [np.asarray(d.embedding, dtype=np.float32) for d in resp.data]  # type: ignore
+            # assert isinstance(client, genai.Client)
+            # result = client.models.embed_content(
+            #     model=GEMINI_MODEL_NAME,
+            #     contents=[
+            #         genai_types.Content(parts=[genai_types.Part.from_text(text=s)])
+            #         for s in inputs
+            #     ],
+            # )
+            # return [np.asarray(emb.values, dtype=np.float32) for emb in result.embeddings]  # type: ignore
 
         except Exception as e:  # noqa: BLE001 - retry on any transient API error
             if attempt == MAX_ATTEMPTS - 1:
@@ -267,12 +267,12 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY")
-    # if not api_key:
-    #     raise SystemExit("OPENROUTER_API_KEY env var (or --api_key) is required.")
+    api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY")
+    if not api_key:
+        raise SystemExit("OPENROUTER_API_KEY env var (or --api_key) is required.")
 
-    # client = OpenRouter(api_key=api_key)
-    client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
+    client = OpenRouter(api_key=api_key)
+    # client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
 
     json_files = sorted(glob.glob(os.path.join(args.input_dir, "*.json")))
     print(f"Processing {len(json_files)} .json files.")
