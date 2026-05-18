@@ -51,7 +51,7 @@ class PageNode:
         document_id: str,
         page_pdf_number: int,
         page_elements: list[dict],
-        page_image: bytes,
+        page_image: bytes | None,
         use_cache: bool = True,
     ):
         self.page_id = f"{document_id}_page:{page_pdf_number}"
@@ -72,7 +72,9 @@ class PageNode:
             if not content:
                 continue
             if isinstance(content, list):
-                content_text = "\n\n".join(str(part) for part in content if part is not None)
+                content_text = "\n\n".join(
+                    str(part) for part in content if part is not None
+                )
             else:
                 content_text = str(content)
 
@@ -94,25 +96,45 @@ class PageNode:
                 text_blocks.append(content_text.strip())
 
         self.page_text = page_text
-        self.page_number = candidate_nums[0] if candidate_nums else str(page_pdf_number + 1)
+        self.page_number = (
+            candidate_nums[0] if candidate_nums else str(page_pdf_number + 1)
+        )
         self.text_nodes = []
         self.table_nodes = []
         self.plot_nodes = []
 
-        # Batching all prompts together
+        start_time = time.time()
         text_prompt = PageNode.description_prompt(page_text)
-        response = DEFAULT_LLM_WRAPPER.call_llm(text_prompt, use_cache=self.use_cache)
+        try:
+            response = DEFAULT_LLM_WRAPPER.call_llm(text_prompt, use_cache=self.use_cache)
+        except Exception as e:
+            raise RuntimeError(f"{type(e).__name__}: {e}") from None
         self.description = response
+        t1 = time.time()
+        # print(f"PageNode description generated in {t1 - start_time:.2f} seconds")
 
         if len(text_blocks) > 0:
             prompts = PageNode.text_blocks_prompt(text_blocks)
-            response = DEFAULT_LLM_WRAPPER.call_llm(prompts, use_cache=self.use_cache)
+            try:
+                response = DEFAULT_LLM_WRAPPER.call_llm(prompts, use_cache=self.use_cache)
+            except Exception as e:
+                raise RuntimeError(f"{type(e).__name__}: {e}") from None
             parsed = parse_json_response(response)
+            t2 = time.time()
+            # print(
+            #     f"PageNode text block descriptions generated in {t2 - t1:.2f} seconds"
+            # )
             if isinstance(parsed, list):
                 parsed = {"text_blocks": parsed}
-            for text_block in parsed.get("text_blocks", []):
-                block_idx = text_block["block_idx"]
-                description = text_block["description"]
+            for idx, text_block in enumerate(parsed.get("text_blocks", [])):
+                block_idx = text_block.get("block_idx", idx)
+                if block_idx >= len(text_blocks):
+                    print(
+                        f"block_idx {block_idx} out of range for text_blocks with length {len(text_blocks)}"
+                    )
+                    block_idx = -1
+
+                description = text_block.get("description", "")
                 self.text_nodes.append(
                     TextNode(
                         text_id=f"{self.page_id}_text:{block_idx}",
@@ -121,16 +143,22 @@ class PageNode:
                     )
                 )
 
+        t3 = time.time()
         if len(tables) > 0:
             prompt = PageNode.tables_prompt(tables)
-            response = DEFAULT_LLM_WRAPPER.call_llm(prompt, use_cache=self.use_cache)
+            try:
+                response = DEFAULT_LLM_WRAPPER.call_llm(prompt, use_cache=self.use_cache)
+            except Exception as e:
+                raise RuntimeError(f"{type(e).__name__}: {e}") from None
             parsed = parse_json_response(response)
+            t4 = time.time()
+            # print(f"PageNode table descriptions generated in {t4 - t3:.2f} seconds")
             if isinstance(parsed, list):
                 parsed = {"tables": parsed}
 
             for table_info in parsed.get("tables", []):
                 title = table_info.get("table_title", "")
-                table_idx = int(table_info["table_idx"])
+                table_idx = int(table_info.get("table_idx", -1))
                 description = table_info.get("description", "")
                 date_start = table_info.get("date_start", "")
                 date_end = table_info.get("date_end", "")
@@ -146,12 +174,18 @@ class PageNode:
                 )
 
         if figures:
-            visual_responses = DEFAULT_LLM_WRAPPER.call_llm_vision(
-                PageNode.plots_prompt(page_text, page_image),
-                page_image,
-                use_cache=self.use_cache,
-            )
+            t5 = time.time()
+            try:
+                visual_responses = DEFAULT_LLM_WRAPPER.call_llm_vision(
+                    PageNode.plots_prompt(page_text, page_image),
+                    page_image,
+                    use_cache=self.use_cache,
+                )
+            except Exception as e:
+                raise RuntimeError(f"{type(e).__name__}: {e}") from None
             parsed = parse_json_response(visual_responses)
+            t6 = time.time()
+            # print(f"PageNode plot descriptions generated in {t6 - t5:.2f} seconds")
             for plot_idx, plot in enumerate(parsed.get("plots", [])):
                 self.plot_nodes.append(
                     PlotNode(
@@ -160,6 +194,11 @@ class PageNode:
                         description=plot.get("description", ""),
                     )
                 )
+        end_time = time.time()
+        tot_time = end_time - start_time
+        # print(f"Total PageNode processing time: {tot_time:.2f} seconds")
+        # if tot_time > 30:
+            # breakpoint()
 
     @staticmethod
     def description_prompt(text: str) -> str:

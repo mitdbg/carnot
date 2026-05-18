@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass, field
+import time
 
 import fitz
 from pqdm.threads import pqdm
@@ -94,23 +95,30 @@ class DocumentNode:
                 else:
                     page_elements[page_id].append(e)
 
-        args = [
-            (
-                self.document_id,
-                idx,
-                page_elements.get(idx, []),
-                page_images[idx],
-                self.use_cache,
-            )
-            for idx in range(self.num_pdf_pages)
-            if len(page_elements[idx]) > 0
-        ]
-        # self.page_nodes = [PageNode(*arg) for arg in args]
+        args = []
+        for idx in range(self.num_pdf_pages):
+            if len(page_elements[idx]) > 0:
+                if [e for e in page_elements[idx] if e["type"] == "figure"]:
+                    img = page_images[idx] 
+                else:
+                    img = None
+                args.append(
+                    (
+                        self.document_id,
+                        idx,
+                        page_elements.get(idx, []),
+                        img,
+                        self.use_cache,
+                    )
+                )
 
+        # self.page_nodes = [PageNode(*arg) for arg in args]
+        # raise Exception
         self.page_nodes = pqdm(
             args,
             PageNode,
-            n_jobs=self.page_process_workers,
+            # n_jobs=self.page_process_workers,
+            n_jobs=32,
             argument_type="args",
             exception_behaviour="immediate",
             desc=f"Processing page nodes in {self.filename}",

@@ -22,6 +22,9 @@ litellm.suppress_debug_info = True
 DEFAULT_LLM_MODEL = "openrouter/google/gemini-2.5-flash"
 DEFAULT_LLM_VISION_MODEL = "openrouter/google/gemini-2.5-flash"
 DEFAULT_EMBEDDING_MODEL = "openrouter/google/gemini-embedding-001"
+# DEFAULT_LLM_MODEL = "gemini/gemini-2.5-flash"
+# DEFAULT_LLM_VISION_MODEL = "gemini/gemini-2.5-flash"
+# DEFAULT_EMBEDDING_MODEL = "gemini/gemini-embedding-001"
 
 EMBEDDING_BATCH_SIZE = 64
 
@@ -177,6 +180,7 @@ class LLMWrapper:
 
     def is_rate_limit_error(self, error: Exception) -> bool:
         status_code = getattr(error, "status_code", None)
+        error_text = str(error).lower()
         if status_code == 429:
             return True
 
@@ -184,7 +188,18 @@ class LLMWrapper:
         if getattr(response, "status_code", None) == 429:
             return True
 
-        error_text = str(error).lower()
+        if isinstance(error, litellm.exceptions.APIError):
+            if (
+                "openrouterexception" in error_text
+                and "server disconnected without sending a response" in error_text
+            ):
+                return True
+            
+        if isinstance(error, litellm.exceptions.ServiceUnavailableError):
+            return True
+
+        if "OpenrouterException" in error_text:
+            return True
         return "429" in error_text or "rate limit" in error_text or "too many requests" in error_text
 
     def run_with_rate_limit_retries(self, request_fn):

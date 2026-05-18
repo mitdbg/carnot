@@ -5,6 +5,7 @@ import os
 import sys
 
 from dotenv import load_dotenv
+import pandas as pd
 
 REPO_ROOT = os.getenv("HOME") + "/carnot"
 if REPO_ROOT not in sys.path:
@@ -62,8 +63,8 @@ print(f"input_files from {cutoff_years[0]} to {cutoff_years[1]}: {len(input_file
 
 # input_files = ["treasury_bulletin_1987_12.pdf"]
 
-input_files = sorted(input_files)
-# indexed_files = pdf_files[:NUM_DOCUMENTS]
+# input_files = sorted(input_files)
+input_files = pdf_files
 pdf_paths = []
 for text_file in input_files:
     pdf_path = f"{PDF_DIR}/{os.path.splitext(text_file)[0]}.pdf"
@@ -83,14 +84,43 @@ for pdf_path in pdf_paths:
 
 index.initialize()
 retriever = Retriever(index)
-documents = retriever.retrieve(query["question"])
-counts = index.counts()
+rows = []
+for query in queries:
+    documents = retriever.retrieve(query["question"])
+    counts = index.counts()
 
-print(f"uid: {query['uid']}")
-print(f"question: {query['question']}")
-print(f"answer: {query['answer']}")
-print(f"gold_source_files: {gold_files}")
-print(f"retrieved results")
-for doc in documents:
-    print(f"Filename: {doc.filename}")
+    print(f"uid: {query['uid']}")
+    print(f"question: {query['question']}")
+    print(f"answer: {query['answer']}")
+    print(f"gold_source_files: {gold_files}")
+    print(f"retrieved results")
+    for doc in documents:
+        print(f"Filename: {doc.filename}")
+    tp = sum([1 for doc in documents if doc.filename in gold_files])
+    fp = sum([1 for doc in documents if doc.filename not in gold_files])
+    fn = sum([1 for doc in gold_files if doc not in [d.filename for doc in documents]])
+    rows.append(
+        {
+            "uid": query["uid"],
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            "precision": tp / (tp + fp) if tp + fp > 0 else 0,
+            "recall": tp / (tp + fn) if tp + fn > 0 else 0,
+            "f1": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn > 0 else 0,
+        }
+    )
+
+df = pd.DataFrame(rows)
+# Overall metrics
+tp = df["tp"].sum()
+fp = df["fp"].sum()
+fn = df["fn"].sum()
+p = tp / (tp + fp) if tp + fp > 0 else 0
+r = tp / (tp + fn) if tp + fn > 0 else 0
+f1 = 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn > 0 else 0
+
+print(f"Overall Precision: {p:.2f}, Recall: {r:.2f}, F1: {f1:.2f}")
+# print(df)
+df.to_csv(f"{REPO_ROOT}/skunk/retrieval_results.csv", index=False)
 # print(f"index contents:\n{index}")
