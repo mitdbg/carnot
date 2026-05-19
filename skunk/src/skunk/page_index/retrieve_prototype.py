@@ -7,9 +7,10 @@ Two-step deterministic-after-LLM pipeline:
 
   1. L1 chapter pick (one LLM call) — chooses a canonical chapter from
      the concept tree given the branch's question/key/period.
-  2. Year-window filter (deterministic) — drops chapter pages whose
-     `(min_year, max_year)` envelope doesn't intersect the period's year
-     window. No-op when the period has no parseable year window.
+  2. Date filter (deterministic) — drops chapter pages whose
+     structured `dates` (verbatim strings parsed back into ISO intervals)
+     don't intersect any of the period's intervals. Pages without dates
+     are kept (recall safety net). No-op when the period is unparseable.
 
 Optional BM25 rerank (default OFF; gated on `ctx.config.bm25_enabled`)
 runs after the year filter. The period parser is supplied by the active
@@ -133,22 +134,30 @@ class PageIndexRetrievePrototype:
         catalog_index: dict[tuple[str, int], PageCatalogRow],
         period: str | None,
     ) -> list[dict[str, Any]]:
-        """Drop candidates whose `(min_year, max_year)` envelope doesn't
-        intersect `period_year_window(period)`. Pages with no envelope
-        (build-time gap; shouldn't happen post-bulletin-fallback) are kept
-        so callers can decide. No-op when the period is unparseable.
+        """Drop candidates whose `row.dates` don't intersect any of the
+        period's ISO intervals. Verbatim dates on the page are parsed via
+        the period parser's `verbatim_date_to_intervals`, preserving
+        range semantics ("1932-1939" is one closed interval, not min/max
+        years 1932/1939) and month/day granularity.
+
+        Pages with no dates and pages whose dates all fail to parse are
+        kept — recall safety net for ToC / continuation pages and pages
+        that survived catalog build with an unrecognized date shape.
+        Strict mode (drop those too) belongs behind a flag if we want it.
+        No-op when the period is unparseable.
         """
-        window = self._period_parser.year_window(period)
-        if window is None:
+        period_intervals = self._period_parser.intervals(period)
+        if not period_intervals:
             return list(candidates)
-        q_lo, q_hi = window
         kept: list[dict[str, Any]] = []
         for c in candidates:
             row = catalog_index.get((c["bulletin"], c["page"]))
-            if row is None or row.min_year is None or row.max_year is None:
+            if row is None or not row.dates:
                 kept.append(c)
                 continue
-            if row.max_year >= q_lo and row.min_year <= q_hi:
+            if self._period_parser.dates_overlap_period(
+                row.dates, period_intervals,
+            ):
                 kept.append(c)
         return kept
 

@@ -275,18 +275,28 @@ class LLMClient:
             {"role": "user", "content": content},
         ]
 
-        # OpenRouter unifies reasoning across providers under `reasoning`; the
-        # native Gemini `thinking.thinking_budget` field is silently dropped.
-        # Map our existing semantics:
-        #   0  → explicitly disabled (gemini-3-flash-preview reasons by default)
-        #   -1 → max effort (Gemini's "unlimited" sentinel)
-        #   >0 → token cap
+        # OpenRouter unifies reasoning across providers under `reasoning`. For
+        # Gemini 3 the legacy `thinkingBudget` (what `reasoning.max_tokens`
+        # forwards to) is accepted but no longer behaves as a hard cap — Google
+        # internally maps it onto the new discrete `thinking_level` (minimal /
+        # low / medium / high), and within a level the model is free to spend
+        # up to the model-wide ceiling (~63k thinking tokens). The only knob
+        # that actually constrains spend is `reasoning.effort`, which maps
+        # cleanly onto `thinking_level`. We bucket the integer budget onto
+        # those levels rather than pass it through verbatim.
+        #   0           → disabled
+        #   1..2048     → low
+        #   2049..8192  → medium
+        #   8193+       → high
+        #   <0          → high (legacy "max effort" sentinel)
         if thinking_budget == 0:
             reasoning: dict = {"enabled": False}
-        elif thinking_budget < 0:
+        elif thinking_budget < 0 or thinking_budget > 8192:
             reasoning = {"effort": "high"}
+        elif thinking_budget > 2048:
+            reasoning = {"effort": "medium"}
         else:
-            reasoning = {"max_tokens": thinking_budget}
+            reasoning = {"effort": "low"}
         extra_body: dict = {"reasoning": reasoning}
 
         client = self._get_openrouter_client()

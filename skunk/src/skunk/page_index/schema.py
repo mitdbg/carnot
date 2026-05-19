@@ -39,10 +39,11 @@ class PageCatalogRow:
 
     # Page-level signals.
     keywords: list[str] = field(default_factory=list)
-    # Year envelope across every 4-digit year occurrence on the page.
-    # None when the page has no recognizable year string.
-    min_year: int | None = None
-    max_year: int | None = None
+    # Verbatim date strings detected on the page ("December 31, 1949",
+    # "Fiscal Year 1991", "1932-1939", "1940"). Retrieve parses each
+    # back into ISO intervals and overlap-checks against the query
+    # period — see TreasuryPeriodParser.verbatim_date_to_intervals.
+    dates: list[str] = field(default_factory=list)
     char_count: int = 0
     digit_ratio: float = 0.0
 

@@ -186,8 +186,7 @@ class TreasuryCatalogBuilder:
             fields = parse_page_fields(elements, bulletin=bulletin)
             row.content_blocks = fields["content_blocks"]
             row.keywords = fields["keywords"]
-            row.min_year = fields["min_year"]
-            row.max_year = fields["max_year"]
+            row.dates = fields["dates"]
             rows.append(row)
 
         _merge_continuation_pages(rows)

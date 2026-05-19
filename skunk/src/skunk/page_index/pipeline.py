@@ -31,12 +31,14 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from skunk.common import LLMClient, load_env_file
+from skunk.common import LLMClient, LLMResponse, load_env_file
 from skunk.config import SkunkConfig
 
 from .corpora import PROFILES, load_profile
@@ -55,6 +57,86 @@ load_env_file(_REPO_ROOT / ".env")
 
 STAGES = ("build_catalog", "extract_l1", "place_pages",
           "merge_chapters", "manifest")
+
+
+# ---------------------------------------------------------------------------
+# Build-time LLM instrumentation
+#
+# Stages call `llm.call(...)` directly (no `ctx` is propagated), so token
+# usage doesn't reach any sink today. `StageStats` accumulates per-stage
+# call counts, tokens, and wall-clock; `StageLLMWrapper` is a drop-in for
+# `LLMClient` that records each successful response under the active stage.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StageStats:
+    """Per-stage LLM call accumulator. Thread-safe via the lock below."""
+    n_calls: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    llm_latency_s: float = 0.0   # summed across calls (parallel-overlapped)
+    n_errors: int = 0
+    wall_s: float = 0.0          # set by stage driver, not by per-call
+    extra: dict = field(default_factory=dict)  # stage-specific counters
+
+    def record(
+        self, *, input_tokens: int | None, output_tokens: int | None,
+        latency_s: float,
+    ) -> None:
+        self.n_calls += 1
+        self.input_tokens += int(input_tokens or 0)
+        self.output_tokens += int(output_tokens or 0)
+        self.llm_latency_s += float(latency_s or 0.0)
+
+
+class StageLLMWrapper:
+    """Wraps an `LLMClient` so every `.call(...)` records into a `StageStats`
+    bucket. Same signature as `LLMClient.call`; passes everything through.
+
+    Errors are not recorded as token usage (they raise before usage is
+    populated); the wrapper increments `n_errors` and re-raises so the
+    underlying retry/error handling stays unchanged.
+    """
+
+    def __init__(self, inner: LLMClient, stats: StageStats,
+                 lock: threading.Lock) -> None:
+        self._inner = inner
+        self._stats = stats
+        self._lock = lock
+
+    def call(self, *args, **kwargs) -> LLMResponse:
+        try:
+            resp = self._inner.call(*args, **kwargs)
+        except Exception:
+            with self._lock:
+                self._stats.n_errors += 1
+            raise
+        with self._lock:
+            self._stats.record(
+                input_tokens=resp.input_tokens,
+                output_tokens=resp.output_tokens,
+                latency_s=resp.latency_s,
+            )
+        return resp
+
+    # Defer anything we don't know about to the underlying client. Stages
+    # only ever call `.call` today; this keeps the wrapper forward-compat.
+    def __getattr__(self, name):  # pragma: no cover - thin proxy
+        return getattr(self._inner, name)
+
+
+# Process-wide stage stats, keyed by stage name. Populated by the stage
+# drivers below and consumed by `stage_manifest` when it writes
+# `build_stats.json`.
+_BUILD_STATS: dict[str, StageStats] = {s: StageStats() for s in STAGES}
+_BUILD_STATS_LOCK = threading.Lock()
+
+
+def _approx_cost_usd(input_tokens: int, output_tokens: int) -> float:
+    """Indicative Gemini Flash rate (matches the deleted retrieve-bench
+    harness): $0.30 / M input, $2.50 / M output. Build stages and
+    retrieval both run on the same model today."""
+    return input_tokens * 0.30e-6 + output_tokens * 2.50e-6
 
 
 # ---------------------------------------------------------------------------
@@ -204,8 +286,13 @@ def stage_build_catalog(args: argparse.Namespace, profile: CorpusProfile) -> Non
                 n_ok += 1
                 if args.verbose:
                     print(f"  [ok]  {bulletin} → {out_path}", flush=True)
+    wall_s = time.monotonic() - t0
+    stats = _BUILD_STATS["build_catalog"]
+    stats.wall_s = wall_s
+    stats.extra.update({"n_bulletins": len(chosen),
+                        "n_ok": n_ok, "n_err": n_err})
     print(f"  built {n_ok} bulletins, {n_err} errors "
-          f"in {time.monotonic() - t0:.1f}s", flush=True)
+          f"in {wall_s:.1f}s", flush=True)
 
 
 def stage_extract_l1(args: argparse.Namespace, profile: CorpusProfile) -> None:
@@ -226,7 +313,9 @@ def stage_extract_l1(args: argparse.Namespace, profile: CorpusProfile) -> None:
     print(f"  {len(bulletins)} bulletins → {l1_dir}", flush=True)
 
     cfg = _config_with_model(args.l1_model)
-    llm = LLMClient(cfg)
+    inner_llm = LLMClient(cfg)
+    stats = _BUILD_STATS["extract_l1"]
+    llm = StageLLMWrapper(inner_llm, stats, _BUILD_STATS_LOCK)
     print(f"  model: {cfg.llm_model}\n", flush=True)
     harvester = profile.l1_harvester
     t0 = time.monotonic()
@@ -262,14 +351,25 @@ def stage_extract_l1(args: argparse.Namespace, profile: CorpusProfile) -> None:
                 if args.verbose:
                     print(f"  [ok]  {bulletin}: {n_spans} L1 spans", flush=True)
 
+    wall_s = time.monotonic() - t0
+    stats.wall_s = wall_s
+    stats.extra.update({"n_bulletins": len(bulletins), "n_ok": n_ok,
+                        "n_err": n_err, "n_empty_spans": n_empty,
+                        "median_spans": (span_dist[len(span_dist) // 2]
+                                         if span_dist else 0)})
     if span_dist:
         span_dist.sort()
         mid = span_dist[len(span_dist) // 2]
         print(f"  done {n_ok}/{len(bulletins)} bulletins, {n_err} errors, "
               f"{n_empty} with 0 spans, median {mid} spans "
-              f"in {time.monotonic() - t0:.1f}s", flush=True)
+              f"in {wall_s:.1f}s", flush=True)
     else:
-        print(f"  done {n_ok}/{len(bulletins)}, {n_err} errors", flush=True)
+        print(f"  done {n_ok}/{len(bulletins)}, {n_err} errors "
+              f"in {wall_s:.1f}s", flush=True)
+    print(f"  LLM: calls={stats.n_calls}  "
+          f"in={stats.input_tokens:,}  out={stats.output_tokens:,}  "
+          f"~${_approx_cost_usd(stats.input_tokens, stats.output_tokens):.3f}",
+          flush=True)
 
 
 def stage_place_pages(args: argparse.Namespace, profile: CorpusProfile) -> None:
@@ -290,7 +390,9 @@ def stage_place_pages(args: argparse.Namespace, profile: CorpusProfile) -> None:
           f"sum L1 spans = {sum(len(v) for v in l1_by_bulletin.values())}",
           flush=True)
     cfg = _config_with_model(args.place_model)
-    llm = LLMClient(cfg)
+    inner_llm = LLMClient(cfg)
+    stats = _BUILD_STATS["place_pages"]
+    llm = StageLLMWrapper(inner_llm, stats, _BUILD_STATS_LOCK)
     print(f"  model: {cfg.llm_model}", flush=True)
 
     placer = profile.page_placer
@@ -307,8 +409,8 @@ def stage_place_pages(args: argparse.Namespace, profile: CorpusProfile) -> None:
         futs = {ex.submit(_run, b): b for b, _ in items}
         done = 0
         for f in as_completed(futs):
-            _, stats = f.result()
-            for k, n in stats.items():
+            _, per_bulletin = f.result()
+            for k, n in per_bulletin.items():
                 totals[k] += n
             done += 1
             if done % 50 == 0 or done == len(items):
@@ -323,6 +425,13 @@ def stage_place_pages(args: argparse.Namespace, profile: CorpusProfile) -> None:
     for _, rows in catalog_by_bulletin.items():
         _persist_catalog(rows, catalog_dir, drop_banner_self=True)
     print(f"  persisted updated catalog → {catalog_dir}", flush=True)
+
+    stats.wall_s = time.monotonic() - started
+    stats.extra.update({"placement_totals": dict(totals)})
+    print(f"  LLM: calls={stats.n_calls}  "
+          f"in={stats.input_tokens:,}  out={stats.output_tokens:,}  "
+          f"~${_approx_cost_usd(stats.input_tokens, stats.output_tokens):.3f}",
+          flush=True)
 
 
 def stage_merge_chapters(args: argparse.Namespace, profile: CorpusProfile) -> None:
@@ -341,15 +450,23 @@ def stage_merge_chapters(args: argparse.Namespace, profile: CorpusProfile) -> No
     print(f"  {len(catalog)} catalog rows loaded", flush=True)
 
     cfg = _config_with_model(args.merge_model)
-    llm = LLMClient(cfg)
+    inner_llm = LLMClient(cfg)
+    stats = _BUILD_STATS["merge_chapters"]
+    llm = StageLLMWrapper(inner_llm, stats, _BUILD_STATS_LOCK)
     print(f"  model: {cfg.llm_model}", flush=True)
 
+    t0 = time.monotonic()
     tree = profile.chapter_merger.build_tree(
         catalog, llm, drop_unfiled=True, verbose=True,
     )
+    stats.wall_s = time.monotonic() - t0
     out_path = args.output_dir / "concept_tree.json"
     out_path.write_text(json.dumps(tree, ensure_ascii=False, indent=2))
     print(f"  wrote tree → {out_path}", flush=True)
+    print(f"  LLM: calls={stats.n_calls}  "
+          f"in={stats.input_tokens:,}  out={stats.output_tokens:,}  "
+          f"~${_approx_cost_usd(stats.input_tokens, stats.output_tokens):.3f}",
+          flush=True)
 
 
 def stage_manifest(args: argparse.Namespace, profile: CorpusProfile) -> None:
@@ -412,6 +529,109 @@ def stage_manifest(args: argparse.Namespace, profile: CorpusProfile) -> None:
     print(f"  chapters: {len(chapter_pages)}    pages: {total_pages}    "
           f"catalog rows: {catalog_rows}    L1 files: {n_l1_files}",
           flush=True)
+
+    # ---- Build statistics dump --------------------------------------------
+    # Per-stage timing + LLM token usage collected via `StageLLMWrapper`.
+    # Plus index-structure stats derived from the freshly-written tree
+    # and catalog. Lives next to `manifest.json` so anyone can replay the
+    # report without re-running the build.
+    stages_out: dict[str, dict] = {}
+    total_in = total_out = total_calls = 0
+    total_wall = 0.0
+    for name in STAGES:
+        s = _BUILD_STATS[name]
+        stages_out[name] = {
+            "wall_s": round(s.wall_s, 2),
+            "n_llm_calls": s.n_calls,
+            "input_tokens": s.input_tokens,
+            "output_tokens": s.output_tokens,
+            "sum_llm_latency_s": round(s.llm_latency_s, 2),
+            "n_llm_errors": s.n_errors,
+            "approx_cost_usd": round(
+                _approx_cost_usd(s.input_tokens, s.output_tokens), 4),
+            "extra": s.extra,
+        }
+        total_in += s.input_tokens
+        total_out += s.output_tokens
+        total_calls += s.n_calls
+        total_wall += s.wall_s
+
+    # Index-structure stats: chapter page distribution, examples coverage,
+    # year + bulletin coverage, content-tier mix from per-row metadata.
+    chapter_examples = {ch: len(data.get("examples", []))
+                        for ch, data in tree["chapters"].items()}
+    chapter_pages_sorted = sorted(chapter_pages.items(), key=lambda x: -x[1])
+    page_counts = list(chapter_pages.values())
+    page_counts.sort()
+    n_ch = max(1, len(page_counts))
+    median_idx = n_ch // 2
+    # Catalog year coverage from one pass over catalog rows. (Placement
+    # tier counts come from the place_pages stage's `extra` payload — no
+    # need to re-derive them here.)
+    bulletins_seen: set[str] = set()
+    year_min = None
+    year_max = None
+    n_pages_with_dates = 0
+    n_pages_total = 0
+    n_pages_with_content = 0
+    for p in (out / "catalog").glob("*.jsonl"):
+        for line in p.open():
+            line = line.strip()
+            if not line:
+                continue
+            row = PageCatalogRow.from_json(line)
+            bulletins_seen.add(row.bulletin)
+            n_pages_total += 1
+            if row.content_blocks:
+                n_pages_with_content += 1
+            try:
+                yr = int(row.bulletin[:4])
+                year_min = yr if year_min is None else min(year_min, yr)
+                year_max = yr if year_max is None else max(year_max, yr)
+            except ValueError:
+                pass
+            if row.dates:
+                n_pages_with_dates += 1
+
+    build_stats = {
+        "pipeline_wall_s": round(total_wall, 2),
+        "totals": {
+            "n_llm_calls": total_calls,
+            "input_tokens": total_in,
+            "output_tokens": total_out,
+            "approx_cost_usd": round(
+                _approx_cost_usd(total_in, total_out), 4),
+        },
+        "stages": stages_out,
+        "index_structure": {
+            "n_chapters": len(chapter_pages),
+            "n_pages_indexed": total_pages,
+            "n_bulletins": len(bulletins_seen),
+            "year_range": [year_min, year_max],
+            "chapter_page_counts": dict(chapter_pages_sorted),
+            "chapter_examples_count": chapter_examples,
+            "chapter_pages_p50": page_counts[median_idx] if page_counts else 0,
+            "chapter_pages_min": page_counts[0] if page_counts else 0,
+            "chapter_pages_max": page_counts[-1] if page_counts else 0,
+            "chapter_pages_mean": round(sum(page_counts) / n_ch, 1),
+            "catalog_rows": n_pages_total,
+            "catalog_rows_with_content": n_pages_with_content,
+            "catalog_rows_with_dates": n_pages_with_dates,
+            "catalog_dates_coverage": (
+                round(n_pages_with_dates / max(1, n_pages_total), 4)),
+            "placement_tier_counts": (
+                _BUILD_STATS["place_pages"].extra.get("placement_totals", {})),
+        },
+        "models": manifest["models"],
+        "built_at": manifest["built_at"],
+        "git_sha": manifest["git_sha"],
+    }
+    stats_path = out / "build_stats.json"
+    stats_path.write_text(json.dumps(build_stats, indent=2, ensure_ascii=False))
+    print(f"  wrote build stats → {stats_path}", flush=True)
+    print(f"  totals: {total_calls} LLM calls, "
+          f"in={total_in:,} out={total_out:,}  "
+          f"~${_approx_cost_usd(total_in, total_out):.3f}", flush=True)
 
 
 # ---------------------------------------------------------------------------

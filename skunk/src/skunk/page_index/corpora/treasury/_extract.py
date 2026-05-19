@@ -1,15 +1,17 @@
 """Per-page deterministic field extractor for Treasury Bulletin pages.
 
 Consumes the parsed-JSON element list for one page and returns:
-    content_blocks, keywords, min_year, max_year
+    content_blocks, keywords, dates
 
 `content_blocks` is one `ContentBlock` per detected table / chart / prose
 block on the page — multi-content pages emit multiple entries. A page
 with no blocks is non-retrievable.
 
-`min_year` / `max_year` is the canonical year envelope — see
-`_canonicalize_year_envelope` for the bulletin-fallback and the +1
-FY/CY-straddle rule.
+`dates` is the page's verbatim date strings in document order
+("December 31, 1949", "Fiscal Year 1991", "1932-1939", "1940").
+Retrieve parses each back via `TreasuryPeriodParser.verbatim_date_to_intervals`
+and overlap-checks against the planner-emitted period. Pages with no
+printed date inherit a single bare-year date matching the bulletin's CY.
 """
 
 from __future__ import annotations
@@ -89,43 +91,127 @@ def _accept_keyword(s: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Year envelope.
+# Structured date extraction (catalog-build side).
+#
+# Lifts verbatim date STRINGS from page text in priority order: longer
+# patterns first so they consume their span before the bare-year fallback
+# sees it. The resulting `list[str]` is stored on the row as `row.dates`;
+# retrieve-time logic parses each string back to ISO intervals via
+# `verbatim_date_to_intervals` and overlap-checks against the period.
+#
+# Compared to a flat 4-digit-year regex this preserves range semantics
+# ("1932-1939" stays one closed interval, not min=1932 / max=1939) and
+# month/day precision ("December 31, 1949" is a one-day interval, not a
+# full-year envelope). Both matter when filtering against narrow periods.
 # ---------------------------------------------------------------------------
 
-# Plausible bulletin-era years. Treasury Bulletin runs 1939–present; widened
-# slightly to admit retrospective references without letting random 4-digit
-# numerics (table IDs, footnote codes) leak in.
-_YEAR_RE = re.compile(r"\b(?:1[89]\d{2}|20\d{2}|21\d{2})\b")
+_MONTH_FULL = (r"(?:January|February|March|April|May|June|July|August|"
+               r"September|October|November|December)")
+_MONTH_ABBR = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?"
+_MONTH_ANY = f"(?:{_MONTH_FULL}|{_MONTH_ABBR})"
+
+# Slash-date pattern: matches MM/DD/YYYY and MM/DD/YY. Heavy in PDO /
+# auction tables where every row carries an auction date in M/D/YY form
+# and TIPS security identifiers carry maturity tags like "07/15/16-D".
+# Captures month / day / year groups for normalization (2-digit years
+# are resolved against the bulletin's own year — see `_extract_dates`).
+_SLASH_DATE_RE = re.compile(
+    r"\b(0?[1-9]|1[0-2])/(0?[1-9]|[12]\d|3[01])/(\d{4}|\d{2})\b"
+)
+
+_DATE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # "December 31, 1949" / "Dec. 31, 1949"
+    re.compile(rf"\b{_MONTH_ANY}\s+\d{{1,2}},\s*\d{{4}}\b", re.IGNORECASE),
+    # "February 1952" / "Feb. 1952"
+    re.compile(rf"\b{_MONTH_ANY}\s+\d{{4}}\b", re.IGNORECASE),
+    # "Calendar Year 1940" / "Fiscal Year 1948" / "CY 1940" / "FY 1948"
+    re.compile(r"\b(?:Calendar Year|Fiscal Year|CY|FY)\s*\d{4}\b",
+               re.IGNORECASE),
+    # "Q3 1953"
+    re.compile(r"\bQ[1-4]\s*\d{4}\b", re.IGNORECASE),
+    # "10/12/06" / "07/15/2016" — slash dates (handled with special-case
+    # normalization below so 2-digit years become 4-digit before storing).
+    _SLASH_DATE_RE,
+    # "1932 through Mar 1939" / "1932 to 1939" / "1932-1939"
+    re.compile(rf"\b\d{{4}}\s*(?:through|to|-)\s*(?:{_MONTH_ANY}\s*)?\d{{4}}\b",
+               re.IGNORECASE),
+    # Bare 4-digit year — runs LAST so the longer patterns win first.
+    # Restricted to plausible bulletin-era years to keep table IDs /
+    # footnote codes out of the envelope.
+    re.compile(r"\b(?:1[89]\d{2}|20\d{2}|21\d{2})\b"),
+)
 
 
-def _extract_year_envelope(text: str) -> tuple[int | None, int | None]:
-    years = [int(m.group(0)) for m in _YEAR_RE.finditer(text)]
-    if not years:
-        return None, None
-    return min(years), max(years)
+def _resolve_two_digit_year(yy: int, bulletin_year: int) -> int:
+    """Map a 2-digit year to the century that puts it closest to
+    `bulletin_year`. Treasury data uses 2-digit years for both auction
+    dates (a year or two before publication) and maturities (decades
+    after publication), so a fixed pivot doesn't fit; bulletin-centered
+    resolution does. Ties (50-year distance) prefer the same century as
+    bulletin_year to avoid future-year overreach."""
+    cand_a = (bulletin_year // 100) * 100 + yy
+    cand_b = cand_a + 100 if cand_a <= bulletin_year else cand_a - 100
+    if abs(cand_a - bulletin_year) <= abs(cand_b - bulletin_year):
+        return cand_a
+    return cand_b
 
 
-def _canonicalize_year_envelope(
-    raw: tuple[int | None, int | None],
-    bulletin: str,
-) -> tuple[int, int]:
-    """Turn the raw `(min, max)` envelope into the on-disk form.
+def _normalize_slash_match(match_text: str, bulletin_year: int) -> str:
+    """Rewrite a `M/D/YY[YY]` match to a canonical `M/D/YYYY` form so the
+    retrieve-time verbatim parser can handle one shape only."""
+    m = _SLASH_DATE_RE.match(match_text)
+    if not m:
+        return match_text
+    mon, day, year = m.group(1), m.group(2), m.group(3)
+    if len(year) == 2:
+        year = f"{_resolve_two_digit_year(int(year), bulletin_year):04d}"
+    return f"{mon}/{day}/{year}"
 
-    1. **Bulletin fallback.** No years on the page → inherit the parent
-       bulletin's calendar year (most year-less pages are TOC, snapshots,
-       or continuation pages that logically belong to the bulletin's CY).
-    2. **+1 to end year.** A page that only prints `1991` may be CY1991,
-       FY1991 (Oct 1990–Sep 1991), or FY1992 (Oct 1991–Sep 1992). Adding
-       one year of forward slack lets a query for any of those three
-       windows match a page that only prints `1991`. Costs precision; in
-       this corpus, FY/CY ambiguity is the dominant year-filter
-       false-negative source.
+
+def _extract_dates(text: str, *, bulletin: str | None = None) -> list[str]:
+    """Verbatim date strings on the page, document order, deduped
+    case-insensitively. Longer patterns claim their span first; shorter
+    patterns skip anything that overlaps an earlier match.
+
+    `bulletin` (YYYY-MM) is used to resolve 2-digit years in slash dates
+    (e.g. "10/12/06" in a 2007-12 bulletin → "10/12/2006"). Without it
+    we keep 2-digit years verbatim and the retrieve parser will reject
+    them, which costs recall — pass bulletin context whenever available.
     """
-    min_year, max_year = raw
-    if min_year is None or max_year is None:
-        bulletin_year = int(bulletin[:4])
-        min_year = max_year = bulletin_year
-    return min_year, max_year + 1
+    bulletin_year: int | None = None
+    if bulletin:
+        try: bulletin_year = int(bulletin[:4])
+        except ValueError: bulletin_year = None
+
+    spans: list[tuple[int, int, str]] = []
+    for pat in _DATE_PATTERNS:
+        is_slash = pat is _SLASH_DATE_RE
+        for m in pat.finditer(text):
+            if any(not (m.end() <= s or m.start() >= e) for s, e, _ in spans):
+                continue
+            verbatim = m.group(0)
+            # Normalize slash dates so all entries in `dates` share a
+            # parser-friendly shape. 2-digit years require a bulletin
+            # context; without it we drop the match (returning unresolved
+            # "06" would mislead the retrieve filter).
+            if is_slash:
+                if len(m.group(3)) == 2:
+                    if bulletin_year is None:
+                        continue
+                    verbatim = _normalize_slash_match(verbatim, bulletin_year)
+                else:
+                    verbatim = _normalize_slash_match(verbatim, bulletin_year or 2000)
+            spans.append((m.start(), m.end(), verbatim))
+    spans.sort()
+    seen: set[str] = set()
+    out: list[str] = []
+    for _, _, s in spans:
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -416,39 +502,59 @@ def _extract_content_blocks(
 def parse_page_fields(elements: list[dict], *, bulletin: str) -> dict[str, Any]:
     """Deterministic per-page field extraction. No LLM.
 
-    Returns dict with keys: content_blocks, keywords, min_year, max_year.
-    `bulletin` is the page's parent bulletin in "YYYY-MM"; feeds the
-    year-envelope fallback for pages with no 4-digit year.
+    Returns dict with keys: content_blocks, keywords, dates.
+    `bulletin` (YYYY-MM) is the page's parent bulletin; pages with no
+    explicit date strings inherit a single bare-year date matching the
+    bulletin's calendar year so retrieve has *some* signal to overlap-
+    check (TOC / snapshot / continuation pages).
     """
     blocks, all_columns, all_rows = _extract_content_blocks(elements)
-
     plain = _page_plain_text(elements)
-    raw_envelope = _extract_year_envelope(plain)
+    dates = _extract_dates(plain, bulletin=bulletin)
+    # Always seed `dates` with the bulletin's publication month
+    # (`YYYY-MM`) AND its calendar year (`YYYY`):
+    #
+    #   - The YM signal catches retrospective tables whose printed dates
+    #     don't include the period but whose publication month equals it
+    #     (e.g. a Sep 1991 issue whose tables only print 1988–1990 data
+    #     still answers a Sep 1991 question via "1991-09").
+    #   - The bare-year signal is the recall safety net for pages with
+    #     no printed dates at all (TOC, snapshot, continuation, or
+    #     month-without-year prose like "during September") — without it
+    #     we'd drop these for any narrow-period query inside the
+    #     bulletin's own year.
+    #
+    # Dedup below absorbs the case where the text extractor already
+    # surfaced one of these signals.
+    seen = {d.lower() for d in dates}
+    seeds = []
+    if bulletin.lower() not in seen:
+        seeds.append(bulletin)
+        seen.add(bulletin.lower())
+    yr = bulletin[:4]
+    if yr.lower() not in seen:
+        seeds.append(yr)
+    dates = seeds + dates
 
     if blocks:
         primary_caption = next((b.title for b in blocks if b.title), None)
         keywords = _harvest_keywords(primary_caption, all_columns, all_rows[:8])
-        min_year, max_year = _canonicalize_year_envelope(raw_envelope, bulletin)
         return {
             "content_blocks": blocks,
             "keywords": keywords[:20],
-            "min_year": min_year,
-            "max_year": max_year,
+            "dates": dates,
         }
 
     if has_prose_content(elements):
         prose_kw = _harvest_prose_keywords(elements)
         if prose_kw:
-            min_year, max_year = _canonicalize_year_envelope(raw_envelope, bulletin)
             return {
                 "content_blocks": [ContentBlock(
                     kind="prose",
                     title=_resolve_prose_title(elements),
                 )],
                 "keywords": prose_kw,
-                "min_year": min_year,
-                "max_year": max_year,
+                "dates": dates,
             }
 
-    return {"content_blocks": [], "keywords": [],
-            "min_year": None, "max_year": None}
+    return {"content_blocks": [], "keywords": [], "dates": []}
