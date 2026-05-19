@@ -78,6 +78,14 @@ class AnnotatedValue(BaseModel):
       - "vector": value is dict[str, int|float|str], keyed by index_name labels.
       - "table":  value is dict[str, dict[str, int|float|str]],
                   outer key = row_name label, inner key = col_name label.
+
+    Pandas accessor:
+      - `.frame` returns a `pd.DataFrame` view uniform across kinds —
+        scalar → 1×1 (or N×1 for list-form scalars from lookup_external),
+        vector → N×1 with `index.name == index_name`, table → R×C with
+        `index.name == row_name` and `columns.name == col_name`. Lets
+        downstream code work the payload through one idiom without
+        branching on `kind`.
     """
     model_config = ConfigDict(frozen=True)
 

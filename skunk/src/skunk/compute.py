@@ -230,7 +230,7 @@ no commentary, no second block, no fence around (b):
                 "Focus on fixing this specific issue without introducing new mistakes."
             )
         resp = ctx.llm_client.call(
-            self.assemble_system_prompt(ctx), user_msg, thinking_budget=-1, ctx=ctx
+            self.assemble_system_prompt(ctx), user_msg, thinking_budget=4096, ctx=ctx
         )
         raw = resp.text
         ctx.emit("compute", "codegen response", raw=raw)
@@ -327,7 +327,7 @@ A single bare JSON object. No fences, no prose. Exactly one of:
         raw = resp.text
         ctx.emit("compute", "self-critique response", raw=raw)
         try:
-            verdict = CritiqueResult.model_validate_json(raw.strip())
+            verdict = CritiqueResult.model_validate_json(strip_code_fence(raw))
         except ValidationError as e:
             return False, f"self-critique produced malformed reply: {e}"
         if verdict.verdict == "accept":

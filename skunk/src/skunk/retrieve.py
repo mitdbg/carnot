@@ -15,16 +15,14 @@ regression comparison.
 from __future__ import annotations
 
 from skunk.models import HarnessContext, PageRef
+from skunk.plan import RetrieveBranch
 
 
 class RetrieveExecutor:
     """Placeholder retrieve operator. Golden-bypass only; raises on any
     real retrieval call until an external retriever is wired in."""
 
-    def run(
-        self, prev: None, ctx: HarnessContext, *,
-        key: str = "", period: str | None = None,
-    ) -> list[PageRef]:
+    def run(self, ctx: HarnessContext, branch: RetrieveBranch) -> list[PageRef]:
         if ctx.config.golden_pages is not None:
             ctx.emit("retrieve", "golden bypass",
                      n_pages=len(ctx.config.golden_pages),
@@ -32,7 +30,7 @@ class RetrieveExecutor:
             return ctx.config.golden_pages
         raise NotImplementedError(
             "RetrieveExecutor is a placeholder pending external-retriever "
-            f"integration; cannot handle key={key!r} period={period!r}. "
+            f"integration; cannot handle key={branch.key!r} period={branch.period!r}. "
             "Pass `--golden` to the eval harness, or use "
             "`skunk.page_index.retrieve_prototype.PageIndexRetrievePrototype` "
             "directly for the legacy page-index pipeline."

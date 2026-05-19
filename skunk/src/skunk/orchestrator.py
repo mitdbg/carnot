@@ -33,6 +33,8 @@ from skunk.plan import Branch, Plan, PlannerPromptedCall
 from skunk.retrieve import RetrieveExecutor
 from skunk.trace import QuestionTrace, StepTrace, describe_value, full_repr
 
+_NO_INPUT = object()  # sentinel: op has no upstream value (branch heads)
+
 
 class Orchestrator:
     """One Orchestrator per NL question. Owns the ctx, an instance of each
@@ -99,14 +101,15 @@ class Orchestrator:
         """Execute a single branch and return its entries."""
         match branch.kind:
             case "retrieve":
-                ret_args: dict[str, Any] = {"key": branch.key, "period": branch.period}
-                doc = self._run_op("retrieve", ret_args, None, self._retriever.run)
+                doc = self._run_op(
+                    "retrieve", {"branch": branch}, _NO_INPUT, self._retriever.run
+                )
                 return self._run_op(
                     "extract", {"branch": branch}, doc, self._extractor.run
                 )
             case "lookup_external":
                 return self._run_op(
-                    "lookup_external", {"branch": branch}, None, self._looker.run
+                    "lookup_external", {"branch": branch}, _NO_INPUT, self._looker.run
                 )
 
     def _run_parallel(self, branches: list[Branch]) -> list[AnnotatedValue]:
@@ -145,18 +148,20 @@ class Orchestrator:
         prev: Any,
         fn: Callable[..., Any],
     ) -> Any:
-        """Invoke `fn(prev, ctx, **args)`, recording timing and a `StepTrace`
-        entry. Re-raises `StepFailed` / `MissingData` after recording."""
+        """Invoke `fn(prev, ctx, **args)` (or `fn(ctx, **args)` if `prev` is
+        `_NO_INPUT`), recording timing and a `StepTrace` entry. Re-raises
+        `StepFailed` / `MissingData` after recording."""
+        has_input = prev is not _NO_INPUT
         step_idx = len(self._trace.steps) + 1
-        input_desc = describe_value(prev)
-        input_full = full_repr(prev)
+        input_desc = describe_value(prev) if has_input else "(none)"
+        input_full = full_repr(prev) if has_input else "(none)"
         self._ctx.emit(
             "_step", "begin", step_idx=step_idx, op=op_name, args=args, input=input_desc
         )
 
         t0 = time.perf_counter()
         try:
-            result = fn(prev, self._ctx, **args)
+            result = fn(prev, self._ctx, **args) if has_input else fn(self._ctx, **args)
         except (StepFailed, MissingData) as e:
             elapsed = time.perf_counter() - t0
             err_str = (

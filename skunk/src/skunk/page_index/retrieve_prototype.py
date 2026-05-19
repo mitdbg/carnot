@@ -26,6 +26,7 @@ from typing import Any
 
 from skunk.errors import StepFailed
 from skunk.models import HarnessContext, PageRef
+from skunk.plan import RetrieveBranch
 from skunk.page_index import default_profile
 from skunk.page_index.bm25 import Bm25Index
 from skunk.page_index.bm25_runtime import bm25_rerank, build_chapter_index
@@ -151,16 +152,14 @@ class PageIndexRetrievePrototype:
                 kept.append(c)
         return kept
 
-    def run(
-        self, prev: None, ctx: HarnessContext, *,
-        key: str = "", period: str | None = None,
-    ) -> list[PageRef]:
+    def run(self, prev: None, ctx: HarnessContext, *, branch: RetrieveBranch) -> list[PageRef]:
         if ctx.config.golden_pages is not None:
             ctx.emit("retrieve", "golden bypass",
                      n_pages=len(ctx.config.golden_pages),
                      refs=[str(r) for r in ctx.config.golden_pages])
             return ctx.config.golden_pages
 
+        key, period = branch.key, branch.period
         catalog_dir = self._catalog_dir()
 
         try:

@@ -182,16 +182,30 @@ def _load_test_set() -> set[str]:
         return set(json.load(f).get("uids", []))
 
 
-def _pick_uids(df: pd.DataFrame, sample: int | None, uids_arg: str | None) -> list[str]:
+def _pick_uids(
+    df: pd.DataFrame,
+    sample: int | None,
+    uids_arg: str | None,
+    exclude: set[str] | None = None,
+) -> list[str]:
     if uids_arg:
         return [u.strip() for u in uids_arg.split(",") if u.strip()]
     all_uids = [str(u) for u in df["uid"].tolist()]
+    if exclude:
+        all_uids = [u for u in all_uids if u not in exclude]
     if sample is None:
         return all_uids
     return random.sample(all_uids, min(sample, len(all_uids)))
 
 
 def main() -> None:
+    # Force line-buffered stdout/stderr so live operator/LLM events stream to
+    # logs and `tail -f` in real time. Without this, Python block-buffers when
+    # stdout is redirected to a file (~4–8KB chunks), making the harness look
+    # stalled mid-question even though it's working.
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+
     parser = argparse.ArgumentParser(description="End-to-end OfficeQA eval (all UIDs by default)")
     parser.add_argument("--csv", required=True, help="Path to officeqa_pro.csv")
     parser.add_argument("--report", required=True, help="Output CSV report path")
@@ -231,16 +245,15 @@ def main() -> None:
             )
             sys.exit(2)
 
-    uids = _pick_uids(df, args.sample, args.uids)
+    # Exclude test UIDs from the pool BEFORE sampling so --sample N returns N
+    # dev UIDs (rather than N minus however many test UIDs happened to be drawn).
+    exclude = test_set if (test_set and not args.include_test_set) else None
+    if exclude and not args.uids:
+        print(f"[e2e] Excluded {len(exclude)} held-out test-set UID(s) from the pool. "
+              f"Pass --include-test-set to override (see CLAUDE.md).", file=sys.stderr)
+    uids = _pick_uids(df, args.sample, args.uids, exclude=exclude)
 
-    if test_set and not args.include_test_set:
-        before = len(uids)
-        uids = [u for u in uids if u not in test_set]
-        n_excluded = before - len(uids)
-        if n_excluded:
-            print(f"[e2e] Excluded {n_excluded} held-out test-set UID(s). "
-                  f"Pass --include-test-set to override (see CLAUDE.md).", file=sys.stderr)
-    elif test_set and args.include_test_set:
+    if test_set and args.include_test_set:
         print(f"[e2e] WARNING: --include-test-set is on; the held-out {len(test_set)}-UID test set "
               f"is in play. Only use this for final-number measurement, not iterative tuning.",
               file=sys.stderr)

@@ -128,5 +128,4 @@ dir over this one.
 ## Don't write to this directory during development.
 
 This is the shipped artifact. New builds should land in
-`cache/page_index_v3/`. The `eval/eval_retrieve.py` harness reads the
-tree from here by default.
+`cache/page_index_v3/`.

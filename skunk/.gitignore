@@ -15,3 +15,4 @@ cache/
 data/dsl_planning_pass_smoke.csv
 data/drift_cache.json
 data/drift_analysis.csv
+eval/traces/

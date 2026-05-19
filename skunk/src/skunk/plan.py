@@ -42,6 +42,9 @@ def _strip_non_empty(v: str) -> str:
     return v
 
 
+# Field-level constraint: str that must be non-empty after `.strip()`.
+# Used by `RetrieveBranch.key` and `LookupBranch.target` to reject planner
+# replies that emit empty / whitespace-only branch keys.
 NonEmptyStr = Annotated[str, AfterValidator(_strip_non_empty)]
 
 

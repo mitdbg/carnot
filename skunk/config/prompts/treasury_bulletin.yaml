@@ -57,13 +57,13 @@ overrides:
       - |
         ### Example
         Q: What were total U.S. national defense expenditures (millions, nominal) in calendar year 1940?
-        Why this shape: Direct lookup, no calculation. Single point → value_kind='scalar'. units_out pinned by the question. No qualifiers — there's no calculation to disambiguate.
+        Why this shape: Direct lookup, no calculation. Single retrieve branch. units_out pinned by the question. No qualifiers — there's no calculation to disambiguate.
         Plan:
         ```json
         {
           "branches": [
             {"kind": "retrieve", "key": "national defense expenditures",
-             "period": "CY1940", "value_kind": "scalar"}
+             "period": "CY1940"}
           ],
           "computation": {"task": "", "qualifiers": []},
           "presentation": {"units_out": "usd_millions"}
@@ -79,9 +79,9 @@ overrides:
         {
           "branches": [
             {"kind": "retrieve", "key": "national defense expenditures",
-             "period": "CY1940", "value_kind": "scalar"},
+             "period": "CY1940"},
             {"kind": "retrieve", "key": "national defense expenditures",
-             "period": "CY1953", "value_kind": "scalar"}
+             "period": "CY1953"}
           ],
           "computation": {
             "task": "Percent change between the CY1953 value (B) and the CY1940 value (A): (B-A)/A · 100.",
@@ -100,7 +100,7 @@ overrides:
         {
           "branches": [
             {"kind": "retrieve", "key": "weekly average discount rate for new 91-day bills",
-             "period": "1953..1955", "value_kind": "vector"}
+             "period": "1953..1955"}
           ],
           "computation": {
             "task": "Mean of the weekly discount-rate series.",
@@ -119,7 +119,7 @@ overrides:
         {
           "branches": [
             {"kind": "retrieve", "key": "national defense expenditures",
-             "period": "CY1940", "value_kind": "scalar"},
+             "period": "CY1940"},
             {"kind": "lookup_external",
              "target": "U.S. resident population in 1940 (count)"}
           ],
@@ -140,7 +140,7 @@ overrides:
         {
           "branches": [
             {"kind": "retrieve", "key": "national defense expenditures",
-             "period": "CY1953", "value_kind": "scalar"},
+             "period": "CY1953"},
             {"kind": "lookup_external",
              "target": "U.S. CPI-U annual average for 1953 (base 2020=100)",
              "src": "Bureau of Labor Statistics"}
@@ -163,7 +163,7 @@ overrides:
           "branches": [
             {"kind": "retrieve", "key": "chart of total debt held by the public",
              "period": "1990-09",
-             "visual_only": true, "value_kind": "scalar"}
+             "visual_only": true}
           ],
           "computation": {"task": "", "qualifiers": []},
           "presentation": {}
@@ -179,13 +179,13 @@ overrides:
         {
           "branches": [
             {"kind": "retrieve", "key": "net options position for Japanese yen, U.S. Treasury Foreign Currency Reporting",
-             "period": "2016-03", "value_kind": "scalar"},
+             "period": "2016-03"},
             {"kind": "retrieve", "key": "net options position for British pound sterling, U.S. Treasury Foreign Currency Reporting",
-             "period": "2016-03", "value_kind": "scalar"},
+             "period": "2016-03"},
             {"kind": "retrieve", "key": "Japanese yen / USD spot exchange rate",
-             "period": "2016-03", "value_kind": "scalar"},
+             "period": "2016-03"},
             {"kind": "retrieve", "key": "British pound sterling / USD spot exchange rate",
-             "period": "2016-03", "value_kind": "scalar"}
+             "period": "2016-03"}
           ],
           "computation": {
             "task": "Convert the JPY and GBP net options positions to USD using the same-date spot rates, then take the absolute difference.",

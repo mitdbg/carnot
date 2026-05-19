@@ -63,9 +63,9 @@ The load-bearing insight is that `periods_covered` (what period a page *reports 
 ## The 4 operators
 
 - **`retrieve(key, period)`** — only chain head. Returns `list[PageRef]` with `(month, page)` populated (where `page` is the 1-based PDF page index). Currently a placeholder honoring `ctx.config.golden_pages` only; pending external-retriever integration (see "Current state" above).
-- **`extract(key, period, visual_only?, value_kind?)`** — reads `ctx.question` and the located pages via tier dispatch (parsed JSON → vision). Returns `list[AnnotatedValue]` — each entry has a `description`, `value`, `unit`, and one of three **kinds**: `scalar`, `vector` (1-D series with one varying dim), or `table` (2-D grid with row/col dims). Vector/table cells are always primitive scalars; nesting beyond those shapes is rejected by the extract parser before an `AnnotatedValue` is constructed. `extract` is invoked automatically by the orchestrator on every `RetrieveBranch` — `visual_only` / `value_kind` are set on the branch and threaded through. Pass `visual_only=True` to skip Tier 1 and go straight to vision (use for charts/figures).
+- **`extract(key, period, visual_only?)`** — reads `ctx.question` and the located pages via tier dispatch (parsed JSON → vision). Returns `list[AnnotatedValue]` — each entry has a `description`, `value`, `unit`, and one of three **kinds**: `scalar`, `vector` (1-D series with one varying dim), or `table` (2-D grid with row/col dims). Vector/table cells are always primitive scalars; nesting beyond those shapes is rejected by the extract parser before an `AnnotatedValue` is constructed. `extract` is invoked automatically by the orchestrator on every `RetrieveBranch` — `visual_only` is set on the branch and threaded through. Pass `visual_only=True` to skip Tier 1 and go straight to vision (use for charts/figures).
 - **`lookup_external(nl)`** — chain-head capable. Single Gemini call: takes a natural-language description of external factual data (`nl`) and returns `list[AnnotatedValue]` (one entry). Use for CPI-U, FX rates, event dates, named entities (bureau names), and any fact not in the bulletin corpus. The operator infers the appropriate `kind` and `unit` (including `text` for strings).
-- **`compute()`** — chain terminator that subsumes formatting. Reads `ctx.question` plus the upstream extracted/looked-up values; runs a plan-then-codegen LLM call (`CODE\n<python>` or `MISSING:<reason>`), execs the code in-process, then a self-critique LLM call — same domain prompt as the producer, with full context (`question`, `prev`, code, result text) — decides ACCEPT or REVISE:`<reason>`. On REVISE, codegen runs once more with the critique as a prior and ships unconditionally (no second critique → no flap). Within attempt 1, transient codegen/exec failures consume a small retry budget (`compute_max_attempts - 1`). Returns the final answer as a plain `str`. Fails with `StepFailed("compute", …)` when attempt 1 cannot produce a result, or with `MissingData` when codegen on attempt 1 reports `MISSING:` — the orchestrator catches that and runs up to `recovery_max_rounds` re-planning rounds before giving up.
+- **`compute()`** — chain terminator that subsumes formatting. Reads `ctx.question` plus the upstream extracted/looked-up values; runs a single unified loop (`ComputeExecutor.run`) of codegen → in-process exec → self-critique under one shared budget (`compute_max_attempts`, default 3). Each iteration's codegen call may return Python (success), raise `MissingData` (the structured insufficient-data signal), or raise `_ParseFailure` (unparseable reply); exec failures and critique REVISE verdicts feed the next iteration's `prev_code` + `prev_failure`. The critique sees the same domain context as codegen (`question`, `prev`, `computation`/`presentation` JSON, the code, the result). Returns the final answer as a plain `str` on ACCEPT, or — if the budget exhausts after at least one successful exec — the most recent uncritiqued result as a fallback. Fails with `StepFailed("compute", …)` when no iteration ever execs cleanly; propagates `MissingData` (with the same fallback rule) — the orchestrator catches that and runs up to `recovery_max_rounds` re-planning rounds before giving up.
 
 ## Plan shape
 
@@ -73,7 +73,7 @@ A **Plan** is a pydantic model: a `branches` list plus a nested `computation` su
 
 Two branch shapes:
 
-- `RetrieveBranch(key, period, visual_only=False, value_kind=None)` — `retrieve` then `extract` are dispatched together by the orchestrator (extract reads `visual_only` / `value_kind` from the branch).
+- `RetrieveBranch(key, period, visual_only=False)` — `retrieve` then `extract` are dispatched together by the orchestrator (extract reads `visual_only` from the branch).
 - `LookupBranch(target, src=None)` — single `lookup_external` call.
 
 Canonical JSON shape (one branch + computation + presentation):
@@ -81,7 +81,7 @@ Canonical JSON shape (one branch + computation + presentation):
 ```json
 {
   "branches": [
-    {"kind": "retrieve", "key": "national defense expenditures", "period": "CY1940", "value_kind": "scalar"}
+    {"kind": "retrieve", "key": "national defense expenditures", "period": "CY1940"}
   ],
   "computation": {"task": "Report total CY1940 national defense expenditures."},
   "presentation": {"units_out": "in millions of dollars", "precision": 1}

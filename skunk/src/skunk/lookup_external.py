@@ -89,13 +89,7 @@ source    short token naming the publisher domain, e.g. "bls",
     printed precision. Never round, format, or simplify.
 """
 
-    def run(
-        self,
-        prev: None,
-        ctx: HarnessContext,
-        *,
-        branch: LookupBranch,
-    ) -> list[AnnotatedValue]:
+    def run(self, ctx: HarnessContext, branch: LookupBranch) -> list[AnnotatedValue]:
         user_msg = branch.model_dump_json(
             include={"target", "src"}, indent=2, exclude_none=True
         )

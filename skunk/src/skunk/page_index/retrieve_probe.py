@@ -2,8 +2,9 @@
 
 A single LLM call picks one (or up to two) canonical chapter(s) from
 the tree; every page under the picked chapter(s) is returned as the
-prediction. Used by the production retrieve operator
-(`src/skunk/retrieve.py`) and by `eval/eval_retrieve.py`.
+prediction. Used by `page_index.retrieve_prototype.PageIndexRetrievePrototype`;
+not on the default `RetrieveExecutor` path while an external retriever
+is being integrated.
 
 The concept tree is the flat shape produced by `merge.build_tree`:
 

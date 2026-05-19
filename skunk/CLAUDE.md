@@ -50,13 +50,14 @@ The benchmark is `data/officeqa_pro.csv` (133 questions: **101 dev + 32 test**; 
 The agent has no CLI of its own. Public API is `from skunk import Orchestrator, HarnessContext, SkunkConfig, Plan, PageRef, ...` (see `src/skunk/__init__.py`); CLI/UX layers (eval harnesses, future chat UI) live outside `skunk/` and build on top.
 
 - `src/skunk/__init__.py` — public API re-exports
-- `src/skunk/plan.py` — `Plan` dataclass + runtime types (`PageRef`, `AnnotatedValue`) + JSON serde + validator + `PlannerPromptedCall` (question → Plan)
+- `src/skunk/plan.py` — `Plan` dataclass (+ `Computation`, `Presentation`, `RetrieveBranch`, `LookupBranch`) + JSON serde + validator + `PlannerPromptedCall` (question → Plan)
+- `src/skunk/models.py` — cross-cutting runtime types: `PageRef`, `AnnotatedValue` (with `.frame` pandas accessor), `HarnessContext`
 - `src/skunk/orchestrator.py` — `Orchestrator(ctx).execute()` — Plan executor; instantiates one operator-level class per op (`RetrieveExecutor` / `ExtractExecutor` / `ComputeExecutor`, plus `LookupExternalPromptedCall` which doubles as both operator and call-site since `lookup_external` is a single LLM call) and dispatches through their `.run()` methods
 - `src/skunk/{retrieve,extract,lookup_external,compute}.py` — one module per operator; each exposes an operator-level class with a `run(prev, ctx, **kwargs)` method (call-site `PromptedCall` subclasses live alongside as instance attributes on the operator class)
 - `src/skunk/errors.py` — cross-module signals: `StepFailed`, `MissingData`
 - `src/skunk/pyexec.py` — in-process Python exec for operator-generated code (not a security boundary; real isolation is future work): `exec_python_with_env`, `strip_code_fences`
 - `src/skunk/prompted_call.py` — `PromptedCall` base: prompt-assembly for every LLM-prompted call-site inside an operator (planner, extract.text/vision/dedup, compute.codegen/critique, lookup_external)
-- `src/skunk/common.py` — shared runtime: `LLMClient` (OpenRouter + direct-Gemini), `HarnessContext`, `LLMResponse`
+- `src/skunk/common.py` — shared runtime: `LLMClient` (OpenRouter + direct-Gemini), `LLMResponse`, rate-limit + retry helpers
 - `src/skunk/config.py` — `SkunkConfig` (model, RPM, retry, extract/compute knobs)
 - `src/skunk/prompt_overrides.py` — `PromptOverride` YAML loader for corpus / few-shots / lessons
 - `src/skunk/page_index/` — page-index builder (`pipeline.py`) + runtime helpers (`retrieve_probe`, `period`, `pdf`) + `retrieve_prototype.py` (legacy retrieve operator preserved as `PageIndexRetrievePrototype`)

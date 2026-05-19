@@ -152,8 +152,9 @@ multiple separate entries — no nested cells.
 
 description   natural-language label that uniquely identifies the
               datum (series + period + sub-category + any other
-              distinguishing context). Prefer the page's exact row
-              label / column header / caption phrase.
+              distinguishing context). For the label text, use the
+              page's verbatim row text / column header / caption phrase
+              so the downstream consumer can map it back to the page.
               
 index_name    (vector only) name of the varying dimension.
 
@@ -181,10 +182,10 @@ class ExtractTextPromptedCall(PromptedCall):
 You retrieve printed values from page text to fulfill a specific lookup.
 Each user message describes the lookup — what to find and (when stated)
 the period — followed by the full-context question this lookup supports,
-then the page text to draw values from. Emit every printed value that
-could plausibly satisfy the lookup. Do not compute or transform — extract
-only what is printed. Every numeric value emitted MUST appear on the page
-verbatim. Choose the AnnotatedValue shape (scalar / vector / table) that
+then the page text to draw values from. Emit one entry per distinct row
+that could plausibly satisfy the lookup — including cases where multiple
+rows partially match. Do not compute or transform — extract only what
+is printed. Every numeric value emitted MUST appear on the page verbatim. Choose the AnnotatedValue shape (scalar / vector / table) that
 fits the data on the page; pick the smallest shape that captures every
 relevant value.
 
@@ -551,7 +552,6 @@ class ExtractExecutor:
         self,
         prev: list[PageRef] | None,
         ctx: HarnessContext,
-        *,
         branch: RetrieveBranch,
     ) -> list[AnnotatedValue]:
         refs = prev or []
