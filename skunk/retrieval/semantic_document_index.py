@@ -11,14 +11,16 @@ import numpy as np
 
 from skunk.retrieval.nodes import PageNode, PlotNode, TableNode, TextNode
 from skunk.retrieval.nodes.document_node import DocumentNode
-from skunk.retrieval.nodes.llm_wrapper import DEFAULT_EMBEDDING_MODEL, DEFAULT_LLM_WRAPPER
+from skunk.retrieval.nodes.llm_wrapper import DEFAULT_EMBEDDING_MODEL, get_llm_wrapper
 
 SKUNK_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CACHE_DIR = os.path.join(SKUNK_DIR, "cache")
 DEFAULT_CACHE_PATH = os.path.join(DEFAULT_CACHE_DIR, "semantic_document_index.pckl")
 EMBEDDING_CACHE_VERSION = 1
+EMBEDDING_WORKERS = 16
 
 class SemanticDocumentIndex:
+
     def __init__(
         self,
         pdf_dir: str,
@@ -26,6 +28,8 @@ class SemanticDocumentIndex:
         render_binary: bool = True,
         render_zoom: float = 1.0,
         cache_path: str = DEFAULT_CACHE_PATH,
+        cache_flush_idx: int = 12,
+        embedding_workers: int = EMBEDDING_WORKERS,
         use_cache: bool = True,
     ):
         self.cache_path = cache_path
@@ -37,6 +41,8 @@ class SemanticDocumentIndex:
         self.embedding_matrix: np.ndarray | None = None
         self.embedding_model: str | None = None
         self.embedding_faiss_index: faiss.IndexFlatIP | None = None
+        self.cache_flush_idx = cache_flush_idx
+        self.embedding_workers = embedding_workers
         if os.path.exists(self.cache_path) and use_cache:
             try:
                 with open(self.cache_path, "rb") as cache_file:
@@ -47,10 +53,10 @@ class SemanticDocumentIndex:
                     self.embedding_node_ids = cached_data.get("embedding_node_ids", [])
                     self.embedding_matrix = cached_data.get("embedding_matrix")
                     self.embedding_model = cached_data.get("embedding_model")
-                    for document in self.documents.values():
-                        for page_node in document.page_nodes:
-                            if isinstance(page_node, Exception):
-                                raise ValueError("Cached semantic index contains a failed page node result.")
+                    # for document in self.documents.values():
+                    # for page_node in document.page_nodes:
+                    # if isinstance(page_node, Exception):
+                    # raise ValueError("Cached semantic index contains a failed page node result.")
                     if self.embedding_matrix is not None:
                         self._rebuild_faiss_index()
             except (EOFError, OSError, pickle.PickleError, TypeError, AttributeError, KeyError, ValueError):
@@ -90,39 +96,51 @@ class SemanticDocumentIndex:
             )
         os.replace(temp_cache_path, self.cache_path)
 
-    def add(self, document: str | bytes) -> str:
+    def add(self, documents: list[str] | list[bytes]) -> str:
         if importlib.util.find_spec("fitz") is None:
             raise ImportError("SemanticDocumentIndex requires PyMuPDF; install the project dependencies.")
 
-        source_uri = "in_memory.pdf"
-        if isinstance(document, str):
-            source_uri = document
-            with open(document, "rb") as pdf_file:
-                raw_pdf = pdf_file.read()
-        elif isinstance(document, bytes):
-            raw_pdf = document
-        else:
-            raise TypeError("document must be a PDF path or raw PDF bytes")
+        ids = []
+        for idx, document in enumerate(documents):
+            # print("Adding document to index:", document)
+            source_uri = "in_memory.pdf"
+            if isinstance(document, str):
+                source_uri = document
+                with open(document, "rb") as pdf_file:
+                    raw_pdf = pdf_file.read()
+            elif isinstance(document, bytes):
+                raw_pdf = document
+            else:
+                raise TypeError("document must be a PDF path or raw PDF bytes")
 
-        sha256 = hashlib.sha256(raw_pdf).hexdigest()
-        if sha256 in self._sha_to_document_id:
-            return self._sha_to_document_id[sha256]
+            sha256 = hashlib.sha256(raw_pdf).hexdigest()
+            if sha256 in self._sha_to_document_id:
+                ids.append(self._sha_to_document_id[sha256])
+                continue
 
-        document_node = DocumentNode(
-            filename=source_uri,
-            pdf_bytes=raw_pdf,
-            ocr_text_dir=self.ocr_text_dir,
-            use_cache=self.use_cache,
-        )
-        self.documents[document_node.document_id] = document_node
-        self._sha_to_document_id[sha256] = document_node.document_id
-        self.initialized = False
-        if self.use_cache:
-            DEFAULT_LLM_WRAPPER.flush_cache()
-        self._save_cache()
-        return document_node.document_id
+            document_node = DocumentNode(
+                filename=source_uri,
+                pdf_bytes=raw_pdf,
+                ocr_text_dir=self.ocr_text_dir,
+                use_cache=self.use_cache,
+            )
+            self.documents[document_node.document_id] = document_node
+            self._sha_to_document_id[sha256] = document_node.document_id
+            self.initialized = False
 
-    def initialize(self, embedding_model: str = DEFAULT_EMBEDDING_MODEL) -> None:
+            if self.use_cache:
+                if idx == len(documents)-1 or (idx > 0 and (idx % self.cache_flush_idx) == 0):
+                    self._save_cache()
+                    get_llm_wrapper().flush_cache()
+
+            ids.append(document_node.document_id)
+        return ids
+
+    def initialize(
+        self,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        embedding_workers: int | None = None,
+    ) -> None:
         node_ids = []
         descriptions = []
         for document in self.documents.values():
@@ -154,14 +172,16 @@ class SemanticDocumentIndex:
             self._save_cache()
             return
 
-        matrix = np.array(
-            DEFAULT_LLM_WRAPPER.embed_texts(
-                descriptions,
-                model=embedding_model,
-                use_cache=self.use_cache,
-            ),
-            dtype="float32",
+        n_embedding_workers = self.embedding_workers if embedding_workers is None else embedding_workers
+        n_embedding_workers = max(1, min(n_embedding_workers, len(descriptions)))
+        embeddings = get_llm_wrapper().embed_texts(
+            descriptions,
+            model=embedding_model,
+            use_cache=self.use_cache,
+            n_workers=n_embedding_workers,
         )
+
+        matrix = np.array(embeddings, dtype="float32")
         faiss.normalize_L2(matrix)
         self.embedding_idx_map = {node_id: node_idx for node_idx, node_id in enumerate(node_ids)}
         self.embedding_node_ids = node_ids
@@ -169,7 +189,7 @@ class SemanticDocumentIndex:
         self.embedding_model = embedding_model
         self._rebuild_faiss_index()
         if self.use_cache:
-            DEFAULT_LLM_WRAPPER.flush_cache()
+            get_llm_wrapper().flush_cache()
         self._save_cache()
         self.initialized = True
 

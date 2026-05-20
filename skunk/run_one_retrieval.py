@@ -78,9 +78,7 @@ index = SemanticDocumentIndex(
     use_cache=USE_CACHE,
 )
 
-document_ids = []
-for pdf_path in pdf_paths:
-    document_ids.append(index.add(pdf_path))
+index.add(pdf_paths)
 
 index.initialize()
 retriever = Retriever(index)

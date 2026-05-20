@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import pickle
+import random
 import re
 import threading
 import time
@@ -18,29 +19,39 @@ litellm.suppress_debug_info = True
 
 # DEFAULT_LLM_MODEL = "openai/gpt-4o-mini"
 # DEFAULT_LLM_VISION_MODEL = "openai/gpt-4o-mini"
-# DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small"
 DEFAULT_LLM_MODEL = "openrouter/google/gemini-2.5-flash"
 DEFAULT_LLM_VISION_MODEL = "openrouter/google/gemini-2.5-flash"
+# DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small"
 DEFAULT_EMBEDDING_MODEL = "openrouter/google/gemini-embedding-001"
 # DEFAULT_LLM_MODEL = "gemini/gemini-2.5-flash"
 # DEFAULT_LLM_VISION_MODEL = "gemini/gemini-2.5-flash"
 # DEFAULT_EMBEDDING_MODEL = "gemini/gemini-embedding-001"
 
-EMBEDDING_BATCH_SIZE = 64
+EMBEDDING_BATCH_SIZE = 90
 
 LLM_CACHE_PATH = os.environ.get(
     "SKUNK_LLM_CACHE_PATH",
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "cache", "llm_call_cache.pckl")),
+    os.path.abspath(
+        os.path.join(
+            os.path.dirname(__file__), "..", "..", "cache", "llm_call_cache.pckl"
+        )
+    ),
 )
 LLM_RATE_LIMIT_STATE_PATH = f"{LLM_CACHE_PATH}.rate_limit.json"
 LLM_RATE_LIMIT_LOCK_PATH = f"{LLM_RATE_LIMIT_STATE_PATH}.lock"
 LLM_TEXT_SYSTEM_PROMPT = "You extract compact metadata for a semantic document index. Return only the requested text."
-LLM_VISION_SYSTEM_PROMPT = "You match rendered PDF pages to spans of OCR text. Return only valid JSON."
+LLM_VISION_SYSTEM_PROMPT = (
+    "You match rendered PDF pages to spans of OCR text. Return only valid JSON."
+)
 
 DEFAULT_LLM_MAX_WORKERS = int(os.environ.get("LLM_MAX_WORKERS", "32"))
-DEFAULT_LLM_MAX_REQUESTS_PER_MINUTE = int(os.environ.get("LLM_MAX_REQUESTS_PER_MINUTE", "500"))
+DEFAULT_LLM_MAX_REQUESTS_PER_MINUTE = int(
+    os.environ.get("LLM_MAX_REQUESTS_PER_MINUTE", "500")
+)
 DEFAULT_LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "10"))
-DEFAULT_LLM_RETRY_BACKOFF_SECONDS = int(os.environ.get("LLM_RETRY_BACKOFF_SECONDS", "10"))
+DEFAULT_LLM_RETRY_BACKOFF_SECONDS = int(
+    os.environ.get("LLM_RETRY_BACKOFF_SECONDS", "10")
+)
 
 
 def llm_cache_key(request_inputs: dict) -> str:
@@ -49,8 +60,12 @@ def llm_cache_key(request_inputs: dict) -> str:
 
 
 def extract_litellm_text(response) -> str:
-    choice = response.choices[0] if hasattr(response, "choices") else response["choices"][0]
-    message = choice.message if hasattr(choice, "message") else choice.get("message", {})
+    choice = (
+        response.choices[0] if hasattr(response, "choices") else response["choices"][0]
+    )
+    message = (
+        choice.message if hasattr(choice, "message") else choice.get("message", {})
+    )
     content = message.content if hasattr(message, "content") else message.get("content")
 
     if isinstance(content, str) and content.strip():
@@ -146,6 +161,12 @@ class LLMWrapper:
         with self.cache_lock:
             return self.cache.get(cache_key)
 
+    def get_cached_values(self, cache_keys: list[str | None]) -> list:
+        if not self.cache_enabled:
+            return [None] * len(cache_keys)
+        with self.cache_lock:
+            return [self.cache.get(key, None) for key in cache_keys]
+
     def store_cached_value(self, cache_key: str, value) -> None:
         if not self.cache_enabled:
             return
@@ -172,10 +193,15 @@ class LLMWrapper:
             for cache_key, value in disk_cache.items():
                 if cache_key not in self.dirty_cache_entries:
                     self.cache[cache_key] = value
-                elif self.dirty_cache_entries[cache_key] == dirty_cache_entries.get(cache_key):
+                elif self.dirty_cache_entries[cache_key] == dirty_cache_entries.get(
+                    cache_key
+                ):
                     self.cache[cache_key] = value
             for cache_key in dirty_cache_entries:
-                if self.dirty_cache_entries.get(cache_key) == dirty_cache_entries[cache_key]:
+                if (
+                    self.dirty_cache_entries.get(cache_key)
+                    == dirty_cache_entries[cache_key]
+                ):
                     self.dirty_cache_entries.pop(cache_key, None)
 
     def is_rate_limit_error(self, error: Exception) -> bool:
@@ -188,19 +214,43 @@ class LLMWrapper:
         if getattr(response, "status_code", None) == 429:
             return True
 
-        if isinstance(error, litellm.exceptions.APIError):
-            if (
-                "openrouterexception" in error_text
-                and "server disconnected without sending a response" in error_text
-            ):
-                return True
-            
+        return (
+            "429" in error_text
+            or "rate limit" in error_text
+            or "too many requests" in error_text
+        )
+
+    def is_transient_llm_error(self, error: Exception) -> bool:
+        status_code = getattr(error, "status_code", None)
+        if status_code in {408, 500, 502, 503, 504}:
+            return True
+
+        response = getattr(error, "response", None)
+        if getattr(response, "status_code", None) in {408, 500, 502, 503, 504}:
+            return True
+
         if isinstance(error, litellm.exceptions.ServiceUnavailableError):
             return True
 
-        if "OpenrouterException" in error_text:
-            return True
-        return "429" in error_text or "rate limit" in error_text or "too many requests" in error_text
+        error_text = str(error).lower()
+        return any(
+            transient_text in error_text
+            for transient_text in [
+                "openrouterexception",
+                "unexpected_eof_while_reading",
+                "unexpected eof while reading",
+                "server disconnected",
+                "connection reset",
+                "connection error",
+                "remote protocol error",
+                "read timeout",
+                "write timeout",
+                "temporarily unavailable",
+                "bad gateway",
+                "service unavailable",
+                "gateway timeout",
+            ]
+        )
 
     def run_with_rate_limit_retries(self, request_fn):
         attempt_idx = 0
@@ -208,11 +258,25 @@ class LLMWrapper:
             try:
                 return request_fn()
             except Exception as e:
-                if not self.is_rate_limit_error(e) or attempt_idx >= self.max_retries:
+                is_rate_limited = self.is_rate_limit_error(e)
+                is_transient = self.is_transient_llm_error(e)
+                if (
+                    not is_rate_limited and not is_transient
+                ) or attempt_idx >= self.max_retries:
                     raise
-                sleep_seconds = self.retry_backoff_seconds * (attempt_idx + 1)
-                print(f"LLM rate limit hit; retrying in {sleep_seconds} seconds.")
-                self.wait_for_rate_limit_slot()
+                sleep_seconds = self.retry_backoff_seconds * (
+                    attempt_idx + 1
+                ) + random.uniform(0, self.retry_backoff_seconds)
+                if is_rate_limited:
+                    print(
+                        f"LLM rate limit hit; retrying in {sleep_seconds:.1f} seconds."
+                    )
+                    self.wait_for_rate_limit_slot()
+                else:
+                    print(
+                        f"Transient LLM error ({type(e).__name__}: {e}); "
+                        f"retrying in {sleep_seconds:.1f} seconds."
+                    )
                 time.sleep(sleep_seconds)
                 attempt_idx += 1
 
@@ -227,11 +291,17 @@ class LLMWrapper:
                 if os.path.exists(LLM_RATE_LIMIT_STATE_PATH):
                     try:
                         with open(LLM_RATE_LIMIT_STATE_PATH) as state_file:
-                            request_times = json.load(state_file).get("request_times", [])
+                            request_times = json.load(state_file).get(
+                                "request_times", []
+                            )
                     except (json.JSONDecodeError, OSError):
                         request_times = []
 
-                request_times = [request_time for request_time in request_times if now - request_time < 60]
+                request_times = [
+                    request_time
+                    for request_time in request_times
+                    if now - request_time < 60
+                ]
                 if len(request_times) < self.max_requests_per_minute:
                     request_times.append(now)
                     tmp_state_path = f"{LLM_RATE_LIMIT_STATE_PATH}.tmp"
@@ -354,7 +424,9 @@ class LLMWrapper:
             return []
 
         results: list[str | None] = [None] * len(prompts)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="llm-text") as executor:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_workers, thread_name_prefix="llm-text"
+        ) as executor:
             futures = {
                 executor.submit(
                     self.call_llm,
@@ -392,7 +464,9 @@ class LLMWrapper:
             return []
 
         results: list[str | None] = [None] * len(requests)
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="llm-vision") as executor:
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.max_workers, thread_name_prefix="llm-vision"
+        ) as executor:
             futures = {
                 executor.submit(
                     self.call_llm_vision,
@@ -418,46 +492,118 @@ class LLMWrapper:
 
         return [result or "" for result in results]
 
-    def embed_texts(
-        self,
-        texts: list[str],
-        model: str = DEFAULT_EMBEDDING_MODEL,
-        use_cache: bool = True,
-    ) -> list[list[float]]:
-        cleaned_texts = [text.strip() or "empty semantic description" for text in texts]
-        embeddings: list[list[float] | None] = [None] * len(cleaned_texts)
-        uncached_texts = []
-        uncached_positions = []
-
-        for text_idx, text in enumerate(cleaned_texts):
+    def embed_batch(
+        self, model, batch_texts: list[str], use_cache=True
+    ) -> list[tuple[str, list[float]]]:
+        response = self.run_with_rate_limit_retries(
+            lambda batch_texts=batch_texts: litellm.embedding(
+                model=model, input=batch_texts
+            )
+        )
+        batch_embeddings = []
+        new_embeddings = {}
+        for response_idx, item in enumerate(response.data):
+            embedding = item["embedding"] if isinstance(item, dict) else item.embedding
+            text = batch_texts[response_idx]
             request_inputs = {
                 "call_type": "embedding",
                 "model": model,
                 "text": text,
             }
-            cache_key = llm_cache_key(request_inputs)
-            cached_value = self.get_cached_value(cache_key) if use_cache else None
-            if use_cache and cached_value is not None:
-                embeddings[text_idx] = cached_value
-            else:
-                uncached_texts.append(text)
-                uncached_positions.append((text_idx, cache_key))
+            cache_key = llm_cache_key(request_inputs) if use_cache else text
+            batch_embeddings.append((cache_key, embedding))
+            if use_cache:
+                new_embeddings[cache_key] = embedding
+        if use_cache and self.cache_enabled and new_embeddings:
+            with self.cache_lock:
+                self.cache.update(new_embeddings)
+                self.dirty_cache_entries.update(new_embeddings)
+        return batch_embeddings
 
+    def embed_texts(
+        self,
+        texts: list[str],
+        model: str = DEFAULT_EMBEDDING_MODEL,
+        use_cache: bool = True,
+        batch_size: int = EMBEDDING_BATCH_SIZE,
+        n_workers: int = 1,
+    ) -> list[list[float]]:
+        cleaned_texts = [text.strip() or "empty semantic description" for text in texts]
+        embeddings: list[list[float] | None] = [None] * len(cleaned_texts)
+        uncached_texts: list[str] = []
+        uncached_positions_by_key: dict[str, list[int]] = {}
+
+        if use_cache:
+            cache_keys = []
+            for text in cleaned_texts:
+                request_inputs = {
+                    "call_type": "embedding",
+                    "model": model,
+                    "text": text,
+                }
+                cache_keys.append(llm_cache_key(request_inputs))
+
+            cached_values = self.get_cached_values(cache_keys)
+            for text_idx, cached_value in enumerate(cached_values):
+                if cached_value is not None:
+                    embeddings[text_idx] = cached_value
+                else:
+                    cache_key = cache_keys[text_idx]
+                    if cache_key not in uncached_positions_by_key:
+                        uncached_positions_by_key[cache_key] = []
+                        uncached_texts.append(cleaned_texts[text_idx])
+                    uncached_positions_by_key[cache_key].append(text_idx)
+        else:
+            for text_idx, text in enumerate(cleaned_texts):
+                if text not in uncached_positions_by_key:
+                    uncached_positions_by_key[text] = []
+                    uncached_texts.append(text)
+                uncached_positions_by_key[text].append(text_idx)
+
+        print(f"{len(uncached_texts)} uncached texts to embed.")
         if uncached_texts:
-            new_embeddings = {}
-            for batch_start in range(0, len(uncached_texts), EMBEDDING_BATCH_SIZE):
-                batch_texts = uncached_texts[batch_start : batch_start + EMBEDDING_BATCH_SIZE]
-                batch_positions = uncached_positions[batch_start : batch_start + EMBEDDING_BATCH_SIZE]
-                response = self.run_with_rate_limit_retries(lambda: litellm.embedding(model=model, input=batch_texts))
-                for response_idx, item in enumerate(response.data):
-                    embedding = item["embedding"] if isinstance(item, dict) else item.embedding
-                    text_idx, cache_key = batch_positions[response_idx]
-                    new_embeddings[cache_key] = embedding
-                    embeddings[text_idx] = embedding
-            if use_cache and self.cache_enabled:
-                with self.cache_lock:
-                    self.cache.update(new_embeddings)
-                    self.dirty_cache_entries.update(new_embeddings)
+            batch_size = max(1, batch_size)
+            n_embedding_workers = max(1, n_workers)
+            if n_embedding_workers > 1:
+                batch_size = max(
+                    1, (batch_size + n_embedding_workers - 1) // n_embedding_workers
+                )
+
+            batch_text_groups = [
+                uncached_texts[batch_start : batch_start + batch_size]
+                for batch_start in range(0, len(uncached_texts), batch_size)
+            ]
+            n_embedding_workers = min(n_embedding_workers, len(batch_text_groups))
+
+            batches_since_cache_flush = 0
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=n_embedding_workers, thread_name_prefix="llm-embedding"
+            ) as executor:
+                futures = {
+                    executor.submit(
+                        self.embed_batch,
+                        model,
+                        batch_texts,
+                        use_cache=use_cache,
+                    ): batch_idx
+                    for batch_idx, batch_texts in enumerate(batch_text_groups)
+                }
+                completed_futures = tqdm(
+                    concurrent.futures.as_completed(futures),
+                    total=len(futures),
+                    desc="Embedding texts",
+                    unit="batch",
+                )
+                for future in completed_futures:
+                    embedded_batch = future.result()
+                    for cache_key, embedding in embedded_batch:
+                        for text_idx in uncached_positions_by_key[cache_key]:
+                            embeddings[text_idx] = embedding
+                    if use_cache and self.cache_enabled:
+                        batches_since_cache_flush += 1
+                        if batches_since_cache_flush >= 5000:
+                            self.flush_cache()
+                            batches_since_cache_flush = 0
 
         return [embedding for embedding in embeddings if embedding is not None]
 

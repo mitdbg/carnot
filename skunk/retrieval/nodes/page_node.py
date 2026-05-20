@@ -249,7 +249,10 @@ Text blocks:
     def tables_prompt(tables: List[str]) -> str:
         inputs = []
         for table_string in tables:
-            table = pd.read_html(StringIO(table_string))[0]
+            try:
+                table = pd.read_html(StringIO(table_string))[0]
+            except ValueError as e:
+                continue
             if isinstance(table.columns, pd.MultiIndex):
                 table.columns = [
                     " ".join(str(part) for part in column if not pd.isna(part)).strip()

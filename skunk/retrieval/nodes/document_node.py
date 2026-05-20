@@ -118,7 +118,7 @@ class DocumentNode:
             args,
             PageNode,
             # n_jobs=self.page_process_workers,
-            n_jobs=64,
+            n_jobs=128,
             argument_type="args",
             exception_behaviour="immediate",
             desc=f"Processing page nodes in {self.filename}",
