@@ -181,7 +181,7 @@ class SemanticDocumentIndex:
             n_workers=n_embedding_workers,
         )
 
-        matrix = np.array(embeddings, dtype="float32")
+        matrix = embeddings
         faiss.normalize_L2(matrix)
         self.embedding_idx_map = {node_id: node_idx for node_idx, node_id in enumerate(node_ids)}
         self.embedding_node_ids = node_ids
@@ -199,7 +199,7 @@ class SemanticDocumentIndex:
             self.initialized = False
             return
 
-        matrix = np.array(self.embedding_matrix, dtype="float32")
+        matrix = np.asarray(self.embedding_matrix, dtype="float32")
         faiss.normalize_L2(matrix)
         self.embedding_matrix = matrix
         self.embedding_faiss_index = faiss.IndexFlatIP(matrix.shape[1])
@@ -217,11 +217,11 @@ class SemanticDocumentIndex:
             return node.table_id
         return node.plot_id
 
-    def search_description_embeddings(self, query_embedding: list[float], k: int) -> list[tuple[str, float]]:
+    def search_description_embeddings(self, query_embedding: np.ndarray, k: int) -> list[tuple[str, float]]:
         if self.embedding_faiss_index is None:
             raise RuntimeError("SemanticDocumentIndex must be initialized before retrieval.")
 
-        query_matrix = np.array([query_embedding], dtype="float32")
+        query_matrix = np.asarray([query_embedding], dtype="float32")
         faiss.normalize_L2(query_matrix)
         scores, indexes = self.embedding_faiss_index.search(query_matrix, min(k, len(self.embedding_node_ids)))
         results = []

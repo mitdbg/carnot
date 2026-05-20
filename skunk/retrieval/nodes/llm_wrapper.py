@@ -12,6 +12,7 @@ import threading
 import time
 
 import litellm
+import numpy as np
 import untruncate_json
 from tqdm import tqdm
 
@@ -494,7 +495,7 @@ class LLMWrapper:
 
     def embed_batch(
         self, model, batch_texts: list[str], use_cache=True
-    ) -> list[tuple[str, list[float]]]:
+    ) -> list[tuple[str, np.ndarray]]:
         response = self.run_with_rate_limit_retries(
             lambda batch_texts=batch_texts: litellm.embedding(
                 model=model, input=batch_texts
@@ -503,7 +504,8 @@ class LLMWrapper:
         batch_embeddings = []
         new_embeddings = {}
         for response_idx, item in enumerate(response.data):
-            embedding = item["embedding"] if isinstance(item, dict) else item.embedding
+            raw_embedding = item["embedding"] if isinstance(item, dict) else item.embedding
+            embedding = np.asarray(raw_embedding, dtype=np.float32)
             text = batch_texts[response_idx]
             request_inputs = {
                 "call_type": "embedding",
@@ -527,9 +529,9 @@ class LLMWrapper:
         use_cache: bool = True,
         batch_size: int = EMBEDDING_BATCH_SIZE,
         n_workers: int = 1,
-    ) -> list[list[float]]:
+    ) -> np.ndarray:
         cleaned_texts = [text.strip() or "empty semantic description" for text in texts]
-        embeddings: list[list[float] | None] = [None] * len(cleaned_texts)
+        embeddings: list[np.ndarray | None] = [None] * len(cleaned_texts)
         uncached_texts: list[str] = []
         uncached_positions_by_key: dict[str, list[int]] = {}
 
@@ -546,7 +548,7 @@ class LLMWrapper:
             cached_values = self.get_cached_values(cache_keys)
             for text_idx, cached_value in enumerate(cached_values):
                 if cached_value is not None:
-                    embeddings[text_idx] = cached_value
+                    embeddings[text_idx] = np.asarray(cached_value, dtype=np.float32)
                 else:
                     cache_key = cache_keys[text_idx]
                     if cache_key not in uncached_positions_by_key:
@@ -605,7 +607,9 @@ class LLMWrapper:
                             self.flush_cache()
                             batches_since_cache_flush = 0
 
-        return [embedding for embedding in embeddings if embedding is not None]
+        if not embeddings:
+            return np.empty((0, 0), dtype=np.float32)
+        return np.stack(embeddings).astype(np.float32, copy=False)
 
 
 _PROCESS_LLM_WRAPPER = None
