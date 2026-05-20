@@ -11,8 +11,12 @@ Real isolation (subprocess + seccomp, WASM, container) is future work.
 
 from __future__ import annotations
 
+import contextlib
+import datetime
+import io
 import math
 import re
+import statistics
 from typing import Any
 
 import numpy as np
@@ -20,6 +24,22 @@ import pandas as pd
 import statsmodels.api as sm
 
 from skunk.errors import StepFailed
+
+
+def _default_env() -> dict[str, Any]:
+    """Common modules pre-injected into operator-generated-code sandboxes.
+    Shared by `exec_python_with_env` and `exec_python_capture_stdout`.
+    Keeping the set here (rather than per-operator) means the system
+    prompts in compute, lookup_external, etc. all describe the same
+    'already in scope' surface area."""
+    return {
+        "math": math,
+        "statistics": statistics,
+        "datetime": datetime,
+        "np": np, "numpy": np,
+        "pd": pd, "pandas": pd,
+        "sm": sm, "statsmodels": sm,
+    }
 
 # TODO: Should probably add a minimal sandbox / merge with search agent code execution sandbox
 
@@ -45,14 +65,25 @@ def exec_python_with_env(
     (e.g. `result_unit`, `result_kind`) alongside the primary `result`.
     """
     code = strip_code_fences(code)
-    env: dict[str, Any] = {
-        "math": math,
-        "np": np, "numpy": np,
-        "pd": pd, "pandas": pd,
-        "sm": sm, "statsmodels": sm,
-    }
+    env = _default_env()
     env.update(local_vars or {})
     exec(compile(code, "<pyexec>", "exec"), env)  # noqa: S102
     if "result" not in env:
         raise StepFailed("pyexec", f"Code did not set `result`:\n{code}")
     return env, env["result"]
+
+
+def exec_python_capture_stdout(
+    code: str, local_vars: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Exec `code` with stdout redirected to a buffer and return the env
+    plus captured stdout. Used by operators whose contract is "call
+    helpers and print() the answer" (e.g. lookup_external) rather than
+    "assign to `result`" (compute)."""
+    code = strip_code_fences(code)
+    env = _default_env()
+    env.update(local_vars or {})
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        exec(compile(code, "<pyexec>", "exec"), env)  # noqa: S102
+    return env, buf.getvalue()

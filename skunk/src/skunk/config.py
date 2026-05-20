@@ -53,11 +53,13 @@ class SkunkConfig:
     # Compute operator
     compute_max_attempts: int = 3
 
-    # Recovery loop: number of re-plan rounds allowed after the final compute
-    # raises MissingData. Each round calls the planner (LLM) again with a one-shot
-    # recovery lesson injected into ctx.prompt_overrides, then re-executes the
-    # whole returned plan from scratch. Total execute() rounds ≤ recovery_max_rounds + 1.
-    recovery_max_rounds: int = 1
+    # Replan-on-MissingData loop: after compute raises MissingData, the
+    # planner is re-invoked with the prior plan + current `prev` + the
+    # missing-data signal. The orchestrator diffs the returned plan against
+    # the prior plan and executes only the newly-added branches; their
+    # outputs are appended to `prev` before compute is re-invoked. Total
+    # compute invocations per question ≤ recovery_max_rounds + 1.
+    recovery_max_rounds: int = 2
 
     # Prompt overrides YAML — corpus blurbs, few-shots, lessons. Loaded once
     # at the top level and threaded onto HarnessContext.prompt_overrides.

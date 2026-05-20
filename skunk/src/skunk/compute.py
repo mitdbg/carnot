@@ -70,10 +70,18 @@ _PREVIEW_MAX_ROWS = 10
 _PREVIEW_MAX_COLS = 8
 
 
-def _prev_desc(prev: list[AnnotatedValue]) -> str:
+def prev_desc(prev: list[AnnotatedValue], *, full: bool = False) -> str:
     """Render `prev` for the codegen/critique prompts. Every non-scalar entry
-    is shown as its `.frame.head().to_string()` so the prompt and the exec
-    env see the same pandas object."""
+    is shown as a `.to_string()` of its DataFrame so the prompt and the exec
+    env see the same pandas object. `full=False` (codegen) truncates to a
+    head preview; `full=True` (critique) emits every row and column so the
+    reviewer can verify cell-level values the code consumed."""
+    # TODO: try a metadata-only variant (description + kind + axes + shape +
+    # unit, NO frame rows) for both codegen and critique. Hypothesis: showing
+    # any cells biases the model toward those rows; hiding them forces both
+    # agents to reason from the schema alone and route all value lookups
+    # through `.frame`. Compare answer accuracy + token spend against the
+    # current head-preview / full-frame setup.
     import pandas as pd
 
     lines = [f"prev ({len(prev)} entries)"]
@@ -104,25 +112,35 @@ def _prev_desc(prev: list[AnnotatedValue]) -> str:
             lines.append("         frame: (empty)")
             continue
 
-        head = df.iloc[:_PREVIEW_MAX_ROWS, :_PREVIEW_MAX_COLS]
+        if full:
+            view = df
+            max_rows: int | None = None
+            max_cols: int | None = None
+            header = "         frame:"
+        else:
+            view = df.iloc[:_PREVIEW_MAX_ROWS, :_PREVIEW_MAX_COLS]
+            max_rows = _PREVIEW_MAX_ROWS
+            max_cols = _PREVIEW_MAX_COLS
+            header = "         frame.head():"
         with pd.option_context(
-            "display.max_rows", _PREVIEW_MAX_ROWS,
-            "display.max_columns", _PREVIEW_MAX_COLS,
+            "display.max_rows", max_rows,
+            "display.max_columns", max_cols,
             "display.width", 120,
         ):
-            rendered = head.to_string()
-        lines.append("         frame.head():")
+            rendered = view.to_string()
+        lines.append(header)
         lines.extend("         " + ln for ln in rendered.splitlines())
 
-        more_rows = max(0, n_rows - _PREVIEW_MAX_ROWS)
-        more_cols = max(0, n_cols - _PREVIEW_MAX_COLS)
-        if more_rows or more_cols:
-            tail_bits = []
-            if more_rows:
-                tail_bits.append(f"{more_rows} more rows")
-            if more_cols:
-                tail_bits.append(f"{more_cols} more cols")
-            lines.append(f"         ... {', '.join(tail_bits)}")
+        if not full:
+            more_rows = max(0, n_rows - _PREVIEW_MAX_ROWS)
+            more_cols = max(0, n_cols - _PREVIEW_MAX_COLS)
+            if more_rows or more_cols:
+                tail_bits = []
+                if more_rows:
+                    tail_bits.append(f"{more_rows} more rows")
+                if more_cols:
+                    tail_bits.append(f"{more_cols} more cols")
+                lines.append(f"         ... {', '.join(tail_bits)}")
     return "\n".join(lines)
 
 
@@ -218,7 +236,7 @@ no commentary, no second block, no fence around (b):
             f"Question:\n{ctx.question}\n\n"
             f"computation = {plan.computation.model_dump_json()}\n"
             f"presentation = {plan.presentation.model_dump_json()}\n\n"
-            f"prev =\n{_prev_desc(prev)}\n\n"
+            f"prev =\n{prev_desc(prev)}\n\n"
             f"Produce a fenced ```python``` block OR a bare missing-data JSON object."
         )
         if prev_failure:
@@ -230,11 +248,15 @@ no commentary, no second block, no fence around (b):
                 "Focus on fixing this specific issue without introducing new mistakes."
             )
         resp = ctx.llm_client.call(
-            self.assemble_system_prompt(ctx), user_msg, thinking_budget=4096, ctx=ctx
+            self.assemble_system_prompt(ctx), user_msg, effort="medium", ctx=ctx
         )
         raw = resp.text
         ctx.emit("compute", "codegen response", raw=raw)
-        s = raw.strip()
+        # Strip fences upfront so dispatch on `{` works whether the model
+        # wrapped output in ```json ... ``` or emitted bare JSON. Same
+        # treatment for the Python path below — strip_code_fence on
+        # already-stripped text is a no-op.
+        s = strip_code_fence(raw).strip()
 
         if s.startswith("{"):
             try:
@@ -251,7 +273,7 @@ no commentary, no second block, no fence around (b):
                 )
             raise MissingData(signal.description, missing=signal.missing)
 
-        code = strip_code_fence(s).strip()
+        code = s
         if not code:
             raise _ParseFailure(
                 hint=(
@@ -275,9 +297,11 @@ Decide accept or revise.
 
 Question, `computation` and `presentation` JSON (treat them as a
 checklist: each field is a constraint the result must satisfy),
-`prev` summary (each non-scalar entry shown as a `frame.head()`
-preview alongside kind/axis/unit metadata; the same `.frame` view
-the code consumed), the Python that ran, and the produced `result`.
+the full `prev` summary (every non-scalar entry rendered with every
+row and column its `.frame` contains, alongside kind/axis/unit
+metadata — this is the same data the code consumed, not a preview,
+so you can spot-check individual cells the code touched), the
+Python that ran, and the produced `result`.
 
 ## Output format
 
@@ -303,6 +327,11 @@ A single bare JSON object. No fences, no prose. Exactly one of:
 - The result form contradicts the question (wanted "[a, b]" but
   shipped "1.0 2.0"; wanted percent but shipped 0.1234), wraps a
   single value in prose, or doesn't match answer_form / precision.
+- The result contradicts the cells visible in `prev`: code sliced
+  the frame in a way that included/excluded the wrong rows or
+  columns, summed the wrong group, or produced a magnitude that
+  can't be reconciled with the printed values. Use `prev` as the
+  ground truth and walk the code's slice against it.
 """
     def critique(
         self,
@@ -318,7 +347,7 @@ A single bare JSON object. No fences, no prose. Exactly one of:
             f"Question:\n{ctx.question}\n\n"
             f"computation = {plan.computation.model_dump_json()}\n"
             f"presentation = {plan.presentation.model_dump_json()}\n\n"
-            f"prev =\n{_prev_desc(prev)}\n\n"
+            f"prev =\n{prev_desc(prev, full=True)}\n\n"
             f"Code that ran:\n```python\n{code}\n```\n\n"
             f"Produced result:\n{result_text}\n\n"
             f"Output a single bare JSON object with your verdict."
@@ -361,7 +390,7 @@ class ComputeExecutor:
             question=ctx.question,
             computation=plan.computation.model_dump(),
             presentation=plan.presentation.model_dump(),
-            prev_summary=_prev_desc(prev),
+            prev_summary=prev_desc(prev),
         )
 
         prev_code: str | None = None

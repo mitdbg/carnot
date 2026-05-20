@@ -90,7 +90,7 @@ def _llm_cluster(
     )
     t0 = time.monotonic()
     resp = llm.call(system=MERGE_CLUSTER_SYSTEM, user=user,
-                    temperature=0.0, thinking_budget=0)
+                    temperature=0.0, effort="off")
     if verbose:
         print(f"  [merge] LLM clustering in {time.monotonic() - t0:.1f}s",
               flush=True)
@@ -135,7 +135,7 @@ def _llm_consolidate(
     )
     t0 = time.monotonic()
     resp = llm.call(system=MERGE_CONSOLIDATE_SYSTEM, user=user,
-                    temperature=0.0, thinking_budget=0)
+                    temperature=0.0, effort="off")
     if verbose:
         print(f"  [merge] Pass-3 consolidation LLM in "
               f"{time.monotonic() - t0:.1f}s", flush=True)
@@ -178,7 +178,7 @@ def _llm_describe_chapters(
     )
     t0 = time.monotonic()
     resp = llm.call(system=MERGE_DESCRIBE_SYSTEM, user=user,
-                    temperature=0.0, thinking_budget=0)
+                    temperature=0.0, effort="off")
     if verbose:
         print(f"  [merge] Pass-4 description LLM in "
               f"{time.monotonic() - t0:.1f}s", flush=True)

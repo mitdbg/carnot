@@ -96,7 +96,7 @@ def _llm_classify_batch(
         f"{json.dumps(items, ensure_ascii=False, indent=1)}\n"
     )
     resp = llm.call(system=system_prompt, user=user,
-                    temperature=0.0, thinking_budget=0)
+                    temperature=0.0, effort="off")
     obj = parse_json_response(resp.text)
 
     valid = {norm_key(name): name for name in l1_names}

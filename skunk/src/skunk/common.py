@@ -38,7 +38,16 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
+
+
+# Reasoning-effort knob shared across LLM backends. Maps cleanly to
+# OpenRouter `reasoning.effort` (their unified field, honored by Gemini)
+# and to the Gemini SDK's `thinking_level` enum on the direct path.
+# Replaces the legacy `thinking_budget: int` API — Gemini 3 treats the
+# legacy int as a soft suggestion only, not a cap.
+Effort = Literal["off", "low", "medium", "high"]
+_EFFORT_VALUES = ("off", "low", "medium", "high")
 
 from google import genai
 from google.genai import types
@@ -215,15 +224,17 @@ class LLMClient:
         user: str,
         images: list[tuple[str, str]] | None = None,
         temperature: float = 0.0,
-        thinking_budget: int = 0,
+        effort: "Effort" = "off",
         use_google_search: bool = False,
         ctx: "HarnessContext | None" = None,
     ) -> LLMResponse:
+        if effort not in _EFFORT_VALUES:
+            raise ValueError(f"effort must be one of {_EFFORT_VALUES}, got {effort!r}")
         if use_google_search:
-            return self._call_gemini_search(system, user, images, temperature, thinking_budget, ctx)
+            return self._call_gemini_search(system, user, images, temperature, effort, ctx)
         if self._config.use_direct_gemini:
-            return self._call_gemini_direct(system, user, images, temperature, thinking_budget, ctx)
-        return self._call_openrouter(system, user, images, temperature, thinking_budget, ctx)
+            return self._call_gemini_direct(system, user, images, temperature, effort, ctx)
+        return self._call_openrouter(system, user, images, temperature, effort, ctx)
 
     def _retry_call(self, do_call: "Callable[[], LLMResponse]") -> LLMResponse:
         """Run `do_call` under the rate limiter with exponential-backoff retry.
@@ -258,7 +269,7 @@ class LLMClient:
         user: str,
         images: list[tuple[str, str]] | None,
         temperature: float,
-        thinking_budget: int,
+        effort: "Effort",
         ctx: "HarnessContext | None",
     ) -> LLMResponse:
         content: list[dict] = []
@@ -275,28 +286,14 @@ class LLMClient:
             {"role": "user", "content": content},
         ]
 
-        # OpenRouter unifies reasoning across providers under `reasoning`. For
-        # Gemini 3 the legacy `thinkingBudget` (what `reasoning.max_tokens`
-        # forwards to) is accepted but no longer behaves as a hard cap — Google
-        # internally maps it onto the new discrete `thinking_level` (minimal /
-        # low / medium / high), and within a level the model is free to spend
-        # up to the model-wide ceiling (~63k thinking tokens). The only knob
-        # that actually constrains spend is `reasoning.effort`, which maps
-        # cleanly onto `thinking_level`. We bucket the integer budget onto
-        # those levels rather than pass it through verbatim.
-        #   0           → disabled
-        #   1..2048     → low
-        #   2049..8192  → medium
-        #   8193+       → high
-        #   <0          → high (legacy "max effort" sentinel)
-        if thinking_budget == 0:
-            reasoning: dict = {"enabled": False}
-        elif thinking_budget < 0 or thinking_budget > 8192:
-            reasoning = {"effort": "high"}
-        elif thinking_budget > 2048:
-            reasoning = {"effort": "medium"}
-        else:
-            reasoning = {"effort": "low"}
+        # OpenRouter unifies reasoning across providers under `reasoning`.
+        # `reasoning.effort` maps cleanly onto Gemini 3's `thinking_level`
+        # and is the only knob that actually constrains spend; legacy
+        # `reasoning.max_tokens` / `thinkingBudget` is a soft suggestion
+        # on Gemini 3 and burns through the full model ceiling.
+        reasoning: dict = (
+            {"enabled": False} if effort == "off" else {"effort": effort}
+        )
         extra_body: dict = {"reasoning": reasoning}
 
         client = self._get_openrouter_client()
@@ -321,7 +318,7 @@ class LLMClient:
                     "llm", "call",
                     model=model,
                     temperature=temperature,
-                    thinking_budget=thinking_budget,
+                    effort=effort,
                     latency_s=round(latency_s, 3),
                     input_tokens=getattr(usage, "prompt_tokens", None),
                     output_tokens=getattr(usage, "completion_tokens", None),
@@ -392,10 +389,25 @@ class LLMClient:
         return parts
 
     @staticmethod
+    def _effort_to_thinking_config(effort: "Effort") -> "types.ThinkingConfig":
+        # Map skunk's Effort onto Gemini's ThinkingLevel enum, which is
+        # the only knob on the direct-Gemini path that actually caps
+        # thinking spend for Gemini 3. The legacy `thinking_budget=int`
+        # is accepted but soft-bucketed by Google — not a hard cap.
+        if effort == "off":
+            return types.ThinkingConfig(thinking_budget=0)
+        level_map = {
+            "low": types.ThinkingLevel.LOW,
+            "medium": types.ThinkingLevel.MEDIUM,
+            "high": types.ThinkingLevel.HIGH,
+        }
+        return types.ThinkingConfig(thinking_level=level_map[effort])
+
+    @staticmethod
     def _gemini_config(
         system: str,
         temperature: float,
-        thinking_budget: int,
+        effort: "Effort",
         *,
         with_search: bool,
     ) -> "types.GenerateContentConfig":
@@ -403,7 +415,7 @@ class LLMClient:
             system_instruction=system,
             max_output_tokens=65535,
             temperature=temperature,
-            thinking_config=types.ThinkingConfig(thinking_budget=thinking_budget),
+            thinking_config=LLMClient._effort_to_thinking_config(effort),
             tools=[types.Tool(google_search=types.GoogleSearch())] if with_search else None,
         )
 
@@ -413,7 +425,7 @@ class LLMClient:
         user: str,
         images: list[tuple[str, str]] | None,
         temperature: float,
-        thinking_budget: int,
+        effort: "Effort",
         ctx: "HarnessContext | None",
         *,
         with_search: bool,
@@ -425,7 +437,7 @@ class LLMClient:
         client = self._get_gemini_client()
         parts = self._gemini_parts(user, images)
         gen_config = self._gemini_config(
-            system, temperature, thinking_budget, with_search=with_search
+            system, temperature, effort, with_search=with_search
         )
         model = self._config.gemini_model
 
@@ -442,7 +454,7 @@ class LLMClient:
                     "llm", "call",
                     model=model,
                     temperature=temperature,
-                    thinking_budget=thinking_budget,
+                    effort=effort,
                     latency_s=round(latency_s, 3),
                     input_tokens=getattr(usage, "prompt_token_count", None),
                     output_tokens=getattr(usage, "candidates_token_count", None),
@@ -468,11 +480,11 @@ class LLMClient:
         user: str,
         images: list[tuple[str, str]] | None,
         temperature: float,
-        thinking_budget: int,
+        effort: "Effort",
         ctx: "HarnessContext | None",
     ) -> LLMResponse:
         return self._call_gemini(
-            system, user, images, temperature, thinking_budget, ctx, with_search=False,
+            system, user, images, temperature, effort, ctx, with_search=False,
         )
 
     def _call_gemini_search(
@@ -481,7 +493,7 @@ class LLMClient:
         user: str,
         images: list[tuple[str, str]] | None,
         temperature: float,
-        thinking_budget: int,
+        effort: "Effort",
         ctx: "HarnessContext | None",
     ) -> LLMResponse:
         # TECH DEBT: google-genai is kept alive only for Google Search grounding in
@@ -489,5 +501,5 @@ class LLMClient:
         # this method and `_call_gemini` with-search branch, then drop the google-genai
         # dependency.
         return self._call_gemini(
-            system, user, images, temperature, thinking_budget, ctx, with_search=True,
+            system, user, images, temperature, effort, ctx, with_search=True,
         )

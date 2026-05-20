@@ -286,13 +286,29 @@ def main() -> None:
         if args.trace_dir:
             trace_path = str(Path(args.trace_dir) / f"{uid}.txt")
 
-        result = _run_one_question(
-            question=question,
-            verbose=verbose,
-            golden_pages=golden_pages,
-            uid=uid,
-            trace_path=trace_path,
-        )
+        try:
+            result = _run_one_question(
+                question=question,
+                verbose=verbose,
+                golden_pages=golden_pages,
+                uid=uid,
+                trace_path=trace_path,
+            )
+        except Exception as e:
+            # Don't let one runaway UID kill the rest of the batch.
+            import traceback as _tb
+            tb_str = _tb.format_exc()
+            print(f"[e2e] ABORTED UID {uid}: {type(e).__name__}: {e}", file=sys.stderr)
+            if trace_path is not None:
+                try:
+                    Path(trace_path).parent.mkdir(parents=True, exist_ok=True)
+                    Path(trace_path + ".failed").write_text(
+                        f"UID: {uid}\nQ: {question}\n\nUncaught exception:\n{tb_str}\n"
+                    )
+                except Exception:
+                    pass
+            result = {"question": question, "answer": None, "failed": True,
+                     "reason": f"Uncaught: {type(e).__name__}: {e}", "n_steps": 0}
 
         if result["failed"]:
             print(f"FAILED: {result['reason']}")

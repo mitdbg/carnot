@@ -230,7 +230,7 @@ relevant value.
                 system,
                 user_msg,
                 temperature=temperature,
-                thinking_budget=0,
+                effort="off",
                 ctx=ctx,
             )
             parsed = _parse_response_raw(resp.text, ctx) or []
@@ -365,7 +365,7 @@ shape (scalar / vector / table) that fits the data on the page.
             user_msg,
             images=images,
             temperature=0.0,
-            thinking_budget=-1,
+            effort="high",
             ctx=ctx,
         )
         raw = resp.text
@@ -432,7 +432,7 @@ or keys.
             self.assemble_system_prompt(ctx),
             user_msg,
             temperature=0.0,
-            thinking_budget=0,
+            effort="off",
             ctx=ctx,
         )
         raw = resp.text

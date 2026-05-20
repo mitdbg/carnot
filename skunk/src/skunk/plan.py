@@ -31,9 +31,10 @@ from pydantic import (
     ValidationError,
 )
 
+from skunk.common import strip_code_fence
 from skunk.errors import StepFailed
 from skunk.prompted_call import PromptedCall
-from skunk.models import HarnessContext
+from skunk.models import AnnotatedValue, HarnessContext
 
 
 def _strip_non_empty(v: str) -> str:
@@ -195,14 +196,67 @@ worked examples.
 
     def plan(self, question: str, ctx: HarnessContext) -> Plan:
         """Generate a Plan from a natural-language question."""
-        system_prompt = self.assemble_system_prompt(ctx)
-
         base_user_message = f"""\
 Question: {question}
 
 Produce the Plan JSON. Output a single bare JSON object. No markdown fences. No prose.
 """
+        return self._call_with_retry(ctx, base_user_message, label="planner")
 
+    def replan(
+        self,
+        ctx: HarnessContext,
+        prior_plan: Plan,
+        prev: list[AnnotatedValue],
+        missing_reason: str,
+        missing: list[str],
+    ) -> Plan:
+        """Re-plan after compute reported MissingData. Same JSON schema as
+        `plan()`; the orchestrator diffs the returned branches against
+        `prior_plan.branches` and executes only the additions. `computation`
+        / `presentation` from the result fully replace the prior values."""
+        from skunk.compute import prev_desc
+
+        base_user_message = f"""\
+Question: {ctx.question}
+
+Produce the Plan JSON. Output a single bare JSON object. No markdown fences. No prose.
+
+The prior plan you produced did not gather enough data for the compute step:
+
+prior_plan = {prior_plan.model_dump_json()}
+
+prev (data already gathered, will be reused):
+{prev_desc(prev)}
+
+compute reported MISSING DATA:
+  description: {missing_reason}
+  missing:     {missing!r}
+
+Emit an UPDATED plan in the same JSON schema. The orchestrator will:
+  - execute only the branches you ADD (any branch already present in
+    prior_plan.branches is skipped — its output is already in `prev`),
+  - replace `computation` and `presentation` with whatever you emit.
+
+Guidance:
+  - If only inputs are missing, keep prior_plan.branches verbatim and
+    APPEND the new retrieve/lookup branches that close the gap.
+  - If the missing-data signal reveals the calculation itself was
+    misframed (e.g. a qualifier was misinterpreted), additionally
+    revise `computation` / `presentation`.
+  - If you have nothing useful to add and the framing is correct,
+    re-emit prior_plan unchanged — no diff means no work, and the
+    caller will surface the missing-data failure.
+"""
+        return self._call_with_retry(ctx, base_user_message, label="replanner")
+
+    def _call_with_retry(
+        self, ctx: HarnessContext, base_user_message: str, label: str
+    ) -> Plan:
+        """Shared three-attempt loop for `plan()` and `replan()`. Each retry
+        shows ONLY the most recent bad response + its error — no history
+        accumulation."""
+        system_prompt = self.assemble_system_prompt(ctx)
         attempt_errors: list[str] = []
         last_raw: str | None = None
         last_error: str | None = None
@@ -211,9 +265,6 @@ Produce the Plan JSON. Output a single bare JSON object. No markdown fences. No 
             if attempt == 0:
                 user_message = base_user_message
             else:
-                # Each retry shows ONLY the most recent bad response + its
-                # error — no history accumulation. The model needs to see
-                # what it just emitted to self-correct.
                 user_message = (
                     f"{base_user_message}\n"
                     f"Your previous attempt produced this output:\n"
@@ -221,28 +272,28 @@ Produce the Plan JSON. Output a single bare JSON object. No markdown fences. No 
                     f"It failed with: {last_error}\n"
                     "Fix and return valid JSON only."
                 )
-            ctx.emit("planner", "attempt", n=attempt + 1, of=3)
+            ctx.emit(label, "attempt", n=attempt + 1, of=3)
             resp = ctx.llm_client.call(
-                system_prompt, user_message, thinking_budget=-1, ctx=ctx
+                system_prompt, user_message, effort="medium", ctx=ctx
             )
             raw = resp.text
             try:
-                return Plan.model_validate_json(raw.strip())
+                return Plan.model_validate_json(strip_code_fence(raw).strip())
             except ValidationError as e:
                 attempt_errors.append(f"Attempt {attempt + 1}: {e}")
                 last_raw = raw
                 last_error = str(e)
                 ctx.emit(
-                    "planner",
+                    label,
                     "parse/validate failed",
                     n=attempt + 1,
                     error_type=type(e).__name__,
                     error=str(e),
                 )
 
-        ctx.emit("planner", "exhausted", attempts=len(attempt_errors))
+        ctx.emit(label, "exhausted", attempts=len(attempt_errors))
         raise StepFailed(
-            "planner",
+            label,
             f"Failed to produce valid Plan after {len(attempt_errors)} attempts: "
             + "; ".join(attempt_errors),
         )
