@@ -1,0 +1,46 @@
+{
+  "national defense": [
+    "national defense",
+    "national defense and related activities",
+    "budget expenditures classified as general"
+  ],
+  "public debt": ["public debt", "debt outstanding", "gross debt", "marketable public debt"],
+  "individual income tax": [
+    "individual income tax",
+    "individual income taxes",
+    "individual not withheld",
+    "withheld by employers"
+  ],
+  "receipts": ["receipts", "budget receipts", "net receipts", "internal revenue"],
+  "outlays": ["outlays", "expenditures", "budget outlays", "federal fiscal operations"],
+  "expenditures": ["expenditures", "outlays", "budget expenditures"],
+  "foreign exchange": [
+    "foreign exchange",
+    "foreign exchange and securities",
+    "exchange stabilization fund"
+  ],
+  "japanese yen": ["japanese yen", "foreign exchange and securities", "exchange stabilization fund"],
+  "currency in circulation": [
+    "currency in circulation",
+    "currency and coin outstanding",
+    "u.s. currency and coin outstanding and in circulation"
+  ],
+  "coin and currency": [
+    "coin and currency",
+    "currency and coin outstanding",
+    "u.s. currency and coin outstanding and in circulation"
+  ],
+  "treasury notes": ["treasury notes", "treasury financing operations", "debt operations"],
+  "treasury bonds": ["treasury bonds", "average yields", "market quotations"],
+  "corporate bond": ["corporate bond", "moody", "average yields", "high-grade corporate"],
+  "corporate bonds": ["corporate bonds", "moody", "moody's aaa", "highest grade", "average yields"],
+  "highest quality": ["moody's aaa", "highest grade", "high-grade corporate", "average yields"],
+  "fiscal operations": ["fiscal operations", "summary of fiscal operations"],
+  "federal department": ["expenditures by agencies", "outlays by agency", "federal agencies"],
+  "highest spending": ["expenditures by agencies", "outlays by agency"],
+  "gross federal debt": ["gross federal debt", "public debt outstanding", "debt outstanding"],
+  "gross u.s federal debt": ["gross federal debt", "public debt outstanding", "debt outstanding"],
+  "federal debt": ["gross federal debt", "public debt outstanding", "debt outstanding"],
+  "department of defense": ["department of defense", "national defense", "outlays by agency"],
+  "judicial": ["judicial", "judiciary", "judicial branch", "outlays by agency"]
+}

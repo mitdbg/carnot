@@ -1,5 +1,11 @@
-# Keep this directory in git.
-# Add ignore rules for generated/local skunk files below.
+# Git tracks retrieval/ + top-level README. Vendored clones live in _old/ (ignored).
 
 *
 !.gitignore
+!README.md
+!retrieval/
+!retrieval/**
+retrieval/**/__pycache__/
+retrieval/**/*.pyc
+.venv/
+_old/
