@@ -55,7 +55,7 @@ class Orchestrator:
         self._ctx = ctx
         self._current_plan: Plan | None = None
         self._planner = PlannerPromptedCall()
-        self._retriever = RetrieveExecutor()
+        self._retriever = RetrieveExecutor(ctx.config)
         self._extractor = ExtractExecutor()
         self._looker = LookupExternalPromptedCall()
         self._computer = ComputeExecutor()

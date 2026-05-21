@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from skunk.models import PageRef
@@ -70,6 +70,34 @@ class SkunkConfig:
     # Present for train/eval runs; None for production workloads.
     golden_pages: list[PageRef] | None = field(default=None, repr=False)
 
+    # Retrieve operator dispatch. "search_agent" routes to the teammate's
+    # iterative ChromaDB + LLM-loop retriever (default); "page_index" routes
+    # to the legacy PageIndexRetrievePrototype kept for ablations.
+    # (env: SKUNK_RETRIEVER)
+    retriever: Literal["search_agent", "page_index"] = "search_agent"
+
+    # Search-agent corpus artifacts (built offline; see
+    # src/skunk/search_agent/prep/). The agent fails fast at first
+    # non-golden call if either path is missing.
+    # (env: SKUNK_CHROMADB_DIR, SKUNK_CHROMADB_COLLECTION, SKUNK_CLEAN_PAGE_MAP)
+    chromadb_dir: str = "cache/chromadb"
+    chromadb_collection: str = "treasury_pages"
+    clean_page_map_path: str = "cache/clean_page_map.json"
+
+    # Embedding model used by the agent's vector_search tool (must match
+    # whatever produced the stored embeddings).
+    # (env: SKUNK_EMB_MODEL)
+    emb_model_id: str = "google/gemini-embedding-001"
+
+    # Per-question agent budget. The teammate's defaults are 20/20.
+    # (env: SKUNK_AGENT_MAX_STEPS, SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL)
+    agent_max_steps: int = 20
+    agent_max_pages_per_tool_call: int = 20
+
+    # Chat model used by the agent loop. None → fall back to `llm_model`.
+    # (env: SKUNK_AGENT_MODEL)
+    agent_model_id: str | None = None
+
     # BM25 rerank scaffold for the page-index retriever. Default OFF —
     # this is an opt-in experiment. When enabled, the retrieve operator
     # scores year-filtered survivors with an in-memory BM25 index over
@@ -100,4 +128,12 @@ class SkunkConfig:
             bm25_enabled=os.environ.get("SKUNK_BM25_ENABLED", "").lower() in ("1", "true", "yes"),
             bm25_top_k=int(os.environ.get("SKUNK_BM25_TOP_K", "20")),
             bm25_dominance_threshold=float(os.environ.get("SKUNK_BM25_DOMINANCE", "2.0")),
+            retriever=os.environ.get("SKUNK_RETRIEVER", "search_agent"),  # type: ignore[arg-type]
+            chromadb_dir=os.environ.get("SKUNK_CHROMADB_DIR", "cache/chromadb"),
+            chromadb_collection=os.environ.get("SKUNK_CHROMADB_COLLECTION", "treasury_pages"),
+            clean_page_map_path=os.environ.get("SKUNK_CLEAN_PAGE_MAP", "cache/clean_page_map.json"),
+            emb_model_id=os.environ.get("SKUNK_EMB_MODEL", "google/gemini-embedding-001"),
+            agent_max_steps=int(os.environ.get("SKUNK_AGENT_MAX_STEPS", "20")),
+            agent_max_pages_per_tool_call=int(os.environ.get("SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL", "20")),
+            agent_model_id=os.environ.get("SKUNK_AGENT_MODEL") or None,
         )

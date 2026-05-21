@@ -53,6 +53,33 @@ class PageRef:
         return f"PageRef({', '.join(parts)})"
 
 
+def page_key_to_pageref(key: str) -> PageRef:
+    """Parse a search-agent page key into a `PageRef`.
+
+    Accepts both `"YYYY_MM_pageid"` (what the teammate's `final_answer`
+    tool returns) and `"YYYY-MM-pageid"` (what their `retrieve_page_info`
+    tool consumes). The `pageid` component is parsed as an int.
+    """
+    # Split on the LAST separator only so the page id is unambiguous,
+    # then normalize the month separator from `_` to `-`.
+    sep = "_" if "_" in key and key.count("_") >= 2 else "-"
+    try:
+        year_str, month_str, page_str = key.rsplit(sep, 2)
+    except ValueError as e:
+        raise ValueError(f"page key {key!r} not in YYYY{sep}MM{sep}pageid form") from e
+    return PageRef(month=f"{year_str}-{month_str}", page=int(page_str))
+
+
+def pageref_to_page_key(ref: PageRef, sep: str = "-") -> str:
+    """Render a `PageRef` as a search-agent page key. Default separator
+    matches the `retrieve_page_info` form; pass `sep="_"` for the
+    `final_answer` form."""
+    if ref.month is None or ref.page is None:
+        raise ValueError(f"PageRef {ref} missing month or page")
+    year, month = ref.month.split("-", 1)
+    return f"{year}{sep}{month}{sep}{ref.page}"
+
+
 VALUE_KIND_VOCAB: frozenset[str] = frozenset({"scalar", "vector", "table"})
 
 
