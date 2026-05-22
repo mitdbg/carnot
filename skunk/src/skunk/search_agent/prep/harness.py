@@ -10,9 +10,9 @@ import chromadb
 import pandas as pd
 from chromadb.api.models.Collection import Collection
 
-from skunk.logging.tracer import Tracer
-from skunk.retrieve.search_agent import SearchAgent
-from skunk.utils.officeqa_eval import source_docs_to_page_keys, source_files_to_year_months
+from skunk.search_agent.prep.officeqa_eval import source_docs_to_page_keys, source_files_to_year_months
+from skunk.search_agent.search_agent import SearchAgent
+from skunk.search_agent.tracer import Tracer
 
 MODEL_ID = "google/gemini-3-flash-preview"
 

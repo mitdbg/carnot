@@ -35,7 +35,7 @@ from threading import Lock
 import numpy as np
 from google import genai
 from google.genai import types as genai_types  # noqa: F401
-from openrouter import OpenRouter
+from skunk.search_agent.openrouter_client import OpenRouter
 
 # Gemini Embedding 2 Preview context limit (tokens).
 MAX_TOKENS = 8192

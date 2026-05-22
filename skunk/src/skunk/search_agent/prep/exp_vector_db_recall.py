@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import chromadb
 import pandas as pd
 
-from skunk.utils.officeqa_eval import (
+from skunk.search_agent.prep.officeqa_eval import (
     metadata_to_doc_key,
     metadata_to_page_key,
     source_docs_to_page_keys,

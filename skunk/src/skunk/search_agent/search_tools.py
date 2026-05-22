@@ -4,7 +4,7 @@ import subprocess
 
 from chromadb.api.models.Collection import Collection
 from google import genai
-from openrouter import OpenRouter
+from skunk.search_agent.openrouter_client import OpenRouter
 
 # Tokens that are allowed to appear as the *command name* in each segment of a
 # grep pipeline. Anything else causes the command to be rejected.

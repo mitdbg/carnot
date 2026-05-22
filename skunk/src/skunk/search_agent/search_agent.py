@@ -9,17 +9,21 @@ from chromadb.api.models.Collection import Collection
 from google import genai
 from google.genai import types as genai_types  # noqa: F401
 from jinja2 import Template
-from openrouter import OpenRouter
-from utils import (
+from skunk.search_agent.openrouter_client import OpenRouter
+from skunk.search_agent.base import Retriever
+from skunk.search_agent.search_tools import (
+    _make_retrieve_page_info,
+    _make_vector_search,
+    final_answer,
+    run_grep,
+)
+from skunk.search_agent.tracer import Tracer
+from skunk.search_agent.utils import (
     CodeOutput,
     InterpreterError,
     LocalPythonExecutor,
     parse_code_blobs,
 )
-
-from skunk.logging.tracer import Tracer
-from skunk.retrieve.base import Retriever
-from skunk.retrieve.search_tools import _make_retrieve_page_info, _make_vector_search, final_answer, run_grep
 
 MODEL_CONTEXT_WINDOW = 1_000_000
 MODEL_EFFECTIVE_CONTEXT_WINDOW = int(MODEL_CONTEXT_WINDOW * 0.5)
