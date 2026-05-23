@@ -186,11 +186,11 @@ if __name__ == "__main__":
                 match = re.match(r"treasury_bulletin_(\d{4})_(\d{2})\.json", file)
                 year, month = match.groups() # type: ignore
                 
-                # store f"{year}-{month}-{page_id}" --> list of elements on that page
+                # store f"{year}_{month}_{page_id}" (doc_id format) --> list of elements on that page
                 for page_id, elements in page_id_to_elements.items():
-                    page_key = f"{year}-{month}-{page_id}"
+                    page_key = f"{year}_{month}_{page_id}"
                     if page_key not in clean_page_map:
-                        dirty_page_map[f"{year}-{month}-{page_id}"] = elements
+                        dirty_page_map[page_key] = elements
 
     # create a mapping from (year, month, page_idx) to the cleaned page's file path
     completed, errored, total_cost = 0, 0, 0.0
