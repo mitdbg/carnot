@@ -57,8 +57,10 @@ class SemanticDocumentIndex:
                     # for page_node in document.page_nodes:
                     # if isinstance(page_node, Exception):
                     # raise ValueError("Cached semantic index contains a failed page node result.")
-                    if self.embedding_matrix is not None:
-                        self._rebuild_faiss_index()
+                    # if self.embedding_matrix is not None:
+                        # self._rebuild_faiss_index()
+                    # self.initialized = True
+                    # self.initialize()
             except (EOFError, OSError, pickle.PickleError, TypeError, AttributeError, KeyError, ValueError):
                 self.documents: dict[str, DocumentNode] = {}
                 self._sha_to_document_id: dict[str, str] = {}
@@ -181,15 +183,14 @@ class SemanticDocumentIndex:
             n_workers=n_embedding_workers,
         )
 
-        matrix = embeddings
-        faiss.normalize_L2(matrix)
+        faiss.normalize_L2(embeddings)
         self.embedding_idx_map = {node_id: node_idx for node_idx, node_id in enumerate(node_ids)}
         self.embedding_node_ids = node_ids
-        self.embedding_matrix = matrix
+        self.embedding_matrix = embeddings
         self.embedding_model = embedding_model
         self._rebuild_faiss_index()
         if self.use_cache:
-            get_llm_wrapper().flush_cache()
+            get_llm_wrapper().flush_cache(evict_generated_embeddings=True)
         self._save_cache()
         self.initialized = True
 
@@ -232,21 +233,32 @@ class SemanticDocumentIndex:
         return results
 
     def get_node(self, node_id: str) -> DocumentNode | PageNode | TextNode | TableNode | PlotNode:
-        for document in self.documents.values():
-            if document.document_id == node_id:
-                return document
-            for page in document.page_nodes:
-                if page.page_id == node_id:
-                    return page
-                for text_node in page.text_nodes:
-                    if text_node.text_id == node_id:
-                        return text_node
-                for table_node in page.table_nodes:
-                    if table_node.table_id == node_id:
-                        return table_node
-                for plot_node in page.plot_nodes:
-                    if plot_node.plot_id == node_id:
-                        return plot_node
+        doc_id = node_id.split("_")[0]
+        doc = self.documents.get(doc_id)
+        assert doc is not None, f"Document {doc_id} not found in index"
+        if doc_id == node_id:
+            return doc
+
+        # if node_id is doc:9999_page:5_text:234... the page id is doc:9999_page:5
+        page_id = "_".join(node_id.split("_")[:2])
+        page = doc.page_nodes.get(page_id)
+        assert page is not None, f"Page {page_id} not found in document {doc_id}"
+        if page_id == node_id:
+            return page
+
+        if 'text' in node_id:
+            text_node = page.text_nodes.get(node_id)
+            if text_node is not None:
+                return text_node
+        elif 'table' in node_id:
+            table_node = page.table_nodes.get(node_id)
+            if table_node is not None:
+                return table_node
+        elif 'plot' in node_id:
+            plot_node = page.plot_nodes.get(node_id)
+            if plot_node is not None:
+                return plot_node
+
         raise KeyError(node_id)
 
     def get_document_tree(self, document_id: str) -> DocumentNode:

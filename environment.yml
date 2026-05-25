@@ -50,3 +50,4 @@ dependencies:
       - "smolagents[toolkit]"
       - pqdm
       - untruncate-json
+      - json5

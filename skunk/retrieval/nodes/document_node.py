@@ -26,7 +26,7 @@ class DocumentNode:
     document_title: str
     document_date: str
     num_pdf_pages: int
-    page_nodes: list[PageNode] = field(default_factory=list)
+    page_nodes: dict[str, PageNode] = field(default_factory=dict)
     description: str = ""
     ocr_text_dir: str = DEFAULT_OCR_TEXT_DIR
     json_dir: str = DEFAULT_JSON_DIR
@@ -112,9 +112,9 @@ class DocumentNode:
                     )
                 )
 
-        # self.page_nodes = [PageNode(*arg) for arg in args]
+        # page_nodes = [PageNode(*arg) for arg in args]
         # raise Exception
-        self.page_nodes = pqdm(
+        page_nodes = pqdm(
             args,
             PageNode,
             # n_jobs=self.page_process_workers,
@@ -123,11 +123,12 @@ class DocumentNode:
             exception_behaviour="immediate",
             desc=f"Processing page nodes in {self.filename}",
         )
-        for arg, page_node in zip(args, self.page_nodes, strict=True):
+        for arg, page_node in zip(args, page_nodes, strict=True):
             if isinstance(page_node, Exception):
                 raise RuntimeError(
                     f"Failed to process page {arg[1]} in {self.filename}"
                 ) from page_node
+        self.page_nodes = {page_node.page_id: page_node for page_node in page_nodes}
 
     def extract_document_title(self, text: str) -> str:
         if not text.strip():
@@ -193,3 +194,8 @@ Document OCR text:
 
         desc = get_llm_wrapper().call_llm(prompt, use_cache=self.use_cache)
         return desc
+
+    def get_page(self, page_id: str) -> PageNode | None:
+        if page_id in self.page_nodes:
+            return self.page_nodes[page_id]
+        raise KeyError(f"Page {page_id} not found in document {self.document_id}")

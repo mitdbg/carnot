@@ -1,13 +1,18 @@
 from __future__ import annotations
+import re
 
 import json
-import re
+import random
+
+SEED = 42
+random.seed(SEED)
 
 from skunk.retrieval.nodes import PlotNode, TableNode, TextNode
 from skunk.retrieval.nodes.document_node import DocumentNode
 from skunk.retrieval.nodes.llm_wrapper import (
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_LLM_WRAPPER,
+    get_llm_wrapper,
     parse_json_response,
 )
 
@@ -17,14 +22,16 @@ MAX_NODE_CONTENT_CHARS = 1200
 
 
 class Retriever:
+
     def __init__(
         self,
         index,
         candidate_nodes_per_keyword: int = 20,
         relevant_nodes_k: int = 10,
         final_documents_k: int = 5,
+        text_model: str = "openrouter/google/gemini-2.5-flash",
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
-        use_cache: bool | None = None,
+        use_cache: bool | None = True,
     ):
         if candidate_nodes_per_keyword <= 0:
             raise ValueError("candidate_nodes_per_keyword must be positive")
@@ -37,19 +44,24 @@ class Retriever:
         self.candidate_nodes_per_keyword = candidate_nodes_per_keyword
         self.relevant_nodes_k = relevant_nodes_k
         self.final_documents_k = final_documents_k
+        self.text_model = text_model
         self.embedding_model = embedding_model
-        self.use_cache = getattr(index, "use_cache", True) if use_cache is None else use_cache
+        self.use_cache = use_cache
 
     def retrieve(self, question: str) -> list[DocumentNode]:
         if not isinstance(question, str) or not question.strip():
             raise ValueError("question must be a non-empty string")
 
-        assert self.index.initialized, "SemanticDocumentIndex must be initialized before retrieval!"
+        assert (
+            self.index.initialized
+        ), "SemanticDocumentIndex must be initialized before retrieval!"
         content_records = self._content_node_records()
-        content_records_by_id = {record["node_id"]: record for record in content_records}
+        content_records_by_id = {
+            record["node_id"]: record for record in content_records
+        }
         if not content_records:
             return []
-
+        breakpoint()
         keywords = self.decompose_query(question)
         query_terms = []
         seen_terms = set()
@@ -73,10 +85,14 @@ class Retriever:
             ):
                 matched_node = self.index.get_node(matched_node_id)
                 if matched_node_id in content_records_by_id:
-                    scored_records.append((score, content_records_by_id[matched_node_id]))
+                    scored_records.append(
+                        (score, content_records_by_id[matched_node_id])
+                    )
                 elif hasattr(matched_node, "page_id"):
                     scored_records.extend(
-                        (score, record) for record in content_records if record["page_id"] == matched_node.page_id
+                        (score, record)
+                        for record in content_records
+                        if record["page_id"] == matched_node.page_id
                     )
                 elif hasattr(matched_node, "document_id"):
                     scored_records.extend(
@@ -85,7 +101,9 @@ class Retriever:
                         if record["document_id"] == matched_node.document_id
                     )
 
-            scored_records.sort(key=lambda scored_record: scored_record[0], reverse=True)
+            scored_records.sort(
+                key=lambda scored_record: scored_record[0], reverse=True
+            )
             for score, record in scored_records[: self.candidate_nodes_per_keyword]:
                 node_id = record["node_id"]
                 if node_id not in candidates_by_id:
@@ -95,13 +113,19 @@ class Retriever:
                         "matched_terms": [term],
                     }
                 else:
-                    candidates_by_id[node_id]["score"] = max(candidates_by_id[node_id]["score"], score)
+                    candidates_by_id[node_id]["score"] = max(
+                        candidates_by_id[node_id]["score"], score
+                    )
                     candidates_by_id[node_id]["matched_terms"].append(term)
 
-        candidates = sorted(candidates_by_id.values(), key=lambda record: record["score"], reverse=True)
+        candidates = sorted(
+            candidates_by_id.values(), key=lambda record: record["score"], reverse=True
+        )
         relevant_node_ids = self.judge_relevant_nodes(question, candidates)
         if not relevant_node_ids:
-            relevant_node_ids = [record["node_id"] for record in candidates[: self.relevant_nodes_k]]
+            relevant_node_ids = [
+                record["node_id"] for record in candidates[: self.relevant_nodes_k]
+            ]
 
         document_scores = {}
         for rank, node_id in enumerate(relevant_node_ids):
@@ -110,13 +134,24 @@ class Retriever:
             record = candidates_by_id[node_id]
             document_id = record["document_id"]
             rank_bonus = self.relevant_nodes_k - rank
-            document_scores[document_id] = document_scores.get(document_id, 0.0) + record["score"] + rank_bonus
+            document_scores[document_id] = (
+                document_scores.get(document_id, 0.0) + record["score"] + rank_bonus
+            )
+        if self.use_cache:
+            get_llm_wrapper().flush_cache()
 
-        ranked_document_ids = sorted(document_scores, key=lambda document_id: document_scores[document_id], reverse=True)
-        return [self.index.documents[document_id] for document_id in ranked_document_ids[: self.final_documents_k]]
+        ranked_document_ids = sorted(
+            document_scores,
+            key=lambda document_id: document_scores[document_id],
+            reverse=True,
+        )
+        return [
+            self.index.documents[document_id]
+            for document_id in ranked_document_ids[: self.final_documents_k]
+        ]
 
     def decompose_query(self, question: str) -> list[str]:
-        tree_context = self.explore_tree(max_lines=80)
+        tree_context = self.sample_tree(max_lines=80)
         prompt = f"""
 You are preparing a document tree retrieval query.
 
@@ -145,49 +180,63 @@ Question:
 Tree exploration context:
 {tree_context}
 """.strip()
+
         try:
-            parsed = parse_json_response(DEFAULT_LLM_WRAPPER.call_llm(prompt, use_cache=self.use_cache))
+            response = DEFAULT_LLM_WRAPPER.call_llm(
+                prompt, model=self.text_model, use_cache=self.use_cache
+            )
+            parsed = parse_json_response(response)
         except Exception:
             parsed = {"keywords": []}
 
-        keywords = []
-        seen_keywords = set()
+        keywords = set()
         for item in parsed.get("keywords", []):
-            terms = [item] if isinstance(item, str) else [item.get("keyword", ""), *item.get("expansions", [])]
-            for term in terms:
-                normalized = re.sub(r"\s+", " ", str(term).strip().lower())
-                if normalized and normalized not in seen_keywords:
-                    keywords.append(str(term).strip())
-                    seen_keywords.add(normalized)
+            kw_dict = (
+                item
+                if isinstance(item, dict)
+                else {"keyword": str(item), "expansions": []}
+            )
+            primary_keyword = kw_dict.get("keyword", "")
+            if primary_keyword.lower() not in keywords:
+                keywords.add(primary_keyword.lower())
+            else:
+                for expansion in kw_dict.get("expansions", []):
+                    if expansion.lower() not in keywords:
+                        keywords.add(expansion.lower())
+                        continue
 
-        if keywords:
-            return keywords
+        return list(keywords)[:KEYWORD_EXTRACTION_LIMIT]
 
-        fallback_terms = re.findall(r"[A-Za-z][A-Za-z0-9$%.-]{2,}", question)
-        for term in fallback_terms:
-            normalized = term.lower()
-            if normalized not in seen_keywords:
-                keywords.append(term)
-                seen_keywords.add(normalized)
-        return keywords[:KEYWORD_EXTRACTION_LIMIT]
-
-    def explore_tree(self, max_lines: int = 80) -> str:
+    def sample_tree(self, max_lines: int = 80) -> str:
+        """Sample up to max_lines lines of the document tree for LLM context.
+        The output is a text representation of the tree structure, including document titles, page numbers, and node descriptions.
+        """
         lines = []
-        for document in self.index.documents.values():
-            document_title = document.document_title or document.filename or document.document_id
-            lines.append(f"DOCUMENT {document.document_id}: {document_title}; {document.description}")
-            for page in document.page_nodes:
-                lines.append(f"PAGE {page.page_id}: page_number={page.page_number}; {page.description}")
-                for text_node in page.text_nodes:
-                    lines.append(f"TEXT {text_node.text_id}: {text_node.description}")
-                for table_node in page.table_nodes:
-                    table_title = table_node.table_title or "Untitled table"
-                    lines.append(f"TABLE {table_node.table_id}: {table_title}; {table_node.description}")
-                for plot_node in page.plot_nodes:
-                    plot_title = plot_node.plot_title or "Untitled plot"
-                    lines.append(f"PLOT {plot_node.plot_id}: {plot_title}; {plot_node.description}")
+
+        document_keys = list(self.index.documents.keys())
+        sampled_document_idx = sorted(
+            random.sample(document_keys, min(len(document_keys), 10))
+        )
+        documents = [self.index.documents[i] for i in sampled_document_idx]
+
+        for doc in documents:
+            document_title = doc.document_title or doc.filename or doc.document_id
+            lines.append(
+                f"DOCUMENT {doc.document_id}: {document_title}; {doc.description}"
+            )
+            # sample up to 10 pages from the document
+            page_keys = list(doc.page_nodes.keys())
+            sampled_page_idx = sorted(
+                random.sample(page_keys, min(len(page_keys), 10))
+            )
+            for page_id in sampled_page_idx:
+                page = doc.page_nodes[page_id]
+                lines.append(
+                    f"PAGE {page.page_id}: page_number={page.page_number}; {page.description}"
+                )
                 if len(lines) >= max_lines:
                     return "\n".join(lines[:max_lines])
+
         return "\n".join(lines[:max_lines])
 
     def judge_relevant_nodes(self, question: str, candidates: list[dict]) -> list[str]:
@@ -237,13 +286,10 @@ Candidate nodes:
 {json.dumps(prompt_candidates, indent=2)}
 """.strip()
         try:
-            parsed = parse_json_response(
-                DEFAULT_LLM_WRAPPER.call_llm(
-                    prompt,
-                    max_tokens=4096,
-                    use_cache=self.use_cache,
-                )
+            response = DEFAULT_LLM_WRAPPER.call_llm(
+                prompt, model=self.text_model, use_cache=self.use_cache
             )
+            parsed = parse_json_response(response)
         except Exception:
             return []
 

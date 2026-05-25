@@ -1,7 +1,7 @@
 import time
 from dataclasses import dataclass, field
 from io import StringIO
-from typing import List
+from typing import Dict, List
 
 import pandas as pd
 import json
@@ -41,9 +41,9 @@ class PageNode:
     page_id: str
     page_pdf_number: int
     page_number: str
-    text_nodes: list[TextNode] = field(default_factory=list)
-    table_nodes: list[TableNode] = field(default_factory=list)
-    plot_nodes: list[PlotNode] = field(default_factory=list)
+    text_nodes: Dict[str, TextNode] = field(default_factory=dict)
+    table_nodes: Dict[str, TableNode] = field(default_factory=dict)
+    plot_nodes: Dict[str, PlotNode] = field(default_factory=dict)
     description: str = ""
 
     def __init__(
@@ -99,9 +99,9 @@ class PageNode:
         self.page_number = (
             candidate_nums[0] if candidate_nums else str(page_pdf_number + 1)
         )
-        self.text_nodes = []
-        self.table_nodes = []
-        self.plot_nodes = []
+        self.text_nodes = {}
+        self.table_nodes = {}
+        self.plot_nodes = {}
 
         start_time = time.time()
         llm_wrapper = get_llm_wrapper()
@@ -128,7 +128,7 @@ class PageNode:
             if isinstance(parsed, list):
                 parsed = {"text_blocks": parsed}
             for idx, text_block in enumerate(parsed.get("text_blocks", [])):
-                block_idx = text_block.get("block_idx", idx)
+                block_idx = int(text_block.get("block_idx", idx))
                 if block_idx >= len(text_blocks):
                     print(
                         f"block_idx {block_idx} out of range for text_blocks with length {len(text_blocks)}"
@@ -136,12 +136,11 @@ class PageNode:
                     block_idx = -1
 
                 description = text_block.get("description", "")
-                self.text_nodes.append(
-                    TextNode(
-                        text_id=f"{self.page_id}_text:{block_idx}",
-                        text=text_blocks[block_idx],
-                        description=description,
-                    )
+                text_id = f"{self.page_id}_text:{block_idx}"
+                self.text_nodes[text_id] = TextNode(
+                    text_id=text_id,
+                    text=text_blocks[block_idx],
+                    description=description,
                 )
 
         t3 = time.time()
@@ -163,16 +162,16 @@ class PageNode:
                 description = table_info.get("description", "")
                 date_start = table_info.get("date_start", "")
                 date_end = table_info.get("date_end", "")
-                self.table_nodes.append(
-                    TableNode(
-                        table_id=f"{self.page_id}_table:{table_idx}",
+                table_id = f"{self.page_id}_table:{table_idx}"
+                self.table_nodes[table_id] = TableNode(
+                        table_id=table_id,
                         table_title=title,
                         table_data=tables[table_idx],
                         table_date_start=date_start,
                         table_date_end=date_end,
                         description=description,
                     )
-                )
+                
 
         if figures:
             t5 = time.time()
@@ -188,18 +187,17 @@ class PageNode:
             t6 = time.time()
             # print(f"PageNode plot descriptions generated in {t6 - t5:.2f} seconds")
             for plot_idx, plot in enumerate(parsed.get("plots", [])):
-                self.plot_nodes.append(
-                    PlotNode(
-                        plot_id=f"{self.page_id}_plot:{plot_idx}",
-                        plot_title=plot.get("plot_title", ""),
-                        description=plot.get("description", ""),
-                    )
+                plot_id = f"{self.page_id}_plot:{plot_idx}"
+                self.plot_nodes[plot_id] = PlotNode(
+                    plot_id=plot_id,
+                    plot_title=plot.get("plot_title", ""),
+                    description=plot.get("description", ""),
                 )
         end_time = time.time()
         tot_time = end_time - start_time
         # print(f"Total PageNode processing time: {tot_time:.2f} seconds")
         # if tot_time > 30:
-            # breakpoint()
+        # breakpoint()
 
     @staticmethod
     def description_prompt(text: str) -> str:

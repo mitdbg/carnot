@@ -14,20 +14,25 @@ import time
 import litellm
 import numpy as np
 import untruncate_json
+import json5
 from tqdm import tqdm
 
 litellm.suppress_debug_info = True
 
 # DEFAULT_LLM_MODEL = "openai/gpt-4o-mini"
 # DEFAULT_LLM_VISION_MODEL = "openai/gpt-4o-mini"
-DEFAULT_LLM_MODEL = "openrouter/google/gemini-2.5-flash"
-DEFAULT_LLM_VISION_MODEL = "openrouter/google/gemini-2.5-flash"
 # DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small"
-DEFAULT_EMBEDDING_MODEL = "openrouter/google/gemini-embedding-001"
-# DEFAULT_LLM_MODEL = "gemini/gemini-2.5-flash"
-# DEFAULT_LLM_VISION_MODEL = "gemini/gemini-2.5-flash"
-# DEFAULT_EMBEDDING_MODEL = "gemini/gemini-embedding-001"
+# DEFAULT_LLM_MODEL = "openrouter/google/gemini-2.5-flash"
+# DEFAULT_LLM_VISION_MODEL = "openrouter/google/gemini-2.5-flash"
+# DEFAULT_EMBEDDING_MODEL = "openrouter/google/gemini-embedding-001"
+DEFAULT_LLM_MODEL = "vertex_ai/gemini-2.5-flash"
+DEFAULT_LLM_VISION_MODEL = "vertex_ai/gemini-2.5-flash"
+DEFAULT_EMBEDDING_MODEL = "vertex_ai/gemini-embedding-001"
 
+LLM_MAX_WORKERS = 8
+LLM_MAX_REQUESTS_PER_MINUTE = 120
+LLM_MAX_RETRIES = 10
+LLM_RETRY_BACKOFF_SECONDS = 10
 EMBEDDING_BATCH_SIZE = 90
 
 LLM_CACHE_PATH = os.environ.get(
@@ -45,18 +50,28 @@ LLM_VISION_SYSTEM_PROMPT = (
     "You match rendered PDF pages to spans of OCR text. Return only valid JSON."
 )
 
-DEFAULT_LLM_MAX_WORKERS = int(os.environ.get("LLM_MAX_WORKERS", "32"))
+DEFAULT_LLM_MAX_WORKERS = int(os.environ.get("LLM_MAX_WORKERS", LLM_MAX_WORKERS))
 DEFAULT_LLM_MAX_REQUESTS_PER_MINUTE = int(
-    os.environ.get("LLM_MAX_REQUESTS_PER_MINUTE", "500")
+    os.environ.get("LLM_MAX_REQUESTS_PER_MINUTE", LLM_MAX_REQUESTS_PER_MINUTE)
 )
-DEFAULT_LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", "10"))
+DEFAULT_LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", LLM_MAX_RETRIES))
 DEFAULT_LLM_RETRY_BACKOFF_SECONDS = int(
-    os.environ.get("LLM_RETRY_BACKOFF_SECONDS", "10")
+    os.environ.get("LLM_RETRY_BACKOFF_SECONDS", LLM_RETRY_BACKOFF_SECONDS)
 )
 
 
 def llm_cache_key(request_inputs: dict) -> str:
-    request_json = json.dumps(request_inputs, sort_keys=True, separators=(",", ":"))
+    input_monkeypatch = request_inputs.copy()
+    if "gemini/" in request_inputs["model"]:
+        input_monkeypatch["model"] = input_monkeypatch["model"].replace(
+            "gemini/", "openrouter/google/"
+        )
+        input_monkeypatch["model"] = input_monkeypatch["model"].replace(
+            "vertex_ai/", "openrouter/google/"
+        )
+        input_monkeypatch["model"] = input_monkeypatch["model"].replace("3.5", "2.5")
+
+    request_json = json.dumps(input_monkeypatch, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(request_json.encode("utf-8")).hexdigest()
 
 
@@ -83,7 +98,10 @@ def extract_litellm_text(response) -> str:
         if text:
             return text
 
-    raise ValueError(f"No text content in LiteLLM response choice: {choice}")
+    print(
+        f"Warning: LLM response content is an empty string. Returning empty string.\nResponse: {response}"
+    )
+    return ""
 
 
 def parse_json_response(text: str) -> dict:
@@ -93,10 +111,10 @@ def parse_json_response(text: str) -> dict:
         cleaned_text = re.sub(r"\s*```$", "", cleaned_text)
 
     try:
-        return json.loads(cleaned_text)
+        return json.loads(untruncate_json.complete(cleaned_text))
     except json.JSONDecodeError:
         try:
-            return json.loads(untruncate_json.complete(cleaned_text))
+            return json5.loads(cleaned_text)
         except Exception as e:
             print(f"Failed to parse JSON response: {e}\nOriginal text: {text}")
             return {}
@@ -125,6 +143,7 @@ class LLMWrapper:
         self.cache_enabled = cache_enabled
         self.cache_lock = threading.RLock()
         self.dirty_cache_entries = {}
+        self.generated_embedding_cache_keys = set()
         if self.cache_enabled:
             with self.locked_cache_file():
                 self.cache = self.load_cache_from_disk()
@@ -176,7 +195,7 @@ class LLMWrapper:
             self.cache[cache_key] = value
             self.dirty_cache_entries[cache_key] = value
 
-    def flush_cache(self) -> None:
+    def flush_cache(self, evict_generated_embeddings: bool = False) -> None:
         if not self.cache_enabled:
             return
 
@@ -191,19 +210,34 @@ class LLMWrapper:
             self.save_cache_to_disk(disk_cache)
 
         with self.cache_lock:
-            for cache_key, value in disk_cache.items():
-                if cache_key not in self.dirty_cache_entries:
-                    self.cache[cache_key] = value
-                elif self.dirty_cache_entries[cache_key] == dirty_cache_entries.get(
-                    cache_key
-                ):
-                    self.cache[cache_key] = value
             for cache_key in dirty_cache_entries:
-                if (
-                    self.dirty_cache_entries.get(cache_key)
-                    == dirty_cache_entries[cache_key]
-                ):
+                current_dirty_value = self.dirty_cache_entries.get(cache_key)
+                flushed_value = dirty_cache_entries[cache_key]
+                values_match = current_dirty_value is flushed_value
+                if not values_match:
+                    if isinstance(current_dirty_value, np.ndarray) or isinstance(
+                        flushed_value, np.ndarray
+                    ):
+                        values_match = np.array_equal(
+                            current_dirty_value, flushed_value
+                        )
+                    else:
+                        values_match = current_dirty_value == flushed_value
+                if values_match:
                     self.dirty_cache_entries.pop(cache_key, None)
+                    if (
+                        evict_generated_embeddings
+                        and cache_key in self.generated_embedding_cache_keys
+                    ):
+                        self.cache.pop(cache_key, None)
+                        self.generated_embedding_cache_keys.discard(cache_key)
+                    else:
+                        self.cache[cache_key] = flushed_value
+
+            if not evict_generated_embeddings:
+                for cache_key, value in disk_cache.items():
+                    if cache_key not in self.dirty_cache_entries:
+                        self.cache[cache_key] = value
 
     def is_rate_limit_error(self, error: Exception) -> bool:
         status_code = getattr(error, "status_code", None)
@@ -270,7 +304,9 @@ class LLMWrapper:
                 ) + random.uniform(0, self.retry_backoff_seconds)
                 if is_rate_limited:
                     print(
-                        f"LLM rate limit hit; retrying in {sleep_seconds:.1f} seconds."
+                        f"LLM rate limit hit ({type(e).__name__}: {e}); ",
+                        f"{e.with_traceback(None)}",
+                        f"retrying in {sleep_seconds:.1f} seconds.",
                     )
                     self.wait_for_rate_limit_slot()
                 else:
@@ -520,6 +556,7 @@ class LLMWrapper:
             with self.cache_lock:
                 self.cache.update(new_embeddings)
                 self.dirty_cache_entries.update(new_embeddings)
+                self.generated_embedding_cache_keys.update(new_embeddings)
         return batch_embeddings
 
     def embed_texts(
@@ -604,7 +641,7 @@ class LLMWrapper:
                     if use_cache and self.cache_enabled:
                         batches_since_cache_flush += 1
                         if batches_since_cache_flush >= 5000:
-                            self.flush_cache()
+                            self.flush_cache(evict_generated_embeddings=True)
                             batches_since_cache_flush = 0
 
         if not embeddings:
