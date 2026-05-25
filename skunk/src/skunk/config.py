@@ -22,28 +22,20 @@ class SkunkConfig:
     # limiter rather than the thread pool.
     max_parallel_workers: int = 16
 
-    # OpenRouter LLM client — used for all non-search calls (env: SKUNK_LLM_MODEL, SKUNK_LLM_RPM)
-    llm_model: str = "google/gemini-3-flash-preview"
+    # LLM model — all calls (planner, retrieve, extract, compute, lookup_external)
+    # go through GCP Vertex AI. Use bare Vertex model names (no `google/` prefix).
+    # Requires GOOGLE_CLOUD_PROJECT in the environment and ADC set up via
+    # `gcloud auth application-default login`. GOOGLE_CLOUD_LOCATION defaults to
+    # us-central1. (env: SKUNK_LLM_MODEL, SKUNK_LLM_RPM)
+    llm_model: str = "gemini-3-flash-preview"
     # Token-bucket rate limit applied to every LLM call (requests per minute).
-    # Default matches Gemini 2.5 Flash paid-tier 1k RPM quota; adjust for other models.
+    # Default sized for Vertex Gemini Flash paid-tier quotas; adjust for other models.
     llm_rpm: float = 1000.0
     # Per-call retry with exponential backoff. Re-tries any SDK exception;
-    # delay doubles each attempt, capped at gemini_retry_max_delay_s.
-    gemini_max_retries: int = 10
-    gemini_retry_initial_delay_s: float = 0.05
-    gemini_retry_max_delay_s: float = 1.0
-    # Direct Gemini model used only for lookup_external Google Search grounding
-    # (env: SKUNK_GEMINI_MODEL). All other calls go through OpenRouter via llm_model.
-    gemini_model: str = "gemini-3-flash-preview"
-    # Vertex AI (env: SKUNK_USE_VERTEX). When True, uses Vertex AI instead of the direct Gemini API
-    # for the Google Search path. Requires GOOGLE_CLOUD_PROJECT; optionally GOOGLE_CLOUD_LOCATION
-    # (default: us-central1) and GOOGLE_APPLICATION_CREDENTIALS for service-account auth.
-    use_vertex: bool = False
-    # Route every non-search LLM call (planner, retrieve, extract, compute, …)
-    # through the direct Gemini API instead of OpenRouter. Uses `gemini_model`
-    # (default gemini-3-flash-preview) and GEMINI_API_KEY. Useful when
-    # OpenRouter credits are unavailable. (env: SKUNK_USE_DIRECT_GEMINI)
-    use_direct_gemini: bool = False
+    # delay doubles each attempt, capped at llm_retry_max_delay_s.
+    llm_max_retries: int = 10
+    llm_retry_initial_delay_s: float = 0.05
+    llm_retry_max_delay_s: float = 1.0
 
     # Extract operator (env: SKUNK_EXTRACT_N_SAMPLES, SKUNK_EXTRACT_SAMPLE_TEMPERATURE)
     extract_n_samples: int = 3       # LLM calls per tier 1; all surviving entries are merged + deduped
@@ -85,9 +77,9 @@ class SkunkConfig:
     clean_page_map_path: str = "cache/clean_page_map.json"
 
     # Embedding model used by the agent's vector_search tool (must match
-    # whatever produced the stored embeddings).
+    # whatever produced the stored embeddings). Vertex bare name — no `google/` prefix.
     # (env: SKUNK_EMB_MODEL)
-    emb_model_id: str = "google/gemini-embedding-001"
+    emb_model_id: str = "gemini-embedding-001"
 
     # Per-question agent budget. The teammate's defaults are 20/20.
     # (env: SKUNK_AGENT_MAX_STEPS, SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL)
@@ -112,14 +104,11 @@ class SkunkConfig:
     @classmethod
     def from_env(cls) -> SkunkConfig:
         return cls(
-            llm_model=os.environ.get("SKUNK_LLM_MODEL", "google/gemini-3-flash-preview"),
+            llm_model=os.environ.get("SKUNK_LLM_MODEL", "gemini-3-flash-preview"),
             llm_rpm=float(os.environ.get("SKUNK_LLM_RPM", "1000")),
-            gemini_max_retries=int(os.environ.get("SKUNK_GEMINI_MAX_RETRIES", "10")),
-            gemini_retry_initial_delay_s=float(os.environ.get("SKUNK_GEMINI_RETRY_INITIAL_DELAY", "0.05")),
-            gemini_retry_max_delay_s=float(os.environ.get("SKUNK_GEMINI_RETRY_MAX_DELAY", "1.0")),
-            gemini_model=os.environ.get("SKUNK_GEMINI_MODEL", "gemini-3-flash-preview"),
-            use_vertex=os.environ.get("SKUNK_USE_VERTEX", "").lower() in ("1", "true", "yes"),
-            use_direct_gemini=os.environ.get("SKUNK_USE_DIRECT_GEMINI", "").lower() in ("1", "true", "yes"),
+            llm_max_retries=int(os.environ.get("SKUNK_LLM_MAX_RETRIES", "10")),
+            llm_retry_initial_delay_s=float(os.environ.get("SKUNK_LLM_RETRY_INITIAL_DELAY", "0.05")),
+            llm_retry_max_delay_s=float(os.environ.get("SKUNK_LLM_RETRY_MAX_DELAY", "1.0")),
             extract_n_samples=int(os.environ.get("SKUNK_EXTRACT_N_SAMPLES", "3")),
             extract_sample_temperature=float(os.environ.get("SKUNK_EXTRACT_SAMPLE_TEMPERATURE", "0.7")),
             prompt_overrides_path=os.environ.get(
@@ -132,7 +121,7 @@ class SkunkConfig:
             chromadb_dir=os.environ.get("SKUNK_CHROMADB_DIR", "cache/chromadb"),
             chromadb_collection=os.environ.get("SKUNK_CHROMADB_COLLECTION", "treasury_pages"),
             clean_page_map_path=os.environ.get("SKUNK_CLEAN_PAGE_MAP", "cache/clean_page_map.json"),
-            emb_model_id=os.environ.get("SKUNK_EMB_MODEL", "google/gemini-embedding-001"),
+            emb_model_id=os.environ.get("SKUNK_EMB_MODEL", "gemini-embedding-001"),
             agent_max_steps=int(os.environ.get("SKUNK_AGENT_MAX_STEPS", "20")),
             agent_max_pages_per_tool_call=int(os.environ.get("SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL", "20")),
             agent_model_id=os.environ.get("SKUNK_AGENT_MODEL") or None,

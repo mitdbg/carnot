@@ -4,7 +4,6 @@ import subprocess
 
 from chromadb.api.models.Collection import Collection
 from google import genai
-from skunk.search_agent.openrouter_client import OpenRouter
 
 # Tokens that are allowed to appear as the *command name* in each segment of a
 # grep pipeline. Anything else causes the command to be rejected.
@@ -43,7 +42,7 @@ def _make_retrieve_page_info(clean_page_map: dict[str, list]):
     return retrieve_page_info
 
 
-def _make_vector_search(chroma_collection: Collection, emb_model_id: str, openrouter_client: OpenRouter | genai.Client):
+def _make_vector_search(chroma_collection: Collection, emb_model_id: str, genai_client: genai.Client):
     def _build_where(
         filter_year_months: list[tuple[int, int]] | None,
         filter_page_ids: list[int] | None,
@@ -87,12 +86,8 @@ def _make_vector_search(chroma_collection: Collection, emb_model_id: str, openro
         filter_page_ids: list[int] | None = None,
     ) -> str:
         # embed the query using the same model that produced the stored embeddings.
-        resp = openrouter_client.embeddings.generate(input=query, model=emb_model_id)  # type: ignore
-        query_embedding = resp.data[0].embedding  # type: ignore
-        # assert isinstance(openrouter_client, genai.Client)
-        # gemini_emb_model = emb_model_id.removeprefix("google/")
-        # emb_result = openrouter_client.models.embed_content(model=gemini_emb_model, contents=query)
-        # query_embedding = list(emb_result.embeddings[0].values)  # type: ignore
+        emb_result = genai_client.models.embed_content(model=emb_model_id, contents=query)
+        query_embedding = list(emb_result.embeddings[0].values)  # type: ignore
 
         where = _build_where(filter_year_months, filter_page_ids)
         query_kwargs: dict = {
@@ -178,17 +173,6 @@ def run_grep(grep_cmd: str) -> str:
     if proc.returncode not in (0, 1):  # grep returns 1 when no matches found
         out += f"\n[stderr]\n{proc.stderr}"
     return out
-
-# NOTE: tools=... may not be supported by OpenRouter
-# def lookup_external(query: str) -> str:
-#     """Query the model via OpenRouter."""
-#     resp = _openrouter_client.chat.send(
-#         model=MODEL_ID,
-#         messages=[{"role": "user", "content": query}],
-#         tools=[{"googleSearch": {}}],
-#     )
-#     return resp.choices[0].message.content or ""
-
 
 def final_answer(page_keys):
     return page_keys

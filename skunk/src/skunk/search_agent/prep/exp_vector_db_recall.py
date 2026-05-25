@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -41,9 +40,9 @@ QWEN_MODEL_ID = "Qwen/Qwen3-Embedding-8B"
 # ---------------------------------------------------------------------------
 class GeminiEmbedder:
     def __init__(self, model_id: str = GEMINI_MODEL_ID, max_workers: int = 16):
-        from google import genai  # local import so qwen-only runs don't need it
+        from skunk.common import _make_vertex_client  # local so qwen-only runs don't need it
 
-        self.client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        self.client = _make_vertex_client()
         self.model_id = model_id
         self.max_workers = max_workers
 

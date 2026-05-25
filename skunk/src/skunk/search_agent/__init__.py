@@ -6,10 +6,12 @@ tool-using LLM loop (vector_search / retrieve_page_info / run_grep /
 final_answer) over a ChromaDB index + cleaned per-page text, and
 returns a list of page keys.
 
-This first-pass merge keeps the teammate's `OpenRouter` wrapper,
-`LocalPythonExecutor`, and `Tracer` intact rather than porting to the
-framework's `LLMClient` / `pyexec` / `trace`. See "TODO after merge"
-in ARCHITECTURE.md for the follow-up cleanup list.
+The agent's system prompt is assembled by `SearchAgentPromptedCall`
+(subclass of `skunk.prompted_call.PromptedCall`); per-step events
+(system / question / assistant / observation / error) flow through
+`ctx.emit("search_agent", …)` into the orchestrator's `QuestionTrace`.
+The remaining vendored pieces — `OpenRouter` shim and `LocalPythonExecutor`
+— are deferred follow-ups (see "TODO after merge" in ARCHITECTURE.md).
 
 `prep/` holds the offline corpus-prep scripts (page cleaner, vector
 db builder, embedding computation, recall experiment). They are not

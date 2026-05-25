@@ -137,27 +137,33 @@ The only on-disk caches in the runtime path are page-index artifacts:
 
 LLM completions are **not** cached. Tier 2 PNG renders are computed live per call (no disk cache). There is no DSL plan cache — the planner runs once per question.
 
-## TODO after merge (search agent integration)
+## Post-merge integration status
 
 The teammate's `SearchAgent` was merged in (`refs/heads/skunk`) under
 `src/skunk/search_agent/` as a self-contained subtree, wired through
 `RetrieveExecutor` when `config.retriever == "search_agent"` (default).
-The first-pass merge was intentionally conservative — the agent keeps
-its own `OpenRouter` shim, its own `LocalPythonExecutor`, and its own
-`Tracer` instead of the framework's `LLMClient` / `pyexec` / `trace`.
-Open follow-ups:
+The first-pass merge was deliberately conservative; subsequent passes
+have folded most of the agent into the framework's shared infrastructure.
 
-- Unify `src/skunk/pyexec.py` and `src/skunk/search_agent/utils/local_python_executor.py`. The agent loop needs `final_answer` semantics + sandboxing; compute / lookup_external currently use the simpler in-process exec.
-- Port `SearchAgent` to `skunk.common.LLMClient` so it picks up the `effort` knob, the RPM limiter, and retry. The shim at `src/skunk/search_agent/openrouter_client.py` (a local `openrouter` stand-in built on the `openai` SDK) goes away when this lands.
-- Subclass `PromptedCall` for the agent system prompt so corpus / few-shots / lessons overrides in `prompt_overrides.yaml` flow through (today `prompts.yaml` is loaded directly).
-- Replace `src/skunk/search_agent/tracer.py` with `ctx.emit(...)` events; the orchestrator's `StepTrace` already records timing and I/O.
-- Thread `branch.key` / `branch.period` into the agent — today they're logged but discarded; only `ctx.question` reaches `SearchAgent.retrieve()`. Lossy for multi-retrieve plans with distinct keys.
-- Add an embedding entry-point to `LLMClient` and route `vector_search` through it (today it calls `OpenRouter.embeddings.generate` directly).
-- Reconcile `src/skunk/search_agent/prep/officeqa_eval.py` helpers with anything we already have under `eval/util.py`.
-- Decide what to do with the `src/carnot/agents/utils.py` style tweak that came with the merge (`parse_code_blobs` dedent → f-string) — it's a main-Carnot file outside the skunk subdir.
+### Done
+
+- **`PromptedCall` subclass.** `SearchAgentPromptedCall` (in `src/skunk/search_agent/prompted_call.py`) owns the agent's Jinja template and exposes `max_steps` / `max_pages` via `template_vars(ctx)`. Corpus / few-shots / lessons overrides targeting `search_agent` (or `"*"`) flow through automatically. The standalone `prompts.yaml` is gone.
+- **Unified prompt-assembly engine.** `PromptedCall.assemble_system_prompt(ctx)` is now a single Jinja render: subclasses' `system_prompt` is a template, override sections (`corpus` / `few_shots` / `lessons`) are exposed as variables plus a pre-rendered `default_tail`. Layout is no longer hard-coded — subclasses decide where each section lands. The dataset blurb that the abandoned `officeqa_special_notes` slot in `prompts.yaml` was reaching for now lives in `config/prompts/treasury_bulletin.yaml` as a `corpus` override.
+- **Tracer → `ctx.emit`.** Every per-step event in `SearchAgent.retrieve()` (system / question / assistant / observation / error) now flows through `ctx.emit("search_agent", …)` into the orchestrator's `QuestionTrace`. `src/skunk/search_agent/tracer.py` is gone; the offline `prep/harness.py` script uses an inline `_OfflineCtx` stub that writes the same events to a per-question file.
+- **`branch.key` / `branch.period` threading.** `SearchAgent.retrieve(ctx, question, *, branch_key=None, branch_period=None)` now folds the branch hints into the initial user message. `RetrieveExecutor._run_search_agent` forwards them.
+- **One Python sandbox.** `src/skunk/pyexec.py` is now a thin wrapper over the smolagents-derived `LocalPythonExecutor` (the same engine the search-agent loop uses). `compute` and `lookup_external` get the real allowed-import list, the `DANGEROUS_MODULES` / `DANGEROUS_FUNCTIONS` blocklists, and AST-walked evaluation that rejects `exec` / `eval` / `compile`. Public API (`exec_python_with_env`, `exec_python_capture_stdout`, `strip_code_fences`) is preserved; call-sites are unchanged. `numpy` / `pandas` / `statsmodels` plus `math` / `statistics` / `datetime` are pre-injected as global bindings AND listed in the executor's `additional_authorized_imports`, so code that writes either `np.exp(...)` or `import numpy as np; np.exp(...)` works. Callables passed in `local_vars` (e.g. `fetch_fred` / `fetch_bls`) route through `send_tools` so the sandboxed code can't rebind them. Not a hardened sandbox — numpy/pandas internals still run as trusted Python — but a meaningful jump from the prior bare `exec()`.
+
+### Open follow-ups
+
+- Route the agent's chat-stream call and `vector_search` embedding through `skunk.common.LLMClient` so they pick up the RPM limiter, retry, and `effort` knob. After the OpenRouter→Vertex migration the agent now builds its own `genai.Client` via `skunk.common._make_vertex_client` and calls `models.generate_content_stream` / `models.embed_content` directly — same provider as `LLMClient`, but bypassing the unified rate limiter. This requires adding `LLMClient.call_stream() -> Iterator[str]` (the agent loop reads tokens as they arrive) and an `LLMClient.embed_query()` entry-point.
+
+### Intentionally not unified
+
+- **`prep/officeqa_eval.py` vs `eval/util.py`.** Not duplicated on inspection — corpus-specific URL / filename parsing vs harness-agnostic trace dumps.
+- The `src/carnot/agents/utils.py` style tweak that came with the merge (`parse_code_blobs` dedent → f-string) lives outside this skunk subtree; left to the main-Carnot maintainers.
 
 ## What is intentionally NOT in this design
 
 - **Agentic loops confined to retrieve.** When `config.retriever == "search_agent"`, the retrieve operator runs an iterative tool-using LLM loop (`SearchAgent` in `src/skunk/search_agent/`). The other three operators (`extract`, `lookup_external`, `compute`) execute once per call; failure is recorded in the trace. Missing-data recovery is the bounded replan loop in the orchestrator, not per-operator agent loops.
 - **No per-table/per-figure catalog rows.** Page-level granularity matches the benchmark's `source_docs?page=N` labels and the existing `cache/tables/` structure. Going finer adds rows without improving recall.
-- **No PZ runtime dependency.** This repo is plain Python + Gemini API (google-generativeai); PZ stays out of the runtime path.
+- **No PZ runtime dependency.** This repo is plain Python + GCP Vertex AI (google-genai); PZ stays out of the runtime path.

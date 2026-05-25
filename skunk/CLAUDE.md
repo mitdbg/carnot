@@ -70,12 +70,20 @@ The agent has no CLI of its own. Public API is `from skunk import Orchestrator, 
 - **No Palimpzest imports.** This repo is intentionally PZ-free at runtime. Annotation tooling at the OfficeQA-in-PZ stage is a separate project.
 - **No hand-rolled retry loops** inside operators. The orchestrator records failures in the trace; it does not re-plan.
 
-## API keys (.env at repo root)
+## API keys / GCP setup (.env at repo root)
 
-Two LLM paths (see `src/skunk/common.py` docstring):
+All LLM calls (planner, retrieve, extract, compute, lookup_external — including
+the Google Search grounding path) go through **GCP Vertex AI** via the
+`google-genai` SDK. See `src/skunk/common.py` docstring for the routing.
 
-- `OPENROUTER_API_KEY` — default path for every non-search call (planner, extract, compute, codegen, critique). Model is `config.llm_model`, default `google/gemini-3-flash-preview`.
-- `GEMINI_API_KEY` — direct Gemini API; only used by `lookup_external` when `use_google_search=True` for native Google Search grounding. Model is `config.gemini_model`, default `gemini-3-flash-preview`.
+Setup:
+1. `gcloud auth application-default login` — sets up Application Default Credentials
+2. Set `GOOGLE_CLOUD_PROJECT=<project-id>` in `.env` (Vertex AI API must be enabled on the project)
+3. Optional: `GOOGLE_CLOUD_LOCATION` (default `us-central1`)
+
+Default model is `gemini-3-flash-preview` (`config.llm_model`, overridable via
+`SKUNK_LLM_MODEL`). Use bare Vertex model names — do not include the `google/`
+OpenRouter-style prefix.
 
 Optional: `FRED_API_KEY` for the FRED tier of `lookup_external`. `.env.example` is committed; copy to `.env` and fill in.
 

@@ -1,12 +1,11 @@
 """Prompt overrides plumbing.
 
-Each executor owns its core SYSTEM prompt in its own module. Three sections
-are appended at runtime from override entries collected on the
-HarnessContext:
+Each executor owns its core SYSTEM prompt (a Jinja template) in its own
+module. Three named sections of supplementary content flow in from override
+entries on the HarnessContext:
 
   - corpus     — dataset-specific background paragraphs.
-  - few_shots  — list of pre-formatted example strings; the operator
-                 concatenates them verbatim under a "Few-shot examples" header.
+  - few_shots  — list of pre-formatted example strings; rendered verbatim.
                  The YAML author controls the formatting.
   - lessons    — short bullet strings about gotchas / things to watch for.
 
@@ -15,6 +14,13 @@ text blob (corpus / lessons) or a tuple of example strings (few_shots).
 The targets field is a tuple of agent names, with the special wildcard
 "*" meaning "applies to every agent". Multiple overrides for the same
 section + agent concatenate in declaration order.
+
+The `gather_*` helpers below return per-call-site values. `PromptedCall`
+exposes them in template scope as `corpus`, `few_shots`, `lessons` (plus
+a pre-rendered `default_tail` that bundles all three under the
+conventional `## Dataset` / `## Few-shot examples` / `## Lessons learned`
+headers). Subclass templates interpolate these wherever they want — this
+module no longer hard-codes section layout; see `skunk.prompted_call`.
 
 Overrides ship in a YAML file (see `load_prompt_overrides`). Top-level
 runners load one and attach it to `HarnessContext.prompt_overrides`; CLI
@@ -71,21 +77,6 @@ def gather_lessons(overrides: tuple[PromptOverride, ...], agent: str) -> tuple[s
                 if line:
                     out.append(line)
     return tuple(out)
-
-
-def render_lessons_block(lessons: tuple[str, ...]) -> str:
-    """Format a lessons tuple as a markdown bullet list under a header.
-    Returns "" if there are no lessons (so callers can join unconditionally)."""
-    if not lessons:
-        return ""
-    return "## Lessons learned\n" + "\n".join(f"- {lesson}" for lesson in lessons)
-
-
-def render_corpus_block(corpus: str) -> str:
-    """Format the corpus blurb under a header. Returns "" when empty."""
-    if not corpus:
-        return ""
-    return f"## Dataset\n{corpus}"
 
 
 # ---------------------------------------------------------------------------

@@ -192,7 +192,7 @@ presentation fields:
 The dataset section below enumerates the corpus-specific conventions and points to a few
 worked examples.
 
-"""
+{{ default_tail }}"""
 
     def plan(self, question: str, ctx: HarnessContext) -> Plan:
         """Generate a Plan from a natural-language question."""

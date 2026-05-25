@@ -210,7 +210,7 @@ no commentary, no second block, no fence around (b):
 - For multi-part questions, `result` contains only the ultimate
   quantity / identifier the question asks for.
 - Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
-"""
+{{ default_tail }}"""
 
     def codegen(
         self,
@@ -332,7 +332,7 @@ A single bare JSON object. No fences, no prose. Exactly one of:
   columns, summed the wrong group, or produced a magnitude that
   can't be reconciled with the printed values. Use `prev` as the
   ground truth and walk the code's slice against it.
-"""
+{{ default_tail }}"""
     def critique(
         self,
         ctx: HarnessContext,
@@ -352,7 +352,9 @@ A single bare JSON object. No fences, no prose. Exactly one of:
             f"Produced result:\n{result_text}\n\n"
             f"Output a single bare JSON object with your verdict."
         )
-        resp = ctx.llm_client.call(self.assemble_system_prompt(ctx), user, ctx=ctx)
+        resp = ctx.llm_client.call(
+            self.assemble_system_prompt(ctx), user, effort="medium", ctx=ctx
+        )
         raw = resp.text
         ctx.emit("compute", "self-critique response", raw=raw)
         try:

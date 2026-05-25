@@ -11,11 +11,6 @@
 `ctx.config.golden_pages` short-circuits both — for `--golden` eval
 runs the backend is never built.
 
-This is the merge wire-up between our framework and the teammate's
-agent; for the open follow-ups (port the agent to `LLMClient` +
-`PromptedCall`, replace its tracer with `ctx.emit`, thread
-`branch.key` / `branch.period` into the agent), see the "TODO after
-merge" section in `ARCHITECTURE.md`.
 """
 
 from __future__ import annotations
@@ -72,11 +67,12 @@ class RetrieveExecutor:
             "retrieve", "search_agent start",
             key=branch.key, period=branch.period,
         )
-        # NOTE: branch.key / branch.period are logged for the trace but
-        # NOT forwarded into the agent — the teammate's SearchAgent only
-        # consumes ctx.question. Threading these through is a follow-up
-        # (see ARCHITECTURE.md "TODO after merge").
-        page_keys = agent.retrieve(ctx.question)
+        page_keys = agent.retrieve(
+            ctx,
+            ctx.question,
+            branch_key=branch.key,
+            branch_period=branch.period,
+        )
         refs: list[PageRef] = []
         bad: list[str] = []
         for key in page_keys:
@@ -160,19 +156,14 @@ def _build_search_agent(config: SkunkConfig):
             f"under {chromadb_dir!s}: {e}",
         ) from e
 
-    agent_model_id = config.agent_model_id or config.llm_model
-    if not os.environ.get("OPENROUTER_API_KEY"):
+    if not os.environ.get("GOOGLE_CLOUD_PROJECT"):
         raise StepFailed(
             "retrieve",
-            "OPENROUTER_API_KEY not set — required by the search-agent "
-            "OpenRouter shim. Add it to your .env or export it.",
+            "GOOGLE_CLOUD_PROJECT not set — required for Vertex AI. "
+            "Set it in your .env and run `gcloud auth application-default login`.",
         )
     return SearchAgent(
-        model_id=agent_model_id,
+        config=config,
         clean_page_map=clean_page_map,
         chroma_collection=collection,
-        emb_model_id=config.emb_model_id,
-        tracer=None,
-        max_steps=config.agent_max_steps,
-        max_pages_per_tool_call=config.agent_max_pages_per_tool_call,
     )

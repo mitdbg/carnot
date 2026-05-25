@@ -656,7 +656,7 @@ def main() -> int:
                     default=REPO_ROOT / "data" / "officeqa_pro.csv")
     ap.add_argument("--plan-cache", type=Path,
                     default=REPO_ROOT / "cache" / "retrieve_bench_plans.jsonl")
-    ap.add_argument("--filter-model", default="google/gemini-2.5-flash")
+    ap.add_argument("--filter-model", default="gemini-2.5-flash")
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--seed", type=int, default=2026)
     ap.add_argument("--uids", type=str, default=None)

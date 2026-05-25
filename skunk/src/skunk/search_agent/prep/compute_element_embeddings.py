@@ -1,7 +1,6 @@
 """
 Compute embeddings for Treasury Bulletin elements using
-``google/gemini-embedding-2-preview`` via OpenRouter's OpenAI-compatible
-embeddings API.
+``gemini-embedding-2`` on GCP Vertex AI via the ``google-genai`` SDK.
 
 For each .json file in --input_dir:
   * Each non-skipped element's text is preprocessed (table HTML stripped, numeric
@@ -35,7 +34,7 @@ from threading import Lock
 import numpy as np
 from google import genai
 from google.genai import types as genai_types  # noqa: F401
-from skunk.search_agent.openrouter_client import OpenRouter
+from skunk.common import _make_vertex_client
 
 # Gemini Embedding 2 Preview context limit (tokens).
 MAX_TOKENS = 8192
@@ -45,8 +44,7 @@ CHUNK_TOKENS = 8000
 CHARS_PER_TOKEN = 3
 CHUNK_CHARS = CHUNK_TOKENS * CHARS_PER_TOKEN
 MAX_ATTEMPTS = 6
-MODEL_NAME = "google/gemini-embedding-2-preview"  # OpenRouter model ID
-GEMINI_MODEL_NAME = "gemini-embedding-2"  # Gemini API direct model ID
+MODEL_NAME = "gemini-embedding-2"  # Vertex AI model ID
 
 _MULTI_NL_RE = re.compile(r"\n{3,}")
 _TD_RE = re.compile(r"<t[dh][^>]*>(.*?)</t[dh]>", re.DOTALL)
@@ -99,32 +97,25 @@ def _chunk_by_chars(text: str, chunk_chars: int) -> list[str]:
     return [text[i : i + chunk_chars] for i in range(0, len(text), chunk_chars)]
 
 
-def _embed_request(client: OpenRouter | genai.Client, inputs: list[str]) -> list[np.ndarray]:
+def _embed_request(client: genai.Client, inputs: list[str]) -> list[np.ndarray]:
     """Embed a batch of strings with jittered exponential-backoff retry.
 
-    The OpenRouter SDK surfaces HTTP error responses (400, 429, …) as Pydantic
-    validation errors rather than HTTP exceptions because it tries to deserialize
-    the error body as an embeddings response. We detect rate-limits (429) by
-    inspecting the error message and apply a longer base delay; all other errors
-    use standard doubling back-off.
-
-    Empty strings must never appear in *inputs* — the API returns a 400 for any
-    batch that contains one.
+    Empty strings must never appear in *inputs* — the API rejects any batch
+    that contains one. We detect rate-limits (429) by inspecting the error
+    message and apply a longer base delay; all other errors use standard
+    doubling back-off.
     """
     delay = 1.0
     for attempt in range(MAX_ATTEMPTS):
         try:
-            resp = client.embeddings.generate(input=inputs, model=MODEL_NAME)  # type: ignore
-            return [np.asarray(d.embedding, dtype=np.float32) for d in resp.data]  # type: ignore
-            # assert isinstance(client, genai.Client)
-            # result = client.models.embed_content(
-            #     model=GEMINI_MODEL_NAME,
-            #     contents=[
-            #         genai_types.Content(parts=[genai_types.Part.from_text(text=s)])
-            #         for s in inputs
-            #     ],
-            # )
-            # return [np.asarray(emb.values, dtype=np.float32) for emb in result.embeddings]  # type: ignore
+            result = client.models.embed_content(
+                model=MODEL_NAME,
+                contents=[
+                    genai_types.Content(parts=[genai_types.Part.from_text(text=s)])
+                    for s in inputs
+                ],
+            )
+            return [np.asarray(emb.values, dtype=np.float32) for emb in result.embeddings]  # type: ignore
 
         except Exception as e:  # noqa: BLE001 - retry on any transient API error
             if attempt == MAX_ATTEMPTS - 1:
@@ -139,7 +130,7 @@ def _embed_request(client: OpenRouter | genai.Client, inputs: list[str]) -> list
     raise RuntimeError("unreachable")
 
 
-def embed_text(text: str, client: OpenRouter | genai.Client) -> np.ndarray:
+def embed_text(text: str, client: genai.Client) -> np.ndarray:
     """Embed a single element, chunking and averaging if it exceeds context."""
     # The API rejects empty strings with a 400; replace with a single space so
     # elements that preprocess to nothing still produce a valid (near-zero) embedding.
@@ -165,7 +156,7 @@ def _partition_bounds(p: int, partition_size: int, n_total: int) -> tuple[int, i
 def embed_all(
     texts: list[str],
     unique_element_ids: list[str],
-    client: OpenRouter | genai.Client,
+    client: genai.Client,
     n_partitions: int,
     output_dir: str,
     max_workers: int,
@@ -247,8 +238,8 @@ def embed_all(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Compute Gemini Embedding 2 Preview embeddings for each Treasury "
-            "Bulletin element via OpenRouter."
+            "Compute Gemini Embedding 2 embeddings for each Treasury "
+            "Bulletin element via GCP Vertex AI."
         )
     )
     parser.add_argument("--input_dir", type=str, required=True,
@@ -261,18 +252,12 @@ def main():
                         help="Number of embedding partition files to produce.")
     parser.add_argument("--max_workers", type=int, default=16,
                         help="Maximum number of concurrent API requests.")
-    parser.add_argument("--api_key", type=str, default=None,
-                        help="OpenRouter API key (defaults to $OPENROUTER_API_KEY).")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        raise SystemExit("OPENROUTER_API_KEY env var (or --api_key) is required.")
-
-    client = OpenRouter(api_key=api_key)
-    # client = genai.Client(api_key=os.getenv('GEMINI_API_KEY'))
+    # Auth via ADC + GOOGLE_CLOUD_PROJECT (see skunk.common._make_vertex_client).
+    client = _make_vertex_client()
 
     json_files = sorted(glob.glob(os.path.join(args.input_dir, "*.json")))
     print(f"Processing {len(json_files)} .json files.")

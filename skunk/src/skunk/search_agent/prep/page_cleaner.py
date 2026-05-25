@@ -6,14 +6,15 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import fitz
-import litellm
 from tqdm import tqdm
+
+from skunk.common import LLMClient
+from skunk.config import SkunkConfig
 
 MAX_RETRIES = 3
 MAX_WORKERS = 64
 SERIALIZE_CLEAN_PAGE_MAP_EVERY_N_PAGES = 100
 TRUNCATE_TABLE_CHARS = 50
-PAGE_CLEANER_MODEL = "openai/gpt-5.4"
 PAGE_CLEANER_WITH_IMG_PROMPT = """Some of the sentences in this parsed document may be ordered incorrectly. You will be presented with the current ordering of the text content, followed by an image of the PDF page which the text is supposed to transcribe. Please output the correct order of the sentences as a comma separated list of their sentence ids (the number before the colon preceding each sentence). Note that page numbers often appear as <sentence_id>: <number> (or <letter-number>).
 
 {page_contents}"""
@@ -67,13 +68,13 @@ def _render_pdf_page_b64(year, month, page_id, pdfs_dir, dpi=75):
     pix = page.get_pixmap(matrix=mat)
     return base64.b64encode(pix.tobytes("jpg", jpg_quality=60)).decode()
 
-def clean_page(page_key, page_elements, pdfs_dir) -> tuple[str, list[int], float] | tuple[None, None, float]:
+def clean_page(page_key, page_elements, pdfs_dir, llm: LLMClient) -> tuple[str, list[int]] | tuple[None, None]:
     # if the page has a single element, we can skip the LLM and just return that element's content as the clean page text
     if len(page_elements) == 1:
-        return page_elements[0]['content'], [page_elements[0]['id']], 0.0
+        return page_elements[0]['content'], [page_elements[0]['id']]
 
     try_number = 0
-    clean_page_text, sentence_id_order, total_cost = None, [], 0.0
+    clean_page_text, sentence_id_order = None, []
     try:
         # truncate table content to save tokens, then build the page contents string.
         display_texts = _create_element_display_texts(page_elements)
@@ -86,34 +87,40 @@ def clean_page(page_key, page_elements, pdfs_dir) -> tuple[str, list[int], float
         year, month, page_id = page_key.split("-")
         pdf_b64 = _render_pdf_page_b64(year, month, page_id, pdfs_dir)
 
-        messages = [
-            {"role": "user", "content": [
-                {"type": "text", "text": PAGE_CLEANER_WITH_IMG_PROMPT.format(page_contents=page_contents)},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{pdf_b64}"}},
-            ]}
-        ]
+        # Conversation state: prior assistant/user pairs are appended to
+        # user_text on each retry so the model sees the full feedback chain.
+        # (LLMClient.call is single-turn, so we flatten the back-and-forth
+        # into the user prompt rather than maintaining a chat history.)
+        user_text = PAGE_CLEANER_WITH_IMG_PROMPT.format(page_contents=page_contents)
+        images = [("image/jpeg", pdf_b64)]
 
         while clean_page_text is None and try_number < MAX_RETRIES:
             try_number += 1
 
-            # call the LLM to get the correct order of sentences
-            response = litellm.completion(
-                messages=messages,
-                model=PAGE_CLEANER_MODEL,
-            )
-            total_cost += response._hidden_params['response_cost']
-            sentence_id_order_str: str = response.choices[0].message.content # type: ignore
+            sentence_id_order_str = llm.call(
+                system="",
+                user=user_text,
+                images=images,
+            ).text
             try:
                 sentence_id_order = [int(s.strip()) for s in sentence_id_order_str.split(",")]
             except Exception as e:
-                messages.append({"role": "assistant", "content": sentence_id_order_str})
-                messages.append({"role": "user", "content": f"Sorry, I couldn't parse the sentence ids from your response. I got the following error: {e}\n\nPlease make sure to output a comma separated list of integers corresponding to the sentence ids. The sentence ids for this page are: {[elt['id'] for elt in page_elements]}"})
+                user_text += (
+                    f"\n\nYour previous response was:\n{sentence_id_order_str}\n\n"
+                    f"Sorry, I couldn't parse the sentence ids from that response. I got the following error: {e}\n\n"
+                    f"Please make sure to output a comma separated list of integers corresponding to the sentence ids. "
+                    f"The sentence ids for this page are: {[elt['id'] for elt in page_elements]}"
+                )
                 continue
 
             # if the sentence id order doesn't include all sentences, or includes any invalid sentence ids, retry (up to a max number of retries)
             if set(sentence_id_order) != set(elt['id'] for elt in page_elements):
-                messages.append({"role": "assistant", "content": sentence_id_order_str})
-                messages.append({"role": "user", "content": f"The sentence ids you provided do not match the sentence ids on the page. Please try again and make sure to include all sentence ids in your response. The sentence ids for this page are: {[elt['id'] for elt in page_elements]}"})
+                user_text += (
+                    f"\n\nYour previous response was:\n{sentence_id_order_str}\n\n"
+                    f"The sentence ids you provided do not match the sentence ids on the page. "
+                    f"Please try again and make sure to include all sentence ids in your response. "
+                    f"The sentence ids for this page are: {[elt['id'] for elt in page_elements]}"
+                )
                 continue
 
             # construct the clean page text by concatenating the sentences in the correct order
@@ -127,11 +134,11 @@ def clean_page(page_key, page_elements, pdfs_dir) -> tuple[str, list[int], float
         if clean_page_text is None:
             raise Exception(f"Failed to clean page after {MAX_RETRIES} retries.")
 
-        return clean_page_text, sentence_id_order, total_cost
+        return clean_page_text, sentence_id_order
 
     except Exception as e:
         print(f"Error cleaning page ({page_key}): {e}")
-        return None, None, total_cost
+        return None, None
 
 
 if __name__ == "__main__":
@@ -192,21 +199,22 @@ if __name__ == "__main__":
                     if page_key not in clean_page_map:
                         dirty_page_map[f"{year}-{month}-{page_id}"] = elements
 
+    # shared Vertex client; LLMClient is thread-safe for concurrent .call() use
+    # (each call takes the rate-limiter and creates a fresh request).
+    llm = LLMClient(SkunkConfig.from_env())
+
     # create a mapping from (year, month, page_idx) to the cleaned page's file path
-    completed, errored, total_cost = 0, 0, 0.0
+    completed, errored = 0, 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_page_key = {
-            executor.submit(clean_page, page_key, page_elements, args.pdfs_dir): page_key
+            executor.submit(clean_page, page_key, page_elements, args.pdfs_dir, llm): page_key
             for page_key, page_elements in dirty_page_map.items()
         }
 
         with tqdm(total=len(dirty_page_map), desc="Cleaning pages", unit="page") as pbar:
             for future in as_completed(future_to_page_key):
                 page_key = future_to_page_key[future]
-                clean_page_text, element_id_order, dollar_cost = future.result()
-
-                # always add cost; to capture parsing failures
-                total_cost += dollar_cost
+                clean_page_text, element_id_order = future.result()
 
                 # write clean page to disk and then add to the clean page map
                 if clean_page_text is not None:
@@ -225,14 +233,10 @@ if __name__ == "__main__":
                     errored += 1
 
                 pbar.update(1)
-                pbar.set_postfix(completed=completed, errored=errored, cost=f"${total_cost:.4f}")
-
-                # if completed == 100:
-                #     executor.shutdown(wait=False, cancel_futures=True)
-                #     break
+                pbar.set_postfix(completed=completed, errored=errored)
 
     # serialize the final clean page map to disk
     with open(clean_page_map_path, "w") as f:
         json.dump(clean_page_map, f)
 
-    print(f"Done. Total cost: ${total_cost:.4f}")
+    print(f"Done. Completed {completed}, errored {errored}.")

@@ -1,23 +1,21 @@
 from __future__ import annotations
 
-import os
-import pathlib
 import re
 
-import yaml
 from chromadb.api.models.Collection import Collection
 from google import genai
-from google.genai import types as genai_types  # noqa: F401
-from jinja2 import Template
-from skunk.search_agent.openrouter_client import OpenRouter
+from google.genai import types as genai_types
+from skunk.common import _make_vertex_client
+from skunk.config import SkunkConfig
+from skunk.models import HarnessContext
 from skunk.search_agent.base import Retriever
+from skunk.search_agent.prompted_call import SearchAgentPromptedCall
 from skunk.search_agent.search_tools import (
     _make_retrieve_page_info,
     _make_vector_search,
     final_answer,
     run_grep,
 )
-from skunk.search_agent.tracer import Tracer
 from skunk.search_agent.utils import (
     CodeOutput,
     InterpreterError,
@@ -28,16 +26,8 @@ from skunk.search_agent.utils import (
 MODEL_CONTEXT_WINDOW = 1_000_000
 MODEL_EFFECTIVE_CONTEXT_WINDOW = int(MODEL_CONTEXT_WINDOW * 0.5)
 CHARS_PER_TOKEN_ESTIMATE = 4
-MAX_STEPS = 20
 MAX_STEPS_WARNING_STEPS_BEFORE = 3
-MAX_PAGES_PER_TOOL_CALL = 20
 CODE_BLOCK_TAGS = ("```python", "```")
-
-_PROMPTS_FILE = pathlib.Path(__file__).parent / "prompts.yaml"
-with _PROMPTS_FILE.open() as _f:
-    _PROMPTS = yaml.safe_load(_f)
-
-SEARCH_AGENT_SYSTEM_PROMPT: str = _PROMPTS["search_agent_system_prompt"]
 
 # Matches an opening code fence: ```python, ```py, or plain ```.
 # Requires a newline immediately after the language tag so we don't accidentally
@@ -83,27 +73,28 @@ class SearchAgent(Retriever):
     
     def __init__(
         self,
-        model_id: str,
+        config: SkunkConfig,
         clean_page_map: dict[str, list],
         chroma_collection: Collection,
-        emb_model_id: str,
-        tracer: Tracer | None = None,
-        max_steps: int = MAX_STEPS,
-        max_pages_per_tool_call: int = MAX_PAGES_PER_TOOL_CALL,
     ):
-        self.model_id = model_id
-        self.client: OpenRouter | genai.Client = OpenRouter(api_key=os.environ["OPENROUTER_API_KEY"])
-        # self.client: OpenRouter | genai.Client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        # Config-derived knobs: the agent loop bound, the chat model, the
+        # embedding model used by `vector_search`. The system prompt is NOT
+        # built here — it's assembled per-question in `retrieve()` so that
+        # `ctx.prompt_overrides` (corpus / few-shots / lessons targeting
+        # the `search_agent` call-site) can flow through.
+        self.config = config
+        # Strip any leftover `google/` OpenRouter-style prefix; Vertex expects
+        # bare model names.
+        raw_model = config.agent_model_id or config.llm_model
+        self.model_id = raw_model.removeprefix("google/")
+        self.emb_model_id = config.emb_model_id.removeprefix("google/")
+        self.max_steps = config.agent_max_steps
+        self.client: genai.Client = _make_vertex_client()
         self.chroma_collection = chroma_collection
         self.clean_page_map = clean_page_map
-        self.emb_model_id = emb_model_id
-        self.tracer = tracer
-        self.max_steps = max_steps
-        self.max_pages_per_tool_call = max_pages_per_tool_call
-        self.system_prompt = Template(SEARCH_AGENT_SYSTEM_PROMPT).render(max_steps=max_steps, max_pages=max_pages_per_tool_call)
-        self.messages: list[dict] = [
-            {"role": "system", "content": self.system_prompt}
-        ]
+        self.system_prompt: str = ""    # set per-question in retrieve()
+        self.messages: list[dict] = []
+        self._prompted_call = SearchAgentPromptedCall()
 
     def _build_executor(self) -> LocalPythonExecutor:
         executor = LocalPythonExecutor(additional_authorized_imports=[])
@@ -148,39 +139,31 @@ class SearchAgent(Retriever):
         # Stream tokens and stop as soon as a complete ```python...``` block
         # has been received.  This avoids waiting for the model to finish its
         # full "thinking" output after the code block is already parseable.
-        stream = self.client.chat.send(  # type: ignore
+        system_instruction = next(
+            (m["content"] for m in final_messages if m["role"] == "system"), None
+        )
+        genai_contents = [
+            genai_types.Content(
+                role="model" if m["role"] == "assistant" else "user",
+                parts=[genai_types.Part.from_text(text=m["content"])],
+            )
+            for m in final_messages
+            if m["role"] != "system"
+        ]
+        genai_config = genai_types.GenerateContentConfig(
+            system_instruction=system_instruction,
+        )
+        stream = self.client.models.generate_content_stream(
             model=self.model_id,
-            messages=final_messages,  # type: ignore
-            stream=True,
-        )  # type: ignore
-        # assert isinstance(self.client, genai.Client)
-        # gemini_chat_model = self.model_id.removeprefix("google/")
-        # _system_instruction = next(
-        #     (m["content"] for m in final_messages if m["role"] == "system"), None
-        # )
-        # _genai_contents = [
-        #     genai_types.Content(
-        #         role="model" if m["role"] == "assistant" else "user",
-        #         parts=[genai_types.Part.from_text(text=m["content"])],
-        #     )
-        #     for m in final_messages
-        #     if m["role"] != "system"
-        # ]
-        # _genai_config = genai_types.GenerateContentConfig(
-        #     system_instruction=_system_instruction,
-        # )
-        # stream = self.client.models.generate_content_stream(
-        #     model=gemini_chat_model,
-        #     contents=_genai_contents,
-        #     config=_genai_config,
-        # )
+            contents=genai_contents,
+            config=genai_config,
+        )
 
         accumulated = ""
         code_block_closed = False
         in_code_block = False
         for chunk in stream:
-            delta = chunk.choices[0].delta.content or ""  # type: ignore (OpenRouter)
-            # delta = chunk.text or ""  # genai
+            delta = chunk.text or ""
             accumulated += delta
 
             # Track whether we're inside an opening code fence and detect
@@ -218,26 +201,51 @@ class SearchAgent(Retriever):
 
         return accumulated
 
-    def retrieve(self, question: str) -> list[str]:
+    def retrieve(
+        self,
+        ctx: HarnessContext,
+        question: str,
+        *,
+        branch_key: str | None = None,
+        branch_period: str | None = None,
+    ) -> list[str]:
         """
         Given a question, return a list of page keys (in the format
         "year_month_page_id") that are relevant to answering the question.
 
-        If *tracer* is provided, every message is streamed to its file
-        (and to the terminal when ``show_output=True``) as it is produced.
+        Per-step events (system prompt, question, assistant text, tool
+        observations, errors) are routed through `ctx.emit("search_agent", …)`
+        and flow into the orchestrator's `QuestionTrace`.
+
+        `branch_key` / `branch_period` come from the `RetrieveBranch` and
+        are folded into the initial user message so the agent has the same
+        focus hints the planner emitted.
         """
         # Reset per-question state.
         self._completed = False
         self._num_steps = 0
         self._error: str | None = None
 
-        # Reset per-question conversation but keep the system prompt.
-        self.messages = [{"role": "system", "content": self.system_prompt}]
-        self.messages.append({"role": "user", "content": f"Question: {question}"})
+        # Assemble per-question so prompt_overrides on this `ctx` flow through.
+        self.system_prompt = self._prompted_call.assemble_system_prompt(ctx)
 
-        if self.tracer is not None:
-            self.tracer.log_system(self.system_prompt)
-            self.tracer.log_question(f"Question: {question}")
+        # Compose the initial user message. Branch hints land after the
+        # question on their own lines; both are optional and only included
+        # when the planner pinned them.
+        user_parts = [f"Question: {question}"]
+        if branch_key:
+            user_parts.append(f"Search focus: {branch_key}")
+        if branch_period:
+            user_parts.append(f"Time period: {branch_period}")
+        user_msg = "\n".join(user_parts)
+
+        self.messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_msg},
+        ]
+
+        ctx.emit("search_agent", "system", content=self.system_prompt)
+        ctx.emit("search_agent", "question", content=user_msg)
 
         executor = self._build_executor()
 
@@ -248,13 +256,11 @@ class SearchAgent(Retriever):
                 error_msg = f"[generation error: {e}]"
                 self._error = error_msg
                 self.messages.append({"role": "user", "content": error_msg})
-                if self.tracer is not None:
-                    self.tracer.log_error(error_msg)
+                ctx.emit("search_agent", "error", content=error_msg)
                 break
 
             self.messages.append({"role": "assistant", "content": assistant_text})
-            if self.tracer is not None:
-                self.tracer.log_assistant(assistant_text)
+            ctx.emit("search_agent", "assistant", content=assistant_text)
 
             all_blocks = _extract_all_code_blocks(assistant_text)
             multiple_blocks = len(all_blocks) > 1
@@ -270,8 +276,7 @@ class SearchAgent(Retriever):
                         f"python code block from your response.\n{e}"
                     )
                     self.messages.append({"role": "user", "content": obs})
-                    if self.tracer is not None:
-                        self.tracer.log_error(obs)
+                    ctx.emit("search_agent", "error", content=obs)
                     continue
 
             if not code.strip():
@@ -281,8 +286,7 @@ class SearchAgent(Retriever):
                     f"```python ... ``` block with a single tool call."
                 )
                 self.messages.append({"role": "user", "content": obs})
-                if self.tracer is not None:
-                    self.tracer.log_error(obs)
+                ctx.emit("search_agent", "error", content=obs)
                 continue
 
             try:
@@ -290,8 +294,7 @@ class SearchAgent(Retriever):
             except InterpreterError as e:
                 obs = f"Observation (step {step + 1}): execution failed.\n{e}"
                 self.messages.append({"role": "user", "content": obs})
-                if self.tracer is not None:
-                    self.tracer.log_error(obs)
+                ctx.emit("search_agent", "error", content=obs)
                 continue
             except Exception as e:
                 obs = (
@@ -299,8 +302,7 @@ class SearchAgent(Retriever):
                     f"{type(e).__name__}: {e}"
                 )
                 self.messages.append({"role": "user", "content": obs})
-                if self.tracer is not None:
-                    self.tracer.log_error(obs)
+                ctx.emit("search_agent", "error", content=obs)
                 continue
 
             observation_parts = []
@@ -314,14 +316,12 @@ class SearchAgent(Retriever):
             observation = f"Observation (step {step + 1}):\n{observation}"
 
             self.messages.append({"role": "user", "content": observation})
-            if self.tracer is not None:
-                self.tracer.log_observation(observation)
+            ctx.emit("search_agent", "observation", content=observation)
             self._num_steps = step + 1
 
             if multiple_blocks:
                 self.messages.append({"role": "user", "content": MULTIPLE_BLOCKS_REMINDER})
-                if self.tracer is not None:
-                    self.tracer.log_observation(MULTIPLE_BLOCKS_REMINDER)
+                ctx.emit("search_agent", "observation", content=MULTIPLE_BLOCKS_REMINDER)
 
             if out.is_final_answer:
                 self._completed = True

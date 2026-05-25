@@ -39,6 +39,14 @@ overrides:
       The page images you receive are scanned pages from the U.S. Treasury
       Monthly Bulletins.
 
+  # Renders under the search-agent SYSTEM prompt's `## Dataset` header.
+  # Lifted from the abandoned `officeqa_special_notes` blob in the old
+  # `src/skunk/search_agent/prompts.yaml`.
+  - section: corpus
+    targets: [search_agent]
+    content: |
+      The files consist of U.S. Treasury bulletins from 1939 to 2025 Q3. From 1939-1982, every month had a single bulletin. Starting in 1983, bulletins were released quarterly (i.e. in months 3, 6, 9, and 12).
+
   # ---------------------------------------------------------------------
   # Planner lessons — gotchas observed against this corpus.
   # ---------------------------------------------------------------------
@@ -46,6 +54,8 @@ overrides:
     targets: [planner]
     content: |
       One concept per `retrieve.key`. If a question names multiple values (two currencies, two indices, two agencies, two bond classes, ...), emit ONE branch per value rather than bundling — branches run in parallel and splitting is cheap, while bundling forces retrieval to find a single page covering everything. A JPY-vs-GBP question should emit four branches (JPY position, GBP position, JPY/USD rate, GBP/USD rate), not one branch keyed "exchange rates for JPY and GBP".
+
+      U.S. Treasury data — including federal receipts, outlays, surplus/deficit, debt holdings, bond yields and prices, foreign currency positions, and forward-year projections/estimates — is almost certainly carried by this corpus. Prefer `retrieve` over `lookup_external` for anything attributed to the U.S. Treasury, the Treasury Bulletin, or the U.S. Department of the Treasury, even when phrased as "the Treasury's reported estimate" for a future year. Only emit a `lookup_external` for Treasury-attributed values after a replan signals the value is genuinely missing from the corpus.
 
   # ---------------------------------------------------------------------
   # Planner few-shots. Each entry is a pre-formatted block that lands

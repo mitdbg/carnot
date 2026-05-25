@@ -1,13 +1,13 @@
-"""Shared runtime: LLM clients with rate limiting and retry.
+"""Shared runtime: LLM client with rate limiting and retry.
 
-Two LLM paths
--------------
-- OpenRouter (default): all non-search calls go through the OpenAI-compatible
-  OpenRouter API using the `openai` SDK. Configured via OPENROUTER_API_KEY and
-  `config.llm_model`.
-- Gemini direct (search only): `lookup_external` passes `use_google_search=True`
-  to get native Google Search grounding. This path uses the `google-genai` SDK
-  directly with GEMINI_API_KEY. All other callers use the OpenRouter path.
+All LLM traffic goes through GCP Vertex AI via the `google-genai` SDK.
+Set up locally with `gcloud auth application-default login` and configure
+the target project via the `GOOGLE_CLOUD_PROJECT` env var (optionally
+`GOOGLE_CLOUD_LOCATION`, defaults to `us-central1`).
+
+Google Search grounding (used by `lookup_external`) is requested by passing
+`use_google_search=True` to `LLMClient.call`; Vertex's `Tool(google_search=...)`
+provides the same grounding metadata as the AI Studio endpoint.
 
 Rate limiting
 -------------
@@ -20,9 +20,9 @@ then issues the API call.
 
 Retry
 -----
-Any exception from either SDK is treated as transient and retried with
-exponential backoff (`gemini_retry_initial_delay_s`, doubling each attempt,
-capped at `gemini_retry_max_delay_s`) up to `gemini_max_retries` extra attempts.
+Any exception from the SDK is treated as transient and retried with
+exponential backoff (`llm_retry_initial_delay_s`, doubling each attempt,
+capped at `llm_retry_max_delay_s`) up to `llm_max_retries` extra attempts.
 Each failure is logged to stderr. After exhaustion the last exception propagates.
 """
 
@@ -42,8 +42,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 
 # Reasoning-effort knob shared across LLM backends. Maps cleanly to
-# OpenRouter `reasoning.effort` (their unified field, honored by Gemini)
-# and to the Gemini SDK's `thinking_level` enum on the direct path.
+# the Gemini SDK's `thinking_level` enum.
 # Replaces the legacy `thinking_budget: int` API — Gemini 3 treats the
 # legacy int as a soft suggestion only, not a cap.
 Effort = Literal["off", "low", "medium", "high"]
@@ -51,7 +50,6 @@ _EFFORT_VALUES = ("off", "low", "medium", "high")
 
 from google import genai
 from google.genai import types
-from openai import OpenAI
 
 from skunk.config import SkunkConfig
 
@@ -160,6 +158,20 @@ def extract_grounding_titles(api_resp: Any) -> list[str]:
     return titles
 
 
+def extract_search_queries(api_resp: Any) -> list[str]:
+    """`web_search_queries` from grounding_metadata — populated whenever the
+    Google Search tool actually executed, even when Vertex returns no
+    `grounding_chunks`. Used as a 'search ran' signal independent of chunk
+    surfacing, which Vertex AI populates much less reliably than AI Studio."""
+    try:
+        gm = api_resp.candidates[0].grounding_metadata
+        if gm and gm.web_search_queries:
+            return list(gm.web_search_queries)
+    except (IndexError, AttributeError):
+        pass
+    return []
+
+
 def _get_rate_limiter(rpm: float) -> _RateLimiter:
     """Process-singleton rate limiter. Reset if rpm changes between calls."""
     global _RATE_LIMITER, _RATE_LIMITER_RPM
@@ -179,43 +191,36 @@ class LLMResponse:
     output_tokens: int | None
     grounding_urls: list[str] = field(default_factory=list)
     grounding_titles: list[str] = field(default_factory=list)
+    # web_search_queries from Vertex grounding metadata. Populated whenever the
+    # Google Search tool actually fired; more reliable than grounding_urls /
+    # grounding_titles, which Vertex often omits even on grounded responses.
+    search_queries: list[str] = field(default_factory=list)
+
+
+def _make_vertex_client() -> genai.Client:
+    """Build a Vertex AI genai.Client from env. Requires GOOGLE_CLOUD_PROJECT;
+    GOOGLE_CLOUD_LOCATION defaults to us-central1. Auth via ADC
+    (`gcloud auth application-default login`)."""
+    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    if not project:
+        raise RuntimeError("GOOGLE_CLOUD_PROJECT not set (required for Vertex AI)")
+    return genai.Client(
+        vertexai=True,
+        project=project,
+        location=os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"),
+    )
 
 
 class LLMClient:
-    """LLM client: OpenRouter for all calls, direct Gemini only for Google Search grounding."""
+    """LLM client for Vertex AI. Optionally enables Google Search grounding per call."""
 
     def __init__(self, config: SkunkConfig) -> None:
         self._config = config
-        self._openrouter_client: OpenAI | None = None
         self._gemini_client: genai.Client | None = None
-
-    def _get_openrouter_client(self) -> OpenAI:
-        if self._openrouter_client is None:
-            api_key = os.environ.get("OPENROUTER_API_KEY")
-            if not api_key:
-                raise RuntimeError("OPENROUTER_API_KEY not set")
-            self._openrouter_client = OpenAI(
-                api_key=api_key,
-                base_url="https://openrouter.ai/api/v1",
-            )
-        return self._openrouter_client
 
     def _get_gemini_client(self) -> genai.Client:
         if self._gemini_client is None:
-            if self._config.use_vertex:
-                project = os.environ.get("GOOGLE_CLOUD_PROJECT")
-                if not project:
-                    raise RuntimeError("GOOGLE_CLOUD_PROJECT not set (required for Vertex AI)")
-                self._gemini_client = genai.Client(
-                    vertexai=True,
-                    project=project,
-                    location=os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"),
-                )
-            else:
-                api_key = os.environ.get("GEMINI_API_KEY")
-                if not api_key:
-                    raise RuntimeError("GEMINI_API_KEY not set (required for lookup_external Google Search)")
-                self._gemini_client = genai.Client(api_key=api_key)
+            self._gemini_client = _make_vertex_client()
         return self._gemini_client
 
     def call(
@@ -230,11 +235,9 @@ class LLMClient:
     ) -> LLMResponse:
         if effort not in _EFFORT_VALUES:
             raise ValueError(f"effort must be one of {_EFFORT_VALUES}, got {effort!r}")
-        if use_google_search:
-            return self._call_gemini_search(system, user, images, temperature, effort, ctx)
-        if self._config.use_direct_gemini:
-            return self._call_gemini_direct(system, user, images, temperature, effort, ctx)
-        return self._call_openrouter(system, user, images, temperature, effort, ctx)
+        return self._call_gemini(
+            system, user, images, temperature, effort, ctx, with_search=use_google_search,
+        )
 
     def _retry_call(self, do_call: "Callable[[], LLMResponse]") -> LLMResponse:
         """Run `do_call` under the rate limiter with exponential-backoff retry.
@@ -242,9 +245,9 @@ class LLMClient:
         ctx.emit on success; this helper only owns rate-limit acquire +
         retry policy."""
         limiter = _get_rate_limiter(self._config.llm_rpm)
-        max_retries = self._config.gemini_max_retries
-        delay = self._config.gemini_retry_initial_delay_s
-        max_delay = self._config.gemini_retry_max_delay_s
+        max_retries = self._config.llm_max_retries
+        delay = self._config.llm_retry_initial_delay_s
+        max_delay = self._config.llm_retry_max_delay_s
 
         for attempt in range(max_retries + 1):
             limiter.acquire()
@@ -263,79 +266,6 @@ class LLMClient:
                 delay = min(delay * 2, max_delay)
         raise RuntimeError("unreachable: retry loop fell through")
 
-    def _call_openrouter(
-        self,
-        system: str,
-        user: str,
-        images: list[tuple[str, str]] | None,
-        temperature: float,
-        effort: "Effort",
-        ctx: "HarnessContext | None",
-    ) -> LLMResponse:
-        content: list[dict] = []
-        if images:
-            for mime_type, b64_data in images:
-                content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime_type};base64,{b64_data}"},
-                })
-        content.append({"type": "text", "text": user})
-
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": content},
-        ]
-
-        # OpenRouter unifies reasoning across providers under `reasoning`.
-        # `reasoning.effort` maps cleanly onto Gemini 3's `thinking_level`
-        # and is the only knob that actually constrains spend; legacy
-        # `reasoning.max_tokens` / `thinkingBudget` is a soft suggestion
-        # on Gemini 3 and burns through the full model ceiling.
-        reasoning: dict = (
-            {"enabled": False} if effort == "off" else {"effort": effort}
-        )
-        extra_body: dict = {"reasoning": reasoning}
-
-        client = self._get_openrouter_client()
-        model = self._config.llm_model
-
-        def do() -> LLMResponse:
-            t0 = time.monotonic()
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=65535,
-                temperature=temperature,
-                extra_body=extra_body,
-            )
-            latency_s = time.monotonic() - t0
-            output_text = (resp.choices[0].message.content or "").strip()
-            usage = resp.usage
-            ctd = getattr(usage, "completion_tokens_details", None)
-            thinking_tokens = getattr(ctd, "reasoning_tokens", None) if ctd is not None else None
-            if ctx is not None:
-                ctx.emit(
-                    "llm", "call",
-                    model=model,
-                    temperature=temperature,
-                    effort=effort,
-                    latency_s=round(latency_s, 3),
-                    input_tokens=getattr(usage, "prompt_tokens", None),
-                    output_tokens=getattr(usage, "completion_tokens", None),
-                    total_tokens=getattr(usage, "total_tokens", None),
-                    thinking_tokens=thinking_tokens,
-                    input_text=system + "\n\n---\n\n" + user,
-                    output_text=output_text,
-                )
-            return LLMResponse(
-                text=output_text,
-                latency_s=latency_s,
-                input_tokens=getattr(usage, "prompt_tokens", None),
-                output_tokens=getattr(usage, "completion_tokens", None),
-            )
-
-        return self._retry_call(do)
-
     def embed(
         self,
         texts: list[str],
@@ -345,10 +275,10 @@ class LLMClient:
         model: str = "gemini-embedding-001",
         batch_size: int = 100,
     ) -> list[list[float]]:
-        """Batched embedding via the direct Gemini endpoint. Build-time
-        only — used by `page_index.embed_cluster` for L1-bucket clustering
-        at corpus-build time. The retrieval path is embedding-free; do not
-        wire this into per-query code.
+        """Batched embedding via Vertex AI. Build-time only — used by
+        `page_index.embed_cluster` for L1-bucket clustering at corpus-build
+        time. The retrieval path is embedding-free; do not wire this into
+        per-query code.
 
         `task_type` defaults to "CLUSTERING" per Google's docs. Output is
         L2-unnormalized; callers L2-normalize before cosine. Input is
@@ -391,9 +321,9 @@ class LLMClient:
     @staticmethod
     def _effort_to_thinking_config(effort: "Effort") -> "types.ThinkingConfig":
         # Map skunk's Effort onto Gemini's ThinkingLevel enum, which is
-        # the only knob on the direct-Gemini path that actually caps
-        # thinking spend for Gemini 3. The legacy `thinking_budget=int`
-        # is accepted but soft-bucketed by Google — not a hard cap.
+        # the only knob that actually caps thinking spend for Gemini 3.
+        # The legacy `thinking_budget=int` is accepted but soft-bucketed
+        # by Google — not a hard cap.
         if effort == "off":
             return types.ThinkingConfig(thinking_budget=0)
         level_map = {
@@ -430,16 +360,14 @@ class LLMClient:
         *,
         with_search: bool,
     ) -> LLMResponse:
-        """Direct Gemini API path. Used by `_call_gemini_direct` (no search)
-        and `_call_gemini_search` (with Google Search grounding tool).
-        Mirrors the OpenRouter path's emit + LLMResponse shape; the only
-        per-mode difference is the GoogleSearch tool + grounding fields."""
+        """Vertex AI Gemini call. `with_search=True` attaches the Google Search
+        grounding tool and surfaces grounding metadata on the response."""
         client = self._get_gemini_client()
         parts = self._gemini_parts(user, images)
         gen_config = self._gemini_config(
             system, temperature, effort, with_search=with_search
         )
-        model = self._config.gemini_model
+        model = self._config.llm_model
 
         def do() -> LLMResponse:
             t0 = time.monotonic()
@@ -470,36 +398,7 @@ class LLMClient:
                 output_tokens=getattr(usage, "candidates_token_count", None),
                 grounding_urls=extract_grounding_urls(api_resp) if with_search else [],
                 grounding_titles=extract_grounding_titles(api_resp) if with_search else [],
+                search_queries=extract_search_queries(api_resp) if with_search else [],
             )
 
         return self._retry_call(do)
-
-    def _call_gemini_direct(
-        self,
-        system: str,
-        user: str,
-        images: list[tuple[str, str]] | None,
-        temperature: float,
-        effort: "Effort",
-        ctx: "HarnessContext | None",
-    ) -> LLMResponse:
-        return self._call_gemini(
-            system, user, images, temperature, effort, ctx, with_search=False,
-        )
-
-    def _call_gemini_search(
-        self,
-        system: str,
-        user: str,
-        images: list[tuple[str, str]] | None,
-        temperature: float,
-        effort: "Effort",
-        ctx: "HarnessContext | None",
-    ) -> LLMResponse:
-        # TECH DEBT: google-genai is kept alive only for Google Search grounding in
-        # lookup_external. When OpenRouter supports a native web-search tool, delete
-        # this method and `_call_gemini` with-search branch, then drop the google-genai
-        # dependency.
-        return self._call_gemini(
-            system, user, images, temperature, effort, ctx, with_search=True,
-        )

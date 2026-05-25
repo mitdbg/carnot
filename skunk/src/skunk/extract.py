@@ -170,6 +170,7 @@ unit          natural-language label for the printed scale and base,
 
 - Every cell in a vector/table shares one unit (apply any conversion
   once over the whole payload, never cell-by-cell).
+- Never skip the Total / Balance / standalone variant just because a partial / Net / consolidated variant on the same row already matches the lookup phrase.
 - Numbers in `value` are bare — no commas, no $, no %.
 - If nothing relevant is found, return [].
 - Output ONLY the JSON array — no fences, no prose.
@@ -178,19 +179,22 @@ unit          natural-language label for the printed scale and base,
 
 class ExtractTextPromptedCall(PromptedCall):
     name: str = "extract.text"
-    system_prompt: str = f"""\
+    system_prompt: str = """\
 You retrieve printed values from page text to fulfill a specific lookup.
 Each user message describes the lookup — what to find and (when stated)
 the period — followed by the full-context question this lookup supports,
 then the page text to draw values from. Emit one entry per distinct row
 that could plausibly satisfy the lookup — including cases where multiple
 rows partially match. Do not compute or transform — extract only what
-is printed. Every numeric value emitted MUST appear on the page verbatim. Choose the AnnotatedValue shape (scalar / vector / table) that
-fits the data on the page; pick the smallest shape that captures every
-relevant value.
+is printed. Every numeric value emitted MUST appear on the page verbatim.
+Choose the AnnotatedValue shape (scalar / vector / table) that fits the data on the page;
+pick the smallest shape that captures every relevant value.
 
-{EXTRACT_COMMON_PROMPT}
-"""
+{{ common }}
+{{ default_tail }}"""
+
+    def template_vars(self, ctx: HarnessContext) -> dict:
+        return {"common": EXTRACT_COMMON_PROMPT}
 
     def _extract_from_group(
         self,
@@ -311,7 +315,7 @@ relevant value.
 
 class ExtractVisionPromptedCall(PromptedCall):
     name: str = "extract.vision"
-    system_prompt: str = f"""\
+    system_prompt: str = """\
 You retrieve visible values from rendered page images to fulfill a
 specific lookup. Each user message describes the lookup — what to find
 and (when stated) the period — followed by the full-context question
@@ -324,8 +328,11 @@ The only exception is when the question asks for visual understanding
 (e.g., count of bars exceeding a threshold). Choose the AnnotatedValue
 shape (scalar / vector / table) that fits the data on the page.
 
-{EXTRACT_COMMON_PROMPT}
-"""
+{{ common }}
+{{ default_tail }}"""
+
+    def template_vars(self, ctx: HarnessContext) -> dict:
+        return {"common": EXTRACT_COMMON_PROMPT}
 
     def call_once(
         self,
@@ -365,7 +372,7 @@ shape (scalar / vector / table) that fits the data on the page.
             user_msg,
             images=images,
             temperature=0.0,
-            effort="high",
+            effort="off",
             ctx=ctx,
         )
         raw = resp.text
@@ -381,7 +388,7 @@ shape (scalar / vector / table) that fits the data on the page.
 
 class ExtractDedupPromptedCall(PromptedCall):
     name: str = "extract.dedup"
-    system_prompt: str = f"""\
+    system_prompt: str = """\
 You consolidate redundant extraction entries. Multiple independent
 passes over the same pages produced overlapping entries; collapse
 wording duplicates into one representative per distinct datum. The user
@@ -393,7 +400,7 @@ output MUST appear verbatim in some input entry. Do not compute,
 aggregate, average, derive, rescale, round, reformat, or invent values
 or keys.
 
-{EXTRACT_COMMON_PROMPT}
+{{ common }}
 
 ## Dedup rules
 
@@ -404,7 +411,10 @@ or keys.
   same key, keep both as separate output entries with disambiguating
   descriptions.
 - N genuinely distinct datums → N entries.
-"""
+{{ default_tail }}"""
+
+    def template_vars(self, ctx: HarnessContext) -> dict:
+        return {"common": EXTRACT_COMMON_PROMPT}
 
     def dedup(
         self,
@@ -432,7 +442,7 @@ or keys.
             self.assemble_system_prompt(ctx),
             user_msg,
             temperature=0.0,
-            effort="off",
+            effort="medium",
             ctx=ctx,
         )
         raw = resp.text

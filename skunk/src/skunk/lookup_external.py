@@ -243,6 +243,11 @@ Use mode A only if BOTH of the following hold:
       data sources (currently FRED and BLS), AND
   (ii) `src` does NOT name a different specific source.
 
+For (ii): `src` values that name the Federal Reserve, a regional
+Federal Reserve Bank (e.g. "St. Louis Fed", "FRBSF", "Minneapolis
+Fed"), or FRED/FRASER ARE FRED-compatible — prefer mode A with FRED
+for those. They are the same publisher, not a substitute aggregator.
+
 If either condition fails, use mode B.
 
 Emit a single fenced ```python``` block AND NOTHING ELSE — no JSON,
@@ -300,7 +305,7 @@ even if you know it carries the same series. Issue the search via
 your Google Search tool — answering from training memory alone is not
 allowed. Read the snippets and extract the value at the publisher's
 full printed precision. Never round, format, or simplify.
-"""
+{{ default_tail }}"""
 
     def run(self, ctx: HarnessContext, branch: LookupBranch) -> list[AnnotatedValue]:
         user_msg = branch.model_dump_json(
@@ -479,11 +484,14 @@ full printed precision. Never round, format, or simplify.
                 f"Cannot parse response: {e}\nRaw: {resp.text}",
             ) from e
 
-        # System prompt requires search-mode answers to be grounded.
-        if not resp.grounding_titles:
+        # System prompt requires search-mode answers to be grounded. Accept
+        # any of: chunk titles, chunk URIs, or web_search_queries. Vertex AI
+        # often returns only `web_search_queries` even when search clearly
+        # ran (AI Studio populated `grounding_chunks` more reliably).
+        if not (resp.grounding_titles or resp.grounding_urls or resp.search_queries):
             raise StepFailed(
                 self.name,
-                f"Ungrounded reply (no grounding_titles) for target: {branch.target}",
+                f"Ungrounded reply (no grounding metadata) for target: {branch.target}",
             )
 
         v = result.value
