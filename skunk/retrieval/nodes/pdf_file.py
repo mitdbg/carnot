@@ -45,6 +45,7 @@ def render_page(args):
     cpu = args[1]  # number of CPUs
     filename = args[2]  # document filename
     mat = args[3]  # the matrix for rendering
+    selected_pages = args[4] if len(args) > 4 else None
     doc = pymupdf.open(filename)  # open the document
     num_pages = doc.page_count  # get number of pages
 
@@ -55,10 +56,15 @@ def render_page(args):
 
     pages = []
     for i in range(seg_from, seg_to):  # work through our page segment
+        if selected_pages is not None and i not in selected_pages:
+            continue
         page = doc[i]
         pix = page.get_pixmap(alpha=False, matrix=mat)
         out = pix.tobytes("png")
-        pages.append(out)
+        if selected_pages is None:
+            pages.append(out)
+        else:
+            pages.append((i, out))
         # help release memory promptly
         pix = None
         page = None
@@ -67,20 +73,30 @@ def render_page(args):
     return pages 
 
 
-def parse_pdf_pages(filename, n_workers=None, dpi=300) -> list:
+def parse_pdf_pages(filename, n_workers=None, dpi=300, selected_page_indexes=None) -> list | dict[int, bytes]:
     t0 = time.time()  # start the timer
     mat = pymupdf.Matrix(dpi/72, dpi/72)
     cpu = n_workers if n_workers is not None else cpu_count()
+    selected_pages = None
+    if selected_page_indexes is not None:
+        selected_pages = set(selected_page_indexes)
+        if not selected_pages:
+            return {}
+        cpu = min(cpu, len(selected_pages))
 
     # make vectors of arguments for the processes
-    args = [(i, cpu, filename, mat) for i in range(cpu)]
+    args = [(i, cpu, filename, mat, selected_pages) for i in range(cpu)]
     print(f"Starting {cpu} processes for '{filename}'.")
 
-    pool = Pool()  # make pool of 'cpu_count()' processes
+    pool = Pool(processes=min(cpu_count(), cpu))
     pages = pool.map(render_page, args, 1)
+    pool.close()
+    pool.join()
 
     t1 = time.time()  # stop the timer
     print(f"Total time {round(t1 - t0, 2):g} seconds")
+    if selected_pages is not None:
+        return {page_idx: page_image for segment in pages for page_idx, page_image in segment}
     return pages
 
 if __name__ == "__main__":

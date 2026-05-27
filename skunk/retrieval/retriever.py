@@ -61,7 +61,6 @@ class Retriever:
         }
         if not content_records:
             return []
-        breakpoint()
         keywords = self.decompose_query(question)
         query_terms = []
         seen_terms = set()
@@ -306,11 +305,11 @@ Candidate nodes:
     def _content_node_records(self) -> list[dict]:
         records = []
         for document in self.index.documents.values():
-            for page in document.page_nodes:
+            for page in document.page_nodes.values():
                 for node_type, nodes in (
-                    ("text", page.text_nodes),
-                    ("table", page.table_nodes),
-                    ("plot", page.plot_nodes),
+                    ("text", page.text_nodes.values()),
+                    ("table", page.table_nodes.values()),
+                    ("plot", page.plot_nodes.values()),
                 ):
                     for node in nodes:
                         records.append(

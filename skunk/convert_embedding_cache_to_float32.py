@@ -6,16 +6,7 @@ import shutil
 import numpy as np
 
 
-CACHE_PATH = os.environ.get(
-    "SKUNK_LLM_CACHE_PATH",
-    os.path.abspath(
-        os.path.join(
-            os.path.dirname(__file__),
-            "cache",
-            "llm_call_cache.pckl",
-        )
-    ),
-)
+CACHE_PATH = '/home/orcd/scratch/skunk_cache/llm_wrapper_cache.pckl'
 LOCK_PATH = f"{CACHE_PATH}.lock"
 BACKUP_PATH = f"{CACHE_PATH}.bak"
 TMP_PATH = f"{CACHE_PATH}.tmp"

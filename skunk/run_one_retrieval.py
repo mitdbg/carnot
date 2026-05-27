@@ -16,12 +16,15 @@ from skunk.retrieval.retriever import Retriever
 from skunk.retrieval.semantic_document_index import SemanticDocumentIndex
 
 ENV_FILE = f"{REPO_ROOT}/.env"
-DATASET = "officeqa"
+DATA_DIR = "/home/gerarvit/orcd/scratch/officeqa/"
+if not os.path.exists(DATA_DIR):
+    DATA_DIR = f"{REPO_ROOT}/data"
 
 QUERIES_CSV = f"{REPO_ROOT}/skunk/officeqa_pro.csv"
 OFFICEQA_PATH = f"{REPO_ROOT}/skunk/officeqa_pro.csv"
-PDF_DIR = f"{REPO_ROOT}/data/{DATASET}/treasury_bulletin_pdfs"
-DOCS_DIR = f"{REPO_ROOT}/data/{DATASET}/treasury_bulletins_parsed/transformed"
+PDF_DIR = f"{DATA_DIR}/treasury_bulletin_pdfs"
+DOCS_DIR = f"{DATA_DIR}/treasury_bulletins_parsed/transformed"
+JSON_DIR = f"{DATA_DIR}/treasury_bulletins_parsed/jsons"
 RENDER_BINARY = True
 USE_CACHE = True
 
@@ -42,21 +45,25 @@ for text_file in input_files:
         pdf_paths.append(pdf_path)
 
 t0 = time.time()
-print(f"Processing {len(pdf_paths)} PDFs...")
 index = SemanticDocumentIndex(
     pdf_dir=PDF_DIR,
     ocr_text_dir=DOCS_DIR,
+    json_dir=JSON_DIR,
     render_binary=RENDER_BINARY,
     use_cache=USE_CACHE,
 )
 t1 = time.time()
+print(f"Index creation time: {t1 - t0:.2f} seconds")
 index.add(list(reversed(pdf_paths)))
 t2 = time.time()
+print(f"Documents add time: {t2 - t1:.2f} seconds")
 if not index.initialized:
     index.initialize()
+    t3 = time.time()
+    print(f"Index initialization time: {t3 - t2:.2f} seconds")
 
 # retriever = Retriever(index, text_model="openrouter/google/gemini-3.1-pro-preview")
-retriever = Retriever(index, text_model="openrouter/deepseek/deepseek-v4-flash")
+retriever = Retriever(index, text_model="vertex_ai/gemini-embedding-001")
 rows = []
 for query in queries:
     print(f"Running retrieval for query uid {query['uid']}")

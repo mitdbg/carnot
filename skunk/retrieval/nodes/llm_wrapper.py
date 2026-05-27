@@ -11,10 +11,13 @@ import re
 import threading
 import time
 
+import json5
 import litellm
 import numpy as np
 import untruncate_json
-import json5
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types
 from tqdm import tqdm
 
 litellm.suppress_debug_info = True
@@ -29,20 +32,14 @@ DEFAULT_LLM_MODEL = "vertex_ai/gemini-2.5-flash"
 DEFAULT_LLM_VISION_MODEL = "vertex_ai/gemini-2.5-flash"
 DEFAULT_EMBEDDING_MODEL = "vertex_ai/gemini-embedding-001"
 
-LLM_MAX_WORKERS = 8
+LLM_MAX_WORKERS = 32
 LLM_MAX_REQUESTS_PER_MINUTE = 120
 LLM_MAX_RETRIES = 10
 LLM_RETRY_BACKOFF_SECONDS = 10
 EMBEDDING_BATCH_SIZE = 90
 
-LLM_CACHE_PATH = os.environ.get(
-    "SKUNK_LLM_CACHE_PATH",
-    os.path.abspath(
-        os.path.join(
-            os.path.dirname(__file__), "..", "..", "cache", "llm_call_cache.pckl"
-        )
-    ),
-)
+DEFAULT_CACHE_DIR = os.path.expanduser("~/orcd/scratch/skunk_cache/")
+LLM_CACHE_PATH = os.path.join(DEFAULT_CACHE_DIR, "llm_wrapper_cache.pckl")
 LLM_RATE_LIMIT_STATE_PATH = f"{LLM_CACHE_PATH}.rate_limit.json"
 LLM_RATE_LIMIT_LOCK_PATH = f"{LLM_RATE_LIMIT_STATE_PATH}.lock"
 LLM_TEXT_SYSTEM_PROMPT = "You extract compact metadata for a semantic document index. Return only the requested text."
@@ -59,6 +56,9 @@ DEFAULT_LLM_RETRY_BACKOFF_SECONDS = int(
     os.environ.get("LLM_RETRY_BACKOFF_SECONDS", LLM_RETRY_BACKOFF_SECONDS)
 )
 
+
+def remove_provider(model_name):
+    return model_name.split("/")[-1]
 
 def llm_cache_key(request_inputs: dict) -> str:
     input_monkeypatch = request_inputs.copy()
@@ -100,6 +100,28 @@ def extract_litellm_text(response) -> str:
 
     print(
         f"Warning: LLM response content is an empty string. Returning empty string.\nResponse: {response}"
+    )
+    return ""
+
+
+def extract_google_genai_text(response) -> str:
+    response_text = getattr(response, "text", None)
+    if isinstance(response_text, str) and response_text.strip():
+        return response_text.strip()
+
+    parts = []
+    for candidate in getattr(response, "candidates", []) or []:
+        content = getattr(candidate, "content", None)
+        for part in getattr(content, "parts", []) or []:
+            text = getattr(part, "text", None)
+            if text:
+                parts.append(text)
+    text = "".join(parts).strip()
+    if text:
+        return text
+
+    print(
+        f"Warning: Google GenAI response content is an empty string. Returning empty string.\nResponse: {response}"
     )
     return ""
 
@@ -240,7 +262,9 @@ class LLMWrapper:
                         self.cache[cache_key] = value
 
     def is_rate_limit_error(self, error: Exception) -> bool:
-        status_code = getattr(error, "status_code", None)
+        status_code = getattr(error, "status_code", None) or getattr(
+            error, "code", None
+        )
         error_text = str(error).lower()
         if status_code == 429:
             return True
@@ -249,19 +273,35 @@ class LLMWrapper:
         if getattr(response, "status_code", None) == 429:
             return True
 
+        if isinstance(error, genai_errors.APIError) and error.code == 429:
+            return True
+
         return (
             "429" in error_text
             or "rate limit" in error_text
             or "too many requests" in error_text
+            or "resource exhausted" in error_text
+            or "quota exceeded" in error_text
         )
 
     def is_transient_llm_error(self, error: Exception) -> bool:
-        status_code = getattr(error, "status_code", None)
+        status_code = getattr(error, "status_code", None) or getattr(
+            error, "code", None
+        )
         if status_code in {408, 500, 502, 503, 504}:
             return True
 
         response = getattr(error, "response", None)
         if getattr(response, "status_code", None) in {408, 500, 502, 503, 504}:
+            return True
+
+        if isinstance(error, genai_errors.APIError) and error.code in {
+            408,
+            500,
+            502,
+            503,
+            504,
+        }:
             return True
 
         if isinstance(error, litellm.exceptions.ServiceUnavailableError):
@@ -284,6 +324,9 @@ class LLMWrapper:
                 "bad gateway",
                 "service unavailable",
                 "gateway timeout",
+                "deadline exceeded",
+                "internal server error",
+                "server error",
             ]
         )
 
@@ -304,7 +347,7 @@ class LLMWrapper:
                 ) + random.uniform(0, self.retry_backoff_seconds)
                 if is_rate_limited:
                     print(
-                        f"LLM rate limit hit ({type(e).__name__}: {e}); ",
+                        f"LLM error hit limit hit ({type(e).__name__}: {e}); ",
                         f"{e.with_traceback(None)}",
                         f"retrying in {sleep_seconds:.1f} seconds.",
                     )
@@ -314,6 +357,7 @@ class LLMWrapper:
                         f"Transient LLM error ({type(e).__name__}: {e}); "
                         f"retrying in {sleep_seconds:.1f} seconds."
                     )
+                self.flush_cache(evict_generated_embeddings=True)
                 time.sleep(sleep_seconds)
                 attempt_idx += 1
 
@@ -352,6 +396,89 @@ class LLMWrapper:
                 fcntl.flock(lock_file, fcntl.LOCK_UN)
             time.sleep(sleep_seconds)
 
+    def generate_google(
+        self,
+        prompt: str,
+        model: str,
+        system_prompt: str,
+        image_bytes: bytes = None,
+        max_tokens: int = 32000,
+    ) -> str:
+        client = genai.Client(vertexai=True, project="mit-grc-free-tier")
+        if image_bytes is not None:
+            contents = [
+                types.Part.from_bytes(
+                    data=image_bytes,
+                    mime_type="image/jpeg",
+                ),
+                prompt,
+            ]
+        else:
+            contents = prompt
+        response = client.models.generate_content(
+            model=remove_provider(model),
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0,
+                max_output_tokens=max_tokens,
+            ),
+        )
+        return extract_google_genai_text(response)
+
+    def generate_litellm(
+        self,
+        prompt: str,
+        model: str,
+        system_prompt: str,
+        image_bytes: bytes = None,
+        max_tokens: int = 32000,
+    ) -> str:
+
+        if image_bytes is not None:
+            image_base64 = base64.b64encode(image_bytes).decode("ascii")
+            content = [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{image_base64}",
+                    },
+                },
+            ]
+        else:
+            content = prompt
+        response = litellm.completion(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": system_prompt,
+                },
+                {"role": "user", "content": content},
+            ],
+            temperature=0,
+            max_tokens=max_tokens,
+            timeout=self.text_timeout,
+        )
+
+        return extract_litellm_text(response)
+
+    def embed_google(self, documents: list[str], model: str):
+        client = genai.Client(vertexai=True, project="mit-grc-free-tier")
+        if "embedding-001" in model:
+            result = client.models.embed_content(
+                model=model, contents=documents  # type: ignore
+            )
+            embeddings = [e.values for e in result.embeddings]  # type: ignore
+        elif "embedding-2" in model:
+            embeddings = []
+            for doc in documents:
+                result = client.models.embed_content(model=model, contents=documents)  # type: ignore
+                embeddings.append(result.embeddings[0].values)  # type: ignore
+
+        return np.asarray(embeddings)
+
     def call_llm(
         self,
         prompt: str,
@@ -373,24 +500,20 @@ class LLMWrapper:
             if cached_value is not None:
                 return cached_value
 
-        response = self.run_with_rate_limit_retries(
-            lambda: litellm.completion(
+        if "gemini" in model:
+            llm = self.generate_google
+        else:
+            llm = self.generate_litellm
+        response_text = self.run_with_rate_limit_retries(
+            lambda: llm(
+                prompt=prompt,
                 model=model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": LLM_TEXT_SYSTEM_PROMPT,
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0,
+                system_prompt=LLM_TEXT_SYSTEM_PROMPT,
                 max_tokens=max_tokens,
-                timeout=self.text_timeout,
             )
         )
-        response_text = extract_litellm_text(response)
         if use_cache:
-            self.store_cached_value(cache_key, response_text)
+            self.store_cached_value(cache_key, response_text)  # type: ignore
         return response_text
 
     def call_llm_vision(
@@ -416,36 +539,21 @@ class LLMWrapper:
             if cached_value is not None:
                 return cached_value
 
-        image_base64 = base64.b64encode(image_bytes).decode("ascii")
-        response = self.run_with_rate_limit_retries(
-            lambda: litellm.completion(
+        if "gemini" in model:
+            llm = self.generate_google
+        else:
+            llm = self.generate_litellm
+        response_text = self.run_with_rate_limit_retries(
+            lambda: llm(
+                prompt=prompt,
                 model=model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": LLM_VISION_SYSTEM_PROMPT,
-                    },
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/png;base64,{image_base64}",
-                                },
-                            },
-                        ],
-                    },
-                ],
-                temperature=0,
+                system_prompt=LLM_VISION_SYSTEM_PROMPT,
+                image_bytes=image_bytes,
                 max_tokens=max_tokens,
-                timeout=self.vision_timeout,
             )
         )
-        response_text = extract_litellm_text(response)
         if use_cache:
-            self.store_cached_value(cache_key, response_text)
+            self.store_cached_value(cache_key, response_text)  # type: ignore
         return response_text
 
     def batch_call_llm(
@@ -532,16 +640,28 @@ class LLMWrapper:
     def embed_batch(
         self, model, batch_texts: list[str], use_cache=True
     ) -> list[tuple[str, np.ndarray]]:
-        response = self.run_with_rate_limit_retries(
-            lambda batch_texts=batch_texts: litellm.embedding(
-                model=model, input=batch_texts
+        if "gemini" in model:
+            response_embeddings = self.run_with_rate_limit_retries(
+                lambda batch_texts=batch_texts: self.embed_google(
+                    documents=batch_texts, model=remove_provider(model)
+                )
             )
-        )
+        else:
+            response = self.run_with_rate_limit_retries(
+                lambda batch_texts=batch_texts: litellm.embedding(
+                    model=model, input=batch_texts
+                )
+            )
+            response_embeddings = []
+            for item in response.data:
+                raw_embedding = (
+                    item["embedding"] if isinstance(item, dict) else item.embedding
+                )
+                response_embeddings.append(np.asarray(raw_embedding, dtype=np.float32))
+
         batch_embeddings = []
         new_embeddings = {}
-        for response_idx, item in enumerate(response.data):
-            raw_embedding = item["embedding"] if isinstance(item, dict) else item.embedding
-            embedding = np.asarray(raw_embedding, dtype=np.float32)
+        for response_idx, embedding in enumerate(response_embeddings):
             text = batch_texts[response_idx]
             request_inputs = {
                 "call_type": "embedding",
@@ -601,13 +721,7 @@ class LLMWrapper:
 
         print(f"{len(uncached_texts)} uncached texts to embed.")
         if uncached_texts:
-            batch_size = max(1, batch_size)
             n_embedding_workers = max(1, n_workers)
-            if n_embedding_workers > 1:
-                batch_size = max(
-                    1, (batch_size + n_embedding_workers - 1) // n_embedding_workers
-                )
-
             batch_text_groups = [
                 uncached_texts[batch_start : batch_start + batch_size]
                 for batch_start in range(0, len(uncached_texts), batch_size)
@@ -640,13 +754,26 @@ class LLMWrapper:
                             embeddings[text_idx] = embedding
                     if use_cache and self.cache_enabled:
                         batches_since_cache_flush += 1
-                        if batches_since_cache_flush >= 5000:
+                        if batches_since_cache_flush >= 500:
                             self.flush_cache(evict_generated_embeddings=True)
                             batches_since_cache_flush = 0
 
-        if not embeddings:
+        self.flush_cache(evict_generated_embeddings=True)
+
+        if len(embeddings) == 0:
             return np.empty((0, 0), dtype=np.float32)
-        return np.stack(embeddings).astype(np.float32, copy=False)
+        else:
+            embedding_dim = len(embeddings[0])
+
+        embedding_matrix = np.empty((len(embeddings), embedding_dim), dtype=np.float32)
+
+        for embedding_idx, embedding in enumerate(embeddings):
+            if embedding is None:
+                raise ValueError(f"Missing embedding at position {embedding_idx}")
+            embedding_matrix[embedding_idx] = embedding
+            embeddings[embedding_idx] = None
+
+        return embedding_matrix
 
 
 _PROCESS_LLM_WRAPPER = None

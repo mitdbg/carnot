@@ -12,10 +12,8 @@ from skunk.retrieval.nodes.pdf_file import parse_pdf_pages
 from .llm_wrapper import get_llm_wrapper
 from .page_node import PageNode
 
-DEFAULT_OCR_TEXT_DIR = "data/officeqa/treasury_bulletins_parsed/transformed"
-DEFAULT_JSON_DIR = "data/officeqa/treasury_bulletins_parsed/jsons"
 MAX_DOCUMENT_PROMPT_CHARS = 2000
-PAGE_PROCESS_WORKERS = 32
+PAGE_PROCESS_WORKERS = 16
 PAGE_RENDER_DPI = 150
 
 
@@ -26,18 +24,18 @@ class DocumentNode:
     document_title: str
     document_date: str
     num_pdf_pages: int
+    ocr_text_dir: str
+    json_dir: str
     page_nodes: dict[str, PageNode] = field(default_factory=dict)
     description: str = ""
-    ocr_text_dir: str = DEFAULT_OCR_TEXT_DIR
-    json_dir: str = DEFAULT_JSON_DIR
     page_process_workers: int = PAGE_PROCESS_WORKERS
 
     def __init__(
         self,
         filename: str,
         pdf_bytes: bytes,
-        ocr_text_dir: str = DEFAULT_OCR_TEXT_DIR,
-        json_dir: str = DEFAULT_JSON_DIR,
+        ocr_text_dir: str,
+        json_dir: str,
         page_process_workers: int = PAGE_PROCESS_WORKERS,
         use_cache: bool = True,
     ):
@@ -65,12 +63,6 @@ class DocumentNode:
         self.document_title = self.extract_document_title(ocr_text)
         self.document_date = self.extract_document_date(ocr_text)
         self.description = self.describe_text(ocr_text)
-        page_images = parse_pdf_pages(
-            filename,
-            n_workers=self.page_process_workers,
-            dpi=PAGE_RENDER_DPI,
-        )
-        page_images = [p for x in page_images for p in x]
         pdf.close()
 
         stem = os.path.splitext(self.filename)[0]
@@ -95,6 +87,18 @@ class DocumentNode:
                 else:
                     page_elements[page_id].append(e)
 
+        figure_page_indexes = [
+            idx
+            for idx, elements in page_elements.items()
+            if [e for e in elements if e["type"] == "figure"]
+        ]
+        page_images = parse_pdf_pages(
+            filename,
+            n_workers=self.page_process_workers,
+            dpi=PAGE_RENDER_DPI,
+            selected_page_indexes=figure_page_indexes,
+        )
+
         args = []
         for idx in range(self.num_pdf_pages):
             if len(page_elements[idx]) > 0:
@@ -117,8 +121,7 @@ class DocumentNode:
         page_nodes = pqdm(
             args,
             PageNode,
-            # n_jobs=self.page_process_workers,
-            n_jobs=128,
+            n_jobs=self.page_process_workers,
             argument_type="args",
             exception_behaviour="immediate",
             desc=f"Processing page nodes in {self.filename}",
@@ -129,6 +132,7 @@ class DocumentNode:
                     f"Failed to process page {arg[1]} in {self.filename}"
                 ) from page_node
         self.page_nodes = {page_node.page_id: page_node for page_node in page_nodes}
+
 
     def extract_document_title(self, text: str) -> str:
         if not text.strip():

@@ -5,6 +5,7 @@ import importlib.util
 import os
 import pickle
 import re
+import time
 
 import faiss
 import numpy as np
@@ -14,10 +15,10 @@ from skunk.retrieval.nodes.document_node import DocumentNode
 from skunk.retrieval.nodes.llm_wrapper import DEFAULT_EMBEDDING_MODEL, get_llm_wrapper
 
 SKUNK_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_CACHE_DIR = os.path.join(SKUNK_DIR, "cache")
+DEFAULT_CACHE_DIR = os.path.expanduser("~/orcd/scratch/skunk_cache")
 DEFAULT_CACHE_PATH = os.path.join(DEFAULT_CACHE_DIR, "semantic_document_index.pckl")
 EMBEDDING_CACHE_VERSION = 1
-EMBEDDING_WORKERS = 16
+EMBEDDING_WORKERS = 64
 
 class SemanticDocumentIndex:
 
@@ -25,6 +26,7 @@ class SemanticDocumentIndex:
         self,
         pdf_dir: str,
         ocr_text_dir: str,
+        json_dir: str,
         render_binary: bool = True,
         render_zoom: float = 1.0,
         cache_path: str = DEFAULT_CACHE_PATH,
@@ -72,6 +74,7 @@ class SemanticDocumentIndex:
 
         self.pdf_dir = pdf_dir
         self.ocr_text_dir = ocr_text_dir
+        self.json_dir = json_dir
         self.render_binary = render_binary
         self.render_zoom = render_zoom
         self.cache_path = cache_path
@@ -108,14 +111,18 @@ class SemanticDocumentIndex:
             source_uri = "in_memory.pdf"
             if isinstance(document, str):
                 source_uri = document
+                sha256 = hashlib.sha256(os.path.abspath(document).encode("utf-8")).hexdigest()
+                if sha256 in self._sha_to_document_id:
+                    ids.append(self._sha_to_document_id[sha256])
+                    continue
                 with open(document, "rb") as pdf_file:
                     raw_pdf = pdf_file.read()
             elif isinstance(document, bytes):
                 raw_pdf = document
+                sha256 = hashlib.sha256(raw_pdf).hexdigest()
             else:
                 raise TypeError("document must be a PDF path or raw PDF bytes")
 
-            sha256 = hashlib.sha256(raw_pdf).hexdigest()
             if sha256 in self._sha_to_document_id:
                 ids.append(self._sha_to_document_id[sha256])
                 continue
@@ -124,6 +131,7 @@ class SemanticDocumentIndex:
                 filename=source_uri,
                 pdf_bytes=raw_pdf,
                 ocr_text_dir=self.ocr_text_dir,
+                json_dir=self.json_dir,
                 use_cache=self.use_cache,
             )
             self.documents[document_node.document_id] = document_node
@@ -131,11 +139,15 @@ class SemanticDocumentIndex:
             self.initialized = False
 
             if self.use_cache:
-                if idx == len(documents)-1 or (idx > 0 and (idx % self.cache_flush_idx) == 0):
+                if idx == len(documents)-1 or (idx % self.cache_flush_idx) == 0:
                     self._save_cache()
                     get_llm_wrapper().flush_cache()
 
             ids.append(document_node.document_id)
+        if self.use_cache:
+            get_llm_wrapper().flush_cache()
+            self._save_cache()
+
         return ids
 
     def initialize(
@@ -145,25 +157,28 @@ class SemanticDocumentIndex:
     ) -> None:
         node_ids = []
         descriptions = []
+        start = time.time()
         for document in self.documents.values():
             document_description = document.description or f"{document.document_title} {document.document_date} {document.filename}".strip()
             node_ids.append(document.document_id)
             descriptions.append(document_description)
-            for page in document.page_nodes:
+            for page in document.page_nodes.values():
                 page_description = page.description or f"Page {page.page_pdf_number}".strip()
                 node_ids.append(page.page_id)
                 descriptions.append(page_description)
 
-                for text_node in page.text_nodes:
+                for text_node in page.text_nodes.values():
                     node_ids.append(text_node.text_id)
                     descriptions.append(text_node.description or text_node.text)
-                for table_node in page.table_nodes:
+                for table_node in page.table_nodes.values():
                     node_ids.append(table_node.table_id)
                     descriptions.append(table_node.description or f"{table_node.table_title}\n{table_node.table_data}".strip())
-                for plot_node in page.plot_nodes:
+                for plot_node in page.plot_nodes.values():
                     node_ids.append(plot_node.plot_id)
                     descriptions.append(plot_node.description or plot_node.plot_title)
 
+        end = time.time()
+        print(f"Extracted descriptions for {len(node_ids)} nodes in {end - start:.2f} seconds")
         if not node_ids:
             self.initialized = True
             self.embedding_idx_map = {}
@@ -182,6 +197,8 @@ class SemanticDocumentIndex:
             use_cache=self.use_cache,
             n_workers=n_embedding_workers,
         )
+        if self.use_cache:
+            get_llm_wrapper().flush_cache(evict_generated_embeddings=True)
 
         faiss.normalize_L2(embeddings)
         self.embedding_idx_map = {node_id: node_idx for node_idx, node_id in enumerate(node_ids)}
@@ -189,8 +206,6 @@ class SemanticDocumentIndex:
         self.embedding_matrix = embeddings
         self.embedding_model = embedding_model
         self._rebuild_faiss_index()
-        if self.use_cache:
-            get_llm_wrapper().flush_cache(evict_generated_embeddings=True)
         self._save_cache()
         self.initialized = True
 
