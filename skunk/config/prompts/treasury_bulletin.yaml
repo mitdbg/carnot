@@ -293,24 +293,6 @@ overrides:
       is `usd_millions`, divide by 1000 — apply the conversion once over
       the whole payload, never cell-by-cell.
 
-  - section: lessons
-    targets: [compute.critique]
-    content: >
-      Named statistical operations — verify the code implements the
-      standard formula. Common gotchas: `expected_shortfall` on a
-      return/yield series is the SIGNED mean of the tail observations
-      (expect a negative result in a loss context); `arc_elasticity` =
-      ((Q2-Q1)/((Q1+Q2)/2)) / ((P2-P1)/((P1+P2)/2)), not point
-      elasticity, not CAGR; `zipf` defaults to MLE unless the question
-      pins OLS log-rank vs log-size; `hazen_plotting_position` =
-      (i - 0.5) / n (not Weibull i/(n+1) or California i/n); `gini` /
-      `theil` / `cv` are distinct — use the one named;
-      `pearson_correlation` / `partial_correlation` / `spearman` are
-      distinct; `h_spread` / `iqr` = Q3 − Q1 using the percentile method
-      named (default linear-interpolation / Tukey hinges); `cagr` =
-      (V_end / V_start)^(1/n) - 1, where n is the number of intervals
-      (not years inclusive).
-
   # ---------------------------------------------------------------------
   # lookup_external lessons.
   # ---------------------------------------------------------------------

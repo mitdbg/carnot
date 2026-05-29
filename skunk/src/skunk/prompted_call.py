@@ -36,6 +36,8 @@ can interpolate = override `template_vars(ctx)`.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from jinja2 import Environment, StrictUndefined
 
 from skunk.models import HarnessContext
@@ -44,6 +46,9 @@ from skunk.prompt_overrides import (
     gather_few_shots,
     gather_lessons,
 )
+
+if TYPE_CHECKING:
+    from skunk.common import Effort, LLMResponse
 
 # Module-level singleton. `StrictUndefined` so a typo in a `{{ var }}`
 # reference fails loudly at render time instead of silently emitting "".
@@ -94,10 +99,18 @@ class PromptedCall:
     (a Jinja template) as class attributes; `assemble_system_prompt(ctx)`
     renders it against the override registry (`corpus`, `few_shots`,
     `lessons`, `default_tail`) plus any extras the subclass returns from
-    `template_vars(ctx)`."""
+    `template_vars(ctx)`.
+
+    `default_effort` declares this call-site's thinking-effort tier.
+    `call(ctx, user, ...)` resolves effort with priority:
+      1. explicit `effort=` argument (operator retry escalation),
+      2. `ctx.config.effort_overrides[self.name]` (runtime / env override),
+      3. `self.default_effort` (class-level default).
+    """
 
     name: str = ""
     system_prompt: str = ""
+    default_effort: "Effort" = "off"
 
     def template_vars(self, ctx: HarnessContext) -> dict:
         """Subclass hook: return additional variables to expose to the Jinja
@@ -117,3 +130,32 @@ class PromptedCall:
             "default_tail": _build_default_tail(corpus, few_shots, lessons),
         }
         return _ENV.from_string(self.system_prompt).render(**variables)
+
+    def resolve_effort(self, ctx: HarnessContext, effort: "Effort | None") -> "Effort":
+        """Three-tier resolution: explicit arg > config override > class default."""
+        if effort is not None:
+            return effort
+        return ctx.config.effort_overrides.get(self.name, self.default_effort)
+
+    def call(
+        self,
+        ctx: HarnessContext,
+        user: str,
+        *,
+        images: list[tuple[str, str]] | None = None,
+        temperature: float = 0.0,
+        use_google_search: bool = False,
+        effort: "Effort | None" = None,
+    ) -> "LLMResponse":
+        """Assemble the system prompt, resolve the effort tier, and invoke
+        the LLM. Operators call this instead of `ctx.llm_client.call` so
+        the effort knob stays consistent with the resolution rules above."""
+        return ctx.llm_client.call(
+            self.assemble_system_prompt(ctx),
+            user,
+            images=images,
+            temperature=temperature,
+            effort=self.resolve_effort(ctx, effort),
+            use_google_search=use_google_search,
+            ctx=ctx,
+        )

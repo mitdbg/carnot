@@ -81,7 +81,7 @@ Setup:
 2. Set `GOOGLE_CLOUD_PROJECT=<project-id>` in `.env` (Vertex AI API must be enabled on the project)
 3. Optional: `GOOGLE_CLOUD_LOCATION` (default `us-central1`)
 
-Default model is `gemini-3-flash-preview` (`config.llm_model`, overridable via
+Default model is `gemini-3.5-flash` (`config.llm_model`, overridable via
 `SKUNK_LLM_MODEL`). Use bare Vertex model names — do not include the `google/`
 OpenRouter-style prefix.
 

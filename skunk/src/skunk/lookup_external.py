@@ -217,6 +217,7 @@ class LookupResult(BaseModel):
 # TODO: need to move dataset/setup specific calls into the prompt override system
 class LookupExternalPromptedCall(PromptedCall):
     name: str = "lookup_external"
+    default_effort = "off"
     system_prompt: str = """\
 You find data points from a reliable external source. You must
 ground every answer in real data — never invent values.
@@ -313,13 +314,7 @@ full printed precision. Never round, format, or simplify.
         )
 
         ctx.emit(self.name, "calling gemini", target=branch.target, src=branch.src)
-        resp = ctx.llm_client.call(
-            self.assemble_system_prompt(ctx),
-            user_msg,
-            effort="off",
-            use_google_search=True,
-            ctx=ctx,
-        )
+        resp = self.call(ctx, user_msg, use_google_search=True)
         ctx.emit(
             self.name, "gemini response",
             raw=resp.text, grounding_titles=resp.grounding_titles,
@@ -375,8 +370,8 @@ full printed precision. Never round, format, or simplify.
 
         # Second call: feed the program + its stdout back to the model
         # and ask for the final JSON. Reuse the same system prompt
-        # (which documents the mode B JSON shape) and effort=off — this
-        # is pure transcription, not reasoning.
+        # (which documents the mode B JSON shape) — this is pure
+        # transcription, not reasoning, so the default 'off' tier is fine.
         synth_user_msg = (
             "You previously emitted the following Python code in mode A "
             "for this lookup:\n\n"
@@ -396,12 +391,7 @@ full printed precision. Never round, format, or simplify.
             "publisher domain you fetched from (e.g. \"fred\", \"bls\"). "
             "Bare JSON. No markdown fences. No prose."
         )
-        synth_resp = ctx.llm_client.call(
-            self.assemble_system_prompt(ctx),
-            synth_user_msg,
-            effort="off",
-            ctx=ctx,
-        )
+        synth_resp = self.call(ctx, synth_user_msg)
         ctx.emit(self.name, "code mode JSON synthesis", raw=synth_resp.text)
         cleaned = strip_code_fence(synth_resp.text)
         try:
@@ -444,13 +434,7 @@ full printed precision. Never round, format, or simplify.
         ctx.emit(self.name, "calling gemini (retry)",
                  target=branch.target, src=branch.src,
                  prior_error=prior_error)
-        resp = ctx.llm_client.call(
-            self.assemble_system_prompt(ctx),
-            user_msg,
-            effort="off",
-            use_google_search=True,
-            ctx=ctx,
-        )
+        resp = self.call(ctx, user_msg, use_google_search=True)
         ctx.emit(
             self.name, "gemini response (retry)",
             raw=resp.text, grounding_titles=resp.grounding_titles,

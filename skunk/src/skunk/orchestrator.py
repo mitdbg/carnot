@@ -34,6 +34,7 @@ from skunk.extract import ExtractExecutor
 from skunk.lookup_external import LookupExternalPromptedCall
 from skunk.models import AnnotatedValue, HarnessContext
 from skunk.plan import Branch, Plan, PlannerPromptedCall
+from skunk.question_explainer import ConceptExplanation, QuestionExplainer
 from skunk.retrieve import RetrieveExecutor
 from skunk.trace import QuestionTrace, StepTrace, describe_value, full_repr
 
@@ -58,6 +59,7 @@ class Orchestrator:
         self._retriever = RetrieveExecutor(ctx.config)
         self._extractor = ExtractExecutor()
         self._looker = LookupExternalPromptedCall()
+        self._explainer = QuestionExplainer()
         self._computer = ComputeExecutor()
         self._trace = QuestionTrace(question=ctx.question)
 
@@ -86,6 +88,7 @@ class Orchestrator:
             plan = self._current_plan
             if not plan.branches:
                 raise StepFailed("orchestrator", "plan has no branches")
+            concept_explanations = self._explain_concepts()
             prev = self._run_branches(plan.branches)
 
             max_rounds = self._ctx.config.recovery_max_rounds
@@ -93,7 +96,10 @@ class Orchestrator:
                 try:
                     self._trace.answer = self._run_op(
                         "compute",
-                        {"plan": plan},
+                        {
+                            "plan": plan,
+                            "concept_explanations": concept_explanations,
+                        },
                         prev,
                         self._computer.run,
                     )
@@ -155,6 +161,18 @@ class Orchestrator:
                 if not framing_changed:
                     raise missing from None
         return plan, prev
+
+    def _explain_concepts(self) -> list[ConceptExplanation]:
+        """Run the question-explainer step through `_run_op` so it's traced.
+        One LLM call over the question text; returns [] when the explainer
+        finds no non-obvious concepts or the reply is malformed
+        (best-effort — never fatal)."""
+        return self._run_op(
+            "question_explainer",
+            {"question": self._ctx.question},
+            _NO_INPUT,
+            self._explainer.run,
+        )
 
     def _run_branch(self, branch: Branch) -> list[AnnotatedValue]:
         """Execute a single branch and return its entries."""

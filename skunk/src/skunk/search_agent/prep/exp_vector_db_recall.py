@@ -40,9 +40,9 @@ QWEN_MODEL_ID = "Qwen/Qwen3-Embedding-8B"
 # ---------------------------------------------------------------------------
 class GeminiEmbedder:
     def __init__(self, model_id: str = GEMINI_MODEL_ID, max_workers: int = 16):
-        from skunk.common import _make_vertex_client  # local so qwen-only runs don't need it
+        from skunk.common import _make_genai_client  # local so qwen-only runs don't need it
 
-        self.client = _make_vertex_client()
+        self.client = _make_genai_client()
         self.model_id = model_id
         self.max_workers = max_workers
 

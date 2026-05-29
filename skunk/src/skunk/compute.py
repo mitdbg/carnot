@@ -23,12 +23,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
-from skunk.common import strip_code_fence
+from skunk.common import Effort, strip_code_fence
 from skunk.errors import MissingData, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.models import AnnotatedValue, HarnessContext
 from skunk.plan import Plan
 from skunk.pyexec import exec_python_with_env
+from skunk.question_explainer import ConceptExplanation
 
 
 class _ParseFailure(Exception):
@@ -146,6 +147,7 @@ def prev_desc(prev: list[AnnotatedValue], *, full: bool = False) -> str:
 
 class CodegenPromptedCall(PromptedCall):
     name: str = "compute.codegen"
+    default_effort = "medium"
     system_prompt: str = """\
 You write Python that produces the final answer string, or emit a
 structured missing-data signal.
@@ -158,6 +160,11 @@ structured missing-data signal.
 - `presentation` (JSON): the planner's `{units_out, precision,
   answer_form}`. Convert to `units_out`, round to `precision` decimal
   places, format to `answer_form`. Null fields mean unconstrained.
+- Optional `## Concept references` section: one block per non-obvious
+  concept the question references — canonical definition + formula
+  for named operations, domain-specific conventions, etc. Treat each
+  as the authoritative reference; if your default implementation
+  diverges from it, follow the reference.
 - `prev`: list[AnnotatedValue] in the exec environment; these are values previous agents deemed relevant for answering the question.
 
 ## AnnotatedValue API
@@ -219,6 +226,9 @@ no commentary, no second block, no fence around (b):
         prev: list[AnnotatedValue],
         prev_code: str | None,
         prev_failure: str | None,
+        concept_explanations: list[ConceptExplanation] = (),
+        *,
+        effort: Effort | None = None,
     ) -> str:
         """One LLM call. Returns the generated code on success.
         Raises:
@@ -231,11 +241,24 @@ no commentary, no second block, no fence around (b):
         failed attempt (parse/exec failure or critique REVISE verdict).
         Older attempts are deliberately omitted — accumulating them
         dilutes the actual issue to fix. `prev_code` is None when there
-        was no parseable code on the prior attempt (parse failure)."""
+        was no parseable code on the prior attempt (parse failure).
+
+        `concept_explanations` are the non-obvious concepts extracted
+        from the question by `QuestionExplainer`. Empty when the
+        question has no concepts worth explaining (or the explainer
+        call failed)."""
         user_msg = (
             f"Question:\n{ctx.question}\n\n"
             f"computation = {plan.computation.model_dump_json()}\n"
             f"presentation = {plan.presentation.model_dump_json()}\n\n"
+        )
+        if concept_explanations:
+            block = "\n\n".join(
+                f"### {c.concept}\n{c.explanation}"
+                for c in concept_explanations
+            )
+            user_msg += f"## Concept references\n{block}\n\n"
+        user_msg += (
             f"prev =\n{prev_desc(prev)}\n\n"
             f"Produce a fenced ```python``` block OR a bare missing-data JSON object."
         )
@@ -247,9 +270,7 @@ no commentary, no second block, no fence around (b):
                 f"\nSpecific issue to address:\n{prev_failure}\n"
                 "Focus on fixing this specific issue without introducing new mistakes."
             )
-        resp = ctx.llm_client.call(
-            self.assemble_system_prompt(ctx), user_msg, effort="medium", ctx=ctx
-        )
+        resp = self.call(ctx, user_msg, effort=effort)
         raw = resp.text
         ctx.emit("compute", "codegen response", raw=raw)
         # Strip fences upfront so dispatch on `{` works whether the model
@@ -289,6 +310,7 @@ no commentary, no second block, no fence around (b):
 
 class CritiquePromptedCall(PromptedCall):
     name: str = "compute.critique"
+    default_effort = "medium"
     system_prompt: str = """\
 You review code another agent wrote and the string it produced.
 Decide accept or revise.
@@ -352,9 +374,7 @@ A single bare JSON object. No fences, no prose. Exactly one of:
             f"Produced result:\n{result_text}\n\n"
             f"Output a single bare JSON object with your verdict."
         )
-        resp = ctx.llm_client.call(
-            self.assemble_system_prompt(ctx), user, effort="medium", ctx=ctx
-        )
+        resp = self.call(ctx, user)
         raw = resp.text
         ctx.emit("compute", "self-critique response", raw=raw)
         try:
@@ -378,6 +398,7 @@ class ComputeExecutor:
         prev: list[AnnotatedValue],
         ctx: HarnessContext,
         plan: Plan,
+        concept_explanations: list[ConceptExplanation] = (),
     ) -> str:
         """Single retry loop over `compute_max_attempts` iterations. Each
         iteration does codegen → exec → critique. Any failure (parse, exec,
@@ -385,7 +406,13 @@ class ComputeExecutor:
         Returns on critique ACCEPT, or — if the budget exhausts after at
         least one successful exec — the most recent uncritiqued result as
         a fallback. Raises `StepFailed` if no iteration ever execs cleanly,
-        and propagates `MissingData` from the codegen signal."""
+        and propagates `MissingData` from the codegen signal.
+
+        `concept_explanations` is the upstream `QuestionExplainer`
+        output: non-obvious concepts extracted from the question text,
+        each with a short definition + formula. Threaded into every
+        codegen attempt — these are question-derived constants, not
+        retry-dependent."""
         ctx.emit(
             "compute",
             "starting",
@@ -400,8 +427,14 @@ class ComputeExecutor:
         last_result: str | None = None
 
         for try_idx in range(ctx.config.compute_max_attempts):
+            # Escalate effort after the first failed attempt — the cheaper
+            # default got us here, so spend more thinking on the recovery.
+            retry_effort: Effort | None = "high" if try_idx > 0 else None
             try:
-                code = self._codegen.codegen(ctx, plan, prev, prev_code, prev_failure)
+                code = self._codegen.codegen(
+                    ctx, plan, prev, prev_code, prev_failure,
+                    concept_explanations, effort=retry_effort,
+                )
             except _ParseFailure as e:
                 prev_code = None
                 prev_failure = e.hint

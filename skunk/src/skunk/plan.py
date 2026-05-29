@@ -118,6 +118,7 @@ class Plan(BaseModel):
 
 class PlannerPromptedCall(PromptedCall):
     name: str = "planner"
+    default_effort = "medium"
     system_prompt: str = """\
 You are the planner. Given a question, emit a JSON plan that, when executed, produces the answer.
 
@@ -256,7 +257,6 @@ Guidance:
         """Shared three-attempt loop for `plan()` and `replan()`. Each retry
         shows ONLY the most recent bad response + its error — no history
         accumulation."""
-        system_prompt = self.assemble_system_prompt(ctx)
         attempt_errors: list[str] = []
         last_raw: str | None = None
         last_error: str | None = None
@@ -273,9 +273,7 @@ Guidance:
                     "Fix and return valid JSON only."
                 )
             ctx.emit(label, "attempt", n=attempt + 1, of=3)
-            resp = ctx.llm_client.call(
-                system_prompt, user_message, effort="medium", ctx=ctx
-            )
+            resp = self.call(ctx, user_message)
             raw = resp.text
             try:
                 return Plan.model_validate_json(strip_code_fence(raw).strip())

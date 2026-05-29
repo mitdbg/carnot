@@ -5,7 +5,7 @@ import re
 from chromadb.api.models.Collection import Collection
 from google import genai
 from google.genai import types as genai_types
-from skunk.common import _make_vertex_client
+from skunk.common import _make_genai_client
 from skunk.config import SkunkConfig
 from skunk.models import HarnessContext
 from skunk.search_agent.base import Retriever
@@ -89,7 +89,7 @@ class SearchAgent(Retriever):
         self.model_id = raw_model.removeprefix("google/")
         self.emb_model_id = config.emb_model_id.removeprefix("google/")
         self.max_steps = config.agent_max_steps
-        self.client: genai.Client = _make_vertex_client()
+        self.client: genai.Client = _make_genai_client()
         self.chroma_collection = chroma_collection
         self.clean_page_map = clean_page_map
         self.system_prompt: str = ""    # set per-question in retrieve()

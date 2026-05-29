@@ -1,13 +1,12 @@
 """Shared runtime: LLM client with rate limiting and retry.
 
-All LLM traffic goes through GCP Vertex AI via the `google-genai` SDK.
-Set up locally with `gcloud auth application-default login` and configure
-the target project via the `GOOGLE_CLOUD_PROJECT` env var (optionally
-`GOOGLE_CLOUD_LOCATION`, defaults to `us-central1`).
+All LLM traffic goes through the direct Gemini API (AI Studio) via the
+`google-genai` SDK, authenticated by `GEMINI_API_KEY` from `.env`.
 
 Google Search grounding (used by `lookup_external`) is requested by passing
-`use_google_search=True` to `LLMClient.call`; Vertex's `Tool(google_search=...)`
-provides the same grounding metadata as the AI Studio endpoint.
+`use_google_search=True` to `LLMClient.call`; AI Studio supplies it via
+`Tool(google_search=...)` with the same grounding-metadata shape as the
+Vertex endpoint.
 
 Rate limiting
 -------------
@@ -44,9 +43,11 @@ from typing import TYPE_CHECKING, Any, Literal
 # Reasoning-effort knob shared across LLM backends. Maps cleanly to
 # the Gemini SDK's `thinking_level` enum.
 # Replaces the legacy `thinking_budget: int` API — Gemini 3 treats the
-# legacy int as a soft suggestion only, not a cap.
-Effort = Literal["off", "low", "medium", "high"]
-_EFFORT_VALUES = ("off", "low", "medium", "high")
+# legacy int as a soft suggestion only, not a cap. "off" is kept for
+# explicit no-thinking intent (legacy thinking_budget=0); "minimal" is
+# the cheapest Gemini-3 thinking tier (e.g. Gemini 3 Flash).
+Effort = Literal["off", "minimal", "low", "medium", "high"]
+_EFFORT_VALUES = ("off", "minimal", "low", "medium", "high")
 
 from google import genai
 from google.genai import types
@@ -197,22 +198,18 @@ class LLMResponse:
     search_queries: list[str] = field(default_factory=list)
 
 
-def _make_vertex_client() -> genai.Client:
-    """Build a Vertex AI genai.Client from env. Requires GOOGLE_CLOUD_PROJECT;
-    GOOGLE_CLOUD_LOCATION defaults to us-central1. Auth via ADC
-    (`gcloud auth application-default login`)."""
-    project = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    if not project:
-        raise RuntimeError("GOOGLE_CLOUD_PROJECT not set (required for Vertex AI)")
-    return genai.Client(
-        vertexai=True,
-        project=project,
-        location=os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1"),
-    )
+def _make_genai_client() -> genai.Client:
+    """Build a direct-Gemini (AI Studio) genai.Client from `GEMINI_API_KEY`.
+    Auth via api-key; no GCP project required."""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not set (required for Gemini API)")
+    return genai.Client(api_key=api_key)
 
 
 class LLMClient:
-    """LLM client for Vertex AI. Optionally enables Google Search grounding per call."""
+    """LLM client. All calls go through AI Studio (direct Gemini API);
+    `use_google_search=True` attaches the GoogleSearch grounding tool."""
 
     def __init__(self, config: SkunkConfig) -> None:
         self._config = config
@@ -220,7 +217,7 @@ class LLMClient:
 
     def _get_gemini_client(self) -> genai.Client:
         if self._gemini_client is None:
-            self._gemini_client = _make_vertex_client()
+            self._gemini_client = _make_genai_client()
         return self._gemini_client
 
     def call(
@@ -327,6 +324,7 @@ class LLMClient:
         if effort == "off":
             return types.ThinkingConfig(thinking_budget=0)
         level_map = {
+            "minimal": types.ThinkingLevel.MINIMAL,
             "low": types.ThinkingLevel.LOW,
             "medium": types.ThinkingLevel.MEDIUM,
             "high": types.ThinkingLevel.HIGH,

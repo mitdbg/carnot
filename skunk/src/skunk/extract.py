@@ -179,6 +179,7 @@ unit          natural-language label for the printed scale and base,
 
 class ExtractTextPromptedCall(PromptedCall):
     name: str = "extract.text"
+    default_effort = "off"
     system_prompt: str = """\
 You retrieve printed values from page text to fulfill a specific lookup.
 Each user message describes the lookup — what to find and (when stated)
@@ -227,16 +228,9 @@ pick the smallest shape that captures every relevant value.
         verify_text = content
         n_samples = ctx.config.extract_n_samples
         temperature = ctx.config.extract_sample_temperature
-        system = self.assemble_system_prompt(ctx)
 
         def _sample(sample_idx: int) -> list[AnnotatedValue]:
-            resp = ctx.llm_client.call(
-                system,
-                user_msg,
-                temperature=temperature,
-                effort="off",
-                ctx=ctx,
-            )
+            resp = self.call(ctx, user_msg, temperature=temperature)
             parsed = _parse_response_raw(resp.text, ctx) or []
             ctx.emit(
                 "extract",
@@ -315,6 +309,7 @@ pick the smallest shape that captures every relevant value.
 
 class ExtractVisionPromptedCall(PromptedCall):
     name: str = "extract.vision"
+    default_effort = "off"
     system_prompt: str = """\
 You retrieve visible values from rendered page images to fulfill a
 specific lookup. Each user message describes the lookup — what to find
@@ -367,14 +362,7 @@ shape (scalar / vector / table) that fits the data on the page.
         )
 
         ctx.emit("extract", "tier=vision single-call (T=0)", n_images=len(images))
-        resp = ctx.llm_client.call(
-            self.assemble_system_prompt(ctx),
-            user_msg,
-            images=images,
-            temperature=0.0,
-            effort="off",
-            ctx=ctx,
-        )
+        resp = self.call(ctx, user_msg, images=images, temperature=0.0)
         raw = resp.text
         parsed = _parse_response_raw(raw, ctx)
         ctx.emit(
@@ -388,6 +376,7 @@ shape (scalar / vector / table) that fits the data on the page.
 
 class ExtractDedupPromptedCall(PromptedCall):
     name: str = "extract.dedup"
+    default_effort = "medium"
     system_prompt: str = """\
 You consolidate redundant extraction entries. Multiple independent
 passes over the same pages produced overlapping entries; collapse
@@ -438,13 +427,7 @@ or keys.
             "tier=parsed_json dedup call (T=0)",
             n_input_entries=len(envelope),
         )
-        resp = ctx.llm_client.call(
-            self.assemble_system_prompt(ctx),
-            user_msg,
-            temperature=0.0,
-            effort="medium",
-            ctx=ctx,
-        )
+        resp = self.call(ctx, user_msg, temperature=0.0)
         raw = resp.text
         parsed = _parse_response_raw(raw, ctx)
         ctx.emit(

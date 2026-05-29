@@ -30,6 +30,7 @@ from skunk.models import AnnotatedValue, HarnessContext, PageRef
 from skunk.orchestrator import Orchestrator
 from skunk.plan import Plan
 from skunk.prompt_overrides import load_prompt_overrides
+from skunk.question_explainer import ConceptExplanation
 from skunk.trace import QuestionTrace
 
 __all__ = [
@@ -40,6 +41,7 @@ __all__ = [
     "Orchestrator",
     "PageRef",
     "Plan",
+    "ConceptExplanation",
     "QuestionTrace",
     "SkunkConfig",
     "StepFailed",

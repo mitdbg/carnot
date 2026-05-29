@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
+    from skunk.common import Effort
     from skunk.models import PageRef
 
 
@@ -27,7 +28,7 @@ class SkunkConfig:
     # Requires GOOGLE_CLOUD_PROJECT in the environment and ADC set up via
     # `gcloud auth application-default login`. GOOGLE_CLOUD_LOCATION defaults to
     # us-central1. (env: SKUNK_LLM_MODEL, SKUNK_LLM_RPM)
-    llm_model: str = "gemini-3-flash-preview"
+    llm_model: str = "gemini-3.5-flash"
     # Token-bucket rate limit applied to every LLM call (requests per minute).
     # Default sized for Vertex Gemini Flash paid-tier quotas; adjust for other models.
     llm_rpm: float = 1000.0
@@ -36,6 +37,15 @@ class SkunkConfig:
     llm_max_retries: int = 10
     llm_retry_initial_delay_s: float = 0.05
     llm_retry_max_delay_s: float = 1.0
+
+    # Per call-site effort override. Maps `PromptedCall.name` (e.g.
+    # "planner", "compute.codegen", "extract.text") → Effort tier
+    # ("off"|"minimal"|"low"|"medium"|"high"). When a key is missing
+    # the call-site's class-level `default_effort` applies. Operators
+    # may still pass an explicit `effort=` argument at call time to
+    # escalate on retry — that wins over both this dict and the default.
+    # (env: SKUNK_EFFORT_OVERRIDES — comma-separated `name=tier` pairs)
+    effort_overrides: dict[str, "Effort"] = field(default_factory=dict)
 
     # Extract operator (env: SKUNK_EXTRACT_N_SAMPLES, SKUNK_EXTRACT_SAMPLE_TEMPERATURE)
     extract_n_samples: int = 3       # LLM calls per tier 1; all surviving entries are merged + deduped
@@ -104,7 +114,8 @@ class SkunkConfig:
     @classmethod
     def from_env(cls) -> SkunkConfig:
         return cls(
-            llm_model=os.environ.get("SKUNK_LLM_MODEL", "gemini-3-flash-preview"),
+            llm_model=os.environ.get("SKUNK_LLM_MODEL", "gemini-3.5-flash"),
+            effort_overrides=_parse_effort_overrides(os.environ.get("SKUNK_EFFORT_OVERRIDES", "")),
             llm_rpm=float(os.environ.get("SKUNK_LLM_RPM", "1000")),
             llm_max_retries=int(os.environ.get("SKUNK_LLM_MAX_RETRIES", "10")),
             llm_retry_initial_delay_s=float(os.environ.get("SKUNK_LLM_RETRY_INITIAL_DELAY", "0.05")),
@@ -126,3 +137,31 @@ class SkunkConfig:
             agent_max_pages_per_tool_call=int(os.environ.get("SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL", "20")),
             agent_model_id=os.environ.get("SKUNK_AGENT_MODEL") or None,
         )
+
+
+def _parse_effort_overrides(raw: str) -> dict[str, "Effort"]:
+    """Parse `SKUNK_EFFORT_OVERRIDES` ("name=tier,name=tier,...") into a
+    dict. Empty / whitespace-only input → empty dict. Raises ValueError
+    on malformed entries or unknown tiers — we want config typos to
+    fail loudly at startup rather than silently apply the default."""
+    from skunk.common import _EFFORT_VALUES  # local to avoid import cycle
+
+    out: dict[str, Effort] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            raise ValueError(
+                f"SKUNK_EFFORT_OVERRIDES entry {entry!r} missing '=' "
+                f"(expected `name=tier`)"
+            )
+        name, _, tier = entry.partition("=")
+        name = name.strip()
+        tier = tier.strip()
+        if tier not in _EFFORT_VALUES:
+            raise ValueError(
+                f"SKUNK_EFFORT_OVERRIDES tier {tier!r} not in {_EFFORT_VALUES}"
+            )
+        out[name] = tier  # type: ignore[assignment]
+    return out
