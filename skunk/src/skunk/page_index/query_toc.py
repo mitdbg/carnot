@@ -1,10 +1,10 @@
-"""One-shot parent-chapter retriever over the flat concept tree.
+"""Query path — ToC chapter pick over the flat concept tree.
 
-A single LLM call picks one (or up to two) canonical chapter(s) from
-the tree; every page under the picked chapter(s) is returned as the
-prediction. Used by `page_index.retrieve_prototype.PageIndexRetrievePrototype`;
-not on the default `RetrieveExecutor` path while an external retriever
-is being integrated.
+The first pass of the page-index query path
+(`ToC pick → year filter → semantic filter → candidate set`). A single
+LLM call picks up to two canonical chapter(s) from the tree; every page
+under the picked chapter(s) becomes a candidate. Used by
+`page_index.query.PageIndexRetriever`.
 
 The concept tree is the flat shape produced by `merge.build_tree`:
 
@@ -64,9 +64,9 @@ class RetrieveTrace:
     top_k: list[dict[str, Any]] = field(default_factory=list)
     total_walk_s: float = 0.0
     # The chapter(s) the LLM picked. Set by `one_shot_parent_chapter_retrieve`
-    # so downstream steps (e.g. BM25 rerank) can find the per-chapter index
-    # without re-running the LLM. Empty list when the LLM picked nothing
-    # valid; one or two chapter names otherwise.
+    # so downstream steps can attribute candidates without re-running the
+    # LLM. Empty list when the LLM picked nothing valid; one or two chapter
+    # names otherwise.
     picked_chapters: list[str] = field(default_factory=list)
 
 
@@ -91,7 +91,7 @@ def load_concept_tree(path: Path) -> dict[str, Any]:
 def _safe_json(text: str) -> dict[str, Any] | None:
     """Parse JSON object from a (possibly fenced) LLM response."""
     from .util import safe_json_loads
-    obj = safe_json_loads(text, context="retrieve_probe")
+    obj = safe_json_loads(text, context="query_toc")
     return obj if isinstance(obj, dict) else None
 
 
@@ -149,12 +149,17 @@ description may not mention.
 ## Output
 
 Output a SINGLE JSON object (no prose, no fences):
-  {"picked": "<exact chapter label>"}
+  {"picked": ["<exact chapter label>", ...]}
 
 Rules:
-  - Return exactly ONE chapter label, the best match.
-  - Use the EXACT `chapter` value shown; do NOT emit anything from a
+  - Return the best-matching chapter. Return a SECOND chapter only
+    when the question genuinely straddles two chapters and you are
+    unsure which holds the answer — at most TWO labels, best first.
+    A precise downstream filter reads every page you return, so a
+    spurious second chapter only adds cost. When in doubt, return one.
+  - Use the EXACT `chapter` value(s) shown; do NOT emit anything from a
     `description` or `examples` list.
+  - A bare string (one label) is also accepted.
 """
 
 

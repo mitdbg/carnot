@@ -144,7 +144,6 @@ class PromptedCall:
         *,
         images: list[tuple[str, str]] | None = None,
         temperature: float = 0.0,
-        use_google_search: bool = False,
         effort: "Effort | None" = None,
     ) -> "LLMResponse":
         """Assemble the system prompt, resolve the effort tier, and invoke
@@ -156,6 +155,5 @@ class PromptedCall:
             images=images,
             temperature=temperature,
             effort=self.resolve_effort(ctx, effort),
-            use_google_search=use_google_search,
             ctx=ctx,
         )

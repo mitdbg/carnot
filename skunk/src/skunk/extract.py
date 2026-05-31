@@ -34,10 +34,7 @@ from skunk.errors import StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.models import AnnotatedValue, HarnessContext, PageRef
 from skunk.plan import RetrieveBranch
-from skunk.pdf_prep import (
-    get_text_for_pdf_page,
-    render_pdf_page_b64,
-)
+from skunk.corpus import get_page_text, render_page_b64
 
 
 def _cells_with_path(
@@ -485,7 +482,7 @@ class ExtractExecutor:
             refs = refs[: ctx.config.extract_max_pages]
         pages: list[tuple[PageRef, str]] = []
         for ref in refs:
-            text = get_text_for_pdf_page(ref, ctx)
+            text = get_page_text(ref.month, ref.page)
             if not text:
                 ctx.emit("extract", "tier=parsed_json no text", page=str(ref))
                 continue
@@ -503,13 +500,7 @@ class ExtractExecutor:
         if not all_entries:
             ctx.emit("extract", "tier=parsed_json all samples empty after verifier")
             return None
-        ctx.emit(
-            "extract",
-            "tier=parsed_json merged; dedup over full input",
-            n_full_input=len(all_entries),
-        )
-        deduped = self._dedup.dedup(all_entries, ctx)
-        return deduped or None
+        return all_entries or None
 
     def _vision_tier(
         self,
@@ -524,7 +515,11 @@ class ExtractExecutor:
         images: list[tuple[str, str]] = []
         rendered_refs: list[PageRef] = []
         for ref in refs:
-            img = render_pdf_page_b64(ref, ctx)
+            try:
+                img = render_page_b64(ref.month, ref.page, dpi=300, fmt="png")
+            except Exception as e:  # noqa: BLE001 — tier-fallback; any fitz error → skip page
+                ctx.emit("extract", "tier=vision render failed", page=str(ref), error=str(e))
+                img = None
             if img:
                 ctx.emit("extract", "tier=vision rendered png", page=str(ref))
                 images.append(img)

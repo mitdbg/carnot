@@ -55,7 +55,7 @@ from skunk.search_agent.utils import InterpreterError, LocalPythonExecutor
 # statement also works — matches the contract of the prior pyexec
 # `_default_env()` and what the compute / lookup_external system prompts
 # advertise as "already in scope".
-_AUTHORIZED_IMPORTS = ["numpy", "numpy.*", "pandas", "statsmodels", "statsmodels.*"]
+_AUTHORIZED_IMPORTS = ["json", "numpy", "numpy.*", "pandas", "statsmodels", "statsmodels.*"]
 
 _PRELOADED_GLOBALS: dict[str, Any] = {
     "math": math,

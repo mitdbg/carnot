@@ -26,6 +26,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import Any
 
 from skunk.compute import ComputeExecutor
@@ -39,6 +40,21 @@ from skunk.retrieve import RetrieveExecutor
 from skunk.trace import QuestionTrace, StepTrace, describe_value, full_repr
 
 _NO_INPUT = object()  # sentinel: op has no upstream value (branch heads)
+
+
+@dataclass
+class BranchOutcome:
+    """Per-branch result captured by `_run_branches`. `entries` is None on
+    failure; `error` is None on success. Threaded to the replanner so it
+    can see which branches failed and rephrase them."""
+    branch: Branch
+    entries: list[AnnotatedValue] | None
+    error: str | None
+
+
+def _entries(outcomes: list[BranchOutcome]) -> list[AnnotatedValue]:
+    """Flatten the successful entries from a list of outcomes."""
+    return [e for o in outcomes if o.entries for e in o.entries]
 
 
 class Orchestrator:
@@ -62,6 +78,10 @@ class Orchestrator:
         self._explainer = QuestionExplainer()
         self._computer = ComputeExecutor()
         self._trace = QuestionTrace(question=ctx.question)
+        # Running record of per-branch outcomes across the initial plan +
+        # every replan round. The replanner reads `o.error` to surface
+        # failed branches back to the model for reformulation.
+        self._outcomes: list[BranchOutcome] = []
 
     @property
     def current_plan(self) -> Plan | None:
@@ -89,7 +109,8 @@ class Orchestrator:
             if not plan.branches:
                 raise StepFailed("orchestrator", "plan has no branches")
             concept_explanations = self._explain_concepts()
-            prev = self._run_branches(plan.branches)
+            self._outcomes = self._run_branches(plan.branches)
+            prev = _entries(self._outcomes)
 
             max_rounds = self._ctx.config.recovery_max_rounds
             for attempt in range(max_rounds + 1):
@@ -119,16 +140,20 @@ class Orchestrator:
         """One replan round: call planner.replan, diff branches, execute the
         additions, and adopt new computation/presentation. Re-raises the
         `MissingData` if the replanner produced no useful diff."""
+        failed_branches = [(o.branch, o.error) for o in self._outcomes if o.error]
         new_plan = self._run_op(
             "replanner",
             {
                 "prior_plan": plan,
                 "missing_reason": missing.reason,
                 "missing": missing.missing,
+                "failed_branches": failed_branches,
             },
             prev,
-            lambda prev, ctx, prior_plan, missing_reason, missing: (
-                self._planner.replan(ctx, prior_plan, prev, missing_reason, missing)
+            lambda prev, ctx, prior_plan, missing_reason, missing, failed_branches: (
+                self._planner.replan(
+                    ctx, prior_plan, prev, failed_branches, missing_reason, missing
+                )
             ),
         )
         new_branches = [b for b in new_plan.branches if b not in plan.branches]
@@ -146,7 +171,9 @@ class Orchestrator:
         self._current_plan = plan
         if new_branches:
             try:
-                prev = prev + self._run_branches(new_branches)
+                new_outcomes = self._run_branches(new_branches)
+                self._outcomes = [*self._outcomes, *new_outcomes]
+                prev = prev + _entries(new_outcomes)
             except StepFailed as e:
                 # All replan-added branches failed (e.g. extract returned []
                 # on every one). Don't discard the original `prev` — let the
@@ -189,17 +216,19 @@ class Orchestrator:
                     "lookup_external", {"branch": branch}, _NO_INPUT, self._looker.run
                 )
 
-    def _run_branches(self, branches: list[Branch]) -> list[AnnotatedValue]:
-        """Best-effort: drop failed branches, flatten survivors into one entry list.
-
-        Only re-raises if every branch failed; then the first error propagates.
-        Downstream compute() decides whether the survivors are sufficient (and may
-        raise MissingData, which propagates to the caller).
+    def _run_branches(self, branches: list[Branch]) -> list[BranchOutcome]:
+        """Run branches in parallel and return per-branch outcomes (one per
+        input branch, in the same order). Failures become `BranchOutcome`s
+        with `entries=None` / `error=<message>` so the replanner can see
+        them. Re-raises `StepFailed` only when EVERY branch failed — the
+        caller (`execute` initial run, or `_replan_round`) handles the
+        all-failed case as a hard step failure.
         """
         if len(branches) == 1:
-            return self._run_branch(branches[0])
-        results: list[Any] = [None] * len(branches)
-        errors: list[tuple[int, StepFailed]] = []
+            # Fast path: let StepFailed propagate (matches "all failed" for n=1).
+            entries = self._run_branch(branches[0])
+            return [BranchOutcome(branch=branches[0], entries=entries, error=None)]
+        outcomes: list[BranchOutcome | None] = [None] * len(branches)
         with ThreadPoolExecutor(
             max_workers=self._ctx.config.max_parallel_workers
         ) as pool:
@@ -209,16 +238,29 @@ class Orchestrator:
             for future in as_completed(futures):
                 i = futures[future]
                 try:
-                    results[i] = future.result()
+                    outcomes[i] = BranchOutcome(
+                        branch=branches[i], entries=future.result(), error=None
+                    )
                 except StepFailed as e:
-                    errors.append((i, e))
-        for i, e in errors:
-            self._ctx.emit(
-                "orchestrator", "parallel branch failed", branch_idx=i, error=str(e)
+                    self._ctx.emit(
+                        "orchestrator", "parallel branch failed",
+                        branch_idx=i, error=str(e),
+                    )
+                    outcomes[i] = BranchOutcome(
+                        branch=branches[i], entries=None, error=str(e),
+                    )
+        # All non-None at this point — the executor either filled an entries
+        # outcome or an error outcome for every future.
+        result = [o for o in outcomes if o is not None]
+        if all(o.error for o in result):
+            # Preserve the legacy "all failed → propagate" contract by
+            # raising the first error; the caller decides whether to mark
+            # the whole question as failed or just skip the wave.
+            raise StepFailed(
+                "orchestrator",
+                f"all {len(branches)} branches failed; first error: {result[0].error}",
             )
-        if len(errors) == len(branches):
-            raise errors[0][1]
-        return [entry for branch in results if branch is not None for entry in branch]
+        return result
 
 # TODO: why do we need prev? We should be able to collapse this into args? Also, overall "prev" is confusing named.
 #  You seem to always use it to mean "input from last step", but people can totally take it to mean "the previous run of this operator"

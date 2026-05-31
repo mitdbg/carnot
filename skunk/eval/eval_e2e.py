@@ -30,6 +30,7 @@ import random
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pandas as pd
@@ -221,6 +222,10 @@ def main() -> None:
     parser.add_argument("--include-test-set", action="store_true",
                         help="Include the held-out test-set UIDs (see CLAUDE.md). Default is to exclude "
                              "them — only opt in for a deliberate final-number measurement.")
+    parser.add_argument("--workers", type=int, default=32,
+                        help="UID-level concurrency (default: %(default)s). Each worker runs one "
+                             "_run_one_question independently; the process-level LLM rate limiter "
+                             "throttles cross-worker traffic to config.llm_rpm.")
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv)
@@ -259,16 +264,20 @@ def main() -> None:
               file=sys.stderr)
 
     sample_note = f" (sample: {args.sample})" if args.sample and not args.uids else ""
-    print(f"[e2e] Running {len(uids)} UID(s){sample_note}")
+    print(f"[e2e] Running {len(uids)} UID(s){sample_note} with --workers {args.workers}")
 
     golden_lookup = load_golden(args.csv) if args.golden else None
 
     verbose = not args.quiet
-    rows: list[dict] = []
-    for uid in uids:
+
+    def process_uid(uid: str) -> dict | None:
+        """Run one UID end-to-end. Returns a row dict, or None if the UID
+        is missing from the CSV (skip-with-warning, not fatal). Catches
+        and records uncaught exceptions so one runaway UID doesn't kill
+        the batch."""
         if uid not in df_by_uid.index:
             print(f"[e2e] WARNING: {uid!r} not found in {args.csv}", file=sys.stderr)
-            continue
+            return None
         row = df_by_uid.loc[uid]
         question = str(row["question"])
         gold_answer = row.get("answer")
@@ -295,7 +304,6 @@ def main() -> None:
                 trace_path=trace_path,
             )
         except Exception as e:
-            # Don't let one runaway UID kill the rest of the batch.
             import traceback as _tb
             tb_str = _tb.format_exc()
             print(f"[e2e] ABORTED UID {uid}: {type(e).__name__}: {e}", file=sys.stderr)
@@ -311,11 +319,11 @@ def main() -> None:
                      "reason": f"Uncaught: {type(e).__name__}: {e}", "n_steps": 0}
 
         if result["failed"]:
-            print(f"FAILED: {result['reason']}")
+            print(f"[e2e] {uid} FAILED: {result['reason']}")
         else:
-            print(f"Answer: {result['answer']}")
+            print(f"[e2e] {uid} Answer: {result['answer']}")
 
-        rows.append({
+        return {
             "uid": uid,
             "question": question,
             "predicted": result["answer"] if not result["failed"] else "",
@@ -323,7 +331,23 @@ def main() -> None:
             "failed": result["failed"],
             "reason": result["reason"] or "",
             "n_steps": result.get("n_steps", 0),
-        })
+        }
+
+    # Pre-allocate slots so the output CSV preserves the input UID order
+    # regardless of completion order under --workers > 1. The process-level
+    # rate limiter inside LLMClient throttles cross-worker traffic.
+    results: list[dict | None] = [None] * len(uids)
+    if args.workers <= 1:
+        for i, uid in enumerate(uids):
+            results[i] = process_uid(uid)
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(process_uid, uid): i for i, uid in enumerate(uids)}
+            for fut in as_completed(futures):
+                i = futures[fut]
+                results[i] = fut.result()
+
+    rows = [r for r in results if r is not None]
 
     out = Path(args.report)
     out.parent.mkdir(parents=True, exist_ok=True)

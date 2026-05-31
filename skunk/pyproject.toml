@@ -18,6 +18,7 @@ dependencies = [
     "pyyaml",
     "numpy",
     "statsmodels",
+    "tavily-python",
 ]
 
 [project.optional-dependencies]

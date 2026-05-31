@@ -16,7 +16,7 @@ class CatalogBuilder(Protocol):
     """Parse one bulletin's pages into PageCatalogRow list.
 
     `pages` is `{1-based PDF page index: list of parsed-JSON element dicts}`
-    as produced by `..pdf.read_page_elements`. The implementation is
+    as produced by `skunk.corpus.page_elements`. The implementation is
     expected to be deterministic — same input, same output.
     """
 

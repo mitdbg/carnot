@@ -42,9 +42,8 @@ from skunk.common import LLMClient, LLMResponse, load_env_file
 from skunk.config import SkunkConfig
 
 from .corpora import PROFILES, load_profile
-from .pdf import (
-    parsed_json_dir, pdf_dir_from_env, pdf_path_for, read_page_elements,
-    read_pdf_pages,
+from skunk.corpus import (
+    page_elements, page_text_tagged, parsed_json_dir, pdf_dir_from_env,
 )
 from .profile import CorpusProfile, StageError
 from .schema import PageCatalogRow
@@ -268,7 +267,7 @@ def stage_build_catalog(args: argparse.Namespace, profile: CorpusProfile) -> Non
 
     def _do_one(bulletin: str, pdf_path: Path):
         try:
-            pages = read_page_elements(pdf_path, parsed_dir=parsed_dir)
+            pages = page_elements(bulletin, base_dir=parsed_dir, fill_gaps=True)
             rows = builder.parse_bulletin(bulletin, pages)
             out_path = _persist_catalog(rows, out_dir)
             return bulletin, out_path, None
@@ -322,8 +321,7 @@ def stage_extract_l1(args: argparse.Namespace, profile: CorpusProfile) -> None:
 
     def _do_one(bulletin: str):
         try:
-            pdf_path = pdf_path_for(bulletin, args.pdf_dir)
-            pages_text = read_pdf_pages(pdf_path, parsed_dir=parsed_dir)
+            pages_text = page_text_tagged(bulletin, base_dir=parsed_dir)
             rows = catalog_by_bulletin[bulletin]
             spans = harvester.harvest_bulletin(
                 bulletin=bulletin, rows=rows,

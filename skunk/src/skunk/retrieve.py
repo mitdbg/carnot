@@ -4,9 +4,8 @@
 - `"search_agent"` (default) — the teammate's iterative ChromaDB +
   LLM-loop retriever, vendored under `skunk.search_agent`. Returns
   page keys; this module adapts them to `PageRef`.
-- `"page_index"` — the legacy chapter-pick + year-filter retriever
-  preserved under `skunk.page_index.retrieve_prototype` for
-  ablation/regression comparison.
+- `"page_index"` — the page-index retriever (ToC pick → year filter →
+  semantic filter) under `skunk.page_index.query`.
 
 `ctx.config.golden_pages` short-circuits both — for `--golden` eval
 runs the backend is never built.
@@ -34,7 +33,7 @@ class RetrieveExecutor:
         self._config = config
         self._agent = None                # skunk.search_agent.SearchAgent
         self._agent_lock = threading.Lock()
-        self._page_index_proto = None     # PageIndexRetrievePrototype
+        self._page_index = None           # PageIndexRetriever
 
     def run(self, ctx: HarnessContext, branch: RetrieveBranch) -> list[PageRef]:
         if ctx.config.golden_pages is not None:
@@ -101,19 +100,19 @@ class RetrieveExecutor:
             return self._agent
 
     # ------------------------------------------------------------------
-    # page_index backend (legacy prototype)
+    # page_index backend
     # ------------------------------------------------------------------
 
     def _run_page_index(
         self, ctx: HarnessContext, branch: RetrieveBranch
     ) -> list[PageRef]:
-        from skunk.page_index.retrieve_prototype import PageIndexRetrievePrototype
+        from skunk.page_index.query import PageIndexRetriever
 
-        if self._page_index_proto is None:
-            self._page_index_proto = PageIndexRetrievePrototype()
-        # PageIndexRetrievePrototype.run() takes (prev, ctx, *, branch);
+        if self._page_index is None:
+            self._page_index = PageIndexRetriever()
+        # PageIndexRetriever.run() takes (prev, ctx, *, branch);
         # call it directly with prev=None.
-        return self._page_index_proto.run(None, ctx, branch=branch)
+        return self._page_index.run(None, ctx, branch=branch)
 
 
 def _build_search_agent(config: SkunkConfig):

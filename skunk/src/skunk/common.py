@@ -3,10 +3,8 @@
 All LLM traffic goes through the direct Gemini API (AI Studio) via the
 `google-genai` SDK, authenticated by `GEMINI_API_KEY` from `.env`.
 
-Google Search grounding (used by `lookup_external`) is requested by passing
-`use_google_search=True` to `LLMClient.call`; AI Studio supplies it via
-`Tool(google_search=...)` with the same grounding-metadata shape as the
-Vertex endpoint.
+External-data lookups don't use Gemini's Google Search grounding tool
+(see `lookup_external.py` — code-as-proof via typed helpers + Tavily).
 
 Rate limiting
 -------------
@@ -35,7 +33,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -131,48 +129,6 @@ def parse_json_response(text: str) -> Any | None:
         return None
 
 
-def extract_grounding_urls(api_resp: Any) -> list[str]:
-    urls: list[str] = []
-    try:
-        gm = api_resp.candidates[0].grounding_metadata
-        if gm and gm.grounding_chunks:
-            for chunk in gm.grounding_chunks:
-                if chunk.web and chunk.web.uri:
-                    urls.append(chunk.web.uri)
-    except (IndexError, AttributeError):
-        pass
-    return urls
-
-
-def extract_grounding_titles(api_resp: Any) -> list[str]:
-    """Grounding chunk `web.title` values — typically the resolved source domain
-    (e.g. "macrotrends.net"), unlike the `uri` which is a Vertex redirect."""
-    titles: list[str] = []
-    try:
-        gm = api_resp.candidates[0].grounding_metadata
-        if gm and gm.grounding_chunks:
-            for chunk in gm.grounding_chunks:
-                if chunk.web and chunk.web.title:
-                    titles.append(chunk.web.title)
-    except (IndexError, AttributeError):
-        pass
-    return titles
-
-
-def extract_search_queries(api_resp: Any) -> list[str]:
-    """`web_search_queries` from grounding_metadata — populated whenever the
-    Google Search tool actually executed, even when Vertex returns no
-    `grounding_chunks`. Used as a 'search ran' signal independent of chunk
-    surfacing, which Vertex AI populates much less reliably than AI Studio."""
-    try:
-        gm = api_resp.candidates[0].grounding_metadata
-        if gm and gm.web_search_queries:
-            return list(gm.web_search_queries)
-    except (IndexError, AttributeError):
-        pass
-    return []
-
-
 def _get_rate_limiter(rpm: float) -> _RateLimiter:
     """Process-singleton rate limiter. Reset if rpm changes between calls."""
     global _RATE_LIMITER, _RATE_LIMITER_RPM
@@ -190,12 +146,6 @@ class LLMResponse:
     latency_s: float
     input_tokens: int | None
     output_tokens: int | None
-    grounding_urls: list[str] = field(default_factory=list)
-    grounding_titles: list[str] = field(default_factory=list)
-    # web_search_queries from Vertex grounding metadata. Populated whenever the
-    # Google Search tool actually fired; more reliable than grounding_urls /
-    # grounding_titles, which Vertex often omits even on grounded responses.
-    search_queries: list[str] = field(default_factory=list)
 
 
 def _make_genai_client() -> genai.Client:
@@ -208,8 +158,7 @@ def _make_genai_client() -> genai.Client:
 
 
 class LLMClient:
-    """LLM client. All calls go through AI Studio (direct Gemini API);
-    `use_google_search=True` attaches the GoogleSearch grounding tool."""
+    """LLM client. All calls go through AI Studio (direct Gemini API)."""
 
     def __init__(self, config: SkunkConfig) -> None:
         self._config = config
@@ -227,13 +176,12 @@ class LLMClient:
         images: list[tuple[str, str]] | None = None,
         temperature: float = 0.0,
         effort: "Effort" = "off",
-        use_google_search: bool = False,
         ctx: "HarnessContext | None" = None,
     ) -> LLMResponse:
         if effort not in _EFFORT_VALUES:
             raise ValueError(f"effort must be one of {_EFFORT_VALUES}, got {effort!r}")
         return self._call_gemini(
-            system, user, images, temperature, effort, ctx, with_search=use_google_search,
+            system, user, images, temperature, effort, ctx,
         )
 
     def _retry_call(self, do_call: "Callable[[], LLMResponse]") -> LLMResponse:
@@ -272,10 +220,9 @@ class LLMClient:
         model: str = "gemini-embedding-001",
         batch_size: int = 100,
     ) -> list[list[float]]:
-        """Batched embedding via Vertex AI. Build-time only — used by
-        `page_index.embed_cluster` for L1-bucket clustering at corpus-build
-        time. The retrieval path is embedding-free; do not wire this into
-        per-query code.
+        """Batched embedding via Vertex AI. Build-time / offline corpus-prep
+        only. The page-index query path is embedding-free; do not wire this
+        into per-query code.
 
         `task_type` defaults to "CLUSTERING" per Google's docs. Output is
         L2-unnormalized; callers L2-normalize before cosine. Input is
@@ -336,15 +283,12 @@ class LLMClient:
         system: str,
         temperature: float,
         effort: "Effort",
-        *,
-        with_search: bool,
     ) -> "types.GenerateContentConfig":
         return types.GenerateContentConfig(
             system_instruction=system,
             max_output_tokens=65535,
             temperature=temperature,
             thinking_config=LLMClient._effort_to_thinking_config(effort),
-            tools=[types.Tool(google_search=types.GoogleSearch())] if with_search else None,
         )
 
     def _call_gemini(
@@ -355,16 +299,11 @@ class LLMClient:
         temperature: float,
         effort: "Effort",
         ctx: "HarnessContext | None",
-        *,
-        with_search: bool,
     ) -> LLMResponse:
-        """Vertex AI Gemini call. `with_search=True` attaches the Google Search
-        grounding tool and surfaces grounding metadata on the response."""
+        """Gemini call via the direct API (AI Studio)."""
         client = self._get_gemini_client()
         parts = self._gemini_parts(user, images)
-        gen_config = self._gemini_config(
-            system, temperature, effort, with_search=with_search
-        )
+        gen_config = self._gemini_config(system, temperature, effort)
         model = self._config.llm_model
 
         def do() -> LLMResponse:
@@ -394,9 +333,6 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=getattr(usage, "prompt_token_count", None),
                 output_tokens=getattr(usage, "candidates_token_count", None),
-                grounding_urls=extract_grounding_urls(api_resp) if with_search else [],
-                grounding_titles=extract_grounding_titles(api_resp) if with_search else [],
-                search_queries=extract_search_queries(api_resp) if with_search else [],
             )
 
         return self._retry_call(do)

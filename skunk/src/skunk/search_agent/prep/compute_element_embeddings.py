@@ -21,7 +21,6 @@ Usage:
 
 import argparse
 import glob
-import html as _html
 import json
 import os
 import random
@@ -35,6 +34,7 @@ import numpy as np
 from google import genai
 from google.genai import types as genai_types  # noqa: F401
 from skunk.common import _make_genai_client
+from skunk.corpus import preprocess_text
 
 # Gemini Embedding 2 Preview context limit (tokens).
 MAX_TOKENS = 8192
@@ -45,50 +45,6 @@ CHARS_PER_TOKEN = 3
 CHUNK_CHARS = CHUNK_TOKENS * CHARS_PER_TOKEN
 MAX_ATTEMPTS = 6
 MODEL_NAME = "gemini-embedding-2"  # Vertex AI model ID
-
-_MULTI_NL_RE = re.compile(r"\n{3,}")
-_TD_RE = re.compile(r"<t[dh][^>]*>(.*?)</t[dh]>", re.DOTALL)
-_HTML_TAG_RE = re.compile(r"<[^>]+>")
-_LONG_DOTS_RE = re.compile(r"\.{4,}")
-# Matches four-digit years in the range 1776–2026 as whole tokens.
-_YEAR_RE = re.compile(r"\b(177[6-9]|17[89]\d|1[89]\d\d|200\d|201\d|202[0-6])\b")
-
-
-def preprocess_text(text: str, elt_type: str, strip_years: bool = False) -> str:
-    """Preprocess element text for embedding.
-
-    For table elements: strips all HTML tags, drops purely-numeric cells
-    (page numbers), and joins remaining cell text with spaces.
-    For all elements: collapses 3+-newline runs and removes dot-leader
-    sequences (4 or more consecutive periods).
-    If *strip_years* is True, removes all four-digit years in the range
-    1776–2026 from every element type.
-    """
-    if elt_type == "table":
-        cells = [_HTML_TAG_RE.sub("", _html.unescape(m.group(1))).strip() for m in _TD_RE.finditer(text)]
-        cells = [c for c in cells if not re.fullmatch(
-            r"[+\-]?\$\s*[\d,]+(\.\d+)?%?"  # $1,234.56 / $ 194.3
-            r"|[+\-]?[\d,]+(\.\d+)?%?"       # 1,234 / 3.5 / 50%
-            r"|\d[\d,]*[\/\-]\d[\d,]*"        # 4-5 / 283/444
-            r"|\$\s*-+"                        # $ -- / $ -
-            r"|\$\s*\.\d+"                     # $ .6 / $.1
-            r"|\.\d+"                          # .6 / .2 (bare decimals)
-            r"|\*+"                            # * / ** (footnote markers)
-            r"|-{2,}",                         # -- / --- (dash placeholders)
-            c
-        )]
-        text = " ".join(cells)
-    else:
-        text = _MULTI_NL_RE.sub("\n\n", text)
-
-    # Remove dot-leader runs (4+ consecutive periods) from all element types.
-    text = _LONG_DOTS_RE.sub("", text)
-
-    if strip_years:
-        text = _YEAR_RE.sub("", text)
-
-    return text.strip()
-
 
 def _chunk_by_chars(text: str, chunk_chars: int) -> list[str]:
     """Split *text* into non-overlapping chunks of <= chunk_chars characters."""

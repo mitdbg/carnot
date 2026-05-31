@@ -41,7 +41,7 @@ The benchmark is `data/officeqa_pro.csv` (133 questions: **101 dev + 32 test**; 
 - Question → planner emits DSL plan (text) → orchestrator walks AST → 4 operators.
 - 4 ops: `retrieve`, `extract`, `lookup_external`, `compute`. `compute` is the chain terminator and subsumes formatting (it self-plans, codegens, execs, then self-critiques the result against the question with full context — same domain prompt as the producer, no info asymmetry). `extract` accepts `visual_only=True` to skip the parsed-text tier for charts and figures.
 - Extract emits one of three **kinds** per entry: `scalar`, `vector` (1-D series indexed by one dim), or `table` (2-D grid). Vector/table cells are always primitive scalars — nesting is forbidden and enforced in the extract parser. See the "Plan shape" section in `ARCHITECTURE.md` for the contract.
-- Retrieval is **page-level**: `PageRef.page` is the **1-based PDF page index** — the only page-number convention used in the codebase. `RetrieveExecutor` in `src/skunk/retrieve.py` is a dispatcher: golden bypass first (when `ctx.config.golden_pages` is set), then routes to one of two backends per `config.retriever`: `"search_agent"` (default — the iterative ChromaDB + LLM-loop retriever vendored under `src/skunk/search_agent/`, returns page keys that are mapped to `PageRef` via `models.page_key_to_pageref`) or `"page_index"` (the legacy chapter-pick + year-filter retriever preserved at `src/skunk/page_index/retrieve_prototype.py:PageIndexRetrievePrototype` for ablations). The search agent needs `cache/chromadb/` + `cache/clean_page_map.json` built offline (see `src/skunk/search_agent/prep/`); first non-golden call fails fast with a clear error if either is missing.
+- Retrieval is **page-level**: `PageRef.page` is the **1-based PDF page index** — the only page-number convention used in the codebase. `RetrieveExecutor` in `src/skunk/retrieve.py` is a dispatcher: golden bypass first (when `ctx.config.golden_pages` is set), then routes to one of two backends per `config.retriever`: `"search_agent"` (default — the iterative ChromaDB + LLM-loop retriever vendored under `src/skunk/search_agent/`, returns page keys that are mapped to `PageRef` via `models.page_key_to_pageref`) or `"page_index"` (the page-index retriever at `src/skunk/page_index/query.py:PageIndexRetriever` — ToC chapter pick → year filter → two-stage parallel semantic filter). The search agent needs `cache/chromadb/` + `cache/clean_page_map.json` built offline (see `src/skunk/search_agent/prep/`); first non-golden call fails fast with a clear error if either is missing.
 - Extract is per-page tier dispatch: parsed-table text → vision render. No cross-page search.
 - See `ARCHITECTURE.md` for design intent + plan shape; the canonical JSON-schema spec for plans lives in `PlannerPromptedCall.system_prompt` in `src/skunk/plan.py`.
 
@@ -60,7 +60,8 @@ The agent has no CLI of its own. Public API is `from skunk import Orchestrator, 
 - `src/skunk/common.py` — shared runtime: `LLMClient` (OpenRouter + direct-Gemini), `LLMResponse`, rate-limit + retry helpers
 - `src/skunk/config.py` — `SkunkConfig` (model, RPM, retry, extract/compute knobs)
 - `src/skunk/prompt_overrides.py` — `PromptOverride` YAML loader for corpus / few-shots / lessons
-- `src/skunk/page_index/` — page-index builder (`pipeline.py`) + runtime helpers (`retrieve_probe`, `period`, `pdf`) + `retrieve_prototype.py` (legacy retrieve operator preserved as `PageIndexRetrievePrototype`)
+- `src/skunk/corpus.py` — unified corpus access (paths, parsed-JSON loading + per-page element index, PyMuPDF page rendering, text-cleaning primitives). Every consumer — `extract`, the `page_index` build pipeline and `query_semfilter`, and the `search_agent/prep/` scripts — reads the corpus through this one module.
+- `src/skunk/page_index/` — split into a **build pipeline** (`pipeline.py` + `stages/` + `corpora/`, produces the catalog + concept tree) and a **query path** (`query.py` = `PageIndexRetriever`; `query_toc.py` = ToC chapter pick; `query_semfilter.py` = two-stage parallel semantic filter), over shared base modules (`schema.py`, `util.py`, `profile.py`) and the top-level `corpus.py` for corpus I/O. Query pipeline: ToC pick → year filter → semantic filter → candidate set.
 - `src/skunk/search_agent/` — teammate's iterative search agent merged from `refs/heads/skunk`. Self-contained subtree: `search_agent.py` (the agent), `search_tools.py` (`vector_search` / `retrieve_page_info` / `run_grep` / `final_answer`), `prompts.yaml`, `tracer.py`, `utils/local_python_executor.py` (smolagents fork) + `utils/parsing.py`, `openrouter_client.py` (local shim around the `openai` SDK — stands in for the unknown `openrouter` PyPI package the teammate imported), `prep/` (offline corpus prep: `page_cleaner.py`, `create_vector_db.py`, `compute_element_embeddings.py`). See ARCHITECTURE.md "TODO after merge" for the planned utility unification (LLM client, code executor, tracer).
 - `eval/` — `eval_e2e.py` (end-to-end harness); `util.py` for plan-cache + trace-dump helpers; `test_set_uids.json` for the held-out filter
 
@@ -72,9 +73,11 @@ The agent has no CLI of its own. Public API is `from skunk import Orchestrator, 
 
 ## API keys / GCP setup (.env at repo root)
 
-All LLM calls (planner, retrieve, extract, compute, lookup_external — including
-the Google Search grounding path) go through **GCP Vertex AI** via the
-`google-genai` SDK. See `src/skunk/common.py` docstring for the routing.
+All LLM calls (planner, retrieve, extract, compute, lookup_external) go
+through **GCP Vertex AI** via the `google-genai` SDK. See `src/skunk/common.py`
+docstring for the routing. `lookup_external` is code-as-proof only — no
+Google Search grounding; the model writes Python calling typed helpers
+(FRED / BLS / World Bank / Tavily).
 
 Setup:
 1. `gcloud auth application-default login` — sets up Application Default Credentials
@@ -85,7 +88,7 @@ Default model is `gemini-3.5-flash` (`config.llm_model`, overridable via
 `SKUNK_LLM_MODEL`). Use bare Vertex model names — do not include the `google/`
 OpenRouter-style prefix.
 
-Optional: `FRED_API_KEY` for the FRED tier of `lookup_external`. `.env.example` is committed; copy to `.env` and fill in.
+Strongly recommended: `FRED_API_KEY` (FRED helper) and `TAVILY_API_KEY` (web-search helper) for `lookup_external`. `.env.example` is committed; copy to `.env` and fill in.
 
 ## Data corpus (NOT in this repo)
 

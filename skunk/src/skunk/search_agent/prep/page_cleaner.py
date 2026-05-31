@@ -1,15 +1,14 @@
 import argparse
-import base64
 import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import fitz
 from tqdm import tqdm
 
 from skunk.common import LLMClient
 from skunk.config import SkunkConfig
+from skunk.corpus import render_page_b64
 
 MAX_RETRIES = 3
 MAX_WORKERS = 64
@@ -59,15 +58,6 @@ def _create_element_display_texts(page_elements):
 
     return display_texts
 
-def _render_pdf_page_b64(year, month, page_id, pdfs_dir, dpi=75):
-    """Render a single PDF page (1-indexed page_id) and return a base64 JPEG string."""
-    pdf_path = os.path.join(pdfs_dir, f"treasury_bulletin_{year}_{month}.pdf")
-    doc = fitz.open(pdf_path)
-    page = doc[int(page_id) - 1]  # fitz is 0-indexed; page_id may be a string
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    pix = page.get_pixmap(matrix=mat)
-    return base64.b64encode(pix.tobytes("jpg", jpg_quality=60)).decode()
-
 def clean_page(page_key, page_elements, pdfs_dir, llm: LLMClient) -> tuple[str, list[int]] | tuple[None, None]:
     # if the page has a single element, we can skip the LLM and just return that element's content as the clean page text
     if len(page_elements) == 1:
@@ -85,7 +75,11 @@ def clean_page(page_key, page_elements, pdfs_dir, llm: LLMClient) -> tuple[str, 
 
         # get the b64 encoded image of the page
         year, month, page_id = page_key.split("-")
-        pdf_b64 = _render_pdf_page_b64(year, month, page_id, pdfs_dir)
+        rendered = render_page_b64(
+            f"{year}-{month}", int(page_id),
+            dpi=75, fmt="jpg", jpg_quality=60, pdf_dir=pdfs_dir,
+        )
+        pdf_b64 = rendered[1] if rendered else None
 
         # Conversation state: prior assistant/user pairs are appended to
         # user_text on each retry so the model sees the full feedback chain.

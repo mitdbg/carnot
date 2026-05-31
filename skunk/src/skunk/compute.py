@@ -19,6 +19,7 @@ Two LLM contracts:
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
@@ -27,7 +28,7 @@ from skunk.common import Effort, strip_code_fence
 from skunk.errors import MissingData, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.models import AnnotatedValue, HarnessContext
-from skunk.plan import Plan
+from skunk.plan import Plan, Presentation
 from skunk.pyexec import exec_python_with_env
 from skunk.question_explainer import ConceptExplanation
 
@@ -312,18 +313,19 @@ class CritiquePromptedCall(PromptedCall):
     name: str = "compute.critique"
     default_effort = "medium"
     system_prompt: str = """\
-You review code another agent wrote and the string it produced.
+You review code against ONE specific constraint from the plan.
 Decide accept or revise.
 
 ## Inputs
 
-Question, `computation` and `presentation` JSON (treat them as a
-checklist: each field is a constraint the result must satisfy),
-the full `prev` summary (every non-scalar entry rendered with every
-row and column its `.frame` contains, alongside kind/axis/unit
-metadata — this is the same data the code consumed, not a preview,
-so you can spot-check individual cells the code touched), the
-Python that ran, and the produced `result`.
+- Question — context for what the agent is answering.
+- One specific constraint — either a qualifier phrase or the
+  presentation block. This is the ONLY constraint you are checking.
+  Other constraints are someone else's job — do not flag issues
+  outside this one.
+- `prev` summary — the data the code consumed (full, every row/col).
+- The Python code that ran.
+- The produced `result` string.
 
 ## Output format
 
@@ -331,44 +333,28 @@ A single bare JSON object. No fences, no prose. Exactly one of:
 
   {"verdict": "accept"}
   {"verdict": "revise",
-   "reason": "<short reasons why the previous agent was incorrect and issues a re-run should address>"}
+   "reason": "<short, specific reason tied to THIS constraint>"}
 
-## Revise if
-
-- A numeric modifier from the question (e.g. signed vs absolute,
-  per-capita, percent vs decimal, compound vs simple growth) is
-  missing or applied only in a comment. A result whose magnitude or
-  sign disagrees with the question under its modifiers is a strong
-  signal.
-- The question names a specific statistical operation and the code
-  uses a related-but-different formula. Reason format:
-  "code uses <X> but question asks for <named operation>".
-- A description substring used to pick entries from `prev` is not
-  distinctive and could collide with another entry.
-- A required unit conversion is missing or applied cell-by-cell.
-- The result form contradicts the question (wanted "[a, b]" but
-  shipped "1.0 2.0"; wanted percent but shipped 0.1234), wraps a
-  single value in prose, or doesn't match answer_form / precision.
-- The result contradicts the cells visible in `prev`: code sliced
-  the frame in a way that included/excluded the wrong rows or
-  columns, summed the wrong group, or produced a magnitude that
-  can't be reconciled with the printed values. Use `prev` as the
-  ground truth and walk the code's slice against it.
+Accept iff the code AND result honor your assigned constraint.
+Revise otherwise. Be specific about what the code did wrong in your
+reason.
 {{ default_tail }}"""
-    def critique(
+    def _decide(
         self,
         ctx: HarnessContext,
-        plan: Plan,
+        question: str,
+        focus_block: str,
         prev: list[AnnotatedValue],
         code: str,
         result_text: str,
     ) -> tuple[bool, str]:
-        """Same-actor review of (code, result). Returns (accept, reason).
-        Malformed reply → REVISE with diagnostic reason (never silently accept)."""
+        """Shared body for the focused critique. `focus_block` is the
+        already-formatted "Constraint to check (...): ..." line(s).
+        Returns (accept, reason). Malformed reply → REVISE with diagnostic
+        reason (never silently accept)."""
         user = (
-            f"Question:\n{ctx.question}\n\n"
-            f"computation = {plan.computation.model_dump_json()}\n"
-            f"presentation = {plan.presentation.model_dump_json()}\n\n"
+            f"Question:\n{question}\n\n"
+            f"{focus_block}\n\n"
             f"prev =\n{prev_desc(prev, full=True)}\n\n"
             f"Code that ran:\n```python\n{code}\n```\n\n"
             f"Produced result:\n{result_text}\n\n"
@@ -376,7 +362,6 @@ A single bare JSON object. No fences, no prose. Exactly one of:
         )
         resp = self.call(ctx, user)
         raw = resp.text
-        ctx.emit("compute", "self-critique response", raw=raw)
         try:
             verdict = CritiqueResult.model_validate_json(strip_code_fence(raw))
         except ValidationError as e:
@@ -385,6 +370,35 @@ A single bare JSON object. No fences, no prose. Exactly one of:
             return True, ""
         return False, verdict.reason
 
+    def critique_qualifier(
+        self,
+        ctx: HarnessContext,
+        question: str,
+        qualifier: str,
+        prev: list[AnnotatedValue],
+        code: str,
+        result_text: str,
+    ) -> tuple[bool, str]:
+        """Focused critique against a single qualifier phrase."""
+        focus = f"Constraint to check (a qualifier):\n{qualifier}"
+        return self._decide(ctx, question, focus, prev, code, result_text)
+
+    def critique_presentation(
+        self,
+        ctx: HarnessContext,
+        question: str,
+        presentation: "Presentation",
+        prev: list[AnnotatedValue],
+        code: str,
+        result_text: str,
+    ) -> tuple[bool, str]:
+        """Focused critique against the presentation block."""
+        focus = (
+            "Constraint to check (the presentation block):\n"
+            f"{presentation.model_dump_json()}"
+        )
+        return self._decide(ctx, question, focus, prev, code, result_text)
+
 
 class ComputeExecutor:
     """Unified codegen → exec → critique loop. One public `run()`."""
@@ -392,6 +406,50 @@ class ComputeExecutor:
     def __init__(self) -> None:
         self._codegen = CodegenPromptedCall()
         self._critique = CritiquePromptedCall()
+
+    def _critique_parallel(
+        self,
+        ctx: HarnessContext,
+        plan: Plan,
+        prev: list[AnnotatedValue],
+        code: str,
+        result: str,
+    ) -> tuple[bool, str]:
+        """Fan out N+1 focused critiques in parallel — one per
+        `plan.computation.qualifiers[i]`, plus one for the entire
+        `plan.presentation` block. Any REVISE → overall REVISE with
+        the per-focus reasons concatenated. ALL ACCEPT → overall ACCEPT.
+        Pattern mirrors `Orchestrator._run_branches`."""
+        qualifiers = plan.computation.qualifiers
+        n_calls = len(qualifiers) + 1
+        ctx.emit("compute", "critique fan-out", n_calls=n_calls)
+        revises: list[tuple[str, str]] = []  # (focus_label, reason), in completion order
+        with ThreadPoolExecutor(
+            max_workers=ctx.config.max_parallel_workers
+        ) as pool:
+            futs: dict = {}
+            for q in qualifiers:
+                f = pool.submit(
+                    self._critique.critique_qualifier,
+                    ctx, ctx.question, q, prev, code, result,
+                )
+                futs[f] = ("qualifier", q)
+            f = pool.submit(
+                self._critique.critique_presentation,
+                ctx, ctx.question, plan.presentation, prev, code, result,
+            )
+            futs[f] = ("presentation", "presentation")
+            for fut in as_completed(futs):
+                kind, label = futs[fut]
+                try:
+                    accept, reason = fut.result()
+                except Exception as e:
+                    accept, reason = False, f"critique error: {e}"
+                if not accept:
+                    revises.append((f"{kind} '{label}'", reason))
+        if not revises:
+            return True, ""
+        return False, "; ".join(f"{label}: {reason}" for label, reason in revises)
 
     def run(
         self,
@@ -479,9 +537,7 @@ class ComputeExecutor:
                 text=result,
             )
 
-            accept, reason = self._critique.critique(
-                ctx, plan, prev, code, result
-            )
+            accept, reason = self._critique_parallel(ctx, plan, prev, code, result)
             if accept:
                 ctx.emit(
                     "compute",

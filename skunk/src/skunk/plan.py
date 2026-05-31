@@ -163,7 +163,8 @@ retrieve branch fields:
 lookup_external branch fields:
   target        natural-language request for a single external value (e.g. "U.S. CPI-U for July 1953",
                 "JPY/USD spot rate on 2010-06-30"). Use only for values that the corpus is unlikely to carry or when explicitly instructed to do so.
-  src           natural-language description of the source, only if the question explicitly asks for one (e.g. "Bureau of Labor Statistics").
+  src           Set to a publisher name if and only if the question names a
+                single, unambiguous external source. Otherwise null.
 
 computation fields:
   task        Natural language describing the calculation to carry out
@@ -209,14 +210,33 @@ Produce the Plan JSON. Output a single bare JSON object. No markdown fences. No 
         ctx: HarnessContext,
         prior_plan: Plan,
         prev: list[AnnotatedValue],
+        failed_branches: list[tuple["Branch", str]],
         missing_reason: str,
         missing: list[str],
     ) -> Plan:
         """Re-plan after compute reported MissingData. Same JSON schema as
         `plan()`; the orchestrator diffs the returned branches against
         `prior_plan.branches` and executes only the additions. `computation`
-        / `presentation` from the result fully replace the prior values."""
+        / `presentation` from the result fully replace the prior values.
+
+        `failed_branches` lists the prior branches whose execution raised
+        `StepFailed` (their output is NOT in `prev`); the model can retry
+        them by emitting structurally-different replacements (reworded
+        `target`, different `src`, etc.)."""
         from skunk.compute import prev_desc
+
+        if failed_branches:
+            lines = [
+                f"  - {branch.model_dump_json(exclude_none=True)} → ERROR: "
+                f"{err.splitlines()[0][:300] if err else 'unknown'}"
+                for branch, err in failed_branches
+            ]
+            failed_section = (
+                "\nBranches that FAILED in the prior run (their output is NOT in prev):\n"
+                + "\n".join(lines) + "\n"
+            )
+        else:
+            failed_section = ""
 
         base_user_message = f"""\
 Question: {ctx.question}
@@ -229,19 +249,27 @@ prior_plan = {prior_plan.model_dump_json()}
 
 prev (data already gathered, will be reused):
 {prev_desc(prev)}
-
+{failed_section}
 compute reported MISSING DATA:
   description: {missing_reason}
   missing:     {missing!r}
 
-Emit an UPDATED plan in the same JSON schema. The orchestrator will:
-  - execute only the branches you ADD (any branch already present in
-    prior_plan.branches is skipped — its output is already in `prev`),
-  - replace `computation` and `presentation` with whatever you emit.
+Emit an UPDATED plan in the same JSON schema. The orchestrator will execute
+only the branches you ADD (structurally-different from prior_plan.branches);
+exact duplicates are skipped. `computation` / `presentation` from the result
+fully replace the prior values.
 
 Guidance:
-  - If only inputs are missing, keep prior_plan.branches verbatim and
-    APPEND the new retrieve/lookup branches that close the gap.
+  - Successful branches in prior_plan are already in `prev` — do not
+    re-emit them verbatim (the orchestrator drops exact duplicates).
+  - For FAILED branches listed above, retry by emitting a NEW branch
+    with a different formulation: rephrase `target` (more specific
+    publisher, alternate series name), set or change `src`, or switch
+    branch kind (e.g. `lookup_external` → `retrieve` if the corpus may
+    carry it). Vary the wording so the new branch is structurally
+    distinct from the failed one — identical re-emissions are dropped.
+  - If only inputs are missing and prior branches all succeeded, APPEND
+    new retrieve/lookup branches that close the gap.
   - If the missing-data signal reveals the calculation itself was
     misframed (e.g. a qualifier was misinterpreted), additionally
     revise `computation` / `presentation`.

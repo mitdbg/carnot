@@ -1,20 +1,25 @@
-"""Prototype page-index retriever — preserved while we integrate an
-external retrieve implementation. Not wired into `Orchestrator` by
-default; use it directly for regression comparison or to keep BM25
-/ year-filter experiments alive.
+"""Page-index retriever — the query path over the offline-built index.
 
-Two-step deterministic-after-LLM pipeline:
+One of the two retrieval methods (`config.retriever == "page_index"`;
+the other is the iterative `search_agent`). Three deterministic passes
+after the catalog/concept-tree are loaded:
 
-  1. L1 chapter pick (one LLM call) — chooses a canonical chapter from
-     the concept tree given the branch's question/key/period.
-  2. Date filter (deterministic) — drops chapter pages whose
-     structured `dates` (verbatim strings parsed back into ISO intervals)
-     don't intersect any of the period's intervals. Pages without dates
-     are kept (recall safety net). No-op when the period is unparseable.
+  1. ToC chapter pick (one LLM call) — picks up to two canonical
+     chapter(s) from the concept tree given the branch's question / key /
+     period; every page under them becomes a candidate. See
+     `page_index.query_toc`.
+  2. Year filter (deterministic) — drops candidate pages whose structured
+     `dates` (verbatim strings parsed back into ISO intervals) don't
+     intersect any of the period's intervals. Pages without dates are
+     kept (recall safety net). No-op when the period is unparseable.
+  3. Semantic filter (coarse → fine, parallel) — prunes the survivors to
+     a tight candidate set. See `page_index.query_semfilter`. Gated on
+     `config.semfilter_enabled` (off = ToC + year-filter only, for
+     ablation).
 
-Optional BM25 rerank (default OFF; gated on `ctx.config.bm25_enabled`)
-runs after the year filter. The period parser is supplied by the active
-corpus profile (default: treasury; override via `SKUNK_CORPUS_PROFILE`).
+The period parser is supplied by the active corpus profile (default:
+treasury; override via `SKUNK_CORPUS_PROFILE`). Golden bypass is handled
+one level up in `RetrieveExecutor`, so it isn't repeated here.
 """
 
 from __future__ import annotations
@@ -29,9 +34,8 @@ from skunk.errors import StepFailed
 from skunk.models import HarnessContext, PageRef
 from skunk.plan import RetrieveBranch
 from skunk.page_index import default_profile
-from skunk.page_index.bm25 import Bm25Index
-from skunk.page_index.bm25_runtime import bm25_rerank, build_chapter_index
-from skunk.page_index.retrieve_probe import (
+from skunk.page_index.query_semfilter import semantic_filter
+from skunk.page_index.query_toc import (
     load_catalog,
     load_concept_tree,
     one_shot_parent_chapter_retrieve,
@@ -39,15 +43,16 @@ from skunk.page_index.retrieve_probe import (
 from skunk.page_index.schema import PageCatalogRow
 
 
-class PageIndexRetrievePrototype:
-    """Page-index retrieval prototype. One instance per orchestrator;
+class PageIndexRetriever:
+    """Page-index retrieval method. One instance per orchestrator;
     catalog/concept-tree are lazy-loaded and cached per-instance behind a
     lock so a parallel branch fan-out doesn't load the index twice.
 
-    Not a `PromptedCall` subclass — the only LLM call (the L1 chapter
-    pick) is owned by `page_index.retrieve_probe`, which has its own
-    static prompt. This class is the operator-level orchestrator: catalog
-    loading, year-window filter, BM25 rerank, golden-bypass.
+    Not a `PromptedCall` subclass — the only operator-owned LLM call (the
+    ToC chapter pick) lives in `page_index.query_toc`, which has its own
+    static prompt; the semantic filter's calls live in
+    `page_index.query_semfilter`. This class is the operator-level
+    orchestrator: catalog loading, year filter, and stage sequencing.
     """
 
     def __init__(self) -> None:
@@ -58,41 +63,6 @@ class PageIndexRetrievePrototype:
             Path,
             tuple[dict[str, Any], dict[tuple[str, int], PageCatalogRow]],
         ] = {}
-        # BM25 scaffold (default OFF; gated on ctx.config.bm25_enabled).
-        # Per-chapter index built lazily on first hit. Per-chapter lock so
-        # different chapters can build in parallel.
-        self._bm25_cache: dict[tuple[Path, str], Bm25Index] = {}
-        self._bm25_locks_master = threading.Lock()
-        self._bm25_locks: dict[tuple[Path, str], threading.Lock] = {}
-
-    def _bm25_chapter_lock(self, key: tuple[Path, str]) -> threading.Lock:
-        with self._bm25_locks_master:
-            lock = self._bm25_locks.get(key)
-            if lock is None:
-                lock = threading.Lock()
-                self._bm25_locks[key] = lock
-            return lock
-
-    def _get_bm25_index(
-        self,
-        catalog_dir: Path,
-        chapter: str,
-        tree: dict[str, Any],
-        catalog_index: dict[tuple[str, int], PageCatalogRow],
-    ) -> Bm25Index:
-        """Lazy-build a per-chapter BM25 index. Cached on this executor."""
-        key = (catalog_dir.resolve(), chapter)
-        cached = self._bm25_cache.get(key)
-        if cached is not None:
-            return cached
-        with self._bm25_chapter_lock(key):
-            cached = self._bm25_cache.get(key)
-            if cached is not None:
-                return cached
-            pages = tree.get("chapters", {}).get(chapter, {}).get("pages", [])
-            idx = build_chapter_index(pages, catalog_index)
-            self._bm25_cache[key] = idx
-            return idx
 
     def _catalog_dir(self) -> Path:
         """Resolve the page-index catalog directory.
@@ -143,7 +113,6 @@ class PageIndexRetrievePrototype:
         Pages with no dates and pages whose dates all fail to parse are
         kept — recall safety net for ToC / continuation pages and pages
         that survived catalog build with an unrecognized date shape.
-        Strict mode (drop those too) belongs behind a flag if we want it.
         No-op when the period is unparseable.
         """
         period_intervals = self._period_parser.intervals(period)
@@ -162,12 +131,6 @@ class PageIndexRetrievePrototype:
         return kept
 
     def run(self, prev: None, ctx: HarnessContext, *, branch: RetrieveBranch) -> list[PageRef]:
-        if ctx.config.golden_pages is not None:
-            ctx.emit("retrieve", "golden bypass",
-                     n_pages=len(ctx.config.golden_pages),
-                     refs=[str(r) for r in ctx.config.golden_pages])
-            return ctx.config.golden_pages
-
         key, period = branch.key, branch.period
         catalog_dir = self._catalog_dir()
 
@@ -180,37 +143,26 @@ class PageIndexRetrievePrototype:
                 "pipeline first.",
             ) from e
 
-        # 1. L1 chapter pick. (`concept=` is the helper's internal kwarg name;
-        # we pass the NL `key` through unchanged.)
+        # 1. ToC chapter pick. (`concept=` is the helper's internal kwarg
+        # name; we pass the NL `key` through unchanged.)
         chapter_top, trace = one_shot_parent_chapter_retrieve(
             tree, question=ctx.question, concept=key, period=period,
             llm=ctx.llm_client, catalog_index=catalog_index,
         )
 
-        # 2. Year-window filter.
+        # 2. Year filter.
         filtered = self._year_filter(chapter_top, catalog_index, period)
 
-        # 3. Optional BM25 rerank (scaffold, default OFF — see SkunkConfig).
-        # Only runs when the flag is set and the LLM actually picked a
-        # chapter (otherwise there's nothing to score against).
-        bm25_meta: dict[str, Any] = {"enabled": False}
-        if ctx.config.bm25_enabled and filtered and trace.picked_chapters:
-            try:
-                # Use the first picked chapter for the BM25 index. The
-                # tree-page list of that chapter is a superset of `filtered`,
-                # so the index covers every candidate page.
-                index = self._get_bm25_index(
-                    catalog_dir, trace.picked_chapters[0], tree, catalog_index,
-                )
-                filtered, bm25_meta = bm25_rerank(
-                    filtered, index, question=ctx.question, key=key,
-                    top_k=ctx.config.bm25_top_k,
-                    threshold=ctx.config.bm25_dominance_threshold,
-                )
-            except Exception as e:
-                # Scaffold safety: a BM25 failure must not break the
-                # baseline path. Surface in the trace and pass through.
-                bm25_meta = {"enabled": True, "error": f"{type(e).__name__}: {e}"}
+        # 3. Semantic filter (coarse → fine), unless disabled for ablation.
+        sem_meta: dict[str, Any] = {"enabled": False}
+        if ctx.config.semfilter_enabled and filtered:
+            survivors = [(c["bulletin"], int(c["page"])) for c in filtered]
+            kept_keys, sem_meta = semantic_filter(
+                survivors, catalog_index, key, period, ctx,
+            )
+            kept_set = set(kept_keys)
+            filtered = [c for c in filtered
+                        if (c["bulletin"], int(c["page"])) in kept_set]
 
         trace.candidate_count = len(filtered)
         trace.top_k = filtered[:50]
@@ -224,7 +176,7 @@ class PageIndexRetrievePrototype:
             top_k=trace.top_k,
             levels=[asdict(lvl) for lvl in trace.levels],
             picked_chapters=trace.picked_chapters,
-            bm25=bm25_meta,
+            semfilter=sem_meta,
         )
 
         refs: list[PageRef] = [

@@ -76,12 +76,12 @@ run_grep('grep -rli "interest rates" ./treasury_bulletins_cleaned/')
 run_grep('grep -rli "interest rates" ./treasury_bulletins_cleaned/ | xargs grep -li "inflation"')
 ```
 
-### final_answer(page_keys: list[str])
-This tool should be called when you have retrieved all relevant information and are ready to provide a final answer to the question. The input is a list of page keys in the format "year_month_page_id" that correspond to the pages you have identified as relevant. Call this exactly once per question, and only when you are confident. Be sure to use the page_id that corresponds to the index of the page in the bulletin not the page number printed on the page itself, which may differ.
+### final_answer(payload: dict)
+This tool should be called when you have retrieved all relevant information and are ready to provide a final answer. Pass a JSON dict with the page keys you identified as relevant, in the format "year_month_page_id". Call this exactly once per question, and only when you are confident. Be sure to use the page_id that corresponds to the index of the page in the bulletin, not the page number printed on the page itself.
 
-Example:
+Schema:
 ```python
-final_answer(["2002_06_1", "2002_12_26"])
+final_answer({"page_keys": ["2002_06_1", "2002_12_26"]})
 ```
 
 ## Task

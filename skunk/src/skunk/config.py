@@ -48,7 +48,7 @@ class SkunkConfig:
     effort_overrides: dict[str, "Effort"] = field(default_factory=dict)
 
     # Extract operator (env: SKUNK_EXTRACT_N_SAMPLES, SKUNK_EXTRACT_SAMPLE_TEMPERATURE)
-    extract_n_samples: int = 3       # LLM calls per tier 1; all surviving entries are merged + deduped
+    extract_n_samples: int = 1       # LLM calls per tier 1. Sampling + dedup disabled — the 17-UID flip-flop ablation on 2026-05-29 showed no meaningful accuracy gain over single-sample extract.
     extract_sample_temperature: float = 0.7
     extract_max_pages: int = 5       # page cap per tier
 
@@ -72,9 +72,9 @@ class SkunkConfig:
     # Present for train/eval runs; None for production workloads.
     golden_pages: list[PageRef] | None = field(default=None, repr=False)
 
-    # Retrieve operator dispatch. "search_agent" routes to the teammate's
-    # iterative ChromaDB + LLM-loop retriever (default); "page_index" routes
-    # to the legacy PageIndexRetrievePrototype kept for ablations.
+    # Retrieve operator dispatch. "search_agent" routes to the iterative
+    # ChromaDB + LLM-loop retriever (default); "page_index" routes to the
+    # PageIndexRetriever (ToC pick → year filter → semantic filter).
     # (env: SKUNK_RETRIEVER)
     retriever: Literal["search_agent", "page_index"] = "search_agent"
 
@@ -96,20 +96,28 @@ class SkunkConfig:
     agent_max_steps: int = 20
     agent_max_pages_per_tool_call: int = 20
 
+    # Per-call cap for the multi-turn lookup_external agent. Each step is
+    # one (generate → exec → observe) cycle; the agent terminates earlier
+    # via `final_answer(...)`. Shorter than agent_max_steps because lookups
+    # are simpler than retrieval — typically 1–3 steps suffice.
+    # (env: SKUNK_LOOKUP_MAX_STEPS)
+    lookup_max_steps: int = 8
+
     # Chat model used by the agent loop. None → fall back to `llm_model`.
     # (env: SKUNK_AGENT_MODEL)
     agent_model_id: str | None = None
 
-    # BM25 rerank scaffold for the page-index retriever. Default OFF —
-    # this is an opt-in experiment. When enabled, the retrieve operator
-    # scores year-filtered survivors with an in-memory BM25 index over
-    # title + headers + keywords; if the top score clearly dominates the
-    # field (top1/median20 ≥ bm25_dominance_threshold) it truncates to
-    # the top-K, otherwise it returns all survivors in BM25 order.
-    # (env: SKUNK_BM25_ENABLED, SKUNK_BM25_TOP_K, SKUNK_BM25_DOMINANCE)
-    bm25_enabled: bool = False
-    bm25_top_k: int = 20
-    bm25_dominance_threshold: float = 2.0
+    # Semantic filter for the page-index retriever — the third query pass
+    # (ToC pick → year filter → semantic filter). A two-stage cascade:
+    # coarse (page metadata, cheap) then fine (full page text, precise),
+    # each batched and run in parallel across batches. Default ON; set
+    # semfilter_enabled=False for a ToC + year-filter-only ablation.
+    # (env: SKUNK_SEMFILTER_ENABLED, SKUNK_SEMFILTER_BATCH,
+    #  SKUNK_SEMFILTER_WORKERS, SKUNK_SEMFILTER_MAX_PAGE_CHARS)
+    semfilter_enabled: bool = True
+    semfilter_batch_size: int = 20
+    semfilter_workers: int = 16
+    semfilter_max_page_chars: int = 12000
 
     @classmethod
     def from_env(cls) -> SkunkConfig:
@@ -120,14 +128,15 @@ class SkunkConfig:
             llm_max_retries=int(os.environ.get("SKUNK_LLM_MAX_RETRIES", "10")),
             llm_retry_initial_delay_s=float(os.environ.get("SKUNK_LLM_RETRY_INITIAL_DELAY", "0.05")),
             llm_retry_max_delay_s=float(os.environ.get("SKUNK_LLM_RETRY_MAX_DELAY", "1.0")),
-            extract_n_samples=int(os.environ.get("SKUNK_EXTRACT_N_SAMPLES", "3")),
+            extract_n_samples=int(os.environ.get("SKUNK_EXTRACT_N_SAMPLES", "1")),
             extract_sample_temperature=float(os.environ.get("SKUNK_EXTRACT_SAMPLE_TEMPERATURE", "0.7")),
             prompt_overrides_path=os.environ.get(
                 "SKUNK_PROMPT_OVERRIDES", "config/prompts/treasury_bulletin.yaml"
             ),
-            bm25_enabled=os.environ.get("SKUNK_BM25_ENABLED", "").lower() in ("1", "true", "yes"),
-            bm25_top_k=int(os.environ.get("SKUNK_BM25_TOP_K", "20")),
-            bm25_dominance_threshold=float(os.environ.get("SKUNK_BM25_DOMINANCE", "2.0")),
+            semfilter_enabled=os.environ.get("SKUNK_SEMFILTER_ENABLED", "true").lower() in ("1", "true", "yes"),
+            semfilter_batch_size=int(os.environ.get("SKUNK_SEMFILTER_BATCH", "20")),
+            semfilter_workers=int(os.environ.get("SKUNK_SEMFILTER_WORKERS", "16")),
+            semfilter_max_page_chars=int(os.environ.get("SKUNK_SEMFILTER_MAX_PAGE_CHARS", "12000")),
             retriever=os.environ.get("SKUNK_RETRIEVER", "search_agent"),  # type: ignore[arg-type]
             chromadb_dir=os.environ.get("SKUNK_CHROMADB_DIR", "cache/chromadb"),
             chromadb_collection=os.environ.get("SKUNK_CHROMADB_COLLECTION", "treasury_pages"),
@@ -135,6 +144,7 @@ class SkunkConfig:
             emb_model_id=os.environ.get("SKUNK_EMB_MODEL", "gemini-embedding-001"),
             agent_max_steps=int(os.environ.get("SKUNK_AGENT_MAX_STEPS", "20")),
             agent_max_pages_per_tool_call=int(os.environ.get("SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL", "20")),
+            lookup_max_steps=int(os.environ.get("SKUNK_LOOKUP_MAX_STEPS", "8")),
             agent_model_id=os.environ.get("SKUNK_AGENT_MODEL") or None,
         )
 
