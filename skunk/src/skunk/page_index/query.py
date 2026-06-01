@@ -19,7 +19,7 @@ after the catalog/concept-tree are loaded:
 
 The period parser is supplied by the active corpus profile (default:
 treasury; override via `SKUNK_CORPUS_PROFILE`). Golden bypass is handled
-one level up in `RetrieveExecutor`, so it isn't repeated here.
+one level up in `RetrieveDispatcher`, so it isn't repeated here.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from skunk.errors import StepFailed
-from skunk.models import HarnessContext, PageRef
+from skunk.common import HarnessContext, PageRef
 from skunk.plan import RetrieveBranch
 from skunk.page_index import default_profile
 from skunk.page_index.query_semfilter import semantic_filter

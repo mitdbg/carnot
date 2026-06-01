@@ -1,21 +1,12 @@
 """compute operator — codegen + execution over the extracted-value env.
 
-Takes the user's question plus `prev: list[AnnotatedValue]`, generates Python
-that assigns `result` to the formatted answer string, execs it in-process,
-then self-critiques via `CritiquePromptedCall`. A single retry loop in
-`ComputeExecutor.run` covers parse failures, exec exceptions, and critique
-REVISE verdicts under one shared budget. Returns the answer as a plain `str`.
+`ComputeExecutor.run` generates Python that assigns `result` (the answer string),
+execs it in-process, then self-critiques — all under one retry loop covering parse
+failures, exec exceptions, and critique REVISE verdicts.
 
-Two LLM contracts:
-  - codegen: emits EITHER a fenced ```python``` block (success) OR a bare
-    JSON object `{"missing": [...], "description": "..."}` (insufficient
-    data). Dispatch is on the first non-whitespace character. The JSON
-    form surfaces as `MissingData(description, missing=...)`. A malformed
-    reply (neither valid missing-data JSON nor a fenced code block)
-    raises `_ParseFailure`, which `run()` catches and feeds back as the
-    next iteration's `prev_failure`.
-  - critique: emits a single bare JSON object validated onto `CritiqueResult`.
-"""
+Codegen emits either a fenced ```python``` block or a bare missing-data JSON object
+(`{"missing": [...], "description": "..."}` → `MissingData`); a malformed reply raises
+`_ParseFailure`, fed back as the next attempt's `prev_failure`."""
 
 from __future__ import annotations
 
@@ -25,18 +16,17 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
 from skunk.common import Effort, strip_code_fence
-from skunk.errors import MissingData, StepFailed
+from skunk.errors import MissingData, ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
-from skunk.models import AnnotatedValue, HarnessContext
+from skunk.common import AnnotatedValue, HarnessContext
 from skunk.plan import Plan, Presentation
 from skunk.pyexec import exec_python_with_env
 from skunk.question_explainer import ConceptExplanation
 
 
 class _ParseFailure(Exception):
-    """Codegen reply was neither valid missing-data JSON nor a fenced code
-    block. Caught inside `ComputeExecutor.run`; `hint` is fed back as the
-    next iteration's `prev_failure`, `tag` labels the trace event."""
+    """Codegen reply was neither valid missing-data JSON nor a fenced code block.
+    `hint` is fed back as the next attempt's `prev_failure`; `tag` labels the trace."""
 
     def __init__(self, hint: str, tag: Literal["malformed_missing", "no_code"]):
         super().__init__(tag)
@@ -59,9 +49,7 @@ class CritiqueResult(BaseModel):
 
 
 class MissingDataSignal(BaseModel):
-    """LLM-emitted insufficient-data signal. Wire shape:
-      {"missing": [...], "description": "..."}
-    `description` is required; `missing` defaults to []."""
+    """LLM-emitted insufficient-data signal: `{"missing": [...], "description": "..."}`."""
 
     model_config = ConfigDict(frozen=True)
     description: str
@@ -73,17 +61,11 @@ _PREVIEW_MAX_COLS = 8
 
 
 def prev_desc(prev: list[AnnotatedValue], *, full: bool = False) -> str:
-    """Render `prev` for the codegen/critique prompts. Every non-scalar entry
-    is shown as a `.to_string()` of its DataFrame so the prompt and the exec
-    env see the same pandas object. `full=False` (codegen) truncates to a
-    head preview; `full=True` (critique) emits every row and column so the
-    reviewer can verify cell-level values the code consumed."""
-    # TODO: try a metadata-only variant (description + kind + axes + shape +
-    # unit, NO frame rows) for both codegen and critique. Hypothesis: showing
-    # any cells biases the model toward those rows; hiding them forces both
-    # agents to reason from the schema alone and route all value lookups
-    # through `.frame`. Compare answer accuracy + token spend against the
-    # current head-preview / full-frame setup.
+    """Render `prev` for the codegen/critique prompts; non-scalar entries shown as
+    `.to_string()` of their DataFrame. `full=False` (codegen) truncates to a head
+    preview; `full=True` (critique) emits every row/col for cell-level verification."""
+    # TODO: try a metadata-only variant (schema, no frame rows) — showing cells may
+    # bias the model toward those rows. Compare accuracy + token spend.
     import pandas as pd
 
     lines = [f"prev ({len(prev)} entries)"]
@@ -146,10 +128,54 @@ def prev_desc(prev: list[AnnotatedValue], *, full: bool = False) -> str:
     return "\n".join(lines)
 
 
-class CodegenPromptedCall(PromptedCall):
-    name: str = "compute.codegen"
-    default_effort = "medium"
-    system_prompt: str = """\
+def _parse_codegen(raw: str) -> str:
+    """Parse a codegen reply into a Python code string. A `{`-leading JSON object is
+    the missing-data signal (→ `MissingData`); malformed JSON or empty code →
+    `_ParseFailure`. Not a `PromptedCall` parse hook — these are application signals,
+    not format errors for the prompt layer to retry."""
+    # Strip fences first so `{`-dispatch works for both bare and ```json-wrapped JSON.
+    s = strip_code_fence(raw).strip()
+
+    if s.startswith("{"):
+        try:
+            signal = MissingDataSignal.model_validate_json(s)
+        except ValidationError as e:
+            raise _ParseFailure(
+                hint=(
+                    f"Your previous attempt emitted malformed missing-data JSON. "
+                    f"Raw: {raw[:300]}\nError: {e}\n"
+                    "Output ONLY a fenced ```python``` block OR a bare JSON "
+                    '{"missing": [...], "description": "..."} object.'
+                ),
+                tag="malformed_missing",
+            )
+        raise MissingData(signal.description, missing=signal.missing)
+
+    code = s
+    if not code:
+        raise _ParseFailure(
+            hint=(
+                f"Your previous attempt produced empty or un-fenced code. "
+                f"Raw: {raw[:300]}\n"
+                "Output ONLY a fenced ```python``` block OR a bare JSON "
+                '{"missing": [...], "description": "..."} object.'
+            ),
+            tag="no_code",
+        )
+    return code
+
+
+def _parse_critique(raw: str, ctx: HarnessContext) -> CritiqueResult:
+    """Parse a critique reply into a `CritiqueResult`. Malformed JSON → `ParseError`
+    (re-prompted once; `_decide` then degrades to REVISE, never silent accept)."""
+    try:
+        return CritiqueResult.model_validate_json(strip_code_fence(raw))
+    except ValidationError as e:
+        raise ParseError(raw, str(e)) from e
+
+
+class Codegen:
+    _SYSTEM_PROMPT = """\
 You write Python that produces the final answer string, or emit a
 structured missing-data signal.
 
@@ -220,6 +246,13 @@ no commentary, no second block, no fence around (b):
 - Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
 {{ default_tail }}"""
 
+    def __init__(self) -> None:
+        self._prompt = PromptedCall(
+            name="compute.codegen",
+            system_prompt=self._SYSTEM_PROMPT,
+            default_effort="medium",
+        )
+
     def codegen(
         self,
         ctx: HarnessContext,
@@ -231,23 +264,10 @@ no commentary, no second block, no fence around (b):
         *,
         effort: Effort | None = None,
     ) -> str:
-        """One LLM call. Returns the generated code on success.
-        Raises:
-          - `MissingData` — structured missing-data signal; propagates past
-            `compute` to the orchestrator.
-          - `_ParseFailure` — reply was unparseable; caller retries with
-            `failure.hint` as the next `prev_failure`.
-
-        `prev_code` + `prev_failure` describe the single most-recent
-        failed attempt (parse/exec failure or critique REVISE verdict).
-        Older attempts are deliberately omitted — accumulating them
-        dilutes the actual issue to fix. `prev_code` is None when there
-        was no parseable code on the prior attempt (parse failure).
-
-        `concept_explanations` are the non-obvious concepts extracted
-        from the question by `QuestionExplainer`. Empty when the
-        question has no concepts worth explaining (or the explainer
-        call failed)."""
+        """One LLM call returning the generated code. Raises `MissingData` (signal,
+        propagates past compute) or `_ParseFailure` (caller retries with `hint`).
+        `prev_code`/`prev_failure` describe only the most-recent failed attempt —
+        accumulating older ones dilutes the issue to fix."""
         user_msg = (
             f"Question:\n{ctx.question}\n\n"
             f"computation = {plan.computation.model_dump_json()}\n"
@@ -271,48 +291,12 @@ no commentary, no second block, no fence around (b):
                 f"\nSpecific issue to address:\n{prev_failure}\n"
                 "Focus on fixing this specific issue without introducing new mistakes."
             )
-        resp = self.call(ctx, user_msg, effort=effort)
-        raw = resp.text
-        ctx.emit("compute", "codegen response", raw=raw)
-        # Strip fences upfront so dispatch on `{` works whether the model
-        # wrapped output in ```json ... ``` or emitted bare JSON. Same
-        # treatment for the Python path below — strip_code_fence on
-        # already-stripped text is a no-op.
-        s = strip_code_fence(raw).strip()
-
-        if s.startswith("{"):
-            try:
-                signal = MissingDataSignal.model_validate_json(s)
-            except ValidationError as e:
-                raise _ParseFailure(
-                    hint=(
-                        f"Your previous attempt emitted malformed missing-data JSON. "
-                        f"Raw: {raw[:300]}\nError: {e}\n"
-                        "Output ONLY a fenced ```python``` block OR a bare JSON "
-                        '{"missing": [...], "description": "..."} object.'
-                    ),
-                    tag="malformed_missing",
-                )
-            raise MissingData(signal.description, missing=signal.missing)
-
-        code = s
-        if not code:
-            raise _ParseFailure(
-                hint=(
-                    f"Your previous attempt produced empty or un-fenced code. "
-                    f"Raw: {raw[:300]}\n"
-                    "Output ONLY a fenced ```python``` block OR a bare JSON "
-                    '{"missing": [...], "description": "..."} object.'
-                ),
-                tag="no_code",
-            )
-        return code
+        raw = self._prompt.call(ctx, user_msg, effort=effort)
+        return _parse_codegen(raw)
 
 
-class CritiquePromptedCall(PromptedCall):
-    name: str = "compute.critique"
-    default_effort = "medium"
-    system_prompt: str = """\
+class Critique:
+    _SYSTEM_PROMPT = """\
 You review code against ONE specific constraint from the plan.
 Decide accept or revise.
 
@@ -339,6 +323,15 @@ Accept iff the code AND result honor your assigned constraint.
 Revise otherwise. Be specific about what the code did wrong in your
 reason.
 {{ default_tail }}"""
+
+    def __init__(self) -> None:
+        self._prompt = PromptedCall(
+            name="compute.critique",
+            system_prompt=self._SYSTEM_PROMPT,
+            default_effort="medium",
+            parse=_parse_critique,
+        )
+
     def _decide(
         self,
         ctx: HarnessContext,
@@ -348,10 +341,8 @@ reason.
         code: str,
         result_text: str,
     ) -> tuple[bool, str]:
-        """Shared body for the focused critique. `focus_block` is the
-        already-formatted "Constraint to check (...): ..." line(s).
-        Returns (accept, reason). Malformed reply → REVISE with diagnostic
-        reason (never silently accept)."""
+        """Shared body for the focused critique. Returns (accept, reason); a
+        malformed reply → REVISE with a diagnostic reason (never silent accept)."""
         user = (
             f"Question:\n{question}\n\n"
             f"{focus_block}\n\n"
@@ -360,12 +351,10 @@ reason.
             f"Produced result:\n{result_text}\n\n"
             f"Output a single bare JSON object with your verdict."
         )
-        resp = self.call(ctx, user)
-        raw = resp.text
         try:
-            verdict = CritiqueResult.model_validate_json(strip_code_fence(raw))
-        except ValidationError as e:
-            return False, f"self-critique produced malformed reply: {e}"
+            verdict = self._prompt.call(ctx, user)
+        except ParseError as e:
+            return False, f"self-critique produced malformed reply: {e.detail}"
         if verdict.verdict == "accept":
             return True, ""
         return False, verdict.reason
@@ -404,8 +393,8 @@ class ComputeExecutor:
     """Unified codegen → exec → critique loop. One public `run()`."""
 
     def __init__(self) -> None:
-        self._codegen = CodegenPromptedCall()
-        self._critique = CritiquePromptedCall()
+        self._codegen = Codegen()
+        self._critique = Critique()
 
     def _critique_parallel(
         self,
@@ -415,14 +404,11 @@ class ComputeExecutor:
         code: str,
         result: str,
     ) -> tuple[bool, str]:
-        """Fan out N+1 focused critiques in parallel — one per
-        `plan.computation.qualifiers[i]`, plus one for the entire
-        `plan.presentation` block. Any REVISE → overall REVISE with
-        the per-focus reasons concatenated. ALL ACCEPT → overall ACCEPT.
-        Pattern mirrors `Orchestrator._run_branches`."""
+        """Fan out N+1 focused critiques in parallel — one per qualifier plus one
+        for the presentation block. Any REVISE → overall REVISE (reasons concatenated)."""
         qualifiers = plan.computation.qualifiers
         n_calls = len(qualifiers) + 1
-        ctx.emit("compute", "critique fan-out", n_calls=n_calls)
+        ctx.emit("compute", "critique_fanout", n_calls=n_calls)
         revises: list[tuple[str, str]] = []  # (focus_label, reason), in completion order
         with ThreadPoolExecutor(
             max_workers=ctx.config.max_parallel_workers
@@ -458,35 +444,19 @@ class ComputeExecutor:
         plan: Plan,
         concept_explanations: list[ConceptExplanation] = (),
     ) -> str:
-        """Single retry loop over `compute_max_attempts` iterations. Each
-        iteration does codegen → exec → critique. Any failure (parse, exec,
-        or critique REVISE) feeds the next iteration's `prev_failure`.
-        Returns on critique ACCEPT, or — if the budget exhausts after at
-        least one successful exec — the most recent uncritiqued result as
-        a fallback. Raises `StepFailed` if no iteration ever execs cleanly,
-        and propagates `MissingData` from the codegen signal.
-
-        `concept_explanations` is the upstream `QuestionExplainer`
-        output: non-obvious concepts extracted from the question text,
-        each with a short definition + formula. Threaded into every
-        codegen attempt — these are question-derived constants, not
-        retry-dependent."""
-        ctx.emit(
-            "compute",
-            "starting",
-            question=ctx.question,
-            computation=plan.computation.model_dump(),
-            presentation=plan.presentation.model_dump(),
-            prev_summary=prev_desc(prev),
-        )
+        """Retry loop over `compute_max_attempts`: each iteration does codegen → exec
+        → critique, and any failure feeds the next `prev_failure`. Returns on ACCEPT,
+        or the last uncritiqued result if the budget exhausts after a clean exec.
+        Raises `StepFailed` if no iteration ever execs cleanly; propagates `MissingData`."""
+        # No "starting" boundary emit — the orchestrator's trace records this
+        # step's boundary; the plan/computation are the planner step's output.
 
         prev_code: str | None = None
         prev_failure: str | None = None
         last_result: str | None = None
 
         for try_idx in range(ctx.config.compute_max_attempts):
-            # Escalate effort after the first failed attempt — the cheaper
-            # default got us here, so spend more thinking on the recovery.
+            # Escalate effort after the first failed attempt.
             retry_effort: Effort | None = "high" if try_idx > 0 else None
             try:
                 code = self._codegen.codegen(
@@ -497,68 +467,46 @@ class ComputeExecutor:
                 prev_code = None
                 prev_failure = e.hint
                 ctx.emit(
-                    "compute",
-                    f"codegen try {try_idx + 1} {e.tag}",
-                    hint=e.hint,
+                    "compute", "codegen_parse_failed",
+                    attempt=try_idx + 1, tag=e.tag, hint=e.hint,
                 )
                 continue
             except MissingData as e:
                 ctx.emit(
-                    "compute",
-                    f"codegen try {try_idx + 1} reported MISSING",
-                    missing=e.missing,
-                    description=e.reason,
+                    "compute", "codegen_missing",
+                    attempt=try_idx + 1, missing=e.missing, description=e.reason,
                 )
                 if last_result is not None:
                     ctx.emit(
-                        "compute",
-                        "MISSING after a prior successful exec; falling back",
-                        fallback_text=last_result,
+                        "compute", "missing_fallback",
+                        attempt=try_idx + 1, fallback_text=last_result,
                     )
                     return last_result
                 raise
 
-            ctx.emit("compute", f"codegen try {try_idx + 1} code", code=code)
+            ctx.emit("compute", "codegen_code", attempt=try_idx + 1, code=code)
             try:
                 env, _ = exec_python_with_env(code, {"prev": prev})
             except Exception as e:
                 prev_code = code
                 prev_failure = f"Exception during exec: {e}"
-                ctx.emit(
-                    "compute", f"codegen try {try_idx + 1} exec failed", error=str(e)
-                )
+                ctx.emit("compute", "exec_failed", attempt=try_idx + 1, error=str(e))
                 continue
 
             result = str(env.get("result"))
             last_result = result
-            ctx.emit(
-                "compute",
-                f"codegen try {try_idx + 1} produced result",
-                text=result,
-            )
+            ctx.emit("compute", "exec_result", attempt=try_idx + 1, text=result)
 
             accept, reason = self._critique_parallel(ctx, plan, prev, code, result)
             if accept:
-                ctx.emit(
-                    "compute",
-                    f"try {try_idx + 1} self-critique ACCEPT",
-                    text=result,
-                )
+                ctx.emit("compute", "critique_accept", attempt=try_idx + 1, text=result)
                 return result
-            ctx.emit(
-                "compute",
-                f"try {try_idx + 1} self-critique REVISE",
-                reason=reason,
-            )
+            ctx.emit("compute", "critique_revise", attempt=try_idx + 1, reason=reason)
             prev_code = code
             prev_failure = f"Produced result {result!r}. Self-critique flagged: {reason}"
 
         if last_result is not None:
-            ctx.emit(
-                "compute",
-                "budget exhausted after critique REVISE; returning last uncritiqued result",
-                fallback_text=last_result,
-            )
+            ctx.emit("compute", "budget_exhausted", fallback_text=last_result)
             return last_result
         raise StepFailed(
             "compute",

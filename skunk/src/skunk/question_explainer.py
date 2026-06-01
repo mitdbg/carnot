@@ -1,21 +1,8 @@
-"""question_explainer — whole-question concept extraction + explanation.
+"""question_explainer — whole-question concept extraction. One LLM call reads the
+question and extracts the non-obvious concepts a code-writing agent needs (each with a
+short definition), injected into the compute codegen prompt as `## Concept references`.
 
-Prototype alternative to `qualifier_explainer`. Instead of iterating over
-`plan.computation.qualifiers` (which misses named operations the planner
-places in `task` rather than `qualifiers`), this version reads the entire
-question text and extracts the non-obvious mathematical / statistical /
-domain concepts a code-writing agent needs to know to answer correctly,
-each with a short definition + formula.
-
-Single LLM call per question. Output is markdown — one `### <concept>`
-section per non-obvious concept — so LaTeX in the explanations doesn't
-break parsing (the old JSON path choked on `\\alpha`/`\\frac`). Parsed
-into `list[ConceptExplanation]` and injected into the compute codegen
-prompt as the `## Concept references` section.
-
-`qualifier_explainer.py` is kept in tree for comparison but is no longer
-wired into the orchestrator.
-"""
+Output is markdown (one `### <concept>` section each) so LaTeX doesn't break parsing."""
 
 from __future__ import annotations
 
@@ -23,7 +10,7 @@ import re
 
 from pydantic import BaseModel, ConfigDict
 
-from skunk.models import HarnessContext
+from skunk.common import HarnessContext
 from skunk.prompted_call import PromptedCall
 
 
@@ -35,15 +22,11 @@ class ConceptExplanation(BaseModel):
     explanation: str
 
 
-# Matches a section header at the start of a line: "### <concept name>".
-# Used to split the markdown reply into per-concept blocks.
+# Splits the markdown reply on `### <concept>` headers.
 _SECTION_RE = re.compile(r"^###\s+", re.MULTILINE)
 
 
-class QuestionExplainerPromptedCall(PromptedCall):
-    name: str = "question_explainer"
-    default_effort = "low"
-    system_prompt: str = """\
+_QUESTION_SYSTEM_PROMPT = """\
 Read the question. Identify any non-obvious mathematical, statistical,
 or domain concepts a code-writing agent must know to answer correctly.
 For each, give a short explanation — only the information the agent
@@ -73,45 +56,42 @@ escapes. Separate sections with a blank line.
 If no non-obvious concepts apply, output nothing.
 {{ default_tail }}"""
 
-    def explain(self, ctx: HarnessContext, question: str) -> list[ConceptExplanation]:
-        resp = self.call(ctx, f"Question:\n{question}")
-        raw = resp.text.strip()
-        if not raw:
-            return []
-        # Split on `### ` headers. First piece is the preamble before any
-        # header (usually empty); drop it.
-        sections = _SECTION_RE.split(raw)
-        if sections and not sections[0].strip():
-            sections = sections[1:]
-        out: list[ConceptExplanation] = []
-        for sect in sections:
-            sect = sect.strip()
-            if not sect:
-                continue
-            # First line = concept name, remainder = explanation.
-            head, _, body = sect.partition("\n")
-            concept = head.strip()
-            explanation = body.strip()
-            if concept:
-                out.append(
-                    ConceptExplanation(concept=concept, explanation=explanation)
-                )
-        if not out and raw:
-            # LLM emitted prose without any `### ` headers — wrap as one
-            # anonymous block so codegen still sees the content.
-            out.append(
-                ConceptExplanation(concept="(referenced concepts)", explanation=raw)
-            )
-        return out
+
+def _parse_concepts(raw: str, ctx: HarnessContext) -> list[ConceptExplanation]:
+    """Parse the markdown reply into per-`### ` concept sections. Empty body →
+    `[]`; prose without headers → one anonymous block so codegen still sees it."""
+    raw = raw.strip()
+    if not raw:
+        return []
+    sections = _SECTION_RE.split(raw)
+    if sections and not sections[0].strip():  # drop the pre-header preamble
+        sections = sections[1:]
+    out: list[ConceptExplanation] = []
+    for sect in sections:
+        sect = sect.strip()
+        if not sect:
+            continue
+        head, _, body = sect.partition("\n")  # first line = name, rest = explanation
+        concept = head.strip()
+        explanation = body.strip()
+        if concept:
+            out.append(ConceptExplanation(concept=concept, explanation=explanation))
+    if not out and raw:
+        # Prose with no `### ` headers — wrap as one anonymous block.
+        out.append(ConceptExplanation(concept="(referenced concepts)", explanation=raw))
+    return out
 
 
 class QuestionExplainer:
-    """Operator-level wrapper: one LLM call per question, returns
-    extracted concepts with explanations. Empty list when the explainer
-    finds no non-obvious concepts (LLM emits empty body)."""
+    """One LLM call per question → extracted concepts (empty list when none apply)."""
 
     def __init__(self) -> None:
-        self._caller = QuestionExplainerPromptedCall()
+        self._prompt = PromptedCall(
+            name="question_explainer",
+            system_prompt=_QUESTION_SYSTEM_PROMPT,
+            default_effort="low",
+            parse=_parse_concepts,
+        )
 
     def run(self, ctx: HarnessContext, *, question: str) -> list[ConceptExplanation]:
-        return self._caller.explain(ctx, question)
+        return self._prompt.call(ctx, f"Question:\n{question}")

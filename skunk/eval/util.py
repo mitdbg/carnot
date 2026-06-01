@@ -68,8 +68,7 @@ def dump_trace(
 
     for step in trace.steps:
         lines.append("-" * 80)
-        lines.append(f"Step {step.step_idx}: {step.op}  args={step.args}  ({step.elapsed_s:.2f}s)")
-        lines.append(f"  in:  {step.input_full}")
+        lines.append(f"Step {step.step_idx}: {step.op}  ({step.elapsed_s:.2f}s)")
         if step.error:
             lines.append(f"  ERROR: {step.error}")
         else:
@@ -84,7 +83,7 @@ def dump_trace(
                 lines.append(f"    [{src}] {msg}")
                 for k, v in extras.items():
                     s = repr(v)
-                    if not (src == "llm" and k in ("input_text", "output_text")) and len(s) > _TRACE_FIELD_MAX_REPR:
+                    if k not in ("input_text", "output_text") and len(s) > _TRACE_FIELD_MAX_REPR:
                         s = s[:_TRACE_FIELD_MAX_REPR] + "...(truncated)"
                     lines.append(f"      {k}: {s}")
         lines.append("")

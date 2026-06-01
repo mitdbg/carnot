@@ -33,7 +33,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 
-from skunk.models import HarnessContext
+from skunk.common import HarnessContext
 
 from skunk.corpus import page_elements, page_plain_text, parsed_json_dir
 

@@ -1,23 +1,7 @@
-"""Plan + planner.
-
-`PlannerPromptedCall.plan(question, ctx)` emits a `Plan`; the orchestrator walks
-`Plan.branches` and threads `PageRef` / `AnnotatedValue` (both defined in
-`skunk.models`) between operators. The compute operator's terminal output
-is a bare `str` (the final answer).
-
-The Plan AST mirrors the wire JSON shape:
-
-    Plan(branches=[...],
-         computation=Computation(task=..., qualifiers=[...]),
-         presentation=Presentation(units_out=..., precision=..., answer_form=...))
-
-Branches are a discriminated union keyed by `kind`:
-    RetrieveBranch(kind="retrieve", key, period, visual_only)
-    LookupBranch(kind="lookup_external", target, src)
-
-`Plan.model_validate_json(s)` / `plan.model_dump_json()` round-trip without
-any custom translation — model layout *is* the wire layout.
-"""
+"""Plan + planner. `Planner.plan(question, ctx)` emits a `Plan`; the orchestrator
+walks `Plan.branches`. The Plan AST mirrors the wire JSON exactly, so
+`model_validate_json` / `model_dump_json` round-trip with no custom translation.
+Branches are a discriminated union keyed by `kind` (`retrieve` / `lookup_external`)."""
 
 from __future__ import annotations
 
@@ -32,9 +16,9 @@ from pydantic import (
 )
 
 from skunk.common import strip_code_fence
-from skunk.errors import StepFailed
+from skunk.errors import ParseError
 from skunk.prompted_call import PromptedCall
-from skunk.models import AnnotatedValue, HarnessContext
+from skunk.common import AnnotatedValue, HarnessContext
 
 
 def _strip_non_empty(v: str) -> str:
@@ -43,25 +27,18 @@ def _strip_non_empty(v: str) -> str:
     return v
 
 
-# Field-level constraint: str that must be non-empty after `.strip()`.
-# Used by `RetrieveBranch.key` and `LookupBranch.target` to reject planner
-# replies that emit empty / whitespace-only branch keys.
 NonEmptyStr = Annotated[str, AfterValidator(_strip_non_empty)]
 
 
 class RetrieveBranch(BaseModel):
-    """A corpus-retrieval branch. The implicit extract step downstream uses
-    `visual_only` to skip the parsed-text tier and go straight to vision."""
+    """A corpus-retrieval branch. `visual_only` skips the parsed-text tier
+    downstream and goes straight to vision."""
 
     model_config = ConfigDict(frozen=True)
 
     kind: Literal["retrieve"] = "retrieve"
-    # Free-form NL phrase describing the data to find. Embedded into the
-    # corpus ANN query alongside the user's question.
-    key: NonEmptyStr
-    # Free-form NL period — "FY 2023", "2023-01", "January 1940", etc.
-    # None when the question doesn't pin one.
-    period: str | None = None
+    key: NonEmptyStr            # NL phrase describing the data to find
+    period: str | None = None   # NL period ("FY 2023", "2023-01", …); None if unpinned
     visual_only: bool = False
 
 
@@ -71,11 +48,8 @@ class LookupBranch(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     kind: Literal["lookup_external"] = "lookup_external"
-    # Free-form NL request for a single external value.
-    target: NonEmptyStr
-    # Optional NL hint about the preferred source. Threaded into the
-    # operator's user prompt to bias source routing.
-    src: str | None = None
+    target: NonEmptyStr     # NL request for a single external value
+    src: str | None = None  # optional NL source hint, biases routing
 
 
 Branch = Annotated[
@@ -85,9 +59,7 @@ Branch = Annotated[
 
 
 class Computation(BaseModel):
-    """Computation envelope — natural-language spec for the implicit
-    terminal compute phase. `task` may be omitted or null; `qualifiers`
-    defaults to empty list when absent."""
+    """NL spec for the terminal compute phase."""
 
     model_config = ConfigDict(frozen=True)
     task: str | None = None
@@ -95,8 +67,7 @@ class Computation(BaseModel):
 
 
 class Presentation(BaseModel):
-    """Presentation envelope — output-format hints for the compute phase.
-    All fields may be omitted or null in the wire; consumers coerce."""
+    """Output-format hints for the compute phase."""
 
     model_config = ConfigDict(frozen=True)
     units_out: str | None = None
@@ -105,10 +76,6 @@ class Presentation(BaseModel):
 
 
 class Plan(BaseModel):
-    """The whole plan — model layout mirrors the wire JSON exactly, so
-    `model_validate_json` / `model_dump_json` round-trip with no custom
-    translation. See module docstring for the wire shape."""
-
     model_config = ConfigDict(frozen=True)
 
     branches: list[Branch] = Field(min_length=1)
@@ -116,10 +83,24 @@ class Plan(BaseModel):
     presentation: Presentation = Field(default_factory=Presentation)
 
 
-class PlannerPromptedCall(PromptedCall):
-    name: str = "planner"
-    default_effort = "medium"
-    system_prompt: str = """\
+# Output-format instruction appended to every planner message by `_user_message`.
+_OUTPUT_TAIL = (
+    "Produce the Plan JSON. Output a single bare JSON object. "
+    "No markdown fences. No prose."
+)
+
+
+def _parse_plan(raw: str, ctx: HarnessContext) -> Plan:
+    """Parse a planner reply into a validated `Plan`; raise `ParseError` on
+    malformed/invalid JSON so the retry loop can echo it back."""
+    try:
+        return Plan.model_validate_json(strip_code_fence(raw).strip())
+    except ValidationError as e:
+        raise ParseError(raw, str(e)) from e
+
+
+class Planner:
+    _SYSTEM_PROMPT = """\
 You are the planner. Given a question, emit a JSON plan that, when executed, produces the answer.
 
 ## Output format
@@ -145,10 +126,10 @@ You are the planner. Given a question, emit a JSON plan that, when executed, pro
   }
 }
 
-Branches run in parallel. A `retrieve` branch pulls annotated values from
-the corpus. A `lookup_external` branch fetches a single value from
-outside the corpus. `computation` + `presentation` feed an implicit
-final compute phase.
+Branches run in parallel. A `retrieve` branch pulls information from the corpus.
+A `lookup_external` branch fetches a single value from outside the corpus. Use 'lookup_external' only when you are sure the corpus does not contain the answer,
+when the question explicitly asks for an external lookup from a source, or when previous lookups in the corpus failed. `computation` + `presentation` inform a final
+compute step.
 
 ## Field semantics
 
@@ -161,9 +142,14 @@ retrieve branch fields:
   visual_only   true only if question explicitly asks for visual understanding of charts/figures.
 
 lookup_external branch fields:
-  target        natural-language request for a single external value (e.g. "U.S. CPI-U for July 1953",
-                "JPY/USD spot rate on 2010-06-30"). Use only for values that the corpus is unlikely to carry or when explicitly instructed to do so.
-  src           Set to a publisher name if and only if the question names a
+  target        natural-language request for one external value, OR for the same series
+                across consecutive periods (e.g. "U.S. CPI-U for July 1953",
+                "JPY/USD spot rate on 2010-06-30",
+                "annual average GBP per USD for 1950, 1951, 1952").
+                When the question needs the same series across N periods, emit ONE branch
+                with a multi-period target; the lookup agent returns a list payload.
+                Do NOT split into N separate branches — that multiplies failure risk.
+  src           Set to a publisher name if and only if the question requests a
                 single, unambiguous external source. Otherwise null.
 
 computation fields:
@@ -196,14 +182,22 @@ worked examples.
 
 {{ default_tail }}"""
 
-    def plan(self, question: str, ctx: HarnessContext) -> Plan:
-        """Generate a Plan from a natural-language question."""
-        base_user_message = f"""\
-Question: {question}
+    def __init__(self) -> None:
+        self._prompt = PromptedCall(
+            name="planner",
+            system_prompt=self._SYSTEM_PROMPT,
+            default_effort="medium",
+            parse=_parse_plan,
+        )
 
-Produce the Plan JSON. Output a single bare JSON object. No markdown fences. No prose.
-"""
-        return self._call_with_retry(ctx, base_user_message, label="planner")
+    def _user_message(self, question: str, body: str = "") -> str:
+        """Compose a planner user message: question header + optional body
+        (replan context) + output-format tail."""
+        middle = f"{body.rstrip(chr(10))}\n\n" if body else ""
+        return f"Question: {question}\n\n{middle}{_OUTPUT_TAIL}\n"
+
+    def plan(self, question: str, ctx: HarnessContext) -> Plan:
+        return self._prompt.call(ctx, self._user_message(question))
 
     def replan(
         self,
@@ -214,15 +208,11 @@ Produce the Plan JSON. Output a single bare JSON object. No markdown fences. No 
         missing_reason: str,
         missing: list[str],
     ) -> Plan:
-        """Re-plan after compute reported MissingData. Same JSON schema as
-        `plan()`; the orchestrator diffs the returned branches against
-        `prior_plan.branches` and executes only the additions. `computation`
-        / `presentation` from the result fully replace the prior values.
-
-        `failed_branches` lists the prior branches whose execution raised
-        `StepFailed` (their output is NOT in `prev`); the model can retry
-        them by emitting structurally-different replacements (reworded
-        `target`, different `src`, etc.)."""
+        """Re-plan after compute reported MissingData. The orchestrator diffs the
+        returned branches against `prior_plan.branches` and executes only the
+        additions; `computation`/`presentation` fully replace the prior values.
+        `failed_branches` are prior branches that raised `StepFailed` (output NOT
+        in `prev`), retryable via structurally-different replacements."""
         from skunk.compute import prev_desc
 
         if failed_branches:
@@ -233,93 +223,38 @@ Produce the Plan JSON. Output a single bare JSON object. No markdown fences. No 
             ]
             failed_section = (
                 "\nBranches that FAILED in the prior run (their output is NOT in prev):\n"
-                + "\n".join(lines) + "\n"
+                + "\n".join(lines)
+                + "\n"
             )
         else:
             failed_section = ""
 
-        base_user_message = f"""\
-Question: {ctx.question}
-
-Produce the Plan JSON. Output a single bare JSON object. No markdown fences. No prose.
-
-The prior plan you produced did not gather enough data for the compute step:
+        body = f"""\
+You produced a plan that could not be completed. Revise it.
 
 prior_plan = {prior_plan.model_dump_json()}
 
-prev (data already gathered, will be reused):
+prev (data already gathered; treat as available, do NOT request again):
 {prev_desc(prev)}
 {failed_section}
-compute reported MISSING DATA:
+What was missing:
   description: {missing_reason}
   missing:     {missing!r}
 
-Emit an UPDATED plan in the same JSON schema. The orchestrator will execute
-only the branches you ADD (structurally-different from prior_plan.branches);
-exact duplicates are skipped. `computation` / `presentation` from the result
-fully replace the prior values.
-
-Guidance:
-  - Successful branches in prior_plan are already in `prev` — do not
-    re-emit them verbatim (the orchestrator drops exact duplicates).
-  - For FAILED branches listed above, retry by emitting a NEW branch
-    with a different formulation: rephrase `target` (more specific
-    publisher, alternate series name), set or change `src`, or switch
-    branch kind (e.g. `lookup_external` → `retrieve` if the corpus may
-    carry it). Vary the wording so the new branch is structurally
-    distinct from the failed one — identical re-emissions are dropped.
-  - If only inputs are missing and prior branches all succeeded, APPEND
-    new retrieve/lookup branches that close the gap.
-  - If the missing-data signal reveals the calculation itself was
-    misframed (e.g. a qualifier was misinterpreted), additionally
-    revise `computation` / `presentation`.
-  - If you have nothing useful to add and the framing is correct,
-    re-emit prior_plan unchanged — no diff means no work, and the
-    caller will surface the missing-data failure.
-"""
-        return self._call_with_retry(ctx, base_user_message, label="replanner")
-
-    def _call_with_retry(
-        self, ctx: HarnessContext, base_user_message: str, label: str
-    ) -> Plan:
-        """Shared three-attempt loop for `plan()` and `replan()`. Each retry
-        shows ONLY the most recent bad response + its error — no history
-        accumulation."""
-        attempt_errors: list[str] = []
-        last_raw: str | None = None
-        last_error: str | None = None
-
-        for attempt in range(3):
-            if attempt == 0:
-                user_message = base_user_message
-            else:
-                user_message = (
-                    f"{base_user_message}\n"
-                    f"Your previous attempt produced this output:\n"
-                    f"```\n{last_raw}\n```\n\n"
-                    f"It failed with: {last_error}\n"
-                    "Fix and return valid JSON only."
-                )
-            ctx.emit(label, "attempt", n=attempt + 1, of=3)
-            resp = self.call(ctx, user_message)
-            raw = resp.text
-            try:
-                return Plan.model_validate_json(strip_code_fence(raw).strip())
-            except ValidationError as e:
-                attempt_errors.append(f"Attempt {attempt + 1}: {e}")
-                last_raw = raw
-                last_error = str(e)
-                ctx.emit(
-                    label,
-                    "parse/validate failed",
-                    n=attempt + 1,
-                    error_type=type(e).__name__,
-                    error=str(e),
-                )
-
-        ctx.emit(label, "exhausted", attempts=len(attempt_errors))
-        raise StepFailed(
-            label,
-            f"Failed to produce valid Plan after {len(attempt_errors)} attempts: "
-            + "; ".join(attempt_errors),
-        )
+Return a corrected plan in the same JSON schema. Rules:
+  - Include only branches that fetch data you still need. Do not re-list
+    anything already present in `prev`, and never emit two branches for
+    the same value.
+  - For each FAILED branch you still need, write a materially different
+    replacement: a more specific publisher or series name in `target`, a
+    set or changed `src`, or a switch of branch kind (`lookup_external`
+    ↔ `retrieve`). A verbatim repeat will fail the same way.
+  - If the data is simply incomplete, add retrieve/lookup branches that
+    close the gap.
+  - If the missing-data signal shows the calculation itself was misframed
+    (e.g. a qualifier was misread), also revise `computation` /
+    `presentation`; these replace the prior values.
+  - Emit nothing extraneous: no commentary, no placeholder branches.
+  - If you genuinely have nothing to add and the prior framing was
+    correct, re-emit the prior plan unchanged."""
+        return self._prompt.call(ctx, self._user_message(ctx.question, body))

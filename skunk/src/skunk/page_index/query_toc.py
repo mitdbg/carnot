@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -254,11 +254,3 @@ def one_shot_parent_chapter_retrieve(
     trace.top_k = top[:50]
     trace.total_walk_s = time.monotonic() - t_walk
     return top, trace
-
-
-def write_trace_jsonl(trace: RetrieveTrace, path: Path) -> None:
-    """Append one RetrieveTrace as a JSON line."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as f:
-        f.write(json.dumps(asdict(trace), ensure_ascii=False))
-        f.write("\n")

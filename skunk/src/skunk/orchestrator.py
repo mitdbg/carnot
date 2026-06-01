@@ -1,25 +1,12 @@
-"""Orchestrator — per-question execution driver.
+"""Orchestrator — per-question execution driver. One instance per NL question.
 
-`Orchestrator(ctx)` is the per-NL-question lifecycle object. It owns the
-harness context, one instance of every operator class
-(`PlannerPromptedCall`, `RetrieveExecutor`, `ExtractExecutor`,
-`LookupExternalPromptedCall`, `ComputeExecutor`), the `Plan` being executed,
-and the `QuestionTrace` (stats). One instance per question.
+A Plan is a flat list of branches feeding a single compute step: the planner
+produces the Plan, each branch runs via `_run_branch` (parallel when >1), and the
+merged AnnotatedValues feed compute, which returns the answer string.
 
-A Plan has a flat list of branches feeding a single compute step. The
-orchestrator:
-  1. Calls the planner to produce the Plan.
-  2. Runs each branch via `_run_branch` (in parallel when there is more than one).
-  3. Feeds the merged AnnotatedValues to compute, which returns the
-     final answer string.
-
-If compute raises `MissingData`, the orchestrator runs a bounded
-replan loop (`config.recovery_max_rounds` times): the planner is
-re-invoked with the prior plan + current `prev` + missing-data signal;
-only the newly-added branches execute; their outputs are appended to
-`prev` and compute runs again. After the budget is spent, `MissingData`
-propagates to the caller.
-"""
+If compute raises `MissingData`, a bounded replan loop (`config.recovery_max_rounds`)
+re-invokes the planner with the prior plan + `prev` + the missing signal; only the
+newly-added branches execute. After the budget is spent, `MissingData` propagates."""
 
 from __future__ import annotations
 
@@ -32,21 +19,17 @@ from typing import Any
 from skunk.compute import ComputeExecutor
 from skunk.errors import MissingData, StepFailed
 from skunk.extract import ExtractExecutor
-from skunk.lookup_external import LookupExternalPromptedCall
-from skunk.models import AnnotatedValue, HarnessContext
-from skunk.plan import Branch, Plan, PlannerPromptedCall
+from skunk.lookup_external import LookupExternal
+from skunk.common import AnnotatedValue, HarnessContext
+from skunk.plan import Branch, Plan, Planner
 from skunk.question_explainer import ConceptExplanation, QuestionExplainer
-from skunk.retrieve import RetrieveExecutor
+from skunk.retrieve import RetrieveDispatcher
 from skunk.trace import QuestionTrace, StepTrace, describe_value, full_repr
-
-_NO_INPUT = object()  # sentinel: op has no upstream value (branch heads)
-
 
 @dataclass
 class BranchOutcome:
-    """Per-branch result captured by `_run_branches`. `entries` is None on
-    failure; `error` is None on success. Threaded to the replanner so it
-    can see which branches failed and rephrase them."""
+    """Per-branch result. `entries` is None on failure, `error` None on success.
+    Threaded to the replanner so it can rephrase failed branches."""
     branch: Branch
     entries: list[AnnotatedValue] | None
     error: str | None
@@ -58,29 +41,21 @@ def _entries(outcomes: list[BranchOutcome]) -> list[AnnotatedValue]:
 
 
 class Orchestrator:
-    """One Orchestrator per NL question. Owns the ctx, an instance of each
-    operator class, the Plan being executed, and the stats/trace.
-
-    Lifecycle:
-        orch = Orchestrator(ctx)              # planner runs inside execute()
-        answer = orch.execute()               # returns the answer string ("" on failure)
-        orch.current_plan                     # the Plan produced by the planner (None before execute)
-        orch.trace                            # QuestionTrace populated during execute()
-    """
+    """One per NL question. Owns the ctx, an instance of each operator class, the
+    Plan, and the trace. `execute()` runs the planner + data phase + compute and
+    returns the answer string (`""` on failure; see `.trace` for the full record)."""
 
     def __init__(self, ctx: HarnessContext):
         self._ctx = ctx
         self._current_plan: Plan | None = None
-        self._planner = PlannerPromptedCall()
-        self._retriever = RetrieveExecutor(ctx.config)
+        self._planner = Planner()
+        self._retriever = RetrieveDispatcher(ctx.config)
         self._extractor = ExtractExecutor()
-        self._looker = LookupExternalPromptedCall()
+        self._looker = LookupExternal()
         self._explainer = QuestionExplainer()
         self._computer = ComputeExecutor()
         self._trace = QuestionTrace(question=ctx.question)
-        # Running record of per-branch outcomes across the initial plan +
-        # every replan round. The replanner reads `o.error` to surface
-        # failed branches back to the model for reformulation.
+        # Per-branch outcomes across the initial plan + every replan round.
         self._outcomes: list[BranchOutcome] = []
 
     @property
@@ -92,18 +67,12 @@ class Orchestrator:
         return self._trace
 
     def execute(self) -> str:
-        """Resolve the plan, walk the data phase, run compute. Returns the
-        final answer string (empty string on failure — read `self.trace` for
-        the full record including `failed` / `failure_reason`). Catches
-        `StepFailed` and records it on the trace; `MissingData` and any
-        other exception propagate to the caller (after the replan budget
-        is spent)."""
+        """Resolve the plan, walk the data phase, run compute. `StepFailed` is
+        caught and recorded on the trace; other exceptions propagate."""
         try:
-            self._current_plan = self._run_op(
+            self._current_plan = self.execute_with_tracing(
                 "planner",
-                {},
-                self._ctx.question,
-                lambda prev, ctx: self._planner.plan(prev, ctx),
+                lambda: self._planner.plan(self._ctx.question, self._ctx),
             )
             plan = self._current_plan
             if not plan.branches:
@@ -115,14 +84,12 @@ class Orchestrator:
             max_rounds = self._ctx.config.recovery_max_rounds
             for attempt in range(max_rounds + 1):
                 try:
-                    self._trace.answer = self._run_op(
+                    self._trace.answer = self.execute_with_tracing(
                         "compute",
-                        {
-                            "plan": plan,
-                            "concept_explanations": concept_explanations,
-                        },
-                        prev,
-                        self._computer.run,
+                        lambda: self._computer.run(
+                            prev, self._ctx, plan=plan,
+                            concept_explanations=concept_explanations,
+                        ),
                     )
                     break
                 except MissingData as e:
@@ -141,19 +108,10 @@ class Orchestrator:
         additions, and adopt new computation/presentation. Re-raises the
         `MissingData` if the replanner produced no useful diff."""
         failed_branches = [(o.branch, o.error) for o in self._outcomes if o.error]
-        new_plan = self._run_op(
+        new_plan = self.execute_with_tracing(
             "replanner",
-            {
-                "prior_plan": plan,
-                "missing_reason": missing.reason,
-                "missing": missing.missing,
-                "failed_branches": failed_branches,
-            },
-            prev,
-            lambda prev, ctx, prior_plan, missing_reason, missing, failed_branches: (
-                self._planner.replan(
-                    ctx, prior_plan, prev, failed_branches, missing_reason, missing
-                )
+            lambda: self._planner.replan(
+                self._ctx, plan, prev, failed_branches, missing.reason, missing.missing
             ),
         )
         new_branches = [b for b in new_plan.branches if b not in plan.branches]
@@ -175,11 +133,8 @@ class Orchestrator:
                 self._outcomes = [*self._outcomes, *new_outcomes]
                 prev = prev + _entries(new_outcomes)
             except StepFailed as e:
-                # All replan-added branches failed (e.g. extract returned []
-                # on every one). Don't discard the original `prev` — let the
-                # next compute attempt see what we already had. If framing
-                # also didn't change, this round added nothing useful; bail
-                # so we don't waste a compute call producing the same signal.
+                # All replan-added branches failed. Keep the original `prev`; if
+                # framing also didn't change, this round added nothing — bail.
                 self._ctx.emit(
                     "orchestrator",
                     "all replan branches failed; keeping prior prev",
@@ -190,40 +145,35 @@ class Orchestrator:
         return plan, prev
 
     def _explain_concepts(self) -> list[ConceptExplanation]:
-        """Run the question-explainer step through `_run_op` so it's traced.
-        One LLM call over the question text; returns [] when the explainer
-        finds no non-obvious concepts or the reply is malformed
-        (best-effort — never fatal)."""
-        return self._run_op(
+        """Run the question-explainer (traced). Returns [] when there are no
+        non-obvious concepts or the reply is malformed — best-effort, never fatal."""
+        return self.execute_with_tracing(
             "question_explainer",
-            {"question": self._ctx.question},
-            _NO_INPUT,
-            self._explainer.run,
+            lambda: self._explainer.run(self._ctx, question=self._ctx.question),
         )
 
     def _run_branch(self, branch: Branch) -> list[AnnotatedValue]:
         """Execute a single branch and return its entries."""
         match branch.kind:
             case "retrieve":
-                doc = self._run_op(
-                    "retrieve", {"branch": branch}, _NO_INPUT, self._retriever.run
+                doc = self.execute_with_tracing(
+                    "retrieve",
+                    lambda: self._retriever.run(self._ctx, branch),
                 )
-                return self._run_op(
-                    "extract", {"branch": branch}, doc, self._extractor.run
+                return self.execute_with_tracing(
+                    "extract",
+                    lambda: self._extractor.run(doc, self._ctx, branch),
                 )
             case "lookup_external":
-                return self._run_op(
-                    "lookup_external", {"branch": branch}, _NO_INPUT, self._looker.run
+                return self.execute_with_tracing(
+                    "lookup_external",
+                    lambda: self._looker.run(self._ctx, branch),
                 )
 
     def _run_branches(self, branches: list[Branch]) -> list[BranchOutcome]:
-        """Run branches in parallel and return per-branch outcomes (one per
-        input branch, in the same order). Failures become `BranchOutcome`s
-        with `entries=None` / `error=<message>` so the replanner can see
-        them. Re-raises `StepFailed` only when EVERY branch failed — the
-        caller (`execute` initial run, or `_replan_round`) handles the
-        all-failed case as a hard step failure.
-        """
+        """Run branches in parallel, returning one outcome per branch in order.
+        Failures become `BranchOutcome(entries=None, error=...)`. Re-raises
+        `StepFailed` only when EVERY branch failed."""
         if len(branches) == 1:
             # Fast path: let StepFailed propagate (matches "all failed" for n=1).
             entries = self._run_branch(branches[0])
@@ -249,88 +199,40 @@ class Orchestrator:
                     outcomes[i] = BranchOutcome(
                         branch=branches[i], entries=None, error=str(e),
                     )
-        # All non-None at this point — the executor either filled an entries
-        # outcome or an error outcome for every future.
         result = [o for o in outcomes if o is not None]
         if all(o.error for o in result):
-            # Preserve the legacy "all failed → propagate" contract by
-            # raising the first error; the caller decides whether to mark
-            # the whole question as failed or just skip the wave.
+            # All failed → propagate the first error; the caller decides what to do.
             raise StepFailed(
                 "orchestrator",
                 f"all {len(branches)} branches failed; first error: {result[0].error}",
             )
         return result
 
-# TODO: why do we need prev? We should be able to collapse this into args? Also, overall "prev" is confusing named.
-#  You seem to always use it to mean "input from last step", but people can totally take it to mean "the previous run of this operator"
-    def _run_op(
-        self,
-        op_name: str,
-        args: dict[str, Any],
-        prev: Any,
-        fn: Callable[..., Any],
-    ) -> Any:
-        """Invoke `fn(prev, ctx, **args)` (or `fn(ctx, **args)` if `prev` is
-        `_NO_INPUT`), recording timing and a `StepTrace` entry. Re-raises
-        `StepFailed` / `MissingData` after recording."""
-        has_input = prev is not _NO_INPUT
-        step_idx = len(self._trace.steps) + 1
-        input_desc = describe_value(prev) if has_input else "(none)"
-        input_full = full_repr(prev) if has_input else "(none)"
-        self._ctx.emit(
-            "_step", "begin", step_idx=step_idx, op=op_name, args=args, input=input_desc
-        )
+    def execute_with_tracing(self, op_name: str, fn: Callable[[], Any]) -> Any:
+        """Run `fn()` and record one `StepTrace` (op name, timing, result/error).
 
+        `fn` is a zero-arg thunk closing over the actual operator call, so each
+        operator runs with its own natural signature. The `begin` event delimits
+        this step's operator emits in the trace dump. Re-raises `StepFailed` /
+        `MissingData` after recording."""
+        step_idx = len(self._trace.steps) + 1
+        # `_step`/`begin` is the join key between the two observability systems:
+        # it delimits this step's operator emits in the event stream so the
+        # trace dump can group events under their StepTrace (eval/util.py). It is
+        # caller-owned frame infrastructure, not an operator boundary log.
+        self._ctx.emit("_step", "begin", step_idx=step_idx, op=op_name)
         t0 = time.perf_counter()
         try:
-            result = fn(prev, self._ctx, **args) if has_input else fn(self._ctx, **args)
+            result = fn()
         except (StepFailed, MissingData) as e:
-            elapsed = time.perf_counter() - t0
-            err_str = (
-                f"MissingData: {e.reason}" if isinstance(e, MissingData) else str(e)
-            )
-            self._ctx.emit(
-                "_step",
-                "error",
-                step_idx=step_idx,
-                error=err_str,
-                elapsed_s=round(elapsed, 2),
-            )
-            self._trace.steps.append(
-                StepTrace(
-                    op=op_name,
-                    args=args,
-                    input_desc=input_desc,
-                    output_desc="(failed)",
-                    elapsed_s=elapsed,
-                    error=err_str,
-                    input_full=input_full,
-                    output_full="(failed)",
-                    step_idx=step_idx,
-                )
-            )
+            err = f"MissingData: {e.reason}" if isinstance(e, MissingData) else str(e)
+            self._trace.steps.append(StepTrace(
+                op=op_name, output_desc="(failed)", output_full="(failed)",
+                elapsed_s=time.perf_counter() - t0, error=err, step_idx=step_idx,
+            ))
             raise
-        elapsed = time.perf_counter() - t0
-        output_desc = describe_value(result)
-        output_full = full_repr(result)
-        self._ctx.emit(
-            "_step",
-            "done",
-            step_idx=step_idx,
-            output=output_desc,
-            elapsed_s=round(elapsed, 2),
-        )
-        self._trace.steps.append(
-            StepTrace(
-                op=op_name,
-                args=args,
-                input_desc=input_desc,
-                output_desc=output_desc,
-                elapsed_s=elapsed,
-                input_full=input_full,
-                output_full=output_full,
-                step_idx=step_idx,
-            )
-        )
+        self._trace.steps.append(StepTrace(
+            op=op_name, output_desc=describe_value(result), output_full=full_repr(result),
+            elapsed_s=time.perf_counter() - t0, step_idx=step_idx,
+        ))
         return result

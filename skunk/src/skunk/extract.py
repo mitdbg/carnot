@@ -1,26 +1,9 @@
-"""extract operator — question-driven extraction over page text/images.
+"""extract operator — question-driven extraction over page text/images, returning
+`list[AnnotatedValue]` (scalar / vector / table shapes; see `skunk.common`).
 
-Takes the user's question plus a set of retrieved pages, returns a
-`list[AnnotatedValue]` for the downstream compute step. Each entry has one
-of three shapes:
-
-  scalar  — a single number or string.
-  vector  — a 1-D series indexed by one varying dim.
-  table   — a 2-D grid indexed by two varying dims (row × col).
-
-Entries carry `description`, `unit`, and shape-specific axis labels
-(`index_name` for vectors; `row_name` + `col_name` for tables). Cells are
-always primitive scalars — deeper nesting is rejected.
-
-Three call-site executors back the two tiers:
-  `ExtractTextPromptedCall`   — parsed-table text (parsed_json tier).
-  `ExtractVisionPromptedCall` — rendered page images (vision tier).
-  `ExtractDedupPromptedCall`  — consolidates redundant entries from multiple
-                            sampling passes; cannot invent values, only
-                            select representatives.
-
-`ExtractExecutor` owns one instance of each and drives the tier dispatch.
-"""
+`ExtractExecutor` drives a parsed_json → vision tier fallback over three call-site
+executors: `TextExtractor` (parsed-table text), `VisionExtractor` (rendered images),
+`DedupExtractor` (consolidates redundant entries; picks representatives, never invents)."""
 
 from __future__ import annotations
 
@@ -32,7 +15,7 @@ from typing import Any
 from skunk.common import parse_json_response
 from skunk.errors import StepFailed
 from skunk.prompted_call import PromptedCall
-from skunk.models import AnnotatedValue, HarnessContext, PageRef
+from skunk.common import AnnotatedValue, HarnessContext, PageRef
 from skunk.plan import RetrieveBranch
 from skunk.corpus import get_page_text, render_page_b64
 
@@ -58,12 +41,10 @@ def _parse_response_raw(raw: str, ctx: HarnessContext) -> list[AnnotatedValue] |
     entries that fail validation with a diagnostic."""
     obj = parse_json_response(raw)
     if obj is None:
-        ctx.emit("extract", "rejected unparseable response", raw=raw)
+        ctx.emit("extract", "rejected_unparseable", raw=raw)
         return None
     if not isinstance(obj, list):
-        ctx.emit(
-            "extract", "rejected non-array response", got=type(obj).__name__, raw=raw
-        )
+        ctx.emit("extract", "rejected_non_array", got=type(obj).__name__, raw=raw)
         return None
     if not obj:
         return None
@@ -73,15 +54,13 @@ def _parse_response_raw(raw: str, ctx: HarnessContext) -> list[AnnotatedValue] |
         try:
             entries.append(AnnotatedValue.model_validate(entry))
         except (ValueError, TypeError) as e:
-            ctx.emit("extract", "rejected entry", entry_idx=i, reason=str(e))
+            ctx.emit("extract", "rejected_entry", entry_idx=i, reason=str(e))
     return entries
 
 
 def _cell_in_text(value: int | float | str, text: str) -> bool:
-    """True if primitive `value` appears verbatim in `text`. For integer-valued
-    numerics, also try the comma-formatted form (2582 → "2,582") so the prompt's
-    "no commas" output rule doesn't cause false negatives against comma-formatted
-    page text. String check is case-insensitive."""
+    """True if primitive `value` appears verbatim in `text`. Integer-valued numerics
+    also try the comma-formatted form (2582 → "2,582"); strings are case-insensitive."""
     if isinstance(value, str):
         return value.strip().lower() in text.lower()
     candidates: set[str] = {str(value)}
@@ -108,9 +87,8 @@ def _cells_equal(a: Any, b: Any) -> bool:
 def _output_grounded_in_inputs(
     output: AnnotatedValue, inputs: list[AnnotatedValue]
 ) -> bool:
-    """Every cell of `output` must come verbatim from a SINGLE input entry.
-    Scalar output is special-cased: the LLM may flatten one cell of any input
-    vector/table into a scalar, so any cell of any single input may match."""
+    """Every cell of `output` must come verbatim from a SINGLE input entry. Scalar
+    output may match any single cell of any input (the LLM may flatten one cell)."""
     out_cells = list(_cells_with_path(output))
     for s in inputs:
         if output.kind == "scalar":
@@ -123,10 +101,8 @@ def _output_grounded_in_inputs(
     return False
 
 
-# Shared envelope spec used by all three extract executors. Defines the
-# AnnotatedValue shape (scalar / vector / table), field semantics, and the
-# universal output rules. Per-modality system prompts append their own role
-# description and grounding rule.
+# Shared envelope spec (shape + field semantics + output rules) appended to all
+# three extract system prompts via the `{{ common }}` template var.
 EXTRACT_COMMON_PROMPT = """\
 ## AnnotatedValue shape
 
@@ -174,10 +150,21 @@ unit          natural-language label for the printed scale and base,
 """
 
 
-class ExtractTextPromptedCall(PromptedCall):
-    name: str = "extract.text"
-    default_effort = "off"
-    system_prompt: str = """\
+def _make_extract_prompt(name: str, system_prompt: str, default_effort: str) -> PromptedCall:
+    """Build an extract-tier `PromptedCall` (all tiers share the common-rules var
+    and `_parse_response_raw`; only name / prompt / effort differ)."""
+    return PromptedCall(
+        name=name,
+        system_prompt=system_prompt,
+        default_effort=default_effort,
+        # inject the shared extraction-rules block into the SYSTEM template
+        template_vars=lambda ctx: {"common": EXTRACT_COMMON_PROMPT},
+        parse=_parse_response_raw,
+    )
+
+
+class TextExtractor:
+    _SYSTEM_PROMPT = """\
 You retrieve printed values from page text to fulfill a specific lookup.
 Each user message describes the lookup — what to find and (when stated)
 the period — followed by the full-context question this lookup supports,
@@ -191,8 +178,8 @@ pick the smallest shape that captures every relevant value.
 {{ common }}
 {{ default_tail }}"""
 
-    def template_vars(self, ctx: HarnessContext) -> dict:
-        return {"common": EXTRACT_COMMON_PROMPT}
+    def __init__(self) -> None:
+        self._prompt = _make_extract_prompt("extract.text", self._SYSTEM_PROMPT, "off")
 
     def _extract_from_group(
         self,
@@ -201,17 +188,9 @@ pick the smallest shape that captures every relevant value.
         group: list[tuple[PageRef, str]],
         ctx: HarnessContext,
     ) -> list[AnnotatedValue]:
-        """Sample `n_samples` LLM extractions over one page-group at sampling
-        temperature, per-cell-verify each sample's entries against the group's
-        joined page text, return the flat list of kept entries."""
-        # Phrase the lookup in prose, then the surrounding question as
-        # context, then the group's page text concatenated as one block.
-        # Same-bulletin adjacent pages flow together so a continuation table
-        # reads as one contiguous table — the PDF page break is a layout
-        # artifact. The bulletin's own date/page headers inside the page
-        # text provide whatever provenance the LLM needs when writing
-        # `description` fields. Shape (scalar/vector/table) is decided by
-        # the LLM from the data; the planner does not pre-declare it.
+        """Sample `n_samples` extractions over one page-group at sampling temperature,
+        per-cell-verify each against the group's joined page text, return kept entries.
+        Adjacent same-bulletin pages are joined so a continuation table reads as one."""
         target = f"You are looking for {branch.key}"
         if branch.period:
             target += f" for the period {branch.period}"
@@ -227,13 +206,13 @@ pick the smallest shape that captures every relevant value.
         temperature = ctx.config.extract_sample_temperature
 
         def _sample(sample_idx: int) -> list[AnnotatedValue]:
-            resp = self.call(ctx, user_msg, temperature=temperature)
-            parsed = _parse_response_raw(resp.text, ctx) or []
+            parsed = self._prompt.call(ctx, user_msg, temperature=temperature) or []
             ctx.emit(
-                "extract",
-                f"tier=parsed_json sample {sample_idx + 1}/{n_samples} "
-                f"(p={len(group)})",
-                raw=resp.text,
+                "extract", "sample",
+                tier="parsed_json",
+                idx=sample_idx + 1,
+                n=n_samples,
+                n_pages=len(group),
                 n_entries=len(parsed),
             )
             kept = [
@@ -244,8 +223,10 @@ pick the smallest shape that captures every relevant value.
             n_dropped = len(parsed) - len(kept)
             if n_dropped:
                 ctx.emit(
-                    "extract",
-                    f"tier=parsed_json verifier dropped {n_dropped}/{len(parsed)}",
+                    "extract", "verifier_dropped",
+                    tier="parsed_json",
+                    n_dropped=n_dropped,
+                    n_parsed=len(parsed),
                     sample_idx=sample_idx + 1,
                 )
             return kept
@@ -285,14 +266,15 @@ pick the smallest shape that captures every relevant value.
                         continue
                 groups.append([item])
         ctx.emit(
-            "extract",
-            f"tier=parsed_json fan-out {len(groups)}g × {ctx.config.extract_n_samples}s "
-            f"@ T={ctx.config.extract_sample_temperature}",
+            "extract", "fan_out",
+            tier="parsed_json",
             n_groups=len(groups),
+            n_samples=ctx.config.extract_n_samples,
+            temperature=ctx.config.extract_sample_temperature,
             n_pages=len(pages),
             group_sizes=[len(g) for g in groups],
             total_chars=sum(len(t) for _, t in pages),
-            system_prompt=self.assemble_system_prompt(ctx),
+            system_prompt=self._prompt.assemble_system_prompt(ctx),
         )
 
         max_workers = max(1, min(len(groups), ctx.config.max_parallel_workers))
@@ -304,10 +286,8 @@ pick the smallest shape that captures every relevant value.
             return [e for kept in per_group for e in kept]
 
 
-class ExtractVisionPromptedCall(PromptedCall):
-    name: str = "extract.vision"
-    default_effort = "off"
-    system_prompt: str = """\
+class VisionExtractor:
+    _SYSTEM_PROMPT = """\
 You retrieve visible values from rendered page images to fulfill a
 specific lookup. Each user message describes the lookup — what to find
 and (when stated) the period — followed by the full-context question
@@ -323,8 +303,8 @@ shape (scalar / vector / table) that fits the data on the page.
 {{ common }}
 {{ default_tail }}"""
 
-    def template_vars(self, ctx: HarnessContext) -> dict:
-        return {"common": EXTRACT_COMMON_PROMPT}
+    def __init__(self) -> None:
+        self._prompt = _make_extract_prompt("extract.vision", self._SYSTEM_PROMPT, "off")
 
     def call_once(
         self,
@@ -334,10 +314,8 @@ shape (scalar / vector / table) that fits the data on the page.
         rendered_refs: list[PageRef],
         ctx: HarnessContext,
     ) -> list[AnnotatedValue]:
-        """One deterministic (T=0) vision call over rendered page images."""
-        # Images carry no inherent (month, page) header the way page text
-        # does — the numbered identification list below is what maps each
-        # attachment back to its source page.
+        """One deterministic (T=0) vision call over rendered page images. The numbered
+        identification list maps each attachment back to its source page."""
         target = f"You are looking for {branch.key}"
         if branch.period:
             target += f" for the period {branch.period}"
@@ -358,23 +336,18 @@ shape (scalar / vector / table) that fits the data on the page.
             ]
         )
 
-        ctx.emit("extract", "tier=vision single-call (T=0)", n_images=len(images))
-        resp = self.call(ctx, user_msg, images=images, temperature=0.0)
-        raw = resp.text
-        parsed = _parse_response_raw(raw, ctx)
+        ctx.emit("extract", "vision_call", tier="vision", n_images=len(images))
+        parsed = self._prompt.call(ctx, user_msg, images=images, temperature=0.0)
         ctx.emit(
-            "extract",
-            "tier=vision single-call",
-            raw=raw,
+            "extract", "vision_result",
+            tier="vision",
             n_entries=0 if parsed is None else len(parsed),
         )
         return parsed if parsed is not None else []
 
 
-class ExtractDedupPromptedCall(PromptedCall):
-    name: str = "extract.dedup"
-    default_effort = "medium"
-    system_prompt: str = """\
+class DedupExtractor:
+    _SYSTEM_PROMPT = """\
 You consolidate redundant extraction entries. Multiple independent
 passes over the same pages produced overlapping entries; collapse
 wording duplicates into one representative per distinct datum. The user
@@ -399,18 +372,17 @@ or keys.
 - N genuinely distinct datums → N entries.
 {{ default_tail }}"""
 
-    def template_vars(self, ctx: HarnessContext) -> dict:
-        return {"common": EXTRACT_COMMON_PROMPT}
+    def __init__(self) -> None:
+        self._prompt = _make_extract_prompt("extract.dedup", self._SYSTEM_PROMPT, "medium")
 
     def dedup(
         self,
         merged_entries: list[AnnotatedValue],
         ctx: HarnessContext,
     ) -> list[AnnotatedValue]:
-        """LLM-based semantic dedup at T=0. Output is structurally verified
-        against `merged_entries`; entries that fail are dropped. Returns `[]`
-        on empty/unparseable response or all-rejected output — caller's
-        tier-fallback handles it (no silent fallback to un-deduped inputs)."""
+        """LLM semantic dedup at T=0, structurally verified against `merged_entries`.
+        Returns `[]` on empty/unparseable/all-rejected output — caller's tier-fallback
+        handles it (no silent fallback to un-deduped inputs)."""
         if len(merged_entries) <= 1:
             return merged_entries
         envelope = [e.model_dump(exclude_none=True) for e in merged_entries]
@@ -420,23 +392,21 @@ or keys.
             f"Output the consolidated set as a JSON array in the same envelope."
         )
         ctx.emit(
-            "extract",
-            "tier=parsed_json dedup call (T=0)",
+            "extract", "dedup_call",
+            tier="parsed_json",
             n_input_entries=len(envelope),
         )
-        resp = self.call(ctx, user_msg, temperature=0.0)
-        raw = resp.text
-        parsed = _parse_response_raw(raw, ctx)
+        parsed = self._prompt.call(ctx, user_msg, temperature=0.0)
         ctx.emit(
-            "extract",
-            "tier=parsed_json dedup response",
-            raw=raw,
+            "extract", "dedup_response",
+            tier="parsed_json",
             n_entries=0 if parsed is None else len(parsed),
         )
         if not parsed:
             ctx.emit(
-                "extract",
-                "tier=parsed_json dedup failed: empty or unparseable response",
+                "extract", "dedup_failed",
+                tier="parsed_json",
+                reason="empty_or_unparseable",
                 n_input_entries=len(merged_entries),
             )
             return []
@@ -444,13 +414,16 @@ or keys.
         n_dropped = len(parsed) - len(kept)
         if n_dropped:
             ctx.emit(
-                "extract",
-                f"tier=parsed_json dedup verifier dropped {n_dropped}/{len(parsed)}",
+                "extract", "dedup_verifier_dropped",
+                tier="parsed_json",
+                n_dropped=n_dropped,
+                n_parsed=len(parsed),
             )
         if not kept:
             ctx.emit(
-                "extract",
-                "tier=parsed_json dedup failed: every output entry rejected by verifier",
+                "extract", "dedup_failed",
+                tier="parsed_json",
+                reason="all_rejected_by_verifier",
                 n_input_entries=len(merged_entries),
                 n_output_entries=len(parsed),
             )
@@ -463,9 +436,9 @@ class ExtractExecutor:
     executor and drives the parsed_json → vision tier fallback."""
 
     def __init__(self) -> None:
-        self._text = ExtractTextPromptedCall()
-        self._vision = ExtractVisionPromptedCall()
-        self._dedup = ExtractDedupPromptedCall()
+        self._text = TextExtractor()
+        self._vision = VisionExtractor()
+        self._dedup = DedupExtractor()
 
     def _parsed_json_tier(
         self,
@@ -473,32 +446,33 @@ class ExtractExecutor:
         ctx: HarnessContext,
         branch: RetrieveBranch,
     ) -> list[AnnotatedValue] | None:
-        """Tier 1 — group-aware page fan-out → per-cell text verifier → LLM dedup."""
-        # Gather text per ref. Outside golden mode, cap the page count first:
-        # every ref produces a text block in the prompt. Refs whose parsed
-        # source has no text for this PDF page are dropped — the vision tier
-        # can still pick them up on fallback.
+        """Tier 1 — group-aware page fan-out → per-cell text verifier → LLM dedup.
+        Refs with no parsed text are dropped (the vision tier can still pick them up)."""
         if ctx.config.golden_pages is None:
             refs = refs[: ctx.config.extract_max_pages]
         pages: list[tuple[PageRef, str]] = []
         for ref in refs:
             text = get_page_text(ref.month, ref.page)
             if not text:
-                ctx.emit("extract", "tier=parsed_json no text", page=str(ref))
+                ctx.emit("extract", "no_text", tier="parsed_json", page=str(ref))
                 continue
             ctx.emit(
-                "extract",
-                "tier=parsed_json got text",
-                page=str(ref),
-                chars=len(text),
+                "extract", "got_text",
+                tier="parsed_json", page=str(ref), chars=len(text),
             )
             pages.append((ref, text))
         if not pages:
-            ctx.emit("extract", "tier=parsed_json skipped (no text from any ref)")
+            ctx.emit(
+                "extract", "tier_skipped",
+                tier="parsed_json", reason="no_text_from_any_ref",
+            )
             return None
         all_entries = self._text.run(ctx.question, branch, pages, ctx)
         if not all_entries:
-            ctx.emit("extract", "tier=parsed_json all samples empty after verifier")
+            ctx.emit(
+                "extract", "tier_empty",
+                tier="parsed_json", reason="all_samples_empty_after_verifier",
+            )
             return None
         return all_entries or None
 
@@ -518,17 +492,17 @@ class ExtractExecutor:
             try:
                 img = render_page_b64(ref.month, ref.page, dpi=300, fmt="png")
             except Exception as e:  # noqa: BLE001 — tier-fallback; any fitz error → skip page
-                ctx.emit("extract", "tier=vision render failed", page=str(ref), error=str(e))
+                ctx.emit("extract", "render_failed", tier="vision", page=str(ref), error=str(e))
                 img = None
             if img:
-                ctx.emit("extract", "tier=vision rendered png", page=str(ref))
+                ctx.emit("extract", "rendered_png", tier="vision", page=str(ref))
                 images.append(img)
                 rendered_refs.append(ref)
             else:
-                ctx.emit("extract", "tier=vision no png", page=str(ref))
+                ctx.emit("extract", "no_png", tier="vision", page=str(ref))
 
         if not images:
-            ctx.emit("extract", "tier=vision skipped (no images)")
+            ctx.emit("extract", "tier_skipped", tier="vision", reason="no_images")
             return None
 
         entries = self._vision.call_once(
@@ -546,15 +520,8 @@ class ExtractExecutor:
         if not refs:
             raise StepFailed("extract", "No page refs to extract from")
 
-        ctx.emit(
-            "extract",
-            "starting",
-            visual_only=branch.visual_only,
-            n_refs=len(refs),
-            refs=[str(r) for r in refs],
-            key=branch.key or None,
-            period=branch.period,
-        )
+        # No "starting" boundary emit — the orchestrator's trace records this
+        # step's boundary (and the prior retrieve step's output is these refs).
 
         tiers = [] if branch.visual_only else [("parsed_json", self._parsed_json_tier)]
         tiers.append(("vision", self._vision_tier))
@@ -564,8 +531,8 @@ class ExtractExecutor:
             if result is None:
                 continue
             ctx.emit(
-                "extract",
-                f"tier={tier_name} produced values",
+                "extract", "tier_result",
+                tier=tier_name,
                 descriptions=[e.description for e in result],
             )
             return result

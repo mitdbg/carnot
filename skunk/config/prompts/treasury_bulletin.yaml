@@ -146,6 +146,26 @@ overrides:
         }
         ```
 
+      - |
+        ### Example (multi-period external series: ONE branch, list payload)
+        Q: Sum of annual U.S. CPI-U for 1950, 1951, and 1952.
+        Why this shape: Same external series across consecutive years → ONE lookup_external branch with a multi-period target, NOT three. The lookup agent returns a list value; compute sums it.
+        Plan:
+        ```json
+        {
+          "branches": [
+            {"kind": "lookup_external",
+             "target": "U.S. CPI-U annual averages for 1950, 1951, 1952",
+             "src": "Bureau of Labor Statistics"}
+          ],
+          "computation": {
+            "task": "Sum the three CPI-U values.",
+            "qualifiers": []
+          },
+          "presentation": {"units_out": "cpi"}
+        }
+        ```
+
   # ---------------------------------------------------------------------
   # Corpus blurbs for the remaining executors.
   # ---------------------------------------------------------------------

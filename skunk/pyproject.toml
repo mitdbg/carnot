@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "skunk"
 version = "0.1.0"
 description = "Declarative QA pipeline over the U.S. Treasury Bulletin corpus"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "chromadb>=1.4.0",
     "google-genai",
@@ -19,11 +19,7 @@ dependencies = [
     "numpy",
     "statsmodels",
     "tavily-python",
-]
-
-[project.optional-dependencies]
-dev = [
-    "pytest",
+    "pandas-stubs==3.0.3.260530",
 ]
 
 [tool.setuptools.packages.find]
@@ -34,6 +30,9 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 skunk = ["py.typed"]
+
+[tool.ruff]
+target-version = "py312"
 
 [tool.ruff.lint]
 # StepFailed is a deliberate name (read as a tagged failure mode, not a fatal

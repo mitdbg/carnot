@@ -1,72 +1,54 @@
-"""Shared runtime: LLM client with rate limiting and retry.
+"""Shared runtime: the LLM client plus the cross-cutting types threaded between
+operators and the orchestrator (`PageRef`, `AnnotatedValue`, `HarnessContext`).
 
-All LLM traffic goes through the direct Gemini API (AI Studio) via the
-`google-genai` SDK, authenticated by `GEMINI_API_KEY` from `.env`.
-
-External-data lookups don't use Gemini's Google Search grounding tool
-(see `lookup_external.py` — code-as-proof via typed helpers + Tavily).
-
-Rate limiting
--------------
-A single process-wide rate limiter paces all LLM calls at `config.llm_rpm`
-requests/minute. The configured rpm is converted to requests/second
-(rps = rpm/60); slots refill continuously at that rate and the bucket caps at
-one second's worth of capacity, so bursts are bounded to ~1s of requests
-rather than a full minute. `call()` blocks on `acquire()` until a slot is free,
-then issues the API call.
-
-Retry
------
-Any exception from the SDK is treated as transient and retried with
-exponential backoff (`llm_retry_initial_delay_s`, doubling each attempt,
-capped at `llm_retry_max_delay_s`) up to `llm_max_retries` extra attempts.
-Each failure is logged to stderr. After exhaustion the last exception propagates.
-"""
+All LLM traffic goes through the direct Gemini API (AI Studio) via `google-genai`,
+authenticated by `GEMINI_API_KEY`. LLM calls are paced by the process-wide
+token-bucket limiter named `"llm"` (see `_RATE_LIMITS` / `get_rate_limiter`); any
+SDK exception is retried with exponential backoff up to `llm_max_retries` times."""
 
 from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
-import sys
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-
-# Reasoning-effort knob shared across LLM backends. Maps cleanly to
-# the Gemini SDK's `thinking_level` enum.
-# Replaces the legacy `thinking_budget: int` API — Gemini 3 treats the
-# legacy int as a soft suggestion only, not a cap. "off" is kept for
-# explicit no-thinking intent (legacy thinking_budget=0); "minimal" is
-# the cheapest Gemini-3 thinking tier (e.g. Gemini 3 Flash).
-Effort = Literal["off", "minimal", "low", "medium", "high"]
-_EFFORT_VALUES = ("off", "minimal", "low", "medium", "high")
-
+from pydantic import BaseModel, ConfigDict, model_validator
 from google import genai
 from google.genai import types
 
 from skunk.config import SkunkConfig
 
 if TYPE_CHECKING:
-    from skunk.models import HarnessContext
+    from skunk.prompted_call import PromptOverride
+
+# Reasoning-effort knob, mapped onto Gemini's `thinking_level` enum. "off" means
+# no thinking; "minimal" is the cheapest thinking tier.
+Effort = Literal["off", "minimal", "low", "medium", "high"]
+_EFFORT_VALUES = ("off", "minimal", "low", "medium", "high")
+
+# Process-scoped logger: retries happen with no per-question ctx in scope (see
+# `_retry_call`), so they go through stdlib logging rather than `ctx.emit`.
+log = logging.getLogger(__name__)
 
 
 class _RateLimiter:
     """Process-wide request rate limiter. Blocks until a request slot is free."""
 
-    def __init__(self, rate_per_sec: float, capacity: float) -> None:
+    def __init__(self, rate_per_sec: float) -> None:
         if rate_per_sec <= 0:
             raise ValueError(f"rate_per_sec must be > 0 (got {rate_per_sec})")
-        if capacity <= 0:
-            raise ValueError(f"capacity must be > 0 (got {capacity})")
         self._rate = rate_per_sec
-        self._capacity = capacity
-        self._tokens = capacity
+        # Burst capacity = ~1s of refill, floored at 1 token so sub-1/s rates still work.
+        self._capacity = max(1.0, rate_per_sec)
+        self._tokens = self._capacity
         self._last_refill = time.monotonic()
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
@@ -91,9 +73,40 @@ class _RateLimiter:
                 self._cond.wait(timeout=wait_s)
 
 
-_RATE_LIMITER_LOCK = threading.Lock()
-_RATE_LIMITER: _RateLimiter | None = None
-_RATE_LIMITER_RPM: float | None = None
+# Single source of truth for every external rate cap we pace against. Each row is
+# `name: (env override, default rpm)`. The rpm is read ONCE, on first use of the
+# name, and frozen for the rest of the run — buckets are created on demand and
+# never rebuilt (rate limits are immutable for a run). To add a service: add a row
+# and call `get_rate_limiter("<name>")` at the call site.
+_RATE_LIMITS: dict[str, tuple[str, float]] = {
+    # name          (env override,            default rpm)  # rationale
+    "llm":          ("SKUNK_LLM_RPM",        1000.0),  # Gemini generation; provider-side quota
+    "embed":        ("SKUNK_EMBED_RPM",       600.0),  # Gemini embeddings (search_agent.vector_search)
+    "fred":         ("SKUNK_FRED_RPM",        110.0),  # hard 120/min per API key, no paid tier
+    "bls":          ("SKUNK_BLS_RPM",          50.0),  # 500/day (registered); smooth worker bursts
+    "world_bank":   ("SKUNK_WORLD_BANK_RPM",  120.0),  # no published cap; stay a good citizen
+    "tavily":       ("SKUNK_TAVILY_RPM",      100.0),  # ~100/min on the dev tier
+}
+
+_LIMITERS_LOCK = threading.Lock()
+_LIMITERS: dict[str, _RateLimiter] = {}
+
+
+def get_rate_limiter(name: str) -> _RateLimiter:
+    """Process-wide token-bucket limiter for external service `name` (a key of
+    `_RATE_LIMITS`), paced at its rpm — env override read ONCE at first use, then
+    frozen for the run. All threads in this process share the named bucket.
+
+    Scope is per process, NOT per API key: separate processes get independent
+    buckets and do not coordinate, so a multi-process deployment would not be
+    bounded by the underlying per-key cap. The eval harness is single-process."""
+    with _LIMITERS_LOCK:
+        lim = _LIMITERS.get(name)
+        if lim is None:
+            env_var, default = _RATE_LIMITS[name]
+            lim = _RateLimiter(rate_per_sec=float(os.environ.get(env_var, default)) / 60.0)
+            _LIMITERS[name] = lim
+        return lim
 
 
 def load_env_file(path: Path) -> None:
@@ -127,17 +140,6 @@ def parse_json_response(text: str) -> Any | None:
         return json.loads(strip_code_fence(text))
     except json.JSONDecodeError:
         return None
-
-
-def _get_rate_limiter(rpm: float) -> _RateLimiter:
-    """Process-singleton rate limiter. Reset if rpm changes between calls."""
-    global _RATE_LIMITER, _RATE_LIMITER_RPM
-    with _RATE_LIMITER_LOCK:
-        if _RATE_LIMITER is None or _RATE_LIMITER_RPM != rpm:
-            rate = rpm / 60.0
-            _RATE_LIMITER = _RateLimiter(rate_per_sec=rate, capacity=max(1.0, rate))
-            _RATE_LIMITER_RPM = rpm
-        return _RATE_LIMITER
 
 
 @dataclass
@@ -177,19 +179,18 @@ class LLMClient:
         temperature: float = 0.0,
         effort: "Effort" = "off",
         ctx: "HarnessContext | None" = None,
+        call_site: str = "llm",
     ) -> LLMResponse:
         if effort not in _EFFORT_VALUES:
             raise ValueError(f"effort must be one of {_EFFORT_VALUES}, got {effort!r}")
         return self._call_gemini(
-            system, user, images, temperature, effort, ctx,
+            system, user, images, temperature, effort, ctx, call_site,
         )
 
     def _retry_call(self, do_call: "Callable[[], LLMResponse]") -> LLMResponse:
         """Run `do_call` under the rate limiter with exponential-backoff retry.
-        `do_call` owns API invocation, timing, response parsing, and the
-        ctx.emit on success; this helper only owns rate-limit acquire +
-        retry policy."""
-        limiter = _get_rate_limiter(self._config.llm_rpm)
+        `do_call` owns the API invocation, timing, parsing, and success emit."""
+        limiter = get_rate_limiter("llm")
         max_retries = self._config.llm_max_retries
         delay = self._config.llm_retry_initial_delay_s
         max_delay = self._config.llm_retry_max_delay_s
@@ -201,11 +202,9 @@ class LLMClient:
             except Exception as e:
                 if attempt == max_retries:
                     raise
-                print(
-                    f"[LLMClient] attempt {attempt + 1}/{max_retries + 1} failed: "
-                    f"{type(e).__name__}: {e}; sleeping {delay:.1f}s",
-                    file=sys.stderr,
-                    flush=True,
+                log.warning(
+                    "attempt %d/%d failed: %s: %s; sleeping %.1fs",
+                    attempt + 1, max_retries + 1, type(e).__name__, e, delay,
                 )
                 time.sleep(delay)
                 delay = min(delay * 2, max_delay)
@@ -220,16 +219,10 @@ class LLMClient:
         model: str = "gemini-embedding-001",
         batch_size: int = 100,
     ) -> list[list[float]]:
-        """Batched embedding via Vertex AI. Build-time / offline corpus-prep
-        only. The page-index query path is embedding-free; do not wire this
-        into per-query code.
-
-        `task_type` defaults to "CLUSTERING" per Google's docs. Output is
-        L2-unnormalized; callers L2-normalize before cosine. Input is
-        chunked at `batch_size` because Gemini's embed endpoint caps
-        single requests at 100 contents. No retries / no rate limiter:
-        this is a one-shot build-time call, not a sustained workload.
-        """
+        """Batched embedding — build-time / offline corpus-prep only (the query
+        path is embedding-free). Output is L2-unnormalized; callers normalize
+        before cosine. Chunked at `batch_size` (endpoint caps at 100/request).
+        No retries / no rate limiter — one-shot build call."""
         if not texts:
             return []
         client = self._get_gemini_client()
@@ -264,10 +257,8 @@ class LLMClient:
 
     @staticmethod
     def _effort_to_thinking_config(effort: "Effort") -> "types.ThinkingConfig":
-        # Map skunk's Effort onto Gemini's ThinkingLevel enum, which is
-        # the only knob that actually caps thinking spend for Gemini 3.
-        # The legacy `thinking_budget=int` is accepted but soft-bucketed
-        # by Google — not a hard cap.
+        # ThinkingLevel is the only knob that hard-caps thinking spend for Gemini 3
+        # (the legacy thinking_budget int is soft-bucketed).
         if effort == "off":
             return types.ThinkingConfig(thinking_budget=0)
         level_map = {
@@ -291,6 +282,17 @@ class LLMClient:
             thinking_config=LLMClient._effort_to_thinking_config(effort),
         )
 
+    @staticmethod
+    def _usage_tokens(usage: Any) -> dict:
+        """Token counts from a Gemini `usage_metadata` (best-effort — any may be
+        None, e.g. when streaming omits usage)."""
+        return {
+            "input_tokens": getattr(usage, "prompt_token_count", None),
+            "output_tokens": getattr(usage, "candidates_token_count", None),
+            "total_tokens": getattr(usage, "total_token_count", None),
+            "thinking_tokens": getattr(usage, "thoughts_token_count", None),
+        }
+
     def _call_gemini(
         self,
         system: str,
@@ -299,8 +301,9 @@ class LLMClient:
         temperature: float,
         effort: "Effort",
         ctx: "HarnessContext | None",
+        call_site: str = "llm",
     ) -> LLMResponse:
-        """Gemini call via the direct API (AI Studio)."""
+        """Single Gemini call. `call_site` attributes the envelope log to the caller."""
         client = self._get_gemini_client()
         parts = self._gemini_parts(user, images)
         gen_config = self._gemini_config(system, temperature, effort)
@@ -314,25 +317,250 @@ class LLMClient:
             latency_s = time.monotonic() - t0
             usage = api_resp.usage_metadata
             output_text = (api_resp.text or "").strip()
+            toks = self._usage_tokens(usage)
             if ctx is not None:
                 ctx.emit(
-                    "llm", "call",
+                    call_site, "call",
                     model=model,
                     temperature=temperature,
                     effort=effort,
                     latency_s=round(latency_s, 3),
-                    input_tokens=getattr(usage, "prompt_token_count", None),
-                    output_tokens=getattr(usage, "candidates_token_count", None),
-                    total_tokens=getattr(usage, "total_token_count", None),
-                    thinking_tokens=getattr(usage, "thoughts_token_count", None),
+                    **toks,
                     input_text=system + "\n\n---\n\n" + user,
                     output_text=output_text,
                 )
             return LLMResponse(
                 text=output_text,
                 latency_s=latency_s,
-                input_tokens=getattr(usage, "prompt_token_count", None),
-                output_tokens=getattr(usage, "candidates_token_count", None),
+                input_tokens=toks["input_tokens"],
+                output_tokens=toks["output_tokens"],
             )
 
         return self._retry_call(do)
+
+    def stream(
+        self,
+        *,
+        system: str,
+        messages: list[dict],
+        model: str | None = None,
+        should_stop: "Callable[[str], bool] | None" = None,
+        ctx: "HarnessContext | None" = None,
+        call_site: str = "llm",
+    ) -> LLMResponse:
+        """Multi-turn streaming call, accumulating chunks until `should_stop(acc)`
+        or the stream ends. `messages` are the {role, content} turns after the
+        system message ('assistant' → model role, else user). Lets multi-turn
+        agents share this client's rate-limit + retry + logging."""
+        client = self._get_gemini_client()
+        model_id = (model or self._config.llm_model).removeprefix("google/")
+        contents = [
+            types.Content(
+                role="model" if m["role"] == "assistant" else "user",
+                parts=[types.Part.from_text(text=m["content"])],
+            )
+            for m in messages
+        ]
+        gen_config = types.GenerateContentConfig(system_instruction=system)
+
+        def do() -> LLMResponse:
+            t0 = time.monotonic()
+            resp_stream = client.models.generate_content_stream(
+                model=model_id, contents=contents, config=gen_config,
+            )
+            accumulated = ""
+            usage = None
+            for chunk in resp_stream:
+                accumulated += chunk.text or ""
+                usage = getattr(chunk, "usage_metadata", None) or usage
+                if should_stop is not None and should_stop(accumulated):
+                    break
+            try:  # noqa: SIM105
+                resp_stream.close()
+            except Exception:
+                pass
+            latency_s = time.monotonic() - t0
+            toks = self._usage_tokens(usage)
+            if ctx is not None:
+                ctx.emit(
+                    call_site, "call",
+                    model=model_id,
+                    latency_s=round(latency_s, 3),
+                    **toks,
+                    output_text=accumulated,
+                )
+            return LLMResponse(
+                text=accumulated,
+                latency_s=latency_s,
+                input_tokens=toks["input_tokens"],
+                output_tokens=toks["output_tokens"],
+            )
+
+        return self._retry_call(do)
+
+
+# --- Cross-cutting runtime types threaded between operators and the orchestrator ---
+
+
+@dataclass
+class PageRef:
+    """Canonical page coordinate."""
+    month: str | None = None        # "YYYY-MM"
+    page: int | None = None         # 1-based PDF page index (canonical)
+
+    @property
+    def year(self) -> int | None:
+        return int(self.month[:4]) if self.month else None
+
+    def __post_init__(self) -> None:
+        if self.page is not None and self.month is None:
+            raise ValueError(
+                f"PageRef with page={self.page} requires month for parsed-JSON lookup"
+            )
+
+    def __repr__(self) -> str:
+        parts = []
+        if self.year:
+            parts.append(f"year={self.year}")
+        if self.month:
+            parts.append(f"month={self.month}")
+        if self.page is not None:
+            parts.append(f"page={self.page}")
+        return f"PageRef({', '.join(parts)})"
+
+
+def page_key_to_pageref(key: str) -> PageRef:
+    """Parse a search-agent page key (`"YYYY_MM_pageid"` or `"YYYY-MM-pageid"`)
+    into a `PageRef`. Splits on the last separator so the page id is unambiguous."""
+    sep = "_" if "_" in key and key.count("_") >= 2 else "-"
+    try:
+        year_str, month_str, page_str = key.rsplit(sep, 2)
+    except ValueError as e:
+        raise ValueError(f"page key {key!r} not in YYYY{sep}MM{sep}pageid form") from e
+    return PageRef(month=f"{year_str}-{month_str}", page=int(page_str))
+
+
+VALUE_KIND_VOCAB: frozenset[str] = frozenset({"scalar", "vector", "table"})
+
+
+class AnnotatedValue(BaseModel):
+    """One described, annotated datum: a payload plus minimal metadata.
+
+    `description` uniquely distinguishes this entry from its siblings. `unit` is
+    a natural-language label (empty for non-measurements). Payload shape is set
+    by `kind` (enforced at construction — cells are always primitive, no nesting):
+      - "scalar": int|float|str, or a list of those (lookup_external multi-value)
+      - "vector": dict[str, primitive] keyed by `index_name` labels
+      - "table":  dict[str, dict[str, primitive]], outer key `row_name`, inner `col_name`
+
+    `.frame` exposes the payload as a uniform `pd.DataFrame` so downstream code
+    needn't branch on `kind`.
+    """
+    model_config = ConfigDict(frozen=True)
+
+    description: str
+    value: Any
+    unit: str = ""
+    kind: Literal["scalar", "vector", "table"] = "scalar"
+    index_name: str | None = None
+    row_name: str | None = None
+    col_name: str | None = None
+
+    @model_validator(mode="after")
+    def _check_shape(self) -> AnnotatedValue:
+        # bool is an int subclass in Python — exclude it explicitly.
+        def is_prim(c: Any) -> bool:
+            return not isinstance(c, bool) and isinstance(c, (int, float, str))
+
+        v = self.value
+        if self.kind == "scalar":
+            ok = is_prim(v) or (isinstance(v, list) and all(is_prim(c) for c in v))
+            if not ok:
+                raise ValueError(
+                    f"kind=scalar requires int|float|str (or list of those), "
+                    f"got {type(v).__name__}"
+                )
+        elif self.kind == "vector":
+            if not (isinstance(v, dict) and all(
+                isinstance(k, str) and is_prim(c) for k, c in v.items()
+            )):
+                raise ValueError("vector value must be flat dict[str, scalar]")
+            if not self.index_name:
+                raise ValueError("vector entry missing non-empty 'index_name'")
+        else:  # table
+            if not (isinstance(v, dict) and all(
+                isinstance(r, str)
+                and isinstance(row, dict)
+                and all(isinstance(k, str) and is_prim(c) for k, c in row.items())
+                for r, row in v.items()
+            )):
+                raise ValueError(
+                    "table value must be dict[str, dict[str, scalar]] (no nesting)"
+                )
+            if not self.row_name or not self.col_name:
+                raise ValueError("table entry missing non-empty 'row_name'/'col_name'")
+        return self
+
+    @property
+    def frame(self):
+        """Uniform pandas view of the payload: scalar → 1×N column, vector → N×1
+        with `index.name == index_name`, table → R×C with named index/columns."""
+        import pandas as pd
+        v = self.value
+        label = (self.description or "value").strip() or "value"
+        if self.kind == "scalar":
+            rows = list(v) if isinstance(v, list) else [v]
+            return pd.DataFrame({label: rows})
+        if self.kind == "vector":
+            s = pd.Series(v, name=label, dtype=object if not v else None)
+            df = s.to_frame()
+            df.index.name = self.index_name
+            return df
+        df = pd.DataFrame.from_dict(v, orient="index")
+        df.index.name = self.row_name
+        df.columns.name = self.col_name
+        return df
+
+
+@dataclass
+class HarnessContext:
+    question: str
+    verbose: bool = False     # live-print orchestrator + operator events to stdout
+    events: list[dict] = field(default_factory=list)  # per-question diagnostic events
+    config: SkunkConfig = field(default_factory=SkunkConfig.from_env)
+    llm_client: LLMClient | None = None  # inject a mock for tests; auto-created otherwise
+    prompt_overrides: tuple[PromptOverride, ...] = ()  # corpus/few_shot/lesson overrides; operators pick out their own entries by name
+
+    def __post_init__(self) -> None:
+        if self.llm_client is None:
+            self.llm_client = LLMClient(self.config)
+
+    def emit(self, source: str, message: str, **fields: Any) -> None:
+        """Record a request-scoped diagnostic event onto this question's event stream.
+
+        Convention (see ARCHITECTURE.md "Logging & observability"):
+        - `source` is the op / call-site name (e.g. "extract", "compute",
+          "retrieve"). `_step` is reserved for the orchestrator's frame
+          delimiter — do not use it elsewhere.
+        - `message` is a STABLE event-key literal (snake_case, no
+          interpolation). Every variable goes in `**fields`, never into the
+          message string — that keeps events groupable/filterable.
+        - Emit the fact at the layer that owns it, and only there: the
+          orchestrator owns operator boundaries (via the trace), so operators
+          do NOT emit their own "starting"/"done"; each operator emits only
+          its own internal decisions. Use stdlib `logging` (not `emit`) from
+          code that has no per-question ctx (build pipelines, offline prep).
+        """
+        evt = {"source": source, "message": message, **fields}
+        self.events.append(evt)
+        if self.verbose:
+            extra = ""
+            if fields:
+                bits = []
+                for k, v in fields.items():
+                    s = repr(v)
+                    if len(s) > 200:
+                        s = s[:200] + "..."
+                    bits.append(f"{k}={s}")
+                extra = " | " + ", ".join(bits)
+            print(f"  [{source}] {message}{extra}")

@@ -1,13 +1,13 @@
 """Teammate's search agent — vendored under one subtree.
 
-Wired into the framework by `skunk.retrieve.RetrieveExecutor` when
+Wired into the framework by `skunk.retrieve.SearchAgentRetrieveExecutor` when
 `config.retriever == "search_agent"`. The agent runs an iterative
 tool-using LLM loop (vector_search / retrieve_page_info / run_grep /
 final_answer) over a ChromaDB index + cleaned per-page text, and
 returns a list of page keys.
 
-The agent's system prompt is assembled by `SearchAgentPromptedCall`
-(subclass of `skunk.prompted_call.PromptedCall`); per-step events
+The agent's system prompt is assembled by the `PromptedCall` built by
+`make_search_agent_prompt()`; per-step events
 (system / question / assistant / observation / error) flow through
 `ctx.emit("search_agent", …)` into the orchestrator's `QuestionTrace`.
 The remaining vendored pieces — `OpenRouter` shim and `LocalPythonExecutor`

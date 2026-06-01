@@ -1,29 +1,28 @@
-"""lookup_external operator — multi-turn code-as-proof external lookup.
+"""lookup_external operator — multi-turn code-as-proof external lookup. Spins up a
+per-branch `LookupAgent` whose tools fetch from FRED / BLS / World Bank / Tavily
+(see `lookup_tools.py`), then translates the `{value, unit, source}` dict into
+`list[AnnotatedValue]`.
 
-`LookupExternalPromptedCall.run(ctx, branch)` is the orchestrator-facing
-entry. It spins up a per-branch `LookupAgent` (a `MultiTurnAgent`)
-whose tools fetch from FRED / BLS / World Bank / Tavily, runs the
-loop, and translates the `{value, unit, source}` dict into the
-`list[AnnotatedValue]` shape compute expects.
-"""
+The agent's tool set is pluggable: `LookupExternal.run` resolves a list of `Tool`s
+(explicit override → `config.lookup_tools` → all tools) plus a prioritization
+string, and the agent renders its `## Tools` prompt section (each tool's `doc`) +
+prioritization guidance from them. `final_answer` is the always-injected loop
+terminator and is never part of the pluggable set."""
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Any
 
 from skunk.extract import _cell_in_text
-from skunk.lookup_helpers import (
-    fetch_bls, fetch_fred, fetch_url, fetch_world_bank, tavily_search,
-)
-from skunk.models import AnnotatedValue, HarnessContext
-from skunk.multi_turn_agent import MultiTurnAgent, final_answer
+from skunk.lookup_tools import DEFAULT_PRIORITIZATION, resolve_lookup_tools
+from skunk.common import AnnotatedValue, HarnessContext
+from skunk.multi_turn_agent import MultiTurnAgent, Tool
 from skunk.plan import LookupBranch
+from skunk.prompted_call import PromptedCall
 
 
 def _flatten_numbers(value: Any) -> list[float | int]:
-    """Recursively collect primitive numbers (ints/floats, not bools).
-    Non-numeric leaves are silently skipped — grounding is numeric-only."""
+    """Recursively collect primitive numbers (not bools); non-numeric leaves skipped."""
     if isinstance(value, bool):
         return []
     if isinstance(value, (int, float)):
@@ -34,56 +33,22 @@ def _flatten_numbers(value: Any) -> list[float | int]:
 
 
 class LookupAgent(MultiTurnAgent):
-    name: str = "lookup_external"
-    system_prompt: str = """\
-You find one data point from an external source per request. Each
-request is a JSON object {"target": "<value>", "src": "<source | null>"}.
+    _SYSTEM_PROMPT = """\
+You find one external value per request — or a list of values when the
+target names a series across multiple periods. Each request is a JSON
+object {"target": "<value(s)>", "src": "<source | null>"}.
 
 You have ≤8 steps. Each step, output ONE ```python``` block calling
 one tool. The tool's output appears as your next observation.
 
-When you see a number that plausibly answers the target in some tool
-output, your VERY NEXT block should be final_answer. Many historical
-lookups have no single canonical precision — multiple sources may
-report slightly different values. Pick the first plausible hit and
-commit. Searching for confirmation is the dominant failure mode.
+{{ prioritization }}
 
 If `src` is non-null, the answer must come from that publisher. If
 null, any authoritative public source is fine.
 
 ## Tools (already imported)
 
-### fetch_fred(series_id, date)
-FRED API. `date`: YYYY (annual mean), YYYY-MM, YYYY-MM-DD.
-```python
-val = fetch_fred("CPIAUCSL", "1953")     # annual mean of CPI in 1953
-val = fetch_fred("DGS10", "2020-03-15")  # 10y yield near date
-```
-
-### fetch_bls(series_id, date)
-BLS API. Same date format.
-```python
-val = fetch_bls("CUUR0000SA0", "1953")   # CPI-U 1953 annual
-```
-
-### fetch_world_bank(iso3, indicator, year)
-Annual indicators.
-```python
-val = fetch_world_bank("DEU", "NY.GDP.MKTP.CD", "1996")  # Germany nominal GDP
-```
-
-### tavily_search(query, max_results=5)
-Web search. Returns [{title, url, content, score}]. The `content`
-snippet often carries the number directly.
-```python
-hits = tavily_search("annual average GBP USD exchange rate 1941")
-```
-
-### fetch_url(url)
-Fetch and return cleaned page text. Soft-fails on errors.
-```python
-text = fetch_url("https://example.com/historical-rates")
-```
+{{ tools_doc }}
 
 ### final_answer(payload)
 Commit. Call exactly once.
@@ -97,19 +62,19 @@ Also in scope: `math`, `statistics`, `datetime`, `numpy as np`,
 `pandas as pd`, `json`.
 {{ default_tail }}"""
 
-    def __init__(self, branch: LookupBranch, max_steps: int = 8):
+    def __init__(self, branch: LookupBranch, max_steps: int, tools: list[Tool], prioritization: str):
+        super().__init__(
+            PromptedCall(
+                name="lookup_external",
+                system_prompt=self._SYSTEM_PROMPT.replace(
+                    "{{ tools_doc }}", "\n\n".join(t.doc for t in tools)),
+                default_effort="off",
+                template_vars=lambda _ctx: {"prioritization": prioritization},
+            ),
+            tools,
+        )
         self._branch = branch
         self.max_steps = max_steps
-
-    def tools(self) -> dict[str, Callable]:
-        return {
-            "fetch_fred": fetch_fred,
-            "fetch_bls": fetch_bls,
-            "fetch_world_bank": fetch_world_bank,
-            "tavily_search": tavily_search,
-            "fetch_url": fetch_url,
-            "final_answer": final_answer,
-        }
 
     def validate_final_answer(self, payload: dict, observations: list[str]) -> str | None:
         nums = _flatten_numbers(payload.get("value"))
@@ -126,11 +91,14 @@ Also in scope: `math`, `statistics`, `datetime`, `numpy as np`,
         )
 
 
-class LookupExternalPromptedCall:
-    name: str = "lookup_external"
-
-    def run(self, ctx: HarnessContext, branch: LookupBranch) -> list[AnnotatedValue]:
-        agent = LookupAgent(branch, max_steps=ctx.config.lookup_max_steps)
+class LookupExternal:
+    def run(self, ctx: HarnessContext, branch: LookupBranch,
+            tools: list[Tool] | None = None, prioritization: str | None = None) -> list[AnnotatedValue]:
+        tools = resolve_lookup_tools(ctx.config, tools)
+        agent = LookupAgent(
+            branch, max_steps=ctx.config.lookup_max_steps,
+            tools=tools, prioritization=prioritization or DEFAULT_PRIORITIZATION,
+        )
         user_msg = branch.model_dump_json(
             include={"target", "src"}, indent=2, exclude_none=True,
         )

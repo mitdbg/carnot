@@ -1,9 +1,5 @@
-"""Centralized configuration for the skunk harness.
-
-All tuning constants live here. Values can be overridden via environment variables
-(documented next to each field). Construct via SkunkConfig.from_env() or pass
-custom values directly for tests.
-"""
+"""Centralized configuration. All tuning constants live here, overridable via the
+environment (env var noted next to each field). Construct via `SkunkConfig.from_env()`."""
 
 from __future__ import annotations
 
@@ -13,107 +9,78 @@ from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from skunk.common import Effort
-    from skunk.models import PageRef
+    from skunk.common import PageRef
 
 
 @dataclass
 class SkunkConfig:
-    # Orchestrator + extract fan-out. Sized so a typical question
-    # (≤3 branches × ≤5 pages × ≤3 samples) is bounded by the LLM RPM
-    # limiter rather than the thread pool.
+    # Orchestrator + extract fan-out; sized so a typical question is bounded by the
+    # LLM RPM limiter, not the thread pool.
     max_parallel_workers: int = 16
 
-    # LLM model — all calls (planner, retrieve, extract, compute, lookup_external)
-    # go through GCP Vertex AI. Use bare Vertex model names (no `google/` prefix).
-    # Requires GOOGLE_CLOUD_PROJECT in the environment and ADC set up via
-    # `gcloud auth application-default login`. GOOGLE_CLOUD_LOCATION defaults to
-    # us-central1. (env: SKUNK_LLM_MODEL, SKUNK_LLM_RPM)
+    # LLM model — all calls go through GCP Vertex AI (bare model names, no `google/`
+    # prefix). Needs GOOGLE_CLOUD_PROJECT + ADC. (env: SKUNK_LLM_MODEL)
+    # LLM request pacing is a process-wide rate limit (env: SKUNK_LLM_RPM), owned by
+    # `common._RATE_LIMITS` alongside every other external service, not by config.
     llm_model: str = "gemini-3.5-flash"
-    # Token-bucket rate limit applied to every LLM call (requests per minute).
-    # Default sized for Vertex Gemini Flash paid-tier quotas; adjust for other models.
-    llm_rpm: float = 1000.0
-    # Per-call retry with exponential backoff. Re-tries any SDK exception;
-    # delay doubles each attempt, capped at llm_retry_max_delay_s.
+    # Per-call retry: any SDK exception, delay doubling each attempt up to the cap.
     llm_max_retries: int = 10
     llm_retry_initial_delay_s: float = 0.05
     llm_retry_max_delay_s: float = 1.0
 
-    # Per call-site effort override. Maps `PromptedCall.name` (e.g.
-    # "planner", "compute.codegen", "extract.text") → Effort tier
-    # ("off"|"minimal"|"low"|"medium"|"high"). When a key is missing
-    # the call-site's class-level `default_effort` applies. Operators
-    # may still pass an explicit `effort=` argument at call time to
-    # escalate on retry — that wins over both this dict and the default.
+    # Per call-site effort override: `PromptedCall.name` → Effort tier. Missing key →
+    # the call-site's `default_effort`; an explicit `effort=` arg still wins over both.
     # (env: SKUNK_EFFORT_OVERRIDES — comma-separated `name=tier` pairs)
     effort_overrides: dict[str, "Effort"] = field(default_factory=dict)
 
     # Extract operator (env: SKUNK_EXTRACT_N_SAMPLES, SKUNK_EXTRACT_SAMPLE_TEMPERATURE)
-    extract_n_samples: int = 1       # LLM calls per tier 1. Sampling + dedup disabled — the 17-UID flip-flop ablation on 2026-05-29 showed no meaningful accuracy gain over single-sample extract.
+    extract_n_samples: int = 1       # single-sample; multi-sample + dedup disabled (no measured accuracy gain)
     extract_sample_temperature: float = 0.7
     extract_max_pages: int = 5       # page cap per tier
 
     # Compute operator
     compute_max_attempts: int = 3
 
-    # Replan-on-MissingData loop: after compute raises MissingData, the
-    # planner is re-invoked with the prior plan + current `prev` + the
-    # missing-data signal. The orchestrator diffs the returned plan against
-    # the prior plan and executes only the newly-added branches; their
-    # outputs are appended to `prev` before compute is re-invoked. Total
-    # compute invocations per question ≤ recovery_max_rounds + 1.
+    # Replan-on-MissingData loop. Total compute invocations ≤ recovery_max_rounds + 1.
     recovery_max_rounds: int = 2
 
-    # Prompt overrides YAML — corpus blurbs, few-shots, lessons. Loaded once
-    # at the top level and threaded onto HarnessContext.prompt_overrides.
-    # (env: SKUNK_PROMPT_OVERRIDES)
+    # Prompt overrides YAML — corpus blurbs, few-shots, lessons. (env: SKUNK_PROMPT_OVERRIDES)
     prompt_overrides_path: str = "config/prompts/treasury_bulletin.yaml"
 
-    # Ablation: supply golden page refs to bypass the retrieve operator.
-    # Present for train/eval runs; None for production workloads.
+    # Ablation: golden page refs bypass the retrieve operator (eval runs only).
     golden_pages: list[PageRef] | None = field(default=None, repr=False)
 
-    # Retrieve operator dispatch. "search_agent" routes to the iterative
-    # ChromaDB + LLM-loop retriever (default); "page_index" routes to the
-    # PageIndexRetriever (ToC pick → year filter → semantic filter).
-    # (env: SKUNK_RETRIEVER)
+    # Retrieve dispatch: "search_agent" (iterative ChromaDB + LLM loop) or "page_index"
+    # (ToC pick → year filter → semantic filter). (env: SKUNK_RETRIEVER)
     retriever: Literal["search_agent", "page_index"] = "search_agent"
 
-    # Search-agent corpus artifacts (built offline; see
-    # src/skunk/search_agent/prep/). The agent fails fast at first
-    # non-golden call if either path is missing.
+    # Search-agent corpus artifacts (built offline; agent fails fast if missing).
     # (env: SKUNK_CHROMADB_DIR, SKUNK_CHROMADB_COLLECTION, SKUNK_CLEAN_PAGE_MAP)
     chromadb_dir: str = "cache/chromadb"
     chromadb_collection: str = "treasury_pages"
     clean_page_map_path: str = "cache/clean_page_map.json"
 
-    # Embedding model used by the agent's vector_search tool (must match
-    # whatever produced the stored embeddings). Vertex bare name — no `google/` prefix.
+    # Embedding model for vector_search (must match the stored embeddings).
     # (env: SKUNK_EMB_MODEL)
     emb_model_id: str = "gemini-embedding-001"
 
-    # Per-question agent budget. The teammate's defaults are 20/20.
-    # (env: SKUNK_AGENT_MAX_STEPS, SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL)
+    # Per-question search-agent budget. (env: SKUNK_AGENT_MAX_STEPS, SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL)
     agent_max_steps: int = 20
     agent_max_pages_per_tool_call: int = 20
 
-    # Per-call cap for the multi-turn lookup_external agent. Each step is
-    # one (generate → exec → observe) cycle; the agent terminates earlier
-    # via `final_answer(...)`. Shorter than agent_max_steps because lookups
-    # are simpler than retrieval — typically 1–3 steps suffice.
+    # Step cap for the lookup_external agent (terminates earlier via `final_answer`).
     # (env: SKUNK_LOOKUP_MAX_STEPS)
     lookup_max_steps: int = 8
+    # Active lookup tools by name (see `lookup_tools._REGISTRY`); None → all tools.
+    # (env: SKUNK_LOOKUP_TOOLS — comma-separated, e.g. "fetch_fred,tavily_search")
+    lookup_tools: list[str] | None = None
 
-    # Chat model used by the agent loop. None → fall back to `llm_model`.
-    # (env: SKUNK_AGENT_MODEL)
+    # Agent-loop chat model. None → `llm_model`. (env: SKUNK_AGENT_MODEL)
     agent_model_id: str | None = None
 
-    # Semantic filter for the page-index retriever — the third query pass
-    # (ToC pick → year filter → semantic filter). A two-stage cascade:
-    # coarse (page metadata, cheap) then fine (full page text, precise),
-    # each batched and run in parallel across batches. Default ON; set
-    # semfilter_enabled=False for a ToC + year-filter-only ablation.
-    # (env: SKUNK_SEMFILTER_ENABLED, SKUNK_SEMFILTER_BATCH,
-    #  SKUNK_SEMFILTER_WORKERS, SKUNK_SEMFILTER_MAX_PAGE_CHARS)
+    # Page-index semantic filter: two-stage (coarse metadata → fine page text) cascade,
+    # batched and parallel. Set False for a ToC + year-filter-only ablation.
+    # (env: SKUNK_SEMFILTER_ENABLED, SKUNK_SEMFILTER_BATCH, SKUNK_SEMFILTER_WORKERS, SKUNK_SEMFILTER_MAX_PAGE_CHARS)
     semfilter_enabled: bool = True
     semfilter_batch_size: int = 20
     semfilter_workers: int = 16
@@ -124,7 +91,6 @@ class SkunkConfig:
         return cls(
             llm_model=os.environ.get("SKUNK_LLM_MODEL", "gemini-3.5-flash"),
             effort_overrides=_parse_effort_overrides(os.environ.get("SKUNK_EFFORT_OVERRIDES", "")),
-            llm_rpm=float(os.environ.get("SKUNK_LLM_RPM", "1000")),
             llm_max_retries=int(os.environ.get("SKUNK_LLM_MAX_RETRIES", "10")),
             llm_retry_initial_delay_s=float(os.environ.get("SKUNK_LLM_RETRY_INITIAL_DELAY", "0.05")),
             llm_retry_max_delay_s=float(os.environ.get("SKUNK_LLM_RETRY_MAX_DELAY", "1.0")),
@@ -145,15 +111,14 @@ class SkunkConfig:
             agent_max_steps=int(os.environ.get("SKUNK_AGENT_MAX_STEPS", "20")),
             agent_max_pages_per_tool_call=int(os.environ.get("SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL", "20")),
             lookup_max_steps=int(os.environ.get("SKUNK_LOOKUP_MAX_STEPS", "8")),
+            lookup_tools=_parse_csv(os.environ.get("SKUNK_LOOKUP_TOOLS", "")),
             agent_model_id=os.environ.get("SKUNK_AGENT_MODEL") or None,
         )
 
 
 def _parse_effort_overrides(raw: str) -> dict[str, "Effort"]:
-    """Parse `SKUNK_EFFORT_OVERRIDES` ("name=tier,name=tier,...") into a
-    dict. Empty / whitespace-only input → empty dict. Raises ValueError
-    on malformed entries or unknown tiers — we want config typos to
-    fail loudly at startup rather than silently apply the default."""
+    """Parse `SKUNK_EFFORT_OVERRIDES` ("name=tier,...") into a dict. Raises ValueError
+    on malformed entries / unknown tiers so config typos fail loudly at startup."""
     from skunk.common import _EFFORT_VALUES  # local to avoid import cycle
 
     out: dict[str, Effort] = {}
@@ -175,3 +140,10 @@ def _parse_effort_overrides(raw: str) -> dict[str, "Effort"]:
             )
         out[name] = tier  # type: ignore[assignment]
     return out
+
+
+def _parse_csv(raw: str) -> list[str] | None:
+    """Parse a comma-separated env var into a list of trimmed entries, or None when
+    unset/empty (so the field falls back to its default)."""
+    items = [s.strip() for s in raw.split(",") if s.strip()]
+    return items or None

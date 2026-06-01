@@ -10,19 +10,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from skunk.models import AnnotatedValue, PageRef
+from skunk.common import AnnotatedValue, PageRef
 from skunk.plan import Plan
 
 
 @dataclass
 class StepTrace:
     op: str
-    args: dict
-    input_desc: str
     output_desc: str
     elapsed_s: float
     error: str | None = None
-    input_full: str = ""   # full repr (no truncation), for trace dump
     output_full: str = ""  # full repr (no truncation), for trace dump
     step_idx: int = 0
 
@@ -45,7 +42,6 @@ class QuestionTrace:
         for s in self.steps:
             status = f"ERROR: {s.error}" if s.error else "OK"
             lines.append(f"  [{s.op}] {status} ({s.elapsed_s:.2f}s)")
-            lines.append(f"    in:  {s.input_desc}")
             lines.append(f"    out: {s.output_desc}")
         return "\n".join(lines)
 

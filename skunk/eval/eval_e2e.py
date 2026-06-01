@@ -224,8 +224,8 @@ def main() -> None:
                              "them — only opt in for a deliberate final-number measurement.")
     parser.add_argument("--workers", type=int, default=32,
                         help="UID-level concurrency (default: %(default)s). Each worker runs one "
-                             "_run_one_question independently; the process-level LLM rate limiter "
-                             "throttles cross-worker traffic to config.llm_rpm.")
+                             "_run_one_question independently; the process-wide LLM rate limiter "
+                             "throttles cross-worker traffic (env: SKUNK_LLM_RPM).")
     args = parser.parse_args()
 
     df = pd.read_csv(args.csv)
