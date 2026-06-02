@@ -1,6 +1,6 @@
 """compute operator — codegen + execution over the extracted-value env.
 
-`ComputeExecutor.run` generates Python that assigns `result` (the answer string),
+`ComputeOp.run` generates Python that assigns `result` (the answer string),
 execs it in-process, then self-critiques — all under one retry loop covering parse
 failures, exec exceptions, and critique REVISE verdicts.
 
@@ -389,8 +389,8 @@ reason.
         return self._decide(ctx, question, focus, prev, code, result_text)
 
 
-class ComputeExecutor:
-    """Unified codegen → exec → critique loop. One public `run()`."""
+class ComputeOp:
+    """The compute operator — unified codegen → exec → critique loop. One public `run()`."""
 
     def __init__(self) -> None:
         self._codegen = Codegen()

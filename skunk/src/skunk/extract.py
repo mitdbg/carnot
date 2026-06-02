@@ -1,8 +1,8 @@
 """extract operator — question-driven extraction over page text/images, returning
 `list[AnnotatedValue]` (scalar / vector / table shapes; see `skunk.common`).
 
-`ExtractExecutor` drives a parsed_json → vision tier fallback over three call-site
-executors: `TextExtractor` (parsed-table text), `VisionExtractor` (rendered images),
+`ExtractOp` drives a parsed_json → vision tier fallback over three call-site
+extractors: `TextExtractor` (parsed-table text), `VisionExtractor` (rendered images),
 `DedupExtractor` (consolidates redundant entries; picks representatives, never invents)."""
 
 from __future__ import annotations
@@ -203,7 +203,9 @@ pick the smallest shape that captures every relevant value.
         user_msg = "\n\n".join([target, context_line, content])
         verify_text = content
         n_samples = ctx.config.extract_n_samples
-        temperature = ctx.config.extract_sample_temperature
+        # A single sample must be deterministic; the sampling temperature only
+        # makes sense when drawing >1 sample for diversity (then verify + merge).
+        temperature = ctx.config.extract_sample_temperature if n_samples > 1 else 0.0
 
         def _sample(sample_idx: int) -> list[AnnotatedValue]:
             parsed = self._prompt.call(ctx, user_msg, temperature=temperature) or []
@@ -270,7 +272,7 @@ pick the smallest shape that captures every relevant value.
             tier="parsed_json",
             n_groups=len(groups),
             n_samples=ctx.config.extract_n_samples,
-            temperature=ctx.config.extract_sample_temperature,
+            temperature=ctx.config.extract_sample_temperature if ctx.config.extract_n_samples > 1 else 0.0,
             n_pages=len(pages),
             group_sizes=[len(g) for g in groups],
             total_chars=sum(len(t) for _, t in pages),
@@ -431,9 +433,9 @@ or keys.
         return kept
 
 
-class ExtractExecutor:
-    """Question-driven extraction. Owns one instance of each call-site
-    executor and drives the parsed_json → vision tier fallback."""
+class ExtractOp:
+    """The extract operator — question-driven extraction. Owns one instance of
+    each call-site extractor and drives the parsed_json → vision tier fallback."""
 
     def __init__(self) -> None:
         self._text = TextExtractor()

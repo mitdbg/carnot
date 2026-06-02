@@ -23,7 +23,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from skunk.common import HarnessContext
-from skunk.multi_turn_agent import Tool
+from skunk.multi_turn_agent import Tool, render_tools_into
 from skunk.prompted_call import PromptedCall
 
 
@@ -70,7 +70,6 @@ def make_search_agent_prompt(tools: Iterable[Tool]) -> PromptedCall:
     (and any `{{ max_pages }}` inside a tool doc renders in that same pass)."""
     return PromptedCall(
         name="search_agent",
-        system_prompt=_SEARCH_AGENT_SYSTEM_PROMPT.replace(
-            "{{ tools_doc }}", "\n\n".join(t.doc for t in tools)),
+        system_prompt=render_tools_into(_SEARCH_AGENT_SYSTEM_PROMPT, list(tools)),
         template_vars=_search_agent_vars,
     )

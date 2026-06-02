@@ -3,7 +3,7 @@ per-branch `LookupAgent` whose tools fetch from FRED / BLS / World Bank / Tavily
 (see `lookup_tools.py`), then translates the `{value, unit, source}` dict into
 `list[AnnotatedValue]`.
 
-The agent's tool set is pluggable: `LookupExternal.run` resolves a list of `Tool`s
+The agent's tool set is pluggable: `LookupExternalOp.run` resolves a list of `Tool`s
 (explicit override → `config.lookup_tools` → all tools) plus a prioritization
 string, and the agent renders its `## Tools` prompt section (each tool's `doc`) +
 prioritization guidance from them. `final_answer` is the always-injected loop
@@ -11,32 +11,19 @@ terminator and is never part of the pluggable set."""
 
 from __future__ import annotations
 
-from typing import Any
-
-from skunk.extract import _cell_in_text
+from skunk.extract import _cell_in_text, _cells_with_path
 from skunk.lookup_tools import DEFAULT_PRIORITIZATION, resolve_lookup_tools
 from skunk.common import AnnotatedValue, HarnessContext
-from skunk.multi_turn_agent import MultiTurnAgent, Tool
+from skunk.multi_turn_agent import MultiTurnAgent, Tool, render_tools_into
 from skunk.plan import LookupBranch
 from skunk.prompted_call import PromptedCall
 
 
-def _flatten_numbers(value: Any) -> list[float | int]:
-    """Recursively collect primitive numbers (not bools); non-numeric leaves skipped."""
-    if isinstance(value, bool):
-        return []
-    if isinstance(value, (int, float)):
-        return [value]
-    if isinstance(value, list):
-        return [n for item in value for n in _flatten_numbers(item)]
-    return []
-
-
 class LookupAgent(MultiTurnAgent):
     _SYSTEM_PROMPT = """\
-You find one external value per request — or a list of values when the
-target names a series across multiple periods. Each request is a JSON
-object {"target": "<value(s)>", "src": "<source | null>"}.
+You find the external value(s) a request asks for and commit them as one
+`AnnotatedValue`. Each request is a JSON object
+{"target": "<value(s)>", "src": "<source | null>"}.
 
 You have ≤8 steps. Each step, output ONE ```python``` block calling
 one tool. The tool's output appears as your next observation.
@@ -50,24 +37,39 @@ null, any authoritative public source is fine.
 
 {{ tools_doc }}
 
-### final_answer(payload)
-Commit. Call exactly once.
+### final_answer(result)
+Build your answer as ONE `AnnotatedValue` and commit it (call exactly once):
+
+  AnnotatedValue(description="<names the value + its source>", value=<...>,
+                 unit="<e.g. pct, usd, fx_rate>",
+                 kind="scalar" | "vector" | "table",
+                 index_name="<dim>",                  # vector only
+                 row_name="<dim>", col_name="<dim>")  # table only
+
+Use `kind="vector"` — `value` a dict keyed by the period/label, with
+`index_name` — whenever the answer is a series the downstream step will rank,
+select, or aggregate (e.g. "which year did X peak"). Use a plain scalar (or a
+list) only when the labels don't matter. Cells must be primitive (no nesting).
+Fold the source into `description`.
 ```python
-final_answer({"value": 4.03, "unit": "fx_rate", "source": "measuringworth"})
-final_answer({"value": [99.34, 99.21, 101.43, 99.57], "unit": "usd",
-              "source": "treasurydirect"})
+final_answer(AnnotatedValue(
+    description="USD to GBP spot rate, 2002-06-30 (MeasuringWorth)",
+    value=0.6549, unit="fx_rate"))
+final_answer(AnnotatedValue(
+    description="U.S. personal saving rate, 1950-1990 (FRED PSAVERT)",
+    kind="vector", index_name="year",
+    value={"1950": 9.4, "1951": 11.1, "1990": 8.5}, unit="pct"))
 ```
 
-Also in scope: `math`, `statistics`, `datetime`, `numpy as np`,
-`pandas as pd`, `json`.
+`AnnotatedValue` is in scope (like the tools). Also available: `math`,
+`statistics`, `datetime`, `numpy as np`, `pandas as pd`, `json`.
 {{ default_tail }}"""
 
     def __init__(self, branch: LookupBranch, max_steps: int, tools: list[Tool], prioritization: str):
         super().__init__(
             PromptedCall(
                 name="lookup_external",
-                system_prompt=self._SYSTEM_PROMPT.replace(
-                    "{{ tools_doc }}", "\n\n".join(t.doc for t in tools)),
+                system_prompt=render_tools_into(self._SYSTEM_PROMPT, tools),
                 default_effort="off",
                 template_vars=lambda _ctx: {"prioritization": prioritization},
             ),
@@ -76,22 +78,35 @@ Also in scope: `math`, `statistics`, `datetime`, `numpy as np`,
         self._branch = branch
         self.max_steps = max_steps
 
-    def validate_final_answer(self, payload: dict, observations: list[str]) -> str | None:
-        nums = _flatten_numbers(payload.get("value"))
-        if not nums:
-            return None
+    def tools(self) -> dict:
+        """Bind `AnnotatedValue` into the executor namespace (alongside the tools
+        and `final_answer`) so the agent can construct its result object directly."""
+        return super().tools() | {"AnnotatedValue": AnnotatedValue}
+
+    def validate_final_answer(self, payload: object, observations: list[str]) -> str | None:
+        if not isinstance(payload, AnnotatedValue):
+            return (
+                "Call final_answer with a constructed AnnotatedValue(...), e.g. "
+                "final_answer(AnnotatedValue(description=..., value=..., unit=...))."
+            )
+        # Grounding: every numeric cell must appear verbatim in some tool output
+        # (shared with extract's per-cell verifier; covers scalar/vector/table).
         joined = "\n".join(observations)
-        missing = [n for n in nums if not _cell_in_text(n, joined)]
+        missing = [
+            c for _, c in _cells_with_path(payload)
+            if isinstance(c, (int, float)) and not isinstance(c, bool)
+            and not _cell_in_text(c, joined)
+        ]
         if not missing:
             return None
         return (
-            f"Grounding check failed: {missing!r} doesn't appear in any "
-            f"tool output above. Either revise final_answer to match what "
-            f"the tools returned verbatim, or fetch the data first."
+            f"Grounding check failed: {missing!r} doesn't appear in any tool "
+            f"output above. Either fix the value(s) to match what the tools "
+            f"returned verbatim, or fetch the data first."
         )
 
 
-class LookupExternal:
+class LookupExternalOp:
     def run(self, ctx: HarnessContext, branch: LookupBranch,
             tools: list[Tool] | None = None, prioritization: str | None = None) -> list[AnnotatedValue]:
         tools = resolve_lookup_tools(ctx.config, tools)
@@ -102,9 +117,6 @@ class LookupExternal:
         user_msg = branch.model_dump_json(
             include={"target", "src"}, indent=2, exclude_none=True,
         )
-        payload = agent.call(ctx, user_msg)
-        return [AnnotatedValue(
-            description=branch.target,
-            value=payload["value"],
-            unit=payload.get("unit", ""),
-        )]
+        # The agent commits a constructed `AnnotatedValue` (enforced by
+        # `validate_final_answer`), so return it directly.
+        return [agent.call(ctx, user_msg)]

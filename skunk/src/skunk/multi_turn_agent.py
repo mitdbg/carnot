@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 from skunk.errors import StepFailed
 from skunk.prompted_call import PromptedCall
-from skunk.search_agent.utils import LocalPythonExecutor
+from skunk.local_python_executor import LocalPythonExecutor
 
 if TYPE_CHECKING:
     from skunk.common import HarnessContext
@@ -52,6 +52,14 @@ class Tool(ABC):
     @abstractmethod
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """The tool's runtime behaviour."""
+
+
+def render_tools_into(template: str, tools: list[Tool]) -> str:
+    """Splice each tool's `doc` block into the `{{ tools_doc }}` marker in
+    `template`. Single source of truth for a prompt's tool section, so the docs
+    and the bound callables can't drift — shared by every agent that exposes a
+    pluggable tool set (the lookup and search agents)."""
+    return template.replace("{{ tools_doc }}", "\n\n".join(t.doc for t in tools))
 
 
 def _trim(messages: list[dict], budget: int) -> list[dict]:
@@ -159,7 +167,83 @@ class MultiTurnAgent(ABC):
                 observations.append(fb)
                 ctx.emit(self._prompt.name, "validation_failed", content=feedback)
 
-        raise StepFailed(self._prompt.name, "max steps without accepted final_answer")
+        # Out of steps. Before giving up, try one forced commit from what the
+        # agent already has — it often retrieved a usable value and simply never
+        # called final_answer. Gated by `validate_final_answer`, so a committed
+        # answer is as grounded/well-formed as any in-loop one.
+        committed = self._last_chance_commit(ctx, executor, messages, observations)
+        if committed is not None:
+            return committed
+        raise StepFailed(
+            self._prompt.name, "max steps without accepted final_answer",
+            diagnostic=self._failure_diagnostic(ctx, messages),
+        )
+
+    _LAST_CHANCE_PROMPT = (
+        "You are out of exploration steps. Do NOT call any tool other than "
+        "final_answer. Using ONLY values that already appear in your "
+        "observations above, emit a single ```python``` block calling "
+        "final_answer(...) with your best answer. If your observations already "
+        "contain values that satisfy the request, commit them now instead of "
+        "giving up."
+    )
+
+    def _last_chance_commit(
+        self, ctx: "HarnessContext", executor: Any,
+        messages: list[dict], observations: list[str],
+    ) -> dict | None:
+        """One forced terminal turn after `max_steps`: ask the agent to commit a
+        `final_answer` from values already in its observations (no new tool
+        calls). Returns the payload iff it execs to a `final_answer` that passes
+        `validate_final_answer`; else None (caller falls back to the give-up
+        diagnostic). Reuses the in-scope `executor` + the agent's own validator,
+        so the grounding/shape gates still apply. Best-effort: any error → None."""
+        try:
+            msgs = messages + [{"role": "user", "content": self._LAST_CHANCE_PROMPT}]
+            text = self._generate(ctx, msgs)
+            blocks = _CODE_BLOCK_RE.findall(text)
+            if not blocks:
+                return None
+            out = executor(blocks[0].strip())
+            if not out.is_final_answer:
+                return None
+            if self.validate_final_answer(out.output, observations) is None:
+                ctx.emit(self._prompt.name, "last_chance_commit", content=str(out.output))
+                return out.output  # type: ignore[return-value]
+        except Exception as e:  # never let the commit attempt mask the real failure
+            ctx.emit(self._prompt.name, "last_chance_failed", error=str(e))
+        return None
+
+    _GIVE_UP_PROMPT = (
+        "You are out of steps and could not commit a final answer. In 2-4 "
+        "sentences, write a hand-off note for the planner that will retry this: "
+        "state what you were asked for, which tools/series you tried, any "
+        "candidate values you found (quote the numbers and their source "
+        "verbatim), and what blocked you. If a source had no data for the "
+        "requested period (e.g. the series does not go back that far), say so "
+        "explicitly so the planner can route elsewhere. Plain prose, no code block."
+    )
+
+    def _failure_diagnostic(self, ctx: "HarnessContext", messages: list[dict]) -> str:
+        """Best-effort one-turn summary of why this run failed, carried up via
+        `StepFailed.diagnostic` for the replanner. Text-only (no tool exec).
+        Falls back to the tail observations if the summary call errors, so a
+        diagnostic is always present and this can never mask the real failure."""
+        try:
+            convo = _trim(messages, self.context_budget_chars)
+            resp = ctx.llm_client.stream(
+                system=convo[0]["content"],
+                messages=convo[1:] + [{"role": "user", "content": self._GIVE_UP_PROMPT}],
+                model=ctx.config.agent_model_id or ctx.config.llm_model,
+                ctx=ctx,
+                call_site=f"{self._prompt.name}.giveup",
+            )
+            if (text := resp.text.strip()):
+                return text
+        except Exception as e:  # never let the summary turn mask the original failure
+            ctx.emit(self._prompt.name, "giveup_summary_failed", error=str(e))
+        tail = self._observations[-2:]
+        return "(summary unavailable) recent observations:\n" + "\n".join(tail) if tail else ""
 
     def _generate(self, ctx: "HarnessContext", messages: list[dict]) -> str:
         """Stream tokens via the shared `LLMClient`, stopping once a complete

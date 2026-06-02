@@ -28,10 +28,37 @@ from importlib.util import find_spec
 from types import BuiltinFunctionType, FunctionType, ModuleType
 from typing import Any
 
-from .parsing import BASE_BUILTIN_MODULES, truncate_content
-
-
 logger = logging.getLogger(__name__)
+
+
+# Inlined (formerly search_agent/utils/parsing.py): the only parsing helpers the
+# executor needs. `BASE_BUILTIN_MODULES` is the set a sandboxed `import` may
+# resolve without an explicit `additional_authorized_imports` entry.
+BASE_BUILTIN_MODULES = [
+    "collections",
+    "datetime",
+    "itertools",
+    "math",
+    "queue",
+    "random",
+    "re",
+    "stat",
+    "statistics",
+    "time",
+    "unicodedata",
+]
+
+MAX_LENGTH_TRUNCATE_CONTENT = 20000
+
+
+def truncate_content(content: str, max_length: int = MAX_LENGTH_TRUNCATE_CONTENT) -> str:
+    if len(content) <= max_length:
+        return content
+    return (
+        content[: max_length // 2]
+        + f"\n..._This content has been truncated to stay below {max_length} characters_...\n"
+        + content[-max_length // 2 :]
+    )
 
 
 class InterpreterError(ValueError):

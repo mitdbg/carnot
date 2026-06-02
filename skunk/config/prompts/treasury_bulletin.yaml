@@ -55,7 +55,9 @@ overrides:
     content: |
       One concept per `retrieve.key`. If a question names multiple values (two currencies, two indices, two agencies, two bond classes, ...), emit ONE branch per value rather than bundling — branches run in parallel and splitting is cheap, while bundling forces retrieval to find a single page covering everything. A JPY-vs-GBP question should emit four branches (JPY position, GBP position, JPY/USD rate, GBP/USD rate), not one branch keyed "exchange rates for JPY and GBP".
 
-      U.S. Treasury data — including federal receipts, outlays, surplus/deficit, debt holdings, bond yields and prices, foreign currency positions, and forward-year projections/estimates — is almost certainly carried by this corpus. Prefer `retrieve` over `lookup_external` for anything attributed to the U.S. Treasury, the Treasury Bulletin, or the U.S. Department of the Treasury, even when phrased as "the Treasury's reported estimate" for a future year. Only emit a `lookup_external` for Treasury-attributed values after a replan signals the value is genuinely missing from the corpus.
+      Default to `retrieve`; treat `lookup_external` as the fallback. Any value plausibly in the Treasury Bulletin — federal receipts, outlays, surplus/deficit, debt holdings, bond yields and prices, foreign currency positions, market exchange rates, forward-year projections/estimates — should be a `retrieve`, even when phrased as "the Treasury's reported estimate". This INCLUDES third-party macro context the Bulletin reprints, notably nominal GDP (carried in the Ownership-of-Federal-Securities / debt-to-GDP tables). Reach for `lookup_external` only for data clearly outside the corpus (e.g. CPI, FX, or population the Bulletin does not reprint). When in doubt, `retrieve`: a retrieve that finds nothing fails with a diagnostic and is automatically replanned to `lookup_external`, so guessing `retrieve` is cheap and self-correcting.
+
+      Prefer the corpus ESPECIALLY for "as reported" / vintage questions. A live external lookup returns today's revised figures; a series like GDP is revised over time, so the bulletin's as-of-that-date value is the correct one and an external lookup would silently give a wrong number. Retrieve it from the named bulletin (set `as_of`).
 
   # ---------------------------------------------------------------------
   # Planner few-shots. Each entry is a pre-formatted block that lands
@@ -149,7 +151,7 @@ overrides:
       - |
         ### Example (multi-period external series: ONE branch, list payload)
         Q: Sum of annual U.S. CPI-U for 1950, 1951, and 1952.
-        Why this shape: Same external series across consecutive years → ONE lookup_external branch with a multi-period target, NOT three. The lookup agent returns a list value; compute sums it.
+        Why this shape: Same external series across consecutive years → ONE lookup_external branch with a multi-period target, NOT three. The lookup agent returns a labeled series (a vector keyed by year); compute sums it.
         Plan:
         ```json
         {
@@ -163,6 +165,31 @@ overrides:
             "qualifiers": []
           },
           "presentation": {"units_out": "cpi"}
+        }
+        ```
+
+      - |
+        ### Example (vintage: data period ≠ report date; reprinted GDP via retrieve)
+        Q: Using the figures reported in the September 2012 Treasury Bulletin, what was the change in federal debt held by the public as a percent of GDP between the end of fiscal year 2008 and fiscal year 2010?
+        Why this shape: An "as reported in bulletin Y" (vintage) question. The DATA periods are FY2008 and FY2010 → `period`; the reporting vintage is the Sept-2012 bulletin → `as_of`. Never put the report year (2012) in `period` — that is what `as_of` is for. GDP is reprinted in the Bulletin's debt-to-GDP tables, so it is a `retrieve` of the as-of-2012 vintage, NOT a `lookup_external` (which would return today's revised GDP → wrong answer). One branch per (series, period).
+        Plan:
+        ```json
+        {
+          "branches": [
+            {"kind": "retrieve", "key": "federal debt held by the public",
+             "period": "FY2008", "as_of": "September 2012 bulletin"},
+            {"kind": "retrieve", "key": "federal debt held by the public",
+             "period": "FY2010", "as_of": "September 2012 bulletin"},
+            {"kind": "retrieve", "key": "nominal gross domestic product",
+             "period": "FY2008", "as_of": "September 2012 bulletin"},
+            {"kind": "retrieve", "key": "nominal gross domestic product",
+             "period": "FY2010", "as_of": "September 2012 bulletin"}
+          ],
+          "computation": {
+            "task": "For FY2008 and FY2010, compute debt held by the public as a percent of GDP (debt / GDP · 100); report the FY2010 value minus the FY2008 value.",
+            "qualifiers": []
+          },
+          "presentation": {"units_out": "pct", "precision": 1}
         }
         ```
 

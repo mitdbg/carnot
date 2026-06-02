@@ -11,10 +11,11 @@ from skunk.orchestrator import Orchestrator
 from skunk.plan import Plan
 from skunk.prompted_call import load_prompt_overrides
 from skunk.question_explainer import ConceptExplanation
-from skunk.trace import QuestionTrace
+from skunk.result import ExecutionResult
 
 __all__ = [
     "AnnotatedValue",
+    "ExecutionResult",
     "HarnessContext",
     "LLMClient",
     "MissingData",
@@ -22,7 +23,6 @@ __all__ = [
     "PageRef",
     "Plan",
     "ConceptExplanation",
-    "QuestionTrace",
     "SkunkConfig",
     "StepFailed",
     "load_prompt_overrides",

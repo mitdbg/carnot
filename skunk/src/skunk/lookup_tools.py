@@ -5,15 +5,15 @@ active list from an explicit override or `SkunkConfig.lookup_tools` (else all
 registered tools); the lookup agent pairs that list with a free-text
 prioritization string (`DEFAULT_PRIORITIZATION`) when none is supplied.
 
-Shared HTTP/date helpers live here; each tool body keeps its own
-`get_rate_limiter(...)` call so the process-wide rate caps still apply. Tools
-fetch from one source and return a primitive (or snippets), raising
-`RuntimeError` on failure — except `fetch_url`, which soft-fails with a
-`"[fetch_url error: ...]"` marker."""
+Each tool is a **thin wrapper** over one external API: it adds only
+authentication and shared transport (a per-source `get_rate_limiter(...)` cap +
+retry/backoff in `_fetch_json`) and returns the API's parsed JSON for the agent
+to navigate — the agent chooses endpoints, params, and response handling. The
+exception is `fetch_url`, a fetch-and-clean utility (no upstream API) that
+soft-fails with a `"[fetch_url error: ...]"` marker."""
 
 from __future__ import annotations
 
-import calendar
 import json
 import os
 import re
@@ -21,7 +21,6 @@ import ssl
 import time
 import urllib.parse
 import urllib.request
-from datetime import date as _date, timedelta
 from typing import TYPE_CHECKING, Any
 
 from skunk.common import _RateLimiter, get_rate_limiter
@@ -38,32 +37,31 @@ except ImportError:
     _SSL_CTX = ssl.create_default_context()
 
 
-_DATE_YEAR_RE = re.compile(r"^\d{4}$")
-_DATE_YEAR_MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
+def _fetch_json(url: str, limiter: _RateLimiter, timeout: int = 15, retries: int = 4,
+                max_backoff: float = 30.0, data: dict | None = None) -> Any:
+    """Fetch `url`, parse JSON, retrying HTTP 429 / 5xx with exponential backoff.
+    GET by default; if `data` is given it is sent as a JSON POST body. Acquires one
+    `limiter` slot before each request (incl. retries) so the whole process stays
+    under the source's per-key rate cap.
 
-
-def _parse_date(date_str: str) -> tuple[str, int, int | None, int | None]:
-    """Return (kind, year, month, day). kind ∈ {"Y","YM","YMD"}."""
-    if _DATE_YEAR_RE.match(date_str):
-        return ("Y", int(date_str), None, None)
-    if _DATE_YEAR_MONTH_RE.match(date_str):
-        return ("YM", int(date_str[:4]), int(date_str[5:7]), None)
-    d = _date.fromisoformat(date_str)
-    return ("YMD", d.year, d.month, d.day)
-
-
-def _fetch_json(url: str, limiter: _RateLimiter, timeout: int = 15, retries: int = 4) -> Any:
-    """GET `url`, parse JSON, retrying HTTP 429 / 5xx with exponential backoff.
-    Acquires one `limiter` slot before each request (incl. retries) so the whole
-    process stays under the source's per-key rate cap."""
+    Backoff honors a `Retry-After` header when the server sends one; otherwise it
+    is exponential (2, 4, 8, ... s), capped at `max_backoff`. The longer waits
+    matter for sources like FRED whose 429s reflect a rolling-window throttle that
+    a sub-second retry only re-triggers — riding it out is the only thing that
+    clears it."""
+    body = json.dumps(data).encode() if data is not None else None
+    headers = {"Content-Type": "application/json"} if body is not None else {}
     for attempt in range(retries):
         limiter.acquire()
         try:
-            with urllib.request.urlopen(url, timeout=timeout, context=_SSL_CTX) as r:
+            req = urllib.request.Request(url, data=body, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout, context=_SSL_CTX) as r:
                 return json.loads(r.read())
         except urllib.error.HTTPError as e:
             if e.code in (429, 500, 502, 503, 504) and attempt < retries - 1:
-                time.sleep(0.5 * (2 ** attempt))
+                retry_after = e.headers.get("Retry-After") if e.headers else None
+                wait = float(retry_after) if (retry_after and retry_after.isdigit()) else 2.0 * (2 ** attempt)
+                time.sleep(min(wait, max_backoff))
                 continue
             raise
 
@@ -82,14 +80,6 @@ def _get_tavily() -> Any:
     return _TAVILY_CLIENT
 
 
-# High-signal historical-data sites; override via `include_domains=[...]`.
-_DEFAULT_INCLUDE_DOMAINS = [
-    "fred.stlouisfed.org", "measuringworth.com", "macrotrends.net",
-    "bls.gov", "imf.org", "data.worldbank.org",
-    "federalreserve.gov", "treasurydirect.gov", "stats.bis.org",
-    "bankofengland.co.uk", "ecb.europa.eu", "boj.or.jp",
-]
-
 # Tags that never carry primary content — dropped before extracting visible text.
 _DROP_TAGS = {
     "script", "style", "noscript", "nav", "header", "footer",
@@ -100,149 +90,132 @@ _DROP_TAGS = {
 class FredTool(Tool):
     name = "fetch_fred"
 
-    def __call__(self, series_id: str, date_str: str) -> float:
-        """FRED REST API. `date_str` is YYYY (annual mean), YYYY-MM
-        (monthly mean), or YYYY-MM-DD (closest observation within ±5d)."""
+    def __call__(self, endpoint: str, params: dict | None = None) -> dict:
+        """Thin wrapper over the **full FRED API**
+        (https://fred.stlouisfed.org/docs/api/fred/). `endpoint` is any FRED path
+        (e.g. "series/observations", "series/search"); `params` are that endpoint's
+        query args. The tool only injects authentication (`api_key`) + `file_type=json`
+        and returns the parsed JSON — you choose the endpoint, the params, and parse
+        the response yourself."""
         api_key = os.environ.get("FRED_API_KEY", "")
         if not api_key:
             raise RuntimeError("FRED_API_KEY not set")
-        kind, year, month, day = _parse_date(date_str)
-        if kind == "Y":
-            start, end = f"{year:04d}-01-01", f"{year:04d}-12-31"
-        elif kind == "YM":
-            start = f"{year:04d}-{month:02d}-01"
-            end = f"{year:04d}-{month:02d}-{calendar.monthrange(year, month)[1]:02d}"  # [1] = last day of month
-        else:
-            d = _date(year, month, day)
-            start = (d - timedelta(days=5)).isoformat()
-            end = (d + timedelta(days=5)).isoformat()
-        url = "https://api.stlouisfed.org/fred/series/observations?" + urllib.parse.urlencode({
-            "series_id": series_id, "observation_start": start,
-            "observation_end": end, "sort_order": "asc",
-            "api_key": api_key, "file_type": "json",
-        })
-        values = [(o["date"], float(o["value"]))
-                  for o in _fetch_json(url, timeout=10, limiter=get_rate_limiter("fred")).get("observations", [])
-                  if o.get("value", ".") != "."]
-        if not values:
-            raise RuntimeError(f"FRED returned no observations for {series_id} {date_str}")
-        if kind == "YMD":
-            target = _date(year, month, day)
-            return min(values, key=lambda dv: abs((_date.fromisoformat(dv[0]) - target).days))[1]
-        return sum(v for _, v in values) / len(values)
+        query = {**(params or {}), "api_key": api_key, "file_type": "json"}
+        url = "https://api.stlouisfed.org/fred/" + endpoint.strip("/") + "?" + urllib.parse.urlencode(query)
+        return _fetch_json(url, timeout=15, limiter=get_rate_limiter("fred"))
 
     doc = """\
-### fetch_fred(series_id, date)
-FRED API. `date`: YYYY (annual mean), YYYY-MM, YYYY-MM-DD.
+### fetch_fred(endpoint, params={})
+Thin wrapper over the **full FRED API** (https://fred.stlouisfed.org/docs/api/fred/).
+`endpoint` is a FRED path; `params` its query args. The tool adds only your
+api_key + file_type=json and returns the parsed JSON — you pick the endpoint and
+params and parse the response. Pull a whole series (with server-side aggregation
+via `frequency`/`aggregation_method`) in ONE call; never loop single observations.
 ```python
-val = fetch_fred("CPIAUCSL", "1953")     # annual mean of CPI in 1953
-val = fetch_fred("DGS10", "2020-03-15")  # 10y yield near date
-```"""
+# annual averages of the personal saving rate, 1959–1990, in one request
+resp = fetch_fred("series/observations",
+                  {"series_id": "PSAVERT", "observation_start": "1959-01-01",
+                   "observation_end": "1990-12-31",
+                   "frequency": "a", "aggregation_method": "avg"})
+obs = [(o["date"], float(o["value"])) for o in resp["observations"] if o["value"] != "."]
+hits = fetch_fred("series/search", {"search_text": "personal saving rate"})  # find a series_id
+```
+Coverage: daily FX/rate spot series (EXUSUK, EXCAUS, DEX*) begin ~Jan 1971; CPI
+(CPIAUCSL seasonally adjusted, CPIAUCNS not) back to 1947. For pre-1971 FX or
+other pre-API history FRED returns nothing — fall back to tavily_search / fetch_url."""
 
 
 class BlsTool(Tool):
     name = "fetch_bls"
 
-    def __call__(self, series_id: str, date_str: str) -> float:
-        """BLS public REST API. `date_str` is YYYY or YYYY-MM(-DD).
-        Y returns M13 if present, else mean of M01..M12."""
-        kind, year, month, _ = _parse_date(date_str)
-        params = {"startyear": str(year), "endyear": str(year)}
+    def __call__(self, payload: dict) -> dict:
+        """Thin wrapper over the BLS Public Data API v2 `timeseries/data` endpoint
+        (https://www.bls.gov/developers/api_signature_v2.htm). `payload` is the POST
+        body (e.g. {"seriesid": ["CUUR0000SA0"], "startyear": "1960",
+        "endyear": "1962", "annualaverage": true, "calculations": true}). The tool
+        injects your registrationkey (if BLS_API_KEY is set) and returns the parsed
+        JSON — you choose the body fields and parse the response."""
+        body = dict(payload)
         if (key := os.environ.get("BLS_API_KEY", "")):
-            params["registrationkey"] = key
-        url = (f"https://api.bls.gov/publicAPI/v2/timeseries/data/{series_id}?"
-               + urllib.parse.urlencode(params))
-        payload = _fetch_json(url, timeout=15, limiter=get_rate_limiter("bls"))
-        if payload.get("status") != "REQUEST_SUCCEEDED":
-            raise RuntimeError(f"BLS error: {payload.get('status')} / {payload.get('message')}")
-        series = payload.get("Results", {}).get("series", [])
-        if not series or not series[0].get("data"):
-            raise RuntimeError(f"BLS returned no data for {series_id} {date_str}")
-        data = series[0]["data"]
-        periods = {d["period"] for d in data}
-        if kind == "Y":
-            if periods - {f"M{i:02d}" for i in range(1, 14)}:
-                raise RuntimeError(f"BLS series {series_id} is not monthly")
-            for d in data:
-                if d["period"] == "M13":
-                    return float(d["value"])
-            monthly = [float(d["value"]) for d in data if d["period"] != "M13"]
-            return sum(monthly) / len(monthly)
-        target = f"M{month:02d}"
-        for d in data:
-            if d["period"] == target:
-                return float(d["value"])
-        raise RuntimeError(f"BLS series {series_id} has no period {target} for {year}")
+            body.setdefault("registrationkey", key)
+        return _fetch_json("https://api.bls.gov/publicAPI/v2/timeseries/data/",
+                           timeout=15, limiter=get_rate_limiter("bls"), data=body)
 
     doc = """\
-### fetch_bls(series_id, date)
-BLS API. Same date format.
+### fetch_bls(payload)
+Thin wrapper over the **BLS Public Data API v2** `timeseries/data`
+(https://www.bls.gov/developers/api_signature_v2.htm). `payload` is the POST body;
+the tool injects your registrationkey + returns the parsed JSON. You parse it.
 ```python
-val = fetch_bls("CUUR0000SA0", "1953")   # CPI-U 1953 annual
-```"""
+resp = fetch_bls({"seriesid": ["CUUR0000SA0"], "startyear": "1960",
+                  "endyear": "1962", "annualaverage": True})
+data = resp["Results"]["series"][0]["data"]   # [{year, period, periodName, value}, ...]
+```
+Limits: ≤20 years per request and ≤50 series with a registered key (10 / 25
+without). CPI-U is CUUR0000SA0 (NSA) / CUSR0000SA0 (SA); annual averages appear
+as period "M13" (request "annualaverage": True)."""
 
 
 class WorldBankTool(Tool):
     name = "fetch_world_bank"
 
-    def __call__(self, country_iso3: str, indicator: str, year_str: str) -> float:
-        """World Bank Indicators API. Annual only. Common indicators:
-        `NY.GDP.MKTP.CN`, `NY.GDP.MKTP.CD`, `SP.POP.TOTL`, `NY.GDP.PCAP.CD`."""
-        kind, year, _, _ = _parse_date(year_str)
-        if kind != "Y":
-            raise RuntimeError(f"fetch_world_bank: annual only; got {year_str!r}")
-        url = (f"https://api.worldbank.org/v2/country/{country_iso3}/indicator/{indicator}"
-               "?" + urllib.parse.urlencode({"date": str(year), "format": "json"}))
-        payload = _fetch_json(url, timeout=15, limiter=get_rate_limiter("world_bank"))
-        if not isinstance(payload, list) or len(payload) < 2 or not payload[1]:
-            raise RuntimeError(f"World Bank returned no observations for {country_iso3} {indicator} {year}")
-        value = payload[1][0].get("value")
-        if value is None:
-            raise RuntimeError(f"World Bank: null value for {country_iso3} {indicator} {year}")
-        return float(value)
+    def __call__(self, path: str, params: dict | None = None) -> Any:
+        """Thin wrapper over the World Bank Indicators API v2
+        (https://datahelpdesk.worldbank.org/knowledgebase/articles/889392).
+        `path` is the API path after `/v2/`, e.g.
+        "country/USA/indicator/NY.GDP.MKTP.CD"; `params` are query args
+        (date="2003:2012", per_page=100, ...). No key required; the tool adds
+        format=json and returns the parsed JSON — you parse it."""
+        query = {**(params or {}), "format": "json"}
+        url = "https://api.worldbank.org/v2/" + path.strip("/") + "?" + urllib.parse.urlencode(query)
+        return _fetch_json(url, timeout=15, limiter=get_rate_limiter("world_bank"))
 
     doc = """\
-### fetch_world_bank(iso3, indicator, year)
-Annual indicators.
+### fetch_world_bank(path, params={})
+Thin wrapper over the **World Bank Indicators API v2**
+(https://datahelpdesk.worldbank.org/knowledgebase/articles/889392). `path` is the
+path after `/v2/`; `params` its query args. No key; the tool adds format=json and
+returns the parsed JSON — a `[metadata, [observations]]` list.
 ```python
-val = fetch_world_bank("DEU", "NY.GDP.MKTP.CD", "1996")  # Germany nominal GDP
-```"""
+resp = fetch_world_bank("country/USA/indicator/NY.GDP.MKTP.CD",
+                        {"date": "2003:2012", "per_page": 100})
+rows = resp[1]   # [{"date": "2012", "value": 16253970000000.0, ...}, ...]
+```
+Annual data; most indicators start ~1960 and are country-dependent (ISO-3 codes;
+common: NY.GDP.MKTP.CD, NY.GDP.MKTP.CN, SP.POP.TOTL, NY.GDP.PCAP.CD)."""
 
 
 class TavilySearchTool(Tool):
     name = "tavily_search"
 
-    def __call__(
-        self,
-        query: str,
-        max_results: int = 10,
-        include_domains: list[str] | None = None,
-    ) -> list[dict]:
-        """Tavily web search → `[{title, url, content, score}, ...]`. `include_domains`
-        defaults to curated historical-data sites (pass `[]` for whole-web). Snippets
-        only — `include_answer` synthesis is disabled (it can hallucinate numbers)."""
-        if include_domains is None:
-            include_domains = _DEFAULT_INCLUDE_DOMAINS
-        kwargs: dict[str, Any] = {
-            "query": query, "max_results": max_results, "search_depth": "basic",
-        }
-        if include_domains:
-            kwargs["include_domains"] = include_domains
+    def __call__(self, query: str, **kwargs: Any) -> dict:
+        """Thin wrapper over the Tavily Search API
+        (https://docs.tavily.com/api-reference/endpoint/search). `query` plus any
+        kwargs (max_results, search_depth, topic, time_range, include_domains,
+        exclude_domains, include_raw_content, ...) pass straight through to the
+        Tavily client; auth (TAVILY_API_KEY) is injected at the client. Answer
+        synthesis is always off (`include_answer=False`, not overridable) — it can
+        hallucinate numbers. Returns the full Tavily JSON response — you parse it."""
+        kwargs.pop("include_answer", None)  # forced off below; not the model's to set
         get_rate_limiter("tavily").acquire()
-        return _get_tavily().search(**kwargs).get("results", [])
+        return _get_tavily().search(query, include_answer=False, **kwargs)
 
     doc = """\
-### tavily_search(query, max_results=10, include_domains=None)
-Web search, restricted by default to authoritative historical-data
-sites (FRED, BLS, IMF, World Bank, central banks, MeasuringWorth, ...).
-Returns `[{title, url, content, score}, ...]`. The `content` snippet
-often carries the number directly. Pass `include_domains=[]` to
-search the whole web.
+### tavily_search(query, **kwargs)
+Thin wrapper over the **Tavily Search API**
+(https://docs.tavily.com/api-reference/endpoint/search). `query` + any kwargs
+(max_results, search_depth, topic, time_range, include_domains, exclude_domains,
+include_raw_content, ...) pass through to Tavily; the tool injects TAVILY_API_KEY
+and returns the full JSON response. (Answer synthesis is always disabled — snippets
+only — because it can hallucinate numbers.)
 ```python
-hits = tavily_search("annual average GBP USD exchange rate 1941")
-for h in hits:
+resp = tavily_search("annual average GBP USD exchange rate 1941",
+                     include_domains=["measuringworth.com"], max_results=5)
+for h in resp["results"]:
     print(h["url"], "—", h["content"])
-```"""
+```
+Good for values the structured APIs don't cover — pre-1971 FX, pre-API series,
+and one-off figures (MeasuringWorth, central-bank archives)."""
 
 
 class FetchUrlTool(Tool):
@@ -270,7 +243,9 @@ class FetchUrlTool(Tool):
 Fetch and return cleaned page text. Soft-fails on errors.
 ```python
 text = fetch_url("https://example.com/historical-rates")
-```"""
+```
+Use to read a specific historical-data page found via tavily_search
+(e.g. a MeasuringWorth dataset page) when the snippet alone is too short."""
 
 
 # All available lookup tools, keyed by the name the model calls. `final_answer`

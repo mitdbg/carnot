@@ -54,12 +54,15 @@ class SearchAgent(MultiTurnAgent, Retriever):
         *,
         branch_key: str | None = None,
         branch_period: str | None = None,
+        branch_as_of: str | None = None,
     ) -> list[str]:
         parts = [f"Question: {question}"]
         if branch_key:
             parts.append(f"Search focus: {branch_key}")
         if branch_period:
-            parts.append(f"Time period: {branch_period}")
+            parts.append(f"Time period (of the data): {branch_period}")
+        if branch_as_of:
+            parts.append(f"Reported in / as of: {branch_as_of}")
         payload = self.call(ctx, "\n".join(parts))
         keys = payload.get("page_keys") or []
         if isinstance(keys, str):

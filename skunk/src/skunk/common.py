@@ -16,6 +16,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -24,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from google import genai
 from google.genai import types
 
+from skunk import trace
 from skunk.config import SkunkConfig
 
 if TYPE_CHECKING:
@@ -82,7 +84,9 @@ _RATE_LIMITS: dict[str, tuple[str, float]] = {
     # name          (env override,            default rpm)  # rationale
     "llm":          ("SKUNK_LLM_RPM",        1000.0),  # Gemini generation; provider-side quota
     "embed":        ("SKUNK_EMBED_RPM",       600.0),  # Gemini embeddings (search_agent.vector_search)
-    "fred":         ("SKUNK_FRED_RPM",        110.0),  # hard 120/min per API key, no paid tier
+    "fred":         ("SKUNK_FRED_RPM",         60.0),  # hard 120/min per API key; stay well under —
+                                                        # FRED escalates to an extended key-wide ban
+                                                        # (persistent 429s) once the cap is tripped.
     "bls":          ("SKUNK_BLS_RPM",          50.0),  # 500/day (registered); smooth worker bursts
     "world_bank":   ("SKUNK_WORLD_BANK_RPM",  120.0),  # no published cap; stay a good citizen
     "tavily":       ("SKUNK_TAVILY_RPM",      100.0),  # ~100/min on the dev tier
@@ -345,13 +349,15 @@ class LLMClient:
         messages: list[dict],
         model: str | None = None,
         should_stop: "Callable[[str], bool] | None" = None,
+        temperature: float = 0.0,
         ctx: "HarnessContext | None" = None,
         call_site: str = "llm",
     ) -> LLMResponse:
         """Multi-turn streaming call, accumulating chunks until `should_stop(acc)`
         or the stream ends. `messages` are the {role, content} turns after the
         system message ('assistant' → model role, else user). Lets multi-turn
-        agents share this client's rate-limit + retry + logging."""
+        agents share this client's rate-limit + retry + logging. `temperature`
+        defaults to 0.0 — agent loops are deterministic like every other call site."""
         client = self._get_gemini_client()
         model_id = (model or self._config.llm_model).removeprefix("google/")
         contents = [
@@ -361,7 +367,9 @@ class LLMClient:
             )
             for m in messages
         ]
-        gen_config = types.GenerateContentConfig(system_instruction=system)
+        gen_config = types.GenerateContentConfig(
+            system_instruction=system, temperature=temperature,
+        )
 
         def do() -> LLMResponse:
             t0 = time.monotonic()
@@ -385,6 +393,7 @@ class LLMClient:
                 ctx.emit(
                     call_site, "call",
                     model=model_id,
+                    temperature=temperature,
                     latency_s=round(latency_s, 3),
                     **toks,
                     output_text=accumulated,
@@ -525,7 +534,9 @@ class AnnotatedValue(BaseModel):
 @dataclass
 class HarnessContext:
     question: str
-    verbose: bool = False     # live-print orchestrator + operator events to stdout
+    uid: str | None = None    # benchmark UID, when run from the eval harness; tags every event
+    verbose: bool = False     # also echo orchestrator + operator events to the console
+    log_path: str | None = None  # when set, stream this question's events to that file (live, flushed)
     events: list[dict] = field(default_factory=list)  # per-question diagnostic events
     config: SkunkConfig = field(default_factory=SkunkConfig.from_env)
     llm_client: LLMClient | None = None  # inject a mock for tests; auto-created otherwise
@@ -534,33 +545,90 @@ class HarnessContext:
     def __post_init__(self) -> None:
         if self.llm_client is None:
             self.llm_client = LLMClient(self.config)
+        # The active (step_idx, op) frame is thread-local: a single ctx fans
+        # branches out across worker threads (see Orchestrator._run_branches),
+        # so each thread must see only the step it is currently running.
+        self._step_stack = threading.local()
+        # Per-question log file: opened when log_path is set, written line-per-event
+        # and flushed live so a single question's stream lands in its own file (and
+        # survives a crash). Guarded by a lock since branch threads share this ctx.
+        self._logfile = None
+        self._log_lock = threading.Lock()
+        if self.log_path:
+            Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
+            self._logfile = open(self.log_path, "w", encoding="utf-8")  # noqa: SIM115
 
-    def emit(self, source: str, message: str, **fields: Any) -> None:
+    def close(self) -> None:
+        """Close the per-question log file, if one was opened."""
+        with self._log_lock:
+            if self._logfile is not None:
+                self._logfile.close()
+                self._logfile = None
+
+    @contextmanager
+    def step(self, step_idx: int, op: str):
+        """Scope the current operator step on this thread. Every `emit` inside
+        the block is stamped with `(step_idx, op)`; nested steps stack. The
+        orchestrator opens one per traced operator call (replaces the old
+        `_step`/`begin` sentinel event as the trace/event join key)."""
+        stack = getattr(self._step_stack, "stack", None)
+        if stack is None:
+            stack = []
+            self._step_stack.stack = stack
+        stack.append((step_idx, op))
+        try:
+            yield
+        finally:
+            stack.pop()
+
+    def _current_step(self) -> tuple[int | None, str | None]:
+        stack = getattr(self._step_stack, "stack", None)
+        return stack[-1] if stack else (None, None)
+
+    def emit(self, source: str, message: str, level: str | None = None, **fields: Any) -> None:
         """Record a request-scoped diagnostic event onto this question's event stream.
 
         Convention (see ARCHITECTURE.md "Logging & observability"):
         - `source` is the op / call-site name (e.g. "extract", "compute",
-          "retrieve"). `_step` is reserved for the orchestrator's frame
-          delimiter — do not use it elsewhere.
+          "retrieve").
         - `message` is a STABLE event-key literal (snake_case, no
           interpolation). Every variable goes in `**fields`, never into the
           message string — that keeps events groupable/filterable.
         - Emit the fact at the layer that owns it, and only there: the
-          orchestrator owns operator boundaries (via the trace), so operators
-          do NOT emit their own "starting"/"done"; each operator emits only
-          its own internal decisions. Use stdlib `logging` (not `emit`) from
-          code that has no per-question ctx (build pipelines, offline prep).
+          orchestrator owns operator boundaries (the `("orchestrator", "step")`
+          event), so operators do NOT emit their own "starting"/"done"; each
+          operator emits only its own internal decisions. Use stdlib `logging`
+          (not `emit`) from code that has no per-question ctx (build pipelines,
+          offline prep).
+
+        Severity defaults to "warning" for `*_failed` messages or any event
+        carrying an `error` field, else "info"; pass `level=` to override. The
+        event is always captured to `self.events` (per-question, consumed by the
+        trace dump) and the JSONL sink; streamed to this question's `.log` file
+        when one is open; and echoed to the console only when `verbose` (rendered
+        via `trace.render_line`). The per-question file omits `uid` (implied by the
+        filename); the shared console prepends it so interleaved lines stay
+        attributable.
         """
-        evt = {"source": source, "message": message, **fields}
+        step_idx, op = self._current_step()
+        if level is None:
+            level = "warning" if (message.endswith("_failed") or "error" in fields) else "info"
+        evt = {
+            "source": source,
+            "message": message,
+            "step_idx": step_idx,
+            "op": op,
+            "level": level,
+            **fields,
+        }
         self.events.append(evt)
+        trace.write_jsonl({"uid": self.uid, **evt})
+        if self._logfile is not None:
+            # close() only runs in the question's teardown, after all branch
+            # threads have joined — no emit races it, so no re-check under the lock.
+            line = trace.render_line(evt) + "\n"
+            with self._log_lock:
+                self._logfile.write(line)
+                self._logfile.flush()
         if self.verbose:
-            extra = ""
-            if fields:
-                bits = []
-                for k, v in fields.items():
-                    s = repr(v)
-                    if len(s) > 200:
-                        s = s[:200] + "..."
-                    bits.append(f"{k}={s}")
-                extra = " | " + ", ".join(bits)
-            print(f"  [{source}] {message}{extra}")
+            print(trace.render_line({"uid": self.uid, **evt}))

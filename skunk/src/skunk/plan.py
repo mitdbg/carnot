@@ -16,7 +16,7 @@ from pydantic import (
 )
 
 from skunk.common import strip_code_fence
-from skunk.errors import ParseError
+from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.common import AnnotatedValue, HarnessContext
 
@@ -38,7 +38,8 @@ class RetrieveBranch(BaseModel):
 
     kind: Literal["retrieve"] = "retrieve"
     key: NonEmptyStr            # NL phrase describing the data to find
-    period: str | None = None   # NL period ("FY 2023", "2023-01", …); None if unpinned
+    period: str | None = None   # NL period the DATA pertains to ("FY 2023", "2003"); None if unpinned
+    as_of: str | None = None    # NL reporting bulletin/vintage ("June 2013 bulletin"); None unless pinned
     visual_only: bool = False
 
 
@@ -110,6 +111,7 @@ You are the planner. Given a question, emit a JSON plan that, when executed, pro
     {"kind": "retrieve",
      "key": "<natural-language lookup string>",
      "period": "<str | null>",
+     "as_of": "<str | null>",
      "visual_only": <bool>},
     {"kind": "lookup_external",
      "target": "<natural-language request for a single value>",
@@ -137,8 +139,17 @@ retrieve branch fields:
   key           natural-language phrase describing the data to find. Focus only on a singular, cohesive concept.
                 Favor separate branches if the question requires retrieval of multiple values. Examples:
                 "national defense expenditures", "weekly average discount rate for new 91-day bills".
-  period        temporal mask in natural language, e.g. "FY 2023", "2023-01", "2023-01-01".
-                Null when the question doesn't pin one.
+  period        The period the DATA VALUE PERTAINS TO — e.g. "FY 2023", "2023-01", "2003".
+                This is what extract uses to pick the row/column. It is NOT the bulletin/report
+                date. Null when the question doesn't pin one.
+  as_of         The bulletin/vintage the value is REPORTED IN / AS OF, when the question pins one
+                (e.g. "as reported at the end of FY 2013" → "June 2013 bulletin"). This selects
+                WHICH DOCUMENT to read, not which row. Null otherwise (the common case).
+
+                period vs as_of — keep them distinct. A bulletin reprints history, so a value FOR
+                year X can be reported IN a later bulletin Y. "values reported at the end of FY 2013
+                for 2003 and 2012" → period = "2003" / "2012", as_of = "FY 2013 bulletin".
+                NEVER put the report date (2013) in `period`.
   visual_only   true only if question explicitly asks for visual understanding of charts/figures.
 
 lookup_external branch fields:
@@ -147,8 +158,8 @@ lookup_external branch fields:
                 "JPY/USD spot rate on 2010-06-30",
                 "annual average GBP per USD for 1950, 1951, 1952").
                 When the question needs the same series across N periods, emit ONE branch
-                with a multi-period target; the lookup agent returns a list payload.
-                Do NOT split into N separate branches — that multiplies failure risk.
+                with a multi-period target; the lookup agent returns a labeled vector
+                (period→value). Do NOT split into N separate branches — that multiplies failure risk.
   src           Set to a publisher name if and only if the question requests a
                 single, unambiguous external source. Otherwise null.
 
@@ -204,7 +215,7 @@ worked examples.
         ctx: HarnessContext,
         prior_plan: Plan,
         prev: list[AnnotatedValue],
-        failed_branches: list[tuple["Branch", str]],
+        failed_branches: list[tuple["Branch", StepFailed]],
         missing_reason: str,
         missing: list[str],
     ) -> Plan:
@@ -212,18 +223,26 @@ worked examples.
         returned branches against `prior_plan.branches` and executes only the
         additions; `computation`/`presentation` fully replace the prior values.
         `failed_branches` are prior branches that raised `StepFailed` (output NOT
-        in `prev`), retryable via structurally-different replacements."""
+        in `prev`), retryable via structurally-different replacements. Each
+        `StepFailed.diagnostic` (the subagent's account of what it tried, what it
+        found, and what blocked it) is rendered untruncated so the planner can
+        pivot to a source/kind that can actually serve the request."""
         from skunk.compute import prev_desc
 
         if failed_branches:
-            lines = [
-                f"  - {branch.model_dump_json(exclude_none=True)} → ERROR: "
-                f"{err.splitlines()[0][:300] if err else 'unknown'}"
-                for branch, err in failed_branches
-            ]
+            blocks = []
+            for branch, err in failed_branches:
+                block = (
+                    f"  - {branch.model_dump_json(exclude_none=True)}\n"
+                    f"    reason: {err.reason}"
+                )
+                if err.diagnostic:
+                    diag = "\n".join("      " + ln for ln in err.diagnostic.splitlines())
+                    block += f"\n    what the attempt found / why it was blocked:\n{diag}"
+                blocks.append(block)
             failed_section = (
                 "\nBranches that FAILED in the prior run (their output is NOT in prev):\n"
-                + "\n".join(lines)
+                + "\n".join(blocks)
                 + "\n"
             )
         else:
@@ -245,10 +264,15 @@ Return a corrected plan in the same JSON schema. Rules:
   - Include only branches that fetch data you still need. Do not re-list
     anything already present in `prev`, and never emit two branches for
     the same value.
-  - For each FAILED branch you still need, write a materially different
-    replacement: a more specific publisher or series name in `target`, a
-    set or changed `src`, or a switch of branch kind (`lookup_external`
-    ↔ `retrieve`). A verbatim repeat will fail the same way.
+  - For each FAILED branch you still need, READ its "what the attempt
+    found / why it was blocked" note and act on it — it is the prior
+    attempt's first-hand account. If it says a source had no data for the
+    requested period (e.g. a series doesn't reach that far back), do NOT
+    re-issue the same `src`: drop or change it, switch the branch kind
+    (`lookup_external` ↔ `retrieve`), or retarget pre-API history toward a
+    web source. If it names candidate values it found, fold them into a
+    `target` aimed at the source that had them. A verbatim repeat — or a
+    mere rewording with the same `src`/kind — will fail the same way.
   - If the data is simply incomplete, add retrieve/lookup branches that
     close the gap.
   - If the missing-data signal shows the calculation itself was misframed

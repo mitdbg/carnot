@@ -4,11 +4,20 @@ from __future__ import annotations
 
 
 class StepFailed(Exception):
-    """Terminal failure from a plan step."""
-    def __init__(self, op: str, reason: str):
+    """Terminal failure from a plan step.
+
+    `reason` is the terse, stable label (used in the exception message and the
+    trace). `diagnostic` is an optional richer, multi-line explanation — what
+    the step tried, anything it found, and what blocked it — produced by agents
+    that can summarize their own trajectory (see `MultiTurnAgent`). It rides
+    untruncated up to the replanner so it can pivot to a workable source/kind;
+    operators that don't produce one (extract, plain compute) leave it None and
+    the consumers degrade gracefully."""
+    def __init__(self, op: str, reason: str, diagnostic: str | None = None):
         super().__init__(f"[{op}] {reason}")
         self.op = op
         self.reason = reason
+        self.diagnostic = diagnostic
 
 
 class ParseError(StepFailed):

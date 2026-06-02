@@ -19,7 +19,7 @@ after the catalog/concept-tree are loaded:
 
 The period parser is supplied by the active corpus profile (default:
 treasury; override via `SKUNK_CORPUS_PROFILE`). Golden bypass is handled
-one level up in `RetrieveDispatcher`, so it isn't repeated here.
+one level up in `RetrieveOp`, so it isn't repeated here.
 """
 
 from __future__ import annotations
@@ -131,7 +131,11 @@ class PageIndexRetriever:
         return kept
 
     def run(self, prev: None, ctx: HarnessContext, *, branch: RetrieveBranch) -> list[PageRef]:
-        key, period = branch.key, branch.period
+        # Document selection follows the reporting vintage when the question pins
+        # one (`as_of` — e.g. read the 2013 bulletin for values it reports about
+        # 2003/2012); otherwise it follows the data `period`. The data `period`
+        # itself is consumed downstream by extract to pick the row/column.
+        key, period = branch.key, branch.as_of or branch.period
         catalog_dir = self._catalog_dir()
 
         try:

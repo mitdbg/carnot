@@ -27,10 +27,10 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
-import sys
 import threading
 import time
 from collections import Counter
@@ -40,6 +40,7 @@ from pathlib import Path
 
 from skunk.common import LLMClient, LLMResponse, load_env_file
 from skunk.config import SkunkConfig
+from skunk.trace import configure_obs
 
 from .corpora import PROFILES, load_profile
 from skunk.corpus import (
@@ -48,6 +49,8 @@ from skunk.corpus import (
 from .profile import CorpusProfile, StageError
 from .schema import PageCatalogRow
 from .stages.l1_harvest import SectionSpan
+
+log = logging.getLogger(__name__)
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -239,7 +242,7 @@ def _require(condition: bool, hint: str) -> None:
 # ---------------------------------------------------------------------------
 
 def stage_build_catalog(args: argparse.Namespace, profile: CorpusProfile) -> None:
-    print("\n=== Stage 1: build_catalog ===", flush=True)
+    log.info("=== Stage 1: build_catalog ===")
     _require(args.pdf_dir.is_dir(), f"PDF dir does not exist: {args.pdf_dir}")
     parsed_dir = args.parsed_json_dir or parsed_json_dir()
     _require(parsed_dir.is_dir(),
@@ -257,9 +260,9 @@ def stage_build_catalog(args: argparse.Namespace, profile: CorpusProfile) -> Non
 
     out_dir = args.output_dir / "catalog"
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"  {len(chosen)} bulletins → {out_dir}")
-    print(f"  parsed-JSON: {parsed_dir}")
-    print(f"  workers: {args.workers}    (no LLM at this stage)\n", flush=True)
+    log.info(f"{len(chosen)} bulletins → {out_dir}")
+    log.info(f"parsed-JSON: {parsed_dir}")
+    log.info(f"workers: {args.workers}    (no LLM at this stage)")
 
     builder = profile.catalog_builder
     t0 = time.monotonic()
@@ -280,22 +283,21 @@ def stage_build_catalog(args: argparse.Namespace, profile: CorpusProfile) -> Non
             bulletin, out_path, err = f.result()
             if err:
                 n_err += 1
-                print(f"  [err] {bulletin}: {err}", file=sys.stderr, flush=True)
+                log.error(f"[err] {bulletin}: {err}")
             else:
                 n_ok += 1
                 if args.verbose:
-                    print(f"  [ok]  {bulletin} → {out_path}", flush=True)
+                    log.info(f"[ok]  {bulletin} → {out_path}")
     wall_s = time.monotonic() - t0
     stats = _BUILD_STATS["build_catalog"]
     stats.wall_s = wall_s
     stats.extra.update({"n_bulletins": len(chosen),
                         "n_ok": n_ok, "n_err": n_err})
-    print(f"  built {n_ok} bulletins, {n_err} errors "
-          f"in {wall_s:.1f}s", flush=True)
+    log.info(f"built {n_ok} bulletins, {n_err} errors in {wall_s:.1f}s")
 
 
 def stage_extract_l1(args: argparse.Namespace, profile: CorpusProfile) -> None:
-    print("\n=== Stage 2: extract_l1 ===", flush=True)
+    log.info("=== Stage 2: extract_l1 ===")
     catalog_dir = args.output_dir / "catalog"
     _require(catalog_dir.is_dir(),
              f"catalog/ missing at {catalog_dir} — run build_catalog first.")
@@ -309,13 +311,13 @@ def stage_extract_l1(args: argparse.Namespace, profile: CorpusProfile) -> None:
 
     catalog_by_bulletin = _load_catalog_by_bulletin(catalog_dir)
     bulletins = sorted(catalog_by_bulletin)
-    print(f"  {len(bulletins)} bulletins → {l1_dir}", flush=True)
+    log.info(f"{len(bulletins)} bulletins → {l1_dir}")
 
     cfg = _config_with_model(args.l1_model)
     inner_llm = LLMClient(cfg)
     stats = _BUILD_STATS["extract_l1"]
     llm = StageLLMWrapper(inner_llm, stats, _BUILD_STATS_LOCK)
-    print(f"  model: {cfg.llm_model}\n", flush=True)
+    log.info(f"model: {cfg.llm_model}")
     harvester = profile.l1_harvester
     t0 = time.monotonic()
 
@@ -340,14 +342,14 @@ def stage_extract_l1(args: argparse.Namespace, profile: CorpusProfile) -> None:
             bulletin, n_spans, err = f.result()
             if err:
                 n_err += 1
-                print(f"  [err] {bulletin}: {err}", file=sys.stderr, flush=True)
+                log.error(f"[err] {bulletin}: {err}")
             else:
                 n_ok += 1
                 span_dist.append(n_spans)
                 if n_spans == 0:
                     n_empty += 1
                 if args.verbose:
-                    print(f"  [ok]  {bulletin}: {n_spans} L1 spans", flush=True)
+                    log.info(f"[ok]  {bulletin}: {n_spans} L1 spans")
 
     wall_s = time.monotonic() - t0
     stats.wall_s = wall_s
@@ -358,20 +360,17 @@ def stage_extract_l1(args: argparse.Namespace, profile: CorpusProfile) -> None:
     if span_dist:
         span_dist.sort()
         mid = span_dist[len(span_dist) // 2]
-        print(f"  done {n_ok}/{len(bulletins)} bulletins, {n_err} errors, "
-              f"{n_empty} with 0 spans, median {mid} spans "
-              f"in {wall_s:.1f}s", flush=True)
+        log.info(f"done {n_ok}/{len(bulletins)} bulletins, {n_err} errors, "
+                 f"{n_empty} with 0 spans, median {mid} spans in {wall_s:.1f}s")
     else:
-        print(f"  done {n_ok}/{len(bulletins)}, {n_err} errors "
-              f"in {wall_s:.1f}s", flush=True)
-    print(f"  LLM: calls={stats.n_calls}  "
-          f"in={stats.input_tokens:,}  out={stats.output_tokens:,}  "
-          f"~${_approx_cost_usd(stats.input_tokens, stats.output_tokens):.3f}",
-          flush=True)
+        log.info(f"done {n_ok}/{len(bulletins)}, {n_err} errors in {wall_s:.1f}s")
+    log.info(f"LLM: calls={stats.n_calls}  "
+             f"in={stats.input_tokens:,}  out={stats.output_tokens:,}  "
+             f"~${_approx_cost_usd(stats.input_tokens, stats.output_tokens):.3f}")
 
 
 def stage_place_pages(args: argparse.Namespace, profile: CorpusProfile) -> None:
-    print("\n=== Stage 3: place_pages ===", flush=True)
+    log.info("=== Stage 3: place_pages ===")
     catalog_dir = args.output_dir / "catalog"
     l1_dir = args.output_dir / "l1"
     _require(catalog_dir.is_dir(),
@@ -384,14 +383,13 @@ def stage_place_pages(args: argparse.Namespace, profile: CorpusProfile) -> None:
     for bulletin in catalog_by_bulletin:
         l1_by_bulletin[bulletin] = _load_l1(l1_dir / f"{bulletin}.json")
 
-    print(f"  {len(catalog_by_bulletin)} bulletins; "
-          f"sum L1 spans = {sum(len(v) for v in l1_by_bulletin.values())}",
-          flush=True)
+    log.info(f"{len(catalog_by_bulletin)} bulletins; "
+             f"sum L1 spans = {sum(len(v) for v in l1_by_bulletin.values())}")
     cfg = _config_with_model(args.place_model)
     inner_llm = LLMClient(cfg)
     stats = _BUILD_STATS["place_pages"]
     llm = StageLLMWrapper(inner_llm, stats, _BUILD_STATS_LOCK)
-    print(f"  model: {cfg.llm_model}", flush=True)
+    log.info(f"model: {cfg.llm_model}")
 
     placer = profile.page_placer
     items = sorted(catalog_by_bulletin.items())
@@ -412,28 +410,27 @@ def stage_place_pages(args: argparse.Namespace, profile: CorpusProfile) -> None:
                 totals[k] += n
             done += 1
             if done % 50 == 0 or done == len(items):
-                print(f"  placed {done}/{len(items)} bulletins "
-                      f"({time.monotonic() - started:.1f}s)", flush=True)
+                log.info(f"placed {done}/{len(items)} bulletins "
+                         f"({time.monotonic() - started:.1f}s)")
 
-    print("  placement totals:", flush=True)
+    log.info("placement totals:")
     for k in sorted(totals.keys()):
-        print(f"    {totals[k]:>7}  {k}", flush=True)
+        log.info(f"  {totals[k]:>7}  {k}")
 
     # Persist with internal banner_self stripped.
     for _, rows in catalog_by_bulletin.items():
         _persist_catalog(rows, catalog_dir, drop_banner_self=True)
-    print(f"  persisted updated catalog → {catalog_dir}", flush=True)
+    log.info(f"persisted updated catalog → {catalog_dir}")
 
     stats.wall_s = time.monotonic() - started
     stats.extra.update({"placement_totals": dict(totals)})
-    print(f"  LLM: calls={stats.n_calls}  "
-          f"in={stats.input_tokens:,}  out={stats.output_tokens:,}  "
-          f"~${_approx_cost_usd(stats.input_tokens, stats.output_tokens):.3f}",
-          flush=True)
+    log.info(f"LLM: calls={stats.n_calls}  "
+             f"in={stats.input_tokens:,}  out={stats.output_tokens:,}  "
+             f"~${_approx_cost_usd(stats.input_tokens, stats.output_tokens):.3f}")
 
 
 def stage_merge_chapters(args: argparse.Namespace, profile: CorpusProfile) -> None:
-    print("\n=== Stage 4: merge_chapters ===", flush=True)
+    log.info("=== Stage 4: merge_chapters ===")
     catalog_dir = args.output_dir / "catalog"
     _require(catalog_dir.is_dir(),
              f"catalog/ missing at {catalog_dir} — run build_catalog first.")
@@ -445,13 +442,13 @@ def stage_merge_chapters(args: argparse.Namespace, profile: CorpusProfile) -> No
             if not line:
                 continue
             catalog.append(PageCatalogRow.from_json(line))
-    print(f"  {len(catalog)} catalog rows loaded", flush=True)
+    log.info(f"{len(catalog)} catalog rows loaded")
 
     cfg = _config_with_model(args.merge_model)
     inner_llm = LLMClient(cfg)
     stats = _BUILD_STATS["merge_chapters"]
     llm = StageLLMWrapper(inner_llm, stats, _BUILD_STATS_LOCK)
-    print(f"  model: {cfg.llm_model}", flush=True)
+    log.info(f"model: {cfg.llm_model}")
 
     t0 = time.monotonic()
     tree = profile.chapter_merger.build_tree(
@@ -460,15 +457,14 @@ def stage_merge_chapters(args: argparse.Namespace, profile: CorpusProfile) -> No
     stats.wall_s = time.monotonic() - t0
     out_path = args.output_dir / "concept_tree.json"
     out_path.write_text(json.dumps(tree, ensure_ascii=False, indent=2))
-    print(f"  wrote tree → {out_path}", flush=True)
-    print(f"  LLM: calls={stats.n_calls}  "
-          f"in={stats.input_tokens:,}  out={stats.output_tokens:,}  "
-          f"~${_approx_cost_usd(stats.input_tokens, stats.output_tokens):.3f}",
-          flush=True)
+    log.info(f"wrote tree → {out_path}")
+    log.info(f"LLM: calls={stats.n_calls}  "
+             f"in={stats.input_tokens:,}  out={stats.output_tokens:,}  "
+             f"~${_approx_cost_usd(stats.input_tokens, stats.output_tokens):.3f}")
 
 
 def stage_manifest(args: argparse.Namespace, profile: CorpusProfile) -> None:
-    print("\n=== Stage 5: manifest ===", flush=True)
+    log.info("=== Stage 5: manifest ===")
     out = args.output_dir
     tree_path = out / "concept_tree.json"
     _require(tree_path.exists(),
@@ -523,10 +519,9 @@ def stage_manifest(args: argparse.Namespace, profile: CorpusProfile) -> None:
     }
     out_path = out / "manifest.json"
     out_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
-    print(f"  wrote manifest → {out_path}", flush=True)
-    print(f"  chapters: {len(chapter_pages)}    pages: {total_pages}    "
-          f"catalog rows: {catalog_rows}    L1 files: {n_l1_files}",
-          flush=True)
+    log.info(f"wrote manifest → {out_path}")
+    log.info(f"chapters: {len(chapter_pages)}    pages: {total_pages}    "
+             f"catalog rows: {catalog_rows}    L1 files: {n_l1_files}")
 
     # ---- Build statistics dump --------------------------------------------
     # Per-stage timing + LLM token usage collected via `StageLLMWrapper`.
@@ -626,10 +621,10 @@ def stage_manifest(args: argparse.Namespace, profile: CorpusProfile) -> None:
     }
     stats_path = out / "build_stats.json"
     stats_path.write_text(json.dumps(build_stats, indent=2, ensure_ascii=False))
-    print(f"  wrote build stats → {stats_path}", flush=True)
-    print(f"  totals: {total_calls} LLM calls, "
-          f"in={total_in:,} out={total_out:,}  "
-          f"~${_approx_cost_usd(total_in, total_out):.3f}", flush=True)
+    log.info(f"wrote build stats → {stats_path}")
+    log.info(f"totals: {total_calls} LLM calls, "
+             f"in={total_in:,} out={total_out:,}  "
+             f"~${_approx_cost_usd(total_in, total_out):.3f}")
 
 
 # ---------------------------------------------------------------------------
@@ -682,11 +677,12 @@ def main() -> int:
     args = ap.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    configure_obs()
 
     profile = load_profile(args.profile)
-    print(f"Pipeline → {args.output_dir}", flush=True)
-    print(f"  profile: {profile.name}", flush=True)
-    print(f"  window: {args.window}    workers: {args.workers}", flush=True)
+    log.info(f"Pipeline → {args.output_dir}")
+    log.info(f"profile: {profile.name}")
+    log.info(f"window: {args.window}    workers: {args.workers}")
 
     if args.start_from:
         start_idx = STAGES.index(args.start_from)
@@ -694,16 +690,16 @@ def main() -> int:
         start_idx = 0
     to_run = [s for s in STAGES[start_idx:]
               if not getattr(args, f"skip_{s}", False)]
-    print(f"  stages: {to_run}", flush=True)
+    log.info(f"stages: {to_run}")
 
     t0 = time.monotonic()
     try:
         for stage in to_run:
             _STAGE_FUNCS[stage](args, profile)
     except StageError as e:
-        print(f"\n[stage prerequisite error] {e}", file=sys.stderr, flush=True)
+        log.error(f"[stage prerequisite error] {e}")
         return 2
-    print(f"\nPipeline complete in {time.monotonic() - t0:.1f}s", flush=True)
+    log.info(f"Pipeline complete in {time.monotonic() - t0:.1f}s")
     return 0
 
 
