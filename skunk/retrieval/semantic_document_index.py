@@ -17,7 +17,6 @@ from skunk.retrieval.nodes.llm_wrapper import DEFAULT_EMBEDDING_MODEL, get_llm_w
 SKUNK_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CACHE_DIR = os.path.expanduser("~/orcd/scratch/skunk_cache")
 DEFAULT_CACHE_PATH = os.path.join(DEFAULT_CACHE_DIR, "semantic_document_index.pckl")
-EMBEDDING_CACHE_VERSION = 1
 EMBEDDING_WORKERS = 64
 
 class SemanticDocumentIndex:
@@ -91,7 +90,6 @@ class SemanticDocumentIndex:
                 {
                     "documents": self.documents,
                     "sha_to_document_id": self._sha_to_document_id,
-                    "embedding_cache_version": EMBEDDING_CACHE_VERSION,
                     "embedding_idx_map": self.embedding_idx_map,
                     "embedding_node_ids": self.embedding_node_ids,
                     "embedding_matrix": self.embedding_matrix,
@@ -108,7 +106,6 @@ class SemanticDocumentIndex:
         ids = []
         for idx, document in enumerate(documents):
             # print("Adding document to index:", document)
-            source_uri = "in_memory.pdf"
             if isinstance(document, str):
                 source_uri = document
                 sha256 = hashlib.sha256(os.path.abspath(document).encode("utf-8")).hexdigest()
@@ -118,6 +115,7 @@ class SemanticDocumentIndex:
                 with open(document, "rb") as pdf_file:
                     raw_pdf = pdf_file.read()
             elif isinstance(document, bytes):
+                source_uri = "in_memory.pdf"
                 raw_pdf = document
                 sha256 = hashlib.sha256(raw_pdf).hexdigest()
             else:

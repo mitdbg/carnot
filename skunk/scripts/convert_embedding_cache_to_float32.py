@@ -6,7 +6,7 @@ import shutil
 import numpy as np
 
 
-CACHE_PATH = '/home/orcd/scratch/skunk_cache/llm_wrapper_cache.pckl'
+CACHE_PATH = '/home/gerarvit/orcd/scratch/skunk_cache/llm_wrapper_cache.pckl'
 LOCK_PATH = f"{CACHE_PATH}.lock"
 BACKUP_PATH = f"{CACHE_PATH}.bak"
 TMP_PATH = f"{CACHE_PATH}.tmp"

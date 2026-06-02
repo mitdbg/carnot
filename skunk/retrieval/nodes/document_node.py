@@ -2,10 +2,9 @@ import hashlib
 import json
 import os
 from dataclasses import dataclass, field
-import time
-
+import concurrent.futures
 import fitz
-from pqdm.threads import pqdm
+from tqdm import tqdm
 
 from skunk.retrieval.nodes.pdf_file import parse_pdf_pages
 
@@ -13,7 +12,7 @@ from .llm_wrapper import get_llm_wrapper
 from .page_node import PageNode
 
 MAX_DOCUMENT_PROMPT_CHARS = 2000
-PAGE_PROCESS_WORKERS = 16
+PAGE_PROCESS_WORKERS = 128
 PAGE_RENDER_DPI = 150
 
 
@@ -77,7 +76,7 @@ class DocumentNode:
             page_ids = list(set(page_ids))
             if len(page_ids) > 1:
                 print(
-                    f"Warning: element with content {e['content'][:100]} appears on multiple pages {page_ids}, assigning to first page"
+                    f"Warning: element appears on multiple pages {page_ids}, assigning to first page"
                 )
             # json is 1-indexed
             page_id = page_ids[0] - 1 if page_ids else None
@@ -87,7 +86,7 @@ class DocumentNode:
                 else:
                     page_elements[page_id].append(e)
 
-        figure_page_indexes = [
+        figure_page_indices = [
             idx
             for idx, elements in page_elements.items()
             if [e for e in elements if e["type"] == "figure"]
@@ -96,17 +95,17 @@ class DocumentNode:
             filename,
             n_workers=self.page_process_workers,
             dpi=PAGE_RENDER_DPI,
-            selected_page_indexes=figure_page_indexes,
+            selected_page_indices=figure_page_indices,
         )
 
-        args = []
+        page_args = []
         for idx in range(self.num_pdf_pages):
             if len(page_elements[idx]) > 0:
                 if [e for e in page_elements[idx] if e["type"] == "figure"]:
                     img = page_images[idx] 
                 else:
                     img = None
-                args.append(
+                page_args.append(
                     (
                         self.document_id,
                         idx,
@@ -116,23 +115,29 @@ class DocumentNode:
                     )
                 )
 
-        # page_nodes = [PageNode(*arg) for arg in args]
-        # raise Exception
-        page_nodes = pqdm(
-            args,
-            PageNode,
-            n_jobs=self.page_process_workers,
-            argument_type="args",
-            exception_behaviour="immediate",
-            desc=f"Processing page nodes in {self.filename}",
-        )
-        for arg, page_node in zip(args, page_nodes, strict=True):
-            if isinstance(page_node, Exception):
-                raise RuntimeError(
-                    f"Failed to process page {arg[1]} in {self.filename}"
-                ) from page_node
-        self.page_nodes = {page_node.page_id: page_node for page_node in page_nodes}
-
+        self.page_nodes = {}
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.page_process_workers, thread_name_prefix="llm-text"
+        ) as executor:
+            futures = {
+                executor.submit(PageNode, *arg): arg_idx
+                for arg_idx, arg in enumerate(page_args)
+            }
+            completed_futures = concurrent.futures.as_completed(futures)
+            completed_futures = tqdm(
+                completed_futures,
+                total=len(futures),
+                desc="Processing pages",
+                unit="request",
+            )
+            for future in completed_futures:
+                arg_idx = futures[future]
+                page_node = future.result()
+                if isinstance(page_node, Exception):
+                    raise RuntimeError(
+                        f"Failed to process page {page_args[arg_idx][1]} in {self.filename}"
+                    ) from page_node
+                self.page_nodes[page_node.page_id] = page_node
 
     def extract_document_title(self, text: str) -> str:
         if not text.strip():

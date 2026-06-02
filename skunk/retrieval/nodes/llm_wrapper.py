@@ -25,18 +25,14 @@ litellm.suppress_debug_info = True
 # DEFAULT_LLM_MODEL = "openai/gpt-4o-mini"
 # DEFAULT_LLM_VISION_MODEL = "openai/gpt-4o-mini"
 # DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small"
-# DEFAULT_LLM_MODEL = "openrouter/google/gemini-2.5-flash"
-# DEFAULT_LLM_VISION_MODEL = "openrouter/google/gemini-2.5-flash"
-# DEFAULT_EMBEDDING_MODEL = "openrouter/google/gemini-embedding-001"
-DEFAULT_LLM_MODEL = "vertex_ai/gemini-2.5-flash"
-DEFAULT_LLM_VISION_MODEL = "vertex_ai/gemini-2.5-flash"
-DEFAULT_EMBEDDING_MODEL = "vertex_ai/gemini-embedding-001"
 
-LLM_MAX_WORKERS = 32
-LLM_MAX_REQUESTS_PER_MINUTE = 120
-LLM_MAX_RETRIES = 10
-LLM_RETRY_BACKOFF_SECONDS = 10
-EMBEDDING_BATCH_SIZE = 90
+# DEFAULT_LLM_MODEL = "openrouter/google/gemini-3.1-pro-preview"
+# DEFAULT_LLM_VISION_MODEL = "openrouter/google/gemini-3.1-pro-preview"
+# DEFAULT_EMBEDDING_MODEL = "openrouter/google/gemini-embedding-001"
+
+DEFAULT_LLM_MODEL = "vertex_ai/gemini-3.5-flash"
+DEFAULT_LLM_VISION_MODEL = "vertex_ai/gemini-3.5-flash"
+DEFAULT_EMBEDDING_MODEL = "vertex_ai/gemini-embedding-001"
 
 DEFAULT_CACHE_DIR = os.path.expanduser("~/orcd/scratch/skunk_cache/")
 LLM_CACHE_PATH = os.path.join(DEFAULT_CACHE_DIR, "llm_wrapper_cache.pckl")
@@ -47,31 +43,19 @@ LLM_VISION_SYSTEM_PROMPT = (
     "You match rendered PDF pages to spans of OCR text. Return only valid JSON."
 )
 
-DEFAULT_LLM_MAX_WORKERS = int(os.environ.get("LLM_MAX_WORKERS", LLM_MAX_WORKERS))
-DEFAULT_LLM_MAX_REQUESTS_PER_MINUTE = int(
-    os.environ.get("LLM_MAX_REQUESTS_PER_MINUTE", LLM_MAX_REQUESTS_PER_MINUTE)
-)
-DEFAULT_LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", LLM_MAX_RETRIES))
-DEFAULT_LLM_RETRY_BACKOFF_SECONDS = int(
-    os.environ.get("LLM_RETRY_BACKOFF_SECONDS", LLM_RETRY_BACKOFF_SECONDS)
-)
-
+LLM_MAX_WORKERS = int(os.environ.get("LLM_MAX_WORKERS", 32))
+LLM_MAX_REQUESTS_PER_MINUTE = int(os.environ.get("LLM_MAX_REQUESTS_PER_MINUTE", 100))
+LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", 15))
+LLM_RETRY_BACKOFF_SECONDS = int(os.environ.get("LLM_RETRY_BACKOFF_SECONDS", 5))
+EMBEDDING_BATCH_SIZE = int(os.environ.get("EMBEDDING_BATCH_SIZE", 90))
 
 def remove_provider(model_name):
     return model_name.split("/")[-1]
 
 def llm_cache_key(request_inputs: dict) -> str:
-    input_monkeypatch = request_inputs.copy()
-    if "gemini/" in request_inputs["model"]:
-        input_monkeypatch["model"] = input_monkeypatch["model"].replace(
-            "gemini/", "openrouter/google/"
-        )
-        input_monkeypatch["model"] = input_monkeypatch["model"].replace(
-            "vertex_ai/", "openrouter/google/"
-        )
-        input_monkeypatch["model"] = input_monkeypatch["model"].replace("3.5", "2.5")
-
-    request_json = json.dumps(input_monkeypatch, sort_keys=True, separators=(",", ":"))
+    provider_agnostic = request_inputs.copy()
+    provider_agnostic["model"] = remove_provider(provider_agnostic["model"])
+    request_json = json.dumps(provider_agnostic, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(request_json.encode("utf-8")).hexdigest()
 
 
@@ -120,15 +104,15 @@ def extract_google_genai_text(response) -> str:
     if text:
         return text
 
-    print(
-        f"Warning: Google GenAI response content is an empty string. Returning empty string.\nResponse: {response}"
-    )
+    # print(f"Warning: Google GenAI response content is an empty string. Returning empty string.\nResponse: {response}")
     return ""
 
 
 def parse_json_response(text: str) -> dict:
     cleaned_text = text.strip()
-    if cleaned_text.startswith("```"):
+    if cleaned_text == '':
+        return {}
+    elif cleaned_text.startswith("```"):
         cleaned_text = re.sub(r"^```(?:json)?\s*", "", cleaned_text)
         cleaned_text = re.sub(r"\s*```$", "", cleaned_text)
 
@@ -145,10 +129,10 @@ def parse_json_response(text: str) -> dict:
 class LLMWrapper:
     def __init__(
         self,
-        max_workers: int = DEFAULT_LLM_MAX_WORKERS,
-        max_requests_per_minute: int = DEFAULT_LLM_MAX_REQUESTS_PER_MINUTE,
-        max_retries: int = DEFAULT_LLM_MAX_RETRIES,
-        retry_backoff_seconds: int = DEFAULT_LLM_RETRY_BACKOFF_SECONDS,
+        max_workers: int = LLM_MAX_WORKERS,
+        max_requests_per_minute: int = LLM_MAX_REQUESTS_PER_MINUTE,
+        max_retries: int = LLM_MAX_RETRIES,
+        retry_backoff_seconds: int = LLM_RETRY_BACKOFF_SECONDS,
         text_timeout: int = 60,
         vision_timeout: int = 120,
         cache_path: str = LLM_CACHE_PATH,
@@ -484,12 +468,13 @@ class LLMWrapper:
         prompt: str,
         max_tokens: int = 2048,
         model: str = DEFAULT_LLM_MODEL,
+        system_prompt: str = LLM_TEXT_SYSTEM_PROMPT,
         use_cache: bool = True,
     ) -> str:
         request_inputs = {
             "call_type": "litellm_text",
             "model": model,
-            "system_prompt": LLM_TEXT_SYSTEM_PROMPT,
+            "system_prompt": system_prompt,
             "prompt": prompt,
             "temperature": 0,
             "max_tokens": max_tokens,
@@ -508,7 +493,7 @@ class LLMWrapper:
             lambda: llm(
                 prompt=prompt,
                 model=model,
-                system_prompt=LLM_TEXT_SYSTEM_PROMPT,
+                system_prompt=system_prompt,
                 max_tokens=max_tokens,
             )
         )

@@ -195,14 +195,14 @@ class PageNode:
                 )
         end_time = time.time()
         tot_time = end_time - start_time
-        # print(f"Total PageNode processing time: {tot_time:.2f} seconds")
         # if tot_time > 30:
         # breakpoint()
 
     @staticmethod
     def description_prompt(text: str) -> str:
         return f"""
-Write a concise semantic index description for this page.
+Write a concise description that can be used to understand what this page is about.
+If the page is empty, make it clear in the description.
 
 Rules:
 - Return exactly one sentence.

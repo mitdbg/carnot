@@ -73,31 +73,33 @@ def render_page(args):
     return pages 
 
 
-def parse_pdf_pages(filename, n_workers=None, dpi=300, selected_page_indexes=None) -> list | dict[int, bytes]:
+def parse_pdf_pages(
+    filename, n_workers=None, dpi=300, selected_page_indices=None
+) -> list | dict[int, bytes]:
     t0 = time.time()  # start the timer
     mat = pymupdf.Matrix(dpi/72, dpi/72)
     cpu = n_workers if n_workers is not None else cpu_count()
     selected_pages = None
-    if selected_page_indexes is not None:
-        selected_pages = set(selected_page_indexes)
+    if selected_page_indices is not None:
+        selected_pages = set(selected_page_indices)
         if not selected_pages:
             return {}
         cpu = min(cpu, len(selected_pages))
 
     # make vectors of arguments for the processes
     args = [(i, cpu, filename, mat, selected_pages) for i in range(cpu)]
-    print(f"Starting {cpu} processes for '{filename}'.")
-
+    print(f"Reading from disk '{os.path.basename(filename)}'...", end="", flush=True)
     pool = Pool(processes=min(cpu_count(), cpu))
     pages = pool.map(render_page, args, 1)
     pool.close()
     pool.join()
 
     t1 = time.time()  # stop the timer
-    print(f"Total time {round(t1 - t0, 2):g} seconds")
+    print(f" done ({round(t1 - t0, 2):g}s)")
     if selected_pages is not None:
         return {page_idx: page_image for segment in pages for page_idx, page_image in segment}
     return pages
+
 
 if __name__ == "__main__":
     filename = 'data/officeqa/treasury_bulletin_pdfs/treasury_bulletin_1939_01.pdf'
