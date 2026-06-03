@@ -1,19 +1,15 @@
-"""In-process Python exec for operator-generated code.
+"""Sandbox for operator-generated Python code: a thin wrapper around the
+smolagents-derived `LocalPythonExecutor` so `compute` and `lookup_external` get the
+same AST-walked evaluation (import/module/function blocklists, no dunder access) the
+search agent uses.
 
-`exec_python_with_env` runs a snippet in an env preloaded with
-numpy/pandas/statsmodels; callers pass in their own local variables.
-`strip_code_fences` removes a leading/trailing markdown fence.
-
-NOTE: this is not a security boundary. The snippet runs in the host
-process with full builtins, imports, filesystem, and network access.
-Real isolation (subprocess + seccomp, WASM, container) is future work.
-"""
+Not a hardened sandbox: the wrapped modules (numpy, pandas, statsmodels) run as
+trusted Python, so a determined caller can still reach the host. Real isolation
+(subprocess + seccomp, WASM, container) is future work."""
 
 from __future__ import annotations
 
-import contextlib
 import datetime
-import io
 import math
 import re
 import statistics
@@ -24,27 +20,22 @@ import pandas as pd
 import statsmodels.api as sm
 
 from skunk.errors import StepFailed
+from skunk.local_python_executor import InterpreterError, LocalPythonExecutor
 
+# Modules code may `import`; also pre-injected as globals (`_PRELOADED_GLOBALS`) so
+# code that omits the import still works — matches what the system prompts advertise.
+_AUTHORIZED_IMPORTS = ["json", "numpy", "numpy.*", "pandas", "statsmodels", "statsmodels.*"]
 
-def _default_env() -> dict[str, Any]:
-    """Common modules pre-injected into operator-generated-code sandboxes.
-    Shared by `exec_python_with_env` and `exec_python_capture_stdout`.
-    Keeping the set here (rather than per-operator) means the system
-    prompts in compute, lookup_external, etc. all describe the same
-    'already in scope' surface area."""
-    return {
-        "math": math,
-        "statistics": statistics,
-        "datetime": datetime,
-        "np": np, "numpy": np,
-        "pd": pd, "pandas": pd,
-        "sm": sm, "statsmodels": sm,
-    }
+_PRELOADED_GLOBALS: dict[str, Any] = {
+    "math": math,
+    "statistics": statistics,
+    "datetime": datetime,
+    "np": np, "numpy": np,
+    "pd": pd, "pandas": pd,
+    "sm": sm, "statsmodels": sm,
+}
 
-# TODO: Should probably add a minimal sandbox / merge with search agent code execution sandbox
-
-# Strip only a leading ```[lang] fence and a trailing ``` fence. Never strips
-# inline-string lines, even if they happen to start with ```.
+# Strip only a leading ```[lang] fence and a trailing ``` fence (not inline lines).
 _LEADING_FENCE_RE = re.compile(r"\A```[a-zA-Z]*[ \t]*\n")
 _TRAILING_FENCE_RE = re.compile(r"\n```[ \t]*\Z")
 
@@ -56,34 +47,49 @@ def strip_code_fences(code: str) -> str:
     return s.strip()
 
 
+def _new_executor(
+    extra_vars: dict[str, Any],
+    extra_tools: dict[str, Any] | None = None,
+) -> LocalPythonExecutor:
+    """Build a fresh sandboxed executor with the operator preload set (fresh state per
+    call). `send_tools` is called even when empty — `__call__` requires `static_tools`
+    populated, which only happens on that first call."""
+    ex = LocalPythonExecutor(additional_authorized_imports=_AUTHORIZED_IMPORTS)
+    ex.send_tools(extra_tools or {})
+    ex.send_variables({**_PRELOADED_GLOBALS, **extra_vars})
+    return ex
+
+
 def exec_python_with_env(
     code: str, local_vars: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Any]:
-    """Exec `code` and return both the post-exec env and env["result"].
-
-    Useful when the caller needs auxiliary variables the code may have set
-    (e.g. `result_unit`, `result_kind`) alongside the primary `result`.
-    """
+    """Exec `code` and return `(post-exec state, state["result"])`. The state lets the
+    caller read auxiliary variables the code set alongside `result`."""
     code = strip_code_fences(code)
-    env = _default_env()
-    env.update(local_vars or {})
-    exec(compile(code, "<pyexec>", "exec"), env)  # noqa: S102
-    if "result" not in env:
+    ex = _new_executor(local_vars or {})
+    try:
+        ex(code)
+    except InterpreterError as e:
+        raise StepFailed("pyexec", str(e)) from e
+    if "result" not in ex.state:
         raise StepFailed("pyexec", f"Code did not set `result`:\n{code}")
-    return env, env["result"]
+    return ex.state, ex.state["result"]
 
 
 def exec_python_capture_stdout(
     code: str, local_vars: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str]:
-    """Exec `code` with stdout redirected to a buffer and return the env
-    plus captured stdout. Used by operators whose contract is "call
-    helpers and print() the answer" (e.g. lookup_external) rather than
-    "assign to `result`" (compute)."""
+    """Exec `code` with print() output captured; returns (state, stdout). For operators
+    whose contract is "print the answer" rather than "assign `result`". Callable entries
+    in `local_vars` route to `send_tools()` (immutable); data entries to `send_variables()`."""
     code = strip_code_fences(code)
-    env = _default_env()
-    env.update(local_vars or {})
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
-        exec(compile(code, "<pyexec>", "exec"), env)  # noqa: S102
-    return env, buf.getvalue()
+    tools: dict[str, Any] = {}
+    vars_: dict[str, Any] = {}
+    for k, v in (local_vars or {}).items():
+        (tools if callable(v) else vars_)[k] = v
+    ex = _new_executor(vars_, extra_tools=tools)
+    try:
+        out = ex(code)
+    except InterpreterError as e:
+        raise StepFailed("pyexec", str(e)) from e
+    return ex.state, str(out.logs)

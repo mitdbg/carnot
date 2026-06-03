@@ -1,10 +1,10 @@
-"""One-shot parent-chapter retriever over the flat concept tree.
+"""Query path — ToC chapter pick over the flat concept tree.
 
-A single LLM call picks one (or up to two) canonical chapter(s) from
-the tree; every page under the picked chapter(s) is returned as the
-prediction. Used by `page_index.retrieve_prototype.PageIndexRetrievePrototype`;
-not on the default `RetrieveExecutor` path while an external retriever
-is being integrated.
+The first pass of the page-index query path
+(`ToC pick → year filter → semantic filter → candidate set`). A single
+LLM call picks up to two canonical chapter(s) from the tree; every page
+under the picked chapter(s) becomes a candidate. Used by
+`page_index.query.PageIndexRetriever`.
 
 The concept tree is the flat shape produced by `merge.build_tree`:
 
@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -64,9 +64,9 @@ class RetrieveTrace:
     top_k: list[dict[str, Any]] = field(default_factory=list)
     total_walk_s: float = 0.0
     # The chapter(s) the LLM picked. Set by `one_shot_parent_chapter_retrieve`
-    # so downstream steps (e.g. BM25 rerank) can find the per-chapter index
-    # without re-running the LLM. Empty list when the LLM picked nothing
-    # valid; one or two chapter names otherwise.
+    # so downstream steps can attribute candidates without re-running the
+    # LLM. Empty list when the LLM picked nothing valid; one or two chapter
+    # names otherwise.
     picked_chapters: list[str] = field(default_factory=list)
 
 
@@ -91,7 +91,7 @@ def load_concept_tree(path: Path) -> dict[str, Any]:
 def _safe_json(text: str) -> dict[str, Any] | None:
     """Parse JSON object from a (possibly fenced) LLM response."""
     from .util import safe_json_loads
-    obj = safe_json_loads(text, context="retrieve_probe")
+    obj = safe_json_loads(text, context="query_toc")
     return obj if isinstance(obj, dict) else None
 
 
@@ -149,16 +149,21 @@ description may not mention.
 ## Output
 
 Output a SINGLE JSON object (no prose, no fences):
-  {"picked": "<exact chapter label>"}
+  {"picked": ["<exact chapter label>", ...]}
 
 Rules:
-  - Return exactly ONE chapter label, the best match.
-  - Use the EXACT `chapter` value shown; do NOT emit anything from a
+  - Return the best-matching chapter. Return a SECOND chapter only
+    when the question genuinely straddles two chapters and you are
+    unsure which holds the answer — at most TWO labels, best first.
+    A precise downstream filter reads every page you return, so a
+    spurious second chapter only adds cost. When in doubt, return one.
+  - Use the EXACT `chapter` value(s) shown; do NOT emit anything from a
     `description` or `examples` list.
+  - A bare string (one label) is also accepted.
 """
 
 
-def one_shot_parent_chapter_retrieve(
+async def one_shot_parent_chapter_retrieve(
     tree: dict[str, Any],
     question: str,
     concept: str,
@@ -205,7 +210,7 @@ def one_shot_parent_chapter_retrieve(
     level_trace.prompt_excerpt = user[:_EXCERPT_MAX_LEN]
 
     t0 = time.monotonic()
-    resp = llm.call(system=_PARENT_PICK_SYSTEM, user=user, temperature=0.0)
+    resp = await llm.acall(system=_PARENT_PICK_SYSTEM, user=user, temperature=0.0)
     level_trace.latency_s = time.monotonic() - t0
     level_trace.output_chars = len(resp.text)
     level_trace.input_tokens = resp.input_tokens
@@ -249,11 +254,3 @@ def one_shot_parent_chapter_retrieve(
     trace.top_k = top[:50]
     trace.total_walk_s = time.monotonic() - t_walk
     return top, trace
-
-
-def write_trace_jsonl(trace: RetrieveTrace, path: Path) -> None:
-    """Append one RetrieveTrace as a JSON line."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a") as f:
-        f.write(json.dumps(asdict(trace), ensure_ascii=False))
-        f.write("\n")

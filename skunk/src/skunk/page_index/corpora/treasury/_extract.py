@@ -21,6 +21,7 @@ import re
 from html.parser import HTMLParser
 from typing import Any
 
+from skunk.corpus import page_plain_text
 from ...schema import ContentBlock
 from ._classify import _BOILERPLATE_HEADER_RE, has_prose_content
 
@@ -180,8 +181,10 @@ def _extract_dates(text: str, *, bulletin: str | None = None) -> list[str]:
     """
     bulletin_year: int | None = None
     if bulletin:
-        try: bulletin_year = int(bulletin[:4])
-        except ValueError: bulletin_year = None
+        try:
+            bulletin_year = int(bulletin[:4])
+        except ValueError:
+            bulletin_year = None
 
     spans: list[tuple[int, int, str]] = []
     for pat in _DATE_PATTERNS:
@@ -366,25 +369,6 @@ def _harvest_keywords(caption: str | None,
 
 
 # ---------------------------------------------------------------------------
-# Page text reconstruction.
-# ---------------------------------------------------------------------------
-
-def _page_plain_text(elements: list[dict]) -> str:
-    parts: list[str] = []
-    for el in elements:
-        t = (el.get("type") or "").lower()
-        if t == "page_number":
-            continue
-        content = el.get("content")
-        if not content:
-            continue
-        if t == "table":
-            content = re.sub(r"<[^>]+>", " ", str(content))
-        parts.append(str(content))
-    return "\n".join(parts)
-
-
-# ---------------------------------------------------------------------------
 # Prose helpers.
 # ---------------------------------------------------------------------------
 
@@ -509,7 +493,7 @@ def parse_page_fields(elements: list[dict], *, bulletin: str) -> dict[str, Any]:
     check (TOC / snapshot / continuation pages).
     """
     blocks, all_columns, all_rows = _extract_content_blocks(elements)
-    plain = _page_plain_text(elements)
+    plain = page_plain_text(elements)
     dates = _extract_dates(plain, bulletin=bulletin)
     # Always seed `dates` with the bulletin's publication month
     # (`YYYY-MM`) AND its calendar year (`YYYY`):

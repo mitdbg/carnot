@@ -1,26 +1,11 @@
-"""Plan + planner.
-
-`PlannerPromptedCall.plan(question, ctx)` emits a `Plan`; the orchestrator walks
-`Plan.branches` and threads `PageRef` / `AnnotatedValue` (both defined in
-`skunk.models`) between operators. The compute operator's terminal output
-is a bare `str` (the final answer).
-
-The Plan AST mirrors the wire JSON shape:
-
-    Plan(branches=[...],
-         computation=Computation(task=..., qualifiers=[...]),
-         presentation=Presentation(units_out=..., precision=..., answer_form=...))
-
-Branches are a discriminated union keyed by `kind`:
-    RetrieveBranch(kind="retrieve", key, period, visual_only)
-    LookupBranch(kind="lookup_external", target, src)
-
-`Plan.model_validate_json(s)` / `plan.model_dump_json()` round-trip without
-any custom translation — model layout *is* the wire layout.
-"""
+"""Plan + planner. `Planner.plan(question, ctx)` emits a `Plan`; the orchestrator
+walks `Plan.branches`. The Plan AST mirrors the wire JSON exactly, so
+`model_validate_json` / `model_dump_json` round-trip with no custom translation.
+Branches are a discriminated union keyed by `kind` (`retrieve` / `lookup_external`)."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Annotated, Literal, Union
 
 from pydantic import (
@@ -32,9 +17,9 @@ from pydantic import (
 )
 
 from skunk.common import strip_code_fence
-from skunk.errors import StepFailed
+from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
-from skunk.models import AnnotatedValue, HarnessContext
+from skunk.common import AnnotatedValue, ExecutionContext, input_values_desc
 
 
 def _strip_non_empty(v: str) -> str:
@@ -43,25 +28,19 @@ def _strip_non_empty(v: str) -> str:
     return v
 
 
-# Field-level constraint: str that must be non-empty after `.strip()`.
-# Used by `RetrieveBranch.key` and `LookupBranch.target` to reject planner
-# replies that emit empty / whitespace-only branch keys.
 NonEmptyStr = Annotated[str, AfterValidator(_strip_non_empty)]
 
 
 class RetrieveBranch(BaseModel):
-    """A corpus-retrieval branch. The implicit extract step downstream uses
-    `visual_only` to skip the parsed-text tier and go straight to vision."""
+    """A corpus-retrieval branch. `visual_only` skips the parsed-text tier
+    downstream and goes straight to vision."""
 
     model_config = ConfigDict(frozen=True)
 
     kind: Literal["retrieve"] = "retrieve"
-    # Free-form NL phrase describing the data to find. Embedded into the
-    # corpus ANN query alongside the user's question.
-    key: NonEmptyStr
-    # Free-form NL period — "FY 2023", "2023-01", "January 1940", etc.
-    # None when the question doesn't pin one.
-    period: str | None = None
+    key: NonEmptyStr            # NL phrase describing the data to find
+    period: str | None = None   # NL period the DATA pertains to ("FY 2023", "2003"); None if unpinned
+    as_of: str | None = None    # NL reporting bulletin/vintage ("June 2013 bulletin"); None unless pinned
     visual_only: bool = False
 
 
@@ -71,11 +50,8 @@ class LookupBranch(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     kind: Literal["lookup_external"] = "lookup_external"
-    # Free-form NL request for a single external value.
-    target: NonEmptyStr
-    # Optional NL hint about the preferred source. Threaded into the
-    # operator's user prompt to bias source routing.
-    src: str | None = None
+    target: NonEmptyStr     # NL request for a single external value
+    src: str | None = None  # optional NL source hint, biases routing
 
 
 Branch = Annotated[
@@ -84,42 +60,46 @@ Branch = Annotated[
 ]
 
 
-class Computation(BaseModel):
-    """Computation envelope — natural-language spec for the implicit
-    terminal compute phase. `task` may be omitted or null; `qualifiers`
-    defaults to empty list when absent."""
-
-    model_config = ConfigDict(frozen=True)
-    task: str | None = None
-    qualifiers: list[str] = Field(default_factory=list)
-
-
-class Presentation(BaseModel):
-    """Presentation envelope — output-format hints for the compute phase.
-    All fields may be omitted or null in the wire; consumers coerce."""
-
-    model_config = ConfigDict(frozen=True)
-    units_out: str | None = None
-    precision: int | None = Field(default=None, ge=0)
-    answer_form: str | None = None
-
-
 class Plan(BaseModel):
-    """The whole plan — model layout mirrors the wire JSON exactly, so
-    `model_validate_json` / `model_dump_json` round-trip with no custom
-    translation. See module docstring for the wire shape."""
-
     model_config = ConfigDict(frozen=True)
 
     branches: list[Branch] = Field(min_length=1)
-    computation: Computation = Field(default_factory=Computation)
-    presentation: Presentation = Field(default_factory=Presentation)
 
 
-class PlannerPromptedCall(PromptedCall):
-    name: str = "planner"
-    system_prompt: str = """\
-You are the planner. Given a question, emit a JSON plan that, when executed, produces the answer.
+class PlanDiff(BaseModel):
+    """A replan result expressed as a delta against the prior plan."""
+
+    model_config = ConfigDict(frozen=True)
+
+    add: list[Branch] = Field(default_factory=list)
+    drop: list[int] = Field(default_factory=list)
+
+    def apply(self, plan: Plan) -> tuple[Plan, list[int]]:
+        drop = {i for i in self.drop if 0 <= i < len(plan.branches)}
+        kept = [i for i in range(len(plan.branches)) if i not in drop]
+        new_plan = plan.model_copy(
+            update={"branches": [*(plan.branches[i] for i in kept), *self.add]}
+        )
+        return new_plan, kept
+
+
+def _json_parser[T: BaseModel](model: type[T]) -> Callable[[str, ExecutionContext], T]:
+    """Build a `PromptedCall` parse hook that validates the reply as `model`,
+    raising `ParseError` (so the retry loop can echo it back) on malformed/invalid
+    JSON. Used for both the planner (`Plan`) and replanner (`PlanDiff`)."""
+
+    def parse(raw: str, ctx: ExecutionContext) -> T:
+        try:
+            return model.model_validate_json(strip_code_fence(raw).strip())
+        except ValidationError as e:
+            raise ParseError(raw, str(e)) from e
+
+    return parse
+
+
+class Planner:
+    _INITIAL_PLAN_PROMPT = """\
+You are a query planner. Given a question, emit a JSON plan that, when executed, produces the answer.
 
 ## Output format
 
@@ -128,26 +108,18 @@ You are the planner. Given a question, emit a JSON plan that, when executed, pro
     {"kind": "retrieve",
      "key": "<natural-language lookup string>",
      "period": "<str | null>",
+     "as_of": "<str | null>",
      "visual_only": <bool>},
     {"kind": "lookup_external",
      "target": "<natural-language request for a single value>",
      "src": "<natural-language description of requested source, if applicable | null>"}
-  ],
-  "computation": {
-     "task": "<natural-language describing the calculation>",
-     "qualifiers": [<short qualifier phrases>]
-  },
-  "presentation": {
-    "units_out": "<unit | null>",
-    "precision": <int | null>,
-    "answer_form": <natural-language describing the output format | null>
-  }
+  ]
 }
 
-Branches run in parallel. A `retrieve` branch pulls annotated values from
-the corpus. A `lookup_external` branch fetches a single value from
-outside the corpus. `computation` + `presentation` feed an implicit
-final compute phase.
+Branches run in parallel. A `retrieve` branch pulls information from the corpus.
+A `lookup_external` branch fetches a single value from outside the corpus. Use 'lookup_external' only when you are sure the corpus does not contain the answer,
+when the question explicitly asks for an external lookup from a source, or when previous lookups in the corpus failed. A final compute step reads the
+gathered values and the verbatim question to produce the answer.
 
 ## Field semantics
 
@@ -155,145 +127,124 @@ retrieve branch fields:
   key           natural-language phrase describing the data to find. Focus only on a singular, cohesive concept.
                 Favor separate branches if the question requires retrieval of multiple values. Examples:
                 "national defense expenditures", "weekly average discount rate for new 91-day bills".
-  period        temporal mask in natural language, e.g. "FY 2023", "2023-01", "2023-01-01".
-                Null when the question doesn't pin one.
+  period        The period the DATA VALUE PERTAINS TO — e.g. "FY 2023", "2023-01", "2003".
+                This is what extract uses to pick the row/column. It is NOT the bulletin/report
+                date. Null when the question doesn't pin one.
+  as_of         The bulletin/vintage the value is REPORTED IN / AS OF, when the question pins one
+                (e.g. "as reported at the end of FY 2013" → "June 2013 bulletin"). This selects
+                WHICH DOCUMENT to read, not which row. Null otherwise (the common case).
   visual_only   true only if question explicitly asks for visual understanding of charts/figures.
 
 lookup_external branch fields:
-  target        natural-language request for a single external value (e.g. "U.S. CPI-U for July 1953",
-                "JPY/USD spot rate on 2010-06-30"). Use only for values that the corpus is unlikely to carry or when explicitly instructed to do so.
-  src           natural-language description of the source, only if the question explicitly asks for one (e.g. "Bureau of Labor Statistics").
-
-computation fields:
-  task        Natural language describing the calculation to carry out
-              once retrieval has returned relevant data. 
-
-  qualifiers  Optional list of short phrases that nail down a specific qualifier. Each
-              qualifier is one phrase; the compute operator treats every qualifier as a MUST. Use only when
-              the question explicitly pins a choice. Empty list (or omit the field) when the task is
-              unambiguous. Preserve qualifier words from the question VERBATIM — do not
-              paraphrase, simplify, or otherwise modify them. The compute step
-              relies on the exact wording to choose the right operation.
-
-presentation fields:
-  How the final answer is rendered. No semantic content about the calculation itself.
-
-  units_out    Unit of the final answer (e.g., "in millions of
-                   dollars", "as a percent", "in DEM"). Use exact matching strings from the question. 
-                   If the question does NOT name a unit, output `null`.
-                   Do not guess; do not invent; do not fall back to
-                   "text" or any other placeholder.
-  precision    decimal places of the final answer;
-               null when not pinned.
-  answer_form  examples: no commas, bracketed_list for
-               "[a, b, c]", labeled_pair for
-               "[year, value]".
-
-The dataset section below enumerates the corpus-specific conventions and points to a few
-worked examples.
-
+  target        natural-language request for one external value, OR for the same series
+                across consecutive periods (e.g. "U.S. CPI-U for July 1953", or for a
+                multi-period series "TreasuryDirect index ratios for the 2-3/8% Jan-2027
+                TIPS across January-August 2007").
+                When the question needs the same series across N periods, emit ONE branch
+                with a multi-period target; the lookup agent returns a labeled vector
+                (period→value). Do NOT split into N separate branches — that multiplies failure risk.
+  src           Set to a publisher name if and only if the question requests a
+                single, unambiguous external source. Otherwise null.
 """
 
-    def plan(self, question: str, ctx: HarnessContext) -> Plan:
-        """Generate a Plan from a natural-language question."""
-        base_user_message = f"""\
-Question: {question}
+    _REPLAN_INSTRUCTIONS = """\
+You are now replanning: a plan you produced could not be completed. Revise it by
+emitting a DIFF against the prior plan — not a whole new plan. The same
+branch/field semantics above still apply to any branch you add.
 
-Produce the Plan JSON. Output a single bare JSON object. No markdown fences. No prose.
+Return a PlanDiff JSON object with these fields:
+  add            list of NEW branches to run (same retrieve/lookup_external
+                 schema as a plan branch). Empty list if you add nothing.
+  drop           list of prior-branch INDICES (from the numbered prior_plan.branches
+                 list in the question) to remove. Removing a branch also discards the
+                 data it gathered, so drop a branch only when its data is wrong or
+                 must be re-fetched differently. Empty list if you drop nothing.
+
+Rules:
+  - A prior branch you wish to keep appear in NEITHER list: leave it
+    alone and its gathered data is reused as-is. Do NOT re-add branches whose
+    data is already in `prev`.
+  - If data is missing, `add` retrieve/lookup branches that close the gap.
+  - For each FAILED branch you still need, read its "what the attempt found / why
+    it was blocked" note and formulate an alternative query. Pay special attention to whether
+    you are asking for information at the right granularity, and whether you are correctly
+    assuming whether a piece of information is in the corpus or should be fetched externally with
+    the appropriate src.
 """
-        return self._call_with_retry(ctx, base_user_message, label="planner")
 
-    def replan(
+    # Planner and replanner share the initial-plan instructions (same branch/field
+    # semantics); the replanner's system prompt extends them with the diff
+    # instructions, so it carries the full planning context plus how to revise. They
+    # differ in the parsed output shape — `Plan` vs `PlanDiff` (a delta steered by the
+    # dynamic context in the user message). Both are stateless, so they live on the
+    # class rather than being rebuilt per instance.
+    _prompt = PromptedCall(
+        name="planner",
+        system_prompt=_INITIAL_PLAN_PROMPT,
+        default_effort="medium",
+        parse=_json_parser(Plan),
+        output_instruction="Output the Plan as a single bare JSON object — no markdown fences, no prose.",
+    )
+    _replan_prompt = PromptedCall(
+        name="replanner",
+        system_prompt=f"{_INITIAL_PLAN_PROMPT}\n\n{_REPLAN_INSTRUCTIONS}",
+        default_effort="medium",
+        parse=_json_parser(PlanDiff),
+        output_instruction="Output the PlanDiff as a single bare JSON object — no markdown fences, no prose.",
+    )
+
+    async def plan(self, question: str, ctx: ExecutionContext) -> Plan:
+        return await self._prompt.call(ctx, f"Question: {question}")
+
+    @staticmethod
+    def _failed_section(
+        prior_plan: Plan, failed_branches: list[tuple["Branch", StepFailed]]
+    ) -> str:
+        """Render the FAILED-branches block of the replan message ("" when none
+        failed). Each entry carries the branch's prior index, its JSON, and the
+        first-hand diagnostic the failed attempt recorded."""
+        if not failed_branches:
+            return ""
+        branch_index = {id(b): i for i, b in enumerate(prior_plan.branches)}
+        blocks = []
+        for branch, err in failed_branches:
+            idx = branch_index.get(id(branch))
+            block = (
+                f"  - [{idx}] {branch.model_dump_json(exclude_none=True)}\n"
+                f"    reason: {err.reason}"
+            )
+            if err.diagnostic:
+                diag = "\n".join("      " + ln for ln in err.diagnostic.splitlines())
+                block += f"\n    what the attempt found / why it was blocked:\n{diag}"
+            blocks.append(block)
+        return (
+            "Branches that FAILED in the prior run (their output is NOT in prev):\n"
+            + "\n".join(blocks)
+        )
+
+    async def replan(
         self,
-        ctx: HarnessContext,
+        ctx: ExecutionContext,
         prior_plan: Plan,
         prev: list[AnnotatedValue],
+        failed_branches: list[tuple["Branch", StepFailed]],
         missing_reason: str,
         missing: list[str],
-    ) -> Plan:
-        """Re-plan after compute reported MissingData. Same JSON schema as
-        `plan()`; the orchestrator diffs the returned branches against
-        `prior_plan.branches` and executes only the additions. `computation`
-        / `presentation` from the result fully replace the prior values."""
-        from skunk.compute import prev_desc
-
-        base_user_message = f"""\
-Question: {ctx.question}
-
-Produce the Plan JSON. Output a single bare JSON object. No markdown fences. No prose.
-
-The prior plan you produced did not gather enough data for the compute step:
-
-prior_plan = {prior_plan.model_dump_json()}
-
-prev (data already gathered, will be reused):
-{prev_desc(prev)}
-
-compute reported MISSING DATA:
-  description: {missing_reason}
-  missing:     {missing!r}
-
-Emit an UPDATED plan in the same JSON schema. The orchestrator will:
-  - execute only the branches you ADD (any branch already present in
-    prior_plan.branches is skipped — its output is already in `prev`),
-  - replace `computation` and `presentation` with whatever you emit.
-
-Guidance:
-  - If only inputs are missing, keep prior_plan.branches verbatim and
-    APPEND the new retrieve/lookup branches that close the gap.
-  - If the missing-data signal reveals the calculation itself was
-    misframed (e.g. a qualifier was misinterpreted), additionally
-    revise `computation` / `presentation`.
-  - If you have nothing useful to add and the framing is correct,
-    re-emit prior_plan unchanged — no diff means no work, and the
-    caller will surface the missing-data failure.
-"""
-        return self._call_with_retry(ctx, base_user_message, label="replanner")
-
-    def _call_with_retry(
-        self, ctx: HarnessContext, base_user_message: str, label: str
-    ) -> Plan:
-        """Shared three-attempt loop for `plan()` and `replan()`. Each retry
-        shows ONLY the most recent bad response + its error — no history
-        accumulation."""
-        system_prompt = self.assemble_system_prompt(ctx)
-        attempt_errors: list[str] = []
-        last_raw: str | None = None
-        last_error: str | None = None
-
-        for attempt in range(3):
-            if attempt == 0:
-                user_message = base_user_message
-            else:
-                user_message = (
-                    f"{base_user_message}\n"
-                    f"Your previous attempt produced this output:\n"
-                    f"```\n{last_raw}\n```\n\n"
-                    f"It failed with: {last_error}\n"
-                    "Fix and return valid JSON only."
-                )
-            ctx.emit(label, "attempt", n=attempt + 1, of=3)
-            resp = ctx.llm_client.call(
-                system_prompt, user_message, effort="medium", ctx=ctx
-            )
-            raw = resp.text
-            try:
-                return Plan.model_validate_json(strip_code_fence(raw).strip())
-            except ValidationError as e:
-                attempt_errors.append(f"Attempt {attempt + 1}: {e}")
-                last_raw = raw
-                last_error = str(e)
-                ctx.emit(
-                    label,
-                    "parse/validate failed",
-                    n=attempt + 1,
-                    error_type=type(e).__name__,
-                    error=str(e),
-                )
-
-        ctx.emit(label, "exhausted", attempts=len(attempt_errors))
-        raise StepFailed(
-            label,
-            f"Failed to produce valid Plan after {len(attempt_errors)} attempts: "
-            + "; ".join(attempt_errors),
+    ) -> PlanDiff:
+        numbered = "\n".join(
+            f"  [{i}] {b.model_dump_json(exclude_none=True)}"
+            for i, b in enumerate(prior_plan.branches)
         )
+        parts = [
+            f"Question: {ctx.question}",
+            f"prior_plan.branches (reference `drop` by these indices):\n{numbered}",
+            "input_values (data already gathered; treat as available, do NOT request again):\n"
+            f"{input_values_desc(prev)}",
+        ]
+        failed = self._failed_section(prior_plan, failed_branches)
+        if failed:
+            parts.append(failed)
+        parts.append(
+            f"What was missing:\n  description: {missing_reason}\n  missing:     {missing!r}"
+        )
+        return await self._replan_prompt.call(ctx, "\n\n".join(parts))

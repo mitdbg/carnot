@@ -1,21 +1,18 @@
-"""retrieve operator — dispatches to one of two backends based on
-`ctx.config.retriever`:
+"""retrieve operator — one op over three swappable backends.
 
-- `"search_agent"` (default) — the teammate's iterative ChromaDB +
-  LLM-loop retriever, vendored under `skunk.search_agent`. Returns
-  page keys; this module adapts them to `PageRef`.
-- `"page_index"` — the legacy chapter-pick + year-filter retriever
-  preserved under `skunk.page_index.retrieve_prototype` for
-  ablation/regression comparison.
+`RetrieveOp` turns a `RetrieveBranch` into the pages that answer it, picking a
+backend per call:
 
-`ctx.config.golden_pages` short-circuits both — for `--golden` eval
-runs the backend is never built.
+- golden bypass — returns `ctx.config.golden_pages` verbatim (eval ablation;
+  no backend built), taken first when `golden_pages` is set.
+- `search_agent` — iterative ChromaDB + LLM loop under `skunk.search_agent`;
+  returns page keys adapted to `PageRef`.
+- `page_index` — ToC pick → year filter → semantic filter (wraps
+  `skunk.page_index.query.PageIndexRetriever`).
 
-This is the merge wire-up between our framework and the teammate's
-agent; for the open follow-ups (port the agent to `LLMClient` +
-`PromptedCall`, replace its tracer with `ctx.emit`, thread
-`branch.key` / `branch.period` into the agent), see the "TODO after
-merge" section in `ARCHITECTURE.md`.
+The two real backends are built lazily so an unused one (notably ChromaDB) is
+never opened. Backends raise `StepFailed("retrieve", …)` on failure and do not
+emit their own start/done boundaries (the orchestrator's trace owns those).
 """
 
 from __future__ import annotations
@@ -27,56 +24,58 @@ from pathlib import Path
 
 from skunk.config import SkunkConfig
 from skunk.errors import StepFailed
-from skunk.models import HarnessContext, PageRef, page_key_to_pageref
+from skunk.common import ExecutionContext, PageRef, page_key_to_pageref
 from skunk.plan import RetrieveBranch
 
 
-class RetrieveExecutor:
-    """Dispatcher. Holds lazily-built backends so the golden path never
-    pays the cost of opening ChromaDB or loading the clean-page map."""
+class RetrieveOp:
+    """The retrieve operator. Picks a backend per call: golden bypass first
+    (when `ctx.config.golden_pages` is set), otherwise on `config.retriever`.
+    `run` is also the single seam where a future per-branch backend override
+    would plug in. The search-agent and page-index backends are built lazily so
+    an unused one is never opened."""
 
     def __init__(self, config: SkunkConfig) -> None:
         self._config = config
-        self._agent = None                # skunk.search_agent.SearchAgent
+        self._agent = None  # skunk.search_agent.SearchAgent
         self._agent_lock = threading.Lock()
-        self._page_index_proto = None     # PageIndexRetrievePrototype
+        self._page_index_retriever = None  # skunk.page_index.query.PageIndexRetriever
 
-    def run(self, ctx: HarnessContext, branch: RetrieveBranch) -> list[PageRef]:
+    async def run(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
         if ctx.config.golden_pages is not None:
-            ctx.emit(
-                "retrieve", "golden bypass",
-                n_pages=len(ctx.config.golden_pages),
-                refs=[str(r) for r in ctx.config.golden_pages],
-            )
-            return ctx.config.golden_pages
+            return self._run_golden(ctx, branch)
+        match ctx.config.retriever:
+            case "search_agent":
+                return await self._run_search_agent(ctx, branch)
+            case "page_index":
+                return await self._run_page_index(ctx, branch)
+            case other:
+                raise StepFailed(
+                    "retrieve",
+                    f"unknown retriever {other!r}; expected 'search_agent' or 'page_index'",
+                )
 
-        if ctx.config.retriever == "page_index":
-            return self._run_page_index(ctx, branch)
-        if ctx.config.retriever == "search_agent":
-            return self._run_search_agent(ctx, branch)
-        raise StepFailed(
-            "retrieve",
-            f"unknown retriever {ctx.config.retriever!r}; "
-            "expected 'search_agent' or 'page_index'",
-        )
-
-    # ------------------------------------------------------------------
-    # search_agent backend
-    # ------------------------------------------------------------------
-
-    def _run_search_agent(
-        self, ctx: HarnessContext, branch: RetrieveBranch
-    ) -> list[PageRef]:
-        agent = self._ensure_agent(ctx.config)
+    def _run_golden(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
+        """Golden-pages bypass (eval ablation only). `run` only routes here when
+        `golden_pages` is set, but we guard defensively anyway (also narrows the type)."""
+        if ctx.config.golden_pages is None:
+            raise StepFailed("retrieve", "golden bypass reached without golden_pages set")
         ctx.emit(
-            "retrieve", "search_agent start",
-            key=branch.key, period=branch.period,
+            f"golden_bypass n_pages={len(ctx.config.golden_pages)} "
+            f"refs={[str(r) for r in ctx.config.golden_pages]!r}"
         )
-        # NOTE: branch.key / branch.period are logged for the trace but
-        # NOT forwarded into the agent — the teammate's SearchAgent only
-        # consumes ctx.question. Threading these through is a follow-up
-        # (see ARCHITECTURE.md "TODO after merge").
-        page_keys = agent.retrieve(ctx.question)
+        return ctx.config.golden_pages
+
+    async def _run_search_agent(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
+        """Iterative search agent (`skunk.search_agent`); maps its page keys to `PageRef`."""
+        agent = self._ensure_agent(ctx.config)
+        page_keys = await agent.retrieve(
+            ctx,
+            ctx.question,
+            branch_key=branch.key,
+            branch_period=branch.period,
+            branch_as_of=branch.as_of,
+        )
         refs: list[PageRef] = []
         bad: list[str] = []
         for key in page_keys:
@@ -84,11 +83,10 @@ class RetrieveExecutor:
                 refs.append(page_key_to_pageref(key))
             except ValueError:
                 bad.append(key)
-        ctx.emit(
-            "retrieve", "search_agent done",
-            n_pages=len(refs), n_bad_keys=len(bad),
-            bad_keys=bad[:5] if bad else None,
-        )
+        if bad:
+            # Callee-only diagnostic the trace can't show: keys the agent
+            # returned that didn't map to a PageRef.
+            ctx.emit(f"bad_page_keys n_bad={len(bad)} keys={bad[:5]!r}")
         if not refs:
             raise StepFailed(
                 "retrieve",
@@ -97,33 +95,26 @@ class RetrieveExecutor:
         return refs
 
     def _ensure_agent(self, config: SkunkConfig):
-        # Single-flight: first non-golden retrieve in a parallel branch
-        # set must not race with a second one.
+        # Single-flight: parallel branches must not race to open ChromaDB and
+        # load the clean-page map.
         with self._agent_lock:
             if self._agent is None:
                 self._agent = _build_search_agent(config)
             return self._agent
 
-    # ------------------------------------------------------------------
-    # page_index backend (legacy prototype)
-    # ------------------------------------------------------------------
+    async def _run_page_index(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
+        """Page-index retriever (ToC pick → year filter → semantic filter). The
+        inner retriever is built lazily and caches the catalog/concept-tree."""
+        from skunk.page_index.query import PageIndexRetriever
 
-    def _run_page_index(
-        self, ctx: HarnessContext, branch: RetrieveBranch
-    ) -> list[PageRef]:
-        from skunk.page_index.retrieve_prototype import PageIndexRetrievePrototype
-
-        if self._page_index_proto is None:
-            self._page_index_proto = PageIndexRetrievePrototype()
-        # PageIndexRetrievePrototype.run() takes (prev, ctx, *, branch);
-        # call it directly with prev=None.
-        return self._page_index_proto.run(None, ctx, branch=branch)
+        if self._page_index_retriever is None:
+            self._page_index_retriever = PageIndexRetriever()
+        return await self._page_index_retriever.run(None, ctx, branch=branch)
 
 
 def _build_search_agent(config: SkunkConfig):
-    """Open ChromaDB, load the clean-page map, and construct the agent.
-    Raises `StepFailed` with a clear message if either artifact is
-    missing — first non-golden run is where corpus-prep bugs surface."""
+    """Open ChromaDB, load the clean-page map, and construct the agent. Raises
+    `StepFailed` with a clear message if either artifact is missing."""
     import chromadb
 
     from skunk.search_agent import SearchAgent
@@ -160,19 +151,14 @@ def _build_search_agent(config: SkunkConfig):
             f"under {chromadb_dir!s}: {e}",
         ) from e
 
-    agent_model_id = config.agent_model_id or config.llm_model
-    if not os.environ.get("OPENROUTER_API_KEY"):
+    if not os.environ.get("GOOGLE_CLOUD_PROJECT"):
         raise StepFailed(
             "retrieve",
-            "OPENROUTER_API_KEY not set — required by the search-agent "
-            "OpenRouter shim. Add it to your .env or export it.",
+            "GOOGLE_CLOUD_PROJECT not set — required for Vertex AI. "
+            "Set it in your .env and run `gcloud auth application-default login`.",
         )
     return SearchAgent(
-        model_id=agent_model_id,
+        config=config,
         clean_page_map=clean_page_map,
         chroma_collection=collection,
-        emb_model_id=config.emb_model_id,
-        tracer=None,
-        max_steps=config.agent_max_steps,
-        max_pages_per_tool_call=config.agent_max_pages_per_tool_call,
     )

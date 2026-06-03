@@ -32,9 +32,9 @@ This decoupling means retrieval and extraction can be evaluated independently �
        ▼                  ▼                  ▼
                     ┌──────────────────┐
                     │     compute      │   chain terminator:
-                    │ plan → code →    │   self-plans, codegens,
-                    │ exec → verify    │   execs, verifies output
-                    └────────┬─────────┘   format/unit
+                    │  code → exec     │   codegens from the
+                    │                  │   question, execs
+                    └────────┬─────────┘   to the answer
                              │
                              ▼
                           answer
@@ -56,39 +56,43 @@ The retrieve operator owns its page index — the format, schema, and build proc
 
 The load-bearing insight is that `periods_covered` (what period a page *reports on*) is distinct from the bulletin's publication date. A page in the January 1941 bulletin that contains the CY1940 annual summary should be returned for a query on `period='CY1940'` — not the January 1941 bulletins. Any index the retrieve operator builds must capture this distinction.
 
-**Current state (placeholder).** `RetrieveExecutor` in `src/skunk/retrieve.py` is intentionally unwired pending integration of an external retrieve implementation. It honors `ctx.config.golden_pages` (so `eval/eval_e2e.py --golden` works) and otherwise raises `NotImplementedError`. The previous page-index pipeline (L1 chapter pick → year-window filter → optional BM25 rerank) is preserved as a prototype at `src/skunk/page_index/retrieve_prototype.py` (`PageIndexRetrievePrototype`) for regression comparison.
+**Two retrieval methods.** `RetrieveOp` in `src/skunk/retrieve.py` picks one of three backends per call (each a private `_run_*` method): it honors `ctx.config.golden_pages` first (so `eval/eval_e2e.py --golden` bypasses retrieval entirely via the golden branch), then routes on `config.retriever` to one of two alternatives:
 
-**Optional BM25 rerank** (experimental scaffold, default OFF; lives on the prototype path, not the placeholder). When `SkunkConfig.bm25_enabled` is set, an in-memory per-chapter BM25 index over `title + column_headers + row_headers_sample + keywords` reranks the year-filtered candidate set. If the top BM25 score clearly dominates the field (`top1 / median20 ≥ bm25_dominance_threshold`, default 2.0) the candidate list is truncated to `bm25_top_k` (default 20); otherwise all year-filtered survivors are returned in BM25 order. BM25 modules live in `src/skunk/page_index/{bm25,bm25_runtime}.py`. Earlier embedding-based reranking experiments were subtractive at comparable compression ratios (see `data/page_index/README.md`); BM25's IDF scoring is meant to sidestep the semantic-clustering failure mode that hurt embeddings on this corpus.
+- **`search_agent`** (default) — the iterative ChromaDB + LLM-loop retriever vendored under `src/skunk/search_agent/`.
+- **`page_index`** — the page-index retriever at `src/skunk/page_index/query.py` (`PageIndexRetriever`), querying the offline-built catalog + concept tree. Its query path is three passes:
+  1. **ToC chapter pick** (`query_toc.py`) — one LLM call selects up to two canonical chapters from the concept tree; every page under them becomes a candidate.
+  2. **Year filter** — drops candidates whose page-side `dates` (verbatim strings parsed back to ISO intervals) don't intersect the query period; date-less pages are kept (recall net). Honors the `periods_covered` ≠ publication-date distinction above. No-op on an unparseable period.
+  3. **Semantic filter** (`query_semfilter.py`) — a two-stage cascade that prunes the survivors to a tight candidate set: a cheap **coarse** pass over page metadata (titles/headers/dates/keywords), then a precise **fine** pass over full page text that must quote a concrete value cell to keep a page. Both stages are batched and run in parallel across batches; gated on `config.semfilter_enabled` (off → ToC + year-filter only, for ablation).
 
 ## The 4 operators
 
-- **`retrieve(key, period)`** — only chain head. Returns `list[PageRef]` with `(month, page)` populated (where `page` is the 1-based PDF page index). Currently a placeholder honoring `ctx.config.golden_pages` only; pending external-retriever integration (see "Current state" above).
+- **`retrieve(key, period)`** — only chain head. Returns `list[PageRef]` with `(month, page)` populated (where `page` is the 1-based PDF page index). Dispatched by `RetrieveOp` to one of two backends (or short-circuited by `ctx.config.golden_pages`) — see "Two retrieval methods" above.
 - **`extract(key, period, visual_only?)`** — reads `ctx.question` and the located pages via tier dispatch (parsed JSON → vision). Returns `list[AnnotatedValue]` — each entry has a `description`, `value`, `unit`, and one of three **kinds**: `scalar`, `vector` (1-D series with one varying dim), or `table` (2-D grid with row/col dims). Vector/table cells are always primitive scalars; nesting beyond those shapes is rejected by the extract parser before an `AnnotatedValue` is constructed. `extract` is invoked automatically by the orchestrator on every `RetrieveBranch` — `visual_only` is set on the branch and threaded through. Pass `visual_only=True` to skip Tier 1 and go straight to vision (use for charts/figures).
-- **`lookup_external(nl)`** — chain-head capable. Single Gemini call: takes a natural-language description of external factual data (`nl`) and returns `list[AnnotatedValue]` (one entry). Use for CPI-U, FX rates, event dates, named entities (bureau names), and any fact not in the bulletin corpus. The operator infers the appropriate `kind` and `unit` (including `text` for strings).
-- **`compute()`** — chain terminator that subsumes formatting. Reads `ctx.question` plus the upstream extracted/looked-up values; runs a single unified loop (`ComputeExecutor.run`) of codegen → in-process exec → self-critique under one shared budget (`compute_max_attempts`, default 3). Each iteration's codegen call may return Python (success), raise `MissingData` (the structured insufficient-data signal), or raise `_ParseFailure` (unparseable reply); exec failures and critique REVISE verdicts feed the next iteration's `prev_code` + `prev_failure`. The critique sees the same domain context as codegen (`question`, `prev`, `computation`/`presentation` JSON, the code, the result). Returns the final answer as a plain `str` on ACCEPT, or — if the budget exhausts after at least one successful exec — the most recent uncritiqued result as a fallback. Fails with `StepFailed("compute", …)` when no iteration ever execs cleanly; propagates `MissingData` (with the same fallback rule) — the orchestrator catches that and runs up to `recovery_max_rounds` re-planning rounds before giving up.
+- **`lookup_external(nl)`** — chain-head capable. Runs a `LookupAgent` (a `MultiTurnAgent` tool loop: FRED / BLS / World Bank / Tavily / fetch_url, ≤`lookup_max_steps` steps) over a natural-language description of external factual data (`nl`); the agent commits a dict of `AnnotatedValue` fields, which `LookupExternalOp` parses into `list[AnnotatedValue]` (one entry) on the trusted side. Use for CPI-U, FX rates, event dates, named entities (bureau names), and any fact not in the bulletin corpus. The agent infers the appropriate `kind` and `unit` (including `text` for strings).
+- **`compute()`** — chain terminator that subsumes formatting. Reads `ctx.question` plus the upstream extracted/looked-up values; runs a single loop (`ComputeOp.run`) of codegen → in-process exec under one shared budget (`compute_max_attempts`, default 3). Each iteration's codegen call may return Python (success), raise `MissingData` (the structured insufficient-data signal), or raise `_ParseFailure` (unparseable reply); parse and exec failures feed the next iteration's `prev_code` + `prev_failure`. Returns the result of the first clean exec as a plain `str`. Fails with `StepFailed("compute", …)` when no iteration ever execs cleanly; propagates `MissingData` — the orchestrator catches that and runs up to `recovery_max_rounds` re-planning rounds before giving up.
+
+  Each recovery round, `Planner.replan` returns a **`PlanDiff`**, not a fresh plan: `add` branches to run and `drop` indices into the prior branch list (numbered in the replan prompt). The orchestrator applies it **positionally** (`Orchestrator._apply_diff`), keeping `outcomes[i]` aligned with `plan.branches[i]` — a dropped index removes the branch *and* the data it gathered (so compute never sees retracted data), added branches are appended, and unchanged branches keep their already-gathered outcomes and are never re-run. This replaces the old "diff replanned branches by value-equality and additively merge" scheme, which couldn't subtract and re-ran any reworded-but-unchanged branch.
 
 ## Plan shape
 
-A **Plan** is a pydantic model: a `branches` list plus a nested `computation` submodel (free-form `task` + optional `qualifiers`) and a nested `presentation` submodel (`units_out`, `precision`, `answer_form`). The Python layout mirrors the wire JSON exactly, so `Plan.model_validate_json` / `Plan.model_dump_json` round-trip with no custom translation. There is no multi-step decomposition in the AST — every plan is exactly one terminal compute. `PlannerPromptedCall` (in `src/skunk/plan.py`) emits a `Plan`; the orchestrator runs every branch in parallel, then feeds the merged `list[AnnotatedValue]` to compute.
+A **Plan** is a pydantic model: just a `branches` list. Compute reads everything it needs — the calculation to perform *and* the output format (units, precision, list shape) — from the verbatim question, not from a planner paraphrase, so the plan carries no separate requirements object. The Python layout mirrors the wire JSON exactly, so `Plan.model_validate_json` / `Plan.model_dump_json` round-trip with no custom translation. There is no multi-step decomposition in the AST — every plan is exactly one terminal compute. `PlannerPromptedCall` (in `src/skunk/plan.py`) emits a `Plan`; the orchestrator runs every branch in parallel, then feeds the merged `list[AnnotatedValue]` to compute.
 
 Two branch shapes:
 
 - `RetrieveBranch(key, period, visual_only=False)` — `retrieve` then `extract` are dispatched together by the orchestrator (extract reads `visual_only` from the branch).
 - `LookupBranch(target, src=None)` — single `lookup_external` call.
 
-Canonical JSON shape (one branch + computation + presentation):
+Canonical JSON shape (one branch):
 
 ```json
 {
   "branches": [
     {"kind": "retrieve", "key": "national defense expenditures", "period": "CY1940"}
-  ],
-  "computation": {"task": "Report total CY1940 national defense expenditures."},
-  "presentation": {"units_out": "in millions of dollars", "precision": 1}
+  ]
 }
 ```
 
-Per-field semantics (units_out phrasing, when to use `null`, etc.) live in `PlannerPromptedCall.system_prompt` in `src/skunk/plan.py` — that prompt is the canonical schema spec. Runtime contracts (`PageRef`, `AnnotatedValue`, the scalar / vector / table kind taxonomy with primitive-only cells) live in the dataclasses in the same file.
+Per-branch field semantics (`key` / `period` / `as_of` / `visual_only`, when to use `null`, etc.) live in `PlannerPromptedCall.system_prompt` in `src/skunk/plan.py` — that prompt is the canonical schema spec. Runtime contracts (`PageRef`, `AnnotatedValue`, the scalar / vector / table kind taxonomy with primitive-only cells) live in the dataclasses in the same file.
 
 The `AnnotatedValue.kind` taxonomy:
 
@@ -106,12 +110,88 @@ Once retrieve has named specific pages, extract chooses how to read each one:
 Tier 1  parsed-JSON elements bucketed by page_id   — structured text + HTML tables
                                                      (treasury_bulletin_{YYYY}_{MM}.json
                                                      under $OFFICEQA_PARSED_JSON_DIR;
-                                                     see skunk/page_index/pdf.py)
-Tier 2  PNG render at 300 dpi + vision LLM          — live, in-memory bytes (_render_pdf_page_b64)
+                                                     see skunk/corpus.py)
+Tier 2  PNG render at 300 dpi + vision LLM          — live, in-memory bytes (corpus.render_page_b64)
 ```
 (`page` here = `PageRef.page` = 1-based PDF page index)
 
 Tier escalation only happens when the chosen tier reports "value not present". There is no cross-page search — if retrieve picked the wrong pages, the bug is in retrieve, not extract. This is what makes the eval decomposition work.
+
+## Model routing
+
+A run can mix models per call-site. Resolution mirrors the effort knob:
+
+- **`PromptedCall` sites** (planner, extract tiers, compute.codegen, question_explainer, …) resolve their model as `config.model_overrides.get(name, config.llm_model)` — see `PromptedCall.resolve_model`. So the default `llm_model` (env `SKUNK_LLM_MODEL`) applies everywhere unless a site is pinned via `SKUNK_MODEL_OVERRIDES` (`name=model,...`). Example: run on Pro but keep `question_explainer` on cheap Flash.
+- **Agent loops** (`LookupAgent`, search agent) use `config.agent_model_id or config.llm_model` (env `SKUNK_AGENT_MODEL`); they don't read the override map.
+- **Per-model rate limiting.** Each distinct model gets its own token-bucket keyed `llm:<model>` (`_retry_call`/`_aretry_call` via `_llm_model_rpm`). A model's RPM comes from `SKUNK_MODEL_RPM` (`model=rpm,...`), falling back to `SKUNK_LLM_RPM` (default 1000) for any model not listed — so single-model runs are unchanged. Lets a 150-RPM Pro and a high-RPM Flash run concurrently without throttling each other.
+- **Thinking-mode floor.** Gemini 3.x Pro is thinking-only and rejects both `thinking_budget=0` and `MINIMAL`; `_effort_to_thinking_config` floors `off`/`minimal` to `LOW` for such models (`_requires_thinking`), so an `effort="off"` call-site still works (at LOW thinking) when pointed at Pro.
+
+## Logging & observability
+
+There is **one** observability stream and **one** non-observability result
+object — kept strictly separate:
+
+- **Observability = the event stream.** All output renders through one function,
+  `render_line` (in `src/skunk/trace.py`, the logging spine) — no external dependency. Process-scoped
+  stdlib logs reach it via `_LineFormatter` on the root handler (`configure_obs`
+  installs it; the `skunk.*` tree runs at INFO, the root at WARNING to mute
+  third-party chatter). `ExecutionContext.emit(message, level=None)` is the
+  request-scoped entry point; each event is **captured** to `ctx.events`
+  (per-question, for the trace dump) and the JSONL sink always; **streamed** to
+  the question's own `.log` file when `ctx.log_path` is set (live, flushed
+  per-event — so a single question's stream lands in its own file and survives a
+  crash); and **echoed** to the shared console only when `ctx.verbose`. Capture
+  and the per-question file live in `emit` itself (keyed on `ctx`), not in a
+  process-global logging framework, because the eval runs questions concurrently
+  — only `emit` knows which question an event belongs to. (The per-question file
+  omits `uid`, implied by its filename; the interleaved console prepends it.)
+- **Result = `ExecutionResult`** (`src/skunk/result.py`) — the orchestrator's
+  typed *return contract*: `question` / `answer` / `failed` / `failure_reason`,
+  read programmatically (the eval harness builds its report from it; a future UI
+  would too). It is **not** logging and holds no per-step record.
+
+**Operator boundaries are events, emitted by the caller.** The orchestrator's
+`_execute_with_tracing` wraps every operator call and emits one `step …` event
+per step (`elapsed_s` and a short `output` description — or `error` — interpolated
+into the message) — the single source of truth for "what ran, in what order, how
+long, with what result". It is **caller-owned**: the orchestrator logs each
+operator's boundary, so operators never self-report their own start/end. Every
+event (boundary and internal alike) is stamped with the `(step_idx, op)` of the
+operator it fired under: the orchestrator opens `ctx.step(op)` around each traced
+call. That frame lives in a module-level `ContextVar` (a single frame, not a
+stack — steps don't nest; per-`asyncio.Task` copy-on-write isolates the concurrent
+branches, which run as tasks on the question's one worker thread), and the
+`ExecutionContext` owns the monotonic step-index allocator. The trace dump
+(`eval/util.py`) groups events by `step_idx`, headed by `Step N: op` — no sentinel
+event, no `_step` reservation, no separate step structure.
+
+**The convention — log each fact at the layer that owns it, and only there:**
+
+- **Caller owns boundaries.** Operator op/timing/result/error are the
+  orchestrator's `step …` event. Operators MUST NOT emit their own
+  `"starting"` / `"done"` events.
+- **Callee owns its internals.** Only extract knows its tier/sample loop, only
+  compute knows its codegen/exec loop, only the agent loop knows its tool
+  observations — those emit from the operator itself.
+- **LLM I/O is logged once, at the lowest layer that owns the fact.** Raw
+  request/response/tokens/latency → `LLMClient` (`_call_gemini` / `stream`).
+  Parse/validation retries → `PromptedCall`. Semantic decisions → the operator.
+  No layer re-logs another layer's fact.
+- **`message` is one string: a stable snake_case event key, then variables
+  interpolated inline.** There are no structured fields and no separate `source`
+  (the active step's `op` identifies the emitter), e.g.
+  `emit(f"sample tier=parsed_json idx={i} n={n} n_entries={k}")`. Lead with the
+  event key so the stream stays greppable; keep large blobs (full prompts,
+  transcripts, generated code) out of the message — log a count or short `repr`.
+- **Severity is automatic.** `emit` levels an event `warning` when its message
+  contains a `_failed` event key or an `error=` field, else `info`; pass `level=`
+  to override.
+- **Request-scoped → `ctx.emit`; process-scoped → stdlib `logging`.** If a
+  question's `ctx` is in scope, use `ctx.emit`. Code with no per-question ctx
+  (build pipelines under `page_index/`, offline prep under `search_agent/`,
+  library warnings such as `LLMClient`'s retry path) uses
+  `logging.getLogger(__name__)` (or `trace.get_logger(__name__)`) — both render
+  through the same `configure_obs` pipeline.
 
 ## Eval decomposition
 
@@ -137,27 +217,34 @@ The only on-disk caches in the runtime path are page-index artifacts:
 
 LLM completions are **not** cached. Tier 2 PNG renders are computed live per call (no disk cache). There is no DSL plan cache — the planner runs once per question.
 
-## TODO after merge (search agent integration)
+## Post-merge integration status
 
 The teammate's `SearchAgent` was merged in (`refs/heads/skunk`) under
 `src/skunk/search_agent/` as a self-contained subtree, wired through
-`RetrieveExecutor` when `config.retriever == "search_agent"` (default).
-The first-pass merge was intentionally conservative — the agent keeps
-its own `OpenRouter` shim, its own `LocalPythonExecutor`, and its own
-`Tracer` instead of the framework's `LLMClient` / `pyexec` / `trace`.
-Open follow-ups:
+`RetrieveOp` (the `search_agent` backend) when `config.retriever == "search_agent"` (default).
+The first-pass merge was deliberately conservative; subsequent passes
+have folded most of the agent into the framework's shared infrastructure.
 
-- Unify `src/skunk/pyexec.py` and `src/skunk/search_agent/utils/local_python_executor.py`. The agent loop needs `final_answer` semantics + sandboxing; compute / lookup_external currently use the simpler in-process exec.
-- Port `SearchAgent` to `skunk.common.LLMClient` so it picks up the `effort` knob, the RPM limiter, and retry. The shim at `src/skunk/search_agent/openrouter_client.py` (a local `openrouter` stand-in built on the `openai` SDK) goes away when this lands.
-- Subclass `PromptedCall` for the agent system prompt so corpus / few-shots / lessons overrides in `prompt_overrides.yaml` flow through (today `prompts.yaml` is loaded directly).
-- Replace `src/skunk/search_agent/tracer.py` with `ctx.emit(...)` events; the orchestrator's `StepTrace` already records timing and I/O.
-- Thread `branch.key` / `branch.period` into the agent — today they're logged but discarded; only `ctx.question` reaches `SearchAgent.retrieve()`. Lossy for multi-retrieve plans with distinct keys.
-- Add an embedding entry-point to `LLMClient` and route `vector_search` through it (today it calls `OpenRouter.embeddings.generate` directly).
-- Reconcile `src/skunk/search_agent/prep/officeqa_eval.py` helpers with anything we already have under `eval/util.py`.
-- Decide what to do with the `src/carnot/agents/utils.py` style tweak that came with the merge (`parse_code_blobs` dedent → f-string) — it's a main-Carnot file outside the skunk subdir.
+### Done
+
+- **Dual-channel step protocol.** Each step the model emits exactly one fenced block, and the fence language is the channel: a ` ```python ` block is a tool call (exec'd in the `LocalPythonExecutor` with the agent's tools bound; its output becomes the next observation), and a ` ```json ` block is the final answer (parsed directly as data — never exec'd — and gated by `validate_final_answer`). The final answer is data, so it leaves as data: there is no `final_answer` tool, `FinalAnswerException`, or `is_final_answer` flag routing it back through the sandbox. A stray `final_answer(...)` call in a python block just raises `NameError` and is fed back as a misfire. `call()` holds all per-question state in locals, so one agent instance is reentrant across concurrent questions.
+- **`MultiTurnAgent` exclusively owns the agent prompt structure.** The base holds the one canonical `_SYSTEM_TEMPLATE` skeleton — step protocol, `## Tools` section, `## Final answer` framing, and every Jinja slot (`{{ tools_doc }}`, `{{ max_steps }}`, …). A subclass (`SearchAgent`, `LookupAgent`) never writes a template or a slot; it supplies only CONTENT fragments — `name`, `briefing` (identity + task + operating guidance, rendered at the top), and `final_answer_doc` (the JSON payload schema) — which `MultiTurnAgent.__init__` drops into the skeleton (splicing each tool's `doc` into `{{ tools_doc }}` and wiring the vars). Variable definition lives in the base too: it supplies the universal `max_steps`, and a subclass adds extra tool-doc vars through `prompt_vars(ctx)` (search's `max_pages`). Corpus / few-shots / lessons overrides targeting the agent's `name` (or `"*"`) flow through the `PromptedCall` automatically. The standalone `prompts.yaml` and the old `make_search_agent_prompt()` factory are both gone.
+- **Unified prompt-assembly engine.** `PromptedCall.assemble_system_prompt(ctx)` is now a single Jinja render: subclasses' `system_prompt` is a template, override sections (`corpus` / `few_shots` / `lessons`) are exposed as variables plus a pre-rendered `default_tail`. Layout is no longer hard-coded — subclasses decide where each section lands. The dataset blurb that the abandoned `officeqa_special_notes` slot in `prompts.yaml` was reaching for now lives in `config/prompts/treasury_bulletin.yaml` as a `corpus` override.
+- **Tracer → `ctx.emit`.** Every per-step event in `SearchAgent.retrieve()` (system / question / observation / error / validation_failed) flows through `ctx.emit(message)` into the orchestrator's event stream, stamped with the enclosing `retrieve` step's `op`. The model's per-step output is no longer emitted by the agent — `LLMClient.stream` logs it once as the attributed call envelope (latency/tokens), following the information-ownership rule that the LLM client owns the call envelope. `src/skunk/search_agent/tracer.py` is gone; the offline `prep/harness.py` script uses an inline `_OfflineCtx` stub (its `emit(message, level=None)` matches the real ctx) that writes the same events to a per-question file.
+- **`branch.key` / `branch.period` threading.** `SearchAgent.retrieve(ctx, question, *, branch_key=None, branch_period=None)` now folds the branch hints into the initial user message. `RetrieveOp._run_search_agent` forwards them.
+- **One Python sandbox.** `src/skunk/pyexec.py` is now a thin wrapper over the smolagents-derived `LocalPythonExecutor`, a top-level shared module at `src/skunk/local_python_executor.py` (the same engine the search-agent loop uses via `multi_turn_agent`). It was hoisted out of `search_agent/utils/` post-merge — `search_agent/` is a consumer of the sandbox, not its owner. `compute` and `lookup_external` get the real allowed-import list, the `DANGEROUS_MODULES` / `DANGEROUS_FUNCTIONS` blocklists, and AST-walked evaluation that rejects `exec` / `eval` / `compile`. Public API (`exec_python_with_env`, `exec_python_capture_stdout`, `strip_code_fences`) is preserved; call-sites are unchanged. `numpy` / `pandas` / `statsmodels` plus `math` / `statistics` / `datetime` are pre-injected as global bindings AND listed in the executor's `additional_authorized_imports`, so code that writes either `np.exp(...)` or `import numpy as np; np.exp(...)` works. Callables passed in `local_vars` (e.g. `fetch_fred` / `fetch_bls`) route through `send_tools` so the sandboxed code can't rebind them. Not a hardened sandbox — numpy/pandas internals still run as trusted Python — but a meaningful jump from the prior bare `exec()`.
+
+### Open follow-ups
+
+- Route `vector_search`'s embedding through `skunk.common.LLMClient` so it picks up the RPM limiter and retry. The agent's **chat-stream is now done**: `MultiTurnAgent._generate` calls `LLMClient.stream(...)`, which shares the client and runs under the rate limiter + retry and emits the attributed call envelope. What remains is the embedding path — `vector_search` (`search_tools.py`) still calls `models.embed_content` on its own `genai.Client`; folding it into an `LLMClient.embed_query()` entry-point would finish the unification.
+
+### Intentionally not unified
+
+- **`prep/officeqa_eval.py` vs `eval/util.py`.** Not duplicated on inspection — corpus-specific URL / filename parsing vs harness-agnostic trace dumps.
+- The `src/carnot/agents/utils.py` style tweak that came with the merge (`parse_code_blobs` dedent → f-string) lives outside this skunk subtree; left to the main-Carnot maintainers.
 
 ## What is intentionally NOT in this design
 
-- **Agentic loops confined to retrieve.** When `config.retriever == "search_agent"`, the retrieve operator runs an iterative tool-using LLM loop (`SearchAgent` in `src/skunk/search_agent/`). The other three operators (`extract`, `lookup_external`, `compute`) execute once per call; failure is recorded in the trace. Missing-data recovery is the bounded replan loop in the orchestrator, not per-operator agent loops.
+- **Agentic loops confined to retrieve and lookup_external.** Two operators run iterative tool-using LLM loops (both `MultiTurnAgent`s): retrieve when `config.retriever == "search_agent"` (`SearchAgent` in `src/skunk/search_agent/`), and `lookup_external` always (`LookupAgent`). `extract` and `compute` do not loop agentically — they execute once per call (compute's internal codegen→exec retries are a fixed bounded budget, not a tool loop), and failure is recorded in the trace. Crucially, *missing-data recovery* is the bounded replan loop in the orchestrator, not a per-operator retry loop: no operator re-plans or re-dispatches itself on failure.
 - **No per-table/per-figure catalog rows.** Page-level granularity matches the benchmark's `source_docs?page=N` labels and the existing `cache/tables/` structure. Going finer adds rows without improving recall.
-- **No PZ runtime dependency.** This repo is plain Python + Gemini API (google-generativeai); PZ stays out of the runtime path.
+- **No PZ runtime dependency.** This repo is plain Python + GCP Vertex AI (google-genai); PZ stays out of the runtime path.

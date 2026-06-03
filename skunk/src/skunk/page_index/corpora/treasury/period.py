@@ -147,16 +147,22 @@ def _verbatim_to_intervals(s: str) -> list[tuple[str, str]]:
 
     m = _VERB_FY_RE.match(t)
     if m:
-        try: return [_parse_point(f"FY{int(m.group('year'))}")]
-        except ValueError: return []
+        try:
+            return [_parse_point(f"FY{int(m.group('year'))}")]
+        except ValueError:
+            return []
     m = _VERB_CY_RE.match(t)
     if m:
-        try: return [_parse_point(f"CY{int(m.group('year'))}")]
-        except ValueError: return []
+        try:
+            return [_parse_point(f"CY{int(m.group('year'))}")]
+        except ValueError:
+            return []
     m = _VERB_Q_RE.match(t)
     if m:
-        try: return [_parse_point(f"Q{m.group('q')}-{int(m.group('year'))}")]
-        except ValueError: return []
+        try:
+            return [_parse_point(f"Q{m.group('q')}-{int(m.group('year'))}")]
+        except ValueError:
+            return []
     m = _VERB_MD_Y_RE.match(t)
     if m:
         mn = int(m.group("mon"))
@@ -178,7 +184,8 @@ def _verbatim_to_intervals(s: str) -> list[tuple[str, str]]:
         mn = _MONTH_TO_NUM.get(m.group("mon").rstrip("."))
         if mn is None:
             return []
-        y = int(m.group("year")); d = int(m.group("day"))
+        y = int(m.group("year"))
+        d = int(m.group("day"))
         if 1 <= d <= _last_day(y, mn):
             iso = f"{y:04d}-{mn:02d}-{d:02d}"
             return [(iso, iso)]

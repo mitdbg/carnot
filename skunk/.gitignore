@@ -12,10 +12,5 @@ dist/
 
 # generated / cached
 cache/
-data/dsl_planning_pass_smoke.csv
-data/drift_cache.json
-data/drift_analysis.csv
 eval/traces/
-eval/raw_traces/
-eval/test_traces/
-eval/reports/
+eval/runs_*/

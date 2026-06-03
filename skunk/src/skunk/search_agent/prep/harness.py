@@ -1,31 +1,57 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import TextIO
 
 import chromadb
 import pandas as pd
 from chromadb.api.models.Collection import Collection
 
+from skunk.config import SkunkConfig
 from skunk.search_agent.prep.officeqa_eval import source_docs_to_page_keys, source_files_to_year_months
 from skunk.search_agent.search_agent import SearchAgent
-from skunk.search_agent.tracer import Tracer
 
-MODEL_ID = "google/gemini-3-flash-preview"
+MODEL_ID = "gemini-3-flash-preview"
 
 TRACE_DIR = "search_agent_traces"
 BULLETINS_DIR = "treasury_bulletins_cleaned"
 
 
+@dataclass
+class _OfflineCtx:
+    """Minimal ExecutionContext stand-in for the offline harness.
+
+    `SearchAgent.retrieve()` consults ctx for two things: (a)
+    `ctx.prompt_overrides` (empty in this offline path) and (b)
+    `ctx.emit(message, level=None)` for per-step trace events. The
+    orchestrator owns the real ctx in the runtime path; here we write
+    each emitted message to a per-question trace file.
+    """
+
+    config: SkunkConfig
+    trace_file: TextIO
+    show_output: bool = False
+    prompt_overrides: tuple = field(default_factory=tuple)
+
+    def emit(self, message: str, level: str | None = None) -> None:
+        line = f"## {message}\n\n"
+        self.trace_file.write(line)
+        self.trace_file.flush()
+        if self.show_output:
+            print(line, end="")
+
+
 def _run_one(
     row: dict,
-    model_id: str,
+    config: SkunkConfig,
     clean_page_map: dict,
     chroma_collection: Collection,
-    emb_model_id: str,
     show_output: bool,
 ) -> tuple[str, dict]:
     """Run the search agent for a single question and return an analysis dict."""
@@ -34,15 +60,16 @@ def _run_one(
     question = row["question"]
     trace_path = f"{TRACE_DIR}/{uid}_trace.txt"
 
-    with Tracer(trace_path, show_output=show_output) as tracer:
+    with open(trace_path, "w") as trace_file:
+        ctx = _OfflineCtx(config=config, trace_file=trace_file, show_output=show_output)
         agent = SearchAgent(
-            model_id,
+            config=config,
             clean_page_map=clean_page_map,
             chroma_collection=chroma_collection,
-            emb_model_id=emb_model_id,
-            tracer=tracer,
         )
-        page_keys = agent.retrieve(question)
+        # `SearchAgent.retrieve` is async (request-time path); this offline harness
+        # is sync and runs each UID on a pool thread, so bridge with a per-call loop.
+        page_keys = asyncio.run(agent.retrieve(ctx, question))
 
     # Compute accuracy against ground truth.
     source_page_keys = source_docs_to_page_keys(str(row.get("source_docs", "")))
@@ -118,8 +145,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--emb-model-id",
         type=str,
-        default="google/gemini-embedding-2-preview",
-        help="ID of the embedding model to use (default: google/gemini-embedding-2-preview)",
+        default="gemini-embedding-2",
+        help="ID of the embedding model to use (default: gemini-embedding-2)",
     )
     args = parser.parse_args()
 
@@ -147,10 +174,19 @@ if __name__ == "__main__":
     if skipped:
         print(f"Skipping {skipped} question(s) with existing traces.")
 
+    # Build a SkunkConfig from the CLI args. We do NOT call from_env() here
+    # because this is an offline runner with its own knob set; we only fold
+    # in the per-run overrides that affect the SearchAgent.
+    config = SkunkConfig(
+        agent_model_id=args.model_id,
+        emb_model_id=args.emb_model_id,
+        llm_model=args.model_id,
+    )
+
     # step 4: run questions (debug: sequential loop with pdb breakpoint)
     with ThreadPoolExecutor(max_workers=args.parallelism) as pool:
         futures = {
-            pool.submit(_run_one, row, args.model_id, clean_page_map, collection, args.emb_model_id, args.show_output): row # type: ignore
+            pool.submit(_run_one, row, config, clean_page_map, collection, args.show_output): row  # type: ignore
             for row in rows
         }
         for future in as_completed(futures):

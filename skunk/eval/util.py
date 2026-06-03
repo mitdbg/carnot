@@ -9,14 +9,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from skunk.trace import truncate
+
 if TYPE_CHECKING:
     from skunk.plan import PageRef
-    from skunk.trace import QuestionTrace
+    from skunk.result import ExecutionResult
 
 
-# Per-field repr cap in trace dumps. LLM input/output text is kept full for
-# cost/latency post-mortems; everything else is capped so a single trace
-# stays human-scannable on stderr.
+# Per-event message cap in trace dumps, so a single trace stays human-scannable.
+# The JSONL sink keeps each message whole for post-mortems.
 _TRACE_FIELD_MAX_REPR = 800
 
 
@@ -31,7 +32,7 @@ def dump_trace(
     question: str,
     plan_text: str,
     golden_pages: list["PageRef"] | None,
-    trace: "QuestionTrace",
+    result: "ExecutionResult",
     events: list[dict],
     model: str,
 ) -> None:
@@ -53,40 +54,47 @@ def dump_trace(
     else:
         lines.append("Golden pages: (none)")
     lines.append("")
-    lines.append(f"Outcome: {'FAILED — ' + (trace.failure_reason or '') if trace.failed else 'OK'}")
-    lines.append(f"Final answer: {trace.answer!r}")
+    lines.append(f"Outcome: {'FAILED — ' + (result.failure_reason or '') if result.failed else 'OK'}")
+    lines.append(f"Final answer: {result.answer!r}")
     lines.append("")
 
-    events_per_step: dict[int, list[dict]] = {s.step_idx: [] for s in trace.steps}
-    cur_idx: int | None = None
+    # Every event carries a `(step_idx, op)` stamp. Group by step_idx; the orchestrator's
+    # one `step ...` boundary event per operator call sits in its group like any other
+    # line (its message holds elapsed/output/error inline). step_idx=None events
+    # (out-of-step orchestrator emits) go in an "ungrouped" preamble.
+    by_step: dict[int, list[dict]] = {}
+    ungrouped: list[dict] = []
     for ev in events:
-        if ev.get("source") == "_step" and ev.get("message") == "begin":
-            cur_idx = int(ev.get("step_idx", 0))
-            continue
-        if cur_idx is not None and cur_idx in events_per_step:
-            events_per_step[cur_idx].append(ev)
-
-    for step in trace.steps:
-        lines.append("-" * 80)
-        lines.append(f"Step {step.step_idx}: {step.op}  args={step.args}  ({step.elapsed_s:.2f}s)")
-        lines.append(f"  in:  {step.input_full}")
-        if step.error:
-            lines.append(f"  ERROR: {step.error}")
+        idx = ev.get("step_idx")
+        if idx is None:
+            ungrouped.append(ev)
         else:
-            lines.append(f"  out: {step.output_full}")
-        evs = events_per_step.get(step.step_idx, [])
-        if evs:
-            lines.append("  events:")
-            for ev in evs:
-                src = ev.get("source", "")
-                msg = ev.get("message", "")
-                extras = {k: v for k, v in ev.items() if k not in {"source", "message"}}
-                lines.append(f"    [{src}] {msg}")
-                for k, v in extras.items():
-                    s = repr(v)
-                    if not (src == "llm" and k in ("input_text", "output_text")) and len(s) > _TRACE_FIELD_MAX_REPR:
-                        s = s[:_TRACE_FIELD_MAX_REPR] + "...(truncated)"
-                    lines.append(f"      {k}: {s}")
+            by_step.setdefault(idx, []).append(ev)
+
+    if ungrouped:
+        lines.append("-" * 80)
+        lines.append("Ungrouped events:")
+        for ev in ungrouped:
+            lines.extend(_format_event(ev))
+        lines.append("")
+
+    for idx in sorted(by_step):
+        evs = by_step[idx]
+        op = evs[0].get("op", "?")
+        lines.append("-" * 80)
+        lines.append(f"Step {idx}: {op}")
+        for ev in evs:
+            lines.extend(_format_event(ev))
         lines.append("")
 
     out.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _format_event(ev: dict) -> list[str]:
+    """Render one captured event as an indented trace line: the event `message`
+    (prefixed with the level when not "info"), capped for scannability — the JSONL
+    sink keeps the full text."""
+    msg = ev.get("message", "")
+    level = ev.get("level", "info")
+    prefix = f"{level.upper()} " if level != "info" else ""
+    return [f"    {prefix}{truncate(msg, _TRACE_FIELD_MAX_REPR, '...(truncated)')}"]

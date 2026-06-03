@@ -92,8 +92,7 @@ def _llm_cluster(
     resp = llm.call(system=MERGE_CLUSTER_SYSTEM, user=user,
                     temperature=0.0, effort="off")
     if verbose:
-        print(f"  [merge] LLM clustering in {time.monotonic() - t0:.1f}s",
-              flush=True)
+        log.info(f"[merge] LLM clustering in {time.monotonic() - t0:.1f}s")
     obj = parse_json_response(resp.text)
     clusters = (obj or {}).get("clusters", []) if isinstance(obj, dict) else []
 
@@ -137,8 +136,8 @@ def _llm_consolidate(
     resp = llm.call(system=MERGE_CONSOLIDATE_SYSTEM, user=user,
                     temperature=0.0, effort="off")
     if verbose:
-        print(f"  [merge] Pass-3 consolidation LLM in "
-              f"{time.monotonic() - t0:.1f}s", flush=True)
+        log.info(f"[merge] Pass-3 consolidation LLM in "
+                 f"{time.monotonic() - t0:.1f}s")
     obj = parse_json_response(resp.text)
     consolidations = (obj or {}).get("consolidations", []) if isinstance(obj, dict) else []
 
@@ -180,8 +179,8 @@ def _llm_describe_chapters(
     resp = llm.call(system=MERGE_DESCRIBE_SYSTEM, user=user,
                     temperature=0.0, effort="off")
     if verbose:
-        print(f"  [merge] Pass-4 description LLM in "
-              f"{time.monotonic() - t0:.1f}s", flush=True)
+        log.info(f"[merge] Pass-4 description LLM in "
+                 f"{time.monotonic() - t0:.1f}s")
     obj = parse_json_response(resp.text)
     raw = (obj or {}).get("chapters", {}) if isinstance(obj, dict) else {}
     out: dict[str, dict[str, Any]] = {}
@@ -233,14 +232,14 @@ class TreasuryChapterMerger:
             content_rows.append(r)
 
         if verbose:
-            print(f"  [merge] {len(counts)} distinct l1_local names "
-                  f"covering {sum(counts.values())} pages", flush=True)
+            log.info(f"[merge] {len(counts)} distinct l1_local names "
+                     f"covering {sum(counts.values())} pages")
 
         # ── Pass 1: deterministic normalization ────────────────────────
         groups, group_pages, group_display = _normalize_groups(dict(counts))
         if verbose:
-            print(f"  [merge] Pass 1 collapse: {len(counts)} → "
-                  f"{len(groups)} normalized groups", flush=True)
+            log.info(f"[merge] Pass 1 collapse: {len(counts)} → "
+                     f"{len(groups)} normalized groups")
 
         raw_to_display: dict[str, str] = {}
         for k, raws in groups.items():
@@ -256,8 +255,8 @@ class TreasuryChapterMerger:
 
         if verbose:
             canonicals = set(display_to_canonical.values())
-            print(f"  [merge] Pass 2 clustering: {len(display_names)} → "
-                  f"{len(canonicals)} canonical chapters", flush=True)
+            log.info(f"[merge] Pass 2 clustering: {len(display_names)} → "
+                     f"{len(canonicals)} canonical chapters")
 
         raw_to_pass2: dict[str, str] = {
             raw: display_to_canonical.get(display, display)
@@ -282,8 +281,8 @@ class TreasuryChapterMerger:
 
         if verbose:
             finals = set(pass2_to_final.values())
-            print(f"  [merge] Pass 3 consolidation: {len(pass2_canonicals)} → "
-                  f"{len(finals)} final canonical chapters", flush=True)
+            log.info(f"[merge] Pass 3 consolidation: {len(pass2_canonicals)} → "
+                     f"{len(finals)} final canonical chapters")
 
         raw_to_canonical: dict[str, str] = {
             raw: pass2_to_final.get(p2, p2) for raw, p2 in raw_to_pass2.items()
@@ -317,10 +316,9 @@ class TreasuryChapterMerger:
         tree = {"chapters": chapters}
 
         if verbose:
-            print(f"  [merge] final tree: {len(chapters)} chapters, "
-                  f"{sum(c['n_pages'] for c in chapters.values())} pages",
-                  flush=True)
+            log.info(f"[merge] final tree: {len(chapters)} chapters, "
+                     f"{sum(c['n_pages'] for c in chapters.values())} pages")
             for chapter, data in sorted(chapters.items(),
                                         key=lambda kv: -kv[1]["n_pages"]):
-                print(f"    {data['n_pages']:>6}  {chapter}", flush=True)
+                log.info(f"  {data['n_pages']:>6}  {chapter}")
         return tree
