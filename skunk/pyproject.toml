@@ -8,5 +8,12 @@ version = "0.0.0"
 description = "Skunkworks experiments for the Carnot retrieval stack."
 requires-python = ">=3.10"
 
+[project.optional-dependencies]
+# Rollout generation samples directly from Tinker (so captured logprobs are
+# exactly pi_old for the fine-tuned policy). Only needed to run the datagen
+# rollout stage; the OpenRouter-backed roles import fine without these.
+# Also requires the TINKER_API_KEY environment variable at runtime.
+rollout = ["tinker", "tinker_cookbook"]
+
 [tool.setuptools.packages.find]
 where = ["src"]

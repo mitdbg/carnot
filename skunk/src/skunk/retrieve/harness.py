@@ -34,7 +34,7 @@ VALIDATION_UIDS = [
 def _run_one(
     row: dict,
     model_id: str,
-    clean_page_map: dict,
+    document_map: dict[str, str],
     chroma_collection: Collection,
     emb_model_id: str,
     show_output: bool,
@@ -49,7 +49,7 @@ def _run_one(
     with Tracer(trace_path, show_output=show_output) as tracer:
         agent = SearchAgent(
             model_id,
-            clean_page_map=clean_page_map,
+            document_map=document_map,
             chroma_collection=chroma_collection,
             emb_model_id=emb_model_id,
             tracer=tracer,
@@ -155,9 +155,18 @@ if __name__ == "__main__":
     # step 1: load questions
     officeqa_df = pd.read_csv("officeqa_pro.csv")
 
-    # step 2: load mapping from "year-month-page_id" --> [clean page text file path, sorted elements order]
+    # step 2: load the clean_page_map and convert it into a
+    # `document_map: dict[doc_id -> full_text]` by reading each cleaned page
+    # file from disk up-front.
     with open(f"{BULLETINS_DIR}/clean_page_map.json") as f:
         clean_page_map = json.load(f)
+
+    document_map: dict[str, str] = {}
+    for doc_id, entry in clean_page_map.items():
+        rel_path = entry[0]
+        filepath = os.path.join(BULLETINS_DIR, os.path.basename(rel_path))
+        with open(filepath) as f:
+            document_map[doc_id] = f.read()
 
     # step 2.5: load chromadb collection to ensure it's ready before we start processing questions
     client = chromadb.PersistentClient(path=args.chroma_dir)
@@ -183,7 +192,7 @@ if __name__ == "__main__":
     # step 4: run questions (debug: sequential loop with pdb breakpoint)
     with ThreadPoolExecutor(max_workers=args.parallelism) as pool:
         futures = {
-            pool.submit(_run_one, row, args.model_id, clean_page_map, collection, args.emb_model_id, args.show_output, args.trace_dir): row # type: ignore
+            pool.submit(_run_one, row, args.model_id, document_map, collection, args.emb_model_id, args.show_output, args.trace_dir): row # type: ignore
             for row in rows
         }
         for future in as_completed(futures):

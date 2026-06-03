@@ -23,7 +23,6 @@ The collection is produced by `create_vector_db.py`.
 
 from __future__ import annotations
 
-import os
 from collections import defaultdict
 from collections.abc import Callable
 
@@ -36,6 +35,18 @@ PRUNE_RESULT_TAG = "__prune__"
 SEARCH_RESULT_TAG = "__search_result__"
 GREP_RESULT_TAG = "__grep_result__"
 READ_DOCUMENT_RESULT_TAG = "__read_document_result__"
+DATAGEN_FINAL_ANSWER_TAG = "__datagen_final_answer__"
+QUALITY_FILTER_FINAL_ANSWER_TAG = "__quality_filter_final_answer__"
+TASK_SOLVER_FINAL_ANSWER_TAG = "__task_solver_final_answer__"
+
+# Generic message surfaced when search_corpus/grep_corpus return zero hits.
+# ChromaDB does not tell us whether a server-side `$nin` prune filter was
+# what eliminated all candidates, so we use a generic message that mentions
+# both possibilities.
+EMPTY_RESULT_MESSAGE = (
+    "No results found; it is possible that exclusion filters on all "
+    "previously returned chunks prevented any results from being returned."
+)
 
 # ---------------------------------------------------------------------------
 # Internal where-clause helpers
@@ -244,27 +255,14 @@ def _make_grep_corpus(
 # ---------------------------------------------------------------------------
 
 
-def _make_read_document(
-    clean_page_map: dict[str, list],
-    bulletins_dir: str | None = None,
-) -> Callable:
-    """Build a `read_document` tool that returns full cleaned page text.
+def _make_read_document(document_map: dict[str, str]) -> Callable:
+    """Build a `read_document` tool that returns full document text.
 
-    Uses the LLM-reordered text stored on disk and pointed to by
-    `clean_page_map` (we cannot reliably reconstruct a page by simply
-    concatenating its chunks ordered by `element_id`).  `clean_page_map` is
-    keyed by `doc_id` (= page_key, e.g. "2002_12_25").
+    `document_map` is keyed by `doc_id` and maps to the full document text.
     """
 
-    def _resolve_path(rel_path: str) -> str:
-        if bulletins_dir is None or os.path.isabs(rel_path):
-            return rel_path
-
-        basename = os.path.basename(rel_path)
-        return os.path.join(bulletins_dir, basename)
-
     def read_document(doc_id: str | list[str]) -> dict:
-        """Read the cleaned text for one or more pages, given their doc_ids.
+        """Read the text for one or more documents, given their doc_ids.
 
         Returns a tagged dict with one entry per requested doc_id, so the
         SearchAgent can wrap each in a per-doc block that gets redacted if
@@ -274,28 +272,15 @@ def _make_read_document(
 
         docs: list[dict] = []
         for did in doc_ids:
-            entry = clean_page_map.get(did)
-            if entry is None:
+            text = document_map.get(did)
+            if text is None:
                 docs.append(
                     {
                         "doc_id": did,
                         "text": (
                             f"=== doc_id={did} ===\n"
-                            f"[no such page (or no content on page)]"
+                            f"[no such document (or no content in document)]"
                         ),
-                    }
-                )
-                continue
-
-            filepath = _resolve_path(entry[0])
-            try:
-                with open(filepath) as f:
-                    text = f.read()
-            except OSError as e:
-                docs.append(
-                    {
-                        "doc_id": did,
-                        "text": f"=== doc_id={did} ===\n[error reading file: {e}]",
                     }
                 )
                 continue
@@ -303,7 +288,7 @@ def _make_read_document(
             docs.append(
                 {
                     "doc_id": did,
-                    "text": f"=== doc_id={did} ({filepath}) ===\n{text}",
+                    "text": f"=== doc_id={did} ===\n{text}",
                 }
             )
 
@@ -343,10 +328,10 @@ def make_search_tools(
     chroma_collection: Collection,
     emb_model_id: str,
     openrouter_client: OpenRouter | genai.Client,
-    clean_page_map: dict[str, list],
+    document_map: dict[str, str],
     pruned_chunk_ids: set[str],
     pruned_doc_ids: set[str],
-    bulletins_dir: str | None = None,
+    final_answer_fn: Callable | None = None,
 ) -> dict[str, Callable]:
     """Build the full toolset for a SearchAgent invocation.
 
@@ -354,6 +339,11 @@ def make_search_tools(
     by the caller (the SearchAgent).  ``search_corpus`` / ``grep_corpus``
     close over them and read their current contents on every call, so any
     mutations the SearchAgent makes between steps take effect immediately.
+
+    ``final_answer_fn``, if provided, replaces the default ``final_answer``
+    tool. Use this to inject a datagen-specific ``final_answer`` that accepts
+    a different signature (e.g. ``question``, ``answer``, ``chunk_ids``,
+    ``doc_ids`` instead of ``page_keys``).
     """
     return {
         "search_corpus": _make_search_corpus(
@@ -363,11 +353,75 @@ def make_search_tools(
         "grep_corpus": _make_grep_corpus(
             chroma_collection, pruned_chunk_ids, pruned_doc_ids,
         ),
-        "read_document": _make_read_document(clean_page_map, bulletins_dir),
+        "read_document": _make_read_document(document_map),
         "prune": prune,
-        "final_answer": final_answer,
+        "final_answer": final_answer_fn if final_answer_fn is not None else final_answer,
     }
 
 
 def final_answer(page_keys):
     return page_keys
+
+
+def datagen_final_answer(qa_pairs: list[dict]) -> dict:
+    """final_answer variant for the SearchAgent when performing QA synthesis.
+
+    Each entry of ``qa_pairs`` is a dict with keys:
+      - ``question`` (str): the synthesised question.
+      - ``answer`` (list[str]): the answer expressed as a list of *nuggets*,
+        each nugget being a key piece of information essential to the answer.
+      - ``chunk_ids`` (list[str]): the chunk_ids needed to answer the question
+        (doc_ids can be derived downstream from each chunk_id).
+
+    `SearchAgent.qa_synthesis()` reads this dict from the final `_StepOutcome`
+    and returns the list of pairs directly.
+    """
+    normalized: list[dict] = []
+    for pair in qa_pairs:
+        normalized.append({
+            "question": str(pair.get("question", "")),
+            "answer": [str(n) for n in pair.get("answer", [])],
+            "chunk_ids": [str(c) for c in pair.get("chunk_ids", [])],
+        })
+    return {
+        DATAGEN_FINAL_ANSWER_TAG: True,
+        "qa_pairs": normalized,
+    }
+
+
+def quality_filter_final_answer(valid: bool, reasoning: str) -> dict:
+    """final_answer variant for the QualityFilter SearchAgent.
+
+    The QF agent uses the corpus tools to investigate a candidate QA pair
+    against the rollout attempts and the ground truth, then calls this
+    tool exactly once with:
+      - ``valid`` (bool): True iff the pair is unambiguous AND its
+        provided answer is correct (and non-trivially answerable).
+      - ``reasoning`` (str): 1-3 sentence justification.
+
+    `quality_filter.run_quality_filter_for_pair` reads this dict from the
+    final `_StepOutcome.raw_output`.
+    """
+    return {
+        QUALITY_FILTER_FINAL_ANSWER_TAG: True,
+        "valid": bool(valid),
+        "reasoning": str(reasoning),
+    }
+
+
+def task_solver_final_answer(answer: str) -> dict:
+    """final_answer variant for the TaskSolverAgent.
+
+    The TaskSolver calls this exactly once with the plain-string answer it
+    derived from the provided documents (and any Python computations).  Pass
+    the exact fallback string when the documents are insufficient::
+
+        final_answer("I cannot answer this question with the provided documents.")
+
+    ``task_solver.run_task_solver`` reads this dict from the final
+    ``_StepOutcome.raw_output``.
+    """
+    return {
+        TASK_SOLVER_FINAL_ANSWER_TAG: True,
+        "answer": str(answer),
+    }

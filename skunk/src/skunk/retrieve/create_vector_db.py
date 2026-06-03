@@ -1,99 +1,165 @@
+"""Build a ChromaDB collection from precomputed element embeddings.
+
+The on-disk layout produced by every `compute_*_element_embeddings.py`
+script is the same:
+
+  * one or more `embeddings_{...}.npz` files, each containing arrays
+    `embeddings` (float32, [n, d]) and `unique_element_ids` (str, [n])
+  * one or more `metadata{_rank{r}}.json` files containing a single dict
+    mapping `unique_element_id -> per-element metadata dict`
+
+What differs per benchmark is the *shape* of those per-element metadata
+dicts and how they map onto the columns we store in ChromaDB:
+
+  * the row id (= the SearchAgent's `chunk_id`)
+  * the `documents` column (= the chunk's text)
+  * the `metadatas` column, which must always carry `doc_id` + `chunk_id`
+    so the SearchAgent's prune / filter logic works, plus any
+    benchmark-specific filterable fields.
+
+The benchmark-specific bit is isolated in `_BENCHMARK_ADAPTERS` below: to
+add a new benchmark, write an adapter that returns
+`(doc_id, document_text, extra_metadata)` for a single per-element
+metadata dict and register it.
+"""
+
 import argparse
 import json
 import os
+from collections.abc import Callable
 
 import chromadb
 import numpy as np
 
 CHROMA_MAX_BATCH_SIZE = 5461
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Create a ChromaDB vector database from precomputed embeddings.")
-    parser.add_argument("--embeddings-dir", type=str)
-    parser.add_argument("--collection-name", type=str)
-    parser.add_argument("--chroma-path", type=str, default=".chromadb",
-                        help="Directory to store ChromaDB data (default: .chromadb).")
-    args = parser.parse_args()
 
-    # extract args
-    embeddings_dir = args.embeddings_dir
-    collection_name = args.collection_name
-    chroma_path = args.chroma_path
+# An adapter maps a single per-element metadata dict (as produced by an embedding script) to:
+#   (doc_id, document_text, extra_metadata)
+# where `extra_metadata` is a dict of benchmark-specific filterable fields
+# that will be stored alongside the common `doc_id` / `chunk_id` keys.
+ElementAdapter = Callable[[dict], tuple[str, str, dict]]
 
-    # initialize chroma client and collection
-    client = chromadb.PersistentClient(path=chroma_path)
-    collection = client.get_or_create_collection(name=collection_name)
-    print(f"Writing to collection {collection_name!r} at {chroma_path}.")
 
-    # embeddings directory will contain a list of partition files and metadata dictionaries
-    # in one of two possible formats:
-    # - embeddings_{idx}.npz and metadata.json
-    # - embeddings_{rank_id}_{idx}.npz and metadata_rank{rank_id}.json
-    # 
-    # first we load the entire metadata dictionary
-    metadata = {}
+def _officeqa_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
+    """Adapter for `compute_officeqa_element_embeddings.py` outputs."""
+    return (
+        elt_metadata["page_key"],
+        elt_metadata["cleaned"],
+        {
+            "file_id": elt_metadata["file_id"],
+            "year": elt_metadata["year"],
+            "month": elt_metadata["month"],
+            "page_id": elt_metadata["page_id"],
+            "element_id": elt_metadata["element_id"],
+            "type": elt_metadata["type"],
+        },
+    )
+
+
+def _browsecomp_plus_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
+    """Adapter for `compute_browsecomp_plus_element_embeddings.py` outputs."""
+    return (
+        elt_metadata["docid"],
+        elt_metadata["cleaned"],
+        {
+            "url": elt_metadata["url"],
+            "element_id": elt_metadata["element_id"],
+        },
+    )
+
+
+_BENCHMARK_ADAPTERS: dict[str, ElementAdapter] = {
+    "officeqa": _officeqa_adapter,
+    "browsecomp_plus": _browsecomp_plus_adapter,
+}
+
+
+def _load_metadata(embeddings_dir: str) -> dict[str, dict]:
+    """Load and merge every `metadata*.json` file in `embeddings_dir`."""
+    metadata: dict[str, dict] = {}
     for file in os.listdir(embeddings_dir):
         if file.startswith("metadata") and file.endswith(".json"):
             with open(os.path.join(embeddings_dir, file)) as f:
                 metadata.update(json.load(f))
+    return metadata
 
-    # then, we loop through the embedding files and add embeddings to the collection in batches
-    for file in os.listdir(embeddings_dir):
+
+def _add_partition(
+    collection: chromadb.Collection,
+    npz_path: str,
+    metadata: dict[str, dict],
+    adapter: ElementAdapter,
+) -> None:
+    """Add the embeddings stored in one .npz file to the chroma collection."""
+    data = np.load(npz_path)
+    embeddings = data["embeddings"]
+    # `unique_element_ids` are the per-element ids assigned at embedding
+    # time. We use them directly as ChromaDB row ids (= chunk_ids exposed
+    # to the SearchAgent).
+    chunk_ids = [str(cid) for cid in data["unique_element_ids"]]
+
+    doc_ids: list[str] = []
+    documents: list[str] = []
+    extra_metas: list[dict] = []
+    for cid in chunk_ids:
+        elt_metadata = metadata[cid]
+        doc_id, document_text, extra = adapter(elt_metadata)
+        doc_ids.append(doc_id)
+        documents.append(document_text)
+        extra_metas.append(extra)
+
+    for i in range(0, len(embeddings), CHROMA_MAX_BATCH_SIZE):
+        end = i + CHROMA_MAX_BATCH_SIZE
+        batch_embeddings = embeddings[i:end]
+        batch_chunk_ids = chunk_ids[i:end]
+        batch_doc_ids = doc_ids[i:end]
+        batch_documents = documents[i:end]
+        batch_extras = extra_metas[i:end]
+
+        metadata_list = [
+            {"doc_id": batch_doc_ids[j], "chunk_id": batch_chunk_ids[j], **batch_extras[j]}
+            for j in range(len(batch_embeddings))
+        ]
+
+        collection.add(
+            ids=batch_chunk_ids,
+            embeddings=batch_embeddings.tolist(),
+            documents=batch_documents,
+            metadatas=metadata_list,  # type: ignore
+        )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Create a ChromaDB vector database from precomputed embeddings.")
+    parser.add_argument("--embeddings-dir", type=str, required=True)
+    parser.add_argument("--collection-name", type=str, required=True)
+    parser.add_argument("--chroma-path", type=str, default=".chromadb",
+                        help="Directory to store ChromaDB data (default: .chromadb).")
+    parser.add_argument("--benchmark", type=str, required=True,
+                        choices=sorted(_BENCHMARK_ADAPTERS.keys()),
+                        help="Which embedding-script output format to expect.")
+    args = parser.parse_args()
+
+    # get the adapter for this benchmark
+    adapter = _BENCHMARK_ADAPTERS[args.benchmark]
+
+    # create the chroma client and collection
+    client = chromadb.PersistentClient(path=args.chroma_path)
+    collection = client.get_or_create_collection(name=args.collection_name)
+    print(f"Writing to collection {args.collection_name!r} at {args.chroma_path} (benchmark={args.benchmark}).")
+
+    # load the metadata files (mapping from unique_element_id to per-element metadata dict)
+    metadata = _load_metadata(args.embeddings_dir)
+
+    # for each embeddings_{...}.npz file, add its contents to the chroma collection
+    for file in os.listdir(args.embeddings_dir):
+        if not (file.startswith("embeddings") and file.endswith(".npz")):
+            continue
         print(f"Processing file {file}...")
-        if file.startswith("embeddings") and file.endswith(".npz"):
-            # load the embeddings
-            embeddings_path = os.path.join(embeddings_dir, file)
-            data = np.load(embeddings_path)
-            embeddings = data["embeddings"]
-            # `unique_element_ids` are the per-element ids assigned at
-            # embedding time (format: "treasury_bulletin_{yyyy}_{mm}_{page_id}_{element_id}").
-            # We use them directly as ChromaDB row ids (= chunk_ids exposed to
-            # the SearchAgent), and also store the page_key as `doc_id` in
-            # metadata so the agent can prune by doc.
-            chunk_ids = data["unique_element_ids"]
-
-            # get the corresponding metadata for these chunks
-            file_ids, cleaned_contents, years, months, page_ids, page_keys, elt_ids, elt_types = [], [], [], [], [], [], [], []
-            for chunk_id in chunk_ids:
-                elt_metadata = metadata[str(chunk_id)]
-                file_ids.append(elt_metadata["file_id"])
-                cleaned_contents.append(elt_metadata["cleaned"])
-                years.append(elt_metadata["year"])
-                months.append(elt_metadata["month"])
-                page_ids.append(elt_metadata["page_id"])
-                page_keys.append(elt_metadata["page_key"])
-                elt_ids.append(elt_metadata["element_id"])
-                elt_types.append(elt_metadata["type"])
-
-            # add to chroma collection in batches
-            for i in range(0, len(embeddings), CHROMA_MAX_BATCH_SIZE):
-                batch_embeddings = embeddings[i:i+CHROMA_MAX_BATCH_SIZE]
-                batch_chunk_ids = [str(cid) for cid in chunk_ids[i:i+CHROMA_MAX_BATCH_SIZE]]
-                batch_file_ids = file_ids[i:i+CHROMA_MAX_BATCH_SIZE]
-                batch_cleaned_contents = cleaned_contents[i:i+CHROMA_MAX_BATCH_SIZE]
-                batch_years = years[i:i+CHROMA_MAX_BATCH_SIZE]
-                batch_months = months[i:i+CHROMA_MAX_BATCH_SIZE]
-                batch_page_ids = page_ids[i:i+CHROMA_MAX_BATCH_SIZE]
-                batch_page_keys = page_keys[i:i+CHROMA_MAX_BATCH_SIZE]
-                batch_elt_ids = elt_ids[i:i+CHROMA_MAX_BATCH_SIZE]
-                batch_elt_types = elt_types[i:i+CHROMA_MAX_BATCH_SIZE]
-
-                metadata_list = []
-                for j in range(len(batch_embeddings)):
-                    metadata_list.append({
-                        "doc_id": batch_page_keys[j],
-                        "chunk_id": batch_chunk_ids[j],
-                        "file_id": batch_file_ids[j],
-                        "year": batch_years[j],
-                        "month": batch_months[j],
-                        "page_id": batch_page_ids[j],
-                        "element_id": batch_elt_ids[j],
-                        "type": batch_elt_types[j],
-                    })
-
-                collection.add(
-                    ids=batch_chunk_ids,
-                    embeddings=batch_embeddings.tolist(),
-                    documents=batch_cleaned_contents,
-                    metadatas=metadata_list,
-                )
+        _add_partition(
+            collection,
+            os.path.join(args.embeddings_dir, file),
+            metadata,
+            adapter,
+        )

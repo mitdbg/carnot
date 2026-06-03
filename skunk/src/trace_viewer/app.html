@@ -1,0 +1,1198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QA Trace Viewer</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:       #0d0d0d;
+      --bg1:      #141414;
+      --bg2:      #1a1a1a;
+      --bg3:      #202020;
+      --border:   #252525;
+      --border2:  #2e2e2e;
+      --text:     #e0e0e0;
+      --text2:    #aaaaaa;
+      --text3:    #666666;
+      --green:    #33cc33;
+      --yellow:   #e6b800;
+      --red:      #ff4444;
+      --blue:     #3399ff;
+      --green-bg: #001a00;
+      --yellow-bg:#242200;
+      --red-bg:   #2a0000;
+      --blue-bg:  #001524;
+    }
+
+    html, body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+      font-size: 13px;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    /* ── Layout ─────────────────────────────────────────────────────── */
+    #app { max-width: 1400px; margin: 0 auto; padding: 16px; }
+
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .header-title {
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: var(--green);
+    }
+    .header-sub { font-size: 11px; color: var(--text3); }
+
+    /* ── Cards ──────────────────────────────────────────────────────── */
+    .card {
+      background: var(--bg2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 14px 16px;
+      margin-bottom: 10px;
+    }
+    .card-title {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 1.2px;
+      text-transform: uppercase;
+      color: var(--text3);
+      margin-bottom: 10px;
+    }
+
+    /* ── Selector row ───────────────────────────────────────────────── */
+    .selectors { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+    .sel-group { display: flex; flex-direction: column; gap: 4px; }
+    .sel-group label {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+      color: var(--text3);
+    }
+    select {
+      background: var(--bg1);
+      color: var(--text);
+      border: 1px solid var(--border2);
+      border-radius: 4px;
+      padding: 6px 10px;
+      font-size: 12px;
+      min-width: 220px;
+      cursor: pointer;
+      appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23666'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 8px center;
+      padding-right: 24px;
+    }
+    select:focus { outline: none; border-color: var(--green); }
+
+    .sys-toggle-row { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+    .sys-toggle-row label { font-size: 11px; color: var(--text3); cursor: pointer; user-select: none; }
+    input[type=checkbox] { accent-color: var(--green); cursor: pointer; }
+
+    /* ── QA card ─────────────────────────────────────────────────────── */
+    .question-text { font-size: 14px; line-height: 1.65; color: var(--text); margin-bottom: 12px; }
+    .meta-row { margin-bottom: 8px; }
+    .meta-label {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.8px;
+      text-transform: uppercase;
+      color: var(--text3);
+      margin-bottom: 5px;
+    }
+
+    /* ── Dedup top-K tables ─────────────────────────────────────────── */
+    .topk-group { margin-top: 14px; }
+    .topk-list { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+    .topk-row {
+      display: grid;
+      grid-template-columns: 60px 80px 1fr;
+      align-items: baseline;
+      gap: 8px;
+      padding: 5px 8px;
+      background: var(--bg3);
+      border-radius: 4px;
+      border: 1px solid var(--border);
+    }
+    .topk-dist {
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+      color: var(--text3);
+      white-space: nowrap;
+    }
+    .topk-id {
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+      color: var(--blue);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .topk-text {
+      font-size: 12px;
+      color: var(--text2);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .topk-text.unknown { color: var(--text3); font-style: italic; }
+
+    /* ── Alluvial card ──────────────────────────────────────────────── */
+    #alluvial-wrap > summary {
+      list-style: none;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 0;
+    }
+    #alluvial-wrap > summary::-webkit-details-marker { display: none; }
+    #alluvial-wrap[open] > summary { margin-bottom: 12px; }
+    .alluvial-toggle {
+      font-size: 9px;
+      color: var(--text3);
+      width: 12px;
+      display: inline-block;
+    }
+    .nugget {
+      display: inline-block;
+      padding: 2px 9px;
+      background: var(--green-bg);
+      color: var(--green);
+      border: 1px solid var(--green);
+      border-radius: 20px;
+      font-size: 11px;
+      margin: 2px 3px 2px 0;
+    }
+    .chunk-pill {
+      display: inline-block;
+      padding: 2px 8px;
+      background: var(--blue-bg);
+      color: var(--blue);
+      border: 1px solid var(--blue);
+      border-radius: 20px;
+      font-size: 10px;
+      font-family: ui-monospace, monospace;
+      margin: 2px 3px 2px 0;
+    }
+
+    /* ── Funnel ──────────────────────────────────────────────────────── */
+    .funnel { display: flex; align-items: stretch; gap: 6px; }
+    .funnel-stage {
+      flex: 1;
+      min-width: 0;
+      padding: 10px 12px;
+      border-radius: 4px;
+      text-align: center;
+      border: 1px solid var(--border);
+      background: var(--bg1);
+    }
+    .funnel-stage .s-name {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+    }
+    .funnel-stage .s-detail { font-size: 10px; margin-top: 3px; opacity: 0.75; }
+    .funnel-arrow { display: flex; align-items: center; color: var(--border2); font-size: 20px; padding: 0 2px; }
+
+    .s-pass  { border-color: var(--green);  background: var(--green-bg);  color: var(--green); }
+    .s-fail  { border-color: var(--red);    background: var(--red-bg);    color: var(--red); }
+    .s-part  { border-color: var(--yellow); background: var(--yellow-bg); color: var(--yellow); }
+    .s-none  { border-color: var(--border); background: var(--bg1);       color: var(--text3); }
+
+    /* ── Section details ────────────────────────────────────────────── */
+    .sec-details {
+      margin-bottom: 8px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+    }
+    .sec-details > summary {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      background: var(--bg2);
+      cursor: pointer;
+      user-select: none;
+      list-style: none;
+    }
+    .sec-details > summary::-webkit-details-marker { display: none; }
+    .sec-details > summary:hover { background: var(--bg3); }
+    .sec-title { font-weight: 600; font-size: 13px; }
+    .sec-extra { font-size: 11px; color: var(--text3); }
+    .ti {
+      font-size: 9px;
+      color: var(--text3);
+      transition: transform 0.15s;
+      flex-shrink: 0;
+    }
+    .sec-details[open] > summary .ti { transform: rotate(90deg); }
+    .sec-body { padding: 12px 16px; border-top: 1px solid var(--border); }
+
+    /* ── Badges ─────────────────────────────────────────────────────── */
+    .badge {
+      padding: 2px 8px;
+      border-radius: 20px;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    .b-pass { background: var(--green-bg); color: var(--green); border: 1px solid var(--green); }
+    .b-fail { background: var(--red-bg);   color: var(--red);   border: 1px solid var(--red); }
+    .b-part { background: var(--yellow-bg);color: var(--yellow);border: 1px solid var(--yellow); }
+    .b-na   { background: var(--bg1);      color: var(--text3); border: 1px solid var(--border2); }
+
+    /* ── KV rows ─────────────────────────────────────────────────────── */
+    .kv-row {
+      display: flex;
+      gap: 12px;
+      padding: 4px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+    }
+    .kv-row:last-child { border-bottom: none; }
+    .kv-k { color: var(--text3); min-width: 180px; flex-shrink: 0; }
+    .kv-v { font-family: ui-monospace, monospace; color: var(--text); }
+
+    /* ── Messages viewer ────────────────────────────────────────────── */
+    .msgs-wrap {
+      background: var(--bg);
+      border-radius: 4px;
+      padding: 6px;
+      max-height: 680px;
+      overflow-y: auto;
+    }
+    .msg-item {
+      margin: 4px 0;
+      border-radius: 0 4px 4px 0;
+      padding: 8px 12px;
+    }
+    .msg-role-bar {
+      display: flex;
+      gap: 10px;
+      align-items: baseline;
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      margin-bottom: 6px;
+    }
+    .msg-role-bar .token-est { font-weight: 400; opacity: 0.45; }
+    .msg-text {
+      margin: 0;
+      white-space: pre-wrap;
+      font-family: ui-monospace, monospace;
+      font-size: 12px;
+      color: #eeeeee;
+      line-height: 1.55;
+    }
+    .chunk-item {
+      margin: 4px 0;
+      padding: 6px 10px;
+      background: #081420;
+      border-left: 3px solid var(--blue);
+      border-radius: 0 4px 4px 0;
+    }
+    .chunk-meta {
+      font-size: 10px;
+      color: var(--blue);
+      font-family: ui-monospace, monospace;
+      margin-bottom: 4px;
+    }
+    .chunk-text {
+      margin: 0;
+      white-space: pre-wrap;
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+      color: #88bbdd;
+      line-height: 1.4;
+    }
+
+    /* ── Rollout cards ───────────────────────────────────────────────── */
+    .rollout-card {
+      margin-bottom: 6px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .rollout-summary {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      background: var(--bg1);
+      cursor: pointer;
+      user-select: none;
+      list-style: none;
+    }
+    .rollout-summary::-webkit-details-marker { display: none; }
+    .rollout-summary:hover { background: var(--bg3); }
+    .rollout-card[open] .rollout-summary .ti { transform: rotate(90deg); }
+    .rollout-body { padding: 10px 12px; border-top: 1px solid var(--border); }
+    .metrics-row { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 10px; }
+    .metric { font-size: 11px; color: var(--text3); }
+    .metric .mv { color: var(--text); font-family: ui-monospace, monospace; }
+
+    /* ── Inner trace details (inside rollout / quality) ─────────────── */
+    .inner-trace {
+      margin-top: 10px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .inner-trace > summary {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      background: #111;
+      cursor: pointer;
+      user-select: none;
+      list-style: none;
+      font-size: 12px;
+      color: var(--text3);
+    }
+    .inner-trace > summary::-webkit-details-marker { display: none; }
+    .inner-trace > summary:hover { color: var(--text2); }
+    .inner-trace[open] > summary .ti { transform: rotate(90deg); }
+    .inner-trace-body { padding: 8px; border-top: 1px solid var(--border); }
+
+    /* ── Misc ────────────────────────────────────────────────────────── */
+    .empty { color: var(--text3); font-style: italic; font-size: 12px; padding: 4px 0; }
+    .err-txt { color: var(--red); font-size: 12px; padding: 4px 0; }
+
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #444; }
+  </style>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+</head>
+<body>
+<div id="app">
+  <!-- Header -->
+  <div class="header">
+    <span class="header-title">QA Synthesis Trace Viewer</span>
+    <span class="header-sub">inspect each QA pair through the full generation funnel</span>
+  </div>
+
+  <!-- Selectors -->
+  <div class="card">
+    <div class="selectors">
+      <div class="sel-group">
+        <label>Trace Directory</label>
+        <select id="dir-select"><option value="">Loading…</option></select>
+      </div>
+      <div class="sel-group">
+        <label>Seed</label>
+        <select id="seed-select"><option value="">—</option></select>
+      </div>
+      <div class="sel-group">
+        <label>QA Pair</label>
+        <select id="qa-select"><option value="">—</option></select>
+      </div>
+      <div class="sys-toggle-row">
+        <input type="checkbox" id="show-system" />
+        <label for="show-system">Show system messages</label>
+      </div>
+    </div>
+  </div>
+
+  <!-- Aggregate funnel alluvial -->
+  <details id="alluvial-wrap" class="card" open>
+    <summary>
+      <span class="alluvial-toggle">▼</span>
+      <span class="card-title" style="margin:0">Aggregate Funnel</span>
+    </summary>
+    <div id="alluvial-content"><span style="color:var(--text3);font-size:11px">Loading…</span></div>
+  </details>
+
+  <!-- QA info + funnel + traces (hidden until a pair is selected) -->
+  <div id="qa-info" style="display:none">
+    <div class="card" id="qa-card"></div>
+    <div class="card" id="funnel-card"></div>
+    <div id="trace-sections"></div>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ── Constants ─────────────────────────────────────────────────────────────
+const ROLE = {
+  system:    { color: "#888888", bg: "#1a1a1a", label: "SYSTEM" },
+  user:      { color: "#e6b800", bg: "#242200", label: "USER" },
+  assistant: { color: "#33cc33", bg: "#001a00", label: "ASSISTANT" },
+  error:     { color: "#ff4444", bg: "#2a0000", label: "ERROR" },
+};
+
+// ── State ─────────────────────────────────────────────────────────────────
+const S = { dir: "", seed: null, qaId: null, data: null };
+
+// ── Utilities ─────────────────────────────────────────────────────────────
+function esc(s) {
+  return String(s ?? "")
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+function fmt(v) {
+  return (v !== null && v !== undefined) ? Number(v).toFixed(3) : "—";
+}
+async function apiFetch(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`HTTP ${r.status} — ${url}`);
+  return r.json();
+}
+
+// ── Initialise ────────────────────────────────────────────────────────────
+async function init() {
+  try {
+    const { dirs } = await apiFetch("/api/dirs");
+    const sel = document.getElementById("dir-select");
+    sel.innerHTML = dirs.length
+      ? dirs.map(d => `<option value="${esc(d)}">${esc(d)}</option>`).join("")
+      : `<option value="">No trace directories found</option>`;
+    const preferred = dirs.find(d => d.startsWith("qa_synthesis_traces/")) || dirs[0];
+    if (preferred) { S.dir = preferred; sel.value = preferred; await Promise.all([loadSeeds(), loadFunnel()]); }
+    sel.addEventListener("change", () => { S.dir = sel.value; loadSeeds(); loadFunnel(); });
+  } catch (e) { console.error("init:", e); }
+
+  document.getElementById("show-system").addEventListener("change", () => {
+    // Re-render any open message panels
+    document.querySelectorAll(".msgs-wrap[data-msgs]").forEach(w => {
+      const msgs = JSON.parse(w.dataset.msgs);
+      w.innerHTML = buildMsgsHtml(msgs);
+    });
+  });
+}
+
+async function loadFunnel() {
+  const el = document.getElementById("alluvial-content");
+  el.innerHTML = `<span style="color:var(--text3);font-size:11px">Loading…</span>`;
+  try {
+    const funnel = await apiFetch(`/api/funnel?dir=${enc(S.dir)}`);
+    el.innerHTML = '';
+    renderPlotlySankey(funnel, el);
+  } catch (e) {
+    el.innerHTML = `<span style="color:var(--red);font-size:11px">Failed to load funnel data.</span>`;
+  }
+  // sync toggle arrow
+  document.querySelector(".alluvial-toggle").textContent =
+    document.getElementById("alluvial-wrap").open ? "▼" : "▶";
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("alluvial-wrap").addEventListener("toggle", () => {
+    const arrow = document.querySelector(".alluvial-toggle");
+    if (arrow) arrow.textContent = document.getElementById("alluvial-wrap").open ? "▼" : "▶";
+  });
+});
+
+function hexToRgb(hex) {
+  return [parseInt(hex.slice(1,3),16), parseInt(hex.slice(3,5),16), parseInt(hex.slice(5,7),16)];
+}
+
+function renderPlotlySankey(funnel, container) {
+  const DEDUP_DEFS = [
+    { key: 'exact_q_match', label: 'exact Q match', color: '#f97316' },
+    { key: 'exact_a_match', label: 'exact A match', color: '#fb923c' },
+    { key: 'intra_batch',   label: 'in-batch dup',  color: '#ca8a04' },
+    { key: 'similar_q',     label: '\u2248 Q dup',  color: '#dc7e30' },
+    { key: 'similar_a',     label: '\u2248 A dup',  color: '#c84b80' },
+    { key: 'exec_error',    label: 'exec error',    color: '#ef4444' },
+    { key: 'not_run',       label: 'not run',       color: '#6b7280' },
+  ];
+  const ROLLOUT_DEFS = [
+    { key: 'all_fail', label: 'all_fail', color: '#dc2626' },
+    { key: 'all_pass', label: 'all_pass', color: '#0e7490' },
+    { key: 'skipped',  label: 'skipped',  color: '#4b5563' },
+  ];
+  const QUALITY_DEFS = [
+    { key: 'qf_error',    label: 'qf_error',    color: '#9333ea' },
+    { key: 'qf_rejected', label: 'qf_rejected', color: '#b45309' },
+    { key: 'qf_missing',  label: 'qf_missing',  color: '#713f12' },
+  ];
+
+  const dd = funnel.dedup_drop_breakdown || {};
+  const rd = funnel.rollout_drop_breakdown || {};
+  const qd = funnel.quality_drop_breakdown || {};
+  const total = funnel.total_synthesized || 1;
+  // Format a stage label: "Name (p%)"
+  const stageLabel = (name, n) => {
+    if (n == null) return name;
+    const p = Math.round(n / total * 100);
+    return `${name} (${p}%)`;
+  };
+  // Format a drop label: just the reason name
+  const dropLabel = (name, _n) => name;
+
+  // ── Nodes ────────────────────────────────────────────────────────────
+  const nodeLabel = [], nodeColor = [], nodeX = [], nodeY = [], nodeCustomdata = [];
+  const addNode = (label, color, x, y, customdata) => {
+    nodeLabel.push(label); nodeColor.push(color); nodeX.push(x); nodeY.push(y);
+    nodeCustomdata.push(customdata ?? '');
+    return nodeLabel.length - 1;
+  };
+
+  // Main pipeline nodes – y=0.18 keeps them below the top margin
+  const iSynth   = addNode(stageLabel('Synthesized', funnel.total_synthesized),  '#16a34a', 0.01, 0.18, funnel.total_synthesized);
+  const iDedup   = addNode(stageLabel('Dedup',       funnel.total_dedup),        '#16a34a', 0.35, 0.18, funnel.total_dedup);
+  const iRollout = addNode(stageLabel('Rollout',     funnel.total_rollout_passed), '#16a34a', 0.67, 0.18, funnel.total_rollout_passed);
+  const iQuality = addNode(stageLabel('Quality',     funnel.total_rollout_kept),   '#16a34a', 0.99, 0.18, funnel.total_rollout_kept);
+
+  // Drop nodes for a stage are placed in a vertical stack directly below the
+  // pipeline node they branch from (`srcX`), in a lower band. Keeping each
+  // stage's drops in their own column — instead of spreading them across the
+  // gap toward the *next* stage — makes the drop links descend cleanly rather
+  // than cutting diagonally across the horizontal main flow (which is what made
+  // all_fail appear to slice through all_pass). Multiple reasons fan out in y,
+  // not x, so sibling drop ribbons nest instead of crossing.
+  const DROP_Y_TOP = 0.60, DROP_Y_BOT = 0.96;
+  const placeDrops = (defs, breakdown, srcX) => {
+    const active = defs.filter(d => (breakdown[d.key] || 0) > 0);
+    const k = active.length;
+    const x = srcX + 0.05;
+    return active.map((d, i) => {
+      const y = k === 1 ? 0.85 : DROP_Y_TOP + (i / (k - 1)) * (DROP_Y_BOT - DROP_Y_TOP);
+      return { def: d, idx: addNode(dropLabel(d.label, breakdown[d.key]), d.color, x, y, breakdown[d.key]) };
+    });
+  };
+
+  const dedupDrops   = placeDrops(DEDUP_DEFS,   dd, nodeX[iSynth]);    // failed dedup
+  const rolloutDrops = placeDrops(ROLLOUT_DEFS, rd, nodeX[iDedup]);    // all_pass/all_fail/skipped
+  const qualityDrops = placeDrops(QUALITY_DEFS, qd, nodeX[iRollout]);  // qf_* rejections
+
+  // ── Links ────────────────────────────────────────────────────────────
+  const linkSrc = [], linkTgt = [], linkVal = [], linkColor = [], linkLabel = [];
+  const addLink = (src, tgt, val, color, label) => {
+    if (!val || val <= 0) return;
+    linkSrc.push(src); linkTgt.push(tgt); linkVal.push(val);
+    linkColor.push(color); linkLabel.push(label || '');
+  };
+
+  if (funnel.total_dedup != null)
+    addLink(iSynth, iDedup, funnel.total_dedup, 'rgba(34,197,94,0.22)', `kept: ${funnel.total_dedup}`);
+  if (funnel.total_rollout_passed != null)
+    addLink(iDedup, iRollout, funnel.total_rollout_passed, 'rgba(34,197,94,0.22)', `kept: ${funnel.total_rollout_passed}`);
+  if (funnel.total_rollout_kept != null)
+    addLink(iRollout, iQuality, funnel.total_rollout_kept, 'rgba(34,197,94,0.22)', `kept: ${funnel.total_rollout_kept}`);
+
+  const addDropLinks = (src, drops, breakdown) => {
+    drops.forEach(({ def, idx }) => {
+      const [r,g,b] = hexToRgb(def.color);
+      addLink(src, idx, breakdown[def.key], `rgba(${r},${g},${b},0.35)`, `${def.label}: ${breakdown[def.key]}`);
+    });
+  };
+  addDropLinks(iSynth,   dedupDrops,   dd);
+  addDropLinks(iDedup,   rolloutDrops, rd);
+  addDropLinks(iRollout, qualityDrops, qd);
+
+  // ── Render ───────────────────────────────────────────────────────────
+  Plotly.newPlot(container, [{
+    type: 'sankey',
+    orientation: 'h',
+    arrangement: 'fixed',
+    node: {
+      pad: 20,
+      thickness: 22,
+      line: { color: '#2a2a2a', width: 0.5 },
+      label: nodeLabel,
+      color: nodeColor,
+      x: nodeX,
+      y: nodeY,
+      customdata: nodeCustomdata,
+      hovertemplate: '%{customdata}<extra></extra>',
+    },
+    link: {
+      source: linkSrc,
+      target: linkTgt,
+      value: linkVal,
+      color: linkColor,
+      label: linkLabel,
+      hovertemplate: '%{label}<extra></extra>',
+    },
+  }], {
+    font: { family: "ui-monospace,'Cascadia Code','JetBrains Mono',monospace", size: 11, color: '#aaaaaa' },
+    paper_bgcolor: 'transparent',
+    plot_bgcolor: 'transparent',
+    height: 440,
+    margin: { l: 10, r: 20, t: 40, b: 20 },
+  }, { displayModeBar: false, responsive: true });
+}
+
+async function loadSeeds() {
+  const sel = document.getElementById("seed-select");
+  sel.innerHTML = `<option value="">Loading…</option>`;
+  try {
+    const { seeds } = await apiFetch(`/api/seeds?dir=${enc(S.dir)}`);
+    sel.innerHTML = seeds.length
+      ? seeds.map(s => `<option value="${s}">${s}</option>`).join("")
+      : `<option value="">No seeds</option>`;
+    if (seeds.length) { S.seed = seeds[0]; await loadSeedData(); }
+    sel.onchange = () => { S.seed = parseInt(sel.value); loadSeedData(); };
+  } catch (e) {
+    sel.innerHTML = `<option value="">Error</option>`;
+    console.error("loadSeeds:", e);
+  }
+}
+
+async function loadSeedData() {
+  const sel = document.getElementById("qa-select");
+  sel.innerHTML = `<option value="">Loading…</option>`;
+  document.getElementById("qa-info").style.display = "none";
+  try {
+    S.data = await apiFetch(`/api/seed?dir=${enc(S.dir)}&seed=${S.seed}`);
+    const pairs = S.data.qa_pairs || [];
+    sel.innerHTML = pairs.length
+      ? pairs.map(p => {
+          const q = p.question.length > 72 ? p.question.slice(0, 72) + "…" : p.question;
+          return `<option value="${esc(p.qa_id)}">${esc(p.qa_id)}: ${esc(q)}</option>`;
+        }).join("")
+      : `<option value="">No QA pairs</option>`;
+    if (pairs.length) { S.qaId = pairs[0].qa_id; renderView(); }
+    sel.onchange = () => { S.qaId = sel.value; renderView(); };
+  } catch (e) {
+    sel.innerHTML = `<option value="">Error</option>`;
+    console.error("loadSeedData:", e);
+  }
+}
+
+function enc(s) { return encodeURIComponent(s); }
+
+// ── Top-level render ──────────────────────────────────────────────────────
+function renderView() {
+  const pairs = S.data?.qa_pairs || [];
+  const pairIdx = pairs.findIndex(p => p.qa_id === S.qaId);
+  const pair = pairs[pairIdx];
+  if (!pair) return;
+
+  document.getElementById("qa-info").style.display = "";
+  renderQACard(pair);
+  renderFunnel(pair);
+  renderTraceSections(pair, pairIdx);
+}
+
+// ── QA card ───────────────────────────────────────────────────────────────
+function renderQACard(pair) {
+  const nuggets = (pair.answer || []).map(n => `<span class="nugget">${esc(n)}</span>`).join(" ");
+  const chunks  = (pair.chunk_ids || []).map(c => `<span class="chunk-pill">${esc(c)}</span>`).join(" ");
+  document.getElementById("qa-card").innerHTML = `
+    <div class="card-title">QA Pair — ${esc(pair.qa_id)}</div>
+    <div class="question-text">${esc(pair.question)}</div>
+    <div class="meta-row">
+      <div class="meta-label">Answer nuggets</div>
+      <div>${nuggets || '<span class="empty">none</span>'}</div>
+    </div>
+    <div class="meta-row" style="margin-bottom:0">
+      <div class="meta-label">Ground truth chunks</div>
+      <div>${chunks || '<span class="empty">none</span>'}</div>
+    </div>`;
+}
+
+// ── Funnel ────────────────────────────────────────────────────────────────
+function renderFunnel(pair) {
+  const { dedup, rollouts, quality } = S.data;
+  const dedupRec   = findDedup(dedup, pair.qa_id);
+  const rolloutRecs = findRollouts(rollouts, pair.qa_id);
+  const qualityRec = findQuality(quality, pair.qa_id);
+
+  const stages = [
+    { name: "QA Synthesis",    cls: "s-pass", detail: "Generated" },
+    funnelDedup(dedup, dedupRec),
+    funnelRollouts(rolloutRecs),
+    funnelTaskSolver(rolloutRecs),
+    funnelQuality(qualityRec),
+  ];
+
+  const html = stages.map((s, i) => `
+    <div class="funnel-stage ${s.cls}">
+      <div class="s-name">${esc(s.name)}</div>
+      <div class="s-detail">${esc(s.detail)}</div>
+    </div>
+    ${i < stages.length - 1 ? `<div class="funnel-arrow">›</div>` : ""}
+  `).join("");
+
+  document.getElementById("funnel-card").innerHTML =
+    `<div class="card-title">Funnel</div><div class="funnel">${html}</div>`;
+}
+
+function funnelDedup(dedup, rec) {
+  if (!dedup) return { name: "Deduplication", cls: "s-none", detail: "No data" };
+  if (!rec)   return { name: "Deduplication", cls: "s-none", detail: "Not found" };
+  if (rec.filtered) {
+    const why = rec.exact_question_match_id   ? `exact-Q match`
+              : rec.exact_answer_match_id     ? `exact-A match`
+              : rec.intra_batch_duplicate_of  ? `dup of ${rec.intra_batch_duplicate_of}`
+              : "duplicate";
+    return { name: "Deduplication", cls: "s-fail", detail: why };
+  }
+  return { name: "Deduplication", cls: "s-pass", detail: "Passed" };
+}
+
+// Binarization is computed GLOBALLY by the harness against the population mean
+// of the chosen score field (doc_output_recall or eval_score), NOT against this
+// pair's local mean. We therefore read the authoritative `binarized_score`
+// written to *_rollouts_filtered.json. Fallbacks (in order) for phase-1-only
+// data where that field is still null: the global threshold surfaced in
+// `rollout_stats`, then the pair-local mean as a last resort.
+function pairFallbackThreshold(recs) {
+  const gt = S.data && S.data.rollout_stats && S.data.rollout_stats.threshold;
+  if (gt != null) return gt;
+  const scored = recs.filter(r => r.eval_score != null);
+  return scored.length ? scored.reduce((s, r) => s + r.eval_score, 0) / scored.length : 0;
+}
+
+// Binarized score (0/1) for one rollout, or null if it has no score at all.
+function rolloutBinarized(rec, fallbackThreshold) {
+  if (rec.binarized_score != null) return rec.binarized_score;
+  if (rec.eval_score == null) return null;
+  return rec.eval_score > fallbackThreshold ? 1 : 0;
+}
+
+function countRolloutsPassed(recs) {
+  if (!recs || !recs.length) return 0;
+  const thr = pairFallbackThreshold(recs);
+  return recs.filter(r => rolloutBinarized(r, thr) === 1).length;
+}
+
+function funnelRollouts(recs) {
+  if (!recs || !recs.length) return { name: "Rollouts", cls: "s-none", detail: "No data" };
+  const n      = recs.length;
+  const passed = countRolloutsPassed(recs);
+  const kept   = recs.some(r => r.kept === true);
+  const lost   = recs.some(r => r.kept === false);
+  const reason = (recs.find(r => r.discard_reason) || {}).discard_reason || "";
+  const cls    = kept ? "s-pass" : lost ? "s-fail" : "s-part";
+  // When a pair was dropped, the reason (all_pass / all_fail) explains why a
+  // high pass-count still didn't survive -- surface it so "8/8 passed" on a
+  // discarded pair reads as "too easy" rather than looking like a bug.
+  const detail = (!kept && reason) ? `${passed}/${n} passed · ${reason}` : `${passed}/${n} passed`;
+  return { name: "Rollouts", cls, detail };
+}
+
+function funnelTaskSolver(recs) {
+  if (!recs || !recs.length) return { name: "Task Solver", cls: "s-none", detail: "No data" };
+  const scored = recs.filter(r => r.eval_score !== null && r.eval_score !== undefined);
+  if (!scored.length) return { name: "Task Solver", cls: "s-none", detail: "Not run" };
+  const avg = scored.reduce((s, r) => s + r.eval_score, 0) / scored.length;
+  return {
+    name: "Task Solver",
+    cls: avg >= 0.5 ? "s-pass" : "s-fail",
+    detail: `avg eval ${avg.toFixed(2)}`,
+  };
+}
+
+function funnelQuality(rec) {
+  if (!rec)                  return { name: "Quality Filter", cls: "s-none",  detail: "No data" };
+  if (rec.valid === true)    return { name: "Quality Filter", cls: "s-pass",  detail: "Valid" };
+  if (rec.valid === false)   return { name: "Quality Filter", cls: "s-fail",  detail: "Invalid" };
+  return { name: "Quality Filter", cls: "s-none", detail: rec.error || "Unknown" };
+}
+
+// ── Trace sections ────────────────────────────────────────────────────────
+function renderTraceSections(pair, pairIdx) {
+  const { dedup, rollouts, quality } = S.data;
+  const container = document.getElementById("trace-sections");
+  container.innerHTML = "";
+  container.appendChild(makeSynthesisSection(pair, pairIdx));
+  container.appendChild(makeDedupSection(pair, dedup));
+  container.appendChild(makeRolloutsSection(pair, pairIdx, rollouts));
+  container.appendChild(makeQualitySection(pair, quality));
+}
+
+// ── Section: QA Synthesis ─────────────────────────────────────────────────
+function makeSynthesisSection(pair, pairIdx) {
+  const wrap = makeMsgsWrap();
+  const body = document.createElement("div");
+  body.className = "sec-body";
+  body.appendChild(wrap);
+
+  const det = makeSectionDetails({
+    title: "QA Synthesis",
+    extra: `seed ${S.seed}`,
+    badge: "Generated", badgeCls: "b-pass",
+    body,
+  });
+
+  det.addEventListener("toggle", () => {
+    if (det.open && !wrap.dataset.loaded) {
+      wrap.dataset.loaded = "1";
+      loadMsgsInto(`/api/messages?dir=${enc(S.dir)}&file=${enc(`${S.seed}_messages.json`)}`, wrap);
+    }
+  });
+  return det;
+}
+
+// ── Section: Deduplication ────────────────────────────────────────────────
+function makeDedupSection(pair, dedup) {
+  const rec = findDedup(dedup, pair.qa_id);
+  const badge    = !rec ? "N/A"      : rec.filtered ? "Filtered" : "Passed";
+  const badgeCls = !rec ? "b-na"     : rec.filtered ? "b-fail"   : "b-pass";
+
+  const body = document.createElement("div");
+  body.className = "sec-body";
+
+  if (!rec) {
+    body.innerHTML = `<div class="empty">No deduplication data available for this pair.</div>`;
+    return makeSectionDetails({ title: "Deduplication", badge, badgeCls, body });
+  }
+
+  // Static KV rows (always shown immediately)
+  const kvDiv = document.createElement("div");
+  kvDiv.innerHTML = buildDedupStaticHtml(rec);
+  body.appendChild(kvDiv);
+
+  // Placeholder for async top-K groups
+  const topkWrap = document.createElement("div");
+  const allIds = [
+    ...(rec.topk_similar_questions || []).map(x => x.qa_id),
+    ...(rec.topk_similar_answers   || []).map(x => x.qa_id),
+  ];
+  if (allIds.length) {
+    topkWrap.innerHTML = `<div style="margin-top:12px;color:var(--text3);font-size:11px">Loading similar pairs…</div>`;
+    body.appendChild(topkWrap);
+  }
+
+  const details = makeSectionDetails({ title: "Deduplication", badge, badgeCls, body });
+
+  // Lazy-load top-K texts on first open
+  let loaded = false;
+  details.addEventListener("toggle", async () => {
+    if (!details.open || loaded || !allIds.length) return;
+    loaded = true;
+    try {
+      const url = `/api/qa_text?dir=${enc(S.dir)}&ids=${allIds.join(",")}`;
+      const textMap = await apiFetch(url);
+      topkWrap.innerHTML = buildDedupTopkHtml(rec, textMap);
+    } catch (_) {
+      topkWrap.innerHTML = `<div style="margin-top:12px;color:var(--red);font-size:11px">Failed to load similar pair texts.</div>`;
+    }
+  });
+
+  return details;
+}
+
+function buildDedupStaticHtml(rec) {
+  return [
+    ["Filtered",             rec.filtered ? `<span style="color:var(--red)">Yes</span>` : `<span style="color:var(--green)">No</span>`],
+    ["Exact question match", rec.exact_question_match_id  ? mono(rec.exact_question_match_id)  : "—"],
+    ["Exact answer match",   rec.exact_answer_match_id    ? mono(rec.exact_answer_match_id)    : "—"],
+    ["Intra-batch dup of",   rec.intra_batch_duplicate_of ? mono(rec.intra_batch_duplicate_of) : "—"],
+  ].map(([k, v]) => `<div class="kv-row"><span class="kv-k">${k}</span><span class="kv-v">${v}</span></div>`).join("");
+}
+
+function buildDedupTopkHtml(rec, textMap) {
+  function renderGroup(title, items, field) {
+    if (!items || !items.length) return "";
+    const rows = items.map(item => {
+      const info = textMap[item.qa_id] || {};
+      const text = info[field] || "";
+      const textCls = text ? "topk-text" : "topk-text unknown";
+      const textVal = text ? esc(text) : "(text not found)";
+      const dist = item.distance != null ? item.distance.toFixed(4) : "—";
+      return `<div class="topk-row">
+        <span class="topk-dist">${dist}</span>
+        <span class="topk-id">${esc(item.qa_id)}</span>
+        <span class="${textCls}" title="${esc(text)}">${textVal}</span>
+      </div>`;
+    }).join("");
+    return `<div class="topk-group">
+      <div class="meta-label">${title} (${items.length})</div>
+      <div class="topk-list">${rows}</div>
+    </div>`;
+  }
+
+  return renderGroup("Similar Questions", rec.topk_similar_questions, "question") +
+         renderGroup("Similar Answers",   rec.topk_similar_answers,   "answer");
+}
+
+// ── Section: Rollouts ──────────────────────────────────────────────────────
+function makeRolloutsSection(pair, pairIdx, rollouts) {
+  const recs = findRollouts(rollouts, pair.qa_id);
+
+  let badge, badgeCls, extra = "";
+  if (!recs || !recs.length) {
+    badge = "N/A"; badgeCls = "b-na";
+  } else {
+    const passed = countRolloutsPassed(recs);
+    const kept   = recs.some(r => r.kept === true);
+    const lost   = recs.some(r => r.kept === false);
+    badge    = `${passed}/${recs.length}`;
+    badgeCls = kept ? "b-pass" : lost ? "b-fail" : "b-na";
+    extra    = `${recs.length} rollout${recs.length !== 1 ? "s" : ""}`;
+  }
+
+  const body = document.createElement("div");
+  body.className = "sec-body";
+
+  if (!recs || !recs.length) {
+    body.innerHTML = `<div class="empty">No rollout data available for this pair.</div>`;
+  } else {
+    const thr = pairFallbackThreshold(recs);
+    recs.forEach(rec => body.appendChild(makeRolloutCard(rec, pairIdx, thr)));
+  }
+
+  return makeSectionDetails({ title: "Rollouts", extra, badge, badgeCls, body });
+}
+
+function makeRolloutCard(rec, pairIdx, threshold = 0) {
+  const evalScore  = rec.eval_score ?? null;
+  const bScore     = rolloutBinarized(rec, threshold);
+  const scoreStr   = bScore !== null ? String(bScore) : "—";
+  const scoreColor = bScore === 1 ? "var(--green)" : bScore === 0 ? "var(--red)" : "var(--text3)";
+  const badge      = evalScore !== null ? "SCORED" : "UNSCORED";
+  const badgeCls   = evalScore !== null ? "b-pass" : "b-na";
+
+  const evalStr = (rec.eval_score !== null && rec.eval_score !== undefined)
+    ? ` · eval=${rec.eval_score.toFixed(3)}`
+    : "";
+
+  const card = document.createElement("details");
+  card.className = "rollout-card";
+
+  // Summary
+  const sum = document.createElement("summary");
+  sum.className = "rollout-summary";
+  sum.innerHTML = `
+    <span class="ti">▶</span>
+    <span style="font-weight:600">Rollout ${rec.rollout_idx}</span>
+    <span style="font-family:ui-monospace,monospace;font-size:12px;color:${scoreColor}">binarized=${scoreStr}${esc(evalStr)}</span>
+    <span style="font-size:11px;color:var(--text3)">${rec.completed ? `${rec.num_steps} steps` : "incomplete"}</span>
+    <span class="badge ${badgeCls}" style="margin-left:auto">${badge}</span>`;
+  card.appendChild(sum);
+
+  // Body
+  const body = document.createElement("div");
+  body.className = "rollout-body";
+
+  // Metrics
+  const metrics = [
+    ["Doc Recall",   fmt(rec.doc_output_recall)],
+    ["Doc Precision",fmt(rec.doc_output_precision)],
+    ["Doc F1",       fmt(rec.doc_output_f1)],
+    ["Traj Recall",  fmt(rec.doc_trajectory_recall)],
+    ["Chunk Recall", fmt(rec.chunk_output_recall)],
+    ["Eval Score",   rec.eval_score !== null && rec.eval_score !== undefined ? rec.eval_score.toFixed(3) : "—"],
+  ].map(([k, v]) => `<div class="metric">${k}: <span class="mv">${esc(v)}</span></div>`).join("");
+
+  const metricsDiv = document.createElement("div");
+  metricsDiv.className = "metrics-row";
+  metricsDiv.innerHTML = metrics;
+  body.appendChild(metricsDiv);
+
+  // Output doc IDs
+  if (rec.output_doc_ids?.length) {
+    const d = document.createElement("div");
+    d.className = "meta-row";
+    d.innerHTML = `<div class="meta-label">Output doc IDs</div>
+      <div>${rec.output_doc_ids.map(id => `<span class="chunk-pill">${esc(id)}</span>`).join(" ")}</div>`;
+    body.appendChild(d);
+  }
+
+  // Task Solver answer
+  if (rec.task_solver_answer) {
+    const d = document.createElement("div");
+    d.className = "meta-row";
+    d.innerHTML = `<div class="meta-label">Task Solver Answer</div>
+      <pre style="font-size:11px;color:var(--text2);white-space:pre-wrap;font-family:ui-monospace,monospace;padding:6px 8px;background:var(--bg);border-radius:4px;margin-top:4px">${esc(rec.task_solver_answer)}</pre>`;
+    body.appendChild(d);
+  }
+
+  // Eval labels
+  if (rec.eval_labels?.length) {
+    const d = document.createElement("div");
+    d.className = "meta-row";
+    d.innerHTML = `<div class="meta-label">Nugget Eval Labels</div>
+      <div style="margin-top:4px">
+        ${rec.eval_labels.map(l => {
+          const c = l === "support" ? "var(--green)" : l === "partial_support" ? "var(--yellow)" : "var(--red)";
+          return `<span style="color:${c};font-size:11px;font-family:ui-monospace,monospace;margin-right:8px">${esc(l)}</span>`;
+        }).join("")}
+      </div>`;
+    body.appendChild(d);
+  }
+
+  // Lazy agent trace
+  const msgsFile = `${S.seed}_qa${pairIdx}_r${rec.rollout_idx}_messages.json`;
+  body.appendChild(makeInnerTrace(msgsFile));
+  card.appendChild(body);
+  return card;
+}
+
+// ── Section: Quality Filter ───────────────────────────────────────────────
+function makeQualitySection(pair, quality) {
+  const rec     = findQuality(quality, pair.qa_id);
+  const badge    = !rec ? "N/A" : rec.valid === true ? "Valid" : rec.valid === false ? "Invalid" : "Unknown";
+  const badgeCls = !rec ? "b-na" : rec.valid === true ? "b-pass" : rec.valid === false ? "b-fail" : "b-na";
+
+  const body = document.createElement("div");
+  body.className = "sec-body";
+
+  if (!rec) {
+    body.innerHTML = `<div class="empty">No quality filter data available for this pair.</div>`;
+  } else {
+    const rows = [
+      ["Valid",     rec.valid === null ? "null" : `<span style="color:${rec.valid ? "var(--green)" : "var(--red)"}">${esc(String(rec.valid))}</span>`],
+      ["Completed", String(rec.completed)],
+      ["Steps",     String(rec.num_steps)],
+      ...(rec.error ? [["Error", `<span style="color:var(--red)">${esc(rec.error)}</span>`]] : []),
+    ].map(([k, v]) => `<div class="kv-row"><span class="kv-k">${k}</span><span class="kv-v">${v}</span></div>`).join("");
+
+    const reasoning = rec.reasoning ? `
+      <div style="margin-top:12px">
+        <div class="meta-label">Reasoning</div>
+        <pre style="font-size:12px;color:var(--text2);white-space:pre-wrap;font-family:ui-monospace,monospace;padding:8px;background:var(--bg);border-radius:4px;margin-top:4px">${esc(rec.reasoning)}</pre>
+      </div>` : "";
+
+    const detailsDiv = document.createElement("div");
+    detailsDiv.innerHTML = rows + reasoning;
+    body.appendChild(detailsDiv);
+
+    // Lazy agent trace — QF messages are keyed by qa_id, not seed
+    const qfFile = `${pair.qa_id}_qf_messages.json`;
+    body.appendChild(makeInnerTrace(qfFile));
+  }
+
+  return makeSectionDetails({ title: "Quality Filter", badge, badgeCls, body });
+}
+
+// ── DOM helpers ───────────────────────────────────────────────────────────
+
+/** Build a top-level collapsible section. */
+function makeSectionDetails({ title, extra = "", badge, badgeCls, body }) {
+  const det = document.createElement("details");
+  det.className = "sec-details";
+
+  const sum = document.createElement("summary");
+  sum.innerHTML = `
+    <span class="ti">▶</span>
+    <span class="sec-title">${esc(title)}</span>
+    ${extra ? `<span class="sec-extra">${esc(extra)}</span>` : ""}
+    <span class="badge ${badgeCls}" style="margin-left:auto">${esc(badge)}</span>`;
+  det.appendChild(sum);
+  det.appendChild(body);
+  return det;
+}
+
+/** Create an inner collapsible trace viewer with lazy loading. */
+function makeInnerTrace(messagesFile) {
+  const det = document.createElement("details");
+  det.className = "inner-trace";
+
+  const sum = document.createElement("summary");
+  sum.innerHTML = `<span class="ti">▶</span><span>Agent Trace</span>`;
+  det.appendChild(sum);
+
+  const wrap = makeMsgsWrap();
+  const traceBody = document.createElement("div");
+  traceBody.className = "inner-trace-body";
+  traceBody.appendChild(wrap);
+  det.appendChild(traceBody);
+
+  det.addEventListener("toggle", () => {
+    if (det.open && !wrap.dataset.loaded) {
+      wrap.dataset.loaded = "1";
+      const url = `/api/messages?dir=${enc(S.dir)}&file=${enc(messagesFile)}`;
+      loadMsgsInto(url, wrap);
+    }
+  });
+  return det;
+}
+
+/** Create a messages container div with placeholder text. */
+function makeMsgsWrap() {
+  const w = document.createElement("div");
+  w.className = "msgs-wrap";
+  w.innerHTML = `<div class="empty">Expand to load agent trace…</div>`;
+  return w;
+}
+
+// ── Messages loading ──────────────────────────────────────────────────────
+async function loadMsgsInto(url, wrap) {
+  wrap.innerHTML = `<div class="empty">Loading…</div>`;
+  try {
+    const msgs = await apiFetch(url);
+    wrap.dataset.msgs = JSON.stringify(msgs);  // cache for sys-toggle re-render
+    wrap.innerHTML = buildMsgsHtml(msgs);
+  } catch (e) {
+    wrap.innerHTML = `<div class="err-txt">Failed to load messages: ${esc(e.message)}</div>`;
+  }
+}
+
+function buildMsgsHtml(messages) {
+  if (!Array.isArray(messages)) return `<div class="empty">Unexpected format.</div>`;
+  const skipSys = !document.getElementById("show-system").checked;
+  const parts = [];
+
+  for (const msg of messages) {
+    const role = (msg.role || "unknown").toLowerCase();
+    if (skipSys && role === "system") continue;
+
+    const style  = ROLE[role] || { color: "#aaaaaa", bg: "#1a1a1a", label: role.toUpperCase() };
+    const blocks = msg.blocks || [];
+    const totalChars = blocks.reduce((s, b) => s + (b.text || "").length, 0);
+    const tokens = Math.round(totalChars / 4).toLocaleString();
+
+    const blocksHtml = blocks.map(buildBlockHtml).join("");
+    parts.push(`
+      <div class="msg-item" style="border-left:4px solid ${style.color};background:${style.bg}">
+        <div class="msg-role-bar" style="color:${style.color}">
+          <span>${style.label}</span>
+          <span class="token-est">~${tokens} tokens</span>
+        </div>
+        ${blocksHtml || `<span style="color:#444;font-style:italic;font-size:11px">empty</span>`}
+      </div>`);
+  }
+  return parts.length
+    ? parts.join("")
+    : `<div class="empty">No messages${skipSys ? " (system messages hidden)" : ""}.</div>`;
+}
+
+function buildBlockHtml(block) {
+  if (block.type === "chunk") {
+    return `<div class="chunk-item">
+      <div class="chunk-meta">[CHUNK] chunk_id=${esc(block.chunk_id ?? "")} · doc_id=${esc(block.doc_id ?? "")}</div>
+      <pre class="chunk-text">${esc(block.text ?? "")}</pre>
+    </div>`;
+  }
+  // text (default)
+  return `<pre class="msg-text">${esc(block.text ?? "")}</pre>`;
+}
+
+// ── Data helpers ──────────────────────────────────────────────────────────
+function findDedup(dedup, qaId) {
+  return (dedup?.funnel ?? []).find(r => r.qa_id === qaId) ?? null;
+}
+function findRollouts(rollouts, qaId) {
+  if (!rollouts) return null;
+  const recs = rollouts.filter(r => r.qa_id === qaId);
+  return recs.length ? recs : null;
+}
+function findQuality(quality, qaId) {
+  return (quality?.results ?? []).find(r => r.qa_id === qaId) ?? null;
+}
+function mono(s) { return `<span style="font-family:ui-monospace,monospace">${esc(s)}</span>`; }
+
+// ── Boot ──────────────────────────────────────────────────────────────────
+document.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>

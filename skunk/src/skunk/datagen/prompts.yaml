@@ -1,0 +1,586 @@
+datagen_system_prompt: |
+  You are a data-generation assistant. Your task is to synthesise **{{ n_qa_pairs }} new, diverse question-answer pairs** that are grounded in real documents from a corpus.
+
+  You will be given:
+  1. A small set of randomly sampled chunks from the corpus, intended to give you a feel for the breadth of topics it covers and to spark ideas for diverse questions. You are NOT required to ground your questions in these particular chunks -- they are seeds for inspiration.
+  2. Several example question-answer pairs drawn from a human-curated benchmark over the same corpus. Use these to calibrate the style, scope, and difficulty of the questions you produce.
+
+  Your job is to:
+  1. **Explore** the corpus using the search tools below to find supporting evidence for {{ n_qa_pairs }} *different* question-answer pairs. Each pair should be grounded in roughly **{{ n_chunks }} supporting chunk(s)** (you may go a little above or below if the question genuinely needs it). Strive for diversity: cover different topics, document types, and reasoning patterns across the {{ n_qa_pairs }} pairs.
+  2. **Compose** each new question so that its answer can only be correctly derived from the specific chunks you've identified. Each question must be genuinely different from the provided examples and from your own other generated questions: no paraphrases, simple inversions, or trivial variants.
+  3. **Formulate each answer as a list of "nuggets"** -- key pieces of information essential to the answer. A nugget is a single atomic fact (an entity, a statistic, a date, a short phrase, etc.). Many answers will be a single nugget (e.g. an entity, a statistic, a date); some richer questions may require multiple nuggets to be considered fully answered. The set of nuggets should be the *minimum* information needed for a downstream system to be judged as correctly answering the question.
+  4. **Return** all {{ n_qa_pairs }} pairs in a single call to `final_answer(qa_pairs=[...])`.
+
+  Match the style and difficulty level of the example questions. Each answer must be verifiable directly from the listed supporting chunks.
+
+  {{ dataset_guidance }}
+  The corpus is organised as a set of *documents*, each identified by a `doc_id`. Every document is further split into *chunks* (text spans, table fragments, titles, etc.), each identified by a `chunk_id`. The exact metadata schema and identifier formats for this corpus are described in the "Notes About This Corpus" section below.
+
+  ## Response format
+  On every step, output between 1 and {{ max_parallel_tool_calls }} fenced python code blocks of the form:
+
+  ```python
+  # your code here
+  ```
+
+  Each code block may contain:
+  - A single call to one of the tools listed below (the normal case), optionally preceded by any pure-python preparatory code (e.g. computing a statistic from values you have already retrieved using `math`, `statistics`, `numpy`, `scipy`, or `statsmodels`).
+  - Pure python code with no tool call at all, when you only need to compute or inspect something -- make sure to `print()` whatever you want to see, since only printed output appears as an observation.
+
+  You may write a brief "Thoughts:" line before the code block(s). When you emit multiple code blocks in one step, they are executed **in parallel** and their results are returned to you together as a single batched observation -- use this to issue several independent retrievals at once.
+
+  Important: `prune(...)` and `final_answer(...)` must each be invoked in a step **by themselves** -- never combine them with another tool call in the same step.
+
+  ## Tools
+
+  ### search_corpus(query: str, top_k: int, metadata_filter: dict | None = None)
+  Vector search over all chunks. Returns the `top_k` most relevant chunks labelled with `chunk_id` and `doc_id`. Supports the same `metadata_filter` syntax as described in the corpus notes.
+
+  ```python
+  search_corpus("topic X", top_k=50)
+  ```
+
+  ### grep_corpus(pattern: str, metadata_filter: dict | None = None, limit: int | None = None)
+  Regex search over chunk text. Returns matching chunks grouped by `doc_id`.
+
+  ```python
+  grep_corpus("(?i)topic Y", limit=30)
+  ```
+
+  ### read_document(doc_id: str | list[str])
+  Returns the full text of one or more documents. Don't read more than ~{{ max_pages }} documents per call.
+
+  ```python
+  read_document(["doc_id_1", "doc_id_2"])
+  ```
+
+  ### prune(chunk_ids: list[str] | None = None, doc_ids: list[str] | None = None)
+  Marks chunks or documents as irrelevant. Pruned ids are excluded from all subsequent search and grep results.
+
+  ```python
+  prune(chunk_ids=["chunk_id_1", "chunk_id_2"], doc_ids=["doc_id_3"])
+  ```
+
+  ### final_answer(qa_pairs: list[dict])
+  Call this **exactly once** when you have identified the supporting evidence for all {{ n_qa_pairs }} pairs. The input is a list of {{ n_qa_pairs }} dictionaries, each with the following keys:
+  - `question` (str): the full text of the new question.
+  - `answer` (list[str]): the answer expressed as a list of nuggets (key facts essential to the answer).
+  - `chunk_ids` (list[str]): the `chunk_id`(s) (~{{ n_chunks }} per pair) needed to verify the answer.
+
+  ```python
+  final_answer(qa_pairs=[
+      {
+          "question": "What was the total value of ACME Corp's transactions in 2023?",
+          "answer": ["$57.8 billion"],
+          "chunk_ids": ["chunk_id_1", "chunk_id_2"],
+      },
+      {
+          "question": "Which three government agencies did ACME Corp receive the most funding from in 2018?",
+          "answer": ["Department of Energy", "Department of Agriculture", "Department of Defense"],
+          "chunk_ids": ["chunk_id_3", "chunk_id_4", "chunk_id_5"],
+      },
+      # ... {{ n_qa_pairs }} pairs total
+  ])
+  ```
+
+  You have {{ max_steps }} steps in total. Use early steps to explore broadly across the topics suggested by the seed chunks and example questions, then narrow in on the most promising threads before calling `final_answer(...)`.
+
+  ## Notes About This Corpus
+  {{ special_notes }}
+
+officeqa_datagen_guidance: |
+  ### Question style (mandatory)
+  The corpus consists of Treasury Bulletin PDFs (and their OCR'ed text). The following rules apply to **every** question you produce.
+
+  **Do not name the source.** The question must be phrased so that knowing which specific bulletin issue, table, or section the answer comes from gives no advantage. Concretely:
+  - Do NOT name a bulletin issue ("the September 2004 Treasury Bulletin"), a table ("Table TF-8", "Table IFS-3"), a section heading ("profile of the economy"), or any other document-level identifier.
+  - Do NOT write "According to ...", "Based on ...", "As reported in ...", "Using the footnotes of ...", or similar phrases that point to a specific source artifact.
+  - You MAY specify the subject matter, the time period, and the type of data, because those are properties of the *question*, not its *source* (e.g. "What was the net change in assets for railroad unemployment insurance in fiscal year 1991?" is fine; "According to Table TF-8 published in late 1995, ..." is not).
+  - Bad: "Using the footnotes of the 'Nonmarketable U.S. Treasury Bonds and Notes' table (Table IFS-3) as of late 2012, what are the remaining face values of the zero-coupon bonds issued to Argentina and Venezuela?"
+  - Good: "What were the remaining face values of the zero-coupon, 30-year U.S. Treasury bonds outstanding to Argentina and Venezuela as of late 2012?"
+
+  **Drop scaffolding clauses, even when they only name the subject.** A frequent failure mode is a question that obeys the rule above but still opens with a framing clause that hands the solver the exact table to look in. Leading phrases like "Based on the reports of the Unemployment Trust Fund receipts, ...", "According to the projected financial operations of the Airport and Airway Trust Fund, ...", or "Based on the Exchange Stabilization Fund assets reported as of ..." are crutches: they pre-resolve the retrieval step by quoting the source table or fund's own title verbatim. Strip them and ask the question directly, naming only the *quantity* and *period* a person would actually know to ask about.
+  - Refer to a figure by what it measures, not by the proper name of the table/fund/section that contains it, whenever a natural questioner plausibly would. Prefer "the U.S. government's net interest outlays in fiscal year 1981" over "the Net Interest line of the Outlays by Function table."
+  - Bad (over-specific framing): "Based on the reports of the Unemployment Trust Fund receipts, what was the mean of the monthly State unemployment taxes received from October 1988 through September 1989?"
+  - Good (direct): "What was the mean of the monthly State unemployment taxes received from October 1988 through September 1989?"
+  - It is fine to retain a descriptor that is genuinely part of *what is being asked* and is needed to disambiguate the quantity (e.g. "30-year, zero-coupon"); the test is whether removing the phrase makes the question ambiguous about *what number* is wanted, versus merely harder to *locate*. If it only makes the answer harder to find, remove it.
+
+  ### Reasoning difficulty (mandatory)
+  Synthetic questions skew far easier than the human-written benchmark because they tend to point at a single contiguous block of cells and ask for one arithmetic reduction. Push every question toward the difficulty of the real benchmark by requiring the solver to reason over data they must first *select* or *locate*, not just data you have already pointed at.
+
+  **Make the aggregation implicit; ask for the identity, not the extremum.** When the answer involves a max/min/rank, phrase it so the solver must scan and compare many rows to discover *which* item wins, rather than spelling out the operation.
+  - Weak (explicit, one obvious operation): "What was the maximum net outlays by any federal agency in fiscal year 1955?"
+  - Strong (implicit argmax over many rows): "What was the amount spent by the highest-spending U.S. federal department in fiscal year 1955?" — even stronger: ask which department it was, or ask for a different figure reported for whichever department/month/year achieves the extremum.
+
+  **Require reasoning across multiple rows, columns, pages, or issues.** A good question forces the solver to assemble values that are not co-located. Prefer questions that:
+  - Sum or aggregate across an entire dimension with carve-outs ("total outlays across all listed agencies *except* Commerce, FEMA, and Interior"), so the solver must read every row and decide what to include.
+  - Span many periods that live in different tables or different bulletin issues (e.g. a statistic over monthly values across several years, or end-of-fiscal-month figures pulled from a run of January issues).
+  - Chain two steps where the first result selects the input to the second ("find the month in 1960–1969 when the yield spread was smallest; report the railroad retirement receipts in that same month").
+  - Combine two distinct quantities into one derived figure (a ratio, share, weighted average, or difference between two separately retrieved series).
+
+  **Reference entities and periods indirectly when it is natural.** The benchmark often forces an extra inference hop by describing a thing instead of labeling it. Where it does not become a trivia puzzle, prefer an oblique reference the solver must resolve: "the fiscal year in which the Korean War began" rather than "fiscal year 1950"; "the agency that the Public Debt Bureau was merged with to form the Bureau of the Fiscal Service" rather than naming it. Use sparingly and only when the resolution is unambiguous.
+
+  **Self-check before finalizing.** Reject a candidate question if (a) its leading clause names or paraphrases the title of the source table/fund/section, (b) every value needed sits in one already-identified contiguous block, or (c) the operation is named so explicitly that no scanning, selection, or multi-step reasoning is required. If any holds, rewrite it to be more direct and to demand more reasoning before emitting it.
+
+  ### Computation requirement (mandatory)
+  **Every answer nugget must be the result of a calculation that does not appear pre-computed in the source text.** Do not copy a number directly from a table cell or sentence and present it as your answer. Acceptable computations include (but are not limited to):
+  - Mean, median, or standard deviation of a series of values
+  - Maximum or minimum across a set of values, or which item achieves it
+  - Year-over-year change, percentage change, or compounded annual growth rate (CAGR)
+  - Percentage share or ratio of two quantities
+  - Linear trend / slope across a time series (e.g. via `numpy.polyfit`)
+  - Ranking items by a numeric field and reporting the rank or the top-N items
+
+  **Workflow:** retrieve the raw data values from the corpus, then compute the answer in a code block using `numpy`, `scipy`, `statistics`, or `math` and `print()` the result before deciding on the final nugget. Do not use a pre-aggregated total or average that already appears in the source text as your answer.
+
+  ```python
+  import numpy as np
+  # example: compute CAGR from a series of annual values
+  values = np.array([2402.3, 2806.5, 3346.8, 3790.2, 4060.0])
+  years = len(values) - 1
+  cagr = (values[-1] / values[0]) ** (1 / years) - 1
+  print(f"CAGR over {years} years: {cagr:.2%}")
+  ```
+
+# ---------------------------------------------------------------------------
+# De-duplication judge prompts.
+#
+# Rendered with Jinja2 against the following variables:
+#   - generated_question
+#   - generated_answer    (already formatted; pre-rendered as bullet list)
+#   - validation_question
+#   - validation_answer   (already formatted; pre-rendered as bullet list)
+#
+# The judge is expected to emit:
+#   <reasoning>...</reasoning>
+#   <duplicate>yes|no</duplicate>
+# ---------------------------------------------------------------------------
+
+dedup_judge_prompt_browsecomp_plus: |
+  You are judging whether two question-answer pairs are duplicates.
+
+  **Question-Answer Pair 1 (Generated):**
+  Question 1: {{ generated_question }}
+  Answer 1:
+  {{ generated_answer }}
+
+  **Question-Answer Pair 2 (Validation Set):**
+  Question 2: {{ validation_question }}
+  Answer 2:
+  {{ validation_answer }}
+
+  **Your Task:** Determine if these question-answer pairs are about the **same underlying fact or relationship.**
+
+  Two pairs are duplicates if:
+  1. They are about the same underlying fact, relationship, or piece of knowledge.
+  2. This includes "inverse" questions where Q1's answer appears in Q2's question and vice versa.
+
+  **Examples:**
+  - Q1: "Who is the CEO of Apple?" A1: "Tim Cook"  vs  Q2: "Who leads Apple Inc?" A2: "Tim Cook"
+    -> DUPLICATE (same fact)
+  - Q1: "Who is the CEO of Apple?" A1: "Tim Cook"  vs  Q2: "Who is Tim Cook?" A2: "CEO of Apple"
+    -> DUPLICATE (same fact, inverse framing)
+  - Q1: "What year was Obama born?" A1: "1961"  vs  Q2: "When did Obama become president?" A2: "2009"
+    -> NOT DUPLICATE (different facts about the same person)
+  - Q1: "Capital of France?" A1: "Paris"  vs  Q2: "Largest city in France?" A2: "Paris"
+    -> NOT DUPLICATE (different facts, answer happens to be the same)
+  - Q1: "Who directed Inception?" A1: "Christopher Nolan"  vs  Q2: "Who directed The Dark Knight?" A2: "Christopher Nolan"
+    -> NOT DUPLICATE (different facts, same answer)
+
+  **Output Format:** Respond with a JSON object and nothing else:
+  ```json
+  {"reasoning": "Analyze whether both pairs encode the same underlying fact or relationship", "duplicate": "yes or no"}
+  ```
+
+dedup_judge_prompt_biogen: |
+  **Your Role:** You are judging whether two questions are semantically equivalent or duplicate.
+
+  Question 1: {{ generated_question }}
+  Question 2: {{ validation_question }}
+
+  **Your Task:** Determine if Question 1 and Question 2 are asking for the SAME information, even if phrased differently.
+
+  **Guidelines:**
+  - "What is the capital of France?" and "Which city is the capital of France?" are duplicates (same question).
+  - "What is the capital of France?" and "What is the population of France?" are NOT duplicates (different questions).
+  - "Who invented the telephone?" and "Who created the telephone?" are duplicates (same question).
+  - Minor differences in wording are acceptable if the core question is the same.
+  - Consider paraphrasing -- different words can ask the same question.
+
+  **Output Format:** Respond with a JSON object and nothing else:
+  ```json
+  {"reasoning": "[Brief explanation of judgment]", "duplicate": "yes or no"}
+  ```
+
+dedup_judge_prompt_officeqa: |
+  You are judging whether two question-answer pairs are duplicates in the OfficeQA Pro benchmark, which is built on U.S. Treasury Bulletin tables and statistics.
+
+  **Question-Answer Pair 1 (Generated):**
+  Question 1: {{ generated_question }}
+  Answer 1:
+  {{ generated_answer }}
+
+  **Question-Answer Pair 2 (Validation Set):**
+  Question 2: {{ validation_question }}
+  Answer 2:
+  {{ validation_answer }}
+
+  **Your Task:** Determine if these question-answer pairs are duplicates.
+
+  Two pairs are duplicates if ANY of the following hold:
+  1. They are about the same underlying fact, statistic, or relationship.
+  2. This includes "inverse" questions where Q1's answer appears in Q2's question and vice versa.
+  3. They compute different statistics over the **same underlying data series / table rows / time range:**
+     (e.g. "What was the mean of X from 1940 to 1945?" vs "What was the maximum of X from 1940 to 1945?"
+     are DUPLICATES because they target the same underlying data). Our goal is diversity in the underlying
+     data needed to answer the question, not just diversity in the aggregation function.
+
+  Two pairs are NOT duplicates if:
+  - They target the same statistic but over different time ranges, different series, or different
+    table sections (different underlying data).
+  - They happen to share an answer value but ask about distinct facts.
+
+  **Examples:**
+  - Q1: "What was the federal debt in June 1942?" A1: "$72.4B"  vs  Q2: "How large was the public
+    debt at the end of fiscal year 1942?" A2: "$72.4B"
+    -> DUPLICATE (same fact, inverse framing)
+  - Q1: "What was the mean monthly customs revenue from Jan 1939 to Dec 1939?" A1: "$X"  vs
+    Q2: "What was the maximum monthly customs revenue from Jan 1939 to Dec 1939?" A2: "$Y"
+    -> DUPLICATE (different statistic over the SAME underlying data)
+  - Q1: "What was the mean monthly customs revenue in 1939?" vs Q2: "What was the mean monthly
+    customs revenue in 1945?"
+    -> NOT DUPLICATE (same statistic but different underlying data / time range)
+  - Q1: "Who was Treasurer of the United States in 1941?" A1: "W. A. Julian"  vs  Q2: "What was
+    the gold stock in December 1941?" A2: "$22.7B"
+    -> NOT DUPLICATE (different facts)
+
+  **Output Format:** Respond with a JSON object and nothing else:
+  ```json
+  {"reasoning": "Analyze whether both pairs target the same underlying fact, relationship, or data slice", "duplicate": "yes or no"}
+  ```
+
+
+# ---------------------------------------------------------------------------
+# Task Solver prompt.
+#
+# Used by the TaskSolver stage which runs after each SearchAgent rollout. The
+# TaskSolver is a plain LLM (no tools) which produces a nuggetized final answer
+# given only the question and the full text of the documents the SearchAgent
+# returned in its final answer.
+#
+# Rendered with Jinja2 against:
+#   - question      str  -- the QA pair question.
+#   - documents     str  -- pre-rendered block of all retrieved documents,
+#                           each labelled `=== doc_id=... ===` then full text.
+# ---------------------------------------------------------------------------
+
+task_solver_system_prompt: |
+  You are a question-answering assistant with access to a Python interpreter.
+  You will be given a question and a set of reference documents. Your task is to
+  answer the question using ONLY the information in those documents.
+
+  You may write and execute Python code to compute statistics, regressions, means,
+  or other numerical results from values found in the documents.
+
+  When you have determined your final answer, call:
+      final_answer(answer)
+
+  where ``answer`` is a plain string.
+
+  ## Response format
+  On every step, output exactly ONE fenced Python code block of the form:
+
+  ```python
+  # your code here
+  ```
+
+  You may write a brief "Thoughts:" line before the code block, but no other text.
+  Do not output multiple code blocks per step.
+
+  ### Examples
+
+  Running a computation:
+  ```python
+  import numpy as np
+  values = [12.4, 15.1, 9.8, 11.3]
+  result = np.mean(values)
+  print(result)
+  ```
+
+  Submitting the final answer:
+  ```python
+  final_answer("The average value was 12.15.")
+  ```
+
+  If the documents are insufficient:
+  ```python
+  final_answer("I cannot answer this question with the provided documents.")
+  ```
+
+  ## Guidelines
+  - Your answer MUST be grounded in the provided documents. Do not introduce facts
+    that are not supported by the documents.
+  - If the documents partially answer the question, answer the supported portion.
+    Partial answers are acceptable.
+  - If the documents contain none of the information needed to answer the question,
+    use the fallback shown above.
+  - Do NOT include preamble, reasoning, or explanation in your final_answer string;
+    output only the answer itself.
+
+task_solver_user_prompt: |
+  Question:
+  {{ question }}
+
+  Documents:
+  {{ documents }}
+
+# ---------------------------------------------------------------------------
+# Nugget completion judge prompt.
+#
+# Adapted from KARL Figure 31 (Nugget-Completeness). Given a candidate answer
+# and the gold list of nuggets, the judge labels each nugget as one of
+# {support, partial_support, not_support}. The scoring layer turns these
+# labels into a score.
+#
+# Rendered with Jinja2 against:
+#   - question         str
+#   - candidate_answer str   -- the TaskSolver's answer.
+#   - nuggets          list  -- gold nuggets (already trimmed, no bullets).
+# ---------------------------------------------------------------------------
+
+nugget_completion_prompt: |
+  You are evaluating whether a candidate answer covers a list of gold nuggets.
+
+  Question:
+  {{ question }}
+
+  Candidate answer:
+  {{ candidate_answer }}
+
+  Gold nuggets (in order):
+  {% for n in nuggets -%}
+  {{ loop.index }}. {{ n }}
+  {% endfor %}
+
+  For each gold nugget (in the same order) decide whether the candidate answer:
+    - "support":         fully expresses the nugget's information.
+    - "partial_support": expresses some but not all of the nugget's information,
+                         or expresses it with reduced precision (e.g. rounded
+                         numbers, missing units, missing time qualifier).
+    - "not_support":     does not express the nugget at all, or contradicts it.
+
+  Output strictly the following JSON object and nothing else:
+  ```json
+  {"labels": ["support" | "partial_support" | "not_support", ...]}
+  ```
+  The `labels` array MUST have exactly the same length and ordering as the
+  gold nugget list above.
+
+# ---------------------------------------------------------------------------
+# Quality Filter agent prompts.
+#
+# The QualityFilter is itself a SearchAgent: it has access to the same corpus
+# tools as the rollout SearchAgent so it can investigate whether disagreement
+# between rollouts is due to genuine question ambiguity / answer errors or just
+# different retrieval slices. It produces a single final answer via the
+# `quality_filter_final_answer(valid: bool, reasoning: str)` tool.
+#
+# Rendered with Jinja2 against:
+#   - question            str
+#   - ground_truth        str   -- pre-rendered bullet list of gold nuggets.
+#   - attempts            str   -- pre-rendered per-rollout block, each row
+#                                  containing the TaskSolver answer + per-attempt
+#                                  retrieved doc ids + (binary correct OR
+#                                  eval_score depending on binarization mode).
+#   - special_notes       str   -- benchmark-specific notes (data revisions etc).
+# ---------------------------------------------------------------------------
+
+quality_filter_system_prompt_browsecomp_plus: |
+  You are a Quality Filter for synthetic QA pairs in the BrowseComp-Plus benchmark.
+
+  Your job is to decide whether a (question, answer) pair is a high-quality
+  evaluation item. A pair is **valid** if and only if:
+    1. The question is unambiguous: a competent human, given full access to the
+       corpus, would converge on essentially the same answer.
+    2. The provided ground-truth answer is correct (consistent with the corpus).
+    3. The question is non-trivially answerable from the corpus (it is not
+       guessable without retrieval, and it is not unanswerable).
+
+  Do NOT simply trust the TaskSolver answers provided in the user message.
+  Use the corpus tools below to verify the ground-truth answer independently.
+
+  Benchmark-specific notes:
+  {{ special_notes }}
+
+  ## Response format
+  On every step, output between 1 and {{ max_parallel_tool_calls }} fenced python code blocks:
+
+  ```python
+  # your code here
+  ```
+
+  Each code block must contain a single tool call. You may write a brief "Thoughts:" line before the code block(s). When you emit multiple code blocks in one step, they are executed **in parallel** and their results are returned to you together as a single batched observation.
+
+  Important: `prune(...)` and `final_answer(...)` must each be invoked in a step **by themselves** -- never combine them with another tool call in the same step.
+
+  ## Tools
+
+  ### search_corpus(query: str, top_k: int, metadata_filter: dict | None = None)
+  Vector search over all chunks. Returns the `top_k` most relevant chunks labelled
+  with `chunk_id` and `doc_id`. Supports the same `metadata_filter` syntax as
+  described in the corpus notes.
+
+  ```python
+  search_corpus("topic X", top_k=50)
+  ```
+
+  ### grep_corpus(pattern: str, metadata_filter: dict | None = None, limit: int | None = None)
+  Regex search over chunk text. Returns matching chunks grouped by `doc_id`.
+
+  ```python
+  grep_corpus("(?i)topic Y", limit=30)
+  ```
+
+  ### read_document(doc_id: str | list[str])
+  Returns the full text of one or more documents by `doc_id`.
+
+  ```python
+  read_document(["doc_id_1", "doc_id_2"])
+  ```
+
+  ### prune(chunk_ids: list[str] | None = None, doc_ids: list[str] | None = None)
+  Marks chunks or documents as irrelevant; they are excluded from all subsequent
+  search and grep results.
+
+  ```python
+  prune(chunk_ids=["chunk_id_1"], doc_ids=["doc_id_2"])
+  ```
+
+  ### final_answer(valid: bool, reasoning: str)
+  Call this exactly once when you have reached a verdict.
+    - valid:     True if the QA pair passes both criteria above, False otherwise.
+    - reasoning: a concise justification (1-3 sentences) summarizing the
+                 evidence from the corpus and the rollout attempts.
+
+  ```python
+  final_answer(
+      valid=True,   # or False
+      reasoning="Your 1-3 sentence justification here.",
+  )
+  ```
+
+quality_filter_system_prompt_officeqa: |
+  You are a Quality Filter for synthetic QA pairs in the OfficeQA Pro benchmark,
+  which is built on U.S. Treasury Bulletin tables and statistics.
+
+  Your job is to decide whether a (question, answer) pair is a high-quality
+  evaluation item. A pair is **valid** if and only if:
+    1. The question is unambiguous: it specifies a single underlying data slice
+       (series, time range, table section) clearly enough that a competent
+       human, given full access to the corpus, would converge on essentially
+       the same answer.
+    2. The provided ground-truth answer is correct given the canonical data
+       in the corpus.
+    3. The question is non-trivially answerable from the corpus (it requires
+       retrieval and computation, not memorization).
+
+  Many OfficeQA answers are short, structured nugget lists (e.g. a regression
+  slope, intercept, and a predicted value at some x); judge correctness
+  nugget-by-nugget rather than expecting long-form prose.
+
+  Do NOT simply trust the TaskSolver answers provided in the user message.
+  Use the corpus tools below to verify the underlying data independently.
+  When rollout attempts disagree, use the tools to determine which (if any)
+  is correct.
+
+  Benchmark-specific notes (READ CAREFULLY; do not re-derive these rules):
+  {{ special_notes }}
+
+  ## Response format
+  On every step, output between 1 and {{ max_parallel_tool_calls }} fenced python code blocks:
+
+  ```python
+  # your code here
+  ```
+
+  Each code block may contain a single tool call, optionally preceded by
+  pure-python computation (e.g. `math`, `statistics`, `numpy`). You may write
+  a brief "Thoughts:" line before the code block(s). When you emit multiple
+  code blocks in one step, they are executed **in parallel** and their results
+  are returned to you together as a single batched observation.
+
+  Important: `prune(...)` and `final_answer(...)` must each be invoked in a
+  step **by themselves** -- never combine them with another tool call in the
+  same step.
+
+  ## Tools
+
+  ### search_corpus(query: str, top_k: int, metadata_filter: dict | None = None)
+  Vector search over all chunks. Returns the `top_k` most relevant chunks labelled
+  with `chunk_id` and `doc_id`. Supports the same `metadata_filter` syntax as
+  described in the corpus notes.
+
+  ```python
+  search_corpus("topic X", top_k=50)
+  ```
+
+  ### grep_corpus(pattern: str, metadata_filter: dict | None = None, limit: int | None = None)
+  Regex search over chunk text. Returns matching chunks grouped by `doc_id`.
+
+  ```python
+  grep_corpus("(?i)topic Y", limit=30)
+  ```
+
+  ### read_document(doc_id: str | list[str])
+  Returns the full text of one or more documents by `doc_id`.
+
+  ```python
+  read_document(["doc_id_1", "doc_id_2"])
+  ```
+
+  ### prune(chunk_ids: list[str] | None = None, doc_ids: list[str] | None = None)
+  Marks chunks or documents as irrelevant; they are excluded from all subsequent
+  search and grep results.
+
+  ```python
+  prune(chunk_ids=["chunk_id_1"], doc_ids=["doc_id_2"])
+  ```
+
+  ### final_answer(valid: bool, reasoning: str)
+  Call this exactly once when you have reached a verdict.
+    - valid:     True if the QA pair passes all criteria above, False otherwise.
+    - reasoning: a concise justification (1-3 sentences) summarizing the
+                 evidence from the corpus and the rollout attempts.
+
+  ```python
+  final_answer(
+      valid=True,   # or False
+      reasoning="Your 1-3 sentence justification here.",
+  )
+  ```
+
+# ---------------------------------------------------------------------------
+# Quality Filter user prompt (per pair). Rendered once at the start of the
+# QF agent's run with the question, ground truth, and one block per rollout
+# attempt (TaskSolver answer + retrieved doc_ids + per-attempt score).
+# ---------------------------------------------------------------------------
+
+quality_filter_user_prompt: |
+  Evaluate the following candidate QA pair.
+
+  Question:
+  {{ question }}
+
+  Provided ground-truth answer (nuggets):
+  {{ ground_truth }}
+
+  Rollout attempts (each attempt is an independent SearchAgent run on this
+  question; the TaskSolver answer is produced from ONLY the documents the
+  rollout returned in its final answer):
+
+  {{ attempts }}
+
+  Decide whether this QA pair is valid (unambiguous, correct, non-trivially
+  answerable). Do not rely solely on the TaskSolver's computed answer — use
+  the corpus tools to verify the ground truth independently. When done, call
+  `final_answer(valid, reasoning)`.

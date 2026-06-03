@@ -1,6 +1,39 @@
 # Dataset-specific notes about the treasury bulletin collection.
 # Templated into the system prompt via the `special_notes` variable
 # (rendered into the `## Notes About This Corpus` section).
+browsecomp_plus_special_notes: |
+  The corpus consists of 100,195 web pages scraped from URLs relevant to 830 complex, multi-hop fact-seeking questions from BrowseComp. It was assembled in two stages: (1) human-verified positive evidence documents that support the reasoning chain needed to answer each question, and (2) hard-negative documents mined by decomposing each question into sub-queries, running them through web search, and scraping the results. On average, each query is associated with ~6 evidence documents, ~76 hard negatives, and ~3 gold documents (those that implicitly contain the final answer). Average document length is ~5,179 words.
+
+  ### Identifier formats
+  - `doc_id`: a numeric string identifying each scraped web page (e.g. `"4217"`). This is the `docid` field from the `Tevatron/browsecomp-plus-corpus` HuggingFace dataset.
+  - `chunk_id`: `"{doc_id}_{element_id}"` (e.g. `"4217_3"` = the 4th element, 0-indexed, of document 4217). Elements are produced by splitting the document text on `\n\n` and merging consecutive paragraphs until each chunk reaches ~1024 tokens.
+  - When you call `final_answer(page_keys=[...])`, each page key uses the `doc_id` format above.
+
+  ### Available metadata fields (for use with `metadata_filter`)
+  Every chunk has the following metadata you can filter on:
+  - `doc_id`: string, the numeric web-page identifier (see above).
+  - `chunk_id`: string, `"{doc_id}_{element_id}"`.
+  - `url`: string, the exact source URL of the web page (equality/set-membership only — ChromaDB does not support substring or prefix matching).
+  - `element_id`: integer, 0-based index of the chunk within its document.
+
+  ### Example `metadata_filter` clauses
+  ```python
+  # all chunks from a single document
+  {"doc_id": "4217"}
+
+  # only the first two elements of a document (often page title + intro)
+  {"$and": [{"doc_id": "4217"}, {"element_id": {"$in": [0, 1]}}]}
+
+  # all chunks from a known set of relevant documents
+  {"doc_id": {"$in": ["4217", "8031", "12500"]}}
+
+  # only the first element of every document (useful for a title-level scan)
+  {"element_id": 0}
+
+  # all chunks from an exact known URL
+  {"url": "https://example.com/some-article"}
+  ```
+
 officeqa_special_notes: |
   The corpus consists of U.S. Treasury bulletins from 1939 to 2025 Q3. From 1939-1982, every month had a single bulletin. Starting in 1983, bulletins were released quarterly (i.e. in months 3, 6, 9, and 12). Each bulletin is split into pages, and each page is treated as one "document" (with its own `doc_id`).
 
@@ -40,13 +73,15 @@ search_agent_system_prompt: |
   The corpus is organized as a set of *documents*, each identified by a `doc_id`. Every document is further split into *chunks* (text spans, table fragments, titles, etc.), each identified by a `chunk_id`. Each chunk carries metadata you can filter on; the exact metadata schema and identifier formats for this particular corpus are described in the "Notes About This Corpus" section below.
 
   ## Response format
-  On every step, output exactly ONE fenced python code block of the form:
+  On every step, output between 1 and {{ max_parallel_tool_calls }} fenced python code blocks of the form:
 
   ```python
   # your code here
   ```
 
-  The code block must contain a single call to one of the tools listed below. Do not output any other code blocks, and do not output multiple tool calls in a single step. You may write a brief "Thoughts:" line before the code block.
+  Each code block must contain a single call to one of the tools listed below. You may write a brief "Thoughts:" line before the code block(s). When you emit multiple code blocks in one step, they are executed **in parallel** and their results are returned to you together as a single batched observation -- use this to issue several independent retrievals at once (e.g. several `search_corpus` / `grep_corpus` queries for different sub-topics).
+
+  Important: `prune(...)` and `final_answer(...)` must each be invoked in a step **by themselves** -- never combine them with another tool call in the same step.
 
   ## Tools
   In each step, you must invoke one of the following tools:
