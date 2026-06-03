@@ -2,8 +2,8 @@
 in `multi_turn_agent`). Each co-locates its API (`__call__`, what the model
 invokes) and its prompt documentation (`doc`). `resolve_lookup_tools` selects the
 active list from an explicit override or `SkunkConfig.lookup_tools` (else all
-registered tools); the lookup agent pairs that list with a free-text
-prioritization string (`DEFAULT_PRIORITIZATION`) when none is supplied.
+registered tools); the `DEFAULT_PRIORITIZATION` guidance below is folded
+statically into the lookup agent's `briefing`.
 
 Each tool is a **thin wrapper** over one external API: it adds only
 authentication and shared transport (a per-source `get_rate_limiter(...)` cap +
@@ -19,15 +19,14 @@ import os
 import re
 import ssl
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from skunk.common import _RateLimiter, get_rate_limiter
+from skunk.config import SkunkConfig
 from skunk.multi_turn_agent import Tool
-
-if TYPE_CHECKING:
-    from skunk.config import SkunkConfig
 
 
 try:
@@ -106,13 +105,10 @@ class FredTool(Tool):
 
     doc = """\
 ### fetch_fred(endpoint, params={})
-Thin wrapper over the **full FRED API** (https://fred.stlouisfed.org/docs/api/fred/).
-`endpoint` is a FRED path; `params` its query args. The tool adds only your
-api_key + file_type=json and returns the parsed JSON — you pick the endpoint and
-params and parse the response. Pull a whole series (with server-side aggregation
-via `frequency`/`aggregation_method`) in ONE call; never loop single observations.
+FRED API (https://fred.stlouisfed.org/docs/api/fred/). `endpoint` is a FRED path,
+`params` its query args; returns parsed JSON. Pull a whole series in one call via
+`frequency`/`aggregation_method`; don't loop single observations.
 ```python
-# annual averages of the personal saving rate, 1959–1990, in one request
 resp = fetch_fred("series/observations",
                   {"series_id": "PSAVERT", "observation_start": "1959-01-01",
                    "observation_end": "1990-12-31",
@@ -120,9 +116,8 @@ resp = fetch_fred("series/observations",
 obs = [(o["date"], float(o["value"])) for o in resp["observations"] if o["value"] != "."]
 hits = fetch_fred("series/search", {"search_text": "personal saving rate"})  # find a series_id
 ```
-Coverage: daily FX/rate spot series (EXUSUK, EXCAUS, DEX*) begin ~Jan 1971; CPI
-(CPIAUCSL seasonally adjusted, CPIAUCNS not) back to 1947. For pre-1971 FX or
-other pre-API history FRED returns nothing — fall back to tavily_search / fetch_url."""
+FX/rate spot series (EXUSUK, EXCAUS, DEX*) from ~1971; CPI (CPIAUCSL SA, CPIAUCNS
+NSA) from 1947. Pre-API history returns nothing — use tavily_search / fetch_url."""
 
 
 class BlsTool(Tool):
@@ -143,17 +138,15 @@ class BlsTool(Tool):
 
     doc = """\
 ### fetch_bls(payload)
-Thin wrapper over the **BLS Public Data API v2** `timeseries/data`
-(https://www.bls.gov/developers/api_signature_v2.htm). `payload` is the POST body;
-the tool injects your registrationkey + returns the parsed JSON. You parse it.
+BLS Public Data API v2 timeseries/data (https://www.bls.gov/developers/api_signature_v2.htm).
+`payload` is the POST body; returns parsed JSON.
 ```python
 resp = fetch_bls({"seriesid": ["CUUR0000SA0"], "startyear": "1960",
                   "endyear": "1962", "annualaverage": True})
 data = resp["Results"]["series"][0]["data"]   # [{year, period, periodName, value}, ...]
 ```
-Limits: ≤20 years per request and ≤50 series with a registered key (10 / 25
-without). CPI-U is CUUR0000SA0 (NSA) / CUSR0000SA0 (SA); annual averages appear
-as period "M13" (request "annualaverage": True)."""
+≤20 years and ≤50 series per request (10/25 without a key). CPI-U: CUUR0000SA0
+(NSA) / CUSR0000SA0 (SA); annual average is period "M13" (set annualaverage=True)."""
 
 
 class WorldBankTool(Tool):
@@ -172,17 +165,15 @@ class WorldBankTool(Tool):
 
     doc = """\
 ### fetch_world_bank(path, params={})
-Thin wrapper over the **World Bank Indicators API v2**
-(https://datahelpdesk.worldbank.org/knowledgebase/articles/889392). `path` is the
-path after `/v2/`; `params` its query args. No key; the tool adds format=json and
-returns the parsed JSON — a `[metadata, [observations]]` list.
+World Bank Indicators API v2 (https://datahelpdesk.worldbank.org/knowledgebase/articles/889392).
+`path` follows `/v2/`, `params` its query args; returns a [metadata, [observations]] list.
 ```python
 resp = fetch_world_bank("country/USA/indicator/NY.GDP.MKTP.CD",
                         {"date": "2003:2012", "per_page": 100})
 rows = resp[1]   # [{"date": "2012", "value": 16253970000000.0, ...}, ...]
 ```
-Annual data; most indicators start ~1960 and are country-dependent (ISO-3 codes;
-common: NY.GDP.MKTP.CD, NY.GDP.MKTP.CN, SP.POP.TOTL, NY.GDP.PCAP.CD)."""
+Annual data from ~1960; country via ISO-3 codes. Common: NY.GDP.MKTP.CD,
+NY.GDP.MKTP.CN, SP.POP.TOTL, NY.GDP.PCAP.CD."""
 
 
 class TavilySearchTool(Tool):
@@ -192,30 +183,30 @@ class TavilySearchTool(Tool):
         """Thin wrapper over the Tavily Search API
         (https://docs.tavily.com/api-reference/endpoint/search). `query` plus any
         kwargs (max_results, search_depth, topic, time_range, include_domains,
-        exclude_domains, include_raw_content, ...) pass straight through to the
-        Tavily client; auth (TAVILY_API_KEY) is injected at the client. Answer
-        synthesis is always off (`include_answer=False`, not overridable) — it can
-        hallucinate numbers. Returns the full Tavily JSON response — you parse it."""
-        kwargs.pop("include_answer", None)  # forced off below; not the model's to set
+        exclude_domains, ...) pass straight through to the Tavily client; auth
+        (TAVILY_API_KEY) is injected at the client. `include_answer=False` is forced
+        (answer synthesis can hallucinate numbers). Returns the Tavily JSON, whose
+        results are short snippets only — fetch_url a promising hit for full text."""
+        kwargs.pop("include_answer", None)        # forced off below; not the model's to set
+        kwargs.setdefault("max_results", 10)      # prefer breadth; the model may override
         get_rate_limiter("tavily").acquire()
         return _get_tavily().search(query, include_answer=False, **kwargs)
 
     doc = """\
 ### tavily_search(query, **kwargs)
-Thin wrapper over the **Tavily Search API**
-(https://docs.tavily.com/api-reference/endpoint/search). `query` + any kwargs
-(max_results, search_depth, topic, time_range, include_domains, exclude_domains,
-include_raw_content, ...) pass through to Tavily; the tool injects TAVILY_API_KEY
-and returns the full JSON response. (Answer synthesis is always disabled — snippets
-only — because it can hallucinate numbers.)
+Tavily web search (https://docs.tavily.com/api-reference/endpoint/search). `query`
++ kwargs (max_results [default 10], search_depth, time_range, include_domains,
+exclude_domains, ...); returns JSON. Results are short snippets only (`content`) —
+the exact figure is often NOT in the snippet, so fetch_url a promising hit's `url`
+for the full page text (where data tables live).
 ```python
 resp = tavily_search("annual average GBP USD exchange rate 1941",
-                     include_domains=["measuringworth.com"], max_results=5)
+                     include_domains=["measuringworth.com"])
 for h in resp["results"]:
     print(h["url"], "—", h["content"])
+page = fetch_url(resp["results"][0]["url"])   # full text of the best hit
 ```
-Good for values the structured APIs don't cover — pre-1971 FX, pre-API series,
-and one-off figures (MeasuringWorth, central-bank archives)."""
+For values the structured APIs lack — pre-1971 FX, pre-API series, one-off figures."""
 
 
 class FetchUrlTool(Tool):
@@ -240,27 +231,25 @@ class FetchUrlTool(Tool):
 
     doc = """\
 ### fetch_url(url)
-Fetch and return cleaned page text. Soft-fails on errors.
+Fetch a URL → cleaned page text. Soft-fails on errors.
 ```python
 text = fetch_url("https://example.com/historical-rates")
 ```
-Use to read a specific historical-data page found via tavily_search
-(e.g. a MeasuringWorth dataset page) when the snippet alone is too short."""
+Read a specific page found via tavily_search when you need more than the snippet."""
 
 
-# All available lookup tools, keyed by the name the model calls. `final_answer`
-# is NOT here — it is the always-injected loop terminator, not a pluggable tool.
+# All available lookup tools, keyed by the name the model calls. The final answer
+# is NOT here — it is emitted as a ```json``` block and parsed outside the sandbox,
+# not a pluggable tool.
 _REGISTRY: dict[str, Tool] = {
     t.name: t for t in (FredTool(), BlsTool(), WorldBankTool(), TavilySearchTool(), FetchUrlTool())
 }
 
 # Default prioritization guidance (was the inline paragraph in the agent prompt).
 DEFAULT_PRIORITIZATION = """\
-When you see a number that plausibly answers the target in some tool
-output, your VERY NEXT block should be final_answer. Many historical
-lookups have no single canonical precision — multiple sources may
-report slightly different values. Pick the first plausible hit and
-commit. Searching for confirmation is the dominant failure mode."""
+Commit the first plausible hit: once a tool output contains a number that answers
+the target, your next block is your final-answer ```json``` block. Historical values
+vary slightly across sources — don't keep searching for confirmation."""
 
 
 def resolve_lookup_tools(config: "SkunkConfig", explicit: list[Tool] | None = None) -> list[Tool]:

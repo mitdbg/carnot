@@ -10,7 +10,7 @@ import re
 
 from pydantic import BaseModel, ConfigDict
 
-from skunk.common import HarnessContext
+from skunk.common import ExecutionContext
 from skunk.prompted_call import PromptedCall
 
 
@@ -41,7 +41,7 @@ Hard constraints:
   - Skip trivial operations (sum, average, max, ratio, difference).
     Skip pure unit / scope modifiers ("in millions of dollars",
     "for FY 2023").
-  - Include only concepts whose misimplementation would yield the
+  - Include concepts whose misimplementation would yield the
     wrong answer — named statistical operations (geometric mean,
     Zipf exponent, arc elasticity, expected shortfall, Gini,
     H-spread, CAGR, linear regression, etc.), domain-specific
@@ -54,10 +54,10 @@ explanation. Plain text or LaTeX is fine — write naturally, no JSON
 escapes. Separate sections with a blank line.
 
 If no non-obvious concepts apply, output nothing.
-{{ default_tail }}"""
+"""
 
 
-def _parse_concepts(raw: str, ctx: HarnessContext) -> list[ConceptExplanation]:
+def _parse_concepts(raw: str, ctx: ExecutionContext) -> list[ConceptExplanation]:
     """Parse the markdown reply into per-`### ` concept sections. Empty body →
     `[]`; prose without headers → one anonymous block so codegen still sees it."""
     raw = raw.strip()
@@ -85,13 +85,16 @@ def _parse_concepts(raw: str, ctx: HarnessContext) -> list[ConceptExplanation]:
 class QuestionExplainer:
     """One LLM call per question → extracted concepts (empty list when none apply)."""
 
-    def __init__(self) -> None:
-        self._prompt = PromptedCall(
-            name="question_explainer",
-            system_prompt=_QUESTION_SYSTEM_PROMPT,
-            default_effort="low",
-            parse=_parse_concepts,
-        )
+    _prompt = PromptedCall(
+        name="question_explainer",
+        system_prompt=_QUESTION_SYSTEM_PROMPT,
+        default_effort="low",
+        parse=_parse_concepts,
+        output_instruction=(
+            "Output one `### <Concept>` markdown section per concept "
+            "(1–3 sentences each), or nothing if no non-obvious concepts apply."
+        ),
+    )
 
-    def run(self, ctx: HarnessContext, *, question: str) -> list[ConceptExplanation]:
-        return self._prompt.call(ctx, f"Question:\n{question}")
+    async def run(self, ctx: ExecutionContext, *, question: str) -> list[ConceptExplanation]:
+        return await self._prompt.call(ctx, f"Question:\n{question}")

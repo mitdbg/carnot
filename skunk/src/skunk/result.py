@@ -3,9 +3,8 @@
 `ExecutionResult` is the orchestrator's typed return contract — the answer and
 terminal status, read programmatically (e.g. by the eval harness). It is **not**
 observability: per-operator boundaries are logged through the event stream as
-`("orchestrator", "step")` events, not stored here. `describe_value` / `full_repr`
-summarize an operator's return value into that boundary event's
-`output_desc` / `output_full`.
+`step …` events, not stored here. `describe_value` summarizes an operator's
+return value into that boundary event's `output=` description.
 
 Pure data + formatting; no operator or LLM imports.
 """
@@ -47,22 +46,3 @@ def describe_value(v: Any) -> str:
         return f"list({len(v)} branches)"
     s = repr(v)
     return s[:100] + ("..." if len(s) > 100 else "")
-
-
-def full_repr(v: Any) -> str:
-    """Untruncated repr for the boundary event's `output_full`."""
-    if v is None:
-        return "(none)"
-    if isinstance(v, Plan):
-        return v.model_dump_json(indent=2)
-    if isinstance(v, list) and v and isinstance(v[0], PageRef):
-        refs = "\n    ".join(repr(r) for r in v)
-        return f"page refs ({len(v)}):\n    {refs}"
-    if isinstance(v, list) and v and isinstance(v[0], AnnotatedValue):
-        return repr(v)
-    if isinstance(v, str):
-        return f"str: {v!r}"
-    if isinstance(v, list):
-        parts = [f"  [{i}] {full_repr(x)}" for i, x in enumerate(v)]
-        return "list:\n" + "\n".join(parts)
-    return repr(v)

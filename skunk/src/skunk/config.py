@@ -14,29 +14,32 @@ if TYPE_CHECKING:
 
 @dataclass
 class SkunkConfig:
-    # Orchestrator + extract fan-out; sized so a typical question is bounded by the
-    # LLM RPM limiter, not the thread pool.
-    max_parallel_workers: int = 16
-
-    # LLM model — all calls go through GCP Vertex AI (bare model names, no `google/`
-    # prefix). Needs GOOGLE_CLOUD_PROJECT + ADC. (env: SKUNK_LLM_MODEL)
-    # LLM request pacing is a process-wide rate limit (env: SKUNK_LLM_RPM), owned by
-    # `common._RATE_LIMITS` alongside every other external service, not by config.
+    # LLM model — all calls go through the AI Studio Gemini API (bare model names,
+    # no `google/` prefix). Needs GEMINI_API_KEY. (env: SKUNK_LLM_MODEL)
+    # LLM request pacing is a process-wide rate limit (env: SKUNK_LLM_RPM, plus
+    # per-model overrides via SKUNK_MODEL_RPM), owned by `common._RATE_LIMITS` /
+    # `common._llm_model_rpm` alongside every other external service, not by config.
     llm_model: str = "gemini-3.5-flash"
-    # Per-call retry: any SDK exception, delay doubling each attempt up to the cap.
-    llm_max_retries: int = 10
-    llm_retry_initial_delay_s: float = 0.05
-    llm_retry_max_delay_s: float = 1.0
+    # Per-call retry: only transient failures (HTTP 429 + 5xx, network timeouts /
+    # connection resets) are retried — see `common._is_retryable`; non-429 4xx
+    # (bad request, auth, context overflow) raises immediately. Delay doubles each
+    # attempt; the retry count bounds total wait on its own (1→2→4→8→16, ~31s
+    # over 5 retries), so no separate delay cap is needed.
+    llm_max_retries: int = 5
+    llm_retry_initial_delay_s: float = 1.0
 
     # Per call-site effort override: `PromptedCall.name` → Effort tier. Missing key →
     # the call-site's `default_effort`; an explicit `effort=` arg still wins over both.
     # (env: SKUNK_EFFORT_OVERRIDES — comma-separated `name=tier` pairs)
     effort_overrides: dict[str, "Effort"] = field(default_factory=dict)
 
-    # Extract operator (env: SKUNK_EXTRACT_N_SAMPLES, SKUNK_EXTRACT_SAMPLE_TEMPERATURE)
-    extract_n_samples: int = 1       # single-sample; multi-sample + dedup disabled (no measured accuracy gain)
-    extract_sample_temperature: float = 0.7
-    extract_max_pages: int = 5       # page cap per tier
+    # Per call-site model override: `PromptedCall.name` → model id. Missing key →
+    # `llm_model`. Lets one run mix models (e.g. a strong default with cheap Flash
+    # pinned on `question_explainer` / `compute.critique`). Agent loops use
+    # `agent_model_id` instead. Each model is paced by its own RPM bucket — see
+    # `common._llm_model_rpm` (env SKUNK_MODEL_RPM).
+    # (env: SKUNK_MODEL_OVERRIDES — comma-separated `name=model` pairs)
+    model_overrides: dict[str, str] = field(default_factory=dict)
 
     # Compute operator
     compute_max_attempts: int = 3
@@ -68,7 +71,7 @@ class SkunkConfig:
     agent_max_steps: int = 20
     agent_max_pages_per_tool_call: int = 20
 
-    # Step cap for the lookup_external agent (terminates earlier via `final_answer`).
+    # Step cap for the lookup_external agent (terminates earlier via its final-answer JSON block).
     # (env: SKUNK_LOOKUP_MAX_STEPS)
     lookup_max_steps: int = 8
     # Active lookup tools by name (see `lookup_tools._REGISTRY`); None → all tools.
@@ -91,11 +94,9 @@ class SkunkConfig:
         return cls(
             llm_model=os.environ.get("SKUNK_LLM_MODEL", "gemini-3.5-flash"),
             effort_overrides=_parse_effort_overrides(os.environ.get("SKUNK_EFFORT_OVERRIDES", "")),
-            llm_max_retries=int(os.environ.get("SKUNK_LLM_MAX_RETRIES", "10")),
-            llm_retry_initial_delay_s=float(os.environ.get("SKUNK_LLM_RETRY_INITIAL_DELAY", "0.05")),
-            llm_retry_max_delay_s=float(os.environ.get("SKUNK_LLM_RETRY_MAX_DELAY", "1.0")),
-            extract_n_samples=int(os.environ.get("SKUNK_EXTRACT_N_SAMPLES", "1")),
-            extract_sample_temperature=float(os.environ.get("SKUNK_EXTRACT_SAMPLE_TEMPERATURE", "0.7")),
+            model_overrides=_parse_model_overrides(os.environ.get("SKUNK_MODEL_OVERRIDES", "")),
+            llm_max_retries=int(os.environ.get("SKUNK_LLM_MAX_RETRIES", "5")),
+            llm_retry_initial_delay_s=float(os.environ.get("SKUNK_LLM_RETRY_INITIAL_DELAY", "1.0")),
             prompt_overrides_path=os.environ.get(
                 "SKUNK_PROMPT_OVERRIDES", "config/prompts/treasury_bulletin.yaml"
             ),
@@ -139,6 +140,30 @@ def _parse_effort_overrides(raw: str) -> dict[str, "Effort"]:
                 f"SKUNK_EFFORT_OVERRIDES tier {tier!r} not in {_EFFORT_VALUES}"
             )
         out[name] = tier  # type: ignore[assignment]
+    return out
+
+
+def _parse_model_overrides(raw: str) -> dict[str, str]:
+    """Parse `SKUNK_MODEL_OVERRIDES` ("name=model,...") into a dict keyed by
+    `PromptedCall.name`. Model ids are free-form (no enum to validate against);
+    an unknown id surfaces as an API error at the call site. Raises ValueError on
+    a missing '=' so config typos fail loudly at startup."""
+    out: dict[str, str] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            raise ValueError(
+                f"SKUNK_MODEL_OVERRIDES entry {entry!r} missing '=' "
+                f"(expected `name=model`)"
+            )
+        name, _, model = entry.partition("=")
+        name = name.strip()
+        model = model.strip()
+        if not model:
+            raise ValueError(f"SKUNK_MODEL_OVERRIDES entry {entry!r} has empty model")
+        out[name] = model
     return out
 
 

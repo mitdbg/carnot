@@ -1,6 +1,6 @@
 """Unified corpus access for the Treasury Bulletin corpus: path resolution, parsed-JSON
 reading (LRU-cached, indexed by 1-based PDF page), PyMuPDF page rendering, and text
-cleaning. Deliberately free of `HarnessContext`/orchestrator coupling so the offline
+cleaning. Deliberately free of `ExecutionContext`/orchestrator coupling so the offline
 prep scripts can import it.
 
 Text accessors read parsed JSON only (cleaner than PyMuPDF text on scanned 1940s-50s
@@ -18,6 +18,7 @@ from pathlib import Path
 
 import fitz
 
+from skunk.common import B64Image
 from skunk.errors import StepFailed
 
 _FILENAME_RE = re.compile(r"treasury_bulletin_(\d{4})_(\d{2})\.pdf$")
@@ -140,9 +141,8 @@ def render_page_b64(
     fmt: str = "png",
     jpg_quality: int | None = None,
     pdf_dir: Path | str | None = None,
-) -> tuple[str, str] | None:
-    """Render a PDF page to in-memory image bytes → (mime, base64). `fmt` is "png"
-    (lossless) or "jpg" (smaller; honors `jpg_quality`). Returns None when the PDF
+) -> B64Image | None:
+    """Render a PDF page to in-memory image bytes. Returns None when the PDF
     doesn't exist; PyMuPDF errors propagate. No disk cache."""
     if month is None or page is None or int(page) <= 0:
         return None
@@ -158,7 +158,7 @@ def render_page_b64(
     else:
         data = pix.tobytes("png")
         mime = "image/png"
-    return mime, base64.standard_b64encode(data).decode()
+    return B64Image(mime=mime, data=base64.standard_b64encode(data).decode())
 
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")

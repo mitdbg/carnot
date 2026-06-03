@@ -19,7 +19,6 @@ import difflib
 import inspect
 import logging
 import math
-import re
 from collections.abc import Callable, Generator, Mapping
 from dataclasses import dataclass
 from functools import wraps
@@ -304,34 +303,6 @@ def get_iterable(obj):
         return list(obj)
     else:
         raise InterpreterError("Object is not iterable")
-
-
-def fix_final_answer_code(code: str) -> str:
-    """
-    Sometimes an LLM can try to assign a variable to final_answer, which would break the final_answer() tool.
-    This function fixes this behaviour by replacing variable assignments to final_answer with final_answer_variable,
-    while preserving function calls to final_answer().
-    """
-    # First, find if there's a direct assignment to final_answer
-    # Use word boundary and negative lookbehind to ensure it's not an object attribute
-    assignment_pattern = r"(?<!\.)(?<!\w)\bfinal_answer\s*="
-    if "final_answer(" not in code or not re.search(assignment_pattern, code):
-        # If final_answer tool is not called in this blob, then doing the replacement is hazardous because it could false the model's memory for next steps.
-        # Let's not modify the code and leave the subsequent assignment error happen.
-        return code
-
-    # Pattern for replacing variable assignments
-    # Looks for 'final_answer' followed by '=' with optional whitespace
-    # Negative lookbehind ensures we don't match object attributes
-    assignment_regex = r"(?<!\.)(?<!\w)(\bfinal_answer)(\s*=)"
-    code = re.sub(assignment_regex, r"final_answer_variable\2", code)
-
-    # Pattern for replacing variable usage but not function calls
-    # Negative lookahead (?!\s*\() ensures we don't match function calls
-    # Negative lookbehind (?<!\.|\w) ensures we don't match object methods or other variables
-    variable_regex = r"(?<!\.)(?<!\w)(\bfinal_answer\b)(?!\s*\()"
-    code = re.sub(variable_regex, "final_answer_variable", code)
-    return code
 
 
 def build_import_tree(authorized_imports: list[str]) -> dict[str, Any]:
@@ -1544,11 +1515,6 @@ def evaluate_ast(
         raise InterpreterError(f"{expression.__class__.__name__} is not supported.")
 
 
-class FinalAnswerException(Exception):
-    def __init__(self, value):
-        self.value = value
-
-
 def evaluate_python_code(
     code: str,
     static_tools: dict[str, Callable] | None = None,
@@ -1595,28 +1561,13 @@ def evaluate_python_code(
     state["_print_outputs"] = PrintContainer()
     state["_operations_count"] = {"counter": 0}
 
-    if "final_answer" in static_tools:
-        previous_final_answer = static_tools["final_answer"]
-
-        def final_answer(*args, **kwargs):  # Allow arbitrary arguments to be passed
-            raise FinalAnswerException(previous_final_answer(*args, **kwargs))
-
-        static_tools["final_answer"] = final_answer
-
     try:
         for node in expression.body:
             result = evaluate_ast(node, state, static_tools, custom_tools, authorized_imports)
         state["_print_outputs"].value = truncate_content(
             str(state["_print_outputs"]), max_length=max_print_outputs_length
         )
-        is_final_answer = False
-        return result, is_final_answer
-    except FinalAnswerException as e:
-        state["_print_outputs"].value = truncate_content(
-            str(state["_print_outputs"]), max_length=max_print_outputs_length
-        )
-        is_final_answer = True
-        return e.value, is_final_answer
+        return result
     except Exception as e:
         state["_print_outputs"].value = truncate_content(
             str(state["_print_outputs"]), max_length=max_print_outputs_length
@@ -1630,7 +1581,6 @@ def evaluate_python_code(
 class CodeOutput:
     output: Any
     logs: str
-    is_final_answer: bool
 
 
 class PythonExecutor:
@@ -1693,7 +1643,7 @@ class LocalPythonExecutor(PythonExecutor):
             )
 
     def __call__(self, code_action: str) -> CodeOutput:
-        output, is_final_answer = evaluate_python_code(
+        output = evaluate_python_code(
             code_action,
             static_tools=self.static_tools,
             custom_tools=self.custom_tools,
@@ -1702,7 +1652,7 @@ class LocalPythonExecutor(PythonExecutor):
             max_print_outputs_length=self.max_print_outputs_length,
         )
         logs = str(self.state["_print_outputs"])
-        return CodeOutput(output=output, logs=logs, is_final_answer=is_final_answer)
+        return CodeOutput(output=output, logs=logs)
 
     def send_variables(self, variables: dict):
         self.state.update(variables)

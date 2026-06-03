@@ -163,7 +163,7 @@ Rules:
 """
 
 
-def one_shot_parent_chapter_retrieve(
+async def one_shot_parent_chapter_retrieve(
     tree: dict[str, Any],
     question: str,
     concept: str,
@@ -210,7 +210,7 @@ def one_shot_parent_chapter_retrieve(
     level_trace.prompt_excerpt = user[:_EXCERPT_MAX_LEN]
 
     t0 = time.monotonic()
-    resp = llm.call(system=_PARENT_PICK_SYSTEM, user=user, temperature=0.0)
+    resp = await llm.acall(system=_PARENT_PICK_SYSTEM, user=user, temperature=0.0)
     level_trace.latency_s = time.monotonic() - t0
     level_trace.output_chars = len(resp.text)
     level_trace.input_tokens = resp.input_tokens

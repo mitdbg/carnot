@@ -22,18 +22,18 @@ Missing ids in a batch response default to `relevant=True` (recall-safe
 on the occasional truncated large-batch response).
 
 Knobs live on `SkunkConfig` (`semfilter_*`). The stages call
-`ctx.llm_client` directly; fan-out is a plain `ThreadPoolExecutor` (no
+`ctx.llm_client.acall` directly; batch fan-out is `asyncio.gather` (no
 hand-rolled retry — the client owns retries).
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 
-from skunk.common import HarnessContext
+from skunk.common import ExecutionContext
 
 from skunk.corpus import page_elements, page_plain_text, parsed_json_dir
 
@@ -308,14 +308,14 @@ def _chunk(seq: list, n: int) -> list[list]:
     return [seq[i:i + n] for i in range(0, len(seq), n)]
 
 
-def _run_stage(
+async def _run_stage(
     survivors: list[tuple[str, int]],
     catalog_index: dict[tuple[str, int], PageCatalogRow],
     key: str,
     period: str | None,
     page_block_fn,
     system_prompt: str,
-    ctx: HarnessContext,
+    ctx: ExecutionContext,
     *,
     batch_size: int,
     workers: int,
@@ -333,22 +333,20 @@ def _run_stage(
 
     kept: set[tuple[str, int]] = set()
 
-    def _one_batch(batch_pages: list[dict]):
+    async def _one_batch(batch_pages: list[dict]):
         user = _build_batch_user_prompt(key, period, batch_pages)
-        resp = ctx.llm_client.call(system=system_prompt, user=user, temperature=0.0)
+        resp = await ctx.llm_client.acall(system=system_prompt, user=user, temperature=0.0)
         return _parse_batch_decisions(resp.text), batch_pages
 
-    # The set is mutated only here in the single-threaded as_completed loop;
-    # the worker just returns parsed decisions, so no lock is needed.
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-        futs = [ex.submit(_one_batch, b) for b in batches]
-        for f in as_completed(futs):
-            parsed, batch_pages = f.result()
-            for p in batch_pages:
-                # Default missing ids to True (recall-safe on the
-                # occasional truncated large-batch response).
-                if parsed.get(p["id"], True):
-                    kept.add((p["bulletin"], p["page"]))
+    # `workers` no longer caps threads (all batches are coroutines on one loop);
+    # the async LLM rate limiter paces concurrency. The set is mutated only in
+    # this single-threaded gather aftermath, so no lock is needed.
+    for parsed, batch_pages in await asyncio.gather(*[_one_batch(b) for b in batches]):
+        for p in batch_pages:
+            # Default missing ids to True (recall-safe on the
+            # occasional truncated large-batch response).
+            if parsed.get(p["id"], True):
+                kept.add((p["bulletin"], p["page"]))
 
     return [pk for pk in survivors if pk in kept]
 
@@ -357,12 +355,12 @@ def _run_stage(
 # Entry point
 # ---------------------------------------------------------------------------
 
-def semantic_filter(
+async def semantic_filter(
     survivors: list[tuple[str, int]],
     catalog_index: dict[tuple[str, int], PageCatalogRow],
     key: str,
     period: str | None,
-    ctx: HarnessContext,
+    ctx: ExecutionContext,
 ) -> tuple[list[tuple[str, int]], dict]:
     """Coarse → fine cascade over one branch's year-filtered survivors.
 
@@ -370,12 +368,12 @@ def semantic_filter(
     and `meta` carries per-stage sizes for the trace.
     """
     cfg = ctx.config
-    coarse_kept = _run_stage(
+    coarse_kept = await _run_stage(
         survivors, catalog_index, key, period,
         _page_meta_block, _COARSE_SYSTEM_PROMPT, ctx,
         batch_size=cfg.semfilter_batch_size, workers=cfg.semfilter_workers,
     )
-    fine_kept = _run_stage(
+    fine_kept = await _run_stage(
         coarse_kept, catalog_index, key, period,
         lambda row: _page_full_block(row, max_chars=cfg.semfilter_max_page_chars),
         _FINE_SYSTEM_PROMPT, ctx,

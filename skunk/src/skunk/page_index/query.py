@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any
 
 from skunk.errors import StepFailed
-from skunk.common import HarnessContext, PageRef
+from skunk.common import ExecutionContext, PageRef
 from skunk.plan import RetrieveBranch
 from skunk.page_index import default_profile
 from skunk.page_index.query_semfilter import semantic_filter
@@ -130,7 +130,7 @@ class PageIndexRetriever:
                 kept.append(c)
         return kept
 
-    def run(self, prev: None, ctx: HarnessContext, *, branch: RetrieveBranch) -> list[PageRef]:
+    async def run(self, prev: None, ctx: ExecutionContext, *, branch: RetrieveBranch) -> list[PageRef]:
         # Document selection follows the reporting vintage when the question pins
         # one (`as_of` — e.g. read the 2013 bulletin for values it reports about
         # 2003/2012); otherwise it follows the data `period`. The data `period`
@@ -149,7 +149,7 @@ class PageIndexRetriever:
 
         # 1. ToC chapter pick. (`concept=` is the helper's internal kwarg
         # name; we pass the NL `key` through unchanged.)
-        chapter_top, trace = one_shot_parent_chapter_retrieve(
+        chapter_top, trace = await one_shot_parent_chapter_retrieve(
             tree, question=ctx.question, concept=key, period=period,
             llm=ctx.llm_client, catalog_index=catalog_index,
         )
@@ -161,7 +161,7 @@ class PageIndexRetriever:
         sem_meta: dict[str, Any] = {"enabled": False}
         if ctx.config.semfilter_enabled and filtered:
             survivors = [(c["bulletin"], int(c["page"])) for c in filtered]
-            kept_keys, sem_meta = semantic_filter(
+            kept_keys, sem_meta = await semantic_filter(
                 survivors, catalog_index, key, period, ctx,
             )
             kept_set = set(kept_keys)
@@ -172,15 +172,11 @@ class PageIndexRetriever:
         trace.top_k = filtered[:50]
 
         ctx.emit(
-            "retrieve", "page-index retrieve",
-            key=key, period=period,
-            catalog_size=trace.catalog_size,
-            chapter_size=len(chapter_top),
-            candidate_count=trace.candidate_count,
-            top_k=trace.top_k,
-            levels=[asdict(lvl) for lvl in trace.levels],
-            picked_chapters=trace.picked_chapters,
-            semfilter=sem_meta,
+            f"page_index_retrieve key={key!r} period={period!r} "
+            f"catalog_size={trace.catalog_size} chapter_size={len(chapter_top)} "
+            f"candidate_count={trace.candidate_count} top_k={trace.top_k!r} "
+            f"levels={[asdict(lvl) for lvl in trace.levels]!r} "
+            f"picked_chapters={trace.picked_chapters!r} semfilter={sem_meta!r}"
         )
 
         refs: list[PageRef] = [

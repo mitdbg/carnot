@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import os
 import time
@@ -24,14 +25,13 @@ BULLETINS_DIR = "treasury_bulletins_cleaned"
 
 @dataclass
 class _OfflineCtx:
-    """Minimal HarnessContext stand-in for the offline harness.
+    """Minimal ExecutionContext stand-in for the offline harness.
 
     `SearchAgent.retrieve()` consults ctx for two things: (a)
     `ctx.prompt_overrides` (empty in this offline path) and (b)
-    `ctx.emit(source, message, **fields)` for per-step trace events.
-    The orchestrator owns the real ctx in the runtime path; here we
-    write each emitted event to a per-question trace file in the
-    same markdown-ish format `Tracer` used to produce.
+    `ctx.emit(message, level=None)` for per-step trace events. The
+    orchestrator owns the real ctx in the runtime path; here we write
+    each emitted message to a per-question trace file.
     """
 
     config: SkunkConfig
@@ -39,10 +39,8 @@ class _OfflineCtx:
     show_output: bool = False
     prompt_overrides: tuple = field(default_factory=tuple)
 
-    def emit(self, source: str, message: str, **fields) -> None:
-        header = f"## {source}: {message}\n"
-        body = fields.get("content", "")
-        line = header + (str(body) + "\n\n" if body else "\n")
+    def emit(self, message: str, level: str | None = None) -> None:
+        line = f"## {message}\n\n"
         self.trace_file.write(line)
         self.trace_file.flush()
         if self.show_output:
@@ -69,7 +67,9 @@ def _run_one(
             clean_page_map=clean_page_map,
             chroma_collection=chroma_collection,
         )
-        page_keys = agent.retrieve(ctx, question)
+        # `SearchAgent.retrieve` is async (request-time path); this offline harness
+        # is sync and runs each UID on a pool thread, so bridge with a per-call loop.
+        page_keys = asyncio.run(agent.retrieve(ctx, question))
 
     # Compute accuracy against ground truth.
     source_page_keys = source_docs_to_page_keys(str(row.get("source_docs", "")))

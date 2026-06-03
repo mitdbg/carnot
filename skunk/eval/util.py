@@ -16,9 +16,8 @@ if TYPE_CHECKING:
     from skunk.result import ExecutionResult
 
 
-# Per-field repr cap in trace dumps. LLM input/output text is kept full for
-# cost/latency post-mortems; everything else is capped so a single trace
-# stays human-scannable on stderr.
+# Per-event message cap in trace dumps, so a single trace stays human-scannable.
+# The JSONL sink keeps each message whole for post-mortems.
 _TRACE_FIELD_MAX_REPR = 800
 
 
@@ -59,11 +58,10 @@ def dump_trace(
     lines.append(f"Final answer: {result.answer!r}")
     lines.append("")
 
-    # Operator boundaries are `("orchestrator", "step")` events carrying
-    # op / elapsed / output / error, stamped with their step_idx like every other
-    # event. Group all events by step_idx; for each step the boundary event is the
-    # header and the rest are its internals. step_idx=None events go in an
-    # "ungrouped" preamble.
+    # Every event carries a `(step_idx, op)` stamp. Group by step_idx; the orchestrator's
+    # one `step ...` boundary event per operator call sits in its group like any other
+    # line (its message holds elapsed/output/error inline). step_idx=None events
+    # (out-of-step orchestrator emits) go in an "ungrouped" preamble.
     by_step: dict[int, list[dict]] = {}
     ungrouped: list[dict] = []
     for ev in events:
@@ -82,50 +80,21 @@ def dump_trace(
 
     for idx in sorted(by_step):
         evs = by_step[idx]
-        boundary = next(
-            (e for e in evs if e.get("source") == "orchestrator" and e.get("message") == "step"),
-            None,
-        )
-        # Every event in the group carries the same `op` (stamped by ctx.step);
-        # the boundary may be absent only on an uncaught crash, so read it off any event.
         op = evs[0].get("op", "?")
-        elapsed = (boundary or {}).get("elapsed_s")
-        head = f"Step {idx}: {op}"
-        if isinstance(elapsed, (int, float)):
-            head += f"  ({elapsed:.2f}s)"
         lines.append("-" * 80)
-        lines.append(head)
-        if boundary and boundary.get("error"):
-            lines.append(f"  ERROR: {boundary['error']}")
-        elif boundary:
-            lines.append(f"  out: {boundary.get('output_full', '')}")
-        internals = [e for e in evs if e is not boundary]
-        if internals:
-            lines.append("  events:")
-            for ev in internals:
-                lines.extend(_format_event(ev))
+        lines.append(f"Step {idx}: {op}")
+        for ev in evs:
+            lines.extend(_format_event(ev))
         lines.append("")
 
     out.write_text("\n".join(lines), encoding="utf-8")
 
 
-# Per-event meta keys rendered in the header / step grouping, not as fields.
-_EVENT_META = {"source", "message", "step_idx", "op", "level"}
-
-
 def _format_event(ev: dict) -> list[str]:
-    """Render one captured event as indented trace lines: a `[source] message`
-    header (prefixed with the level when not "info") plus its fields."""
-    src = ev.get("source", "")
+    """Render one captured event as an indented trace line: the event `message`
+    (prefixed with the level when not "info"), capped for scannability — the JSONL
+    sink keeps the full text."""
     msg = ev.get("message", "")
     level = ev.get("level", "info")
     prefix = f"{level.upper()} " if level != "info" else ""
-    out = [f"    {prefix}[{src}] {msg}"]
-    for k, v in ev.items():
-        if k in _EVENT_META:
-            continue
-        s = repr(v)
-        if k not in ("input_text", "output_text"):
-            s = truncate(s, _TRACE_FIELD_MAX_REPR, "...(truncated)")
-        out.append(f"      {k}: {s}")
-    return out
+    return [f"    {prefix}{truncate(msg, _TRACE_FIELD_MAX_REPR, '...(truncated)')}"]

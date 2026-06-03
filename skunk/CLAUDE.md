@@ -1,163 +1,76 @@
 # CLAUDE.md
 
-Guide for Claude Code sessions on this repo.
-
-## 🚨 BEFORE RUNNING ANY EVALUATION SCRIPT — READ THIS FIRST 🚨
-
-**32 of the 133 dev UIDs are reserved as a HELD-OUT TEST SET** (see
-`eval/test_set_uids.json`). Tuning prompts/code against them, inspecting
-their traces, or including them in any benchmark run counts as
-contamination. The remaining **101 UIDs are the dev set**.
-
-Before running ANY `--n N`, `--uids UIDxxxx,...`, or "all-questions" sweep:
-
-1. **Verify the eval script excludes test UIDs by default.** Every eval
-   harness in this repo (`eval/eval_e2e.py`, any new one) MUST load
-   `eval/test_set_uids.json` and filter them out unless
-   `--include-test-set` is explicitly passed.
-2. **If you're writing a new eval script**, add the test-set filter
-   BEFORE running anything. Don't sample-then-filter — that wastes calls.
-3. **If you're invoking with `--uids`**, intersect the requested UIDs
-   with `eval/test_set_uids.json["uids"]` and ABORT (not warn) if any
-   match. There is no legitimate reason to point at test UIDs from a
-   command line unless `--include-test-set` is set.
-4. **When reporting numbers**, always state whether they're on dev
-   (101 UIDs) or include the test set (133 UIDs). Numbers on the full
-   133 set are contaminated for any claim about generalization.
-
-If you find a script that doesn't enforce this filter, **fix the script
-before running** — otherwise everything you tune downstream is biased.
-
-See "Held-out test set" section below for the canonical list and seed.
+Operational guide for Claude Code sessions on this repo. For how the system actually
+works — architecture, design intent, the plan-shape spec — read `ARCHITECTURE.md`.
 
 ## What this is
 
-OfficeQA — a declarative QA pipeline over the U.S. Treasury Bulletin corpus (696 monthly PDFs, 1939–2025). Questions are answered by composing 4 operators into a typed DSL plan; an orchestrator walks the plan and dispatches each operator.
+OfficeQA — a declarative QA pipeline over the U.S. Treasury Bulletin corpus (696 monthly
+PDFs, 1939–2025). Questions are answered by composing 4 operators
+(`retrieve` / `extract` / `lookup_external` / `compute`) into a typed DSL plan that an
+orchestrator walks. Benchmark: `data/officeqa_pro.csv` (133 questions = 101 dev + 32 test;
+not tracked in git, keep locally).
 
-The benchmark is `data/officeqa_pro.csv` (133 questions: **101 dev + 32 test**; not tracked in git, keep locally).
+## 🚨 Held-out test set — READ BEFORE ANY EVAL RUN 🚨
 
-## Architecture in one screen
+**32 of the 133 benchmark UIDs are a HELD-OUT TEST SET — do not run on these during
+development.** The canonical list (plus the sampling seed + rationale) is
+`eval/test_set_uids.json`; the other **101 are dev**. Tuning prompts/code against the 32,
+inspecting their traces, or including them in a run is contamination that biases
+everything downstream.
 
-- Question → planner emits DSL plan (text) → orchestrator walks AST → 4 operators.
-- 4 ops: `retrieve`, `extract`, `lookup_external`, `compute`. `compute` is the chain terminator and subsumes formatting (it self-plans, codegens, execs, then self-critiques the result against the question with full context — same domain prompt as the producer, no info asymmetry). `extract` accepts `visual_only=True` to skip the parsed-text tier for charts and figures.
-- Extract emits one of three **kinds** per entry: `scalar`, `vector` (1-D series indexed by one dim), or `table` (2-D grid). Vector/table cells are always primitive scalars — nesting is forbidden and enforced in the extract parser. See the "Plan shape" section in `ARCHITECTURE.md` for the contract.
-- Retrieval is **page-level**: `PageRef.page` is the **1-based PDF page index** — the only page-number convention used in the codebase. `RetrieveOp` in `src/skunk/retrieve.py` picks one of three backends per call: golden bypass first (when `ctx.config.golden_pages` is set), then routes per `config.retriever` to `"search_agent"` (default — the iterative ChromaDB + LLM-loop retriever vendored under `src/skunk/search_agent/`; returns page keys that are mapped to `PageRef` via `models.page_key_to_pageref`) or `"page_index"` (the page-index retriever at `src/skunk/page_index/query.py:PageIndexRetriever` — ToC chapter pick → year filter → two-stage parallel semantic filter). The search agent needs `cache/chromadb/` + `cache/clean_page_map.json` built offline (see `src/skunk/search_agent/prep/`); first non-golden call fails fast with a clear error if either is missing.
-- Extract is per-page tier dispatch: parsed-table text → vision render. No cross-page search.
-- See `ARCHITECTURE.md` for design intent + plan shape; the canonical JSON-schema spec for plans lives in `PlannerPromptedCall.system_prompt` in `src/skunk/plan.py`.
+- Every eval harness MUST load `eval/test_set_uids.json` and filter the 32 out by
+  default. `--include-test-set` overrides only for a deliberate final-number run.
+- Writing a new eval script: copy the filter from `eval/eval_e2e.py` and wire it in
+  BEFORE the first LLM call. Verify by grepping the script for `test_set_uids`; if it's
+  missing, fix the script before running.
+- Invoking with `--uids`: intersect with the test set and ABORT (not warn) on any match.
+- Reporting numbers: always state dev-only (101) vs full (133). Full-set numbers are
+  contaminated for any generalization claim.
+- Expanding the test set later: re-sample; never add UIDs already tuned against.
 
-## Layout
+Test UIDs: UID0035, UID0036, UID0039, UID0050, UID0065, UID0068, UID0073, UID0093,
+UID0094, UID0100, UID0108, UID0118, UID0120, UID0134, UID0147, UID0161, UID0168, UID0170,
+UID0179, UID0182, UID0183, UID0187, UID0196, UID0204, UID0211, UID0212, UID0216, UID0218,
+UID0227, UID0230, UID0238, UID0240.
 
-The agent has no CLI of its own. Public API is `from skunk import Orchestrator, HarnessContext, SkunkConfig, Plan, PageRef, ...` (see `src/skunk/__init__.py`); CLI/UX layers (eval harnesses, future chat UI) live outside `skunk/` and build on top.
+## Running experiments
 
-- `src/skunk/__init__.py` — public API re-exports
-- `src/skunk/plan.py` — `Plan` dataclass (+ `Computation`, `Presentation`, `RetrieveBranch`, `LookupBranch`) + JSON serde + validator + `PlannerPromptedCall` (question → Plan)
-- `src/skunk/orchestrator.py` — `Orchestrator(ctx).execute()` — Plan executor; instantiates one operator-level class per op (`RetrieveOp` / `ExtractOp` / `ComputeOp`, plus `LookupExternalOp` which doubles as both operator and call-site since `lookup_external` is a single LLM call) and dispatches through their `.run()` methods
-- `src/skunk/{retrieve,extract,lookup_external,compute}.py` — one module per operator; each exposes an operator-level class with a `run(prev, ctx, **kwargs)` method (call-site `PromptedCall` subclasses live alongside as instance attributes on the operator class)
-- `src/skunk/multi_turn_agent.py` — `MultiTurnAgent` loop base + the shared **`Tool`** ABC (one class per tool, co-locating its `__call__` API and `doc` prompt block; deps captured in `__init__`) and `render_tools_into(template, tools)` (splices tool `doc`s into a `{{ tools_doc }}` marker before Jinja render, so docs and the bound callables can't drift). Both the lookup and search agents define their tools as `Tool` subclasses. `final_answer` is the always-injected terminator, never a `Tool`.
-- `src/skunk/lookup_tools.py` — the lookup agent's `Tool` subclasses (FRED/BLS/World Bank/Tavily/fetch_url), the `_REGISTRY`, `DEFAULT_PRIORITIZATION`, and `resolve_lookup_tools` (active list from explicit override → `config.lookup_tools` (env `SKUNK_LOOKUP_TOOLS`) → all). The agent is configured with a list of tools + a prioritization string.
-- `src/skunk/errors.py` — cross-module signals: `StepFailed`, `MissingData`
-- `src/skunk/pyexec.py` — in-process Python exec for operator-generated code (not a security boundary; real isolation is future work): `exec_python_with_env`, `strip_code_fences`. Thin wrapper over `src/skunk/local_python_executor.py`.
-- `src/skunk/local_python_executor.py` — the smolagents-derived `LocalPythonExecutor` sandbox engine (AST-walked eval, import/dunder blocklists). Top-level shared infra: `pyexec.py` wraps it for `compute`/`lookup_external` codegen; `multi_turn_agent` drives it directly for the lookup/search agent loops.
-- `src/skunk/prompted_call.py` — `PromptedCall` base: prompt-assembly for every LLM-prompted call-site inside an operator (planner, extract.text/vision/dedup, compute.codegen/critique, lookup_external). Also the `PromptOverride` type + `load_prompt_overrides` YAML loader (corpus / few-shots / lessons), since `PromptedCall` is their primary consumer.
-- `src/skunk/common.py` — shared runtime: `LLMClient` (direct-Gemini via `google-genai`), `LLMResponse`, rate-limit + retry helpers, plus the cross-cutting types threaded between operators and the orchestrator: `PageRef`, `AnnotatedValue` (with `.frame` pandas accessor), `HarnessContext`
-- `src/skunk/config.py` — `SkunkConfig` (model, RPM, retry, extract/compute knobs)
-- `src/skunk/corpus.py` — unified corpus access (paths, parsed-JSON loading + per-page element index, PyMuPDF page rendering, text-cleaning primitives). Every consumer — `extract`, the `page_index` build pipeline and `query_semfilter`, and the `search_agent/prep/` scripts — reads the corpus through this one module.
-- `src/skunk/page_index/` — split into a **build pipeline** (`pipeline.py` + `stages/` + `corpora/`, produces the catalog + concept tree) and a **query path** (`query.py` = `PageIndexRetriever`; `query_toc.py` = ToC chapter pick; `query_semfilter.py` = two-stage parallel semantic filter), over shared base modules (`schema.py`, `util.py`, `profile.py`) and the top-level `corpus.py` for corpus I/O. Query pipeline: ToC pick → year filter → semantic filter → candidate set.
-- `src/skunk/search_agent/` — teammate's iterative search agent merged from `refs/heads/skunk`. Self-contained subtree: `search_agent.py` (the agent), `search_tools.py` (`Tool` subclasses `VectorSearchTool` / `RetrievePageInfoTool` / `RunGrepTool`, built from the shared `Tool` ABC), `prompts.yaml`, `openrouter_client.py` (local shim around the `openai` SDK — stands in for the unknown `openrouter` PyPI package the teammate imported), `prep/` (offline corpus prep: `page_cleaner.py`, `create_vector_db.py`, `compute_element_embeddings.py`). The post-merge utility unification is largely done: the tracer is gone (events flow through `ctx.emit`), the sandbox executor has been hoisted to the top-level `src/skunk/local_python_executor.py` and is shared via `pyexec.py`, and the agent's chat-stream now routes through `LLMClient.stream` (only `vector_search`'s embedding call is still direct — see ARCHITECTURE.md follow-ups).
-- `eval/` — `eval_e2e.py` (end-to-end harness); `util.py` for plan-cache + trace-dump helpers; `test_set_uids.json` for the held-out filter
+- **Don't autonomously launch full dev sweeps.** Implement, sanity-check on a couple of
+  dev UIDs, then hand the run command to the user.
+- Harness is `eval/eval_e2e.py`. State dev-only vs full in any reported number (see above).
+- The default `search_agent` retriever needs `cache/chromadb/` + `cache/clean_page_map.json`
+  built offline (`src/skunk/search_agent/prep/`); the first non-golden run errors clearly
+  if either is missing.
 
 ## Conventions
 
-- No new ops without updating: `ARCHITECTURE.md`, the planner system prompt in `src/skunk/plan.py`, the validator, AND the eval harnesses.
-- **No Palimpzest imports.** This repo is intentionally PZ-free at runtime. Annotation tooling at the OfficeQA-in-PZ stage is a separate project.
-- **No hand-rolled retry loops** inside operators. The orchestrator records failures in the trace; it does not re-plan.
-- **Logging — log each fact at the layer that owns it, and only there** (full rules in `ARCHITECTURE.md` → "Logging & observability"). One rendering function: `src/skunk/trace.py:render_line` (the logging spine; no external dep) formats every event; process-scoped `logging.getLogger(__name__)` sites reach it via `_LineFormatter` on the root handler (`configure_obs` installs it; `skunk.*` at INFO, root at WARNING). **Observability is one stream** — `ctx.emit(source, message, **fields)`, captured to `ctx.events` + JSONL always, streamed live to the question's own `<trace-dir>/<uid>.log` when `ctx.log_path` is set (per-question, flushed, crash-safe), and echoed to the shared console only when `verbose` (opt-in). Operator **boundaries are caller-emitted events**: the orchestrator's `_execute_with_tracing` emits one `("orchestrator", "step")` event per op (op/elapsed/output/error); operators never self-report. Kept **separate** from observability is `ExecutionResult` (`src/skunk/result.py`) — the orchestrator's typed return contract (`question`/`answer`/`failed`/`failure_reason`), read programmatically by the eval harness; it holds no step record. Rules: caller owns boundaries → operators do NOT emit their own `"starting"`/`"done"`; LLM I/O is logged once at `LLMClient` (parse retries at `PromptedCall`); `message` is a stable snake_case key with all variables in `**fields` (no interpolation); severity is auto (`_failed`/`error` field → warning, else info; `level=` overrides); request-scoped events use `ctx.emit`, process-scoped code with no ctx (build/offline prep, `LLMClient` retries) uses `logging.getLogger(__name__)`. Each event is stamped with its `(step_idx, op)` via `ctx.step(...)` (a thread-local frame the orchestrator opens per traced call); the trace dump groups events by that `step_idx`, using the `"step"` event as the header — no `_step` sentinel.
+- **Use `python3` / `pip3`, not `python` / `pip`** — no `python` on PATH (exit 127). In a
+  batched/parallel tool call, one `python: command not found` aborts the whole batch.
+- **No new ops** without updating `ARCHITECTURE.md`, the planner system prompt in
+  `src/skunk/plan.py`, the validator, AND `eval/eval_e2e.py`.
+- **Logging**: one event stream via `ctx.emit(...)`; full rules in `ARCHITECTURE.md` →
+  "Logging & observability".
 
-## Local environment gotchas
+## Setup (.env at repo root)
 
-- **Use `python3` / `pip3`, not `python` / `pip`.** This machine has no
-  `python` on PATH — bare `python ...` fails with `command not found`
-  (exit 127). Always invoke `python3` (e.g. `python3 -m py_compile ...`,
-  `python3 -m pytest tests/pytest`). In a batched/parallel tool call, a
-  single `python: command not found` aborts the *whole* batch, so this
-  bites harder than it looks.
+All LLM calls go through **GCP Vertex AI** via the `google-genai` SDK:
+1. `gcloud auth application-default login`
+2. `GOOGLE_CLOUD_PROJECT=<project-id>` in `.env` (Vertex AI API enabled on the project)
+3. Optional `GOOGLE_CLOUD_LOCATION` (default `us-central1`)
 
-## API keys / GCP setup (.env at repo root)
+Default model `gemini-3.5-flash` (override via `SKUNK_LLM_MODEL`; use bare Vertex names, no
+`google/` prefix). Strongly recommended for `lookup_external`: `FRED_API_KEY`,
+`TAVILY_API_KEY`. Copy `.env.example` → `.env`.
 
-All LLM calls (planner, retrieve, extract, compute, lookup_external) go
-through **GCP Vertex AI** via the `google-genai` SDK. See `src/skunk/common.py`
-docstring for the routing. `lookup_external` is code-as-proof only — no
-Google Search grounding; the model writes Python calling typed helpers
-(FRED / BLS / World Bank / Tavily).
+## Data corpus (not in this repo)
 
-Setup:
-1. `gcloud auth application-default login` — sets up Application Default Credentials
-2. Set `GOOGLE_CLOUD_PROJECT=<project-id>` in `.env` (Vertex AI API must be enabled on the project)
-3. Optional: `GOOGLE_CLOUD_LOCATION` (default `us-central1`)
-
-Default model is `gemini-3.5-flash` (`config.llm_model`, overridable via
-`SKUNK_LLM_MODEL`). Use bare Vertex model names — do not include the `google/`
-OpenRouter-style prefix.
-
-Strongly recommended: `FRED_API_KEY` (FRED helper) and `TAVILY_API_KEY` (web-search helper) for `lookup_external`. `.env.example` is committed; copy to `.env` and fill in.
-
-## Data corpus (NOT in this repo)
-
-- Treasury Bulletin PDFs live at `~/Desktop/officeqa/treasury_bulletin_pdfs/` (~20 GB, 696 files).
-- Path is configurable via `OFFICEQA_PDF_DIR` env var; default is the path above.
-- Pre-extracted tables and rendered pages live under `cache/` (gitignored), populated on first use.
+Treasury Bulletin PDFs at `~/Desktop/officeqa/treasury_bulletin_pdfs/` (~20 GB, 696 files);
+override with `OFFICEQA_PDF_DIR`. Pre-extracted tables and rendered pages live under
+`cache/` (gitignored), populated on first use.
 
 ## Pointers
 
-- `ARCHITECTURE.md` — design intent + plan-shape spec; no iteration history
-- `src/skunk/plan.py` — canonical Plan dataclasses + `PlannerPromptedCall.system_prompt` (the JSON-schema spec for plans)
-- `data/officeqa_pro.csv` — benchmark (133 questions, with `source_docs?page=N` and `answer` golden truth; not tracked in git)
-
-## Held-out test set (CRITICAL — do not run on these during development)
-
-32 UIDs are reserved as a held-out test set. They were picked 2026-05-14 by random
-sample (seed 20260514) from the UIDs we had **never inspected** at that point —
-i.e. excluding the pre-existing curated 32, the 33 baseline-run problematic UIDs
-(failures + >5% wrongs), and the 5 moderate-error UIDs whose traces we examined
-in the failure catalog.
-
-**Rule**: development runs of ANY eval harness (`eval/eval_e2e.py`,
-any new script under `eval/`) must NOT touch
-these UIDs. Looking at their traces, tuning prompts against them, or
-selecting them by `--uids` counts as contamination. They exist to give
-us a clean measurement of generalization when we want to publish a
-final number.
-
-The canonical list lives in `eval/test_set_uids.json` (machine-readable, with seed
-and rationale). **Every eval harness MUST load this file and filter out
-the test UIDs by default.** Pass `--include-test-set` to override only
-when you have a deliberate reason (e.g. running the final number for a
-writeup). If you add a new eval script, copy the filter logic from
-`eval/eval_e2e.py`.
-
-Verify the filter is wired before you run: search the script for
-`test_set_uids`. If absent, ADD it before running — don't run first
-and filter later. (See the 🚨 banner at the top of this file.)
-
-Test UIDs (32):
-```
-UID0035, UID0036, UID0039, UID0050, UID0065, UID0068, UID0073, UID0093,
-UID0094, UID0100, UID0108, UID0118, UID0120, UID0134, UID0147, UID0161,
-UID0168, UID0170, UID0179, UID0182, UID0183, UID0187, UID0196, UID0204,
-UID0211, UID0212, UID0216, UID0218, UID0227, UID0230, UID0238, UID0240
-```
-
-If you need to expand the test set later, do it by re-sampling — never by adding
-UIDs the model has already been tuned against.
-
-## Things to verify before claiming a feature is "done"
-
-- Operator changes: each operator class's `.run()` method still has its signature (`RetrieveOp` / `ExtractOp` / `ComputeOp` / `LookupExternalOp` in `src/skunk/{retrieve,extract,compute,lookup_external}.py`); `eval/eval_e2e.py` still passes.
-- New ops or new args: documented in the "Plan shape" section of `ARCHITECTURE.md`, and the planner system prompt in `src/skunk/plan.py` is updated.
-- **Eval/benchmark numbers**: confirmed the run was on **dev only** (101
-  UIDs after filtering `eval/test_set_uids.json`). Numbers on the full
-  133-UID set are contaminated; state explicitly in any writeup whether
-  the held-out 32 were included.
-- **New eval scripts**: implement the test-set filter before any LLM
-  call. Search the script for `test_set_uids` — if missing, it WILL
-  contaminate.
+- `ARCHITECTURE.md` — architecture, design intent, plan-shape spec
+- `src/skunk/plan.py` — canonical Plan dataclasses + the planner system prompt (plan JSON schema)
+- `data/officeqa_pro.csv` — benchmark (not in git)

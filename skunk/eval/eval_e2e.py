@@ -6,15 +6,20 @@ downstream scorer consumes.
 
 Usage
 -----
-  # All UIDs in the CSV (default)
-  python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv
+  # All UIDs in the CSV (default) — run dir auto-named under eval/traces/
+  python -m eval.eval_e2e --csv data/officeqa_pro.csv
+
+  # Give the run a human-readable label
+  python -m eval.eval_e2e --csv data/officeqa_pro.csv --run-name golden_sweep
 
   # Sample 10 random UIDs
-  python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv --sample 10
+  python -m eval.eval_e2e --csv data/officeqa_pro.csv --sample 10
 
   # Run only specific UIDs, bypassing retrieve with golden pages
-  python -m eval.eval_e2e --csv data/officeqa_pro.csv --report eval/e2e_report.csv \\
-      --uids UID0001,UID0030 --golden
+  python -m eval.eval_e2e --csv data/officeqa_pro.csv --uids UID0001,UID0030 --golden
+
+All outputs (per-question traces, run.log, report.csv, events.jsonl) land in a
+single run directory: eval/traces/<run-name>_<timestamp>/  (gitignored).
 
 `--golden` parses `source_docs?page=N` URLs from --csv and injects them as
 PageRefs, so extract/compute run on exactly the pages the benchmark deems
@@ -25,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import asyncio
 import os
 import random
 import re
@@ -52,7 +58,6 @@ def _load_env(path: Path) -> None:
 _load_env(REPO_ROOT / ".env")
 
 from skunk import (  # noqa: E402
-    HarnessContext,
     MissingData,
     Orchestrator,
     PageRef,
@@ -118,7 +123,7 @@ def load_golden(csv_path: str | Path) -> dict[str, list[PageRef]]:
 # ---------------------------------------------------------------------------
 
 
-def _run_one_question(
+async def _run_one_question(
     question: str,
     *,
     verbose: bool,
@@ -144,24 +149,24 @@ def _run_one_question(
         load_prompt_overrides(overrides_path) if overrides_path.exists() else ()
     )
 
-    ctx = HarnessContext(
-        question=question,
+    orch = Orchestrator(
+        question,
         uid=uid,
         verbose=verbose,
         log_path=log_path,
         config=config,
         prompt_overrides=prompt_overrides,
     )
+    ctx = orch.ctx
 
     try:
         if verbose:
             print(f"\n[e2e] Planning: {question[:80]}...")
 
         t0 = time.perf_counter()
-        orch = Orchestrator(ctx)
         failure: MissingData | StepFailed | None = None
         try:
-            orch.execute()
+            await orch.execute()
         except (MissingData, StepFailed) as e:
             # A terminal failure — compute ran out of recovery budget (MissingData)
             # or an operator gave up (StepFailed, e.g. every branch failed). Record
@@ -200,14 +205,12 @@ def _run_one_question(
                 "answer": None,
                 "failed": True,
                 "reason": result.failure_reason,
-                "n_steps": orch.n_steps,
             }
         return {
             "question": question,
             "answer": result.answer,
             "failed": result.failed,
             "reason": result.failure_reason,
-            "n_steps": orch.n_steps,
         }
     finally:
         ctx.close()
@@ -220,7 +223,6 @@ REPORT_FIELDS = [
     "gold_answer",
     "failed",
     "reason",
-    "n_steps",
 ]
 
 # Held-out test set — see CLAUDE.md. Loaded lazily so the file is optional.
@@ -264,7 +266,13 @@ def main() -> None:
         description="End-to-end OfficeQA eval (all UIDs by default)"
     )
     parser.add_argument("--csv", required=True, help="Path to officeqa_pro.csv")
-    parser.add_argument("--report", required=True, help="Output CSV report path")
+    parser.add_argument(
+        "--run-name",
+        default="",
+        help="Human-readable label prepended to the auto-timestamped run directory "
+        "under eval/traces/ (e.g. 'golden_sweep' → eval/traces/golden_sweep_20260601_153000/). "
+        "Defaults to the empty string, giving eval/traces/20260601_153000/.",
+    )
     parser.add_argument("--sample", type=int, help="Run a random subset of N UIDs")
     parser.add_argument("--uids", help="Comma-separated UIDs (overrides --sample)")
     parser.add_argument(
@@ -273,15 +281,15 @@ def main() -> None:
         help="Inject golden pages from --csv instead of running retrieve",
     )
     parser.add_argument(
-        "--trace-dir",
-        default="eval/traces",
-        help="Per-question debug trace directory (default: %(default)s; '' to disable)",
+        "--no-traces",
+        action="store_true",
+        help="Disable per-question trace files (run dir still created for report.csv).",
     )
     parser.add_argument(
         "--console",
         action="store_true",
         help="Also echo the live (interleaved) event firehose to stdout. Off by "
-        "default — per-question events stream to <trace-dir>/<uid>.log instead.",
+        "default — per-question events stream to <run-dir>/traces/<uid>.log instead.",
     )
     parser.add_argument(
         "--include-test-set",
@@ -299,13 +307,25 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Build the run directory: eval/traces/[<run-name>_]<YYYYMMDD_HHMMSS>/
+    import datetime
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_label = f"{args.run_name}_{ts}" if args.run_name else ts
+    run_dir = Path("eval/traces") / run_label
+    trace_dir = run_dir / "traces" if not args.no_traces else None
+    report_path = run_dir / "report.csv"
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+    if trace_dir:
+        trace_dir.mkdir(parents=True, exist_ok=True)
+
     # Configure the unified logging pipeline once for the whole process. When a
     # trace dir is set, also open a run-wide JSONL sink (one structured line per
     # event, tagged with uid/step_idx) alongside the per-question text traces.
-    jsonl_path = str(Path(args.trace_dir) / "events.jsonl") if args.trace_dir else None
-    if jsonl_path:
-        Path(args.trace_dir).mkdir(parents=True, exist_ok=True)
+    jsonl_path = str(trace_dir / "events.jsonl") if trace_dir else None
     configure_obs(jsonl_path=jsonl_path)
+
+    print(f"[e2e] Run directory: {run_dir}")
 
     df = pd.read_csv(args.csv)
     df_by_uid = df.set_index("uid")
@@ -356,7 +376,7 @@ def main() -> None:
 
     verbose = args.console
 
-    def process_uid(uid: str) -> dict | None:
+    async def process_uid(uid: str) -> dict | None:
         """Run one UID end-to-end. Returns a row dict, or None if the UID
         is missing from the CSV (skip-with-warning, not fatal). Catches
         and records uncaught exceptions so one runaway UID doesn't kill
@@ -378,12 +398,12 @@ def main() -> None:
                 print(f"[e2e] WARNING: no golden pages for {uid!r}")
 
         trace_path = log_path = None
-        if args.trace_dir:
-            trace_path = str(Path(args.trace_dir) / f"{uid}.txt")
-            log_path = str(Path(args.trace_dir) / f"{uid}.log")
+        if trace_dir:
+            trace_path = str(trace_dir / f"{uid}.txt")
+            log_path = str(trace_dir / f"{uid}.log")
 
         try:
-            result = _run_one_question(
+            result = await _run_one_question(
                 question=question,
                 verbose=verbose,
                 golden_pages=golden_pages,
@@ -409,7 +429,6 @@ def main() -> None:
                 "answer": None,
                 "failed": True,
                 "reason": f"Uncaught: {type(e).__name__}: {e}",
-                "n_steps": 0,
             }
 
         if result["failed"]:
@@ -424,27 +443,29 @@ def main() -> None:
             "gold_answer": gold_answer,
             "failed": result["failed"],
             "reason": result["reason"] or "",
-            "n_steps": result.get("n_steps", 0),
         }
 
-    # Pre-allocate slots so the output CSV preserves the input UID order
-    # regardless of completion order under --workers > 1. The process-level
-    # rate limiter inside LLMClient throttles cross-worker traffic.
+    # Each question runs on its own worker thread (shared pool), driving its own
+    # event loop via `asyncio.run`. LLM I/O is async *within* a question (branch +
+    # fan-out concurrency); code exec runs inline on the worker thread. `--workers`
+    # is the cross-question concurrency cap. Slots are pre-allocated so the output
+    # CSV preserves input UID order regardless of completion order.
+    def _run_uid(uid: str) -> dict | None:
+        return asyncio.run(process_uid(uid))
+
     results: list[dict | None] = [None] * len(uids)
     if args.workers <= 1:
         for i, uid in enumerate(uids):
-            results[i] = process_uid(uid)
+            results[i] = _run_uid(uid)
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(process_uid, uid): i for i, uid in enumerate(uids)}
+            futures = {pool.submit(_run_uid, uid): i for i, uid in enumerate(uids)}
             for fut in as_completed(futures):
-                i = futures[fut]
-                results[i] = fut.result()
+                results[futures[fut]] = fut.result()
 
     rows = [r for r in results if r is not None]
 
-    out = Path(args.report)
-    out.parent.mkdir(parents=True, exist_ok=True)
+    out = report_path
     with out.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=REPORT_FIELDS)
         writer.writeheader()

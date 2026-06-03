@@ -24,7 +24,7 @@ from pathlib import Path
 
 from skunk.config import SkunkConfig
 from skunk.errors import StepFailed
-from skunk.common import HarnessContext, PageRef, page_key_to_pageref
+from skunk.common import ExecutionContext, PageRef, page_key_to_pageref
 from skunk.plan import RetrieveBranch
 
 
@@ -41,37 +41,35 @@ class RetrieveOp:
         self._agent_lock = threading.Lock()
         self._page_index_retriever = None  # skunk.page_index.query.PageIndexRetriever
 
-    def run(self, ctx: HarnessContext, branch: RetrieveBranch) -> list[PageRef]:
+    async def run(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
         if ctx.config.golden_pages is not None:
             return self._run_golden(ctx, branch)
         match ctx.config.retriever:
             case "search_agent":
-                return self._run_search_agent(ctx, branch)
+                return await self._run_search_agent(ctx, branch)
             case "page_index":
-                return self._run_page_index(ctx, branch)
+                return await self._run_page_index(ctx, branch)
             case other:
                 raise StepFailed(
                     "retrieve",
                     f"unknown retriever {other!r}; expected 'search_agent' or 'page_index'",
                 )
 
-    def _run_golden(self, ctx: HarnessContext, branch: RetrieveBranch) -> list[PageRef]:
+    def _run_golden(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
         """Golden-pages bypass (eval ablation only). `run` only routes here when
         `golden_pages` is set, but we guard defensively anyway (also narrows the type)."""
         if ctx.config.golden_pages is None:
             raise StepFailed("retrieve", "golden bypass reached without golden_pages set")
         ctx.emit(
-            "retrieve",
-            "golden_bypass",
-            n_pages=len(ctx.config.golden_pages),
-            refs=[str(r) for r in ctx.config.golden_pages],
+            f"golden_bypass n_pages={len(ctx.config.golden_pages)} "
+            f"refs={[str(r) for r in ctx.config.golden_pages]!r}"
         )
         return ctx.config.golden_pages
 
-    def _run_search_agent(self, ctx: HarnessContext, branch: RetrieveBranch) -> list[PageRef]:
+    async def _run_search_agent(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
         """Iterative search agent (`skunk.search_agent`); maps its page keys to `PageRef`."""
         agent = self._ensure_agent(ctx.config)
-        page_keys = agent.retrieve(
+        page_keys = await agent.retrieve(
             ctx,
             ctx.question,
             branch_key=branch.key,
@@ -88,7 +86,7 @@ class RetrieveOp:
         if bad:
             # Callee-only diagnostic the trace can't show: keys the agent
             # returned that didn't map to a PageRef.
-            ctx.emit("retrieve", "bad_page_keys", n_bad=len(bad), keys=bad[:5])
+            ctx.emit(f"bad_page_keys n_bad={len(bad)} keys={bad[:5]!r}")
         if not refs:
             raise StepFailed(
                 "retrieve",
@@ -104,14 +102,14 @@ class RetrieveOp:
                 self._agent = _build_search_agent(config)
             return self._agent
 
-    def _run_page_index(self, ctx: HarnessContext, branch: RetrieveBranch) -> list[PageRef]:
+    async def _run_page_index(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
         """Page-index retriever (ToC pick → year filter → semantic filter). The
         inner retriever is built lazily and caches the catalog/concept-tree."""
         from skunk.page_index.query import PageIndexRetriever
 
         if self._page_index_retriever is None:
             self._page_index_retriever = PageIndexRetriever()
-        return self._page_index_retriever.run(None, ctx, branch=branch)
+        return await self._page_index_retriever.run(None, ctx, branch=branch)
 
 
 def _build_search_agent(config: SkunkConfig):

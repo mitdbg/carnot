@@ -20,6 +20,23 @@ overrides:
       a 696-document corpus of monthly Treasury bulletins (1939–2025) under
       the OfficeQA harness.
 
+      Each bulletin is organized into recurring sections; the value a question
+      needs almost always sits in one of them:
+        - Profile of the Economy — U.S. macro conditions in narrative + charts:
+          real GDP growth, employment/payrolls, unemployment, prices/inflation,
+          and the personal saving rate (often plotted, not tabulated).
+        - Federal Fiscal Operations — receipts, outlays, surplus/deficit by
+          month/fiscal year, agency, and function.
+        - Federal Debt — public debt outstanding, ownership of federal
+          securities, and debt as a percent of GDP (carries nominal GDP).
+        - Treasury financing & securities — auction results, offerings, and
+          market quotations (yields and bid/ask prices) for bills, notes,
+          bonds, and TIPS.
+        - Trust funds — Social Security (OASI/DI), Highway, and other federal
+          trust-fund receipts, expenditures, and balances.
+        - International — foreign currency positions, Treasury reporting rates
+          of exchange, and capital movements (TIC).
+
       Period-string syntax this corpus uses (free-form NL accepted; the
       examples below are the conventions most legible to the retriever):
         `CY1940`         calendar year 1940
@@ -55,7 +72,7 @@ overrides:
     content: |
       One concept per `retrieve.key`. If a question names multiple values (two currencies, two indices, two agencies, two bond classes, ...), emit ONE branch per value rather than bundling — branches run in parallel and splitting is cheap, while bundling forces retrieval to find a single page covering everything. A JPY-vs-GBP question should emit four branches (JPY position, GBP position, JPY/USD rate, GBP/USD rate), not one branch keyed "exchange rates for JPY and GBP".
 
-      Default to `retrieve`; treat `lookup_external` as the fallback. Any value plausibly in the Treasury Bulletin — federal receipts, outlays, surplus/deficit, debt holdings, bond yields and prices, foreign currency positions, market exchange rates, forward-year projections/estimates — should be a `retrieve`, even when phrased as "the Treasury's reported estimate". This INCLUDES third-party macro context the Bulletin reprints, notably nominal GDP (carried in the Ownership-of-Federal-Securities / debt-to-GDP tables). Reach for `lookup_external` only for data clearly outside the corpus (e.g. CPI, FX, or population the Bulletin does not reprint). When in doubt, `retrieve`: a retrieve that finds nothing fails with a diagnostic and is automatically replanned to `lookup_external`, so guessing `retrieve` is cheap and self-correcting.
+      Default to `retrieve`. When in doubt about whether a value is in the corpus, use `retrieve` first — you will get a chance to replan it as a `lookup_external` if it turns out not to be there. The two errors are not symmetric: a `retrieve` that finds nothing fails loudly and is automatically replanned, whereas a wrong `lookup_external` silently returns a different (often later-revised) vintage and is never corrected. Reach for `lookup_external` only when the value has no plausible home in any Treasury Bulletin.
 
       Prefer the corpus ESPECIALLY for "as reported" / vintage questions. A live external lookup returns today's revised figures; a series like GDP is revised over time, so the bulletin's as-of-that-date value is the correct one and an external lookup would silently give a wrong number. Retrieve it from the named bulletin (set `as_of`).
 
@@ -69,7 +86,7 @@ overrides:
       - |
         ### Example
         Q: Absolute percent change in national defense expenditures between CY1940 and CY1953, rounded to hundredths.
-        Why this shape: One closed-form calculation over two scalar lookups. The task sentence pins the formula; one qualifier nails the absolute-vs-signed and percent-form choices.
+        Why this shape: One closed-form calculation over two scalar lookups. The question pins the formula; one qualifier nails the absolute-vs-signed and percent-form choices.
         Plan:
         ```json
         {
@@ -79,40 +96,17 @@ overrides:
             {"kind": "retrieve", "key": "national defense expenditures",
              "period": "CY1953"}
           ],
-          "computation": {
-            "task": "Percent change between the CY1953 value (B) and the CY1940 value (A): (B-A)/A · 100.",
-            "qualifiers": ["absolute value, not signed", "in percent form (multiply by 100)"]
-          },
-          "presentation": {"units_out": "pct", "precision": 2}
-        }
-        ```
-
-      - |
-        ### Example
-        Q: Per-capita national defense expenditures in CY1940, in nominal dollars.
-        Why this shape: Defense spending is in the corpus (retrieve); U.S. population is not (lookup_external). Question names no publisher → `src` is null.
-        Plan:
-        ```json
-        {
-          "branches": [
-            {"kind": "retrieve", "key": "national defense expenditures",
-             "period": "CY1940"},
-            {"kind": "lookup_external",
-             "target": "U.S. resident population in 1940 (count)",
-             "src": null}
-          ],
-          "computation": {
-            "task": "Per-capita = national defense expenditures (usd) divided by U.S. population (count).",
-            "qualifiers": []
-          },
-          "presentation": {"units_out": "usd"}
+          "requirements": {
+            "qualifiers": ["absolute value, not signed", "in percent form (multiply by 100)"],
+            "units_out": "pct", "precision": 2
+          }
         }
         ```
 
       - |
         ### Example
         Q: Real (CPI-adjusted, 2020 dollars) value of total national defense expenditures in CY1953.
-        Why this shape: Nominal value from the corpus, deflator from outside it. Task names the adjustment and base year; a qualifier pins the deflator direction. `src` biases the external lookup toward the canonical BLS series.
+        Why this shape: Nominal value from the corpus, deflator from outside it. A qualifier pins the deflator direction. `src` biases the external lookup toward the canonical BLS series.
         Plan:
         ```json
         {
@@ -123,11 +117,10 @@ overrides:
              "target": "U.S. CPI-U annual average for 1953 (base 2020=100)",
              "src": "Bureau of Labor Statistics"}
           ],
-          "computation": {
-            "task": "Real value = nominal CY1953 defense expenditures divided by the 1953 CPI-U (base 2020=100), expressed in 2020 dollars.",
-            "qualifiers": ["real = nominal / (CPI / 100); the result is already in 2020 dollars, no further scaling"]
-          },
-          "presentation": {"units_out": "usd_millions"}
+          "requirements": {
+            "qualifiers": ["real = nominal / (CPI / 100); the result is already in 2020 dollars, no further scaling"],
+            "units_out": "usd_millions"
+          }
         }
         ```
 
@@ -143,8 +136,7 @@ overrides:
              "period": "1990-09",
              "visual_only": true}
           ],
-          "computation": {"task": "", "qualifiers": []},
-          "presentation": {}
+          "requirements": {"qualifiers": []}
         }
         ```
 
@@ -160,11 +152,10 @@ overrides:
              "target": "U.S. CPI-U annual averages for 1950, 1951, 1952",
              "src": "Bureau of Labor Statistics"}
           ],
-          "computation": {
-            "task": "Sum the three CPI-U values.",
-            "qualifiers": []
-          },
-          "presentation": {"units_out": "cpi"}
+          "requirements": {
+            "qualifiers": [],
+            "units_out": "cpi"
+          }
         }
         ```
 
@@ -185,11 +176,10 @@ overrides:
             {"kind": "retrieve", "key": "nominal gross domestic product",
              "period": "FY2010", "as_of": "September 2012 bulletin"}
           ],
-          "computation": {
-            "task": "For FY2008 and FY2010, compute debt held by the public as a percent of GDP (debt / GDP · 100); report the FY2010 value minus the FY2008 value.",
-            "qualifiers": []
-          },
-          "presentation": {"units_out": "pct", "precision": 1}
+          "requirements": {
+            "qualifiers": [],
+            "units_out": "pct", "precision": 1
+          }
         }
         ```
 
@@ -197,16 +187,9 @@ overrides:
   # Corpus blurbs for the remaining executors.
   # ---------------------------------------------------------------------
   - section: corpus
-    targets: [extract.dedup]
-    content: |
-      The entries you consolidate were extracted from U.S. Treasury Monthly
-      Bulletin pages. Common units include `usd_millions`, `usd_thousands`,
-      `pct`, `fx_rate`, `count`, `text`.
-
-  - section: corpus
     targets: [compute.codegen, compute.critique]
     content: |
-      The values in `prev` were extracted from U.S. Treasury Monthly
+      The values in `input_values` were extracted from U.S. Treasury Monthly
       Bulletin pages. Common units in this corpus: `usd`, `usd_thousands`,
       `usd_millions`, `usd_billions`, `pct`, `count`, `year`, `rate`,
       `fx_rate`, `text`. Foreign currency follows `<iso3>_<scale>`
@@ -258,7 +241,7 @@ overrides:
     targets: [compute.codegen]
     content: >
       Numeric modifiers — each modifier present in the question (or echoed
-      in `computation`) MUST appear as an explicit operation, not a
+      in `requirements.qualifiers`) MUST appear as an explicit operation, not a
       comment. Common forms: `signed` vs `absolute` — never silently abs()
       a value meant signed; `normalized` / `midpoint normalized` — apply
       explicitly ((V2-V1)/((V1+V2)/2)); `log of` / `ln(...)` — wrap in
@@ -281,6 +264,14 @@ overrides:
       is `usd_millions`, divide by 1000 — apply the conversion once over
       the whole payload, never cell-by-cell.
 
+  - section: lessons
+    targets: [compute.codegen]
+    content: >
+      Prefer a printed total/summary row over re-aggregating its
+      components when both are present in `input_values`. Bulletin tables
+      print their own totals; the printed figure is authoritative and
+      avoids rounding drift from summing parts.
+
   # ---------------------------------------------------------------------
   # lookup_external lessons.
   # ---------------------------------------------------------------------
@@ -291,168 +282,32 @@ overrides:
       `usd_millions`, `usd_billions`, `pct`, `count`, `rate`, `text`.
 
   # ---------------------------------------------------------------------
-  # Few-shots for extract executors.
-  # ---------------------------------------------------------------------
-  - section: few_shots
-    targets: [extract.text]
-    content:
-      - |
-        ### Example (scalar)
-        Q: National defense expenditures in CY1940, in millions of nominal dollars.
-        Why this shape: One printed figure → scalar. Tag shaped <series>:<period>; unit from the column header.
-        Output:
-        ```json
-        [
-          {"description": "Total national defense expenditures, CY1940",
-           "tag": "national_defense_expenditures:cy1940",
-           "kind": "scalar", "value": 1799, "unit": "usd_millions"}
-        ]
-        ```
-
-      - |
-        ### Example (vector from a 2-D grid)
-        Q: Monthly national defense expenditures from 1942-03 through 1942-08.
-        Why this shape: Question reads as a 1-D series → vector with combined ISO keys, not a table. Question pins the range, so `expected_index_range` is set.
-        Output:
-        ```json
-        [
-          {"description": "Monthly national defense expenditures, 1942-03..1942-08",
-           "tag": "national_defense_expenditures:1942-03..1942-08",
-           "kind": "vector", "index_name": "month",
-           "value": {"1942-03": 3515, "1942-04": 3939, "1942-05": 4262,
-                     "1942-06": 4901, "1942-07": 5113, "1942-08": 5630},
-           "unit": "usd_millions",
-           "expected_index_range": "1942-03..1942-08"}
-        ]
-        ```
-
-      - |
-        ### Example (table for true 2-D analysis)
-        Q: National defense expenditures by year × month for 1942 and 1943.
-        Why this shape: Question compares rows (years) against columns (months) — genuine 2-D analysis → table.
-        Output:
-        ```json
-        [
-          {"description": "National defense expenditures, year × month, 1942–1943",
-           "tag": "national_defense_expenditures:1942..1943",
-           "kind": "table", "row_name": "year", "col_name": "month",
-           "value": {"1942": {"01": 1200, "02": 1450, "03": 3515},
-                     "1943": {"01": 5500, "02": 5800, "03": 7746}},
-           "unit": "usd_millions"}
-        ]
-        ```
-
-  - section: few_shots
-    targets: [extract.vision]
-    content:
-      - |
-        ### Example (chart read, scalar)
-        Q: From the chart on page 5 of the September 1990 Bulletin, what was the total debt held by the public at the end of CY1989?
-        Why this shape: A single value visible on the chart → scalar; unit grounded in the chart's legend ("billions of dollars").
-        Output:
-        ```json
-        [
-          {"description": "Total debt held by the public, end of CY1989 (Sep 1990 Bulletin chart, page 5)",
-           "tag": "total_debt_held_by_public:cy1989",
-           "kind": "scalar", "value": 2191.5, "unit": "usd_billions"}
-        ]
-        ```
-
-      - |
-        ### Example (chart-feature count — the derivation carve-out)
-        Q: How many distinct lines are drawn on the rate-of-return chart on page 12 of the March 1975 Bulletin?
-        Why this shape: Chart-feature count — the question asks for something visible but not printed as a number. The vision carve-out applies: emit a derived scalar with unit=count.
-        Output:
-        ```json
-        [
-          {"description": "Distinct lines on the rate-of-return chart, Mar 1975 Bulletin page 12",
-           "tag": "rate_of_return_chart_lines:1975-03",
-           "kind": "scalar", "value": 4, "unit": "count"}
-        ]
-        ```
-
-  - section: few_shots
-    targets: [extract.dedup]
-    content:
-      - |
-        ### Example (collapse wording duplicates)
-        Input:
-        ```json
-        [
-          {"description": "Total national defense expenditures, CY1940",
-           "tag": "national_defense_expenditures:cy1940",
-           "kind": "scalar", "value": 1799, "unit": "usd_millions"},
-          {"description": "U.S. defense expenditures, calendar year 1940 (millions of dollars)",
-           "tag": "national_defense_expenditures:cy1940",
-           "kind": "scalar", "value": 1799, "unit": "usd_millions"},
-          {"description": "Defense outlays — CY1940 — usd millions",
-           "tag": "national_defense_expenditures:cy1940",
-           "kind": "scalar", "value": 1799, "unit": "usd_millions"}
-        ]
-        ```
-        Why this shape: Same datum × three wordings → collapse to ONE; keep the clearest, most specific description.
-        Output:
-        ```json
-        [
-          {"description": "Total national defense expenditures, CY1940",
-           "tag": "national_defense_expenditures:cy1940",
-           "kind": "scalar", "value": 1799, "unit": "usd_millions"}
-        ]
-        ```
-
-      - |
-        ### Example (disagreement → keep both)
-        Input:
-        ```json
-        [
-          {"description": "CY1940 defense expenditures (Treasury Bulletin table 1)",
-           "tag": "national_defense_expenditures:cy1940",
-           "kind": "scalar", "value": 1799, "unit": "usd_millions"},
-          {"description": "CY1940 defense expenditures (Daily Treasury Statement reconciliation)",
-           "tag": "national_defense_expenditures:cy1940",
-           "kind": "scalar", "value": 1804, "unit": "usd_millions"}
-        ]
-        ```
-        Why this shape: Two values disagree at the same tag → keep BOTH as separate entries, with descriptions that disambiguate the source. Never average.
-        Output:
-        ```json
-        [
-          {"description": "CY1940 defense expenditures (Treasury Bulletin table 1)",
-           "tag": "national_defense_expenditures:cy1940",
-           "kind": "scalar", "value": 1799, "unit": "usd_millions"},
-          {"description": "CY1940 defense expenditures (Daily Treasury Statement reconciliation)",
-           "tag": "national_defense_expenditures:cy1940",
-           "kind": "scalar", "value": 1804, "unit": "usd_millions"}
-        ]
-        ```
-
-  # ---------------------------------------------------------------------
   # Few-shots for compute executors.
   # ---------------------------------------------------------------------
   - section: few_shots
     targets: [compute.codegen]
     content:
       - |
-        ### Example (closed-form, tag-matched)
+        ### Example (closed-form, two scalars)
         Q: Absolute percent change in national defense expenditures between CY1940 and CY1953.
-        prev: two scalars tagged national_defense_expenditures:cy1940 and national_defense_expenditures:cy1953, both unit=usd_millions.
-        Why this shape: Tag-match both, apply (B-A)/A·100, abs(), format. No unit conversion needed (same scale).
+        input_values: two scalars — national defense expenditures for CY1940 and for CY1953, both unit=usd_millions.
+        Why this shape: Pick each by its description, apply (B-A)/A·100, abs(), format. No unit conversion needed (same scale).
         Output:
         ```python
-        a = next(e for e in prev if e.tag == 'national_defense_expenditures:cy1940').value
-        b = next(e for e in prev if e.tag == 'national_defense_expenditures:cy1953').value
+        a = next(e for e in input_values if 'CY1940' in e.description).value
+        b = next(e for e in input_values if 'CY1953' in e.description).value
         result = f'{abs((b - a) / a * 100):.2f}'
         ```
 
       - |
         ### Example (FX conversion)
         Q: JPY net options position in millions of USD, mid-March 2016.
-        prev: scalar value=2300 unit=jpy_billions, and scalar unit=fx_rate description="JPY per USD spot, 2016-03".
+        input_values: scalar value=2300 unit=jpy_billions, and scalar unit=fx_rate description="JPY per USD spot, 2016-03".
         Why this shape: Foreign currency → locate the fx_rate, read direction from its description ("JPY per USD" → divide), then rescale billions → millions.
         Output:
         ```python
-        jpy_b = next(e for e in prev if e.unit == 'jpy_billions').value
-        rate  = next(e for e in prev if e.unit == 'fx_rate').value  # JPY per USD
+        jpy_b = next(e for e in input_values if e.unit == 'jpy_billions').value
+        rate  = next(e for e in input_values if e.unit == 'fx_rate').value  # JPY per USD
         usd_m = jpy_b * 1000 / rate
         result = f'{usd_m:,.2f}'
         ```
@@ -460,10 +315,69 @@ overrides:
       - |
         ### Example (missing-data signal — bare JSON, NO fence)
         Q: Real (CPI-adjusted, 2020 dollars) value of CY1953 national defense expenditures.
-        prev: only the nominal CY1953 scalar; no CPI series.
-        Why this shape: Required deflator is not in prev. Emit the bare missing-data JSON object (NO fence). Never fabricate.
+        input_values: only the nominal CY1953 scalar; no CPI series.
+        Why this shape: Required deflator is not in input_values. Emit the bare missing-data JSON object (NO fence). Never fabricate.
         Output (literal, no fence in your reply):
-        {"missing": ["cpi:1953", "cpi:2020"], "description": "no CPI series in prev to convert nominal CY1953 to 2020 dollars"}
+        {"missing": ["cpi:1953", "cpi:2020"], "description": "no CPI series in input_values to convert nominal CY1953 to 2020 dollars"}
+
+  # ---------------------------------------------------------------------
+  # Few-shots for the compute self-critique. Each shows ONE focus
+  # (a single qualifier OR the output-format fields), the code that ran,
+  # the result, and the bare-JSON verdict. Mined from real dev traces.
+  # Discipline: judge ONLY the assigned constraint; a clean result that
+  # violates some OTHER constraint is still an accept here.
+  # ---------------------------------------------------------------------
+  - section: few_shots
+    targets: [compute.critique]
+    content:
+      - |
+        ### Example (accept — qualifier honored)
+        Question: Absolute difference between the Feb and May figures, in millions, rounded to hundredths.
+        Constraint to check (a qualifier):
+        absolute value, not signed
+        Code that ran:
+        ```python
+        a = next(e for e in input_values if 'Feb' in e.description).value
+        b = next(e for e in input_values if 'May' in e.description).value
+        result = f"{abs(a - b):.2f}"
+        ```
+        Produced result: 11.60
+        Why: the qualifier demands an unsigned magnitude; `abs(...)` applies it
+        explicitly and the value is non-negative. This one constraint is honored,
+        so accept — rounding/units are someone else's focus.
+        Output: {"verdict": "accept"}
+
+      - |
+        ### Example (revise — qualifier: a required intermediate step is missing)
+        Question: H-spread of the annual debt values, with intermediate values rounded to the tenths of a billion.
+        Constraint to check (a qualifier):
+        intermediate values rounded to the tenths of a billion
+        Code that ran:
+        ```python
+        q1 = np.percentile(vals, 25)
+        q3 = np.percentile(vals, 75)
+        result = f"{q3 - q1:.2f}"
+        ```
+        Produced result: 41.27
+        Why: the qualifier requires Q1 and Q3 to be rounded to a tenth of a billion
+        BEFORE the spread is taken; the code subtracts the raw quartiles. A modifier
+        named in the question is absent as an explicit operation → revise.
+        Output: {"verdict": "revise", "reason": "Q1 and Q3 are not rounded to the tenths of a billion before the subtraction the qualifier requires; round each (e.g. round(q, 1)) before computing the spread."}
+
+      - |
+        ### Example (revise — output-format: unit symbol missing)
+        Question: Percent change between the two figures, expressed as a percent, rounded to two decimals.
+        Constraint to check (the output-format fields):
+        {"units_out": "pct", "precision": 2, "answer_form": null}
+        Code that ran:
+        ```python
+        result = f"{(b - a) / a * 100:.2f}"
+        ```
+        Produced result: 6.14
+        Why: units_out is `pct`, so the rendered answer must carry the `%` sign;
+        `6.14` omits it. The numeric value and 2-dp precision are correct, but this
+        focus is the rendering → revise.
+        Output: {"verdict": "revise", "reason": "units_out is 'pct' but the result '6.14' has no '%' sign; render it as '6.14%'."}
 
   # ---------------------------------------------------------------------
   # Few-shots for lookup_external.
@@ -473,14 +387,20 @@ overrides:
     content:
       - |
         ### Example (publisher pinned by `src`)
-        Input:
+        Request:
         ```json
         {"target": "U.S. CPI-U annual average for 1953 (base 2020=100)",
          "src": "Bureau of Labor Statistics"}
         ```
-        Why this shape: `src` pins BLS — search there (site:bls.gov or similar); return the publisher's full printed precision.
-        Output:
-        ```json
-        {"value": 14.4, "unit": "cpi", "source": "bls"}
+        Why this shape: `src` pins BLS — query the BLS CPI series via the BLS tool, then commit ONE scalar value at the publisher's full printed precision. There is no separate source field — fold it into the description.
+        Step (one tool call):
+        ```python
+        fetch_bls({"seriesid": ["CUUR0000SA0"], "startyear": "1953", "endyear": "1953"})
+        ```
+        Commit (after reading the observation):
+        ```python
+        final_answer({
+            "description": "U.S. CPI-U annual average, 1953, rebased to 2020=100 (BLS)",
+            "value": 14.4, "unit": "cpi"})
         ```
 

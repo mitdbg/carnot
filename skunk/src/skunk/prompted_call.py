@@ -1,35 +1,16 @@
-"""PromptedCall — the runtime helper each LLM-prompted call-site HAS-A. It renders
-a Jinja `system_prompt`, runs the LLM call, and parses the reply into a typed result.
-
-The override registry (`prompt_overrides.yaml`, selected per call-site by name)
-supplies the template vars `corpus`, `few_shots`, `lessons`, and `default_tail`
-(the pre-rendered conventional trailing block). Templates wanting that layout end
-with `{{ default_tail }}`; others reference the raw vars. A `template_vars` provider
-adds runtime entries.
-
-Templates needing a literal `{{`/`{%` must wrap it in `{% raw %}…{% endraw %}`.
-"""
-
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import Literal, cast
 
 import yaml
-from jinja2 import Environment, StrictUndefined
 
-from skunk.common import HarnessContext
+from skunk.common import B64Image, Effort, ExecutionContext
 from skunk.errors import ParseError
 
-if TYPE_CHECKING:
-    from skunk.common import Effort
 
-
-# Supplementary prompt content (corpus / few_shots / lessons) loaded from YAML and
-# attached to `HarnessContext.prompt_overrides`. `PromptedCall` selects each
-# call-site's slices by name ("*" = all).
 Section = Literal["corpus", "few_shots", "lessons"]
 
 
@@ -37,13 +18,11 @@ Section = Literal["corpus", "few_shots", "lessons"]
 class PromptOverride:
     section: Section
     targets: tuple[str, ...]                          # agent names; "*" = all
-    content: str | tuple[str, ...]                    # str for corpus/lessons; tuple[str, ...] for few_shots
+    content: str | tuple[str, ...]                    # str for corpus/lessons; tuple for few_shots
 
 
 def load_prompt_overrides(path: str | Path) -> tuple[PromptOverride, ...]:
-    """Read a YAML override file → tuple of `PromptOverride`. Each entry has
-    `section` (corpus/few_shots/lessons), `targets` (agent names or "*"), and
-    `content` (a string, or a list of strings for few_shots)."""
+    """Read a YAML override file → tuple of `PromptOverride`."""
     data = yaml.safe_load(Path(path).read_text())
     if not data or "overrides" not in data:
         return ()
@@ -70,50 +49,39 @@ def load_prompt_overrides(path: str | Path) -> tuple[PromptOverride, ...]:
 
     return tuple(out)
 
-# Yields extra Jinja vars from `ctx` at render time (e.g. an agent's `max_steps`).
-TemplateVarsProvider = Callable[["HarnessContext"], dict]
 
-
-def _identity(raw: str, ctx: HarnessContext) -> str:
-    """Default parser — return the raw model text unchanged (`PromptedCall[str]`)."""
+def _identity(raw: str, _ctx: ExecutionContext) -> str:
     return raw
 
-# `StrictUndefined` makes a typo'd `{{ var }}` fail loudly; `keep_trailing_newline`
-# preserves the trailing `\n` of triple-quoted templates.
-_ENV = Environment(
-    autoescape=False,
-    keep_trailing_newline=True,
-    undefined=StrictUndefined,
-)
+
+@dataclass(frozen=True)
+class _PromptParts:
+    corpus: str
+    few_shots: tuple[str, ...]
+    lessons: tuple[str, ...]
 
 
-def _build_default_tail(
-    corpus: str,
-    few_shots: tuple[str, ...],
-    lessons: tuple[str, ...],
-) -> str:
-    """The conventional `## Dataset` / `## Few-shot examples` / `## Lessons learned`
-    trailing block. Empty when no overrides target this call-site."""
-    parts: list[str] = []
-    if corpus:
-        parts.append("\n## Dataset\n" + corpus)
-    if few_shots:
-        parts.append("\n## Few-shot examples\n" + "\n\n".join(few_shots))
-    if lessons:
-        parts.append("\n## Lessons learned\n" + "\n".join(f"- {lesson}" for lesson in lessons))
-    return "".join(parts)
+def _build_tail(parts: _PromptParts) -> str:
+    sections: list[str] = []
+    if parts.corpus:
+        sections.append("\n## Dataset\n" + parts.corpus)
+    if parts.few_shots:
+        sections.append("\n## Few-shot examples\n" + "\n\n".join(parts.few_shots))
+    if parts.lessons:
+        sections.append("\n## Lessons learned\n" + "\n".join(f"- {lesson}" for lesson in parts.lessons))
+    if not sections:
+        return ""
+    return (
+        "\nThe dataset section below enumerates the corpus-specific conventions and points to a few\n"
+        "worked examples.\n" + "".join(sections)
+    )
 
 
-def _gather_overrides(
-    overrides: tuple[PromptOverride, ...], name: str
-) -> tuple[str, tuple[str, ...], tuple[str, ...]]:
-    """Select this call-site's (corpus, few_shots, lessons) override slices from the
-    registry, concatenating multiple entries per section in declaration order."""
+def _gather_overrides(overrides: tuple[PromptOverride, ...], name: str) -> _PromptParts:
     corpus_parts: list[str] = []
     few_shots: list[str] = []
     lessons: list[str] = []
     for o in overrides:
-        # `"*"` targets every call-site; otherwise match this call-site by name
         if "*" not in o.targets and name not in o.targets:
             continue
         if o.section == "corpus" and isinstance(o.content, str) and o.content:
@@ -125,7 +93,11 @@ def _gather_overrides(
                 stripped = line.strip()
                 if stripped:
                     lessons.append(stripped)
-    return "\n\n".join(corpus_parts), tuple(few_shots), tuple(lessons)
+    return _PromptParts(
+        corpus="\n\n".join(corpus_parts),
+        few_shots=tuple(few_shots),
+        lessons=tuple(lessons),
+    )
 
 
 class PromptedCall[T]:
@@ -134,87 +106,111 @@ class PromptedCall[T]:
     call-sites carry only their domain logic. `call()` returns `parse(raw_text, ctx)`
     (default parser returns raw text → a bare `PromptedCall` is `PromptedCall[str]`).
     `name` is the override-registry / effort-override key.
-
-    The `parse` hook may raise a call-site control-flow signal or `ParseError`; the
-    raw response is logged before parse runs, so a parse failure is still traced."""
+    """
 
     def __init__(
         self,
         *,
         name: str,
         system_prompt: str,
-        default_effort: "Effort" = "off",
-        template_vars: TemplateVarsProvider | None = None,
-        parse: Callable[[str, HarnessContext], T] = _identity,  # type: ignore[assignment]
+        default_effort: Effort = "off",
+        parse: Callable[[str, ExecutionContext], T] = _identity,  # type: ignore[assignment]
+        output_instruction: str | None = None,
         max_parse_retries: int = 1,
     ) -> None:
         self.name = name
-        self.system_prompt = system_prompt
-        self.default_effort = default_effort
-        self._template_vars = template_vars
+        self._system_prompt = system_prompt
+        self._default_effort = default_effort
         self._parse = parse
+        self._output_instruction = output_instruction
         self._max_parse_retries = max_parse_retries
 
-    def assemble_system_prompt(self, ctx: HarnessContext) -> str:
-        corpus, few_shots, lessons = _gather_overrides(ctx.prompt_overrides, self.name)
-        variables = {
-            **(self._template_vars(ctx) if self._template_vars else {}),
-            "corpus": corpus,
-            "few_shots": few_shots,
-            "lessons": lessons,
-            "default_tail": _build_default_tail(corpus, few_shots, lessons),
-        }
-        return _ENV.from_string(self.system_prompt).render(**variables)
+    def _assemble_system_prompt(self, ctx: ExecutionContext) -> str:
+        return self._system_prompt + _build_tail(_gather_overrides(ctx.prompt_overrides, self.name))
 
-    def resolve_effort(self, ctx: HarnessContext, effort: "Effort | None") -> "Effort":
-        """Resolution priority: explicit arg > config override > class default."""
+    def _resolve_effort(self, ctx: ExecutionContext, effort: Effort | None) -> Effort:
         if effort is not None:
             return effort
-        return ctx.config.effort_overrides.get(self.name, self.default_effort)
+        return cast(Effort, ctx.config.effort_overrides.get(self.name, self._default_effort))
 
-    @staticmethod
-    def _retry_message(user: str, e: ParseError) -> str:
-        """Re-prompt body for a parse retry: original user message + the
-        unparseable reply + the error. No history accumulation."""
-        return (
-            f"{user}\n\n"
-            f"Your previous reply could not be parsed:\n```\n{e.raw}\n```\n\n"
-            f"Error: {e.detail}\n"
-            "Fix the issue and return a valid response."
-        )
+    def _resolve_model(self, ctx: ExecutionContext) -> str:
+        return ctx.config.model_overrides.get(self.name, ctx.config.llm_model)
 
-    def call(
+    def _compose_user(self, user: str, retry: ParseError | None) -> str:
+        parts = [user]
+        if retry is not None:
+            parts.append(
+                f"Your previous reply could not be parsed:\n```\n{retry.raw}\n```\n\n"
+                f"Error: {retry.detail}\nFix the issue and return a valid response."
+            )
+        if self._output_instruction:
+            parts.append(self._output_instruction)
+        return "\n\n".join(parts)
+
+    async def call(
         self,
-        ctx: HarnessContext,
-        user: str,
+        ctx: ExecutionContext,
+        user: str = "",
         *,
-        images: list[tuple[str, str]] | None = None,
+        messages: list[dict] | None = None,
+        images: list[B64Image] | None = None,
         temperature: float = 0.0,
-        effort: "Effort | None" = None,
+        effort: Effort | None = None,
+        should_stop: Callable[[str], bool] | None = None,
     ) -> T:
         """Assemble the prompt, resolve effort, invoke the LLM, then parse into a
-        typed result. A `ParseError` re-prompts up to `max_parse_retries` times
-        (the only retry this layer owns); any other parse exception (e.g.
-        `MissingData`) is application-level and propagates immediately."""
-        eff = self.resolve_effort(ctx, effort)
-        system = self.assemble_system_prompt(ctx)  # identical across retries; render once
-        message = user
+        typed result.
+
+        Single-shot (default): assembles system+user, calls `acall`, retries on
+        `ParseError` up to `max_parse_retries` times.
+
+        Multi-turn (pass `messages`): assembles system, streams via `astream` with
+        optional `should_stop`; no retry — the caller owns the loop.
+        """
+        eff = self._resolve_effort(ctx, effort)
+        system = self._assemble_system_prompt(ctx)
+        if messages is not None:
+            model = ctx.config.agent_model_id or self._resolve_model(ctx)
+            messages = list(messages)  # work on a copy so callers don't see retry exchanges
+            attempt = 0
+            while True:
+                resp = await ctx.llm_client.astream(
+                    system=system,
+                    messages=messages,
+                    model=model,
+                    should_stop=should_stop,
+                    effort=eff,
+                    ctx=ctx,
+                    call_site=self.name,
+                )
+                try:
+                    return self._parse(resp.text, ctx)
+                except ParseError as e:
+                    if attempt >= self._max_parse_retries:
+                        raise
+                    ctx.emit(f"parse_retry call_site={self.name} attempt={attempt + 1} error={e.detail!r}")
+                    messages.append({"role": "assistant", "content": resp.text})
+                    messages.append({"role": "user", "content": self._compose_user("", e).strip()})
+                    attempt += 1
+        model = self._resolve_model(ctx)
         attempt = 0
+        retry: ParseError | None = None
         while True:
-            resp = ctx.llm_client.call(
+            resp = await ctx.llm_client.acall(
                 system,
-                message,
+                self._compose_user(user, retry),
                 images=images,
                 temperature=temperature,
                 effort=eff,
                 ctx=ctx,
                 call_site=self.name,
+                model=model,
             )
             try:
                 return self._parse(resp.text, ctx)
             except ParseError as e:
                 if attempt >= self._max_parse_retries:
                     raise
-                ctx.emit(self.name, "parse_retry", attempt=attempt + 1, error=e.detail)
-                message = self._retry_message(user, e)
+                ctx.emit(f"parse_retry call_site={self.name} attempt={attempt + 1} error={e.detail!r}")
+                retry = e
                 attempt += 1

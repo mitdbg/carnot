@@ -25,9 +25,22 @@ GREP_FORBIDDEN_PATTERNS = [
 
 class RetrievePageInfoTool(Tool):
     name = "retrieve_page_info"
+    _DOC_TEMPLATE = """\
+### retrieve_page_info(year_month_page_tuples: list[tuple[int, int, int]])
+This tool returns the cleaned text content for each page specified by the input list of (year, month, page_id) tuples. Don't read more than ~{{ max_pages }} pages per tool call, as they may exceed your context window.
 
-    def __init__(self, clean_page_map: dict[str, list]):
+Example:
+```python
+# retrieve content for pages 19 and 26 of the December 2002 bulletin
+retrieve_page_info([(2002, 12, 19), (2002, 12, 26)])
+
+# retrieve pages 20 to 30 for every month of the 1970 bulletin
+retrieve_page_info([(1970, m, p) for m in range(1, 13) for p in range(20, 31)])
+```"""
+
+    def __init__(self, clean_page_map: dict[str, list], max_pages: int):
         self._clean_page_map = clean_page_map
+        self.doc = self._DOC_TEMPLATE.replace("{{ max_pages }}", str(max_pages))
 
     def __call__(self, year_month_page_tuples):
         chunks = []
@@ -47,19 +60,6 @@ class RetrievePageInfoTool(Tool):
                 continue
             chunks.append(f"=== {key} ({filepath}) ===\n{text}")
         return "\n\n".join(chunks)
-
-    doc = """\
-### retrieve_page_info(year_month_page_tuples: list[tuple[int, int, int]])
-This tool returns the cleaned text content for each page specified by the input list of (year, month, page_id) tuples. Don't read more than ~{{ max_pages }} pages per tool call, as they may exceed your context window.
-
-Example:
-```python
-# retrieve content for pages 19 and 26 of the December 2002 bulletin
-retrieve_page_info([(2002, 12, 19), (2002, 12, 26)])
-
-# retrieve pages 20 to 30 for every month of the 1970 bulletin
-retrieve_page_info([(1970, m, p) for m in range(1, 13) for p in range(20, 31)])
-```"""
 
 
 def _build_where(
