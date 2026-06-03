@@ -1,6 +1,6 @@
 """OfficeQA — declarative QA pipeline over the U.S. Treasury Bulletin corpus.
 
-question → Planner → Plan (branches + requirements) → orchestrator →
+question → Planner → Plan (branches) → orchestrator →
 {retrieve, extract, lookup_external, compute}, where `compute` is the chain terminator
 and subsumes formatting. Public API is re-exported below; see ARCHITECTURE.md for intent."""
 

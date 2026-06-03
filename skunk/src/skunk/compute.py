@@ -1,31 +1,15 @@
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Sequence
-from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from skunk.common import Effort, strip_code_fence
 from skunk.errors import MissingData, ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.common import AnnotatedValue, ExecutionContext, input_values_desc
-from skunk.plan import Plan, Requirements
 from skunk.pyexec import exec_python_with_env
 from skunk.question_explainer import ConceptExplanation
-
-
-
-class CritiqueResult(BaseModel):
-    model_config = ConfigDict(frozen=True)
-    verdict: Literal["accept", "revise"]
-    reason: str = ""
-
-    @model_validator(mode="after")
-    def _revise_needs_reason(self) -> CritiqueResult:
-        if self.verdict == "revise" and not self.reason.strip():
-            raise ValueError("verdict=revise requires non-empty 'reason'")
-        return self
 
 
 class MissingDataSignal(BaseModel):
@@ -68,26 +52,13 @@ def _parse_codegen(raw: str) -> str:
     return s
 
 
-def _parse_critique(raw: str, _: ExecutionContext) -> CritiqueResult:
-    """Parse a critique reply into a `CritiqueResult`. Malformed JSON → `ParseError`
-    (re-prompted once; `_decide` then degrades to REVISE, never silent accept)."""
-    try:
-        return CritiqueResult.model_validate_json(strip_code_fence(raw))
-    except ValidationError as e:
-        raise ParseError(raw, str(e)) from e
-
-
 class Codegen:
     _SYSTEM_PROMPT = """\
 You write Python that produces the final answer string, or emit a structured missing-data signal.
 
 ## Inputs
-- The user's question — the authoritative statement of what to compute.
-- `requirements` (JSON): the planner's distilled constraints on the answer.
-  `qualifiers` — each a MUST-apply modifier from the question. The
-  output-format fields `units_out` / `precision` / `answer_form` — convert
-  to `units_out`, round to `precision` decimal places, format to
-  `answer_form`. Null fields mean unconstrained.
+- The user's question — the authoritative statement of what to compute,
+  including the output format (units, decimal places, list/bracket shape).
 - Optional `## Concept references` section: one block per non-obvious
   concept the question references — canonical definition + formula
   for named operations, domain-specific conventions, etc. Treat each
@@ -152,7 +123,6 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
     async def codegen(
         self,
         ctx: ExecutionContext,
-        plan: Plan,
         input_values: list[AnnotatedValue],
         prev_code: str | None,
         prev_failure: str | None,
@@ -164,10 +134,7 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
         propagates past compute) or `_ParseFailure` (caller retries with `hint`).
         `prev_code`/`prev_failure` describe only the most-recent failed attempt —
         accumulating older ones dilutes the issue to fix."""
-        user_msg = (
-            f"Question:\n{ctx.question}\n\n"
-            f"requirements = {plan.requirements.model_dump_json()}\n\n"
-        )
+        user_msg = f"Question:\n{ctx.question}\n\n"
         if concept_explanations:
             block = "\n\n".join(
                 f"### {c.concept}\n{c.explanation}"
@@ -187,168 +154,32 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
         return _parse_codegen(raw)
 
 
-class Critique:
-    _SYSTEM_PROMPT = """\
-You review code against ONE specific constraint from the plan.
-Decide accept or revise.
-
-## Inputs
-
-- Question — context for what the agent is answering.
-- One specific constraint — either a qualifier phrase or the
-  output-format fields (units_out / precision / answer_form). This is
-  the ONLY constraint you are checking. Other constraints are someone
-  else's job — do not flag issues outside this one.
-- `input_values` summary — the data the code consumed (full, every row/col).
-- The Python code that ran.
-- The produced `result` string.
-
-## Output format
-
-A single bare JSON object. No fences, no prose. Exactly one of:
-
-  {"verdict": "accept"}
-  {"verdict": "revise",
-   "reason": "<short, specific reason tied to THIS constraint>"}
-
-Accept iff the code AND result honor your assigned constraint.
-Revise otherwise. Be specific about what the code did wrong in your
-reason.
-"""
-
-    _prompt = PromptedCall(
-        name="compute.critique",
-        system_prompt=_SYSTEM_PROMPT,
-        default_effort="off",
-        parse=_parse_critique,
-        output_instruction="Output a single bare JSON object with your verdict — no markdown fences, no prose.",
-    )
-
-    async def review(
-        self,
-        ctx: ExecutionContext,
-        plan: Plan,
-        input_values: list[AnnotatedValue],
-        code: str,
-        result: str,
-    ) -> tuple[bool, str]:
-        """Fan out N+1 focused critiques in parallel — one per qualifier plus one
-        for the output-format fields. Any REVISE → overall REVISE (reasons concatenated)."""
-        qualifiers = plan.requirements.qualifiers
-        n_calls = len(qualifiers) + 1
-        ctx.emit(f"critique_fanout n_calls={n_calls}")
-        labels = [("qualifier", q) for q in qualifiers] + [
-            ("output format", "units_out/precision/answer_form")
-        ]
-        coros = [
-            self._critique_qualifier(ctx, ctx.question, q, input_values, code, result)
-            for q in qualifiers
-        ]
-        coros.append(
-            self._critique_format(
-                ctx, ctx.question, plan.requirements, input_values, code, result,
-            )
-        )
-        outcomes = await asyncio.gather(*coros, return_exceptions=True)
-        revises: list[tuple[str, str]] = []  # (focus_label, reason)
-        for (kind, label), outcome in zip(labels, outcomes):
-            if isinstance(outcome, BaseException):
-                accept, reason = False, f"critique error: {outcome}"
-            else:
-                accept, reason = outcome
-            if not accept:
-                revises.append((f"{kind} '{label}'", reason))
-        if not revises:
-            return True, ""
-        return False, "; ".join(f"{label}: {reason}" for label, reason in revises)
-
-    async def _decide(
-        self,
-        ctx: ExecutionContext,
-        question: str,
-        focus_block: str,
-        input_values: list[AnnotatedValue],
-        code: str,
-        result_text: str,
-    ) -> tuple[bool, str]:
-        """Shared body for the focused critique. Returns (accept, reason); a
-        malformed reply → REVISE with a diagnostic reason (never silent accept)."""
-        user = (
-            f"Question:\n{question}\n\n"
-            f"{focus_block}\n\n"
-            f"input_values =\n{input_values_desc(input_values)}\n\n"
-            f"Code that ran:\n```python\n{code}\n```\n\n"
-            f"Produced result:\n{result_text}"
-        )
-        try:
-            verdict = await self._prompt.call(ctx, user)
-        except ParseError as e:
-            return False, f"self-critique produced malformed reply: {e.detail}"
-        if verdict.verdict == "accept":
-            return True, ""
-        return False, verdict.reason
-
-    async def _critique_qualifier(
-        self,
-        ctx: ExecutionContext,
-        question: str,
-        qualifier: str,
-        input_values: list[AnnotatedValue],
-        code: str,
-        result_text: str,
-    ) -> tuple[bool, str]:
-        """Focused critique against a single qualifier phrase."""
-        focus = f"Constraint to check:\n{qualifier}"
-        return await self._decide(ctx, question, focus, input_values, code, result_text)
-
-    async def _critique_format(
-        self,
-        ctx: ExecutionContext,
-        question: str,
-        requirements: "Requirements",
-        input_values: list[AnnotatedValue],
-        code: str,
-        result_text: str,
-    ) -> tuple[bool, str]:
-        """Focused critique against the output-format fields (units_out / precision /
-        answer_form), checked as one unit — the qualifiers are someone else's job."""
-        focus = (
-            "Output format to check:\n"
-            f"{requirements.model_dump_json(include={'units_out', 'precision', 'answer_form'})}"
-        )
-        return await self._decide(ctx, question, focus, input_values, code, result_text)
-
-
 class ComputeOp:
-    """The compute operator — unified codegen → exec → critique loop. One public `run()`."""
+    """The compute operator — a codegen → exec loop. One public `run()`."""
     def __init__(self) -> None:
         self._codegen = Codegen()
-        self._critique = Critique()
 
     async def run(
         self,
         input_values: list[AnnotatedValue],
         ctx: ExecutionContext,
-        plan: Plan,
         concept_explanations: Sequence[ConceptExplanation] = (),
     ) -> str:
-        """Retry loop over `compute_max_attempts`: each iteration does codegen → exec
-        → critique, and any failure feeds the next `prev_failure`. Returns on ACCEPT,
-        or — if the budget exhausts after at least one clean exec — the last result
-        (which critique rejected) as a best-effort answer. Raises `StepFailed` if no
-        iteration ever execs cleanly; propagates `MissingData` (codegen's give-up
-        signal) so the orchestrator can recover by gathering more data and replanning."""
+        """Retry loop over `compute_max_attempts`: each iteration does codegen → exec,
+        and any failure feeds the next attempt's `prev_failure`. Returns the result of
+        the first clean exec. Raises `StepFailed` if no iteration ever execs cleanly;
+        propagates `MissingData` (codegen's give-up signal) so the orchestrator can
+        recover by gathering more data and replanning."""
         # No "starting" boundary emit — the orchestrator's trace records this
-        # step's boundary; the plan/requirements are the planner step's output.
+        # step's boundary; the plan is the planner step's output.
 
         prev_code: str | None = None
         prev_failure: str | None = None
-        last_result: str | None = None
 
         for try_idx in range(ctx.config.compute_max_attempts):
             try:
                 code = await self._codegen.codegen(
-                    ctx, plan, input_values, prev_code, prev_failure,
+                    ctx, input_values, prev_code, prev_failure,
                     concept_explanations,
                 )
             except ParseError as e:
@@ -358,9 +189,7 @@ class ComputeOp:
                 continue
             except MissingData as e:
                 # Trust the signal: propagate so the orchestrator's recovery loop can
-                # gather the missing data and replan. We deliberately do NOT fall back
-                # to a prior clean-but-critique-rejected result — that would suppress
-                # recovery in favor of an answer the self-critique already flagged.
+                # gather the missing data and replan.
                 ctx.emit(
                     f"codegen_missing attempt={try_idx + 1} missing={e.missing!r} "
                     f"description={e.reason!r}"
@@ -377,20 +206,9 @@ class ComputeOp:
                 continue
 
             result = str(env.get("result"))
-            last_result = result
             ctx.emit(f"exec_result attempt={try_idx + 1} text={result!r}")
+            return result
 
-            accept, reason = await self._critique.review(ctx, plan, input_values, code, result)
-            if accept:
-                ctx.emit(f"critique_accept attempt={try_idx + 1} text={result!r}")
-                return result
-            ctx.emit(f"critique_revise attempt={try_idx + 1} reason={reason!r}")
-            prev_code = code
-            prev_failure = f"Produced result {result!r}. Self-critique flagged: {reason}"
-
-        if last_result is not None:
-            ctx.emit(f"budget_exhausted fallback_text={last_result!r}")
-            return last_result
         raise StepFailed(
             "compute",
             f"no successful exec within budget; last failure: {prev_failure}",

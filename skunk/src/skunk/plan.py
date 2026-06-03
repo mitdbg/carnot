@@ -60,24 +60,10 @@ Branch = Annotated[
 ]
 
 
-class Requirements(BaseModel):
-    """NL spec for the terminal compute phase: the constraints the final answer
-    must satisfy. `qualifiers` pin the calculation; `units_out` / `precision` /
-    `answer_form` pin how it is rendered. Compute is one unified operator that
-    owns both calculation and formatting, so they travel as a single object."""
-
-    model_config = ConfigDict(frozen=True)
-    qualifiers: list[str] = Field(default_factory=list)
-    units_out: str | None = None
-    precision: int | None = Field(default=None, ge=0)
-    answer_form: str | None = None
-
-
 class Plan(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     branches: list[Branch] = Field(min_length=1)
-    requirements: Requirements = Field(default_factory=Requirements)
 
 
 class PlanDiff(BaseModel):
@@ -87,16 +73,12 @@ class PlanDiff(BaseModel):
 
     add: list[Branch] = Field(default_factory=list)
     drop: list[int] = Field(default_factory=list)
-    requirements: Requirements | None = None
 
     def apply(self, plan: Plan) -> tuple[Plan, list[int]]:
         drop = {i for i in self.drop if 0 <= i < len(plan.branches)}
         kept = [i for i in range(len(plan.branches)) if i not in drop]
         new_plan = plan.model_copy(
-            update={
-                "branches": [*(plan.branches[i] for i in kept), *self.add],
-                "requirements": self.requirements or plan.requirements,
-            }
+            update={"branches": [*(plan.branches[i] for i in kept), *self.add]}
         )
         return new_plan, kept
 
@@ -131,19 +113,13 @@ You are a query planner. Given a question, emit a JSON plan that, when executed,
     {"kind": "lookup_external",
      "target": "<natural-language request for a single value>",
      "src": "<natural-language description of requested source, if applicable | null>"}
-  ],
-  "requirements": {
-     "qualifiers": [<short qualifier phrases>],
-     "units_out": "<unit | null>",
-     "precision": <int | null>,
-     "answer_form": <natural-language describing the output format | null>
-  }
+  ]
 }
 
 Branches run in parallel. A `retrieve` branch pulls information from the corpus.
 A `lookup_external` branch fetches a single value from outside the corpus. Use 'lookup_external' only when you are sure the corpus does not contain the answer,
-when the question explicitly asks for an external lookup from a source, or when previous lookups in the corpus failed. `requirements` informs a final
-compute step.
+when the question explicitly asks for an external lookup from a source, or when previous lookups in the corpus failed. A final compute step reads the
+gathered values and the verbatim question to produce the answer.
 
 ## Field semantics
 
@@ -169,24 +145,6 @@ lookup_external branch fields:
                 (period→value). Do NOT split into N separate branches — that multiplies failure risk.
   src           Set to a publisher name if and only if the question requests a
                 single, unambiguous external source. Otherwise null.
-
-requirements fields (constraints on the final answer; `qualifiers` pin the
-calculation, the rest pin how it is rendered):
-  qualifiers   Optional list of short phrases that nail down a specific qualifier. Each
-               qualifier is one phrase; the compute operator treats every qualifier as a MUST. Use only when
-               the question explicitly pins a choice. Empty list (or omit the field) when the question is
-               unambiguous. Preserve qualifier words from the question VERBATIM — do not
-               paraphrase, simplify, or otherwise modify them. The compute step
-               relies on the exact wording to choose the right operation.
-  units_out    Unit of the final answer (e.g., "in millions of
-               dollars", "as a percent", "in DEM"). Use exact matching strings from the question.
-               If the question does NOT name a unit, output `null`.
-               Do not guess; do not invent; do not fall back to
-               "text" or any other placeholder.
-  precision    decimal places of the final answer; null when not pinned.
-  answer_form  examples: no commas, bracketed_list for "[a, b, c]",
-               labeled_pair for "[year, value]". Pure rendering — no
-               semantic content about the calculation itself.
 """
 
     _REPLAN_INSTRUCTIONS = """\
@@ -201,7 +159,6 @@ Return a PlanDiff JSON object with these fields:
                  list in the question) to remove. Removing a branch also discards the
                  data it gathered, so drop a branch only when its data is wrong or
                  must be re-fetched differently. Empty list if you drop nothing.
-  requirements   a replacement requirements object, or null to keep the prior one.
 
 Rules:
   - A prior branch you wish to keep appear in NEITHER list: leave it
@@ -213,9 +170,6 @@ Rules:
     you are asking for information at the right granularity, and whether you are correctly
     assuming whether a piece of information is in the corpus or should be fetched externally with
     the appropriate src.
-  - Only if the missing-data signal shows the calculation itself was misframed (e.g. a
-    qualifier was misread), set `requirements` to a corrected object; it
-    replaces the prior value.
 """
 
     # Planner and replanner share the initial-plan instructions (same branch/field
@@ -284,7 +238,6 @@ Rules:
         parts = [
             f"Question: {ctx.question}",
             f"prior_plan.branches (reference `drop` by these indices):\n{numbered}",
-            f"prior requirements = {prior_plan.requirements.model_dump_json()}",
             "input_values (data already gathered; treat as available, do NOT request again):\n"
             f"{input_values_desc(prev)}",
         ]

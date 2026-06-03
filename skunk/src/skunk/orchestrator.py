@@ -96,7 +96,6 @@ class Orchestrator:
                     lambda: self._compute.run(
                         entries,
                         self._ctx,
-                        plan,
                         concept_explanations=explanations,
                     ),
                 )

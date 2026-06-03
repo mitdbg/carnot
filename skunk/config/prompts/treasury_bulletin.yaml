@@ -86,7 +86,7 @@ overrides:
       - |
         ### Example
         Q: Absolute percent change in national defense expenditures between CY1940 and CY1953, rounded to hundredths.
-        Why this shape: One closed-form calculation over two scalar lookups. The question pins the formula; one qualifier nails the absolute-vs-signed and percent-form choices.
+        Why this shape: One closed-form calculation over two scalar lookups. The question itself states the formula, the absolute/percent-form choices, and the rounding; compute reads them from the verbatim question.
         Plan:
         ```json
         {
@@ -95,18 +95,14 @@ overrides:
              "period": "CY1940"},
             {"kind": "retrieve", "key": "national defense expenditures",
              "period": "CY1953"}
-          ],
-          "requirements": {
-            "qualifiers": ["absolute value, not signed", "in percent form (multiply by 100)"],
-            "units_out": "pct", "precision": 2
-          }
+          ]
         }
         ```
 
       - |
         ### Example
         Q: Real (CPI-adjusted, 2020 dollars) value of total national defense expenditures in CY1953.
-        Why this shape: Nominal value from the corpus, deflator from outside it. A qualifier pins the deflator direction. `src` biases the external lookup toward the canonical BLS series.
+        Why this shape: Nominal value from the corpus, deflator from outside it. `src` biases the external lookup toward the canonical BLS series.
         Plan:
         ```json
         {
@@ -116,18 +112,14 @@ overrides:
             {"kind": "lookup_external",
              "target": "U.S. CPI-U annual average for 1953 (base 2020=100)",
              "src": "Bureau of Labor Statistics"}
-          ],
-          "requirements": {
-            "qualifiers": ["real = nominal / (CPI / 100); the result is already in 2020 dollars, no further scaling"],
-            "units_out": "usd_millions"
-          }
+          ]
         }
         ```
 
       - |
         ### Example
         Q: Read the total debt held by the public from the September 1990 Treasury Bulletin chart on page 5.
-        Why this shape: Chart read with visual_only=True. Direct lookup, no calculation, no qualifiers.
+        Why this shape: Chart read with visual_only=True. Direct lookup, no calculation.
         Plan:
         ```json
         {
@@ -135,8 +127,7 @@ overrides:
             {"kind": "retrieve", "key": "chart of total debt held by the public",
              "period": "1990-09",
              "visual_only": true}
-          ],
-          "requirements": {"qualifiers": []}
+          ]
         }
         ```
 
@@ -151,11 +142,7 @@ overrides:
             {"kind": "lookup_external",
              "target": "U.S. CPI-U annual averages for 1950, 1951, 1952",
              "src": "Bureau of Labor Statistics"}
-          ],
-          "requirements": {
-            "qualifiers": [],
-            "units_out": "cpi"
-          }
+          ]
         }
         ```
 
@@ -175,11 +162,7 @@ overrides:
              "period": "FY2008", "as_of": "September 2012 bulletin"},
             {"kind": "retrieve", "key": "nominal gross domestic product",
              "period": "FY2010", "as_of": "September 2012 bulletin"}
-          ],
-          "requirements": {
-            "qualifiers": [],
-            "units_out": "pct", "precision": 1
-          }
+          ]
         }
         ```
 
@@ -187,7 +170,7 @@ overrides:
   # Corpus blurbs for the remaining executors.
   # ---------------------------------------------------------------------
   - section: corpus
-    targets: [compute.codegen, compute.critique]
+    targets: [compute.codegen]
     content: |
       The values in `input_values` were extracted from U.S. Treasury Monthly
       Bulletin pages. Common units in this corpus: `usd`, `usd_thousands`,
@@ -240,9 +223,9 @@ overrides:
   - section: lessons
     targets: [compute.codegen]
     content: >
-      Numeric modifiers — each modifier present in the question (or echoed
-      in `requirements.qualifiers`) MUST appear as an explicit operation, not a
-      comment. Common forms: `signed` vs `absolute` — never silently abs()
+      Numeric modifiers — each modifier present in the question MUST appear
+      as an explicit operation, not a comment. Common forms: `signed` vs
+      `absolute` — never silently abs()
       a value meant signed; `normalized` / `midpoint normalized` — apply
       explicitly ((V2-V1)/((V1+V2)/2)); `log of` / `ln(...)` — wrap in
       np.log; `per capita` — divide by population; `in percent form` vs
@@ -260,9 +243,10 @@ overrides:
   - section: lessons
     targets: [compute.codegen]
     content: >
-      Scale conversion: if a value is in `usd_thousands` and `units_out`
-      is `usd_millions`, divide by 1000 — apply the conversion once over
-      the whole payload, never cell-by-cell.
+      Scale conversion: when an input value's scale differs from the unit the
+      question asks for (e.g. value in `usd_thousands`, question wants millions),
+      convert it — apply the conversion once over the whole payload, never
+      cell-by-cell.
 
   - section: lessons
     targets: [compute.codegen]
@@ -319,65 +303,6 @@ overrides:
         Why this shape: Required deflator is not in input_values. Emit the bare missing-data JSON object (NO fence). Never fabricate.
         Output (literal, no fence in your reply):
         {"missing": ["cpi:1953", "cpi:2020"], "description": "no CPI series in input_values to convert nominal CY1953 to 2020 dollars"}
-
-  # ---------------------------------------------------------------------
-  # Few-shots for the compute self-critique. Each shows ONE focus
-  # (a single qualifier OR the output-format fields), the code that ran,
-  # the result, and the bare-JSON verdict. Mined from real dev traces.
-  # Discipline: judge ONLY the assigned constraint; a clean result that
-  # violates some OTHER constraint is still an accept here.
-  # ---------------------------------------------------------------------
-  - section: few_shots
-    targets: [compute.critique]
-    content:
-      - |
-        ### Example (accept — qualifier honored)
-        Question: Absolute difference between the Feb and May figures, in millions, rounded to hundredths.
-        Constraint to check (a qualifier):
-        absolute value, not signed
-        Code that ran:
-        ```python
-        a = next(e for e in input_values if 'Feb' in e.description).value
-        b = next(e for e in input_values if 'May' in e.description).value
-        result = f"{abs(a - b):.2f}"
-        ```
-        Produced result: 11.60
-        Why: the qualifier demands an unsigned magnitude; `abs(...)` applies it
-        explicitly and the value is non-negative. This one constraint is honored,
-        so accept — rounding/units are someone else's focus.
-        Output: {"verdict": "accept"}
-
-      - |
-        ### Example (revise — qualifier: a required intermediate step is missing)
-        Question: H-spread of the annual debt values, with intermediate values rounded to the tenths of a billion.
-        Constraint to check (a qualifier):
-        intermediate values rounded to the tenths of a billion
-        Code that ran:
-        ```python
-        q1 = np.percentile(vals, 25)
-        q3 = np.percentile(vals, 75)
-        result = f"{q3 - q1:.2f}"
-        ```
-        Produced result: 41.27
-        Why: the qualifier requires Q1 and Q3 to be rounded to a tenth of a billion
-        BEFORE the spread is taken; the code subtracts the raw quartiles. A modifier
-        named in the question is absent as an explicit operation → revise.
-        Output: {"verdict": "revise", "reason": "Q1 and Q3 are not rounded to the tenths of a billion before the subtraction the qualifier requires; round each (e.g. round(q, 1)) before computing the spread."}
-
-      - |
-        ### Example (revise — output-format: unit symbol missing)
-        Question: Percent change between the two figures, expressed as a percent, rounded to two decimals.
-        Constraint to check (the output-format fields):
-        {"units_out": "pct", "precision": 2, "answer_form": null}
-        Code that ran:
-        ```python
-        result = f"{(b - a) / a * 100:.2f}"
-        ```
-        Produced result: 6.14
-        Why: units_out is `pct`, so the rendered answer must carry the `%` sign;
-        `6.14` omits it. The numeric value and 2-dp precision are correct, but this
-        focus is the rendering → revise.
-        Output: {"verdict": "revise", "reason": "units_out is 'pct' but the result '6.14' has no '%' sign; render it as '6.14%'."}
 
   # ---------------------------------------------------------------------
   # Few-shots for lookup_external.

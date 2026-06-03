@@ -35,7 +35,7 @@ class SkunkConfig:
 
     # Per call-site model override: `PromptedCall.name` → model id. Missing key →
     # `llm_model`. Lets one run mix models (e.g. a strong default with cheap Flash
-    # pinned on `question_explainer` / `compute.critique`). Agent loops use
+    # pinned on `question_explainer`). Agent loops use
     # `agent_model_id` instead. Each model is paced by its own RPM bucket — see
     # `common._llm_model_rpm` (env SKUNK_MODEL_RPM).
     # (env: SKUNK_MODEL_OVERRIDES — comma-separated `name=model` pairs)

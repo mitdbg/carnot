@@ -887,12 +887,11 @@ def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
 
 
 def input_values_desc(input_values: list[AnnotatedValue]) -> str:
-    """Render `input_values` for the codegen / critique / re-planner prompts as a
+    """Render `input_values` for the codegen / re-planner prompts as a
     **schema view** — axis labels + dtypes + a small `head` sample, NOT a full cell
     dump. Generated code operates on the frames symbolically (full frames live in the
     exec env), so it needs the labels (to write selections) and a small sample (number
-    encoding, sentinels, magnitude for the unit decision), not the interior grid.
-    Codegen and critique share this one view, so there's no info asymmetry."""
+    encoding, sentinels, magnitude for the unit decision), not the interior grid."""
     lines = [f"input_values ({len(input_values)} entries)"]
     for i, e in enumerate(input_values):
         lines.extend(_describe_entry(i, e))

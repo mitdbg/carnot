@@ -32,9 +32,9 @@ This decoupling means retrieval and extraction can be evaluated independently �
        ▼                  ▼                  ▼
                     ┌──────────────────┐
                     │     compute      │   chain terminator:
-                    │ plan → code →    │   self-plans, codegens,
-                    │ exec → verify    │   execs, verifies output
-                    └────────┬─────────┘   format/unit
+                    │  code → exec     │   codegens from the
+                    │                  │   question, execs
+                    └────────┬─────────┘   to the answer
                              │
                              ▼
                           answer
@@ -69,31 +69,30 @@ The load-bearing insight is that `periods_covered` (what period a page *reports 
 - **`retrieve(key, period)`** — only chain head. Returns `list[PageRef]` with `(month, page)` populated (where `page` is the 1-based PDF page index). Dispatched by `RetrieveOp` to one of two backends (or short-circuited by `ctx.config.golden_pages`) — see "Two retrieval methods" above.
 - **`extract(key, period, visual_only?)`** — reads `ctx.question` and the located pages via tier dispatch (parsed JSON → vision). Returns `list[AnnotatedValue]` — each entry has a `description`, `value`, `unit`, and one of three **kinds**: `scalar`, `vector` (1-D series with one varying dim), or `table` (2-D grid with row/col dims). Vector/table cells are always primitive scalars; nesting beyond those shapes is rejected by the extract parser before an `AnnotatedValue` is constructed. `extract` is invoked automatically by the orchestrator on every `RetrieveBranch` — `visual_only` is set on the branch and threaded through. Pass `visual_only=True` to skip Tier 1 and go straight to vision (use for charts/figures).
 - **`lookup_external(nl)`** — chain-head capable. Runs a `LookupAgent` (a `MultiTurnAgent` tool loop: FRED / BLS / World Bank / Tavily / fetch_url, ≤`lookup_max_steps` steps) over a natural-language description of external factual data (`nl`); the agent commits a dict of `AnnotatedValue` fields, which `LookupExternalOp` parses into `list[AnnotatedValue]` (one entry) on the trusted side. Use for CPI-U, FX rates, event dates, named entities (bureau names), and any fact not in the bulletin corpus. The agent infers the appropriate `kind` and `unit` (including `text` for strings).
-- **`compute()`** — chain terminator that subsumes formatting. Reads `ctx.question` plus the upstream extracted/looked-up values; runs a single unified loop (`ComputeOp.run`) of codegen → in-process exec → self-critique under one shared budget (`compute_max_attempts`, default 3). Each iteration's codegen call may return Python (success), raise `MissingData` (the structured insufficient-data signal), or raise `_ParseFailure` (unparseable reply); exec failures and critique REVISE verdicts feed the next iteration's `prev_code` + `prev_failure`. The critique sees the same domain context as codegen (`question`, `prev`, `requirements` JSON, the code, the result). Returns the final answer as a plain `str` on ACCEPT, or — if the budget exhausts after at least one successful exec — the most recent uncritiqued result as a fallback. Fails with `StepFailed("compute", …)` when no iteration ever execs cleanly; propagates `MissingData` (with the same fallback rule) — the orchestrator catches that and runs up to `recovery_max_rounds` re-planning rounds before giving up.
+- **`compute()`** — chain terminator that subsumes formatting. Reads `ctx.question` plus the upstream extracted/looked-up values; runs a single loop (`ComputeOp.run`) of codegen → in-process exec under one shared budget (`compute_max_attempts`, default 3). Each iteration's codegen call may return Python (success), raise `MissingData` (the structured insufficient-data signal), or raise `_ParseFailure` (unparseable reply); parse and exec failures feed the next iteration's `prev_code` + `prev_failure`. Returns the result of the first clean exec as a plain `str`. Fails with `StepFailed("compute", …)` when no iteration ever execs cleanly; propagates `MissingData` — the orchestrator catches that and runs up to `recovery_max_rounds` re-planning rounds before giving up.
 
-  Each recovery round, `Planner.replan` returns a **`PlanDiff`**, not a fresh plan: `add` branches to run, `drop` indices into the prior branch list (numbered in the replan prompt), and an optional `requirements` replacement. The orchestrator applies it **positionally** (`Orchestrator._apply_diff`), keeping `outcomes[i]` aligned with `plan.branches[i]` — a dropped index removes the branch *and* the data it gathered (so compute never sees retracted data), added branches are appended, and unchanged branches keep their already-gathered outcomes and are never re-run. This replaces the old "diff replanned branches by value-equality and additively merge" scheme, which couldn't subtract and re-ran any reworded-but-unchanged branch.
+  Each recovery round, `Planner.replan` returns a **`PlanDiff`**, not a fresh plan: `add` branches to run and `drop` indices into the prior branch list (numbered in the replan prompt). The orchestrator applies it **positionally** (`Orchestrator._apply_diff`), keeping `outcomes[i]` aligned with `plan.branches[i]` — a dropped index removes the branch *and* the data it gathered (so compute never sees retracted data), added branches are appended, and unchanged branches keep their already-gathered outcomes and are never re-run. This replaces the old "diff replanned branches by value-equality and additively merge" scheme, which couldn't subtract and re-ran any reworded-but-unchanged branch.
 
 ## Plan shape
 
-A **Plan** is a pydantic model: a `branches` list plus a nested `requirements` submodel (`qualifiers`, `units_out`, `precision`, `answer_form`). Compute reads the calculation to perform from the verbatim question, not from a planner paraphrase — `requirements.qualifiers` carries only the MUST-apply modifiers distilled from the question, while `units_out` / `precision` / `answer_form` pin how the answer is rendered. Compute is one unified operator that owns both calculation and formatting, so the two travel as a single object. The Python layout mirrors the wire JSON exactly, so `Plan.model_validate_json` / `Plan.model_dump_json` round-trip with no custom translation. There is no multi-step decomposition in the AST — every plan is exactly one terminal compute. `PlannerPromptedCall` (in `src/skunk/plan.py`) emits a `Plan`; the orchestrator runs every branch in parallel, then feeds the merged `list[AnnotatedValue]` to compute.
+A **Plan** is a pydantic model: just a `branches` list. Compute reads everything it needs — the calculation to perform *and* the output format (units, precision, list shape) — from the verbatim question, not from a planner paraphrase, so the plan carries no separate requirements object. The Python layout mirrors the wire JSON exactly, so `Plan.model_validate_json` / `Plan.model_dump_json` round-trip with no custom translation. There is no multi-step decomposition in the AST — every plan is exactly one terminal compute. `PlannerPromptedCall` (in `src/skunk/plan.py`) emits a `Plan`; the orchestrator runs every branch in parallel, then feeds the merged `list[AnnotatedValue]` to compute.
 
 Two branch shapes:
 
 - `RetrieveBranch(key, period, visual_only=False)` — `retrieve` then `extract` are dispatched together by the orchestrator (extract reads `visual_only` from the branch).
 - `LookupBranch(target, src=None)` — single `lookup_external` call.
 
-Canonical JSON shape (one branch + requirements):
+Canonical JSON shape (one branch):
 
 ```json
 {
   "branches": [
     {"kind": "retrieve", "key": "national defense expenditures", "period": "CY1940"}
-  ],
-  "requirements": {"qualifiers": [], "units_out": "in millions of dollars", "precision": 1}
+  ]
 }
 ```
 
-Per-field semantics (units_out phrasing, when to use `null`, etc.) live in `PlannerPromptedCall.system_prompt` in `src/skunk/plan.py` — that prompt is the canonical schema spec. Runtime contracts (`PageRef`, `AnnotatedValue`, the scalar / vector / table kind taxonomy with primitive-only cells) live in the dataclasses in the same file.
+Per-branch field semantics (`key` / `period` / `as_of` / `visual_only`, when to use `null`, etc.) live in `PlannerPromptedCall.system_prompt` in `src/skunk/plan.py` — that prompt is the canonical schema spec. Runtime contracts (`PageRef`, `AnnotatedValue`, the scalar / vector / table kind taxonomy with primitive-only cells) live in the dataclasses in the same file.
 
 The `AnnotatedValue.kind` taxonomy:
 
@@ -122,7 +121,7 @@ Tier escalation only happens when the chosen tier reports "value not present". T
 
 A run can mix models per call-site. Resolution mirrors the effort knob:
 
-- **`PromptedCall` sites** (planner, extract tiers, compute.codegen/critique, question_explainer, …) resolve their model as `config.model_overrides.get(name, config.llm_model)` — see `PromptedCall.resolve_model`. So the default `llm_model` (env `SKUNK_LLM_MODEL`) applies everywhere unless a site is pinned via `SKUNK_MODEL_OVERRIDES` (`name=model,...`). Example: run on Pro but keep `question_explainer` / `compute.critique` on cheap Flash.
+- **`PromptedCall` sites** (planner, extract tiers, compute.codegen, question_explainer, …) resolve their model as `config.model_overrides.get(name, config.llm_model)` — see `PromptedCall.resolve_model`. So the default `llm_model` (env `SKUNK_LLM_MODEL`) applies everywhere unless a site is pinned via `SKUNK_MODEL_OVERRIDES` (`name=model,...`). Example: run on Pro but keep `question_explainer` on cheap Flash.
 - **Agent loops** (`LookupAgent`, search agent) use `config.agent_model_id or config.llm_model` (env `SKUNK_AGENT_MODEL`); they don't read the override map.
 - **Per-model rate limiting.** Each distinct model gets its own token-bucket keyed `llm:<model>` (`_retry_call`/`_aretry_call` via `_llm_model_rpm`). A model's RPM comes from `SKUNK_MODEL_RPM` (`model=rpm,...`), falling back to `SKUNK_LLM_RPM` (default 1000) for any model not listed — so single-model runs are unchanged. Lets a 150-RPM Pro and a high-RPM Flash run concurrently without throttling each other.
 - **Thinking-mode floor.** Gemini 3.x Pro is thinking-only and rejects both `thinking_budget=0` and `MINIMAL`; `_effort_to_thinking_config` floors `off`/`minimal` to `LOW` for such models (`_requires_thinking`), so an `effort="off"` call-site still works (at LOW thinking) when pointed at Pro.
@@ -172,7 +171,7 @@ event, no `_step` reservation, no separate step structure.
   orchestrator's `step …` event. Operators MUST NOT emit their own
   `"starting"` / `"done"` events.
 - **Callee owns its internals.** Only extract knows its tier/sample loop, only
-  compute knows its codegen/critique loop, only the agent loop knows its tool
+  compute knows its codegen/exec loop, only the agent loop knows its tool
   observations — those emit from the operator itself.
 - **LLM I/O is logged once, at the lowest layer that owns the fact.** Raw
   request/response/tokens/latency → `LLMClient` (`_call_gemini` / `stream`).
@@ -246,6 +245,6 @@ have folded most of the agent into the framework's shared infrastructure.
 
 ## What is intentionally NOT in this design
 
-- **Agentic loops confined to retrieve and lookup_external.** Two operators run iterative tool-using LLM loops (both `MultiTurnAgent`s): retrieve when `config.retriever == "search_agent"` (`SearchAgent` in `src/skunk/search_agent/`), and `lookup_external` always (`LookupAgent`). `extract` and `compute` do not loop agentically — they execute once per call (compute's internal codegen→critique retries are a fixed bounded budget, not a tool loop), and failure is recorded in the trace. Crucially, *missing-data recovery* is the bounded replan loop in the orchestrator, not a per-operator retry loop: no operator re-plans or re-dispatches itself on failure.
+- **Agentic loops confined to retrieve and lookup_external.** Two operators run iterative tool-using LLM loops (both `MultiTurnAgent`s): retrieve when `config.retriever == "search_agent"` (`SearchAgent` in `src/skunk/search_agent/`), and `lookup_external` always (`LookupAgent`). `extract` and `compute` do not loop agentically — they execute once per call (compute's internal codegen→exec retries are a fixed bounded budget, not a tool loop), and failure is recorded in the trace. Crucially, *missing-data recovery* is the bounded replan loop in the orchestrator, not a per-operator retry loop: no operator re-plans or re-dispatches itself on failure.
 - **No per-table/per-figure catalog rows.** Page-level granularity matches the benchmark's `source_docs?page=N` labels and the existing `cache/tables/` structure. Going finer adds rows without improving recall.
 - **No PZ runtime dependency.** This repo is plain Python + GCP Vertex AI (google-genai); PZ stays out of the runtime path.

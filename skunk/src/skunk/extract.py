@@ -99,7 +99,11 @@ EXTRACT_COMMON_PROMPT = """\
 ## AnnotatedValue shape
 
 A single JSON ARRAY of entries, one per distinct datum (or [] if nothing
-relevant is found). Pick the smallest shape that fits:
+relevant is found). Pick the shape that best preserves the page structure:
+- scalar  when the page has a single relevant value for one period
+- vector  when the row spans multiple years/periods and several may
+          be needed (e.g. a time-series row); key by year/period label
+- table   when both rows and columns vary
 
   scalar: {"description":"...","kind":"scalar",
            "value":<num|str>,"unit":"..."}
@@ -119,6 +123,9 @@ description   natural-language label that uniquely identifies the
               distinguishing context). For the label text, use the
               page's verbatim row text / column header / caption phrase
               so the downstream consumer can map it back to the page.
+              If the value comes from a specific year or period column
+              of a multi-year table, you should include that year/period
+              in the description.
 
 index_name    (vector only) name of the varying dimension.
 
