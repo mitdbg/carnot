@@ -4,12 +4,12 @@ The package separates cleanly into two halves plus a shared base:
 
   Build pipeline (offline) — `pipeline.py`, `stages/`, `corpora/`.
     Produces a per-page catalog + flat concept tree over a configurable
-    corpus. Output lives under `cache/page_index/` (`catalog/{bulletin}.jsonl`
-    + `concept_tree.json`).
+    corpus. Output lives under `artifact/page_index/` (`catalog/{bulletin}.jsonl`
+    + `concept_tree.json`), the shipped in-repo index.
 
   Query path (per-query) — `query.py` (`PageIndexRetriever`, the entry
     point), `query_toc.py` (ToC chapter pick), `query_semfilter.py`
-    (two-stage parallel semantic filter). The pipeline is:
+    (coarse summary filter). The pipeline is:
     ToC pick → year filter → semantic filter → candidate set.
 
   Shared — `schema.py` (catalog row, written by build / read by query),

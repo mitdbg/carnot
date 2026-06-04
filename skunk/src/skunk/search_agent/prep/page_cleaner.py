@@ -9,11 +9,13 @@ from tqdm import tqdm
 from skunk.common import LLMClient
 from skunk.config import SkunkConfig
 from skunk.corpus import render_page_b64
+# Table-truncation logic now lives in `corpus` (also reused on-the-fly by the
+# page-index full-text filter); imported here under its original name.
+from skunk.corpus import _table_display_texts as _create_element_display_texts
 
 MAX_RETRIES = 3
 MAX_WORKERS = 64
 SERIALIZE_CLEAN_PAGE_MAP_EVERY_N_PAGES = 100
-TRUNCATE_TABLE_CHARS = 50
 PAGE_CLEANER_WITH_IMG_PROMPT = """Some of the sentences in this parsed document may be ordered incorrectly. You will be presented with the current ordering of the text content, followed by an image of the PDF page which the text is supposed to transcribe. Please output the correct order of the sentences as a comma separated list of their sentence ids (the number before the colon preceding each sentence). Note that page numbers often appear as <sentence_id>: <number> (or <letter-number>).
 
 {page_contents}"""
@@ -21,42 +23,6 @@ PAGE_CLEANER_WITH_IMG_PROMPT = """Some of the sentences in this parsed document 
 PAGE_CLEANER_PROMPT = """Some of the sentences in this parsed document may be ordered incorrectly. Please output the correct order of the sentences as a comma separated list of their sentence ids (the number before the colon preceding each sentence):
 
 {page_contents}"""
-
-def _create_element_display_texts(page_elements):
-    """Return a dict mapping table element id -> display string for every element.
-
-    For each table, uses whichever is shorter: its first row or its first TRUNCATE_TABLE_CHARS chars.
-    If multiple tables on the page share the same candidate, extends to the shortest
-    unique prefix. Appends '...(truncated)' when the content was shortened.
-    """
-    def _short_cand(content):
-        row = content.split('\n')[0]
-        return row if len(row) <= TRUNCATE_TABLE_CHARS else content[:TRUNCATE_TABLE_CHARS]
-
-    # initialize display_texts with all non-table elements (which will be fully included in the prompt)
-    display_texts = {elt['id']: elt['content'] for elt in page_elements if elt['type'] != 'table'}
-
-    # for table elements, truncate the context and add to display texts
-    table_elts = [elt for elt in page_elements if elt['type'] == 'table']
-    candidates = {e['id']: _short_cand(e['content']) for e in table_elts}
-
-    if len(table_elts) > 1:
-        cand_values = list(candidates.values())
-        for elt in table_elts:
-            if cand_values.count(candidates[elt['id']]) > 1:
-                content = elt['content']
-                other_contents = [e['content'] for e in table_elts if e['id'] != elt['id']]
-                for length in range(len(candidates[elt['id']]) + 1, len(content) + 1):
-                    prefix = content[:length]
-                    if not any(other.startswith(prefix) for other in other_contents):
-                        candidates[elt['id']] = prefix
-                        break
-
-    for elt in table_elts:
-        cand = candidates[elt['id']]
-        display_texts[elt['id']] = cand + '...(truncated)' if len(cand) < len(elt['content']) else elt['content']
-
-    return display_texts
 
 def clean_page(page_key, page_elements, pdfs_dir, llm: LLMClient) -> tuple[str, list[int]] | tuple[None, None]:
     # if the page has a single element, we can skip the LLM and just return that element's content as the clean page text

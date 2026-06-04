@@ -53,9 +53,9 @@ class SkunkConfig:
     # Ablation: golden page refs bypass the retrieve operator (eval runs only).
     golden_pages: list[PageRef] | None = field(default=None, repr=False)
 
-    # Retrieve dispatch: "search_agent" (iterative ChromaDB + LLM loop) or "page_index"
-    # (ToC pick → year filter → semantic filter). (env: SKUNK_RETRIEVER)
-    retriever: Literal["search_agent", "page_index"] = "search_agent"
+    # Retrieve dispatch: "page_index" (ToC pick → year filter → coarse summary filter,
+    # the default) or "search_agent" (iterative ChromaDB + LLM loop). (env: SKUNK_RETRIEVER)
+    retriever: Literal["search_agent", "page_index"] = "page_index"
 
     # Search-agent corpus artifacts (built offline; agent fails fast if missing).
     # (env: SKUNK_CHROMADB_DIR, SKUNK_CHROMADB_COLLECTION, SKUNK_CLEAN_PAGE_MAP)
@@ -81,13 +81,14 @@ class SkunkConfig:
     # Agent-loop chat model. None → `llm_model`. (env: SKUNK_AGENT_MODEL)
     agent_model_id: str | None = None
 
-    # Page-index semantic filter: two-stage (coarse metadata → fine page text) cascade,
-    # batched and parallel. Set False for a ToC + year-filter-only ablation.
-    # (env: SKUNK_SEMFILTER_ENABLED, SKUNK_SEMFILTER_BATCH, SKUNK_SEMFILTER_WORKERS, SKUNK_SEMFILTER_MAX_PAGE_CHARS)
+    # Page-index semantic filter: a single coarse pass over each year-filtered page's
+    # metadata summary, judged against the full question on `semfilter_model`
+    # (positional true/false per page). Set `semfilter_enabled=False` for a
+    # ToC + year-filter-only ablation.
+    # (env: SKUNK_SEMFILTER_ENABLED, SKUNK_SEMFILTER_MODEL, SKUNK_SEMFILTER_BATCH)
     semfilter_enabled: bool = True
+    semfilter_model: str = "gemini-3.1-flash-lite"
     semfilter_batch_size: int = 20
-    semfilter_workers: int = 16
-    semfilter_max_page_chars: int = 12000
 
     @classmethod
     def from_env(cls) -> SkunkConfig:
@@ -101,10 +102,9 @@ class SkunkConfig:
                 "SKUNK_PROMPT_OVERRIDES", "config/prompts/treasury_bulletin.yaml"
             ),
             semfilter_enabled=os.environ.get("SKUNK_SEMFILTER_ENABLED", "true").lower() in ("1", "true", "yes"),
+            semfilter_model=os.environ.get("SKUNK_SEMFILTER_MODEL", "gemini-3.1-flash-lite"),
             semfilter_batch_size=int(os.environ.get("SKUNK_SEMFILTER_BATCH", "20")),
-            semfilter_workers=int(os.environ.get("SKUNK_SEMFILTER_WORKERS", "16")),
-            semfilter_max_page_chars=int(os.environ.get("SKUNK_SEMFILTER_MAX_PAGE_CHARS", "12000")),
-            retriever=os.environ.get("SKUNK_RETRIEVER", "search_agent"),  # type: ignore[arg-type]
+            retriever=os.environ.get("SKUNK_RETRIEVER", "page_index"),  # type: ignore[arg-type]
             chromadb_dir=os.environ.get("SKUNK_CHROMADB_DIR", "cache/chromadb"),
             chromadb_collection=os.environ.get("SKUNK_CHROMADB_COLLECTION", "treasury_pages"),
             clean_page_map_path=os.environ.get("SKUNK_CLEAN_PAGE_MAP", "cache/clean_page_map.json"),

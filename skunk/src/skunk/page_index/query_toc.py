@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from skunk.common import LLMClient
+from skunk.common import ExecutionContext, LLMClient
 
 from .schema import PageCatalogRow
 
@@ -171,6 +171,7 @@ async def one_shot_parent_chapter_retrieve(
     llm: LLMClient,
     catalog_index: dict[tuple[str, int], PageCatalogRow],
     *,
+    ctx: ExecutionContext | None = None,
     uid: str | None = None,
     retrieve_idx: int = 0,
 ) -> tuple[list[dict[str, Any]], RetrieveTrace]:
@@ -210,7 +211,10 @@ async def one_shot_parent_chapter_retrieve(
     level_trace.prompt_excerpt = user[:_EXCERPT_MAX_LEN]
 
     t0 = time.monotonic()
-    resp = await llm.acall(system=_PARENT_PICK_SYSTEM, user=user, temperature=0.0)
+    resp = await llm.acall(
+        system=_PARENT_PICK_SYSTEM, user=user, temperature=0.0,
+        ctx=ctx, call_site="toc_pick",
+    )
     level_trace.latency_s = time.monotonic() - t0
     level_trace.output_chars = len(resp.text)
     level_trace.input_tokens = resp.input_tokens
