@@ -30,9 +30,9 @@ litellm.suppress_debug_info = True
 # DEFAULT_LLM_VISION_MODEL = "openrouter/google/gemini-3.1-pro-preview"
 # DEFAULT_EMBEDDING_MODEL = "openrouter/google/gemini-embedding-001"
 
-DEFAULT_LLM_MODEL = "vertex_ai/gemini-3.5-flash"
-DEFAULT_LLM_VISION_MODEL = "vertex_ai/gemini-3.5-flash"
-DEFAULT_EMBEDDING_MODEL = "vertex_ai/gemini-embedding-001"
+DEFAULT_LLM_MODEL = "gemini/gemini-3.5-flash"
+DEFAULT_LLM_VISION_MODEL = "gemini/gemini-3.5-flash"
+DEFAULT_EMBEDDING_MODEL = "gemini/gemini-embedding-001"
 
 DEFAULT_CACHE_DIR = os.path.expanduser("~/orcd/scratch/skunk_cache/")
 LLM_CACHE_PATH = os.path.join(DEFAULT_CACHE_DIR, "llm_wrapper_cache.pckl")
@@ -44,9 +44,9 @@ LLM_VISION_SYSTEM_PROMPT = (
 )
 
 LLM_MAX_WORKERS = int(os.environ.get("LLM_MAX_WORKERS", 32))
-LLM_MAX_REQUESTS_PER_MINUTE = int(os.environ.get("LLM_MAX_REQUESTS_PER_MINUTE", 100))
+LLM_MAX_REQUESTS_PER_MINUTE = int(os.environ.get("LLM_MAX_REQUESTS_PER_MINUTE", 15000))
 LLM_MAX_RETRIES = int(os.environ.get("LLM_MAX_RETRIES", 15))
-LLM_RETRY_BACKOFF_SECONDS = int(os.environ.get("LLM_RETRY_BACKOFF_SECONDS", 5))
+LLM_RETRY_BACKOFF_SECONDS = int(os.environ.get("LLM_RETRY_BACKOFF_SECONDS", 30))
 EMBEDDING_BATCH_SIZE = int(os.environ.get("EMBEDDING_BATCH_SIZE", 90))
 
 def remove_provider(model_name):
@@ -112,9 +112,12 @@ def parse_json_response(text: str) -> dict:
     cleaned_text = text.strip()
     if cleaned_text == '':
         return {}
-    elif cleaned_text.startswith("```"):
-        cleaned_text = re.sub(r"^```(?:json)?\s*", "", cleaned_text)
-        cleaned_text = re.sub(r"\s*```$", "", cleaned_text)
+    elif "```" in cleaned_text:
+        matches = re.findall(
+            r"```(?:json)?\s*(.*?)\s*```", cleaned_text, flags=re.DOTALL
+        )
+        if matches:
+            cleaned_text = matches[-1].strip()
 
     try:
         return json.loads(untruncate_json.complete(cleaned_text))
@@ -122,7 +125,9 @@ def parse_json_response(text: str) -> dict:
         try:
             return json5.loads(cleaned_text)
         except Exception as e:
-            print(f"Failed to parse JSON response: {e}\nOriginal text: {text}")
+            # print(f"Failed to parse JSON response: {e}\nOriginal text: {text}")
+            # with open("json_parse_error.txt", "w") as f:
+            # f.write(text)
             return {}
 
 
@@ -148,6 +153,7 @@ class LLMWrapper:
         self.cache_lock_path = f"{self.cache_path}.lock"
         self.cache_enabled = cache_enabled
         self.cache_lock = threading.RLock()
+        self.flush_lock = threading.Lock()
         self.dirty_cache_entries = {}
         self.generated_embedding_cache_keys = set()
         if self.cache_enabled:
@@ -201,49 +207,70 @@ class LLMWrapper:
             self.cache[cache_key] = value
             self.dirty_cache_entries[cache_key] = value
 
-    def flush_cache(self, evict_generated_embeddings: bool = False) -> None:
+    def flush_cache(
+        self, evict_generated_embeddings: bool = False, wait: bool = True
+    ) -> bool:
+        """
+        Flush dirty in-memory cache entries to disk.
+
+        A process-local flush lock prevents multiple expensive pickle writes from
+        running at the same time. When wait is False, this method is non-blocking:
+        if another thread is already flushing, it returns False and leaves dirty
+        entries in memory for a later flush. When wait is True, it blocks until
+        the flush lock is acquired, which is appropriate for final or durability
+        flushes.
+
+        If evict_generated_embeddings is True, generated embedding arrays are
+        removed from the in-memory cache after they have been persisted.
+        """
         if not self.cache_enabled:
-            return
+            return False
+        acquired = self.flush_lock.acquire(blocking=wait)
+        if not acquired:
+            return False
+        try:
+            with self.cache_lock:
+                if not self.dirty_cache_entries:
+                    return False
+                dirty_cache_entries = dict(self.dirty_cache_entries)
 
-        with self.cache_lock:
-            if not self.dirty_cache_entries:
-                return
-            dirty_cache_entries = dict(self.dirty_cache_entries)
+            with self.locked_cache_file():
+                disk_cache = self.load_cache_from_disk()
+                disk_cache.update(dirty_cache_entries)
+                self.save_cache_to_disk(disk_cache)
 
-        with self.locked_cache_file():
-            disk_cache = self.load_cache_from_disk()
-            disk_cache.update(dirty_cache_entries)
-            self.save_cache_to_disk(disk_cache)
+            with self.cache_lock:
+                for cache_key in dirty_cache_entries:
+                    current_dirty_value = self.dirty_cache_entries.get(cache_key)
+                    flushed_value = dirty_cache_entries[cache_key]
+                    values_match = current_dirty_value is flushed_value
+                    if not values_match:
+                        if isinstance(current_dirty_value, np.ndarray) or isinstance(
+                            flushed_value, np.ndarray
+                        ):
+                            values_match = np.array_equal(
+                                current_dirty_value, flushed_value
+                            )
+                        else:
+                            values_match = current_dirty_value == flushed_value
+                    if values_match:
+                        self.dirty_cache_entries.pop(cache_key, None)
+                        if (
+                            evict_generated_embeddings
+                            and cache_key in self.generated_embedding_cache_keys
+                        ):
+                            self.cache.pop(cache_key, None)
+                            self.generated_embedding_cache_keys.discard(cache_key)
+                        else:
+                            self.cache[cache_key] = flushed_value
 
-        with self.cache_lock:
-            for cache_key in dirty_cache_entries:
-                current_dirty_value = self.dirty_cache_entries.get(cache_key)
-                flushed_value = dirty_cache_entries[cache_key]
-                values_match = current_dirty_value is flushed_value
-                if not values_match:
-                    if isinstance(current_dirty_value, np.ndarray) or isinstance(
-                        flushed_value, np.ndarray
-                    ):
-                        values_match = np.array_equal(
-                            current_dirty_value, flushed_value
-                        )
-                    else:
-                        values_match = current_dirty_value == flushed_value
-                if values_match:
-                    self.dirty_cache_entries.pop(cache_key, None)
-                    if (
-                        evict_generated_embeddings
-                        and cache_key in self.generated_embedding_cache_keys
-                    ):
-                        self.cache.pop(cache_key, None)
-                        self.generated_embedding_cache_keys.discard(cache_key)
-                    else:
-                        self.cache[cache_key] = flushed_value
-
-            if not evict_generated_embeddings:
-                for cache_key, value in disk_cache.items():
-                    if cache_key not in self.dirty_cache_entries:
-                        self.cache[cache_key] = value
+                if not evict_generated_embeddings:
+                    for cache_key, value in disk_cache.items():
+                        if cache_key not in self.dirty_cache_entries:
+                            self.cache[cache_key] = value
+            return True
+        finally:
+            self.flush_lock.release()
 
     def is_rate_limit_error(self, error: Exception) -> bool:
         status_code = getattr(error, "status_code", None) or getattr(
@@ -330,18 +357,18 @@ class LLMWrapper:
                     attempt_idx + 1
                 ) + random.uniform(0, self.retry_backoff_seconds)
                 if is_rate_limited:
-                    print(
-                        f"LLM error hit limit hit ({type(e).__name__}: {e}); ",
-                        f"{e.with_traceback(None)}",
-                        f"retrying in {sleep_seconds:.1f} seconds.",
-                    )
+                    # print(
+                    #     f"LLM error hit limit hit ({type(e).__name__}: {e}); ",
+                    #     f"{e.with_traceback(None)}",
+                    #     f"retrying in {sleep_seconds:.1f} seconds.",
+                    # )
                     self.wait_for_rate_limit_slot()
-                else:
-                    print(
-                        f"Transient LLM error ({type(e).__name__}: {e}); "
-                        f"retrying in {sleep_seconds:.1f} seconds."
-                    )
-                self.flush_cache(evict_generated_embeddings=True)
+                # else:
+                # print(
+                #     f"Transient LLM error ({type(e).__name__}: {e}); "
+                #     f"retrying in {sleep_seconds:.1f} seconds."
+                # )
+                # self.flush_cache(evict_generated_embeddings=True)
                 time.sleep(sleep_seconds)
                 attempt_idx += 1
 
@@ -388,7 +415,12 @@ class LLMWrapper:
         image_bytes: bytes = None,
         max_tokens: int = 32000,
     ) -> str:
-        client = genai.Client(vertexai=True, project="mit-grc-free-tier")
+        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GOOGLE_API_KEY or GEMINI_API_KEY environment variable is not set"
+            )
+        client = genai.Client(api_key=api_key)
         if image_bytes is not None:
             contents = [
                 types.Part.from_bytes(
@@ -449,16 +481,34 @@ class LLMWrapper:
         return extract_litellm_text(response)
 
     def embed_google(self, documents: list[str], model: str):
-        client = genai.Client(vertexai=True, project="mit-grc-free-tier")
-        if "embedding-001" in model:
-            result = client.models.embed_content(
-                model=model, contents=documents  # type: ignore
+        api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            raise RuntimeError(
+                "GOOGLE_API_KEY or GEMINI_API_KEY environment variable is not set"
             )
-            embeddings = [e.values for e in result.embeddings]  # type: ignore
-        elif "embedding-2" in model:
+        client = genai.Client(api_key=api_key)
+        google_model = remove_provider(model)
+        embeddings = []
+        if "embedding-001" in google_model:
+            result = client.models.embed_content(
+                model=google_model,
+                contents=documents,  # type: ignore
+                config=types.EmbedContentConfig(output_dimensionality=768),
+            )
+
+            for e in result.embeddings:
+                np_emb = np.array(e.values, dtype=np.float32)
+                normed_embedding = np_emb / np.linalg.norm(np_emb)
+                embeddings.append(normed_embedding)
+
+        elif "embedding-2" in google_model:
             embeddings = []
             for doc in documents:
-                result = client.models.embed_content(model=model, contents=documents)  # type: ignore
+                result = client.models.embed_content(
+                    model=google_model,
+                    contents=doc,
+                    config=types.EmbedContentConfig(output_dimensionality=768),
+                )  # type: ignore
                 embeddings.append(result.embeddings[0].values)  # type: ignore
 
         return np.asarray(embeddings)
@@ -576,7 +626,7 @@ class LLMWrapper:
                     unit="request",
                 )
             for future in completed_futures:
-                prompt_idx = futures[future]
+                prompt_idx = futures.pop(future)
                 results[prompt_idx] = future.result()
 
         return [result or "" for result in results]
@@ -617,7 +667,7 @@ class LLMWrapper:
                     unit="request",
                 )
             for future in completed_futures:
-                request_idx = futures[future]
+                request_idx = futures.pop(future)
                 results[request_idx] = future.result()
 
         return [result or "" for result in results]
@@ -689,7 +739,7 @@ class LLMWrapper:
 
             cached_values = self.get_cached_values(cache_keys)
             for text_idx, cached_value in enumerate(cached_values):
-                if cached_value is not None:
+                if cached_value is not None and len(cached_value) == 768:
                     embeddings[text_idx] = np.asarray(cached_value, dtype=np.float32)
                 else:
                     cache_key = cache_keys[text_idx]
@@ -737,13 +787,14 @@ class LLMWrapper:
                     for cache_key, embedding in embedded_batch:
                         for text_idx in uncached_positions_by_key[cache_key]:
                             embeddings[text_idx] = embedding
-                    if use_cache and self.cache_enabled:
-                        batches_since_cache_flush += 1
-                        if batches_since_cache_flush >= 500:
-                            self.flush_cache(evict_generated_embeddings=True)
-                            batches_since_cache_flush = 0
+                    # if use_cache and self.cache_enabled:
+                    # batches_since_cache_flush += 1
+                    # if batches_since_cache_flush >= 200:
+                    #     self.flush_cache(evict_generated_embeddings=True)
+                    #     batches_since_cache_flush = 0
 
-        self.flush_cache(evict_generated_embeddings=True)
+        if use_cache:
+            self.flush_cache(evict_generated_embeddings=True, wait=True)
 
         if len(embeddings) == 0:
             return np.empty((0, 0), dtype=np.float32)

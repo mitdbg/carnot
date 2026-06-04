@@ -17,7 +17,7 @@ from skunk.retrieval.nodes.llm_wrapper import DEFAULT_EMBEDDING_MODEL, get_llm_w
 SKUNK_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CACHE_DIR = os.path.expanduser("~/orcd/scratch/skunk_cache")
 DEFAULT_CACHE_PATH = os.path.join(DEFAULT_CACHE_DIR, "semantic_document_index.pckl")
-EMBEDDING_WORKERS = 64
+EMBEDDING_WORKERS = 16
 
 class SemanticDocumentIndex:
 
@@ -59,7 +59,7 @@ class SemanticDocumentIndex:
                     # if isinstance(page_node, Exception):
                     # raise ValueError("Cached semantic index contains a failed page node result.")
                     # if self.embedding_matrix is not None:
-                        # self._rebuild_faiss_index()
+                    # self._rebuild_faiss_index()
                     # self.initialized = True
                     # self.initialize()
             except (EOFError, OSError, pickle.PickleError, TypeError, AttributeError, KeyError, ValueError):
@@ -196,7 +196,7 @@ class SemanticDocumentIndex:
             n_workers=n_embedding_workers,
         )
         if self.use_cache:
-            get_llm_wrapper().flush_cache(evict_generated_embeddings=True)
+            get_llm_wrapper().flush_cache(evict_generated_embeddings=True, wait=True)
 
         faiss.normalize_L2(embeddings)
         self.embedding_idx_map = {node_id: node_idx for node_idx, node_id in enumerate(node_ids)}
@@ -217,7 +217,7 @@ class SemanticDocumentIndex:
         faiss.normalize_L2(matrix)
         self.embedding_matrix = matrix
         self.embedding_faiss_index = faiss.IndexFlatIP(matrix.shape[1])
-        self.embedding_faiss_index.add(matrix)
+        self.embedding_faiss_index.add(x=matrix)
         self.initialized = True
 
     def get_node_id(self, node: DocumentNode | PageNode | TextNode | TableNode | PlotNode) -> str:
@@ -237,7 +237,7 @@ class SemanticDocumentIndex:
 
         query_matrix = np.asarray([query_embedding], dtype="float32")
         faiss.normalize_L2(query_matrix)
-        scores, indexes = self.embedding_faiss_index.search(query_matrix, min(k, len(self.embedding_node_ids)))
+        scores, indexes = self.embedding_faiss_index.search(query_matrix, k=min(k, len(self.embedding_node_ids)))
         results = []
         for score, node_idx in zip(scores[0], indexes[0], strict=True):
             if node_idx == -1:
@@ -289,10 +289,10 @@ class SemanticDocumentIndex:
         }
         for document in self.documents.values():
             output["page_nodes"] += len(document.page_nodes)
-            for page in document.page_nodes:
-                output["text_nodes"] += len(page.text_nodes)
-                output["table_nodes"] += len(page.table_nodes)
-                output["plot_nodes"] += len(page.plot_nodes)
+            for page in document.page_nodes.values():
+                output["text_nodes"] += len(page.text_nodes.values())
+                output["table_nodes"] += len(page.table_nodes.values())
+                output["plot_nodes"] += len(page.plot_nodes.values())
         output["content_nodes"] = output["text_nodes"] + output["table_nodes"] + output["plot_nodes"]
         return output
 
@@ -326,7 +326,7 @@ class SemanticDocumentIndex:
             if document_desc:
                 output.append(f"{document_prefix}|-- description: {document_desc}")
 
-            pages = document.page_nodes
+            pages = document.page_nodes.values()
             if not pages:
                 output.append(f"{document_prefix}`-- pages: empty")
                 continue

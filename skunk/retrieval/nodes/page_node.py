@@ -226,19 +226,22 @@ Your task is to provide a concise semantic description for each text snippet, de
 Write a concise description with important keyword that can serve to retrieve this text block in a semantic index.
 The output should be a JSON list of descriptions, one for each text block, in the same order as the input text blocks.
 Output format:
-json
+```json
 {{
     'text_blocks':[{{
         'block_idx': 'index of the text block in the input list',
         'description': 'concise semantic description of the text block'
     }}]
 }}
+```
 Rules:
+- Return only valid JSON.
 - Do not include markdown or explanation.
 - Maximum 180 characters.
 - Describe the text subject matter and the kinds of information it contains.
 - Do not include labels, quotes, markdown, or explanation.
 - Do not mention OCR or that you are reading extracted text.
+- The output must be valid JSON and follow the specified format. Do not use natural language to describe the output, only return the JSON.
 Text blocks:
 {texts}
 """.strip()

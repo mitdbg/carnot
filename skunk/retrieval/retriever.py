@@ -1,5 +1,6 @@
 from __future__ import annotations
 import re
+import time
 
 import json
 import random
@@ -29,7 +30,7 @@ class Retriever:
         candidate_nodes_per_keyword: int = 20,
         relevant_nodes_k: int = 10,
         final_documents_k: int = 5,
-        text_model: str = "openrouter/google/gemini-2.5-flash",
+        text_model: str = "vertex_ai/gemini-3.1-pro-preview",
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         use_cache: bool | None = True,
     ):
@@ -49,6 +50,8 @@ class Retriever:
         self.use_cache = use_cache
 
     def retrieve(self, question: str) -> list[DocumentNode]:
+        retrieve_start = time.time()
+        stage_start = retrieve_start
         if not isinstance(question, str) or not question.strip():
             raise ValueError("question must be a non-empty string")
 
@@ -59,9 +62,14 @@ class Retriever:
         content_records_by_id = {
             record["node_id"]: record for record in content_records
         }
+        print(f"[retrieve timing] content records: {time.time() - stage_start:.2f}s")
         if not content_records:
+            print(f"[retrieve timing] total: {time.time() - retrieve_start:.2f}s")
             return []
+        stage_start = time.time()
         keywords = self.decompose_query(question)
+        print(f"[retrieve timing] decompose query: {time.time() - stage_start:.2f}s")
+        stage_start = time.time()
         query_terms = []
         seen_terms = set()
         for term in [question, *keywords]:
@@ -69,12 +77,19 @@ class Retriever:
             if normalized and normalized not in seen_terms:
                 query_terms.append(term.strip())
                 seen_terms.add(normalized)
+        print(
+            f"[retrieve timing] prepare query terms ({len(query_terms)}): "
+            f"{time.time() - stage_start:.2f}s"
+        )
 
+        stage_start = time.time()
         term_embeddings = DEFAULT_LLM_WRAPPER.embed_texts(
             query_terms,
             model=self.embedding_model,
-            use_cache=self.use_cache,
+            use_cache=False,
         )
+        print(f"[retrieve timing] embed query terms: {time.time() - stage_start:.2f}s")
+        stage_start = time.time()
         candidates_by_id = {}
         for term, term_embedding in zip(query_terms, term_embeddings, strict=True):
             scored_records = []
@@ -120,12 +135,22 @@ class Retriever:
         candidates = sorted(
             candidates_by_id.values(), key=lambda record: record["score"], reverse=True
         )
+        print(
+            f"[retrieve timing] search candidates ({len(candidates)}): "
+            f"{time.time() - stage_start:.2f}s"
+        )
+        stage_start = time.time()
         relevant_node_ids = self.judge_relevant_nodes(question, candidates)
+        print(
+            f"[retrieve timing] judge relevant nodes ({len(relevant_node_ids)}): "
+            f"{time.time() - stage_start:.2f}s"
+        )
         if not relevant_node_ids:
             relevant_node_ids = [
                 record["node_id"] for record in candidates[: self.relevant_nodes_k]
             ]
 
+        stage_start = time.time()
         document_scores = {}
         for rank, node_id in enumerate(relevant_node_ids):
             if node_id not in candidates_by_id:
@@ -136,18 +161,28 @@ class Retriever:
             document_scores[document_id] = (
                 document_scores.get(document_id, 0.0) + record["score"] + rank_bonus
             )
+        print(
+            f"[retrieve timing] score documents ({len(document_scores)}): "
+            f"{time.time() - stage_start:.2f}s"
+        )
         if self.use_cache:
+            stage_start = time.time()
             get_llm_wrapper().flush_cache()
+            print(f"[retrieve timing] flush cache: {time.time() - stage_start:.2f}s")
 
+        stage_start = time.time()
         ranked_document_ids = sorted(
             document_scores,
             key=lambda document_id: document_scores[document_id],
             reverse=True,
         )
-        return [
+        results = [
             self.index.documents[document_id]
             for document_id in ranked_document_ids[: self.final_documents_k]
         ]
+        print(f"[retrieve timing] rank documents: {time.time() - stage_start:.2f}s")
+        print(f"[retrieve timing] total: {time.time() - retrieve_start:.2f}s")
+        return results
 
     def decompose_query(self, question: str) -> list[str]:
         tree_context = self.sample_tree(max_lines=80)
