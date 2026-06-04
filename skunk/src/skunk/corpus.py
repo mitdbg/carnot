@@ -259,7 +259,6 @@ def page_sanitized_text(elements: list[dict]) -> str:
         parts.append(str(txt))
     return "\n".join(parts)
 
-
 def preprocess_text(text: str, elt_type: str, strip_years: bool = False) -> str:
     """Preprocess element text for embedding: tables → tag-stripped non-placeholder
     cells joined by spaces; others → collapsed newline runs. Always drops dot-leader

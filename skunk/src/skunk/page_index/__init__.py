@@ -10,6 +10,7 @@ The package separates cleanly into two halves plus a shared base:
   Query path (per-query) — `query.py` (`PageIndexRetriever`, the entry
     point), `query_toc.py` (ToC chapter pick), `query_semfilter.py`
     (coarse summary filter). The pipeline is:
+
     ToC pick → year filter → semantic filter → candidate set.
 
   Shared — `schema.py` (catalog row, written by build / read by query),

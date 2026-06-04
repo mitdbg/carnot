@@ -80,6 +80,7 @@ class PageIndexRetriever:
         nested = base / "catalog"
         return nested if nested.is_dir() else base
 
+
     def _tree_path(self, catalog_dir: Path) -> Path:
         """Locate `concept_tree.json` — sibling of the catalog dir, with
         a fallback to the catalog dir itself for older layouts."""
@@ -157,6 +158,7 @@ class PageIndexRetriever:
         chapter_top, trace = await one_shot_parent_chapter_retrieve(
             tree, question=ctx.question, concept=key, period=period,
             llm=ctx.llm_client, catalog_index=catalog_index, ctx=ctx,
+
         )
 
         # 2. Year filter.
@@ -167,6 +169,7 @@ class PageIndexRetriever:
         if ctx.config.semfilter_enabled and filtered:
             survivors = [(c["bulletin"], int(c["page"])) for c in filtered]
             kept_keys, sem_meta = await semantic_filter(survivors, catalog_index, ctx)
+
             kept_set = set(kept_keys)
             filtered = [c for c in filtered
                         if (c["bulletin"], int(c["page"])) in kept_set]

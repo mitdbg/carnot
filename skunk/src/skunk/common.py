@@ -342,7 +342,6 @@ def _estimate_prompt_tokens(system: str, user: str) -> float:
     Approximate by design — it only paces throughput, it doesn't bill."""
     return (len(system) + len(user)) / 4.0
 
-
 def _requires_thinking(model: str) -> bool:
     """True for models that mandate thinking mode (reject `thinking_budget=0`).
     Gemini 3.x Pro tiers are thinking-only; Flash/Flash-Lite accept budget=0."""

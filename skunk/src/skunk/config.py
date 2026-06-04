@@ -90,6 +90,7 @@ class SkunkConfig:
     semfilter_model: str = "gemini-3.1-flash-lite"
     semfilter_batch_size: int = 20
 
+
     @classmethod
     def from_env(cls) -> SkunkConfig:
         return cls(

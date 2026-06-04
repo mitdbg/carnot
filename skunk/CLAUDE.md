@@ -60,6 +60,7 @@ via the `google-genai` SDK, authenticated with an **AI Studio API key** — not 
 2. `GEMINI_API_KEY=<key>` in `.env`
 
 Default model `gemini-3.5-flash` (override via `SKUNK_LLM_MODEL`; use bare model names, no
+
 `google/` prefix). Strongly recommended for `lookup_external`: `FRED_API_KEY`,
 `TAVILY_API_KEY`. Copy `.env.example` → `.env`.
 
