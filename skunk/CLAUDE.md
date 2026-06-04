@@ -54,12 +54,13 @@ UID0227, UID0230, UID0238, UID0240.
 
 ## Setup (.env at repo root)
 
-All LLM calls go through **GCP Vertex AI** via the `google-genai` SDK:
-1. `gcloud auth application-default login`
-2. `GOOGLE_CLOUD_PROJECT=<project-id>` in `.env` (Vertex AI API enabled on the project)
-3. Optional `GOOGLE_CLOUD_LOCATION` (default `us-central1`)
+All LLM calls go through the **AI Studio Gemini API** (`generativelanguage.googleapis.com`)
+via the `google-genai` SDK, authenticated with an **AI Studio API key** — not Vertex/ADC:
+1. Create a key at https://aistudio.google.com/apikey
+2. `GEMINI_API_KEY=<key>` in `.env`
 
-Default model `gemini-3.5-flash` (override via `SKUNK_LLM_MODEL`; use bare Vertex names, no
+Default model `gemini-3.5-flash` (override via `SKUNK_LLM_MODEL`; use bare model names, no
+
 `google/` prefix). Strongly recommended for `lookup_external`: `FRED_API_KEY`,
 `TAVILY_API_KEY`. Copy `.env.example` → `.env`.
 

@@ -210,9 +210,9 @@ Each operator exposes a standalone `run(prev, ctx, **kwargs)` callable on its op
 
 ## Caches
 
-The only on-disk caches in the runtime path are page-index artifacts:
+The page-index artifact is the only on-disk index in the runtime path:
 
-- `cache/page_index_v3/` — full build output (catalog rows, L1 spans, chapter tree); the shipped tree at `data/page_index/concept_tree.json` is promoted from here. See `src/skunk/page_index/pipeline.py`.
+- `artifact/page_index/` — the shipped, in-repo build output (per-bulletin `catalog/*.jsonl`, `concept_tree.json`, `manifest.json`). Tracked in git so a fresh checkout works without a rebuild. The retriever reads it by default; override with `$SKUNK_PAGE_INDEX_DIR`. The build pipeline (`src/skunk/page_index/pipeline.py`) writes here too (`--output-dir`, default `artifact/page_index`).
 - Parsed-JSON corpus at `$OFFICEQA_PARSED_JSON_DIR` (default `~/Desktop/officeqa/treasury_bulletins_parsed/jsons/`) — read by Tier 1 of extract and by the page-index builder.
 
 LLM completions are **not** cached. Tier 2 PNG renders are computed live per call (no disk cache). There is no DSL plan cache — the planner runs once per question.

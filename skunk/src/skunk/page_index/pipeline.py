@@ -651,8 +651,8 @@ def main() -> int:
     ap.add_argument("--profile", choices=sorted(PROFILES), default="treasury",
                     help="Corpus profile (default: treasury).")
     ap.add_argument("--output-dir", type=Path,
-                    default=Path("cache/page_index"),
-                    help="Target directory for all stage outputs.")
+                    default=Path("artifact/page_index"),
+                    help="Target directory for all stage outputs (the shipped, in-repo index).")
     ap.add_argument("--window", type=_parse_window, default=(1939, 2025),
                     help="Inclusive year window (default 1939-2025).")
     ap.add_argument("--bulletins", type=str, default=None,

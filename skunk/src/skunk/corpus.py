@@ -197,6 +197,68 @@ def page_plain_text(elements: list[dict]) -> str:
     return "\n".join(parts)
 
 
+# Table elements carry the page's numeric grid — the bulk of its tokens. For uses
+# that only need a page's *topic* (not its values), truncate each table to a short
+# identifying snippet. Logic originally from `search_agent.prep.page_cleaner`
+# (table-truncation for the page-reorder cleaner); homed here so the request path
+# can reuse it without importing the prep module.
+TRUNCATE_TABLE_CHARS = 50
+
+
+def _table_display_texts(page_elements: list[dict]) -> dict:
+    """Map element id → display string. Non-table elements pass through whole; each
+    table is shortened to whichever is shorter of its first row or its first
+    `TRUNCATE_TABLE_CHARS` chars, extended to the shortest prefix that stays unique
+    among the page's tables, with '...(truncated)' appended when shortened."""
+    def _short_cand(content):
+        row = content.split('\n')[0]
+        return row if len(row) <= TRUNCATE_TABLE_CHARS else content[:TRUNCATE_TABLE_CHARS]
+
+    display_texts = {elt['id']: elt['content'] for elt in page_elements if elt['type'] != 'table'}
+
+    table_elts = [elt for elt in page_elements if elt['type'] == 'table']
+    candidates = {e['id']: _short_cand(e['content']) for e in table_elts}
+
+    if len(table_elts) > 1:
+        cand_values = list(candidates.values())
+        for elt in table_elts:
+            if cand_values.count(candidates[elt['id']]) > 1:
+                content = elt['content']
+                other_contents = [e['content'] for e in table_elts if e['id'] != elt['id']]
+                for length in range(len(candidates[elt['id']]) + 1, len(content) + 1):
+                    prefix = content[:length]
+                    if not any(other.startswith(prefix) for other in other_contents):
+                        candidates[elt['id']] = prefix
+                        break
+
+    for elt in table_elts:
+        cand = candidates[elt['id']]
+        display_texts[elt['id']] = cand + '...(truncated)' if len(cand) < len(elt['content']) else elt['content']
+
+    return display_texts
+
+
+def page_sanitized_text(elements: list[dict]) -> str:
+    """Like `page_plain_text`, but each TABLE is truncated to a short identifying
+    snippet — its title / first row (via `_table_display_texts`) — instead of its
+    full grid. Keeps titles/prose/column-headers; drops per-row detail and the
+    token-heavy numeric body."""
+    if not elements:
+        return ""
+    display = _table_display_texts(elements)
+    parts: list[str] = []
+    for el in elements:
+        t = (el.get("type") or "").lower()
+        if t == "page_number":
+            continue
+        txt = display.get(el.get("id"), el.get("content"))
+        if not txt:
+            continue
+        if t == "table":
+            txt = _HTML_TAG_RE.sub(" ", str(txt))  # strip HTML from the (truncated) snippet
+        parts.append(str(txt))
+    return "\n".join(parts)
+
 def preprocess_text(text: str, elt_type: str, strip_years: bool = False) -> str:
     """Preprocess element text for embedding: tables → tag-stripped non-placeholder
     cells joined by spaces; others → collapsed newline runs. Always drops dot-leader

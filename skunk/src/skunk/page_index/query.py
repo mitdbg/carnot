@@ -65,15 +65,21 @@ class PageIndexRetriever:
         ] = {}
 
     def _catalog_dir(self) -> Path:
-        """Resolve the page-index catalog directory.
+        """Resolve the page-index catalog directory (the dir holding the
+        per-bulletin `*.jsonl`).
 
-        Override with `SKUNK_PAGE_INDEX_DIR`. Default points at the
-        in-repo cache built by the page-index pipeline.
+        Base is `SKUNK_PAGE_INDEX_DIR` if set, else the in-repo shipped
+        artifact `artifact/page_index` (the built index, tracked in git).
+        The built layout nests the catalog under `<base>/catalog/` with
+        `concept_tree.json` as its sibling, so we descend into `catalog/`
+        when it exists; a base pointing straight at the per-bulletin
+        jsonl is used as-is.
         """
         env = os.environ.get("SKUNK_PAGE_INDEX_DIR")
-        if env:
-            return Path(env)
-        return Path(__file__).resolve().parents[3] / "cache" / "page_index"
+        base = Path(env) if env else Path(__file__).resolve().parents[3] / "artifact" / "page_index"
+        nested = base / "catalog"
+        return nested if nested.is_dir() else base
+
 
     def _tree_path(self, catalog_dir: Path) -> Path:
         """Locate `concept_tree.json` — sibling of the catalog dir, with
@@ -151,19 +157,19 @@ class PageIndexRetriever:
         # name; we pass the NL `key` through unchanged.)
         chapter_top, trace = await one_shot_parent_chapter_retrieve(
             tree, question=ctx.question, concept=key, period=period,
-            llm=ctx.llm_client, catalog_index=catalog_index,
+            llm=ctx.llm_client, catalog_index=catalog_index, ctx=ctx,
+
         )
 
         # 2. Year filter.
         filtered = self._year_filter(chapter_top, catalog_index, period)
 
-        # 3. Semantic filter (coarse → fine), unless disabled for ablation.
+        # 3. Coarse summary filter, unless disabled for ablation.
         sem_meta: dict[str, Any] = {"enabled": False}
         if ctx.config.semfilter_enabled and filtered:
             survivors = [(c["bulletin"], int(c["page"])) for c in filtered]
-            kept_keys, sem_meta = await semantic_filter(
-                survivors, catalog_index, key, period, ctx,
-            )
+            kept_keys, sem_meta = await semantic_filter(survivors, catalog_index, ctx)
+
             kept_set = set(kept_keys)
             filtered = [c for c in filtered
                         if (c["bulletin"], int(c["page"])) in kept_set]

@@ -246,6 +246,102 @@ def _llm_model_rpm(model: str) -> float:
     return _MODEL_RPM.get(model, float(os.environ.get("SKUNK_LLM_RPM", "1000")))
 
 
+# ---------------------------------------------------------------------------
+# Tokens-per-minute (TPM) throttle — async, opt-in via SKUNK_MODEL_TPM.
+#
+# The RPM limiter alone can't bound token throughput: one request can carry tens
+# of thousands of tokens, so a request-paced run still blows a TPM quota (the
+# full-text page-index filter pushed ~36M tok/min and 429-stormed). This bucket
+# meters estimated *input* tokens per call. Mirrors `_AsyncRateLimiter`'s
+# cross-loop safety (threading.Lock around refill+deduct, sleep outside the lock).
+# Off unless `SKUNK_MODEL_TPM` names the model, so it's scoped to experiments.
+# ---------------------------------------------------------------------------
+
+class _AsyncTokenBudget:
+    """Like `_AsyncRateLimiter` but `acquire(amount)` deducts a variable token
+    count (the call's estimated input tokens). `capacity` allows a short burst
+    and must exceed the largest single request, or `acquire` would cap-clamp it."""
+
+    def __init__(self, rate_per_sec: float, capacity: float) -> None:
+        if rate_per_sec <= 0:
+            raise ValueError(f"rate_per_sec must be > 0 (got {rate_per_sec})")
+        self._rate = rate_per_sec
+        self._capacity = max(capacity, rate_per_sec)
+        self._tokens = self._capacity
+        self._last_refill = time.monotonic()
+        self._lock = threading.Lock()
+
+    def _refill_locked(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        if elapsed > 0:
+            self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+            self._last_refill = now
+
+    async def acquire(self, amount: float) -> None:
+        amount = max(0.0, min(float(amount), self._capacity))
+        while True:
+            with self._lock:
+                self._refill_locked()
+                if self._tokens >= amount:
+                    self._tokens -= amount
+                    return
+                wait_s = (amount - self._tokens) / self._rate
+            await asyncio.sleep(wait_s)
+
+    def settle(self, delta: float) -> None:
+        """Post-call correction: charge `delta` (actual minus estimated tokens)
+        without awaiting. May drive the balance negative so the next `acquire`
+        waits longer — this is what makes the throttle track ACTUAL token usage
+        even when the pre-call estimate is off. No-op for delta 0."""
+        if not delta:
+            return
+        with self._lock:
+            self._refill_locked()
+            self._tokens -= delta
+
+
+_ASYNC_TPM_LOCK = threading.Lock()
+_ASYNC_TPM_LIMITERS: dict[str, _AsyncTokenBudget] = {}
+
+
+def get_async_tpm_limiter(model: str, tpm: float) -> _AsyncTokenBudget:
+    """Process-wide TPM bucket for `model`, paced at `tpm` tokens/min. Capacity is
+    ~4s of budget so a few large concurrent requests can burst, then throttle."""
+    with _ASYNC_TPM_LOCK:
+        lim = _ASYNC_TPM_LIMITERS.get(model)
+        if lim is None:
+            rate_per_sec = tpm / 60.0
+            lim = _AsyncTokenBudget(rate_per_sec, capacity=max(rate_per_sec * 4.0, 256_000.0))
+            _ASYNC_TPM_LIMITERS[model] = lim
+        return lim
+
+
+_MODEL_TPM: dict[str, float] | None = None
+
+
+def _llm_model_tpm(model: str) -> float | None:
+    """Per-minute *token* cap for `model`, parsed once from `SKUNK_MODEL_TPM`
+    ("model=tpm,..."). Returns None (no throttle) when unset — so the TPM bucket
+    is inert unless explicitly configured."""
+    global _MODEL_TPM
+    if _MODEL_TPM is None:
+        out: dict[str, float] = {}
+        for entry in os.environ.get("SKUNK_MODEL_TPM", "").split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            name, _, tpm = entry.partition("=")
+            out[name.strip()] = float(tpm.strip())
+        _MODEL_TPM = out
+    return _MODEL_TPM.get(model)
+
+
+def _estimate_prompt_tokens(system: str, user: str) -> float:
+    """Cheap pre-call input-token estimate (~4 chars/token) for the TPM bucket.
+    Approximate by design — it only paces throughput, it doesn't bill."""
+    return (len(system) + len(user)) / 4.0
+
 def _requires_thinking(model: str) -> bool:
     """True for models that mandate thinking mode (reject `thinking_budget=0`).
     Gemini 3.x Pro tiers are thinking-only; Flash/Flash-Lite accept budget=0."""
@@ -572,6 +668,18 @@ class LLMClient:
         gen_config = self._gemini_config(system, temperature, effort, model)
 
         async def do() -> LLMResponse:
+            # TPM throttle (opt-in via SKUNK_MODEL_TPM): meter input tokens so
+            # throughput stays under quota. Charge an estimate up front for pacing,
+            # then `settle` the actual-vs-estimate delta after the call so the
+            # bucket tracks REAL token usage (the char/4 estimate runs ~2x low on
+            # dense tabular text). Inside `do` so each retry re-charges. Separate
+            # from the RPM limiter.
+            tpm = _llm_model_tpm(model)
+            tpm_lim, est = None, 0.0
+            if tpm:
+                est = _estimate_prompt_tokens(system, user)
+                tpm_lim = get_async_tpm_limiter(model, tpm)
+                await tpm_lim.acquire(est)
             t0 = time.monotonic()
             api_resp = await client.aio.models.generate_content(
                 model=model, contents=parts, config=gen_config,
@@ -580,6 +688,8 @@ class LLMClient:
             usage = api_resp.usage_metadata
             output_text = (api_resp.text or "").strip()
             toks = self._usage_tokens(usage)
+            if tpm_lim is not None:
+                tpm_lim.settle((toks["input_tokens"] or 0) - est)
             if ctx is not None:
                 ctx.emit(
                     f"call call_site={call_site} model={model} temp={temperature} "
