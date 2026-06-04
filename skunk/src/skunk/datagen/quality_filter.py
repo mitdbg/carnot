@@ -5,8 +5,8 @@ the rollout pass-rate filter we instantiate a fresh ``SearchAgent``
 configured as a *Quality Filter*: it has the same corpus tools as the
 rollout agent but its system prompt instructs it to decide whether the
 candidate pair is unambiguous AND correct (KARL paper, Appendix D2,
-Figures 35 / 36). The verdict is committed via a single call to
-``quality_filter_final_answer(valid, reasoning)``.
+Figures 35 / 36). The verdict is committed as a single ```json``` final answer
+``{"valid": bool, "reasoning": str}`` (parsed by the agent loop, not a tool).
 
 The QF agent has access to the corpus so it can resolve genuine
 ambiguities (e.g. an OfficeQA question that targets a data slice where
@@ -20,6 +20,7 @@ pairs without re-judging the ones already on disk.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import pathlib
@@ -29,12 +30,9 @@ from typing import TYPE_CHECKING
 import yaml
 from jinja2 import Template
 
-from skunk.logging.tracer import Tracer
-from skunk.retrieve.search_agent import MAX_PARALLEL_TOOL_CALLS, SearchAgent
-from skunk.retrieve.search_tools import (
-    QUALITY_FILTER_FINAL_ANSWER_TAG,
-    quality_filter_final_answer,
-)
+from skunk.common import ExecutionContext
+from skunk.config import SkunkConfig
+from skunk.search_agent.search_agent import SearchAgent
 
 if TYPE_CHECKING:
     from chromadb.api.models.Collection import Collection
@@ -118,6 +116,28 @@ class QualityFilterFunnel:
 
 
 # ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+
+
+class QualityFilterAgent(SearchAgent):
+    """SearchAgent specialised as a Quality Filter judge.
+
+    Inherits the corpus tools + block trajectory + prune redaction; supplies a
+    judge system prompt (via ``system_prompt_override``) and commits its verdict
+    as a ```json``` final answer ``{"valid": bool, "reasoning": str}`` (parsed by
+    the base loop, not a tool).
+    """
+
+    name = "quality_filter"
+
+    def validate_final_answer(self, payload: object, observations: list[str]) -> str | None:
+        if not isinstance(payload, dict) or "valid" not in payload or "reasoning" not in payload:
+            return 'Emit a JSON object {"valid": true|false, "reasoning": "..."}.'
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Per-pair entry point
 # ---------------------------------------------------------------------------
 
@@ -135,7 +155,6 @@ def run_quality_filter_for_pair(
 
     system_prompt = Template(cfg.system_prompt_template).render(
         special_notes=cfg.special_notes,
-        max_parallel_tool_calls=MAX_PARALLEL_TOOL_CALLS,
     )
     user_prompt = Template(QUALITY_FILTER_USER_PROMPT).render(
         question=pair.question,
@@ -143,43 +162,43 @@ def run_quality_filter_for_pair(
         attempts=_render_attempts(rollout_records, cfg.binarization_mode),
     )
 
+    config = SkunkConfig(
+        agent_model_id=cfg.model_id.removeprefix("google/"),
+        emb_model_id=cfg.emb_model_id,
+        agent_max_steps=cfg.max_steps,
+        agent_max_pages_per_tool_call=cfg.max_pages_per_tool_call,
+    )
+    ctx = ExecutionContext(question=pair.question, config=config, log_path=trace_path, verbose=show_output)
+    agent: QualityFilterAgent | None = None
+    valid: bool | None = None
+    reasoning: str = ""
     try:
-        with Tracer(trace_path, show_output=show_output) as tracer:
-            agent = SearchAgent(
-                cfg.model_id,
-                document_map=cfg.document_map,
-                chroma_collection=cfg.chroma_collection,
-                emb_model_id=cfg.emb_model_id,
-                tracer=tracer,
-                max_steps=cfg.max_steps,
-                max_pages_per_tool_call=cfg.max_pages_per_tool_call,
-                model_context_window=cfg.model_context_window,
-                system_prompt_override=system_prompt,
-                final_answer_fn=quality_filter_final_answer,
-                service_tier=cfg.service_tier,
-            )
-            outcome = agent._run_loop(user_prompt)
-        raw = outcome.raw_output
-        valid: bool | None = None
-        reasoning: str = ""
-        if isinstance(raw, dict) and raw.get(QUALITY_FILTER_FINAL_ANSWER_TAG):
-            valid = bool(raw.get("valid"))
-            reasoning = str(raw.get("reasoning") or "")
-        completed = bool(agent._completed)
-        num_steps = int(agent._num_steps)
-        error = agent._error
+        agent = QualityFilterAgent(
+            config=config,
+            document_map=cfg.document_map,
+            chroma_collection=cfg.chroma_collection,
+            system_prompt_override=system_prompt,
+        )
+        payload = asyncio.run(agent.call(ctx, user_prompt))
+        if isinstance(payload, dict):
+            valid = bool(payload.get("valid"))
+            reasoning = str(payload.get("reasoning") or "")
+        completed = valid is not None
+        error = None
     except Exception as e:
-        valid = None
-        reasoning = ""
         completed = False
-        num_steps = 0
         error = f"quality_filter agent crashed: {e}"
+    finally:
+        ctx.close()
+
+    # `step` count = number of assistant turns in the (kept) trajectory.
+    num_steps = sum(1 for m in agent.messages if m["role"] == "assistant") if agent else 0
 
     # persist the message trajectory alongside the trace, when available.
     try:
-        if "agent" in locals():
+        if agent is not None:
             with open(messages_path, "w") as f:
-                json.dump(agent.messages_to_jsonable(), f, indent=2)  # type: ignore[name-defined]
+                json.dump(agent.messages_to_jsonable(), f, indent=2)
     except Exception:
         pass
 

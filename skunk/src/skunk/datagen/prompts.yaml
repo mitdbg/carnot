@@ -9,7 +9,7 @@ datagen_system_prompt: |
   1. **Explore** the corpus using the search tools below to find supporting evidence for {{ n_qa_pairs }} *different* question-answer pairs. Each pair should be grounded in roughly **{{ n_chunks }} supporting chunk(s)** (you may go a little above or below if the question genuinely needs it). Strive for diversity: cover different topics, document types, and reasoning patterns across the {{ n_qa_pairs }} pairs.
   2. **Compose** each new question so that its answer can only be correctly derived from the specific chunks you've identified. Each question must be genuinely different from the provided examples and from your own other generated questions: no paraphrases, simple inversions, or trivial variants.
   3. **Formulate each answer as a list of "nuggets"** -- key pieces of information essential to the answer. A nugget is a single atomic fact (an entity, a statistic, a date, a short phrase, etc.). Many answers will be a single nugget (e.g. an entity, a statistic, a date); some richer questions may require multiple nuggets to be considered fully answered. The set of nuggets should be the *minimum* information needed for a downstream system to be judged as correctly answering the question.
-  4. **Return** all {{ n_qa_pairs }} pairs in a single call to `final_answer(qa_pairs=[...])`.
+  4. **Return** all {{ n_qa_pairs }} pairs as your final answer (a JSON block; see "Final answer" below).
 
   Match the style and difficulty level of the example questions. Each answer must be verifiable directly from the listed supporting chunks.
 
@@ -17,19 +17,15 @@ datagen_system_prompt: |
   The corpus is organised as a set of *documents*, each identified by a `doc_id`. Every document is further split into *chunks* (text spans, table fragments, titles, etc.), each identified by a `chunk_id`. The exact metadata schema and identifier formats for this corpus are described in the "Notes About This Corpus" section below.
 
   ## Response format
-  On every step, output between 1 and {{ max_parallel_tool_calls }} fenced python code blocks of the form:
+  On every step, output EITHER one fenced python code block:
 
   ```python
   # your code here
   ```
 
-  Each code block may contain:
-  - A single call to one of the tools listed below (the normal case), optionally preceded by any pure-python preparatory code (e.g. computing a statistic from values you have already retrieved using `math`, `statistics`, `numpy`, `scipy`, or `statsmodels`).
-  - Pure python code with no tool call at all, when you only need to compute or inspect something -- make sure to `print()` whatever you want to see, since only printed output appears as an observation.
+  A code block may contain a single call to one of the tools listed below (the normal case), optionally preceded by any pure-python preparatory code (e.g. computing a statistic with `math`, `statistics`, `numpy`, `scipy`, or `statsmodels`); or pure python with no tool call when you only need to compute or inspect something -- `print()` whatever you want to see, since only printed output appears as an observation.
 
-  You may write a brief "Thoughts:" line before the code block(s). When you emit multiple code blocks in one step, they are executed **in parallel** and their results are returned to you together as a single batched observation -- use this to issue several independent retrievals at once.
-
-  Important: `prune(...)` and `final_answer(...)` must each be invoked in a step **by themselves** -- never combine them with another tool call in the same step.
+  OR, when you are done, a single ```json``` block with your final answer (see "Final answer" below). It is parsed as data (not executed) — write plain JSON literals (no Python, no trailing commas). You may write a brief "Thoughts:" line before the block.
 
   ## Tools
 
@@ -61,29 +57,28 @@ datagen_system_prompt: |
   prune(chunk_ids=["chunk_id_1", "chunk_id_2"], doc_ids=["doc_id_3"])
   ```
 
-  ### final_answer(qa_pairs: list[dict])
-  Call this **exactly once** when you have identified the supporting evidence for all {{ n_qa_pairs }} pairs. The input is a list of {{ n_qa_pairs }} dictionaries, each with the following keys:
+  ## Final answer
+  When you have identified the supporting evidence for all {{ n_qa_pairs }} pairs, emit a single ```json``` block with a `qa_pairs` list of {{ n_qa_pairs }} objects, each with the following keys:
   - `question` (str): the full text of the new question.
   - `answer` (list[str]): the answer expressed as a list of nuggets (key facts essential to the answer).
   - `chunk_ids` (list[str]): the `chunk_id`(s) (~{{ n_chunks }} per pair) needed to verify the answer.
 
-  ```python
-  final_answer(qa_pairs=[
+  ```json
+  {"qa_pairs": [
       {
           "question": "What was the total value of ACME Corp's transactions in 2023?",
           "answer": ["$57.8 billion"],
-          "chunk_ids": ["chunk_id_1", "chunk_id_2"],
+          "chunk_ids": ["chunk_id_1", "chunk_id_2"]
       },
       {
           "question": "Which three government agencies did ACME Corp receive the most funding from in 2018?",
           "answer": ["Department of Energy", "Department of Agriculture", "Department of Defense"],
-          "chunk_ids": ["chunk_id_3", "chunk_id_4", "chunk_id_5"],
-      },
-      # ... {{ n_qa_pairs }} pairs total
-  ])
+          "chunk_ids": ["chunk_id_3", "chunk_id_4", "chunk_id_5"]
+      }
+  ]}
   ```
 
-  You have {{ max_steps }} steps in total. Use early steps to explore broadly across the topics suggested by the seed chunks and example questions, then narrow in on the most promising threads before calling `final_answer(...)`.
+  You have {{ max_steps }} steps in total. Use early steps to explore broadly across the topics suggested by the seed chunks and example questions, then narrow in on the most promising threads before emitting your final answer.
 
   ## Notes About This Corpus
   {{ special_notes }}
@@ -282,20 +277,24 @@ task_solver_system_prompt: |
   You may write and execute Python code to compute statistics, regressions, means,
   or other numerical results from values found in the documents.
 
-  When you have determined your final answer, call:
-      final_answer(answer)
-
-  where ``answer`` is a plain string.
-
   ## Response format
-  On every step, output exactly ONE fenced Python code block of the form:
+  On every step, output EITHER:
+    - exactly ONE fenced Python code block (to compute intermediate results):
 
   ```python
   # your code here
+  print(result)
   ```
 
-  You may write a brief "Thoughts:" line before the code block, but no other text.
-  Do not output multiple code blocks per step.
+    - OR a single ```json``` block with your final answer (emit this once, when ready):
+
+  ```json
+  {"answer": "<your plain-string answer>"}
+  ```
+
+  You may write a brief "Thoughts:" line before the block, but no other text. Do
+  not output multiple blocks per step. The ```json``` final answer is parsed as
+  data (not executed) — write a plain JSON literal.
 
   ### Examples
 
@@ -308,13 +307,13 @@ task_solver_system_prompt: |
   ```
 
   Submitting the final answer:
-  ```python
-  final_answer("The average value was 12.15.")
+  ```json
+  {"answer": "The average value was 12.15."}
   ```
 
   If the documents are insufficient:
-  ```python
-  final_answer("I cannot answer this question with the provided documents.")
+  ```json
+  {"answer": "I cannot answer this question with the provided documents."}
   ```
 
   ## Guidelines
@@ -324,7 +323,7 @@ task_solver_system_prompt: |
     Partial answers are acceptable.
   - If the documents contain none of the information needed to answer the question,
     use the fallback shown above.
-  - Do NOT include preamble, reasoning, or explanation in your final_answer string;
+  - Do NOT include preamble, reasoning, or explanation in your answer string;
     output only the answer itself.
 
 task_solver_user_prompt: |
@@ -413,15 +412,19 @@ quality_filter_system_prompt_browsecomp_plus: |
   {{ special_notes }}
 
   ## Response format
-  On every step, output between 1 and {{ max_parallel_tool_calls }} fenced python code blocks:
+  On every step, output EITHER one fenced python code block containing a single tool call:
 
   ```python
-  # your code here
+  # a single tool call
   ```
 
-  Each code block must contain a single tool call. You may write a brief "Thoughts:" line before the code block(s). When you emit multiple code blocks in one step, they are executed **in parallel** and their results are returned to you together as a single batched observation.
+  OR a single ```json``` block with your final verdict (emit this once, when ready):
 
-  Important: `prune(...)` and `final_answer(...)` must each be invoked in a step **by themselves** -- never combine them with another tool call in the same step.
+  ```json
+  {"valid": true, "reasoning": "<1-3 sentence justification>"}
+  ```
+
+  You may write a brief "Thoughts:" line before the block. The ```json``` final answer is parsed as data (not executed) — write a plain JSON literal (`true`/`false`, no Python).
 
   ## Tools
 
@@ -456,17 +459,14 @@ quality_filter_system_prompt_browsecomp_plus: |
   prune(chunk_ids=["chunk_id_1"], doc_ids=["doc_id_2"])
   ```
 
-  ### final_answer(valid: bool, reasoning: str)
-  Call this exactly once when you have reached a verdict.
-    - valid:     True if the QA pair passes both criteria above, False otherwise.
+  ## Final verdict
+  When you have reached a verdict, emit it as the single ```json``` final answer:
+    - valid:     true if the QA pair passes both criteria above, false otherwise.
     - reasoning: a concise justification (1-3 sentences) summarizing the
                  evidence from the corpus and the rollout attempts.
 
-  ```python
-  final_answer(
-      valid=True,   # or False
-      reasoning="Your 1-3 sentence justification here.",
-  )
+  ```json
+  {"valid": true, "reasoning": "Your 1-3 sentence justification here."}
   ```
 
 quality_filter_system_prompt_officeqa: |
@@ -497,21 +497,21 @@ quality_filter_system_prompt_officeqa: |
   {{ special_notes }}
 
   ## Response format
-  On every step, output between 1 and {{ max_parallel_tool_calls }} fenced python code blocks:
+  On every step, output EITHER one fenced python code block containing a single
+  tool call (optionally preceded by pure-python computation, e.g. `math`,
+  `statistics`, `numpy`):
 
   ```python
-  # your code here
+  # a single tool call
   ```
 
-  Each code block may contain a single tool call, optionally preceded by
-  pure-python computation (e.g. `math`, `statistics`, `numpy`). You may write
-  a brief "Thoughts:" line before the code block(s). When you emit multiple
-  code blocks in one step, they are executed **in parallel** and their results
-  are returned to you together as a single batched observation.
+  OR a single ```json``` block with your final verdict (emit this once, when ready):
 
-  Important: `prune(...)` and `final_answer(...)` must each be invoked in a
-  step **by themselves** -- never combine them with another tool call in the
-  same step.
+  ```json
+  {"valid": true, "reasoning": "<1-3 sentence justification>"}
+  ```
+
+  You may write a brief "Thoughts:" line before the block. The ```json``` final answer is parsed as data (not executed) — write a plain JSON literal (`true`/`false`, no Python).
 
   ## Tools
 
@@ -546,17 +546,14 @@ quality_filter_system_prompt_officeqa: |
   prune(chunk_ids=["chunk_id_1"], doc_ids=["doc_id_2"])
   ```
 
-  ### final_answer(valid: bool, reasoning: str)
-  Call this exactly once when you have reached a verdict.
-    - valid:     True if the QA pair passes all criteria above, False otherwise.
+  ## Final verdict
+  When you have reached a verdict, emit it as the single ```json``` final answer:
+    - valid:     true if the QA pair passes all criteria above, false otherwise.
     - reasoning: a concise justification (1-3 sentences) summarizing the
                  evidence from the corpus and the rollout attempts.
 
-  ```python
-  final_answer(
-      valid=True,   # or False
-      reasoning="Your 1-3 sentence justification here.",
-  )
+  ```json
+  {"valid": true, "reasoning": "Your 1-3 sentence justification here."}
   ```
 
 # ---------------------------------------------------------------------------
@@ -582,5 +579,5 @@ quality_filter_user_prompt: |
 
   Decide whether this QA pair is valid (unambiguous, correct, non-trivially
   answerable). Do not rely solely on the TaskSolver's computed answer — use
-  the corpus tools to verify the ground truth independently. When done, call
-  `final_answer(valid, reasoning)`.
+  the corpus tools to verify the ground truth independently. When done, emit your
+  verdict as the single ```json``` final answer.

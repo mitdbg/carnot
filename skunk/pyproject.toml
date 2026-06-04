@@ -1,19 +1,44 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "skunk"
-version = "0.0.0"
-description = "Skunkworks experiments for the Carnot retrieval stack."
-requires-python = ">=3.10"
+version = "0.1.0"
+description = "Declarative QA pipeline over the U.S. Treasury Bulletin corpus"
+requires-python = ">=3.12"
+dependencies = [
+    "chromadb>=1.4.0",
+    "google-genai",
+    "jinja2",
+    "openrouter",
+    "pandas",
+    "pyarrow",
+    "pydantic>=2",
+    "pymupdf",
+    "pyyaml",
+    "numpy",
+    "statsmodels",
+    "tavily-python",
+    "pandas-stubs==3.0.3.260530",
+]
 
 [project.optional-dependencies]
-# Rollout generation samples directly from Tinker (so captured logprobs are
-# exactly pi_old for the fine-tuned policy). Only needed to run the datagen
-# rollout stage; the OpenRouter-backed roles import fine without these.
-# Also requires the TINKER_API_KEY environment variable at runtime.
 rollout = ["tinker", "tinker_cookbook"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.package-data]
+skunk = ["py.typed"]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+# StepFailed is a deliberate name (read as a tagged failure mode, not a fatal
+# error); we intentionally don't follow PEP 8's "Error" suffix convention here.
+extend-ignore = ["N818"]

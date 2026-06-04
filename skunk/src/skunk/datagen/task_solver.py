@@ -24,6 +24,7 @@ the QualityFilter agent.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import pathlib
 import re
@@ -33,13 +34,9 @@ from typing import TYPE_CHECKING
 import yaml
 from jinja2 import Template
 
-from skunk.logging.tracer import Tracer
-from skunk.retrieve.search_agent import SearchAgent
-from skunk.retrieve.search_tools import (
-    TASK_SOLVER_FINAL_ANSWER_TAG,
-    task_solver_final_answer,
-)
-from skunk.utils.local_python_executor import LocalPythonExecutor
+from skunk.common import ExecutionContext
+from skunk.config import SkunkConfig
+from skunk.multi_turn_agent import MultiTurnAgent
 
 if TYPE_CHECKING:
     from openrouter import OpenRouter
@@ -105,20 +102,21 @@ class TaskSolverConfig:
 # ---------------------------------------------------------------------------
 
 
-class TaskSolverAgent(SearchAgent):
-    """SearchAgent subclass with only Python code execution.
+class TaskSolverAgent(MultiTurnAgent):
+    """A tools-free ``MultiTurnAgent`` with only Python code execution.
 
-    The corpus tools (``search_corpus``, ``grep_corpus``, ``read_document``,
-    ``prune``) are stripped from the executor.  The only callable exposed to
-    the model is ``final_answer(answer)``.  Document context is provided
-    directly in the initial user message rather than fetched at runtime.
+    There are no corpus tools: document context is provided directly in the
+    initial user message rather than fetched at runtime, and the agent computes
+    intermediate results in python steps. The final answer is a ```json``` block
+    ``{"answer": "..."}`` (parsed by the base loop, not a tool).
 
-    The Python interpreter supports common scientific libraries so the agent
-    can compute statistics, regressions, and other numerical results from
-    values found in those documents.
+    The Python interpreter authorizes common scientific libraries so the agent
+    can compute statistics, regressions, and other numerical results from values
+    found in those documents.
     """
 
-    _AUTHORIZED_IMPORTS: list[str] = [
+    name = "task_solver"
+    authorized_imports: list[str] = [
         "math",
         "statistics",
         "numpy",
@@ -134,33 +132,19 @@ class TaskSolverAgent(SearchAgent):
 
     def __init__(
         self,
-        model_id: str,
         system_prompt: str,
         max_steps: int = 30,
         model_context_window: int = 1_000_000,
-        tracer: Tracer | None = None,
-        service_tier: str | None = None,
     ) -> None:
-        super().__init__(
-            model_id=model_id,
-            document_map={},
-            chroma_collection=None,  # type: ignore[arg-type]
-            emb_model_id="",
-            tracer=tracer,
-            max_steps=max_steps,
-            model_context_window=model_context_window,
-            system_prompt_override=system_prompt,
-            final_answer_fn=task_solver_final_answer,
-            additional_authorized_imports=self._AUTHORIZED_IMPORTS,
-            service_tier=service_tier,
-        )
+        super().__init__([], max_steps=max_steps, system_prompt_override=system_prompt)
+        # Large doc context is packed into the first user message; size the
+        # trajectory budget to the model window so it is not trimmed away.
+        self.context_budget_chars = model_context_window * _CHARS_PER_TOKEN_ESTIMATE
 
-    def _build_executor(self) -> LocalPythonExecutor:  # type: ignore[override]
-        executor = LocalPythonExecutor(
-            additional_authorized_imports=self.additional_authorized_imports,
-        )
-        executor.send_tools({"final_answer": task_solver_final_answer})
-        return executor
+    def validate_final_answer(self, payload: object, observations: list[str]) -> str | None:
+        if not isinstance(payload, dict) or "answer" not in payload:
+            return 'Emit a JSON object with a single "answer" key, e.g. {"answer": "..."}.'
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -200,23 +184,24 @@ def run_task_solver(
         documents=packed,
     )
 
+    config = SkunkConfig(
+        agent_model_id=cfg.task_solver_model_id.removeprefix("google/"),
+        agent_max_steps=cfg.task_solver_max_steps,
+    )
+    ctx = ExecutionContext(question=question, config=config)
     try:
         agent = TaskSolverAgent(
-            model_id=cfg.task_solver_model_id,
             system_prompt=TASK_SOLVER_SYSTEM_PROMPT,
             max_steps=cfg.task_solver_max_steps,
             model_context_window=cfg.model_context_window,
-            service_tier=cfg.service_tier,
         )
-        outcome = agent._run_loop(user_message)
+        payload = asyncio.run(agent.call(ctx, user_message))
     except Exception as e:
         return "", f"task_solver agent crashed: {e}"
 
-    raw = outcome.raw_output
-    if isinstance(raw, dict) and raw.get(TASK_SOLVER_FINAL_ANSWER_TAG):
-        return str(raw.get("answer") or ""), agent._error
-    error = agent._error or "task_solver: agent did not call final_answer"
-    return "", error
+    if isinstance(payload, dict) and "answer" in payload:
+        return str(payload.get("answer") or ""), None
+    return "", "task_solver: agent did not return a final answer"
 
 
 def _pack_documents(

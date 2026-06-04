@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import json
 import math
 import os
@@ -38,24 +39,23 @@ from skunk.datagen.rollout import (
 )
 from skunk.datagen.task_solver import TaskSolverConfig
 from skunk.datagen.tinker_cost import resolve_prices, write_run_report
-from skunk.logging.tracer import Tracer
-from skunk.retrieve.search_agent import (
-    BROWSECOMP_PLUS_SPECIAL_NOTES,
-    DEFAULT_ROLLOUT_SAMPLING_PARAMS,
-    MAX_PAGES_PER_TOOL_CALL,
-    MAX_PARALLEL_TOOL_CALLS,
-    OFFICEQA_SPECIAL_NOTES,
-    SearchAgent,
-)
-from skunk.retrieve.search_tools import (
-    datagen_final_answer,
-)
-from skunk.retrieve.tinker_backend import (
+from skunk.common import ExecutionContext
+from skunk.config import SkunkConfig
+from skunk.prompted_call import PromptOverride, load_prompt_overrides
+from skunk.search_agent.search_agent import SearchAgent
+from skunk.search_agent.prep.tinker_backend import (
     DEFAULT_ROLLOUT_MAX_TOKENS,
     DEFAULT_TINKER_BASE_MODEL,
     DEFAULT_TINKER_RENDERER,
     build_tinker_backend,
 )
+
+# Pulled in from the (deleted) retrieve.search_agent module; the corpus
+# `special_notes` blocks now live in the per-benchmark prompt-override YAMLs.
+MAX_PAGES_PER_TOOL_CALL = 20
+# Default sampling for RL rollouts (recorded per-rollout for provenance and
+# forwarded to the Tinker backend).
+DEFAULT_ROLLOUT_SAMPLING_PARAMS: dict = {"temperature": 1.0, "top_p": 1.0}
 
 TRACE_DIR = "qa_synthesis_traces"
 VAL_FRAC = 0.25
@@ -69,7 +69,7 @@ DEFAULT_N_ROLLOUTS = 8
 # for the next, keeping the Tinker sampling backend saturated end-to-end.
 DEFAULT_ROLLOUT_CONCURRENCY = 32
 # Rollout policy. Rollouts sample directly from Tinker via `tinker_backend`
-# (see skunk.retrieve.tinker_backend), so the per-token logprobs captured here
+# (see skunk.search_agent.prep.tinker_backend), so the per-token logprobs captured here
 # are exactly pi_old -- the behaviour-policy denominator in the GRPO / CISPO
 # importance ratio -- for the model we fine-tune. Sampling from Tinker (rather
 # than an fp8 OpenRouter build behind a single pinned provider) removes both the
@@ -89,14 +89,28 @@ with DATAGEN_PROMPT_FILE.open() as _f:
 DATAGEN_SYSTEM_PROMPT: str = _DATAGEN_PROMPTS["datagen_system_prompt"]
 OFFICEQA_DATAGEN_GUIDANCE: str = _DATAGEN_PROMPTS["officeqa_datagen_guidance"]
 
-# map each benchmark to the SearchAgent `special_notes` block describing its
-# corpus (identifier formats, available metadata fields, example filter
-# clauses). Used both when synthesising QA pairs (`generate_one`) and when
-# running rollouts so the agent always sees corpus notes that match the
-# benchmark it's operating on.
+# map each benchmark to its prompt-override YAML. The `search_agent` corpus
+# blurb in that file describes the corpus (identifier formats, metadata fields,
+# example filter clauses); we both render it into the datagen synthesis prompt
+# and feed the loaded overrides to the rollout SearchAgent via `ctx`.
+BENCHMARK_PROMPT_OVERRIDES_PATH: dict[str, str] = {
+    "officeqa":        "config/prompts/treasury_bulletin.yaml",
+    "browsecomp-plus": "config/prompts/browsecomp_plus.yaml",
+}
+
+
+def _load_corpus_notes(overrides_path: str, agent_name: str = "search_agent") -> str:
+    """Load the `corpus`-section override targeting `agent_name` from a
+    prompt-override YAML — the per-benchmark corpus notes string."""
+    for ov in load_prompt_overrides(overrides_path):
+        if ov.section == "corpus" and agent_name in ov.targets and isinstance(ov.content, str):
+            return ov.content
+    return ""
+
+
+# Per-benchmark corpus notes, rendered into the synthesis prompt (`generate_one`).
 BENCHMARK_SPECIAL_NOTES: dict[str, str] = {
-    "officeqa":        OFFICEQA_SPECIAL_NOTES,
-    "browsecomp-plus": BROWSECOMP_PLUS_SPECIAL_NOTES,
+    bench: _load_corpus_notes(path) for bench, path in BENCHMARK_PROMPT_OVERRIDES_PATH.items()
 }
 
 # map each benchmark to its de-duplication judge prompt template.
@@ -127,6 +141,33 @@ CHROMA_PAGE_SIZE = 5000
 # so it can compute statistics (means, regressions, etc.) from raw values it
 # retrieves from the corpus rather than just regurgitating pre-computed numbers.
 DATAGEN_AUTHORIZED_IMPORTS = ["math", "statistics", "numpy", "scipy", "statsmodels"]
+
+
+class QASynthAgent(SearchAgent):
+    """SearchAgent specialised for QA-pair synthesis (datagen, genai backend).
+
+    Same corpus tools as the rollout agent, driven by a synthesis system prompt
+    (via ``system_prompt_override``); commits a ```json``` final answer
+    ``{"qa_pairs": [{"question", "answer", "chunk_ids"}, ...]}`` (parsed by the
+    base loop, not a tool).
+    """
+
+    name = "qa_synth"
+    authorized_imports = DATAGEN_AUTHORIZED_IMPORTS
+
+    def validate_final_answer(self, payload: object, observations: list[str]) -> str | None:
+        if not isinstance(payload, dict) or not isinstance(payload.get("qa_pairs"), list):
+            return ('Emit a JSON object {"qa_pairs": [{"question": ..., '
+                    '"answer": [...], "chunk_ids": [...]}, ...]}.')
+        return None
+
+    async def synth(self, ctx: ExecutionContext, user_prompt: str) -> list[dict]:
+        """Run the synthesis loop; return the list of pair dicts (or [] on failure)."""
+        try:
+            payload = await self.call(ctx, user_prompt)
+        except Exception:
+            return []
+        return payload.get("qa_pairs", []) if isinstance(payload, dict) else []
 
 
 @dataclass
@@ -288,7 +329,7 @@ def generate_one(
     emb_model_id: str,
     show_output: bool,
     trace_dir: str,
-    special_notes: str = OFFICEQA_SPECIAL_NOTES,
+    special_notes: str = "",
     dataset_guidance: str = "",
     n_examples: int = 5,
     n_qa_pairs: int = DEFAULT_N_QA_PAIRS,
@@ -312,7 +353,6 @@ def generate_one(
     system_prompt = Template(DATAGEN_SYSTEM_PROMPT).render(
         max_steps=AGENT_MAX_STEPS,
         max_pages=MAX_PAGES_PER_TOOL_CALL,
-        max_parallel_tool_calls=MAX_PARALLEL_TOOL_CALLS,
         special_notes=special_notes,
         dataset_guidance=dataset_guidance,
         n_chunks=n_chunks,
@@ -323,21 +363,25 @@ def generate_one(
     os.makedirs(trace_dir, exist_ok=True)
     trace_path = f"{trace_dir}/{seed}_trace.txt"
 
-    with Tracer(trace_path, show_output=show_output) as tracer:
-        agent = SearchAgent(
-            model_id,
+    config = SkunkConfig(
+        agent_model_id=model_id.removeprefix("google/"),
+        emb_model_id=emb_model_id,
+        agent_max_steps=AGENT_MAX_STEPS,
+        agent_max_pages_per_tool_call=MAX_PAGES_PER_TOOL_CALL,
+    )
+    # `special_notes` is rendered inline above, so this ctx carries no prompt
+    # overrides (avoids double-injecting the corpus blurb via the override tail).
+    ctx = ExecutionContext(question=user_prompt, config=config, log_path=trace_path, verbose=show_output)
+    try:
+        agent = QASynthAgent(
+            config=config,
             document_map=document_map,
             chroma_collection=chroma_collection,
-            emb_model_id=emb_model_id,
-            tracer=tracer,
-            max_steps=AGENT_MAX_STEPS,
-            max_pages_per_tool_call=MAX_PAGES_PER_TOOL_CALL,
             system_prompt_override=system_prompt,
-            final_answer_fn=datagen_final_answer,
-            additional_authorized_imports=DATAGEN_AUTHORIZED_IMPORTS,
-            service_tier=service_tier,
         )
-        raw_pairs = agent.qa_synthesis(user_prompt)
+        raw_pairs = asyncio.run(agent.synth(ctx, user_prompt))
+    finally:
+        ctx.close()
 
     # persist the full message trajectory alongside the trace.
     messages_path = f"{trace_dir}/{seed}_messages.json"
@@ -366,9 +410,9 @@ def generate_one(
         pairs=pairs,
         target_n_qa_pairs=n_qa_pairs,
         target_n_chunks_per_pair=n_chunks,
-        completed=agent._completed,
-        num_steps=agent._num_steps,
-        error=agent._error,
+        completed=bool(raw_pairs),
+        num_steps=sum(1 for m in agent.messages if m["role"] == "assistant"),
+        error=None if raw_pairs else "qa_synthesis returned no pairs",
         total_time_sec=time.perf_counter() - start,
     )
 
@@ -447,44 +491,57 @@ def _make_rollout_agent_factory(
     The chunk-level "output" set is reconstructed downstream by expanding
     each output doc_id into its full chunk set.
     """
+    config = SkunkConfig(
+        agent_model_id=model_id.removeprefix("google/"),
+        emb_model_id=emb_model_id,
+        agent_max_steps=AGENT_MAX_STEPS,
+        agent_max_pages_per_tool_call=MAX_PAGES_PER_TOOL_CALL,
+    )
+    # Feed the benchmark's corpus notes through the prompt-override channel so the
+    # default (test-time) SearchAgent prompt is used verbatim — no behaviour drift.
+    overrides = (
+        (PromptOverride(section="corpus", targets=("search_agent",), content=special_notes),)
+        if special_notes else ()
+    )
+
     def factory(question: str, trace_path: str, messages_path: str, show_output: bool):
-        with Tracer(trace_path, show_output=show_output) as tracer:
+        ctx = ExecutionContext(
+            question=question, config=config, prompt_overrides=overrides,
+            log_path=trace_path, verbose=show_output,
+        )
+        agent: SearchAgent | None = None
+        output_doc_ids: list[str] = []
+        error: str | None = None
+        try:
             agent = SearchAgent(
-                model_id,
+                config=config,
                 document_map=document_map,
                 chroma_collection=chroma_collection,
-                emb_model_id=emb_model_id,
-                tracer=tracer,
-                max_steps=AGENT_MAX_STEPS,
-                max_pages_per_tool_call=MAX_PAGES_PER_TOOL_CALL,
-                model_context_window=model_context_window,
-                special_notes=special_notes,
+                # The shared Tinker backend generates every assistant turn, so the
+                # `logprobs` blocks in `messages_to_jsonable()` carry log pi_old.
+                generation_backend=tinker_backend,
                 sampling_params=sampling_params,
-                tinker_backend=tinker_backend, # type: ignore
-                # These are training rollouts (RL data generation), so enable the
-                # soft prune nudge at the effective-context threshold -- it lets
-                # the agent prune proactively instead of only when forced at the
-                # hard cutoff.
-                train=True,
+                capture_logprobs=True,
             )
-            output_doc_ids = agent.retrieve(question)
+            output_doc_ids = asyncio.run(agent.retrieve(ctx, question))
+            completed = True
+        except Exception as e:
+            completed = False
+            error = f"rollout agent failed: {e}"
+        finally:
+            ctx.close()
 
         # persist the full message trajectory alongside the trace, then
         # derive the trajectory chunk_ids (every chunk surfaced in any
         # tool observation during the rollout) from the same jsonable
         # form so trajectory metrics are reproducible offline.
-        messages_jsonable = agent.messages_to_jsonable()
+        messages_jsonable = agent.messages_to_jsonable() if agent else []
         with open(messages_path, "w") as f:
             json.dump(messages_jsonable, f, indent=2)
         trajectory_chunk_ids = extract_trajectory_chunk_ids(messages_jsonable)
+        num_steps = sum(1 for m in (agent.messages if agent else []) if m["role"] == "assistant")
 
-        return (
-            output_doc_ids,
-            trajectory_chunk_ids,
-            agent._completed,
-            agent._num_steps,
-            agent._error,
-        )
+        return (output_doc_ids, trajectory_chunk_ids, completed, num_steps, error)
 
     return factory
 

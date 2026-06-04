@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# secrets
+.env
+
+# generated / cached
+cache/
+eval/traces/
+eval/runs_*/
