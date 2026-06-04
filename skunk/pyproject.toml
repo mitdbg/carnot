@@ -11,6 +11,7 @@ dependencies = [
     "chromadb>=1.4.0",
     "google-genai",
     "jinja2",
+    "openrouter",
     "pandas",
     "pyarrow",
     "pydantic>=2",
@@ -21,6 +22,9 @@ dependencies = [
     "tavily-python",
     "pandas-stubs==3.0.3.260530",
 ]
+
+[project.optional-dependencies]
+rollout = ["tinker", "tinker_cookbook"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
