@@ -37,8 +37,12 @@ class RetrieveOp:
 
     def __init__(self, config: SkunkConfig) -> None:
         self._config = config
-        self._agent = None  # skunk.search_agent.SearchAgent
-        self._agent_lock = threading.Lock()
+        # Cached read-only resources (ChromaDB collection + doc_id→text map),
+        # shared across branches and opened once. A fresh SearchAgent is built
+        # per branch since it now carries per-question state (block trajectory +
+        # prune sets), so it cannot be shared across concurrent branches.
+        self._resources = None  # tuple[Collection, dict[str, str]]
+        self._resources_lock = threading.Lock()
         self._page_index_retriever = None  # skunk.page_index.query.PageIndexRetriever
 
     async def run(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
@@ -68,7 +72,16 @@ class RetrieveOp:
 
     async def _run_search_agent(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
         """Iterative search agent (`skunk.search_agent`); maps its page keys to `PageRef`."""
-        agent = self._ensure_agent(ctx.config)
+        from skunk.search_agent import SearchAgent
+
+        collection, document_map = self._ensure_resources(ctx.config)
+        # Fresh agent per branch: it holds per-question state (trajectory + prune
+        # sets); the ChromaDB collection + document map underneath are shared.
+        agent = SearchAgent(
+            config=ctx.config,
+            document_map=document_map,
+            chroma_collection=collection,
+        )
         page_keys = await agent.retrieve(
             ctx,
             ctx.question,
@@ -94,13 +107,14 @@ class RetrieveOp:
             )
         return refs
 
-    def _ensure_agent(self, config: SkunkConfig):
+    def _ensure_resources(self, config: SkunkConfig):
         # Single-flight: parallel branches must not race to open ChromaDB and
-        # load the clean-page map.
-        with self._agent_lock:
-            if self._agent is None:
-                self._agent = _build_search_agent(config)
-            return self._agent
+        # load the document-text map. These resources are read-only + shared;
+        # only the per-branch SearchAgent built around them holds mutable state.
+        with self._resources_lock:
+            if self._resources is None:
+                self._resources = _build_resources(config)
+            return self._resources
 
     async def _run_page_index(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
         """Page-index retriever (ToC pick → year filter → semantic filter). The
@@ -112,12 +126,11 @@ class RetrieveOp:
         return await self._page_index_retriever.run(None, ctx, branch=branch)
 
 
-def _build_search_agent(config: SkunkConfig):
-    """Open ChromaDB, load the clean-page map, and construct the agent. Raises
-    `StepFailed` with a clear message if either artifact is missing."""
+def _build_resources(config: SkunkConfig):
+    """Open ChromaDB and build the doc_id→text map from the clean-page map.
+    Returns (collection, document_map). Raises `StepFailed` with a clear message
+    if either artifact is missing."""
     import chromadb
-
-    from skunk.search_agent import SearchAgent
 
     chromadb_dir = Path(config.chromadb_dir)
     clean_page_map_path = Path(config.clean_page_map_path)
@@ -141,6 +154,19 @@ def _build_search_agent(config: SkunkConfig):
     with clean_page_map_path.open() as f:
         clean_page_map = json.load(f)
 
+    # clean_page_map: doc_id -> [clean_page_path, element_id_order]. Eagerly load
+    # each cleaned page's text so `read_document` can serve it by doc_id. Built
+    # once and shared across branches. Missing/unreadable pages are skipped here
+    # and surface as "no such document" at read time (mirrors the old lazy read).
+    document_map: dict[str, str] = {}
+    for doc_id, entry in clean_page_map.items():
+        path = entry[0] if isinstance(entry, (list, tuple)) else entry
+        try:
+            with open(path) as pf:
+                document_map[doc_id] = pf.read()
+        except OSError:
+            continue
+
     chroma_client = chromadb.PersistentClient(path=str(chromadb_dir))
     try:
         collection = chroma_client.get_collection(name=config.chromadb_collection)
@@ -157,8 +183,4 @@ def _build_search_agent(config: SkunkConfig):
             "GOOGLE_CLOUD_PROJECT not set — required for Vertex AI. "
             "Set it in your .env and run `gcloud auth application-default login`.",
         )
-    return SearchAgent(
-        config=config,
-        clean_page_map=clean_page_map,
-        chroma_collection=collection,
-    )
+    return collection, document_map

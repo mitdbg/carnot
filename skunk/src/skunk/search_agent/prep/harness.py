@@ -22,6 +22,17 @@ MODEL_ID = "gemini-3-flash-preview"
 TRACE_DIR = "search_agent_traces"
 BULLETINS_DIR = "treasury_bulletins_cleaned"
 
+# validation set: the 34 UIDs that completed in v2_search_agent_traces.
+VALIDATION_UIDS = [
+    "UID0001", "UID0003", "UID0004", "UID0005", "UID0007",
+    "UID0009", "UID0010", "UID0012", "UID0013", "UID0015",
+    "UID0017", "UID0018", "UID0019", "UID0022", "UID0025",
+    "UID0027", "UID0028", "UID0029", "UID0030", "UID0031",
+    "UID0032", "UID0035", "UID0036", "UID0037", "UID0039",
+    "UID0042", "UID0044", "UID0049", "UID0050", "UID0053",
+    "UID0055", "UID0056", "UID0057", "UID0058",
+]
+
 
 @dataclass
 class _OfflineCtx:
@@ -50,21 +61,22 @@ class _OfflineCtx:
 def _run_one(
     row: dict,
     config: SkunkConfig,
-    clean_page_map: dict,
+    document_map: dict[str, str],
     chroma_collection: Collection,
     show_output: bool,
+    trace_dir: str,
 ) -> tuple[str, dict]:
     """Run the search agent for a single question and return an analysis dict."""
     start_time = time.perf_counter()
     uid = row["uid"]
     question = row["question"]
-    trace_path = f"{TRACE_DIR}/{uid}_trace.txt"
+    trace_path = f"{trace_dir}/{uid}_trace.txt"
 
     with open(trace_path, "w") as trace_file:
         ctx = _OfflineCtx(config=config, trace_file=trace_file, show_output=show_output)
         agent = SearchAgent(
             config=config,
-            clean_page_map=clean_page_map,
+            document_map=document_map,
             chroma_collection=chroma_collection,
         )
         # `SearchAgent.retrieve` is async (request-time path); this offline harness
@@ -88,9 +100,9 @@ def _run_one(
             correct_document = sum(1 for ym in source_year_months if ym in final_yms) / len(source_year_months)
 
     # persist the full message history for later debugging.
-    messages_path = f"{TRACE_DIR}/{uid}_messages.json"
+    messages_path = f"{trace_dir}/{uid}_messages.json"
     with open(messages_path, "w") as f:
-        json.dump(agent.messages, f, indent=2)
+        json.dump(agent.messages_to_jsonable(), f, indent=2)
 
     analysis = {
         "uid": uid,
@@ -148,7 +160,20 @@ if __name__ == "__main__":
         default="gemini-embedding-2",
         help="ID of the embedding model to use (default: gemini-embedding-2)",
     )
+    parser.add_argument(
+        "--uid",
+        type=str,
+        default=None,
+        help="Run on a single UID for a smoke test (streams logs to stdout). Must be in VALIDATION_UIDS.",
+    )
     args = parser.parse_args()
+
+    # If --uid is set, force a smoke-test configuration: single UID, sequential, stream output.
+    if args.uid is not None:
+        if args.uid not in VALIDATION_UIDS:
+            parser.error(f"--uid {args.uid} is not in VALIDATION_UIDS")
+        args.parallelism = 1
+        args.show_output = True
 
     # step 0: initialize directories for agent traces
     os.makedirs(args.trace_dir, exist_ok=True)
@@ -156,21 +181,37 @@ if __name__ == "__main__":
     # step 1: load questions
     officeqa_df = pd.read_csv("officeqa_pro.csv")
 
-    # step 2: load mapping from "year-month-page_id" --> [clean page text file path, sorted elements order]
+    # step 2: load the clean_page_map and convert it into a
+    # `document_map: dict[doc_id -> full_text]` by reading each cleaned page
+    # file from disk up-front.
     with open(f"{BULLETINS_DIR}/clean_page_map.json") as f:
         clean_page_map = json.load(f)
+
+    document_map: dict[str, str] = {}
+    for doc_id, entry in clean_page_map.items():
+        rel_path = entry[0]
+        filepath = os.path.join(BULLETINS_DIR, os.path.basename(rel_path))
+        with open(filepath) as f:
+            document_map[doc_id] = f.read()
 
     # step 2.5: load chromadb collection to ensure it's ready before we start processing questions
     client = chromadb.PersistentClient(path=args.chroma_dir)
     collection = client.get_collection(args.chroma_collection_name)
 
-    # step 3: filter out questions whose traces already exist
+    # step 3: restrict to the validation set (or the single --uid smoke-test target),
+    # then filter out questions whose traces already exist.
+    target_uids = {args.uid} if args.uid is not None else set(VALIDATION_UIDS)
+    validation_df = officeqa_df[officeqa_df["uid"].isin(target_uids)]
+    missing = target_uids - set(validation_df["uid"])
+    if missing:
+        print(f"WARNING: {len(missing)} target UID(s) not found in officeqa_pro.csv: {sorted(missing)}")
+
     rows = [
         row
-        for _, row in officeqa_df.iterrows()
+        for _, row in validation_df.iterrows()
         if not os.path.exists(f"{args.trace_dir}/{row['uid']}_trace.txt")
     ]
-    skipped = len(officeqa_df) - len(rows)
+    skipped = len(validation_df) - len(rows)
     if skipped:
         print(f"Skipping {skipped} question(s) with existing traces.")
 
@@ -186,7 +227,7 @@ if __name__ == "__main__":
     # step 4: run questions (debug: sequential loop with pdb breakpoint)
     with ThreadPoolExecutor(max_workers=args.parallelism) as pool:
         futures = {
-            pool.submit(_run_one, row, config, clean_page_map, collection, args.show_output): row  # type: ignore
+            pool.submit(_run_one, row, config, document_map, collection, args.show_output, args.trace_dir): row  # type: ignore
             for row in rows
         }
         for future in as_completed(futures):

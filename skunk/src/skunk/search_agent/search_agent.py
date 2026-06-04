@@ -1,76 +1,209 @@
 """SearchAgent — iterative code-execution retriever.
 
-Inherits the multi-turn loop from `MultiTurnAgent`, and follows its
-content-fragment contract: this class supplies `name`, `briefing`,
-`final_answer_doc`, and the chroma/page-map-backed tool set; the base owns
-`_SYSTEM_TEMPLATE` and assembles the `PromptedCall` (splicing `{{ tools_doc }}`,
-wiring the Jinja vars). `{{ max_steps }}` is the base's universal var;
-`{{ max_pages }}` (referenced inside a tool `doc`) comes from this class's `_prompt_vars`.
-Corpus / few-shot / lessons overrides addressed to `search_agent` (e.g. the
-dataset blurb rendered under `## Dataset`) are appended by the `PromptedCall`
-— same mechanism as every other call-site. Exposes the `Retriever` entry point.
+Subclasses `MultiTurnAgent`: it supplies the search-specific system prompt
+(`briefing` + `final_answer_doc`) and the chroma/page-map-backed tool set
+(`search_corpus` / `grep_corpus` / `read_document` / `prune`), and lets the base
+own the multi-turn loop, the block trajectory, and the JSON final-answer
+mechanism. The final answer is a ```json``` block ({"page_keys": [...]}), not a
+tool.
 
-This instance is safe to reuse concurrently across questions: `MultiTurnAgent.call()`
-keeps all per-question state in locals (the deps captured here — config, client,
-chroma collection, page map — are read-only), so a single `SearchAgent` can serve
-many questions in parallel.
+Two overrides specialise the base for retrieval:
+  - `_blocks_from_output` turns the tools' structured (tagged-dict) returns into
+    `ChunkBlock`s (one per chunk, carrying chunk_id / doc_id) so the full
+    trajectory is preserved for reward computation.
+  - `_block_is_visible` redacts chunks the agent has `prune(...)`d from the
+    LLM-facing render, faithful to its prune commands during rollout.
+
+The three tools that read/write prune state share the agent's per-question
+`_pruned_chunk_ids` / `_pruned_doc_ids` sets. The orchestrator builds one
+`SearchAgent` per question / branch, so these sets never leak across questions.
 """
 
 from __future__ import annotations
 
+import os
+
 from chromadb.api.models.Collection import Collection
 
-from skunk.common import _make_genai_client
+from skunk.common import ExecutionContext, _make_genai_client
 from skunk.config import SkunkConfig
-from skunk.common import ExecutionContext
-from skunk.multi_turn_agent import MultiTurnAgent
+from skunk.local_python_executor import CodeOutput
+from skunk.multi_turn_agent import Block, ChunkBlock, MultiTurnAgent, TextBlock
 from skunk.search_agent.base import Retriever
 from skunk.search_agent.search_tools import (
-    RetrievePageInfoTool, RunGrepTool, VectorSearchTool,
+    EMPTY_RESULT_MESSAGE,
+    GREP_RESULT_TAG,
+    PRUNE_RESULT_TAG,
+    READ_DOCUMENT_RESULT_TAG,
+    SEARCH_RESULT_TAG,
+    EmbeddingClient,
+    GrepCorpusTool,
+    PruneTool,
+    ReadDocumentTool,
+    SearchCorpusTool,
 )
+
+
+def _make_embedding_client(emb_model_id: str) -> tuple[EmbeddingClient, str]:
+    """Pick the embedding backend from the model id and return (client, model_id).
+
+    Gemini embeddings go through genai (AI Studio); everything else (e.g. Qwen)
+    goes through OpenRouter. The returned model id has any `google/` prefix
+    stripped for the genai path and is passed through unchanged otherwise.
+    """
+    cleaned = emb_model_id.removeprefix("google/")
+    if "gemini" in cleaned.lower():
+        return _make_genai_client(), cleaned
+    from openrouter import OpenRouter
+
+    return OpenRouter(api_key=os.environ["OPENROUTER_API_KEY"]), emb_model_id
 
 
 class SearchAgent(MultiTurnAgent, Retriever):
     name = "search_agent"
-    # Larger than MultiTurnAgent default — search chains have many
-    # page-content observations and a 20-step ceiling.
+    # Larger than the MultiTurnAgent default — search chains accumulate many
+    # page-content observations across a 20-step ceiling.
     context_budget_chars: int = 500_000 * 4  # ~500K tokens × 4 char/token
     warn_steps_remaining = 2
 
     briefing = (
         "You are a helpful assistant for retrieving relevant information from a large "
-        "collection of files. You will be given a question, and your task is to identify "
-        "which files are relevant to answering the question. Some questions require "
-        "looking up information that is not contained in the files; this will be handled "
-        "by a separate agent, so you should only focus on retrieving relevant files for "
-        "the remainder of the question. "
+        "collection of documents. You will be given a question, and your task is to "
+        "identify which documents are relevant to answering it. The corpus is organized "
+        "as documents (each identified by a `doc_id`), each split into chunks (text spans, "
+        "tables, titles, ...) identified by a `chunk_id`; every chunk carries metadata you "
+        "can filter on. Some questions require looking up information that is not contained "
+        "in the corpus; that is handled by a separate agent, so you should only focus on "
+        "retrieving relevant documents for the remainder of the question. "
         "You do not need to retrieve everything in a single tool call: use early steps to "
-        "explore files of potential relevance, then refine your searches in later steps "
-        "based on what you find."
+        "explore documents of potential relevance, then refine your searches in later steps "
+        "based on what you find. Use `prune(...)` aggressively on chunks and docs you have "
+        "ruled out, to keep later searches focused and your context window manageable."
     )
 
     final_answer_doc = """\
-A JSON object with the page keys you identified as relevant, in the format
-"year_month_page_id". Use the page_id that corresponds to the index of the page in
-the bulletin, not the page number printed on the page itself.
+A JSON object with the `doc_id`s you identified as relevant, under the key
+"page_keys":
 ```json
 {"page_keys": ["2002_06_1", "2002_12_26"]}
-```"""
+```
+Use each `doc_id` exactly as it appears in the search / grep results."""
 
-    def __init__(self, config: SkunkConfig, clean_page_map: dict, chroma_collection: Collection):
+    def __init__(
+        self,
+        config: SkunkConfig,
+        document_map: dict[str, str],
+        chroma_collection: Collection,
+        *,
+        system_prompt_override: str | None = None,
+        generation_backend=None,
+        sampling_params: dict | None = None,
+        capture_logprobs: bool = False,
+    ):
         self.config = config
-        self.client = _make_genai_client()
         self.chroma_collection = chroma_collection
-        self.clean_page_map = clean_page_map
-        self.emb_model_id = config.emb_model_id.removeprefix("google/")
-        # Tool instances capture their deps; the prompt's `## Tools` section is
-        # generated from their `doc`s by the base, so tools and docs can't drift.
+        self.document_map = document_map
+        self.emb_client, self.emb_model_id = _make_embedding_client(config.emb_model_id)
+
+        # Per-question prune state: shared by the search / grep / prune tools and
+        # read by `_block_is_visible` for redaction. One SearchAgent per
+        # question / branch ⇒ these sets never cross-talk between questions.
+        self._pruned_chunk_ids: set[str] = set()
+        self._pruned_doc_ids: set[str] = set()
+
+        # Tool instances capture their deps; the prompt's tool docs are generated
+        # from their `doc`s by the base, so tools and docs can't drift.
         tools = [
-            RetrievePageInfoTool(self.clean_page_map, config.agent_max_pages_per_tool_call),
-            VectorSearchTool(self.chroma_collection, self.emb_model_id, self.client),
-            RunGrepTool(),
+            SearchCorpusTool(
+                self.chroma_collection, self.emb_model_id, self.emb_client,
+                self._pruned_chunk_ids, self._pruned_doc_ids,
+            ),
+            GrepCorpusTool(self.chroma_collection, self._pruned_chunk_ids, self._pruned_doc_ids),
+            ReadDocumentTool(self.document_map, config.agent_max_pages_per_tool_call),
+            PruneTool(self._pruned_chunk_ids, self._pruned_doc_ids),
         ]
-        super().__init__(tools, max_steps=config.agent_max_steps)
+        super().__init__(
+            tools, max_steps=config.agent_max_steps,
+            system_prompt_override=system_prompt_override,
+            generation_backend=generation_backend,
+            sampling_params=sampling_params,
+            capture_logprobs=capture_logprobs,
+        )
+
+    # ------------------------------------------------------------------
+    # Block rendering / redaction (override the base hooks)
+    # ------------------------------------------------------------------
+
+    def _block_is_visible(self, block: Block) -> bool:
+        """Redact pruned chunks from the LLM-facing render (full trajectory is kept)."""
+        if isinstance(block, ChunkBlock):
+            if block.chunk_id is not None and block.chunk_id in self._pruned_chunk_ids:
+                return False
+            if block.doc_id in self._pruned_doc_ids:
+                return False
+        return True
+
+    def _blocks_from_output(self, out: CodeOutput) -> list[Block]:
+        """Render a tool result into blocks. Chunk-bearing payloads become one
+        `ChunkBlock` per chunk (redactable); everything else is a `TextBlock`."""
+        blocks: list[Block] = []
+        stdout_s = (out.logs or "").strip()
+        if stdout_s:
+            blocks.append(TextBlock(f"[stdout]\n{stdout_s}"))
+        output = out.output
+
+        if isinstance(output, dict) and output.get(SEARCH_RESULT_TAG):
+            if output.get("error"):
+                blocks.append(TextBlock(f"[error]\n{output['error']}"))
+            elif not output["chunks"]:
+                blocks.append(TextBlock(EMPTY_RESULT_MESSAGE))
+            else:
+                blocks.extend(
+                    ChunkBlock(chunk_id=c["chunk_id"], doc_id=c["doc_id"], text=c["text"])
+                    for c in output["chunks"]
+                )
+            return blocks
+
+        if isinstance(output, dict) and output.get(GREP_RESULT_TAG):
+            if output.get("error"):
+                blocks.append(TextBlock(f"[error]\n{output['error']}"))
+            elif not output["groups"]:
+                blocks.append(TextBlock(EMPTY_RESULT_MESSAGE))
+            else:
+                for group in output["groups"]:
+                    blocks.append(TextBlock(group["header"]))
+                    blocks.extend(
+                        ChunkBlock(chunk_id=c["chunk_id"], doc_id=c["doc_id"], text=c["text"])
+                        for c in group["chunks"]
+                    )
+            return blocks
+
+        if isinstance(output, dict) and output.get(READ_DOCUMENT_RESULT_TAG):
+            blocks.extend(
+                ChunkBlock(chunk_id=None, doc_id=d["doc_id"], text=d["text"])
+                for d in output["docs"]
+            )
+            return blocks
+
+        if isinstance(output, dict) and output.get(PRUNE_RESULT_TAG):
+            blocks.append(TextBlock(
+                f"[result]\nPruned {output['new_chunk_count']} chunk(s) and "
+                f"{output['new_doc_count']} doc(s). {output['total_chunks']} chunk(s) and "
+                f"{output['total_docs']} doc(s) are now excluded from future searches."
+            ))
+            return blocks
+
+        # Non-structured output: default [result] rendering (mirrors the base).
+        result_s = "" if output is None else str(output).strip()
+        if result_s and result_s != stdout_s and result_s not in stdout_s:
+            blocks.append(TextBlock(f"[result]\n{result_s}"))
+        if not blocks:
+            blocks.append(TextBlock("[no output]"))
+        return blocks
+
+    # ------------------------------------------------------------------
+    # Retriever entry point
+    # ------------------------------------------------------------------
 
     async def retrieve(
         self,
