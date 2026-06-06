@@ -1,18 +1,7 @@
-"""Treasury Bulletin chapter merger — `ChapterMerger` impl.
+"""Build phase 3c — cross-bulletin chapter merge.
 
-Four-pass cross-bulletin merge of per-bulletin L1 vocabularies into the
-flat global canonical chapter set:
-
-  Pass 1 — Deterministic normalization (`normalize_label`, group by
-           lowercased form). Collapses OCR variants, case-only diffs,
-           trailing punctuation.
-  Pass 2 — LLM clustering across era-drift synonyms.
-  Pass 3 — LLM consolidation: roll Pass-2 canonicals up into the eight
-           recurring modern chapters (+ rare era-specific overflow).
-  Pass 4 — LLM description + examples per final chapter.
-
-Output: the flat tree dict that becomes shipped `concept_tree.json`.
-"""
+Consolidate the per-bulletin `section` labels into the global concept tree:
+deterministic normalization -> LLM clustering -> consolidation -> description."""
 
 from __future__ import annotations
 
@@ -24,19 +13,11 @@ from typing import Any
 
 from skunk.common import LLMClient, parse_json_response
 
-from ...schema import PageCatalogRow
-from ...stages.placer import UNFILED
-from .prompts import (
-    MERGE_CLUSTER_SYSTEM, MERGE_CONSOLIDATE_SYSTEM, MERGE_DESCRIBE_SYSTEM,
-)
-from .text_norm import norm_key, normalize_label
+from .data_model import BuildPage
+from .placer import UNFILED
+from .text_norm import normalize_label, norm_key
 
 log = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Pass 1: deterministic normalization
-# ---------------------------------------------------------------------------
 
 def _normalize_groups(
     l1_counts: dict[str, int],
@@ -201,7 +182,7 @@ def _llm_describe_chapters(
 # Public class
 # ---------------------------------------------------------------------------
 
-def _posting_for_row(r: PageCatalogRow) -> dict[str, Any]:
+def _posting_for_row(r: BuildPage) -> dict[str, Any]:
     return {
         "bulletin": r.bulletin,
         "page": r.page,
@@ -214,25 +195,25 @@ class TreasuryChapterMerger:
 
     def build_tree(
         self,
-        catalog: list[PageCatalogRow],
+        catalog: list[BuildPage],
         llm: LLMClient,
         *,
         drop_unfiled: bool = True,
         verbose: bool = True,
     ) -> dict[str, Any]:
-        content_rows: list[PageCatalogRow] = []
+        content_rows: list[BuildPage] = []
         counts: Counter[str] = Counter()
         for r in catalog:
             if not r.content_blocks:
                 continue
-            l1 = (r.l1_local or "").strip()
+            l1 = (r.section or "").strip()
             if not l1 or (l1 == UNFILED and drop_unfiled):
                 continue
             counts[l1] += 1
             content_rows.append(r)
 
         if verbose:
-            log.info(f"[merge] {len(counts)} distinct l1_local names "
+            log.info(f"[merge] {len(counts)} distinct section names "
                      f"covering {sum(counts.values())} pages")
 
         # ── Pass 1: deterministic normalization ────────────────────────
@@ -301,7 +282,7 @@ class TreasuryChapterMerger:
         # ── Assemble tree ──────────────────────────────────────────────
         chapters: dict[str, dict[str, Any]] = {}
         for r in content_rows:
-            l1 = (r.l1_local or "").strip()
+            l1 = (r.section or "").strip()
             canonical = raw_to_canonical.get(l1, l1)
             meta = descriptions.get(canonical, {"description": "", "examples": []})
             bucket = chapters.setdefault(canonical, {
@@ -322,3 +303,105 @@ class TreasuryChapterMerger:
                                         key=lambda kv: -kv[1]["n_pages"]):
                 log.info(f"  {data['n_pages']:>6}  {chapter}")
         return tree
+
+MERGE_CLUSTER_SYSTEM = """You cluster U.S. Treasury Bulletin chapter headings into canonical chapters.
+
+You receive distinct top-level chapter names observed across many bulletins (1939-2025), each
+a recurring or era-specific chapter. Some are clear synonyms ("FEDERAL DEBT" / "Federal debt" /
+"Public debt and guaranteed obligations of the United States Government" all mean Federal Debt);
+some are era-specific with no modern analogue. Cluster them so each cluster is one recurring
+chapter concept across decades.
+
+Rules:
+  - One CANONICAL name per cluster — short, Title Case, no trailing punctuation. Match modern
+    usage when possible (e.g. "Federal Fiscal Operations", "Federal Debt", "Capital Movements",
+    "Foreign Currency Positions", "International Financial Statistics", "Trust Funds",
+    "Government Corporations and Business-Type Activities", "Profile of the Economy").
+  - Every input name appears in exactly one cluster's `members`.
+  - Don't force a target count — let the data decide. A meaningfully distinct 1940s-only chapter
+    can stay a one-member cluster.
+  - ESF / "Exchange Stabilization Fund" entries: split between Capital Movements and Foreign
+    Currency Positions if they look distinct across eras, else merge — follow the data.
+  - Never split one canonical chapter into multiple clusters.
+
+Output a SINGLE JSON object, no prose or fences:
+  {"clusters": [{"canonical": "Federal Debt",
+                 "members": ["FEDERAL DEBT", "Federal debt", "Public debt and guaranteed
+                  obligations of the United States Government", ...]}, ...]}
+"""
+
+
+MERGE_CONSOLIDATE_SYSTEM = """You consolidate U.S. Treasury Bulletin canonical chapters by rolling
+up sub-chapters into their broader parents.
+
+You receive canonical chapters, each annotated with its page count and the raw L1 names it
+absorbed in the previous pass. The downstream retriever picks ONE chapter per question, so finer
+sub-chapter splits only make that decision harder. Clear sub-chapter → parent rollups:
+
+  - "Ownership of Federal Securities" → Federal Debt
+  - "Market Quotations on Treasury Securities" → Federal Debt
+  - "Average Yields of Long-Term Bonds" → Federal Debt
+  - "U.S. Savings Bonds and Notes" → Federal Debt
+  - "Public Debt Operations" → Federal Debt
+  - "Monetary Statistics" → International Financial Statistics
+  - "Account of the U.S. Treasury" → Federal Fiscal Operations
+  - "Internal Revenue Statistics / Collections" → Federal Fiscal Operations
+  - "Federal Obligations" → Federal Fiscal Operations
+  - "Federal Agencies Financial Reports" → Government Corporations and Business-Type Activities
+  - "Bureau of the Fiscal Service Operations" → Federal Fiscal Operations
+  - "Federal Credit Programs" → Federal Fiscal Operations
+
+Target: the 8 recurring modern chapters (Federal Fiscal Operations, Federal Debt, Capital
+Movements, Foreign Currency Positions, International Financial Statistics, Trust Funds, Government
+Corporations and Business-Type Activities, Profile of the Economy), plus 1-3 genuinely distinct
+era-specific chapters (e.g. "War Activities Program" if the data supports it). Never split a
+parent into multiple clusters. Don't force a truly distinct input into a modern chapter — but the
+bar is high.
+
+CRITICAL — no holding-pen buckets. Never create catch-all chapters ("Special Reports", "Special
+Articles", "Miscellaneous", "Other", "Reports and Studies", etc.): real questions name a topic,
+not a publication form, so these never get picked. Route would-be members by content shape:
+  - Customs / vessel-clearance / import-tariff / shipping-tonnage tables (pre-1960) → Federal Fiscal Operations
+  - Treasury Financing Operations narrative + auction announcements + debt-issuance writeups → Federal Debt
+  - Speeches, congressional testimony, special articles, narrative analytical reports → Profile of the Economy
+  - Social Security / OASI / trust-fund narrative reports → Trust Funds
+  - Internal revenue / tax-policy narrative → Federal Fiscal Operations
+  - Masthead / front-matter / cumulative table-of-contents pages → Profile of the Economy
+  - War-era program appropriations → "War Activities Program" if dense enough, else Federal Fiscal Operations
+
+When a sub-area could fit a topical chapter, fit it there. Keep a separate chapter only when its
+members are so era-specific that no modern chapter applies AND it has enough pages to be worth a
+separate retrieve target.
+
+Output a SINGLE JSON object, no prose or fences:
+  {"consolidations": [{"parent": "Federal Debt",
+                       "members": ["Federal Debt", "Public Debt Operations",
+                        "Ownership of Federal Securities", ...]}, ...]}
+
+Every input canonical appears in exactly one consolidation's `members` (a no-rollup canonical is
+its own one-member consolidation).
+"""
+
+
+MERGE_DESCRIBE_SYSTEM = """You write a scope description and a short example list for each U.S.
+Treasury Bulletin canonical chapter.
+
+You receive canonical chapters, each with the raw sub-chapter/variant names absorbed during
+merge. For each, produce:
+
+  1. `description` — concrete prose stating what the chapter covers. Stop when another phrase
+     wouldn't help a retriever tell this chapter from the others (a sentence is often enough;
+     chapters with many sub-areas may need 2-3).
+  2. `examples` — 4-10 concrete raw sub-chapter/topic names from the input that: cover the
+     chapter's distinct sub-areas (not 5 variants of one topic); include era-specific or
+     special-program entries a prose description would smooth over (e.g. "PUBLIC WORKS
+     ADMINISTRATION", "WAR ACTIVITIES BY GOVERNMENT AGENCIES"); stay short (phrases, not full
+     captions). These are the retriever's string-match anchors for era/program/topic vocabulary.
+
+Both fields are shown to a downstream retriever LLM — keep them complementary, not redundant.
+
+Output a SINGLE JSON object, no prose or fences:
+  {"chapters": {"<canonical>": {"description": "<scope>", "examples": ["<sub-area>", ...]}, ...}}
+
+Every input chapter appears as a key.
+"""

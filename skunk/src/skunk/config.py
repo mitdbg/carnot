@@ -53,9 +53,9 @@ class SkunkConfig:
     # Ablation: golden page refs bypass the retrieve operator (eval runs only).
     golden_pages: list[PageRef] | None = field(default=None, repr=False)
 
-    # Retrieve dispatch: "page_index" (ToC pick → year filter → coarse summary filter,
+    # Retrieve dispatch: "page_index_old" (ToC pick → year filter → coarse summary filter,
     # the default) or "search_agent" (iterative ChromaDB + LLM loop). (env: SKUNK_RETRIEVER)
-    retriever: Literal["search_agent", "page_index"] = "page_index"
+    retriever: Literal["search_agent", "page_index_old"] = "page_index_old"
 
     # Search-agent corpus artifacts (built offline; agent fails fast if missing).
     # (env: SKUNK_CHROMADB_DIR, SKUNK_CHROMADB_COLLECTION, SKUNK_CLEAN_PAGE_MAP)
@@ -82,28 +82,38 @@ class SkunkConfig:
     agent_model_id: str | None = None
 
     # Page-index semantic filter: a single coarse pass over each year-filtered page's
-    # metadata summary, judged against the full question on `semfilter_model`
-    # (positional true/false per page). Set `semfilter_enabled=False` for a
-    # ToC + year-filter-only ablation.
-    # (env: SKUNK_SEMFILTER_ENABLED, SKUNK_SEMFILTER_MODEL, SKUNK_SEMFILTER_BATCH)
-    semfilter_enabled: bool = True
-    semfilter_model: str = "gemini-3.1-flash-lite"
+    # metadata summary, judged against the full question (positional true/false per
+    # page). The filter runs on a cheaper model, resolved through the standard
+    # per-call model-override registry under key "semfilter" (seeded in
+    # `__post_init__`) — so it's tuned like any other call-site rather than via a
+    # dedicated field. (env: SKUNK_SEMFILTER_MODEL, SKUNK_SEMFILTER_BATCH)
     semfilter_batch_size: int = 20
 
+    def __post_init__(self) -> None:
+        # Route the semantic filter's (cheaper) model through the model-override
+        # registry so `PromptedCall` resolves it like every other call-site.
+        # Defaulted here unless a run pins it explicitly (SKUNK_MODEL_OVERRIDES=
+        # semfilter=… or, via `from_env`, SKUNK_SEMFILTER_MODEL).
+        self.model_overrides.setdefault("semfilter", "gemini-3.1-flash-lite")
 
     @classmethod
     def from_env(cls) -> SkunkConfig:
+        model_overrides = _parse_model_overrides(os.environ.get("SKUNK_MODEL_OVERRIDES", ""))
+        # SKUNK_SEMFILTER_MODEL is a convenience knob for the "semfilter" override;
+        # an explicit SKUNK_MODEL_OVERRIDES=semfilter=… wins, and the hardcoded
+        # default (`__post_init__`) fills in if neither is set.
+        sem_model = os.environ.get("SKUNK_SEMFILTER_MODEL")
+        if sem_model:
+            model_overrides.setdefault("semfilter", sem_model)
         return cls(
             llm_model=os.environ.get("SKUNK_LLM_MODEL", "gemini-3.5-flash"),
             effort_overrides=_parse_effort_overrides(os.environ.get("SKUNK_EFFORT_OVERRIDES", "")),
-            model_overrides=_parse_model_overrides(os.environ.get("SKUNK_MODEL_OVERRIDES", "")),
+            model_overrides=model_overrides,
             llm_max_retries=int(os.environ.get("SKUNK_LLM_MAX_RETRIES", "5")),
             llm_retry_initial_delay_s=float(os.environ.get("SKUNK_LLM_RETRY_INITIAL_DELAY", "1.0")),
             prompt_overrides_path=os.environ.get(
                 "SKUNK_PROMPT_OVERRIDES", "config/prompts/treasury_bulletin.yaml"
             ),
-            semfilter_enabled=os.environ.get("SKUNK_SEMFILTER_ENABLED", "true").lower() in ("1", "true", "yes"),
-            semfilter_model=os.environ.get("SKUNK_SEMFILTER_MODEL", "gemini-3.1-flash-lite"),
             semfilter_batch_size=int(os.environ.get("SKUNK_SEMFILTER_BATCH", "20")),
             retriever=os.environ.get("SKUNK_RETRIEVER", "page_index"),  # type: ignore[arg-type]
             chromadb_dir=os.environ.get("SKUNK_CHROMADB_DIR", "cache/chromadb"),

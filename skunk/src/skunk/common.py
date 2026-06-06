@@ -395,6 +395,11 @@ def parse_json_response(text: str) -> Any | None:
         return None
 
 
+def chunk(seq: list, n: int) -> list[list]:
+    """Split `seq` into consecutive sub-lists of at most `n` items."""
+    return [seq[i:i + n] for i in range(0, len(seq), n)]
+
+
 @dataclass
 class LLMResponse:
     text: str
@@ -834,10 +839,11 @@ class LLMClient:
 # --- Cross-cutting runtime types threaded between operators and the orchestrator ---
 
 
-@dataclass
+@dataclass(frozen=True)
 class PageRef:
-    """Canonical page coordinate."""
-    month: str | None = None        # "YYYY-MM"
+    """Canonical page coordinate. Frozen so it's hashable — usable as a dict key
+    and set member (e.g. the page-index catalog is keyed by `PageRef`)."""
+    month: str | None = None        # "YYYY-MM" (a.k.a. bulletin in the page index)
     page: int | None = None         # 1-based PDF page index (canonical)
 
     @property

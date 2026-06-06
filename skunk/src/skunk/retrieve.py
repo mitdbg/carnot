@@ -7,8 +7,8 @@ backend per call:
   no backend built), taken first when `golden_pages` is set.
 - `search_agent` — iterative ChromaDB + LLM loop under `skunk.search_agent`;
   returns page keys adapted to `PageRef`.
-- `page_index` — ToC pick → year filter → semantic filter (wraps
-  `skunk.page_index.query.PageIndexRetriever`).
+- `page_index_old` — ToC pick → year filter → semantic filter (wraps
+  `skunk.page_index_old.query.PageIndexRetriever`).
 
 The two real backends are built lazily so an unused one (notably ChromaDB) is
 never opened. Backends raise `StepFailed("retrieve", …)` on failure and do not
@@ -43,7 +43,7 @@ class RetrieveOp:
         # prune sets), so it cannot be shared across concurrent branches.
         self._resources = None  # tuple[Collection, dict[str, str]]
         self._resources_lock = threading.Lock()
-        self._page_index_retriever = None  # skunk.page_index.query.PageIndexRetriever
+        self._page_index_retriever = None  # skunk.page_index_old.query.PageIndexRetriever
 
     async def run(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
         if ctx.config.golden_pages is not None:
@@ -51,12 +51,12 @@ class RetrieveOp:
         match ctx.config.retriever:
             case "search_agent":
                 return await self._run_search_agent(ctx, branch)
-            case "page_index":
+            case "page_index_old":
                 return await self._run_page_index(ctx, branch)
             case other:
                 raise StepFailed(
                     "retrieve",
-                    f"unknown retriever {other!r}; expected 'search_agent' or 'page_index'",
+                    f"unknown retriever {other!r}; expected 'search_agent' or 'page_index_old'",
                 )
 
     def _run_golden(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
@@ -123,7 +123,7 @@ class RetrieveOp:
 
         if self._page_index_retriever is None:
             self._page_index_retriever = PageIndexRetriever()
-        return await self._page_index_retriever.run(None, ctx, branch=branch)
+        return await self._page_index_retriever.retrieve(ctx, branch=branch)
 
 
 def _build_resources(config: SkunkConfig):

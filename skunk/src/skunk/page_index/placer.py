@@ -1,57 +1,36 @@
-"""Treasury Bulletin page placer — `PagePlacer` impl.
+"""Build phase 3b — per-page placement.
 
-Six-method cascade per content page (cheapest first):
-
-  A — printed-page span lookup (deterministic)
-  B — banner_self exact match (deterministic)
-  a1 — difflib-based typo correction (deterministic)
-  a2 — LLM typo correction (allow null) on the ambiguous residual
-  b — neighbor inheritance (deterministic, iterate to fixed point)
-  c — LLM strict-pick prediction (forced pick) on the final residual
-  d — `_Unfiled` bucket (everything that survived)
-
-Mutates `rows` in place; returns per-method counters for visibility.
-"""
+Assign each content page a level-1 `section` (one of the bulletin's L1 chapters
+from the harvester) via a waterfall: ToC-span lookup, banner-exact, deterministic
+typo match, LLM typo/predict, neighbor inheritance. Unfilable pages get `UNFILED`."""
 
 from __future__ import annotations
 
 import difflib
 import json
 from collections import Counter
-from dataclasses import dataclass
 from typing import Any
 
 from skunk.common import LLMClient, parse_json_response
 
-from ...schema import PageCatalogRow
-from ...stages.l1_harvest import SectionSpan, section_for_printed_page
-from ...stages.placer import UNFILED
-from .prompts import PLACER_PREDICT_SYSTEM, PLACER_TYPO_SYSTEM
-from .text_norm import norm_key, normalize_label
+from .data_model import BuildPage
+from .l1_harvest import SectionSpan, section_for_printed_page
+from .text_norm import normalize_label, norm_key
+
+# Sentinel chapter for content pages that couldn't be filed under any L1 section.
+UNFILED = "_Unfiled"
 
 
-@dataclass(frozen=True)
-class TypoMatchConfig:
-    """Empirical thresholds for the deterministic difflib typo matcher.
-
-    Tuned on the 1939-2025 Treasury Bulletin OCR corpus. The 0.85 floor
-    catches OCR variants ("FEERAL DEBT" vs "FEDERAL DEBT") without
-    accepting spurious matches across unrelated chapter names; the 0.05
-    margin keeps difflib from picking between two near-tie matches
-    (defers to the LLM typo path instead).
-    """
-    ratio_min: float = 0.85
-    margin_min: float = 0.05
+# Empirical thresholds for the deterministic difflib typo matcher, tuned on the
+# 1939-2025 Treasury Bulletin OCR corpus. The 0.85 floor catches OCR variants
+# ("FEERAL DEBT" vs "FEDERAL DEBT") without accepting spurious matches across
+# unrelated chapter names; the 0.05 margin keeps difflib from picking between two
+# near-tie matches (defers to the LLM typo path instead).
+_TYPO_RATIO_MIN = 0.85
+_TYPO_MARGIN_MIN = 0.05
 
 
-_DEFAULT_TYPO = TypoMatchConfig()
-
-
-def _typo_match(
-    label: str | None,
-    l1_names_lower: dict[str, str],
-    cfg: TypoMatchConfig = _DEFAULT_TYPO,
-) -> str | None:
+def _typo_match(label: str | None, l1_names_lower: dict[str, str]) -> str | None:
     if not label or not l1_names_lower:
         return None
     normed = normalize_label(label).lower().strip()
@@ -64,13 +43,13 @@ def _typo_match(
     scored.sort(reverse=True)
     top_r, top_name = scored[0]
     runner_r = scored[1][0] if len(scored) > 1 else 0.0
-    if top_r >= cfg.ratio_min and (top_r - runner_r) >= cfg.margin_min:
+    if top_r >= _TYPO_RATIO_MIN and (top_r - runner_r) >= _TYPO_MARGIN_MIN:
         return top_name
     return None
 
 
 def _llm_classify_batch(
-    pages: list[PageCatalogRow],
+    pages: list[BuildPage],
     l1_names: list[str],
     llm: LLMClient,
     *,
@@ -124,12 +103,9 @@ def _llm_classify_batch(
 class TreasuryPagePlacer:
     """`PagePlacer` impl for Treasury Bulletin pages."""
 
-    def __init__(self, typo_cfg: TypoMatchConfig = _DEFAULT_TYPO) -> None:
-        self.typo_cfg = typo_cfg
-
     def place_bulletin(
         self,
-        rows: list[PageCatalogRow],
+        rows: list[BuildPage],
         spans: list[SectionSpan],
         llm: LLMClient | None,
     ) -> dict[str, int]:
@@ -139,7 +115,7 @@ class TreasuryPagePlacer:
         if not l1_names:
             for r in rows:
                 if r.content_blocks:
-                    r.l1_local = UNFILED
+                    r.section = UNFILED
                     stats["d_unfiled_no_l1"] += 1
             return dict(stats)
 
@@ -149,40 +125,39 @@ class TreasuryPagePlacer:
             return dict(stats)
 
         # ── Methods A + B ────────────────────────────────────────────
-        pool_after_ab: list[PageCatalogRow] = []
+        pool_after_ab: list[BuildPage] = []
         for r in content_rows:
             if r.printed_page and spans:
                 sec = section_for_printed_page(spans, r.printed_page)
                 if sec:
-                    r.l1_local = sec
+                    r.section = sec
                     stats["A_span"] += 1
                     continue
 
             if r.banner_self:
                 key = norm_key(normalize_label(r.banner_self))
                 if key in l1_names_lower:
-                    r.l1_local = l1_names_lower[key]
+                    r.section = l1_names_lower[key]
                     stats["B_banner_exact"] += 1
                     continue
 
             pool_after_ab.append(r)
 
         # ── Fallback a1: deterministic typo ──────────────────────────
-        pool_a2: list[PageCatalogRow] = []
+        pool_a2: list[BuildPage] = []
         for r in pool_after_ab:
             match = _typo_match(
                 r.banner_self or r.primary_title,
                 l1_names_lower,
-                self.typo_cfg,
             )
             if match is not None:
-                r.l1_local = match
+                r.section = match
                 stats["a1_typo_det"] += 1
             else:
                 pool_a2.append(r)
 
         # ── Fallback a2: LLM typo correction (allow null) ────────────
-        pool_b: list[PageCatalogRow] = []
+        pool_b: list[BuildPage] = []
         if pool_a2 and llm is not None:
             results = _llm_classify_batch(
                 pool_a2, l1_names, llm,
@@ -191,7 +166,7 @@ class TreasuryPagePlacer:
             )
             for r, picked in zip(pool_a2, results):
                 if picked is not None:
-                    r.l1_local = picked
+                    r.section = picked
                     stats["a2_typo_llm"] += 1
                 else:
                     pool_b.append(r)
@@ -200,12 +175,12 @@ class TreasuryPagePlacer:
 
         # ── Fallback b: neighbor inheritance ─────────────────────────
         placed_by_page: dict[int, str] = {
-            r.page: r.l1_local for r in rows if r.l1_local
+            r.page: r.section for r in rows if r.section
         }
         pool_c = pool_b
         while True:
-            new_inh: list[PageCatalogRow] = []
-            still: list[PageCatalogRow] = []
+            new_inh: list[BuildPage] = []
+            still: list[BuildPage] = []
             for r in pool_c:
                 votes: list[str] = []
                 for off in (-2, -1, 1, 2):
@@ -213,7 +188,7 @@ class TreasuryPagePlacer:
                     if v and v != UNFILED:
                         votes.append(v)
                 if len(votes) >= 2 and len(set(votes)) == 1:
-                    r.l1_local = votes[0]
+                    r.section = votes[0]
                     placed_by_page[r.page] = votes[0]
                     new_inh.append(r)
                     stats["b_neighbor"] += 1
@@ -232,15 +207,60 @@ class TreasuryPagePlacer:
             )
             for r, picked in zip(pool_c, results):
                 if picked is not None:
-                    r.l1_local = picked
+                    r.section = picked
                     placed_by_page[r.page] = picked
                     stats["c_llm_predict"] += 1
                 else:
-                    r.l1_local = UNFILED
+                    r.section = UNFILED
                     stats["d_unfiled_llm_skip"] += 1
         else:
             for r in pool_c:
-                r.l1_local = UNFILED
+                r.section = UNFILED
                 stats["d_unfiled_no_llm"] += 1
 
         return dict(stats)
+
+
+# ---------------------------------------------------------------------------
+# Pass 1: deterministic normalization
+# ---------------------------------------------------------------------------
+
+PLACER_TYPO_SYSTEM = """You match Treasury Bulletin pages to one of the bulletin's own chapter
+headings by their page banner.
+
+You receive the bulletin's L1 chapter list (verbatim from its TOC) and a batch of pages, each
+with a `banner` (the page's own [page_header]/[title], possibly OCR-corrupted) and a `title`
+(the table caption, often longer and more descriptive).
+
+For each page, pick which chapter it belongs to. Treat OCR variants ("FEERAL DEBT" → "FEDERAL
+DEBT"), missing whitespace ("TRUSTFUNDS" → "TRUST FUNDS"), and synonym phrasings ("Public debt
+operations" vs "Debt operations") as matches. Output null if none is a reasonable match —
+don't force one.
+
+Output a SINGLE JSON object, no prose or fences:
+  {"assignments": [{"id": <0-based index>, "chapter": "<exact L1 name>" | null}, ...]}
+
+One entry per input page; use the chapter name EXACTLY as shown.
+"""
+
+
+PLACER_PREDICT_SYSTEM = """You place Treasury Bulletin pages into one of the bulletin's chapters
+using the page's full metadata.
+
+You receive the bulletin's L1 chapter list and a batch of pages, each with:
+  - `banner`: the page's [page_header]/[title] (may be empty or OCR'd)
+  - `title`: verbatim table caption — often the strongest signal
+  - `column_headers`: column header strings (truncated)
+  - `keywords`: top noun phrases from the page
+
+For each page pick the SINGLE best-matching chapter — every page lands somewhere, so you MUST
+pick one. Use `title` and `column_headers` as the primary signal; `banner` is supplementary
+(may be missing or noisy).
+
+Output a SINGLE JSON object, no prose or fences:
+  {"assignments": [{"id": <0-based index>, "chapter": "<exact L1 name>"}, ...]}
+
+One entry per input page; use the chapter name EXACTLY as shown.
+"""
+
+

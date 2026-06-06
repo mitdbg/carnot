@@ -83,7 +83,7 @@ the vector layer is not shipped.
 from pathlib import Path
 from data.page_index.retrieve import RetrievalIndex
 
-idx = RetrievalIndex.load(Path("data/page_index/concept_tree.json"))
+idx = RetrievalIndex.load(Path("data/page_index_old/concept_tree.json"))
 
 # Bring your own LLM as a (system_prompt, user_prompt) -> text callable.
 def my_llm(system: str, user: str) -> str:

@@ -1,19 +1,12 @@
-"""Deterministic text normalization for Treasury Bulletin section labels.
+"""Label normalization shared by the chapter-build phases (placer, merger).
 
-OCR-substitution table, year-suffix / roman-numeral / continuation
-stripping, and the final whitespace-collapsing `normalize_label`
-entrypoint. Pure deterministic, no LLM. Used by the Treasury placer and
-merger for cleaning labels before matching / clustering.
-
-The substitution table grew empirically from OCR errors observed across
-the 1939-2025 corpus. Keep entries focused on whole-word patterns where
-the replacement is unambiguous.
-"""
+Collapses OCR noise and strips year/as-of suffixes, continuation markers, leading
+numerals, and trailing punctuation so chapter headings from different bulletins
+compare equal. `norm_key` is the lowercased grouping key."""
 
 from __future__ import annotations
 
 import re
-
 
 # Letter-substitution + missing-whitespace + truncation OCR errors seen in
 # the parsed-JSON output on scanned mid-century bulletins.
@@ -95,3 +88,5 @@ def normalize_label(raw: str) -> str:
 def norm_key(s: str) -> str:
     """Lowercased grouping key for case-insensitive matching."""
     return s.lower().strip()
+
+

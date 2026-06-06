@@ -1,39 +1,15 @@
 """Page-index: an offline-built catalog + the retriever that queries it.
 
-The package separates cleanly into two halves plus a shared base:
+A flat set of modules for one corpus (Treasury Bulletin):
 
-  Build pipeline (offline) — `pipeline.py`, `stages/`, `corpora/`.
-    Produces a per-page catalog + flat concept tree over a configurable
-    corpus. Output lives under `artifact/page_index/` (`catalog/{bulletin}.jsonl`
-    + `concept_tree.json`), the shipped in-repo index.
+  Build (offline) — `pipeline.py` sequences the phases: `catalog.py` (parse),
+    `summarize.py` (LLM enrich), then `l1_harvest.py` → `placer.py` → `merger.py`
+    (chapters), with `text_norm.py` shared by the last two. Produces the artifact
+    under `artifact/page_index_old/` (slim `catalog/` + `concept_tree.json`).
 
-  Query path (per-query) — `query.py` (`PageIndexRetriever`, the entry
-    point), `query_toc.py` (ToC chapter pick), `query_semfilter.py`
-    (coarse summary filter). The pipeline is:
+  Query (per-query) — `query.py`: the `PageIndexRetriever` (loads the
+    artifact, then ToC pick → year filter → semantic filter).
 
-    ToC pick → year filter → semantic filter → candidate set.
-
-  Shared — `schema.py` (catalog row, written by build / read by query),
-    `pdf.py` (parsed-JSON page reader), `util.py`, `profile.py`.
-
-Runtime callers fetch their profile via `default_profile()`; the active
-profile is selected by `SKUNK_CORPUS_PROFILE` (default: treasury).
+  Shared — `data_model.py` (catalog row, concept tree, artifact layout),
+    `period.py` (period grammar).
 """
-
-from __future__ import annotations
-
-import os
-
-from .corpora import load_profile
-from .profile import CorpusProfile, StageError
-
-
-def default_profile() -> CorpusProfile:
-    """Load the runtime corpus profile.
-
-    Env override: `SKUNK_CORPUS_PROFILE` (default: `"treasury"`).
-    """
-    return load_profile(os.environ.get("SKUNK_CORPUS_PROFILE", "treasury"))
-
-
-__all__ = ["CorpusProfile", "StageError", "default_profile"]

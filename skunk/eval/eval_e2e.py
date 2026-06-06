@@ -459,7 +459,7 @@ def main() -> None:
             results[i] = _run_uid(uid)
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = {pool.submit(_run_uid, uid): i for i, uid in enumerate(uids)}
+            futures = {pool.submit(lambda : asyncio.run(process_uid(uid))): i for i, uid in enumerate(uids)}
             for fut in as_completed(futures):
                 results[futures[fut]] = fut.result()
 

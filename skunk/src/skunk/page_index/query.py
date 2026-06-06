@@ -1,198 +1,277 @@
-"""Page-index retriever — the query path over the offline-built index.
+"""Page-index query path: the `PageIndexRetriever` over an offline-built artifact.
 
-One of the two retrieval methods (`config.retriever == "page_index"`;
-the other is the iterative `search_agent`). Three deterministic passes
-after the catalog/concept-tree are loaded:
-
-  1. ToC chapter pick (one LLM call) — picks up to two canonical
-     chapter(s) from the concept tree given the branch's question / key /
-     period; every page under them becomes a candidate. See
-     `page_index.query_toc`.
-  2. Year filter (deterministic) — drops candidate pages whose structured
-     `dates` (verbatim strings parsed back into ISO intervals) don't
-     intersect any of the period's intervals. Pages without dates are
-     kept (recall safety net). No-op when the period is unparseable.
-  3. Semantic filter (coarse → fine, parallel) — prunes the survivors to
-     a tight candidate set. See `page_index.query_semfilter`. Gated on
-     `config.semfilter_enabled` (off = ToC + year-filter only, for
-     ablation).
-
-The period parser is supplied by the active corpus profile (default:
-treasury; override via `SKUNK_CORPUS_PROFILE`). Golden bypass is handled
-one level up in `RetrieveOp`, so it isn't repeated here.
-"""
+Retrieval is three passes: ToC chapter pick → year filter → coarse semantic
+(summary) filter → candidate set."""
 
 from __future__ import annotations
 
+import json
+import asyncio
 import os
-import threading
-from dataclasses import asdict
+import re
 from pathlib import Path
+from skunk.common import ExecutionContext, PageRef, chunk, parse_json_response
+from skunk.errors import StepFailed, ParseError
+from skunk.plan import RetrieveBranch
+from skunk.prompted_call import PromptedCall
 from typing import Any
 
-from skunk.errors import StepFailed
-from skunk.common import ExecutionContext, PageRef
-from skunk.plan import RetrieveBranch
-from skunk.page_index import default_profile
-from skunk.page_index.query_semfilter import semantic_filter
-from skunk.page_index.query_toc import (
-    load_catalog,
-    load_concept_tree,
-    one_shot_parent_chapter_retrieve,
-)
-from skunk.page_index.schema import PageCatalogRow
+from .data_model import CATALOG_SUBDIR, TREE_FILE, ConceptTree, PageCatalogRow
+
+
+def page_index_root() -> Path:
+    """Query-side artifact root — `SKUNK_PAGE_INDEX_DIR`, the single source of truth."""
+    env = os.environ.get("SKUNK_PAGE_INDEX_DIR")
+    if not env:
+        raise StepFailed("retrieve", "SKUNK_PAGE_INDEX_DIR is not set; point it at "
+                         "a built page-index artifact.")
+    return Path(env)
+
+
+# -- period matching (for the year filter) ----------------------------------
+# The planner emits periods as canonical `YYYY-MM` — a single month, an inclusive
+# `lo..hi` range, or a comma-separated enumeration. Fiscal-year / quarter expansion
+# is the planner's job (see the corpus prompt), so there is no grammar to expand.
+
+_MONTH_RE = re.compile(r"\d{4}-\d{2}")
+
+
+def _to_intervals(period: str | None) -> list[tuple[str, str]] | None:
+    """Parse a `YYYY-MM` period into inclusive `(low, high)` month intervals.
+    None when empty or malformed (the year filter then no-ops)."""
+    if not period:
+        return None
+    try:
+        out: list[tuple[str, str]] = []
+        for part in (p.strip() for p in period.split(",")):
+            if not part:
+                continue
+            lo, _, hi = part.partition("..")
+            lo, hi = lo.strip(), (hi.strip() or lo.strip())
+            if not (_MONTH_RE.fullmatch(lo) and _MONTH_RE.fullmatch(hi)):
+                raise ValueError(f"not YYYY-MM: {part!r}")
+            if lo > hi:
+                raise ValueError(f"range start > end: {part!r}")
+            out.append((lo, hi))
+        return out or None
+    except ValueError:
+        return None
+
+
+def _overlaps(interval: tuple[str, str], period_intervals: list[tuple[str, str]]) -> bool:
+    """True iff a page's `YYYY-MM` `(low, high)` span overlaps any period interval.
+    Compared at month granularity (`[:7]`, tolerating a stray day in stored data)."""
+    lo, hi = interval[0][:7], interval[1][:7]
+    return any(not (hi < p_lo[:7] or lo > p_hi[:7]) for p_lo, p_hi in period_intervals)
 
 
 class PageIndexRetriever:
-    """Page-index retrieval method. One instance per orchestrator;
-    catalog/concept-tree are lazy-loaded and cached per-instance behind a
-    lock so a parallel branch fan-out doesn't load the index twice.
+    """Orchestrates the retrieve stages: ToC chapter pick → year filter → coarse
+    semantic filter. The artifact (concept tree + per-page catalog) is loaded and
+    projected once at construction, then read by the (parallel) branch fan-out."""
 
-    Not a `PromptedCall` subclass — the only operator-owned LLM call (the
-    ToC chapter pick) lives in `page_index.query_toc`, which has its own
-    static prompt; the semantic filter's calls live in
-    `page_index.query_semfilter`. This class is the operator-level
-    orchestrator: catalog loading, year filter, and stage sequencing.
-    """
+    _CHAPTER_PICK_PROMPT = """\
+You pick the Treasury Bulletin chapter most likely to contain the answer.
+
+## Input
+
+A single JSON object:
+  {"question": "<question>", "concept": "<concept tag>", "period": "<period>",
+   "chapters": [{"chapter": "<name>", "n_pages": <int>,
+                 "description": "<scope>", "examples": ["<sub-area>", ...]}, ...]}
+
+Match the question against each chapter's `description` and `examples`.
+
+## Output
+
+A single bare JSON object — no prose, no markdown fences:
+  {"picked": ["<exact chapter name>", ...]}
+
+Return the best chapter, using its EXACT `chapter` value. Add a second only when the
+question genuinely straddles two and you can't tell which holds the answer. You may return
+at most two chapters.
+"""
+
+    _SEMFILTER_SYSTEM_PROMPT = """\
+For each candidate Treasury Bulletin page, decide whether it contains information to help answer the question.
+You see only a compact SUMMARY per page — table titles, column/row labels, dates, keywords — not the actual numbers.
+Keep a page (true) when its summary suggests it reports the kind of data the question needs for a relevant
+time period; mark it false when the page is clearly unrelated.
+
+## Input
+
+A question line, then a JSON array of candidate pages. Each page (any field may be absent when empty):
+  {"bulletin": "<YYYY-MM>", "page": <int>, "keywords": ["<term>", ...],
+   "date_interval": ["<YYYY-MM>", "<YYYY-MM>"],
+   "content_blocks": [{"title": "<table/chart title>", "column_headers": ["<col>", ...],
+                       "row_headers": ["<row>", ...], "summary": "<what the block is about>"}, ...]}
+
+## Output
+
+A single bare JSON array of booleans — no prose, no markdown fences — one entry per input page, in order:
+  [true, false, ...]
+"""
 
     def __init__(self) -> None:
-        self._profile = default_profile()
-        self._period_parser = self._profile.period_parser
-        self._index_lock = threading.Lock()
-        self._index_cache: dict[
-            Path,
-            tuple[dict[str, Any], dict[tuple[str, int], PageCatalogRow]],
-        ] = {}
+        root = page_index_root()
+        try:
+            tree = ConceptTree.model_validate_json((root / TREE_FILE).read_bytes())
+        except FileNotFoundError as e:
+            raise StepFailed("retrieve", f"page index not built ({e}); run the "
+                             "page-index build pipeline first.") from e
+        rows = [PageCatalogRow.from_json(line)
+                for f in sorted((root / CATALOG_SUBDIR).glob("*.jsonl"))
+                for line in f.read_text().splitlines() if line]
+        self._chapters = tree.chapters
+        self._catalog = {r.ref: r for r in rows}
+        # Chapter projection for the ToC prompt, largest first (`pages` excluded).
+        self._listing = sorted(
+            ({"chapter": name,
+              **c.model_dump(include={"n_pages", "description", "examples"})}
+             for name, c in self._chapters.items()),
+            key=lambda x: -x["n_pages"],
+        )
+        self._valid = {name.lower(): name for name in self._chapters}   # lowercased -> canonical
+        self._catalog_size = sum(c.n_pages for c in self._chapters.values())
 
-    def _catalog_dir(self) -> Path:
-        """Resolve the page-index catalog directory (the dir holding the
-        per-bulletin `*.jsonl`).
+        # `output_instruction` is re-appended after the data on every call/retry
+        # (the double-attention reminder), so the user turn carries only the inputs.
+        self._chapter_pick: PromptedCall[list[str]] = PromptedCall(
+            name="toc_pick",
+            system_prompt=self._CHAPTER_PICK_PROMPT,
+            parse=self._parse_chapter_picks,
+            output_instruction='Output ONLY the JSON object {"picked": [...]} — exact chapter names, at most two.',
+        )
+        self._semfilter: PromptedCall[list[bool]] = PromptedCall(
+            name="semfilter",
+            system_prompt=self._SEMFILTER_SYSTEM_PROMPT,
+            parse=self._parse_bool_list,
+            output_instruction="Output ONLY a JSON array of true/false — one entry per page, in the order given, no prose.",
+        )
 
-        Base is `SKUNK_PAGE_INDEX_DIR` if set, else the in-repo shipped
-        artifact `artifact/page_index` (the built index, tracked in git).
-        The built layout nests the catalog under `<base>/catalog/` with
-        `concept_tree.json` as its sibling, so we descend into `catalog/`
-        when it exists; a base pointing straight at the per-bulletin
-        jsonl is used as-is.
-        """
-        env = os.environ.get("SKUNK_PAGE_INDEX_DIR")
-        base = Path(env) if env else Path(__file__).resolve().parents[3] / "artifact" / "page_index"
-        nested = base / "catalog"
-        return nested if nested.is_dir() else base
+    # -- reply parsing ---------------------------------------------------------
 
+    def _parse_chapter_picks(self, text: str, _ctx: ExecutionContext) -> list[str]:
+        """Parse `picked` and canonicalize against the loaded chapters
+        (case-insensitive; unknowns dropped, deduped, order preserved). Raises
+        `ParseError` (→ one reprompt) on a non-array, more than two picks, or no
+        recognized chapter."""
+        obj = parse_json_response(text)
+        raw = obj.get("picked") if isinstance(obj, dict) else None
+        if not isinstance(raw, list):
+            raise ParseError(text, 'expected a "picked" array of chapter names')
+        names = [s for x in raw if (s := str(x).strip())]
+        if len(names) > 2:
+            raise ParseError(text, f"expected at most 2 chapters, got {len(names)}")
+        picked = list(dict.fromkeys(v for s in names if (v := self._valid.get(s.lower()))))
+        if not picked:
+            raise ParseError(text, "no recognized chapter names in 'picked'")
+        return picked
 
-    def _tree_path(self, catalog_dir: Path) -> Path:
-        """Locate `concept_tree.json` — sibling of the catalog dir, with
-        a fallback to the catalog dir itself for older layouts."""
-        sibling = catalog_dir.parent / "concept_tree.json"
-        if sibling.exists():
-            return sibling
-        return catalog_dir / "concept_tree.json"
+    @staticmethod
+    def _parse_bool_list(text: str, _ctx: ExecutionContext) -> list[bool]:
+        """Strict: a JSON array of JSON booleans — no coercion, no token-scan
+        fallback. Raises `ParseError` (→ one reprompt) on a non-array or any
+        non-boolean element. The per-batch count is checked by the caller."""
+        obj = parse_json_response(text)
+        if not isinstance(obj, list) or not all(isinstance(x, bool) for x in obj):
+            raise ParseError(text, "expected a JSON array of booleans (true/false)")
+        return obj
 
-    def _load_index(
-        self, catalog_dir: Path,
-    ) -> tuple[dict[str, Any], dict[tuple[str, int], PageCatalogRow]]:
-        """Lazy-load + cache (concept tree, catalog index) by resolved dir."""
-        key = catalog_dir.resolve()
-        with self._index_lock:
-            cached = self._index_cache.get(key)
-            if cached is not None:
-                return cached
-            tree = load_concept_tree(self._tree_path(catalog_dir))
-            catalog_rows = load_catalog(catalog_dir)
-            catalog_index = {(r.bulletin, r.page): r for r in catalog_rows}
-            self._index_cache[key] = (tree, catalog_index)
-            return tree, catalog_index
+    # -- stages ----------------------------------------------------------------
+
+    async def _pick_chapters(
+        self,
+        *,
+        question: str,
+        concept: str,
+        period: str | None,
+        ctx: ExecutionContext,
+    ) -> list[PageRef]:
+        user = json.dumps(
+            {"question": question, "concept": concept, "period": period,
+             "chapters": self._listing},
+            ensure_ascii=False, indent=1,
+        )
+        picked = await self._chapter_pick.call(ctx, user, temperature=0.0)
+        # Pages partition across chapters, so the union across picks is unique.
+        pages = [ref for ch in picked for ref in self._chapters[ch].pages]
+        ctx.emit(f"pick_chapters picked={picked!r} pages={len(pages)}")
+        return pages
 
     def _year_filter(
         self,
-        candidates: list[dict[str, Any]],
-        catalog_index: dict[tuple[str, int], PageCatalogRow],
-        period: str | None,
-    ) -> list[dict[str, Any]]:
-        """Drop candidates whose `row.dates` don't intersect any of the
-        period's ISO intervals. Verbatim dates on the page are parsed via
-        the period parser's `verbatim_date_to_intervals`, preserving
-        range semantics ("1932-1939" is one closed interval, not min/max
-        years 1932/1939) and month/day granularity.
+        candidates: list[PageRef],
+        branch: RetrieveBranch,
+        ctx: ExecutionContext,
+    ) -> list[PageRef]:
+        if branch.as_of:
+            as_of_intervals = _to_intervals(branch.as_of)
+            if as_of_intervals:
+                kept = [ref for ref in candidates
+                        if ref.month and _overlaps((ref.month, ref.month), as_of_intervals)]
+                ctx.emit(f"year_filter as_of={branch.as_of!r} kept={len(kept)}/{len(candidates)}")
+                return kept
 
-        Pages with no dates and pages whose dates all fail to parse are
-        kept — recall safety net for ToC / continuation pages and pages
-        that survived catalog build with an unrecognized date shape.
-        No-op when the period is unparseable.
-        """
-        period_intervals = self._period_parser.intervals(period)
+        period_intervals = _to_intervals(branch.period)
         if not period_intervals:
             return list(candidates)
-        kept: list[dict[str, Any]] = []
-        for c in candidates:
-            row = catalog_index.get((c["bulletin"], c["page"]))
-            if row is None or not row.dates:
-                kept.append(c)
-                continue
-            if self._period_parser.dates_overlap_period(
-                row.dates, period_intervals,
-            ):
-                kept.append(c)
+        kept = []
+        for ref in candidates:
+            row = self._catalog.get(ref)
+            # Keep when the page has no span (can't filter it) or its span overlaps.
+            if row is None or row.date_interval is None or _overlaps(row.date_interval, period_intervals):
+                kept.append(ref)
+        ctx.emit(f"year_filter period={branch.period!r} kept={len(kept)}/{len(candidates)}")
         return kept
 
-    async def run(self, prev: None, ctx: ExecutionContext, *, branch: RetrieveBranch) -> list[PageRef]:
-        # Document selection follows the reporting vintage when the question pins
-        # one (`as_of` — e.g. read the 2013 bulletin for values it reports about
-        # 2003/2012); otherwise it follows the data `period`. The data `period`
-        # itself is consumed downstream by extract to pick the row/column.
-        key, period = branch.key, branch.as_of or branch.period
-        catalog_dir = self._catalog_dir()
+    async def _semantic_filter(
+        self,
+        survivors: list[PageRef],
+        ctx: ExecutionContext,
+    ) -> list[PageRef]:
+        cfg = ctx.config
+        model = cfg.model_overrides.get("semfilter", cfg.llm_model)
+        # What the filter sees: page-level signals plus content_blocks one level
+        # deep — no full text, no numeric grid. `exclude_none` drops null fields.
+        filter_view: dict[str, Any] = {
+            "bulletin": True, "page": True, "keywords": True, "date_interval": True,
+            "content_blocks": {"__all__": {"title", "column_headers", "row_headers", "summary"}},
+        }
+        blocks = [(pk, self._catalog[pk].model_dump(include=filter_view, exclude_none=True))
+                  for pk in survivors]
 
-        try:
-            tree, catalog_index = self._load_index(catalog_dir)
-        except FileNotFoundError as e:
-            raise StepFailed(
-                "retrieve",
-                f"page index not built ({e}); run the page-index build "
-                "pipeline first.",
-            ) from e
+        async def _one_batch(batch: list[tuple[PageRef, dict]]) -> list[PageRef]:
+            pages = [d for _, d in batch]
+            n = len(pages)
+            user = (
+                f"question: {ctx.question}\n\n"
+                f"pages (JSON, {n} entries):\n"
+                f"{json.dumps(pages, ensure_ascii=False, indent=1)}"
+            )
+            bools = await self._semfilter.call(ctx, user, temperature=0.0)
+            if len(bools) != n:
+                raise StepFailed("retrieve",
+                                 f"semantic filter returned {len(bools)} verdicts for {n} pages")
+            return [pk for (pk, _), keep in zip(batch, bools) if keep]
 
-        # 1. ToC chapter pick. (`concept=` is the helper's internal kwarg
-        # name; we pass the NL `key` through unchanged.)
-        chapter_top, trace = await one_shot_parent_chapter_retrieve(
-            tree, question=ctx.question, concept=key, period=period,
-            llm=ctx.llm_client, catalog_index=catalog_index, ctx=ctx,
+        batches_kept = await asyncio.gather(
+            *[_one_batch(b) for b in chunk(blocks, cfg.semfilter_batch_size)])
+        kept = [pk for batch in batches_kept for pk in batch]
+        ctx.emit(f"semantic_filter model={model} kept={len(kept)}/{len(survivors)}")
+        return kept
 
+    async def retrieve(self, ctx: ExecutionContext, *, branch: RetrieveBranch) -> list[PageRef]:
+        chapter_pages = await self._pick_chapters(
+            question=ctx.question, concept=branch.key, period=branch.period, ctx=ctx,
         )
-
-        # 2. Year filter.
-        filtered = self._year_filter(chapter_top, catalog_index, period)
-
-        # 3. Coarse summary filter, unless disabled for ablation.
-        sem_meta: dict[str, Any] = {"enabled": False}
-        if ctx.config.semfilter_enabled and filtered:
-            survivors = [(c["bulletin"], int(c["page"])) for c in filtered]
-            kept_keys, sem_meta = await semantic_filter(survivors, catalog_index, ctx)
-
-            kept_set = set(kept_keys)
-            filtered = [c for c in filtered
-                        if (c["bulletin"], int(c["page"])) in kept_set]
-
-        trace.candidate_count = len(filtered)
-        trace.top_k = filtered[:50]
+        filtered = self._year_filter(chapter_pages, branch, ctx)
+        filtered = await self._semantic_filter(filtered, ctx)
 
         ctx.emit(
-            f"page_index_retrieve key={key!r} period={period!r} "
-            f"catalog_size={trace.catalog_size} chapter_size={len(chapter_top)} "
-            f"candidate_count={trace.candidate_count} top_k={trace.top_k!r} "
-            f"levels={[asdict(lvl) for lvl in trace.levels]!r} "
-            f"picked_chapters={trace.picked_chapters!r} semfilter={sem_meta!r}"
+            f"page_index_retrieve key={branch.key!r} period={branch.period!r} as_of={branch.as_of!r} "
+            f"catalog_size={self._catalog_size} candidate_count={len(filtered)} "
         )
-
-        refs: list[PageRef] = [
-            PageRef(month=r["bulletin"], page=int(r["page"])) for r in filtered
-        ]
-        if not refs:
-            raise StepFailed(
-                "retrieve",
-                f"no pages matched key={key!r} period={period!r} "
-                f"(chapter={len(chapter_top)})",
-            )
-
-        return refs
+        # Empty is fine to return — extract raises loudly on no refs, which the
+        # orchestrator records as a failed branch and replans.
+        return filtered
