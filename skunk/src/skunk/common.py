@@ -1,18 +1,14 @@
-"""Shared runtime: the LLM client plus the cross-cutting types threaded between
-operators and the orchestrator (`PageRef`, `AnnotatedValue`, `ExecutionContext`).
+"""Shared runtime: the process-wide rate limiters plus the cross-cutting types
+threaded between operators and the orchestrator (`PageRef`, `AnnotatedValue`,
+`ExecutionContext`).
 
-All LLM traffic goes through the direct Gemini API (AI Studio) via `google-genai`,
-authenticated by `GEMINI_API_KEY`. LLM calls are paced by the process-wide
-token-bucket limiter named `"llm"` (see `_RATE_LIMITS` / `get_rate_limiter`); only
-transient SDK exceptions (HTTP 429 + 5xx, network timeouts / connection resets —
-see `_is_retryable`) are retried with exponential backoff up to `llm_max_retries`
-times. The limiter paces traffic; the retry rides out throttling and blips the
-limiter can't prevent (provider-side 429, TPM quotas, multi-process fan-out)."""
+The LLM client itself lives in `skunk.llm_client`; this module owns the external
+rate-limit infrastructure it (and the data-source tools) pace against — the
+process-wide token-bucket limiters (see `_RATE_LIMITS` / `get_rate_limiter`)."""
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextvars
 import json
 import logging
@@ -20,29 +16,26 @@ import os
 import re
 import threading
 import time
-from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-import httpx
 import pandas as pd
-import requests
 from pydantic import BaseModel, ConfigDict, model_validator
 from google import genai
-from google.genai import errors as genai_errors
-from google.genai import types
 
 from skunk import trace
 from skunk.config import SkunkConfig
 
 if TYPE_CHECKING:
+    from skunk.llm_client import LLMClient
     from skunk.prompted_call import PromptOverride
 
 # Reasoning-effort knob, mapped onto Gemini's `thinking_level` enum. "off" means
 # no thinking; "minimal" is the cheapest thinking tier.
 Effort = Literal["off", "minimal", "low", "medium", "high"]
+EFFORT_VALUES = ("off", "minimal", "low", "medium", "high")
 
 
 @dataclass
@@ -51,32 +44,11 @@ class B64Image:
 
     mime: str
     data: str
-_EFFORT_VALUES = ("off", "minimal", "low", "medium", "high")
 
-# Process-scoped logger: retries happen with no per-question ctx in scope (see
-# `_retry_call`), so they go through stdlib logging rather than `ctx.emit`.
+
+# Process-scoped logger for code with no per-question ctx in scope (build
+# pipelines, offline prep); request-path code uses `ctx.emit` instead.
 log = logging.getLogger(__name__)
-
-
-def _is_retryable(e: BaseException) -> bool:
-    """True for transient failures worth retrying: HTTP 429 (throttling) and 5xx
-    (server-side), plus network-layer timeouts / connection resets from the
-    underlying transport (`httpx` async, `requests` sync). Non-429 4xx — bad
-    request, auth, context-length overflow — is a permanent error that will never
-    succeed, so it raises immediately instead of burning the retry budget."""
-    if isinstance(e, genai_errors.APIError):
-        code = getattr(e, "code", None)
-        return code == 429 or (code is not None and 500 <= code < 600)
-    # Transport faults: connection resets, read timeouts, DNS failures, etc.
-    return isinstance(
-        e,
-        (
-            httpx.TimeoutException,
-            httpx.TransportError,
-            requests.exceptions.Timeout,
-            requests.exceptions.ConnectionError,
-        ),
-    )
 
 
 class _RateLimiter:
@@ -120,14 +92,20 @@ class _RateLimiter:
 # and call `get_rate_limiter("<name>")` at the call site.
 _RATE_LIMITS: dict[str, tuple[str, float]] = {
     # name          (env override,            default rpm)  # rationale
-    "llm":          ("SKUNK_LLM_RPM",        1000.0),  # Gemini generation; provider-side quota
-    "embed":        ("SKUNK_EMBED_RPM",       600.0),  # Gemini embeddings (search_agent.vector_search)
-    "fred":         ("SKUNK_FRED_RPM",         60.0),  # hard 120/min per API key; stay well under —
-                                                        # FRED escalates to an extended key-wide ban
-                                                        # (persistent 429s) once the cap is tripped.
-    "bls":          ("SKUNK_BLS_RPM",          50.0),  # 500/day (registered); smooth worker bursts
-    "world_bank":   ("SKUNK_WORLD_BANK_RPM",  120.0),  # no published cap; stay a good citizen
-    "tavily":       ("SKUNK_TAVILY_RPM",      100.0),  # ~100/min on the dev tier
+    "llm": ("SKUNK_LLM_RPM", 1000.0),  # Gemini generation; provider-side quota
+    "embed": (
+        "SKUNK_EMBED_RPM",
+        600.0,
+    ),  # Gemini embeddings (search_agent.vector_search)
+    "fred": ("SKUNK_FRED_RPM", 60.0),  # hard 120/min per API key; stay well under —
+    # FRED escalates to an extended key-wide ban
+    # (persistent 429s) once the cap is tripped.
+    "bls": ("SKUNK_BLS_RPM", 50.0),  # 500/day (registered); smooth worker bursts
+    "world_bank": (
+        "SKUNK_WORLD_BANK_RPM",
+        120.0,
+    ),  # no published cap; stay a good citizen
+    "tavily": ("SKUNK_TAVILY_RPM", 100.0),  # ~100/min on the dev tier
 }
 
 _LIMITERS_LOCK = threading.Lock()
@@ -211,7 +189,9 @@ _ASYNC_LIMITERS_LOCK = threading.Lock()
 _ASYNC_LIMITERS: dict[str, _AsyncRateLimiter] = {}
 
 
-def get_async_rate_limiter(name: str, rate_per_min: float | None = None) -> _AsyncRateLimiter:
+def get_async_rate_limiter(
+    name: str, rate_per_min: float | None = None
+) -> _AsyncRateLimiter:
     """Process-wide async token-bucket limiter for service `name`, paced at its
     rpm. Request-time analogue of `get_rate_limiter` (same `rate_per_min` rule for
     dynamic per-model buckets); the returned bucket is shared across all
@@ -220,133 +200,11 @@ def get_async_rate_limiter(name: str, rate_per_min: float | None = None) -> _Asy
     with _ASYNC_LIMITERS_LOCK:
         lim = _ASYNC_LIMITERS.get(name)
         if lim is None:
-            lim = _AsyncRateLimiter(rate_per_sec=_resolve_rate_per_sec(name, rate_per_min))
+            lim = _AsyncRateLimiter(
+                rate_per_sec=_resolve_rate_per_sec(name, rate_per_min)
+            )
             _ASYNC_LIMITERS[name] = lim
         return lim
-
-
-_MODEL_RPM: dict[str, float] | None = None
-
-
-def _llm_model_rpm(model: str) -> float:
-    """Per-minute request cap for an LLM `model`. Parsed once from `SKUNK_MODEL_RPM`
-    ("model=rpm,..."); a model not listed falls back to `SKUNK_LLM_RPM` (default
-    1000), so single-model runs are unaffected. Each model gets its own limiter
-    bucket (`llm:<model>`), so mixed-model runs pace independently."""
-    global _MODEL_RPM
-    if _MODEL_RPM is None:
-        out: dict[str, float] = {}
-        for entry in os.environ.get("SKUNK_MODEL_RPM", "").split(","):
-            entry = entry.strip()
-            if not entry:
-                continue
-            name, _, rpm = entry.partition("=")
-            out[name.strip()] = float(rpm.strip())
-        _MODEL_RPM = out
-    return _MODEL_RPM.get(model, float(os.environ.get("SKUNK_LLM_RPM", "1000")))
-
-
-# ---------------------------------------------------------------------------
-# Tokens-per-minute (TPM) throttle — async, opt-in via SKUNK_MODEL_TPM.
-#
-# The RPM limiter alone can't bound token throughput: one request can carry tens
-# of thousands of tokens, so a request-paced run still blows a TPM quota (the
-# full-text page-index filter pushed ~36M tok/min and 429-stormed). This bucket
-# meters estimated *input* tokens per call. Mirrors `_AsyncRateLimiter`'s
-# cross-loop safety (threading.Lock around refill+deduct, sleep outside the lock).
-# Off unless `SKUNK_MODEL_TPM` names the model, so it's scoped to experiments.
-# ---------------------------------------------------------------------------
-
-class _AsyncTokenBudget:
-    """Like `_AsyncRateLimiter` but `acquire(amount)` deducts a variable token
-    count (the call's estimated input tokens). `capacity` allows a short burst
-    and must exceed the largest single request, or `acquire` would cap-clamp it."""
-
-    def __init__(self, rate_per_sec: float, capacity: float) -> None:
-        if rate_per_sec <= 0:
-            raise ValueError(f"rate_per_sec must be > 0 (got {rate_per_sec})")
-        self._rate = rate_per_sec
-        self._capacity = max(capacity, rate_per_sec)
-        self._tokens = self._capacity
-        self._last_refill = time.monotonic()
-        self._lock = threading.Lock()
-
-    def _refill_locked(self) -> None:
-        now = time.monotonic()
-        elapsed = now - self._last_refill
-        if elapsed > 0:
-            self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
-            self._last_refill = now
-
-    async def acquire(self, amount: float) -> None:
-        amount = max(0.0, min(float(amount), self._capacity))
-        while True:
-            with self._lock:
-                self._refill_locked()
-                if self._tokens >= amount:
-                    self._tokens -= amount
-                    return
-                wait_s = (amount - self._tokens) / self._rate
-            await asyncio.sleep(wait_s)
-
-    def settle(self, delta: float) -> None:
-        """Post-call correction: charge `delta` (actual minus estimated tokens)
-        without awaiting. May drive the balance negative so the next `acquire`
-        waits longer — this is what makes the throttle track ACTUAL token usage
-        even when the pre-call estimate is off. No-op for delta 0."""
-        if not delta:
-            return
-        with self._lock:
-            self._refill_locked()
-            self._tokens -= delta
-
-
-_ASYNC_TPM_LOCK = threading.Lock()
-_ASYNC_TPM_LIMITERS: dict[str, _AsyncTokenBudget] = {}
-
-
-def get_async_tpm_limiter(model: str, tpm: float) -> _AsyncTokenBudget:
-    """Process-wide TPM bucket for `model`, paced at `tpm` tokens/min. Capacity is
-    ~4s of budget so a few large concurrent requests can burst, then throttle."""
-    with _ASYNC_TPM_LOCK:
-        lim = _ASYNC_TPM_LIMITERS.get(model)
-        if lim is None:
-            rate_per_sec = tpm / 60.0
-            lim = _AsyncTokenBudget(rate_per_sec, capacity=max(rate_per_sec * 4.0, 256_000.0))
-            _ASYNC_TPM_LIMITERS[model] = lim
-        return lim
-
-
-_MODEL_TPM: dict[str, float] | None = None
-
-
-def _llm_model_tpm(model: str) -> float | None:
-    """Per-minute *token* cap for `model`, parsed once from `SKUNK_MODEL_TPM`
-    ("model=tpm,..."). Returns None (no throttle) when unset — so the TPM bucket
-    is inert unless explicitly configured."""
-    global _MODEL_TPM
-    if _MODEL_TPM is None:
-        out: dict[str, float] = {}
-        for entry in os.environ.get("SKUNK_MODEL_TPM", "").split(","):
-            entry = entry.strip()
-            if not entry:
-                continue
-            name, _, tpm = entry.partition("=")
-            out[name.strip()] = float(tpm.strip())
-        _MODEL_TPM = out
-    return _MODEL_TPM.get(model)
-
-
-def _estimate_prompt_tokens(system: str, user: str) -> float:
-    """Cheap pre-call input-token estimate (~4 chars/token) for the TPM bucket.
-    Approximate by design — it only paces throughput, it doesn't bill."""
-    return (len(system) + len(user)) / 4.0
-
-def _requires_thinking(model: str) -> bool:
-    """True for models that mandate thinking mode (reject `thinking_budget=0`).
-    Gemini 3.x Pro tiers are thinking-only; Flash/Flash-Lite accept budget=0."""
-    m = model.lower()
-    return "gemini-3" in m and "pro" in m
 
 
 # Active (step_idx, op) frame for the current operator call. A ContextVar, not
@@ -360,6 +218,34 @@ def _requires_thinking(model: str) -> bool:
 _step_frame: contextvars.ContextVar[tuple[int, str] | None] = contextvars.ContextVar(
     "skunk_step_frame", default=None
 )
+
+
+# Map a message's leading snake_case event key to a semantic `kind` (the role used
+# by the trace viewer for color-coding). Call sites that pass `kind=` explicitly win;
+# this only classifies the legacy one-liner emits that don't. Unknown keys → "note"
+# (a neutral, informational event).
+_KIND_BY_PREFIX: dict[str, str] = {
+    "question": "user",
+    "observation": "observation",
+    "error": "error",
+    "call": "call",
+    "step": "step",
+    "validation_failed": "error",
+    "terminal_giveup": "error",
+    "terminal_turn_failed": "error",
+    "terminal_commit": "note",
+    "steps_low_warning": "note",
+    "parallel_branch_failed": "error",
+    "replan_dropped": "note",
+    "codegen_missing": "note",
+}
+
+
+def infer_kind(message: str) -> str:
+    """Classify a one-liner `emit` message into a semantic `kind` from its leading
+    event key (see `_KIND_BY_PREFIX`). Used when a call site doesn't pass `kind=`."""
+    token = message.split(" ", 1)[0] if message else ""
+    return _KIND_BY_PREFIX.get(token, "note")
 
 
 def load_env_file(path: Path) -> None:
@@ -408,432 +294,13 @@ class LLMResponse:
     output_tokens: int | None
 
 
-def _make_genai_client() -> genai.Client:
+def make_genai_client() -> genai.Client:
     """Build a direct-Gemini (AI Studio) genai.Client from `GEMINI_API_KEY`.
     Auth via api-key; no GCP project required."""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not set (required for Gemini API)")
     return genai.Client(api_key=api_key)
-
-
-class LLMClient:
-    """LLM client. All calls go through AI Studio (direct Gemini API)."""
-
-    def __init__(self, config: SkunkConfig) -> None:
-        self._config = config
-        self._gemini_client: genai.Client | None = None
-
-    def _get_gemini_client(self) -> genai.Client:
-        if self._gemini_client is None:
-            self._gemini_client = _make_genai_client()
-        return self._gemini_client
-
-    def call(
-        self,
-        system: str,
-        user: str,
-        images: list[B64Image] | None = None,
-        temperature: float = 0.0,
-        effort: "Effort" = "off",
-        ctx: "ExecutionContext | None" = None,
-        call_site: str = "llm",
-        model: str | None = None,
-    ) -> LLMResponse:
-        return self._call_gemini(
-            system, user, images, temperature, effort, ctx, call_site,
-            model or self._config.llm_model,
-        )
-
-    async def acall(
-        self,
-        system: str,
-        user: str,
-        images: list[B64Image] | None = None,
-        temperature: float = 0.0,
-        effort: "Effort" = "off",
-        ctx: "ExecutionContext | None" = None,
-        call_site: str = "llm",
-        model: str | None = None,
-    ) -> LLMResponse:
-        """Async twin of `call` for the request path."""
-        return await self._acall_gemini(
-            system, user, images, temperature, effort, ctx, call_site,
-            model or self._config.llm_model,
-        )
-
-    def _retry_call(self, do_call: "Callable[[], LLMResponse]", model: str) -> LLMResponse:
-        """Run `do_call` under `model`'s rate limiter with exponential-backoff
-        retry. `do_call` owns the API invocation, timing, parsing, and success emit."""
-        limiter = get_rate_limiter(f"llm:{model}", rate_per_min=_llm_model_rpm(model))
-        max_retries = self._config.llm_max_retries
-        delay = self._config.llm_retry_initial_delay_s
-
-        for attempt in range(max_retries + 1):
-            limiter.acquire()
-            try:
-                return do_call()
-            except Exception as e:
-                # Log EVERY failure with its message — including the final one
-                # before we re-raise — so a fatal error is never silent.
-                stop = attempt == max_retries or not _is_retryable(e)
-                log.warning(
-                    "llm call failed (attempt %d/%d): %s: %s%s",
-                    attempt + 1, max_retries + 1, type(e).__name__, e,
-                    "" if stop else f"; retrying in {delay:.1f}s",
-                )
-                if stop:
-                    raise
-                time.sleep(delay)
-                delay *= 2
-        raise RuntimeError("unreachable: retry loop fell through")
-
-    async def _aretry_call(
-        self, do_call: "Callable[[], Awaitable[LLMResponse]]", model: str
-    ) -> LLMResponse:
-        """Async twin of `_retry_call`: awaits `model`'s async rate limiter and the
-        coroutine `do_call`, backing off via `asyncio.sleep` (never blocking the
-        event loop). `do_call` owns the API invocation, timing, parsing, and emit."""
-        limiter = get_async_rate_limiter(f"llm:{model}", rate_per_min=_llm_model_rpm(model))
-        max_retries = self._config.llm_max_retries
-        delay = self._config.llm_retry_initial_delay_s
-
-        for attempt in range(max_retries + 1):
-            await limiter.acquire()
-            try:
-                return await do_call()
-            except Exception as e:
-                # Log EVERY failure with its message — including the final one
-                # before we re-raise — so a fatal error is never silent.
-                stop = attempt == max_retries or not _is_retryable(e)
-                log.warning(
-                    "llm call failed (attempt %d/%d): %s: %s%s",
-                    attempt + 1, max_retries + 1, type(e).__name__, e,
-                    "" if stop else f"; retrying in {delay:.1f}s",
-                )
-                if stop:
-                    raise
-                await asyncio.sleep(delay)
-                delay *= 2
-        raise RuntimeError("unreachable: retry loop fell through")
-
-    def embed(
-        self,
-        texts: list[str],
-        *,
-        task_type: str = "CLUSTERING",
-        dim: int = 768,
-        model: str = "gemini-embedding-001",
-        batch_size: int = 100,
-    ) -> list[list[float]]:
-        """Batched embedding — build-time / offline corpus-prep only (the query
-        path is embedding-free). Output is L2-unnormalized; callers normalize
-        before cosine. Chunked at `batch_size` (endpoint caps at 100/request).
-        No retries / no rate limiter — one-shot build call."""
-        if not texts:
-            return []
-        client = self._get_gemini_client()
-        cfg = types.EmbedContentConfig(
-            task_type=task_type, output_dimensionality=dim,
-        )
-        out: list[list[float]] = []
-        for start in range(0, len(texts), batch_size):
-            chunk = texts[start:start + batch_size]
-            resp = client.models.embed_content(
-                model=model, contents=chunk, config=cfg,  # type: ignore[arg-type]
-            )
-            if not resp.embeddings:
-                raise RuntimeError(f"embed model {model!r} returned no embeddings for {len(chunk)} inputs")
-            vecs = [list(e.values or ()) for e in resp.embeddings]
-            if len(vecs) != len(chunk):
-                raise RuntimeError(
-                    f"embed model {model!r} returned {len(vecs)} vectors "
-                    f"for {len(chunk)} inputs; model likely requires batch_size=1"
-                )
-            out.extend(vecs)
-        return out
-
-    @staticmethod
-    def _gemini_parts(user: str, images: list[B64Image] | None) -> list[Any]:
-        parts: list[Any] = []
-        if images:
-            for img in images:
-                parts.append(
-                    types.Part.from_bytes(data=base64.b64decode(img.data), mime_type=img.mime)
-                )
-        parts.append(types.Part.from_text(text=user))
-        return parts
-
-    @staticmethod
-    def _effort_to_thinking_config(effort: "Effort", model: str) -> "types.ThinkingConfig":
-        # ThinkingLevel is the only knob that hard-caps thinking spend for Gemini 3
-        # (the legacy thinking_budget int is soft-bucketed).
-        if _requires_thinking(model):
-            # Gemini 3.x Pro: thinking is mandatory AND MINIMAL is unsupported, so
-            # "off"/"minimal" floor at LOW (the cheapest tier this model accepts).
-            level_map = {
-                "off": types.ThinkingLevel.LOW,
-                "minimal": types.ThinkingLevel.LOW,
-                "low": types.ThinkingLevel.LOW,
-                "medium": types.ThinkingLevel.MEDIUM,
-                "high": types.ThinkingLevel.HIGH,
-            }
-            return types.ThinkingConfig(thinking_level=level_map[effort])
-        if effort == "off":
-            return types.ThinkingConfig(thinking_budget=0)
-        level_map = {
-            "minimal": types.ThinkingLevel.MINIMAL,
-            "low": types.ThinkingLevel.LOW,
-            "medium": types.ThinkingLevel.MEDIUM,
-            "high": types.ThinkingLevel.HIGH,
-        }
-        return types.ThinkingConfig(thinking_level=level_map[effort])
-
-    @staticmethod
-    def _gemini_config(
-        system: str,
-        temperature: float,
-        effort: "Effort",
-        model: str,
-    ) -> "types.GenerateContentConfig":
-        return types.GenerateContentConfig(
-            system_instruction=system,
-            max_output_tokens=65535,
-            temperature=temperature,
-            thinking_config=LLMClient._effort_to_thinking_config(effort, model),
-        )
-
-    @staticmethod
-    def _usage_tokens(usage: Any) -> dict:
-        """Token counts from a Gemini `usage_metadata` (best-effort — any may be
-        None, e.g. when streaming omits usage)."""
-        return {
-            "input_tokens": getattr(usage, "prompt_token_count", None),
-            "output_tokens": getattr(usage, "candidates_token_count", None),
-            "total_tokens": getattr(usage, "total_token_count", None),
-            "thinking_tokens": getattr(usage, "thoughts_token_count", None),
-        }
-
-    def _call_gemini(
-        self,
-        system: str,
-        user: str,
-        images: list[B64Image] | None,
-        temperature: float,
-        effort: "Effort",
-        ctx: "ExecutionContext | None",
-        call_site: str = "llm",
-        model: str | None = None,
-    ) -> LLMResponse:
-        """Single Gemini call. `call_site` attributes the envelope log to the caller."""
-        client = self._get_gemini_client()
-        parts = self._gemini_parts(user, images)
-        model = model or self._config.llm_model
-        gen_config = self._gemini_config(system, temperature, effort, model)
-
-        def do() -> LLMResponse:
-            t0 = time.monotonic()
-            api_resp = client.models.generate_content(
-                model=model, contents=parts, config=gen_config,
-            )
-            latency_s = time.monotonic() - t0
-            usage = api_resp.usage_metadata
-            output_text = (api_resp.text or "").strip()
-            toks = self._usage_tokens(usage)
-            if ctx is not None:
-                ctx.emit(
-                    f"call call_site={call_site} model={model} temp={temperature} "
-                    f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']}"
-                )
-            return LLMResponse(
-                text=output_text,
-                latency_s=latency_s,
-                input_tokens=toks["input_tokens"],
-                output_tokens=toks["output_tokens"],
-            )
-
-        return self._retry_call(do, model)
-
-    async def _acall_gemini(
-        self,
-        system: str,
-        user: str,
-        images: list[B64Image] | None,
-        temperature: float,
-        effort: "Effort",
-        ctx: "ExecutionContext | None",
-        call_site: str = "llm",
-        model: str | None = None,
-    ) -> LLMResponse:
-        """Async twin of `_call_gemini` — uses `client.aio.models.generate_content`."""
-        client = self._get_gemini_client()
-        parts = self._gemini_parts(user, images)
-        model = model or self._config.llm_model
-        gen_config = self._gemini_config(system, temperature, effort, model)
-
-        async def do() -> LLMResponse:
-            # TPM throttle (opt-in via SKUNK_MODEL_TPM): meter input tokens so
-            # throughput stays under quota. Charge an estimate up front for pacing,
-            # then `settle` the actual-vs-estimate delta after the call so the
-            # bucket tracks REAL token usage (the char/4 estimate runs ~2x low on
-            # dense tabular text). Inside `do` so each retry re-charges. Separate
-            # from the RPM limiter.
-            tpm = _llm_model_tpm(model)
-            tpm_lim, est = None, 0.0
-            if tpm:
-                est = _estimate_prompt_tokens(system, user)
-                tpm_lim = get_async_tpm_limiter(model, tpm)
-                await tpm_lim.acquire(est)
-            t0 = time.monotonic()
-            api_resp = await client.aio.models.generate_content(
-                model=model, contents=parts, config=gen_config,
-            )
-            latency_s = time.monotonic() - t0
-            usage = api_resp.usage_metadata
-            output_text = (api_resp.text or "").strip()
-            toks = self._usage_tokens(usage)
-            if tpm_lim is not None:
-                tpm_lim.settle((toks["input_tokens"] or 0) - est)
-            if ctx is not None:
-                ctx.emit(
-                    f"call call_site={call_site} model={model} temp={temperature} "
-                    f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']}"
-                )
-            return LLMResponse(
-                text=output_text,
-                latency_s=latency_s,
-                input_tokens=toks["input_tokens"],
-                output_tokens=toks["output_tokens"],
-            )
-
-        return await self._aretry_call(do, model)
-
-    def stream(
-        self,
-        *,
-        system: str,
-        messages: list[dict],
-        model: str | None = None,
-        should_stop: "Callable[[str], bool] | None" = None,
-        temperature: float = 0.0,
-        effort: "Effort" = "off",
-        ctx: "ExecutionContext | None" = None,
-        call_site: str = "llm",
-    ) -> LLMResponse:
-        """Multi-turn streaming call, accumulating chunks until `should_stop(acc)`
-        or the stream ends. `messages` are the {role, content} turns after the
-        system message ('assistant' → model role, else user). Lets multi-turn
-        agents share this client's rate-limit + retry + logging. `temperature`
-        defaults to 0.0 — agent loops are deterministic like every other call site.
-        `effort` maps onto Gemini's thinking config exactly like the single-shot
-        path (`_gemini_config`), so agent loops are tunable like every other call site."""
-        client = self._get_gemini_client()
-        model_id = (model or self._config.llm_model).removeprefix("google/")
-        contents = [
-            types.Content(
-                role="model" if m["role"] == "assistant" else "user",
-                parts=[types.Part.from_text(text=m["content"])],
-            )
-            for m in messages
-        ]
-        gen_config = self._gemini_config(system, temperature, effort, model_id)
-
-        def do() -> LLMResponse:
-            t0 = time.monotonic()
-            resp_stream = client.models.generate_content_stream(
-                model=model_id, contents=contents, config=gen_config,  # type: ignore[arg-type]
-            )
-            accumulated = ""
-            usage = None
-            for chunk in resp_stream:
-                accumulated += chunk.text or ""
-                usage = getattr(chunk, "usage_metadata", None) or usage
-                if should_stop is not None and should_stop(accumulated):
-                    break
-            close = getattr(resp_stream, "close", None)
-            if close is not None:
-                try:  # noqa: SIM105
-                    close()
-                except Exception:
-                    pass
-            latency_s = time.monotonic() - t0
-            toks = self._usage_tokens(usage)
-            if ctx is not None:
-                ctx.emit(
-                    f"call call_site={call_site} model={model_id} temp={temperature} "
-                    f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']}"
-                )
-            return LLMResponse(
-                text=accumulated,
-                latency_s=latency_s,
-                input_tokens=toks["input_tokens"],
-                output_tokens=toks["output_tokens"],
-            )
-
-        return self._retry_call(do, model_id)
-
-    async def astream(
-        self,
-        *,
-        system: str,
-        messages: list[dict],
-        model: str | None = None,
-        should_stop: "Callable[[str], bool] | None" = None,
-        temperature: float = 0.0,
-        effort: "Effort" = "off",
-        ctx: "ExecutionContext | None" = None,
-        call_site: str = "llm",
-    ) -> LLMResponse:
-        """Async twin of `stream` — uses `client.aio.models.generate_content_stream`
-        and `async for`, so the event loop runs other tasks between chunks."""
-        client = self._get_gemini_client()
-        model_id = (model or self._config.llm_model).removeprefix("google/")
-        contents = [
-            types.Content(
-                role="model" if m["role"] == "assistant" else "user",
-                parts=[types.Part.from_text(text=m["content"])],
-            )
-            for m in messages
-        ]
-        gen_config = self._gemini_config(system, temperature, effort, model_id)
-
-        async def do() -> LLMResponse:
-            t0 = time.monotonic()
-            resp_stream = await client.aio.models.generate_content_stream(
-                model=model_id, contents=contents, config=gen_config,  # type: ignore[arg-type]
-            )
-            accumulated = ""
-            usage = None
-            async for chunk in resp_stream:
-                accumulated += chunk.text or ""
-                usage = getattr(chunk, "usage_metadata", None) or usage
-                if should_stop is not None and should_stop(accumulated):
-                    break
-            aclose = getattr(resp_stream, "aclose", None)
-            if aclose is not None:
-                try:  # noqa: SIM105
-                    await aclose()
-                except Exception:
-                    pass
-            latency_s = time.monotonic() - t0
-            toks = self._usage_tokens(usage)
-            if ctx is not None:
-                ctx.emit(
-                    f"call call_site={call_site} model={model_id} temp={temperature} "
-                    f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']}"
-                )
-            return LLMResponse(
-                text=accumulated,
-                latency_s=latency_s,
-                input_tokens=toks["input_tokens"],
-                output_tokens=toks["output_tokens"],
-            )
-
-        return await self._aretry_call(do, model_id)
 
 
 # --- Cross-cutting runtime types threaded between operators and the orchestrator ---
@@ -845,6 +312,7 @@ class PageRef:
     and set member (e.g. the page-index catalog is keyed by `PageRef`)."""
     month: str | None = None        # "YYYY-MM" (a.k.a. bulletin in the page index)
     page: int | None = None         # 1-based PDF page index (canonical)
+
 
     @property
     def year(self) -> int | None:
@@ -894,6 +362,7 @@ class AnnotatedValue(BaseModel):
     `.frame` exposes the payload as a uniform `pd.DataFrame` so downstream code
     needn't branch on `kind`.
     """
+
     model_config = ConfigDict(frozen=True)
 
     description: str
@@ -919,19 +388,23 @@ class AnnotatedValue(BaseModel):
                     f"got {type(v).__name__}"
                 )
         elif self.kind == "vector":
-            if not (isinstance(v, dict) and all(
-                isinstance(k, str) and is_prim(c) for k, c in v.items()
-            )):
+            if not (
+                isinstance(v, dict)
+                and all(isinstance(k, str) and is_prim(c) for k, c in v.items())
+            ):
                 raise ValueError("vector value must be flat dict[str, scalar]")
             if not self.index_name:
                 raise ValueError("vector entry missing non-empty 'index_name'")
         else:  # table
-            if not (isinstance(v, dict) and all(
-                isinstance(r, str)
-                and isinstance(row, dict)
-                and all(isinstance(k, str) and is_prim(c) for k, c in row.items())
-                for r, row in v.items()
-            )):
+            if not (
+                isinstance(v, dict)
+                and all(
+                    isinstance(r, str)
+                    and isinstance(row, dict)
+                    and all(isinstance(k, str) and is_prim(c) for k, c in row.items())
+                    for r, row in v.items()
+                )
+            ):
                 raise ValueError(
                     "table value must be dict[str, dict[str, scalar]] (no nesting)"
                 )
@@ -967,7 +440,9 @@ def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
     """Schema view of one `AnnotatedValue`: the meta line, then (for non-scalars) the
     full index labels — load-bearing, they're what generated code keys `.loc[...]` on,
     and aren't otherwise in the prompt — plus a tiny `head` sample. Scalars show in full."""
-    head = f"  input_values[{i}]  description: {(e.description or '(no description)')!r}"
+    head = (
+        f"  input_values[{i}]  description: {(e.description or '(no description)')!r}"
+    )
     if e.kind == "scalar":
         return [head, f"{_PAD}value={e.value!r}  (kind=scalar, unit={e.unit!r})"]
 
@@ -1019,17 +494,30 @@ class ExecutionContext:
     """Per-question execution state, owned by exactly one `Orchestrator` and never
     shared across questions or threads.
     """
+
     question: str
-    uid: str | None = None    # benchmark UID, when run from the eval harness; tags every event
-    verbose: bool = False     # also echo orchestrator + operator events to the console
-    log_path: str | None = None  # when set, stream this question's events to that file (live, flushed)
+    uid: str | None = (
+        None  # benchmark UID, when run from the eval harness; tags every event
+    )
+    verbose: bool = False  # also echo orchestrator + operator events to the console
+    log_path: str | None = (
+        None  # when set, stream this question's events to that file (live, flushed)
+    )
     events: list[dict] = field(default_factory=list)  # per-question diagnostic events
     config: SkunkConfig = field(default_factory=SkunkConfig.from_env)
-    llm_client: LLMClient | None = None  # auto-created in __post_init__; pass a mock to override
-    prompt_overrides: tuple[PromptOverride, ...] = ()  # corpus/few_shot/lesson overrides; operators pick out their own entries by name
+    llm_client: LLMClient | None = (
+        None  # auto-created in __post_init__; pass a mock to override
+    )
+    prompt_overrides: tuple[
+        PromptOverride, ...
+    ] = ()  # corpus/few_shot/lesson overrides; operators pick out their own entries by name
 
     def __post_init__(self) -> None:
         if self.llm_client is None:
+            # Local import: `skunk.llm_client` imports from this module, so a
+            # top-level import would be circular.
+            from skunk.llm_client import LLMClient
+
             self.llm_client = LLMClient(self.config)
         # The active (step_idx, op) frame lives in the module-level `_step_frame`
         # ContextVar (per asyncio task), not on the instance — see its definition.
@@ -1046,6 +534,10 @@ class ExecutionContext:
         # inside `step()` before any `await`, so the single-thread/cooperative
         # contract (see class docstring) makes it race-free without a lock.
         self._next_step_idx = 1
+        # Query start, for the per-event `t` offset (seconds since this question
+        # began). Stamped at ctx construction — the orchestrator builds the ctx
+        # right before `execute()`, so this is ~"t=0 at the start of the query".
+        self._t0 = time.monotonic()
 
     def close(self) -> None:
         """Close the per-question log file, if one was opened."""
@@ -1074,7 +566,14 @@ class ExecutionContext:
     def _current_step(self) -> tuple[int | None, str | None]:
         return _step_frame.get() or (None, None)
 
-    def emit(self, message: str, level: str | None = None) -> None:
+    def emit(
+        self,
+        message: str,
+        level: str | None = None,
+        *,
+        kind: str | None = None,
+        data: dict | None = None,
+    ) -> None:
         """Record a request-scoped diagnostic event onto this question's event stream.
 
         Convention (see ARCHITECTURE.md "Logging & observability"):
@@ -1083,9 +582,20 @@ class ExecutionContext:
           emits carry `op=None` and rely on the message alone.
         - `message` is a single human-readable string. Lead it with a stable
           snake_case event key, then interpolate any variables inline
-          (`f"verifier_dropped n_dropped={n} n_parsed={m}"`). There are no
-          structured fields — keep large blobs (full prompts, transcripts) out of
-          the message; log a count or short `repr` instead.
+          (`f"verifier_dropped n_dropped={n} n_parsed={m}"`). Keep large blobs out
+          of the *message* (it must stay a scannable one-liner) — but they may go in
+          `data` (see below).
+        - `kind` is the event's semantic role for the trace viewer's color-coding
+          (`system` / `user` / `assistant` / `observation` / `error` / `call` /
+          `plan` / `summary` / `step` / `note`). When omitted it is inferred from the
+          message's leading event key (`infer_kind`), so legacy one-liners need no
+          change.
+        - `data` is an optional structured payload (the full system prompt, an
+          assistant turn, structured observation blocks, a plan, a node summary).
+          It is captured to `self.events` and the durable JSONL sink for the viewer,
+          but is **deliberately excluded** from the rendered console / `.log` line
+          (which stays the scannable one-liner). Pass JSON-friendly values; the JSONL
+          sink falls back to `str` for anything else.
         - Emit the fact at the layer that owns it, and only there: the
           orchestrator owns operator boundaries (the `"step"` event), so operators
           do NOT emit their own "starting"/"done"; each operator emits only its own
@@ -1103,13 +613,22 @@ class ExecutionContext:
         """
         step_idx, op = self._current_step()
         if level is None:
-            level = "warning" if ("_failed" in message or "error=" in message) else "info"
+            level = (
+                "warning" if ("_failed" in message or "error=" in message) else "info"
+            )
         evt = {
             "message": message,
             "step_idx": step_idx,
             "op": op,
             "level": level,
+            "kind": kind if kind is not None else infer_kind(message),
+            # Seconds since the question began — the trace viewer's timeline axis
+            # (start/end offsets, latencies). Skipped on the rendered line (the
+            # console already carries a wall-clock HH:MM:SS).
+            "t": round(time.monotonic() - self._t0, 3),
         }
+        if data is not None:
+            evt["data"] = data
         self.events.append(evt)
         trace.write_jsonl({"uid": self.uid, **evt})
         if self._logfile is not None:

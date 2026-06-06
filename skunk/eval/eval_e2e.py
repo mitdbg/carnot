@@ -15,6 +15,9 @@ Usage
   # Sample 10 random UIDs
   python -m eval.eval_e2e --csv data/officeqa_pro.csv --sample 10
 
+  # Run the canonical dev set (first 70 non-test UIDs in eval/dev_set_uids.json)
+  python -m eval.eval_e2e --csv data/officeqa_pro.csv --dev-set
+
   # Run only specific UIDs, bypassing retrieve with golden pages
   python -m eval.eval_e2e --csv data/officeqa_pro.csv --uids UID0001,UID0030 --golden
 
@@ -37,6 +40,7 @@ import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 import pandas as pd
@@ -69,6 +73,7 @@ from skunk import (  # noqa: E402
 from skunk.trace import configure_obs  # noqa: E402
 
 from eval.util import dump_trace  # noqa: E402
+from skunk.eval.scoring import SCORER_VERSION, score_correct  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Golden page parsing (source_docs URLs → PageRefs)
@@ -125,7 +130,6 @@ def load_golden(csv_path: str | Path) -> dict[str, list[PageRef]]:
 
 async def _run_one_question(
     question: str,
-    *,
     verbose: bool,
     uid: str | None = None,
     golden_pages: list[PageRef] | None = None,
@@ -221,12 +225,28 @@ REPORT_FIELDS = [
     "question",
     "predicted",
     "gold_answer",
+    # 1/0 per the official OfficeQA Cup scorer at 0.0% absolute relative error
+    # (the competition metric). See skunk.eval.scoring.
+    "correct",
+    "golden_pages",
     "failed",
     "reason",
 ]
 
+
+def _fmt_golden_pages(pages: list[PageRef] | None) -> str:
+    """Render golden page refs as a compact `month:page` list for the report /
+    trace viewer (the viewer splits on whitespace, then on the last colon)."""
+    if not pages:
+        return ""
+    return " ".join(f"{p.month}:{p.page}" for p in pages)
+
+
 # Held-out test set — see CLAUDE.md. Loaded lazily so the file is optional.
 _TEST_SET_PATH = REPO_ROOT / "eval" / "test_set_uids.json"
+
+# Dev set — the canonical first-70 non-test UIDs used by --dev-set.
+_DEV_SET_PATH = REPO_ROOT / "eval" / "dev_set_uids.json"
 
 
 def _load_test_set() -> set[str]:
@@ -236,6 +256,15 @@ def _load_test_set() -> set[str]:
 
     with _TEST_SET_PATH.open() as f:
         return set(json.load(f).get("uids", []))
+
+
+def _load_dev_set() -> list[str]:
+    if not _DEV_SET_PATH.exists():
+        return []
+    import json
+
+    with _DEV_SET_PATH.open() as f:
+        return [str(u) for u in json.load(f).get("uids", [])]
 
 
 def _pick_uids(
@@ -254,13 +283,116 @@ def _pick_uids(
     return random.sample(all_uids, min(sample, len(all_uids)))
 
 
+@dataclass(frozen=True)
+class EvalConfig:
+    """Settings shared by every UID in one run.
+
+    Built once in `main` after argument parsing, then passed (read-only) to every worker.
+    """
+
+    csv_path: str
+    df_by_uid: pd.DataFrame
+    golden_lookup: dict[str, list[PageRef]] | None
+    # Always-populated golden map for the report's `golden_pages` column (the trace
+    # viewer's groundtruth chips), independent of `--golden` injection above.
+    golden_report: dict[str, list[PageRef]]
+    trace_dir: Path | None
+    verbose: bool
+
+
+async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
+    """Run one UID end-to-end. Returns a row dict, or None if the UID
+    is missing from the CSV (skip-with-warning, not fatal). Catches
+    and records uncaught exceptions so one runaway UID doesn't kill
+    the batch."""
+    if uid not in cfg.df_by_uid.index:
+        print(f"[e2e] WARNING: {uid!r} not found in {cfg.csv_path}", file=sys.stderr)
+        return None
+
+    row = cfg.df_by_uid.loc[uid]
+    question = str(row["question"])
+    gold_answer = row.get("answer")
+    print(f"\n{'=' * 60}\nUID: {uid}\nQ: {question}")
+
+    golden_pages = None
+    if cfg.golden_lookup is not None:
+        golden_pages = cfg.golden_lookup.get(uid, [])
+        if not golden_pages:
+            print(f"[e2e] WARNING: no golden pages for {uid!r}")
+
+    trace_path = log_path = None
+    if cfg.trace_dir:
+        trace_path = str(cfg.trace_dir / f"{uid}.txt")
+        log_path = str(cfg.trace_dir / f"{uid}.log")
+
+    try:
+        result = await _run_one_question(
+            question=question,
+            verbose=cfg.verbose,
+            golden_pages=golden_pages,
+            uid=uid,
+            trace_path=trace_path,
+            log_path=log_path,
+        )
+    except Exception as e:
+        import traceback as _tb
+
+        tb_str = _tb.format_exc()
+        print(f"[e2e] ABORTED UID {uid}: {type(e).__name__}: {e}", file=sys.stderr)
+        if trace_path is not None:
+            try:
+                Path(trace_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(trace_path + ".failed").write_text(
+                    f"UID: {uid}\nQ: {question}\n\nUncaught exception:\n{tb_str}\n"
+                )
+            except Exception:
+                pass
+        result = {
+            "question": question,
+            "answer": None,
+            "failed": True,
+            "reason": f"Uncaught: {type(e).__name__}: {e}",
+        }
+
+    predicted = result["answer"] if not result["failed"] else ""
+
+    # Grade against gold with the official cup scorer at 0.0% rel-err (1/0).
+    correct = score_correct(gold_answer, predicted)
+
+    if result["failed"]:
+        print(f"[e2e] {uid} FAILED: {result['reason']}")
+    else:
+        mark = "✓" if correct else "✗"
+        print(f"[e2e] {uid} Answer: {result['answer']}  [{mark} vs gold: {gold_answer!r}]")
+
+    return {
+        "uid": uid,
+        "question": question,
+        "predicted": predicted,
+        "gold_answer": gold_answer,
+        "correct": correct,
+        "golden_pages": _fmt_golden_pages(cfg.golden_report.get(uid)),
+        "failed": result["failed"],
+        "reason": result["reason"] or "",
+    }
+
+
+# We parallelize the execution of questions using a thread pool; each worker thread
+# runs an event loop (via `asyncio.run`) which allows network I/O (LLM calls) to be
+# concurrent within the question. Since each question executes an orchestrator, which
+# may execute multiple operators in parallel, this enables us to run questions (and
+# to some extent their operators) concurrently.
+def _run_uid(uid: str, cfg: EvalConfig) -> dict | None:
+    return asyncio.run(process_uid(uid, cfg))
+
+
 def main() -> None:
     # Force line-buffered stdout/stderr so live operator/LLM events stream to
     # logs and `tail -f` in real time. Without this, Python block-buffers when
     # stdout is redirected to a file (~4–8KB chunks), making the harness look
     # stalled mid-question even though it's working.
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
+    sys.stdout.reconfigure(line_buffering=True)  # type: ignore
+    sys.stderr.reconfigure(line_buffering=True)  # type: ignore
 
     parser = argparse.ArgumentParser(
         description="End-to-end OfficeQA eval (all UIDs by default)"
@@ -275,6 +407,13 @@ def main() -> None:
     )
     parser.add_argument("--sample", type=int, help="Run a random subset of N UIDs")
     parser.add_argument("--uids", help="Comma-separated UIDs (overrides --sample)")
+    parser.add_argument(
+        "--dev-set",
+        action="store_true",
+        help="Run on the canonical dev set in eval/dev_set_uids.json (the first 70 "
+        "non-test UIDs). Mutually exclusive with --uids; combine with --sample to "
+        "run a random subset of the dev set.",
+    )
     parser.add_argument(
         "--golden",
         action="store_true",
@@ -309,6 +448,7 @@ def main() -> None:
 
     # Build the run directory: eval/traces/[<run-name>_]<YYYYMMDD_HHMMSS>/
     import datetime
+
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     run_label = f"{args.run_name}_{ts}" if args.run_name else ts
     run_dir = Path("eval/traces") / run_label
@@ -326,11 +466,19 @@ def main() -> None:
     configure_obs(jsonl_path=jsonl_path)
 
     print(f"[e2e] Run directory: {run_dir}")
+    print(f"[e2e] Scoring with official cup scorer ({SCORER_VERSION}) at 0.0% rel-err.")
 
     df = pd.read_csv(args.csv)
     df_by_uid = df.set_index("uid")
 
     test_set = _load_test_set()
+
+    if args.dev_set and args.uids:
+        print(
+            "[e2e] ABORT: --dev-set and --uids are mutually exclusive.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
 
     # ABORT (not warn) when --uids names test UIDs without --include-test-set.
     # Per CLAUDE.md: there is no legitimate reason for an explicit UID list
@@ -352,13 +500,38 @@ def main() -> None:
     # Exclude test UIDs from the pool BEFORE sampling so --sample N returns N
     # dev UIDs (rather than N minus however many test UIDs happened to be drawn).
     exclude = test_set if (test_set and not args.include_test_set) else None
-    if exclude and not args.uids:
+    if exclude and not args.uids and not args.dev_set:
         print(
             f"[e2e] Excluded {len(exclude)} held-out test-set UID(s) from the pool. "
             f"Pass --include-test-set to override (see CLAUDE.md).",
             file=sys.stderr,
         )
-    uids = _pick_uids(df, args.sample, args.uids, exclude=exclude)
+
+    if args.dev_set:
+        dev_uids = _load_dev_set()
+        if not dev_uids:
+            print(
+                f"[e2e] ABORT: --dev-set given but {_DEV_SET_PATH} is missing or empty.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        # The dev set is test-set-free by construction; guard anyway so a stale
+        # file can never smuggle a held-out UID into a dev run.
+        if test_set and not args.include_test_set:
+            leaked = sorted(set(dev_uids) & test_set)
+            if leaked:
+                print(
+                    f"[e2e] ABORT: {_DEV_SET_PATH} contains {len(leaked)} held-out "
+                    f"test-set UID(s): {', '.join(leaked)}.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+        uids = dev_uids
+        if args.sample:
+            uids = random.sample(uids, min(args.sample, len(uids)))
+        print(f"[e2e] --dev-set: {len(uids)} of {len(dev_uids)} dev UID(s).")
+    else:
+        uids = _pick_uids(df, args.sample, args.uids, exclude=exclude)
 
     if test_set and args.include_test_set:
         print(
@@ -372,94 +545,33 @@ def main() -> None:
         f"[e2e] Running {len(uids)} UID(s){sample_note} with --workers {args.workers}"
     )
 
-    golden_lookup = load_golden(args.csv) if args.golden else None
+    # `golden_report` is always loaded (for the report's groundtruth column);
+    # `golden_lookup` (the injection path) stays gated on the `--golden` ablation.
+    golden_report = load_golden(args.csv)
+    golden_lookup = golden_report if args.golden else None
 
-    verbose = args.console
+    cfg = EvalConfig(
+        csv_path=args.csv,
+        df_by_uid=df_by_uid,
+        golden_lookup=golden_lookup,
+        golden_report=golden_report,
+        trace_dir=trace_dir,
+        verbose=args.console,
+    )
 
-    async def process_uid(uid: str) -> dict | None:
-        """Run one UID end-to-end. Returns a row dict, or None if the UID
-        is missing from the CSV (skip-with-warning, not fatal). Catches
-        and records uncaught exceptions so one runaway UID doesn't kill
-        the batch."""
-        if uid not in df_by_uid.index:
-            print(f"[e2e] WARNING: {uid!r} not found in {args.csv}", file=sys.stderr)
-            return None
-        row = df_by_uid.loc[uid]
-        question = str(row["question"])
-        gold_answer = row.get("answer")
-        gold_answer = "" if pd.isna(gold_answer) else str(gold_answer)
-
-        print(f"\n{'=' * 60}\nUID: {uid}\nQ: {question}")
-
-        golden_pages = None
-        if golden_lookup is not None:
-            golden_pages = golden_lookup.get(uid, [])
-            if not golden_pages:
-                print(f"[e2e] WARNING: no golden pages for {uid!r}")
-
-        trace_path = log_path = None
-        if trace_dir:
-            trace_path = str(trace_dir / f"{uid}.txt")
-            log_path = str(trace_dir / f"{uid}.log")
-
-        try:
-            result = await _run_one_question(
-                question=question,
-                verbose=verbose,
-                golden_pages=golden_pages,
-                uid=uid,
-                trace_path=trace_path,
-                log_path=log_path,
-            )
-        except Exception as e:
-            import traceback as _tb
-
-            tb_str = _tb.format_exc()
-            print(f"[e2e] ABORTED UID {uid}: {type(e).__name__}: {e}", file=sys.stderr)
-            if trace_path is not None:
-                try:
-                    Path(trace_path).parent.mkdir(parents=True, exist_ok=True)
-                    Path(trace_path + ".failed").write_text(
-                        f"UID: {uid}\nQ: {question}\n\nUncaught exception:\n{tb_str}\n"
-                    )
-                except Exception:
-                    pass
-            result = {
-                "question": question,
-                "answer": None,
-                "failed": True,
-                "reason": f"Uncaught: {type(e).__name__}: {e}",
-            }
-
-        if result["failed"]:
-            print(f"[e2e] {uid} FAILED: {result['reason']}")
-        else:
-            print(f"[e2e] {uid} Answer: {result['answer']}")
-
-        return {
-            "uid": uid,
-            "question": question,
-            "predicted": result["answer"] if not result["failed"] else "",
-            "gold_answer": gold_answer,
-            "failed": result["failed"],
-            "reason": result["reason"] or "",
-        }
-
-    # Each question runs on its own worker thread (shared pool), driving its own
-    # event loop via `asyncio.run`. LLM I/O is async *within* a question (branch +
-    # fan-out concurrency); code exec runs inline on the worker thread. `--workers`
-    # is the cross-question concurrency cap. Slots are pre-allocated so the output
-    # CSV preserves input UID order regardless of completion order.
-    def _run_uid(uid: str) -> dict | None:
-        return asyncio.run(process_uid(uid))
-
+    # `results` is pre-allocated so the output CSV preserves input UID order
+    # regardless of completion order.
     results: list[dict | None] = [None] * len(uids)
     if args.workers <= 1:
         for i, uid in enumerate(uids):
-            results[i] = _run_uid(uid)
+            results[i] = _run_uid(uid, cfg)
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
+<<<<<<< HEAD
             futures = {pool.submit(lambda : asyncio.run(process_uid(uid))): i for i, uid in enumerate(uids)}
+=======
+            futures = {pool.submit(_run_uid, uid, cfg): i for i, uid in enumerate(uids)}
+>>>>>>> skunk
             for fut in as_completed(futures):
                 results[futures[fut]] = fut.result()
 
@@ -474,10 +586,14 @@ def main() -> None:
     n_total = len(rows)
     n_failed = sum(1 for r in rows if r["failed"])
     print(f"\n[e2e] Wrote {out} ({n_total} rows)")
-    print(
-        f"[e2e] Summary: {n_total - n_failed}/{n_total} produced an answer "
-        f"(no scoring — see {out} for predicted vs gold_answer)"
-    )
+    print(f"[e2e] {n_total - n_failed}/{n_total} produced an answer")
+    if n_total:
+        n_correct = sum(1 for r in rows if r["correct"] == 1)
+        pct = 100.0 * n_correct / n_total
+        print(
+            f"[e2e] Accuracy: {n_correct}/{n_total} correct ({pct:.1f}%) "
+            f"at 0.0% absolute relative error ({SCORER_VERSION})"
+        )
 
 
 if __name__ == "__main__":

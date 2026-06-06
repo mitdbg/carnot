@@ -38,23 +38,17 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pydantic import BaseModel, Field
 from pathlib import Path
 
-from skunk.common import ExecutionContext, LLMResponse, load_env_file
+
+from skunk.common import load_env_file
+from skunk.llm_client import LLMClient, LLMResponse
 from skunk.config import SkunkConfig
 from skunk.trace import configure_obs
 
-from skunk.corpus import (
-    page_elements, page_text_tagged, parse_bulletin_filename, parsed_json_dir,
-    pdf_dir_from_env,
-)
-from .data_model import (
-    BUILD_STATS_FILE, BUILD_SUBDIR, CATALOG_SUBDIR, L1_SUBDIR, MANIFEST_FILE,
-    TREE_FILE, BuildPage, PageCatalogRow,
-)
-from .catalog import TreasuryCatalogBuilder
-from .summarize import PageSummarizer
-from .l1_harvest import SectionSpan, TreasuryL1Harvester
-from .placer import TreasuryPagePlacer
-from .merger import TreasuryChapterMerger
+from .corpora import PROFILES, load_profile
+from skunk.corpus import page_elements, page_text_tagged
+from .profile import CorpusProfile, StageError
+from .schema import PageCatalogRow
+from .stages.l1_harvest import SectionSpan
 
 log = logging.getLogger(__name__)
 
@@ -204,10 +198,10 @@ def _parse_window(s: str) -> tuple[int, int]:
     return lo, hi
 
 
-def _config_with_model(model: str | None) -> SkunkConfig:
-    cfg = SkunkConfig.from_env()
+def _config_with_model(cfg: SkunkConfig, model: str | None) -> SkunkConfig:
+    """Per-stage view of the run's single `SkunkConfig`, with an optional model override."""
     if model and model != cfg.llm_model:
-        cfg = dataclasses.replace(cfg, llm_model=model)
+        return dataclasses.replace(cfg, llm_model=model)
     return cfg
 
 
@@ -283,7 +277,7 @@ def _require(condition: bool, hint: str) -> None:
 def stage_build_catalog(args: argparse.Namespace) -> None:
     log.info("=== Stage 1: build_catalog ===")
     _require(args.pdf_dir.is_dir(), f"PDF dir does not exist: {args.pdf_dir}")
-    parsed_dir = args.parsed_json_dir or parsed_json_dir()
+    parsed_dir = args.parsed_json_dir
     _require(parsed_dir.is_dir(),
              f"Parsed-JSON dir does not exist: {parsed_dir}")
 
@@ -402,7 +396,7 @@ def stage_extract_l1(args: argparse.Namespace) -> None:
     _require(build_dir.is_dir(),
              f"build/ missing at {build_dir} — run build_catalog first.")
 
-    parsed_dir = args.parsed_json_dir or parsed_json_dir()
+    parsed_dir = args.parsed_json_dir
     _require(parsed_dir.is_dir(),
              f"Parsed-JSON dir does not exist: {parsed_dir}")
 
@@ -413,9 +407,10 @@ def stage_extract_l1(args: argparse.Namespace) -> None:
     bulletins = sorted(build_by_bulletin)
     log.info(f"{len(bulletins)} bulletins → {l1_dir}")
 
-    cfg = _config_with_model(args.l1_model)
-    ctx = ExecutionContext(question="build:extract_l1", config=cfg)
-    llm = _StageClient(ctx)
+    cfg = _config_with_model(args.cfg, args.l1_model)
+    inner_llm = LLMClient(cfg)
+    stats = _BUILD_STATS["extract_l1"]
+    llm = StageLLMWrapper(inner_llm, stats, _BUILD_STATS_LOCK)
     log.info(f"model: {cfg.llm_model}")
     harvester = TreasuryL1Harvester()
     t0 = time.monotonic()
@@ -485,9 +480,11 @@ def stage_place_pages(args: argparse.Namespace) -> None:
 
     log.info(f"{len(build_by_bulletin)} bulletins; "
              f"sum L1 spans = {sum(len(v) for v in l1_by_bulletin.values())}")
-    cfg = _config_with_model(args.place_model)
-    ctx = ExecutionContext(question="build:place_pages", config=cfg)
-    llm = _StageClient(ctx)
+
+    cfg = _config_with_model(args.cfg, args.place_model)
+    inner_llm = LLMClient(cfg)
+    stats = _BUILD_STATS["place_pages"]
+    llm = StageLLMWrapper(inner_llm, stats, _BUILD_STATS_LOCK)
     log.info(f"model: {cfg.llm_model}")
 
     placer = TreasuryPagePlacer()
@@ -540,9 +537,11 @@ def stage_merge_chapters(args: argparse.Namespace) -> None:
     catalog: list[BuildPage] = [r for rows in build_by_bulletin.values() for r in rows]
     log.info(f"{len(catalog)} build rows loaded")
 
-    cfg = _config_with_model(args.merge_model)
-    ctx = ExecutionContext(question="build:merge_chapters", config=cfg)
-    llm = _StageClient(ctx)
+
+    cfg = _config_with_model(args.cfg, args.merge_model)
+    inner_llm = LLMClient(cfg)
+    stats = _BUILD_STATS["merge_chapters"]
+    llm = StageLLMWrapper(inner_llm, stats, _BUILD_STATS_LOCK)
     log.info(f"model: {cfg.llm_model}")
 
     t0 = time.monotonic()
@@ -591,7 +590,7 @@ def stage_manifest(args: argparse.Namespace) -> None:
         capture_output=True, text=True,
     ).stdout.strip()
 
-    cfg = SkunkConfig.from_env()
+    cfg = args.cfg
     manifest = {
         "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "git_sha": git_sha[:12] if git_sha else None,
@@ -757,10 +756,11 @@ def main() -> int:
                     help="Inclusive year window (default 1939-2025).")
     ap.add_argument("--bulletins", type=str, default=None,
                     help="Comma-separated YYYY-MM to override (debug).")
-    ap.add_argument("--pdf-dir", type=Path, default=pdf_dir_from_env(),
-                    help="Directory holding corpus PDF files.")
+
+    ap.add_argument("--pdf-dir", type=Path, default=None,
+                    help="Directory holding corpus PDF files (default: SkunkConfig.pdf_dir).")
     ap.add_argument("--parsed-json-dir", type=Path, default=None,
-                    help="Parsed-JSON corpus dir; defaults to env/parsed_json_dir().")
+                    help="Parsed-JSON corpus dir (default: SkunkConfig.parsed_json_dir).")
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--summarize-model", type=str, default=None,
                     help="LLM model override for summarize (else SkunkConfig default).")
@@ -777,6 +777,13 @@ def main() -> int:
                         dest=f"skip_{s}")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+
+    # The single config for this run: built once here (the entrypoint) and threaded to
+    # every stage via `args.cfg`. CLI dir flags override the config's defaults; per-stage
+    # model overrides go through `_config_with_model`.
+    args.cfg = SkunkConfig.from_env()
+    args.pdf_dir = args.pdf_dir or args.cfg.pdf_dir
+    args.parsed_json_dir = args.parsed_json_dir or args.cfg.parsed_json_dir
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     configure_obs()

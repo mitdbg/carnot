@@ -178,11 +178,36 @@ event, no `_step` reservation, no separate step structure.
   Parse/validation retries → `PromptedCall`. Semantic decisions → the operator.
   No layer re-logs another layer's fact.
 - **`message` is one string: a stable snake_case event key, then variables
-  interpolated inline.** There are no structured fields and no separate `source`
-  (the active step's `op` identifies the emitter), e.g.
+  interpolated inline.** There is no separate `source` (the active step's `op`
+  identifies the emitter), e.g.
   `emit(f"sample tier=parsed_json idx={i} n={n} n_entries={k}")`. Lead with the
   event key so the stream stays greppable; keep large blobs (full prompts,
-  transcripts, generated code) out of the message — log a count or short `repr`.
+  transcripts, generated code) out of the **message** — log a count or short `repr`.
+- **`kind` + `data` + `t` are the trace viewer's structured channel (optional).**
+  The *message* stays a scannable one-liner, but three extra fields ride alongside
+  it for the post-hoc trace viewer (`eval/trace_viewer/`). `kind` is the event's
+  semantic role (`system` / `user` / `assistant` / `observation` / `error` / `call`
+  / `plan` / `summary` / `step` / `note`) used for color-coding, inferred from the
+  message's leading event key when omitted (`common.infer_kind`). `data` is a
+  JSON-able structured payload. `t` is seconds since the question began (the
+  viewer's timeline axis), stamped automatically on every event. The structured
+  captures, each at the layer that owns the fact:
+    - **Agent turns** (multi-turn `retrieve` / `lookup_external`): the system
+      prompt, each assistant turn, and structured observation blocks
+      (`multi_turn_agent`).
+    - **Single-shot operator I/O** (`planner` / `question_explainer` / `extract` /
+      `compute` / `replanner`): system + user + each assistant reply, emitted once
+      at the `PromptedCall.call` chokepoint (the multi-turn branch never reaches it,
+      so there is no double-log).
+    - **Plan + node summaries** (orchestrator): one `plan` event per revision
+      (branches carry a stable `branch_id`; replan revisions carry the
+      `reason`/`missing` that triggered them), and each `step` boundary's
+      `summarize_value` node summary (`result.summarize_value`).
+  `kind`/`data`/`t` are captured to `ctx.events` and the JSONL sink but
+  **deliberately excluded from the rendered console / `.log` line** (`render_line`
+  skips them; the line already carries a wall-clock `HH:MM:SS`) so the human
+  one-liner is unchanged. Use `data` only for the genuinely large/structured
+  payloads a viewer needs; everyday events stay message-only.
 - **Severity is automatic.** `emit` levels an event `warning` when its message
   contains a `_failed` event key or an `error=` field, else `info`; pass `level=`
   to override.

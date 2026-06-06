@@ -11,7 +11,8 @@ import time
 from collections import Counter
 from typing import Any
 
-from skunk.common import LLMClient, parse_json_response
+from skunk.common import parse_json_response
+from skunk.llm_client import LLMClient
 
 from .data_model import BuildPage
 from .placer import UNFILED

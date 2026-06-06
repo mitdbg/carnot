@@ -27,7 +27,7 @@ def _render_pages_b64(
     rendered_refs: list[PageRef] = []
     for ref in refs:
         try:
-            img = render_page_b64(ref.month, ref.page, dpi=dpi, fmt=fmt)
+            img = render_page_b64(ref.month, ref.page, dpi=dpi, fmt=fmt, pdf_dir=ctx.config.pdf_dir)
         except Exception as e:  # noqa: BLE001 — vision tier fallback; any fitz error → skip page
             ctx.emit(f"render_failed page={str(ref)} error={str(e)!r}")
             continue
@@ -172,7 +172,7 @@ pick the smallest shape that captures every relevant value."""
         read them), appending a figure-note hint when the page carries charts."""
         pages: list[tuple[PageRef, str]] = []
         for ref in refs:
-            text = get_page_text(ref.month, ref.page)
+            text = get_page_text(ref.month, ref.page, base_dir=ctx.config.parsed_json_dir)
             if not text:
                 ctx.emit(f"no_text tier=parsed_json page={str(ref)}")
                 continue
@@ -181,7 +181,7 @@ pick the smallest shape that captures every relevant value."""
             # value missing or scrapes it from prose. Flag any figures so it can defer
             # to the vision tier instead.
             try:
-                els = page_elements(ref.month).get(ref.page) or []  # type: ignore[arg-type]
+                els = page_elements(ref.month, base_dir=ctx.config.parsed_json_dir).get(ref.page) or []  # type: ignore[arg-type]
             except Exception:  # noqa: BLE001 — best-effort hint; never block extraction on a parse miss
                 els = []
             n_figs = sum(1 for e in els if e.get("type") == "figure")
