@@ -28,7 +28,6 @@ import dataclasses
 import hashlib
 import json
 import logging
-import os
 import re
 import subprocess
 import threading
@@ -38,14 +37,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from skunk.common import LLMClient, LLMResponse, load_env_file
+from skunk.common import load_env_file
+from skunk.llm_client import LLMClient, LLMResponse
 from skunk.config import SkunkConfig
 from skunk.trace import configure_obs
 
 from .corpora import PROFILES, load_profile
-from skunk.corpus import (
-    page_elements, page_text_tagged, parsed_json_dir, pdf_dir_from_env,
-)
+from skunk.corpus import page_elements, page_text_tagged
 from .profile import CorpusProfile, StageError
 from .schema import PageCatalogRow
 from .stages.l1_harvest import SectionSpan
@@ -185,10 +183,10 @@ def _parse_window(s: str) -> tuple[int, int]:
     return lo, hi
 
 
-def _config_with_model(model: str | None) -> SkunkConfig:
-    cfg = SkunkConfig.from_env()
+def _config_with_model(cfg: SkunkConfig, model: str | None) -> SkunkConfig:
+    """Per-stage view of the run's single `SkunkConfig`, with an optional model override."""
     if model and model != cfg.llm_model:
-        cfg = dataclasses.replace(cfg, llm_model=model)
+        return dataclasses.replace(cfg, llm_model=model)
     return cfg
 
 
@@ -244,7 +242,7 @@ def _require(condition: bool, hint: str) -> None:
 def stage_build_catalog(args: argparse.Namespace, profile: CorpusProfile) -> None:
     log.info("=== Stage 1: build_catalog ===")
     _require(args.pdf_dir.is_dir(), f"PDF dir does not exist: {args.pdf_dir}")
-    parsed_dir = args.parsed_json_dir or parsed_json_dir()
+    parsed_dir = args.parsed_json_dir
     _require(parsed_dir.is_dir(),
              f"Parsed-JSON dir does not exist: {parsed_dir}")
 
@@ -302,7 +300,7 @@ def stage_extract_l1(args: argparse.Namespace, profile: CorpusProfile) -> None:
     _require(catalog_dir.is_dir(),
              f"catalog/ missing at {catalog_dir} — run build_catalog first.")
 
-    parsed_dir = args.parsed_json_dir or parsed_json_dir()
+    parsed_dir = args.parsed_json_dir
     _require(parsed_dir.is_dir(),
              f"Parsed-JSON dir does not exist: {parsed_dir}")
 
@@ -313,7 +311,7 @@ def stage_extract_l1(args: argparse.Namespace, profile: CorpusProfile) -> None:
     bulletins = sorted(catalog_by_bulletin)
     log.info(f"{len(bulletins)} bulletins → {l1_dir}")
 
-    cfg = _config_with_model(args.l1_model)
+    cfg = _config_with_model(args.cfg, args.l1_model)
     inner_llm = LLMClient(cfg)
     stats = _BUILD_STATS["extract_l1"]
     llm = StageLLMWrapper(inner_llm, stats, _BUILD_STATS_LOCK)
@@ -385,7 +383,7 @@ def stage_place_pages(args: argparse.Namespace, profile: CorpusProfile) -> None:
 
     log.info(f"{len(catalog_by_bulletin)} bulletins; "
              f"sum L1 spans = {sum(len(v) for v in l1_by_bulletin.values())}")
-    cfg = _config_with_model(args.place_model)
+    cfg = _config_with_model(args.cfg, args.place_model)
     inner_llm = LLMClient(cfg)
     stats = _BUILD_STATS["place_pages"]
     llm = StageLLMWrapper(inner_llm, stats, _BUILD_STATS_LOCK)
@@ -444,7 +442,7 @@ def stage_merge_chapters(args: argparse.Namespace, profile: CorpusProfile) -> No
             catalog.append(PageCatalogRow.from_json(line))
     log.info(f"{len(catalog)} catalog rows loaded")
 
-    cfg = _config_with_model(args.merge_model)
+    cfg = _config_with_model(args.cfg, args.merge_model)
     inner_llm = LLMClient(cfg)
     stats = _BUILD_STATS["merge_chapters"]
     llm = StageLLMWrapper(inner_llm, stats, _BUILD_STATS_LOCK)
@@ -486,7 +484,7 @@ def stage_manifest(args: argparse.Namespace, profile: CorpusProfile) -> None:
         capture_output=True, text=True,
     ).stdout.strip()
 
-    cfg = SkunkConfig.from_env()
+    cfg = args.cfg
     manifest = {
         "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "git_sha": git_sha[:12] if git_sha else None,
@@ -640,11 +638,6 @@ _STAGE_FUNCS = {
 }
 
 
-def _default_pdf_dir() -> Path:
-    env = os.environ.get("OFFICEQA_PDF_DIR")
-    return Path(env) if env else pdf_dir_from_env()
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Corpus-agnostic page-index build pipeline.")
@@ -657,10 +650,10 @@ def main() -> int:
                     help="Inclusive year window (default 1939-2025).")
     ap.add_argument("--bulletins", type=str, default=None,
                     help="Comma-separated YYYY-MM to override (debug).")
-    ap.add_argument("--pdf-dir", type=Path, default=_default_pdf_dir(),
-                    help="Directory holding corpus PDF files.")
+    ap.add_argument("--pdf-dir", type=Path, default=None,
+                    help="Directory holding corpus PDF files (default: SkunkConfig.pdf_dir).")
     ap.add_argument("--parsed-json-dir", type=Path, default=None,
-                    help="Parsed-JSON corpus dir; defaults to env/parsed_json_dir().")
+                    help="Parsed-JSON corpus dir (default: SkunkConfig.parsed_json_dir).")
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--l1-model", type=str, default=None,
                     help="LLM model override for extract_l1 (else SkunkConfig default).")
@@ -675,6 +668,13 @@ def main() -> int:
                         dest=f"skip_{s}")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
+
+    # The single config for this run: built once here (the entrypoint) and threaded to
+    # every stage via `args.cfg`. CLI dir flags override the config's defaults; per-stage
+    # model overrides go through `_config_with_model`.
+    args.cfg = SkunkConfig.from_env()
+    args.pdf_dir = args.pdf_dir or args.cfg.pdf_dir
+    args.parsed_json_dir = args.parsed_json_dir or args.cfg.parsed_json_dir
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     configure_obs()

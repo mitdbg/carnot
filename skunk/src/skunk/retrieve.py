@@ -18,7 +18,6 @@ emit their own start/done boundaries (the orchestrator's trace owns those).
 from __future__ import annotations
 
 import json
-import os
 import threading
 from pathlib import Path
 
@@ -177,10 +176,4 @@ def _build_resources(config: SkunkConfig):
             f"under {chromadb_dir!s}: {e}",
         ) from e
 
-    if not os.environ.get("GOOGLE_CLOUD_PROJECT"):
-        raise StepFailed(
-            "retrieve",
-            "GOOGLE_CLOUD_PROJECT not set — required for Vertex AI. "
-            "Set it in your .env and run `gcloud auth application-default login`.",
-        )
     return collection, document_map

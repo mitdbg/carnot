@@ -64,6 +64,11 @@ Default model `gemini-3.5-flash` (override via `SKUNK_LLM_MODEL`; use bare model
 `google/` prefix). Strongly recommended for `lookup_external`: `FRED_API_KEY`,
 `TAVILY_API_KEY`. Copy `.env.example` → `.env`.
 
+To route generation through **OpenRouter** instead, set `SKUNK_LLM_PROVIDER=openrouter`
+with `OPENROUTER_API_KEY`; in that mode `SKUNK_LLM_MODEL` (and any model overrides) must be
+full OpenRouter ids, e.g. `google/gemini-2.5-flash` or `qwen/qwen-2.5-72b-instruct`.
+Embeddings are unaffected (they dispatch on the embedding model id).
+
 ## Data corpus (not in this repo)
 
 Treasury Bulletin PDFs at `~/Desktop/officeqa/treasury_bulletin_pdfs/` (~20 GB, 696 files);

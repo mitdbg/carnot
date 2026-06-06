@@ -23,7 +23,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from skunk.common import ExecutionContext, LLMClient
+from skunk.common import ExecutionContext
+from skunk.llm_client import LLMClient
 
 from .schema import PageCatalogRow
 

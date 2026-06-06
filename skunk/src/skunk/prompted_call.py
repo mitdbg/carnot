@@ -17,8 +17,8 @@ Section = Literal["corpus", "few_shots", "lessons"]
 @dataclass(frozen=True)
 class PromptOverride:
     section: Section
-    targets: tuple[str, ...]                          # agent names; "*" = all
-    content: str | tuple[str, ...]                    # str for corpus/lessons; tuple for few_shots
+    targets: tuple[str, ...]  # agent names; "*" = all
+    content: str | tuple[str, ...]  # str for corpus/lessons; tuple for few_shots
 
 
 def load_prompt_overrides(path: str | Path) -> tuple[PromptOverride, ...]:
@@ -68,7 +68,10 @@ def _build_tail(parts: _PromptParts) -> str:
     if parts.few_shots:
         sections.append("\n## Few-shot examples\n" + "\n\n".join(parts.few_shots))
     if parts.lessons:
-        sections.append("\n## Lessons learned\n" + "\n".join(f"- {lesson}" for lesson in parts.lessons))
+        sections.append(
+            "\n## Lessons learned\n"
+            + "\n".join(f"- {lesson}" for lesson in parts.lessons)
+        )
     if not sections:
         return ""
     return (
@@ -126,12 +129,16 @@ class PromptedCall[T]:
         self._max_parse_retries = max_parse_retries
 
     def _assemble_system_prompt(self, ctx: ExecutionContext) -> str:
-        return self._system_prompt + _build_tail(_gather_overrides(ctx.prompt_overrides, self.name))
+        return self._system_prompt + _build_tail(
+            _gather_overrides(ctx.prompt_overrides, self.name)
+        )
 
     def _resolve_effort(self, ctx: ExecutionContext, effort: Effort | None) -> Effort:
         if effort is not None:
             return effort
-        return cast(Effort, ctx.config.effort_overrides.get(self.name, self._default_effort))
+        return cast(
+            Effort, ctx.config.effort_overrides.get(self.name, self._default_effort)
+        )
 
     def _resolve_model(self, ctx: ExecutionContext) -> str:
         return ctx.config.model_overrides.get(self.name, ctx.config.llm_model)
@@ -171,7 +178,9 @@ class PromptedCall[T]:
         system = self._assemble_system_prompt(ctx)
         if messages is not None:
             model = ctx.config.agent_model_id or self._resolve_model(ctx)
-            messages = list(messages)  # work on a copy so callers don't see retry exchanges
+            messages = list(
+                messages
+            )  # work on a copy so callers don't see retry exchanges
             attempt = 0
             while True:
                 resp = await ctx.llm_client.astream(
@@ -188,11 +197,32 @@ class PromptedCall[T]:
                 except ParseError as e:
                     if attempt >= self._max_parse_retries:
                         raise
-                    ctx.emit(f"parse_retry call_site={self.name} attempt={attempt + 1} error={e.detail!r}")
+                    ctx.emit(
+                        f"parse_retry call_site={self.name} attempt={attempt + 1} error={e.detail!r}"
+                    )
                     messages.append({"role": "assistant", "content": resp.text})
-                    messages.append({"role": "user", "content": self._compose_user("", e).strip()})
+                    messages.append(
+                        {"role": "user", "content": self._compose_user("", e).strip()}
+                    )
                     attempt += 1
         model = self._resolve_model(ctx)
+        # Capture the operator's full LLM I/O for the trace viewer — the `call`
+        # envelope LLMClient logs carries only latency/tokens, not the text. System
+        # + the base user go once; each attempt's assistant reply is emitted as it
+        # arrives. The multi-turn branch above never reaches here, and those agents
+        # emit their own per-turn system/assistant via `MultiTurnAgent`, so there is
+        # no double-logging.
+        ctx.emit(
+            f"prompt_system call_site={self.name} chars={len(system)}",
+            kind="system",
+            data={"text": system},
+        )
+        base_user = self._compose_user(user, None)
+        ctx.emit(
+            f"prompt_user call_site={self.name} chars={len(base_user)}",
+            kind="user",
+            data={"text": base_user},
+        )
         attempt = 0
         retry: ParseError | None = None
         while True:
@@ -206,11 +236,18 @@ class PromptedCall[T]:
                 call_site=self.name,
                 model=model,
             )
+            ctx.emit(
+                f"assistant call_site={self.name} chars={len(resp.text)}",
+                kind="assistant",
+                data={"text": resp.text},
+            )
             try:
                 return self._parse(resp.text, ctx)
             except ParseError as e:
                 if attempt >= self._max_parse_retries:
                     raise
-                ctx.emit(f"parse_retry call_site={self.name} attempt={attempt + 1} error={e.detail!r}")
+                ctx.emit(
+                    f"parse_retry call_site={self.name} attempt={attempt + 1} error={e.detail!r}"
+                )
                 retry = e
                 attempt += 1

@@ -33,7 +33,7 @@ from threading import Lock
 import numpy as np
 from google import genai
 from google.genai import types as genai_types  # noqa: F401
-from skunk.common import _make_genai_client
+from skunk.common import make_genai_client
 from skunk.corpus import preprocess_text
 
 # Gemini Embedding 2 Preview context limit (tokens).
@@ -212,8 +212,8 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Auth via ADC + GOOGLE_CLOUD_PROJECT (see skunk.common._make_genai_client).
-    client = _make_genai_client()
+    # Auth via ADC + GOOGLE_CLOUD_PROJECT (see skunk.common.make_genai_client).
+    client = make_genai_client()
 
     json_files = sorted(glob.glob(os.path.join(args.input_dir, "*.json")))
     print(f"Processing {len(json_files)} .json files.")

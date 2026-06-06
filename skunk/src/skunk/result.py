@@ -46,3 +46,45 @@ def describe_value(v: Any) -> str:
         return f"list({len(v)} branches)"
     s = repr(v)
     return s[:100] + ("..." if len(s) > 100 else "")
+
+
+def _summarize_annotated(e: AnnotatedValue) -> dict:
+    """One `AnnotatedValue` as a JSON-able dict for the trace viewer's node summary."""
+    return {
+        "description": e.description,
+        "unit": e.unit,
+        "value_kind": e.kind,
+        "value": e.value,
+    }
+
+
+def summarize_value(v: Any) -> dict:
+    """Structured, JSON-able summary of an operator's return value — the machine-
+    readable companion to `describe_value`, attached to the `step` boundary event so
+    the trace viewer can render a rich collapsed node summary (pages a retrieve
+    returned, extracted values, the computed answer)."""
+    if v is None:
+        return {"type": "none"}
+    if isinstance(v, Plan):
+        return {
+            "type": "plan",
+            "branches": [b.model_dump(mode="json") for b in v.branches],
+        }
+    if isinstance(v, list) and v and isinstance(v[0], PageRef):
+        return {
+            "type": "pages",
+            "pages": [{"month": p.month, "page": p.page} for p in v],
+        }
+    if isinstance(v, list) and v and isinstance(v[0], AnnotatedValue):
+        return {"type": "values", "values": [_summarize_annotated(e) for e in v]}
+    if isinstance(v, str):
+        return {"type": "answer", "answer": v}
+    if isinstance(v, list):
+        return {"type": "list", "n": len(v)}
+    dump = getattr(v, "model_dump", None)
+    if callable(dump):
+        try:
+            return {"type": type(v).__name__, "value": dump(mode="json")}
+        except Exception:
+            pass
+    return {"type": "scalar", "value": describe_value(v)}

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-from skunk.common import LLMClient
+from skunk.llm_client import LLMClient
 
 from ..schema import PageCatalogRow
 from .l1_harvest import SectionSpan
