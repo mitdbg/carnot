@@ -4,7 +4,8 @@ question → Planner → Plan (branches) → orchestrator →
 {retrieve, extract, lookup_external, compute}, where `compute` is the chain terminator
 and subsumes formatting. Public API is re-exported below; see ARCHITECTURE.md for intent."""
 
-from skunk.common import AnnotatedValue, ExecutionContext, LLMClient, PageRef
+from skunk.common import AnnotatedValue, ExecutionContext, PageRef
+from skunk.llm_client import LLMClient
 from skunk.config import SkunkConfig
 from skunk.errors import MissingData, StepFailed
 from skunk.orchestrator import Orchestrator

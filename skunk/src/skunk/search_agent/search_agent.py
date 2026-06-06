@@ -25,7 +25,7 @@ import os
 
 from chromadb.api.models.Collection import Collection
 
-from skunk.common import ExecutionContext, _make_genai_client
+from skunk.common import ExecutionContext, make_genai_client
 from skunk.config import SkunkConfig
 from skunk.local_python_executor import CodeOutput
 from skunk.multi_turn_agent import Block, ChunkBlock, MultiTurnAgent, TextBlock
@@ -53,7 +53,7 @@ def _make_embedding_client(emb_model_id: str) -> tuple[EmbeddingClient, str]:
     """
     cleaned = emb_model_id.removeprefix("google/")
     if "gemini" in cleaned.lower():
-        return _make_genai_client(), cleaned
+        return make_genai_client(), cleaned
     from openrouter import OpenRouter
 
     return OpenRouter(api_key=os.environ["OPENROUTER_API_KEY"]), emb_model_id

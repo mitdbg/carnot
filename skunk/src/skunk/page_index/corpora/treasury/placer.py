@@ -21,7 +21,8 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
-from skunk.common import LLMClient, parse_json_response
+from skunk.common import parse_json_response
+from skunk.llm_client import LLMClient
 
 from ...schema import PageCatalogRow
 from ...stages.l1_harvest import SectionSpan, section_for_printed_page

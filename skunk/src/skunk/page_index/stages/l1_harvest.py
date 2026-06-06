@@ -11,7 +11,7 @@ import re
 from dataclasses import dataclass
 from typing import Protocol
 
-from skunk.common import LLMClient
+from skunk.llm_client import LLMClient
 
 from ..schema import PageCatalogRow
 

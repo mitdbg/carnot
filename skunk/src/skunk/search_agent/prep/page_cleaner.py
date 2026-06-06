@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from tqdm import tqdm
 
-from skunk.common import LLMClient
+from skunk.llm_client import LLMClient
 from skunk.config import SkunkConfig
 from skunk.corpus import render_page_b64
 # Table-truncation logic now lives in `corpus` (also reused on-the-fly by the

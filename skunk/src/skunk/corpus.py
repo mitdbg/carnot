@@ -11,7 +11,6 @@ from __future__ import annotations
 import base64
 import html as _html
 import json
-import os
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -23,9 +22,6 @@ from skunk.errors import StepFailed
 
 _FILENAME_RE = re.compile(r"treasury_bulletin_(\d{4})_(\d{2})\.pdf$")
 
-_PARSED_JSON_DEFAULT_DIR = Path.home() / "Desktop/officeqa/treasury_bulletins_parsed/jsons"
-_PDF_DEFAULT_DIR = Path.home() / "Desktop/officeqa/treasury_bulletin_pdfs"
-
 
 def parse_bulletin_filename(path: str | Path) -> str:
     """treasury_bulletin_1953_06.pdf  ->  '1953-06'."""
@@ -35,32 +31,24 @@ def parse_bulletin_filename(path: str | Path) -> str:
     return f"{m.group(1)}-{m.group(2)}"
 
 
-def parsed_json_dir() -> Path:
-    """Resolve the parsed-JSON directory (env override, then default)."""
-    d = os.environ.get("OFFICEQA_PARSED_JSON_DIR")
-    return Path(d) if d else _PARSED_JSON_DEFAULT_DIR
+# Directory args below are required, not defaulted: the corpus lives wherever the
+# caller's single `SkunkConfig` says (`config.parsed_json_dir` / `config.pdf_dir`).
+# These functions never resolve a directory on their own — that would reintroduce a
+# second, possibly-divergent source of truth alongside the entrypoint's config.
 
 
-def pdf_dir_from_env() -> Path:
-    """Resolve the PDF corpus directory (env override, then default)."""
-    d = os.environ.get("OFFICEQA_PDF_DIR")
-    return Path(d) if d else _PDF_DEFAULT_DIR
-
-
-def pdf_path_for(bulletin: str, pdf_dir: Path | str | None = None) -> Path:
-    """Inverse of `parse_bulletin_filename`: '1953-06' -> <dir>/treasury_bulletin_1953_06.pdf."""
+def pdf_path_for(bulletin: str, pdf_dir: Path | str) -> Path:
+    """Inverse of `parse_bulletin_filename`: '1953-06' -> <pdf_dir>/treasury_bulletin_1953_06.pdf."""
     year, mon = bulletin.split("-")
-    base = Path(pdf_dir) if pdf_dir is not None else pdf_dir_from_env()
-    return base / f"treasury_bulletin_{int(year):04d}_{int(mon):02d}.pdf"
+    return Path(pdf_dir) / f"treasury_bulletin_{int(year):04d}_{int(mon):02d}.pdf"
 
 
 @lru_cache(maxsize=64)
-def load_parsed_doc(month: str, base_dir: str | None = None) -> dict:
-    """Load a bulletin's parsed-JSON document (LRU-cached). Raises FileNotFoundError
-    if missing; json errors propagate."""
+def load_parsed_doc(month: str, base_dir: str) -> dict:
+    """Load a bulletin's parsed-JSON document from `base_dir` (LRU-cached on both args).
+    Raises FileNotFoundError if missing; json errors propagate."""
     year, mon = month.split("-")
-    base = Path(base_dir) if base_dir is not None else parsed_json_dir()
-    p = base / f"treasury_bulletin_{year}_{mon}.json"
+    p = Path(base_dir) / f"treasury_bulletin_{year}_{mon}.json"
     if not p.exists():
         raise FileNotFoundError(f"parsed-JSON not found: {p}")
     return json.loads(p.read_text())
@@ -69,14 +57,13 @@ def load_parsed_doc(month: str, base_dir: str | None = None) -> dict:
 def page_elements(
     month: str,
     *,
-    base_dir: str | Path | None = None,
+    base_dir: str | Path,
     fill_gaps: bool = False,
 ) -> dict[int, list[dict]]:
     """`{1-based PDF page index → list of parsed-JSON element dicts}`. `fill_gaps=False`
     (default) includes only pages carrying elements; `fill_gaps=True` includes every
     page `1..max_page` (empty list for blanks) — the dense view the build pipeline wants."""
-    base = str(base_dir) if base_dir is not None else None
-    doc = load_parsed_doc(month, base)
+    doc = load_parsed_doc(month, str(base_dir))
 
     by_page: dict[int, list[dict]] = {}
     max_page = 0
@@ -97,14 +84,14 @@ def page_elements(
     return by_page
 
 
-def get_page_text(month: str | None, page: int | None) -> str | None:
+def get_page_text(month: str | None, page: int | None, *, base_dir: str | Path) -> str | None:
     """Concatenated parsed-JSON `content` for a PDF page (extract Tier 1; HTML tables
     verbatim). Raises `StepFailed` if the source is missing/corrupt; returns None when
     the source is healthy but this page has no content."""
     if month is None or page is None:
         return None
     try:
-        idx = page_elements(month)
+        idx = page_elements(month, base_dir=base_dir)
     except (FileNotFoundError, OSError, json.JSONDecodeError) as e:
         raise StepFailed("extract", f"parsed-JSON unavailable for {month}: {e}") from e
     elements = idx.get(int(page))
@@ -114,7 +101,7 @@ def get_page_text(month: str | None, page: int | None) -> str | None:
     return "\n\n".join(parts) if parts else None
 
 
-def page_text_tagged(month: str, *, base_dir: str | Path | None = None) -> dict[int, str]:
+def page_text_tagged(month: str, *, base_dir: str | Path) -> dict[int, str]:
     """`{1-based PDF page index: concatenated page text}` for the build pipeline. Each
     element is prefixed with its parsed `[type]` for structural signal; `page_number`
     elements are dropped, blank pages map to "". Raises FileNotFoundError if missing."""
@@ -137,10 +124,10 @@ def render_page_b64(
     month: str | None,
     page: int | None,
     *,
+    pdf_dir: Path | str,
     dpi: int = 300,
     fmt: str = "png",
     jpg_quality: int | None = None,
-    pdf_dir: Path | str | None = None,
 ) -> B64Image | None:
     """Render a PDF page to in-memory image bytes. Returns None when the PDF
     doesn't exist; PyMuPDF errors propagate. No disk cache."""

@@ -92,7 +92,7 @@ class QuestionExplainer:
         parse=_parse_concepts,
         output_instruction=(
             "Output one `### <Concept>` markdown section per concept "
-            "(1–3 sentences each), or nothing if no non-obvious concepts apply."
+            "(1–3 sentences each), or nothing if only obvious concepts apply."
         ),
     )
 

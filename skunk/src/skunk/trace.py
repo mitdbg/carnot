@@ -66,9 +66,17 @@ def render_line(evt: dict) -> str:
     level = evt.get("level", "info")
     parts = [f"{ts} [{level:<7}] {evt.get('message', '')}"]
     for key, value in evt.items():
-        if key in ("message", "level"):
+        # `kind` (a viewer color-coding role), `data` (a structured payload, often a
+        # large blob), and `t` (the viewer's seconds-since-query-start offset; the
+        # line already carries a wall-clock HH:MM:SS) are for the captured/JSONL record
+        # and the trace viewer, not the scannable one-liner — keep them off the line.
+        if key in ("message", "level", "kind", "data", "t"):
             continue
-        s = truncate(value, _CONSOLE_FIELD_CAP) if isinstance(value, str) else repr(value)
+        s = (
+            truncate(value, _CONSOLE_FIELD_CAP)
+            if isinstance(value, str)
+            else repr(value)
+        )
         parts.append(f"{key}={s}")
     return "  ".join(parts)
 
@@ -79,11 +87,13 @@ class _LineFormatter(logging.Formatter):
     share the exact format of the per-question event stream."""
 
     def format(self, record: logging.LogRecord) -> str:
-        return render_line({
-            "message": record.getMessage(),
-            "level": record.levelname.lower(),
-            "logger": record.name,
-        })
+        return render_line(
+            {
+                "message": record.getMessage(),
+                "level": record.levelname.lower(),
+                "logger": record.name,
+            }
+        )
 
 
 def configure_obs(*, jsonl_path: str | None = None) -> None:

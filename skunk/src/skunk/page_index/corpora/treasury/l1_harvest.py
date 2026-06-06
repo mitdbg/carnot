@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 from collections import Counter
 
-from skunk.common import LLMClient
+from skunk.llm_client import LLMClient
 
 from ...schema import PageCatalogRow
 from ...stages.l1_harvest import SectionSpan

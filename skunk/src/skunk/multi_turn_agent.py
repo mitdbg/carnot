@@ -13,7 +13,9 @@ from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.local_python_executor import CodeOutput, LocalPythonExecutor
 
-_ENV = Environment(autoescape=False, keep_trailing_newline=True, undefined=StrictUndefined)
+_ENV = Environment(
+    autoescape=False, keep_trailing_newline=True, undefined=StrictUndefined
+)
 
 
 # ---------------------------------------------------------------------------
@@ -44,6 +46,20 @@ class ChunkBlock:
 Block = TextBlock | ChunkBlock
 
 
+def _block_to_jsonable(b: Block) -> dict:
+    """One trajectory block as a JSON-serializable dict (`{type, text, ...}`). Shared
+    by `messages_to_jsonable` (full-trajectory persistence) and the per-step
+    observation event the trace viewer renders."""
+    if isinstance(b, ChunkBlock):
+        return {
+            "type": "chunk",
+            "chunk_id": b.chunk_id,
+            "doc_id": b.doc_id,
+            "text": b.text,
+        }
+    return {"type": "text", "text": b.text}
+
+
 _FENCE_RE = re.compile(r"```([a-zA-Z0-9_]*)\n(.*?)```", re.DOTALL)
 _OPEN_FENCE_RE = re.compile(r"```[a-zA-Z0-9_]*\n")
 
@@ -51,7 +67,7 @@ _OPEN_FENCE_RE = re.compile(r"```[a-zA-Z0-9_]*\n")
 def _has_complete_block(acc: str) -> bool:
     """True once `acc` holds a complete fenced block — the streaming `should_stop`."""
     open_m = _OPEN_FENCE_RE.search(acc)
-    return bool(open_m and "```" in acc[open_m.end():])
+    return bool(open_m and "```" in acc[open_m.end() :])
 
 
 @dataclass
@@ -70,15 +86,20 @@ def _parse_step(text: str, _: ExecutionContext) -> _StepOutput:
     """Parse the first fenced block and raise `ParseError` on bad format. Never executes."""
     m = _FENCE_RE.search(text)
     if m is None:
-        raise ParseError(raw=text, detail="no fenced block — emit ONE ```python``` block (tool call) "
-                         "or ```json``` block (final answer).")
+        raise ParseError(
+            raw=text,
+            detail="no fenced block — emit ONE ```python``` block (tool call) "
+            "or ```json``` block (final answer).",
+        )
     lang, body = m.group(1).lower(), m.group(2).strip()
     if lang != "json":
         return _StepOutput(code=body, raw=text)
     try:
         return _StepOutput(result=json.loads(body), raw=text)
     except json.JSONDecodeError as e:
-        raise ParseError(raw=text, detail=f"final-answer JSON was malformed — {e}") from e
+        raise ParseError(
+            raw=text, detail=f"final-answer JSON was malformed — {e}"
+        ) from e
 
 
 def _trim(messages: list[dict], budget: int) -> list[dict]:
@@ -86,8 +107,10 @@ def _trim(messages: list[dict], budget: int) -> list[dict]:
     drop the middle behind a placeholder so observation history can't bloat unbounded."""
     if sum(len(m["content"]) for m in messages) <= budget:
         return messages
-    head = [messages[0],  # first user question — always kept
-            {"role": "user", "content": "...(earlier steps truncated)..."}]
+    head = [
+        messages[0],  # first user question — always kept
+        {"role": "user", "content": "...(earlier steps truncated)..."},
+    ]
     remaining = budget - sum(len(m["content"]) for m in head)
     tail: list[dict] = []
     for m in reversed(messages[1:]):
@@ -124,8 +147,10 @@ class GenerationBackend(Protocol):
         unless `capture_logprobs`, else the schema `messages_to_jsonable` persists."""
         ...
 
+
 class MultiTurnAgent(ABC):
     """A tool-loop agent that takes a series of tool call actions and produces a final answer."""
+
     name: str
     briefing: str
     final_answer_doc: str
@@ -214,7 +239,9 @@ Requirements for the final answer:
             max_parse_retries=self.max_recover_retries,
         )
 
-    def validate_final_answer(self, payload: object, observations: list[str]) -> str | None:
+    def validate_final_answer(
+        self, payload: object, observations: list[str]
+    ) -> str | None:
         """Return None to accept, or feedback string to reject (loop continues with it as an observation)."""
         return None
 
@@ -250,7 +277,9 @@ Requirements for the final answer:
         and any message left empty after redaction."""
         rendered: list[dict] = []
         for msg in self.messages:
-            parts = [b.text for b in msg["blocks"] if b.text and self._block_is_visible(b)]
+            parts = [
+                b.text for b in msg["blocks"] if b.text and self._block_is_visible(b)
+            ]
             if not parts:
                 continue
             rendered.append({"role": msg["role"], "content": "\n\n".join(parts)})
@@ -262,14 +291,7 @@ Requirements for the final answer:
         dataclass blocks that `json.dump` cannot serialize directly."""
         out: list[dict] = []
         for msg in self.messages:
-            blocks_json: list[dict] = []
-            for b in msg["blocks"]:
-                if isinstance(b, ChunkBlock):
-                    blocks_json.append(
-                        {"type": "chunk", "chunk_id": b.chunk_id, "doc_id": b.doc_id, "text": b.text}
-                    )
-                else:
-                    blocks_json.append({"type": "text", "text": b.text})
+            blocks_json = [_block_to_jsonable(b) for b in msg["blocks"]]
             entry: dict = {"role": msg["role"], "blocks": blocks_json}
             # Assistant turns sampled via a rollout backend carry per-token
             # `token_logprobs` (= log pi_old); the loss mask is reconstructable
@@ -282,7 +304,9 @@ Requirements for the final answer:
     async def call(self, ctx: ExecutionContext, user: str, **_) -> Any:
         """Run the multi-turn loop, returning the parsed json final-answer payload. Extra
         kwargs are ignored (signature compat with single-shot calls)."""
-        executor = LocalPythonExecutor(additional_authorized_imports=self.authorized_imports)
+        executor = LocalPythonExecutor(
+            additional_authorized_imports=self.authorized_imports
+        )
         # The final answer is parsed outside the sandbox, so it is NOT bound here.
         executor.send_tools({t.name: t for t in self._tools})
 
@@ -291,7 +315,16 @@ Requirements for the final answer:
         self.messages = [{"role": "user", "blocks": [TextBlock(user)]}]
         observations: list[str] = []
 
-        ctx.emit(f"question {user!r}")
+        # Capture the system prompt + opening question into the event stream so the
+        # trace viewer can show them (the console / `.log` keep only the one-liners —
+        # the full text rides in `data`). The system prompt is static for the call.
+        system_prompt = self._prompt._assemble_system_prompt(ctx)
+        ctx.emit(
+            f"system_prompt chars={len(system_prompt)}",
+            kind="system",
+            data={"text": system_prompt},
+        )
+        ctx.emit(f"question {user!r}", kind="user", data={"text": user})
 
         # `step` counts only turns that progressed (observation or final answer); `turn`
         # numbers every attempt, including misfired re-prompts.
@@ -299,7 +332,12 @@ Requirements for the final answer:
         warned = False
         while self.max_steps is None or step < self.max_steps:
             step += 1
-            if self.warn_steps_remaining is not None and not warned and self.max_steps is not None and self.max_steps - step + 1 <= self.warn_steps_remaining:
+            if (
+                self.warn_steps_remaining is not None
+                and not warned
+                and self.max_steps is not None
+                and self.max_steps - step + 1 <= self.warn_steps_remaining
+            ):
                 warned = True
                 left = self.max_steps - step + 1
                 warn = (
@@ -315,13 +353,21 @@ Requirements for the final answer:
             turn += 1
             try:
                 step_out = await self._llm_step(ctx)
-                assistant_msg: dict = {"role": "assistant", "blocks": [TextBlock(step_out.raw)]}
+                assistant_msg: dict = {
+                    "role": "assistant",
+                    "blocks": [TextBlock(step_out.raw)],
+                }
                 # `_last_logprobs` is set by the backend path of `_llm_step`
                 # (None on the PromptedCall path); attach it so the trajectory
                 # carries `log pi_old` for downstream RL reward computation.
                 if self._last_logprobs is not None:
                     assistant_msg["logprobs"] = self._last_logprobs
                 self.messages.append(assistant_msg)
+                ctx.emit(
+                    f"assistant step={turn} chars={len(step_out.raw)}",
+                    kind="assistant",
+                    data={"text": step_out.raw},
+                )
                 if step_out.code is not None:
                     # Inline (not to_thread): tool code runs on this question's worker
                     # thread; blocking here only affects sibling branches of the question.
@@ -332,7 +378,9 @@ Requirements for the final answer:
                 self.messages.append({"role": "user", "blocks": [TextBlock(obs)]})
                 ctx.emit(f"error {obs!r}")
             except Exception as e:  # tool code raised
-                obs = f"Observation (step {turn}): exec failed — {type(e).__name__}: {e}"
+                obs = (
+                    f"Observation (step {turn}): exec failed — {type(e).__name__}: {e}"
+                )
                 self.messages.append({"role": "user", "blocks": [TextBlock(obs)]})
                 ctx.emit(f"error {obs!r}")
 
@@ -353,11 +401,23 @@ Requirements for the final answer:
             assert out is not None  # a non-final step that ended ⇒ tool exec succeeded
             # Structured observation: subclasses may emit redactable ChunkBlocks; the
             # default renders stdout / result as TextBlocks (see `_blocks_from_output`).
-            obs_blocks: list[Block] = [TextBlock(f"Observation (step {turn}):"), *self._blocks_from_output(out)]
+            obs_blocks: list[Block] = [
+                TextBlock(f"Observation (step {turn}):"),
+                *self._blocks_from_output(out),
+            ]
             self.messages.append({"role": "user", "blocks": obs_blocks})
-            obs_text = "\n\n".join(b.text for b in obs_blocks if b.text and self._block_is_visible(b))
+            visible_blocks = [
+                b for b in obs_blocks if b.text and self._block_is_visible(b)
+            ]
+            obs_text = "\n\n".join(b.text for b in visible_blocks)
             observations.append(obs_text)
-            ctx.emit(f"observation {obs_text!r}")
+            # Structured observation for the viewer: keep each block typed (chunk blocks
+            # carry chunk_id/doc_id) so it can render them like the agent saw them.
+            ctx.emit(
+                f"observation {obs_text!r}",
+                kind="observation",
+                data={"blocks": [_block_to_jsonable(b) for b in visible_blocks]},
+            )
 
         # Out of steps: one forced terminal turn that either commits an answer from the
         # existing observations or hands off to the planner with a diagnostic.
@@ -380,7 +440,9 @@ Requirements for the final answer:
             step_out = await self._llm_step(
                 ctx, extra=[{"role": "user", "content": self._TERMINAL_PROMPT}]
             )
-            diagnostic = step_out.raw.strip()  # default: the whole reply is the hand-off note
+            diagnostic = (
+                step_out.raw.strip()
+            )  # default: the whole reply is the hand-off note
             if step_out.code is None:  # json block
                 result = step_out.result
                 # `{"error": <note>}` is the explicit give-up envelope (a reserved key the
@@ -396,12 +458,18 @@ Requirements for the final answer:
             ctx.emit(f"terminal_turn_failed error={str(e)!r}")
         if not diagnostic:
             tail = observations[-2:]
-            diagnostic = "(summary unavailable) recent observations:\n" + "\n".join(tail) if tail else ""
+            diagnostic = (
+                "(summary unavailable) recent observations:\n" + "\n".join(tail)
+                if tail
+                else ""
+            )
         raise StepFailed(
             self.name, "max steps without accepted final answer", diagnostic=diagnostic
         )
 
-    async def _llm_step(self, ctx: ExecutionContext, extra: list[dict] | None = None) -> _StepOutput:
+    async def _llm_step(
+        self, ctx: ExecutionContext, extra: list[dict] | None = None
+    ) -> _StepOutput:
         """Render the visible trajectory (`_render_for_llm`), collapse stale observations,
         trim to `context_budget_chars`, then route through `PromptedCall.call()` — stopping
         at the first complete fenced block. `extra` appends transient messages (e.g. the
@@ -412,9 +480,10 @@ Requirements for the final answer:
         if self.visible_observations is not None:
             user_idxs = [i for i, m in enumerate(messages) if m["role"] == "user"]
             # user_idxs[0] is the initial question — always kept; the rest are results.
-            keep = set(user_idxs[1:][-self.visible_observations:]) | {user_idxs[0]}
+            keep = set(user_idxs[1:][-self.visible_observations :]) | {user_idxs[0]}
             messages = [
-                m if (m["role"] != "user" or i in keep)
+                m
+                if (m["role"] != "user" or i in keep)
                 else {"role": "user", "content": "[earlier tool result hidden]"}
                 for i, m in enumerate(messages)
             ]
@@ -423,7 +492,9 @@ Requirements for the final answer:
             trimmed = trimmed + extra
         if self._backend is None:
             self._last_logprobs = None
-            return await self._prompt.call(ctx, messages=trimmed, should_stop=_has_complete_block)
+            return await self._prompt.call(
+                ctx, messages=trimmed, should_stop=_has_complete_block
+            )
         # Backend path (e.g. Tinker rollouts): prepend the assembled system
         # prompt, sample one turn synchronously (the rollout owns its thread +
         # loop), stash logprobs for `call()`, then parse. A bad parse raises

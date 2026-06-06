@@ -751,7 +751,7 @@ if __name__ == "__main__":
         "--chroma-collection-name",
         type=str,
         default="qwen-v2",
-        help="Name of the ChromaDB collection (default: qwen)",
+        help="Name of the ChromaDB collection (default: qwen-v2)",
     )
     parser.add_argument(
         "--num-new-seeds",
