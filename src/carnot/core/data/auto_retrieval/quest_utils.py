@@ -11,7 +11,8 @@ from typing import List, Dict, Any, Iterable, Optional
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_TOKENIZER_MODEL = "BAAI/bge-small-en-v1.5"
+# DEFAULT_TOKENIZER_MODEL = "BAAI/bge-small-en-v1.5"
+DEFAULT_TOKENIZER_MODEL = "text-embedding-3-large"
 
 
 def normalize_title_slug(s: str) -> str:
@@ -47,8 +48,25 @@ def read_jsonl(path: str) -> Iterable[Dict[str, Any]]:
 
 
 def build_tokenizer(model_name: str = DEFAULT_TOKENIZER_MODEL):
-    from transformers import AutoTokenizer
-    return AutoTokenizer.from_pretrained(model_name, use_fast=True, model_max_length=100000)
+    # from transformers import AutoTokenizer
+    # return AutoTokenizer.from_pretrained(model_name, use_fast=True, model_max_length=100000)
+    import tiktoken
+
+    class _TiktokenWrapper:
+        """Thin adapter so tiktoken exposes the same .encode()/.decode() interface
+        that the rest of quest_utils expects (matching HuggingFace AutoTokenizer)."""
+
+        def __init__(self, encoding: tiktoken.Encoding):
+            self._enc = encoding
+
+        def encode(self, text: str, add_special_tokens: bool = False) -> List[int]:
+            return self._enc.encode(text)
+
+        def decode(self, tokens: List[int], skip_special_tokens: bool = True) -> str:
+            return self._enc.decode(tokens)
+
+    enc = tiktoken.encoding_for_model(model_name)
+    return _TiktokenWrapper(enc)
 
 
 def chunk_by_tokens(text: str, tokenizer, chunk_size: int, overlap: int) -> List[str]:
@@ -86,10 +104,10 @@ def prepare_quest_documents(
 
     for idx, raw in enumerate(read_jsonl(jsonl_path)):
         if max_docs is not None and idx >= max_docs:
-            logger.info(f"Reached limit of {max_docs} documents.")
+            logger.info(f"quest_utils: Reached limit of {max_docs} documents.")
             break
-        if idx % 1000 == 0:
-            logger.info(f"Processing document {idx}...")
+        if idx % 50 == 0:
+            logger.info(f"quest_utils: Processing document {idx}...")
 
         title = (raw.get("title") or "").strip() or "untitled"
         text = (raw.get("text") or raw.get("description") or "").strip()

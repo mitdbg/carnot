@@ -14,31 +14,15 @@ import dspy
 
 logger = logging.getLogger(__name__)
 
-class InferHierarchySignature(dspy.Signature):
-    """Infer a minimal graph of direct broader-parent relations among metadata values.
+class InferHierarchyPrecisionSignature(dspy.Signature):
+    """Infer direct broader-parent relations with high precision (fewer, confident edges).
 
-    You are given a list of unique string values from one structured metadata column
-    (identified by column_name). Return DIRECT parent relations where one value is a
-    narrower geographic, administrative, regional, temporal, or categorical member of another.
-
-    Rules:
-    - Return a MINIMAL graph of DIRECT parent edges only.
-    - Do NOT include transitive ancestors.
-      Example: if A -> B and B -> C, do NOT also output A -> C.
-    - A value may have MULTIPLE direct parents when multiple broader groupings are valid
-      and all of them appear in the input list.
-      Example: "California" may have direct parents ["United States", "West Coast"].
+    Return DIRECT parent edges only:
+    - Each child must have a clearly obvious broader category parent.
     - Every child and parent MUST appear verbatim in the input values list.
-    - Do NOT introduce any new value.
-    - Do NOT include reflexive edges.
-    - Prefer precision over recall: only include relations you are highly confident about.
+    - Do NOT introduce new values; do NOT include reflexive edges.
+    - Prefer precision: only include relations you are highly confident about.
     - If the column has no clear hierarchy, return {}.
-
-    Notes:
-    - Valid parent relations include administrative containment, geographic containment,
-      regional grouping membership, temporal period membership, and other clear broader-category relations.
-    - Do NOT include weak topical association or semantic relatedness.
-    - Python will compute the transitive closure later, so only output the direct edges needed.
     """
 
     column_name: str = dspy.InputField(
@@ -48,13 +32,32 @@ class InferHierarchySignature(dspy.Signature):
         desc="JSON array of the unique string values present in this column."
     )
     hierarchy_json: str = dspy.OutputField(
-    desc=(
-        "Return ONLY a JSON object mapping each child value to a list of its DIRECT parent values. "
-        "Use minimal non-redundant edges only. "
-        "A value may have multiple direct parents. "
-        "Omit values with no parent. "
+        desc="Return ONLY a JSON object mapping child values to lists of DIRECT parent values. "
+        "Omit values with no parent."
     )
-)
+
+
+class InferHierarchyRecallSignature(dspy.Signature):
+    """Infer direct broader-parent relations with focus on recall (more inclusive edges).
+
+    Return all plausible DIRECT parent edges:
+    - Include administrative, jurisdictional, categorical, and regional relations.
+    - Every child and parent MUST appear verbatim in the input values list.
+    - Do NOT introduce new values; do NOT include reflexive edges.
+    - Be inclusive: find all valid containment/membership/grouping relations.
+    - If the column has no clear hierarchy, return {}.
+    """
+
+    column_name: str = dspy.InputField(
+        desc="The domain:facet column name (e.g. 'film:location', 'animal:location')."
+    )
+    values_json: str = dspy.InputField(
+        desc="JSON array of the unique string values present in this column."
+    )
+    hierarchy_json: str = dspy.OutputField(
+        desc="Return ONLY a JSON object mapping child values to lists of DIRECT parent values. "
+        "Omit values with no parent."
+    )
 
 # Few-shot examples.
 # Example 1: DAG with multiple parents + regional subdivision + empty non-geographic values.
@@ -81,17 +84,28 @@ _FEW_SHOT_EXAMPLES = [
 
 
 class HierarchyInferenceModule(dspy.Module):
+    """Two-pass hierarchy inference: precision pass + recall pass, then union."""
     def __init__(self) -> None:
         super().__init__()
-        self._predict = dspy.Predict(InferHierarchySignature)
+        self._predict_precision = dspy.Predict(InferHierarchyPrecisionSignature)
+        self._predict_recall = dspy.Predict(InferHierarchyRecallSignature)
 
-    def forward(self, column_name: str, values_json: str) -> str:
-        result = self._predict(
+    def forward(self, column_name: str, values_json: str) -> Tuple[str, str]:
+        """Run both passes; return (precision_result, recall_result)."""
+        result_p = self._predict_precision(
             column_name=column_name,
             values_json=values_json,
             demos=_FEW_SHOT_EXAMPLES,
         )
-        return getattr(result, "hierarchy_json", "{}").strip()
+        result_r = self._predict_recall(
+            column_name=column_name,
+            values_json=values_json,
+            demos=_FEW_SHOT_EXAMPLES,
+        )
+        return (
+            getattr(result_p, "hierarchy_json", "{}").strip(),
+            getattr(result_r, "hierarchy_json", "{}").strip(),
+        )
 
 def _compute_transitive_closure(
     direct_parents: Dict[str, List[str]],
@@ -194,28 +208,34 @@ def _infer_column_hierarchy(
     column_name: str,
     global_values: Set[str],
 ) -> Dict[str, Set[str]]:
-    """Run LLM hierarchy inference for one column; return ancestor map."""
+    """Run two-pass hierarchy inference (precision + recall), union edges, compute closure."""
     values_json = json.dumps(sorted(global_values), ensure_ascii=False)
 
     try:
-        raw = module(column_name=column_name, values_json=values_json)
+        raw_precision, raw_recall = module(column_name=column_name, values_json=values_json)
     except Exception as exc:
         logger.error("LLM call failed for column '%s': %s", column_name, exc)
         return {}
 
-    direct_parents = _parse_hierarchy_json(raw, global_values)
+    edges_precision = _parse_hierarchy_json(raw_precision, global_values)
+    edges_recall = _parse_hierarchy_json(raw_recall, global_values)
 
-    if direct_parents:
-        total_edges = sum(len(v) for v in direct_parents.values())
-        logger.info(
-            "Column '%s': %d direct edges inferred (from %d values)",
-            column_name, total_edges, len(global_values),
-        )
-    else:
-        logger.info(
-            "Column '%s': no containment relations inferred (from %d values)",
-            column_name, len(global_values),
-        )
+    # Union edges from both passes.
+    direct_parents: Dict[str, List[str]] = dict(edges_precision)
+    for child, parents in edges_recall.items():
+        if child in direct_parents:
+            # Merge parent lists, keep unique.
+            direct_parents[child] = list(dict.fromkeys(direct_parents[child] + parents))
+        else:
+            direct_parents[child] = parents
+
+    total_p = sum(len(v) for v in edges_precision.values())
+    total_r = sum(len(v) for v in edges_recall.values())
+    total_union = sum(len(v) for v in direct_parents.values())
+    logger.info(
+        "Column '%s': precision=%d edges, recall=%d edges, union=%d edges (from %d values)",
+        column_name, total_p, total_r, total_union, len(global_values),
+    )
 
     return _compute_transitive_closure(direct_parents, global_values)
 
@@ -264,7 +284,7 @@ def postprocess_sem_map(
     if not api_key:
         raise RuntimeError("Missing OPENAI_API_KEY in environment.")
 
-    lm = dspy.LM("openai/gpt-5.1", temperature=1.0, max_tokens=16000, api_key=api_key)
+    lm = dspy.LM("openai/gpt-5.1", temperature=1.0, max_tokens=32000, api_key=api_key)
     dspy.configure(lm=lm)
     module = HierarchyInferenceModule()
 

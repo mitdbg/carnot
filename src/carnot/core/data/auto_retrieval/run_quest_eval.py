@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Set
 
 from _internal.chroma_store import ChromaStore
 from _internal.query_planner import LLMQueryPlanner
-from _internal.sem_map import sem_map, expand_sem_map_results_to_tags
+from _internal.sem_map import sem_map, expand_sem_map_results_to_tags, _build_concept_schema_cols
 from _internal.hierarchy_augment import postprocess_sem_map
 from quest_utils import prepare_quest_documents, QuestQuery, prepare_quest_queries
 
@@ -111,16 +111,27 @@ def expand_metas(
             inner = type_str[5:-1]
             return list[_deserialize_type(inner)]
         return str  # safe fallback
-
-    # Load concept schema, restoring Python types from their JSON-serialized names.
-    concept_schema_cols = [
-        {**col, "type": _deserialize_type(col["type"])}
-        for col in json.loads(
-            (HERE / "sem_map_subset_1/concept_schema_cols.json").read_text(encoding="utf-8")
+    
+    schema_cache_path = HERE / "tmp/concept_schema_cols.json"
+    schema_cache_path.parent.mkdir(parents=True, exist_ok=True)
+   
+    concept_schema_cols = _build_concept_schema_cols()
+    schema_cache_path.write_text(
+        json.dumps(_schema_cols_json(concept_schema_cols),
+                   indent=2,
+                   ensure_ascii=False),
+        encoding="utf-8",
         )
-    ]
-        
+    
     # sem_results, concept_schema_cols = sem_map(data=data_rows, concept_schema_cols=concept_schema_cols)
+    # Load postprocess_step1_normalized.json from previous run instead
+    # postprocess_output_path = HERE / "sem_map_subset_3" / "postprocess_step1_normalized.json"
+    # if not postprocess_output_path.exists():
+    #     raise FileNotFoundError(
+    #         f"postprocess_step1_normalized.json not found at {postprocess_output_path}. "
+    #         "Run postprocess_sem_map first or set expand_meta=True above."
+    #     )
+    # sem_results = json.loads(postprocess_output_path.read_text(encoding="utf-8"))
 
     # logger.info("Postprocessing sem_map raw output...")
     # sem_results = postprocess_sem_map(
@@ -223,11 +234,13 @@ def create_collection(
     documents_path: str,
     collection_name: str,
     persist_directory: str,
-    embedding_model_name: str = "Qwen/Qwen3-Embedding-4B",
+    # embedding_model_name: str = "Qwen/Qwen3-Embedding-4B",
+    embedding_model_name: str = "text-embedding-3-large",
     expand_meta: bool = False,
     reset_collection: bool = False,
     max_docs: Optional[int] = None,
     dump_intermediate: bool = True,
+    embed: bool = False,
 ) -> ChromaStore:
     if reset_collection:
         ChromaStore.reset_collection(
@@ -239,6 +252,7 @@ def create_collection(
         collection_name=collection_name,
         persist_directory=persist_directory,
         embedding_model_name=embedding_model_name,
+        embed=embed,
     )
 
     existing_count = store.count()
@@ -255,6 +269,8 @@ def create_collection(
     for doc_item in dataset:
         text = doc_item["text"]
         meta = doc_item["metadata"]
+        # if not meta["entity_id"].startswith("Defendor"):
+        #     continue
         data_rows.append({"id": meta["entity_id"], "text": text})
         docs.append(text)
         metas.append(meta)
@@ -267,7 +283,7 @@ def create_collection(
             min_frequency=3,
             dump_intermediate=dump_intermediate,
         )
-
+            
     if docs:
         store.upsert_documents(documents=docs, metadatas=metas)
         logger.info(f"Ingested {len(docs)} documents into '{collection_name}'")
@@ -279,8 +295,10 @@ def evaluate_collection(
     store: ChromaStore,
     queries: List[QuestQuery],
     query_planner: Optional[LLMQueryPlanner] = None,
+    planner_mode: str = "one_shot",
     output_path: Optional[str] = None,
     top_k: int = 20,
+    filter_only: bool = False,
 ) -> float:
     if not queries:
         logger.warning("No queries to evaluate.")
@@ -290,27 +308,64 @@ def evaluate_collection(
     total_precision = 0.0
     total_mrr = 0.0
     total_ndcg = 0.0
+    total_n_filtered = 0
     f_out = (Path(output_path).parent.mkdir(parents=True, exist_ok=True) or open(output_path, "w", encoding="utf-8")) if output_path else None
+
+    # Pre-build a lightweight id→{title,source} index so the filter-only
+    # path can skip expensive per-query metadata deserialization.
+    title_index = store.build_title_index() if filter_only else {}
 
     gold_set = set()
     relevance_fn = lambda d: 1.0 if d in gold_set else 0.0
+    where_clauses = [None] * len(queries)
+
+    # if query_planner:
+    #     logger.info("Planning metadata filters for %d queries...", len(queries))
+    #     where_clauses = query_planner.plan_queries(
+    #         [q.query for q in queries],
+    #         mode=planner_mode,
+    #     )
 
     try:
         for i, q in enumerate(queries):
+            where_clause = None
+            if query_planner:
+                for attempt in range(3):
+                    where_clause = query_planner.plan(q.query, mode=planner_mode)
+                    if where_clause is not None:
+                        break
+                    logger.warning(f"Query {i + 1}: plan() returned None (attempt {attempt + 1}/3)")
             logger.info(f"Evaluating query {i + 1}/{len(queries)}: {q.query}")
-            where_clause = query_planner.plan(q.query) if query_planner else None
-            results = store.query(q.query, n_results=top_k, where_filter=where_clause)
-            # results = store.get(where=where_clause)
-            if where_clause and len(results) == 0:
-                logger.info(f"metadata filter did not return any results for query: {q.query}. Falling back to pure vector search.")
-                results = store.query(q.query, n_results=top_k)
-                
+            logger.info(f"where_clause: {where_clause}")
 
+            if filter_only:
+                # Metadata-filter-only mode: two-pass approach
+                # Pass 1: get matching IDs only (no metadata deserialization)
+                # Pass 2: resolve titles from pre-built in-memory index
+                if where_clause:
+                    filtered_ids = store.get_filtered_ids(where=where_clause)
+                else:
+                    filtered_ids = store.get_filtered_ids()
+                results = [
+                    {"id": doc_id, "metadata": title_index.get(doc_id, {})}
+                    for doc_id in filtered_ids
+                ]
+            else:
+                results = store.query(q.query, n_results=top_k, where_filter=where_clause)
+                if where_clause and len(results) == 0:
+                    logger.info(f"metadata filter did not return any results for query: {q.query}. Falling back to pure vector search.")
+                    results = store.query(q.query, n_results=top_k)
+
+            # Deduplicate by title
             predicted = []
+            seen_titles = set()
             retrieved_details = []
             for result in results:
                 meta = result.get("metadata") or {}
                 title = meta.get("title")
+                if title in seen_titles:
+                    continue
+                seen_titles.add(title)
                 predicted.append(title)
                 if f_out:
                     retrieved_details.append({
@@ -319,32 +374,43 @@ def evaluate_collection(
                         "score": result.get("distance"),
                     })
 
+            n_filtered = len(predicted)
             gold_set.clear()
             gold_set.update(q.docs)
-            rec = recall_at_k(predicted, gold_set, top_k)
-            prec = precision_at_k(predicted, gold_set, top_k)
-            rr = reciprocal_rank_at_k(predicted, gold_set, top_k)
-            ndcg = ndcg_at_k(predicted, relevance_fn, q.docs, top_k)
+            effective_k = n_filtered if filter_only else top_k
+            rec = recall_at_k(predicted, gold_set, effective_k)
+            prec = precision_at_k(predicted, gold_set, effective_k)
+            rr = reciprocal_rank_at_k(predicted, gold_set, effective_k)
+            ndcg = ndcg_at_k(predicted, relevance_fn, q.docs, effective_k)
 
             total_recall += rec
             total_precision += prec
             total_mrr += rr
             total_ndcg += ndcg
+            total_n_filtered += n_filtered
 
             if f_out:
-                f_out.write(json.dumps({
+                entry = {
                     "query_index": i,
                     "query": q.query,
+                    "n_filtered_docs": n_filtered,
                     f"recall@{top_k}": rec,
                     f"precision@{top_k}": prec,
                     f"mrr@{top_k}": rr,
                     f"ndcg@{top_k}": ndcg,
-                    f"retrieved_top_{top_k}": retrieved_details,
-                }) + "\n")
+                }
+                if filter_only:
+                    entry["where_clause"] = where_clause
+                    entry["filtered_titles"] = predicted
+                else:
+                    entry[f"retrieved_top_{top_k}"] = retrieved_details
+                f_out.write(json.dumps(entry) + "\n")
                 f_out.flush()
 
-            if i % 10 == 0:
-                logger.info(f"Evaluated {i + 1}/{len(queries)} queries. Recall@{top_k}: {rec:.4f}")
+            logger.info(
+                f"[{i + 1}/{len(queries)}] {q.query}  |  "
+                f"filtered={n_filtered}  recall={rec:.4f}  prec={prec:.4f}  mrr={rr:.4f}  ndcg={ndcg:.4f}"
+            )
     finally:
         if f_out:
             n = len(queries)
@@ -352,7 +418,9 @@ def evaluate_collection(
             avg_precision = total_precision / n
             avg_mrr = total_mrr / n
             avg_ndcg = total_ndcg / n
+            avg_n_filtered = total_n_filtered / n
             f_out.write(json.dumps({
+                f"Average n_filtered_docs": avg_n_filtered,
                 f"Average Recall@{top_k}": avg_recall,
                 f"Average Precision@{top_k}": avg_precision,
                 f"Average MRR@{top_k}": avg_mrr,
@@ -423,7 +491,8 @@ if __name__ == "__main__":
         max_docs = 100
 
     queries = prepare_quest_queries(source=queries_source)
-    embedding_model_name = "Qwen/Qwen3-Embedding-4B"
+    # embedding_model_name = "Qwen/Qwen3-Embedding-4B"
+    embedding_model_name = "text-embedding-3-large"
     
     # Base collection
     # store = create_collection(
@@ -435,6 +504,7 @@ if __name__ == "__main__":
     #     reset_collection=True,
     #     max_docs=max_docs,
     #     dump_intermediate=args.dump_intermediate,
+    #     embed=True,
     # )
     
     # avg_recall = evaluate_collection(
@@ -450,13 +520,17 @@ if __name__ == "__main__":
         collection_name=f"quest_expanded{collection_suffix}",
         persist_directory=f"./chroma_collections_{embedding_model_name}",
         embedding_model_name=embedding_model_name,
-        expand_meta=True,
-        reset_collection=True,
+        expand_meta=False,
+        reset_collection=False,
         max_docs=max_docs,
         dump_intermediate=args.dump_intermediate,
+        embed=False,
     )
 
-    filter_catalog_path = HERE / "sem_map_subset_3/filter_catalog.json"
+    # Use per-subset filter catalog; fall back to combined tmp/filter_catalog.json
+    filter_catalog_path = HERE / f"sem_map{collection_suffix}/filter_catalog.json"
+    if not filter_catalog_path.exists():
+        filter_catalog_path = HERE / "tmp/filter_catalog.json"
     query_planner = LLMQueryPlanner(filter_catalog_path) if filter_catalog_path.exists() else None
 
     avg_recall = evaluate_collection(
@@ -464,5 +538,6 @@ if __name__ == "__main__":
         queries,
         query_planner=query_planner,
         output_path=f"results_{embedding_model_name}/quest_eval_results_val_expanded{collection_suffix}.jsonl",
+        filter_only=True,
     )
     print(f"Average Recall (Expanded Collection): {avg_recall:.4f}")

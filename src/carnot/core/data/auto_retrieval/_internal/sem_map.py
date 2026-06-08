@@ -4,14 +4,73 @@ import json
 import random
 from functools import lru_cache
 from pathlib import Path
-from pprint import pprint
 import re
 from typing import Any, Dict, List, Mapping, Sequence, Tuple, get_args, get_origin
 
-DEFAULT_TOP_K_CONCEPTS = 30
-CONCEPTS_JSON_REL_PATH = Path("results/quest_concepts/two_stage/per_query_concepts.json")
+DEFAULT_TOP_K_CONCEPTS = 29
+CONCEPTS_JSON_REL_PATH = Path("/dataheart/zhuohan/mit/research/Carnot/src/carnot/core/data/auto_retrieval/tmp/per_query_concepts.json")
 INTEGER_PATTERN = re.compile(r"^[+-]?\d+$")
 FLOAT_PATTERN = re.compile(r"^[+-]?(?:\d+\.\d+|\d+\.\d*|\.\d+)$")
+
+# ---------------------------------------------------------------------------
+# A full document example used in the sem_map task description so the LLM
+# sees what extraction from a real encyclopedia article looks like.
+# Source: "The Guilty (2021 film)" from QUEST subset_1.
+# ---------------------------------------------------------------------------
+_DOCUMENT_EXAMPLE_TEXT = (
+    "'''''The Guilty''''' is a 2021 American crime thriller film directed and "
+    "produced by Antoine Fuqua, from a screenplay by Nic Pizzolatto. A remake "
+    "of the 2018 Danish film of the same name, the film stars Jake Gyllenhaal "
+    "and Christina Vidal, with the voices of Ethan Hawke, Riley Keough, Eli "
+    "Goree, Da'Vine Joy Randolph, Paul Dano, and Peter Sarsgaard.\n"
+    "\n"
+    "''The Guilty'' had its world premiere at the 2021 Toronto International "
+    "Film Festival on September 11, 2021. The film was released in a limited "
+    "release on September 24, 2021, then digitally on Netflix on October 1. "
+    "It received positive reviews from critics, with Gyllenhaal's performance "
+    "being praised, but it is felt that the remake was inferior to the "
+    "original film.\n"
+    "Troubled LAPD officer Joe Baylor is working the night shift at a 911 "
+    "call center while he awaits a court hearing for an incident that occurred "
+    "on duty eight months prior. He answers a call from a woman named Emily "
+    "Lighton who reveals she has been abducted. Joe learns that she and her "
+    "abductor are traveling in a white van, but Emily is forced to hang up "
+    "before she can provide more details. Joe relays the information to the "
+    "California Highway Patrol but they are unable to locate the van without "
+    "a license plate number.\n"
+    "\n"
+    "Joe calls Emily's home phone and speaks with her six-year-old daughter "
+    "Abby, who tells Joe that her mom left the house with her dad, Henry "
+    "Fisher. After getting Henry's cell phone number from Abby, Joe is able "
+    "to retrieve the van's plate number, which he relays to the CHP. He also "
+    "sends a patrol car to check on Abby and her baby brother, Oliver. Joe "
+    "learns Henry has a record of assault. He calls Henry and demands to know "
+    "where he is taking Emily, but Henry hangs up. Joe then calls his former "
+    "partner Rick, who is off-duty, and asks him to visit Henry's house. Rick "
+    "expresses concern about Joe's hearing, at which he is set to provide "
+    "testimony.\n"
+    "\n"
+    "Joe receives a panicked call from Abby when two officers arrive at her "
+    "home; he instructs her to let them in. The officers notice blood on Abby "
+    "and, upon searching the property, find Oliver in the bedroom either "
+    "gravely injured or dead. Joe then calls Emily back and convinces her to "
+    "pull the handbrake of the van, which she does, but it fails to crash the "
+    "vehicle. Henry puts Emily"
+)
+
+_DOCUMENT_EXAMPLE_EXTRACTION = (
+    "  film:genre → [\"crime\", \"thriller\"]\n"
+    "  film:subject → [\"kidnapping\", \"police misconduct\"]\n"
+    "  film:country_of_origin → [\"United States\", \"Denmark\"]\n"
+    "  film:setting_location → [\"Los Angeles\"]\n"
+    "  film:setting → [\"911 call center\"]\n"
+    "  film:year → 2021\n"
+    "  film:release_year → 2021\n"
+    "  film:country → [\"United States\"]\n"
+    "  film:time_period → [\"2020s\"]\n"
+    "  film:theme → [\"guilt\", \"justice\"]\n"
+    "  (all plant_taxon, biological_taxon, book, animal, bird, organism fields → null)"
+)
 
 
 def _concepts_output_path() -> Path:
@@ -24,7 +83,7 @@ def _load_concepts_output(path: str) -> Dict[str, Any]:
 
 
 def _select_top_domain_facets(concepts_output: Mapping[str, Any], top_k: int) -> List[Tuple[str, str]]:
-    facet_frequencies = concepts_output.get("facet_frequencies", {})
+    facet_frequencies = concepts_output.get("facet_frequencies_pruned", {})
     if not isinstance(facet_frequencies, Mapping):
         raise ValueError("Expected 'facet_frequencies' to be a mapping in concepts output JSON.")
 
@@ -168,24 +227,23 @@ def _build_desc(
             ]
             example_parts.append(
                 (
-                    f"Example {idx} - text chunk: {query!r}; "
+                    f"Example {idx} - text: {query!r}; "
                     f"values: {json.dumps(values, ensure_ascii=False)}"
                 )
             )
         examples_str = " ".join(example_parts)
     else:
         examples_str = "None available."
+
     return (
-    f"Extract only explicit values for (domain: {domain}, facet: {facet}) from the text chunk. Return null if the text does not explicitly state a {facet} for a {domain}. "
-    f"Return standardized, canonical values when the text clearly refers to a known value, using a consistent form across documents. Do not change the meaning. If standardization is uncertain, use the exact text-supported value (or return null if the value itself is uncertain). "
-    f"Return only concise entity-like values (i.e., node-style values suitable for a knowledge graph), not descriptive phrases, clauses, or sentences."
-    "If the expected type is list[type] and only one value is present, return it as a single-element list (e.g., [value]). "
-    "If the expected type is int, return a single numeric value (not a list). "
-    "An int type means exactly one number or null. "
-    "A list[str] type means it may return one string (as a single-element list), multiple strings, or null.\n\n"
-    "The following examples show you how to extract values for this domain and facet. "
-    f"Example: {examples_str} "
-)
+        f"(domain: {domain}, facet: {facet}). "
+        f"Extract ALL values for this facet that are explicitly stated or "
+        f"clearly implied anywhere in the text. Values may appear in any part "
+        f"of the text — subordinate clauses, parentheticals, background context, "
+        f"or indirect references all count. "
+        f"Return null only if truly nothing relevant appears. "
+        f"Examples from short queries: {examples_str}"
+    )
 
 
 def _build_concept_schema_cols(
@@ -319,6 +377,8 @@ def sem_map(
     concept_schema_cols: List[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
     import palimpzest as pz
+    from palimpzest.constants import Model
+    from palimpzest.query.processor.config import QueryProcessorConfig
 
     if concepts_output_path is not None:
         concept_schema_cols = _build_concept_schema_cols(top_k=DEFAULT_TOP_K_CONCEPTS, concepts_output_path=concepts_output_path)
@@ -334,17 +394,6 @@ def sem_map(
     if len(names) != len(set(names)):
         raise RuntimeError("Schema contains duplicate column names.")
     
-    # payload = {
-    #     "top_k": DEFAULT_TOP_K_CONCEPTS,
-    #     "num_cols": len(concept_schema_cols),
-    #     "schema_preview": [
-    #         {"name": c["name"], "type": c["type"], "desc": c["desc"]}
-    #         for c in concept_schema_cols[:10]
-    #     ],
-    # }
-    # pprint(payload, sort_dicts=False)
-    # import pdb; pdb.set_trace()
-    
     rows: List[Dict[str, str]] = []
     for d in data:
         doc_id = str(d.get("id", "")).strip()
@@ -355,10 +404,46 @@ def sem_map(
     if not rows:
         return {}, concept_schema_cols
 
+    # config = QueryProcessorConfig(
+    #     available_models=[Model.GPT_5_1],
+    #     reasoning_effort="none",
+    # )
+
     dataset = pz.MemoryDataset(id="sem-map", vals=rows)
     cols_for_pz = [dict(c) for c in concept_schema_cols]
-    dataset = dataset.sem_map(cols=cols_for_pz)
-    output = dataset.run(max_quality=True)
+    dataset = dataset.sem_map(
+        cols=cols_for_pz,
+        desc=(
+            "Extract values for each output field from the text. "
+            "Each field represents a (domain, facet) pair with examples showing the kind of values expected. "
+            "For each field, extract ALL values that are explicitly stated or clearly implied by the text. "
+            "Be comprehensive: scan the entire text for every relevant value per field. "
+            "Do not stop after finding one or two values — a field may have many. "
+            "The same text may provide values for multiple fields. "
+            "Return null for a field only if the text contains nothing relevant to that facet. "
+            "IMPORTANT: Many fields will not apply to the document's domain — return null for those. "
+            "Focus your attention on the fields whose domain matches the text. "
+            "For the fields that DO apply, be thorough: values may appear anywhere in the text, "
+            "not just in the opening sentence. Scan the full text carefully. "
+            "FORMATTING: Return concise, canonical entity values (knowledge-graph style). "
+            "Do NOT return raw descriptive phrases — condense to entity names or labels "
+            "(e.g., 'the frozen tundra of Siberia' → 'Siberia'). "
+            "For list[str] fields, always return a list (even a single-element list). "
+            "For int fields, return a single number or null. "
+            "The examples shown per field are drawn from short category-style descriptions. "
+            "The actual text you analyze may be longer (e.g., encyclopedia entries or article summaries). "
+            "Apply the same extraction logic regardless of text length or style.\n"
+            "\n"
+            "DOCUMENT EXAMPLE:\n"
+            "Text:\n" + _DOCUMENT_EXAMPLE_TEXT + "\n"
+            "\n"
+            "Expected extraction:\n" + _DOCUMENT_EXAMPLE_EXTRACTION
+        ),
+    )
+
+    validator = pz.Validator(model=pz.Model.GPT_5)
+    output = dataset.optimize_and_run(max_quality=True, validator=validator)
+    # output = dataset.run(max_quality=True)
     
     col_names = [c["name"] for c in concept_schema_cols]
     type_by_name = {c["name"]: c["type"] for c in concept_schema_cols}

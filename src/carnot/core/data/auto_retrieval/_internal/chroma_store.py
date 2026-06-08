@@ -3,9 +3,12 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 import chromadb
-from sentence_transformers import SentenceTransformer
+# from sentence_transformers import SentenceTransformer
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
+
+OPENAI_EMBEDDING_MODEL = "text-embedding-3-large"
 
 
 class ChromaStore:
@@ -13,16 +16,21 @@ class ChromaStore:
         self,
         collection_name: Optional[str] = None,
         persist_directory: str = "./chroma_db",
-        embedding_model_name: str = "Qwen/Qwen3-Embedding-4B",
+        # embedding_model_name: str = "Qwen/Qwen3-Embedding-4B",
+        embedding_model_name: str = OPENAI_EMBEDDING_MODEL,
         distance_metric: str = "cosine",
         collection: Optional[Any] = None,
         normalize_embeddings: bool = True,
+        embed: bool = True,
     ):
+        self.embed = embed
+
         if collection is not None:
             self.collection = collection
             self.embedding_model_name = embedding_model_name
             self.normalize_embeddings = normalize_embeddings
-            self.model = SentenceTransformer(embedding_model_name)
+            # self.model = SentenceTransformer(embedding_model_name) if self.embed else None
+            self._openai_client = OpenAI() if self.embed else None
             return
 
         if not collection_name:
@@ -31,7 +39,8 @@ class ChromaStore:
         self.client = chromadb.PersistentClient(path=persist_directory)
         self.embedding_model_name = embedding_model_name
         self.normalize_embeddings = normalize_embeddings
-        self.model = SentenceTransformer(embedding_model_name)
+        # self.model = SentenceTransformer(embedding_model_name) if self.embed else None
+        self._openai_client = OpenAI() if self.embed else None
 
         # Note: when supplying embeddings manually, do NOT pass embedding_function.
         self.collection = self.client.get_or_create_collection(
@@ -43,39 +52,53 @@ class ChromaStore:
             f"using embedding model '{embedding_model_name}'"
         )
 
-    def _embed_documents(self, texts: List[str]) -> List[List[float]]:
+    def _embed_documents(self, texts: List[str]) -> Optional[List[List[float]]]:
+        if not self.embed:
+            return None
         if not texts:
             return []
-        embeddings = self.model.encode(
-            texts,
-            normalize_embeddings=self.normalize_embeddings,
-            convert_to_numpy=True,
-            show_progress_bar=False,
+        # embeddings = self.model.encode(
+        #     texts,
+        #     normalize_embeddings=self.normalize_embeddings,
+        #     convert_to_numpy=True,
+        #     show_progress_bar=False,
+        # )
+        # return embeddings.tolist()
+        response = self._openai_client.embeddings.create(
+            input=texts,
+            model=self.embedding_model_name,
         )
-        return embeddings.tolist()
+        return [item.embedding for item in response.data]
 
-    def _embed_query(self, query_text: str) -> List[float]:
-        # Qwen3 embedding models support query-specific prompting.
-        encode_kwargs = {
-            "normalize_embeddings": self.normalize_embeddings,
-            "convert_to_numpy": True,
-            "show_progress_bar": False,
-        }
-
-        if self.embedding_model_name.startswith("Qwen/"):
-            query_embedding = self.model.encode(
-                [query_text],
-                prompt_name="query",
-                **encode_kwargs,
-            )[0]
-        else:
-            # For BGE / MiniLM / most standard ST models, regular encode is fine.
-            query_embedding = self.model.encode(
-                [query_text],
-                **encode_kwargs,
-            )[0]
-
-        return query_embedding.tolist()
+    def _embed_query(self, query_text: str) -> Optional[List[float]]:
+        if not self.embed:
+            return None
+        # # Qwen3 embedding models support query-specific prompting.
+        # encode_kwargs = {
+        #     "normalize_embeddings": self.normalize_embeddings,
+        #     "convert_to_numpy": True,
+        #     "show_progress_bar": False,
+        # }
+        #
+        # if self.embedding_model_name.startswith("Qwen/"):
+        #     query_embedding = self.model.encode(
+        #         [query_text],
+        #         prompt_name="query",
+        #         **encode_kwargs,
+        #     )[0]
+        # else:
+        #     # For BGE / MiniLM / most standard ST models, regular encode is fine.
+        #     query_embedding = self.model.encode(
+        #         [query_text],
+        #         **encode_kwargs,
+        #     )[0]
+        #
+        # return query_embedding.tolist()
+        response = self._openai_client.embeddings.create(
+            input=query_text,
+            model=self.embedding_model_name,
+        )
+        return response.data[0].embedding
 
     def upsert_documents(
         self,
@@ -103,12 +126,14 @@ class ChromaStore:
             batch_metas = metadatas[start:end] if metadatas is not None else None
             batch_embeddings = self._embed_documents(batch_docs)
 
-            self.collection.upsert(
+            upsert_kwargs = dict(
                 ids=batch_ids,
                 documents=batch_docs,
                 metadatas=batch_metas,
-                embeddings=batch_embeddings,
             )
+            if batch_embeddings is not None:
+                upsert_kwargs["embeddings"] = batch_embeddings
+            self.collection.upsert(**upsert_kwargs)
 
         return ids
 
@@ -120,12 +145,16 @@ class ChromaStore:
     ) -> List[Dict[str, Any]]:
         query_embedding = self._embed_query(query_text)
 
-        results = self.collection.query(
-            query_embeddings=[query_embedding],
+        query_kwargs = dict(
             n_results=n_results,
             where=where_filter,
             include=["documents", "metadatas", "distances"],
         )
+        if query_embedding is not None:
+            query_kwargs["query_embeddings"] = [query_embedding]
+        else:
+            query_kwargs["query_texts"] = [query_text]
+        results = self.collection.query(**query_kwargs)
 
         clean_results = []
         if results["ids"] and len(results["ids"]) > 0:
@@ -182,7 +211,8 @@ class ChromaStore:
         results = self.collection.get(
             where=where,
             limit=limit,
-            include=["documents", "metadatas"],
+            include=["metadatas"],
+            # include=["documents", "metadatas"],
         )
 
         clean = []
@@ -204,6 +234,32 @@ class ChromaStore:
                     }
                 )
         return clean
+
+    def get_filtered_ids(
+        self,
+        where: Optional[Dict[str, Any]] = None,
+        limit: Optional[int] = None,
+    ) -> List[str]:
+        """Return only IDs matching *where* (no metadata deserialization)."""
+        results = self.collection.get(
+            where=where,
+            limit=limit,
+            include=[],
+        )
+        return results["ids"] if results["ids"] else []
+
+    def build_title_index(self) -> Dict[str, Dict[str, Any]]:
+        """Build an in-memory id -> {title, source} mapping for the whole collection."""
+        results = self.collection.get(include=["metadatas"])
+        index: Dict[str, Dict[str, Any]] = {}
+        if results["ids"]:
+            for i, doc_id in enumerate(results["ids"]):
+                meta = results["metadatas"][i] if results.get("metadatas") else {}
+                index[doc_id] = {
+                    "title": meta.get("title") if meta else None,
+                    "source": meta.get("source") if meta else None,
+                }
+        return index
 
     def delete(self, ids: List[str]):
         self.collection.delete(ids=ids)
