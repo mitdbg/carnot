@@ -17,6 +17,7 @@ emit their own start/done boundaries (the orchestrator's trace owns those).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from pathlib import Path
@@ -42,7 +43,9 @@ class RetrieveOp:
         # prune sets), so it cannot be shared across concurrent branches.
         self._resources = None  # tuple[Collection, dict[str, str]]
         self._resources_lock = threading.Lock()
-        self._page_index_retriever = None  # skunk.page_index_old.query.PageIndexRetriever
+        self._page_index_retriever = (
+            None  # skunk.page_index_old.query.PageIndexRetriever
+        )
 
     async def run(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
         if ctx.config.golden_pages is not None:
@@ -51,25 +54,75 @@ class RetrieveOp:
             case "search_agent":
                 return await self._run_search_agent(ctx, branch)
             case "page_index_old":
-                return await self._run_page_index(ctx, branch)
+                return (await self._page_index().retrieve_all(ctx, [branch]))[0]
             case other:
                 raise StepFailed(
                     "retrieve",
                     f"unknown retriever {other!r}; expected 'search_agent' or 'page_index_old'",
                 )
 
-    def _run_golden(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
+    async def run_all(
+        self, ctx: ExecutionContext, branches: list[RetrieveBranch]
+    ) -> list[list[PageRef] | StepFailed]:
+        """Retrieve for several branches at once, result aligned to `branches`. A slot is
+        that branch's page refs, or a `StepFailed` to attribute to that branch alone — so a
+        single branch failing does not sink its siblings (the orchestrator routes each slot
+        to its own extract / records the error). The page-index backend scans each unique
+        candidate page with the LLM semantic filter at most once (judging it against all
+        branch targets) and routes survivors back per branch; the other backends have no
+        shared-scan benefit and run per branch via the same `run` seam. A whole-sweep /
+        infra failure (unknown retriever, missing index) raises instead."""
+        if ctx.config.golden_pages is not None:
+            out: list[list[PageRef] | StepFailed] = [
+                self._run_golden(ctx, b) for b in branches
+            ]
+            return out
+        match ctx.config.retriever:
+            case "search_agent":
+                # Independent per branch (fresh agent + per-question state); isolate
+                # per-branch failures so one branch's StepFailed doesn't fail the rest.
+                settled = await asyncio.gather(
+                    *(self._run_search_agent(ctx, b) for b in branches),
+                    return_exceptions=True,
+                )
+                results: list[list[PageRef] | StepFailed] = []
+                for r in settled:
+                    if isinstance(r, StepFailed):
+                        results.append(r)
+                    elif isinstance(r, BaseException):
+                        raise r
+                    else:
+                        results.append(r)
+                return results
+            case "page_index_old":
+                return [
+                    refs
+                    for refs in await self._page_index().retrieve_all(ctx, branches)
+                ]
+            case other:
+                raise StepFailed(
+                    "retrieve",
+                    f"unknown retriever {other!r}; expected 'search_agent' or 'page_index_old'",
+                )
+
+    def _run_golden(
+        self, ctx: ExecutionContext, branch: RetrieveBranch
+    ) -> list[PageRef]:
         """Golden-pages bypass (eval ablation only). `run` only routes here when
         `golden_pages` is set, but we guard defensively anyway (also narrows the type)."""
         if ctx.config.golden_pages is None:
-            raise StepFailed("retrieve", "golden bypass reached without golden_pages set")
+            raise StepFailed(
+                "retrieve", "golden bypass reached without golden_pages set"
+            )
         ctx.emit(
             f"golden_bypass n_pages={len(ctx.config.golden_pages)} "
             f"refs={[str(r) for r in ctx.config.golden_pages]!r}"
         )
         return ctx.config.golden_pages
 
-    async def _run_search_agent(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
+    async def _run_search_agent(
+        self, ctx: ExecutionContext, branch: RetrieveBranch
+    ) -> list[PageRef]:
         """Iterative search agent (`skunk.search_agent`); maps its page keys to `PageRef`."""
         from skunk.search_agent import SearchAgent
 
@@ -115,14 +168,14 @@ class RetrieveOp:
                 self._resources = _build_resources(config)
             return self._resources
 
-    async def _run_page_index(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
-        """Page-index retriever (ToC pick → year filter → semantic filter). The
-        inner retriever is built lazily and caches the catalog/concept-tree."""
+    def _page_index(self):
+        """Lazily build + cache the page-index retriever (loads the catalog/concept-tree
+        once). Used by both the single-branch `run` and the batched `run_all`."""
         from skunk.page_index.query import PageIndexRetriever
 
         if self._page_index_retriever is None:
             self._page_index_retriever = PageIndexRetriever()
-        return await self._page_index_retriever.retrieve(ctx, branch=branch)
+        return self._page_index_retriever
 
 
 def _build_resources(config: SkunkConfig):

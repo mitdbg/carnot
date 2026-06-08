@@ -30,7 +30,6 @@ def _strip_non_empty(v: str) -> str:
 
 NonEmptyStr = Annotated[str, AfterValidator(_strip_non_empty)]
 
-
 class RetrieveBranch(BaseModel):
     """A corpus-retrieval branch. `visual_only` skips the parsed-text tier
     downstream and goes straight to vision."""
@@ -40,7 +39,7 @@ class RetrieveBranch(BaseModel):
     kind: Literal["retrieve"] = "retrieve"
     key: NonEmptyStr            # NL phrase describing the data to find
     period: str | None = None   # YYYY-MM month/range the DATA pertains to ("2013-06", "2022-10..2023-09"); None if unpinned
-    as_of: str | None = None    # YYYY-MM reporting bulletin month ("2012-09"); None unless pinned
+    as_of: str | None = None    # YYYY-MM reporting/vintage bulletin month ("2012-09"); recorded for extraction, NOT used by retrieval
     visual_only: bool = False
 
 
@@ -127,15 +126,11 @@ retrieve branch fields:
   key           natural-language phrase describing the data to find. Focus only on a singular, cohesive concept.
                 Favor separate branches if the question requires retrieval of multiple values. Examples:
                 "national defense expenditures", "weekly average discount rate for new 91-day bills".
-  period        The period the DATA VALUE PERTAINS TO, as canonical months: a single
-                "YYYY-MM" or an inclusive "YYYY-MM..YYYY-MM" range (expand fiscal years,
-                calendar years, and quarters to month ranges yourself — see the corpus
-                notes). This is what extract uses to pick the row/column. It is NOT the
-                bulletin/report date. Null when the question doesn't pin one.
-  as_of         The bulletin/vintage the value is REPORTED IN / AS OF, as the bulletin
-                month "YYYY-MM", when the question pins one (e.g. "as reported at the end
-                of FY 2013" → "2013-06"). This selects WHICH DOCUMENT to read, not which
-                row. Null otherwise (the common case).
+  period        The period the data value pertains to as canonical months (i.e, a single
+                "YYYY-MM" or an inclusive "YYYY-MM..YYYY-MM" range, expanding fiscal years,
+                calendar years, and quarters to month ranges). Null when the question doesn't pin a data period.
+  as_of         If the question pins a point-in-time snapshot / publication date for a bulletin. Populate this field only
+                when the question explicitly asks for a specific bulletin. Null (common case) when the question doesn't ask for a specific bulletin.
   visual_only   true only if question explicitly asks for visual understanding of charts/figures.
 
 lookup_external branch fields:
@@ -144,8 +139,7 @@ lookup_external branch fields:
                 multi-period series "TreasuryDirect index ratios for the 2-3/8% Jan-2027
                 TIPS across January-August 2007").
                 When the question needs the same series across N periods, emit ONE branch
-                with a multi-period target; the lookup agent returns a labeled vector
-                (period→value). Do NOT split into N separate branches — that multiplies failure risk.
+                with a multi-period target. Do NOT split into N separate branches.
   src           Set to a publisher name if and only if the question requests a
                 single, unambiguous external source. Otherwise null.
 """

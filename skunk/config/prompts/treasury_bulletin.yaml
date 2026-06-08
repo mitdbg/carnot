@@ -45,7 +45,6 @@ overrides:
         quarter Qn YYYY     ->  that quarter's 3 months (Q2 2023 -> 2023-04..2023-06)
         fiscal year FYy     ->  (y-1)-10..y-09        (FY2008 -> 2007-10..2008-09);
                                 for FY BEFORE 1977,  (y-1)-07..y-06 (FY1939 -> 1938-07..1939-06)
-      `as_of` is the reporting bulletin month: "September 2012 bulletin" -> `2012-09`.
 
   - section: corpus
     targets: [extract.text]
@@ -96,6 +95,29 @@ overrides:
       ```
 
   # ---------------------------------------------------------------------
+  # Page-index build family — per-page scan, ToC extraction/reconstruction,
+  # and the cross-issue chapter merge + era segmentation. All reason over the
+  # same Treasury section taxonomy, so they share this corpus blurb.
+  # ---------------------------------------------------------------------
+  - section: corpus
+    targets: [page_scan, page_scan_vision, toc_outline, toc_reconstruct, chapter_merge, era_segment, era_merge]
+    content: |
+      The pages are from the U.S. Treasury Monthly Bulletin — monthly
+      federal-finance statistics (public debt, receipts/outlays, ownership of
+      Treasury securities, exchange stabilization, foreign currency positions,
+      trust funds). Fiscal year FYy is the 12 months ending in year y:
+      (y-1)-10..y-09 from FY1977 on, and (y-1)-07..y-06 before 1977. Calendar
+      year is Jan–Dec. Resolve relative or partial dates against the
+      publication month.
+
+  - section: lessons
+    targets: [page_scan, page_scan_vision]
+    content: >
+      A cumulative table of contents — a multi-month / multi-issue contents
+      grid, usually at the back of the issue — is NOT the issue's table of
+      contents; label it non_content.
+
+  # ---------------------------------------------------------------------
   # Planner lessons — gotchas observed against this corpus.
   # ---------------------------------------------------------------------
   - section: lessons
@@ -107,6 +129,8 @@ overrides:
 
       Prefer the corpus ESPECIALLY for "as reported" / vintage questions. A live external lookup returns today's revised figures; a series like GDP is revised over time, so the bulletin's as-of-that-date value is the correct one and an external lookup would silently give a wrong number. Retrieve it from the named bulletin (set `as_of`).
 
+      Set `as_of` ONLY when the question explicitly NAMES a bulletin issue (e.g. "the September 2012 Treasury Bulletin"). Do NOT derive it from a vague or implied time reference — for example, "the end of FY 2010", "as of March 2003"; Leave as_of blank in these cases.
+
       Be careful about fiscal year (FY) vs calendar year (CY). CYy is y-01..y-12, but FYy is the 12 months ending in year y — (y-1)-10..y-09 from FY1977 on, and (y-1)-07..y-06 before 1977. The months 1976-07..1976-09 are the "transition quarter" between FY1976 and FY1977 and belong to neither — pin them directly if a question asks for that period.
 
   # ---------------------------------------------------------------------
@@ -117,9 +141,8 @@ overrides:
     targets: [planner]
     content:
       - |
-        ### Example
+        ### Example (plain date range, NO bulletin named → period only; leave as_of null — do NOT infer a "vintage" issue from the data years)
         Q: Absolute percent change in national defense expenditures between CY1940 and CY1953, rounded to hundredths.
-        Why this shape: One closed-form calculation over two scalar lookups. The question itself states the formula, the absolute/percent-form choices, and the rounding; compute reads them from the verbatim question.
         Plan:
         ```json
         {
@@ -135,7 +158,6 @@ overrides:
       - |
         ### Example
         Q: Real (CPI-adjusted, 2020 dollars) value of total national defense expenditures in CY1953.
-        Why this shape: Nominal value from the corpus, deflator from outside it. `src` biases the external lookup toward the canonical BLS series. The calendar year CY1953 expands to the month range 1953-01..1953-12.
         Plan:
         ```json
         {
@@ -150,15 +172,14 @@ overrides:
         ```
 
       - |
-        ### Example
-        Q: Read the total debt held by the public from the September 1990 Treasury Bulletin chart on page 5.
-        Why this shape: Chart read with visual_only=True. Direct lookup, no calculation.
+        ### Example (named issue ≠ data window → as_of and period DIFFER)
+        Q: Read the total debt held by the public for December 1985 from the chart in the September 1990 Treasury Bulletin.
         Plan:
         ```json
         {
           "branches": [
             {"kind": "retrieve", "key": "chart of total debt held by the public",
-             "period": "1990-09",
+             "period": "1985-12", "as_of": "1990-09",
              "visual_only": true}
           ]
         }
@@ -167,7 +188,6 @@ overrides:
       - |
         ### Example (multi-period external series: ONE branch, list payload)
         Q: Sum of annual U.S. CPI-U for 1950, 1951, and 1952.
-        Why this shape: Same external series across consecutive years → ONE lookup_external branch with a multi-period target, NOT three. The lookup agent returns a labeled series (a vector keyed by year); compute sums it.
         Plan:
         ```json
         {
@@ -182,7 +202,6 @@ overrides:
       - |
         ### Example (vintage: data period ≠ report date; reprinted GDP via retrieve)
         Q: Using the figures reported in the September 2012 Treasury Bulletin, what was the change in federal debt held by the public as a percent of GDP between the end of fiscal year 2008 and fiscal year 2010?
-        Why this shape: An "as reported in bulletin Y" (vintage) question. The DATA periods are FY2008 and FY2010 → `period` (post-1977 fiscal years expand to 2007-10..2008-09 and 2009-10..2010-09); the reporting vintage is the Sept-2012 bulletin → `as_of` = 2012-09. Never put the report year (2012) in `period` — that is what `as_of` is for. GDP is reprinted in the Bulletin's debt-to-GDP tables, so it is a `retrieve` of the as-of-2012 vintage, NOT a `lookup_external` (which would return today's revised GDP → wrong answer). One branch per (series, period).
         Plan:
         ```json
         {
@@ -198,6 +217,7 @@ overrides:
           ]
         }
         ```
+
 
   # ---------------------------------------------------------------------
   # Corpus blurbs for the remaining executors.

@@ -16,7 +16,9 @@ if TYPE_CHECKING:
 # Default corpus locations (overridable via env / explicit construction — see the
 # `parsed_json_dir` / `pdf_dir` fields below). Homed here so `SkunkConfig` is the single
 # source of truth for where the corpus lives; `corpus.py` resolves through it.
-_DEFAULT_PARSED_JSON_DIR = Path.home() / "Desktop/officeqa/treasury_bulletins_parsed/jsons"
+_DEFAULT_PARSED_JSON_DIR = (
+    Path.home() / "Desktop/officeqa/treasury_bulletins_parsed/jsons"
+)
 _DEFAULT_PDF_DIR = Path.home() / "Desktop/officeqa/treasury_bulletin_pdfs"
 
 
@@ -105,12 +107,36 @@ class SkunkConfig:
     agent_model_id: str | None = None
 
     # Page-index semantic filter: a single coarse pass over each year-filtered page's
-    # metadata summary, judged against the full question (positional true/false per
-    # page). The filter runs on a cheaper model, resolved through the standard
-    # per-call model-override registry under key "semfilter" (seeded in
-    # `__post_init__`) — so it's tuned like any other call-site rather than via a
-    # dedicated field. (env: SKUNK_SEMFILTER_MODEL, SKUNK_SEMFILTER_BATCH)
-    semfilter_batch_size: int = 20
+    # metadata summary, scored once against every active branch target at once (a B×K
+    # true/false matrix, one row per page, one column per target). The filter runs on a
+    # cheaper model, resolved through the standard per-call model-override registry under
+    # key "semfilter" (seeded in `__post_init__`) — so it's tuned like any other call-site
+    # rather than via a dedicated field. NOTE: with the flat-block filter this is the max
+    # CONTENT BLOCKS per call (pages are exploded into blocks and packed page-coherently up to
+    # this cap), not pages. 32: the flat shape is far less batch-sensitive than the old nested
+    # page objects, so a wide cap keeps call count / latency low without losing recall.
+    # (env: SKUNK_SEMFILTER_MODEL, SKUNK_SEMFILTER_BATCH)
+    semfilter_batch_size: int = 32
+
+    # Stop the page-index retrieve after ToC pick + year filter, skipping the semantic
+    # filter entirely — used to measure the ToC+date recall ceiling / elimination rate in
+    # isolation. (env: SKUNK_RETRIEVE_SKIP_SEMFILTER=1)
+    retrieve_skip_semfilter: bool = False
+
+    # Intermediate page-selection stage (opt-in, page-index retriever only). After the
+    # semantic filter routes survivors per branch, a small per-branch agent (PageSelectAgent)
+    # narrows them to the pages the branch actually needs — browsing per-era candidate
+    # summaries (grep / read_file) and reading candidate pages (read_page) — before extract.
+    # Off by default (prototype); the agent falls back to keep-all on an unusable answer, so
+    # recall is preserved. (env: SKUNK_PAGE_SELECT=1)
+    page_select: bool = False
+
+    # Build: the `vision_rescan` stage always re-reads `parse_broken` pages (mangled parses). Pages
+    # flagged `has_unparsed_graphics` that are CHART-ONLY (a chart/figure with no table on the page,
+    # so its data is otherwise lost) are re-read only when this is on. That set is the bulk of the
+    # vision working set (~6k pages corpus-wide) and low-value for table-centric queries, so chart
+    # re-reading is an opt-in phase, default off. (env: SKUNK_VISION_RESCAN_CHARTS=1)
+    vision_rescan_charts: bool = False
 
     def __post_init__(self) -> None:
         # Route the semantic filter's (cheaper) model through the model-override
@@ -121,7 +147,9 @@ class SkunkConfig:
 
     @classmethod
     def from_env(cls) -> SkunkConfig:
-        model_overrides = _parse_model_overrides(os.environ.get("SKUNK_MODEL_OVERRIDES", ""))
+        model_overrides = _parse_model_overrides(
+            os.environ.get("SKUNK_MODEL_OVERRIDES", "")
+        )
         # SKUNK_SEMFILTER_MODEL is a convenience knob for the "semfilter" override;
         # an explicit SKUNK_MODEL_OVERRIDES=semfilter=… wins, and the hardcoded
         # default (`__post_init__`) fills in if neither is set.
@@ -131,23 +159,39 @@ class SkunkConfig:
         return cls(
             llm_model=os.environ.get("SKUNK_LLM_MODEL", "gemini-3.5-flash"),
             llm_provider=os.environ.get("SKUNK_LLM_PROVIDER", "genai"),  # type: ignore[arg-type]
-            effort_overrides=_parse_effort_overrides(os.environ.get("SKUNK_EFFORT_OVERRIDES", "")),
+            effort_overrides=_parse_effort_overrides(
+                os.environ.get("SKUNK_EFFORT_OVERRIDES", "")
+            ),
             model_overrides=model_overrides,
             llm_max_retries=int(os.environ.get("SKUNK_LLM_MAX_RETRIES", "5")),
-            llm_retry_initial_delay_s=float(os.environ.get("SKUNK_LLM_RETRY_INITIAL_DELAY", "1.0")),
-            parsed_json_dir=Path(os.environ.get("OFFICEQA_PARSED_JSON_DIR") or _DEFAULT_PARSED_JSON_DIR),
+            llm_retry_initial_delay_s=float(
+                os.environ.get("SKUNK_LLM_RETRY_INITIAL_DELAY", "1.0")
+            ),
+            parsed_json_dir=Path(
+                os.environ.get("OFFICEQA_PARSED_JSON_DIR") or _DEFAULT_PARSED_JSON_DIR
+            ),
             pdf_dir=Path(os.environ.get("OFFICEQA_PDF_DIR") or _DEFAULT_PDF_DIR),
             prompt_overrides_path=os.environ.get(
                 "SKUNK_PROMPT_OVERRIDES", "config/prompts/treasury_bulletin.yaml"
             ),
-            semfilter_batch_size=int(os.environ.get("SKUNK_SEMFILTER_BATCH", "20")),
-            retriever=os.environ.get("SKUNK_RETRIEVER", "page_index"),  # type: ignore[arg-type]
+            semfilter_batch_size=int(os.environ.get("SKUNK_SEMFILTER_BATCH", "32")),
+            retrieve_skip_semfilter=os.environ.get("SKUNK_RETRIEVE_SKIP_SEMFILTER", "")
+            not in ("", "0"),
+            page_select=os.environ.get("SKUNK_PAGE_SELECT", "") not in ("", "0"),
+            vision_rescan_charts=os.environ.get("SKUNK_VISION_RESCAN_CHARTS", "") not in ("", "0"),
+            retriever=os.environ.get("SKUNK_RETRIEVER", "page_index_old"),  # type: ignore[arg-type]
             chromadb_dir=os.environ.get("SKUNK_CHROMADB_DIR", "cache/chromadb"),
-            chromadb_collection=os.environ.get("SKUNK_CHROMADB_COLLECTION", "treasury_pages"),
-            clean_page_map_path=os.environ.get("SKUNK_CLEAN_PAGE_MAP", "cache/clean_page_map.json"),
+            chromadb_collection=os.environ.get(
+                "SKUNK_CHROMADB_COLLECTION", "treasury_pages"
+            ),
+            clean_page_map_path=os.environ.get(
+                "SKUNK_CLEAN_PAGE_MAP", "cache/clean_page_map.json"
+            ),
             emb_model_id=os.environ.get("SKUNK_EMB_MODEL", "gemini-embedding-001"),
             agent_max_steps=int(os.environ.get("SKUNK_AGENT_MAX_STEPS", "20")),
-            agent_max_pages_per_tool_call=int(os.environ.get("SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL", "20")),
+            agent_max_pages_per_tool_call=int(
+                os.environ.get("SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL", "20")
+            ),
             lookup_max_steps=int(os.environ.get("SKUNK_LOOKUP_MAX_STEPS", "8")),
             lookup_tools=_parse_csv(os.environ.get("SKUNK_LOOKUP_TOOLS", "")),
             agent_model_id=os.environ.get("SKUNK_AGENT_MODEL") or None,

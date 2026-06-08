@@ -14,29 +14,31 @@ from skunk.common import (
 from skunk.errors import StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.plan import RetrieveBranch
-from skunk.corpus import get_page_text, page_elements, render_page_b64
+from skunk.page_index.store import get_page_store
+
 
 def _render_pages_b64(
     refs: list[PageRef],
     ctx: ExecutionContext,
-    *,
-    dpi: int = 300,
-    fmt: str = "png",
 ) -> tuple[list[B64Image], list[PageRef]]:
+    """Page images for the vision tier, from the page store (rendered on demand at 200 DPI +
+    cached). The returned refs identify each image's source page so the prompt's numbered list
+    can't conflate them."""
+    store = get_page_store(str(ctx.config.pdf_dir))
     images: list[B64Image] = []
     rendered_refs: list[PageRef] = []
     for ref in refs:
         try:
-            img = render_page_b64(ref.month, ref.page, dpi=dpi, fmt=fmt, pdf_dir=ctx.config.pdf_dir)
-        except Exception as e:  # noqa: BLE001 — vision tier fallback; any fitz error → skip page
+            img = store.image(ref)
+        except Exception as e:  # noqa: BLE001 — vision tier fallback; any render error → skip page
             ctx.emit(f"render_failed page={str(ref)} error={str(e)!r}")
             continue
-        if img:
-            ctx.emit(f"rendered_png page={str(ref)}")
-            images.append(img)
-            rendered_refs.append(ref)
-        else:
+        if img is None:
             ctx.emit(f"no_png page={str(ref)}")
+            continue
+        ctx.emit(f"rendered_png page={str(ref)}")
+        images.append(img)
+        rendered_refs.append(ref)
     return images, rendered_refs
 
 
@@ -168,36 +170,16 @@ pick the smallest shape that captures every relevant value."""
 
     @staticmethod
     def _fetch_page_texts(refs: list[PageRef], ctx: ExecutionContext) -> list[tuple[PageRef, str]]:
-        """Fetch parsed text per ref; skip pages with none (the vision tier can still
-        read them), appending a figure-note hint when the page carries charts."""
+        """Fetch each ref's text from the page store (an anchor's text is its merged member
+        pages, with any figure note already baked in); skip refs with none (the vision tier can
+        still read them)."""
+        store = get_page_store(str(ctx.config.pdf_dir))
         pages: list[tuple[PageRef, str]] = []
         for ref in refs:
-            text = get_page_text(ref.month, ref.page, base_dir=ctx.config.parsed_json_dir)
+            text = store.text(ref)
             if not text:
                 ctx.emit(f"no_text tier=parsed_json page={str(ref)}")
                 continue
-            # Figures are parsed as `type="figure"` with `content=null`: their plotted
-            # data is absent from the text, so without a heads-up the tier reports the
-            # value missing or scrapes it from prose. Flag any figures so it can defer
-            # to the vision tier instead.
-            try:
-                els = page_elements(ref.month, base_dir=ctx.config.parsed_json_dir).get(ref.page) or []  # type: ignore[arg-type]
-            except Exception:  # noqa: BLE001 — best-effort hint; never block extraction on a parse miss
-                els = []
-            n_figs = sum(1 for e in els if e.get("type") == "figure")
-            if n_figs:
-                headers = list(dict.fromkeys(
-                    e["content"].strip() for e in els
-                    if e.get("type") in ("title", "section_header") and e.get("content")
-                ))
-                note = (
-                    f"[This page has {n_figs} figure(s)/chart(s) (headings: "
-                    f"{'; '.join(headers) or '(untitled)'}) whose plotted data is NOT in the "
-                    f"text above. If the value you need appears only in a chart, return [] so "
-                    f"the vision tier can read it.]"
-                )
-                ctx.emit(f"figure_hint tier=parsed_json page={str(ref)} note_chars={len(note)}")
-                text = f"{text}\n\n{note}"
             ctx.emit(f"got_text tier=parsed_json page={str(ref)} chars={len(text)}")
             pages.append((ref, text))
         return pages

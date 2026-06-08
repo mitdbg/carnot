@@ -296,11 +296,25 @@ class LLMResponse:
 
 def make_genai_client() -> genai.Client:
     """Build a direct-Gemini (AI Studio) genai.Client from `GEMINI_API_KEY`.
-    Auth via api-key; no GCP project required."""
+    Auth via api-key; no GCP project required.
+
+    A per-request timeout (`SKUNK_LLM_TIMEOUT_S`, default 120s) is set so a runaway
+    "thinking" call — a known Gemini soft-limit issue where one request streams its
+    thought trace for minutes — raises `httpx.ReadTimeout` instead of hanging forever.
+    That exception is retryable (`llm_client._is_retryable`), so the call retries and
+    normally completes (runaways are sporadic). Without this, one stuck call wedges the
+    whole `asyncio.gather` over a batch — fatal at small semfilter batch sizes, where a
+    single UID fans out into thousands of concurrent single-page calls."""
+    from google.genai import types
+
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not set (required for Gemini API)")
-    return genai.Client(api_key=api_key)
+    timeout_s = float(os.environ.get("SKUNK_LLM_TIMEOUT_S", "120"))
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=int(timeout_s * 1000)),  # SDK wants ms
+    )
 
 
 # --- Cross-cutting runtime types threaded between operators and the orchestrator ---
