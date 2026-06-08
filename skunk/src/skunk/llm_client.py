@@ -207,6 +207,9 @@ class LLMResponse:
     latency_s: float
     input_tokens: int | None
     output_tokens: int | None
+    # Cached (prompt-cache hit) input tokens, when the provider reports them.
+    # Subset of input_tokens; None when unknown.
+    cache_input_tokens: int | None = None
 
 
 def _make_openrouter_client() -> "OpenRouter":
@@ -425,6 +428,7 @@ class LLMClient:
             "output_tokens": getattr(usage, "candidates_token_count", None),
             "total_tokens": getattr(usage, "total_token_count", None),
             "thinking_tokens": getattr(usage, "thoughts_token_count", None),
+            "cache_input_tokens": getattr(usage, "cached_content_token_count", None),
         }
 
     def _call_gemini(
@@ -464,6 +468,7 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
+                cache_input_tokens=toks.get("cache_input_tokens"),
             )
 
         return self._retry_call(do, model)
@@ -519,6 +524,7 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
+                cache_input_tokens=toks.get("cache_input_tokens"),
             )
 
         return await self._aretry_call(do, model)
@@ -602,6 +608,7 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
+                cache_input_tokens=toks.get("cache_input_tokens"),
             )
 
         return self._retry_call(do, model_id)
@@ -680,6 +687,7 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
+                cache_input_tokens=toks.get("cache_input_tokens"),
             )
 
         return await self._aretry_call(do, model_id)
@@ -721,10 +729,12 @@ class LLMClient:
     @staticmethod
     def _usage_tokens_openrouter(usage: Any) -> dict:
         """Token counts from an OpenRouter `ChatUsage` (best-effort — any may be None)."""
+        details = getattr(usage, "prompt_tokens_details", None)
         return {
             "input_tokens": getattr(usage, "prompt_tokens", None),
             "output_tokens": getattr(usage, "completion_tokens", None),
             "total_tokens": getattr(usage, "total_tokens", None),
+            "cache_input_tokens": getattr(details, "cached_tokens", None) if details else None,
         }
 
     def _call_openrouter(
@@ -767,6 +777,7 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
+                cache_input_tokens=toks.get("cache_input_tokens"),
             )
 
         return self._retry_call(do, model)
@@ -820,6 +831,7 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
+                cache_input_tokens=toks.get("cache_input_tokens"),
             )
 
         return await self._aretry_call(do, model)
@@ -888,6 +900,7 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
+                cache_input_tokens=toks.get("cache_input_tokens"),
             )
 
         return self._retry_call(do, model_id)
@@ -936,6 +949,7 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
+                cache_input_tokens=toks.get("cache_input_tokens"),
             )
 
         return await self._aretry_call(do, model_id)
