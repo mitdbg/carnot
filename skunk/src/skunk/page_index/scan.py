@@ -32,14 +32,14 @@ class PageScan(BaseModel):
     )
     date_interval: tuple[str, str] | None = None
     blocks: list[ContentBlock] = Field(default_factory=list)
-    # Build-only: physical pages folded into this one by `merge_continuations` (the dropped
-    # continuation pages this anchor now represents). The scan LLM never sets it.
+    # Legacy: pages a retired merge pass folded into this one. Nothing folds any more
+    # (every page is its own catalog row; `is_continuation` is metadata only) — kept,
+    # always empty, so older artifacts still validate. The scan LLM never sets it.
     continuation_pages: list[int] = Field(default_factory=list)
     # Build-only routing: set True once this page has been through the vision_rescan tier
     # (re-read from the rendered image). The marker — not the flags — is what resume keys on,
     # since a page can stay flagged after a successful re-read (e.g. a chart whose data can be
-    # described but not extracted). Declared here so it survives `merge_continuations`' model
-    # round-trip. The scan LLM never sets it; the vision_rescan stage does.
+    # described but not extracted). The scan LLM never sets it; the vision_rescan stage does.
     vision_rescanned: bool = False
 
     @field_validator("date_interval")
@@ -206,53 +206,3 @@ async def vision_scan_page(
     return await _vision_scan.call(
         ctx, f"publication month: {bulletin}", images=[image]
     )
-
-
-def _widen(
-    a: tuple[str, str] | None, b: tuple[str, str] | None
-) -> tuple[str, str] | None:
-    """Union two `(low, high)` month spans into the enclosing span (None acts as empty)."""
-    if a is None:
-        return b
-    if b is None:
-        return a
-    return (min(a[0], b[0]), max(a[1], b[1]))
-
-
-def merge_continuations(scans: dict[int, PageScan]) -> tuple[dict[int, PageScan], int]:
-    """Fold each continuation page into the previous content page and drop it (deterministic, no LLM).
-
-    Walks pages in ascending order keeping an `anchor` — the most recent kept CONTENT page,
-    reset to None on any non-content page (so a continuation never merges across a section
-    divider). A content page flagged `is_continuation` with a live anchor is folded into that
-    anchor — its blocks appended, `date_interval` widened — and its page number recorded in
-    `anchor.continuation_pages`; the page itself is dropped from the result. Any other page is
-    kept and becomes the new anchor, so an orphan continuation (one with no preceding content
-    page) stays standalone. Page numbers are never renumbered.
-
-    `is_continuation` fires only on a genuine label-less fragment (a table whose rows carry over
-    with no restated headers, or a prose/footnote spillover), so continuations are sparse and
-    each appends at most one or two fragment blocks — no need to fuse a split table back into one
-    block. Both halves stay on the anchor's row (the head block carries the headers) and the page
-    store serves every member page, so retrieval and extract see the whole table either way.
-
-    Returns `(merged_scans, n_merged)`.
-    """
-    out: dict[int, PageScan] = {}
-    anchor: PageScan | None = None
-    n_merged = 0
-    for page in sorted(scans):
-        s = scans[page]
-        if s.page_role != "content":
-            out[page] = s
-            anchor = None
-            continue
-        if s.is_continuation and anchor is not None:
-            anchor.blocks.extend(s.blocks)
-            anchor.date_interval = _widen(anchor.date_interval, s.date_interval)
-            anchor.continuation_pages.extend([page, *s.continuation_pages])
-            n_merged += 1
-            continue
-        out[page] = s
-        anchor = s
-    return out, n_merged

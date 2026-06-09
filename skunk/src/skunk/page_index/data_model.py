@@ -47,6 +47,18 @@ class ContentBlock(BaseModel):
     # What the block reports; set by the scan, read by the semantic filter.
     summary: str | None = None
 
+    # Cross-page table merge (the build's `table_merge` pass; the scan LLM never sets
+    # these). A table block with NO row and NO column labels is a genuine continuation —
+    # a fragment whose headers live on an earlier page, or a "Footnotes to Table X"
+    # spillover. The pass links it to its parent block:
+    #   - `extra_pages` (on the PARENT) — the later pages whose fragment blocks were folded
+    #     into this block. Retrieval expands a selected block to [its own page, *extra_pages]
+    #     so the text tier reads and the vision tier renders every page of the table.
+    #   - `merged_into` (on the FRAGMENT) — the parent block's page. The catalog projection
+    #     drops merged fragments (the parent's row covers them); scans keep them, lossless.
+    extra_pages: list[int] = Field(default_factory=list)
+    merged_into: int | None = None
+
 
 # Prompt blurb for the ContentBlock object — one source of truth shared by every prompt that
 # emits or reads a content block (the page scan that produces them, the semantic filter that
@@ -95,6 +107,14 @@ class PageCatalogRow(BaseModel):
         kept anchor into these so extract reads the merged text once (continuation pages carry
         no text of their own) and the vision tier renders every page of the continued table."""
         return [PageRef(month=self.bulletin, page=p) for p in self.member_pages]
+
+    def block_refs(self, block: ContentBlock) -> list[PageRef]:
+        """The physical pages ONE block spans: the row's member pages plus the block's own
+        cross-page merge tail (`extra_pages`), deduped in order. This is what a selected block
+        expands to — so extract's text tier reads, and its vision tier renders, every page of
+        a table that continues across pages, while unmerged blocks stay a single page."""
+        pages = list(dict.fromkeys(self.member_pages + list(block.extra_pages)))
+        return [PageRef(month=self.bulletin, page=p) for p in pages]
 
     @property
     def primary_title(self) -> str | None:
