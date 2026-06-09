@@ -39,7 +39,7 @@ class RetrieveBranch(BaseModel):
     kind: Literal["retrieve"] = "retrieve"
     key: NonEmptyStr            # NL phrase describing the data to find
     period: str | None = None   # YYYY-MM month/range the DATA pertains to ("2013-06", "2022-10..2023-09"); None if unpinned
-    as_of: str | None = None    # YYYY-MM reporting/vintage bulletin month ("2012-09"); recorded for extraction, NOT used by retrieval
+    as_of: str | None = None    # YYYY-MM publication/vintage bulletin month ("2012-09"); pins the issue in retrieve (era prune + year filter; block_select tie-breaker) and is stamped onto extracted values as provenance
     visual_only: bool = False
 
 
@@ -191,7 +191,7 @@ Rules:
     )
 
     async def plan(self, question: str, ctx: ExecutionContext) -> Plan:
-        return await self._prompt.call(ctx, f"Question: {question}")
+        return await self._prompt.call(ctx, f"Question: {question}", temperature=0.0)
 
     @staticmethod
     def _failed_section(
@@ -244,4 +244,4 @@ Rules:
         parts.append(
             f"What was missing:\n  description: {missing_reason}\n  missing:     {missing!r}"
         )
-        return await self._replan_prompt.call(ctx, "\n\n".join(parts))
+        return await self._replan_prompt.call(ctx, "\n\n".join(parts), temperature=0.4)

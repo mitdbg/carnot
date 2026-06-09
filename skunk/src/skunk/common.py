@@ -16,6 +16,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +32,7 @@ from skunk.config import SkunkConfig
 if TYPE_CHECKING:
     from skunk.llm_client import LLMClient
     from skunk.prompted_call import PromptOverride
+    from skunk.page_index.data_model import ContentBlock
 
 # Reasoning-effort knob, mapped onto Gemini's `thinking_level` enum. "off" means
 # no thinking; "minimal" is the cheapest thinking tier.
@@ -317,6 +319,19 @@ def page_key_to_pageref(key: str) -> PageRef:
     return PageRef(month=f"{year_str}-{month_str}", page=int(page_str))
 
 
+@dataclass(frozen=True)
+class BlockRef:
+    """One retrieved CONTENT BLOCK — the retriever's native output unit. `page` is the anchor
+    page, `block_index` its position in `content_blocks` (None for a page kept wholesale).
+    `member_refs` are the physical pages this block spans (anchor + any table-merge extra pages).
+    `block` is excluded from identity so `BlockRef`s de-dupe on `page`/`block_index`/`member_refs`."""
+
+    page: PageRef
+    block_index: int | None
+    member_refs: tuple[PageRef, ...]
+    block: ContentBlock | None = field(default=None, compare=False)
+
+
 VALUE_KIND_VOCAB: frozenset[str] = frozenset({"scalar", "vector", "table"})
 
 
@@ -332,6 +347,15 @@ class AnnotatedValue(BaseModel):
 
     `.frame` exposes the payload as a uniform `pd.DataFrame` so downstream code
     needn't branch on `kind`.
+
+    Provenance (`bulletin`/`pages`/`as_of`/`requested_period`/`retrieve_key`) is
+    machine-stamped from the extract inputs — the source page refs and the
+    retrieve branch — NOT authored by the LLM. It is absent (None/empty) for
+    external lookups and for older payloads. `bulletin` is the issue the value
+    was printed in ("YYYY-MM", lexically sortable = chronological); downstream
+    compute uses it to sort/filter by publication date — e.g. to pick the
+    latest non-revised vintage across several bulletins, where the LLM-written
+    `description` of the same series+period can be identical across issues.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -343,6 +367,14 @@ class AnnotatedValue(BaseModel):
     index_name: str | None = None
     row_name: str | None = None
     col_name: str | None = None
+
+    # Provenance — copied from the source page/branch at extract time, never
+    # LLM-written. Defaults keep external lookups and old payloads valid.
+    bulletin: str | None = None        # source issue "YYYY-MM" (publication date)
+    pages: tuple[int, ...] = ()        # source PDF page(s); () when unattributable
+    as_of: str | None = None           # branch.as_of — pinned vintage requested
+    requested_period: str | None = None  # branch.period — data window requested
+    retrieve_key: str | None = None    # branch.key — concept this datum serves
 
     @model_validator(mode="after")
     def _check_shape(self) -> AnnotatedValue:
@@ -407,15 +439,39 @@ _SAMPLE_ROWS = 2
 _PAD = "         "  # 9-space continuation indent for an entry's detail lines
 
 
+def _provenance_str(e: AnnotatedValue) -> str:
+    """One-line provenance for the schema view — only the fields that are set, so
+    external lookups (no bulletin) stay uncluttered. Empty string when nothing is set."""
+    parts: list[str] = []
+    if e.bulletin:
+        parts.append(f"bulletin={e.bulletin!r}")
+    if e.pages:
+        parts.append(f"pages={list(e.pages)!r}")
+    if e.as_of:
+        parts.append(f"as_of={e.as_of!r}")
+    if e.requested_period:
+        parts.append(f"requested_period={e.requested_period!r}")
+    if e.retrieve_key:
+        parts.append(f"retrieve_key={e.retrieve_key!r}")
+    return " ".join(parts)
+
+
 def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
     """Schema view of one `AnnotatedValue`: the meta line, then (for non-scalars) the
     full index labels — load-bearing, they're what generated code keys `.loc[...]` on,
-    and aren't otherwise in the prompt — plus a tiny `head` sample. Scalars show in full."""
+    and aren't otherwise in the prompt — plus a tiny `head` sample. Scalars show in full.
+    A `provenance:` line carries the machine-stamped source fields when present."""
     head = (
         f"  input_values[{i}]  description: {(e.description or '(no description)')!r}"
     )
+    prov = _provenance_str(e)
+    prov_lines = [f"{_PAD}provenance: {prov}"] if prov else []
     if e.kind == "scalar":
-        return [head, f"{_PAD}value={e.value!r}  (kind=scalar, unit={e.unit!r})"]
+        return [
+            head,
+            f"{_PAD}value={e.value!r}  (kind=scalar, unit={e.unit!r})",
+            *prov_lines,
+        ]
 
     df = e.frame
     n_rows, n_cols = df.shape
@@ -607,3 +663,40 @@ class ExecutionContext:
             self._logfile.flush()
         if self.verbose:
             print(trace.render_line({"uid": self.uid, **evt}))
+
+
+async def traced_step[T](
+    ctx: ExecutionContext,
+    op_name: str,
+    fn: Callable[[], Awaitable[T]],
+    *,
+    branch_id: int | None = None,
+) -> T:
+    """Run `fn` inside a `ctx.step` frame and emit a boundary event with elapsed time."""
+    from skunk.errors import MissingData, StepFailed
+    from skunk.result import describe_value, summarize_value
+
+    t0 = time.perf_counter()
+    with ctx.step(op_name):
+        try:
+            result = await fn()
+        except (StepFailed, MissingData) as e:
+            err = f"MissingData: {e.reason}" if isinstance(e, MissingData) else str(e)
+            elapsed = round(time.perf_counter() - t0, 3)
+            ctx.emit(
+                f"step elapsed_s={elapsed} output=(failed) error={err!r}",
+                kind="step",
+                data={"branch_id": branch_id, "elapsed_s": elapsed, "error": err},
+            )
+            raise
+        elapsed = round(time.perf_counter() - t0, 3)
+        ctx.emit(
+            f"step elapsed_s={elapsed} output={describe_value(result)!r}",
+            kind="step",
+            data={
+                "branch_id": branch_id,
+                "elapsed_s": elapsed,
+                "summary": summarize_value(result),
+            },
+        )
+    return result

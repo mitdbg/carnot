@@ -9,8 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from skunk.common import Effort
-    from skunk.common import PageRef
+    from skunk.common import BlockRef, Effort, PageRef
 
 
 # Default corpus locations (overridable via env / explicit construction — see the
@@ -78,9 +77,16 @@ class SkunkConfig:
     # Ablation: golden page refs bypass the retrieve operator (eval runs only).
     golden_pages: list[PageRef] | None = field(default=None, repr=False)
 
-    # Retrieve dispatch: "page_index_old" (ToC pick → year filter → coarse summary filter,
-    # the default) or "search_agent" (iterative ChromaDB + LLM loop). (env: SKUNK_RETRIEVER)
-    retriever: Literal["search_agent", "page_index_old"] = "page_index_old"
+    # Replay: the page-index blocks `block_select` chose, injected alongside `golden_pages`
+    # when replaying a block-aware retrieval cache (`--retrieval-cache`). Lets extract block-scope
+    # exactly as the live run did, bypassing retrieve. None on live runs and for `--golden` /
+    # search-agent caches (no blocks) — extract then reads whole pages. (eval runs only)
+    cached_blocks: list[BlockRef] | None = field(default=None, repr=False)
+
+    # Retrieve dispatch: "page_index" (ToC pick → year filter → coarse summary filter →
+    # block selection, the default) or "search_agent" (iterative ChromaDB + LLM loop).
+    # (env: SKUNK_RETRIEVER)
+    retriever: Literal["search_agent", "page_index"] = "page_index"
 
     # Search-agent corpus artifacts (built offline; agent fails fast if missing).
     # (env: SKUNK_CHROMADB_DIR, SKUNK_CHROMADB_COLLECTION, SKUNK_CLEAN_PAGE_MAP)
@@ -98,7 +104,7 @@ class SkunkConfig:
 
     # Step cap for the lookup_external agent (terminates earlier via its final-answer JSON block).
     # (env: SKUNK_LOOKUP_MAX_STEPS)
-    lookup_max_steps: int = 8
+    lookup_max_steps: int = 4
     # Active lookup tools by name (see `lookup_tools._REGISTRY`); None → all tools.
     # (env: SKUNK_LOOKUP_TOOLS — comma-separated, e.g. "fetch_fred,tavily_search")
     lookup_tools: list[str] | None = None
@@ -122,12 +128,6 @@ class SkunkConfig:
     # filter entirely — used to measure the ToC+date recall ceiling / elimination rate in
     # isolation. (env: SKUNK_RETRIEVE_SKIP_SEMFILTER=1)
     retrieve_skip_semfilter: bool = False
-
-    # Intermediate block-selection stage (opt-in, page-index retriever only). After the semantic
-    # filter routes survivors per branch, `BlockSelectAgent` reduces the candidate blocks with a
-    # tournament of small packed group calls down to the few relevant blocks (block granularity),
-    # then expands to page refs — before extract. (env: SKUNK_BLOCK_SELECT=1)
-    block_select: bool = True
 
     # Extract: skip the parsed-text (OCR) tier entirely and read values straight off the rendered
     # page images (vision tier). Default on — vision is robust to the OCR corruption that the
@@ -191,10 +191,9 @@ class SkunkConfig:
             semfilter_batch_size=int(os.environ.get("SKUNK_SEMFILTER_BATCH", "32")),
             retrieve_skip_semfilter=os.environ.get("SKUNK_RETRIEVE_SKIP_SEMFILTER", "")
             not in ("", "0"),
-            block_select=os.environ.get("SKUNK_BLOCK_SELECT", "1") not in ("", "0"),
             extract_vision_only=os.environ.get("SKUNK_EXTRACT_VISION_ONLY", "1") not in ("", "0"),
             vision_rescan_charts=os.environ.get("SKUNK_VISION_RESCAN_CHARTS", "") not in ("", "0"),
-            retriever=os.environ.get("SKUNK_RETRIEVER", "page_index_old"),  # type: ignore[arg-type]
+            retriever=os.environ.get("SKUNK_RETRIEVER", "page_index"),  # type: ignore[arg-type]
             chromadb_dir=os.environ.get("SKUNK_CHROMADB_DIR", "cache/chromadb"),
             chromadb_collection=os.environ.get(
                 "SKUNK_CHROMADB_COLLECTION", "treasury_pages"
@@ -207,7 +206,7 @@ class SkunkConfig:
             agent_max_pages_per_tool_call=int(
                 os.environ.get("SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL", "20")
             ),
-            lookup_max_steps=int(os.environ.get("SKUNK_LOOKUP_MAX_STEPS", "8")),
+            lookup_max_steps=int(os.environ.get("SKUNK_LOOKUP_MAX_STEPS", "4")),
             lookup_tools=_parse_csv(os.environ.get("SKUNK_LOOKUP_TOOLS", "")),
             agent_model_id=os.environ.get("SKUNK_AGENT_MODEL") or None,
         )

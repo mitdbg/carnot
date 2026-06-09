@@ -16,18 +16,28 @@ per-bulletin (`BulletinStage`); two are whole-corpus reductions:
   3. `vision_rescan` (reduction)               — re-scan each page the text scan flagged
      (`has_unparsed_graphics` / `parse_broken`) from its rendered PDF IMAGE, overwriting that
      page's record in the scan file in place (one `vision_scan_page` LLM call per flagged page).
-  4. `merge_continuations` (reduction)         — fold each `is_continuation` page into the
-     previous content page and drop it, rewriting the scan file in place (no LLM).
+  4. `table_merge` (reduction)                 — link each label-less table fragment (a block
+     with NO row/column labels: a continued table's bare data rows, or a footnotes spillover)
+     to its parent block via one flash call per candidate, annotating the scan file in place
+     (`extra_pages` on the parent / `merged_into` on the fragment; see `table_merge.py`).
   5. `toc`         (`build/toc/<b>.json`)      — coalesce the scan's `toc` pages, then one
      `outline_issue` call extracts the chapter outline AND flags non-ToCs (`is_toc`).
   6. `reconstruct_toc` (reduction)             — fill each ToC-less issue's outline from its
      section-divider pages, using neighbors' real ToCs as reference (overwrites its toc file).
   7. `place`       (`build/place/<b>.json`)    — file each content page under its chapter.
   8. `catalog`     (`build/catalog/<b>.jsonl`) — the slim query-facing per-page rows.
-  9. `page_store`  (`build/pages/<b>.json`)    — per catalog row, its member pages' JSON text
+  9. `page_store`  (`build/pages/<b>.json`)    — per catalog row, its page's JSON text
      (reusing `chop_bulletin`) + figure descriptors; the content source the query path reads.
  10. `era_merge`   (`concept_tree.json`, reduction) — segment the timeline into eras, then
      build each era's canonical table of contents.
+
+There is deliberately NO page-level continuation merge: the scan's `is_continuation` flag is
+kept as metadata only. An earlier `merge_continuations` stage folded flagged pages into their
+preceding anchor, but the flag fires on "(Continued)" captions for pages that are fully
+self-contained (in this corpus continued tables restate their headers), so merging glued
+distinct self-readable pages into multi-page anchors — wrecking per-page `date_interval`s
+and ballooning what retrieval hands extract. Every page stands as its own catalog row; the
+rare GENUINE continuations (~50 corpus-wide) are linked at TABLE granularity by `table_merge`.
 
 Shared machinery — a single `BuildContext` owns the LLM client, the corpus list, the
 process-wide token budget, and the concurrency semaphore. The `Stage` protocol is just
@@ -61,7 +71,8 @@ from skunk.trace import configure_obs
 
 from .data_model import PAGES_SUBDIR, RENDERS_SUBDIR, TREE_FILE, PageCatalogRow
 from .eras import build_concept_tree
-from .scan import PageScan, merge_continuations, scan_page, vision_scan_page
+from .scan import PageScan, scan_page, vision_scan_page
+from .table_merge import apply_merge, find_candidates, resolve_parent
 from .store import read_cached_image, render_cache_path, render_to_cache
 from .toc_index import (
     TocHierarchy,
@@ -519,7 +530,7 @@ def _patch_catalog_inline(
 
 
 class VisionRescanStage(Stage):
-    """Reduction (after `scan`, before `merge_continuations`): re-scan each page the text
+    """Reduction (after `scan`, before `toc`): re-scan each page the text
     scan flagged — `has_unparsed_graphics` (a chart/figure the parser dropped) or
     `parse_broken` (cells too scrambled to trust) — from its rendered PDF IMAGE, overwriting
     that page's record in the scan artifact in place. The vision LLM can read the graphic or
@@ -654,43 +665,107 @@ class VisionRescanStage(Stage):
 
 
 # ---------------------------------------------------------------------------
-# Stage: merge_continuations — fold continuation pages into their anchor (no LLM)
+# Stage: table_merge — link label-less table fragments to their parent block (LLM)
 # ---------------------------------------------------------------------------
 
 
-class MergeContinuationsStage(Stage):
-    """Reduction (after `scan`, before `toc`): fold each continuation page into the previous
-    content page and drop it, rewriting the scan artifact in place. Deterministic, no LLM —
-    `merge_continuations` does the work (append the fragment's blocks, record the page). Because
-    every later stage reads the scan artifacts, the dropped pages are never placed, cataloged, or
-    referenced by the concept tree; the anchor records them in `continuation_pages`, and the
-    `page_store` stage assembles the anchor's merged text/images from that member list. Resume
-    skips artifacts already marked `"merged"` (a re-run must not recompute over already-folded
-    anchors)."""
+class TableMergeStage(Stage):
+    """Reduction (after `vision_rescan`, before `toc`): for each table block with NO row and
+    NO column labels — the validated genuine-continuation signal (~50 corpus-wide; every
+    self-contained "(Continued)" reprint restates its labels and is skipped) — one flash call
+    picks the parent block it belongs to, and the scan file is annotated in place
+    (`table_merge.apply_merge`: `extra_pages` on the parent, `merged_into` on the fragment;
+    lossless, nothing deleted). Candidates within a bulletin are judged sequentially in page
+    order so a chained fragment links to the already-resolved root, never to a sibling
+    fragment; bulletins run in parallel.
 
-    name = "merge_continuations"
+    Skips bulletins still carrying legacy page-level `continuation_pages` (un-merge them
+    first — `scripts/unmerge_rescan.py`). Resume: a successfully processed bulletin is marked
+    `"table_merged"`; a bulletin with any failed call stays unmarked and retries next run
+    (already-applied merges are skipped via their `merged_into`/`extra_pages` annotations).
+    When the bulletin's catalog file already exists (a retrofit over a built corpus), each
+    revised page's catalog row is patched inline, same as `vision_rescan`."""
+
+    name = "table_merge"
+    workers = 16
 
     async def run(self, bctx: BuildContext) -> dict:
-        agg: dict[str, int] = defaultdict(int)
-        for bulletin in bctx.bulletins:
-            path = bctx.paths.bulletin_file(_SCANS_SUBDIR, bulletin)
+        pending: list[str] = []
+        legacy: list[str] = []
+        for b in bctx.bulletins:
+            path = bctx.paths.bulletin_file(_SCANS_SUBDIR, b)
             if not path.exists():
                 continue
             data = json.loads(path.read_text())
-            if data.get("merged"):
+            if data.get("table_merged"):
                 continue
-            scans = {
-                int(p): PageScan.model_validate(s) for p, s in data["scans"].items()
-            }
-            merged, n_merged = merge_continuations(scans)
-            data["scans"] = {
-                str(p): merged[p].model_dump(mode="json") for p in sorted(merged)
-            }
-            data["merged"] = True
-            data["n_merged"] = n_merged
-            _atomic_write_json(path, data)
-            agg["bulletins"] += 1
-            agg["merged"] += n_merged
+            scans = data["scans"]
+            if any(s.get("continuation_pages") for s in scans.values()):
+                legacy.append(b)
+                continue
+            if find_candidates(scans):
+                pending.append(b)
+        if legacy:
+            log.warning(
+                f"[{self.name}] {len(legacy)} bulletin(s) still page-merged — skipped; "
+                f"run scripts/unmerge_rescan.py first (e.g. {legacy[:5]})"
+            )
+        log.info(f"[{self.name}] {len(pending)} bulletin(s) with merge candidates")
+        if not pending:
+            return {"legacy_skipped": len(legacy)} if legacy else {}
+
+        sem = asyncio.Semaphore(self.workers)
+        agg: dict[str, int] = defaultdict(int)
+        done = 0
+
+        async def one(bulletin: str) -> None:
+            nonlocal done
+            async with sem:
+                path = bctx.paths.bulletin_file(_SCANS_SUBDIR, bulletin)
+                data = json.loads(path.read_text())
+                scans: dict[str, dict] = data["scans"]
+                texts = chop_bulletin(
+                    bulletin, parsed_json_dir=bctx.config.parsed_json_dir
+                )
+                revised: set[int] = set()
+                failed = False
+                # Sequential within the bulletin: each applied merge updates `scans`, so the
+                # next candidate's parent listing excludes already-merged fragments.
+                for page, bi in find_candidates(scans):
+                    async with bctx.llm_sem, bctx.unit_ctx() as ctx:
+                        try:
+                            parent = await resolve_parent(
+                                ctx, bulletin, scans, page, bi, texts.get(page, "")
+                            )
+                        except Exception as e:  # noqa: BLE001 — record, never abort the batch
+                            failed = True
+                            agg["failed"] += 1
+                            log.warning(
+                                f"[{self.name}] {bulletin} p{page}#{bi} failed: "
+                                f"{type(e).__name__}: {e}"
+                            )
+                            continue
+                    if parent is None:
+                        agg["standalone"] += 1
+                        continue
+                    apply_merge(scans, (page, bi), parent)
+                    revised.update({page, parent[0]})
+                    agg["merged"] += 1
+                if not failed:
+                    data["table_merged"] = True
+                _atomic_write_json(path, data)
+                _patch_catalog_inline(bctx, bulletin, scans, sorted(revised))
+                agg["bulletins"] += 1
+                done += 1
+                if done % _PROGRESS_EVERY == 0 or done == len(pending):
+                    bctx.write_progress(self.name, done, len(pending), agg)
+                    log.info(
+                        f"[{self.name}] {done}/{len(pending)} | ${bctx.cost:.2f} | {dict(agg)}"
+                    )
+
+        await asyncio.gather(*[one(b) for b in pending])
+        if legacy:
+            agg["legacy_skipped"] = len(legacy)
         return dict(agg)
 
 
@@ -825,7 +900,11 @@ def _catalog_row(bulletin: str, page: int, scan: dict) -> PageCatalogRow | None:
     return PageCatalogRow(
         bulletin=bulletin,
         page=page,
-        content_blocks=scan.get("blocks", []),
+        # Fragments the table_merge pass linked to a parent block don't ship — the parent's
+        # row covers them (its block carries the fragment's page in `extra_pages`).
+        content_blocks=[
+            b for b in scan.get("blocks", []) if b.get("merged_into") is None
+        ],
         date_interval=scan.get("date_interval"),
         continuation_pages=scan.get("continuation_pages", []),
     )
@@ -886,10 +965,10 @@ def _figure_note(elems: dict[int, list[dict]], pages: list[int]) -> str:
 
 class PageStoreStage(BulletinStage):
     """Build the page store (`pages/<bulletin>.json` = `{page: text}`): per catalog row, the
-    already-merged text the store serves — its member pages' JSON text (via `elements_to_text`,
-    the same chopping the scan uses) joined, with a figure note appended. Continuation
-    merge is applied here via `row.member_pages` (anchor + folded continuations), so the store
-    stays a dumb page→text map. No LLM, no rendering — images render on demand in `PageStore`."""
+    text the store serves — its member pages' JSON text (via `elements_to_text`, the same
+    chopping the scan uses) joined, with a figure note appended. `row.member_pages` is just
+    the row's own page now that nothing folds continuations, so the store is a dumb
+    page→text map. No LLM, no rendering — images render on demand in `PageStore`."""
 
     name = "page_store"
     out_subdir = PAGES_SUBDIR
@@ -1082,7 +1161,7 @@ PIPELINE: tuple[Stage, ...] = (
     ScanStage(),
     PreRenderStage(),
     VisionRescanStage(),
-    MergeContinuationsStage(),
+    TableMergeStage(),
     TocStage(),
     ReconstructTocStage(),
     PlaceStage(),

@@ -74,6 +74,11 @@ You write Python that produces the final answer string, or emit a structured mis
   .kind          "scalar" | "vector" | "table"  (rarely needed; prefer .frame)
   .index_name    (vector)   .row_name / .col_name (table)
   .value         raw payload — only use if you specifically need the dict/list form
+  .bulletin           source issue "YYYY-MM" the value was printed in
+  .pages              source PDF page number(s)
+  .as_of              issue the plan pinned (when the question named one), else None
+  .requested_period   data window the value was retrieved for
+  .retrieve_key       the concept this datum was retrieved for
 
 ## Payload access
 
@@ -104,6 +109,9 @@ no commentary, no second block, no fence around (b):
       answer — no prose, no "Answer:", no question restatement. For a
       multi-part question, `result` is only the ultimate quantity /
       identifier asked for, not any intermediate.
+      Carry full precision through every intermediate; round or format only
+      at the latest possible step — the final `result` string — to the
+      decimal places the question states.
   (b) Insufficient data — a single bare JSON object:
         {"missing": [<short identifier strings>],
          "description": "<one-line explanation>"}
@@ -116,7 +124,7 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
     _prompt = PromptedCall(
         name="compute.codegen",
         system_prompt=_SYSTEM_PROMPT,
-        default_effort="medium",
+        default_effort="high",
         output_instruction="Produce a fenced ```python``` block OR a bare missing-data JSON object.",
     )
 

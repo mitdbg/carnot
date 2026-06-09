@@ -17,45 +17,28 @@ overrides:
     targets: [planner]
     content: |
       Questions are answered against the U.S. Treasury Monthly Bulletins,
-      a 696-document corpus of monthly Treasury bulletins (1939–2025) under
-      the OfficeQA harness.
+      a 696-document corpus spanning 1939–2025. Emit period and as_of as
+      canonical month ranges (YYYY-MM or YYYY-MM..YYYY-MM), never natural
+      language — expand fiscal years, calendar years, and quarters to months
+      yourself per the date conventions below.
 
-      Each bulletin is organized into recurring sections; the value a question
-      needs almost always sits in one of them:
-        - Profile of the Economy — U.S. macro conditions in narrative + charts:
-          real GDP growth, employment/payrolls, unemployment, prices/inflation,
-          and the personal saving rate (often plotted, not tabulated).
-        - Federal Fiscal Operations — receipts, outlays, surplus/deficit by
-          month/fiscal year, agency, and function.
-        - Federal Debt — public debt outstanding, ownership of federal
-          securities, and debt as a percent of GDP (carries nominal GDP).
-        - Treasury financing & securities — auction results, offerings, and
-          market quotations (yields and bid/ask prices) for bills, notes,
-          bonds, and TIPS.
-        - Trust funds — Social Security (OASI/DI), Highway, and other federal
-          trust-fund receipts, expenditures, and balances.
-        - International — foreign currency positions, Treasury reporting rates
-          of exchange, and capital movements (TIC).
-
-      Emit `period`/`as_of` as canonical months — never natural language:
-        `2025-03`              a single bulletin month
-        `2022-10..2023-09`     an inclusive month range
-      Expand fiscal years, calendar years, and quarters to month ranges yourself:
-        calendar year YYYY  ->  YYYY-01..YYYY-12      (e.g. 1940  -> 1940-01..1940-12)
-        quarter Qn YYYY     ->  that quarter's 3 months (Q2 2023 -> 2023-04..2023-06)
-        fiscal year FYy     ->  (y-1)-10..y-09        (FY2008 -> 2007-10..2008-09);
-                                for FY BEFORE 1977,  (y-1)-07..y-06 (FY1939 -> 1938-07..1939-06)
+  # Shared date math — the planner expands question dates; the page-index build
+  # agents resolve dates printed on a page. Same conventions, stated once.
+  - section: corpus
+    targets: [planner, page_scan, page_scan_vision, toc_outline, toc_reconstruct, chapter_merge, era_segment, era_merge]
+    content: |
+      Date conventions. Calendar year YYYY = YYYY-01..YYYY-12. Quarter Qn YYYY =
+      that quarter's three months (Q2 2023 = 2023-04..2023-06). Fiscal year FYy =
+      the 12 months ending in year y: (y-1)-10..y-09 from FY1977 on,
+      (y-1)-07..y-06 before 1977 (FY2008 = 2007-10..2008-09;
+      FY1939 = 1938-07..1939-06). The months 1976-07..1976-09 are the
+      FY1976→FY1977 "transition quarter" and belong to neither fiscal year —
+      pin them directly.
 
   - section: corpus
-    targets: [extract.text]
+    targets: [extract.text, extract.vision]
     content: |
-      The pages you receive are from the U.S. Treasury Bulletins.
-
-  - section: corpus
-    targets: [extract.vision]
-    content: |
-      The page images you receive are scanned pages from the U.S. Treasury
-      Monthly Bulletins.
+      The pages you receive are from the U.S. Treasury Monthly Bulletins.
 
   # Renders under the search-agent SYSTEM prompt's `## Dataset` header.
   # Lifted from the abandoned `officeqa_special_notes` blob in the old
@@ -105,10 +88,8 @@ overrides:
       The pages are from the U.S. Treasury Monthly Bulletin — monthly
       federal-finance statistics (public debt, receipts/outlays, ownership of
       Treasury securities, exchange stabilization, foreign currency positions,
-      trust funds). Fiscal year FYy is the 12 months ending in year y:
-      (y-1)-10..y-09 from FY1977 on, and (y-1)-07..y-06 before 1977. Calendar
-      year is Jan–Dec. Resolve relative or partial dates against the
-      publication month.
+      trust funds). Resolve relative or partial dates against the publication
+      month.
 
   - section: lessons
     targets: [page_scan, page_scan_vision]
@@ -125,9 +106,9 @@ overrides:
     content: |
       One concept per `retrieve.key`. If a question names multiple values (two currencies, two indices, two agencies, two bond classes, ...), emit ONE branch per value rather than bundling — branches run in parallel and splitting is cheap, while bundling forces retrieval to find a single page covering everything. A JPY-vs-GBP question should emit four branches (JPY position, GBP position, JPY/USD rate, GBP/USD rate), not one branch keyed "exchange rates for JPY and GBP".
 
-      Default to `retrieve`. When in doubt about whether a value is in the corpus, use `retrieve` first — you will get a chance to replan it as a `lookup_external` if it turns out not to be there. The two errors are not symmetric: a `retrieve` that finds nothing fails loudly and is automatically replanned, whereas a wrong `lookup_external` silently returns a different (often later-revised) vintage and is never corrected. Reach for `lookup_external` only when the value has no plausible home in any Treasury Bulletin.
+      Default to `retrieve`; reach for `lookup_external` only when a value has no plausible home in any Treasury Bulletin. The two errors are asymmetric: a `retrieve` that finds nothing fails loudly and is automatically replanned, whereas a wrong `lookup_external` silently returns a different (usually later-revised) vintage and is never corrected. This bites hardest on "as reported" / vintage questions and revised series like GDP, where the bulletin's as-of-that-date figure is the correct one but a live lookup returns today's revised number — retrieve from the named bulletin and set `as_of`.
 
-      Prefer the corpus ESPECIALLY for "as reported" / vintage questions. A live external lookup returns today's revised figures; a series like GDP is revised over time, so the bulletin's as-of-that-date value is the correct one and an external lookup would silently give a wrong number. Retrieve it from the named bulletin (set `as_of`).
+      Set `as_of` ONLY when the question explicitly NAMES a bulletin issue (e.g. "the September 2012 Treasury Bulletin"). Do NOT derive it from a vague or implied time reference — for example, "the end of FY 2010", "as of March 2003"; Leave as_of blank in these cases.
 
       Set `as_of` ONLY when the question explicitly NAMES a bulletin issue (e.g. "the September 2012 Treasury Bulletin"). Do NOT derive it from a vague or implied time reference — for example, "the end of FY 2010", "as of March 2003"; Leave as_of blank in these cases.
 
@@ -226,10 +207,16 @@ overrides:
     targets: [compute.codegen]
     content: |
       The values in `input_values` were extracted from U.S. Treasury Monthly
-      Bulletin pages. Common units in this corpus: `usd`, `usd_thousands`,
-      `usd_millions`, `usd_billions`, `pct`, `count`, `year`, `rate`,
-      `fx_rate`, `text`. Foreign currency follows `<iso3>_<scale>`
-      (e.g. `jpy_billions`, `gbp_millions`).
+      Bulletin pages.
+
+  # Shared unit vocabulary — emitted by compute and lookup_external alike.
+  - section: corpus
+    targets: [compute.codegen, lookup_external]
+    content: |
+      Unit tokens for this corpus: `usd`, `usd_thousands`, `usd_millions`,
+      `usd_billions`, `pct`, `count`, `year`, `rate`, `fx_rate`, `cpi`, `text`.
+      Foreign currency follows `<iso3>_<scale>` (e.g. `jpy_billions`,
+      `gbp_millions`).
 
   - section: corpus
     targets: [lookup_external]
@@ -240,17 +227,8 @@ overrides:
       do not carry directly.
 
   # ---------------------------------------------------------------------
-  # Extract lessons — gotchas observed against this corpus.
+  # Extract lessons
   # ---------------------------------------------------------------------
-  - section: lessons
-    targets: [extract.text]
-    content: >
-      Vector vs table for 2-D grids: when the page prints a 2-D year×month
-      grid but the question reads as a 1-D series ("every month from X to
-      Y"), emit ONE vector with combined ISO keys ("1942-03", "1942-04",
-      ...) rather than a table. Use table only when the question genuinely
-      compares rows against columns.
-
   - section: lessons
     targets: [extract.text, extract.vision]
     content: >
@@ -258,17 +236,23 @@ overrides:
       parenthetical legend, footnote like "(In millions of dollars)".
       Never guess from magnitude: if the page shows "74" under a "billions
       of yen" header, emit value=74 and unit=jpy_billions. Do not silently
-      rescale or convert foreign currency to USD — leave it native, and
-      downstream compute will apply the FX rate.
+      rescale or convert foreign currency to USD — leave it native.
 
   - section: lessons
     targets: [extract.text, extract.vision]
     content: >
-      Unit tokens for this corpus: `usd`, `usd_thousands`, `usd_millions`,
-      `usd_billions`, `pct`, `count`, `year`, `rate`, `fx_rate`, `text`.
-      Foreign currency follows `<iso3>_<scale>` (e.g. `jpy_billions`,
-      `gbp_millions`). Use `mixed` only when one cell genuinely combines
-      incompatible units.
+      Watch for qualifier-mismatched rows. Treasury tables stack rows whose
+      labels differ by a single subtle modifier — "Total Public Debt
+      Securities" vs "Total interest-bearing debt", gross vs net, total vs
+      a subtotal, "held by the public" vs "intragovernmental", outstanding
+      vs issued. The lookup is satisfied only by a row matching the requested series
+      including EVERY qualifier. Do not substitute a near-label row for the
+      exact series. When the page has several qualifier-variants, emit each
+      as its own entry with the page's verbatim row text in `description`
+      (so the modifier is visible downstream) rather than collapsing to one.
+      When the only row present is a near-match (the exact series is not on
+      the page), still emit it, but make the qualifier difference explicit
+      in `description` — never present it as the exact series.
 
   # ---------------------------------------------------------------------
   # Compute lessons.
@@ -276,47 +260,10 @@ overrides:
   - section: lessons
     targets: [compute.codegen]
     content: >
-      Numeric modifiers — each modifier present in the question MUST appear
-      as an explicit operation, not a comment. Common forms: `signed` vs
-      `absolute` — never silently abs()
-      a value meant signed; `normalized` / `midpoint normalized` — apply
-      explicitly ((V2-V1)/((V1+V2)/2)); `log of` / `ln(...)` — wrap in
-      np.log; `per capita` — divide by population; `in percent form` vs
-      `as a decimal` — scale by 100 and format the result string to match.
-
-  - section: lessons
-    targets: [compute.codegen]
-    content: >
-      FX direction: when the question wants USD and an input is foreign
-      (`<iso3>_<scale>`), locate the matching `fx_rate` entry and apply
-      it — `value * rate` if the rate is "USD per <iso>", `value / rate`
-      if "<iso> per USD". Read the rate's description for direction; do
-      not guess.
-
-  - section: lessons
-    targets: [compute.codegen]
-    content: >
-      Scale conversion: when an input value's scale differs from the unit the
-      question asks for (e.g. value in `usd_thousands`, question wants millions),
-      convert it — apply the conversion once over the whole payload, never
-      cell-by-cell.
-
-  - section: lessons
-    targets: [compute.codegen]
-    content: >
       Prefer a printed total/summary row over re-aggregating its
       components when both are present in `input_values`. Bulletin tables
       print their own totals; the printed figure is authoritative and
       avoids rounding drift from summing parts.
-
-  # ---------------------------------------------------------------------
-  # lookup_external lessons.
-  # ---------------------------------------------------------------------
-  - section: lessons
-    targets: [lookup_external]
-    content: >
-      Unit tokens commonly used here: `year`, `cpi`, `fx_rate`,
-      `usd_millions`, `usd_billions`, `pct`, `count`, `rate`, `text`.
 
   # ---------------------------------------------------------------------
   # Few-shots for compute executors.
