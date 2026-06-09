@@ -52,7 +52,17 @@ log = logging.getLogger(__name__)
 
 
 class _RateLimiter:
-    """Process-wide request rate limiter. Blocks until a request slot is free."""
+    """Process-wide token-bucket rate limiter with BOTH interfaces over ONE bucket.
+
+    `acquire()` blocks the calling thread; `acquire_async()` yields to the event loop. Both
+    draw from the same tokens, so a name's rate cap holds whether it's hit from sync code
+    (offline build, the `requests`-based lookup tools, embeddings prep, the sync LLM path) or
+    from async code (the async request-path LLM calls).
+
+    Thread-safe: a `threading.Condition` guards the refill+deduct. The async path holds that
+    lock only across the (non-awaiting) token math and sleeps via `asyncio.sleep` OUTSIDE it,
+    so it never blocks its event loop. Sync waiters block on `cond.wait(timeout)` and re-check
+    on timeout, so no notify is needed when the async path deducts (and vice versa)."""
 
     def __init__(self, rate_per_sec: float) -> None:
         if rate_per_sec <= 0:
@@ -74,7 +84,7 @@ class _RateLimiter:
         self._last_refill = now
 
     def acquire(self) -> None:
-        """Block until 1 request slot is available, then deduct it."""
+        """Sync: block the calling thread until 1 slot is free, then deduct it."""
         with self._cond:
             while True:
                 self._refill_locked()
@@ -83,6 +93,18 @@ class _RateLimiter:
                     return
                 wait_s = (1.0 - self._tokens) / self._rate
                 self._cond.wait(timeout=wait_s)
+
+    async def acquire_async(self) -> None:
+        """Async: yield to the loop until 1 slot is free, then deduct it. The lock is held
+        only across the synchronous token math; the wait is `await asyncio.sleep` outside it."""
+        while True:
+            with self._lock:
+                self._refill_locked()
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait_s = (1.0 - self._tokens) / self._rate
+            await asyncio.sleep(wait_s)
 
 
 # Single source of truth for every external rate cap we pace against. Each row is
@@ -125,10 +147,11 @@ def _resolve_rate_per_sec(name: str, rate_per_min: float | None) -> float:
 
 
 def get_rate_limiter(name: str, rate_per_min: float | None = None) -> _RateLimiter:
-    """Process-wide token-bucket limiter for external service `name`, paced at its
-    rpm — read ONCE at first use, then frozen for the run. Known services key off
-    `_RATE_LIMITS` (env override); dynamic buckets (per-model `llm:<model>`) pass
-    an explicit `rate_per_min`. All threads in this process share the named bucket.
+    """Process-wide token-bucket limiter for service `name`, paced at its rpm — read ONCE at
+    first use, then frozen for the run. ONE bucket per name, serving BOTH sync `acquire()` and
+    async `acquire_async()` callers (so the cap holds across sync+async use). Known services
+    key off `_RATE_LIMITS` (env override); dynamic buckets (per-model `llm:<model>`) pass an
+    explicit `rate_per_min`. All threads in this process share the named bucket.
 
     Scope is per process, NOT per API key: separate processes get independent
     buckets and do not coordinate, so a multi-process deployment would not be
@@ -138,72 +161,6 @@ def get_rate_limiter(name: str, rate_per_min: float | None = None) -> _RateLimit
         if lim is None:
             lim = _RateLimiter(rate_per_sec=_resolve_rate_per_sec(name, rate_per_min))
             _LIMITERS[name] = lim
-        return lim
-
-
-class _AsyncRateLimiter:
-    """Async twin of `_RateLimiter`. Same token bucket, but `acquire` yields to
-    the loop (`await asyncio.sleep`) instead of blocking a thread on a `Condition`.
-
-    The instance is a process-wide singleton (see `_ASYNC_LIMITERS`) shared across
-    every per-question event loop — and those loops run on *different* worker
-    threads — so the token math IS contended. A `threading.Lock` guards the
-    refill+deduct; it is held only across that synchronous section, never across
-    the `await asyncio.sleep`."""
-
-    def __init__(self, rate_per_sec: float) -> None:
-        if rate_per_sec <= 0:
-            raise ValueError(f"rate_per_sec must be > 0 (got {rate_per_sec})")
-        self._rate = rate_per_sec
-        self._capacity = max(1.0, rate_per_sec)
-        self._tokens = self._capacity
-        self._last_refill = time.monotonic()
-        self._lock = threading.Lock()
-
-    def _refill_locked(self) -> None:
-        now = time.monotonic()
-        elapsed = now - self._last_refill
-        if elapsed <= 0:
-            return
-        self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
-        self._last_refill = now
-
-    async def acquire(self) -> None:
-        """Yield until 1 request slot is available, then deduct it."""
-        while True:
-            with self._lock:
-                self._refill_locked()
-                if self._tokens >= 1.0:
-                    self._tokens -= 1.0
-                    return
-                wait_s = (1.0 - self._tokens) / self._rate
-            await asyncio.sleep(wait_s)
-
-
-# Async limiters mirror the sync `_LIMITERS` registry, keyed by the same names
-# (same rpm from `_RATE_LIMITS`). Distinct instances: the sync buckets pace the
-# offline build, these pace the request path. Shared across every per-question
-# loop (each on its own worker thread), so creation is lock-guarded like the sync
-# side.
-_ASYNC_LIMITERS_LOCK = threading.Lock()
-_ASYNC_LIMITERS: dict[str, _AsyncRateLimiter] = {}
-
-
-def get_async_rate_limiter(
-    name: str, rate_per_min: float | None = None
-) -> _AsyncRateLimiter:
-    """Process-wide async token-bucket limiter for service `name`, paced at its
-    rpm. Request-time analogue of `get_rate_limiter` (same `rate_per_min` rule for
-    dynamic per-model buckets); the returned bucket is shared across all
-    per-question loop threads (its own lock makes `acquire` thread-safe). See
-    `get_rate_limiter` for the scope caveat."""
-    with _ASYNC_LIMITERS_LOCK:
-        lim = _ASYNC_LIMITERS.get(name)
-        if lim is None:
-            lim = _AsyncRateLimiter(
-                rate_per_sec=_resolve_rate_per_sec(name, rate_per_min)
-            )
-            _ASYNC_LIMITERS[name] = lim
         return lim
 
 

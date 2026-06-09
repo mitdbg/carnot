@@ -21,11 +21,15 @@ import asyncio
 import json
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from skunk.config import SkunkConfig
 from skunk.errors import StepFailed
 from skunk.common import ExecutionContext, PageRef, page_key_to_pageref
 from skunk.plan import RetrieveBranch
+
+if TYPE_CHECKING:
+    from skunk.page_index.query import BlockRef
 
 
 class RetrieveOp:
@@ -50,11 +54,14 @@ class RetrieveOp:
     async def run(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
         if ctx.config.golden_pages is not None:
             return self._run_golden(ctx, branch)
-        match ctx.config.retriever:
+        # `str(...)` widens the Literal so the defensive `case _` stays reachable — env can
+        # inject an out-of-Literal `SKUNK_RETRIEVER` (config.py constructs it with a type-ignore).
+        match str(ctx.config.retriever):
             case "search_agent":
                 return await self._run_search_agent(ctx, branch)
             case "page_index_old":
-                return (await self._page_index().retrieve_all(ctx, [branch]))[0]
+                blocks = (await self._page_index().retrieve_all(ctx, [branch]))[0]
+                return self._blocks_to_pagerefs(blocks)
             case other:
                 raise StepFailed(
                     "retrieve",
@@ -77,7 +84,7 @@ class RetrieveOp:
                 self._run_golden(ctx, b) for b in branches
             ]
             return out
-        match ctx.config.retriever:
+        match str(ctx.config.retriever):  # widen Literal — see `run` for why
             case "search_agent":
                 # Independent per branch (fresh agent + per-question state); isolate
                 # per-branch failures so one branch's StepFailed doesn't fail the rest.
@@ -95,10 +102,8 @@ class RetrieveOp:
                         results.append(r)
                 return results
             case "page_index_old":
-                return [
-                    refs
-                    for refs in await self._page_index().retrieve_all(ctx, branches)
-                ]
+                per_branch = await self._page_index().retrieve_all(ctx, branches)
+                return [self._blocks_to_pagerefs(blocks) for blocks in per_branch]
             case other:
                 raise StepFailed(
                     "retrieve",
@@ -106,9 +111,10 @@ class RetrieveOp:
                 )
 
     def _run_golden(
-        self, ctx: ExecutionContext, branch: RetrieveBranch
+        self, ctx: ExecutionContext, _branch: RetrieveBranch
     ) -> list[PageRef]:
-        """Golden-pages bypass (eval ablation only). `run` only routes here when
+        """Golden-pages bypass (eval ablation only). Branch-agnostic — the configured golden
+        set is returned for every branch (hence `_branch`). `run` only routes here when
         `golden_pages` is set, but we guard defensively anyway (also narrows the type)."""
         if ctx.config.golden_pages is None:
             raise StepFailed(
@@ -176,6 +182,24 @@ class RetrieveOp:
         if self._page_index_retriever is None:
             self._page_index_retriever = PageIndexRetriever()
         return self._page_index_retriever
+
+    @staticmethod
+    def _blocks_to_pagerefs(blocks: list[BlockRef]) -> list[PageRef]:
+        """Dumb block→page translation layer: the page-index retriever now outputs at BLOCK
+        granularity (`BlockRef`), but the extraction pipeline still consumes `PageRef`s. Collapse
+        each block to the physical pages extract must read — its page's member refs (anchor +
+        folded continuation run, carried on every `BlockRef`) — de-duped, first-seen order
+        preserved. Several kept blocks on one page (or one anchor + its continuations) collapse to
+        that page's refs once. This is the only place block granularity is discarded; lift it out
+        when the extraction pipeline learns to take blocks directly."""
+        seen: set[PageRef] = set()
+        refs: list[PageRef] = []
+        for b in blocks:
+            for r in b.member_refs:
+                if r not in seen:
+                    seen.add(r)
+                    refs.append(r)
+        return refs
 
 
 def _build_resources(config: SkunkConfig):

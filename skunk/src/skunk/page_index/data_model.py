@@ -14,10 +14,12 @@ from skunk.errors import StepFailed
 
 
 # Artifact filenames under the build/query root, joined at each call site.
-CATALOG_SUBDIR = "catalog"          # slim shipped rows (PageCatalogRow); query-facing
-PAGES_SUBDIR = "pages"              # per-bulletin page store: anchor -> member texts + figures
-RENDERS_SUBDIR = "renders"          # lazy 200-DPI page-image cache (written on first vision read)
-TREE_FILE = "concept_tree.json"     # era-keyed concept tree (ConceptTree)
+CATALOG_SUBDIR = "catalog"  # slim shipped rows (PageCatalogRow); query-facing
+PAGES_SUBDIR = "pages"  # per-bulletin page store: anchor -> member texts + figures
+RENDERS_SUBDIR = (
+    "renders"  # lazy 200-DPI page-image cache (written on first vision read)
+)
+TREE_FILE = "concept_tree.json"  # era-keyed concept tree (ConceptTree)
 
 
 def page_index_root() -> Path:
@@ -25,14 +27,17 @@ def page_index_root() -> Path:
     retriever (`query.py`) and the page store (`store.py`)."""
     env = os.environ.get("SKUNK_PAGE_INDEX_DIR")
     if not env:
-        raise StepFailed("retrieve", "SKUNK_PAGE_INDEX_DIR is not set; point it at "
-                         "a built page-index artifact.")
+        raise StepFailed(
+            "retrieve",
+            "SKUNK_PAGE_INDEX_DIR is not set; point it at a built page-index artifact.",
+        )
     return Path(env)
 
 
 class ContentBlock(BaseModel):
     """One detected content block on a page: a table, a chart, or prose. A page
     may carry several."""
+
     kind: Literal["table", "chart", "prose"]
     title: str | None = None
     # Tables only — empty for chart/prose.
@@ -62,8 +67,9 @@ figure/graph/plot), or one "prose" block (the narrative text on a page that has 
 class PageCatalogRow(BaseModel):
     """One shipped catalog row per retrievable PDF page — the query-facing schema,
     projected from each content page's `PageScan` by the catalog stage."""
-    bulletin: str                                   # "YYYY-MM"
-    page: int                                       # 1-based PDF page index
+
+    bulletin: str  # "YYYY-MM"
+    page: int  # 1-based PDF page index
 
     content_blocks: list[ContentBlock] = Field(default_factory=list)
     # `YYYY-MM` `(low, high)` data span from the scan; read by the year filter.
@@ -134,12 +140,16 @@ class PageRange(BaseModel):
     """A chapter bucket's run of pages within ONE issue (inclusive, 1-based). Placement
     files a chapter as a contiguous physical range per issue, so a bucket's membership is
     naturally a list of these — one per issue it appears in."""
-    bulletin: str       # "YYYY-MM"
-    start: int          # first 1-based PDF page (inclusive)
-    end: int            # last 1-based PDF page (inclusive)
+
+    bulletin: str  # "YYYY-MM"
+    start: int  # first 1-based PDF page (inclusive)
+    end: int  # last 1-based PDF page (inclusive)
 
     def refs(self) -> list[PageRef]:
-        return [PageRef(month=self.bulletin, page=p) for p in range(self.start, self.end + 1)]
+        return [
+            PageRef(month=self.bulletin, page=p)
+            for p in range(self.start, self.end + 1)
+        ]
 
 
 class Chapter(BaseModel):
@@ -149,6 +159,7 @@ class Chapter(BaseModel):
     `pages` are its page ranges (its membership). (The build-time `members` (raw headings) and
     sub-section `children` are intermediates only — neither is persisted; the picker relies on
     description/examples.)"""
+
     n_pages: int = 0
     # Picker-facing scope blurb (describe pass) — summarized from sampled page table titles.
     description: str = ""
@@ -173,6 +184,7 @@ A chapter is one top-level bucket of the era's table of contents, keyed by its n
 class EraTree(BaseModel):
     """One era's chapter tree: an inclusive `YYYY-MM` span, a label, and that era's
     `name -> Chapter` buckets (pages partitioned within the era)."""
+
     span: tuple[str, str]
     label: str = ""
     chapters: dict[str, Chapter] = Field(default_factory=dict)
@@ -181,12 +193,20 @@ class EraTree(BaseModel):
 class ConceptTree(BaseModel):
     """Era-keyed chapter trees on disk under a top-level `"eras"` key. A legacy
     single-tree file (`{"chapters": {...}}`) loads as one all-spanning era."""
+
     eras: list[EraTree] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
     def _accept_legacy(cls, v):
         if isinstance(v, dict) and "eras" not in v and "chapters" in v:
-            return {"eras": [{"span": ["0000-00", "9999-99"], "label": "all",
-                              "chapters": v["chapters"]}]}
+            return {
+                "eras": [
+                    {
+                        "span": ["0000-00", "9999-99"],
+                        "label": "all",
+                        "chapters": v["chapters"],
+                    }
+                ]
+            }
         return v

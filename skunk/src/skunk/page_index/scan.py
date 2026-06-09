@@ -27,7 +27,9 @@ class PageScan(BaseModel):
     printed_page: str | None = None
     is_continuation: bool = False
     has_unparsed_graphics: bool = False
-    parse_broken: bool = False  # parsed elements too mangled to trust → re-read from the PDF
+    parse_broken: bool = (
+        False  # parsed elements too mangled to trust → re-read from the PDF
+    )
     date_interval: tuple[str, str] | None = None
     blocks: list[ContentBlock] = Field(default_factory=list)
     # Build-only: physical pages folded into this one by `merge_continuations` (the dropped
@@ -56,7 +58,9 @@ class PageScan(BaseModel):
     def _headers_tables_only(self) -> "PageScan":
         for b in self.blocks:
             if b.kind != "table" and (b.column_headers or b.row_headers):
-                raise ValueError(f"{b.kind} block carries table-only column/row headers")
+                raise ValueError(
+                    f"{b.kind} block carries table-only column/row headers"
+                )
         return self
 
 
@@ -199,10 +203,14 @@ async def vision_scan_page(
     """Re-scan one page from its rendered IMAGE → a validated `PageScan`. Used by the
     pipeline's `vision_rescan` stage to redo pages the text scan flagged
     (`has_unparsed_graphics` / `parse_broken`). Same output object as `scan_page`."""
-    return await _vision_scan.call(ctx, f"publication month: {bulletin}", images=[image])
+    return await _vision_scan.call(
+        ctx, f"publication month: {bulletin}", images=[image]
+    )
 
 
-def _widen(a: tuple[str, str] | None, b: tuple[str, str] | None) -> tuple[str, str] | None:
+def _widen(
+    a: tuple[str, str] | None, b: tuple[str, str] | None
+) -> tuple[str, str] | None:
     """Union two `(low, high)` month spans into the enclosing span (None acts as empty)."""
     if a is None:
         return b

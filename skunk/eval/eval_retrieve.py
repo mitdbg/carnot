@@ -82,14 +82,16 @@ _CALL_RE = re.compile(r"call call_site=(\S+) .*?latency_s=([0-9.]+) in_tok=(\d+)
 # "semantic_filter … kept=K/S" (S = pages entering the filter); sum across a UID's
 # branches + eras for the per-stage candidate counts.
 _PICK_RE = re.compile(r"pick_chapters .* pages=(\d+)")
-# "semantic_filter … kept=K/S judged=J cached=C" — judged/cached present in the live filter
-# path (absent in the SKIPPED ceiling emit), so they're optional groups.
+# "semantic_filter … kept=K/S blocks_kept=B judged=J cached=C blocks=N" — kept/S are PAGES
+# (S = pages entering the filter); judged/cached present in the live filter path (absent in the
+# SKIPPED ceiling emit), so they're optional groups. `.*` skips the intervening blocks_kept field.
 _SEMFILTER_RE = re.compile(
-    r"semantic_filter .* kept=(\d+)/(\d+)(?: judged=(\d+) cached=(\d+))?"
+    r"semantic_filter .* kept=(\d+)/(\d+)(?:.* judged=(\d+) cached=(\d+))?"
 )
 # Final retrieve emit carries the full catalog size — used for the ToC+date elimination
-# rate (fraction of the whole index NOT in the candidate set).
-_RETR_RE = re.compile(r"page_index_retrieve .*catalog_size=(\d+) .*candidate_count=(\d+)")
+# rate (fraction of the whole index NOT in the candidate set). Output is now block-granular
+# (`block_count`); the page-level candidate count is taken from the returned refs, not here.
+_RETR_RE = re.compile(r"page_index_retrieve .*catalog_size=(\d+) .*block_count=(\d+)")
 
 
 # ---------------------------------------------------------------------------

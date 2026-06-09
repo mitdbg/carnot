@@ -43,6 +43,7 @@ def _norm_key(name: str) -> str:
     digest dedups on and the finalize maps raw headings to canonical chapters with."""
     return _WS.sub(" ", name.strip().lower()).strip(" .-")
 
+
 # Bulletins per segmentation call — a context-window batch (≈32 issues' chapter-name sets
 # fit comfortably in one call), NOT an assumption about how long an era lasts.
 _CHUNK_BULLETINS = 32
@@ -51,8 +52,9 @@ _CHUNK_BULLETINS = 32
 class EraSpan(BaseModel):
     """One era: an inclusive `YYYY-MM` span and a short label. Spans returned by
     `segment_corpus` are contiguous and gapless across the corpus month range."""
-    start: str   # "YYYY-MM" inclusive
-    end: str     # "YYYY-MM" inclusive
+
+    start: str  # "YYYY-MM" inclusive
+    end: str  # "YYYY-MM" inclusive
     label: str = ""
 
     @model_validator(mode="after")
@@ -69,11 +71,16 @@ class _Seg:
     chapter's sub-section (children) anywhere in the run. `core` — the schema the seam-merge
     compares — is the recurring top-level chapters with those sub-sections removed, so a
     sub-section that occasionally leaks to the top level never counts as a schema entry."""
-    bulletins: list[str]       # member bulletin ids, in date order
+
+    bulletins: list[str]  # member bulletin ids, in date order
     label: str
-    counts: dict[str, int]     # top-level chapter -> number of the segment's issues it heads
-    child_names: set[str]      # names that appear as a sub-section (child) somewhere in the run
-    n: int                     # number of issues in the segment
+    counts: dict[
+        str, int
+    ]  # top-level chapter -> number of the segment's issues it heads
+    child_names: set[
+        str
+    ]  # names that appear as a sub-section (child) somewhere in the run
+    n: int  # number of issues in the segment
 
     @property
     def start(self) -> str:
@@ -87,13 +94,17 @@ class _Seg:
     def core(self) -> list[str]:
         """The recurring schema — top-level chapters in at least half the issues, minus any
         name that is really a sub-section (appears as a child elsewhere)."""
-        return sorted(c for c, k in self.counts.items()
-                      if 2 * k >= self.n and c not in self.child_names)
+        return sorted(
+            c
+            for c, k in self.counts.items()
+            if 2 * k >= self.n and c not in self.child_names
+        )
 
 
 # ---------------------------------------------------------------------------
 # Per-bulletin digest (no LLM)
 # ---------------------------------------------------------------------------
+
 
 def _bulletin_digest(gather: dict) -> list[dict]:
     """Corpus gather → each issue's table of contents, oldest first:
@@ -111,7 +122,9 @@ def _bulletin_digest(gather: dict) -> list[dict]:
             if not name or name in seen:
                 continue
             seen.add(name)
-            children = list(dict.fromkeys(k for ch in c.get("children", []) if (k := _norm_key(ch))))
+            children = list(
+                dict.fromkeys(k for ch in c.get("children", []) if (k := _norm_key(ch)))
+            )
             chapters.append({"name": name, "children": children})
         out.append({"bulletin": b, "chapters": chapters})
     return out
@@ -137,8 +150,9 @@ def _to_eras(segs: list[_Seg]) -> list[EraSpan]:
 # LLM calls
 # ---------------------------------------------------------------------------
 
+
 class _ChunkSeg(BaseModel):
-    start: str        # bulletin YYYY-MM where this segment begins
+    start: str  # bulletin YYYY-MM where this segment begins
     label: str = ""
 
 
@@ -148,7 +162,7 @@ class _ChunkResult(BaseModel):
 
 class _MergeDecision(BaseModel):
     merge: bool
-    label: str = ""   # label for the combined era when merge is true
+    label: str = ""  # label for the combined era when merge is true
 
 
 def _json_parser(model):
@@ -157,6 +171,7 @@ def _json_parser(model):
             return model.model_validate_json(strip_code_fence(raw).strip())
         except ValidationError as e:
             raise ParseError(raw, str(e)) from e
+
     return parse
 
 
@@ -166,7 +181,8 @@ You are given the table of contents of consecutive issues of a periodical in dat
 list of chapters.
 
 """
-    + TOC_CHAPTER_FIELDS + """
+    + TOC_CHAPTER_FIELDS
+    + """
 
 Each issue here lists its top-level chapters with their `children`; the page labels are omitted.
 
@@ -245,7 +261,9 @@ async def segment_chunk(ctx: ExecutionContext, chunk: list[dict]) -> list[_Seg]:
     """One `era_segment` call → the batch's contiguous segments. Segment starts are
     snapped to actual batch issues (the first is forced to the batch's first issue), and
     each segment tallies its top-level chapters and sub-sections (for its `core` schema)."""
-    res = await _segment_call.call(ctx, json.dumps({"issues": chunk}, ensure_ascii=False, indent=1))
+    res = await _segment_call.call(
+        ctx, json.dumps({"issues": chunk}, ensure_ascii=False, indent=1)
+    )
     ids = [d["bulletin"] for d in chunk]
     toc = {d["bulletin"]: d["chapters"] for d in chunk}
     labels = {s.start: s.label for s in res.segments if s.start in toc}
@@ -255,45 +273,67 @@ async def segment_chunk(ctx: ExecutionContext, chunk: list[dict]) -> list[_Seg]:
         nxt = starts[i + 1] if i + 1 < len(starts) else None
         members = [b for b in ids if st <= b and (nxt is None or b < nxt)]
         counts, child_names = _tally([toc[b] for b in members])
-        segs.append(_Seg(bulletins=members, label=labels.get(st, ""),
-                         counts=counts, child_names=child_names, n=len(members)))
+        segs.append(
+            _Seg(
+                bulletins=members,
+                label=labels.get(st, ""),
+                counts=counts,
+                child_names=child_names,
+                n=len(members),
+            )
+        )
     return segs
 
 
-async def _combine(ctx: ExecutionContext, left: list[_Seg], right: list[_Seg]) -> list[_Seg]:
+async def _combine(
+    ctx: ExecutionContext, left: list[_Seg], right: list[_Seg]
+) -> list[_Seg]:
     """Concatenate two adjacent segment lists, reconciling the one blind adjacency (the
     seam between `left[-1]` and `right[0]`) with a single `era_merge` call that compares the
     two segments' recurring `core` schemas. Within-batch boundaries are trusted (the
     detection call only splits on persistent shifts)."""
     a, b = left[-1], right[0]
     user = json.dumps(
-        {"left": {"span": [a.start, a.end], "label": a.label, "chapters": a.core},
-         "right": {"span": [b.start, b.end], "label": b.label, "chapters": b.core}},
-        ensure_ascii=False, indent=1,
+        {
+            "left": {"span": [a.start, a.end], "label": a.label, "chapters": a.core},
+            "right": {"span": [b.start, b.end], "label": b.label, "chapters": b.core},
+        },
+        ensure_ascii=False,
+        indent=1,
     )
     dec = await _merge_call.call(ctx, user)
     if dec.merge:
         counts = dict(a.counts)
         for c, k in b.counts.items():
             counts[c] = counts.get(c, 0) + k
-        merged = _Seg(bulletins=a.bulletins + b.bulletins, label=dec.label or a.label,
-                      counts=counts, child_names=a.child_names | b.child_names, n=a.n + b.n)
+        merged = _Seg(
+            bulletins=a.bulletins + b.bulletins,
+            label=dec.label or a.label,
+            counts=counts,
+            child_names=a.child_names | b.child_names,
+            n=a.n + b.n,
+        )
         return left[:-1] + [merged] + right[1:]
     return left + right
 
 
 async def _reduce(
-    ctx: ExecutionContext, blocks: list[list[_Seg]], sem: asyncio.Semaphore | None,
+    ctx: ExecutionContext,
+    blocks: list[list[_Seg]],
+    sem: asyncio.Semaphore | None,
 ) -> list[_Seg]:
     """Recursively pairwise-combine adjacent blocks (32→64→128…), reconciling each blind
     batch seam, until one segment list remains. Combines at a level are independent → run
     in parallel, bounded by `sem`."""
+
     async def _guarded(left: list[_Seg], right: list[_Seg]) -> list[_Seg]:
-        async with (sem or nullcontext()):
+        async with sem or nullcontext():
             return await _combine(ctx, left, right)
 
     while len(blocks) > 1:
-        tasks = [_guarded(blocks[i], blocks[i + 1]) for i in range(0, len(blocks) - 1, 2)]
+        tasks = [
+            _guarded(blocks[i], blocks[i + 1]) for i in range(0, len(blocks) - 1, 2)
+        ]
         combined = await asyncio.gather(*tasks)
         nxt = list(combined)
         if len(blocks) % 2 == 1:
@@ -303,7 +343,10 @@ async def _reduce(
 
 
 async def segment_corpus(
-    ctx: ExecutionContext, gather: dict, *, sem: asyncio.Semaphore | None = None,
+    ctx: ExecutionContext,
+    gather: dict,
+    *,
+    sem: asyncio.Semaphore | None = None,
 ) -> list[EraSpan]:
     """Full segmentation: chunk the bulletins into batches of `_CHUNK_BULLETINS`, segment
     each batch (parallel map), recursively merge across the blind batch seams → a gapless
@@ -312,10 +355,13 @@ async def segment_corpus(
     digest = _bulletin_digest(gather)
     if not digest:
         return []
-    chunks = [digest[i:i + _CHUNK_BULLETINS] for i in range(0, len(digest), _CHUNK_BULLETINS)]
+    chunks = [
+        digest[i : i + _CHUNK_BULLETINS]
+        for i in range(0, len(digest), _CHUNK_BULLETINS)
+    ]
 
     async def _seg(chunk: list[dict]) -> list[_Seg]:
-        async with (sem or nullcontext()):
+        async with sem or nullcontext():
             return await segment_chunk(ctx, chunk)
 
     blocks = await asyncio.gather(*[_seg(c) for c in chunks])
@@ -327,7 +373,10 @@ async def segment_corpus(
 # Per-era finalization — one canonical table of contents per era
 # ---------------------------------------------------------------------------
 
-def partition_gather_by_era(gather: dict, eras: list[EraSpan]) -> list[tuple[EraSpan, dict]]:
+
+def partition_gather_by_era(
+    gather: dict, eras: list[EraSpan]
+) -> list[tuple[EraSpan, dict]]:
     """Bucket the corpus gather into one sub-gather per era, by each bulletin's `YYYY-MM`
     falling within `[era.start, era.end]` (inclusive). Returns `[(era, sub_gather), ...]` in
     era order; bulletins outside every span are dropped (the eras cover the corpus)."""
@@ -353,7 +402,9 @@ def _aggregate(gather: dict) -> dict:
         for c in data["chapters"]:
             k = _norm_key(c["name"])
             e = agg.setdefault(
-                k, {"display": c["name"], "n_pages": 0, "n_issues": 0, "children": set()})
+                k,
+                {"display": c["name"], "n_pages": 0, "n_issues": 0, "children": set()},
+            )
             e["n_pages"] += c["n_pages"]
             e["n_issues"] += 1
             e["children"].update(c["children"])
@@ -374,8 +425,8 @@ def _contiguous_ranges(pages: list[int]) -> list[tuple[int, int]]:
 
 
 class _FinalChapter(BaseModel):
-    name: str                                          # canonical top-level chapter name
-    members: list[str] = Field(default_factory=list)   # raw headings folded into it
+    name: str  # canonical top-level chapter name
+    members: list[str] = Field(default_factory=list)  # raw headings folded into it
     secondary: list[str] = Field(default_factory=list)  # deduped sub-sections under it
 
 
@@ -438,11 +489,20 @@ async def _finalize_era(
     agg = _aggregate(gather)
     if not agg:
         return {}
-    payload = [{"name": e["display"], "n_pages": e["n_pages"], "n_issues": e["n_issues"],
-                "children": sorted(e["children"])[:10], "listed_as_child_of": e["listed_as_child_of"]}
-               for e in sorted(agg.values(), key=lambda e: -e["n_pages"])]
-    async with (sem or nullcontext()):
-        res = await _finalize_call.call(ctx, json.dumps({"chapters": payload}, ensure_ascii=False, indent=1))
+    payload = [
+        {
+            "name": e["display"],
+            "n_pages": e["n_pages"],
+            "n_issues": e["n_issues"],
+            "children": sorted(e["children"])[:10],
+            "listed_as_child_of": e["listed_as_child_of"],
+        }
+        for e in sorted(agg.values(), key=lambda e: -e["n_pages"])
+    ]
+    async with sem or nullcontext():
+        res = await _finalize_call.call(
+            ctx, json.dumps({"chapters": payload}, ensure_ascii=False, indent=1)
+        )
 
     # `ch.secondary` (sub-section children) is a build-time signal that helps the LLM fold
     # sub-sections into their parent here; it is NOT persisted — the describe pass populates the
@@ -451,7 +511,7 @@ async def _finalize_era(
     for ch in res.chapters:
         for m in ch.members:
             raw_to_canon[_norm_key(m)] = ch.name
-    for e in agg.values():               # any heading the LLM omitted → its own chapter
+    for e in agg.values():  # any heading the LLM omitted → its own chapter
         raw_to_canon.setdefault(_norm_key(e["display"]), e["display"])
 
     # File each placed page under its canonical chapter as page ranges.
@@ -463,9 +523,11 @@ async def _finalize_era(
 
     chapters: dict[str, dict] = {}
     for canon, by_bulletin in pages.items():
-        ranges = [{"bulletin": b, "start": s, "end": e}
-                  for b in sorted(by_bulletin)
-                  for s, e in _contiguous_ranges(sorted(by_bulletin[b]))]
+        ranges = [
+            {"bulletin": b, "start": s, "end": e}
+            for b in sorted(by_bulletin)
+            for s, e in _contiguous_ranges(sorted(by_bulletin[b]))
+        ]
         chapters[canon] = {
             "n_pages": sum(len(p) for p in by_bulletin.values()),
             "pages": ranges,
@@ -537,7 +599,9 @@ _describe_call: PromptedCall[_DescribeResult] = PromptedCall(
 )
 
 
-def _chapter_titles(chapter: dict, titles_by_page: dict[tuple[str, int], list[str]]) -> list[str]:
+def _chapter_titles(
+    chapter: dict, titles_by_page: dict[tuple[str, int], list[str]]
+) -> list[str]:
     """The chapter's most-frequent table titles (top `_DESCRIBE_TITLE_CAP`), gathered from the
     catalog titles on every page in its ranges. Frequency-ranked so recurring monthly tables lead
     and one-off OCR garble falls off."""
@@ -545,14 +609,17 @@ def _chapter_titles(chapter: dict, titles_by_page: dict[tuple[str, int], list[st
     for pr in chapter["pages"]:
         for pg in range(pr["start"], pr["end"] + 1):
             for t in titles_by_page.get((pr["bulletin"], pg), ()):
-                if (t := t.strip()):
+                if t := t.strip():
                     cnt[t] += 1
     return [t for t, _ in cnt.most_common(_DESCRIBE_TITLE_CAP)]
 
 
 async def _describe_era(
-    ctx: ExecutionContext, chapters: dict,
-    titles_by_page: dict[tuple[str, int], list[str]], *, sem: asyncio.Semaphore | None,
+    ctx: ExecutionContext,
+    chapters: dict,
+    titles_by_page: dict[tuple[str, int], list[str]],
+    *,
+    sem: asyncio.Semaphore | None,
 ) -> dict:
     """Pass 4 — one `chapter_describe` call fills `description` + `examples` on each of the era's
     chapters, summarizing a sample of the real table titles on its pages. In-place on the
@@ -560,11 +627,14 @@ async def _describe_era(
     its name + n_pages)."""
     if not chapters:
         return chapters
-    payload = [{"chapter": name, "table_titles": _chapter_titles(c, titles_by_page)}
-               for name, c in chapters.items()]
-    async with (sem or nullcontext()):
+    payload = [
+        {"chapter": name, "table_titles": _chapter_titles(c, titles_by_page)}
+        for name, c in chapters.items()
+    ]
+    async with sem or nullcontext():
         res = await _describe_call.call(
-            ctx, json.dumps({"chapters": payload}, ensure_ascii=False, indent=1))
+            ctx, json.dumps({"chapters": payload}, ensure_ascii=False, indent=1)
+        )
     for name, c in chapters.items():
         d = res.chapters.get(name)
         c["description"] = d.description if d else ""
@@ -573,8 +643,11 @@ async def _describe_era(
 
 
 async def build_concept_tree(
-    ctx: ExecutionContext, gather: dict,
-    titles_by_page: dict[tuple[str, int], list[str]], *, sem: asyncio.Semaphore | None = None,
+    ctx: ExecutionContext,
+    gather: dict,
+    titles_by_page: dict[tuple[str, int], list[str]],
+    *,
+    sem: asyncio.Semaphore | None = None,
 ) -> dict:
     """Segment the corpus into eras, then build each era's canonical table of contents from its
     chapter headings (one `chapter_finalize` call per era, run in parallel), and describe each
@@ -588,5 +661,6 @@ async def build_concept_tree(
         return {"span": [era.start, era.end], "label": era.label, "chapters": chapters}
 
     out = await asyncio.gather(
-        *[_one(era, sub) for era, sub in partition_gather_by_era(gather, eras)])
+        *[_one(era, sub) for era, sub in partition_gather_by_era(gather, eras)]
+    )
     return {"eras": list(out)}

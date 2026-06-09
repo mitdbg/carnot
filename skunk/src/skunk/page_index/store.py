@@ -32,7 +32,13 @@ from skunk.common import B64Image, PageRef
 from skunk.corpus import render_page_b64
 from skunk.errors import StepFailed
 
-from .data_model import CATALOG_SUBDIR, PAGES_SUBDIR, RENDERS_SUBDIR, PageCatalogRow, page_index_root
+from .data_model import (
+    CATALOG_SUBDIR,
+    PAGES_SUBDIR,
+    RENDERS_SUBDIR,
+    PageCatalogRow,
+    page_index_root,
+)
 
 RENDER_DPI = 200
 
@@ -66,8 +72,10 @@ class PageStore:
         self._renders_dir = Path(root) / RENDERS_SUBDIR
         self._pdf_dir = pdf_dir
         self._lock = threading.Lock()
-        self._text: dict[str, dict[int, str]] = {}       # bulletin -> {page: text}
-        self._catalog: dict[str, dict[int, PageCatalogRow]] = {}  # bulletin -> {page: anchor row}
+        self._text: dict[str, dict[int, str]] = {}  # bulletin -> {page: text}
+        self._catalog: dict[
+            str, dict[int, PageCatalogRow]
+        ] = {}  # bulletin -> {page: anchor row}
         self._page_locks: dict[str, threading.Lock] = {}  # render key -> lock
 
     # -- text -----------------------------------------------------------------
@@ -86,8 +94,11 @@ class PageStore:
         if cached is not None:
             return cached
         if not self._pages_dir.exists():
-            raise StepFailed("extract", f"page store not built ({self._pages_dir} missing); "
-                             "run the page-index build pipeline first.")
+            raise StepFailed(
+                "extract",
+                f"page store not built ({self._pages_dir} missing); "
+                "run the page-index build pipeline first.",
+            )
         path = self._pages_dir / f"{bulletin}.json"
         raw = json.loads(path.read_text()) if path.exists() else {}
         entries = {int(p): t for p, t in raw.items()}
@@ -119,12 +130,20 @@ class PageStore:
         if cached is not None:
             return cached
         if not self._catalog_dir.exists():
-            raise StepFailed("retrieve", f"catalog not built ({self._catalog_dir} missing); "
-                             "run the page-index build pipeline first.")
+            raise StepFailed(
+                "retrieve",
+                f"catalog not built ({self._catalog_dir} missing); "
+                "run the page-index build pipeline first.",
+            )
         path = self._catalog_dir / f"{bulletin}.jsonl"
         rows = (
-            [PageCatalogRow.from_json(line) for line in path.read_text().splitlines() if line]
-            if path.exists() else []
+            [
+                PageCatalogRow.from_json(line)
+                for line in path.read_text().splitlines()
+                if line
+            ]
+            if path.exists()
+            else []
         )
         entries: dict[int, PageCatalogRow] = {}
         for row in rows:
@@ -145,10 +164,15 @@ class PageStore:
         if img is not None:
             return img
         with self._lock_for(f"{ref.month}/{ref.page}"):
-            img = read_cached_image(self._renders_dir, ref.month, ref.page)  # re-check under lock
+            img = read_cached_image(
+                self._renders_dir, ref.month, ref.page
+            )  # re-check under lock
             if img is not None:
                 return img
-            if render_to_cache(ref.month, ref.page, self._pdf_dir, self._renders_dir) == "skipped":
+            if (
+                render_to_cache(ref.month, ref.page, self._pdf_dir, self._renders_dir)
+                == "skipped"
+            ):
                 return None
             return read_cached_image(self._renders_dir, ref.month, ref.page)
 
@@ -162,12 +186,16 @@ def render_cache_path(renders_dir: str | Path, month: str, page: int) -> Path:
     return Path(renders_dir) / month / f"{page}.png"
 
 
-def read_cached_image(renders_dir: str | Path, month: str, page: int) -> B64Image | None:
+def read_cached_image(
+    renders_dir: str | Path, month: str, page: int
+) -> B64Image | None:
     """The page's cached PNG as a `B64Image`, or None if it hasn't been rendered yet."""
     return _read_png(render_cache_path(renders_dir, month, page))
 
 
-def render_to_cache(month: str, page: int, pdf_dir: str | Path, renders_dir: str | Path) -> str:
+def render_to_cache(
+    month: str, page: int, pdf_dir: str | Path, renders_dir: str | Path
+) -> str:
     """Ensure the page's `renders/<month>/<page>.png` exists at `RENDER_DPI`, rendering it once
     if absent. Returns "cached" (already present), "rendered" (newly written), or "skipped" (no
     PDF / incomplete ref). Top-level and picklable so a pre-render stage can fan it out across a
@@ -190,7 +218,9 @@ def _read_png(path: Path) -> B64Image | None:
     """Load a cached PNG into a `B64Image`, or None if it isn't there."""
     if not path.exists():
         return None
-    return B64Image(mime="image/png", data=base64.standard_b64encode(path.read_bytes()).decode())
+    return B64Image(
+        mime="image/png", data=base64.standard_b64encode(path.read_bytes()).decode()
+    )
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:

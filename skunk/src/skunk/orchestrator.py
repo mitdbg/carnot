@@ -264,33 +264,31 @@ class Orchestrator:
     async def _maybe_select(
         self, branch: RetrieveBranch, doc: list[PageRef], bid: int
     ) -> list[PageRef]:
-        """Intermediate page-selection stage (opt-in via `config.page_select`, page-index path
-        only). Between the semantic filter and extract, a small per-branch `PageSelectAgent`
-        narrows the filter's survivors to the pages this branch actually needs — browsing the
-        candidates' per-era summaries and reading pages to verify, all served by the `PageStore`.
-        Runs once per retrieve branch, isolated and in parallel with its siblings (it's called
-        from `_tail`, itself fanned out by `_run_branches`). A no-op for golden / search-agent
-        retrieval or when disabled; any setup failure falls back to the unfiltered refs, and the
-        agent itself keeps-all on an unusable answer — so this never sinks a branch."""
+        """Intermediate selection stage (opt-in, page-index path only). Between the semantic
+        filter and extract, `block_select` (`config.block_select`) narrows the filter's survivors
+        to what this branch actually needs: a tournament of small packed group calls that reduces
+        the candidate blocks to the few relevant ones (block granularity). Runs once per retrieve
+        branch, isolated and in parallel with its siblings (called from `_tail`, fanned out by
+        `_run_branches`). A no-op for golden / search-agent retrieval, when disabled, or when no
+        candidate ref resolves to a catalog block (nothing to narrow). Otherwise the selector runs
+        and its result is used directly — there is NO degrade-to-unfiltered-refs fallback: a
+        selector failure propagates and fails the branch loudly rather than silently flooding
+        extract with every candidate."""
         cfg = self._ctx.config
         if (
-            not cfg.page_select
+            not cfg.block_select
             or not doc
             or cfg.golden_pages is not None
             or cfg.retriever != "page_index_old"
         ):
             return doc
-        try:
-            from skunk.page_index.page_select import PageSelectAgent
+        from skunk.page_index.block_select import BlockSelectAgent
 
-            agent = PageSelectAgent(doc, str(cfg.pdf_dir))
-        except Exception as e:  # noqa: BLE001 — artifact/load problem: keep the unfiltered refs
-            self._ctx.emit(f"page_select_skipped reason={type(e).__name__}: {e}")
-            return doc
+        agent = BlockSelectAgent(doc, str(cfg.pdf_dir))
         if not agent.has_candidates():
             return doc
         return await self._execute_with_tracing(
-            "page_select",
+            "block_select",
             lambda: agent.select(self._ctx, self._ctx.question, branch),
             branch_id=bid,
         )

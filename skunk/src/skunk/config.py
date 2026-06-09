@@ -123,13 +123,17 @@ class SkunkConfig:
     # isolation. (env: SKUNK_RETRIEVE_SKIP_SEMFILTER=1)
     retrieve_skip_semfilter: bool = False
 
-    # Intermediate page-selection stage (opt-in, page-index retriever only). After the
-    # semantic filter routes survivors per branch, a small per-branch agent (PageSelectAgent)
-    # narrows them to the pages the branch actually needs — browsing per-era candidate
-    # summaries (grep / read_file) and reading candidate pages (read_page) — before extract.
-    # Off by default (prototype); the agent falls back to keep-all on an unusable answer, so
-    # recall is preserved. (env: SKUNK_PAGE_SELECT=1)
-    page_select: bool = False
+    # Intermediate block-selection stage (opt-in, page-index retriever only). After the semantic
+    # filter routes survivors per branch, `BlockSelectAgent` reduces the candidate blocks with a
+    # tournament of small packed group calls down to the few relevant blocks (block granularity),
+    # then expands to page refs — before extract. (env: SKUNK_BLOCK_SELECT=1)
+    block_select: bool = True
+
+    # Extract: skip the parsed-text (OCR) tier entirely and read values straight off the rendered
+    # page images (vision tier). Default on — vision is robust to the OCR corruption that the
+    # parsed-text tier suffers on dense scanned tables (validated: it recovered single-cell OCR
+    # misses on the dev set). Disable with SKUNK_EXTRACT_VISION_ONLY=0 to use the parsed-text tier.
+    extract_vision_only: bool = True
 
     # Build: the `vision_rescan` stage always re-reads `parse_broken` pages (mangled parses). Pages
     # flagged `has_unparsed_graphics` that are CHART-ONLY (a chart/figure with no table on the page,
@@ -139,11 +143,21 @@ class SkunkConfig:
     vision_rescan_charts: bool = False
 
     def __post_init__(self) -> None:
-        # Route the semantic filter's (cheaper) model through the model-override
-        # registry so `PromptedCall` resolves it like every other call-site.
-        # Defaulted here unless a run pins it explicitly (SKUNK_MODEL_OVERRIDES=
-        # semfilter=… or, via `from_env`, SKUNK_SEMFILTER_MODEL).
+        # Route per-stage models through the override registry so `PromptedCall` resolves them
+        # like every other call-site. Defaulted here unless a run pins them explicitly
+        # (SKUNK_MODEL_OVERRIDES=stage=… or, for the filter, SKUNK_SEMFILTER_MODEL). Efforts
+        # come from each call-site's `default_effort` (compute=medium; block_select/extract=off),
+        # overridable via SKUNK_EFFORT_OVERRIDES.
+        # - semfilter: the cheap coarse filter runs on flash-lite.
+        # - block_select / extract: flash — block selection and value extraction are cheap reads
+        #   (extraction reads off the rendered page or parsed text; thinking off).
+        # - compute.codegen: the only Pro stage — codegen/reasoning over the extracted values.
+        # Everything else (planner, toc_pick, …) runs on the base `llm_model` (flash).
         self.model_overrides.setdefault("semfilter", "gemini-3.1-flash-lite")
+        self.model_overrides.setdefault("block_select", "gemini-3.5-flash")
+        self.model_overrides.setdefault("extract.text", "gemini-3.5-flash")
+        self.model_overrides.setdefault("extract.vision", "gemini-3.5-flash")
+        self.model_overrides.setdefault("compute.codegen", "gemini-3.1-pro-preview")
 
     @classmethod
     def from_env(cls) -> SkunkConfig:
@@ -177,7 +191,8 @@ class SkunkConfig:
             semfilter_batch_size=int(os.environ.get("SKUNK_SEMFILTER_BATCH", "32")),
             retrieve_skip_semfilter=os.environ.get("SKUNK_RETRIEVE_SKIP_SEMFILTER", "")
             not in ("", "0"),
-            page_select=os.environ.get("SKUNK_PAGE_SELECT", "") not in ("", "0"),
+            block_select=os.environ.get("SKUNK_BLOCK_SELECT", "1") not in ("", "0"),
+            extract_vision_only=os.environ.get("SKUNK_EXTRACT_VISION_ONLY", "1") not in ("", "0"),
             vision_rescan_charts=os.environ.get("SKUNK_VISION_RESCAN_CHARTS", "") not in ("", "0"),
             retriever=os.environ.get("SKUNK_RETRIEVER", "page_index_old"),  # type: ignore[arg-type]
             chromadb_dir=os.environ.get("SKUNK_CHROMADB_DIR", "cache/chromadb"),

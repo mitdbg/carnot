@@ -42,7 +42,9 @@ def _render_pages_b64(
     return images, rendered_refs
 
 
-def _parse_extract_response(raw: str, ctx: ExecutionContext) -> list[AnnotatedValue] | None:
+def _parse_extract_response(
+    raw: str, ctx: ExecutionContext
+) -> list[AnnotatedValue] | None:
     """Parse an LLM response into AnnotatedValues. Returns None on unparseable
     / non-array / empty (caller falls through to the next tier); drops individual
     entries that fail validation with a diagnostic."""
@@ -145,7 +147,9 @@ unit          natural-language label for the printed scale and base,
 # Each tier's system prompt is its own `_PREAMBLE` followed by the shared
 # `EXTRACT_COMMON_PROMPT`; both tiers parse with `_parse_extract_response` and share
 # the JSON-array output instruction below.
-_EXTRACT_OUTPUT_INSTRUCTION = "Output a JSON array of AnnotatedValue entries — no markdown fences, no prose."
+_EXTRACT_OUTPUT_INSTRUCTION = (
+    "Output a JSON array of AnnotatedValue entries — no markdown fences, no prose."
+)
 
 
 class TextExtractor:
@@ -153,12 +157,18 @@ class TextExtractor:
 You retrieve printed values from page text to fulfill a specific lookup.
 Each user message describes the lookup — what to find and (when stated)
 the period — followed by the full-context question this lookup supports,
-then the page text to draw values from. Emit one entry per distinct row
-that could plausibly satisfy the lookup — including cases where multiple
-rows partially match. Do not compute or transform — extract only what
-is printed. Every numeric value emitted MUST appear on the page verbatim.
-Choose the AnnotatedValue shape (scalar / vector / table) that fits the data on the page;
-pick the smallest shape that captures every relevant value."""
+then PAGE METADATA (a structured summary of each table/figure on the
+page: its title, column/row labels, and a short description) and finally
+the page text to draw values from. The page text is flattened, so its
+columns and rows can be hard to read; use the metadata to make sense of
+the layout — which column/row a value sits under, which table it belongs
+to, what the period and units are. Emit one entry per distinct row that
+could plausibly satisfy the lookup — including cases where multiple rows
+partially match. Do not compute or transform — extract only what is
+printed. Every numeric value emitted MUST appear in the PAGE TEXT
+verbatim (the metadata is context, not a source of values). Choose the
+AnnotatedValue shape (scalar / vector / table) that fits the data on the
+page; pick the smallest shape that captures every relevant value."""
 
     _prompt = PromptedCall(
         name="extract.text",
@@ -169,7 +179,9 @@ pick the smallest shape that captures every relevant value."""
     )
 
     @staticmethod
-    def _fetch_page_texts(refs: list[PageRef], ctx: ExecutionContext) -> list[tuple[PageRef, str]]:
+    def _fetch_page_texts(
+        refs: list[PageRef], ctx: ExecutionContext
+    ) -> list[tuple[PageRef, str]]:
         """Fetch each ref's text from the page store (an anchor's text is its merged member
         pages, with any figure note already baked in); skip refs with none (the vision tier can
         still read them)."""
@@ -185,6 +197,28 @@ pick the smallest shape that captures every relevant value."""
         return pages
 
     @staticmethod
+    def _page_metadata(refs: list[PageRef], ctx: ExecutionContext) -> str:
+        """A structured summary of each content block on the group's pages — title, kind,
+        column/row labels, and the block summary (NO numeric values) — to help the model read
+        the flattened page text. Empty string when no catalog metadata is available."""
+        store = get_page_store(str(ctx.config.pdf_dir))
+        lines: list[str] = []
+        for ref in refs:
+            row = store.catalog_row(ref)
+            if row is None:
+                continue
+            for block in row.content_blocks:
+                parts = [f"{block.kind}: {block.title or '(untitled)'}"]
+                if block.column_headers:
+                    parts.append(f"columns: {', '.join(block.column_headers)}")
+                if block.row_headers:
+                    parts.append(f"rows: {', '.join(block.row_headers)}")
+                if block.summary:
+                    parts.append(block.summary)
+                lines.append(f"- page {ref.page}: " + " | ".join(parts))
+        return "\n".join(lines)
+
+    @staticmethod
     def _group_refs(refs: list[PageRef], *, single_group: bool) -> list[list[PageRef]]:
         """Bundle consecutive same-bulletin pages so a table spanning pages reads as one
         prompt. `single_group` (golden mode) keeps every ref in one group instead.
@@ -197,8 +231,10 @@ pick the smallest shape that captures every relevant value."""
             prev = groups[-1][-1] if groups else None
             if (
                 prev is not None
-                and ref.month is not None and ref.month == prev.month
-                and ref.page is not None and prev.page is not None
+                and ref.month is not None
+                and ref.month == prev.month
+                and ref.page is not None
+                and prev.page is not None
                 and ref.page == prev.page + 1
             ):
                 groups[-1].append(ref)
@@ -215,23 +251,43 @@ pick the smallest shape that captures every relevant value."""
     ) -> list[AnnotatedValue]:
         pages = self._fetch_page_texts(group_refs, ctx)
         if not pages:
-            ctx.emit(f"group_skipped tier=parsed_json reason=no_text refs={[str(r) for r in group_refs]!r}")
+            ctx.emit(
+                f"group_skipped tier=parsed_json reason=no_text refs={[str(r) for r in group_refs]!r}"
+            )
             return []
         # Build the prompt around the group's joined page text. `content` is kept on its
         # own so the verifier checks emitted cells against the page text, not the prompt
         # scaffolding.
         # TODO: further cleanup / context-management should happen here per group
         content = "\n\n".join(text for _, text in pages)
-        user_msg = "\n\n".join([
-            f"You are looking for {branch.key}{f' for the period {branch.period}' if branch.period else ''}.",
-            f'For full context, this lookup serves to help answer the question: "{question}"',
-            content,
-        ])
+        metadata = self._page_metadata([ref for ref, _ in pages], ctx)
+        user_msg = "\n\n".join(
+            [
+                f"You are looking for {branch.key}{f' for the period {branch.period}' if branch.period else ''}.",
+                f'For full context, this lookup serves to help answer the question: "{question}"',
+                *(
+                    [
+                        f"Page metadata (context to interpret the layout — not a source of values):\n{metadata}"
+                    ]
+                    if metadata
+                    else []
+                ),
+                content,
+            ]
+        )
         parsed = await self._prompt.call(ctx, user_msg, temperature=0.0) or []
-        ctx.emit(f"extracted tier=parsed_json n_pages={len(pages)} n_entries={len(parsed)}")
-        kept = [e for e in parsed if all(_cell_in_text(v, content) for _, v in _cells_with_path(e))]
+        ctx.emit(
+            f"extracted tier=parsed_json n_pages={len(pages)} n_entries={len(parsed)}"
+        )
+        kept = [
+            e
+            for e in parsed
+            if all(_cell_in_text(v, content) for _, v in _cells_with_path(e))
+        ]
         if len(kept) < len(parsed):
-            ctx.emit(f"verifier_dropped tier=parsed_json n_dropped={len(parsed) - len(kept)} n_parsed={len(parsed)}")
+            ctx.emit(
+                f"verifier_dropped tier=parsed_json n_dropped={len(parsed) - len(kept)} n_parsed={len(parsed)}"
+            )
         return kept
 
     async def run(
@@ -241,13 +297,17 @@ pick the smallest shape that captures every relevant value."""
         refs: list[PageRef],
         ctx: ExecutionContext,
     ) -> list[AnnotatedValue]:
-        groups = self._group_refs(refs, single_group=ctx.config.golden_pages is not None)
+        groups = self._group_refs(
+            refs, single_group=ctx.config.golden_pages is not None
+        )
         ctx.emit(
             f"fan_out tier=parsed_json n_groups={len(groups)} n_refs={len(refs)} "
             f"group_sizes={[len(g) for g in groups]}"
         )
 
-        per_group = await asyncio.gather(*[self._extract_group(g, branch, question, ctx) for g in groups])
+        per_group = await asyncio.gather(
+            *[self._extract_group(g, branch, question, ctx) for g in groups]
+        )
         entries = [e for kept in per_group for e in kept]
         if not entries:
             ctx.emit("tier_empty tier=parsed_json reason=no_entries")
@@ -291,14 +351,18 @@ shape (scalar / vector / table) that fits the data on the page."""
             f"Image {i + 1}: PDF page {ref.page} of the {ref.month} Treasury Bulletin"
             for i, ref in enumerate(rendered_refs)
         ]
-        user_msg = "\n\n".join([
-            f"You are looking for {branch.key}{period}.",
-            f'For full context, this lookup serves to help answer the question: "{question}"',
-            "Images attached, in order:\n" + "\n".join(image_lines),
-        ])
+        user_msg = "\n\n".join(
+            [
+                f"You are looking for {branch.key}{period}.",
+                f'For full context, this lookup serves to help answer the question: "{question}"',
+                "Images attached, in order:\n" + "\n".join(image_lines),
+            ]
+        )
         ctx.emit(f"vision_call tier=vision n_images={len(images)}")
         entries = await self._prompt.call(ctx, user_msg, images=images, temperature=0.0)
-        ctx.emit(f"vision_result tier=vision n_entries={0 if entries is None else len(entries)}")
+        ctx.emit(
+            f"vision_result tier=vision n_entries={0 if entries is None else len(entries)}"
+        )
         return entries or []
 
 
@@ -319,19 +383,25 @@ class ExtractOp:
         if not refs:
             raise StepFailed("extract", "No page refs to extract from")
 
-        # parsed_json tier first (skipped for visual_only charts/figures); fall through
-        # to the vision tier when it finds nothing.
-        if not branch.visual_only:
+        # parsed_json tier first (skipped for visual_only charts/figures, or entirely when
+        # `extract_vision_only` forces straight-to-vision); fall through to the vision tier
+        # when it finds nothing.
+        if not branch.visual_only and not ctx.config.extract_vision_only:
             entries = await self._text.run(ctx.question, branch, refs, ctx)
             if entries:
-                ctx.emit(f"tier_result tier=parsed_json descriptions={[e.description for e in entries]!r}")
+                ctx.emit(
+                    f"tier_result tier=parsed_json descriptions={[e.description for e in entries]!r}"
+                )
                 return entries
 
         # vision tier — render the pages, then read values off the images.
         images, rendered_refs = _render_pages_b64(refs, ctx)
-        entries = await self._vision.run(ctx.question, branch, images, rendered_refs, ctx)
+        entries = await self._vision.run(
+            ctx.question, branch, images, rendered_refs, ctx
+        )
         if not entries:
             raise StepFailed("extract", "no relevant values found across tiers")
-        ctx.emit(f"tier_result tier=vision descriptions={[e.description for e in entries]!r}")
+        ctx.emit(
+            f"tier_result tier=vision descriptions={[e.description for e in entries]!r}"
+        )
         return entries
-

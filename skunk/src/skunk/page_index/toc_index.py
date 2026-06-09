@@ -31,12 +31,15 @@ from .scan import PageScan
 # ToC hierarchy — LLM output (from the ToC text alone)
 # ---------------------------------------------------------------------------
 
+
 class TocChapter(BaseModel):
     name: str
     children: list[str] = Field(default_factory=list)
-    start_printed: str = ""       # printed page label where the chapter begins (real ToC)
+    start_printed: str = ""  # printed page label where the chapter begins (real ToC)
     end_printed: str | None = None
-    start_page: int | None = None  # physical PDF page (the reconstructed path binds here)
+    start_page: int | None = (
+        None  # physical PDF page (the reconstructed path binds here)
+    )
 
 
 # Prompt blurb for a TocChapter — shared by the ToC-outline prompt (real ToC, uses the printed
@@ -65,7 +68,7 @@ class TocHierarchy(BaseModel):
     @model_validator(mode="after")
     def _check(self) -> "TocHierarchy":
         if not self.is_toc:
-            self.chapters = []   # a flagged non-ToC has no chapters
+            self.chapters = []  # a flagged non-ToC has no chapters
             return self
         for c in self.chapters:
             # A chapter needs a name and SOME start anchor: a printed label (real ToC)
@@ -75,7 +78,8 @@ class TocHierarchy(BaseModel):
         return self
 
 
-_OUTLINE_SYSTEM = """\
+_OUTLINE_SYSTEM = (
+    """\
 You read the candidate table-of-contents page(s) of ONE issue of a periodical and EITHER
 extract its chapter structure OR flag the pages as not a real table of contents.
 
@@ -114,7 +118,9 @@ Return the issue's TOP-LEVEL chapters, in body order, each with its printed page
 ]}
 
 Each chapter:
-""" + TOC_CHAPTER_FIELDS + """
+"""
+    + TOC_CHAPTER_FIELDS
+    + """
 
 Here use the printed labels (start_printed / end_printed). A chapter ends just before the next
 begins; the last ends at the ToC's final page reference.
@@ -124,6 +130,7 @@ begins; the last ends at the ToC's final page reference.
 - Skip entries that are not body chapters (cover, contents, masthead, index, lists of tables).
 - When `is_toc` is false, `chapters` MUST be empty.
 """
+)
 
 
 def _parse_outline(raw: str, _ctx: ExecutionContext) -> TocHierarchy:
@@ -150,7 +157,9 @@ async def outline_issue(
     aren't a real table of contents. Empty `toc_texts` → `is_toc=False` with no call."""
     if not toc_texts:
         return TocHierarchy(is_toc=False)
-    toc = "\n\n".join(f"--- TOC page {idx} ---\n{t}" for idx, t in sorted(toc_texts.items()))
+    toc = "\n\n".join(
+        f"--- TOC page {idx} ---\n{t}" for idx, t in sorted(toc_texts.items())
+    )
     user = f"issue: {bulletin}\n\nTABLE-OF-CONTENTS TEXT:\n{toc}"
     return await _outline.call(ctx, user)
 
@@ -209,7 +218,11 @@ _reconstruct: PromptedCall[TocHierarchy] = PromptedCall(
 
 
 async def reconstruct_outline(
-    ctx: ExecutionContext, *, bulletin: str, page_views: list[dict], reference: list[str]
+    ctx: ExecutionContext,
+    *,
+    bulletin: str,
+    page_views: list[dict],
+    reference: list[str],
 ) -> TocHierarchy:
     """One `toc_reconstruct` LLM call → a `TocHierarchy` (source='reconstructed') for an issue
     with no ToC. Chapters are read from the issue's section-DIVIDER pages (a chapter name on an
@@ -220,8 +233,10 @@ async def reconstruct_outline(
     if not page_views:
         return TocHierarchy(is_toc=False, source="reconstructed")
     ref = "\n".join(f"  - {r}" for r in reference) or "  (none)"
-    user = (f"issue: {bulletin}\n\nREFERENCE CHAPTERS (neighboring issues):\n{ref}\n\n"
-            f"PAGES (JSON, {len(page_views)} entries):\n{json.dumps(page_views, ensure_ascii=False)}")
+    user = (
+        f"issue: {bulletin}\n\nREFERENCE CHAPTERS (neighboring issues):\n{ref}\n\n"
+        f"PAGES (JSON, {len(page_views)} entries):\n{json.dumps(page_views, ensure_ascii=False)}"
+    )
     return await _reconstruct.call(ctx, user)
 
 
@@ -274,7 +289,9 @@ def _resolve_start(start_printed: str, scans: dict[int, PageScan]) -> int | None
     key = _printed_key(start_printed)
     if key is None:
         return None
-    return next((i for i in sorted(scans) if _printed_key(scans[i].printed_page) == key), None)
+    return next(
+        (i for i in sorted(scans) if _printed_key(scans[i].printed_page) == key), None
+    )
 
 
 def _chapter_start_phys(ch: TocChapter, scans: dict[int, PageScan]) -> int | None:
