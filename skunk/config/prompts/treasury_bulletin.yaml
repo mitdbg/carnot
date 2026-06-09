@@ -110,6 +110,10 @@ overrides:
 
       Set `as_of` ONLY when the question explicitly NAMES a bulletin issue (e.g. "the September 2012 Treasury Bulletin"). Do NOT derive it from a vague or implied time reference — for example, "the end of FY 2010", "as of March 2003"; Leave as_of blank in these cases.
 
+      Set `as_of` ONLY when the question explicitly NAMES a bulletin issue (e.g. "the September 2012 Treasury Bulletin"). Do NOT derive it from a vague or implied time reference — for example, "the end of FY 2010", "as of March 2003"; Leave as_of blank in these cases.
+
+      Be careful about fiscal year (FY) vs calendar year (CY). CYy is y-01..y-12, but FYy is the 12 months ending in year y — (y-1)-10..y-09 from FY1977 on, and (y-1)-07..y-06 before 1977. The months 1976-07..1976-09 are the "transition quarter" between FY1976 and FY1977 and belong to neither — pin them directly if a question asks for that period.
+
   # ---------------------------------------------------------------------
   # Planner few-shots. Each entry is a pre-formatted block that lands
   # verbatim under the planner's "## Few-shot examples" header.

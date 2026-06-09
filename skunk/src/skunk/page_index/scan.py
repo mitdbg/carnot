@@ -32,14 +32,7 @@ class PageScan(BaseModel):
     )
     date_interval: tuple[str, str] | None = None
     blocks: list[ContentBlock] = Field(default_factory=list)
-    # Legacy: pages a retired merge pass folded into this one. Nothing folds any more
-    # (every page is its own catalog row; `is_continuation` is metadata only) — kept,
-    # always empty, so older artifacts still validate. The scan LLM never sets it.
     continuation_pages: list[int] = Field(default_factory=list)
-    # Build-only routing: set True once this page has been through the vision_rescan tier
-    # (re-read from the rendered image). The marker — not the flags — is what resume keys on,
-    # since a page can stay flagged after a successful re-read (e.g. a chart whose data can be
-    # described but not extracted). The scan LLM never sets it; the vision_rescan stage does.
     vision_rescanned: bool = False
 
     @field_validator("date_interval")

@@ -15,11 +15,15 @@ import asyncio
 import json
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from skunk.config import SkunkConfig
 from skunk.errors import StepFailed
 from skunk.common import BlockRef, ExecutionContext, PageRef, page_key_to_pageref
 from skunk.plan import RetrieveBranch
+
+if TYPE_CHECKING:
+    from skunk.page_index.query import BlockRef
 
 
 # TODO: this is just a hack to make blocks work with search agents. We should probably fix this at some point
@@ -36,7 +40,9 @@ class RetrieveOp:
         self._config = config
         self._resources = None  # (Collection, dict[str, str]) — shared across branches
         self._resources_lock = threading.Lock()
-        self._page_index_retriever = None  # skunk.page_index.query.PageIndexRetriever
+        self._page_index_retriever = (
+            None  # skunk.page_index_old.query.PageIndexRetriever
+        )
 
     async def run(
         self, ctx: ExecutionContext, branch: RetrieveBranch
@@ -51,7 +57,7 @@ class RetrieveOp:
             case other:
                 raise StepFailed(
                     "retrieve",
-                    f"unknown retriever {other!r}; expected 'search_agent' or 'page_index'",
+                    f"unknown retriever {other!r}; expected 'search_agent' or 'page_index_old'",
                 )
 
     async def run_all(

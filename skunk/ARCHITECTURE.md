@@ -76,6 +76,7 @@ The load-bearing insight is that `periods_covered` (what period a page *reports 
 
   **Page store** (`page_index/store.py`, `PageStore`) — the artifact's source of truth for page CONTENT, with two thread-safe access paths: `text(ref)` and `image(ref)`. The `page_store` pipeline stage writes `pages/<bulletin>.json` (`{page: text}`): each page's own text (reusing the build's `chop_bulletin`/`elements_to_text`) with a figure note appended — a dumb page→text map, one entry per catalog row. `extract.py` reads Tier-1 text and the vision tier's **page images** through `PageStore` and no longer touches the corpus parsed-JSON/PDFs; images are rendered on demand at 200 DPI (`renders/<bulletin>/<page>.png`) and cached, with at-most-once rendering per page under concurrency. (Extract therefore requires the page-store artifact to exist.)
 
+
 ## The 4 operators
 
 - **`retrieve(key, period)`** — only chain head. Returns `list[PageRef]` with `(month, page)` populated (where `page` is the 1-based PDF page index). Dispatched by `RetrieveOp` to one of two backends (or short-circuited by `ctx.config.golden_pages`) — see "Two retrieval methods" above.

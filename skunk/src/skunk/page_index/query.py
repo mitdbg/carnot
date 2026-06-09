@@ -9,7 +9,23 @@ is kept iff any block fits any target. Output is BLOCK-granular (`BlockRef`).
 reduction over the semantic filter's survivors, narrowing each branch to at most `_KEEP`
 blocks."""
 
-from __future__ import annotations
+Retrieval (`retrieve_all`) runs all of a question's branches at once: each branch keeps
+its own cheap candidate pass (per-era ToC chapter pick → year filter), then ONE coarse
+semantic (summary) filter scans the deduped union of candidates — every unique page at
+most once. That filter explodes each page into its CONTENT BLOCKS and judges them as a
+single FLAT list (one boolean per block) against the branch RETRIEVAL TARGETS; a page is
+kept iff ANY of its blocks fits ANY target. Two choices make the coarse model reliable
+here: (1) judging the clean targets rather than the raw, computation-heavy question, and
+(2) the flat block list rather than nested page objects, which keeps per-item judgments
+stable at larger batches. A question-scoped decision cache keeps a page from being judged
+twice across sibling branches (per-branch `run` calls share it via the ctx). Survivors
+route back to a branch iff that branch's cheap pass kept the page AND the filter marked
+it relevant.
+
+Because the filter judges per block, the retriever's native output is BLOCK-granular
+(`BlockRef` — the kept block, its anchor page, and that page's member refs). The
+extraction pipeline still consumes `PageRef`s, so the block→page translation lives in
+`RetrieveOp` (`retrieve.py`), keeping this module's output at its true granularity."""
 
 import json
 import asyncio
