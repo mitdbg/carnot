@@ -571,7 +571,7 @@ class LLMClient:
         contents = [
             types.Content(
                 role="model" if m["role"] == "assistant" else "user",
-                parts=[types.Part.from_text(text=m["content"])],
+                parts=self._gemini_parts(m["content"], m.get("images")),
             )
             for m in messages
         ]
@@ -650,7 +650,7 @@ class LLMClient:
         contents = [
             types.Content(
                 role="model" if m["role"] == "assistant" else "user",
-                parts=[types.Part.from_text(text=m["content"])],
+                parts=self._gemini_parts(m["content"], m.get("images")),
             )
             for m in messages
         ]
@@ -844,7 +844,10 @@ class LLMClient:
         if system:
             out.append({"role": "system", "content": system})
         out.extend(
-            {"role": "assistant" if m["role"] == "assistant" else "user", "content": m["content"]}
+            {
+                "role": "assistant" if m["role"] == "assistant" else "user",
+                "content": LLMClient._openrouter_content(m["content"], m.get("images")),
+            }
             for m in messages
         )
         return out

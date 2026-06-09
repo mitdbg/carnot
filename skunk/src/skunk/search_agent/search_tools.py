@@ -41,13 +41,16 @@ chunks at render time. These sets are per-question state: the owning
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
+from pathlib import Path
 
 from chromadb.api.models.Collection import Collection
 from google import genai
 from openrouter import OpenRouter
 
 from skunk.common import get_rate_limiter
+from skunk.corpus import render_page_b64
 from skunk.multi_turn_agent import Tool
 
 # Tags identifying each tool's structured return payload to the SearchAgent.
@@ -55,6 +58,7 @@ PRUNE_RESULT_TAG = "__prune__"
 SEARCH_RESULT_TAG = "__search_result__"
 GREP_RESULT_TAG = "__grep_result__"
 READ_DOCUMENT_RESULT_TAG = "__read_document_result__"
+VIEW_FIGURE_RESULT_TAG = "__view_figure_result__"
 
 # Embedding clients we know how to query. Gemini embeddings go through
 # `genai.Client`; Qwen (and other OpenRouter-hosted) embeddings are only
@@ -300,6 +304,83 @@ read_document(["doc_id_1", "doc_id_2"])
             else:
                 docs.append({"doc_id": did, "text": f"=== doc_id={did} ===\n{text}"})
         return {READ_DOCUMENT_RESULT_TAG: True, "docs": docs}
+
+
+class ViewFigureTool(Tool):
+    """Render the full page containing a `<figure id=N>` placeholder the agent saw while
+    reading a document, and hand it back as an image observation. We render the *whole*
+    page (not a bbox crop) so the agent sees the figure in context plus any sibling
+    figures on the page, and so OCR coordinate errors can't clip the chart."""
+
+    name = "view_figure"
+
+    def __init__(
+        self,
+        document_map: dict[str, str],
+        pdf_dir: str | Path,
+        *,
+        dpi: int = 300,
+        fmt: str = "png",
+    ):
+        self._document_map = document_map
+        self._pdf_dir = pdf_dir
+        self._dpi = dpi
+        self._fmt = fmt
+
+    @staticmethod
+    def _figure_ids(page_text: str) -> list[str]:
+        """The figure ids that appear as `<figure id=N>` placeholders in `page_text`."""
+        return re.findall(r"<figure id=([^>]+)>", page_text)
+
+    def __call__(self, doc_id: str, figure_id: int | str) -> dict:
+        page_text = self._document_map.get(doc_id)
+        if page_text is None:
+            return {VIEW_FIGURE_RESULT_TAG: True, "error": f"no such document: {doc_id!r}"}
+        if f"<figure id={figure_id}>" not in page_text:
+            visible = self._figure_ids(page_text)
+            hint = (
+                f"figure ids on this page: {visible}" if visible else "this page has no figures"
+            )
+            return {
+                VIEW_FIGURE_RESULT_TAG: True,
+                "error": f"no figure with id={figure_id} on doc_id={doc_id}; {hint}",
+            }
+        # doc_id is `{year}_{month}_{page_id}`; render_page_b64 wants month as "YYYY-MM".
+        try:
+            year, month, page = doc_id.split("_")
+        except ValueError:
+            return {
+                VIEW_FIGURE_RESULT_TAG: True,
+                "error": f"doc_id {doc_id!r} is not in the expected '<year>_<month>_<page>' format",
+            }
+        try:
+            img = render_page_b64(
+                f"{year}-{month}", int(page),
+                pdf_dir=self._pdf_dir, dpi=self._dpi, fmt=self._fmt,
+            )
+        except Exception as e:
+            return {VIEW_FIGURE_RESULT_TAG: True, "error": f"view_figure render error: {e}"}
+        if img is None:
+            return {
+                VIEW_FIGURE_RESULT_TAG: True,
+                "error": f"could not render page for doc_id={doc_id} (PDF missing)",
+            }
+        return {
+            VIEW_FIGURE_RESULT_TAG: True,
+            "doc_id": doc_id,
+            "figure_id": figure_id,
+            "mime": img.mime,
+            "data": img.data,
+        }
+
+    doc = """\
+### view_figure(doc_id: str, figure_id: int | str)
+When you read a document and see a `<figure id=N>` placeholder (a chart/figure that is NOT in the searchable text), call this tool to actually *see* it. It returns an image of the **entire page** that contains the figure — so you see the figure in context, along with any other figures on that page — appended to your messages, just like reading the page's text. Use it to judge whether a page whose answer may live in a chart is relevant. Pass the `doc_id` of the page you read and the `id` from the `<figure id=N>` placeholder.
+
+```python
+# you read doc_id "2002_12_8" and saw "<figure id=5>"; now view it
+view_figure("2002_12_8", 5)
+```"""
 
 
 class PruneTool(Tool):
