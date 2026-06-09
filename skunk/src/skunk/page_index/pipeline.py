@@ -1,705 +1,1174 @@
-"""Corpus-agnostic page-index build driver.
+"""End-to-end page-index build pipeline.
 
-Composes a `CorpusProfile` (`--profile <name>`) of five stage
-implementations into the end-to-end build:
+One entry point (`main` / `python -m skunk.page_index.pipeline`) runs every stage in
+order over the Treasury Bulletin corpus, writing each stage's artifact into a single
+build folder. There are deliberately NO flags to run a stage in isolation — the whole
+pipeline runs start to finish; ad-hoc single-stage runs are patched in as needed.
 
-    catalog → extract_l1 → place_pages → merge_chapters → manifest
+The pipeline is a list of `Stage`s (`PIPELINE`) that `run_build` calls in order. Most are
+per-bulletin (`BulletinStage`); two are whole-corpus reductions:
 
-Outputs land under `--output-dir`:
+  1. `scan`        (`build/scans/<b>.json`)    — one `scan_page` LLM call per non-empty page
+     → its `PageScan` (role, blocks, dates) + per-page errors.
+  2. `prerender`   (`build/renders/<b>/<p>.png`, reduction) — pre-render the pages `vision_rescan`
+     will LLM-scan (flagged + not yet re-read) into the image cache `PageStore` serves (no LLM);
+     warms the critical-path render for the next stage + query-time vision.
+  3. `vision_rescan` (reduction)               — re-scan each page the text scan flagged
+     (`has_unparsed_graphics` / `parse_broken`) from its rendered PDF IMAGE, overwriting that
+     page's record in the scan file in place (one `vision_scan_page` LLM call per flagged page).
+  4. `merge_continuations` (reduction)         — fold each `is_continuation` page into the
+     previous content page and drop it, rewriting the scan file in place (no LLM).
+  5. `toc`         (`build/toc/<b>.json`)      — coalesce the scan's `toc` pages, then one
+     `outline_issue` call extracts the chapter outline AND flags non-ToCs (`is_toc`).
+  6. `reconstruct_toc` (reduction)             — fill each ToC-less issue's outline from its
+     section-divider pages, using neighbors' real ToCs as reference (overwrites its toc file).
+  7. `place`       (`build/place/<b>.json`)    — file each content page under its chapter.
+  8. `catalog`     (`build/catalog/<b>.jsonl`) — the slim query-facing per-page rows.
+  9. `page_store`  (`build/pages/<b>.json`)    — per catalog row, its member pages' JSON text
+     (reusing `chop_bulletin`) + figure descriptors; the content source the query path reads.
+ 10. `era_merge`   (`concept_tree.json`, reduction) — segment the timeline into eras, then
+     build each era's canonical table of contents.
 
-    <output-dir>/
-      catalog/{bulletin}.jsonl × N    per-bulletin catalog rows
-      l1/{bulletin}.json × N          per-bulletin L1 chapter spans
-      concept_tree.json               flat global chapter tree
-      manifest.json                   build metadata
-
-Every stage is idempotent and re-runnable. Re-running picks up from the
-last persisted output; `--start-from <stage>` skips earlier stages and
-validates that their on-disk prerequisites are present.
-
-Cost / wall-clock estimates are profile-specific; consult the profile's
-docs.
+Shared machinery — a single `BuildContext` owns the LLM client, the corpus list, the
+process-wide token budget, and the concurrency semaphore. The `Stage` protocol is just
+`name` + `run`; `BulletinStage.run` gives per-bulletin stages uniform resume (skip bulletins
+already built), persistence, and progress, while the reductions carry their own resume
+(skip when their output already exists).
 """
 
 from __future__ import annotations
 
 import argparse
-import dataclasses
-import hashlib
+import asyncio
 import json
 import logging
 import re
-import subprocess
-import threading
+import sys
 import time
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from abc import ABC, abstractmethod
+from collections import Counter, defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from skunk.common import load_env_file
-from skunk.llm_client import LLMClient, LLMResponse
+from skunk.common import ExecutionContext, load_env_file
+from skunk.errors import ParseError
 from skunk.config import SkunkConfig
+from skunk.corpus import page_elements, parse_bulletin_filename
+from skunk.llm_client import LLMClient
+from skunk.prompted_call import load_prompt_overrides
 from skunk.trace import configure_obs
 
-from .corpora import PROFILES, load_profile
-from skunk.corpus import page_elements, page_text_tagged
-from .profile import CorpusProfile, StageError
-from .schema import PageCatalogRow
-from .stages.l1_harvest import SectionSpan
+from .data_model import PAGES_SUBDIR, RENDERS_SUBDIR, TREE_FILE, PageCatalogRow
+from .eras import build_concept_tree
+from .scan import PageScan, merge_continuations, scan_page, vision_scan_page
+from .store import read_cached_image, render_cache_path, render_to_cache
+from .toc_index import (
+    TocHierarchy,
+    coalesce_toc_ranges,
+    outline_issue,
+    place_pages,
+    reconstruct_outline,
+)
 
-log = logging.getLogger(__name__)
+# Fixed name under the `skunk.*` tree (so `python -m`'s `__main__` still logs at INFO).
+log = logging.getLogger("skunk.page_index.pipeline")
 
+CORPUS_NAME = "treasury"
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 load_env_file(_REPO_ROOT / ".env")
 
+# Gemini Flash token pricing (USD/token), matching eval/eval_retrieve.py's
+# `_FLASH_IN`/`_FLASH_OUT`: $0.30 / 1M input, $2.50 / 1M output.
+_FLASH_IN, _FLASH_OUT = 0.30e-6, 2.50e-6
 
-STAGES = ("build_catalog", "extract_l1", "place_pages",
-          "merge_chapters", "manifest")
+# Visual element types whose mere presence is content (a figure-only page is not blank).
+_VISUAL_TYPES = frozenset({"figure", "image", "chart", "plot", "diagram"})
 
+# Pull the token counts the LLM client stamps onto each `call` event off a unit ctx.
+_CALL_RE = re.compile(r"in_tok=(\d+) out_tok=(\d+)")
 
-# ---------------------------------------------------------------------------
-# Build-time LLM instrumentation
-#
-# Stages call `llm.call(...)` directly (no `ctx` is propagated), so token
-# usage doesn't reach any sink today. `StageStats` accumulates per-stage
-# call counts, tokens, and wall-clock; `StageLLMWrapper` is a drop-in for
-# `LLMClient` that records each successful response under the active stage.
-# ---------------------------------------------------------------------------
+# How often (in completed bulletins) a stage writes progress + re-checks guards.
+_PROGRESS_EVERY = 24
 
-@dataclass
-class StageStats:
-    """Per-stage LLM call accumulator. Thread-safe via the lock below."""
-    n_calls: int = 0
-    input_tokens: int = 0
-    output_tokens: int = 0
-    llm_latency_s: float = 0.0   # summed across calls (parallel-overlapped)
-    n_errors: int = 0
-    wall_s: float = 0.0          # set by stage driver, not by per-call
-    extra: dict = field(default_factory=dict)  # stage-specific counters
-
-    def record(
-        self, *, input_tokens: int | None, output_tokens: int | None,
-        latency_s: float,
-    ) -> None:
-        self.n_calls += 1
-        self.input_tokens += int(input_tokens or 0)
-        self.output_tokens += int(output_tokens or 0)
-        self.llm_latency_s += float(latency_s or 0.0)
-
-
-class StageLLMWrapper:
-    """Wraps an `LLMClient` so every `.call(...)` records into a `StageStats`
-    bucket. Same signature as `LLMClient.call`; passes everything through.
-
-    Errors are not recorded as token usage (they raise before usage is
-    populated); the wrapper increments `n_errors` and re-raises so the
-    underlying retry/error handling stays unchanged.
-    """
-
-    def __init__(self, inner: LLMClient, stats: StageStats,
-                 lock: threading.Lock) -> None:
-        self._inner = inner
-        self._stats = stats
-        self._lock = lock
-
-    def call(self, *args, **kwargs) -> LLMResponse:
-        try:
-            resp = self._inner.call(*args, **kwargs)
-        except Exception:
-            with self._lock:
-                self._stats.n_errors += 1
-            raise
-        with self._lock:
-            self._stats.record(
-                input_tokens=resp.input_tokens,
-                output_tokens=resp.output_tokens,
-                latency_s=resp.latency_s,
-            )
-        return resp
-
-    # Defer anything we don't know about to the underlying client. Stages
-    # only ever call `.call` today; this keeps the wrapper forward-compat.
-    def __getattr__(self, name):  # pragma: no cover - thin proxy
-        return getattr(self._inner, name)
-
-
-# Process-wide stage stats, keyed by stage name. Populated by the stage
-# drivers below and consumed by `stage_manifest` when it writes
-# `build_stats.json`.
-_BUILD_STATS: dict[str, StageStats] = {s: StageStats() for s in STAGES}
-_BUILD_STATS_LOCK = threading.Lock()
-
-
-def _approx_cost_usd(input_tokens: int, output_tokens: int) -> float:
-    """Indicative Gemini Flash rate (matches the deleted retrieve-bench
-    harness): $0.30 / M input, $2.50 / M output. Build stages and
-    retrieval both run on the same model today."""
-    return input_tokens * 0.30e-6 + output_tokens * 2.50e-6
+# Pre-render progress cadence (in pages — the prerender unit is a page, not a bulletin).
+_PRERENDER_PROGRESS_EVERY = 500
 
 
 # ---------------------------------------------------------------------------
-# Helpers — corpus-agnostic FS layout + bulletin discovery
+# Shared primitives
 # ---------------------------------------------------------------------------
 
-def _bulletin_id(path: Path, profile: CorpusProfile) -> str | None:
-    """Use the profile's filename pattern to derive `YYYY-MM` for `path`.
-    Returns None when the filename doesn't match."""
-    m = profile.bulletin_filename_re.search(path.name)
-    if not m:
-        return None
-    return f"{m.group(1)}-{m.group(2)}"
+
+def _tokens_from_ctx(ctx: ExecutionContext) -> tuple[int, int]:
+    """Sum input/output tokens across a unit ctx's `call` events (None tok → skipped)."""
+    tin = tout = 0
+    for e in ctx.events:
+        m = _CALL_RE.search(e.get("message", ""))
+        if m:
+            tin += int(m.group(1))
+            tout += int(m.group(2))
+    return tin, tout
 
 
-def _discover_bulletins(
-    pdf_dir: Path, profile: CorpusProfile, window: tuple[int, int],
-    only: set[str] | None = None,
-) -> list[tuple[str, Path]]:
-    """Walk `pdf_dir`, filter by `window` (and optional `only` allowlist).
-    Returns `[(bulletin_id, path), ...]` sorted by id."""
-    y_lo, y_hi = window
-    out: list[tuple[str, Path]] = []
-    for p in sorted(pdf_dir.iterdir()):
-        b = _bulletin_id(p, profile)
-        if b is None:
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write `text` to `path` via a tmp file + rename (no partial files)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text)
+    tmp.rename(path)
+
+
+def _atomic_write_json(path: Path, obj: object) -> None:
+    """Write `obj` as JSON to `path` via a tmp file + rename (no partial files)."""
+    _atomic_write_text(path, json.dumps(obj, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# Pass 1 — chop a bulletin's parsed JSON into per-page strings (deterministic, no LLM)
+# ---------------------------------------------------------------------------
+
+
+def elements_to_text(elements: list[dict]) -> str:
+    """One page's parsed-JSON elements → a tagged string (`[type] content`) in document
+    order. A visual element with no text still emits a bare `[type]` marker so
+    figure-only pages aren't lost; other text-less elements are skipped."""
+    parts: list[str] = []
+    for el in elements:
+        t = el.get("type") or "text"
+        content = el.get("content")
+        if content is None or content == "":
+            if t in _VISUAL_TYPES:
+                parts.append(f"[{t}]")
             continue
-        year = int(b[:4])
-        if not (y_lo <= year <= y_hi):
+        parts.append(f"[{t}] {content}")
+    return "\n\n".join(parts)
+
+
+def chop_bulletin(bulletin: str, *, parsed_json_dir: Path | str) -> dict[int, str]:
+    """`{1-based PDF page: page_string}` for every page of one bulletin (1..max in
+    order; blank pages map to "")."""
+    pages = page_elements(bulletin, base_dir=parsed_json_dir, fill_gaps=True)
+    return {idx: elements_to_text(elements) for idx, elements in sorted(pages.items())}
+
+
+def discover_bulletins(pdf_dir: Path, only: set[str] | None = None) -> list[str]:
+    """Corpus bulletin ids (sorted YYYY-MM), optionally restricted to the `only` set."""
+    out: list[str] = []
+    for p in sorted(pdf_dir.iterdir()):
+        try:
+            b = parse_bulletin_filename(p)
+        except ValueError:
             continue
         if only and b not in only:
             continue
-        out.append((b, p))
+        out.append(b)
     return out
 
 
-def _parse_window(s: str) -> tuple[int, int]:
-    m = re.fullmatch(r"(\d{4})-(\d{4})", s)
-    if not m:
-        raise argparse.ArgumentTypeError(f"--window must be YYYY-YYYY, got {s!r}")
-    lo, hi = int(m.group(1)), int(m.group(2))
-    if hi < lo:
-        raise argparse.ArgumentTypeError(f"--window end < start: {s}")
-    return lo, hi
+# ---------------------------------------------------------------------------
+# Build folder layout + shared run context
+# ---------------------------------------------------------------------------
+
+_SCANS_SUBDIR = "scans"
+_TOC_SUBDIR = "toc"
+_PLACE_SUBDIR = "place"
+_CATALOG_SUBDIR = "catalog"
 
 
-def _config_with_model(cfg: SkunkConfig, model: str | None) -> SkunkConfig:
-    """Per-stage view of the run's single `SkunkConfig`, with an optional model override."""
-    if model and model != cfg.llm_model:
-        return dataclasses.replace(cfg, llm_model=model)
-    return cfg
+@dataclass(frozen=True)
+class BuildPaths:
+    """Every build artifact lives under one `root` (the `--build-dir`)."""
+
+    root: Path
+
+    def stage_dir(self, subdir: str) -> Path:
+        return self.root / subdir
+
+    def bulletin_file(self, subdir: str, bulletin: str, ext: str = "json") -> Path:
+        """A stage's per-bulletin artifact path — the one place the `<root>/<subdir>/
+        <bulletin>.<ext>` layout is spelled (the driver writes it; a later stage reads
+        an earlier stage's via the same accessor). Most stages use `.json`; the catalog
+        stage ships `.jsonl`."""
+        return self.root / subdir / f"{bulletin}.{ext}"
+
+    @property
+    def progress_file(self) -> Path:
+        return self.root / "_progress.json"
 
 
-def _persist_catalog(rows: list[PageCatalogRow], out_dir: Path,
-                     *, drop_banner_self: bool = False) -> Path:
-    if not rows:
-        raise ValueError("no rows to persist")
-    bulletin = rows[0].bulletin
-    path = out_dir / f"{bulletin}.jsonl"
-    with path.open("w") as f:
-        for r in rows:
-            f.write(r.to_json(drop_banner_self=drop_banner_self))
-            f.write("\n")
-    return path
+@dataclass
+class BuildContext:
+    """Per-run state shared by every stage: corpus list, config + prompt overrides, the
+    one LLM client and its concurrency semaphore, and cumulative token totals for the
+    cost report. One instance per `run_build`, used on one event loop.
 
+    The model and its RPM/TPM rate limits are NOT owned here — they come from
+    `SkunkConfig` and the `llm_client` rate limiter (env SKUNK_LLM_MODEL,
+    SKUNK_MODEL_RPM/TPM, SKUNK_LLM_RPM), the same as every other entry point."""
 
-def _load_catalog_by_bulletin(catalog_dir: Path) -> dict[str, list[PageCatalogRow]]:
-    out: dict[str, list[PageCatalogRow]] = {}
-    for p in sorted(catalog_dir.glob("*.jsonl")):
-        rows: list[PageCatalogRow] = []
-        for line in p.open():
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(PageCatalogRow.from_json(line))
-        if rows:
-            out[rows[0].bulletin] = rows
-    return out
+    config: SkunkConfig
+    paths: BuildPaths
+    bulletins: list[str]
+    overrides: tuple = ()
+    llm_concurrency: int = 128
 
+    client: LLMClient = field(init=False)
+    llm_sem: asyncio.Semaphore = field(init=False)
+    in_tok: int = field(default=0, init=False)
+    out_tok: int = field(default=0, init=False)
+    _t0: float = field(init=False)
 
-def _save_l1(path: Path, spans: list[SectionSpan]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = [dataclasses.asdict(sp) for sp in spans]
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    def __post_init__(self) -> None:
+        self.client = LLMClient(self.config)
+        # Created here (before the loop) but only ever used inside the single
+        # `asyncio.run(run_build(...))` loop, so it binds to that loop on first use.
+        self.llm_sem = asyncio.Semaphore(self.llm_concurrency)
+        self._t0 = time.perf_counter()
 
+    @property
+    def cost(self) -> float:
+        return self.in_tok * _FLASH_IN + self.out_tok * _FLASH_OUT
 
-def _load_l1(path: Path) -> list[SectionSpan]:
-    if not path.exists():
-        return []
-    raw = json.loads(path.read_text())
-    return [SectionSpan(**item) for item in raw]
+    @asynccontextmanager
+    async def unit_ctx(self):
+        """One LLM unit's throwaway ctx (shared client; its small event list is GC'd
+        after the unit). On exit it folds the unit's token usage into the run totals
+        and closes — so every stage's cost is counted by construction, the stage just
+        does `async with bctx.unit_ctx() as ctx:`."""
+        ctx = ExecutionContext(
+            question="build",
+            llm_client=self.client,
+            config=self.config,
+            prompt_overrides=self.overrides,
+        )
+        try:
+            yield ctx
+        finally:
+            tin, tout = _tokens_from_ctx(ctx)
+            self.in_tok += tin
+            self.out_tok += tout
+            ctx.close()
 
-
-def _require(condition: bool, hint: str) -> None:
-    if not condition:
-        raise StageError(hint)
+    def write_progress(self, stage: str, done: int, total: int, agg: dict) -> None:
+        _atomic_write_json(
+            self.paths.progress_file,
+            {
+                "stage": stage,
+                "stage_done": done,
+                "stage_total": total,
+                "in_tok": self.in_tok,
+                "out_tok": self.out_tok,
+                "cost_usd": round(self.cost, 2),
+                "wall_s": round(time.perf_counter() - self._t0, 1),
+                **{f"stage_{k}": v for k, v in agg.items()},
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
-# Stages
+# Stage protocol + driver
 # ---------------------------------------------------------------------------
 
-def stage_build_catalog(args: argparse.Namespace, profile: CorpusProfile) -> None:
-    log.info("=== Stage 1: build_catalog ===")
-    _require(args.pdf_dir.is_dir(), f"PDF dir does not exist: {args.pdf_dir}")
-    parsed_dir = args.parsed_json_dir
-    _require(parsed_dir.is_dir(),
-             f"Parsed-JSON dir does not exist: {parsed_dir}")
 
-    only = ({b.strip() for b in args.bulletins.split(",") if b.strip()}
-            if args.bulletins else None)
-    chosen = _discover_bulletins(args.pdf_dir, profile, args.window, only=only)
-    if only:
-        missing = only - {b for b, _ in chosen}
-        _require(not missing,
-                 f"Requested bulletins not in window: {sorted(missing)}")
-    _require(bool(chosen),
-             f"No bulletins matched window {args.window} / --bulletins")
+class Stage(ABC):
+    """One pipeline stage. `run` does the stage's whole job and returns its aggregated
+    stats; `run_build` just calls each stage's `run` in order. Per-bulletin stages subclass
+    `BulletinStage`; the whole-corpus reductions (`ReconstructTocStage`, `EraMergeStage`)
+    implement `run` directly."""
 
-    out_dir = args.output_dir / "catalog"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    log.info(f"{len(chosen)} bulletins → {out_dir}")
-    log.info(f"parsed-JSON: {parsed_dir}")
-    log.info(f"workers: {args.workers}    (no LLM at this stage)")
+    name: str
 
-    builder = profile.catalog_builder
-    t0 = time.monotonic()
-    n_ok = n_err = 0
-
-    def _do_one(bulletin: str, pdf_path: Path):
-        try:
-            pages = page_elements(bulletin, base_dir=parsed_dir, fill_gaps=True)
-            rows = builder.parse_bulletin(bulletin, pages)
-            out_path = _persist_catalog(rows, out_dir)
-            return bulletin, out_path, None
-        except Exception as e:  # noqa: BLE001
-            return bulletin, None, f"{type(e).__name__}: {e}"
-
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = [ex.submit(_do_one, b, p) for b, p in chosen]
-        for f in as_completed(futs):
-            bulletin, out_path, err = f.result()
-            if err:
-                n_err += 1
-                log.error(f"[err] {bulletin}: {err}")
-            else:
-                n_ok += 1
-                if args.verbose:
-                    log.info(f"[ok]  {bulletin} → {out_path}")
-    wall_s = time.monotonic() - t0
-    stats = _BUILD_STATS["build_catalog"]
-    stats.wall_s = wall_s
-    stats.extra.update({"n_bulletins": len(chosen),
-                        "n_ok": n_ok, "n_err": n_err})
-    log.info(f"built {n_ok} bulletins, {n_err} errors in {wall_s:.1f}s")
+    @abstractmethod
+    async def run(self, bctx: BuildContext) -> dict: ...
 
 
-def stage_extract_l1(args: argparse.Namespace, profile: CorpusProfile) -> None:
-    log.info("=== Stage 2: extract_l1 ===")
-    catalog_dir = args.output_dir / "catalog"
-    _require(catalog_dir.is_dir(),
-             f"catalog/ missing at {catalog_dir} — run build_catalog first.")
+class BulletinStage(Stage):
+    """A per-bulletin stage: produces `<build>/<out_subdir>/<bulletin>.<ext>` for each
+    bulletin. `run` owns iteration, resume (skip already-built bulletins), concurrency,
+    persistence, and progress; a subclass owns only its per-bulletin `process`."""
 
-    parsed_dir = args.parsed_json_dir
-    _require(parsed_dir.is_dir(),
-             f"Parsed-JSON dir does not exist: {parsed_dir}")
-
-    l1_dir = args.output_dir / "l1"
-    l1_dir.mkdir(parents=True, exist_ok=True)
-
-    catalog_by_bulletin = _load_catalog_by_bulletin(catalog_dir)
-    bulletins = sorted(catalog_by_bulletin)
-    log.info(f"{len(bulletins)} bulletins → {l1_dir}")
-
-    cfg = _config_with_model(args.cfg, args.l1_model)
-    inner_llm = LLMClient(cfg)
-    stats = _BUILD_STATS["extract_l1"]
-    llm = StageLLMWrapper(inner_llm, stats, _BUILD_STATS_LOCK)
-    log.info(f"model: {cfg.llm_model}")
-    harvester = profile.l1_harvester
-    t0 = time.monotonic()
-
-    def _do_one(bulletin: str):
-        try:
-            pages_text = page_text_tagged(bulletin, base_dir=parsed_dir)
-            rows = catalog_by_bulletin[bulletin]
-            spans = harvester.harvest_bulletin(
-                bulletin=bulletin, rows=rows,
-                pages_text=pages_text, llm=llm,
-            )
-            _save_l1(l1_dir / f"{bulletin}.json", spans)
-            return bulletin, len(spans), None
-        except Exception as e:  # noqa: BLE001
-            return bulletin, 0, f"{type(e).__name__}: {e}"
-
-    n_ok = n_err = n_empty = 0
-    span_dist: list[int] = []
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = [ex.submit(_do_one, b) for b in bulletins]
-        for f in as_completed(futs):
-            bulletin, n_spans, err = f.result()
-            if err:
-                n_err += 1
-                log.error(f"[err] {bulletin}: {err}")
-            else:
-                n_ok += 1
-                span_dist.append(n_spans)
-                if n_spans == 0:
-                    n_empty += 1
-                if args.verbose:
-                    log.info(f"[ok]  {bulletin}: {n_spans} L1 spans")
-
-    wall_s = time.monotonic() - t0
-    stats.wall_s = wall_s
-    stats.extra.update({"n_bulletins": len(bulletins), "n_ok": n_ok,
-                        "n_err": n_err, "n_empty_spans": n_empty,
-                        "median_spans": (span_dist[len(span_dist) // 2]
-                                         if span_dist else 0)})
-    if span_dist:
-        span_dist.sort()
-        mid = span_dist[len(span_dist) // 2]
-        log.info(f"done {n_ok}/{len(bulletins)} bulletins, {n_err} errors, "
-                 f"{n_empty} with 0 spans, median {mid} spans in {wall_s:.1f}s")
-    else:
-        log.info(f"done {n_ok}/{len(bulletins)}, {n_err} errors in {wall_s:.1f}s")
-    log.info(f"LLM: calls={stats.n_calls}  "
-             f"in={stats.input_tokens:,}  out={stats.output_tokens:,}  "
-             f"~${_approx_cost_usd(stats.input_tokens, stats.output_tokens):.3f}")
-
-
-def stage_place_pages(args: argparse.Namespace, profile: CorpusProfile) -> None:
-    log.info("=== Stage 3: place_pages ===")
-    catalog_dir = args.output_dir / "catalog"
-    l1_dir = args.output_dir / "l1"
-    _require(catalog_dir.is_dir(),
-             f"catalog/ missing at {catalog_dir} — run build_catalog first.")
-    _require(l1_dir.is_dir(),
-             f"l1/ missing at {l1_dir} — run extract_l1 first.")
-
-    catalog_by_bulletin = _load_catalog_by_bulletin(catalog_dir)
-    l1_by_bulletin: dict[str, list[SectionSpan]] = {}
-    for bulletin in catalog_by_bulletin:
-        l1_by_bulletin[bulletin] = _load_l1(l1_dir / f"{bulletin}.json")
-
-    log.info(f"{len(catalog_by_bulletin)} bulletins; "
-             f"sum L1 spans = {sum(len(v) for v in l1_by_bulletin.values())}")
-    cfg = _config_with_model(args.cfg, args.place_model)
-    inner_llm = LLMClient(cfg)
-    stats = _BUILD_STATS["place_pages"]
-    llm = StageLLMWrapper(inner_llm, stats, _BUILD_STATS_LOCK)
-    log.info(f"model: {cfg.llm_model}")
-
-    placer = profile.page_placer
-    items = sorted(catalog_by_bulletin.items())
-    started = time.monotonic()
-
-    def _run(bulletin: str) -> tuple[str, dict[str, int]]:
-        rows = catalog_by_bulletin[bulletin]
-        spans = l1_by_bulletin.get(bulletin, [])
-        return bulletin, placer.place_bulletin(rows, spans, llm)
-
-    totals: Counter[str] = Counter()
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(_run, b): b for b, _ in items}
-        done = 0
-        for f in as_completed(futs):
-            _, per_bulletin = f.result()
-            for k, n in per_bulletin.items():
-                totals[k] += n
-            done += 1
-            if done % 50 == 0 or done == len(items):
-                log.info(f"placed {done}/{len(items)} bulletins "
-                         f"({time.monotonic() - started:.1f}s)")
-
-    log.info("placement totals:")
-    for k in sorted(totals.keys()):
-        log.info(f"  {totals[k]:>7}  {k}")
-
-    # Persist with internal banner_self stripped.
-    for _, rows in catalog_by_bulletin.items():
-        _persist_catalog(rows, catalog_dir, drop_banner_self=True)
-    log.info(f"persisted updated catalog → {catalog_dir}")
-
-    stats.wall_s = time.monotonic() - started
-    stats.extra.update({"placement_totals": dict(totals)})
-    log.info(f"LLM: calls={stats.n_calls}  "
-             f"in={stats.input_tokens:,}  out={stats.output_tokens:,}  "
-             f"~${_approx_cost_usd(stats.input_tokens, stats.output_tokens):.3f}")
-
-
-def stage_merge_chapters(args: argparse.Namespace, profile: CorpusProfile) -> None:
-    log.info("=== Stage 4: merge_chapters ===")
-    catalog_dir = args.output_dir / "catalog"
-    _require(catalog_dir.is_dir(),
-             f"catalog/ missing at {catalog_dir} — run build_catalog first.")
-
-    catalog: list[PageCatalogRow] = []
-    for p in sorted(catalog_dir.glob("*.jsonl")):
-        for line in p.open():
-            line = line.strip()
-            if not line:
-                continue
-            catalog.append(PageCatalogRow.from_json(line))
-    log.info(f"{len(catalog)} catalog rows loaded")
-
-    cfg = _config_with_model(args.cfg, args.merge_model)
-    inner_llm = LLMClient(cfg)
-    stats = _BUILD_STATS["merge_chapters"]
-    llm = StageLLMWrapper(inner_llm, stats, _BUILD_STATS_LOCK)
-    log.info(f"model: {cfg.llm_model}")
-
-    t0 = time.monotonic()
-    tree = profile.chapter_merger.build_tree(
-        catalog, llm, drop_unfiled=True, verbose=True,
+    out_subdir: str
+    out_ext: str = (
+        "json"  # per-bulletin file extension; the catalog stage ships "jsonl"
     )
-    stats.wall_s = time.monotonic() - t0
-    out_path = args.output_dir / "concept_tree.json"
-    out_path.write_text(json.dumps(tree, ensure_ascii=False, indent=2))
-    log.info(f"wrote tree → {out_path}")
-    log.info(f"LLM: calls={stats.n_calls}  "
-             f"in={stats.input_tokens:,}  out={stats.output_tokens:,}  "
-             f"~${_approx_cost_usd(stats.input_tokens, stats.output_tokens):.3f}")
+    workers: int = 16  # max bulletins open at once (memory); LLM calls are additionally
+    #                     bounded by the shared `BuildContext.llm_sem`.
+
+    @abstractmethod
+    async def process(
+        self, bctx: BuildContext, bulletin: str
+    ) -> tuple[dict | None, dict]:
+        """Build one bulletin. Returns `(payload | None, stats_delta)`; `payload=None`
+        means "write nothing" (e.g. a prerequisite artifact is missing)."""
+
+    def serialize(self, payload: dict) -> str:
+        """Render a `process` payload to the bytes written on disk. Default is JSON;
+        the catalog stage overrides this to emit JSONL."""
+        return json.dumps(payload, ensure_ascii=False)
+
+    async def run(self, bctx: BuildContext) -> dict:
+        """Run `process` over every not-yet-built bulletin: `workers` at a time, each
+        persisted as it finishes, with periodic progress writes."""
+        out_dir = bctx.paths.stage_dir(self.out_subdir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        pending = [
+            b
+            for b in bctx.bulletins
+            if not bctx.paths.bulletin_file(self.out_subdir, b, self.out_ext).exists()
+        ]
+        n_skip = len(bctx.bulletins) - len(pending)
+        log.info(
+            f"[{self.name}] {len(bctx.bulletins)} bulletins: {n_skip} done, "
+            f"{len(pending)} to build -> {out_dir}"
+        )
+        if not pending:
+            return {}
+
+        sem = asyncio.Semaphore(self.workers)
+        agg: dict[str, int] = defaultdict(int)
+        done = 0
+
+        async def one(bulletin: str) -> None:
+            nonlocal done
+            async with sem:
+                payload, delta = await self.process(bctx, bulletin)
+                if payload is not None:
+                    _atomic_write_text(
+                        bctx.paths.bulletin_file(
+                            self.out_subdir, bulletin, self.out_ext
+                        ),
+                        self.serialize(payload),
+                    )
+                for k, v in delta.items():
+                    agg[k] += v
+                done += 1
+                if done % _PROGRESS_EVERY == 0 or done == len(pending):
+                    bctx.write_progress(self.name, done, len(pending), agg)
+                    log.info(
+                        f"[{self.name}] {done}/{len(pending)} | ${bctx.cost:.2f} | {dict(agg)}"
+                    )
+
+        await asyncio.gather(*[one(b) for b in pending])
+        return dict(agg)
 
 
-def stage_manifest(args: argparse.Namespace, profile: CorpusProfile) -> None:
-    log.info("=== Stage 5: manifest ===")
-    out = args.output_dir
-    tree_path = out / "concept_tree.json"
-    _require(tree_path.exists(),
-             "concept_tree.json missing — run merge_chapters first.")
+# ---------------------------------------------------------------------------
+# Stage: scan (pass 2)
+# ---------------------------------------------------------------------------
 
-    tree = json.loads(tree_path.read_text())
-    chapter_pages = {ch: data["n_pages"]
-                     for ch, data in tree["chapters"].items()}
-    total_pages = sum(chapter_pages.values())
 
-    catalog_rows = 0
-    for p in (out / "catalog").glob("*.jsonl"):
-        catalog_rows += sum(1 for _ in p.open())
-    n_l1_files = len(list((out / "l1").glob("*.json")))
+class ScanStage(BulletinStage):
+    name = "scan"
+    out_subdir = _SCANS_SUBDIR
+    workers = (
+        16  # ~16 bulletins' page text in memory; ~128 page calls in flight (llm_sem)
+    )
 
-    tree_hash = hashlib.sha256(tree_path.read_bytes()).hexdigest()[:16]
-    git_sha = subprocess.run(
-        ["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"],
-        capture_output=True, text=True,
-    ).stdout.strip()
+    async def process(
+        self, bctx: BuildContext, bulletin: str
+    ) -> tuple[dict | None, dict]:
+        pages = chop_bulletin(bulletin, parsed_json_dir=bctx.config.parsed_json_dir)
+        nonempty = {p: t for p, t in pages.items() if t.strip()}
+        scans: dict[int, dict] = {}
+        errors: dict[int, str] = {}
+        deferred: dict[int, str] = {}
 
-    cfg = args.cfg
-    manifest = {
-        "built_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "git_sha": git_sha[:12] if git_sha else None,
-        "profile": profile.name,
-        "pdf_dir": str(args.pdf_dir),
-        "corpus": {
-            "pdf_dir": str(args.pdf_dir),
-            "bulletins": len(list((out / "catalog").glob("*.jsonl"))),
-            "window": list(args.window),
-        },
-        "tree": {
-            "path": "concept_tree.json",
-            "sha256_first16": tree_hash,
-            "n_chapters": len(chapter_pages),
-            "n_pages_indexed": total_pages,
-            "chapter_page_counts": chapter_pages,
-        },
-        "catalog": {
-            "path": "catalog/",
-            "n_files": len(list((out / "catalog").glob("*.jsonl"))),
-            "n_rows": catalog_rows,
-        },
-        "l1": {"path": "l1/", "n_files": n_l1_files},
-        "models": {
-            "extract_l1": args.l1_model or cfg.llm_model,
-            "place_pages": args.place_model or cfg.llm_model,
-            "merge_chapters": args.merge_model or cfg.llm_model,
-            "retriever_runtime": cfg.llm_model,
-        },
-    }
-    out_path = out / "manifest.json"
-    out_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
-    log.info(f"wrote manifest → {out_path}")
-    log.info(f"chapters: {len(chapter_pages)}    pages: {total_pages}    "
-             f"catalog rows: {catalog_rows}    L1 files: {n_l1_files}")
+        async def scan_one(page: int, text: str) -> None:
+            async with bctx.llm_sem, bctx.unit_ctx() as ctx:
+                try:
+                    scans[page] = (
+                        await scan_page(ctx, text, bulletin=bulletin)
+                    ).model_dump(mode="json")
+                except ParseError as e:
+                    # The text scan couldn't yield valid output even after its temperature-escalating
+                    # retries — a handful of dense numeric tables (e.g. the Foreign Series Securities
+                    # schedule, packed with "M/D/YY" tokens) reliably derail it into degenerate or
+                    # invalid JSON. Don't drop the page: keep a `parse_broken` placeholder so the
+                    # `vision_rescan` tier re-reads it from the rendered image (a different modality
+                    # that doesn't choke on the raw HTML), then overwrites this record.
+                    scans[page] = PageScan(
+                        page_role="content", parse_broken=True
+                    ).model_dump(mode="json")
+                    deferred[page] = e.detail[:120]
+                except Exception as e:  # noqa: BLE001 — record, never abort the batch
+                    errors[page] = f"{type(e).__name__}: {e}"
 
-    # ---- Build statistics dump --------------------------------------------
-    # Per-stage timing + LLM token usage collected via `StageLLMWrapper`.
-    # Plus index-structure stats derived from the freshly-written tree
-    # and catalog. Lives next to `manifest.json` so anyone can replay the
-    # report without re-running the build.
-    stages_out: dict[str, dict] = {}
-    total_in = total_out = total_calls = 0
-    total_wall = 0.0
-    for name in STAGES:
-        s = _BUILD_STATS[name]
-        stages_out[name] = {
-            "wall_s": round(s.wall_s, 2),
-            "n_llm_calls": s.n_calls,
-            "input_tokens": s.input_tokens,
-            "output_tokens": s.output_tokens,
-            "sum_llm_latency_s": round(s.llm_latency_s, 2),
-            "n_llm_errors": s.n_errors,
-            "approx_cost_usd": round(
-                _approx_cost_usd(s.input_tokens, s.output_tokens), 4),
-            "extra": s.extra,
+        await asyncio.gather(*[scan_one(p, t) for p, t in nonempty.items()])
+
+        payload = {
+            "bulletin": bulletin,
+            "n_pages": len(nonempty),
+            "scans": {str(p): scans[p] for p in sorted(scans)},
+            "errors": {str(p): errors[p] for p in sorted(errors)},
+            "deferred": {str(p): deferred[p] for p in sorted(deferred)},
         }
-        total_in += s.input_tokens
-        total_out += s.output_tokens
-        total_calls += s.n_calls
-        total_wall += s.wall_s
+        return payload, {
+            "pages": len(nonempty),
+            "failed": len(errors),
+            "deferred_to_vision": len(deferred),
+        }
 
-    # Index-structure stats: chapter page distribution, examples coverage,
-    # year + bulletin coverage, content-tier mix from per-row metadata.
-    chapter_examples = {ch: len(data.get("examples", []))
-                        for ch, data in tree["chapters"].items()}
-    chapter_pages_sorted = sorted(chapter_pages.items(), key=lambda x: -x[1])
-    page_counts = list(chapter_pages.values())
-    page_counts.sort()
-    n_ch = max(1, len(page_counts))
-    median_idx = n_ch // 2
-    # Catalog year coverage from one pass over catalog rows. (Placement
-    # tier counts come from the place_pages stage's `extra` payload — no
-    # need to re-derive them here.)
-    bulletins_seen: set[str] = set()
-    year_min = None
-    year_max = None
-    n_pages_with_dates = 0
-    n_pages_total = 0
-    n_pages_with_content = 0
-    for p in (out / "catalog").glob("*.jsonl"):
-        for line in p.open():
-            line = line.strip()
+
+# ---------------------------------------------------------------------------
+# Stage: vision_rescan — redo flagged pages from rendered PDF images (LLM, vision)
+# ---------------------------------------------------------------------------
+
+
+def _is_flagged(scan: dict, *, include_charts: bool) -> bool:
+    """A page the text scan flagged for a vision re-read. Two cases:
+
+    - `parse_broken`: the parsed elements were too mangled to trust — ALWAYS re-read.
+    - `has_unparsed_graphics`: a chart/figure whose data isn't in the page's own text/tables.
+      Re-read only when `include_charts` is on AND the page has NO table block — i.e. the chart
+      is the page's sole data source (chart-only / figure-only), so its data is lost without
+      vision. A chart beside a table is redundant (the table carries the numbers). Chart re-read
+      is an opt-in phase (`config.vision_rescan_charts`, default off): it's the bulk of the
+      vision working set (~6k pages) and low-value for table-centric queries.
+    """
+    if scan.get("parse_broken"):
+        return True
+    if include_charts and scan.get("has_unparsed_graphics"):
+        return not any(b.get("kind") == "table" for b in scan.get("blocks", []))
+    return False
+
+
+class PreRenderStage(Stage):
+    """Pre-render the vision tier's working set into the `renders/` image cache that
+    `PageStore.image` serves, so `vision_rescan` (and query-time vision reads) get a warm PNG
+    instead of paying render latency on the LLM call's critical path. Scope is exactly the pages
+    `vision_rescan` will LLM-scan — flagged (`has_unparsed_graphics` / `parse_broken`) AND not yet
+    `vision_rescanned` — NOT every page. Resume: a page whose PNG already exists is skipped."""
+
+    name = "prerender"
+
+    async def run(self, bctx: BuildContext) -> dict:
+        renders_dir = bctx.paths.root / RENDERS_SUBDIR
+        targets: list[tuple[str, int]] = []
+        for b in bctx.bulletins:
+            path = bctx.paths.bulletin_file(_SCANS_SUBDIR, b)
+            if not path.exists():
+                continue
+            data = json.loads(path.read_text())
+            if data.get(
+                "vision_rescanned"
+            ):  # legacy bulletin-level: vision_rescan migrates it,
+                continue  # doesn't LLM-scan its pages → nothing to warm
+            for p, s in data["scans"].items():
+                if (
+                    _is_flagged(s, include_charts=bctx.config.vision_rescan_charts)
+                    and not s.get("vision_rescanned")
+                    and not render_cache_path(renders_dir, b, int(p)).exists()
+                ):
+                    targets.append((b, int(p)))
+        log.info(
+            f"[{self.name}] {len(targets)} vision pages to pre-render -> {renders_dir}"
+        )
+        if not targets:
+            return {}
+
+        agg: dict[str, int] = defaultdict(int)
+        done = 0
+
+        async def one(bulletin: str, page: int) -> None:
+            nonlocal done
+            # Rendering is offloaded to a thread so the event loop stays responsive. PyMuPDF is
+            # GIL-serialized, so renders don't truly run in parallel — fine for this build step.
+            status = await asyncio.to_thread(
+                render_to_cache,
+                bulletin,
+                page,
+                str(bctx.config.pdf_dir),
+                str(renders_dir),
+            )
+            agg[status] += 1
+            done += 1
+            if done % _PRERENDER_PROGRESS_EVERY == 0 or done == len(targets):
+                bctx.write_progress(self.name, done, len(targets), agg)
+                log.info(f"[{self.name}] {done}/{len(targets)} | {dict(agg)}")
+
+        await asyncio.gather(*[one(b, p) for b, p in targets])
+        return dict(agg)
+
+
+def _patch_catalog_inline(
+    bctx: BuildContext, bulletin: str, scans: dict[str, dict], revised: list[int]
+) -> None:
+    """Replace each `revised` page's row in the bulletin's existing catalog file, in place.
+    No-op when the catalog file doesn't exist yet (a fresh forward build — the catalog stage
+    builds it later from the updated scans). Untouched rows keep their original bytes; a revised
+    page that is no longer `content` is dropped, one that became `content` is added. Rows are
+    rewritten in ascending page order, matching `CatalogStage`."""
+    if not revised:
+        return
+    cat_path = bctx.paths.bulletin_file(_CATALOG_SUBDIR, bulletin, "jsonl")
+    if not cat_path.exists():
+        return
+    by_page: dict[int, str] = {}
+    for line in cat_path.read_text().splitlines():
+        if line.strip():
+            by_page[PageCatalogRow.from_json(line).page] = line
+    for page in revised:
+        row = _catalog_row(bulletin, page, scans[str(page)])
+        if row is None:
+            by_page.pop(page, None)
+        else:
+            by_page[page] = row.to_json()
+    _atomic_write_text(cat_path, "\n".join(by_page[p] for p in sorted(by_page)))
+
+
+class VisionRescanStage(Stage):
+    """Reduction (after `scan`, before `merge_continuations`): re-scan each page the text
+    scan flagged — `has_unparsed_graphics` (a chart/figure the parser dropped) or
+    `parse_broken` (cells too scrambled to trust) — from its rendered PDF IMAGE, overwriting
+    that page's record in the scan artifact in place. The vision LLM can read the graphic or
+    the garbled table the parsed text lost, emitting the same `PageScan` object.
+
+    Resume is PER PAGE: a page is re-read iff it is flagged AND its own `vision_rescanned`
+    marker is unset, and the marker is set only on a successful re-read. So a transient (e.g.
+    network) failure leaves just that page unmarked — it retries next run on its own, with no
+    bulletin-wide reset and no redundant re-read of pages that already succeeded. A legacy
+    bulletin-level `vision_rescanned` flag (from an earlier coarser pass) is migrated to
+    per-page markers on first encounter.
+
+    When a bulletin's catalog file already exists (a patch over an already-built corpus, not a
+    fresh forward build where the catalog stage runs later), each revised page's catalog row is
+    replaced inline from the new scan via `_catalog_row` — so the shipped catalog reflects the
+    vision results without a full catalog rebuild. Untouched rows are left byte-for-byte."""
+
+    name = "vision_rescan"
+    workers = (
+        16  # bulletins open at once; page calls are additionally bounded by `llm_sem`
+    )
+
+    async def run(self, bctx: BuildContext) -> dict:
+        def work(data: dict) -> tuple[bool, list[int]]:
+            """`(needs_migration, pages_to_read)` for a loaded scan file: a legacy bulletin-level
+            flag means migrate; otherwise the flagged pages whose per-page marker is unset."""
+            if data.get("vision_rescanned"):
+                return True, []
+            todo = [
+                int(p)
+                for p, s in data["scans"].items()
+                if _is_flagged(s, include_charts=bctx.config.vision_rescan_charts)
+                and not s.get("vision_rescanned")
+            ]
+            return False, todo
+
+        pending: list[str] = []
+        for b in bctx.bulletins:
+            path = bctx.paths.bulletin_file(_SCANS_SUBDIR, b)
+            if not path.exists():
+                continue
+            migrate, todo = work(json.loads(path.read_text()))
+            if migrate or todo:
+                pending.append(b)
+        log.info(
+            f"[{self.name}] {len(bctx.bulletins)} bulletins: "
+            f"{len(bctx.bulletins) - len(pending)} done, {len(pending)} with pages to rescan"
+        )
+        if not pending:
+            return {}
+
+        sem = asyncio.Semaphore(self.workers)
+        agg: dict[str, int] = defaultdict(int)
+        done = 0
+        renders_dir = bctx.paths.root / RENDERS_SUBDIR
+
+        async def one(bulletin: str) -> None:
+            nonlocal done
+            async with sem:
+                path = bctx.paths.bulletin_file(_SCANS_SUBDIR, bulletin)
+                data = json.loads(path.read_text())
+                scans: dict[str, dict] = data["scans"]
+                migrate, todo = work(data)
+
+                if migrate:
+                    # Legacy bulletin-level flag → per-page markers on its flagged pages (all of
+                    # which were re-read under the old pass), then drop the bulletin-level key.
+                    data.pop("vision_rescanned")
+                    for s in scans.values():
+                        # Legacy bulletin-level flag: the old pass re-read everything flagged
+                        # (charts included), so migrate those same pages' per-page markers.
+                        if _is_flagged(s, include_charts=True):
+                            s["vision_rescanned"] = True
+                    _atomic_write_json(path, data)
+                    agg["migrated"] += 1
+                elif todo:
+                    revised: list[int] = []
+
+                    async def rescan_one(page: int) -> None:
+                        # Render through the shared `renders/` cache, cache-first: a page the
+                        # prerender stage already warmed is just read back; a cold one is
+                        # rendered+cached here. Offloaded to a thread so the event loop keeps
+                        # driving in-flight LLM calls. Same PNG the query-time vision tier reads
+                        # via `PageStore`.
+                        status = await asyncio.to_thread(
+                            render_to_cache,
+                            bulletin,
+                            page,
+                            str(bctx.config.pdf_dir),
+                            str(renders_dir),
+                        )
+                        img = read_cached_image(renders_dir, bulletin, page)
+                        if (
+                            status == "skipped" or img is None
+                        ):  # PDF missing → leave the page
+                            agg["skipped"] += 1
+                            return
+                        async with bctx.llm_sem, bctx.unit_ctx() as ctx:
+                            try:
+                                res = await vision_scan_page(
+                                    ctx, img, bulletin=bulletin
+                                )
+                                res.vision_rescanned = (
+                                    True  # per-page marker → resume skips it
+                                )
+                                scans[str(page)] = res.model_dump(mode="json")
+                                revised.append(page)
+                                agg["revised"] += 1
+                            except Exception as e:  # noqa: BLE001 — record, never abort the batch
+                                agg["failed"] += 1
+                                log.warning(
+                                    f"[{self.name}] {bulletin} p{page} failed: "
+                                    f"{type(e).__name__}: {e}"
+                                )
+
+                    # Only successfully re-read pages get their marker set, so a failed page (e.g.
+                    # a transient network error) stays unmarked and retries on the next run.
+                    await asyncio.gather(*[rescan_one(p) for p in todo])
+                    _atomic_write_json(path, data)
+                    _patch_catalog_inline(bctx, bulletin, scans, revised)
+                    agg["bulletins"] += 1
+
+                done += 1
+                if done % _PROGRESS_EVERY == 0 or done == len(pending):
+                    bctx.write_progress(self.name, done, len(pending), agg)
+                    log.info(
+                        f"[{self.name}] {done}/{len(pending)} | ${bctx.cost:.2f} | {dict(agg)}"
+                    )
+
+        await asyncio.gather(*[one(b) for b in pending])
+        return dict(agg)
+
+
+# ---------------------------------------------------------------------------
+# Stage: merge_continuations — fold continuation pages into their anchor (no LLM)
+# ---------------------------------------------------------------------------
+
+
+class MergeContinuationsStage(Stage):
+    """Reduction (after `scan`, before `toc`): fold each continuation page into the previous
+    content page and drop it, rewriting the scan artifact in place. Deterministic, no LLM —
+    `merge_continuations` does the work (append the fragment's blocks, record the page). Because
+    every later stage reads the scan artifacts, the dropped pages are never placed, cataloged, or
+    referenced by the concept tree; the anchor records them in `continuation_pages`, and the
+    `page_store` stage assembles the anchor's merged text/images from that member list. Resume
+    skips artifacts already marked `"merged"` (a re-run must not recompute over already-folded
+    anchors)."""
+
+    name = "merge_continuations"
+
+    async def run(self, bctx: BuildContext) -> dict:
+        agg: dict[str, int] = defaultdict(int)
+        for bulletin in bctx.bulletins:
+            path = bctx.paths.bulletin_file(_SCANS_SUBDIR, bulletin)
+            if not path.exists():
+                continue
+            data = json.loads(path.read_text())
+            if data.get("merged"):
+                continue
+            scans = {
+                int(p): PageScan.model_validate(s) for p, s in data["scans"].items()
+            }
+            merged, n_merged = merge_continuations(scans)
+            data["scans"] = {
+                str(p): merged[p].model_dump(mode="json") for p in sorted(merged)
+            }
+            data["merged"] = True
+            data["n_merged"] = n_merged
+            _atomic_write_json(path, data)
+            agg["bulletins"] += 1
+            agg["merged"] += n_merged
+        return dict(agg)
+
+
+# ---------------------------------------------------------------------------
+# Stage: toc (pass 3a) — build (coalesce) + extraction (LLM, with is_toc filter)
+# ---------------------------------------------------------------------------
+
+
+class TocStage(BulletinStage):
+    name = "toc"
+    out_subdir = _TOC_SUBDIR
+    workers = (
+        64  # one quick call per bulletin → bulletin-level concurrency is the throttle
+    )
+
+    async def process(
+        self, bctx: BuildContext, bulletin: str
+    ) -> tuple[dict | None, dict]:
+        scan_path = bctx.paths.bulletin_file(_SCANS_SUBDIR, bulletin)
+        if not scan_path.exists():
+            return (
+                None,
+                {},
+            )  # scan stage hasn't produced this bulletin (e.g. stopped early)
+        data = json.loads(scan_path.read_text())
+
+        # ToC build: coalesce the scan's `toc` tags into contiguous ranges, then read
+        # ONLY those pages' text (incl. a single bridged interstitial). No heuristics —
+        # the extractor's `is_toc` flag does the filtering.
+        ranges = coalesce_toc_ranges(
+            sorted(
+                int(p) for p, s in data["scans"].items() if s.get("page_role") == "toc"
+            )
+        )
+        cand = sorted({p for a, z in ranges for p in range(a, z + 1)})
+        toc_texts: dict[int, str] = {}
+        if cand:  # only touch the parsed JSON when there's a candidate ToC to read
+            elems = page_elements(
+                bulletin, base_dir=bctx.config.parsed_json_dir, fill_gaps=True
+            )
+            toc_texts = {
+                p: txt
+                for p in cand
+                if (txt := elements_to_text(elems.get(p, []))).strip()
+            }
+
+        # A ToC-less issue (no genuine ToC page) is left `is_toc=False` here; the
+        # `reconstruct_toc` stage fills it from its section-divider pages once every real ToC
+        # is built (it needs neighbors' ToCs as reference). See `ReconstructTocStage`.
+        async with bctx.unit_ctx() as ctx:
+            try:
+                hierarchy = await outline_issue(
+                    ctx, bulletin=bulletin, toc_texts=toc_texts
+                )
+            except Exception as e:  # noqa: BLE001 — record, never abort the batch
+                log.warning(f"[toc] {bulletin} failed: {type(e).__name__}: {e}")
+                return None, {"failed": 1}
+
+        payload = {
+            "bulletin": bulletin,
+            "toc_ranges": [list(r) for r in ranges],
+            "n_toc_pages": len(toc_texts),
+            "toc_pages": list(toc_texts.keys()),
+            **hierarchy.model_dump(),
+        }
+        return payload, {
+            "with_toc": int(hierarchy.is_toc),
+            "flagged_bogus": int(bool(toc_texts) and not hierarchy.is_toc),
+            "chapters": len(hierarchy.chapters),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Stage: place (pass 3b) — file content pages under chapters (plain Python, no LLM)
+# ---------------------------------------------------------------------------
+
+
+class PlaceStage(BulletinStage):
+    name = "place"
+    out_subdir = _PLACE_SUBDIR
+    workers = (
+        64  # pure Python (no LLM) → bulletin-level concurrency is the only throttle
+    )
+
+    async def process(
+        self, bctx: BuildContext, bulletin: str
+    ) -> tuple[dict | None, dict]:
+        toc_path = bctx.paths.bulletin_file(_TOC_SUBDIR, bulletin)
+        scan_path = bctx.paths.bulletin_file(_SCANS_SUBDIR, bulletin)
+        if not (toc_path.exists() and scan_path.exists()):
+            return None, {}  # an upstream stage hasn't produced this bulletin yet
+
+        hierarchy = TocHierarchy.model_validate_json(toc_path.read_text())
+        scans = {
+            int(p): PageScan.model_validate(s)
+            for p, s in json.loads(scan_path.read_text())["scans"].items()
+        }
+        assign, stats = place_pages(hierarchy, scans)
+
+        # Gather row in the exact shape `merge_chapters` consumes — chapters derived
+        # from the placement so names + page counts always agree with `assign`.
+        counts = Counter(assign.values())
+        children = {c.name: c.children for c in hierarchy.chapters}
+        chapters = [
+            {"name": name, "children": children.get(name, []), "n_pages": n}
+            for name, n in counts.items()
+        ]
+        payload = {
+            "bulletin": bulletin,
+            "chapters": chapters,
+            "assign": {str(p): name for p, name in sorted(assign.items())},
+            "stats": stats,
+        }
+        return payload, {
+            "n_filed": stats["n_filed"],
+            "n_unfiled": stats["n_unfiled"],
+            "no_chapters": int(not chapters),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Stage: catalog — the slim query-facing per-page rows (plain Python, no LLM)
+# ---------------------------------------------------------------------------
+
+
+def _catalog_row(bulletin: str, page: int, scan: dict) -> PageCatalogRow | None:
+    """Project one page's scan dict into its shipped catalog row, or None when the page
+    is not `content` (only content pages ship). The single source of truth for the
+    scan → catalog projection, shared by `CatalogStage` and `vision_rescan`'s inline patch."""
+    if scan.get("page_role") != "content":
+        return None
+    return PageCatalogRow(
+        bulletin=bulletin,
+        page=page,
+        content_blocks=scan.get("blocks", []),
+        date_interval=scan.get("date_interval"),
+        continuation_pages=scan.get("continuation_pages", []),
+    )
+
+
+class CatalogStage(BulletinStage):
+    name = "catalog"
+    out_subdir = _CATALOG_SUBDIR
+    out_ext = "jsonl"  # the query path globs `catalog/*.jsonl`, one row per line
+    workers = 64
+
+    async def process(
+        self, bctx: BuildContext, bulletin: str
+    ) -> tuple[dict | None, dict]:
+        scan_path = bctx.paths.bulletin_file(_SCANS_SUBDIR, bulletin)
+        if not scan_path.exists():
+            return None, {}
+        scans = json.loads(scan_path.read_text())["scans"]
+        rows = [
+            r
+            for p, s in sorted(scans.items(), key=lambda kv: int(kv[0]))
+            if (r := _catalog_row(bulletin, int(p), s)) is not None
+        ]
+        return {"lines": [r.to_json() for r in rows]}, {"rows": len(rows)}
+
+    def serialize(self, payload: dict) -> str:
+        return "\n".join(payload["lines"])
+
+
+# ---------------------------------------------------------------------------
+# Stage: page_store — per-row member texts + figure descriptors (plain Python, no LLM)
+# ---------------------------------------------------------------------------
+
+
+def _figure_note(elems: dict[int, list[dict]], pages: list[int]) -> str:
+    """A figure heads-up across `pages`, or "" when none carry a figure. Figures' plotted
+    data is absent from the parsed text, so the text tier appends this so it can defer to the
+    vision tier instead of scraping a value from prose."""
+    n = 0
+    headings: list[str] = []
+    for p in pages:
+        els = elems.get(p, [])
+        n += sum(1 for e in els if e.get("type") == "figure")
+        headings += [
+            e["content"].strip()
+            for e in els
+            if e.get("type") in ("title", "section_header") and e.get("content")
+        ]
+    if n == 0:
+        return ""
+    headers = "; ".join(dict.fromkeys(headings)) or "(untitled)"
+    return (
+        f"[This page has {n} figure(s)/chart(s) (headings: {headers}) whose plotted data is NOT "
+        f"in the text above. If the value you need appears only in a chart, return [] so the "
+        f"vision tier can read it.]"
+    )
+
+
+class PageStoreStage(BulletinStage):
+    """Build the page store (`pages/<bulletin>.json` = `{page: text}`): per catalog row, the
+    already-merged text the store serves — its member pages' JSON text (via `elements_to_text`,
+    the same chopping the scan uses) joined, with a figure note appended. Continuation
+    merge is applied here via `row.member_pages` (anchor + folded continuations), so the store
+    stays a dumb page→text map. No LLM, no rendering — images render on demand in `PageStore`."""
+
+    name = "page_store"
+    out_subdir = PAGES_SUBDIR
+    workers = 32  # pure Python; reads parsed JSON (LRU-cached doc load) per bulletin
+
+    async def process(
+        self, bctx: BuildContext, bulletin: str
+    ) -> tuple[dict | None, dict]:
+        catalog_path = bctx.paths.bulletin_file(_CATALOG_SUBDIR, bulletin, "jsonl")
+        if not catalog_path.exists():
+            return None, {}  # catalog stage hasn't produced this bulletin yet
+        rows = [
+            PageCatalogRow.from_json(line)
+            for line in catalog_path.read_text().splitlines()
+            if line
+        ]
+        # One parsed-JSON load; derive both the per-page text and figure notes from it
+        # (`elements_to_text` is exactly what `chop_bulletin` applies).
+        elems = page_elements(
+            bulletin, base_dir=bctx.config.parsed_json_dir, fill_gaps=True
+        )
+        texts = {p: elements_to_text(e) for p, e in elems.items()}
+        entries: dict[str, str] = {}
+        for row in rows:
+            body = "\n\n".join(t for p in row.member_pages if (t := texts.get(p, "")))
+            note = _figure_note(elems, row.member_pages)
+            entries[str(row.page)] = "\n\n".join(filter(None, [body, note]))
+        return {"entries": entries}, {"rows": len(rows)}
+
+    def serialize(self, payload: dict) -> str:
+        return json.dumps(payload["entries"], ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Driver + entry point
+# ---------------------------------------------------------------------------
+
+
+def _page_views(scans: dict[str, dict]) -> list[dict]:
+    """Per-page projection for ToC reconstruction — every page's scan signals (role, printed
+    label, block titles/summaries), in physical order. All roles are kept: a section-divider
+    page (a chapter name on an otherwise empty page) is tagged `non_content` carrying one prose
+    block whose title is the chapter name."""
+    out: list[dict] = []
+    for p in sorted(scans, key=int):
+        s = scans[p]
+        out.append(
+            {
+                "page": int(p),
+                "role": s["page_role"],
+                "printed_page": s.get("printed_page"),
+                "blocks": [
+                    {"title": b.get("title"), "summary": b.get("summary")}
+                    for b in s.get("blocks", [])
+                ],
+            }
+        )
+    return out
+
+
+def _reference_chapters(
+    real_tocs: dict[str, list[str]], target: str, *, k: int = 1
+) -> list[str]:
+    """Top-level chapter names from the `k` nearest real-ToC issues before and after `target`
+    (deduped, order preserved) — the reconstruction's naming + coverage reference."""
+    before = sorted(b for b in real_tocs if b < target)[-k:]
+    after = sorted(b for b in real_tocs if b > target)[:k]
+    return list(dict.fromkeys(name for b in before + after for name in real_tocs[b]))
+
+
+class ReconstructTocStage(Stage):
+    """Reduction (after `toc`, before `place`): fill each ToC-less issue's outline from its
+    section-divider pages, using neighboring issues' real ToCs as the naming + coverage
+    reference. Not per-bulletin — it needs every real ToC built first (for reference), and it
+    overwrites the `is_toc=False` toc artifacts in place. Resume skips any already
+    reconstructed (`source == "reconstructed"`)."""
+
+    name = "reconstruct_toc"
+
+    async def run(self, bctx: BuildContext) -> dict:
+        arts: dict[str, dict] = {}
+        for b in bctx.bulletins:
+            path = bctx.paths.bulletin_file(_TOC_SUBDIR, b)
+            if path.exists():
+                arts[b] = json.loads(path.read_text())
+        # Reference pool: top-level chapters of genuine (non-reconstructed) ToCs only.
+        real_tocs = {
+            b: [c["name"] for c in a.get("chapters", [])]
+            for b, a in arts.items()
+            if a.get("is_toc") and a.get("source", "toc") == "toc"
+        }
+        pending = [
+            b
+            for b, a in arts.items()
+            if not a.get("is_toc") and a.get("source") != "reconstructed"
+        ]
+        if not pending:
+            return {}
+
+        agg: dict[str, int] = defaultdict(int)
+
+        async def one(bulletin: str) -> None:
+            scan_path = bctx.paths.bulletin_file(_SCANS_SUBDIR, bulletin)
+            if not scan_path.exists():
+                return
+            views = _page_views(json.loads(scan_path.read_text())["scans"])
+            reference = _reference_chapters(real_tocs, bulletin)
+            async with bctx.llm_sem, bctx.unit_ctx() as ctx:
+                try:
+                    hierarchy = await reconstruct_outline(
+                        ctx, bulletin=bulletin, page_views=views, reference=reference
+                    )
+                except Exception as e:  # noqa: BLE001 — record, never abort the batch
+                    log.warning(
+                        f"[{self.name}] {bulletin} failed: {type(e).__name__}: {e}"
+                    )
+                    agg["failed"] += 1
+                    return
+            # Overwrite the toc artifact in place, keeping its non-hierarchy fields.
+            _atomic_write_json(
+                bctx.paths.bulletin_file(_TOC_SUBDIR, bulletin),
+                {**arts[bulletin], **hierarchy.model_dump()},
+            )
+            agg["reconstructed"] += int(hierarchy.is_toc)
+            agg["empty"] += int(not hierarchy.is_toc)
+            agg["chapters"] += len(hierarchy.chapters)
+
+        await asyncio.gather(*[one(b) for b in pending])
+        return dict(agg)
+
+
+def _gather_all(bctx: BuildContext) -> dict:
+    """Load every placed bulletin (`build/place/<b>.json`) into the gather dict the era
+    merge consumes: `{bulletin: {"chapters": [...], "assign": {...}}}`."""
+    gather: dict[str, dict] = {}
+    for b in bctx.bulletins:
+        p = bctx.paths.bulletin_file(_PLACE_SUBDIR, b)
+        if not p.exists():
+            continue
+        d = json.loads(p.read_text())
+        gather[b] = {"chapters": d["chapters"], "assign": d["assign"]}
+    return gather
+
+
+def _gather_titles(bctx: BuildContext) -> dict[tuple[str, int], list[str]]:
+    """`{(bulletin, page): [table titles]}` from every catalog row — the raw material the era
+    merge's describe pass samples to summarize each chapter's description/examples."""
+    titles: dict[tuple[str, int], list[str]] = {}
+    for b in bctx.bulletins:
+        p = bctx.paths.bulletin_file(_CATALOG_SUBDIR, b, "jsonl")
+        if not p.exists():
+            continue
+        for line in p.read_text().splitlines():
             if not line:
                 continue
             row = PageCatalogRow.from_json(line)
-            bulletins_seen.add(row.bulletin)
-            n_pages_total += 1
-            if row.content_blocks:
-                n_pages_with_content += 1
-            try:
-                yr = int(row.bulletin[:4])
-                year_min = yr if year_min is None else min(year_min, yr)
-                year_max = yr if year_max is None else max(year_max, yr)
-            except ValueError:
-                pass
-            if row.dates:
-                n_pages_with_dates += 1
-
-    build_stats = {
-        "pipeline_wall_s": round(total_wall, 2),
-        "totals": {
-            "n_llm_calls": total_calls,
-            "input_tokens": total_in,
-            "output_tokens": total_out,
-            "approx_cost_usd": round(
-                _approx_cost_usd(total_in, total_out), 4),
-        },
-        "stages": stages_out,
-        "index_structure": {
-            "n_chapters": len(chapter_pages),
-            "n_pages_indexed": total_pages,
-            "n_bulletins": len(bulletins_seen),
-            "year_range": [year_min, year_max],
-            "chapter_page_counts": dict(chapter_pages_sorted),
-            "chapter_examples_count": chapter_examples,
-            "chapter_pages_p50": page_counts[median_idx] if page_counts else 0,
-            "chapter_pages_min": page_counts[0] if page_counts else 0,
-            "chapter_pages_max": page_counts[-1] if page_counts else 0,
-            "chapter_pages_mean": round(sum(page_counts) / n_ch, 1),
-            "catalog_rows": n_pages_total,
-            "catalog_rows_with_content": n_pages_with_content,
-            "catalog_rows_with_dates": n_pages_with_dates,
-            "catalog_dates_coverage": (
-                round(n_pages_with_dates / max(1, n_pages_total), 4)),
-            "placement_tier_counts": (
-                _BUILD_STATS["place_pages"].extra.get("placement_totals", {})),
-        },
-        "models": manifest["models"],
-        "built_at": manifest["built_at"],
-        "git_sha": manifest["git_sha"],
-    }
-    stats_path = out / "build_stats.json"
-    stats_path.write_text(json.dumps(build_stats, indent=2, ensure_ascii=False))
-    log.info(f"wrote build stats → {stats_path}")
-    log.info(f"totals: {total_calls} LLM calls, "
-             f"in={total_in:,} out={total_out:,}  "
-             f"~${_approx_cost_usd(total_in, total_out):.3f}")
+            if ts := [blk.title for blk in row.content_blocks if blk.title]:
+                titles[(b, row.page)] = ts
+    return titles
 
 
-# ---------------------------------------------------------------------------
-# Driver
-# ---------------------------------------------------------------------------
+class EraMergeStage(Stage):
+    """Reduction (last): gather all placements → segment the timeline into eras → build each
+    era's canonical table of contents → write `concept_tree.json`. Resume = skip when the file
+    already exists; delete it to rebuild after adding or re-placing bulletins."""
 
-_STAGE_FUNCS = {
-    "build_catalog": stage_build_catalog,
-    "extract_l1": stage_extract_l1,
-    "place_pages": stage_place_pages,
-    "merge_chapters": stage_merge_chapters,
-    "manifest": stage_manifest,
-}
+    name = "era_merge"
+
+    async def run(self, bctx: BuildContext) -> dict:
+        out = bctx.paths.root / TREE_FILE
+        if out.exists():
+            log.info(f"[{self.name}] {out.name} exists, skipping")
+            return {}
+        gather = _gather_all(bctx)
+        if not gather:
+            log.warning(
+                f"[{self.name}] no placement rows found; run the place stage first"
+            )
+            return {}
+        titles = _gather_titles(bctx)
+        async with bctx.unit_ctx() as ctx:
+            tree = await build_concept_tree(ctx, gather, titles, sem=bctx.llm_sem)
+        _atomic_write_json(out, tree)
+        return {"eras": len(tree["eras"]), "bulletins": len(gather)}
+
+
+# The pipeline, in order. `run_build` calls each stage's `run` and logs its stats; per-bulletin
+# stages (`BulletinStage`) and the reductions share the same `Stage.run` interface.
+PIPELINE: tuple[Stage, ...] = (
+    ScanStage(),
+    PreRenderStage(),
+    VisionRescanStage(),
+    MergeContinuationsStage(),
+    TocStage(),
+    ReconstructTocStage(),
+    PlaceStage(),
+    CatalogStage(),
+    PageStoreStage(),
+    EraMergeStage(),
+)
+
+
+async def run_build(bctx: BuildContext) -> None:
+    """Run every stage in `PIPELINE`, in order, on one event loop."""
+    for stage in PIPELINE:
+        agg = await stage.run(bctx)
+        log.info(
+            f"[{stage.name}] complete {dict(agg)} | cumulative ${bctx.cost:.2f} "
+            f"(in={bctx.in_tok:,} out={bctx.out_tok:,})"
+        )
 
 
 def main() -> int:
+    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[union-attr]
+    sys.stderr.reconfigure(line_buffering=True)  # type: ignore[union-attr]
+
     ap = argparse.ArgumentParser(
-        description="Corpus-agnostic page-index build pipeline.")
-    ap.add_argument("--profile", choices=sorted(PROFILES), default="treasury",
-                    help="Corpus profile (default: treasury).")
-    ap.add_argument("--output-dir", type=Path,
-                    default=Path("artifact/page_index"),
-                    help="Target directory for all stage outputs (the shipped, in-repo index).")
-    ap.add_argument("--window", type=_parse_window, default=(1939, 2025),
-                    help="Inclusive year window (default 1939-2025).")
-    ap.add_argument("--bulletins", type=str, default=None,
-                    help="Comma-separated YYYY-MM to override (debug).")
-    ap.add_argument("--pdf-dir", type=Path, default=None,
-                    help="Directory holding corpus PDF files (default: SkunkConfig.pdf_dir).")
-    ap.add_argument("--parsed-json-dir", type=Path, default=None,
-                    help="Parsed-JSON corpus dir (default: SkunkConfig.parsed_json_dir).")
-    ap.add_argument("--workers", type=int, default=16)
-    ap.add_argument("--l1-model", type=str, default=None,
-                    help="LLM model override for extract_l1 (else SkunkConfig default).")
-    ap.add_argument("--place-model", type=str, default=None,
-                    help="LLM model override for place_pages.")
-    ap.add_argument("--merge-model", type=str, default=None,
-                    help="LLM model override for merge_chapters.")
-    ap.add_argument("--start-from", choices=STAGES, default=None,
-                    help="Skip stages prior to this one (their outputs must exist).")
-    for s in STAGES:
-        ap.add_argument(f"--skip-{s.replace('_', '-')}", action="store_true",
-                        dest=f"skip_{s}")
-    ap.add_argument("--verbose", action="store_true")
+        description="Treasury Bulletin page-index build (end-to-end, all stages)."
+    )
+    ap.add_argument(
+        "--build-dir",
+        type=Path,
+        default=Path("build"),
+        help="Build folder for all intermediate artifacts (default: build/).",
+    )
+    ap.add_argument(
+        "--bulletins",
+        type=str,
+        default=None,
+        help="Comma-separated YYYY-MM allowlist for dev (default: whole corpus).",
+    )
+    ap.add_argument(
+        "--concurrency", type=int, default=128, help="Max concurrent LLM calls."
+    )
     args = ap.parse_args()
 
-    # The single config for this run: built once here (the entrypoint) and threaded to
-    # every stage via `args.cfg`. CLI dir flags override the config's defaults; per-stage
-    # model overrides go through `_config_with_model`.
-    args.cfg = SkunkConfig.from_env()
-    args.pdf_dir = args.pdf_dir or args.cfg.pdf_dir
-    args.parsed_json_dir = args.parsed_json_dir or args.cfg.parsed_json_dir
-
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    # Model + per-model RPM/TPM are read from SkunkConfig and the llm_client rate
+    # limiter (env SKUNK_LLM_MODEL, SKUNK_MODEL_RPM/TPM, SKUNK_LLM_RPM) — the build
+    # doesn't override them.
     configure_obs()
+    config = SkunkConfig.from_env()
+    only = (
+        {b.strip() for b in args.bulletins.split(",") if b.strip()}
+        if args.bulletins
+        else None
+    )
+    bulletins = discover_bulletins(config.pdf_dir, only=only)
+    if not bulletins:
+        print("no bulletins discovered", file=sys.stderr)
+        return 1
 
-    profile = load_profile(args.profile)
-    log.info(f"Pipeline → {args.output_dir}")
-    log.info(f"profile: {profile.name}")
-    log.info(f"window: {args.window}    workers: {args.workers}")
+    overrides_path = Path(config.prompt_overrides_path)
+    overrides = load_prompt_overrides(overrides_path) if overrides_path.exists() else ()
 
-    if args.start_from:
-        start_idx = STAGES.index(args.start_from)
-    else:
-        start_idx = 0
-    to_run = [s for s in STAGES[start_idx:]
-              if not getattr(args, f"skip_{s}", False)]
-    log.info(f"stages: {to_run}")
+    bctx = BuildContext(
+        config=config,
+        paths=BuildPaths(args.build_dir),
+        bulletins=bulletins,
+        overrides=overrides,
+        llm_concurrency=args.concurrency,
+    )
 
-    t0 = time.monotonic()
-    try:
-        for stage in to_run:
-            _STAGE_FUNCS[stage](args, profile)
-    except StageError as e:
-        log.error(f"[stage prerequisite error] {e}")
-        return 2
-    log.info(f"Pipeline complete in {time.monotonic() - t0:.1f}s")
+    log.info(
+        f"build → {args.build_dir}  corpus={CORPUS_NAME}  model={config.llm_model}  "
+        f"concurrency={args.concurrency}"
+    )
+    log.info(
+        f"{len(bulletins)} bulletins; pipeline: {' → '.join(s.name for s in PIPELINE)}"
+    )
+
+    asyncio.run(run_build(bctx))
+
+    wall = time.perf_counter() - bctx._t0
+    print("\n=== BUILD COMPLETE ===")
+    print(f"tokens:  in={bctx.in_tok:,}  out={bctx.out_tok:,}")
+    print(
+        f"cost:    ${bctx.cost:.2f}  (flash @ ${_FLASH_IN * 1e6:.2f}/${_FLASH_OUT * 1e6:.2f} per 1M in/out)"
+    )
+    print(f"wall:    {wall / 60:.1f} min ({wall:.0f}s)")
     return 0
 
 

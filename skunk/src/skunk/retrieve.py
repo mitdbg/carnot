@@ -7,8 +7,8 @@ backend per call:
   no backend built), taken first when `golden_pages` is set.
 - `search_agent` — iterative ChromaDB + LLM loop under `skunk.search_agent`;
   returns page keys adapted to `PageRef`.
-- `page_index` — ToC pick → year filter → semantic filter (wraps
-  `skunk.page_index.query.PageIndexRetriever`).
+- `page_index_old` — ToC pick → year filter → semantic filter (wraps
+  `skunk.page_index_old.query.PageIndexRetriever`).
 
 The two real backends are built lazily so an unused one (notably ChromaDB) is
 never opened. Backends raise `StepFailed("retrieve", …)` on failure and do not
@@ -17,14 +17,19 @@ emit their own start/done boundaries (the orchestrator's trace owns those).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from skunk.config import SkunkConfig
 from skunk.errors import StepFailed
 from skunk.common import ExecutionContext, PageRef, page_key_to_pageref
 from skunk.plan import RetrieveBranch
+
+if TYPE_CHECKING:
+    from skunk.page_index.query import BlockRef
 
 
 class RetrieveOp:
@@ -42,34 +47,88 @@ class RetrieveOp:
         # prune sets), so it cannot be shared across concurrent branches.
         self._resources = None  # tuple[Collection, dict[str, str]]
         self._resources_lock = threading.Lock()
-        self._page_index_retriever = None  # skunk.page_index.query.PageIndexRetriever
+        self._page_index_retriever = (
+            None  # skunk.page_index_old.query.PageIndexRetriever
+        )
 
     async def run(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
         if ctx.config.golden_pages is not None:
             return self._run_golden(ctx, branch)
-        match ctx.config.retriever:
+        # `str(...)` widens the Literal so the defensive `case _` stays reachable — env can
+        # inject an out-of-Literal `SKUNK_RETRIEVER` (config.py constructs it with a type-ignore).
+        match str(ctx.config.retriever):
             case "search_agent":
                 return await self._run_search_agent(ctx, branch)
-            case "page_index":
-                return await self._run_page_index(ctx, branch)
+            case "page_index_old":
+                blocks = (await self._page_index().retrieve_all(ctx, [branch]))[0]
+                return self._blocks_to_pagerefs(blocks)
             case other:
                 raise StepFailed(
                     "retrieve",
-                    f"unknown retriever {other!r}; expected 'search_agent' or 'page_index'",
+                    f"unknown retriever {other!r}; expected 'search_agent' or 'page_index_old'",
                 )
 
-    def _run_golden(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
-        """Golden-pages bypass (eval ablation only). `run` only routes here when
+    async def run_all(
+        self, ctx: ExecutionContext, branches: list[RetrieveBranch]
+    ) -> list[list[PageRef] | StepFailed]:
+        """Retrieve for several branches at once, result aligned to `branches`. A slot is
+        that branch's page refs, or a `StepFailed` to attribute to that branch alone — so a
+        single branch failing does not sink its siblings (the orchestrator routes each slot
+        to its own extract / records the error). The page-index backend scans each unique
+        candidate page with the LLM semantic filter at most once (judging it against all
+        branch targets) and routes survivors back per branch; the other backends have no
+        shared-scan benefit and run per branch via the same `run` seam. A whole-sweep /
+        infra failure (unknown retriever, missing index) raises instead."""
+        if ctx.config.golden_pages is not None:
+            out: list[list[PageRef] | StepFailed] = [
+                self._run_golden(ctx, b) for b in branches
+            ]
+            return out
+        match str(ctx.config.retriever):  # widen Literal — see `run` for why
+            case "search_agent":
+                # Independent per branch (fresh agent + per-question state); isolate
+                # per-branch failures so one branch's StepFailed doesn't fail the rest.
+                settled = await asyncio.gather(
+                    *(self._run_search_agent(ctx, b) for b in branches),
+                    return_exceptions=True,
+                )
+                results: list[list[PageRef] | StepFailed] = []
+                for r in settled:
+                    if isinstance(r, StepFailed):
+                        results.append(r)
+                    elif isinstance(r, BaseException):
+                        raise r
+                    else:
+                        results.append(r)
+                return results
+            case "page_index_old":
+                per_branch = await self._page_index().retrieve_all(ctx, branches)
+                return [self._blocks_to_pagerefs(blocks) for blocks in per_branch]
+            case other:
+                raise StepFailed(
+                    "retrieve",
+                    f"unknown retriever {other!r}; expected 'search_agent' or 'page_index_old'",
+                )
+
+    def _run_golden(
+        self, ctx: ExecutionContext, _branch: RetrieveBranch
+    ) -> list[PageRef]:
+        """Golden-pages bypass (eval ablation only). Branch-agnostic — the configured golden
+        set is returned for every branch (hence `_branch`). `run` only routes here when
         `golden_pages` is set, but we guard defensively anyway (also narrows the type)."""
         if ctx.config.golden_pages is None:
-            raise StepFailed("retrieve", "golden bypass reached without golden_pages set")
+            raise StepFailed(
+                "retrieve", "golden bypass reached without golden_pages set"
+            )
         ctx.emit(
             f"golden_bypass n_pages={len(ctx.config.golden_pages)} "
             f"refs={[str(r) for r in ctx.config.golden_pages]!r}"
         )
         return ctx.config.golden_pages
 
-    async def _run_search_agent(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
+    async def _run_search_agent(
+        self, ctx: ExecutionContext, branch: RetrieveBranch
+    ) -> list[PageRef]:
         """Iterative search agent (`skunk.search_agent`); maps its page keys to `PageRef`."""
         from skunk.search_agent import SearchAgent
 
@@ -115,14 +174,32 @@ class RetrieveOp:
                 self._resources = _build_resources(config)
             return self._resources
 
-    async def _run_page_index(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
-        """Page-index retriever (ToC pick → year filter → semantic filter). The
-        inner retriever is built lazily and caches the catalog/concept-tree."""
+    def _page_index(self):
+        """Lazily build + cache the page-index retriever (loads the catalog/concept-tree
+        once). Used by both the single-branch `run` and the batched `run_all`."""
         from skunk.page_index.query import PageIndexRetriever
 
         if self._page_index_retriever is None:
             self._page_index_retriever = PageIndexRetriever()
-        return await self._page_index_retriever.run(None, ctx, branch=branch)
+        return self._page_index_retriever
+
+    @staticmethod
+    def _blocks_to_pagerefs(blocks: list[BlockRef]) -> list[PageRef]:
+        """Dumb block→page translation layer: the page-index retriever now outputs at BLOCK
+        granularity (`BlockRef`), but the extraction pipeline still consumes `PageRef`s. Collapse
+        each block to the physical pages extract must read — its page's member refs (anchor +
+        folded continuation run, carried on every `BlockRef`) — de-duped, first-seen order
+        preserved. Several kept blocks on one page (or one anchor + its continuations) collapse to
+        that page's refs once. This is the only place block granularity is discarded; lift it out
+        when the extraction pipeline learns to take blocks directly."""
+        seen: set[PageRef] = set()
+        refs: list[PageRef] = []
+        for b in blocks:
+            for r in b.member_refs:
+                if r not in seen:
+                    seen.add(r)
+                    refs.append(r)
+        return refs
 
 
 def _build_resources(config: SkunkConfig):

@@ -4,14 +4,15 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import cast
 from skunk.compute import ComputeOp
 from skunk.config import SkunkConfig
 from skunk.errors import MissingData, StepFailed
 from skunk.extract import ExtractOp
 from skunk.lookup_external import LookupExternalOp
-from skunk.common import AnnotatedValue, ExecutionContext
+from skunk.common import AnnotatedValue, ExecutionContext, PageRef
 from skunk.llm_client import LLMClient
-from skunk.plan import Branch, Plan, PlanDiff, Planner
+from skunk.plan import Branch, Plan, PlanDiff, Planner, RetrieveBranch
 from skunk.prompted_call import PromptOverride
 from skunk.question_explainer import QuestionExplainer
 from skunk.retrieve import RetrieveOp
@@ -189,29 +190,61 @@ class Orchestrator:
             data=data,
         )
 
-    async def _run_branch(self, branch: Branch, branch_id: int) -> list[AnnotatedValue]:
-        if branch.kind == "retrieve":
-            doc = await self._execute_with_tracing(
-                "retrieve",
-                lambda: self._retrieve.run(self._ctx, branch),
-                branch_id=branch_id,
+    async def _run_retrieve_phase(
+        self, branches: list[RetrieveBranch]
+    ) -> list[list[PageRef] | StepFailed]:
+        """Unified multi-scan retrieve for every retrieve branch at once: their candidate
+        pages are deduped and the LLM semantic filter scans each unique page at most once,
+        judging it against all branches' targets, then routes the survivors back per branch.
+        Returns each branch's routed page refs in input order, or — if the whole sweep fails
+        — the `StepFailed` to attribute to every retrieve branch so each replans on its own.
+        Not tied to one branch's trace step (it spans them), so `branch_id` is left unset."""
+        if not branches:
+            return []
+        try:
+            return list(
+                await self._execute_with_tracing(
+                    "retrieve",
+                    lambda: self._retrieve.run_all(self._ctx, branches),
+                )
             )
-            return await self._execute_with_tracing(
-                "extract",
-                lambda: self._extract.run(doc, self._ctx, branch),
-                branch_id=branch_id,
-            )
-        return await self._execute_with_tracing(
-            "lookup_external",
-            lambda: self._lookup.run(self._ctx, branch),
-            branch_id=branch_id,
-        )
+        except StepFailed as e:
+            return [e] * len(branches)
 
     async def _run_branches(
         self, branches: list[Branch], branch_ids: list[int]
     ) -> list[BranchOutcome]:
+        # Global retrieve phase: all retrieve branches share one deduped semantic-filter
+        # sweep, then each branch's routed refs feed its own extract. Lookup branches are
+        # independent and run in the per-branch tail below.
+        retrieve_pos = [i for i, b in enumerate(branches) if b.kind == "retrieve"]
+        docs = await self._run_retrieve_phase(
+            [cast(RetrieveBranch, branches[i]) for i in retrieve_pos]
+        )
+        docs_by_pos: dict[int, list[PageRef] | StepFailed] = dict(
+            zip(retrieve_pos, docs)
+        )
+
+        async def _tail(pos: int) -> list[AnnotatedValue]:
+            branch, bid = branches[pos], branch_ids[pos]
+            if branch.kind == "retrieve":
+                doc = docs_by_pos[pos]
+                if isinstance(doc, StepFailed):
+                    raise doc
+                doc = await self._maybe_select(cast(RetrieveBranch, branch), doc, bid)
+                return await self._execute_with_tracing(
+                    "extract",
+                    lambda: self._extract.run(doc, self._ctx, branch),
+                    branch_id=bid,
+                )
+            return await self._execute_with_tracing(
+                "lookup_external",
+                lambda: self._lookup.run(self._ctx, branch),
+                branch_id=bid,
+            )
+
         results = await asyncio.gather(
-            *(self._run_branch(b, bid) for b, bid in zip(branches, branch_ids)),
+            *(_tail(i) for i in range(len(branches))),
             return_exceptions=True,
         )
         outcomes: list[BranchOutcome] = []
@@ -227,6 +260,38 @@ class Orchestrator:
             else:
                 outcomes.append(BranchOutcome(branch=branch, entries=res, error=None))
         return outcomes
+
+    async def _maybe_select(
+        self, branch: RetrieveBranch, doc: list[PageRef], bid: int
+    ) -> list[PageRef]:
+        """Intermediate selection stage (opt-in, page-index path only). Between the semantic
+        filter and extract, `block_select` (`config.block_select`) narrows the filter's survivors
+        to what this branch actually needs: a tournament of small packed group calls that reduces
+        the candidate blocks to the few relevant ones (block granularity). Runs once per retrieve
+        branch, isolated and in parallel with its siblings (called from `_tail`, fanned out by
+        `_run_branches`). A no-op for golden / search-agent retrieval, when disabled, or when no
+        candidate ref resolves to a catalog block (nothing to narrow). Otherwise the selector runs
+        and its result is used directly — there is NO degrade-to-unfiltered-refs fallback: a
+        selector failure propagates and fails the branch loudly rather than silently flooding
+        extract with every candidate."""
+        cfg = self._ctx.config
+        if (
+            not cfg.block_select
+            or not doc
+            or cfg.golden_pages is not None
+            or cfg.retriever != "page_index_old"
+        ):
+            return doc
+        from skunk.page_index.block_select import BlockSelectAgent
+
+        agent = BlockSelectAgent(doc, str(cfg.pdf_dir))
+        if not agent.has_candidates():
+            return doc
+        return await self._execute_with_tracing(
+            "block_select",
+            lambda: agent.select(self._ctx, self._ctx.question, branch),
+            branch_id=bid,
+        )
 
     async def _execute_with_tracing[T](
         self,

@@ -101,23 +101,30 @@ def get_page_text(month: str | None, page: int | None, *, base_dir: str | Path) 
     return "\n\n".join(parts) if parts else None
 
 
-def page_text_tagged(month: str, *, base_dir: str | Path) -> dict[int, str]:
+def page_tagged_text(elements: list[dict]) -> str:
+    """Concatenate one page's parsed-JSON elements, each prefixed with its parsed
+    `[type]` for structural signal. `page_number` elements are dropped; an empty
+    page yields "". This is the per-page form of `page_text_tagged`."""
+    parts: list[str] = []
+    for el in elements:
+        content = el.get("content")
+        if content is None:
+            continue
+        t = el.get("type") or "text"
+        if t == "page_number":
+            continue
+        parts.append(f"[{t}] {content}")
+    return "\n\n".join(parts) if parts else ""
+
+
+def page_text_tagged(month: str, *, base_dir: str | Path | None = None) -> dict[int, str]:
     """`{1-based PDF page index: concatenated page text}` for the build pipeline. Each
     element is prefixed with its parsed `[type]` for structural signal; `page_number`
     elements are dropped, blank pages map to "". Raises FileNotFoundError if missing."""
-    out: dict[int, str] = {}
-    for pdf_page, elements in page_elements(month, base_dir=base_dir, fill_gaps=True).items():
-        parts: list[str] = []
-        for el in elements:
-            content = el.get("content")
-            if content is None:
-                continue
-            t = el.get("type") or "text"
-            if t == "page_number":
-                continue
-            parts.append(f"[{t}] {content}")
-        out[pdf_page] = "\n\n".join(parts) if parts else ""
-    return out
+    return {
+        pdf_page: page_tagged_text(elements)
+        for pdf_page, elements in page_elements(month, base_dir=base_dir, fill_gaps=True).items()
+    }
 
 
 def render_page_b64(
