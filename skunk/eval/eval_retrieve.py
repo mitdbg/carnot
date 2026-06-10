@@ -4,7 +4,7 @@ no compute, no planner).
 For each UID it gets the plan's retrieve branches — from the cache
 (`cache/retrieve_bench_plans.jsonl`) if present, else by running the planner here (which
 rebuilds the cache in the current canonical-period format; `--replan` forces it) — and
-runs `RetrieveOp` over the `page_index_old` backend (per-era ToC pick → year filter →
+runs `RetrieveOp` over the `page_index` backend (per-era ToC pick → year filter →
 coarse summary filter on flash-lite). The retrieved pages are scored against the
 benchmark's gold `source_docs` pages.
 
@@ -52,7 +52,7 @@ import os  # noqa: E402
 
 _MODEL = "gemini-3.1-flash-lite"  # default filter model (override: --filter-model)
 _RUN_ENV = {
-    "SKUNK_RETRIEVER": "page_index_old",
+    "SKUNK_RETRIEVER": "page_index",
     "SKUNK_SEMFILTER_BATCH": "32",
 }
 for _k, _v in _RUN_ENV.items():
@@ -240,11 +240,11 @@ async def _retrieve_uid(
         # One pass over all branches: the filter judges the full target list and the union
         # of candidates is scanned once. A per-branch slot may be a StepFailed (no pages) —
         # attribute it to that branch, keep the rest.
-        for refs in await op.run_all(ctx, branches):
-            if isinstance(refs, StepFailed):
+        for slot in await op.run_all(ctx, branches):
+            if isinstance(slot, StepFailed):
                 n_failed += 1
             else:
-                retrieved |= _refkeys(refs)
+                retrieved |= _refkeys(slot.refs)
         for evt in ctx.events:
             msg = evt.get("message", "")
             m = _CALL_RE.search(msg)
@@ -402,7 +402,7 @@ def main() -> None:
     test_set = set() if args.include_test_set else _load_test_set()
 
     config = SkunkConfig.from_env()
-    assert config.retriever == "page_index_old", "run env not applied"
+    assert config.retriever == "page_index", "run env not applied"
     overrides_path = Path(config.prompt_overrides_path)
     overrides = load_prompt_overrides(overrides_path) if overrides_path.exists() else ()
 

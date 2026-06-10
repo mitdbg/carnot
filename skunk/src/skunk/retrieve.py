@@ -1,18 +1,12 @@
 """retrieve operator — one op over three swappable backends.
 
-`RetrieveOp` turns a `RetrieveBranch` into the pages that answer it, picking a
-backend per call:
+`RetrieveOp` turns a `RetrieveBranch` into the pages that answer it:
+- golden bypass — returns `ctx.config.golden_pages` verbatim (eval ablation).
+- `search_agent` — iterative ChromaDB + LLM loop under `skunk.search_agent`.
+- `page_index` — ToC pick → year filter → semantic filter → block selection
+  (all within `PageIndexRetriever.retrieve_all`).
 
-- golden bypass — returns `ctx.config.golden_pages` verbatim (eval ablation;
-  no backend built), taken first when `golden_pages` is set.
-- `search_agent` — iterative ChromaDB + LLM loop under `skunk.search_agent`;
-  returns page keys adapted to `PageRef`.
-- `page_index_old` — ToC pick → year filter → semantic filter (wraps
-  `skunk.page_index_old.query.PageIndexRetriever`).
-
-The two real backends are built lazily so an unused one (notably ChromaDB) is
-never opened. Backends raise `StepFailed("retrieve", …)` on failure and do not
-emit their own start/done boundaries (the orchestrator's trace owns those).
+The two real backends are built lazily.
 """
 
 from __future__ import annotations
@@ -25,43 +19,41 @@ from typing import TYPE_CHECKING
 
 from skunk.config import SkunkConfig
 from skunk.errors import StepFailed
-from skunk.common import ExecutionContext, PageRef, page_key_to_pageref
+from skunk.common import BlockRef, ExecutionContext, PageRef, page_key_to_pageref
 from skunk.plan import RetrieveBranch
 
 if TYPE_CHECKING:
     from skunk.page_index.query import BlockRef
 
 
-class RetrieveOp:
-    """The retrieve operator. Picks a backend per call: golden bypass first
-    (when `ctx.config.golden_pages` is set), otherwise on `config.retriever`.
-    `run` is also the single seam where a future per-branch backend override
-    would plug in. The search-agent and page-index backends are built lazily so
-    an unused one is never opened."""
+# TODO: this is just a hack to make blocks work with search agents. We should probably fix this at some point
+def _whole_page_blocks(refs: list[PageRef]) -> list[BlockRef]:
+    """Wrap bare page refs (golden / search-agent) as whole-page `BlockRef`s (`block_index=None`),
+    so extract reads them the same as page-index blocks — just with no specific block to scope to."""
+    return [
+        BlockRef(page=r, block_index=None, member_refs=(r,), block=None) for r in refs
+    ]
 
+
+class RetrieveOp:
     def __init__(self, config: SkunkConfig) -> None:
         self._config = config
-        # Cached read-only resources (ChromaDB collection + doc_id→text map),
-        # shared across branches and opened once. A fresh SearchAgent is built
-        # per branch since it now carries per-question state (block trajectory +
-        # prune sets), so it cannot be shared across concurrent branches.
-        self._resources = None  # tuple[Collection, dict[str, str]]
+        self._resources = None  # (Collection, dict[str, str]) — shared across branches
         self._resources_lock = threading.Lock()
         self._page_index_retriever = (
             None  # skunk.page_index_old.query.PageIndexRetriever
         )
 
-    async def run(self, ctx: ExecutionContext, branch: RetrieveBranch) -> list[PageRef]:
+    async def run(
+        self, ctx: ExecutionContext, branch: RetrieveBranch
+    ) -> list[BlockRef]:
         if ctx.config.golden_pages is not None:
-            return self._run_golden(ctx, branch)
-        # `str(...)` widens the Literal so the defensive `case _` stays reachable — env can
-        # inject an out-of-Literal `SKUNK_RETRIEVER` (config.py constructs it with a type-ignore).
+            return self._golden_blocks(ctx)
         match str(ctx.config.retriever):
             case "search_agent":
-                return await self._run_search_agent(ctx, branch)
-            case "page_index_old":
-                blocks = (await self._page_index().retrieve_all(ctx, [branch]))[0]
-                return self._blocks_to_pagerefs(blocks)
+                return _whole_page_blocks(await self._run_search_agent(ctx, branch))
+            case "page_index":
+                return (await self._page_index().retrieve_all(ctx, [branch]))[0]
             case other:
                 raise StepFailed(
                     "retrieve",
@@ -70,71 +62,52 @@ class RetrieveOp:
 
     async def run_all(
         self, ctx: ExecutionContext, branches: list[RetrieveBranch]
-    ) -> list[list[PageRef] | StepFailed]:
+    ) -> list[list[BlockRef] | StepFailed]:
         """Retrieve for several branches at once, result aligned to `branches`. A slot is
-        that branch's page refs, or a `StepFailed` to attribute to that branch alone — so a
-        single branch failing does not sink its siblings (the orchestrator routes each slot
-        to its own extract / records the error). The page-index backend scans each unique
-        candidate page with the LLM semantic filter at most once (judging it against all
-        branch targets) and routes survivors back per branch; the other backends have no
-        shared-scan benefit and run per branch via the same `run` seam. A whole-sweep /
-        infra failure (unknown retriever, missing index) raises instead."""
+        that branch's blocks or a `StepFailed` — a single branch failing does not
+        sink its siblings. A whole-sweep failure (unknown retriever, missing index) raises."""
         if ctx.config.golden_pages is not None:
-            out: list[list[PageRef] | StepFailed] = [
-                self._run_golden(ctx, b) for b in branches
-            ]
-            return out
-        match str(ctx.config.retriever):  # widen Literal — see `run` for why
+            return [self._golden_blocks(ctx) for _ in branches]
+        match str(ctx.config.retriever):
             case "search_agent":
-                # Independent per branch (fresh agent + per-question state); isolate
-                # per-branch failures so one branch's StepFailed doesn't fail the rest.
                 settled = await asyncio.gather(
                     *(self._run_search_agent(ctx, b) for b in branches),
                     return_exceptions=True,
                 )
-                results: list[list[PageRef] | StepFailed] = []
+                out: list[list[BlockRef] | StepFailed] = []
                 for r in settled:
                     if isinstance(r, StepFailed):
-                        results.append(r)
+                        out.append(r)
                     elif isinstance(r, BaseException):
                         raise r
                     else:
-                        results.append(r)
-                return results
-            case "page_index_old":
-                per_branch = await self._page_index().retrieve_all(ctx, branches)
-                return [self._blocks_to_pagerefs(blocks) for blocks in per_branch]
+                        out.append(_whole_page_blocks(r))
+                return out
+            case "page_index":
+                return list(await self._page_index().retrieve_all(ctx, branches))
             case other:
                 raise StepFailed(
                     "retrieve",
-                    f"unknown retriever {other!r}; expected 'search_agent' or 'page_index_old'",
+                    f"unknown retriever {other!r}; expected 'search_agent' or 'page_index'",
                 )
 
-    def _run_golden(
-        self, ctx: ExecutionContext, _branch: RetrieveBranch
-    ) -> list[PageRef]:
-        """Golden-pages bypass (eval ablation only). Branch-agnostic — the configured golden
-        set is returned for every branch (hence `_branch`). `run` only routes here when
-        `golden_pages` is set, but we guard defensively anyway (also narrows the type)."""
-        if ctx.config.golden_pages is None:
-            raise StepFailed(
-                "retrieve", "golden bypass reached without golden_pages set"
-            )
-        ctx.emit(
-            f"golden_bypass n_pages={len(ctx.config.golden_pages)} "
-            f"refs={[str(r) for r in ctx.config.golden_pages]!r}"
-        )
-        return ctx.config.golden_pages
+    def _golden_blocks(self, ctx: ExecutionContext) -> list[BlockRef]:
+        """Golden / replay bypass → `BlockRef`s. A block-aware cache replay injects the cached
+        blocks (`config.cached_blocks`) so extract block-scopes as the live run did; plain
+        `--golden` (no blocks) wraps its pages as whole-page blocks."""
+        pages = ctx.config.golden_pages
+        assert pages is not None
+        ctx.emit(f"golden_bypass n_pages={len(pages)} refs={[str(r) for r in pages]!r}")
+        if ctx.config.cached_blocks is not None:
+            return ctx.config.cached_blocks
+        return _whole_page_blocks(pages)
 
     async def _run_search_agent(
         self, ctx: ExecutionContext, branch: RetrieveBranch
     ) -> list[PageRef]:
-        """Iterative search agent (`skunk.search_agent`); maps its page keys to `PageRef`."""
         from skunk.search_agent import SearchAgent
 
         collection, document_map = self._ensure_resources(ctx.config)
-        # Fresh agent per branch: it holds per-question state (trajectory + prune
-        # sets); the ChromaDB collection + document map underneath are shared.
         agent = SearchAgent(
             config=ctx.config,
             document_map=document_map,
@@ -155,8 +128,6 @@ class RetrieveOp:
             except ValueError:
                 bad.append(key)
         if bad:
-            # Callee-only diagnostic the trace can't show: keys the agent
-            # returned that didn't map to a PageRef.
             ctx.emit(f"bad_page_keys n_bad={len(bad)} keys={bad[:5]!r}")
         if not refs:
             raise StepFailed(
@@ -166,46 +137,20 @@ class RetrieveOp:
         return refs
 
     def _ensure_resources(self, config: SkunkConfig):
-        # Single-flight: parallel branches must not race to open ChromaDB and
-        # load the document-text map. These resources are read-only + shared;
-        # only the per-branch SearchAgent built around them holds mutable state.
+        # Single-flight: parallel branches must not race to open ChromaDB.
         with self._resources_lock:
             if self._resources is None:
                 self._resources = _build_resources(config)
             return self._resources
 
     def _page_index(self):
-        """Lazily build + cache the page-index retriever (loads the catalog/concept-tree
-        once). Used by both the single-branch `run` and the batched `run_all`."""
         from skunk.page_index.query import PageIndexRetriever
 
         if self._page_index_retriever is None:
             self._page_index_retriever = PageIndexRetriever()
         return self._page_index_retriever
 
-    @staticmethod
-    def _blocks_to_pagerefs(blocks: list[BlockRef]) -> list[PageRef]:
-        """Dumb block→page translation layer: the page-index retriever now outputs at BLOCK
-        granularity (`BlockRef`), but the extraction pipeline still consumes `PageRef`s. Collapse
-        each block to the physical pages extract must read — its page's member refs (anchor +
-        folded continuation run, carried on every `BlockRef`) — de-duped, first-seen order
-        preserved. Several kept blocks on one page (or one anchor + its continuations) collapse to
-        that page's refs once. This is the only place block granularity is discarded; lift it out
-        when the extraction pipeline learns to take blocks directly."""
-        seen: set[PageRef] = set()
-        refs: list[PageRef] = []
-        for b in blocks:
-            for r in b.member_refs:
-                if r not in seen:
-                    seen.add(r)
-                    refs.append(r)
-        return refs
-
-
 def _build_resources(config: SkunkConfig):
-    """Open ChromaDB and build the doc_id→text map from the clean-page map.
-    Returns (collection, document_map). Raises `StepFailed` with a clear message
-    if either artifact is missing."""
     import chromadb
 
     chromadb_dir = Path(config.chromadb_dir)
@@ -230,10 +175,6 @@ def _build_resources(config: SkunkConfig):
     with clean_page_map_path.open() as f:
         clean_page_map = json.load(f)
 
-    # clean_page_map: doc_id -> [clean_page_path, element_id_order]. Eagerly load
-    # each cleaned page's text so `read_document` can serve it by doc_id. Built
-    # once and shared across branches. Missing/unreadable pages are skipped here
-    # and surface as "no such document" at read time (mirrors the old lazy read).
     document_map: dict[str, str] = {}
     for doc_id, entry in clean_page_map.items():
         path = entry[0] if isinstance(entry, (list, tuple)) else entry
@@ -246,7 +187,7 @@ def _build_resources(config: SkunkConfig):
     chroma_client = chromadb.PersistentClient(path=str(chromadb_dir))
     try:
         collection = chroma_client.get_collection(name=config.chromadb_collection)
-    except Exception as e:  # chromadb raises a custom NotFound-style error
+    except Exception as e:
         raise StepFailed(
             "retrieve",
             f"chromadb collection {config.chromadb_collection!r} not found "

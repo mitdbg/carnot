@@ -81,7 +81,10 @@ class PageStore:
     # -- text -----------------------------------------------------------------
 
     def text(self, ref: PageRef) -> str | None:
-        """The page's stored text (the anchor's already-merged text), or None when absent."""
+        """One PHYSICAL page's stored text, or None when absent. (Under the block-level table
+        merge the page store keys text per physical page — a continued table's tail lives on its
+        own `extra_pages` entry, not folded into the anchor — so a multi-page block's text is the
+        concatenation of its `block_refs` pages, which extract feeds whole.)"""
         if ref.month is None or ref.page is None:
             return None
         return self._bulletin_text(ref.month).get(int(ref.page))
