@@ -315,8 +315,17 @@ REPORT_FIELDS = [
     # Free-text annotation. Auto-seeded with the failure reason for `fail` rows; blank
     # otherwise (a human refines it during triage).
     "note",
+    # The question text + `gold`/`golden_pages`, mirrored under the trace viewer's
+    # expected column names so `eval/trace_viewer/` renders without per-schema patches:
+    # `gold_answer` == `gold`, `golden_pages` is space-separated `month:page` tokens,
+    # and `failed`/`reason` are derived from `category`/`note` for its pass/fail badge.
+    "question",
     "predicted",
     "gold",
+    "gold_answer",
+    "golden_pages",
+    "failed",
+    "reason",
     # n_hit/n_gold — retrieved pages (post block-select) that intersect the gold pages.
     "retrieval_recall",
     # Wall-clock span of the UID's trace log (first→last event), seconds.
@@ -542,14 +551,21 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
 
     retrieved_blocks = result.get("retrieved_blocks", [])
     category = "correct" if correct else ("fail" if result["failed"] else "wrong")
+    gold_report_pages = cfg.golden_report.get(uid) or []
     return {
         "uid": uid,
         "category": category,
         # Seed `note` with the failure reason so `fail` rows are self-describing; correct/
         # wrong rows start blank for manual triage.
         "note": (result["reason"] or "") if result["failed"] else "",
+        # Trace-viewer mirror columns (see REPORT_FIELDS). `golden_pages` uses the viewer's
+        # `month:page` token form; `failed`/`reason` feed its pass/fail badge.
+        "question": question,
         "predicted": predicted,
         "gold": gold_answer,
+        "gold_answer": gold_answer,
+        "golden_pages": " ".join(f"{p.month}:{p.page}" for p in gold_report_pages),
+        "reason": result.get("reason") or "",
         "retrieval_recall": _retrieval_recall(retrieved_blocks, cfg.golden_report.get(uid)),
         # latency_s / cost_usd are filled in main() from the UID's trace log once it's
         # flushed (left blank under --no-traces).
