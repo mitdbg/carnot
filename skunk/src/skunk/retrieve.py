@@ -113,12 +113,18 @@ class RetrieveOp:
             document_map=document_map,
             chroma_collection=collection,
         )
+        # The agent hint is free text; render a per-entry pin list to its pinned months.
+        as_of_hint = (
+            ", ".join(m for m in branch.as_of if m) or None
+            if isinstance(branch.as_of, list)
+            else branch.as_of
+        )
         page_keys = await agent.retrieve(
             ctx,
             ctx.question,
             branch_key=branch.key,
             branch_period=branch.period,
-            branch_as_of=branch.as_of,
+            branch_as_of=as_of_hint,
         )
         refs: list[PageRef] = []
         bad: list[str] = []
@@ -149,6 +155,7 @@ class RetrieveOp:
         if self._page_index_retriever is None:
             self._page_index_retriever = PageIndexRetriever()
         return self._page_index_retriever
+
 
 def _build_resources(config: SkunkConfig):
     import chromadb

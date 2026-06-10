@@ -28,8 +28,7 @@ import threading
 from functools import lru_cache
 from pathlib import Path
 
-from skunk.common import B64Image, PageRef
-from skunk.corpus import render_page_b64
+from skunk.common import B64Image, PageRef, render_page_b64
 from skunk.errors import StepFailed
 
 from .data_model import (

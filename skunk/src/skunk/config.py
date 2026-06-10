@@ -124,16 +124,12 @@ class SkunkConfig:
     # (env: SKUNK_SEMFILTER_MODEL, SKUNK_SEMFILTER_BATCH)
     semfilter_batch_size: int = 32
 
-    # Stop the page-index retrieve after ToC pick + year filter, skipping the semantic
-    # filter entirely — used to measure the ToC+date recall ceiling / elimination rate in
-    # isolation. (env: SKUNK_RETRIEVE_SKIP_SEMFILTER=1)
-    retrieve_skip_semfilter: bool = False
-
     # Extract: skip the parsed-text (OCR) tier entirely and read values straight off the rendered
-    # page images (vision tier). Default on — vision is robust to the OCR corruption that the
-    # parsed-text tier suffers on dense scanned tables (validated: it recovered single-cell OCR
-    # misses on the dev set). Disable with SKUNK_EXTRACT_VISION_ONLY=0 to use the parsed-text tier.
-    extract_vision_only: bool = True
+    # page images (vision tier). Default OFF — parsed text first, vision as the fallback tier.
+    # Vision-only is robust to OCR corruption on dense scanned tables (it recovered single-cell
+    # OCR misses on the dev set) but costs more and can run away on thinking-only pro models;
+    # enable per-run with SKUNK_EXTRACT_VISION_ONLY=1 when OCR quality is the binding issue.
+    extract_vision_only: bool = False
 
     # Build: the `vision_rescan` stage always re-reads `parse_broken` pages (mangled parses). Pages
     # flagged `has_unparsed_graphics` that are CHART-ONLY (a chart/figure with no table on the page,
@@ -146,18 +142,23 @@ class SkunkConfig:
         # Route per-stage models through the override registry so `PromptedCall` resolves them
         # like every other call-site. Defaulted here unless a run pins them explicitly
         # (SKUNK_MODEL_OVERRIDES=stage=… or, for the filter, SKUNK_SEMFILTER_MODEL). Efforts
-        # come from each call-site's `default_effort` (compute=medium; block_select/extract=off),
-        # overridable via SKUNK_EFFORT_OVERRIDES.
+        # come from each call-site's `default_effort` (compute=high; planner/replanner/extract=medium;
+        # block_select=off), overridable via SKUNK_EFFORT_OVERRIDES.
         # - semfilter: the cheap coarse filter runs on flash-lite.
-        # - block_select / extract: flash — block selection and value extraction are cheap reads
-        #   (extraction reads off the rendered page or parsed text; thinking off).
-        # - compute.codegen: the only Pro stage — codegen/reasoning over the extracted values.
+        # - block_select: flash — block selection is a cheap read (thinking off).
+        # - extract.{text,vision,confirm}: Pro — value extraction off dense scanned tables is the
+        #   accuracy-binding read, so it gets the strong model with medium thinking.
+        # - compute.codegen: flash — codegen/reasoning over the extracted values (high thinking).
+        # - replanner: flash — recovering a failed plan runs flash at medium thinking; the initial
+        #   planner also runs flash (the common path).
         # Everything else (planner, toc_pick, …) runs on the base `llm_model` (flash).
         self.model_overrides.setdefault("semfilter", "gemini-3.1-flash-lite")
         self.model_overrides.setdefault("block_select", "gemini-3.5-flash")
-        self.model_overrides.setdefault("extract.text", "gemini-3.5-flash")
-        self.model_overrides.setdefault("extract.vision", "gemini-3.5-flash")
-        self.model_overrides.setdefault("compute.codegen", "gemini-3.1-pro-preview")
+        self.model_overrides.setdefault("extract.text", "gemini-3.1-pro-preview")
+        self.model_overrides.setdefault("extract.vision", "gemini-3.1-pro-preview")
+        self.model_overrides.setdefault("extract.confirm", "gemini-3.1-pro-preview")
+        self.model_overrides.setdefault("compute.codegen", "gemini-3.5-flash")
+        self.model_overrides.setdefault("replanner", "gemini-3.5-flash")
 
     @classmethod
     def from_env(cls) -> SkunkConfig:
@@ -189,9 +190,7 @@ class SkunkConfig:
                 "SKUNK_PROMPT_OVERRIDES", "config/prompts/treasury_bulletin.yaml"
             ),
             semfilter_batch_size=int(os.environ.get("SKUNK_SEMFILTER_BATCH", "32")),
-            retrieve_skip_semfilter=os.environ.get("SKUNK_RETRIEVE_SKIP_SEMFILTER", "")
-            not in ("", "0"),
-            extract_vision_only=os.environ.get("SKUNK_EXTRACT_VISION_ONLY", "1") not in ("", "0"),
+            extract_vision_only=os.environ.get("SKUNK_EXTRACT_VISION_ONLY", "0") not in ("", "0"),
             vision_rescan_charts=os.environ.get("SKUNK_VISION_RESCAN_CHARTS", "") not in ("", "0"),
             retriever=os.environ.get("SKUNK_RETRIEVER", "page_index"),  # type: ignore[arg-type]
             chromadb_dir=os.environ.get("SKUNK_CHROMADB_DIR", "cache/chromadb"),

@@ -64,15 +64,24 @@ def _is_retryable(e: BaseException) -> bool:
         code = getattr(e, "status_code", None)
         return code == 429 or (code is not None and 500 <= code < 600)
     # Transport faults: connection resets, read timeouts, DNS failures, etc.
-    return isinstance(
-        e,
-        (
-            httpx.TimeoutException,
-            httpx.TransportError,
-            requests.exceptions.Timeout,
-            requests.exceptions.ConnectionError,
-        ),
+    # `TimeoutError` covers asyncio timeouts on the async SDK path; the genai
+    # async transport is aiohttp, whose connection faults (`ClientOSError`:
+    # broken pipe / reset) derive from `ClientConnectionError` — none of which
+    # the httpx/requests types below catch.
+    retryable: tuple[type[BaseException], ...] = (
+        TimeoutError,
+        httpx.TimeoutException,
+        httpx.TransportError,
+        requests.exceptions.Timeout,
+        requests.exceptions.ConnectionError,
     )
+    try:
+        import aiohttp
+
+        retryable += (aiohttp.ClientConnectionError,)
+    except ImportError:
+        pass
+    return isinstance(e, retryable)
 
 
 _MODEL_RPM: dict[str, float] | None = None

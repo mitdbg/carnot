@@ -8,16 +8,15 @@ pages); PyMuPDF is used solely for rendering page images."""
 
 from __future__ import annotations
 
-import base64
 import html as _html
 import json
 import re
 from functools import lru_cache
 from pathlib import Path
 
-import fitz
-
-from skunk.common import B64Image
+# Re-exported for `skunk.search_agent.prep.page_cleaner`, which imports it from here; the
+# rasterizer itself now lives in `common` (the single page-render primitive).
+from skunk.common import pdf_path_for, render_page_b64  # noqa: F401
 from skunk.errors import StepFailed
 
 _FILENAME_RE = re.compile(r"treasury_bulletin_(\d{4})_(\d{2})\.pdf$")
@@ -35,12 +34,6 @@ def parse_bulletin_filename(path: str | Path) -> str:
 # caller's single `SkunkConfig` says (`config.parsed_json_dir` / `config.pdf_dir`).
 # These functions never resolve a directory on their own — that would reintroduce a
 # second, possibly-divergent source of truth alongside the entrypoint's config.
-
-
-def pdf_path_for(bulletin: str, pdf_dir: Path | str) -> Path:
-    """Inverse of `parse_bulletin_filename`: '1953-06' -> <pdf_dir>/treasury_bulletin_1953_06.pdf."""
-    year, mon = bulletin.split("-")
-    return Path(pdf_dir) / f"treasury_bulletin_{int(year):04d}_{int(mon):02d}.pdf"
 
 
 @lru_cache(maxsize=64)
@@ -125,34 +118,6 @@ def page_text_tagged(month: str, *, base_dir: str | Path | None = None) -> dict[
         pdf_page: page_tagged_text(elements)
         for pdf_page, elements in page_elements(month, base_dir=base_dir, fill_gaps=True).items()
     }
-
-
-def render_page_b64(
-    month: str | None,
-    page: int | None,
-    *,
-    pdf_dir: Path | str,
-    dpi: int = 300,
-    fmt: str = "png",
-    jpg_quality: int | None = None,
-) -> B64Image | None:
-    """Render a PDF page to in-memory image bytes. Returns None when the PDF
-    doesn't exist; PyMuPDF errors propagate. No disk cache."""
-    if month is None or page is None or int(page) <= 0:
-        return None
-    pdf_path = pdf_path_for(month, pdf_dir)
-    if not pdf_path.exists():
-        return None
-    mat = fitz.Matrix(dpi / 72, dpi / 72)
-    with fitz.open(pdf_path) as doc:
-        pix = doc[int(page) - 1].get_pixmap(matrix=mat)
-    if fmt == "jpg":
-        data = pix.tobytes("jpg", jpg_quality=jpg_quality if jpg_quality is not None else 95)
-        mime = "image/jpeg"
-    else:
-        data = pix.tobytes("png")
-        mime = "image/png"
-    return B64Image(mime=mime, data=base64.standard_b64encode(data).decode())
 
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
