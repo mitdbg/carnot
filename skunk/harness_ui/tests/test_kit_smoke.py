@@ -47,7 +47,7 @@ async def _running_harness(round_seconds: int = 8, start_delay: int = 0):
         port=port,
         start_delay=start_delay,
         round_seconds=round_seconds,
-        questions_path=Path(__file__).parent.parent / "practice_questions.json",
+        questions_path=Path(__file__).parent.parent / "questions" / "practice_questions.json",
         once=False,
     )
     app, _state, _stop = build_app(cfg)

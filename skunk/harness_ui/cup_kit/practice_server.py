@@ -27,7 +27,7 @@ Usage::
 
     python practice_server.py [--port 8765] [--host 127.0.0.1]
                               [--round-seconds 180]
-                              [--questions practice_questions.json]
+                              [--questions questions/practice_questions.json]
                               [--once] [--verbose]
 """
 
@@ -720,12 +720,11 @@ def _parse_args(argv: list[str]) -> _Config:
         default=180,
         help="active window per round in seconds (default: %(default)s)",
     )
-    # ``practice_questions.json`` ships at the kit root, one level up
-    # from this file (which lives in cup_kit/).
+    # Bundled question sets live in questions/, next to cup_kit/.
     p.add_argument(
         "--questions",
         type=Path,
-        default=Path(__file__).resolve().parent.parent / "practice_questions.json",
+        default=Path(__file__).resolve().parent.parent / "questions" / "practice_questions.json",
     )
     p.add_argument("--once", action="store_true", help="run one full cycle then exit 0 (for CI)")
     p.add_argument("--verbose", action="store_true")
