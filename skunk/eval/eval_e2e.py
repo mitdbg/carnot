@@ -307,24 +307,85 @@ async def _run_one_question(
 
 REPORT_FIELDS = [
     "uid",
-    "question",
+    # correct / wrong / fail — `correct` per the official cup scorer; `fail` = no answer
+    # (uncaught error or MissingData); `wrong` = produced an answer that scored 0. The
+    # finer failure-mode triage (compute / retrieval / lookup) the merged report carries
+    # is a manual pass over `wrong`/`fail`.
+    "category",
+    # Free-text annotation. Auto-seeded with the failure reason for `fail` rows; blank
+    # otherwise (a human refines it during triage).
+    "note",
     "predicted",
-    "gold_answer",
-    # 1/0 per the official OfficeQA Cup scorer at 0.0% absolute relative error
-    # (the competition metric). See skunk.eval.scoring.
-    "correct",
-    "golden_pages",
-    "failed",
-    "reason",
+    "gold",
+    # n_hit/n_gold — retrieved pages (post block-select) that intersect the gold pages.
+    "retrieval_recall",
+    # Wall-clock span of the UID's trace log (first→last event), seconds.
+    "latency_s",
+    # USD billed for this UID's generation calls (see PRICES; thinking billed at output).
+    "cost_usd",
 ]
 
+# USD per token (input, output); thinking tokens billed at the output rate. Copied from
+# scripts/analyze_trace.py — keep the two in sync if Gemini pricing changes.
+PRICES = {
+    "gemini-3.5-flash": (0.30e-6, 2.50e-6),
+    "gemini-3.1-flash-lite": (0.10e-6, 0.40e-6),
+}
+_CALL_RE = re.compile(
+    r"call call_site=\S+ model=(\S+) .*?in_tok=(\d+) out_tok=(\d+) think_tok=(\S+)"
+)
+_TS_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2}) ")
 
-def _fmt_golden_pages(pages: list[PageRef] | None) -> str:
-    """Render golden page refs as a compact `month:page` list for the report /
-    trace viewer (the viewer splits on whitespace, then on the last colon)."""
-    if not pages:
+
+def _log_cost_latency(log_path: str | None) -> tuple[str, str]:
+    """Aggregate a UID's generation cost (USD) and wall-clock latency (s) from its trace
+    `.log` by summing `call` events (per PRICES) and spanning the first→last timestamp.
+    Returns ('', '') when the log is absent (e.g. --no-traces) or unparseable — those
+    columns are simply left blank, matching the merged report's optional metrics."""
+    if not log_path or not Path(log_path).exists():
+        return "", ""
+    cost = 0.0
+    first_ts = last_ts = None
+    saw_call = False
+    for line in Path(log_path).open():
+        m = _TS_RE.match(line)
+        if m:
+            h, mi, s = map(int, m.groups())
+            ts = h * 3600 + mi * 60 + s
+            if first_ts is None:
+                first_ts = ts
+            last_ts = ts
+        c = _CALL_RE.search(line)
+        if c:
+            model, i, o, t = c.group(1), int(c.group(2)), int(c.group(3)), c.group(4)
+            t = 0 if t == "None" else int(t)
+            price = PRICES.get(model)
+            if price is None:
+                continue
+            pin, pout = price
+            cost += i * pin + (o + t) * pout
+            saw_call = True
+    latency = ""
+    if first_ts is not None and last_ts is not None:
+        span = last_ts - first_ts
+        if span < 0:  # crossed midnight
+            span += 24 * 3600
+        latency = str(span)
+    return (f"{cost:.4f}" if saw_call else ""), latency
+
+
+def _retrieval_recall(retrieved_blocks: list, gold_pages: list[PageRef] | None) -> str:
+    """n_hit/n_gold — how many gold pages the retrieve phase actually surfaced (matched on
+    month:page across the blocks' member pages). '' when no gold pages are recorded."""
+    if not gold_pages:
         return ""
-    return " ".join(f"{p.month}:{p.page}" for p in pages)
+    gold = {(p.month, p.page) for p in gold_pages}
+    got = {
+        (r.month, r.page)
+        for b in retrieved_blocks
+        for r in getattr(b, "member_refs", ())
+    }
+    return f"{len(gold & got)}/{len(gold)}"
 
 
 # Held-out test set — see CLAUDE.md. Loaded lazily so the file is optional.
@@ -479,18 +540,27 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
         mark = "✓" if correct else "✗"
         print(f"[e2e] {uid} Answer: {result['answer']}  [{mark} vs gold: {gold_answer!r}]")
 
+    retrieved_blocks = result.get("retrieved_blocks", [])
+    category = "correct" if correct else ("fail" if result["failed"] else "wrong")
     return {
         "uid": uid,
-        "question": question,
+        "category": category,
+        # Seed `note` with the failure reason so `fail` rows are self-describing; correct/
+        # wrong rows start blank for manual triage.
+        "note": (result["reason"] or "") if result["failed"] else "",
         "predicted": predicted,
-        "gold_answer": gold_answer,
+        "gold": gold_answer,
+        "retrieval_recall": _retrieval_recall(retrieved_blocks, cfg.golden_report.get(uid)),
+        # latency_s / cost_usd are filled in main() from the UID's trace log once it's
+        # flushed (left blank under --no-traces).
+        "latency_s": "",
+        "cost_usd": "",
+        # Internal helper keys — dropped from the CSV by extrasaction="ignore"; consumed by
+        # main() for the accuracy tally, retrieval cache, and per-UID cost/latency backfill.
         "correct": correct,
-        "golden_pages": _fmt_golden_pages(cfg.golden_report.get(uid)),
         "failed": result["failed"],
-        "reason": result["reason"] or "",
-        # Not a REPORT_FIELDS column (DictWriter drops it via extrasaction="ignore");
-        # consumed by main() to build the retrieval cache.
-        "retrieved_blocks": result.get("retrieved_blocks", []),
+        "retrieved_blocks": retrieved_blocks,
+        "_log_path": log_path,
     }
 
 
@@ -726,6 +796,11 @@ def main() -> None:
                 results[futures[fut]] = fut.result()
 
     rows = [r for r in results if r is not None]
+
+    # Backfill per-UID cost / latency from the now-flushed trace logs (cheap post-hoc
+    # parse — see _log_cost_latency). Blank under --no-traces.
+    for r in rows:
+        r["cost_usd"], r["latency_s"] = _log_cost_latency(r.get("_log_path"))
 
     out = report_path
     with out.open("w", newline="", encoding="utf-8") as f:
