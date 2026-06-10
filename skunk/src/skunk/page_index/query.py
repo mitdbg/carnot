@@ -11,9 +11,18 @@ blocks."""
 
 import json
 import asyncio
+import logging
 import re
 from pathlib import Path
-from skunk.common import BlockRef, ExecutionContext, PageRef, chunk, parse_json_response, traced_step
+from typing import NamedTuple
+from skunk.common import (
+    BlockRef,
+    ExecutionContext,
+    PageRef,
+    chunk,
+    parse_json_response,
+    traced_step,
+)
 from skunk.errors import StepFailed, ParseError
 from skunk.plan import RetrieveBranch
 from skunk.prompted_call import PromptedCall
@@ -35,13 +44,33 @@ from .store import get_page_store
 _MONTH_RE = re.compile(r"\d{4}-\d{2}")
 
 
-def _to_intervals(period: str | None) -> list[tuple[str, str]] | None:
-    """Parse a `YYYY-MM` period string into inclusive `(lo, hi)` month intervals.
-    Returns None when empty or malformed (callers then no-op the filter)."""
+class _PeriodEntry(NamedTuple):
+    lo: str  # inclusive YYYY-MM data-span start
+    hi: str  # inclusive YYYY-MM data-span end
+    pin: str | None  # YYYY-MM ISSUE this span's value is pinned to, or None
+
+    @property
+    def span(self) -> str:
+        return self.lo if self.lo == self.hi else f"{self.lo}..{self.hi}"
+
+    @property
+    def label(self) -> str:
+        return (
+            f"{self.span} (as reported in the {self.pin} issue)"
+            if self.pin
+            else self.span
+        )
+
+
+def _to_entries(period: str | None) -> list[_PeriodEntry] | None:
+    """Parse a period string into entries: a comma-list of `YYYY-MM` months /
+    `YYYY-MM..YYYY-MM` ranges. Returns None when empty or malformed (callers then
+    no-op the filter). Pins arrive separately on `branch.as_of` — see
+    `_branch_entries`."""
     if not period:
         return None
     try:
-        out: list[tuple[str, str]] = []
+        out: list[_PeriodEntry] = []
         for part in (p.strip() for p in period.split(",")):
             if not part:
                 continue
@@ -51,13 +80,45 @@ def _to_intervals(period: str | None) -> list[tuple[str, str]] | None:
                 raise ValueError(f"not YYYY-MM: {part!r}")
             if lo > hi:
                 raise ValueError(f"range start > end: {part!r}")
-            out.append((lo, hi))
+            out.append(_PeriodEntry(lo, hi, None))
         return out or None
     except ValueError:
         return None
 
 
-def _overlaps(interval: tuple[str, str], period_intervals: list[tuple[str, str]]) -> bool:
+def _branch_entries(branch: RetrieveBranch) -> list[_PeriodEntry] | None:
+    """The branch's period entries with per-entry issue pins attached from a list
+    `as_of` (aligned 1:1 with the entries, None slots = unpinned; parity is enforced
+    at plan parse time, so a mismatch here just leaves entries unpinned). A scalar
+    `as_of` is a whole-branch publication filter, applied separately."""
+    entries = _to_entries(branch.period)
+    if entries and isinstance(branch.as_of, list) and len(branch.as_of) == len(entries):
+        entries = [
+            e._replace(pin=pin) if pin and _MONTH_RE.fullmatch(pin) else e
+            for e, pin in zip(entries, branch.as_of)
+        ]
+    return entries
+
+
+def _scalar_as_of_intervals(
+    as_of: str | list[str | None] | None,
+) -> list[tuple[str, str]] | None:
+    """Publication-month intervals of a WHOLE-BRANCH (scalar) `as_of`. A list `as_of`
+    is per-entry pins — handled via `_branch_entries`, never as a branch-wide filter
+    (it would exclude the pages serving the unpinned entries)."""
+    return None if isinstance(as_of, list) else _to_intervals(as_of)
+
+
+def _to_intervals(period: str | None) -> list[tuple[str, str]] | None:
+    """The period's `(lo, hi)` data spans — for callers that only care about
+    data-time coverage (era pruning)."""
+    entries = _to_entries(period)
+    return [(e.lo, e.hi) for e in entries] if entries else None
+
+
+def _overlaps(
+    interval: tuple[str, str], period_intervals: list[tuple[str, str]]
+) -> bool:
     """True iff a `(lo, hi)` YYYY-MM span overlaps any interval in `period_intervals`."""
     lo, hi = interval[0][:7], interval[1][:7]
     return any(not (hi < p_lo[:7] or lo > p_hi[:7]) for p_lo, p_hi in period_intervals)
@@ -90,12 +151,12 @@ class PageIndexRetriever:
     _CHAPTER_PICK_PROMPT = (
         """\
 For each Treasury Bulletin chapter, decide whether the answer to the question could PLAUSIBLY be
-in it. Judge every chapter independently — this is NOT a single best pick; any number may be true.
+in it. Judge every chapter independently and return true if you cannot confidently rule it out.
 
 ## Input
 
 A single JSON object:
-  {"question": "<question>", "concept": "<concept tag>", "period": "<period>",
+  {"question": "<question>",
    "chapters": [{"chapter": "<name>", "n_pages": <int>, "description": "<scope>",
                  "examples": ["<sub-area>", ...]}, ...]}
 
@@ -103,7 +164,8 @@ A single JSON object:
         + CHAPTER_FIELDS
         + """
 
-Match the question against each chapter's name, `description`, and `examples`.
+Each chapter's `description`, and `examples` should be used for reference, but may not contain the verbatim wording of the question even though
+it contains relevant information. Use semantic understanding to make the judgement.
 
 ## Output
 
@@ -166,17 +228,18 @@ appears in — then `dates=`, the time span the block's DATA covers, then a
 compact summary (title, column/row labels) — NOT the numbers.
 
 Return ONLY the blocks that most directly report the target's data, best-first, and never more
-than the cap stated in the request — fewer when fewer are appropriate. When choosing:
-  - If the question pins a specific issue ("as reported in the <Month Year> Bulletin", "as of <date>"), select
-    blocks whose ISSUE (the `YYYY_MM`) is that bulletin; the explicit wording overrides the generic data period.
-  - Otherwise prefer the block whose title / headers / `dates=` span match the target most precisely, and prefer
-    a data table over a chart of the same series.
-  - Match the asked concept at its EXACT scope. A row/column label that wraps the concept in extra words — "<concept> and
+than the cap stated in the request — fewer when fewer are appropriate. Apply the rules below
+IN ORDER — when two rules disagree, the earlier one wins:
+  - If the question pins a specific source ("as reported in the <Month Year> Bulletin", "as of <date>"), select
+    blocks that best match that source; the explicit wording overrides the generic data period.
+  - Otherwise prefer the block whose title / headers / `dates=` span match the target most precisely. Beware of the EXACT scope
+    of the target: a row/column label that wraps the concept in extra words — "<concept> and
     related activities", "<concept>, including …", etc. — names a BROADER aggregate and will have different values from
     the bare concept. Prefer the block that reports exactly the asked scope.
-  - If multiple blocks match the target, pick the best one and do not emit duplicates.
   - When the same figure is restated across many issues, prefer the most recent issue unless the question
     explicitly asks for a version.
+  - One block per statistic per period of the data period; fewer than the cap is
+    better than padding with reprints.
 
 ## Output
 
@@ -186,7 +249,8 @@ more than the requested cap) under "block_ids":
 Use each `block_id` exactly as it appears."""
 
     _GROUP_SIZE = 64  # blocks per tournament call
-    _KEEP = 4         # blocks kept per group; hard output cap per branch
+    _KEEP = 4  # blocks kept per group; output cap for a single-interval branch
+    _KEEP_PER_INTERVAL = 2  # output cap per interval of a multi-interval (comma) period
 
     # -- construction ----------------------------------------------------------
 
@@ -211,18 +275,52 @@ Use each `block_id` exactly as it appears."""
         self._catalog_size = sum(
             c.n_pages for era in self._tree.eras for c in era.chapters.values()
         )
+        self._warn_if_tree_stale()
+
+    def _warn_if_tree_stale(self) -> None:
+        """Warn when a meaningful share of catalog anchors fall outside every chapter's
+        page ranges — such pages can never surface through the ToC pick, so retrieval
+        silently loses them. Happens when the tree is rebuilt from stale place files (or
+        not refiled after a placement patch; see scripts/refile_concept_tree.py). ~1.5%
+        front-matter pages are legitimately unplaced, hence the threshold."""
+        covered: dict[str, list[tuple[int, int]]] = {}
+        for era in self._tree.eras:
+            for c in era.chapters.values():
+                for pr in c.pages:
+                    covered.setdefault(pr.bulletin, []).append((pr.start, pr.end))
+        unreachable = 0
+        for ref in self._catalog:
+            page = ref.page
+            if page is None:
+                continue
+            if not any(s <= page <= e for s, e in covered.get(ref.month or "", ())):
+                unreachable += 1
+        frac = unreachable / len(self._catalog) if self._catalog else 0.0
+        if frac > 0.05:
+            logging.getLogger(__name__).warning(
+                "page-index tree is stale: %d/%d catalog anchors (%.1f%%) are in no "
+                "chapter page range and are unreachable by retrieval — refile the tree "
+                "(python3 -m scripts.refile_concept_tree).",
+                unreachable,
+                len(self._catalog),
+                100 * frac,
+            )
 
     # -- shared parse util -----------------------------------------------------
 
     @staticmethod
-    def _parse_bool_list(text: str, _ctx: ExecutionContext, n: int | None = None) -> list[bool]:
+    def _parse_bool_list(
+        text: str, _ctx: ExecutionContext, n: int | None = None
+    ) -> list[bool]:
         """Parse a JSON boolean array; raises `ParseError` on non-array, non-boolean elements,
         or (when `n` is given) wrong length."""
         obj = parse_json_response(text)
         if not isinstance(obj, list) or not all(isinstance(x, bool) for x in obj):
             raise ParseError(text, "expected a JSON array of booleans (true/false)")
         if n is not None and len(obj) != n:
-            raise ParseError(text, f"expected {n} booleans (one per item, in order), got {len(obj)}")
+            raise ParseError(
+                text, f"expected {n} booleans (one per item, in order), got {len(obj)}"
+            )
         return obj
 
     # -- retrieval stages ------------------------------------------------------
@@ -230,11 +328,15 @@ Use each `block_id` exactly as it appears."""
     def _eras_for_branch(self, branch: RetrieveBranch) -> list[EraTree]:
         """Eras whose ToC to scan. `as_of` pins a publication month (scan only containing eras);
         `period` prunes eras whose span ends before the period starts; neither keeps all eras."""
-        as_of_iv = _to_intervals(branch.as_of)
+        as_of_iv = _scalar_as_of_intervals(branch.as_of)
         if as_of_iv:
             lo = min(x[0][:7] for x in as_of_iv)
             hi = max(x[1][:7] for x in as_of_iv)
-            kept = [e for e in self._tree.eras if not (e.span[1][:7] < lo or e.span[0][:7] > hi)]
+            kept = [
+                e
+                for e in self._tree.eras
+                if not (e.span[1][:7] < lo or e.span[0][:7] > hi)
+            ]
             return kept or self._tree.eras
         intervals = _to_intervals(branch.period)
         if not intervals:
@@ -243,26 +345,50 @@ Use each `block_id` exactly as it appears."""
         kept = [e for e in self._tree.eras if e.span[1][:7] >= earliest]
         return kept or self._tree.eras
 
-    async def _pick_chapters(self, *, branch: RetrieveBranch, ctx: ExecutionContext) -> list[PageRef]:
-        eras = self._eras_for_branch(branch)
+    def _eras_for_branches(self, branches: list[RetrieveBranch]) -> list[EraTree]:
+        """Union (in tree order) of the eras relevant to ANY branch — the eras the single
+        question-driven ToC pick scans. Per-branch date narrowing is reapplied later in the
+        per-branch `_year_filter`, so this only needs to be a superset."""
+        wanted = {id(e) for b in branches for e in self._eras_for_branch(b)}
+        return [e for e in self._tree.eras if id(e) in wanted]
+
+    async def _pick_chapters(
+        self, *, branches: list[RetrieveBranch], ctx: ExecutionContext
+    ) -> list[PageRef]:
+        """One unified ToC pick for the whole question, shared by every branch. Picks chapters
+        from the branch-spanning eras conditioned ONLY on the original question text (not any
+        branch's concept/period); returns the deduped union of candidate pages, which each
+        branch then narrows by its own period/as_of in `_year_filter`."""
+        eras = self._eras_for_branches(branches)
         ctx.emit(
-            f"pick_chapters_eras key={branch.key!r} period={branch.period!r} as_of={branch.as_of!r} "
-            f"eras={len(eras)}/{len(self._tree.eras)}"
+            f"pick_chapters_eras eras={len(eras)}/{len(self._tree.eras)} branches={len(branches)}"
         )
         per_era = await asyncio.gather(
-            *[self._pick_era_chapters(era, branch=branch, ctx=ctx) for era in eras]
+            *[self._pick_era_chapters(era, ctx=ctx) for era in eras]
         )
-        return [ref for era_pages in per_era for ref in era_pages]
+        seen: set[PageRef] = set()
+        out: list[PageRef] = []
+        for era_pages in per_era:
+            for ref in era_pages:
+                if ref not in seen:
+                    seen.add(ref)
+                    out.append(ref)
+        return out
 
     async def _pick_era_chapters(
-        self, era: EraTree, *, branch: RetrieveBranch, ctx: ExecutionContext
+        self, era: EraTree, *, ctx: ExecutionContext
     ) -> list[PageRef]:
         chapters = era.chapters
         if not chapters:
             return []
         listing = sorted(
             (
-                {"chapter": name, "n_pages": c.n_pages, "description": c.description, "examples": list(c.examples)}
+                {
+                    "chapter": name,
+                    "n_pages": c.n_pages,
+                    "description": c.description,
+                    "examples": list(c.examples),
+                }
                 for name, c in chapters.items()
             ),
             key=lambda x: -x["n_pages"],
@@ -285,7 +411,7 @@ Use each `block_id` exactly as it appears."""
             output_instruction="Output ONLY a JSON array of true/false — one per chapter, in the given order, no prose.",
         )
         user = json.dumps(
-            {"question": ctx.question, "concept": branch.key, "period": branch.period, "chapters": listing},
+            {"question": ctx.question, "chapters": listing},
             ensure_ascii=False,
             indent=1,
         )
@@ -299,27 +425,42 @@ Use each `block_id` exactly as it appears."""
     ) -> list[PageRef]:
         # as_of filters by PUBLICATION month; period filters by DATA span. Both apply when set.
         kept = list(candidates)
-        as_of_intervals = _to_intervals(branch.as_of)
+        as_of_intervals = _scalar_as_of_intervals(branch.as_of)
         if as_of_intervals:
-            kept = [ref for ref in kept if ref.month and _overlaps((ref.month, ref.month), as_of_intervals)]
-        period_intervals = _to_intervals(branch.period)
-        if period_intervals:
             kept = [
                 ref
                 for ref in kept
-                if (row := self._catalog.get(ref)) is not None
-                and row.date_interval is not None
-                and _overlaps(row.date_interval, period_intervals)
+                if ref.month and _overlaps((ref.month, ref.month), as_of_intervals)
             ]
+        entries = _branch_entries(branch)
+        if entries:
+            # A candidate passes on ANY entry: an unpinned entry wants data-span
+            # overlap; a pinned entry wants the page PUBLISHED in the pinned issue
+            # (and a missing date_interval doesn't disqualify pages of the named
+            # issue — the pin already narrows to one bulletin).
+            def _passes(ref: PageRef) -> bool:
+                row = self._catalog.get(ref)
+                if row is None:
+                    return False
+                for e in entries:
+                    if e.pin is not None:
+                        if ref.month == e.pin and (
+                            row.date_interval is None
+                            or _overlaps(row.date_interval, [(e.lo, e.hi)])
+                        ):
+                            return True
+                    elif row.date_interval is not None and _overlaps(
+                        row.date_interval, [(e.lo, e.hi)]
+                    ):
+                        return True
+                return False
+
+            kept = [ref for ref in kept if _passes(ref)]
         ctx.emit(
             f"year_filter as_of={branch.as_of!r} period={branch.period!r} "
             f"kept={len(kept)}/{len(candidates)}"
         )
         return kept
-
-    async def _candidates_for(self, branch: RetrieveBranch, ctx: ExecutionContext) -> list[PageRef]:
-        chapter_pages = await self._pick_chapters(branch=branch, ctx=ctx)
-        return self._year_filter(chapter_pages, branch, ctx)
 
     async def _semantic_filter(
         self,
@@ -328,10 +469,13 @@ Use each `block_id` exactly as it appears."""
         ctx: ExecutionContext,
     ) -> dict[PageRef, list[bool]]:
         """Judge each candidate page against all branch RETRIEVAL TARGETS, returning one boolean
-        per content block. A batch whose reply is unparsable degrades to keep-all (recall over
-        precision)."""
+        per content block. A batch whose reply is unparsable (after parse retries) raises
+        StepFailed — no keep-all fallback — so the sweep fails and every branch replans."""
         cfg = ctx.config
-        targets = [{"target": i + 1, "concept": b.key, "period": b.period} for i, b in enumerate(branches)]
+        targets = [
+            {"target": i + 1, "concept": b.key, "period": b.period}
+            for i, b in enumerate(branches)
+        ]
         targets_json = json.dumps(targets, ensure_ascii=False, indent=1)
 
         verdict: dict[PageRef, list[bool]] = {}
@@ -340,9 +484,14 @@ Use each `block_id` exactly as it appears."""
             row = self._catalog[pk]
             rows = [
                 {
-                    "bulletin": pk.month, "page": pk.page, "date_interval": row.date_interval,
-                    "kind": b.kind, "title": b.title, "column_headers": b.column_headers,
-                    "row_headers": b.row_headers, "summary": b.summary,
+                    "bulletin": pk.month,
+                    "page": pk.page,
+                    "date_interval": row.date_interval,
+                    "kind": b.kind,
+                    "title": b.title,
+                    "column_headers": b.column_headers,
+                    "row_headers": b.row_headers,
+                    "summary": b.summary,
                 }
                 for b in row.content_blocks
             ]
@@ -354,7 +503,9 @@ Use each `block_id` exactly as it appears."""
         cap = max(1, cfg.semfilter_batch_size)
         batches = _batch_by_size(groups, cap)
 
-        async def _one_batch(batch: list[tuple[PageRef, list[dict]]]) -> dict[PageRef, list[bool]]:
+        async def _one_batch(
+            batch: list[tuple[PageRef, list[dict]]],
+        ) -> dict[PageRef, list[bool]]:
             flat = [(pk, r) for pk, rows in batch for r in rows]
             block_rows = [r for _, r in flat]
             n = len(block_rows)
@@ -379,8 +530,13 @@ Use each `block_id` exactly as it appears."""
             try:
                 verdicts = await sem_call.call(ctx, user, temperature=0.0)
             except ParseError as e:
-                ctx.emit(f"semfilter_batch_degraded n_blocks={n} error={str(e)!r}")
-                verdicts = [True] * n
+                # No keep-all fallback: an unparsable verdict (after parse retries) fails
+                # the retrieve sweep so every branch replans, rather than silently keeping
+                # the whole batch (which re-inflates the downstream block set).
+                raise StepFailed(
+                    "retrieve",
+                    f"semfilter verdict unparsable for {n}-block batch: {e}",
+                ) from e
             out: dict[PageRef, list[bool]] = {pk: [] for pk, _ in batch}
             for (pk, _), v in zip(flat, verdicts):
                 out[pk].append(v)
@@ -403,7 +559,9 @@ Use each `block_id` exactly as it appears."""
         row = self._catalog.get(ref)
         members = tuple(row.member_refs()) if row is not None else (ref,)
         if not verdicts:
-            return [BlockRef(page=ref, block_index=None, member_refs=members, block=None)]
+            return [
+                BlockRef(page=ref, block_index=None, member_refs=members, block=None)
+            ]
         blocks = row.content_blocks if row is not None else []
         return [
             BlockRef(
@@ -424,14 +582,15 @@ Use each `block_id` exactly as it appears."""
         self,
         ctx: ExecutionContext,
         branches: list[RetrieveBranch],
-    ) -> list[list[BlockRef]]:
+    ) -> list[list[BlockRef] | StepFailed]:
         """Retrieve for every branch in one pass and narrow with block selection. Phases:
-        (1) per-branch cheap candidates (ToC pick → year filter) run in parallel;
-        (2) one semantic-filter sweep over the deduped union; (3) block selection per
-        branch in parallel — a selection failure falls back to the semantic-filter output
+        (1) one question-driven ToC pick shared across branches, then a per-branch year/as_of
+        date filter; (2) one semantic-filter sweep over the deduped union; (3) block selection
+        per branch in parallel — a selection failure falls back to the semantic-filter output
         for that branch rather than failing it. Output is BLOCK-granular, aligned to `branches`."""
-        # Phase 1 — cheap candidates
-        cand = await asyncio.gather(*[self._candidates_for(b, ctx) for b in branches])
+        # Phase 1 — one unified ToC pick (question only), then each branch's own date filter.
+        chapter_pages = await self._pick_chapters(branches=branches, ctx=ctx)
+        cand = [self._year_filter(chapter_pages, b, ctx) for b in branches]
 
         wanted: dict[PageRef, set[int]] = {}
         for i, refs in enumerate(cand):
@@ -440,20 +599,17 @@ Use each `block_id` exactly as it appears."""
         unique = sorted(wanted, key=lambda r: (r.month or "", r.page or 0))
 
         # Phase 2 — semantic filter
-        if ctx.config.retrieve_skip_semfilter:
-            verdict = {
-                ref: [True] * len(self._catalog[ref].content_blocks) if ref in self._catalog else []
-                for ref in unique
-            }
-            ctx.emit(f"semantic_filter SKIPPED kept={len(unique)}/{len(unique)}")
-        else:
-            verdict = await self._semantic_filter(unique, branches, ctx)
+        verdict = await self._semantic_filter(unique, branches, ctx)
 
         # Route per branch
         branch_blocks: list[list[BlockRef]] = []
         for i, refs in enumerate(cand):
             kept_pages = [ref for ref in refs if not verdict[ref] or any(verdict[ref])]
-            block_refs = [br for ref in kept_pages for br in self._block_refs_for(ref, verdict[ref])]
+            block_refs = [
+                br
+                for ref in kept_pages
+                for br in self._block_refs_for(ref, verdict[ref])
+            ]
             b = branches[i]
             ctx.emit(
                 f"page_index_retrieve key={b.key!r} period={b.period!r} as_of={b.as_of!r} "
@@ -464,28 +620,50 @@ Use each `block_id` exactly as it appears."""
         # Phase 3 — block selection per branch in parallel
         pdf_dir = str(ctx.config.pdf_dir)
 
-        async def _select(block_refs: list[BlockRef], branch: RetrieveBranch) -> list[BlockRef]:
+        async def _select(
+            block_refs: list[BlockRef], branch: RetrieveBranch
+        ) -> list[BlockRef]:
             if not block_refs:
                 return block_refs
-            member_refs = list(dict.fromkeys(r for b in block_refs for r in b.member_refs))
+            member_refs = list(
+                dict.fromkeys(r for b in block_refs for r in b.member_refs)
+            )
             selected = await traced_step(
-                ctx, "block_select",
-                lambda: self.select_blocks(member_refs, pdf_dir, ctx, ctx.question, branch),
+                ctx,
+                "block_select",
+                lambda: self.select_blocks(
+                    member_refs, pdf_dir, ctx, ctx.question, branch
+                ),
             )
             if not selected:
-                ctx.emit(f"block_select_empty key={branch.key!r} falling back to semfilter output")
-                return block_refs
+                # No fallback. block_select rejecting every candidate means the target
+                # isn't in this branch's pages (e.g. an external series mis-routed to a
+                # retrieve branch). Fail the branch so compute hits MissingData and the
+                # replanner re-routes — never dump the full uncapped semfilter set into
+                # extract (that path produced a ~1000-page vision call → 1 GiB 400).
+                raise StepFailed(
+                    "retrieve",
+                    f"block_select selected no blocks for branch {branch.key!r}",
+                )
             return selected
 
         settled = await asyncio.gather(
             *(_select(brs, b) for brs, b in zip(branch_blocks, branches)),
             return_exceptions=True,
         )
-        out: list[list[BlockRef]] = []
-        for block_refs, r in zip(branch_blocks, settled):
-            if isinstance(r, BaseException):
-                ctx.emit(f"block_select_failed error={str(r)!r}")
-                out.append(block_refs)
+        out: list[list[BlockRef] | StepFailed] = []
+        for branch, r in zip(branches, settled):
+            if isinstance(r, StepFailed):
+                out.append(r)
+            elif isinstance(r, BaseException):
+                # block_select itself errored — surface as a failed branch (→ replan),
+                # not a fallback to the full uncapped candidate set.
+                ctx.emit(f"block_select_failed key={branch.key!r} error={str(r)!r}")
+                out.append(
+                    StepFailed(
+                        "retrieve", f"block_select error for {branch.key!r}: {r}"
+                    )
+                )
             else:
                 out.append(r)
         return out
@@ -498,11 +676,18 @@ Use each `block_id` exactly as it appears."""
         branch: RetrieveBranch,
         *,
         keep: int,
+        period_label: str | None = None,
     ) -> list[str]:
-        """One tournament group call. Returns at most `keep` block ids, best-first."""
+        """One tournament group call. Returns at most `keep` block ids, best-first.
+        `period_label` overrides the displayed data period (set when selecting for one
+        interval of a multi-interval period)."""
         lines = []
         for bid, (row, _bi, block) in items:
-            dates = f"{row.date_interval[0]}..{row.date_interval[1]}" if row.date_interval else "none"
+            dates = (
+                f"{row.date_interval[0]}..{row.date_interval[1]}"
+                if row.date_interval
+                else "none"
+            )
             line = f"[{bid}] dates={dates} | {block.kind} with title: {block.title or '(untitled)'}"
             if block.column_headers:
                 line += f" [cols: {', '.join(block.column_headers)}]"
@@ -513,10 +698,14 @@ Use each `block_id` exactly as it appears."""
             lines.append(line)
 
         parts = [f'Research question: "{question}"', f"Retrieval target: {branch.key}"]
-        if branch.period:
-            parts.append(f"Data period: {branch.period}")
-        if branch.as_of:
-            parts.append(f"Reported in / as of (issue pinned by the plan): {branch.as_of}")
+        if period_label or branch.period:
+            parts.append(f"Data period: {period_label or branch.period}")
+        if isinstance(branch.as_of, str) and branch.as_of:
+            # Whole-branch pin only; per-entry (list) pins surface through each
+            # tournament's period_label instead.
+            parts.append(
+                f"Reported in / as of (issue pinned by the plan): {branch.as_of}"
+            )
         parts.append(f"Candidate blocks — return at most {keep}:\n" + "\n".join(lines))
         user = "\n".join(parts)
 
@@ -531,7 +720,10 @@ Use each `block_id` exactly as it appears."""
                 raise ParseError(text, 'expected {"block_ids": [...]}')
             for i in ids:
                 if str(i) not in valid_ids:
-                    raise ParseError(text, f"unknown block_id {str(i)!r} — return only ids from the candidate list")
+                    raise ParseError(
+                        text,
+                        f"unknown block_id {str(i)!r} — return only ids from the candidate list",
+                    )
             return list(dict.fromkeys(str(i) for i in ids))[:keep]
 
         call: PromptedCall[list[str]] = PromptedCall(
@@ -547,6 +739,54 @@ Use each `block_id` exactly as it appears."""
         )
         return await call.call(ctx, user, temperature=0.0)
 
+    async def _tournament(
+        self,
+        ctx: ExecutionContext,
+        blocks: list[tuple[str, tuple[PageCatalogRow, int, ContentBlock]]],
+        question: str,
+        branch: RetrieveBranch,
+        *,
+        final_keep: int,
+        period_label: str | None = None,
+    ) -> tuple[list[str], int]:
+        """Tournament-reduce `blocks` to at most `final_keep` ids, best-first: while the
+        field exceeds one group, keep the best `_KEEP` of each `_GROUP_SIZE` group, then one
+        precision call over the survivors. Returns `(chosen_ids, rounds)`."""
+        by_id = dict(blocks)
+        current = blocks
+        rounds = 0
+        while len(current) > self._GROUP_SIZE:
+            rounds += 1
+            groups = chunk(current, self._GROUP_SIZE)
+            results = await asyncio.gather(
+                *(
+                    self._pick_blocks(
+                        ctx,
+                        g,
+                        question,
+                        branch,
+                        keep=self._KEEP,
+                        period_label=period_label,
+                    )
+                    for g in groups
+                )
+            )
+            survivor_ids = list(dict.fromkeys(bid for ids in results for bid in ids))
+            ctx.emit(
+                f"block_select_round round={rounds} groups={len(groups)} "
+                f"in={len(current)} survivors={len(survivor_ids)}"
+            )
+            current = [(bid, by_id[bid]) for bid in survivor_ids]
+            if not current:
+                break
+
+        if not current:
+            return [], rounds
+        chosen = await self._pick_blocks(
+            ctx, current, question, branch, keep=final_keep, period_label=period_label
+        )
+        return chosen, rounds
+
     async def select_blocks(
         self,
         refs: list[PageRef],
@@ -555,9 +795,16 @@ Use each `block_id` exactly as it appears."""
         question: str,
         branch: RetrieveBranch,
     ) -> list[BlockRef]:
-        """Tournament-reduce `refs` to at most `_KEEP` blocks for this branch. Uses
-        `get_page_store` to resolve continuation refs to their anchor rows. Returns `[]` if no
-        ref resolves to a catalog block."""
+        """Tournament-reduce `refs` to the branch's blocks. Uses `get_page_store` to resolve
+        continuation refs to their anchor rows. Returns `[]` if no ref resolves to a catalog
+        block.
+
+        A single-interval (or unpinned) period runs ONE tournament capped at `_KEEP`. A
+        multi-interval period (comma-separated) runs one tournament PER interval — over the
+        blocks whose data span overlaps that interval — each capped at `_KEEP_PER_INTERVAL`,
+        and unions the winners. A flat per-branch cap would let one interval's blocks crowd
+        out another's (and makes >_KEEP-interval questions unsatisfiable); there is
+        deliberately no global re-narrowing pass over the union."""
         store = get_page_store(str(pdf_dir))
 
         rows: list[PageCatalogRow] = []
@@ -578,31 +825,81 @@ Use each `block_id` exactly as it appears."""
         if not all_blocks:
             return []
 
-        current = list(all_blocks.items())
-        n0 = len(current)
-        rounds = 0
-        while len(current) > self._GROUP_SIZE:
-            rounds += 1
-            groups = chunk(current, self._GROUP_SIZE)
-            results = await asyncio.gather(
-                *(self._pick_blocks(ctx, g, question, branch, keep=self._KEEP) for g in groups)
-            )
-            survivor_ids = list(dict.fromkeys(bid for ids in results for bid in ids))
-            ctx.emit(
-                f"block_select_round round={rounds} groups={len(groups)} "
-                f"in={len(current)} survivors={len(survivor_ids)}"
-            )
-            current = [(bid, all_blocks[bid]) for bid in survivor_ids]
-            if not current:
-                break
+        items = list(all_blocks.items())
+        n0 = len(items)
+        entries = _branch_entries(branch)
 
-        chosen = await self._pick_blocks(ctx, current, question, branch, keep=self._KEEP) if current else []
+        def _entry_part(
+            e: _PeriodEntry,
+        ) -> list[tuple[str, tuple[PageCatalogRow, int, ContentBlock]]]:
+            # A pinned entry's pool is the pinned ISSUE's blocks only; an unpinned
+            # entry's pool is everything whose data span overlaps (no-interval pages
+            # join every pool).
+            return [
+                it
+                for it in items
+                if (e.pin is None or it[1][0].bulletin == e.pin)
+                and (
+                    it[1][0].date_interval is None
+                    or _overlaps(it[1][0].date_interval, [(e.lo, e.hi)])
+                )
+            ]
+
+        if entries and len(entries) > 1:
+            parts: list[
+                tuple[str, list[tuple[str, tuple[PageCatalogRow, int, ContentBlock]]]]
+            ] = []
+            for e in entries:
+                part = _entry_part(e)
+                if part:
+                    parts.append((e.label, part))
+            results = await asyncio.gather(
+                *(
+                    self._tournament(
+                        ctx,
+                        part,
+                        question,
+                        branch,
+                        final_keep=self._KEEP_PER_INTERVAL,
+                        period_label=label,
+                    )
+                    for label, part in parts
+                )
+            )
+            for (label, part), (ids, _) in zip(parts, results):
+                ctx.emit(
+                    f"block_select_interval interval={label!r} "
+                    f"candidates={len(part)} selected={len(ids)}"
+                )
+            rounds = max((r for _, r in results), default=0)
+            chosen = list(dict.fromkeys(bid for ids, _ in results for bid in ids))
+            cap = self._KEEP_PER_INTERVAL * len(parts)
+        else:
+            # Single entry (or no parseable period): one tournament. The label is
+            # rendered from the entry so a pinned period shows as prose, not raw `@`.
+            chosen, rounds = await self._tournament(
+                ctx,
+                items,
+                question,
+                branch,
+                final_keep=self._KEEP,
+                period_label=entries[0].label if entries else None,
+            )
+            cap = self._KEEP
+
         selected = []
         for bid in chosen:
             row, bi, block = all_blocks[bid]
-            selected.append(BlockRef(page=row.ref, block_index=bi, member_refs=tuple(row.block_refs(block)), block=block))
+            selected.append(
+                BlockRef(
+                    page=row.ref,
+                    block_index=bi,
+                    member_refs=tuple(row.block_refs(block)),
+                    block=block,
+                )
+            )
         ctx.emit(
             f"block_select key={branch.key!r} candidates={n0} rounds={rounds} "
-            f"selected_blocks={len(selected)} top_k={self._KEEP}"
+            f"selected_blocks={len(selected)} top_k={cap}"
         )
         return selected

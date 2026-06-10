@@ -9,6 +9,7 @@ process-wide token-bucket limiters (see `_RATE_LIMITS` / `get_rate_limiter`)."""
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import json
 import logging
@@ -46,6 +47,44 @@ class B64Image:
 
     mime: str
     data: str
+
+
+def pdf_path_for(bulletin: str, pdf_dir: Path | str) -> Path:
+    """'1953-06' -> <pdf_dir>/treasury_bulletin_1953_06.pdf. Inverse of the bulletin-id parse."""
+    year, mon = bulletin.split("-")
+    return Path(pdf_dir) / f"treasury_bulletin_{int(year):04d}_{int(mon):02d}.pdf"
+
+
+def render_page_b64(
+    month: str | None,
+    page: int | None,
+    *,
+    pdf_dir: Path | str,
+    dpi: int = 300,
+    fmt: str = "png",
+    jpg_quality: int | None = None,
+) -> B64Image | None:
+    """The single PDF-page rasterizer for the repo: render one page to in-memory image bytes via
+    PyMuPDF. Returns None when the PDF doesn't exist; PyMuPDF errors propagate. No disk cache (the
+    page store layers its own cache on top). `fitz` is imported lazily so importing `common`
+    doesn't pull in PyMuPDF."""
+    if month is None or page is None or int(page) <= 0:
+        return None
+    pdf_path = pdf_path_for(month, pdf_dir)
+    if not pdf_path.exists():
+        return None
+    import fitz
+
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    with fitz.open(pdf_path) as doc:
+        pix = doc[int(page) - 1].get_pixmap(matrix=mat)
+    if fmt == "jpg":
+        data = pix.tobytes("jpg", jpg_quality=jpg_quality if jpg_quality is not None else 95)
+        mime = "image/jpeg"
+    else:
+        data = pix.tobytes("png")
+        mime = "image/png"
+    return B64Image(mime=mime, data=base64.standard_b64encode(data).decode())
 
 
 # Process-scoped logger for code with no per-question ctx in scope (build
@@ -242,7 +281,7 @@ def parse_json_response(text: str) -> Any | None:
 
 def chunk(seq: list, n: int) -> list[list]:
     """Split `seq` into consecutive sub-lists of at most `n` items."""
-    return [seq[i:i + n] for i in range(0, len(seq), n)]
+    return [seq[i : i + n] for i in range(0, len(seq), n)]
 
 
 @dataclass
@@ -257,23 +296,16 @@ def make_genai_client() -> genai.Client:
     """Build a direct-Gemini (AI Studio) genai.Client from `GEMINI_API_KEY`.
     Auth via api-key; no GCP project required.
 
-    A per-request timeout (`SKUNK_LLM_TIMEOUT_S`, default 120s) is set so a runaway
-    "thinking" call — a known Gemini soft-limit issue where one request streams its
-    thought trace for minutes — raises `httpx.ReadTimeout` instead of hanging forever.
-    That exception is retryable (`llm_client._is_retryable`), so the call retries and
-    normally completes (runaways are sporadic). Without this, one stuck call wedges the
-    whole `asyncio.gather` over a batch — fatal at small semfilter batch sizes, where a
-    single UID fans out into thousands of concurrent single-page calls."""
-    from google.genai import types
-
+    No client-side request timeout is set: HttpOptions.timeout doubles as a
+    SERVER deadline (the API kills the request with 504 DEADLINE_EXCEEDED at
+    the cutoff), which turned long-thinking calls — e.g. Gemini 3.x Pro vision
+    reads that deliberate for minutes — into deterministic retry-storm failures.
+    Slow calls are given however long the transport allows; transport-level
+    connection faults still surface and are retried (`llm_client._is_retryable`)."""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not set (required for Gemini API)")
-    timeout_s = float(os.environ.get("SKUNK_LLM_TIMEOUT_S", "120"))
-    return genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(timeout=int(timeout_s * 1000)),  # SDK wants ms
-    )
+    return genai.Client(api_key=api_key)
 
 
 # --- Cross-cutting runtime types threaded between operators and the orchestrator ---
@@ -283,9 +315,9 @@ def make_genai_client() -> genai.Client:
 class PageRef:
     """Canonical page coordinate. Frozen so it's hashable — usable as a dict key
     and set member (e.g. the page-index catalog is keyed by `PageRef`)."""
-    month: str | None = None        # "YYYY-MM" (a.k.a. bulletin in the page index)
-    page: int | None = None         # 1-based PDF page index (canonical)
 
+    month: str | None = None  # "YYYY-MM" (a.k.a. bulletin in the page index)
+    page: int | None = None  # 1-based PDF page index (canonical)
 
     @property
     def year(self) -> int | None:
@@ -370,11 +402,13 @@ class AnnotatedValue(BaseModel):
 
     # Provenance — copied from the source page/branch at extract time, never
     # LLM-written. Defaults keep external lookups and old payloads valid.
-    bulletin: str | None = None        # source issue "YYYY-MM" (publication date)
-    pages: tuple[int, ...] = ()        # source PDF page(s); () when unattributable
-    as_of: str | None = None           # branch.as_of — pinned vintage requested
+    bulletin: str | None = None  # source issue "YYYY-MM" (publication date)
+    pages: tuple[int, ...] = ()  # source PDF page(s); () when unattributable
+    as_of: str | list[str | None] | None = (
+        None  # branch.as_of — pinned vintage requested (a list = per-period-entry pins)
+    )
     requested_period: str | None = None  # branch.period — data window requested
-    retrieve_key: str | None = None    # branch.key — concept this datum serves
+    retrieve_key: str | None = None  # branch.key — concept this datum serves
 
     @model_validator(mode="after")
     def _check_shape(self) -> AnnotatedValue:
@@ -435,7 +469,6 @@ class AnnotatedValue(BaseModel):
         return df
 
 
-_SAMPLE_ROWS = 2
 _PAD = "         "  # 9-space continuation indent for an entry's detail lines
 
 
@@ -459,8 +492,8 @@ def _provenance_str(e: AnnotatedValue) -> str:
 def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
     """Schema view of one `AnnotatedValue`: the meta line, then (for non-scalars) the
     full index labels — load-bearing, they're what generated code keys `.loc[...]` on,
-    and aren't otherwise in the prompt — plus a tiny `head` sample. Scalars show in full.
-    A `provenance:` line carries the machine-stamped source fields when present."""
+    and aren't otherwise in the prompt. Scalars show in full. A `provenance:` line
+    carries the machine-stamped source fields when present."""
     head = (
         f"  input_values[{i}]  description: {(e.description or '(no description)')!r}"
     )
@@ -496,20 +529,14 @@ def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
 
     labels = [str(x) for x in df.index]
     lines.append(f"{_PAD}index ({len(labels)} labels): [{', '.join(labels)}]")
-
-    with pd.option_context("display.max_columns", None, "display.width", 120):
-        rendered = df.head(_SAMPLE_ROWS).to_string()
-    lines.append(f"{_PAD}sample (first {min(_SAMPLE_ROWS, n_rows)} of {n_rows} rows):")
-    lines.extend(_PAD + ln for ln in rendered.splitlines())
     return lines
 
 
 def input_values_desc(input_values: list[AnnotatedValue]) -> str:
     """Render `input_values` for the codegen / re-planner prompts as a
-    **schema view** — axis labels + dtypes + a small `head` sample, NOT a full cell
-    dump. Generated code operates on the frames symbolically (full frames live in the
-    exec env), so it needs the labels (to write selections) and a small sample (number
-    encoding, sentinels, magnitude for the unit decision), not the interior grid."""
+    **schema view** — axis labels + dtypes, NOT a cell dump. Generated code operates
+    on the frames symbolically (full frames live in the exec env), so it needs the
+    labels (to write selections), not the interior grid."""
     lines = [f"input_values ({len(input_values)} entries)"]
     for i, e in enumerate(input_values):
         lines.extend(_describe_entry(i, e))
@@ -609,7 +636,7 @@ class ExecutionContext:
           emits carry `op=None` and rely on the message alone.
         - `message` is a single human-readable string. Lead it with a stable
           snake_case event key, then interpolate any variables inline
-          (`f"verifier_dropped n_dropped={n} n_parsed={m}"`). Keep large blobs out
+          (`f"extracted tier=parsed_json n_entries={n}"`). Keep large blobs out
           of the *message* (it must stay a scannable one-liner) — but they may go in
           `data` (see below).
         - `kind` is the event's semantic role for the trace viewer's color-coding
