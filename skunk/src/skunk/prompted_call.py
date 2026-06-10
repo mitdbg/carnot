@@ -164,6 +164,8 @@ class PromptedCall[T]:
         temperature: float = 0.0,
         effort: Effort | None = None,
         should_stop: Callable[[str], bool] | None = None,
+        max_output_tokens: int | None = None,
+        timeout_s: float | None = None,
     ) -> T:
         """Assemble the prompt, resolve effort, invoke the LLM, then parse into a
         typed result.
@@ -191,6 +193,8 @@ class PromptedCall[T]:
                     effort=eff,
                     ctx=ctx,
                     call_site=self.name,
+                    max_output_tokens=max_output_tokens,
+                    timeout_s=timeout_s,
                 )
                 try:
                     return self._parse(resp.text, ctx)
