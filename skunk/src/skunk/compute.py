@@ -93,12 +93,20 @@ Always read data through `e.frame`:
              `columns.name == e.col_name`.
 
 For each non-scalar entry the `input_values =` block below shows a schema view:
-the full axis labels (index labels + column names), per-column dtypes, and a
-2-row sample — NOT every cell. The full frame is what you get in the exec env;
-write code against it (`.loc[...]`, `.idxmax()`, etc.) using the labels shown.
+the full axis labels (index labels + column names) and per-column dtypes — NOT
+the cell values. The full frame is what you get in the exec env; write code
+against it (`.loc[...]`, `.idxmax()`, etc.) using the labels shown.
 Apply unit conversions once over the whole frame (e.g. `df * 1e-6`), never
 cell-by-cell.
 
+## Selecting inputs
+
+- Pick the entries you need from the `input_values =` block and reference
+  them by index (`input_values[7].frame`). Do not re-locate entries at
+  runtime by filtering on `.description`.
+- Entries may repeat. Pick the one whose description best matches the question's wording.
+  Do NOT use multiple entries for max/min/avg/sum/etc.
+  
 ## Output format
 
 Emit exactly one of the two forms below and nothing else — no prose,
@@ -124,7 +132,7 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
     _prompt = PromptedCall(
         name="compute.codegen",
         system_prompt=_SYSTEM_PROMPT,
-        default_effort="high",
+        default_effort="medium",
         output_instruction="Produce a fenced ```python``` block OR a bare missing-data JSON object.",
     )
 

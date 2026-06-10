@@ -315,8 +315,16 @@ REPORT_FIELDS = [
     # Free-text annotation. Auto-seeded with the failure reason for `fail` rows; blank
     # otherwise (a human refines it during triage).
     "note",
+    # The question text + `gold_answer`/`golden_pages`, mirrored under the trace viewer's
+    # expected column names so `eval/trace_viewer/` renders without per-schema patches:
+    # `golden_pages` is space-separated `month:page` tokens, and `failed`/`reason` are
+    # derived from `category`/`note` for its pass/fail badge.
+    "question",
     "predicted",
-    "gold",
+    "gold_answer",
+    "golden_pages",
+    "failed",
+    "reason",
     # n_hit/n_gold — retrieved pages (post block-select) that intersect the gold pages.
     "retrieval_recall",
     # Wall-clock span of the UID's trace log (first→last event), seconds.
@@ -542,14 +550,20 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
 
     retrieved_blocks = result.get("retrieved_blocks", [])
     category = "correct" if correct else ("fail" if result["failed"] else "wrong")
+    gold_report_pages = cfg.golden_report.get(uid) or []
     return {
         "uid": uid,
         "category": category,
         # Seed `note` with the failure reason so `fail` rows are self-describing; correct/
         # wrong rows start blank for manual triage.
         "note": (result["reason"] or "") if result["failed"] else "",
+        # Trace-viewer mirror columns (see REPORT_FIELDS). `golden_pages` uses the viewer's
+        # `month:page` token form; `failed`/`reason` feed its pass/fail badge.
+        "question": question,
         "predicted": predicted,
-        "gold": gold_answer,
+        "gold_answer": gold_answer,
+        "golden_pages": " ".join(f"{p.month}:{p.page}" for p in gold_report_pages),
+        "reason": result.get("reason") or "",
         "retrieval_recall": _retrieval_recall(retrieved_blocks, cfg.golden_report.get(uid)),
         # latency_s / cost_usd are filled in main() from the UID's trace log once it's
         # flushed (left blank under --no-traces).
@@ -670,6 +684,19 @@ def main() -> None:
     # event, tagged with uid/step_idx) alongside the per-question text traces.
     jsonl_path = str(trace_dir / "events.jsonl") if trace_dir else None
     configure_obs(jsonl_path=jsonl_path)
+
+    # Persist stdlib-logging warnings (LLM retry/timeout warnings from
+    # `llm_client._retry_call`, third-party libs) to the run dir. These have no
+    # per-question ctx so they bypass the event stream; without this sink they
+    # exist only on the console and vanish with the terminal.
+    import logging
+
+    from skunk.trace import _LineFormatter
+
+    warn_handler = logging.FileHandler(run_dir / "warnings.log")
+    warn_handler.setLevel(logging.WARNING)
+    warn_handler.setFormatter(_LineFormatter())
+    logging.getLogger().addHandler(warn_handler)
 
     print(f"[e2e] Run directory: {run_dir}")
     print(f"[e2e] Scoring with official cup scorer ({SCORER_VERSION}) at 0.0% rel-err.")

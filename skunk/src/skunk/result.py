@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from skunk.common import AnnotatedValue, PageRef
+from skunk.common import AnnotatedValue, PageRef, page_key_to_pageref
 from skunk.plan import Plan
 
 
@@ -79,6 +79,15 @@ def summarize_value(v: Any) -> dict:
         return {"type": "values", "values": [_summarize_annotated(e) for e in v]}
     if isinstance(v, str):
         return {"type": "answer", "answer": v}
+    if isinstance(v, list) and v and all(isinstance(x, str) for x in v):
+        # The search-agent retriever returns page keys ("YYYY_MM_pageid") rather than
+        # PageRefs. Parse them back so the node summary is the same "pages" shape the
+        # trace viewer renders; fall through to a plain list if any key doesn't parse.
+        try:
+            refs = [page_key_to_pageref(x) for x in v]
+            return {"type": "pages", "pages": [{"month": p.month, "page": p.page} for p in refs]}
+        except ValueError:
+            pass
     if isinstance(v, list):
         return {"type": "list", "n": len(v)}
     dump = getattr(v, "model_dump", None)
