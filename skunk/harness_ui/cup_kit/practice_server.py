@@ -27,7 +27,7 @@ Usage::
 
     python practice_server.py [--port 8765] [--host 127.0.0.1]
                               [--round-seconds 180]
-                              [--questions practice_questions.json]
+                              [--questions questions/practice_questions.json]
                               [--once] [--verbose]
 """
 
