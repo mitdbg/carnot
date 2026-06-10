@@ -64,10 +64,12 @@ def _is_retryable(e: BaseException) -> bool:
         code = getattr(e, "status_code", None)
         return code == 429 or (code is not None and 500 <= code < 600)
     # Transport faults: connection resets, read timeouts, DNS failures, etc.
-    # `TimeoutError` covers asyncio timeouts on the async SDK path; the genai
-    # async transport is aiohttp, whose connection faults (`ClientOSError`:
-    # broken pipe / reset) derive from `ClientConnectionError` — none of which
-    # the httpx/requests types below catch.
+    # `TimeoutError` covers both asyncio timeouts on the async SDK path and our own
+    # per-request wall-clock cap (asyncio.wait_for in the streaming path raises builtin
+    # TimeoutError) — treat a tripped timeout as a transient fault worth retrying, same as a
+    # transport-level read timeout. The genai async transport is aiohttp, whose connection
+    # faults (`ClientOSError`: broken pipe / reset) derive from `ClientConnectionError` — none
+    # of which the httpx/requests types below catch.
     retryable: tuple[type[BaseException], ...] = (
         TimeoutError,
         httpx.TimeoutException,
@@ -237,6 +239,9 @@ class LLMResponse:
     latency_s: float
     input_tokens: int | None
     output_tokens: int | None
+    # Cached (prompt-cache hit) input tokens, when the provider reports them.
+    # Subset of input_tokens; None when unknown.
+    cache_input_tokens: int | None = None
 
 
 def _make_openrouter_client() -> "OpenRouter":
@@ -438,12 +443,24 @@ class LLMClient:
         temperature: float,
         effort: Effort,
         model: str,
+        max_output_tokens: int = 65535,
+        timeout_s: float | None = None,
     ) -> types.GenerateContentConfig:
+        # NOTE: on Gemini 3.x `max_output_tokens` is a COMBINED budget for thinking
+        # + visible tokens, so it must stay comfortably above the effort tier's
+        # thinking spend (medium ≈ 2.5K, high ≈ 16K thinking tokens) or the visible
+        # answer is starved to empty (finish_reason=MAX_TOKENS). `timeout_s` sets the
+        # SDK's per-read HTTP timeout; the streaming path additionally enforces a
+        # hard wall-clock cap via asyncio.wait_for.
+        http_options = (
+            types.HttpOptions(timeout=int(timeout_s * 1000)) if timeout_s is not None else None
+        )
         return types.GenerateContentConfig(
             system_instruction=system,
-            max_output_tokens=65535,
+            max_output_tokens=max_output_tokens,
             temperature=temperature,
             thinking_config=LLMClient._effort_to_thinking_config(effort, model),
+            http_options=http_options,
         )
 
     @staticmethod
@@ -455,6 +472,7 @@ class LLMClient:
             "output_tokens": getattr(usage, "candidates_token_count", None),
             "total_tokens": getattr(usage, "total_token_count", None),
             "thinking_tokens": getattr(usage, "thoughts_token_count", None),
+            "cache_input_tokens": getattr(usage, "cached_content_token_count", None),
         }
 
     def _call_gemini(
@@ -495,6 +513,7 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
+                cache_input_tokens=toks.get("cache_input_tokens"),
             )
 
         return self._retry_call(do, model)
@@ -551,6 +570,7 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
+                cache_input_tokens=toks.get("cache_input_tokens"),
             )
 
         return await self._aretry_call(do, model)
@@ -597,7 +617,7 @@ class LLMClient:
         contents = [
             types.Content(
                 role="model" if m["role"] == "assistant" else "user",
-                parts=[types.Part.from_text(text=m["content"])],
+                parts=self._gemini_parts(m["content"], m.get("images")),
             )
             for m in messages
         ]
@@ -635,6 +655,7 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
+                cache_input_tokens=toks.get("cache_input_tokens"),
             )
 
         return self._retry_call(do, model_id)
@@ -650,11 +671,18 @@ class LLMClient:
         effort: Effort = "off",
         ctx: ExecutionContext | None = None,
         call_site: str = "llm",
+        max_output_tokens: int | None = None,
+        timeout_s: float | None = None,
     ) -> LLMResponse:
         """Async twin of `stream` — uses `client.aio.models.generate_content_stream`
-        and `async for`, so the event loop runs other tasks between chunks."""
+        and `async for`, so the event loop runs other tasks between chunks.
+
+        `max_output_tokens` overrides the per-call output cap (None → provider
+        default); `timeout_s` enforces a hard per-request wall-clock cap. Both are
+        opt-in and currently used only by the search agent (see `MultiTurnAgent`)."""
         kw = dict(system=system, messages=messages, model=model, should_stop=should_stop,
-                  temperature=temperature, effort=effort, ctx=ctx, call_site=call_site)
+                  temperature=temperature, effort=effort, ctx=ctx, call_site=call_site,
+                  max_output_tokens=max_output_tokens, timeout_s=timeout_s)
         if self._config.llm_provider == "openrouter":
             return await self._astream_openrouter(**kw) # type: ignore
         return await self._astream_gemini(**kw) # type: ignore
@@ -670,36 +698,56 @@ class LLMClient:
         effort: Effort = "off",
         ctx: ExecutionContext | None = None,
         call_site: str = "llm",
+        max_output_tokens: int | None = None,
+        timeout_s: float | None = None,
     ) -> LLMResponse:
         client = self._get_gemini_client()
         model_id = (model or self._config.llm_model).removeprefix("google/")
         contents = [
             types.Content(
                 role="model" if m["role"] == "assistant" else "user",
-                parts=[types.Part.from_text(text=m["content"])],
+                parts=self._gemini_parts(m["content"], m.get("images")),
             )
             for m in messages
         ]
-        gen_config = self._gemini_config(system, temperature, effort, model_id)
+        gen_config = self._gemini_config(
+            system, temperature, effort, model_id,
+            max_output_tokens if max_output_tokens is not None else 65535,
+            timeout_s,
+        )
 
-        async def do() -> LLMResponse:
-            t0 = time.monotonic()
+        async def _consume() -> tuple[str, Any]:
             resp_stream = await client.aio.models.generate_content_stream(
                 model=model_id, contents=contents, config=gen_config,  # type: ignore[arg-type]
             )
             accumulated = ""
             usage = None
-            async for chunk in resp_stream:
-                accumulated += chunk.text or ""
-                usage = getattr(chunk, "usage_metadata", None) or usage
-                if should_stop is not None and should_stop(accumulated):
-                    break
-            aclose = getattr(resp_stream, "aclose", None)
-            if aclose is not None:
-                try:  # noqa: SIM105
-                    await aclose()
-                except Exception:
-                    pass
+            try:
+                async for chunk in resp_stream:
+                    accumulated += chunk.text or ""
+                    usage = getattr(chunk, "usage_metadata", None) or usage
+                    if should_stop is not None and should_stop(accumulated):
+                        break
+            finally:
+                # Runs on normal completion AND on wait_for cancellation, so a
+                # timed-out stream still releases its connection.
+                aclose = getattr(resp_stream, "aclose", None)
+                if aclose is not None:
+                    try:  # noqa: SIM105
+                        await aclose()
+                    except Exception:
+                        pass
+            return accumulated, usage
+
+        async def do() -> LLMResponse:
+            t0 = time.monotonic()
+            if timeout_s is not None:
+                # Hard wall-clock cap: http_options.timeout is only per-read, so a
+                # slow-but-steady runaway would never trip it. On timeout this raises
+                # TimeoutError, which `_is_retryable` treats as a transient fault.
+                accumulated, usage = await asyncio.wait_for(_consume(), timeout_s)
+            else:
+                accumulated, usage = await _consume()
             latency_s = time.monotonic() - t0
             toks = self._usage_tokens(usage)
             if ctx is not None:
@@ -714,6 +762,7 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
+                cache_input_tokens=toks.get("cache_input_tokens"),
             )
 
         return await self._aretry_call(do, model_id)
@@ -755,10 +804,12 @@ class LLMClient:
     @staticmethod
     def _usage_tokens_openrouter(usage: Any) -> dict:
         """Token counts from an OpenRouter `ChatUsage` (best-effort — any may be None)."""
+        details = getattr(usage, "prompt_tokens_details", None)
         return {
             "input_tokens": getattr(usage, "prompt_tokens", None),
             "output_tokens": getattr(usage, "completion_tokens", None),
             "total_tokens": getattr(usage, "total_tokens", None),
+            "cache_input_tokens": getattr(details, "cached_tokens", None) if details else None,
         }
 
     def _call_openrouter(
@@ -802,6 +853,7 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
+                cache_input_tokens=toks.get("cache_input_tokens"),
             )
 
         return self._retry_call(do, model)
@@ -856,6 +908,7 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
+                cache_input_tokens=toks.get("cache_input_tokens"),
             )
 
         return await self._aretry_call(do, model)
@@ -868,7 +921,10 @@ class LLMClient:
         if system:
             out.append({"role": "system", "content": system})
         out.extend(
-            {"role": "assistant" if m["role"] == "assistant" else "user", "content": m["content"]}
+            {
+                "role": "assistant" if m["role"] == "assistant" else "user",
+                "content": LLMClient._openrouter_content(m["content"], m.get("images")),
+            }
             for m in messages
         )
         return out
@@ -925,6 +981,7 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
+                cache_input_tokens=toks.get("cache_input_tokens"),
             )
 
         return self._retry_call(do, model_id)
@@ -940,26 +997,36 @@ class LLMClient:
         effort: Effort = "off",
         ctx: ExecutionContext | None = None,
         call_site: str = "llm",
+        max_output_tokens: int | None = None,
+        timeout_s: float | None = None,
     ) -> LLMResponse:
         """Async twin of `_stream_openrouter` — uses `client.chat.send_async` + `async for`."""
         client = self._get_openrouter_client()
         model_id = model or self._config.llm_model
         or_messages = self._openrouter_chat_messages(system, messages)
         reasoning = self._effort_to_reasoning(effort)
+        extra = {"max_tokens": max_output_tokens} if max_output_tokens is not None else {}
 
-        async def do() -> LLMResponse:
-            t0 = time.monotonic()
+        async def _consume() -> tuple[str, Any]:
             accumulated = ""
             usage = None
             async with await client.chat.send_async(
                 model=model_id, messages=or_messages, stream=True, # type: ignore
-                temperature=temperature, reasoning=reasoning, # type: ignore
+                temperature=temperature, reasoning=reasoning, **extra, # type: ignore
             ) as resp_stream:
                 async for chunk in resp_stream:
                     accumulated += self._openrouter_chunk_text(chunk)
                     usage = getattr(chunk, "usage", None) or usage
                     if should_stop is not None and should_stop(accumulated):
                         break
+            return accumulated, usage
+
+        async def do() -> LLMResponse:
+            t0 = time.monotonic()
+            if timeout_s is not None:
+                accumulated, usage = await asyncio.wait_for(_consume(), timeout_s)
+            else:
+                accumulated, usage = await _consume()
             latency_s = time.monotonic() - t0
             toks = self._usage_tokens_openrouter(usage)
             if ctx is not None:
@@ -974,6 +1041,7 @@ class LLMClient:
                 latency_s=latency_s,
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
+                cache_input_tokens=toks.get("cache_input_tokens"),
             )
 
         return await self._aretry_call(do, model_id)

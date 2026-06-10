@@ -93,8 +93,41 @@ def dump_trace(
 def _format_event(ev: dict) -> list[str]:
     """Render one captured event as an indented trace line: the event `message`
     (prefixed with the level when not "info"), capped for scannability — the JSONL
-    sink keeps the full text."""
+    sink keeps the full text.
+
+    Operator boundary (`step`) events also carry a structured `data.summary` of
+    what the operator committed; we expand the `pages` / `values` shapes here so the
+    retrieved documents, extracted values, and external lookup values land in the
+    human-readable trace (not only the JSONL sink). The raw `message` already
+    elides these (it holds a short `output=` description), so without this they were
+    invisible in `.txt`/`.log`."""
     msg = ev.get("message", "")
     level = ev.get("level", "info")
     prefix = f"{level.upper()} " if level != "info" else ""
-    return [f"    {prefix}{truncate(msg, _TRACE_FIELD_MAX_REPR, '...(truncated)')}"]
+    lines = [f"    {prefix}{truncate(msg, _TRACE_FIELD_MAX_REPR, '...(truncated)')}"]
+    summary = (ev.get("data") or {}).get("summary")
+    if summary:
+        lines.extend(_format_summary(summary))
+    return lines
+
+
+def _format_summary(summary: dict) -> list[str]:
+    """Expand an operator's committed value summary (`result.summarize_value`) into
+    full trace lines. Renders the `pages` shape (a retrieve's documents) and the
+    `values` shape (an extract's values / an external lookup's values); other shapes
+    (plan, answer, …) are already conveyed by the message and produce no extra lines."""
+    kind = summary.get("type")
+    if kind == "pages":
+        pages = summary.get("pages", [])
+        lines = [f"      committed {len(pages)} retrieved document(s):"]
+        lines += [f"        - month={p.get('month')} page={p.get('page')}" for p in pages]
+        return lines
+    if kind == "values":
+        values = summary.get("values", [])
+        lines = [f"      committed {len(values)} value(s):"]
+        for e in values:
+            unit = f" [{e['unit']}]" if e.get("unit") else ""
+            val = truncate(repr(e.get("value")), _TRACE_FIELD_MAX_REPR, "...(truncated)")
+            lines.append(f"        - {e.get('description', '')}: {val}{unit}")
+        return lines
+    return []
