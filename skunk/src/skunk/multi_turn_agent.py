@@ -407,6 +407,7 @@ Requirements for the final answer:
                     data={"text": step_out.raw},
                 )
                 if step_out.code is not None:
+                    ctx.emit(f"tool_code {step_out.code!r}")
                     # Inline (not to_thread): tool code runs on this question's worker
                     # thread; blocking here only affects sibling branches of the question.
                     out = executor(step_out.code)

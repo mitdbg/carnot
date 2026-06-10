@@ -14,47 +14,32 @@ overrides:
   # Corpus blurbs — one per agent that mentions the dataset.
   # ---------------------------------------------------------------------
   - section: corpus
-    targets: [planner]
+    targets: [planner, replanner]
     content: |
       Questions are answered against the U.S. Treasury Monthly Bulletins,
-      a 696-document corpus of monthly Treasury bulletins (1939–2025) under
-      the OfficeQA harness.
+      a 696-document corpus spanning 1939–2025. Emit period and as_of as
+      canonical month ranges (YYYY-MM, YYYY-MM..YYYY-MM, or a comma-separated
+      list of these), never natural language — expand fiscal years, calendar
+      years, and quarters to months yourself per the date conventions below.
 
-      Each bulletin is organized into recurring sections; the value a question
-      needs almost always sits in one of them:
-        - Profile of the Economy — U.S. macro conditions in narrative + charts:
-          real GDP growth, employment/payrolls, unemployment, prices/inflation,
-          and the personal saving rate (often plotted, not tabulated).
-        - Federal Fiscal Operations — receipts, outlays, surplus/deficit by
-          month/fiscal year, agency, and function.
-        - Federal Debt — public debt outstanding, ownership of federal
-          securities, and debt as a percent of GDP (carries nominal GDP).
-        - Treasury financing & securities — auction results, offerings, and
-          market quotations (yields and bid/ask prices) for bills, notes,
-          bonds, and TIPS.
-        - Trust funds — Social Security (OASI/DI), Highway, and other federal
-          trust-fund receipts, expenditures, and balances.
-        - International — foreign currency positions, Treasury reporting rates
-          of exchange, and capital movements (TIC).
-
-      Period-string syntax this corpus uses (free-form NL accepted; the
-      examples below are the conventions most legible to the retriever):
-        `CY1940`         calendar year 1940
-        `FY1939`         fiscal year 1939
-        `CY1953..CY1955` range, inclusive
-        `2025-03`        single bulletin month
-        `2025-03-31`     specific date
+  # Shared date math — the planner expands question dates; the page-index build
+  # agents resolve dates printed on a page. Same conventions, stated once.
+  - section: corpus
+    targets: [planner, replanner, page_scan, page_scan_vision, toc_outline, toc_reconstruct, chapter_merge, era_segment, era_merge]
+    content: |
+      Date conventions. Carefully distinguish fiscal year (FY) from calendar year
+      (CY). Calendar year YYYY = YYYY-01..YYYY-12. Quarter Qn YYYY =
+      that quarter's three months (Q2 2023 = 2023-04..2023-06). Fiscal year FYy =
+      the 12 months ending in year y: (y-1)-10..y-09 from FY1977 on,
+      (y-1)-07..y-06 before 1977 (FY2008 = 2007-10..2008-09;
+      FY1939 = 1938-07..1939-06). The months 1976-07..1976-09 are the
+      FY1976→FY1977 "transition quarter" and belong to neither fiscal year —
+      pin them directly.
 
   - section: corpus
-    targets: [extract.text]
+    targets: [extract.text, extract.vision]
     content: |
-      The pages you receive are from the U.S. Treasury Bulletins.
-
-  - section: corpus
-    targets: [extract.vision]
-    content: |
-      The page images you receive are scanned pages from the U.S. Treasury
-      Monthly Bulletins.
+      The pages you receive are from the U.S. Treasury Monthly Bulletins.
 
   # Renders under the search-agent SYSTEM prompt's `## Dataset` header.
   # Lifted from the abandoned `officeqa_special_notes` blob in the old
@@ -94,17 +79,39 @@ overrides:
       ```
 
   # ---------------------------------------------------------------------
+  # Page-index build family — per-page scan, ToC extraction/reconstruction,
+  # and the cross-issue chapter merge + era segmentation. All reason over the
+  # same Treasury section taxonomy, so they share this corpus blurb.
+  # ---------------------------------------------------------------------
+  - section: corpus
+    targets: [page_scan, page_scan_vision, toc_outline, toc_reconstruct, chapter_merge, era_segment, era_merge]
+    content: |
+      The pages are from the U.S. Treasury Monthly Bulletin — monthly
+      federal-finance statistics (public debt, receipts/outlays, ownership of
+      Treasury securities, exchange stabilization, foreign currency positions,
+      trust funds). Resolve relative or partial dates against the publication
+      month.
+
+  - section: lessons
+    targets: [page_scan, page_scan_vision]
+    content: >
+      A cumulative table of contents — a multi-month / multi-issue contents
+      grid, usually at the back of the issue — is NOT the issue's table of
+      contents; label it non_content.
+
+  # ---------------------------------------------------------------------
   # Planner lessons — gotchas observed against this corpus.
   # ---------------------------------------------------------------------
   - section: lessons
-    targets: [planner]
+    targets: [planner, replanner]
     content: |
-      One concept per `retrieve.key`. If a question names multiple values (two currencies, two indices, two agencies, two bond classes, ...), emit ONE branch per value rather than bundling — branches run in parallel and splitting is cheap, while bundling forces retrieval to find a single page covering everything. A JPY-vs-GBP question should emit four branches (JPY position, GBP position, JPY/USD rate, GBP/USD rate), not one branch keyed "exchange rates for JPY and GBP".
+      One concept per `retrieve.key`. If a question names multiple values (two currencies, two indices, two agencies, two bond classes, ...), emit ONE branch per value rather than bundling — branches run in parallel and splitting is cheap, while bundling forces retrieval to find a single page covering everything. 
+      The converse also holds: one branch per concept. Do not emit several branches that re-describe the same table/statistic ("bids submitted for note X", "allotments of note X", "operations for note X" = ONE branch), and do not split the same concept across periods into same-key branches — use one branch with a comma-separated period ("1940-01..1940-12, 1953-01..1953-12").
 
-      Default to `retrieve`. When in doubt about whether a value is in the corpus, use `retrieve` first — you will get a chance to replan it as a `lookup_external` if it turns out not to be there. The two errors are not symmetric: a `retrieve` that finds nothing fails loudly and is automatically replanned, whereas a wrong `lookup_external` silently returns a different (often later-revised) vintage and is never corrected. Reach for `lookup_external` only when the value has no plausible home in any Treasury Bulletin.
-
-      Prefer the corpus ESPECIALLY for "as reported" / vintage questions. A live external lookup returns today's revised figures; a series like GDP is revised over time, so the bulletin's as-of-that-date value is the correct one and an external lookup would silently give a wrong number. Retrieve it from the named bulletin (set `as_of`).
-
+  - section: lessons
+    targets: [replanner]
+    content: |
+      When replanning, carefully review as_of first and prefer dropping it if its choice could have caused lookup failure. Only switch to external lookup if you are convinced that the retrieval term was correct and the corpus does not contain the information requested
   # ---------------------------------------------------------------------
   # Planner few-shots. Each entry is a pre-formatted block that lands
   # verbatim under the planner's "## Few-shot examples" header.
@@ -113,87 +120,126 @@ overrides:
     targets: [planner]
     content:
       - |
-        ### Example
+        ### Example (plain date range, NO bulletin named → period only; leave as_of null — do NOT infer a "vintage" issue from the data years. Same concept, two periods → ONE branch, comma-separated period)
         Q: Absolute percent change in national defense expenditures between CY1940 and CY1953, rounded to hundredths.
-        Why this shape: One closed-form calculation over two scalar lookups. The question itself states the formula, the absolute/percent-form choices, and the rounding; compute reads them from the verbatim question.
         Plan:
         ```json
         {
           "branches": [
             {"kind": "retrieve", "key": "national defense expenditures",
-             "period": "CY1940"},
-            {"kind": "retrieve", "key": "national defense expenditures",
-             "period": "CY1953"}
+             "period": "1940-01..1940-12, 1953-01..1953-12"}
           ]
         }
         ```
 
       - |
-        ### Example
+        ### Example (a needed value looks external (CPI) — still emit a retrieve for it, keyed by the question's wording. If the corpus has no such value, the lookup is injected at replan; never emit lookup_external here.)
         Q: Real (CPI-adjusted, 2020 dollars) value of total national defense expenditures in CY1953.
-        Why this shape: Nominal value from the corpus, deflator from outside it. `src` biases the external lookup toward the canonical BLS series.
         Plan:
         ```json
         {
           "branches": [
             {"kind": "retrieve", "key": "national defense expenditures",
-             "period": "CY1953"},
-            {"kind": "lookup_external",
-             "target": "U.S. CPI-U annual average for 1953 (base 2020=100)",
-             "src": "Bureau of Labor Statistics"}
+             "period": "1953-01..1953-12"},
+            {"kind": "retrieve", "key": "CPI",
+             "period": "1953-01..1953-12"}
           ]
         }
         ```
 
       - |
-        ### Example
-        Q: Read the total debt held by the public from the September 1990 Treasury Bulletin chart on page 5.
-        Why this shape: Chart read with visual_only=True. Direct lookup, no calculation.
+        ### Example (named issue ≠ data window → as_of and period DIFFER)
+        Q: Read the total debt held by the public for December 1985 from the chart in the September 1990 Treasury Bulletin.
         Plan:
         ```json
         {
           "branches": [
-            {"kind": "retrieve", "key": "chart of total debt held by the public",
-             "period": "1990-09",
+            {"kind": "retrieve", "key": "total debt held by the public",
+             "period": "1985-12", "as_of": "1990-09",
              "visual_only": true}
           ]
         }
         ```
 
       - |
-        ### Example (multi-period external series: ONE branch, list payload)
-        Q: Sum of annual U.S. CPI-U for 1950, 1951, and 1952.
-        Why this shape: Same external series across consecutive years → ONE lookup_external branch with a multi-period target, NOT three. The lookup agent returns a labeled series (a vector keyed by year); compute sums it.
+        ### Example (named issue applies to ONE period entry only → as_of array aligned with period entries, null = unpinned)
+        Q: Difference between net interest outlays in FY1981 and the FY1980 figure as printed in the November 1981 Bulletin.
         Plan:
         ```json
         {
           "branches": [
-            {"kind": "lookup_external",
-             "target": "U.S. CPI-U annual averages for 1950, 1951, 1952",
-             "src": "Bureau of Labor Statistics"}
+            {"kind": "retrieve", "key": "net interest outlays",
+             "period": "1980-10..1981-09, 1979-10..1980-09",
+             "as_of": [null, "1981-11"]}
           ]
         }
         ```
 
       - |
-        ### Example (vintage: data period ≠ report date; reprinted GDP via retrieve)
+        ### Example (vintage: data period ≠ report date; reprinted GDP via retrieve. Two concepts × two periods → TWO branches, comma-separated periods)
         Q: Using the figures reported in the September 2012 Treasury Bulletin, what was the change in federal debt held by the public as a percent of GDP between the end of fiscal year 2008 and fiscal year 2010?
-        Why this shape: An "as reported in bulletin Y" (vintage) question. The DATA periods are FY2008 and FY2010 → `period`; the reporting vintage is the Sept-2012 bulletin → `as_of`. Never put the report year (2012) in `period` — that is what `as_of` is for. GDP is reprinted in the Bulletin's debt-to-GDP tables, so it is a `retrieve` of the as-of-2012 vintage, NOT a `lookup_external` (which would return today's revised GDP → wrong answer). One branch per (series, period).
         Plan:
         ```json
         {
           "branches": [
             {"kind": "retrieve", "key": "federal debt held by the public",
-             "period": "FY2008", "as_of": "September 2012 bulletin"},
-            {"kind": "retrieve", "key": "federal debt held by the public",
-             "period": "FY2010", "as_of": "September 2012 bulletin"},
-            {"kind": "retrieve", "key": "nominal gross domestic product",
-             "period": "FY2008", "as_of": "September 2012 bulletin"},
-            {"kind": "retrieve", "key": "nominal gross domestic product",
-             "period": "FY2010", "as_of": "September 2012 bulletin"}
+             "period": "2007-10..2008-09, 2009-10..2010-09", "as_of": "2012-09"},
+            {"kind": "retrieve", "key": "GDP",
+             "period": "2007-10..2008-09, 2009-10..2010-09", "as_of": "2012-09"}
           ]
         }
         ```
+
+
+  # ---------------------------------------------------------------------
+  # Replanner few-shots. Diff-shaped examples — the replanner emits a PlanDiff
+  # (add/drop), not a whole Plan, so it does NOT share the planner few-shots
+  # above (those render full `branches` plans). lookup_external is a REPLAN-ONLY
+  # branch (the initial plan is retrieve-only), so the lookup-injection path is
+  # shown here, not in the planner few-shots. The add/drop rules themselves live
+  # in the replan system prompt and are not restated.
+  # ---------------------------------------------------------------------
+  - section: few_shots
+    targets: [replanner]
+    content:
+      - |
+        ### Example (one branch failed → drop it by index, re-add reworded; keep the branch that succeeded)
+        prior_plan.branches:
+          [0] {"kind": "retrieve", "key": "unemployment insurance tax receipts", "period": "2009-01..2009-12"}
+          [1] {"kind": "retrieve", "key": "national defense expenditures", "period": "2009-01..2009-12"}
+        Branch [0] FAILED: retrieval found no table named for "unemployment insurance
+        tax receipts" — the corpus files these receipts under the Unemployment Trust
+        Fund. Branch [1] succeeded and its value is already in prev.
+        PlanDiff:
+        ```json
+        {
+          "add": [
+            {"kind": "retrieve", "key": "Unemployment Trust Fund receipts",
+             "period": "2009-01..2009-12"}
+          ],
+          "drop": [0]
+        }
+        ```
+
+      - |
+        ### Example (a value is not in the corpus → drop the doomed retrieve, inject a lookup_external)
+        prior_plan.branches:
+          [0] {"kind": "retrieve", "key": "national defense expenditures", "period": "1953-01..1953-12"}
+          [1] {"kind": "retrieve", "key": "CPI", "period": "1953-01..1953-12"}
+        Branch [1] FAILED: no consumer-price index series anywhere in the Treasury
+        Bulletin corpus. Branch [0] succeeded (in prev). What was missing: cpi:1953.
+        The question named no publisher, so leave `src` null.
+        PlanDiff:
+        ```json
+        {
+          "add": [
+            {"kind": "lookup_external",
+             "target": "U.S. CPI-U annual average for 1953 (base 2020=100)"}
+          ],
+          "drop": [1]
+        }
+        ```
+
 
   # ---------------------------------------------------------------------
   # Corpus blurbs for the remaining executors.
@@ -202,10 +248,16 @@ overrides:
     targets: [compute.codegen]
     content: |
       The values in `input_values` were extracted from U.S. Treasury Monthly
-      Bulletin pages. Common units in this corpus: `usd`, `usd_thousands`,
-      `usd_millions`, `usd_billions`, `pct`, `count`, `year`, `rate`,
-      `fx_rate`, `text`. Foreign currency follows `<iso3>_<scale>`
-      (e.g. `jpy_billions`, `gbp_millions`).
+      Bulletin pages.
+
+  # Shared unit vocabulary — emitted by compute and lookup_external alike.
+  - section: corpus
+    targets: [compute.codegen, lookup_external]
+    content: |
+      Unit tokens for this corpus: `usd`, `usd_thousands`, `usd_millions`,
+      `usd_billions`, `pct`, `count`, `year`, `rate`, `fx_rate`, `cpi`, `text`.
+      Foreign currency follows `<iso3>_<scale>` (e.g. `jpy_billions`,
+      `gbp_millions`).
 
   - section: corpus
     targets: [lookup_external]
@@ -216,17 +268,8 @@ overrides:
       do not carry directly.
 
   # ---------------------------------------------------------------------
-  # Extract lessons — gotchas observed against this corpus.
+  # Extract lessons
   # ---------------------------------------------------------------------
-  - section: lessons
-    targets: [extract.text]
-    content: >
-      Vector vs table for 2-D grids: when the page prints a 2-D year×month
-      grid but the question reads as a 1-D series ("every month from X to
-      Y"), emit ONE vector with combined ISO keys ("1942-03", "1942-04",
-      ...) rather than a table. Use table only when the question genuinely
-      compares rows against columns.
-
   - section: lessons
     targets: [extract.text, extract.vision]
     content: >
@@ -234,17 +277,23 @@ overrides:
       parenthetical legend, footnote like "(In millions of dollars)".
       Never guess from magnitude: if the page shows "74" under a "billions
       of yen" header, emit value=74 and unit=jpy_billions. Do not silently
-      rescale or convert foreign currency to USD — leave it native, and
-      downstream compute will apply the FX rate.
+      rescale or convert foreign currency to USD — leave it native.
 
   - section: lessons
     targets: [extract.text, extract.vision]
     content: >
-      Unit tokens for this corpus: `usd`, `usd_thousands`, `usd_millions`,
-      `usd_billions`, `pct`, `count`, `year`, `rate`, `fx_rate`, `text`.
-      Foreign currency follows `<iso3>_<scale>` (e.g. `jpy_billions`,
-      `gbp_millions`). Use `mixed` only when one cell genuinely combines
-      incompatible units.
+      Watch for qualifier-mismatched rows. Treasury tables stack rows whose
+      labels differ by a single subtle modifier — "Total Public Debt
+      Securities" vs "Total interest-bearing debt", gross vs net, total vs
+      a subtotal, "held by the public" vs "intragovernmental", outstanding
+      vs issued. The lookup is satisfied only by a row matching the requested series
+      including EVERY qualifier. Do not substitute a near-label row for the
+      exact series. When the page has several qualifier-variants, emit each
+      as its own entry with the page's verbatim row text in `description`
+      (so the modifier is visible downstream) rather than collapsing to one.
+      When the only row present is a near-match (the exact series is not on
+      the page), still emit it, but make the qualifier difference explicit
+      in `description` — never present it as the exact series.
 
   # ---------------------------------------------------------------------
   # Compute lessons.
@@ -252,47 +301,10 @@ overrides:
   - section: lessons
     targets: [compute.codegen]
     content: >
-      Numeric modifiers — each modifier present in the question MUST appear
-      as an explicit operation, not a comment. Common forms: `signed` vs
-      `absolute` — never silently abs()
-      a value meant signed; `normalized` / `midpoint normalized` — apply
-      explicitly ((V2-V1)/((V1+V2)/2)); `log of` / `ln(...)` — wrap in
-      np.log; `per capita` — divide by population; `in percent form` vs
-      `as a decimal` — scale by 100 and format the result string to match.
-
-  - section: lessons
-    targets: [compute.codegen]
-    content: >
-      FX direction: when the question wants USD and an input is foreign
-      (`<iso3>_<scale>`), locate the matching `fx_rate` entry and apply
-      it — `value * rate` if the rate is "USD per <iso>", `value / rate`
-      if "<iso> per USD". Read the rate's description for direction; do
-      not guess.
-
-  - section: lessons
-    targets: [compute.codegen]
-    content: >
-      Scale conversion: when an input value's scale differs from the unit the
-      question asks for (e.g. value in `usd_thousands`, question wants millions),
-      convert it — apply the conversion once over the whole payload, never
-      cell-by-cell.
-
-  - section: lessons
-    targets: [compute.codegen]
-    content: >
       Prefer a printed total/summary row over re-aggregating its
       components when both are present in `input_values`. Bulletin tables
       print their own totals; the printed figure is authoritative and
       avoids rounding drift from summing parts.
-
-  # ---------------------------------------------------------------------
-  # lookup_external lessons.
-  # ---------------------------------------------------------------------
-  - section: lessons
-    targets: [lookup_external]
-    content: >
-      Unit tokens commonly used here: `year`, `cpi`, `fx_rate`,
-      `usd_millions`, `usd_billions`, `pct`, `count`, `rate`, `text`.
 
   # ---------------------------------------------------------------------
   # Few-shots for compute executors.
@@ -303,24 +315,24 @@ overrides:
       - |
         ### Example (closed-form, two scalars)
         Q: Absolute percent change in national defense expenditures between CY1940 and CY1953.
-        input_values: two scalars — national defense expenditures for CY1940 and for CY1953, both unit=usd_millions.
-        Why this shape: Pick each by its description, apply (B-A)/A·100, abs(), format. No unit conversion needed (same scale).
+        input_values: two scalars — [0] national defense expenditures for CY1940, [1] same for CY1953, both unit=usd_millions.
+        Why this shape: Identify each entry in the input_values block, reference it by index, apply (B-A)/A·100, abs(), format. No unit conversion needed (same scale).
         Output:
         ```python
-        a = next(e for e in input_values if 'CY1940' in e.description).value
-        b = next(e for e in input_values if 'CY1953' in e.description).value
+        a = input_values[0].value  # national defense expenditures, CY1940
+        b = input_values[1].value  # national defense expenditures, CY1953
         result = f'{abs((b - a) / a * 100):.2f}'
         ```
 
       - |
         ### Example (FX conversion)
         Q: JPY net options position in millions of USD, mid-March 2016.
-        input_values: scalar value=2300 unit=jpy_billions, and scalar unit=fx_rate description="JPY per USD spot, 2016-03".
-        Why this shape: Foreign currency → locate the fx_rate, read direction from its description ("JPY per USD" → divide), then rescale billions → millions.
+        input_values: [0] scalar value=2300 unit=jpy_billions, [1] scalar unit=fx_rate description="JPY per USD spot, 2016-03".
+        Why this shape: Foreign currency → find the fx_rate entry in the block, read direction from its description ("JPY per USD" → divide), then rescale billions → millions.
         Output:
         ```python
-        jpy_b = next(e for e in input_values if e.unit == 'jpy_billions').value
-        rate  = next(e for e in input_values if e.unit == 'fx_rate').value  # JPY per USD
+        jpy_b = input_values[0].value  # 2300, jpy_billions
+        rate  = input_values[1].value  # JPY per USD spot → divide
         usd_m = jpy_b * 1000 / rate
         result = f'{usd_m:,.2f}'
         ```

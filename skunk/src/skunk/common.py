@@ -9,6 +9,7 @@ process-wide token-bucket limiters (see `_RATE_LIMITS` / `get_rate_limiter`)."""
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import json
 import logging
@@ -16,6 +17,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,6 +33,7 @@ from skunk.config import SkunkConfig
 if TYPE_CHECKING:
     from skunk.llm_client import LLMClient
     from skunk.prompted_call import PromptOverride
+    from skunk.page_index.data_model import ContentBlock
 
 # Reasoning-effort knob, mapped onto Gemini's `thinking_level` enum. "off" means
 # no thinking; "minimal" is the cheapest thinking tier.
@@ -46,13 +49,61 @@ class B64Image:
     data: str
 
 
+def pdf_path_for(bulletin: str, pdf_dir: Path | str) -> Path:
+    """'1953-06' -> <pdf_dir>/treasury_bulletin_1953_06.pdf. Inverse of the bulletin-id parse."""
+    year, mon = bulletin.split("-")
+    return Path(pdf_dir) / f"treasury_bulletin_{int(year):04d}_{int(mon):02d}.pdf"
+
+
+def render_page_b64(
+    month: str | None,
+    page: int | None,
+    *,
+    pdf_dir: Path | str,
+    dpi: int = 300,
+    fmt: str = "png",
+    jpg_quality: int | None = None,
+) -> B64Image | None:
+    """The single PDF-page rasterizer for the repo: render one page to in-memory image bytes via
+    PyMuPDF. Returns None when the PDF doesn't exist; PyMuPDF errors propagate. No disk cache (the
+    page store layers its own cache on top). `fitz` is imported lazily so importing `common`
+    doesn't pull in PyMuPDF."""
+    if month is None or page is None or int(page) <= 0:
+        return None
+    pdf_path = pdf_path_for(month, pdf_dir)
+    if not pdf_path.exists():
+        return None
+    import fitz
+
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    with fitz.open(pdf_path) as doc:
+        pix = doc[int(page) - 1].get_pixmap(matrix=mat)
+    if fmt == "jpg":
+        data = pix.tobytes("jpg", jpg_quality=jpg_quality if jpg_quality is not None else 95)
+        mime = "image/jpeg"
+    else:
+        data = pix.tobytes("png")
+        mime = "image/png"
+    return B64Image(mime=mime, data=base64.standard_b64encode(data).decode())
+
+
 # Process-scoped logger for code with no per-question ctx in scope (build
 # pipelines, offline prep); request-path code uses `ctx.emit` instead.
 log = logging.getLogger(__name__)
 
 
 class _RateLimiter:
-    """Process-wide request rate limiter. Blocks until a request slot is free."""
+    """Process-wide token-bucket rate limiter with BOTH interfaces over ONE bucket.
+
+    `acquire()` blocks the calling thread; `acquire_async()` yields to the event loop. Both
+    draw from the same tokens, so a name's rate cap holds whether it's hit from sync code
+    (offline build, the `requests`-based lookup tools, embeddings prep, the sync LLM path) or
+    from async code (the async request-path LLM calls).
+
+    Thread-safe: a `threading.Condition` guards the refill+deduct. The async path holds that
+    lock only across the (non-awaiting) token math and sleeps via `asyncio.sleep` OUTSIDE it,
+    so it never blocks its event loop. Sync waiters block on `cond.wait(timeout)` and re-check
+    on timeout, so no notify is needed when the async path deducts (and vice versa)."""
 
     def __init__(self, rate_per_sec: float) -> None:
         if rate_per_sec <= 0:
@@ -74,7 +125,7 @@ class _RateLimiter:
         self._last_refill = now
 
     def acquire(self) -> None:
-        """Block until 1 request slot is available, then deduct it."""
+        """Sync: block the calling thread until 1 slot is free, then deduct it."""
         with self._cond:
             while True:
                 self._refill_locked()
@@ -83,6 +134,18 @@ class _RateLimiter:
                     return
                 wait_s = (1.0 - self._tokens) / self._rate
                 self._cond.wait(timeout=wait_s)
+
+    async def acquire_async(self) -> None:
+        """Async: yield to the loop until 1 slot is free, then deduct it. The lock is held
+        only across the synchronous token math; the wait is `await asyncio.sleep` outside it."""
+        while True:
+            with self._lock:
+                self._refill_locked()
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                wait_s = (1.0 - self._tokens) / self._rate
+            await asyncio.sleep(wait_s)
 
 
 # Single source of truth for every external rate cap we pace against. Each row is
@@ -125,10 +188,11 @@ def _resolve_rate_per_sec(name: str, rate_per_min: float | None) -> float:
 
 
 def get_rate_limiter(name: str, rate_per_min: float | None = None) -> _RateLimiter:
-    """Process-wide token-bucket limiter for external service `name`, paced at its
-    rpm — read ONCE at first use, then frozen for the run. Known services key off
-    `_RATE_LIMITS` (env override); dynamic buckets (per-model `llm:<model>`) pass
-    an explicit `rate_per_min`. All threads in this process share the named bucket.
+    """Process-wide token-bucket limiter for service `name`, paced at its rpm — read ONCE at
+    first use, then frozen for the run. ONE bucket per name, serving BOTH sync `acquire()` and
+    async `acquire_async()` callers (so the cap holds across sync+async use). Known services
+    key off `_RATE_LIMITS` (env override); dynamic buckets (per-model `llm:<model>`) pass an
+    explicit `rate_per_min`. All threads in this process share the named bucket.
 
     Scope is per process, NOT per API key: separate processes get independent
     buckets and do not coordinate, so a multi-process deployment would not be
@@ -138,72 +202,6 @@ def get_rate_limiter(name: str, rate_per_min: float | None = None) -> _RateLimit
         if lim is None:
             lim = _RateLimiter(rate_per_sec=_resolve_rate_per_sec(name, rate_per_min))
             _LIMITERS[name] = lim
-        return lim
-
-
-class _AsyncRateLimiter:
-    """Async twin of `_RateLimiter`. Same token bucket, but `acquire` yields to
-    the loop (`await asyncio.sleep`) instead of blocking a thread on a `Condition`.
-
-    The instance is a process-wide singleton (see `_ASYNC_LIMITERS`) shared across
-    every per-question event loop — and those loops run on *different* worker
-    threads — so the token math IS contended. A `threading.Lock` guards the
-    refill+deduct; it is held only across that synchronous section, never across
-    the `await asyncio.sleep`."""
-
-    def __init__(self, rate_per_sec: float) -> None:
-        if rate_per_sec <= 0:
-            raise ValueError(f"rate_per_sec must be > 0 (got {rate_per_sec})")
-        self._rate = rate_per_sec
-        self._capacity = max(1.0, rate_per_sec)
-        self._tokens = self._capacity
-        self._last_refill = time.monotonic()
-        self._lock = threading.Lock()
-
-    def _refill_locked(self) -> None:
-        now = time.monotonic()
-        elapsed = now - self._last_refill
-        if elapsed <= 0:
-            return
-        self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
-        self._last_refill = now
-
-    async def acquire(self) -> None:
-        """Yield until 1 request slot is available, then deduct it."""
-        while True:
-            with self._lock:
-                self._refill_locked()
-                if self._tokens >= 1.0:
-                    self._tokens -= 1.0
-                    return
-                wait_s = (1.0 - self._tokens) / self._rate
-            await asyncio.sleep(wait_s)
-
-
-# Async limiters mirror the sync `_LIMITERS` registry, keyed by the same names
-# (same rpm from `_RATE_LIMITS`). Distinct instances: the sync buckets pace the
-# offline build, these pace the request path. Shared across every per-question
-# loop (each on its own worker thread), so creation is lock-guarded like the sync
-# side.
-_ASYNC_LIMITERS_LOCK = threading.Lock()
-_ASYNC_LIMITERS: dict[str, _AsyncRateLimiter] = {}
-
-
-def get_async_rate_limiter(
-    name: str, rate_per_min: float | None = None
-) -> _AsyncRateLimiter:
-    """Process-wide async token-bucket limiter for service `name`, paced at its
-    rpm. Request-time analogue of `get_rate_limiter` (same `rate_per_min` rule for
-    dynamic per-model buckets); the returned bucket is shared across all
-    per-question loop threads (its own lock makes `acquire` thread-safe). See
-    `get_rate_limiter` for the scope caveat."""
-    with _ASYNC_LIMITERS_LOCK:
-        lim = _ASYNC_LIMITERS.get(name)
-        if lim is None:
-            lim = _AsyncRateLimiter(
-                rate_per_sec=_resolve_rate_per_sec(name, rate_per_min)
-            )
-            _ASYNC_LIMITERS[name] = lim
         return lim
 
 
@@ -281,9 +279,29 @@ def parse_json_response(text: str) -> Any | None:
         return None
 
 
+def chunk(seq: list, n: int) -> list[list]:
+    """Split `seq` into consecutive sub-lists of at most `n` items."""
+    return [seq[i : i + n] for i in range(0, len(seq), n)]
+
+
+@dataclass
+class LLMResponse:
+    text: str
+    latency_s: float
+    input_tokens: int | None
+    output_tokens: int | None
+
+
 def make_genai_client() -> genai.Client:
     """Build a direct-Gemini (AI Studio) genai.Client from `GEMINI_API_KEY`.
-    Auth via api-key; no GCP project required."""
+    Auth via api-key; no GCP project required.
+
+    No client-side request timeout is set: HttpOptions.timeout doubles as a
+    SERVER deadline (the API kills the request with 504 DEADLINE_EXCEEDED at
+    the cutoff), which turned long-thinking calls — e.g. Gemini 3.x Pro vision
+    reads that deliberate for minutes — into deterministic retry-storm failures.
+    Slow calls are given however long the transport allows; transport-level
+    connection faults still surface and are retried (`llm_client._is_retryable`)."""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not set (required for Gemini API)")
@@ -293,11 +311,12 @@ def make_genai_client() -> genai.Client:
 # --- Cross-cutting runtime types threaded between operators and the orchestrator ---
 
 
-@dataclass
+@dataclass(frozen=True)
 class PageRef:
-    """Canonical page coordinate."""
+    """Canonical page coordinate. Frozen so it's hashable — usable as a dict key
+    and set member (e.g. the page-index catalog is keyed by `PageRef`)."""
 
-    month: str | None = None  # "YYYY-MM"
+    month: str | None = None  # "YYYY-MM" (a.k.a. bulletin in the page index)
     page: int | None = None  # 1-based PDF page index (canonical)
 
     @property
@@ -332,6 +351,19 @@ def page_key_to_pageref(key: str) -> PageRef:
     return PageRef(month=f"{year_str}-{month_str}", page=int(page_str))
 
 
+@dataclass(frozen=True)
+class BlockRef:
+    """One retrieved CONTENT BLOCK — the retriever's native output unit. `page` is the anchor
+    page, `block_index` its position in `content_blocks` (None for a page kept wholesale).
+    `member_refs` are the physical pages this block spans (anchor + any table-merge extra pages).
+    `block` is excluded from identity so `BlockRef`s de-dupe on `page`/`block_index`/`member_refs`."""
+
+    page: PageRef
+    block_index: int | None
+    member_refs: tuple[PageRef, ...]
+    block: ContentBlock | None = field(default=None, compare=False)
+
+
 VALUE_KIND_VOCAB: frozenset[str] = frozenset({"scalar", "vector", "table"})
 
 
@@ -347,6 +379,15 @@ class AnnotatedValue(BaseModel):
 
     `.frame` exposes the payload as a uniform `pd.DataFrame` so downstream code
     needn't branch on `kind`.
+
+    Provenance (`bulletin`/`pages`/`as_of`/`requested_period`/`retrieve_key`) is
+    machine-stamped from the extract inputs — the source page refs and the
+    retrieve branch — NOT authored by the LLM. It is absent (None/empty) for
+    external lookups and for older payloads. `bulletin` is the issue the value
+    was printed in ("YYYY-MM", lexically sortable = chronological); downstream
+    compute uses it to sort/filter by publication date — e.g. to pick the
+    latest non-revised vintage across several bulletins, where the LLM-written
+    `description` of the same series+period can be identical across issues.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -358,6 +399,16 @@ class AnnotatedValue(BaseModel):
     index_name: str | None = None
     row_name: str | None = None
     col_name: str | None = None
+
+    # Provenance — copied from the source page/branch at extract time, never
+    # LLM-written. Defaults keep external lookups and old payloads valid.
+    bulletin: str | None = None  # source issue "YYYY-MM" (publication date)
+    pages: tuple[int, ...] = ()  # source PDF page(s); () when unattributable
+    as_of: str | list[str | None] | None = (
+        None  # branch.as_of — pinned vintage requested (a list = per-period-entry pins)
+    )
+    requested_period: str | None = None  # branch.period — data window requested
+    retrieve_key: str | None = None  # branch.key — concept this datum serves
 
     @model_validator(mode="after")
     def _check_shape(self) -> AnnotatedValue:
@@ -418,19 +469,42 @@ class AnnotatedValue(BaseModel):
         return df
 
 
-_SAMPLE_ROWS = 2
 _PAD = "         "  # 9-space continuation indent for an entry's detail lines
+
+
+def _provenance_str(e: AnnotatedValue) -> str:
+    """One-line provenance for the schema view — only the fields that are set, so
+    external lookups (no bulletin) stay uncluttered. Empty string when nothing is set."""
+    parts: list[str] = []
+    if e.bulletin:
+        parts.append(f"bulletin={e.bulletin!r}")
+    if e.pages:
+        parts.append(f"pages={list(e.pages)!r}")
+    if e.as_of:
+        parts.append(f"as_of={e.as_of!r}")
+    if e.requested_period:
+        parts.append(f"requested_period={e.requested_period!r}")
+    if e.retrieve_key:
+        parts.append(f"retrieve_key={e.retrieve_key!r}")
+    return " ".join(parts)
 
 
 def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
     """Schema view of one `AnnotatedValue`: the meta line, then (for non-scalars) the
     full index labels — load-bearing, they're what generated code keys `.loc[...]` on,
-    and aren't otherwise in the prompt — plus a tiny `head` sample. Scalars show in full."""
+    and aren't otherwise in the prompt. Scalars show in full. A `provenance:` line
+    carries the machine-stamped source fields when present."""
     head = (
         f"  input_values[{i}]  description: {(e.description or '(no description)')!r}"
     )
+    prov = _provenance_str(e)
+    prov_lines = [f"{_PAD}provenance: {prov}"] if prov else []
     if e.kind == "scalar":
-        return [head, f"{_PAD}value={e.value!r}  (kind=scalar, unit={e.unit!r})"]
+        return [
+            head,
+            f"{_PAD}value={e.value!r}  (kind=scalar, unit={e.unit!r})",
+            *prov_lines,
+        ]
 
     df = e.frame
     n_rows, n_cols = df.shape
@@ -455,20 +529,14 @@ def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
 
     labels = [str(x) for x in df.index]
     lines.append(f"{_PAD}index ({len(labels)} labels): [{', '.join(labels)}]")
-
-    with pd.option_context("display.max_columns", None, "display.width", 120):
-        rendered = df.head(_SAMPLE_ROWS).to_string()
-    lines.append(f"{_PAD}sample (first {min(_SAMPLE_ROWS, n_rows)} of {n_rows} rows):")
-    lines.extend(_PAD + ln for ln in rendered.splitlines())
     return lines
 
 
 def input_values_desc(input_values: list[AnnotatedValue]) -> str:
     """Render `input_values` for the codegen / re-planner prompts as a
-    **schema view** — axis labels + dtypes + a small `head` sample, NOT a full cell
-    dump. Generated code operates on the frames symbolically (full frames live in the
-    exec env), so it needs the labels (to write selections) and a small sample (number
-    encoding, sentinels, magnitude for the unit decision), not the interior grid."""
+    **schema view** — axis labels + dtypes, NOT a cell dump. Generated code operates
+    on the frames symbolically (full frames live in the exec env), so it needs the
+    labels (to write selections), not the interior grid."""
     lines = [f"input_values ({len(input_values)} entries)"]
     for i, e in enumerate(input_values):
         lines.extend(_describe_entry(i, e))
@@ -568,7 +636,7 @@ class ExecutionContext:
           emits carry `op=None` and rely on the message alone.
         - `message` is a single human-readable string. Lead it with a stable
           snake_case event key, then interpolate any variables inline
-          (`f"verifier_dropped n_dropped={n} n_parsed={m}"`). Keep large blobs out
+          (`f"extracted tier=parsed_json n_entries={n}"`). Keep large blobs out
           of the *message* (it must stay a scannable one-liner) — but they may go in
           `data` (see below).
         - `kind` is the event's semantic role for the trace viewer's color-coding
@@ -622,3 +690,40 @@ class ExecutionContext:
             self._logfile.flush()
         if self.verbose:
             print(trace.render_line({"uid": self.uid, **evt}))
+
+
+async def traced_step[T](
+    ctx: ExecutionContext,
+    op_name: str,
+    fn: Callable[[], Awaitable[T]],
+    *,
+    branch_id: int | None = None,
+) -> T:
+    """Run `fn` inside a `ctx.step` frame and emit a boundary event with elapsed time."""
+    from skunk.errors import MissingData, StepFailed
+    from skunk.result import describe_value, summarize_value
+
+    t0 = time.perf_counter()
+    with ctx.step(op_name):
+        try:
+            result = await fn()
+        except (StepFailed, MissingData) as e:
+            err = f"MissingData: {e.reason}" if isinstance(e, MissingData) else str(e)
+            elapsed = round(time.perf_counter() - t0, 3)
+            ctx.emit(
+                f"step elapsed_s={elapsed} output=(failed) error={err!r}",
+                kind="step",
+                data={"branch_id": branch_id, "elapsed_s": elapsed, "error": err},
+            )
+            raise
+        elapsed = round(time.perf_counter() - t0, 3)
+        ctx.emit(
+            f"step elapsed_s={elapsed} output={describe_value(result)!r}",
+            kind="step",
+            data={
+                "branch_id": branch_id,
+                "elapsed_s": elapsed,
+                "summary": summarize_value(result),
+            },
+        )
+    return result

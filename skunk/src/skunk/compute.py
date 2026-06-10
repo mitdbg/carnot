@@ -74,6 +74,11 @@ You write Python that produces the final answer string, or emit a structured mis
   .kind          "scalar" | "vector" | "table"  (rarely needed; prefer .frame)
   .index_name    (vector)   .row_name / .col_name (table)
   .value         raw payload — only use if you specifically need the dict/list form
+  .bulletin           source issue "YYYY-MM" the value was printed in
+  .pages              source PDF page number(s)
+  .as_of              issue the plan pinned (when the question named one), else None
+  .requested_period   data window the value was retrieved for
+  .retrieve_key       the concept this datum was retrieved for
 
 ## Payload access
 
@@ -88,12 +93,20 @@ Always read data through `e.frame`:
              `columns.name == e.col_name`.
 
 For each non-scalar entry the `input_values =` block below shows a schema view:
-the full axis labels (index labels + column names), per-column dtypes, and a
-2-row sample — NOT every cell. The full frame is what you get in the exec env;
-write code against it (`.loc[...]`, `.idxmax()`, etc.) using the labels shown.
+the full axis labels (index labels + column names) and per-column dtypes — NOT
+the cell values. The full frame is what you get in the exec env; write code
+against it (`.loc[...]`, `.idxmax()`, etc.) using the labels shown.
 Apply unit conversions once over the whole frame (e.g. `df * 1e-6`), never
 cell-by-cell.
 
+## Selecting inputs
+
+- Pick the entries you need from the `input_values =` block and reference
+  them by index (`input_values[7].frame`). Do not re-locate entries at
+  runtime by filtering on `.description`.
+- Entries may repeat. Pick the one whose description best matches the question's wording.
+  Do NOT use multiple entries for max/min/avg/sum/etc.
+  
 ## Output format
 
 Emit exactly one of the two forms below and nothing else — no prose,
@@ -104,6 +117,9 @@ no commentary, no second block, no fence around (b):
       answer — no prose, no "Answer:", no question restatement. For a
       multi-part question, `result` is only the ultimate quantity /
       identifier asked for, not any intermediate.
+      Carry full precision through every intermediate; round or format only
+      at the latest possible step — the final `result` string — to the
+      decimal places the question states.
   (b) Insufficient data — a single bare JSON object:
         {"missing": [<short identifier strings>],
          "description": "<one-line explanation>"}

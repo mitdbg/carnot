@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="ascii">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Skunk Client</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='client.css') }}">
+  <script defer src="{{ url_for('static', path='client.js') }}"></script>
+</head>
+<body data-server-url="{{ server_url | e }}">
+<header>
+  <div class="topbar">
+    <h1>Skunk Human Console</h1>
+    <div class="meta">
+      <span class="pill">Server <strong id="serverUrl">-</strong></span>
+      <span class="pill">Connection <strong id="connection">-</strong></span>
+      <span class="pill">Round <strong id="roundNum">-</strong></span>
+      <span class="pill">Round Status <strong id="roundStatus">-</strong></span>
+      <span class="pill">Resubmits <strong id="resubmitsLeft">-</strong></span>
+    </div>
+  </div>
+</header>
+<main>
+  <section class="summary">
+    <div id="roundTimerMetric" class="metric timer"><span>Time Remaining</span><strong id="roundTimer">--:--</strong></div>
+    <div class="metric"><span>Total</span><strong id="mTotal">0</strong></div>
+    <div class="metric"><span>Running</span><strong id="mRunning">0</strong></div>
+    <div class="metric"><span>Ready</span><strong id="mReady">0</strong></div>
+    <div class="metric"><span>Submitted</span><strong id="mSubmitted">0</strong></div>
+    <div class="metric"><span>Failed</span><strong id="mFailed">0</strong></div>
+    <div class="metric"><span>Completed</span><strong id="mCompleted">0</strong></div>
+  </section>
+  <div id="lastEvent" class="event">Connecting...</div>
+  <div id="app">Connecting...</div>
+</main>
+</body>
+</html>

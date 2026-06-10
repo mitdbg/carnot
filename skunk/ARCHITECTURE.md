@@ -15,10 +15,10 @@ This decoupling means retrieval and extraction can be evaluated independently �
    question ───────▶│  planner   │  one LLM call
                     │   (DSL)    │
                     └─────┬──────┘
-                          │  ChainNode AST
+                          │  Plan (branches list)
                           ▼
                     ┌────────────┐
-                    │orchestrator│  walks AST; parallel branches; speculative pre-warm
+                    │orchestrator│  parallel branches; one shared retrieve sweep
                     └─────┬──────┘
                           │
        ┌──────────────────┼──────────────────┐
@@ -26,7 +26,7 @@ This decoupling means retrieval and extraction can be evaluated independently �
        ▼                  ▼                  ▼
   ┌─────────┐        ┌─────────┐        ┌─────────────┐
   │retrieve │        │ extract │        │lookup_extern│   per-op operators
-  │ catalog │        │ tier 1-3│        │   gemini    │
+  │ catalog │        │ tier 1-2│        │   gemini    │
   └─────────┘        └─────────┘        └─────────────┘
        │                  │                  │
        ▼                  ▼                  ▼
@@ -56,18 +56,31 @@ The retrieve operator owns its page index — the format, schema, and build proc
 
 The load-bearing insight is that `periods_covered` (what period a page *reports on*) is distinct from the bulletin's publication date. A page in the January 1941 bulletin that contains the CY1940 annual summary should be returned for a query on `period='CY1940'` — not the January 1941 bulletins. Any index the retrieve operator builds must capture this distinction.
 
-**Two retrieval methods.** `RetrieveOp` in `src/skunk/retrieve.py` picks one of three backends per call (each a private `_run_*` method): it honors `ctx.config.golden_pages` first (so `eval/eval_e2e.py --golden` bypasses retrieval entirely via the golden branch), then routes on `config.retriever` to one of two alternatives:
+**Two retrieval methods.** `RetrieveOp` in `src/skunk/retrieve.py` picks a backend per call: it honors `ctx.config.golden_pages` first (so `eval/eval_e2e.py --golden` bypasses retrieval entirely via the golden branch), then routes on `config.retriever`:
 
-- **`search_agent`** (default) — the iterative ChromaDB + LLM-loop retriever vendored under `src/skunk/search_agent/`.
-- **`page_index`** — the page-index retriever at `src/skunk/page_index/query.py` (`PageIndexRetriever`), querying the offline-built catalog + concept tree. Its query path is three passes:
-  1. **ToC chapter pick** (`query_toc.py`) — one LLM call selects up to two canonical chapters from the concept tree; every page under them becomes a candidate.
-  2. **Year filter** — drops candidates whose page-side `dates` (verbatim strings parsed back to ISO intervals) don't intersect the query period; date-less pages are kept (recall net). Honors the `periods_covered` ≠ publication-date distinction above. No-op on an unparseable period.
-  3. **Semantic filter** (`query_semfilter.py`) — a two-stage cascade that prunes the survivors to a tight candidate set: a cheap **coarse** pass over page metadata (titles/headers/dates/keywords), then a precise **fine** pass over full page text that must quote a concrete value cell to keep a page. Both stages are batched and run in parallel across batches; gated on `config.semfilter_enabled` (off → ToC + year-filter only, for ablation).
+- **`page_index`** (default) — the page-index retriever at `src/skunk/page_index/query.py` (`PageIndexRetriever`), querying the offline-built catalog + concept tree, followed by the intrinsic `block_select` narrowing stage (`RetrieveOp._select`). See its query path below.
+- **`search_agent`** — the iterative ChromaDB + LLM-loop retriever vendored under `src/skunk/search_agent/`.
+
+**Multi-scan query path (`page_index`).** A question's `retrieve` branches are run **together**, not in isolation, by `PageIndexRetriever.retrieve_all(ctx, branches)`, so the expensive LLM semantic filter scans each unique candidate page **at most once per question**:
+
+  1. **Per-branch cheap candidates** (parallel, per branch — `_candidates_for`):
+     - **ToC chapter pick** (`_pick_chapters` in `query.py`) — one LLM call **per era** judges every chapter in that era's taxonomy independently (any number may match; errs toward inclusion) against the branch's `key`/`period`; every page under a kept chapter becomes a candidate.
+     - **Year filter** (`_year_filter`) — keeps only candidates whose page-side `date_interval` overlaps the branch period, and **drops undatable pages** (front matter / dividers / OCR-broken — no benchmark gold page is undatable). Honors the `periods_covered` ≠ publication-date distinction above. A list `as_of` pins period entries to issues (aligned 1:1, null = unpinned): a candidate then passes on ANY entry — an unpinned entry by data-span overlap, a pinned entry by being PUBLISHED in the pinned issue (a missing `date_interval` doesn't disqualify pages of the named issue). A scalar `as_of` stays a whole-branch publication filter. No-op on an unparseable period.
+  2. **One global semantic filter** (`_multi_semantic_filter`) — the union of all branches' candidates is deduped, and each unique page is scored **once** against **all** branch targets at once. The filter sees only a compact per-page SUMMARY (titles/column-row labels/dates — no numbers) and returns a B×K boolean matrix (one row per page, one column per target); a batch whose reply is malformed degrades to keep-all (recall over precision; extract is the precision gate). Batched (`config.semfilter_batch_size`) and parallel across batches. Skippable via `config.retrieve_skip_semfilter` (ToC + year-filter only, for the recall-ceiling ablation). A page routes to branch *i* iff *i*'s cheap filters kept it **and** the matrix marks it relevant to target *i* — so sibling-concept branches (e.g. "total public debt" vs "debt held by the public") that share a page each keep only their own column.
+
+  There is deliberately **no page-level continuation merging**: every catalog row is one physical page, scored on its own metadata. The scan still emits `is_continuation`, but as metadata only — in this corpus "(Continued)" pages restate their own headers (they are self-readable), so the retired build-time merge pass glued distinct self-contained pages into multi-page anchors, widening `date_interval`s and ballooning what retrieval handed extract (a ≤4-block selection could emit 14 pages). `PageCatalogRow.continuation_pages` survives in the schema for old-artifact compatibility and is always empty.
+
+  The rare GENUINE continuations (~50 corpus-wide) are linked at TABLE granularity instead, by the build's `table_merge` pass (`page_index/table_merge.py`): a table block with NO row and NO column labels — bare continued data rows, or a "Footnotes to Table X" spillover — is matched to its parent block by one flash call (the empty-labels signal is the validated discriminator; captions are not trusted). The parent block records the fragment's page in `ContentBlock.extra_pages`, the fragment records `merged_into` and is dropped from the shipped catalog. A retrieved/selected block expands to `row.block_refs(block)` = its own page + `extra_pages`, so the text tier reads and the vision tier renders every page of the continued table — and only those pages.
+
+  The `search_agent` backend has no shared-scan benefit, so `run_all` runs it per branch (a fresh agent each) with per-branch failure isolation; a single branch's `StepFailed` is attributed to that branch alone and does not sink its siblings.
+
+  **Page store** (`page_index/store.py`, `PageStore`) — the artifact's source of truth for page CONTENT, with two thread-safe access paths: `text(ref)` and `image(ref)`. The `page_store` pipeline stage writes `pages/<bulletin>.json` (`{page: text}`): each page's own text (reusing the build's `chop_bulletin`/`elements_to_text`) with a figure note appended — a dumb page→text map, one entry per catalog row. `extract.py` reads Tier-1 text and the vision tier's **page images** through `PageStore` and no longer touches the corpus parsed-JSON/PDFs; images are rendered on demand at 200 DPI (`renders/<bulletin>/<page>.png`) and cached, with at-most-once rendering per page under concurrency. (Extract therefore requires the page-store artifact to exist.)
+
 
 ## The 4 operators
 
 - **`retrieve(key, period)`** — only chain head. Returns `list[PageRef]` with `(month, page)` populated (where `page` is the 1-based PDF page index). Dispatched by `RetrieveOp` to one of two backends (or short-circuited by `ctx.config.golden_pages`) — see "Two retrieval methods" above.
-- **`extract(key, period, visual_only?)`** — reads `ctx.question` and the located pages via tier dispatch (parsed JSON → vision). Returns `list[AnnotatedValue]` — each entry has a `description`, `value`, `unit`, and one of three **kinds**: `scalar`, `vector` (1-D series with one varying dim), or `table` (2-D grid with row/col dims). Vector/table cells are always primitive scalars; nesting beyond those shapes is rejected by the extract parser before an `AnnotatedValue` is constructed. `extract` is invoked automatically by the orchestrator on every `RetrieveBranch` — `visual_only` is set on the branch and threaded through. Pass `visual_only=True` to skip Tier 1 and go straight to vision (use for charts/figures).
+- **`extract(key, period, visual_only?)`** — reads `ctx.question` and the located pages via tier dispatch (parsed JSON → vision). Returns `list[AnnotatedValue]` — each entry has a `description`, `value`, `unit`, one of three **kinds** (`scalar`, `vector` (1-D series with one varying dim), or `table` (2-D grid with row/col dims)), and machine-stamped **provenance** (`bulletin` / `pages` / `as_of` / `requested_period` / `retrieve_key`, copied from the source page + branch — see the `AnnotatedValue.kind` section below). Vector/table cells are always primitive scalars; nesting beyond those shapes is rejected by the extract parser before an `AnnotatedValue` is constructed. `extract` is invoked automatically by the orchestrator on every `RetrieveBranch` — `visual_only` is set on the branch and threaded through. Pass `visual_only=True` to skip Tier 1 and go straight to vision (use for charts/figures).
 - **`lookup_external(nl)`** — chain-head capable. Runs a `LookupAgent` (a `MultiTurnAgent` tool loop: FRED / BLS / World Bank / Tavily / fetch_url, ≤`lookup_max_steps` steps) over a natural-language description of external factual data (`nl`); the agent commits a dict of `AnnotatedValue` fields, which `LookupExternalOp` parses into `list[AnnotatedValue]` (one entry) on the trusted side. Use for CPI-U, FX rates, event dates, named entities (bureau names), and any fact not in the bulletin corpus. The agent infers the appropriate `kind` and `unit` (including `text` for strings).
 - **`compute()`** — chain terminator that subsumes formatting. Reads `ctx.question` plus the upstream extracted/looked-up values; runs a single loop (`ComputeOp.run`) of codegen → in-process exec under one shared budget (`compute_max_attempts`, default 3). Each iteration's codegen call may return Python (success), raise `MissingData` (the structured insufficient-data signal), or raise `_ParseFailure` (unparseable reply); parse and exec failures feed the next iteration's `prev_code` + `prev_failure`. Returns the result of the first clean exec as a plain `str`. Fails with `StepFailed("compute", …)` when no iteration ever execs cleanly; propagates `MissingData` — the orchestrator catches that and runs up to `recovery_max_rounds` re-planning rounds before giving up.
 
@@ -75,12 +88,14 @@ The load-bearing insight is that `periods_covered` (what period a page *reports 
 
 ## Plan shape
 
-A **Plan** is a pydantic model: just a `branches` list. Compute reads everything it needs — the calculation to perform *and* the output format (units, precision, list shape) — from the verbatim question, not from a planner paraphrase, so the plan carries no separate requirements object. The Python layout mirrors the wire JSON exactly, so `Plan.model_validate_json` / `Plan.model_dump_json` round-trip with no custom translation. There is no multi-step decomposition in the AST — every plan is exactly one terminal compute. `PlannerPromptedCall` (in `src/skunk/plan.py`) emits a `Plan`; the orchestrator runs every branch in parallel, then feeds the merged `list[AnnotatedValue]` to compute.
+A **Plan** is a pydantic model: just a `branches` list. Compute reads everything it needs — the calculation to perform *and* the output format (units, precision, list shape) — from the verbatim question, not from a planner paraphrase, so the plan carries no separate requirements object. The Python layout mirrors the wire JSON exactly, so `Plan.model_validate_json` / `Plan.model_dump_json` round-trip with no custom translation. There is no multi-step decomposition — every plan is exactly one terminal compute. `PlannerPromptedCall` (in `src/skunk/plan.py`) emits a `Plan`; the orchestrator runs branches in parallel, then feeds the merged `list[AnnotatedValue]` to compute. Concretely it runs all `retrieve` branches through **one shared retrieve sweep** (`Orchestrator._run_retrieve_phase` → `RetrieveOp.run_all`, the multi-scan above), then dispatches each branch's `extract` (and every `lookup_external`) in parallel; results stay aligned with `plan.branches` by position.
+
+**The initial plan is retrieve-only.** `_parse_plan` rejects any `lookup_external` branch on the first pass: the planner assumes every value the question needs lives in the corpus and emits a `retrieve` branch for each (even values that look external — CPI, GDP, FX rates). A `lookup_external` enters the plan **only at replan**, when the corpus genuinely lacks a value — a retrieve branch finds nothing and/or compute raises `MissingData`, and `Planner.replan` adds the lookup via `PlanDiff`. This makes "default to retrieve; reach for external lookup only when the corpus has no home for the value" structural rather than advisory, at the cost of one replan round per externally-sourced value. (The `src`-verbatim rule — a lookup may pin a publisher only when the question names it — therefore lives in `_parse_plan_diff`, not `_parse_plan`.)
 
 Two branch shapes:
 
-- `RetrieveBranch(key, period, visual_only=False)` — `retrieve` then `extract` are dispatched together by the orchestrator (extract reads `visual_only` from the branch).
-- `LookupBranch(target, src=None)` — single `lookup_external` call.
+- `RetrieveBranch(key, period, as_of=None, visual_only=False)` — `retrieve` then `extract` are dispatched for the branch by the orchestrator (extract reads `visual_only` from the branch; `as_of` is the reporting/vintage **publication** month applying to the WHOLE branch — used by retrieve to pin the issue (era pruning + year filter, with `block_select` as the exact-issue tie-breaker) and stamped onto each extracted value as provenance for compute; it does **not** otherwise steer extraction). When a question pins only SOME of a branch's period entries to a named issue, `as_of` is an array aligned 1:1 with the comma-separated period entries, null for unpinned slots (period "1980-10..1981-09, 1979-10..1980-09" with as_of [null, "1981-11"] = FY1981 unpinned, FY1980 from the 1981-11 issue); a pinned entry's `block_select` pool is restricted to the pinned issue and its tournament label says so. Array/period parity is enforced in the planner's parse hook (`_parse_plan`), so a misaligned plan is a `ParseError` the retry loop has the model re-emit. Replan-added branches must have null `as_of` — same mechanism (`_parse_plan_diff`); a wrong replan-time pin excludes the right issue outright; issue choice belongs to the block picker.
+- `LookupBranch(target, src=None)` — single `lookup_external` call. Replan-only (see above): never present in an initial plan, added only by a `PlanDiff`. `src` is set only when the question names a publisher (verbatim), enforced in `_parse_plan_diff`.
 
 Canonical JSON shape (one branch):
 
@@ -102,26 +117,27 @@ The `AnnotatedValue.kind` taxonomy:
 
 Cells must be primitive scalars (`int` / `float` / `str`, no `bool`, no nesting beyond these shapes). The extract parser rejects deeper structures before constructing an `AnnotatedValue`.
 
+Each `AnnotatedValue` also carries **machine-stamped provenance** — `bulletin` (the source issue `"YYYY-MM"` the value was printed in, i.e. the publication date), `pages` (source PDF page numbers), and the originating branch's `as_of` / `requested_period` / `retrieve_key`. These are copied from the extract inputs (the source `PageRef`s and the `RetrieveBranch`), **never authored by the LLM** — extract stamps them onto the parsed entries in `_stamp_provenance` (`extract.py`). `bulletin`/`pages` are attributed only when every page in a single extract call shares one issue (the common `as_of` / single-issue branch); a call spanning multiple issues leaves them empty, since the reply carries no per-page attribution. All provenance fields default to `None`/`()`, so `lookup_external` values (which have no bulletin) and older payloads stay valid. `bulletin` sorts lexically = chronologically, so compute selects/filters by publication date with it — the load-bearing case is several vintages of the *same* series+period whose LLM-written `description`s are identical and are distinguishable only by `bulletin`. Provenance surfaces in the compute/replanner schema view via `input_values_desc` (`common.py`).
+
 ## Per-page tier dispatch in extract
 
-Once retrieve has named specific pages, extract chooses how to read each one:
+Once retrieve has named specific pages, extract chooses how to read each one. Both tiers read CONTENT through the page-index `PageStore` (`page_index/store.py`, `get_page_store`) keyed by `PageRef` — extract no longer touches the corpus parsed-JSON / PDFs at query time:
 
 ```
-Tier 1  parsed-JSON elements bucketed by page_id   — structured text + HTML tables
-                                                     (treasury_bulletin_{YYYY}_{MM}.json
-                                                     under $OFFICEQA_PARSED_JSON_DIR;
-                                                     see skunk/corpus.py)
-Tier 2  PNG render at 300 dpi + vision LLM          — live, in-memory bytes (corpus.render_page_b64)
+Tier 1  page-store text (TextExtractor)    — the page's text via store.text(ref),
+        emitted as tier=parsed_json          built offline from the parsed JSON; structured text + tables
+Tier 2  page-store image + vision LLM       — store.image(ref): PNG rendered on demand at 200 DPI and
+        (VisionExtractor)                    cached to renders/<bulletin>/<page>.png
 ```
-(`page` here = `PageRef.page` = 1-based PDF page index)
+(`page` here = `PageRef.page` = 1-based PDF page index. Tier-1 events keep the `tier=parsed_json` label for continuity, though the text now comes from the store, not the corpus.)
 
-Tier escalation only happens when the chosen tier reports "value not present". There is no cross-page search — if retrieve picked the wrong pages, the bug is in retrieve, not extract. This is what makes the eval decomposition work.
+Tier escalation only happens when the chosen tier reports "value not present" (or `visual_only` skips straight to Tier 2). There is no cross-page search — if retrieve picked the wrong pages, the bug is in retrieve, not extract. This is what makes the eval decomposition work.
 
 ## Model routing
 
 A run can mix models per call-site. Resolution mirrors the effort knob:
 
-- **`PromptedCall` sites** (planner, extract tiers, compute.codegen, question_explainer, …) resolve their model as `config.model_overrides.get(name, config.llm_model)` — see `PromptedCall.resolve_model`. So the default `llm_model` (env `SKUNK_LLM_MODEL`) applies everywhere unless a site is pinned via `SKUNK_MODEL_OVERRIDES` (`name=model,...`). Example: run on Pro but keep `question_explainer` on cheap Flash.
+- **`PromptedCall` sites** (planner, extract tiers, compute.codegen, question_explainer, …) resolve their model as `config.model_overrides.get(name, config.llm_model)` — see `PromptedCall._resolve_model`. So the default `llm_model` (env `SKUNK_LLM_MODEL`) applies everywhere unless a site is pinned via `SKUNK_MODEL_OVERRIDES` (`name=model,...`). Example: run on Pro but keep `question_explainer` on cheap Flash.
 - **Agent loops** (`LookupAgent`, search agent) use `config.agent_model_id or config.llm_model` (env `SKUNK_AGENT_MODEL`); they don't read the override map.
 - **Per-model rate limiting.** Each distinct model gets its own token-bucket keyed `llm:<model>` (`_retry_call`/`_aretry_call` via `_llm_model_rpm`). A model's RPM comes from `SKUNK_MODEL_RPM` (`model=rpm,...`), falling back to `SKUNK_LLM_RPM` (default 1000) for any model not listed — so single-model runs are unchanged. Lets a 150-RPM Pro and a high-RPM Flash run concurrently without throttling each other.
 - **Thinking-mode floor.** Gemini 3.x Pro is thinking-only and rejects both `thinking_budget=0` and `MINIMAL`; `_effort_to_thinking_config` floors `off`/`minimal` to `LOW` for such models (`_requires_thinking`), so an `effort="off"` call-site still works (at LOW thinking) when pointed at Pro.
@@ -238,15 +254,17 @@ Each operator exposes a standalone `run(prev, ctx, **kwargs)` callable on its op
 The page-index artifact is the only on-disk index in the runtime path:
 
 - `artifact/page_index/` — the shipped, in-repo build output (per-bulletin `catalog/*.jsonl`, `concept_tree.json`, `manifest.json`). Tracked in git so a fresh checkout works without a rebuild. The retriever reads it by default; override with `$SKUNK_PAGE_INDEX_DIR`. The build pipeline (`src/skunk/page_index/pipeline.py`) writes here too (`--output-dir`, default `artifact/page_index`).
-- Parsed-JSON corpus at `$OFFICEQA_PARSED_JSON_DIR` (default `~/Desktop/officeqa/treasury_bulletins_parsed/jsons/`) — read by Tier 1 of extract and by the page-index builder.
+- Parsed-JSON corpus at `$OFFICEQA_PARSED_JSON_DIR` (default `~/Desktop/officeqa/treasury_bulletins_parsed/jsons/`) — read by the page-index builder (which bakes the Tier-1 text into the page store); extract reads it at query time only through the store, not the corpus directly.
 
-LLM completions are **not** cached. Tier 2 PNG renders are computed live per call (no disk cache). There is no DSL plan cache — the planner runs once per question.
+LLM completions are **not** cached. Tier 2 PNG renders are cached to disk by the page store (`renders/<bulletin>/<page>.png`, 200 DPI, rendered at most once per page under concurrency). There is no DSL plan cache — the planner runs once per question.
+
+The eval harness keeps a **retrieval cache** for iteration, not a runtime cache: every real `eval/eval_e2e.py` run auto-writes its retrieve output (`Orchestrator.retrieved_pages`, the deduped page union per UID) to `<run-dir>/retrieval_cache.json`, and `--retrieval-cache <path>` replays one by injecting those pages golden-style (bypassing the retrieve operator) so extract/compute can be tuned without re-paying retrieval. Cached pages are captured at the retrieve phase's output — after the `block_select` narrowing — so replay extracts exactly the pages the original run read.
 
 ## Post-merge integration status
 
 The teammate's `SearchAgent` was merged in (`refs/heads/skunk`) under
 `src/skunk/search_agent/` as a self-contained subtree, wired through
-`RetrieveOp` (the `search_agent` backend) when `config.retriever == "search_agent"` (default).
+`RetrieveOp` (the `search_agent` backend) when `config.retriever == "search_agent"` (the page-index backend, `page_index`, is the default).
 The first-pass merge was deliberately conservative; subsequent passes
 have folded most of the agent into the framework's shared infrastructure.
 
@@ -272,4 +290,4 @@ have folded most of the agent into the framework's shared infrastructure.
 
 - **Agentic loops confined to retrieve and lookup_external.** Two operators run iterative tool-using LLM loops (both `MultiTurnAgent`s): retrieve when `config.retriever == "search_agent"` (`SearchAgent` in `src/skunk/search_agent/`), and `lookup_external` always (`LookupAgent`). `extract` and `compute` do not loop agentically — they execute once per call (compute's internal codegen→exec retries are a fixed bounded budget, not a tool loop), and failure is recorded in the trace. Crucially, *missing-data recovery* is the bounded replan loop in the orchestrator, not a per-operator retry loop: no operator re-plans or re-dispatches itself on failure.
 - **No per-table/per-figure catalog rows.** Page-level granularity matches the benchmark's `source_docs?page=N` labels and the existing `cache/tables/` structure. Going finer adds rows without improving recall.
-- **No PZ runtime dependency.** This repo is plain Python + GCP Vertex AI (google-genai); PZ stays out of the runtime path.
+- **No PZ runtime dependency.** This repo is plain Python; LLM calls go through the AI Studio Gemini API (`google-genai`, authenticated by `GEMINI_API_KEY`) or OpenRouter (`SKUNK_LLM_PROVIDER=openrouter`) — not Vertex/ADC. PZ stays out of the runtime path.

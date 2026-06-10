@@ -1,39 +1,26 @@
-"""Page-index: an offline-built catalog + the retriever that queries it.
+"""Page-index: an offline-built catalog + page store + the retriever that queries them.
 
-The package separates cleanly into two halves plus a shared base:
+Query (per-query) — `query.py`: the `PageIndexRetriever` (loads the
+  artifact, then ToC pick → year filter → semantic filter). Every catalog row is a
+  single physical page (nothing is merged at build time), so a kept row maps
+  straight to the page extract reads / the vision tier renders.
 
-  Build pipeline (offline) — `pipeline.py`, `stages/`, `corpora/`.
-    Produces a per-page catalog + flat concept tree over a configurable
-    corpus. Output lives under `artifact/page_index/` (`catalog/{bulletin}.jsonl`
-    + `concept_tree.json`), the shipped in-repo index.
+Page store — `store.py`: the artifact's source of truth for page CONTENT, with two
+  thread-safe access paths — `text(ref)` (read from `pages/<bulletin>.json`) and
+  `image(ref)` (rendered on demand at 200 DPI, cached to `renders/`). The build writes each
+  page's text (plus a figure note) under its page key, so the store stays a dumb
+  page→text map. `extract.py` reads text and vision-tier images through `PageStore`,
+  so the request path never touches the corpus parsed-JSON/PDFs directly.
 
-  Query path (per-query) — `query.py` (`PageIndexRetriever`, the entry
-    point), `query_toc.py` (ToC chapter pick), `query_semfilter.py`
-    (coarse summary filter). The pipeline is:
+Data model — `data_model.py`: the on-disk artifact schema (catalog row,
+  era-keyed concept tree, filename layout) shared by build and query.
 
-    ToC pick → year filter → semantic filter → candidate set.
-
-  Shared — `schema.py` (catalog row, written by build / read by query),
-    `pdf.py` (parsed-JSON page reader), `util.py`, `profile.py`.
-
-Runtime callers fetch their profile via `default_profile()`; the active
-profile is selected by `SKUNK_CORPUS_PROFILE` (default: treasury).
+Build (offline) — `pipeline.py`: the end-to-end build pipeline
+  (scan → toc → reconstruct → place → catalog → page_store → era_merge), writing
+  each artifact under one build folder. There is deliberately no continuation-merge
+  pass — the scan's `is_continuation` flag is metadata only (see the pipeline module
+  docstring for why). Domain logic lives alongside: `scan.py` (page scan),
+  `toc_index.py` (per-issue ToC extraction, reconstruction for ToC-less issues,
+  placement), and `eras.py` (era segmentation + per-era canonical chapter build →
+  the concept tree).
 """
-
-from __future__ import annotations
-
-import os
-
-from .corpora import load_profile
-from .profile import CorpusProfile, StageError
-
-
-def default_profile() -> CorpusProfile:
-    """Load the runtime corpus profile.
-
-    Env override: `SKUNK_CORPUS_PROFILE` (default: `"treasury"`).
-    """
-    return load_profile(os.environ.get("SKUNK_CORPUS_PROFILE", "treasury"))
-
-
-__all__ = ["CorpusProfile", "StageError", "default_profile"]

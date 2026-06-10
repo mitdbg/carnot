@@ -30,7 +30,6 @@ from google.genai import types
 from skunk.common import (
     Effort,
     make_genai_client,
-    get_async_rate_limiter,
     get_rate_limiter,
 )
 
@@ -65,29 +64,44 @@ def _is_retryable(e: BaseException) -> bool:
         code = getattr(e, "status_code", None)
         return code == 429 or (code is not None and 500 <= code < 600)
     # Transport faults: connection resets, read timeouts, DNS failures, etc.
-    # `TimeoutError` covers our own per-request wall-clock cap (asyncio.wait_for in
-    # the streaming path raises builtin TimeoutError) — treat a tripped timeout as
-    # a transient fault worth retrying, same as a transport-level read timeout.
-    return isinstance(
-        e,
-        (
-            TimeoutError,
-            httpx.TimeoutException,
-            httpx.TransportError,
-            requests.exceptions.Timeout,
-            requests.exceptions.ConnectionError,
-        ),
+    # `TimeoutError` covers both asyncio timeouts on the async SDK path and our own
+    # per-request wall-clock cap (asyncio.wait_for in the streaming path raises builtin
+    # TimeoutError) — treat a tripped timeout as a transient fault worth retrying, same as a
+    # transport-level read timeout. The genai async transport is aiohttp, whose connection
+    # faults (`ClientOSError`: broken pipe / reset) derive from `ClientConnectionError` — none
+    # of which the httpx/requests types below catch.
+    retryable: tuple[type[BaseException], ...] = (
+        TimeoutError,
+        httpx.TimeoutException,
+        httpx.TransportError,
+        requests.exceptions.Timeout,
+        requests.exceptions.ConnectionError,
     )
+    try:
+        import aiohttp
+
+        retryable += (aiohttp.ClientConnectionError,)
+    except ImportError:
+        pass
+    return isinstance(e, retryable)
 
 
 _MODEL_RPM: dict[str, float] | None = None
 
+# Built-in per-model request caps (provider account limits). Overridable per model via
+# SKUNK_MODEL_RPM ("model=rpm,..."); a model in neither falls back to SKUNK_LLM_RPM.
+_DEFAULT_RPM: dict[str, float] = {
+    "gemini-3.5-flash": 1000.0,
+    "gemini-3.1-flash-lite": 4000.0,
+    "gemini-3.1-pro-preview": 150.0,
+}
+
 
 def _llm_model_rpm(model: str) -> float:
     """Per-minute request cap for an LLM `model`. Parsed once from `SKUNK_MODEL_RPM`
-    ("model=rpm,..."); a model not listed falls back to `SKUNK_LLM_RPM` (default
-    1000), so single-model runs are unaffected. Each model gets its own limiter
-    bucket (`llm:<model>`), so mixed-model runs pace independently."""
+    ("model=rpm,..."); a model not listed falls back to its `_DEFAULT_RPM`, then to
+    `SKUNK_LLM_RPM` (default 1000). Each model gets its own limiter bucket
+    (`llm:<model>`), so mixed-model runs pace independently."""
     global _MODEL_RPM
     if _MODEL_RPM is None:
         out: dict[str, float] = {}
@@ -98,7 +112,11 @@ def _llm_model_rpm(model: str) -> float:
             name, _, rpm = entry.partition("=")
             out[name.strip()] = float(rpm.strip())
         _MODEL_RPM = out
-    return _MODEL_RPM.get(model, float(os.environ.get("SKUNK_LLM_RPM", "1000")))
+    if model in _MODEL_RPM:
+        return _MODEL_RPM[model]
+    if model in _DEFAULT_RPM:
+        return _DEFAULT_RPM[model]
+    return float(os.environ.get("SKUNK_LLM_RPM", "1000"))
 
 
 # ---------------------------------------------------------------------------
@@ -107,13 +125,13 @@ def _llm_model_rpm(model: str) -> float:
 # The RPM limiter alone can't bound token throughput: one request can carry tens
 # of thousands of tokens, so a request-paced run still blows a TPM quota (the
 # full-text page-index filter pushed ~36M tok/min and 429-stormed). This bucket
-# meters estimated *input* tokens per call. Mirrors `_AsyncRateLimiter`'s
+# meters estimated *input* tokens per call. Mirrors `_RateLimiter.acquire_async`'s
 # cross-loop safety (threading.Lock around refill+deduct, sleep outside the lock).
 # Off unless `SKUNK_MODEL_TPM` names the model, so it's scoped to experiments.
 # ---------------------------------------------------------------------------
 
 class _AsyncTokenBudget:
-    """Like `_AsyncRateLimiter` but `acquire(amount)` deducts a variable token
+    """Like `_RateLimiter.acquire_async` but `acquire(amount)` deducts a variable token
     count (the call's estimated input tokens). `capacity` allows a short burst
     and must exceed the largest single request, or `acquire` would cap-clamp it."""
 
@@ -174,11 +192,19 @@ def get_async_tpm_limiter(model: str, tpm: float) -> _AsyncTokenBudget:
 
 _MODEL_TPM: dict[str, float] | None = None
 
+# Built-in per-model token-per-minute caps (provider account limits). Overridable per model
+# via SKUNK_MODEL_TPM ("model=tpm,..."); a model in neither is unthrottled (None) and paced
+# by RPM alone (e.g. Pro).
+_DEFAULT_TPM: dict[str, float] = {
+    "gemini-3.5-flash": 4_000_000.0,
+    "gemini-3.1-flash-lite": 25_000_000.0,
+}
+
 
 def _llm_model_tpm(model: str) -> float | None:
     """Per-minute *token* cap for `model`, parsed once from `SKUNK_MODEL_TPM`
-    ("model=tpm,..."). Returns None (no throttle) when unset — so the TPM bucket
-    is inert unless explicitly configured."""
+    ("model=tpm,..."), else its `_DEFAULT_TPM`. Returns None (no throttle) when neither
+    sets it — so the TPM bucket is inert for unlisted models (e.g. Pro, paced by RPM)."""
     global _MODEL_TPM
     if _MODEL_TPM is None:
         out: dict[str, float] = {}
@@ -189,7 +215,9 @@ def _llm_model_tpm(model: str) -> float | None:
             name, _, tpm = entry.partition("=")
             out[name.strip()] = float(tpm.strip())
         _MODEL_TPM = out
-    return _MODEL_TPM.get(model)
+    if model in _MODEL_TPM:
+        return _MODEL_TPM[model]
+    return _DEFAULT_TPM.get(model)
 
 
 def _estimate_prompt_tokens(system: str, user: str) -> float:
@@ -314,12 +342,12 @@ class LLMClient:
         """Async twin of `_retry_call`: awaits `model`'s async rate limiter and the
         coroutine `do_call`, backing off via `asyncio.sleep` (never blocking the
         event loop). `do_call` owns the API invocation, timing, parsing, and emit."""
-        limiter = get_async_rate_limiter(f"llm:{model}", rate_per_min=_llm_model_rpm(model))
+        limiter = get_rate_limiter(f"llm:{model}", rate_per_min=_llm_model_rpm(model))
         max_retries = self._config.llm_max_retries
         delay = self._config.llm_retry_initial_delay_s
 
         for attempt in range(max_retries + 1):
-            await limiter.acquire()
+            await limiter.acquire_async()
             try:
                 return await do_call()
             except Exception as e:
@@ -477,7 +505,8 @@ class LLMClient:
                 ctx.emit(
                     f"call call_site={call_site} model={model} temp={temperature} "
                     f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']}"
+                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
+                    f"think_tok={toks['thinking_tokens']}"
                 )
             return LLMResponse(
                 text=output_text,
@@ -533,7 +562,8 @@ class LLMClient:
                 ctx.emit(
                     f"call call_site={call_site} model={model} temp={temperature} "
                     f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']}"
+                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
+                    f"think_tok={toks['thinking_tokens']}"
                 )
             return LLMResponse(
                 text=output_text,
@@ -617,7 +647,8 @@ class LLMClient:
                 ctx.emit(
                     f"call call_site={call_site} model={model_id} temp={temperature} "
                     f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']}"
+                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
+                    f"think_tok={toks['thinking_tokens']}"
                 )
             return LLMResponse(
                 text=accumulated,
@@ -723,7 +754,8 @@ class LLMClient:
                 ctx.emit(
                     f"call call_site={call_site} model={model_id} temp={temperature} "
                     f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']}"
+                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
+                    f"think_tok={toks['thinking_tokens']}"
                 )
             return LLMResponse(
                 text=accumulated,
@@ -813,7 +845,8 @@ class LLMClient:
                 ctx.emit(
                     f"call call_site={call_site} model={model} temp={temperature} "
                     f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']}"
+                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
+                    f"think_tok={toks['thinking_tokens']}"
                 )
             return LLMResponse(
                 text=output_text,
@@ -867,7 +900,8 @@ class LLMClient:
                 ctx.emit(
                     f"call call_site={call_site} model={model} temp={temperature} "
                     f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']}"
+                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
+                    f"think_tok={toks['thinking_tokens']}"
                 )
             return LLMResponse(
                 text=output_text,
@@ -939,7 +973,8 @@ class LLMClient:
                 ctx.emit(
                     f"call call_site={call_site} model={model_id} temp={temperature} "
                     f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']}"
+                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
+                    f"think_tok={toks['thinking_tokens']}"
                 )
             return LLMResponse(
                 text=accumulated,
@@ -998,7 +1033,8 @@ class LLMClient:
                 ctx.emit(
                     f"call call_site={call_site} model={model_id} temp={temperature} "
                     f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']}"
+                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
+                    f"think_tok={toks['thinking_tokens']}"
                 )
             return LLMResponse(
                 text=accumulated,

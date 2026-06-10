@@ -230,11 +230,17 @@ class PromptedCall[T]:
         attempt = 0
         retry: ParseError | None = None
         while True:
+            # First attempt honors the caller's temperature (usually 0.0 for determinism);
+            # parse-retries ESCALATE it. A temp-0 reply that won't parse tends to regenerate
+            # verbatim even when re-prompted with the error, so nudging temperature — not just
+            # re-asking — is what actually breaks a degenerate output (e.g. prose-as-JSON, an
+            # unescaped backslash). 0.0 → 0.4 → 0.6 → 0.8, capped at 1.0.
+            attempt_temp = temperature if attempt == 0 else min(1.0, 0.4 + 0.2 * (attempt - 1))
             resp = await ctx.llm_client.acall(
                 system,
                 self._compose_user(user, retry),
                 images=images,
-                temperature=temperature,
+                temperature=attempt_temp,
                 effort=eff,
                 ctx=ctx,
                 call_site=self.name,
@@ -251,7 +257,8 @@ class PromptedCall[T]:
                 if attempt >= self._max_parse_retries:
                     raise
                 ctx.emit(
-                    f"parse_retry call_site={self.name} attempt={attempt + 1} error={e.detail!r}"
+                    f"parse_retry call_site={self.name} attempt={attempt + 1} "
+                    f"next_temp={min(1.0, 0.4 + 0.2 * attempt):.1f} error={e.detail!r}"
                 )
                 retry = e
                 attempt += 1

@@ -1,21 +1,20 @@
 from __future__ import annotations
 
 import asyncio
-import time
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import cast
 from skunk.compute import ComputeOp
 from skunk.config import SkunkConfig
 from skunk.errors import MissingData, StepFailed
 from skunk.extract import ExtractOp
 from skunk.lookup_external import LookupExternalOp
-from skunk.common import AnnotatedValue, ExecutionContext
+from skunk.common import AnnotatedValue, BlockRef, ExecutionContext, traced_step
 from skunk.llm_client import LLMClient
-from skunk.plan import Branch, Plan, PlanDiff, Planner
+from skunk.plan import Branch, Plan, PlanDiff, Planner, RetrieveBranch
 from skunk.prompted_call import PromptOverride
 from skunk.question_explainer import QuestionExplainer
 from skunk.retrieve import RetrieveOp
-from skunk.result import ExecutionResult, describe_value, summarize_value
+from skunk.result import ExecutionResult
 
 
 @dataclass
@@ -64,10 +63,21 @@ class Orchestrator:
         self._explainer = QuestionExplainer()
         self._compute = ComputeOp()
         self._result = ExecutionResult(question=question)
+        # Deduped union of every BlockRef the retrieve phase produced this question (first-seen
+        # order, accumulated across the initial sweep and any replan sweeps). Exposed via
+        # `retrieved_blocks` so the eval harness can cache and replay a run without re-paying
+        # retrieval. Empty under golden/replay bypass (retrieve never runs).
+        self._retrieved_blocks: list[BlockRef] = []
 
     @property
     def ctx(self) -> ExecutionContext:
         return self._ctx
+
+    @property
+    def retrieved_blocks(self) -> list[BlockRef]:
+        """Deduped union of blocks from every retrieve sweep this question (empty under
+        golden/replay bypass). Pages are derivable via each block's `member_refs`."""
+        return self._retrieved_blocks
 
     @property
     def current_plan(self) -> Plan | None:
@@ -79,14 +89,14 @@ class Orchestrator:
 
     async def execute(self) -> str:
         explain_task = asyncio.create_task(
-            self._execute_with_tracing(
-                "question_explainer",
+            traced_step(
+                self._ctx, "question_explainer",
                 lambda: self._explainer.run(self._ctx, question=self._ctx.question),
             )
         )
         try:
-            plan = await self._execute_with_tracing(
-                "planner",
+            plan = await traced_step(
+                self._ctx, "planner",
                 lambda: self._planner.plan(self._ctx.question, self._ctx),
             )
             self._branch_ids = self._alloc_branch_ids(len(plan.branches))
@@ -101,8 +111,8 @@ class Orchestrator:
             self._current_plan = plan
             entries = [e for o in outcomes if o.entries for e in o.entries]
             try:
-                self._result.answer = await self._execute_with_tracing(
-                    "compute",
+                self._result.answer = await traced_step(
+                    self._ctx, "compute",
                     lambda: self._compute.run(
                         entries,
                         self._ctx,
@@ -119,8 +129,8 @@ class Orchestrator:
                 # block exit, and the lambda is also opaque to ruff's use analysis.
                 reason, missing = e.reason, e.missing
                 failed = [(o.branch, o.error) for o in outcomes if o.error]
-                diff = await self._execute_with_tracing(
-                    "replanner",
+                diff = await traced_step(
+                    self._ctx, "replanner",
                     lambda: self._planner.replan(
                         self._ctx,
                         plan,
@@ -189,29 +199,78 @@ class Orchestrator:
             data=data,
         )
 
-    async def _run_branch(self, branch: Branch, branch_id: int) -> list[AnnotatedValue]:
-        if branch.kind == "retrieve":
-            doc = await self._execute_with_tracing(
-                "retrieve",
-                lambda: self._retrieve.run(self._ctx, branch),
-                branch_id=branch_id,
+    async def _run_retrieve_phase(
+        self, branches: list[RetrieveBranch]
+    ) -> list[list[BlockRef] | StepFailed]:
+        """Unified multi-scan retrieve for every retrieve branch at once: their candidate
+        pages are deduped and the LLM semantic filter scans each unique page at most once,
+        judging it against all branches' targets, then routes the survivors back per branch.
+        On the page-index path the routed survivors are further narrowed by the backend's
+        intrinsic `block_select` stage before they are returned. Returns each branch's
+        blocks in input order, or — if the whole sweep fails — the `StepFailed` to
+        attribute to every retrieve branch so each replans on its own. The shared `retrieve`
+        sweep spans all branches, so its trace step carries no `branch_id`."""
+        if not branches:
+            return []
+        try:
+            docs: list[list[BlockRef] | StepFailed] = list(
+                await traced_step(
+                    self._ctx, "retrieve",
+                    lambda: self._retrieve.run_all(self._ctx, branches),
+                )
             )
-            return await self._execute_with_tracing(
-                "extract",
-                lambda: self._extract.run(doc, self._ctx, branch),
-                branch_id=branch_id,
-            )
-        return await self._execute_with_tracing(
-            "lookup_external",
-            lambda: self._lookup.run(self._ctx, branch),
-            branch_id=branch_id,
-        )
+        except StepFailed as e:
+            return [e] * len(branches)
+
+        # Accumulate the deduped block union (cache seam). Replan sweeps extend the same
+        # list, so rebuild the seen-set from the current list each call rather than carrying
+        # a persistent set that would outlive the sweep it was built for.
+        seen_blocks = set(self._retrieved_blocks)
+        for doc in docs:
+            if isinstance(doc, StepFailed):
+                continue
+            for blk in doc:
+                if blk not in seen_blocks:
+                    seen_blocks.add(blk)
+                    self._retrieved_blocks.append(blk)
+        return docs
 
     async def _run_branches(
         self, branches: list[Branch], branch_ids: list[int]
     ) -> list[BranchOutcome]:
+        # Global retrieve phase: all retrieve branches share one deduped semantic-filter
+        # sweep, then each branch's routed refs feed its own extract. Lookup branches are
+        # independent and run in the per-branch tail below.
+        retrieve_pos = [i for i, b in enumerate(branches) if b.kind == "retrieve"]
+        docs = await self._run_retrieve_phase(
+            [cast(RetrieveBranch, branches[i]) for i in retrieve_pos]
+        )
+        docs_by_pos: dict[int, list[BlockRef] | StepFailed] = dict(
+            zip(retrieve_pos, docs)
+        )
+
+        async def _tail(pos: int) -> list[AnnotatedValue]:
+            branch, bid = branches[pos], branch_ids[pos]
+            if branch.kind == "retrieve":
+                # Already post-block-select: `_run_retrieve_phase` returned the branch's blocks
+                # (page-index selections, or whole-page blocks for golden / search-agent). Extract
+                # reads those and feeds each block's pages whole.
+                doc = docs_by_pos[pos]
+                if isinstance(doc, StepFailed):
+                    raise doc
+                return await traced_step(
+                    self._ctx, "extract",
+                    lambda: self._extract.run(doc, self._ctx, branch),
+                    branch_id=bid,
+                )
+            return await traced_step(
+                self._ctx, "lookup_external",
+                lambda: self._lookup.run(self._ctx, branch),
+                branch_id=bid,
+            )
+
         results = await asyncio.gather(
-            *(self._run_branch(b, bid) for b, bid in zip(branches, branch_ids)),
+            *(_tail(i) for i in range(len(branches))),
             return_exceptions=True,
         )
         outcomes: list[BranchOutcome] = []
@@ -227,37 +286,3 @@ class Orchestrator:
             else:
                 outcomes.append(BranchOutcome(branch=branch, entries=res, error=None))
         return outcomes
-
-    async def _execute_with_tracing[T](
-        self,
-        op_name: str,
-        fn: Callable[[], Awaitable[T]],
-        *,
-        branch_id: int | None = None,
-    ) -> T:
-        t0 = time.perf_counter()
-        with self._ctx.step(op_name):
-            try:
-                result = await fn()
-            except (StepFailed, MissingData) as e:
-                err = (
-                    f"MissingData: {e.reason}" if isinstance(e, MissingData) else str(e)
-                )
-                elapsed = round(time.perf_counter() - t0, 3)
-                self._ctx.emit(
-                    f"step elapsed_s={elapsed} output=(failed) error={err!r}",
-                    kind="step",
-                    data={"branch_id": branch_id, "elapsed_s": elapsed, "error": err},
-                )
-                raise
-            elapsed = round(time.perf_counter() - t0, 3)
-            self._ctx.emit(
-                f"step elapsed_s={elapsed} output={describe_value(result)!r}",
-                kind="step",
-                data={
-                    "branch_id": branch_id,
-                    "elapsed_s": elapsed,
-                    "summary": summarize_value(result),
-                },
-            )
-        return result

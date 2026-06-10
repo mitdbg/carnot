@@ -27,9 +27,9 @@ Usage
 
 ```python
 from pathlib import Path
-from data.page_index.retrieve import RetrievalIndex
+from data.page_index_old.retrieve import RetrievalIndex
 
-idx = RetrievalIndex.load(Path("data/page_index/concept_tree.json"))
+idx = RetrievalIndex.load(Path("data/page_index_old/concept_tree.json"))
 
 # Caller supplies an LLM callable: (system_prompt, user_prompt) -> text
 def my_llm(system: str, user: str) -> str:
