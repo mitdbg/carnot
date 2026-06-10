@@ -79,6 +79,12 @@ class AgentWorkerPool:
             if attempt is None:
                 self._queues.agent.task_done()
                 continue
+            if self._loop is not None and self._on_completion is not None:
+                self._loop.call_soon_threadsafe(
+                    self._on_completion,
+                    task_id,
+                    "processing",
+                )
             outcome = "failed"
             try:
                 task = self._registry.get(task_id)

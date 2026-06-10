@@ -8,9 +8,10 @@ SKUNK_CLIENT_PORT="8790"
 ROUND_SECONDS="3600"
 QUESTIONS="questions/officeqa_2x5_questions.json"
 CUP_TEAM_TOKEN="anything"
-REASONER="${REASONER:-skunk_reasoner:solve}"
+# REASONER="skunk_reasoner:solve"
 # REASONER="dummy_agent:solve"
-CONCURRENCY="3"
+REASONER="cached_reasoner:solve"
+CONCURRENCY="5"
 AUTO_SUBMIT="${AUTO_SUBMIT:-false}"
 PYTHON_BIN="${PYTHON_BIN:-/home/gerardo/.local/share/mamba/envs/carnot/bin/python}"
 
@@ -18,6 +19,7 @@ cd "$(dirname "$0")"
 export CUP_BASE_URL="http://${HOST}:${CUP_PORT}"
 export CUP_TEAM_TOKEN
 export SKUNK_SERVER_URL="http://${HOST}:${SKUNK_SERVER_PORT}"
+export SKUNK_PAGE_INDEX_DIR="${SKUNK_PAGE_INDEX_DIR:-$(cd .. && pwd)/cache/build_v3}"
 
 "$PYTHON_BIN" practice_server.py --host "$HOST" --port "$CUP_PORT" \
   --round-seconds "$ROUND_SECONDS" --questions "$QUESTIONS" &

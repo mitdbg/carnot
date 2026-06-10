@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from types import SimpleNamespace
 import httpx
 import pytest  # type: ignore[import-not-found]
@@ -22,6 +23,12 @@ from skunk_server.human_worker_registry import HumanWorkerRegistry
 from skunk_server.task_queues import TaskQueues
 from skunk_server.task_registry import TaskConflict, TaskRegistry
 from skunk_server.submission_coordinator import SubmissionCoordinator
+from skunk_reasoner import (
+    SKUNK_ROOT,
+    _set_default_env,
+    _source_docs_from_events,
+    _structured_reasoning_payload,
+)
 
 
 def _ready_task(registry: TaskRegistry, question_id: str = "q1"):
@@ -119,6 +126,14 @@ def test_worker_registry_names_are_mnemonic() -> None:
     assert first.mnemonic == f"Treasury Tables ({first.worker_id[:4]})"
 
 
+def test_reasoner_defaults_page_index_to_repo_cache(monkeypatch) -> None:
+    monkeypatch.delenv("SKUNK_PAGE_INDEX_DIR", raising=False)
+
+    _set_default_env()
+
+    assert os.environ["SKUNK_PAGE_INDEX_DIR"] == str(SKUNK_ROOT / "cache/build_v3")
+
+
 def test_agent_worker_pool_success_and_failure() -> None:
     async def run() -> None:
         loop = asyncio.get_running_loop()
@@ -142,7 +157,10 @@ def test_agent_worker_pool_success_and_failure() -> None:
                 await asyncio.sleep(0.02)
             assert success_task.status == TaskStatus.READY
             assert success_task.latest_candidate is not None
-            assert success_events == [(success_task.task_id, "ready")]
+            assert success_events == [
+                (success_task.task_id, "processing"),
+                (success_task.task_id, "ready"),
+            ]
         finally:
             success_pool.stop()
 
@@ -284,6 +302,69 @@ def test_client_source_route_serves_pdf_pages(tmp_path) -> None:
     assert response.headers["content-type"].startswith("application/pdf")
     assert response.headers["content-disposition"].startswith("inline")
     assert response.content.startswith(b"%PDF-1.4")
+
+
+def test_reasoning_payload_includes_branch_cards_and_code() -> None:
+    events = [
+        {
+            "kind": "plan",
+            "data": {
+                "label": "initial",
+                "branches": [
+                    {"branch_id": 0, "kind": "retrieve", "key": "inflation", "period": "1954-02", "as_of": "1954-02"},
+                    {"branch_id": 1, "kind": "lookup_external", "target": "cpi", "src": "fred"},
+                ],
+            },
+        },
+        {
+            "kind": "step",
+            "op": "extract",
+            "data": {"branch_id": 0, "summary": {"type": "values", "values": [{"description": "inflation"}]}},
+        },
+        {
+            "kind": "step",
+            "op": "lookup_external",
+            "data": {"branch_id": 1, "summary": {"type": "scalar", "value": 3.1}},
+        },
+        {
+            "kind": "step",
+            "op": "compute",
+            "data": {"attempt": 1, "code": "result = '42'"},
+        },
+    ]
+
+    payload = _structured_reasoning_payload(events, ["Treasury Bulletin 1954-02 PDF page 4"])
+
+    assert payload["summary"]["branch_count"] == 2
+    assert payload["branches"][0]["searched"]["key"] == "inflation"
+    assert payload["branches"][1]["searched"]["target"] == "cpi"
+    assert payload["python_code"] == "result = '42'"
+
+
+def test_source_docs_are_read_from_structured_step_provenance() -> None:
+    events = [
+        {
+            "kind": "step",
+            "op": "extract",
+            "data": {
+                "summary": {
+                    "type": "values",
+                    "values": [
+                        {
+                            "description": "reported value",
+                            "bulletin": "1954-02",
+                            "pages": [4, 5],
+                        }
+                    ],
+                }
+            },
+        }
+    ]
+
+    assert _source_docs_from_events(events) == [
+        "Treasury Bulletin 1954-02 PDF page 4",
+        "Treasury Bulletin 1954-02 PDF page 5",
+    ]
 
 
 def test_auto_submit_records_immediate_score_feedback() -> None:

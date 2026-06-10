@@ -50,6 +50,22 @@ function connect() {
   socket.onerror = () => socket.close();
 }
 
+async function hydrate() {
+  try {
+    const response = await fetch(SERVER + "/api/state");
+    if (!response.ok) return;
+    const snapshot = await response.json();
+    // A WebSocket snapshot includes this browser's worker identity. Do not
+    // overwrite it if the socket won the race with this initial HTTP request.
+    if (!state.worker) {
+      state = snapshot;
+      render();
+    }
+  } catch {
+    // The WebSocket reconnect loop remains the authoritative recovery path.
+  }
+}
+
 async function command(path, body, method = "POST") {
   const response = await fetch(SERVER + path, {
     method,
@@ -113,6 +129,85 @@ function taskBadgeClass(task) {
   return "queued";
 }
 
+function parseReasoningPayload(reasoning) {
+  if (typeof reasoning !== "string" || !reasoning.trim().startsWith("{")) return null;
+  try {
+    const parsed = JSON.parse(reasoning);
+    if (parsed && Array.isArray(parsed.branches)) return parsed;
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function formatReasoningValue(value) {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  return JSON.stringify(value, null, 2);
+}
+
+function reasoningVisual(reasoning, answer) {
+  const payload = parseReasoningPayload(reasoning);
+  if (!payload) return "";
+  const branches = payload.branches || [];
+  const code = payload.python_code || "";
+  const attempts = payload.python_attempts || [];
+  return `<section class="reasoning-shell">
+    <div class="label">Reasoning Flow</div>
+    <div class="reasoning-flow">
+      <div class="flow-branches">
+      ${branches.map(branch => `
+        <article class="flow-lane ${esc(branch.status || "ok")}">
+          <div class="flow-node search-node">
+            <span class="flow-kicker">${esc((branch.kind || "branch").replace("_", " "))} ${esc(branch.branch_id)}</span>
+            <strong>${esc(formatReasoningValue(branch.searched) || "No search detail")}</strong>
+          </div>
+          <div class="flow-arrow" aria-hidden="true"></div>
+          <div class="flow-node value-node">
+            <span class="flow-kicker">${esc(branch.output_step || "extracted values")}</span>
+            <strong>${esc(formatReasoningValue(branch.output) || "No value captured")}</strong>
+          </div>
+        </article>
+      `).join("")}
+      </div>
+      <div class="flow-merge" aria-hidden="true"></div>
+      <div class="flow-node compute-node">
+        <span class="flow-kicker">Python compute${payload.python_attempt ? ` · attempt ${esc(payload.python_attempt)}` : ""}</span>
+        <pre class="code-block">${esc(code || "No python code captured.")}</pre>
+        ${attempts.length > 1 ? `<span class="flow-note">${esc(attempts.length)} compute attempts captured</span>` : ""}
+      </div>
+      <div class="flow-arrow vertical" aria-hidden="true"></div>
+      <div class="flow-node answer-node">
+        <span class="flow-kicker">Final answer</span>
+        <strong>${esc(answer || "-")}</strong>
+      </div>
+    </div>
+  </section>`;
+}
+
+function taskElapsedSeconds(task) {
+  const attempts = task.attempts || [];
+  if (!attempts.length) return null;
+  return attempts.reduce((total, attempt) => {
+    const started = Date.parse(attempt.started_at);
+    const completed = Date.parse(attempt.completed_at || new Date().toISOString());
+    return total + (Number.isFinite(started) && Number.isFinite(completed)
+      ? Math.max(0, completed - started) / 1000
+      : 0);
+  }, 0);
+}
+
+function formatClock(timestamp) {
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) return "-";
+  return date.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+}
+
 function formatDuration(seconds) {
   if (!Number.isFinite(seconds)) return "--:--";
   const safe = Math.max(0, Math.floor(seconds));
@@ -174,9 +269,12 @@ function renderDetail(task) {
     ? `<div class="label">Submission</div><pre>${esc(submission.status)}${submission.correct === null || submission.correct === undefined ? "" : ` | correct=${submission.correct} | points=${submission.points_awarded ?? "-"}`}</pre>`
     : "";
   const answerSection = candidate
-    ? `<div class="label">Answer</div><pre class="answer">${esc(candidate.answer_text)}</pre>
-      <div class="label">Reasoning</div><pre>${esc(candidate.reasoning)}</pre>
-      ${candidate.source_docs?.length ? `<div class="label">Source Docs</div><div class="docs">${candidate.source_docs.map(sourceDocHtml).join("")}</div>` : ""}`
+    ? `${candidate.source_docs?.length ? `<div class="label">Source Docs</div><div class="docs">${candidate.source_docs.map(sourceDocHtml).join("")}</div>` : ""}`
+    : "";
+  const reasoningPayload = candidate ? parseReasoningPayload(candidate.reasoning) : null;
+  const reasoningSection = candidate
+    ? reasoningVisual(candidate.reasoning, candidate.answer_text)
+      || `<div class="label">Reasoning</div><pre>${esc(candidate.reasoning)}</pre>`
     : "";
   const detailActions = [];
   if ((task.status === "READY" || task.status === "FAILED") && workerId) {
@@ -199,17 +297,21 @@ function renderDetail(task) {
     }
     detailActions.push(`<button onclick="releaseAssignment('${js(assignment.assignment_id)}')">Release</button>`);
   }
+  const elapsed = taskElapsedSeconds(task);
   const taskMeta = `
-    <div class="kv">
+    <div class="kv task-meta">
       <div><span>Status</span><strong>${esc(task.status)}</strong></div>
-      <div><span>Elapsed</span><strong>${task.elapsed_s !== null && task.elapsed_s !== undefined ? esc(task.elapsed_s) + "s" : "-"}</strong></div>
-      <div><span>Updated</span><strong>${esc(task.updated_at || "-")}</strong></div>
+      <div class="answer-metric"><span>Answer</span><strong>${esc(candidate?.answer_text || "-")}</strong></div>
+      <div><span>Elapsed</span><strong>${elapsed === null ? "-" : esc(formatDuration(elapsed))}</strong></div>
+      <div><span>Updated</span><strong>${esc(formatClock(task.updated_at))}</strong></div>
+      <div><span>Replans</span><strong>${esc(reasoningPayload?.summary?.replan_count ?? "-")}</strong></div>
     </div>`;
   return `<div class="detail-body">
     <p class="prompt">R${esc(task.round_num)} / ${esc(task.question_id)}</p>
     <div class="label">Prompt</div><pre>${esc(task.prompt)}</pre>
     ${taskMeta}
     ${answerSection}
+    ${reasoningSection}
     ${submissionLine}
     ${cupFeedback}
     ${assignmentSummary}
@@ -306,5 +408,6 @@ window.directAnswer = (assignmentId, version) => run(command("/api/human-answers
 }));
 window.selectTask = selectTask;
 
+hydrate();
 connect();
 setInterval(updateRoundTimer, 1000);
