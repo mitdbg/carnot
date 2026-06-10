@@ -23,8 +23,8 @@ and lets an operator submit answers manually.
 - `dummy_agent.py` - test reasoner. `solve(prompt)` waits 5-10 seconds and
   returns a random number.
 - `CONSOLE_README.md` - operator-facing usage instructions.
-- `officeqa_3x5_questions.json` - 3 rounds of 5 OfficeQA questions generated
-  from the first 15 rows of `skunk/officeqa_full.csv`.
+- `questions/officeqa_3x5_questions.json` - 3 rounds of 5 OfficeQA questions
+  generated from the first 15 rows of `skunk/officeqa_full.csv`.
 
 ## Runtime Shape
 
@@ -44,12 +44,14 @@ The reasoner is configured as `module:function` and must return an
 The browser UI is a master-detail layout:
 
 - Top summary bar: Cup URL, connection status, round number, round status,
-  resubmits left, and aggregate counters.
+  resubmits left, a live countdown derived from the round's `ends_at`, and
+  aggregate counters.
 - Left panel: list of received questions. Each row shows round/question ID,
   prompt preview, and execution status.
 - Right panel: selected question details. Shows full prompt, status, elapsed
   time, updated timestamp, answer, reasoning, source docs, scoring feedback,
-  rejection/errors, and per-question Submit/Retry buttons.
+  rejection/errors, and per-question Submit/Retry buttons. Treasury Bulletin
+  source references link to the relevant local PDF page in a new browser tab.
 - Left panel header includes Submit All, enabled only when at least one current
   question has a computed answer ready to submit.
 
@@ -83,6 +85,8 @@ longer allowed.
 
 - `GET /` - embedded browser UI.
 - `GET /api/state` - full console state snapshot.
+- `GET /api/source/{YYYY-MM}` - serve one configured local Treasury Bulletin
+  PDF for source-document links.
 - `POST /api/questions/{round_num}/{question_id}/retry` - rerun the reasoner for
   one question.
 - `POST /api/questions/{round_num}/{question_id}/submit` - submit one computed
@@ -98,7 +102,7 @@ longer allowed.
 - Added manual per-question Submit and Retry buttons.
 - Added `CONSOLE_README.md` so console usage docs stay separate from the
   official practice kit README.
-- Added `officeqa_3x5_questions.json` with 3 rounds of 5 OfficeQA questions.
+- Added `questions/officeqa_3x5_questions.json` with 3 rounds of 5 OfficeQA questions.
 - Added `dummy_agent.py` for UI testing.
 - Added `skunk_reasoner.py` and made `serve_local_console.sh` default to
   `skunk_reasoner:solve`; `dummy_agent:solve` remains available as an override.
@@ -108,3 +112,5 @@ longer allowed.
 - Added round-close/new-round clearing behavior so previous-round questions are
   removed when submissions are no longer allowed.
 - Added Submit All for all currently computed answers.
+- Added a live round countdown to the summary panel.
+- Made Treasury Bulletin source-document chips open their cited PDF page.

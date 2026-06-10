@@ -19,7 +19,7 @@ Defaults:
 
 - Practice Cup API: `http://127.0.0.1:8765`
 - Console UI: `http://127.0.0.1:8787`
-- Questions: `officeqa_3x5_questions.json`
+- Questions: `questions/officeqa_3x5_questions.json`
 - Token: `anything`
 - Reasoner: `skunk_reasoner:solve`
 - Round length: `900` seconds
@@ -34,10 +34,14 @@ http://127.0.0.1:8787
 
 ```bash
 ROUND_SECONDS=120 ./serve_local_console.sh
-QUESTIONS=practice_questions.json ./serve_local_console.sh
+QUESTIONS=questions/practice_questions.json ./serve_local_console.sh
 REASONER=dummy_agent:solve CONCURRENCY=5 ./serve_local_console.sh
 CUP_PORT=9000 CONSOLE_PORT=8788 ./serve_local_console.sh
 ```
+
+Source-document links use `OFFICEQA_PDF_DIR`, which defaults to
+`../data/officeqa/treasury_bulletin_pdfs` relative to this repository. Override
+it with `OFFICEQA_PDF_DIR=/path/to/pdfs` or `--pdf-dir /path/to/pdfs`.
 
 The `--reasoner` value is `module:function`. The function should follow the
 same contract as `reference_agent.solve(prompt) -> AgentAnswer`.

@@ -19,6 +19,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import sys
 import time
 from collections.abc import Awaitable, Callable
@@ -31,7 +32,7 @@ from typing import Any
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from websockets.exceptions import WebSocketException
 
 from cup_kit.agent_runtime import AgentAnswer
@@ -78,6 +79,7 @@ class ConsoleConfig:
     cup_team_token: str
     reasoner_ref: str
     concurrency: int
+    pdf_dir: Path
     reconnect_backoff_s: float = 1.0
 
 
@@ -408,6 +410,13 @@ def build_app(config: ConsoleConfig, reasoner: Reasoner) -> FastAPI:
     async def api_state() -> JSONResponse:
         return JSONResponse(await state.snapshot())
 
+    @app.get("/api/source/{month}")
+    async def api_source(month: str) -> FileResponse:
+        pdf_path = _source_pdf_path(config.pdf_dir, month)
+        if not pdf_path.is_file():
+            raise HTTPException(status_code=404, detail=f"bulletin PDF not found for {month}")
+        return FileResponse(pdf_path, media_type="application/pdf")
+
     @app.post("/api/questions/{round_num}/{question_id}/retry")
     async def api_retry(round_num: int, question_id: str) -> JSONResponse:
         try:
@@ -530,6 +539,13 @@ def _clean_source_docs(source_docs: list[str]) -> list[str]:
     return out[:64]
 
 
+def _source_pdf_path(pdf_dir: Path, month: str) -> Path:
+    if re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month) is None:
+        raise HTTPException(status_code=400, detail="month must use YYYY-MM")
+    year, mon = month.split("-")
+    return pdf_dir / f"treasury_bulletin_{year}_{mon}.pdf"
+
+
 def _key(round_num: int, question_id: str) -> str:
     return f"{round_num}:{question_id}"
 
@@ -539,6 +555,7 @@ def _now_iso() -> str:
 
 
 def _parse_args() -> argparse.Namespace:
+    default_pdf_dir = Path(__file__).resolve().parents[2] / "data/officeqa/treasury_bulletin_pdfs"
     parser = argparse.ArgumentParser(description="OfficeQA Cup local operator console")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
@@ -546,6 +563,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--team-token", default=os.environ.get("CUP_TEAM_TOKEN", ""))
     parser.add_argument("--reasoner", default=os.environ.get("CONSOLE_REASONER", "reference_agent:solve"))
     parser.add_argument("--concurrency", type=int, default=int(os.environ.get("CONSOLE_CONCURRENCY", "3")))
+    parser.add_argument(
+        "--pdf-dir",
+        type=Path,
+        default=Path(os.environ.get("OFFICEQA_PDF_DIR", default_pdf_dir)),
+        help="Treasury Bulletin PDF directory used by source-document links",
+    )
     return parser.parse_args()
 
 
@@ -561,6 +584,7 @@ def main() -> None:
         cup_team_token=args.team_token,
         reasoner_ref=args.reasoner,
         concurrency=max(1, args.concurrency),
+        pdf_dir=args.pdf_dir.resolve(),
     )
     reasoner = _load_reasoner(args.reasoner)
     app = build_app(config, reasoner)
@@ -644,7 +668,7 @@ _INDEX_HTML = r"""<!doctype html>
     }
     .summary {
       display: grid;
-      grid-template-columns: repeat(5, minmax(120px, 1fr));
+      grid-template-columns: repeat(6, minmax(110px, 1fr));
       gap: 10px;
       margin-bottom: 12px;
     }
@@ -667,6 +691,11 @@ _INDEX_HTML = r"""<!doctype html>
       font-size: 20px;
       line-height: 1.1;
     }
+    .metric.timer strong {
+      font-variant-numeric: tabular-nums;
+    }
+    .metric.timer.warning strong { color: var(--warn); }
+    .metric.timer.expired strong { color: var(--bad); }
     .event {
       padding: 10px 12px;
       border: 1px solid var(--line);
@@ -829,6 +858,7 @@ _INDEX_HTML = r"""<!doctype html>
       margin-top: 6px;
     }
     .doc {
+      display: inline-block;
       border: 1px solid var(--line);
       border-radius: 999px;
       padding: 2px 8px;
@@ -838,6 +868,12 @@ _INDEX_HTML = r"""<!doctype html>
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
+      text-decoration: none;
+    }
+    a.doc:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+      text-decoration: underline;
     }
     .actions {
       display: flex;
@@ -914,6 +950,10 @@ _INDEX_HTML = r"""<!doctype html>
   </header>
   <main>
     <section class="summary">
+      <div id="roundTimerMetric" class="metric timer">
+        <span>Time Remaining</span>
+        <strong id="roundTimer" aria-live="off">--:--</strong>
+      </div>
       <div class="metric"><span>Total</span><strong id="mTotal">0</strong></div>
       <div class="metric"><span>Running</span><strong id="mRunning">0</strong></div>
       <div class="metric"><span>Ready</span><strong id="mReady">0</strong></div>
@@ -947,6 +987,25 @@ _INDEX_HTML = r"""<!doctype html>
     const $ = (id) => document.getElementById(id);
     const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const js = (s) => String(s ?? "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+    function updateRoundTimer() {
+      const timer = $("roundTimer");
+      const metric = $("roundTimerMetric");
+      const deadline = state?.ends_at ? Date.parse(state.ends_at) : NaN;
+      metric.classList.remove("warning", "expired");
+      if (!Number.isFinite(deadline)) {
+        timer.textContent = "--:--";
+        return;
+      }
+      const remainingSeconds = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
+      const hours = Math.floor(remainingSeconds / 3600);
+      const minutes = Math.floor((remainingSeconds % 3600) / 60);
+      const seconds = remainingSeconds % 60;
+      timer.textContent = hours > 0
+        ? `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+        : `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+      if (remainingSeconds === 0) metric.classList.add("expired");
+      else if (remainingSeconds <= 60) metric.classList.add("warning");
+    }
     function counts(questions) {
       const by = (fn) => questions.filter(fn).length;
       return {
@@ -969,6 +1028,7 @@ _INDEX_HTML = r"""<!doctype html>
       $("round").textContent = next.round_num ?? "-";
       $("roundStatus").textContent = next.round_status || "-";
       $("resubmits").textContent = next.resubmits_left ?? "-";
+      updateRoundTimer();
       const c = counts(next.questions || []);
       $("mTotal").textContent = c.total;
       $("mRunning").textContent = c.running;
@@ -1015,7 +1075,7 @@ _INDEX_HTML = r"""<!doctype html>
       status.className = `status ${q.status}`;
       status.textContent = q.status;
       const canSubmit = ["ready", "rejected", "submitted", "scored"].includes(q.status) && q.answer;
-      const docs = (q.source_docs || []).map(d => `<span class="doc" title="${esc(d)}">${esc(d)}</span>`).join("");
+      const docs = (q.source_docs || []).map(sourceDocHtml).join("");
       const verdict = q.correct === null || q.correct === undefined ? "" : `<div class="label">Score</div><pre>${q.correct ? "correct" : "wrong"}${q.points_awarded !== null && q.points_awarded !== undefined ? " / " + q.points_awarded + " pts" : ""}</pre>`;
       const err = q.error || q.rejection_reason;
       content.className = "detail-body";
@@ -1036,6 +1096,20 @@ _INDEX_HTML = r"""<!doctype html>
           <button onclick="retry(${Number(q.round_num)}, '${js(q.question_id)}')">Retry</button>
         </div>`;
     }
+    function sourceDocHtml(doc) {
+      const label = String(doc ?? "");
+      let href = null;
+      if (/^https?:\/\//i.test(label)) {
+        href = label;
+      } else {
+        const match = label.match(/^Treasury Bulletin (\d{4}-(?:0[1-9]|1[0-2])) PDF page (\d+)$/);
+        if (match) {
+          href = `/api/source/${encodeURIComponent(match[1])}#page=${Number(match[2])}`;
+        }
+      }
+      if (!href) return `<span class="doc" title="${esc(label)}">${esc(label)}</span>`;
+      return `<a class="doc" href="${esc(href)}" target="_blank" rel="noopener noreferrer" title="Open ${esc(label)}">${esc(label)}</a>`;
+    }
     async function submitAnswer(roundNum, questionId) {
       await fetch(`/api/questions/${roundNum}/${encodeURIComponent(questionId)}/submit`, {method: "POST"});
     }
@@ -1053,6 +1127,7 @@ _INDEX_HTML = r"""<!doctype html>
     }
     fetch("/api/state").then(r => r.json()).then(render);
     connect();
+    setInterval(updateRoundTimer, 1000);
   </script>
 </body>
 </html>

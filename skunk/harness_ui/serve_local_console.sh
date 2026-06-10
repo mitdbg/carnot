@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOST="${HOST:-127.0.0.1}"
-CUP_PORT="${CUP_PORT:-8765}"
-CONSOLE_PORT="${CONSOLE_PORT:-8787}"
-ROUND_SECONDS="${ROUND_SECONDS:-30}"
-QUESTIONS="${QUESTIONS:-officeqa_3x5_questions.json}"
-CUP_TEAM_TOKEN="${CUP_TEAM_TOKEN:-anything}"
-# REASONER="${REASONER:-skunk_reasoner:solve}"
-REASONER="${REASONER-dummy_agent:solve}"
-CONCURRENCY="${CONCURRENCY:-3}"
+HOST="127.0.0.1"
+CUP_PORT="8765"
+CONSOLE_PORT="8787"
+ROUND_SECONDS="3600"
+QUESTIONS="questions/officeqa_2x5_questions.json"
+CUP_TEAM_TOKEN="anything"
+REASONER="${REASONER:-skunk_reasoner:solve}"
+# REASONER="dummy_agent:solve"
+CONCURRENCY="3"
 
 cd "$(dirname "$0")"
 export CUP_BASE_URL="http://${HOST}:${CUP_PORT}"
