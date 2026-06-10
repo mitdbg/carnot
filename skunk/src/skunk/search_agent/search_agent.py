@@ -107,6 +107,13 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         self.document_map = document_map
         self.emb_client, self.emb_model_id = _make_embedding_client(config.emb_model_id)
 
+        # Bound each search-step LLM call: cap output (was uncapped → runaway
+        # generations streamed to the 65535-token ceiling at 200–800s each) and
+        # impose a hard per-request wall-clock timeout. See SkunkConfig for the
+        # thinking/max_output_tokens interaction caveat.
+        self.max_output_tokens = config.search_agent_max_output_tokens
+        self.request_timeout_s = config.search_agent_request_timeout_s
+
         # Per-question prune state: shared by the search / grep / prune tools and
         # read by `_block_is_visible` for redaction. One SearchAgent per
         # question / branch ⇒ these sets never cross-talk between questions.

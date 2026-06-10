@@ -209,12 +209,14 @@ async def _run_one_question(
                 "answer": None,
                 "failed": True,
                 "reason": result.failure_reason,
+                "wall_s": round(wall_s, 3),
             }
         return {
             "question": question,
             "answer": result.answer,
             "failed": result.failed,
             "reason": result.failure_reason,
+            "wall_s": round(wall_s, 3),
         }
     finally:
         ctx.close()
@@ -231,6 +233,8 @@ REPORT_FIELDS = [
     "golden_pages",
     "failed",
     "reason",
+    # Total wall-clock seconds to plan + execute the query (see _run_one_question).
+    "wall_s",
 ]
 
 
@@ -352,6 +356,8 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
             "answer": None,
             "failed": True,
             "reason": f"Uncaught: {type(e).__name__}: {e}",
+            # The exception escaped before _run_one_question timed the run.
+            "wall_s": None,
         }
 
     predicted = result["answer"] if not result["failed"] else ""
@@ -374,6 +380,9 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
         "golden_pages": _fmt_golden_pages(cfg.golden_report.get(uid)),
         "failed": result["failed"],
         "reason": result["reason"] or "",
+        # Total wall-clock seconds to plan + execute this query (excludes eval-side
+        # trace dumping); None if the run aborted before timing.
+        "wall_s": result.get("wall_s"),
     }
 
 

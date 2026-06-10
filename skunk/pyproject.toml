@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Declarative QA pipeline over the U.S. Treasury Bulletin corpus"
 requires-python = ">=3.12"
 dependencies = [
+    "beautifulsoup4",
     "chromadb>=1.4.0",
     "google-genai",
     "jinja2",

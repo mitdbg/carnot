@@ -181,6 +181,14 @@ class MultiTurnAgent(ABC):
     final_answer_doc: str
     default_effort: Effort = "medium"
 
+    # Per-step generation caps, threaded to `PromptedCall.call` → the LLM stream.
+    # Both None → provider defaults (uncapped output, no wall-clock timeout),
+    # preserving behaviour for every agent that doesn't opt in. `SearchAgent` sets
+    # these to bound runaway generations (output ran to the 65535-token ceiling,
+    # 200–800s per call) and to cap genuinely hung requests.
+    max_output_tokens: int | None = None
+    request_timeout_s: float | None = None
+
     _SYSTEM_TEMPLATE = """\
 {{ briefing }}
 
@@ -523,7 +531,9 @@ Requirements for the final answer:
         if self._backend is None:
             self._last_logprobs = None
             return await self._prompt.call(
-                ctx, messages=trimmed, should_stop=_has_complete_block
+                ctx, messages=trimmed, should_stop=_has_complete_block,
+                max_output_tokens=self.max_output_tokens,
+                timeout_s=self.request_timeout_s,
             )
         # Backend path (e.g. Tinker rollouts): prepend the assembled system
         # prompt, sample one turn synchronously (the rollout owns its thread +

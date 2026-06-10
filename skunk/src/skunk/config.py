@@ -94,6 +94,16 @@ class SkunkConfig:
     agent_max_steps: int = 20
     agent_max_pages_per_tool_call: int = 20
 
+    # Search-agent per-LLM-call caps (RetrieveOp only). On Gemini 3.x
+    # `max_output_tokens` is a COMBINED thinking+visible budget, so keep it above the
+    # effort tier's thinking spend (medium ≈ 2.5K, high ≈ 16K thinking tokens) or the
+    # visible answer is starved to empty (finish_reason=MAX_TOKENS). 4096 is safe at
+    # the default medium effort; raise it if the search agent is moved to high.
+    # `request_timeout_s` is a hard per-request wall-clock cap (retried on trip).
+    # (env: SKUNK_SEARCH_MAX_OUTPUT_TOKENS, SKUNK_SEARCH_TIMEOUT_S)
+    search_agent_max_output_tokens: int = 4096
+    search_agent_request_timeout_s: float = 120.0
+
     # Step cap for the lookup_external agent (terminates earlier via its final-answer JSON block).
     # (env: SKUNK_LOOKUP_MAX_STEPS)
     lookup_max_steps: int = 8
@@ -138,6 +148,8 @@ class SkunkConfig:
             emb_model_id=os.environ.get("SKUNK_EMB_MODEL", "gemini-embedding-001"),
             agent_max_steps=int(os.environ.get("SKUNK_AGENT_MAX_STEPS", "20")),
             agent_max_pages_per_tool_call=int(os.environ.get("SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL", "20")),
+            search_agent_max_output_tokens=int(os.environ.get("SKUNK_SEARCH_MAX_OUTPUT_TOKENS", "4096")),
+            search_agent_request_timeout_s=float(os.environ.get("SKUNK_SEARCH_TIMEOUT_S", "120")),
             lookup_max_steps=int(os.environ.get("SKUNK_LOOKUP_MAX_STEPS", "8")),
             lookup_tools=_parse_csv(os.environ.get("SKUNK_LOOKUP_TOOLS", "")),
             agent_model_id=os.environ.get("SKUNK_AGENT_MODEL") or None,
