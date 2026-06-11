@@ -7,6 +7,7 @@ from skunk.compute import ComputeOp
 from skunk.config import SkunkConfig
 from skunk.errors import MissingData, StepFailed
 from skunk.extract import ExtractOp
+from skunk.human import HumanAssist
 from skunk.lookup_external import LookupExternalOp
 from skunk.common import AnnotatedValue, BlockRef, ExecutionContext, traced_step
 from skunk.llm_client import LLMClient
@@ -60,6 +61,9 @@ class Orchestrator:
         self._retrieve = RetrieveOp(self._ctx.config)
         self._extract = ExtractOp()
         self._lookup = LookupExternalOp()
+        # Human-in-the-loop middleware (inert unless a SKUNK_HUMAN_* flag is set). Gates on
+        # ctx.config per call, so constructing it unconditionally is free when disabled.
+        self._human = HumanAssist()
         self._explainer = QuestionExplainer()
         self._compute = ComputeOp()
         self._result = ExecutionResult(question=question)
@@ -90,13 +94,15 @@ class Orchestrator:
     async def execute(self) -> str:
         explain_task = asyncio.create_task(
             traced_step(
-                self._ctx, "question_explainer",
+                self._ctx,
+                "question_explainer",
                 lambda: self._explainer.run(self._ctx, question=self._ctx.question),
             )
         )
         try:
             plan = await traced_step(
-                self._ctx, "planner",
+                self._ctx,
+                "planner",
                 lambda: self._planner.plan(self._ctx.question, self._ctx),
             )
             self._branch_ids = self._alloc_branch_ids(len(plan.branches))
@@ -112,7 +118,8 @@ class Orchestrator:
             entries = [e for o in outcomes if o.entries for e in o.entries]
             try:
                 self._result.answer = await traced_step(
-                    self._ctx, "compute",
+                    self._ctx,
+                    "compute",
                     lambda: self._compute.run(
                         entries,
                         self._ctx,
@@ -130,7 +137,8 @@ class Orchestrator:
                 reason, missing = e.reason, e.missing
                 failed = [(o.branch, o.error) for o in outcomes if o.error]
                 diff = await traced_step(
-                    self._ctx, "replanner",
+                    self._ctx,
+                    "replanner",
                     lambda: self._planner.replan(
                         self._ctx,
                         plan,
@@ -200,7 +208,7 @@ class Orchestrator:
         )
 
     async def _run_retrieve_phase(
-        self, branches: list[RetrieveBranch]
+        self, branches: list[RetrieveBranch], branch_ids: list[int]
     ) -> list[list[BlockRef] | StepFailed]:
         """Unified multi-scan retrieve for every retrieve branch at once: their candidate
         pages are deduped and the LLM semantic filter scans each unique page at most once,
@@ -208,17 +216,30 @@ class Orchestrator:
         On the page-index path the routed survivors are further narrowed by the backend's
         intrinsic `block_select` stage before they are returned. Returns each branch's
         blocks in input order, or — if the whole sweep fails — the `StepFailed` to
-        attribute to every retrieve branch so each replans on its own. The shared `retrieve`
-        sweep spans all branches, so its trace step carries no `branch_id`."""
+        attribute to every retrieve branch so each replans on its own.
+
+        Tracing is backend-aware: the page-index sweep spans all branches, so it is one
+        phase `retrieve` step with no `branch_id`; the search-agent backend runs an
+        independent agent per branch, so `run_all` emits a per-branch `retrieve` step (each
+        carrying its `branch_id` + retrieved `pages`) and we do not add a phase step here."""
         if not branches:
             return []
         try:
-            docs: list[list[BlockRef] | StepFailed] = list(
-                await traced_step(
-                    self._ctx, "retrieve",
-                    lambda: self._retrieve.run_all(self._ctx, branches),
+            if (
+                str(self._ctx.config.retriever) == "search_agent"
+                and self._ctx.config.golden_pages is None
+            ):
+                docs: list[list[BlockRef] | StepFailed] = list(
+                    await self._retrieve.run_all(self._ctx, branches, branch_ids)
                 )
-            )
+            else:
+                docs = list(
+                    await traced_step(
+                        self._ctx,
+                        "retrieve",
+                        lambda: self._retrieve.run_all(self._ctx, branches, branch_ids),
+                    )
+                )
         except StepFailed as e:
             return [e] * len(branches)
 
@@ -243,7 +264,8 @@ class Orchestrator:
         # independent and run in the per-branch tail below.
         retrieve_pos = [i for i, b in enumerate(branches) if b.kind == "retrieve"]
         docs = await self._run_retrieve_phase(
-            [cast(RetrieveBranch, branches[i]) for i in retrieve_pos]
+            [cast(RetrieveBranch, branches[i]) for i in retrieve_pos],
+            [branch_ids[i] for i in retrieve_pos],
         )
         docs_by_pos: dict[int, list[BlockRef] | StepFailed] = dict(
             zip(retrieve_pos, docs)
@@ -258,13 +280,35 @@ class Orchestrator:
                 doc = docs_by_pos[pos]
                 if isinstance(doc, StepFailed):
                     raise doc
-                return await traced_step(
-                    self._ctx, "extract",
+                entries = await traced_step(
+                    self._ctx,
+                    "extract",
                     lambda: self._extract.run(doc, self._ctx, branch),
                     branch_id=bid,
                 )
+                # Human verifies/produces the extracted value(s) (figure or OCR/table read)
+                # only when the policy opts in — no step (or prompt) on the default path.
+                if self._human.wants_verify(branch, entries, self._ctx):
+                    entries = await traced_step(
+                        self._ctx,
+                        "human_verify",
+                        lambda: self._human.verify_extract(
+                            entries, doc, branch, self._ctx
+                        ),
+                        branch_id=bid,
+                    )
+                return entries
+            # Human performs the external lookup when the flag is on; else the lookup agent.
+            if self._human.wants_lookup(branch, self._ctx):
+                return await traced_step(
+                    self._ctx,
+                    "human_lookup",
+                    lambda: self._human.human_lookup(branch, self._ctx),
+                    branch_id=bid,
+                )
             return await traced_step(
-                self._ctx, "lookup_external",
+                self._ctx,
+                "lookup_external",
                 lambda: self._lookup.run(self._ctx, branch),
                 branch_id=bid,
             )

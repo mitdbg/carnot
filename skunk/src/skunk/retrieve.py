@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 from skunk.config import SkunkConfig
 from skunk.errors import StepFailed
-from skunk.common import BlockRef, ExecutionContext, PageRef, page_key_to_pageref
+from skunk.common import BlockRef, ExecutionContext, PageRef, page_key_to_pageref, traced_step
 from skunk.plan import RetrieveBranch
 
 if TYPE_CHECKING:
@@ -61,17 +61,37 @@ class RetrieveOp:
                 )
 
     async def run_all(
-        self, ctx: ExecutionContext, branches: list[RetrieveBranch]
+        self,
+        ctx: ExecutionContext,
+        branches: list[RetrieveBranch],
+        branch_ids: list[int] | None = None,
     ) -> list[list[BlockRef] | StepFailed]:
         """Retrieve for several branches at once, result aligned to `branches`. A slot is
         that branch's blocks or a `StepFailed` — a single branch failing does not
-        sink its siblings. A whole-sweep failure (unknown retriever, missing index) raises."""
+        sink its siblings. A whole-sweep failure (unknown retriever, missing index) raises.
+
+        `branch_ids` (search-agent backend only) aligns each branch to its stable id so its
+        retrieve runs in a per-branch `traced_step`: the rollout + the returned pages then
+        attach to that branch in the trace viewer. The page-index backend is a single shared
+        sweep, so it owns no per-branch step here (the orchestrator traces the whole phase)."""
         if ctx.config.golden_pages is not None:
             return [self._golden_blocks(ctx) for _ in branches]
         match str(ctx.config.retriever):
             case "search_agent":
+                ids = branch_ids if branch_ids is not None else [None] * len(branches)
+
+                async def _one(b: RetrieveBranch, bid: int | None) -> list[BlockRef]:
+                    # Per-branch `retrieve` step (branch_id=bid) so the SearchAgent rollout
+                    # and its `pages` summary group under this branch in the viewer.
+                    refs = await traced_step(
+                        ctx, "retrieve",
+                        lambda: self._run_search_agent(ctx, b),
+                        branch_id=bid,
+                    )
+                    return _whole_page_blocks(refs)
+
                 settled = await asyncio.gather(
-                    *(self._run_search_agent(ctx, b) for b in branches),
+                    *(_one(b, bid) for b, bid in zip(branches, ids)),
                     return_exceptions=True,
                 )
                 out: list[list[BlockRef] | StepFailed] = []
@@ -81,7 +101,7 @@ class RetrieveOp:
                     elif isinstance(r, BaseException):
                         raise r
                     else:
-                        out.append(_whole_page_blocks(r))
+                        out.append(r)
                 return out
             case "page_index":
                 return list(await self._page_index().retrieve_all(ctx, branches))

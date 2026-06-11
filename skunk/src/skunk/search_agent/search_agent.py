@@ -79,8 +79,11 @@ class SearchAgent(MultiTurnAgent, Retriever):
         "retrieving relevant documents for the remainder of the question. "
         "You do not need to retrieve everything in a single tool call: use early steps to "
         "explore documents of potential relevance, then refine your searches in later steps "
-        "based on what you find. Use `prune(...)` aggressively on chunks and docs you have "
-        "ruled out, to keep later searches focused and your context window manageable."
+        "based on what you find. When a step has several independent searches to run (e.g. "
+        "different sub-topics or time periods), issue them as parallel `search_corpus` / "
+        "`grep_corpus` calls in one step rather than one at a time. Use `prune(...)` "
+        "aggressively on chunks and docs you have ruled out, to keep later searches focused "
+        "and your context window manageable."
     )
 
     final_answer_doc = """\
@@ -127,13 +130,17 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
                 self.chroma_collection, self.emb_model_id, self.emb_client,
                 self._pruned_chunk_ids, self._pruned_doc_ids,
             ),
-            GrepCorpusTool(self.chroma_collection, self._pruned_chunk_ids, self._pruned_doc_ids),
+            GrepCorpusTool(
+                self.chroma_collection, self._pruned_chunk_ids, self._pruned_doc_ids,
+                config.grep_max_output_tokens,
+            ),
             ReadDocumentTool(self.document_map, config.agent_max_pages_per_tool_call),
             ViewFigureTool(self.document_map, config.pdf_dir),
             PruneTool(self._pruned_chunk_ids, self._pruned_doc_ids),
         ]
         super().__init__(
             tools, max_steps=config.agent_max_steps,
+            max_parallel_tool_calls=config.search_agent_max_parallel_tool_calls,
             system_prompt_override=system_prompt_override,
             generation_backend=generation_backend,
             sampling_params=sampling_params,
@@ -186,6 +193,9 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
                         ChunkBlock(chunk_id=c["chunk_id"], doc_id=c["doc_id"], text=c["text"])
                         for c in group["chunks"]
                     )
+            # Surfaced when the output cap dropped hits (visible TextBlock, not redactable).
+            if output.get("truncation_note"):
+                blocks.append(TextBlock(output["truncation_note"]))
             return blocks
 
         if isinstance(output, dict) and output.get(READ_DOCUMENT_RESULT_TAG):

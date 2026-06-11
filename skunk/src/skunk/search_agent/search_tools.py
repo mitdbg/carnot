@@ -206,15 +206,27 @@ search_corpus("topic Y", top_k=50, metadata_filter={"$and": [{"field_a": "value_
 class GrepCorpusTool(Tool):
     name = "grep_corpus"
 
+    # Token→char factor for the output cap (mirrors `_estimate_prompt_tokens`'s ~4 chars/token).
+    _CHARS_PER_TOKEN = 4
+    # Display unit only: the truncation note renders the token cap as "Nk tokens" for
+    # readability (200000 → "200k"). Not a model/context-limit knob — the cap itself is
+    # `SkunkConfig.grep_max_output_tokens`; this is just thousands-formatting.
+    _TOKENS_PER_K = 1000
+
     def __init__(
         self,
         chroma_collection: Collection,
         pruned_chunk_ids: set[str],
         pruned_doc_ids: set[str],
+        max_output_tokens: int,
     ):
         self._chroma_collection = chroma_collection
         self._pruned_chunk_ids = pruned_chunk_ids
         self._pruned_doc_ids = pruned_doc_ids
+        # Hard cap on the rendered observation size (chars). `limit=None` returns every
+        # matching chunk, so a broad pattern can otherwise dump 100s of K of tokens into
+        # the context in one shot and 400 the next request (see SkunkConfig.grep_max_output_tokens).
+        self._max_output_chars = max_output_tokens * self._CHARS_PER_TOKEN
 
     def __call__(
         self,
@@ -252,18 +264,48 @@ class GrepCorpusTool(Tool):
         for cid, doc, meta in zip(ids, documents, metadatas, strict=True):
             grouped[meta["doc_id"]].append((meta["element_id"], cid, doc))  # type: ignore
 
+        # Build groups in deterministic (doc_id, element_id) order, stopping once the
+        # rendered size would exceed `_max_output_chars`. Dropped hits are reported via a
+        # `truncation_note` so the agent knows to narrow its pattern / pass `limit` rather
+        # than assuming it saw everything.
         groups: list[dict] = []
+        used_chars = 0
+        total_chunks = sum(len(v) for v in grouped.values())
+        kept_chunks = 0
+        truncated = False
         for doc_id in sorted(grouped):
-            doc_chunks = [
-                {"chunk_id": cid, "doc_id": doc_id, "text": f"  [chunk_id={cid}] {text}"}
-                for _, cid, text in sorted(grouped[doc_id])
-            ]
-            groups.append({"doc_id": doc_id, "header": f"\n# doc_id={doc_id}", "chunks": doc_chunks})
-        return {GREP_RESULT_TAG: True, "groups": groups}
+            if truncated:
+                break
+            header = f"\n# doc_id={doc_id}"
+            doc_chunks: list[dict] = []
+            for _, cid, text in sorted(grouped[doc_id]):
+                chunk_text = f"  [chunk_id={cid}] {text}"
+                # Count the header only once we commit the first chunk of this doc.
+                cost = len(chunk_text) + (len(header) if not doc_chunks else 0)
+                if doc_chunks or groups:  # always allow the very first chunk through
+                    if used_chars + cost > self._max_output_chars:
+                        truncated = True
+                        break
+                used_chars += cost
+                doc_chunks.append({"chunk_id": cid, "doc_id": doc_id, "text": chunk_text})
+                kept_chunks += 1
+            if doc_chunks:
+                groups.append({"doc_id": doc_id, "header": header, "chunks": doc_chunks})
+
+        result: dict = {GREP_RESULT_TAG: True, "groups": groups}
+        if truncated:
+            dropped = total_chunks - kept_chunks
+            cap_k = self._max_output_chars // self._CHARS_PER_TOKEN // self._TOKENS_PER_K
+            result["truncation_note"] = (
+                f"[grep_corpus output truncated: showing {kept_chunks} of {total_chunks} matching "
+                f"chunk(s) (~{cap_k}k-token cap reached); {dropped} chunk(s) omitted. Narrow the "
+                f"pattern, add a metadata_filter, or pass limit=N to see specific hits.]"
+            )
+        return result
 
     doc = """\
 ### grep_corpus(pattern: str, metadata_filter: dict | None = None, limit: int | None = None)
-This tool performs a regex search over the cleaned text of every chunk in the corpus and returns the matching chunks grouped by their `doc_id`. Each hit includes its `chunk_id` so you can later refer to it or prune it. By default (`limit=None`), every matching chunk is returned -- which is useful for "find every doc that mentions X" queries -- but you should pass `limit=N` for narrower exploratory searches. The same `metadata_filter` syntax as `search_corpus` is supported. Any chunks or docs you have previously pruned via `prune(...)` are automatically excluded from the results.
+This tool performs a regex search over the cleaned text of every chunk in the corpus and returns the matching chunks grouped by their `doc_id`. Each hit includes its `chunk_id` so you can later refer to it or prune it. By default (`limit=None`), every matching chunk is returned -- which is useful for "find every doc that mentions X" queries -- but you should pass `limit=N` for narrower exploratory searches. The same `metadata_filter` syntax as `search_corpus` is supported. Any chunks or docs you have previously pruned via `prune(...)` are automatically excluded from the results. The total output is capped: if a broad pattern matches more than the cap, the result is truncated with a note telling you how many hits were omitted -- narrow the pattern, add a `metadata_filter`, or pass `limit=N` to see the rest.
 
 ```python
 # find every chunk that mentions "topic X" (case insensitive)

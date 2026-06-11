@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import ast
+import asyncio
 import json
 import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from jinja2 import Environment, StrictUndefined
@@ -86,45 +89,97 @@ def _block_to_jsonable(b: Block) -> dict:
 
 
 _FENCE_RE = re.compile(r"```([a-zA-Z0-9_]*)\n(.*?)```", re.DOTALL)
-_OPEN_FENCE_RE = re.compile(r"```[a-zA-Z0-9_]*\n")
 
 
-def _has_complete_block(acc: str) -> bool:
-    """True once `acc` holds a complete fenced block — the streaming `should_stop`."""
-    open_m = _OPEN_FENCE_RE.search(acc)
-    return bool(open_m and "```" in acc[open_m.end() :])
+def _make_should_stop(max_parallel: int) -> "Callable[[str], bool]":
+    """Build the streaming `should_stop` for an agent that may emit up to `max_parallel`
+    parallel tool blocks per step. Stop once a ```json``` final-answer block completes
+    (it is always emitted on its own) or once `max_parallel` fenced blocks are complete.
+    For `max_parallel == 1` this is the original behaviour — stop at the first complete
+    block."""
+
+    def should_stop(acc: str) -> bool:
+        blocks = _FENCE_RE.findall(acc)
+        if any(lang.lower() == "json" for lang, _ in blocks):
+            return True
+        return len(blocks) >= max_parallel
+
+    return should_stop
+
+
+def _tool_name(code: str) -> str | None:
+    """Best-effort name of the first call in a tool-call block (e.g. `prune` /
+    `search_corpus`), for prune-isolation checks and per-call observation headers.
+    Returns None when the body does not parse or contains no call."""
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            fn = node.func
+            if isinstance(fn, ast.Name):
+                return fn.id
+            if isinstance(fn, ast.Attribute):
+                return fn.attr
+    return None
 
 
 @dataclass
 class _StepOutput:
-    """A successfully parsed model response, discriminated by `code`: a ```python``` tool-
-    call body to execute (`code is not None`), or — when `code is None` — a ```json``` final
-    answer in `result` (plain `Any`, so a literal `null` payload is represented as-is).
-    `raw` carries the verbatim model text so the caller can append it to message history."""
+    """A successfully parsed model response. `is_final` ⇒ a ```json``` final answer in
+    `result` (plain `Any`, so a literal `null` payload is represented as-is). Otherwise
+    `codes` holds the (1..N) ```python``` tool-call bodies to execute. `mixed_final` flags
+    a ```json``` block that appeared alongside tool calls (ignored, with a warning, since
+    the final answer must be emitted on its own). `raw` carries the verbatim model text so
+    the caller can append it to message history."""
 
-    code: str | None = None
+    codes: list[str] = field(default_factory=list)
     result: Any = None
+    is_final: bool = False
+    mixed_final: bool = False
     raw: str = ""
 
 
+@dataclass
+class _CallResult:
+    """Outcome of executing one tool-call block in a (possibly parallel) batch. Exactly
+    one of `output` / `error` is populated."""
+
+    output: CodeOutput | None = None
+    error: str | None = None
+
+
 def _parse_step(text: str, _: ExecutionContext) -> _StepOutput:
-    """Parse the first fenced block and raise `ParseError` on bad format. Never executes."""
-    m = _FENCE_RE.search(text)
-    if m is None:
+    """Parse every fenced block and raise `ParseError` on bad format. Never executes.
+    A lone ```json``` block is the final answer; otherwise all ```python``` blocks are
+    returned as `codes` (capping / prune-isolation are applied by the loop, which knows
+    the agent's `max_parallel_tool_calls`)."""
+    blocks = _FENCE_RE.findall(text)
+    if not blocks:
         raise ParseError(
             raw=text,
-            detail="no fenced block — emit ONE ```python``` block (tool call) "
-            "or ```json``` block (final answer).",
+            detail="no fenced block — emit ```python``` block(s) (tool calls) "
+            "or ONE ```json``` block (final answer).",
         )
-    lang, body = m.group(1).lower(), m.group(2).strip()
-    if lang != "json":
-        return _StepOutput(code=body, raw=text)
-    try:
-        return _StepOutput(result=json.loads(body), raw=text)
-    except json.JSONDecodeError as e:
+    # A single json block is the final answer; parse it as data.
+    if len(blocks) == 1 and blocks[0][0].lower() == "json":
+        body = blocks[0][1].strip()
+        try:
+            return _StepOutput(result=json.loads(body), is_final=True, raw=text)
+        except json.JSONDecodeError as e:
+            raise ParseError(
+                raw=text, detail=f"final-answer JSON was malformed — {e}"
+            ) from e
+    codes = [body.strip() for lang, body in blocks if lang.lower() != "json"]
+    if not codes:
+        # Only json block(s), but not a single one ⇒ ambiguous final answer.
         raise ParseError(
-            raw=text, detail=f"final-answer JSON was malformed — {e}"
-        ) from e
+            raw=text,
+            detail="emit your final answer as a single ```json``` block by itself.",
+        )
+    mixed_final = any(lang.lower() == "json" for lang, _ in blocks)
+    return _StepOutput(codes=codes, mixed_final=mixed_final, raw=text)
 
 
 def _trim(messages: list[dict], budget: int) -> list[dict]:
@@ -196,12 +251,28 @@ class MultiTurnAgent(ABC):
 
 {{ tools_doc }}
 
+{% if max_parallel_tool_calls > 1 -%}
+You have ≤{{ max_steps }} steps. On each step, output either:
+  - between 1 and {{ max_parallel_tool_calls }} ```python``` blocks, each containing a
+    single tool call. When you emit more than one, they are executed **in parallel** and
+    their outputs are returned together as one batched observation — use this to issue
+    several independent tool calls at once (e.g. searches for different sub-topics). Do
+    not exceed {{ max_parallel_tool_calls }} blocks; extra ones are dropped. The parallel
+    blocks share no state, so a block must not depend on another's result.
+  - a single ```json``` block containing your final answer — emit this once, when you are
+    ready to finish. It is parsed as data (not executed), so write plain JSON
+    literals (no Python, no variables, no trailing commas).
+
+Your final answer must be emitted in a step **by itself** (do not combine the ```json```
+block with tool calls).
+{%- else -%}
 You have ≤{{ max_steps }} steps. On each step, output exactly ONE fenced block:
   - a ```python``` block containing a single tool call — the tool will be executed and its output appears
     as your next observation; or
   - a ```json``` block containing your final answer — emit this once, when you are
     ready to finish. It is parsed as data (not executed), so write plain JSON
     literals (no Python, no variables, no trailing commas).
+{%- endif %}
 
 Requirements for the final answer:
 {{ final_answer_doc }}"""
@@ -225,11 +296,18 @@ Requirements for the final answer:
     # this to allow numpy / scipy / statistics / ... in their python steps.
     authorized_imports: list[str] = []
 
+    # Max tool-call blocks the agent may emit (and run in parallel) per step. 1 keeps the
+    # classic one-call-per-step behaviour. Subclasses pass a config-derived value; stateful
+    # compute agents (e.g. the task solver) keep this at 1 so cross-step interpreter state
+    # survives in the single persistent sandbox.
+    max_parallel_tool_calls: int = 1
+
     def __init__(
         self,
         tools: list[Tool],
         *,
         max_steps: int | None = None,
+        max_parallel_tool_calls: int = 1,
         system_prompt_override: str | None = None,
         generation_backend: GenerationBackend | None = None,
         sampling_params: dict | None = None,
@@ -237,6 +315,9 @@ Requirements for the final answer:
     ) -> None:
         self._tools = tools
         self.max_steps = max_steps
+        self.max_parallel_tool_calls = max(1, max_parallel_tool_calls)
+        # Streaming stop: allow up to N complete blocks (or one json final answer).
+        self._should_stop = _make_should_stop(self.max_parallel_tool_calls)
         # Full block trajectory of the most recent `call()`; rebuilt per call.
         # Kept on the instance (one agent per question / branch) so callers can
         # read `messages_to_jsonable()` after the run for reward / persistence.
@@ -262,6 +343,7 @@ Requirements for the final answer:
             system_prompt = _ENV.from_string(template).render(
                 briefing=self.briefing,
                 max_steps=self.max_steps,
+                max_parallel_tool_calls=self.max_parallel_tool_calls,
                 final_answer_doc=self.final_answer_doc,
             )
         self._prompt: PromptedCall[_StepOutput] = PromptedCall(
@@ -270,6 +352,73 @@ Requirements for the final answer:
             default_effort=self.default_effort,
             parse=_parse_step,
             max_parse_retries=self.max_recover_retries,
+        )
+
+    def _build_executor(self) -> LocalPythonExecutor:
+        """A fresh sandbox with the agent's tools bound. The loop keeps one persistent
+        executor for single-call steps (cross-step state survives); parallel batches use
+        one fresh executor per block so concurrent calls cannot race on interpreter state."""
+        executor = LocalPythonExecutor(
+            additional_authorized_imports=self.authorized_imports
+        )
+        executor.send_tools({t.name: t for t in self._tools})
+        return executor
+
+    def _prepare_codes(self, step_out: _StepOutput) -> tuple[list[str], list[str]]:
+        """Apply the over-cap and prune-isolation rules to a step's tool-call blocks.
+        Returns `(codes_to_run, notices)` — notices are appended to the observation so the
+        model can correct course (they never abort the step)."""
+        codes = list(step_out.codes)
+        notices: list[str] = []
+        if step_out.mixed_final:
+            notices.append(
+                "Your ```json``` final-answer block was ignored — emit the final answer "
+                "in a step by itself, with no tool calls."
+            )
+        if len(codes) > self.max_parallel_tool_calls:
+            notices.append(
+                f"You emitted {len(codes)} tool-call blocks; only the first "
+                f"{self.max_parallel_tool_calls} were executed. Keep each step to at most "
+                f"{self.max_parallel_tool_calls} ```python``` block(s)."
+            )
+            codes = codes[: self.max_parallel_tool_calls]
+        # `prune(...)` mutates state the other tools read; only safe to run on its own.
+        if len(codes) > 1:
+            kept = [c for c in codes if _tool_name(c) != "prune"]
+            if len(kept) != len(codes):
+                notices.append(
+                    "`prune(...)` was ignored — it mutates shared search state and must be "
+                    "issued in a step by itself, not combined with other tool calls."
+                )
+                codes = kept
+        return codes, notices
+
+    @staticmethod
+    def _run_block(executor: LocalPythonExecutor, code: str) -> _CallResult:
+        """Run one tool-call block, capturing the result or the error (never raising)."""
+        try:
+            return _CallResult(output=executor(code))
+        except Exception as e:
+            return _CallResult(error=f"{type(e).__name__}: {e}")
+
+    async def _execute_codes(self, codes: list[str]) -> list[_CallResult]:
+        """Execute a step's tool-call blocks, offloaded from the event loop so this
+        question's sibling branches keep progressing while the blocking tool I/O runs.
+
+        A single block reuses the persistent executor (cross-step state survives). A
+        parallel batch runs each block in its own fresh executor — concurrent calls can't
+        then race on interpreter state — and `gather` + `to_thread` keeps the loop free."""
+        if not codes:
+            return []
+        if len(codes) == 1:
+            return [await asyncio.to_thread(self._run_block, self._executor, codes[0])]
+        return list(
+            await asyncio.gather(
+                *(
+                    asyncio.to_thread(self._run_block, self._build_executor(), c)
+                    for c in codes
+                )
+            )
         )
 
     def validate_final_answer(
@@ -342,11 +491,10 @@ Requirements for the final answer:
     async def call(self, ctx: ExecutionContext, user: str, **_) -> Any:
         """Run the multi-turn loop, returning the parsed json final-answer payload. Extra
         kwargs are ignored (signature compat with single-shot calls)."""
-        executor = LocalPythonExecutor(
-            additional_authorized_imports=self.authorized_imports
-        )
+        # Persistent sandbox for single-call steps — cross-step interpreter state survives
+        # here. Parallel batches use one fresh executor per block (see `_execute_codes`).
         # The final answer is parsed outside the sandbox, so it is NOT bound here.
-        executor.send_tools({t.name: t for t in self._tools})
+        self._executor = self._build_executor()
 
         # Full block trajectory (no system message; call() assembles it each turn).
         # `_render_for_llm()` produces the redacted, flattened view sent to the model.
@@ -387,7 +535,9 @@ Requirements for the final answer:
             # Generate → parse (retried by PromptedCall on format errors) → execute.
             # `done` is set on success; errors append an observation and advance the step.
             done: _StepOutput | None = None
-            out: CodeOutput | None = None
+            results: list[_CallResult] | None = None
+            executed_codes: list[str] = []
+            notices: list[str] = []
             turn += 1
             try:
                 step_out = await self._llm_step(ctx)
@@ -406,17 +556,20 @@ Requirements for the final answer:
                     kind="assistant",
                     data={"text": step_out.raw},
                 )
-                if step_out.code is not None:
-                    ctx.emit(f"tool_code {step_out.code!r}")
-                    # Inline (not to_thread): tool code runs on this question's worker
-                    # thread; blocking here only affects sibling branches of the question.
-                    out = executor(step_out.code)
+                if not step_out.is_final:
+                    # Apply the cap + prune-isolation rules, then run the (1..N) blocks.
+                    # Parallel batches are offloaded so the event loop stays free for
+                    # this question's sibling branches (see `_execute_codes`).
+                    executed_codes, notices = self._prepare_codes(step_out)
+                    for c in executed_codes:
+                        ctx.emit(f"tool_code {c!r}")
+                    results = await self._execute_codes(executed_codes)
                 done = step_out
             except ParseError as e:
                 obs = f"Observation (step {turn}): {e.detail}"
                 self.messages.append({"role": "user", "blocks": [TextBlock(obs)]})
                 ctx.emit(f"error {obs!r}")
-            except Exception as e:  # tool code raised
+            except Exception as e:  # LLM step / batch machinery failed
                 obs = (
                     f"Observation (step {turn}): exec failed — {type(e).__name__}: {e}"
                 )
@@ -426,7 +579,7 @@ Requirements for the final answer:
             if done is None:
                 continue  # step spent on misfires; advance
 
-            if done.code is None:  # final-answer block
+            if done.is_final:  # final-answer block
                 payload = done.result
                 feedback = self.validate_final_answer(payload, observations)
                 if feedback is None:
@@ -437,13 +590,27 @@ Requirements for the final answer:
                 ctx.emit(f"validation_failed {feedback!r}")
                 continue
 
-            assert out is not None  # a non-final step that ended ⇒ tool exec succeeded
-            # Structured observation: subclasses may emit redactable ChunkBlocks; the
-            # default renders stdout / result as TextBlocks (see `_blocks_from_output`).
-            obs_blocks: list[Block] = [
-                TextBlock(f"Observation (step {turn}):"),
-                *self._blocks_from_output(out),
-            ]
+            assert results is not None  # non-final step ⇒ a (possibly empty) batch ran
+            # One batched observation for the whole step. Each call gets a header when
+            # >1 ran; successes render via `_blocks_from_output` (subclasses may emit
+            # redactable ChunkBlocks), failures as `[error]` blocks. Cap / prune-isolation
+            # notices are appended so the model can correct course next step.
+            obs_blocks: list[Block] = [TextBlock(f"Observation (step {turn}):")]
+            n = len(results)
+            for i, (code, res) in enumerate(zip(executed_codes, results)):
+                if n > 1:
+                    obs_blocks.append(
+                        TextBlock(
+                            f"--- Tool call {i + 1}/{n} ({_tool_name(code) or '<unknown>'}(...)) ---"
+                        )
+                    )
+                if res.error is not None:
+                    obs_blocks.append(TextBlock(f"[error]\n{res.error}"))
+                else:
+                    assert res.output is not None
+                    obs_blocks.extend(self._blocks_from_output(res.output))
+            for notice in notices:
+                obs_blocks.append(TextBlock(f"[notice] {notice}"))
             self.messages.append({"role": "user", "blocks": obs_blocks})
             visible_blocks = [
                 b for b in obs_blocks if b.text and self._block_is_visible(b)
@@ -482,7 +649,7 @@ Requirements for the final answer:
             diagnostic = (
                 step_out.raw.strip()
             )  # default: the whole reply is the hand-off note
-            if step_out.code is None:  # json block
+            if step_out.is_final:  # json block
                 result = step_out.result
                 # `{"error": <note>}` is the explicit give-up envelope (a reserved key the
                 # real answer schemas don't use); anything else is a commit candidate.
@@ -511,8 +678,9 @@ Requirements for the final answer:
     ) -> _StepOutput:
         """Render the visible trajectory (`_render_for_llm`), collapse stale observations,
         trim to `context_budget_chars`, then route through `PromptedCall.call()` — stopping
-        at the first complete fenced block. `extra` appends transient messages (e.g. the
-        terminal-turn prompt) that are deliberately NOT stored in `self.messages`."""
+        once the step's block(s) complete (`self._should_stop`). `extra` appends transient
+        messages (e.g. the terminal-turn prompt) that are deliberately NOT stored in
+        `self.messages`."""
         messages = self._render_for_llm()
         # Collapse all but the most recent `visible_observations` tool results to a
         # placeholder (None = keep all), keeping the question + every assistant turn.
@@ -532,7 +700,7 @@ Requirements for the final answer:
         if self._backend is None:
             self._last_logprobs = None
             return await self._prompt.call(
-                ctx, messages=trimmed, should_stop=_has_complete_block,
+                ctx, messages=trimmed, should_stop=self._should_stop,
                 max_output_tokens=self.max_output_tokens,
                 timeout_s=self.request_timeout_s,
             )
