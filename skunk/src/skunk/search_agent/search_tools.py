@@ -113,12 +113,14 @@ class SearchCorpusTool(Tool):
         emb_client: EmbeddingClient,
         pruned_chunk_ids: set[str],
         pruned_doc_ids: set[str],
+        required_metadata_filter: dict | None = None,
     ):
         self._chroma_collection = chroma_collection
         self._emb_model_id = emb_model_id
         self._emb_client = emb_client
         self._pruned_chunk_ids = pruned_chunk_ids
         self._pruned_doc_ids = pruned_doc_ids
+        self._required_metadata_filter = required_metadata_filter
 
     def _embed_query(self, query: str) -> list[float]:
         """Embed `query` with the same model that produced the stored embeddings.
@@ -145,8 +147,15 @@ class SearchCorpusTool(Tool):
     ) -> dict:
         query_embedding = self._embed_query(query)
 
+        combined_filter = metadata_filter
+        if self._required_metadata_filter and metadata_filter:
+            combined_filter = {
+                "$and": [self._required_metadata_filter, metadata_filter]
+            }
+        elif self._required_metadata_filter:
+            combined_filter = self._required_metadata_filter
         where = _build_metadata_where(
-            metadata_filter=metadata_filter,
+            metadata_filter=combined_filter,
             ignore_chunk_ids=self._pruned_chunk_ids,
             ignore_doc_ids=self._pruned_doc_ids,
         )
@@ -219,6 +228,7 @@ class GrepCorpusTool(Tool):
         pruned_chunk_ids: set[str],
         pruned_doc_ids: set[str],
         max_output_tokens: int,
+        required_metadata_filter: dict | None = None,
     ):
         self._chroma_collection = chroma_collection
         self._pruned_chunk_ids = pruned_chunk_ids
@@ -227,6 +237,7 @@ class GrepCorpusTool(Tool):
         # matching chunk, so a broad pattern can otherwise dump 100s of K of tokens into
         # the context in one shot and 400 the next request (see SkunkConfig.grep_max_output_tokens).
         self._max_output_chars = max_output_tokens * self._CHARS_PER_TOKEN
+        self._required_metadata_filter = required_metadata_filter
 
     def __call__(
         self,
@@ -234,8 +245,15 @@ class GrepCorpusTool(Tool):
         metadata_filter: dict | None = None,
         limit: int | None = None,
     ) -> dict:
+        combined_filter = metadata_filter
+        if self._required_metadata_filter and metadata_filter:
+            combined_filter = {
+                "$and": [self._required_metadata_filter, metadata_filter]
+            }
+        elif self._required_metadata_filter:
+            combined_filter = self._required_metadata_filter
         where = _build_metadata_where(
-            metadata_filter=metadata_filter,
+            metadata_filter=combined_filter,
             ignore_chunk_ids=self._pruned_chunk_ids,
             ignore_doc_ids=self._pruned_doc_ids,
         )

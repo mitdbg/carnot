@@ -319,6 +319,10 @@ Rules:
   - A prior branch you wish to keep appear in NEITHER list: leave it
     alone and its gathered data is reused as-is. Do NOT re-add branches whose
     data is already in `prev`.
+  - Human-provided resolutions explicitly map prior missing identifiers to
+    `input_values` entries. Treat those identifiers as resolved by those entries.
+    Do not request them again unless the latest missing-data signal still names
+    them, which means the supplied information was insufficient or unusable.
   - If data is missing, `add` retrieve/lookup branches that close the gap.
   - For each FAILED branch you still need, read its "what the attempt found / why
     it was blocked" note and formulate an alternative query. Pay special attention to whether
@@ -411,6 +415,7 @@ external lookup is injected automatically at replan.
         failed_branches: list[tuple["Branch", StepFailed]],
         missing_reason: str,
         missing: list[str],
+        human_resolutions: list[tuple[int, list[str]]] | None = None,
     ) -> PlanDiff:
         numbered = "\n".join(
             f"  [{i}] {b.model_dump_json(exclude_none=True)}"
@@ -425,7 +430,17 @@ external lookup is injected automatically at replan.
         failed = self._failed_section(prior_plan, failed_branches)
         if failed:
             parts.append(failed)
+        if human_resolutions:
+            resolved = "\n".join(
+                f"  - prior missing {resolved_missing!r} -> input_values[{input_index}]"
+                for input_index, resolved_missing in human_resolutions
+            )
+            parts.append(
+                "Human-provided resolutions (explicit mapping to available inputs):\n"
+                f"{resolved}"
+            )
         parts.append(
-            f"What was missing:\n  description: {missing_reason}\n  missing:     {missing!r}"
+            "Latest missing-data signal after validating all available inputs:\n"
+            f"  description: {missing_reason}\n  missing:     {missing!r}"
         )
         return await self._replan_prompt.call(ctx, "\n\n".join(parts), temperature=0.4)

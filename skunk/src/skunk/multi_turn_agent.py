@@ -11,7 +11,7 @@ from typing import Any, Protocol
 
 from jinja2 import Environment, StrictUndefined
 
-from skunk.common import B64Image, Effort, ExecutionContext
+from skunk.common import B64Image, Effort, ExecutionContext, PendingHumanIntervention
 from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.local_python_executor import CodeOutput, LocalPythonExecutor
@@ -391,6 +391,16 @@ Requirements for the final answer:
                     "issued in a step by itself, not combined with other tool calls."
                 )
                 codes = kept
+        # `request_human(...)` pauses the step for a human; pairing it with speculative tool
+        # calls is confusing, so isolate it the same way as `prune`.
+        if len(codes) > 1:
+            kept = [c for c in codes if _tool_name(c) != "request_human"]
+            if len(kept) != len(codes):
+                notices.append(
+                    "`request_human(...)` was ignored — it pauses the step for a human and "
+                    "must be issued in a step by itself, not combined with other tool calls."
+                )
+                codes = kept
         return codes, notices
 
     @staticmethod
@@ -420,6 +430,25 @@ Requirements for the final answer:
                 )
             )
         )
+
+    async def _resolve_human_interventions(
+        self, ctx: ExecutionContext, results: list[_CallResult]
+    ) -> list[_CallResult]:
+        """Await any `PendingHumanIntervention` a tool returned (the `request_human` tool),
+        replacing it in-place with the human's resolved response before the observation is
+        rendered. Pending awaits run concurrently so a parallel batch is not serialized on
+        each human round-trip."""
+
+        async def _resolve(res: _CallResult) -> _CallResult:
+            if res.output is not None and isinstance(
+                res.output.output, PendingHumanIntervention
+            ):
+                ctx.emit("human_intervention_waiting", kind="note")
+                res.output.output = await res.output.output.response
+                ctx.emit("human_intervention_resolved", kind="note")
+            return res
+
+        return list(await asyncio.gather(*(_resolve(r) for r in results)))
 
     def validate_final_answer(
         self, payload: object, observations: list[str]
@@ -564,6 +593,11 @@ Requirements for the final answer:
                     for c in executed_codes:
                         ctx.emit(f"tool_code {c!r}")
                     results = await self._execute_codes(executed_codes)
+                    # A `request_human` call returns a `PendingHumanIntervention`; await the
+                    # human's response and splice it back in before the observation renders.
+                    # `request_human` is isolation-only (see `_prepare_codes`), so at most one
+                    # runs per step, but resolve concurrently to stay general.
+                    results = await self._resolve_human_interventions(ctx, results)
                 done = step_out
             except ParseError as e:
                 obs = f"Observation (step {turn}): {e.detail}"

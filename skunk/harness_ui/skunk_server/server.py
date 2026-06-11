@@ -11,6 +11,7 @@ import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI
@@ -66,11 +67,18 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
         events.broadcast,
         config.auto_submit,
     )
-    pool = AgentWorkerPool(registry, queues, loaded_reasoner, config.concurrency)
+    pool = AgentWorkerPool(
+        registry,
+        queues,
+        loaded_reasoner,
+        config.concurrency,
+        human_requester=broker.request_intervention,
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         loop = asyncio.get_running_loop()
+        broker.start(loop, events.broadcast)
         pool.start(loop, coordinator.handle_agent_completion)
         listener = asyncio.create_task(adapter.listen())
         try:
@@ -81,6 +89,7 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
                 await listener
             except asyncio.CancelledError:
                 pass
+            broker.cancel_all()
             pool.stop()
 
     app = FastAPI(title="Skunk Server", lifespan=lifespan)

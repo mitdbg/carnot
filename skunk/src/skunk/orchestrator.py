@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from typing import cast
 from skunk.compute import ComputeOp
 from skunk.config import SkunkConfig
@@ -9,7 +10,13 @@ from skunk.errors import MissingData, StepFailed
 from skunk.extract import ExtractOp
 from skunk.human import HumanAssist
 from skunk.lookup_external import LookupExternalOp
-from skunk.common import AnnotatedValue, BlockRef, ExecutionContext, traced_step
+from skunk.common import (
+    AnnotatedValue,
+    BlockRef,
+    ExecutionContext,
+    HumanInterventionHandler,
+    traced_step,
+)
 from skunk.llm_client import LLMClient
 from skunk.plan import Branch, Plan, PlanDiff, Planner, RetrieveBranch
 from skunk.prompted_call import PromptOverride
@@ -23,6 +30,7 @@ class BranchOutcome:
     branch: Branch
     entries: list[AnnotatedValue] | None
     error: StepFailed | None
+    blocks: list[BlockRef] = field(default_factory=list)
 
 
 class Orchestrator:
@@ -39,6 +47,7 @@ class Orchestrator:
         config: SkunkConfig | None = None,
         prompt_overrides: tuple[PromptOverride, ...] = (),
         llm_client: LLMClient | None = None,
+        human_intervention_handler: HumanInterventionHandler | None = None,
     ):
         self._ctx = ExecutionContext(
             question=question,
@@ -48,6 +57,7 @@ class Orchestrator:
             config=config or SkunkConfig.from_env(),
             prompt_overrides=prompt_overrides,
             llm_client=llm_client,
+            human_intervention_handler=human_intervention_handler,
         )
         self._current_plan: Plan | None = None
         # Stable per-question branch identity. `_branch_ids[i]` is the id of the
@@ -57,6 +67,7 @@ class Orchestrator:
         # viewer keys plan-branch ↔ operator-step on this id to render revision tabs.
         self._branch_ids: list[int] = []
         self._next_branch_id = 0
+        self._last_executed_branch_ids: set[int] = set()
         self._planner = Planner()
         self._retrieve = RetrieveOp(self._ctx.config)
         self._extract = ExtractOp()
@@ -106,6 +117,7 @@ class Orchestrator:
                 lambda: self._planner.plan(self._ctx.question, self._ctx),
             )
             self._branch_ids = self._alloc_branch_ids(len(plan.branches))
+            self._last_executed_branch_ids = set(self._branch_ids)
             self._emit_plan(plan, "initial")
             outcomes = await self._run_branches(plan.branches, self._branch_ids)
             explanations = await explain_task
@@ -113,9 +125,14 @@ class Orchestrator:
             explain_task.cancel()
 
         attempt = 0
+        human_entries: list[AnnotatedValue] = []
+        human_resolutions: list[list[str]] = []
         while True:
             self._current_plan = plan
-            entries = [e for o in outcomes if o.entries for e in o.entries]
+            entries = [
+                *[e for o in outcomes if o.entries for e in o.entries],
+                *human_entries,
+            ]
             try:
                 self._result.answer = await traced_step(
                     self._ctx,
@@ -135,7 +152,334 @@ class Orchestrator:
                 # Bind before the lambda: Python deletes the `except` variable on
                 # block exit, and the lambda is also opaque to ruff's use analysis.
                 reason, missing = e.reason, e.missing
+                handler = self._ctx.human_intervention_handler
+                if handler is None:
+                    raise
+                self._emit_plan(
+                    plan,
+                    "human_pending",
+                    reason=reason,
+                    missing=missing,
+                    recovery_round=attempt,
+                )
+                likely_pages: list[dict[str, str | int | None]] = []
+                seen_pages: set[tuple[str | None, int | None]] = set()
+                for entry in entries:
+                    for page in entry.pages:
+                        key = (entry.bulletin, page)
+                        if key not in seen_pages:
+                            seen_pages.add(key)
+                            likely_pages.append(
+                                {"bulletin": entry.bulletin, "page": page}
+                            )
+                for block in self._retrieved_blocks:
+                    for ref in block.member_refs:
+                        key = (ref.month, ref.page)
+                        if key not in seen_pages:
+                            seen_pages.add(key)
+                            likely_pages.append(
+                                {"bulletin": ref.month, "page": ref.page}
+                            )
+                likely_pages = likely_pages[:8]
+                source_docs = [
+                    f"Treasury Bulletin {page['bulletin']} PDF page {page['page']}"
+                    for page in likely_pages
+                    if page["bulletin"] and page["page"] is not None
+                ]
+                guidance = {
+                    "recovery_round": attempt,
+                    "previous_round_plan": [
+                        {
+                            "branch_id": branch_id,
+                            **branch.model_dump(mode="json"),
+                            "searched": (
+                                {
+                                    "key": branch.key,
+                                    "period": branch.period,
+                                    "as_of": branch.as_of,
+                                    "visual_only": branch.visual_only,
+                                }
+                                if branch.kind == "retrieve"
+                                else {
+                                    "target": branch.target,
+                                    "src": branch.src,
+                                }
+                            ),
+                            "blocks": [
+                                {
+                                    "bulletin": block_ref.page.month,
+                                    "page": block_ref.page.page,
+                                    "block_index": block_ref.block_index,
+                                    "member_pages": [
+                                        {"bulletin": ref.month, "page": ref.page}
+                                        for ref in block_ref.member_refs
+                                    ],
+                                    "kind": (
+                                        block_ref.block.kind
+                                        if block_ref.block
+                                        else None
+                                    ),
+                                    "title": (
+                                        block_ref.block.title
+                                        if block_ref.block
+                                        else None
+                                    ),
+                                    "column_headers": (
+                                        block_ref.block.column_headers
+                                        if block_ref.block
+                                        else []
+                                    ),
+                                    "row_headers": (
+                                        block_ref.block.row_headers
+                                        if block_ref.block
+                                        else []
+                                    ),
+                                    "summary": (
+                                        block_ref.block.summary
+                                        if block_ref.block
+                                        else None
+                                    ),
+                                }
+                                for block_ref in outcome.blocks
+                            ],
+                            "output": (
+                                {
+                                    "type": "values",
+                                    "values": [
+                                        {
+                                            "description": entry.description,
+                                            "unit": entry.unit,
+                                            "value_kind": entry.kind,
+                                            "value": entry.value,
+                                            "index_name": entry.index_name,
+                                            "row_name": entry.row_name,
+                                            "col_name": entry.col_name,
+                                            "bulletin": entry.bulletin,
+                                            "pages": list(entry.pages),
+                                            "source_block_page": (
+                                                entry.source_block_page
+                                            ),
+                                            "source_block_index": (
+                                                entry.source_block_index
+                                            ),
+                                        }
+                                        for entry in outcome.entries
+                                    ],
+                                }
+                                if outcome.entries is not None
+                                else None
+                            ),
+                            "output_step": (
+                                "extract"
+                                if branch.kind == "retrieve"
+                                else "lookup_external"
+                            ),
+                            "status": (
+                                "failed"
+                                if outcome.error is not None
+                                else "ok"
+                            ),
+                            "execution_status": (
+                                "executed"
+                                if branch_id in self._last_executed_branch_ids
+                                else "carried_forward"
+                            ),
+                            "outcome_status": (
+                                "failed" if outcome.error is not None else "succeeded"
+                            ),
+                            "error": (
+                                str(outcome.error)
+                                if outcome.error is not None
+                                else None
+                            ),
+                            "considered_pages": (
+                                outcome.error.details.get("considered_pages", [])
+                                if outcome.error is not None
+                                else []
+                            ),
+                        }
+                        for branch_id, branch, outcome in zip(
+                            self._branch_ids, plan.branches, outcomes
+                        )
+                    ],
+                    "partial_plan": [
+                        {
+                            "branch_id": branch_id,
+                            **branch.model_dump(mode="json"),
+                        }
+                        for branch_id, branch in zip(self._branch_ids, plan.branches)
+                    ],
+                    "gathered_values": [
+                        {
+                            "description": entry.description,
+                            "value": entry.value,
+                            "unit": entry.unit,
+                            "bulletin": entry.bulletin,
+                            "pages": list(entry.pages),
+                        }
+                        for entry in entries
+                    ],
+                    "failed_branches": [
+                        {
+                            "branch_id": branch_id,
+                            "branch": outcome.branch.model_dump(mode="json"),
+                            "error": str(outcome.error),
+                            "considered_pages": outcome.error.details.get(
+                                "considered_pages", []
+                            ),
+                        }
+                        for branch_id, outcome in zip(self._branch_ids, outcomes)
+                        if outcome.error is not None
+                    ],
+                    "likely_pages": likely_pages,
+                    "missing": missing,
+                    "reason": reason,
+                }
+                instructions = (
+                    "Provide the missing information needed to answer the question. "
+                    f"Failure reason: {reason}"
+                )
+                if missing:
+                    instructions += f"\nMissing values: {', '.join(missing)}"
+                response = await handler(
+                    "missing_data",
+                    instructions,
+                    f"Question: {self._ctx.question}",
+                    source_docs,
+                    guidance,
+                )
+                response_text = str(response.get("response", "")).strip()
+                retrieval_directives: dict[int, list[str]] = {}
+                current_retrieve_ids = {
+                    branch_id
+                    for branch_id, branch in zip(self._branch_ids, plan.branches)
+                    if branch.kind == "retrieve"
+                }
+                for item in response.get("retrieval_directives", []):
+                    if not isinstance(item, dict):
+                        continue
+                    branch_id = item.get("branch_id")
+                    documents = item.get("documents")
+                    if (
+                        not isinstance(branch_id, int)
+                        or branch_id not in current_retrieve_ids
+                        or not isinstance(documents, list)
+                    ):
+                        continue
+                    bulletins = []
+                    for document in documents:
+                        match = re.fullmatch(
+                            r"Treasury Bulletin (\d{4}-(?:0[1-9]|1[0-2])) PDF",
+                            str(document).strip(),
+                        )
+                        if match and match.group(1) not in bulletins:
+                            bulletins.append(match.group(1))
+                    if bulletins:
+                        retrieval_directives[branch_id] = bulletins
+                if not response_text and not retrieval_directives:
+                    raise RuntimeError("human intervention returned an empty response")
+                response_sources = [
+                    str(item).strip()
+                    for item in response.get("source_docs", [])
+                    if str(item).strip()
+                ]
+                if retrieval_directives:
+                    rerun_positions = [
+                        i
+                        for i, (branch_id, branch) in enumerate(
+                            zip(self._branch_ids, plan.branches)
+                        )
+                        if branch_id in retrieval_directives
+                        and branch.kind == "retrieve"
+                    ]
+                    if rerun_positions:
+                        rerun_branches = [plan.branches[i] for i in rerun_positions]
+                        rerun_ids = [self._branch_ids[i] for i in rerun_positions]
+                        rerun_outcomes = await self._run_branches(
+                            rerun_branches,
+                            rerun_ids,
+                            document_scopes=retrieval_directives,
+                        )
+                        outcomes = list(outcomes)
+                        for position, outcome in zip(
+                            rerun_positions, rerun_outcomes
+                        ):
+                            outcomes[position] = outcome
+                        self._last_executed_branch_ids = set(rerun_ids)
+                        self._ctx.emit(
+                            "human_directed_retrieval",
+                            kind="observation",
+                            data={
+                                "directives": [
+                                    {
+                                        "branch_id": branch_id,
+                                        "bulletins": retrieval_directives[branch_id],
+                                    }
+                                    for branch_id in rerun_ids
+                                ]
+                            },
+                        )
+                if response_text:
+                    description = (
+                        f"Human-provided value for: {', '.join(missing)}"
+                        if missing
+                        else f"Human-provided information for: {reason}"
+                    )
+                    if response_sources:
+                        description += f" (sources: {', '.join(response_sources)})"
+                    human_entry = AnnotatedValue(
+                        description=description,
+                        value=response_text,
+                    )
+                    human_entries.append(human_entry)
+                    human_resolutions.append(list(missing))
+                entries = [
+                    *[entry for outcome in outcomes if outcome.entries for entry in outcome.entries],
+                    *human_entries,
+                ]
+                self._ctx.emit(
+                    "mandatory_human_intervention_resolved",
+                    kind="observation",
+                    data={
+                        "response": response_text,
+                        "source_docs": response_sources,
+                        "retrieval_directives": [
+                            {
+                                "branch_id": branch_id,
+                                "bulletins": bulletins,
+                            }
+                            for branch_id, bulletins in retrieval_directives.items()
+                        ],
+                        "missing": missing,
+                    },
+                )
+                try:
+                    self._result.answer = await traced_step(
+                        self._ctx, "compute",
+                        lambda: self._compute.run(
+                            entries,
+                            self._ctx,
+                            concept_explanations=explanations,
+                        ),
+                    )
+                    return self._result.answer
+                except MissingData as post_human_error:
+                    reason = post_human_error.reason
+                    missing = post_human_error.missing
+
+                self._emit_plan(
+                    plan,
+                    "replan_pending",
+                    reason=reason,
+                    missing=missing,
+                    recovery_round=attempt,
+                )
                 failed = [(o.branch, o.error) for o in outcomes if o.error]
+                first_human_index = len(entries) - len(human_entries)
+                human_resolution_refs = [
+                    (first_human_index + i, resolved_missing)
+                    for i, resolved_missing in enumerate(human_resolutions)
+                ]
                 diff = await traced_step(
                     self._ctx,
                     "replanner",
@@ -146,10 +490,23 @@ class Orchestrator:
                         failed,
                         reason,
                         missing,
+                        human_resolution_refs,
                     ),
                 )
-                plan, outcomes = await self._apply_diff(plan, outcomes, diff)
-                self._emit_plan(plan, "replan", reason=reason, missing=missing)
+                self._ctx.human_intervention_enabled = (
+                    attempt == 1 and self._ctx.human_intervention_handler is not None
+                )
+                try:
+                    plan, outcomes = await self._apply_diff(plan, outcomes, diff)
+                finally:
+                    self._ctx.human_intervention_enabled = False
+                self._emit_plan(
+                    plan,
+                    "replan",
+                    reason=reason,
+                    missing=missing,
+                    recovery_round=attempt,
+                )
 
     def _alloc_branch_ids(self, n: int) -> list[int]:
         """Allocate `n` fresh, monotonically-increasing branch ids (stable for the
@@ -175,6 +532,7 @@ class Orchestrator:
         kept_ids = [self._branch_ids[i] for i in kept]
         added_ids = self._alloc_branch_ids(len(diff.add))
         self._branch_ids = [*kept_ids, *added_ids]
+        self._last_executed_branch_ids = set(added_ids)
         new_outcomes = await self._run_branches(diff.add, added_ids) if diff.add else []
         return new_plan, [*kept_outcomes, *new_outcomes]
 
@@ -185,6 +543,7 @@ class Orchestrator:
         *,
         reason: str | None = None,
         missing: list[str] | None = None,
+        recovery_round: int | None = None,
     ) -> None:
         """Emit the current plan as a structured `kind="plan"` event — one per
         revision — so the trace viewer can render the revision tabs. Each branch
@@ -201,6 +560,8 @@ class Orchestrator:
             data["reason"] = reason
         if missing is not None:
             data["missing"] = missing
+        if recovery_round is not None:
+            data["recovery_round"] = recovery_round
         self._ctx.emit(
             f"plan label={label} branches={len(plan.branches)}",
             kind="plan",
@@ -208,7 +569,10 @@ class Orchestrator:
         )
 
     async def _run_retrieve_phase(
-        self, branches: list[RetrieveBranch], branch_ids: list[int]
+        self,
+        branches: list[RetrieveBranch],
+        branch_ids: list[int],
+        document_scopes: list[list[str] | None] | None = None,
     ) -> list[list[BlockRef] | StepFailed]:
         """Unified multi-scan retrieve for every retrieve branch at once: their candidate
         pages are deduped and the LLM semantic filter scans each unique page at most once,
@@ -230,14 +594,24 @@ class Orchestrator:
                 and self._ctx.config.golden_pages is None
             ):
                 docs: list[list[BlockRef] | StepFailed] = list(
-                    await self._retrieve.run_all(self._ctx, branches, branch_ids)
+                    await self._retrieve.run_all(
+                        self._ctx,
+                        branches,
+                        branch_ids,
+                        document_scopes=document_scopes,
+                    )
                 )
             else:
                 docs = list(
                     await traced_step(
                         self._ctx,
                         "retrieve",
-                        lambda: self._retrieve.run_all(self._ctx, branches, branch_ids),
+                        lambda: self._retrieve.run_all(
+                            self._ctx,
+                            branches,
+                            branch_ids,
+                            document_scopes=document_scopes,
+                        ),
                     )
                 )
         except StepFailed as e:
@@ -257,7 +631,11 @@ class Orchestrator:
         return docs
 
     async def _run_branches(
-        self, branches: list[Branch], branch_ids: list[int]
+        self,
+        branches: list[Branch],
+        branch_ids: list[int],
+        *,
+        document_scopes: dict[int, list[str]] | None = None,
     ) -> list[BranchOutcome]:
         # Global retrieve phase: all retrieve branches share one deduped semantic-filter
         # sweep, then each branch's routed refs feed its own extract. Lookup branches are
@@ -266,6 +644,10 @@ class Orchestrator:
         docs = await self._run_retrieve_phase(
             [cast(RetrieveBranch, branches[i]) for i in retrieve_pos],
             [branch_ids[i] for i in retrieve_pos],
+            document_scopes=[
+                (document_scopes or {}).get(branch_ids[i])
+                for i in retrieve_pos
+            ],
         )
         docs_by_pos: dict[int, list[BlockRef] | StepFailed] = dict(
             zip(retrieve_pos, docs)
@@ -285,6 +667,35 @@ class Orchestrator:
                     "extract",
                     lambda: self._extract.run(doc, self._ctx, branch),
                     branch_id=bid,
+                    summary_metadata={
+                        "blocks": [
+                            {
+                                "bulletin": block_ref.page.month,
+                                "page": block_ref.page.page,
+                                "block_index": block_ref.block_index,
+                                "member_pages": [
+                                    {"bulletin": ref.month, "page": ref.page}
+                                    for ref in block_ref.member_refs
+                                ],
+                                "kind": block_ref.block.kind if block_ref.block else None,
+                                "title": block_ref.block.title if block_ref.block else None,
+                                "column_headers": (
+                                    block_ref.block.column_headers
+                                    if block_ref.block
+                                    else []
+                                ),
+                                "row_headers": (
+                                    block_ref.block.row_headers
+                                    if block_ref.block
+                                    else []
+                                ),
+                                "summary": (
+                                    block_ref.block.summary if block_ref.block else None
+                                ),
+                            }
+                            for block_ref in doc
+                        ]
+                    },
                 )
                 # Human verifies/produces the extracted value(s) (figure or OCR/table read)
                 # only when the policy opts in — no step (or prompt) on the default path.
@@ -318,15 +729,33 @@ class Orchestrator:
             return_exceptions=True,
         )
         outcomes: list[BranchOutcome] = []
-        for bid, (branch, res) in zip(branch_ids, zip(branches, results)):
+        for pos, (bid, branch, res) in enumerate(
+            zip(branch_ids, branches, results)
+        ):
+            selected = docs_by_pos.get(pos)
+            blocks = selected if isinstance(selected, list) else []
             if isinstance(res, StepFailed):
                 self._ctx.emit(
                     f"parallel_branch_failed branch_id={bid} error={str(res)!r}",
                     data={"branch_id": bid},
                 )
-                outcomes.append(BranchOutcome(branch=branch, entries=None, error=res))
+                outcomes.append(
+                    BranchOutcome(
+                        branch=branch,
+                        entries=None,
+                        error=res,
+                        blocks=blocks,
+                    )
+                )
             elif isinstance(res, BaseException):
                 raise res
             else:
-                outcomes.append(BranchOutcome(branch=branch, entries=res, error=None))
+                outcomes.append(
+                    BranchOutcome(
+                        branch=branch,
+                        entries=res,
+                        error=None,
+                        blocks=blocks,
+                    )
+                )
         return outcomes

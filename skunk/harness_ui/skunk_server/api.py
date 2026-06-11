@@ -51,6 +51,17 @@ class HumanAnswerRequest(BaseModel):
     source_docs: list[str] = Field(default_factory=list)
 
 
+class InterventionClaimRequest(BaseModel):
+    worker_id: str
+
+
+class InterventionResolveRequest(BaseModel):
+    worker_id: str
+    response: str = ""
+    source_docs: list[str] = Field(default_factory=list)
+    retrieval_directives: list[dict[str, Any]] = Field(default_factory=list)
+
+
 def install_routes(
     app: FastAPI,
     registry: TaskRegistry,
@@ -156,6 +167,72 @@ def install_routes(
         except (TaskConflict, ValueError) as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         return {"status": "submitted"}
+
+    @app.post("/api/interventions/{intervention_id}/claim")
+    async def claim_intervention(
+        intervention_id: str,
+        body: InterventionClaimRequest,
+    ) -> dict[str, Any]:
+        try:
+            intervention = broker.claim_intervention(
+                body.worker_id,
+                intervention_id,
+            )
+        except KeyError as error:
+            raise HTTPException(
+                status_code=404,
+                detail="worker or human intervention not found",
+            ) from error
+        except TaskConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        await events.broadcast()
+        return to_jsonable(intervention)
+
+    @app.post("/api/interventions/{intervention_id}/release")
+    async def release_intervention(
+        intervention_id: str,
+        body: InterventionClaimRequest,
+    ) -> dict[str, Any]:
+        try:
+            intervention = broker.release_intervention(
+                body.worker_id,
+                intervention_id,
+            )
+        except KeyError as error:
+            raise HTTPException(
+                status_code=404,
+                detail="human intervention not found",
+            ) from error
+        except TaskConflict as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        await events.broadcast()
+        return to_jsonable(intervention)
+
+    @app.post("/api/interventions/{intervention_id}/resolve")
+    async def resolve_intervention(
+        intervention_id: str,
+        body: InterventionResolveRequest,
+    ) -> dict[str, Any]:
+        try:
+            task, intervention = broker.resolve_intervention(
+                body.worker_id,
+                intervention_id,
+                body.response,
+                body.source_docs,
+                body.retrieval_directives,
+            )
+        except KeyError as error:
+            raise HTTPException(
+                status_code=404,
+                detail="human intervention not found",
+            ) from error
+        except (TaskConflict, ValueError) as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        await events.broadcast()
+        return {
+            "task": to_jsonable(task),
+            "intervention": to_jsonable(intervention),
+        }
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket) -> None:
