@@ -40,10 +40,12 @@ async def solve(
     prompt: str,
     *,
     human_intervention_handler=None,
+    trace_event_handler=None,
 ) -> AgentAnswer:
     return await SkunkReasoner().solve(
         prompt,
         human_intervention_handler=human_intervention_handler,
+        trace_event_handler=trace_event_handler,
     )
 
 
@@ -51,10 +53,12 @@ async def solve_with_trace(
     prompt: str,
     *,
     human_intervention_handler=None,
+    trace_event_handler=None,
 ) -> tuple[AgentAnswer, list[dict]]:
     return await SkunkReasoner().solve_with_trace(
         prompt,
         human_intervention_handler=human_intervention_handler,
+        trace_event_handler=trace_event_handler,
     )
 
 
@@ -63,10 +67,17 @@ class SkunkReasoner:
     def set_default_env() -> None:
         _set_default_env()
 
-    async def solve(self, prompt: str, *, human_intervention_handler=None) -> AgentAnswer:
+    async def solve(
+        self,
+        prompt: str,
+        *,
+        human_intervention_handler=None,
+        trace_event_handler=None,
+    ) -> AgentAnswer:
         answer, _events = await self.solve_with_trace(
             prompt,
             human_intervention_handler=human_intervention_handler,
+            trace_event_handler=trace_event_handler,
         )
         return answer
 
@@ -75,10 +86,12 @@ class SkunkReasoner:
         prompt: str,
         *,
         human_intervention_handler=None,
+        trace_event_handler=None,
     ) -> tuple[AgentAnswer, list[dict]]:
         answer, events = await self.execute(
             prompt,
             human_intervention_handler=human_intervention_handler,
+            trace_event_handler=trace_event_handler,
         )
         source_docs = self.source_docs_from_events(events)
         return (
@@ -95,6 +108,7 @@ class SkunkReasoner:
         prompt: str,
         *,
         human_intervention_handler=None,
+        trace_event_handler=None,
     ) -> tuple[str, list[dict]]:
         from skunk import MissingData, Orchestrator, SkunkConfig, StepFailed, load_prompt_overrides
 
@@ -113,6 +127,20 @@ class SkunkReasoner:
             verbose=os.environ.get("SKUNK_CONSOLE_VERBOSE", "").lower() in {"1", "true", "yes"},
             human_intervention_handler=human_intervention_handler,
         )
+        if trace_event_handler is not None:
+            original_emit = orch.ctx.emit
+
+            def emit_and_forward(
+                message: str,
+                level: str | None = None,
+                *,
+                kind: str | None = None,
+                data: dict | None = None,
+            ) -> None:
+                original_emit(message, level, kind=kind, data=data)
+                trace_event_handler(dict(orch.ctx.events[-1]))
+
+            orch.ctx.emit = emit_and_forward  # type: ignore[method-assign]
         try:
             try:
                 answer = await orch.execute()
@@ -160,11 +188,15 @@ def _structured_reasoning_payload(events: list[dict], source_docs: list[str]) ->
     replan_count = 0
     counted_recovery_rounds: set[int] = set()
     last_plan_label = None
+    human_directed_retrieval = False
 
     for evt in events:
         kind = evt.get("kind")
         data = evt.get("data") if isinstance(evt.get("data"), dict) else {}
         message = str(evt.get("message", ""))
+
+        if message == "human_directed_retrieval":
+            human_directed_retrieval = True
 
         if kind == "plan" and data:
             last_plan_label = data.get("label")
@@ -275,6 +307,7 @@ def _structured_reasoning_payload(events: list[dict], source_docs: list[str]) ->
             "source_docs": source_docs[:8],
             "branch_count": len(branches),
             "replan_count": replan_count,
+            "human_directed_retrieval": human_directed_retrieval,
         },
         "branches": branches,
         "python_code": compute_code,

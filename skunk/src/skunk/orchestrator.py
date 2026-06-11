@@ -32,6 +32,27 @@ class BranchOutcome:
     blocks: list[BlockRef] = field(default_factory=list)
 
 
+def _merge_branch_outcome(previous: BranchOutcome, new: BranchOutcome) -> BranchOutcome:
+    if previous.error is not None or previous.entries is None:
+        return new
+    if new.error is not None or new.entries is None:
+        return new
+    entries: list[AnnotatedValue] = []
+    seen_entries: set[str] = set()
+    for entry in [*previous.entries, *new.entries]:
+        key = entry.model_dump_json()
+        if key not in seen_entries:
+            seen_entries.add(key)
+            entries.append(entry)
+    blocks = list(dict.fromkeys([*previous.blocks, *new.blocks]))
+    return BranchOutcome(
+        branch=new.branch,
+        entries=entries,
+        error=None,
+        blocks=blocks,
+    )
+
+
 class Orchestrator:
     """One per NL question. The orchestrator drives the work forward by invoking the planner and stepping through the plan.
     It is also responsible for catching any execution errors and replanning when necessary."""
@@ -397,7 +418,9 @@ class Orchestrator:
                         for position, outcome in zip(
                             rerun_positions, rerun_outcomes
                         ):
-                            outcomes[position] = outcome
+                            outcomes[position] = _merge_branch_outcome(
+                                outcomes[position], outcome
+                            )
                         self._last_executed_branch_ids = set(rerun_ids)
                         self._ctx.emit(
                             "human_directed_retrieval",
@@ -459,6 +482,24 @@ class Orchestrator:
                 except MissingData as post_human_error:
                     reason = post_human_error.reason
                     missing = post_human_error.missing
+                    if retrieval_directives:
+                        self._ctx.emit(
+                            "human_annotation_retry_incomplete",
+                            kind="observation",
+                            data={
+                                "recovery_round": attempt,
+                                "branch_ids": sorted(retrieval_directives),
+                                "reason": reason,
+                                "missing": missing,
+                            },
+                        )
+                        # A branch annotation is itself the recovery action for this
+                        # round: it reruns the same stable branch with updated retrieval
+                        # context. Only a later, unannotated round may structurally
+                        # rewrite the plan.
+                        attempt += 1
+                        if attempt > self._ctx.config.recovery_max_rounds:
+                            raise
 
                 self._emit_plan(
                     plan,
