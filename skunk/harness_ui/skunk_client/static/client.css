@@ -332,6 +332,50 @@ main {
 .intervention-card textarea {
   margin-top: 8px;
 }
+/* verify_extract / figure / lookup correction form */
+.verify-preview {
+  margin: 8px 0;
+  max-height: 240px;
+  overflow: auto;
+  font-size: 12px;
+}
+.verify-preview-empty {
+  margin: 8px 0;
+  color: var(--muted);
+  font-style: italic;
+}
+.verify-form {
+  display: grid;
+  flex: 1 0 100%;
+  gap: 12px;
+  width: 100%;
+}
+.verify-candidate {
+  display: grid;
+  gap: 4px;
+  padding: 10px;
+  border: 1px solid var(--border, rgba(127, 127, 127, 0.3));
+  border-radius: 8px;
+}
+.verify-candidate .label {
+  margin-bottom: 4px;
+}
+.verify-candidate label {
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+.verify-candidate input,
+.verify-candidate select,
+.verify-candidate textarea {
+  width: 100%;
+  min-width: 0;
+}
+.verify-candidate textarea.verify-value {
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 12px;
+}
 .corpus-document-field {
   display: grid;
   gap: 6px;

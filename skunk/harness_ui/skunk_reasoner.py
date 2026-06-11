@@ -106,6 +106,20 @@ class SkunkReasoner:
         overrides_path = Path(config.prompt_overrides_path)
         prompt_overrides = load_prompt_overrides(overrides_path) if overrides_path.exists() else ()
 
+        # Master switch for ALL human-in-the-loop behavior — the verify/figure/lookup gates
+        # AND the broker recovery flow both hinge on the handler being present. Default ON
+        # keeps the competition-server behavior; SKUNK_HUMAN_INTERVENTION=0 drops the handler
+        # for a fully autonomous run (the orchestrator then uses the console channel, which
+        # is inert while the SKUNK_HUMAN_* gates are off, and a MissingData fails the attempt
+        # instead of paging a human).
+        if os.environ.get("SKUNK_HUMAN_INTERVENTION", "1").lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            human_intervention_handler = None
+
         orch = Orchestrator(
             prompt,
             config=config,

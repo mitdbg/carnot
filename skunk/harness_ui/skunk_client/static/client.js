@@ -751,6 +751,78 @@ function renderCorpusDocumentPicker(pickerKey, focusSearch = false) {
   }
 }
 
+// Kinds raised by the `human.py` verification gates (BrokerChannel): the worker confirms or
+// corrects the model's extracted value, answers a figure question, or performs a lookup.
+const VERIFY_KINDS = ["verify_extract", "figure", "lookup"];
+const VERIFY_FIELDS = [
+  "description", "value", "unit", "kind", "index_name", "row_name", "col_name",
+];
+const VERIFY_VALUE_KINDS = ["scalar", "vector", "table"];
+
+function verifyFieldInputHtml(interventionId, index, field, value) {
+  const inputId = `verify_${js(interventionId)}_${index}_${field}`;
+  if (field === "kind") {
+    const current = VERIFY_VALUE_KINDS.includes(value) ? value : "scalar";
+    return `<label for="${inputId}">kind</label>
+      <select id="${inputId}" data-vfield="kind">${VERIFY_VALUE_KINDS.map(k => (
+        `<option value="${k}"${k === current ? " selected" : ""}>${k}</option>`
+      )).join("")}</select>`;
+  }
+  if (field === "value") {
+    const scalar = value === null || value === undefined ||
+      ["string", "number", "boolean"].includes(typeof value);
+    const text = value === null || value === undefined
+      ? ""
+      : (scalar ? String(value) : JSON.stringify(value, null, 2));
+    return `<label for="${inputId}">value</label>
+      <textarea id="${inputId}" data-vfield="value" class="verify-value" rows="${scalar ? 1 : 4}"
+        placeholder="scalar (e.g. 42) or JSON for vector/table">${esc(text)}</textarea>`;
+  }
+  const text = value === null || value === undefined ? "" : String(value);
+  const required = field === "description" ? " required" : "";
+  return `<label for="${inputId}">${esc(field)}</label>
+    <input id="${inputId}" data-vfield="${esc(field)}" value="${esc(text)}"${required}>`;
+}
+
+function verifyCandidateFormHtml(interventionId, index, candidate) {
+  const inputs = VERIFY_FIELDS
+    .map(f => verifyFieldInputHtml(interventionId, index, f, candidate ? candidate[f] : null))
+    .join("");
+  return `<div class="verify-candidate" data-vindex="${index}">
+    <div class="label">Answer ${index + 1}</div>
+    ${inputs}
+  </div>`;
+}
+
+function verifyFormHtml(intervention) {
+  const guidance = intervention.guidance || {};
+  const candidates = Array.isArray(guidance.candidates) ? guidance.candidates : [];
+  // lookup has no model candidate → one empty form to author the value.
+  const forms = candidates.length
+    ? candidates.map((c, i) => verifyCandidateFormHtml(intervention.intervention_id, i, c))
+    : [verifyCandidateFormHtml(intervention.intervention_id, 0, null)];
+  return `<div id="verify_form_${esc(intervention.intervention_id)}" class="verify-form">
+    ${forms.join("")}
+    <div class="actions">
+      ${candidates.length
+        ? `<button class="primary" onclick="resolveIntervention('${js(intervention.intervention_id)}', {accept: true})">Accept as-is</button>`
+        : ""}
+      <button class="primary" onclick="resolveIntervention('${js(intervention.intervention_id)}')">Submit correction</button>
+      <button onclick="releaseIntervention('${js(intervention.intervention_id)}')">Release</button>
+    </div>
+  </div>`;
+}
+
+function verifyPreviewHtml(intervention) {
+  const guidance = intervention.guidance || {};
+  const candidates = Array.isArray(guidance.candidates) ? guidance.candidates : [];
+  const heading = intervention.kind === "lookup" ? "Lookup request" : "Model's answer";
+  const body = candidates.length
+    ? `<pre class="verify-preview">${esc(JSON.stringify(candidates, null, 2))}</pre>`
+    : `<p class="verify-preview-empty">No model answer — provide the value.</p>`;
+  return `<div class="label">${heading}</div>${body}`;
+}
+
 function interventionHtml(intervention) {
   const isMine = intervention.status === "CLAIMED" && intervention.claimed_by === workerId;
   const requestedSources = intervention.source_docs?.length
@@ -779,6 +851,7 @@ function interventionHtml(intervention) {
   const missingValues = intervention.kind === "missing_data" && Array.isArray(guidance.missing)
     ? guidance.missing.map(value => String(value).trim()).filter(Boolean)
     : [];
+  const verifyTask = VERIFY_KINDS.includes(intervention.kind);
   const guidanceHtml = Object.keys(guidance).length
     ? `<div class="intervention-guidance">
         ${guidance.recovery_round
@@ -812,21 +885,25 @@ function interventionHtml(intervention) {
         ${missingValues.map(value => `<div class="missing-information-item">${esc(value)}</div>`).join("")}
       </div>`
     : "";
+  // Verify/figure/lookup show the model's candidate(s) in place of the recovery guidance blob.
+  const detailBlock = verifyTask ? verifyPreviewHtml(intervention) : guidanceHtml;
   const requestContext = missingValues.length
     ? `<details class="request-context">
         <summary>Request context</summary>
         <p>${esc(intervention.instructions)}</p>
         ${intervention.context ? `<p class="intervention-context">${esc(intervention.context)}</p>` : ""}
         ${requestedSources}
-        ${guidanceHtml}
+        ${detailBlock}
       </details>`
     : `<p>${esc(intervention.instructions)}</p>
       ${intervention.context ? `<p class="intervention-context">${esc(intervention.context)}</p>` : ""}
       ${requestedSources}
-      ${guidanceHtml}`;
+      ${detailBlock}`;
   let controls = "";
   if (intervention.status === "PENDING" && workerId) {
     controls = `<button class="primary" onclick="claimIntervention('${js(intervention.intervention_id)}')">Claim Request</button>`;
+  } else if (isMine && verifyTask) {
+    controls = verifyFormHtml(intervention);
   } else if (isMine) {
     const directivePickers = directiveBranches.map(branch => {
       const pickerKey = `${intervention.intervention_id}:${branch.branch_id}`;
@@ -1070,12 +1147,62 @@ window.removeInterventionSource = (interventionId, reference) => {
   selectedInterventionSources(interventionId).delete(reference);
   renderCorpusDocumentPicker(interventionId, true);
 };
-window.resolveIntervention = interventionId => {
+// Read a verify/figure/lookup form back into a list of AnnotatedValue-shaped objects, or
+// null if it fails client-side validation (so the caller aborts the submit).
+function collectVerifyValues(interventionId) {
+  const form = document.getElementById(`verify_form_${interventionId}`);
+  if (!form) return null;
+  const out = [];
+  for (const container of form.querySelectorAll(".verify-candidate")) {
+    const obj = {};
+    for (const input of container.querySelectorAll("[data-vfield]")) {
+      const field = input.dataset.vfield;
+      const raw = input.value;
+      const trimmed = raw.trim();
+      if (field === "value") {
+        if (trimmed === "") { obj.value = null; continue; }
+        try { obj.value = JSON.parse(trimmed); }   // number / JSON dict / quoted string
+        catch { obj.value = raw; }                  // bare text → string
+      } else if (field === "kind") {
+        obj.kind = raw || "scalar";
+      } else if (field === "description") {
+        obj.description = trimmed;                   // required (input enforces non-empty)
+      } else if (trimmed !== "") {
+        obj[field] = trimmed;                        // omit empties → model defaults (unit "" / None)
+      }
+    }
+    out.push(obj);
+  }
+  // Require a description and a value on every answer (esp. lookup, which has no candidate).
+  const bad = out.find(o => !o.description || o.value === null || o.value === undefined);
+  if (!out.length || bad) {
+    const focusTarget = form.querySelector(":invalid")
+      || form.querySelector('[data-vfield="value"]');
+    focusTarget?.reportValidity?.();
+    focusTarget?.focus?.();
+    return null;
+  }
+  return out;
+}
+
+window.resolveIntervention = (interventionId, options = {}) => {
   const task = state.tasks.find(item => (
     item.human_interventions?.some(intervention => intervention.intervention_id === interventionId)
   ));
   const intervention = task?.human_interventions?.find(item => item.intervention_id === interventionId);
   const guidance = intervention?.guidance || {};
+  if (VERIFY_KINDS.includes(intervention?.kind)) {
+    let response = "";
+    if (!options.accept) {
+      const values = collectVerifyValues(interventionId);
+      if (!values) return;                           // validation failed → stay on the form
+      response = JSON.stringify(values);
+    }
+    return run(command(
+      `/api/interventions/${interventionId}/resolve`,
+      { worker_id: workerId, response, source_docs: [], retrieval_directives: [] },
+    ));
+  }
   const failed = Array.isArray(guidance.failed_branches)
     ? guidance.failed_branches.filter(item => (
         Number.isInteger(item.branch_id) && item.branch?.kind === "retrieve"

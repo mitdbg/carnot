@@ -166,8 +166,10 @@ class SkunkConfig:
     # Human-in-the-loop: route specific sub-tasks to a person instead of (or after) the
     # model. Three independent toggles, all default OFF (zero behavior change when unset);
     # the policy/channel wiring lives in `human.py` and is enforced at the orchestrator
-    # dispatch seam, so no operator or planner code changes when these flip. With any flag
-    # on a run blocks on the console — target a handful of UIDs at a time, not a sweep.
+    # dispatch seam, so no operator or planner code changes when these flip. Transport is
+    # chosen by handler presence: under the competition server these route through the async
+    # broker/web UI (non-blocking — a worker resolves each request); for a local CLI run with
+    # no handler they fall back to the blocking console, so target a handful of UIDs, not a sweep.
     # - human_figure: for `visual_only` retrieve branches (chart/figure questions the
     #   vision model reads unreliably), show the human the rendered page(s) + the model's
     #   candidate and take their answer. (env: SKUNK_HUMAN_FIGURE=1)

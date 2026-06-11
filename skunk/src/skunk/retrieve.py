@@ -60,6 +60,7 @@ class RetrieveOp:
                     f"unknown retriever {other!r}; expected 'search_agent' or 'page_index_old'",
                 )
 
+
     async def run_all(
         self,
         ctx: ExecutionContext,

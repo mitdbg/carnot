@@ -8,7 +8,7 @@ from skunk.compute import ComputeOp
 from skunk.config import SkunkConfig
 from skunk.errors import MissingData, StepFailed
 from skunk.extract import ExtractOp
-from skunk.human import HumanAssist
+from skunk.human import BrokerChannel, ConsoleChannel, HumanAssist
 from skunk.lookup_external import LookupExternalOp
 from skunk.common import (
     AnnotatedValue,
@@ -74,7 +74,16 @@ class Orchestrator:
         self._lookup = LookupExternalOp()
         # Human-in-the-loop middleware (inert unless a SKUNK_HUMAN_* flag is set). Gates on
         # ctx.config per call, so constructing it unconditionally is free when disabled.
-        self._human = HumanAssist()
+        # Channel by transport: under the competition server a handler is present → route
+        # human requests through the async broker/web UI; for a local CLI run fall back to
+        # the blocking console. (Selecting by handler-presence also keeps the SKUNK_HUMAN_*
+        # flags from hanging a server worker on stdin.)
+        human_channel = (
+            BrokerChannel(self._ctx.human_intervention_handler)
+            if self._ctx.human_intervention_handler is not None
+            else ConsoleChannel()
+        )
+        self._human = HumanAssist(channel=human_channel)
         self._explainer = QuestionExplainer()
         self._compute = ComputeOp()
         self._result = ExecutionResult(question=question)

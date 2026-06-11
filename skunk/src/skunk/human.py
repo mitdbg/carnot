@@ -9,15 +9,18 @@ set this is inert. Three pieces, each a swappable seam:
   - `HumanAssistPolicy` decides *whether* a human is asked for a given operator call. Today
     it's all-or-nothing per flag; future nuance (verify only list-valued extractions, etc.)
     lives entirely here — no operator/orchestrator change.
-  - `HumanChannel` is the I/O *how*. `ConsoleChannel` (default) renders the source page(s),
-    prints the model's candidate(s), and reads a typed reply on stdin. The client/server
-    harness UI can later implement the same interface without touching anything else.
+  - `HumanChannel` is the I/O *how*. `ConsoleChannel` rasterizes the source page(s), prints
+    the model's candidate(s), and reads a typed reply on stdin (blocking, dev/local).
+    `BrokerChannel` instead delegates to the competition harness's async
+    `HumanInterventionHandler`, so a worker resolves the request in the web UI and the
+    branch's coroutine suspends without blocking the event loop. The orchestrator picks the
+    channel by handler presence (broker under the server, console for a local CLI run).
   - `HumanAssist` is the facade the orchestrator holds: it joins policy + channel and
     returns `list[AnnotatedValue]` — the same currency every operator speaks.
 
-With any flag on, a run blocks on the console one branch at a time (a module-level
+On the `ConsoleChannel` a run blocks on the console one branch at a time (a module-level
 `asyncio.Lock` serializes prompts across parallel branches), so target a few UIDs, not a
-sweep.
+sweep. The `BrokerChannel` has no such limit — many interventions can be outstanding at once.
 """
 
 from __future__ import annotations
@@ -29,7 +32,13 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
-from skunk.common import AnnotatedValue, B64Image, ExecutionContext
+from skunk.common import (
+    AnnotatedValue,
+    B64Image,
+    ExecutionContext,
+    HumanInterventionHandler,
+    PageRef,
+)
 from skunk.errors import ParseError
 from skunk.extract import _blocks_to_pagerefs, _render_pages_b64, _stamp_provenance
 from skunk.plan import Branch, LookupBranch, RetrieveBranch
@@ -48,12 +57,14 @@ HumanTask = Literal["verify_extract", "figure", "lookup"]
 @dataclass
 class HumanRequest:
     """One unit of work handed to a human: the framing, the model's current answer (if any),
-    and the source-page images to look at (empty for an external lookup)."""
+    and the source pages to look at (empty for an external lookup). Pages are carried as
+    refs, not pre-rendered images — each channel renders them only if it needs to (the
+    console rasterizes to PNG; the web UI links to the live page viewer)."""
 
     task: HumanTask
     instruction: str
     candidates: list[AnnotatedValue]
-    images: list[B64Image] = field(default_factory=list)
+    pages: list[PageRef] = field(default_factory=list)
     branch: Branch | None = None
 
 
@@ -93,16 +104,18 @@ def _parse_reply(raw: str) -> list[AnnotatedValue]:
 
 
 class ConsoleChannel:
-    """Blocking stdin/stdout channel. Renders each image to a temp PNG and prints its path,
-    prints the candidate(s) + instruction, then reads a reply: a blank line accepts the
-    candidates unchanged; otherwise paste a JSON object/array (terminated by a line `END`)
-    to override. Stdin is read off the event loop via `asyncio.to_thread`."""
+    """Blocking stdin/stdout channel. Rasterizes the source page(s) to temp PNGs and prints
+    their paths, prints the candidate(s) + instruction, then reads a reply: a blank line
+    accepts the candidates unchanged; otherwise paste a JSON object/array (terminated by a
+    line `END`) to override. Stdin is read off the event loop via `asyncio.to_thread`."""
 
     async def ask(
         self, req: HumanRequest, ctx: ExecutionContext
     ) -> list[AnnotatedValue]:
         async with _PROMPT_LOCK:
-            paths = self._dump_images(req.images)
+            # Render page refs to b64 only here, where the terminal actually needs pixels.
+            images, _ = _render_pages_b64(req.pages, ctx) if req.pages else ([], [])
+            paths = self._dump_images(images)
             while True:
                 self._render_prompt(req, paths)
                 raw = await asyncio.to_thread(self._read_stdin)
@@ -167,6 +180,65 @@ class ConsoleChannel:
         return "".join(lines)
 
 
+class BrokerChannel:
+    """Async, server-mediated channel: delegates to the competition harness's
+    `HumanInterventionHandler` (`ctx.human_intervention_handler`) instead of blocking on
+    stdin. Awaiting the handler suspends only this branch's coroutine — the event loop keeps
+    running every other branch and question — so the system never blocks on human feedback;
+    the verified value still gates this branch (compute awaits it). The handler creates a
+    `HumanIntervention` a worker claims/resolves in the web UI; the worker's corrected
+    `AnnotatedValue`(s) ride back JSON-encoded in the response's `response` field (an empty
+    response = "accept the model's candidates as-is")."""
+
+    def __init__(self, handler: HumanInterventionHandler) -> None:
+        self._handler = handler
+
+    async def ask(
+        self, req: HumanRequest, ctx: ExecutionContext
+    ) -> list[AnnotatedValue]:
+        # Page refs as the UI's canonical doc strings so its existing source-page viewer
+        # (`/api/source/{month}/page/{page}.png`) renders them — no pixels shipped over the wire.
+        source_docs = [
+            f"Treasury Bulletin {p.month} PDF page {p.page}"
+            for p in req.pages
+            if p.month is not None and p.page is not None
+        ]
+        guidance = {
+            "task": req.task,
+            "candidates": [c.model_dump(include=set(_FIELDS)) for c in req.candidates],
+            "fields": list(_FIELDS),
+        }
+        ctx.emit(
+            f"human_request task={req.task} candidates={len(req.candidates)} "
+            f"n_pages={len(source_docs)} via=broker",
+            kind="user",
+        )
+        result = await self._handler(
+            req.task, req.instruction, ctx.question, source_docs, guidance
+        )
+        raw = (result.get("response") or "").strip()
+        if not raw:
+            # Accept-as-is: no correction submitted → keep the model's candidates.
+            ctx.emit(
+                f"human_response action=accept n={len(req.candidates)}", kind="user"
+            )
+            return list(req.candidates)
+        try:
+            parsed = _parse_reply(raw)
+        except ParseError as e:
+            # The worker already resolved in the UI — unlike the console we cannot re-prompt.
+            # Fall back to the model's candidates (if any) rather than crashing the branch;
+            # surface the reason in the trace. A lookup has no candidate, so re-raise there.
+            ctx.emit(
+                f"human_response action=parse_failed detail={e.detail!r}", kind="user"
+            )
+            if req.candidates:
+                return list(req.candidates)
+            raise
+        ctx.emit(f"human_response action=override n={len(parsed)}", kind="user")
+        return parsed
+
+
 class HumanAssistPolicy:
     """Decides *whether* a human is consulted for a given operator call. The future-nuance
     seam: today all-or-nothing per flag; tomorrow e.g. verify only list-valued extractions
@@ -225,8 +297,6 @@ class HumanAssist:
         answer, re-stamped with the branch/page provenance the operators stamp. Assumes the
         caller already gated on `wants_verify`."""
         refs = _blocks_to_pagerefs(blocks)
-        # best-effort render; skip the page store entirely when there are no source pages.
-        images, _ = _render_pages_b64(refs, ctx) if refs else ([], [])
         instruction = (
             "This answer must be read off the figure/chart on the page(s) below — the "
             "model is unreliable here. Give the correct value(s)."
@@ -236,7 +306,7 @@ class HumanAssist:
         )
         ctx.emit(
             f"human_request task={'figure' if branch.visual_only else 'verify_extract'} "
-            f"candidates={[e.description for e in entries]!r} n_images={len(images)}",
+            f"candidates={[e.description for e in entries]!r} n_pages={len(refs)}",
             kind="user",
         )
         reply = await self._channel.ask(
@@ -244,7 +314,7 @@ class HumanAssist:
                 task="figure" if branch.visual_only else "verify_extract",
                 instruction=instruction,
                 candidates=entries,
-                images=images,
+                pages=refs,
                 branch=branch,
             ),
             ctx,
@@ -268,7 +338,7 @@ class HumanAssist:
                 task="lookup",
                 instruction=instruction,
                 candidates=[],
-                images=[],
+                pages=[],
                 branch=branch,
             ),
             ctx,
