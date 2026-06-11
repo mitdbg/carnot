@@ -25,8 +25,14 @@ import os
 
 from chromadb.api.models.Collection import Collection
 
-from skunk.common import B64Image, ExecutionContext, make_genai_client
+from skunk.common import (
+    B64Image,
+    ExecutionContext,
+    HumanInterventionHandler,
+    make_genai_client,
+)
 from skunk.config import SkunkConfig
+from skunk.human_intervention import RequestHumanTool
 from skunk.local_python_executor import CodeOutput
 from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent, TextBlock
 from skunk.search_agent.base import Retriever
@@ -101,11 +107,37 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         generation_backend=None,
         sampling_params: dict | None = None,
         capture_logprobs: bool = False,
+        human_intervention_handler: HumanInterventionHandler | None = None,
+        required_bulletins: list[str] | None = None,
     ):
         self.config = config
         self.chroma_collection = chroma_collection
-        self.document_map = document_map
+        required_doc_prefixes = {
+            bulletin.replace("-", "_") + "_"
+            for bulletin in required_bulletins or []
+        }
+        self.document_map = (
+            {
+                doc_id: text
+                for doc_id, text in document_map.items()
+                if any(doc_id.startswith(prefix) for prefix in required_doc_prefixes)
+            }
+            if required_doc_prefixes
+            else document_map
+        )
         self.emb_client, self.emb_model_id = _make_embedding_client(config.emb_model_id)
+        required_filter = None
+        if required_bulletins:
+            clauses = [
+                {
+                    "$and": [
+                        {"year": bulletin[:4]},
+                        {"month": bulletin[5:]},
+                    ]
+                }
+                for bulletin in required_bulletins
+            ]
+            required_filter = clauses[0] if len(clauses) == 1 else {"$or": clauses}
 
         # Bound each search-step LLM call: cap output (was uncapped → runaway
         # generations streamed to the 65535-token ceiling at 200–800s each) and
@@ -126,12 +158,20 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             SearchCorpusTool(
                 self.chroma_collection, self.emb_model_id, self.emb_client,
                 self._pruned_chunk_ids, self._pruned_doc_ids,
+                required_filter,
             ),
-            GrepCorpusTool(self.chroma_collection, self._pruned_chunk_ids, self._pruned_doc_ids),
+            GrepCorpusTool(
+                self.chroma_collection,
+                self._pruned_chunk_ids,
+                self._pruned_doc_ids,
+                required_filter,
+            ),
             ReadDocumentTool(self.document_map, config.agent_max_pages_per_tool_call),
             ViewFigureTool(self.document_map, config.pdf_dir),
             PruneTool(self._pruned_chunk_ids, self._pruned_doc_ids),
         ]
+        if human_intervention_handler is not None:
+            tools.append(RequestHumanTool(human_intervention_handler))
         super().__init__(
             tools, max_steps=config.agent_max_steps,
             system_prompt_override=system_prompt_override,
@@ -239,6 +279,7 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         branch_key: str | None = None,
         branch_period: str | None = None,
         branch_as_of: str | None = None,
+        required_bulletins: list[str] | None = None,
     ) -> list[str]:
         parts = [f"Question: {question}"]
         if branch_key:
@@ -247,6 +288,11 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             parts.append(f"Time period (of the data): {branch_period}")
         if branch_as_of:
             parts.append(f"Reported in / as of: {branch_as_of}")
+        if required_bulletins:
+            parts.append(
+                "Human-required source bulletins (hard scope): "
+                + ", ".join(required_bulletins)
+            )
         payload = await self.call(ctx, "\n".join(parts))
         keys = payload.get("page_keys") or []
         if isinstance(keys, str):

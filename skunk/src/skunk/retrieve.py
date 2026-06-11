@@ -61,17 +61,29 @@ class RetrieveOp:
                 )
 
     async def run_all(
-        self, ctx: ExecutionContext, branches: list[RetrieveBranch]
+        self,
+        ctx: ExecutionContext,
+        branches: list[RetrieveBranch],
+        *,
+        document_scopes: list[list[str] | None] | None = None,
     ) -> list[list[BlockRef] | StepFailed]:
         """Retrieve for several branches at once, result aligned to `branches`. A slot is
         that branch's blocks or a `StepFailed` — a single branch failing does not
         sink its siblings. A whole-sweep failure (unknown retriever, missing index) raises."""
         if ctx.config.golden_pages is not None:
             return [self._golden_blocks(ctx) for _ in branches]
+        scopes = document_scopes or [None] * len(branches)
         match str(ctx.config.retriever):
             case "search_agent":
                 settled = await asyncio.gather(
-                    *(self._run_search_agent(ctx, b) for b in branches),
+                    *(
+                        self._run_search_agent(
+                            ctx,
+                            branch,
+                            required_bulletins=scope,
+                        )
+                        for branch, scope in zip(branches, scopes)
+                    ),
                     return_exceptions=True,
                 )
                 out: list[list[BlockRef] | StepFailed] = []
@@ -84,7 +96,13 @@ class RetrieveOp:
                         out.append(_whole_page_blocks(r))
                 return out
             case "page_index":
-                return list(await self._page_index().retrieve_all(ctx, branches))
+                return list(
+                    await self._page_index().retrieve_all(
+                        ctx,
+                        branches,
+                        document_scopes=scopes,
+                    )
+                )
             case other:
                 raise StepFailed(
                     "retrieve",
@@ -103,7 +121,11 @@ class RetrieveOp:
         return _whole_page_blocks(pages)
 
     async def _run_search_agent(
-        self, ctx: ExecutionContext, branch: RetrieveBranch
+        self,
+        ctx: ExecutionContext,
+        branch: RetrieveBranch,
+        *,
+        required_bulletins: list[str] | None = None,
     ) -> list[PageRef]:
         from skunk.search_agent import SearchAgent
 
@@ -112,6 +134,12 @@ class RetrieveOp:
             config=ctx.config,
             document_map=document_map,
             chroma_collection=collection,
+            human_intervention_handler=(
+                ctx.human_intervention_handler
+                if ctx.human_intervention_enabled
+                else None
+            ),
+            required_bulletins=required_bulletins,
         )
         # The agent hint is free text; render a per-entry pin list to its pinned months.
         as_of_hint = (
@@ -125,12 +153,17 @@ class RetrieveOp:
             branch_key=branch.key,
             branch_period=branch.period,
             branch_as_of=as_of_hint,
+            required_bulletins=required_bulletins,
         )
         refs: list[PageRef] = []
         bad: list[str] = []
         for key in page_keys:
             try:
-                refs.append(page_key_to_pageref(key))
+                ref = page_key_to_pageref(key)
+                if required_bulletins and ref.month not in required_bulletins:
+                    bad.append(key)
+                    continue
+                refs.append(ref)
             except ValueError:
                 bad.append(key)
         if bad:

@@ -40,6 +40,16 @@ if TYPE_CHECKING:
 Effort = Literal["off", "minimal", "low", "medium", "high"]
 EFFORT_VALUES = ("off", "minimal", "low", "medium", "high")
 
+HumanInterventionHandler = Callable[
+    [str, str, str | None, list[str], dict[str, Any] | None],
+    Awaitable[dict[str, Any]],
+]
+
+
+@dataclass(frozen=True)
+class PendingHumanIntervention:
+    response: Awaitable[dict[str, Any]]
+
 
 @dataclass
 class B64Image:
@@ -567,6 +577,8 @@ class ExecutionContext:
     prompt_overrides: tuple[
         PromptOverride, ...
     ] = ()  # corpus/few_shot/lesson overrides; operators pick out their own entries by name
+    human_intervention_handler: HumanInterventionHandler | None = None
+    human_intervention_enabled: bool = False
 
     def __post_init__(self) -> None:
         if self.llm_client is None:

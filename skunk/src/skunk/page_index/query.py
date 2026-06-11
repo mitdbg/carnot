@@ -582,6 +582,8 @@ Use each `block_id` exactly as it appears."""
         self,
         ctx: ExecutionContext,
         branches: list[RetrieveBranch],
+        *,
+        document_scopes: list[list[str] | None] | None = None,
     ) -> list[list[BlockRef] | StepFailed]:
         """Retrieve for every branch in one pass and narrow with block selection. Phases:
         (1) one question-driven ToC pick shared across branches, then a per-branch year/as_of
@@ -589,8 +591,31 @@ Use each `block_id` exactly as it appears."""
         per branch in parallel — a selection failure falls back to the semantic-filter output
         for that branch rather than failing it. Output is BLOCK-granular, aligned to `branches`."""
         # Phase 1 — one unified ToC pick (question only), then each branch's own date filter.
-        chapter_pages = await self._pick_chapters(branches=branches, ctx=ctx)
-        cand = [self._year_filter(chapter_pages, b, ctx) for b in branches]
+        scopes = document_scopes or [None] * len(branches)
+        unscoped = [branch for branch, scope in zip(branches, scopes) if not scope]
+        chapter_pages = (
+            await self._pick_chapters(branches=unscoped, ctx=ctx)
+            if unscoped
+            else []
+        )
+        cand = []
+        for branch, scope in zip(branches, scopes):
+            if scope:
+                refs = sorted(
+                    (
+                        ref
+                        for ref in self._catalog
+                        if ref.month in set(scope)
+                    ),
+                    key=lambda ref: (ref.month or "", ref.page or 0),
+                )
+                ctx.emit(
+                    f"human_document_scope key={branch.key!r} "
+                    f"bulletins={scope!r} pages={len(refs)}"
+                )
+                cand.append(refs)
+            else:
+                cand.append(self._year_filter(chapter_pages, branch, ctx))
 
         wanted: dict[PageRef, set[int]] = {}
         for i, refs in enumerate(cand):
@@ -644,6 +669,12 @@ Use each `block_id` exactly as it appears."""
                 raise StepFailed(
                     "retrieve",
                     f"block_select selected no blocks for branch {branch.key!r}",
+                    details={
+                        "considered_pages": [
+                            {"bulletin": ref.month, "page": ref.page}
+                            for ref in member_refs
+                        ]
+                    },
                 )
             return selected
 
@@ -652,7 +683,7 @@ Use each `block_id` exactly as it appears."""
             return_exceptions=True,
         )
         out: list[list[BlockRef] | StepFailed] = []
-        for branch, r in zip(branches, settled):
+        for branch_index, (branch, r) in enumerate(zip(branches, settled)):
             if isinstance(r, StepFailed):
                 out.append(r)
             elif isinstance(r, BaseException):
@@ -661,7 +692,18 @@ Use each `block_id` exactly as it appears."""
                 ctx.emit(f"block_select_failed key={branch.key!r} error={str(r)!r}")
                 out.append(
                     StepFailed(
-                        "retrieve", f"block_select error for {branch.key!r}: {r}"
+                        "retrieve",
+                        f"block_select error for {branch.key!r}: {r}",
+                        details={
+                            "considered_pages": [
+                                {"bulletin": ref.month, "page": ref.page}
+                                for ref in dict.fromkeys(
+                                    member
+                                    for block_ref in branch_blocks[branch_index]
+                                    for member in block_ref.member_refs
+                                )
+                            ]
+                        },
                     )
                 )
             else:

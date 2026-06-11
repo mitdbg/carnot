@@ -25,6 +25,7 @@
     <div id="roundTimerMetric" class="metric timer"><span>Time Remaining</span><strong id="roundTimer">--:--</strong></div>
     <div class="metric"><span>Total</span><strong id="mTotal">0</strong></div>
     <div class="metric"><span>Running</span><strong id="mRunning">0</strong></div>
+    <div class="metric"><span>Await Human</span><strong id="mAwaitHuman">0</strong></div>
     <div class="metric"><span>Ready</span><strong id="mReady">0</strong></div>
     <div class="metric"><span>Submitted</span><strong id="mSubmitted">0</strong></div>
     <div class="metric"><span>Failed</span><strong id="mFailed">0</strong></div>
@@ -36,7 +37,7 @@
 <dialog id="extractionModal" class="extraction-modal">
   <div class="modal-head">
     <div>
-      <span class="flow-kicker">Extraction Results</span>
+      <span id="extractionModalKicker" class="flow-kicker">Extraction Results</span>
       <strong id="extractionModalTitle">Selected block</strong>
     </div>
     <button type="button" onclick="closeExtractionModal()">Close</button>

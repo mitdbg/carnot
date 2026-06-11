@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from datetime import datetime
 
 from skunk_server.domain import (
@@ -11,6 +12,8 @@ from skunk_server.domain import (
     Attempt,
     FailureRecord,
     HumanAssignment,
+    HumanIntervention,
+    HumanInterventionStatus,
     QuestionTask,
     RoundState,
     SubmissionRecord,
@@ -28,8 +31,16 @@ class TaskRegistry:
     def __init__(self) -> None:
         self._tasks: dict[str, QuestionTask] = {}
         self._assignments: dict[str, HumanAssignment] = {}
+        self._interventions: dict[str, HumanIntervention] = {}
         self._round = RoundState()
         self._lock = threading.RLock()
+        self._intervention_cancel_callback: Callable[[list[str]], None] | None = None
+
+    def set_intervention_cancel_callback(
+        self,
+        callback: Callable[[list[str]], None],
+    ) -> None:
+        self._intervention_cancel_callback = callback
 
     def create_task(
         self,
@@ -135,6 +146,135 @@ class TaskRegistry:
             task.current_attempt_id = None
             self._set_status(task, TaskStatus.FAILED)
             return True
+
+    def create_intervention(
+        self,
+        task_id: str,
+        attempt_id: str,
+        kind: str,
+        instructions: str,
+        context: str | None,
+        source_docs: list[str],
+        guidance: dict | None = None,
+    ) -> HumanIntervention:
+        with self._lock:
+            task = self._require_task(task_id)
+            if task.current_attempt_id != attempt_id:
+                raise TaskConflict("human intervention targets a stale attempt")
+            if task.status not in {TaskStatus.PROCESSING, TaskStatus.AWAIT_HUMAN}:
+                raise TaskConflict(
+                    f"task cannot request human intervention; status={task.status}"
+                )
+            intervention = HumanIntervention(
+                task_id=task_id,
+                attempt_id=attempt_id,
+                kind=kind,
+                instructions=instructions,
+                context=context,
+                source_docs=source_docs,
+                guidance=dict(guidance or {}),
+            )
+            task.human_interventions.append(intervention)
+            self._interventions[intervention.intervention_id] = intervention
+            if task.status == TaskStatus.PROCESSING:
+                self._set_status(task, TaskStatus.AWAIT_HUMAN)
+            else:
+                task.updated_at = utc_now()
+            return intervention
+
+    def claim_intervention(
+        self,
+        intervention_id: str,
+        worker_id: str,
+    ) -> HumanIntervention:
+        with self._lock:
+            intervention = self._require_intervention(intervention_id)
+            task = self._require_task(intervention.task_id)
+            if (
+                task.current_attempt_id != intervention.attempt_id
+                or task.status != TaskStatus.AWAIT_HUMAN
+            ):
+                raise TaskConflict("human intervention is no longer actionable")
+            if intervention.status == HumanInterventionStatus.CLAIMED:
+                if intervention.claimed_by == worker_id:
+                    return intervention
+                raise TaskConflict("human intervention is claimed by another worker")
+            if intervention.status != HumanInterventionStatus.PENDING:
+                raise TaskConflict(
+                    f"human intervention is not pending; status={intervention.status}"
+                )
+            intervention.status = HumanInterventionStatus.CLAIMED
+            intervention.claimed_by = worker_id
+            intervention.claimed_at = utc_now()
+            task.updated_at = utc_now()
+            return intervention
+
+    def release_intervention(
+        self,
+        intervention_id: str,
+        worker_id: str,
+    ) -> HumanIntervention:
+        with self._lock:
+            intervention = self._require_intervention(intervention_id)
+            if intervention.status != HumanInterventionStatus.CLAIMED:
+                raise TaskConflict(
+                    f"human intervention is not claimed; status={intervention.status}"
+                )
+            if intervention.claimed_by != worker_id:
+                raise TaskConflict("human intervention belongs to another worker")
+            intervention.status = HumanInterventionStatus.PENDING
+            intervention.claimed_by = None
+            intervention.claimed_at = None
+            self._require_task(intervention.task_id).updated_at = utc_now()
+            return intervention
+
+    def resolve_intervention(
+        self,
+        intervention_id: str,
+        worker_id: str,
+        response: str,
+        source_docs: list[str],
+        retrieval_directives: list[dict] | None = None,
+    ) -> tuple[QuestionTask, HumanIntervention]:
+        cleaned = response.strip()
+        directives = list(retrieval_directives or [])
+        if not cleaned and not directives:
+            raise ValueError(
+                "human intervention response or retrieval directive must not be empty"
+            )
+        with self._lock:
+            intervention = self._require_intervention(intervention_id)
+            task = self._require_task(intervention.task_id)
+            if intervention.status != HumanInterventionStatus.CLAIMED:
+                raise TaskConflict(
+                    f"human intervention is not claimed; status={intervention.status}"
+                )
+            if intervention.claimed_by != worker_id:
+                raise TaskConflict("human intervention belongs to another worker")
+            if (
+                task.current_attempt_id != intervention.attempt_id
+                or task.status != TaskStatus.AWAIT_HUMAN
+            ):
+                raise TaskConflict("human intervention is no longer actionable")
+            intervention.status = HumanInterventionStatus.RESOLVED
+            intervention.response = cleaned or None
+            intervention.response_source_docs = list(source_docs)
+            intervention.response_retrieval_directives = directives
+            intervention.resolved_at = utc_now()
+            unresolved = any(
+                item.attempt_id == intervention.attempt_id
+                and item.status
+                in {
+                    HumanInterventionStatus.PENDING,
+                    HumanInterventionStatus.CLAIMED,
+                }
+                for item in task.human_interventions
+            )
+            if not unresolved:
+                self._set_status(task, TaskStatus.PROCESSING)
+            else:
+                task.updated_at = utc_now()
+            return task, intervention
 
     def create_assignment(self, task_id: str, worker_id: str) -> HumanAssignment:
         with self._lock:
@@ -354,6 +494,7 @@ class TaskRegistry:
             return None
 
     def close_round(self, round_num: int, status: str) -> None:
+        cancelled: list[str] = []
         with self._lock:
             self._round.round_num = round_num
             self._round.status = status
@@ -363,7 +504,10 @@ class TaskRegistry:
                     TaskStatus.SCORED,
                     TaskStatus.CANCELLED,
                 }:
+                    cancelled.extend(self._cancel_interventions(task))
                     self._set_status(task, TaskStatus.CANCELLED)
+        if cancelled and self._intervention_cancel_callback is not None:
+            self._intervention_cancel_callback(cancelled)
 
     def _validate_action(
         self,
@@ -402,6 +546,27 @@ class TaskRegistry:
         task.version += 1
         task.updated_at = utc_now()
 
+    def cancel_active_interventions(self) -> list[str]:
+        with self._lock:
+            cancelled: list[str] = []
+            for task in self._tasks.values():
+                cancelled.extend(self._cancel_interventions(task))
+            return cancelled
+
+    @staticmethod
+    def _cancel_interventions(task: QuestionTask) -> list[str]:
+        cancelled: list[str] = []
+        now = utc_now()
+        for intervention in task.human_interventions:
+            if intervention.status in {
+                HumanInterventionStatus.PENDING,
+                HumanInterventionStatus.CLAIMED,
+            }:
+                intervention.status = HumanInterventionStatus.CANCELLED
+                intervention.resolved_at = now
+                cancelled.append(intervention.intervention_id)
+        return cancelled
+
     def _require_task(self, task_id: str) -> QuestionTask:
         task = self._tasks.get(task_id)
         if task is None:
@@ -413,6 +578,12 @@ class TaskRegistry:
         if assignment is None:
             raise KeyError(assignment_id)
         return assignment
+
+    def _require_intervention(self, intervention_id: str) -> HumanIntervention:
+        intervention = self._interventions.get(intervention_id)
+        if intervention is None:
+            raise KeyError(intervention_id)
+        return intervention
 
     @staticmethod
     def _find_submission(task: QuestionTask, local_submission_id: str) -> SubmissionRecord:

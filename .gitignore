@@ -3,7 +3,17 @@
 */.github
 */.chats
 */.claude
+.chats/
+.github/
+.claude/
+.codex/
+AGENTS.md
 
+# data
+data/
+skunk/data/
+
+skunk/.vscode
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

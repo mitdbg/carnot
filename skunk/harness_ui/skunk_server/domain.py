@@ -22,6 +22,7 @@ class TaskStatus(StrEnum):
     QUEUED = "QUEUED"
     RETRY_QUEUED = "RETRY_QUEUED"
     PROCESSING = "PROCESSING"
+    AWAIT_HUMAN = "AWAIT_HUMAN"
     READY = "READY"
     FAILED = "FAILED"
     SUBMITTING = "SUBMITTING"
@@ -35,6 +36,13 @@ class AssignmentStatus(StrEnum):
     RELEASED = "RELEASED"
     COMPLETED = "COMPLETED"
     SUPERSEDED = "SUPERSEDED"
+
+
+class HumanInterventionStatus(StrEnum):
+    PENDING = "PENDING"
+    CLAIMED = "CLAIMED"
+    RESOLVED = "RESOLVED"
+    CANCELLED = "CANCELLED"
 
 
 class SubmissionStatus(StrEnum):
@@ -105,6 +113,26 @@ class HumanAssignment:
 
 
 @dataclass
+class HumanIntervention:
+    task_id: str
+    attempt_id: str
+    kind: str
+    instructions: str
+    context: str | None = None
+    source_docs: list[str] = field(default_factory=list)
+    guidance: dict[str, Any] = field(default_factory=dict)
+    intervention_id: str = field(default_factory=new_id)
+    status: HumanInterventionStatus = HumanInterventionStatus.PENDING
+    claimed_by: str | None = None
+    response: str | None = None
+    response_source_docs: list[str] = field(default_factory=list)
+    response_retrieval_directives: list[dict[str, Any]] = field(default_factory=list)
+    created_at: datetime = field(default_factory=utc_now)
+    claimed_at: datetime | None = None
+    resolved_at: datetime | None = None
+
+
+@dataclass
 class SubmissionRecord:
     task_id: str
     candidate_id: str
@@ -130,6 +158,7 @@ class QuestionTask:
     answer_candidates: list[AnswerCandidate] = field(default_factory=list)
     failures: list[FailureRecord] = field(default_factory=list)
     assignments: list[HumanAssignment] = field(default_factory=list)
+    human_interventions: list[HumanIntervention] = field(default_factory=list)
     submissions: list[SubmissionRecord] = field(default_factory=list)
     cup_feedback: list[str] = field(default_factory=list)
     pending_retry_feedback: str | None = None

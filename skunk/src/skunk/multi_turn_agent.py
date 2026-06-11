@@ -8,7 +8,7 @@ from typing import Any, Protocol
 
 from jinja2 import Environment, StrictUndefined
 
-from skunk.common import B64Image, Effort, ExecutionContext
+from skunk.common import B64Image, Effort, ExecutionContext, PendingHumanIntervention
 from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.local_python_executor import CodeOutput, LocalPythonExecutor
@@ -411,6 +411,10 @@ Requirements for the final answer:
                     # Inline (not to_thread): tool code runs on this question's worker
                     # thread; blocking here only affects sibling branches of the question.
                     out = executor(step_out.code)
+                    if isinstance(out.output, PendingHumanIntervention):
+                        ctx.emit("human_intervention_waiting", kind="note")
+                        out.output = await out.output.response
+                        ctx.emit("human_intervention_resolved", kind="note")
                 done = step_out
             except ParseError as e:
                 obs = f"Observation (step {turn}): {e.detail}"
