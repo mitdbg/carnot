@@ -1,0 +1,26 @@
+UID0057   # same statistic printed twice in one issue, off by 1 (rounding); benchmark internally inconsistent
+UID0130   # two tables both labeled "Total Federal securities", off by 1 in last digit
+UID0177   # Subject vs Total-outstanding column never named; miss = not-subject sliver
+UID0005   # question wording matches reclassified table; gold requires contemporaneous print
+UID0102   # vintage ambiguity (quarterly first prints vs Dec reprint) + rounding-target ambiguity
+UID0194   # contemporaneous vs revised print; revised arguably more correct
+UID0113   # relative difference: decimal vs x100 never specified; "percentage points" contradictory
+UID0190   # two official receipt bases (unrevised vs reclassified); neither pinned
+UID0201   # population vs sample Gini; factor of exactly 2 at n=2
+UID0148   # "how many ... in millions of USD" — count vs amount self-contradictory
+UID0228   # output scale (rupees vs millions of rupees) never named; same digits
+UID0221   # absolute difference unit (dollars vs millions) never named; same quantity
+UID0111   # HP-filter trend demanded beyond cross-implementation reproducibility (1e-6 gap)
+UID0101   # arc elasticity over time ill-posed (year-axis coding arbitrary); elements 1-2 match
+UID0120   # answers identical; whitespace-sensitive string scoring artifact (held-out test UID)
+UID0100   # two contradictory rounding rules + unanchored regression index origin (held-out test UID)
+UID0230   # annualization convention sqrt(52) vs sqrt(365/7) unstated (held-out test UID)
+UID0214   # official published one-decimal YoY rate (5.9%) vs full precision from same CPI values (5.932%)
+UID0165   # 1%-tail loss from 4 observations; convention-underdetermined (std variants span 4276-7113)
+UID0069   # ES "for the yield values" vs "portfolio return approach" — one sentence, two contradictory halves
+UID0042   # Zipf exponent: both regression directions textbook-standard (Lotka 1.172 vs rank-size 0.702)
+UID0225   # exact rounding tie 12.595 at requested hundredths; half-up vs float tie-breaking
+UID0213   # "CPI-U for those years": annual-average (gold) vs December monthly (ours), identical balances
+UID0220   # "absolute percent difference": relative-to-base 31.2 (ours) vs symmetric 27.0 (gold), gold's own page+values
+UID0226   # sample vs population std on the question-named column (ddof=1 5678.4 vs ddof=0 4636.4, sqrt(3/2) apart); 0201 family
+UID0013   # OLS intercept over-precision at rounding boundary (-184.1416 -> .142 vs gold .143); 0111 family, asymmetric (only ours reproduces)

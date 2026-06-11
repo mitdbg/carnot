@@ -79,7 +79,9 @@ def render_page_b64(
     with fitz.open(pdf_path) as doc:
         pix = doc[int(page) - 1].get_pixmap(matrix=mat)
     if fmt == "jpg":
-        data = pix.tobytes("jpg", jpg_quality=jpg_quality if jpg_quality is not None else 95)
+        data = pix.tobytes(
+            "jpg", jpg_quality=jpg_quality if jpg_quality is not None else 95
+        )
         mime = "image/jpeg"
     else:
         data = pix.tobytes("png")
@@ -364,6 +366,26 @@ class BlockRef:
     block: ContentBlock | None = field(default=None, compare=False)
 
 
+@dataclass(frozen=True)
+class SemPoolEntry:
+    """One sem_filter-surviving content block, kept after block selection as the repair
+    candidate pool. Self-contained (interval + display metadata copied out of the catalog
+    row) so the extract-side repair pass can re-rank and re-select without catalog access —
+    which also makes it serializable into the eval retrieval cache for replay."""
+
+    ref: BlockRef  # anchor + members; block=None is fine (extract reads pages whole)
+    interval: (
+        tuple[str, str] | None
+    )  # the anchor page's data interval ("YYYY-MM" lo/hi)
+    kind: str = "table"
+    title: str | None = None
+    summary: str | None = None
+    cols: tuple[str, ...] = ()
+    rows_tail: tuple[
+        str, ...
+    ] = ()  # trailing row headers — shows the data window's end
+
+
 VALUE_KIND_VOCAB: frozenset[str] = frozenset({"scalar", "vector", "table"})
 
 
@@ -380,6 +402,13 @@ class AnnotatedValue(BaseModel):
     `.frame` exposes the payload as a uniform `pd.DataFrame` so downstream code
     needn't branch on `kind`.
 
+    `qualifiers` is LLM-authored at extract time: the verbatim source-text
+    fragments that locate and discriminate the datum on its page — the column
+    header it was read under, row label, footnote markers, print flags (p/r).
+    Downstream selection matches these against the question's qualifier words
+    when several look-alike entries compete. Empty for external lookups and
+    older payloads.
+
     Provenance (`bulletin`/`pages`/`as_of`/`requested_period`/`retrieve_key`) is
     machine-stamped from the extract inputs — the source page refs and the
     retrieve branch — NOT authored by the LLM. It is absent (None/empty) for
@@ -395,6 +424,7 @@ class AnnotatedValue(BaseModel):
     description: str
     value: Any
     unit: str = ""
+    qualifiers: str = ""
     kind: Literal["scalar", "vector", "table"] = "scalar"
     index_name: str | None = None
     row_name: str | None = None
@@ -499,6 +529,8 @@ def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
     )
     prov = _provenance_str(e)
     prov_lines = [f"{_PAD}provenance: {prov}"] if prov else []
+    if e.qualifiers:
+        prov_lines.insert(0, f"{_PAD}qualifiers: {e.qualifiers!r}")
     if e.kind == "scalar":
         return [
             head,
@@ -515,7 +547,7 @@ def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
             f"kind=table, row_name={e.row_name!r}, col_name={e.col_name!r}, "
             f"unit={e.unit!r}, shape=({n_rows}, {n_cols})"
         )
-    lines = [head, f"{_PAD}{meta}"]
+    lines = [head, f"{_PAD}{meta}", *prov_lines]
     if n_rows == 0:
         lines.append(f"{_PAD}frame: (empty)")
         return lines

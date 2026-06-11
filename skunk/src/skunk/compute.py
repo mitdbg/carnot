@@ -69,6 +69,8 @@ You write Python that produces the final answer string, or emit a structured mis
 ## AnnotatedValue API
 
   .description   natural-language label
+  .qualifiers    verbatim page fragments the value was read under — column
+                 header, row label, footnote markers, print flags (p/r)
   .frame         pd.DataFrame view of the payload (uniform across kinds)
   .unit          natural-language unit, e.g. "millions of dollars", "percent"
   .kind          "scalar" | "vector" | "table"  (rarely needed; prefer .frame)
@@ -104,7 +106,10 @@ cell-by-cell.
 - Pick the entries you need from the `input_values =` block and reference
   them by index (`input_values[7].frame`). Do not re-locate entries at
   runtime by filtering on `.description`.
-- Entries may repeat. Pick the one whose description best matches the question's wording.
+- Entries may repeat. Pick the one whose description AND qualifiers best match
+  the question's wording — a qualifier word in the question ("subject to
+  limitation", "accepted", "issued", "total outstanding") must match the
+  entry's qualifiers, not just its description.
   Do NOT use multiple entries for max/min/avg/sum/etc.
   
 ## Output format

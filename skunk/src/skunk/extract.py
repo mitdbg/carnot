@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from collections.abc import Callable, Iterator
 from typing import Any
 
@@ -11,6 +12,7 @@ from skunk.common import (
     BlockRef,
     ExecutionContext,
     PageRef,
+    SemPoolEntry,
     parse_json_response,
 )
 from skunk.errors import ParseError, StepFailed
@@ -98,6 +100,29 @@ def _parse_extract_response(raw: str, ctx: ExecutionContext) -> list[AnnotatedVa
             raw,
             "some entries are not valid AnnotatedValues — fix their shape/fields:\n"
             + "\n".join(bad),
+        )
+
+    # Distinguishability: two entries with identical (description, qualifiers) but
+    # different values are unusable downstream — the consumer cannot tell which cell
+    # is which (the page discriminator was dropped). Re-prompt with the offenders.
+    by_label: dict[tuple[str, str], list[int]] = {}
+    for i, e in enumerate(entries):
+        by_label.setdefault((e.description, e.qualifiers), []).append(i)
+    clashes = [
+        idxs
+        for idxs in by_label.values()
+        if len(idxs) > 1
+        and len({json.dumps(entries[i].value, sort_keys=True) for i in idxs}) > 1
+    ]
+    if clashes:
+        raise ParseError(
+            raw,
+            "these entry groups are indistinguishable (same description AND qualifiers) "
+            "yet hold different values — add the discriminating column header / year / "
+            "footnote / table title to 'qualifiers':\n"
+            + "\n".join(
+                f"entries {idxs}: {entries[idxs[0]].description!r}" for idxs in clashes
+            ),
         )
     return entries
 
@@ -220,12 +245,12 @@ relevant is found). Pick the shape that best preserves the page structure:
           be needed (e.g. a time-series row); key by year/period label
 - table   when both rows and columns vary
 
-  scalar: {"description":"...","kind":"scalar",
+  scalar: {"description":"...","qualifiers":"...","kind":"scalar",
            "value":<num|str>,"unit":"..."}
-  vector: {"description":"...","kind":"vector",
+  vector: {"description":"...","qualifiers":"...","kind":"vector",
            "index_name":"<dim>",
            "value":{"<index>":<value>,...},"unit":"..."}
-  table:  {"description":"...","kind":"table",
+  table:  {"description":"...","qualifiers":"...","kind":"table",
            "row_name":"<dim>","col_name":"<dim>",
            "value":{"<row>":{"<col>":<value>,...},...},"unit":"..."}
 
@@ -241,7 +266,16 @@ description   natural-language label that uniquely identifies the
               distinguishing context). For the label text, use the
               page's verbatim row text / column header / caption phrase
               so the downstream consumer can map it back to the page.
-              
+
+qualifiers    the page's verbatim fragments that LOCATE and DISCRIMINATE
+              this datum: the exact column header the value(s) sit under,
+              the row label, any footnote markers on the value or its
+              row/column (e.g. "2/", "p", "r"), the table title when
+              several similar tables share the page. Copy the fragments
+              verbatim; separate with " | ". Two entries reading
+              different cells MUST differ in description or qualifiers.
+              "" only when the page offers no such discriminators.
+
 index_name    (vector only) name of the varying dimension.
 
 row_name /col_name      (table only) names of the two varying dimensions.
@@ -540,6 +574,8 @@ def _entry_semantic_dict(e: AnnotatedValue) -> dict[str, Any]:
     d: dict[str, Any] = {"description": e.description, "kind": e.kind, "value": e.value}
     if e.unit:
         d["unit"] = e.unit
+    if e.qualifiers:
+        d["qualifiers"] = e.qualifiers
     for name in ("index_name", "row_name", "col_name"):
         v = getattr(e, name)
         if v is not None:
@@ -572,6 +608,8 @@ def _confirm_structure_diff(orig: AnnotatedValue, got: AnnotatedValue) -> list[s
         return diffs + [f"kind changed {orig.kind} -> {got.kind}"]
     if got.unit != orig.unit:
         diffs.append(f"unit changed {orig.unit!r} -> {got.unit!r}")
+    if orig.qualifiers and got.qualifiers != orig.qualifiers:
+        diffs.append(f"qualifiers changed {orig.qualifiers!r} -> {got.qualifiers!r}")
     for name in ("index_name", "row_name", "col_name"):
         if getattr(got, name) != getattr(orig, name):
             diffs.append(
@@ -770,24 +808,366 @@ index_name / row_name / col_name, or the keys or shape of any value."""
         return corrected
 
 
+def _truncate_keys(keys: list[str], cap: int = 30) -> str:
+    shown = ", ".join(keys[:cap])
+    extra = f", …(+{len(keys) - cap} more)" if len(keys) > cap else ""
+    return f"[{shown}{extra}]"
+
+
+def _entry_review_line(i: int, e: AnnotatedValue) -> str:
+    """One compact line per entry for the review prompt: identity + provenance + the
+    period-bearing structure (keys matter for coverage; values are capped)."""
+    src = f"bulletin={e.bulletin or '?'} pages={list(e.pages) or '?'}"
+    if e.kind == "scalar":
+        body = f"value={e.value!r}"
+    elif e.kind == "vector":
+        v = e.value if isinstance(e.value, dict) else {}
+        pairs = ", ".join(f"{k}: {c!r}" for k, c in list(v.items())[:12])
+        extra = f", …(+{len(v) - 12} more)" if len(v) > 12 else ""
+        body = f"index={e.index_name!r} value={{{pairs}{extra}}}"
+    else:  # table
+        v = e.value if isinstance(e.value, dict) else {}
+        cols = sorted({c for row in v.values() for c in row}) if v else []
+        body = (
+            f"rows({e.row_name!r})={_truncate_keys(list(v))} "
+            f"cols({e.col_name!r})={_truncate_keys(cols)}"
+        )
+    unit = f" unit={e.unit!r}" if e.unit else ""
+    quals = f" qualifiers={e.qualifiers!r}" if e.qualifiers else ""
+    return f"[{i}] description={e.description!r}{unit}{quals} kind={e.kind} {src} {body}"
+
+
+def _make_review_parse(n_entries: int) -> Callable[[str, ExecutionContext], dict]:
+    """Parse hook for the coverage review verdict. Validates shape and internal
+    consistency; violations raise `ParseError` (→ `call()` re-prompts)."""
+
+    def parse(raw: str, ctx: ExecutionContext) -> dict:
+        obj = parse_json_response(raw)
+        if not isinstance(obj, dict):
+            raise ParseError(raw, "reply must be a single JSON object")
+        problems: list[str] = []
+        complete = obj.get("complete")
+        missing = obj.get("missing")
+        dups = obj.get("duplicates")
+        if not isinstance(complete, bool):
+            problems.append("'complete' must be a boolean")
+        if not isinstance(missing, list) or not all(
+            isinstance(m, dict)
+            and isinstance(m.get("period"), str)
+            and isinstance(m.get("what"), str)
+            and m["what"].strip()
+            for m in missing
+        ):
+            problems.append(
+                '\'missing\' must be a list of {"period": str, "what": str} objects'
+            )
+        elif isinstance(complete, bool) and complete != (len(missing) == 0):
+            problems.append("'complete' must be true if and only if 'missing' is empty")
+        seen: set[int] = set()
+        if not isinstance(dups, list):
+            problems.append("'duplicates' must be a list")
+        else:
+            for g, grp in enumerate(dups):
+                if not (
+                    isinstance(grp, dict)
+                    and isinstance(grp.get("keep"), int)
+                    and isinstance(grp.get("drop"), list)
+                    and all(isinstance(d, int) for d in grp["drop"])
+                ):
+                    problems.append(
+                        f'duplicates[{g}] must be {{"keep": int, "drop": [int, ...], "why": str}}'
+                    )
+                    continue
+                idxs = [grp["keep"], *grp["drop"]]
+                bad = [i for i in idxs if not 0 <= i < n_entries]
+                if bad:
+                    problems.append(
+                        f"duplicates[{g}]: entry indices {bad} out of range 0..{n_entries - 1}"
+                    )
+                if grp["keep"] in grp["drop"]:
+                    problems.append(
+                        f"duplicates[{g}]: 'keep' index also listed in 'drop'"
+                    )
+                overlap = seen.intersection(idxs)
+                if overlap:
+                    problems.append(
+                        f"duplicates[{g}]: indices {sorted(overlap)} already in another group"
+                    )
+                seen.update(idxs)
+        if problems:
+            raise ParseError(raw, "fix these issues:\n" + "\n".join(problems))
+        return {"complete": complete, "missing": missing, "duplicates": dups}
+
+    return parse
+
+
+class CoverageReview:
+    """SHADOW coverage/duplicate audit of a branch's final extracted entries. One text-only
+    call per branch: does the entry set cover every requested period at the implied
+    granularity, and which entries duplicate one another (same series + period reprinted
+    across issues)? The verdict is only emitted to the event stream — `run_shadow` never
+    raises and never alters the entries, so it cannot influence the run."""
+
+    _SYSTEM = """\
+You audit the output of a data-extraction pass over U.S. Treasury Bulletin pages.
+
+The user message gives one retrieval request: the data sought, the period(s) the data
+must cover (comma-separated `YYYY-MM` months or inclusive `YYYY-MM..YYYY-MM` ranges;
+absent = unpinned), optionally a pinned source issue (`as_of` = the bulletin the values
+must be read from), the full question the request serves, and a numbered list of the
+extracted entries (description, unit, shape, source issue/pages, values).
+
+Decide two things:
+
+1. COVERAGE. The entries must contain the requested values for EVERY requested period,
+   at the granularity the request implies (monthly / quarterly / annual / single as-of
+   date). List every requested period or value no entry provides.
+   - A fiscal-year or annual figure does NOT satisfy a request for specific months.
+   - A value from any issue counts — unless `as_of` pins the issue, then only entries
+     from that issue count.
+   - Flag only values the request needs. Do not invent nice-to-haves.
+2. DUPLICATES. Group entries reporting the SAME series for the SAME period(s) — e.g. one
+   table reprinted in consecutive issues. Per group keep ONE entry: the one from the
+   latest bulletin, unless `as_of` pins an issue (then keep that issue's entry).
+   Entries covering different periods of the same series are NOT duplicates. Singleton
+   entries appear in no group."""
+
+    async def run_shadow(
+        self,
+        question: str,
+        branch: RetrieveBranch,
+        entries: list[AnnotatedValue],
+        ctx: ExecutionContext,
+    ) -> tuple[list[AnnotatedValue], dict | None]:
+        """Emit the review verdict for `entries`; swallow every failure. Returns
+        `(entries, verdict)` — entries unchanged unless `extract_review_dedup` is on, in
+        which case entries in any duplicate group's `drop` list are removed. `verdict` is
+        None when the review itself failed (the caller treats that as no-op)."""
+        try:
+            verdict = await self._review(question, branch, entries, ctx)
+        except ParseError as e:
+            ctx.emit(f"review_parse_failed error={e.detail!r}")
+            return entries, None
+        except Exception as e:  # noqa: BLE001 — review must never break the branch
+            ctx.emit(f"review_failed error={e!r}")
+            return entries, None
+        if not ctx.config.extract_review_dedup or not verdict["duplicates"]:
+            return entries, verdict
+        drop = {i for g in verdict["duplicates"] for i in g["drop"]}
+        kept = [e for i, e in enumerate(entries) if i not in drop]
+        ctx.emit(
+            f"review_dedup_applied dropped={sorted(drop)} n_in={len(entries)} n_out={len(kept)} "
+            f"dropped_descriptions={[entries[i].description for i in sorted(drop)]!r}"
+        )
+        return kept, verdict
+
+    async def _review(
+        self,
+        question: str,
+        branch: RetrieveBranch,
+        entries: list[AnnotatedValue],
+        ctx: ExecutionContext,
+    ) -> dict:
+        period = (
+            f"\nPeriod(s) the data must cover: {branch.period}" if branch.period else ""
+        )
+        as_of = f"\nPinned source issue (as_of): {branch.as_of}" if branch.as_of else ""
+        lines = "\n".join(_entry_review_line(i, e) for i, e in enumerate(entries))
+        user_msg = "\n\n".join(
+            [
+                f"Retrieval request: {branch.key}{period}{as_of}",
+                f'For full context, the request serves to help answer the question: "{question}"',
+                f"Extracted entries ({len(entries)}):\n{lines}",
+            ]
+        )
+        prompt: PromptedCall[dict] = PromptedCall(
+            name="extract.review",
+            system_prompt=self._SYSTEM,
+            default_effort="low",  # span-coverage judgment is a reasoning task
+            parse=_make_review_parse(len(entries)),
+            output_instruction=(
+                "Output ONLY a JSON object — no prose, no markdown fences:\n"
+                '{"complete": <bool — true iff "missing" is empty>,\n'
+                ' "missing": [{"period": "<YYYY-MM | YYYY-MM..YYYY-MM | short label>", '
+                '"what": "<the missing value(s)>"}, ...],\n'
+                ' "duplicates": [{"keep": <entry index>, "drop": [<entry indices>], '
+                '"why": "<short>"}, ...]}'
+            ),
+        )
+        verdict = await prompt.call(ctx, user_msg, temperature=0.0)
+        ctx.emit(f"review_verdict {json.dumps(verdict, ensure_ascii=False)}")
+        return verdict
+
+
+# Coverage-repair bounds: one add-only round per branch, ≤_REPAIR_MAX_NEEDS flagged gaps
+# consumed, ≤_REPAIR_KEEP_PER_NEED blocks selected per gap from a ≤_REPAIR_GROUP_SIZE
+# prefiltered candidate group, and the branch's total block count (original + repair)
+# capped at _REPAIR_MAX_TOTAL_BLOCKS (extract fan-out guard).
+_REPAIR_MAX_NEEDS = 4
+# 4, not 2: a monthly gap often spans several issues' ~3-month windows (e.g. Jan–Aug =
+# three consecutive quarterly issues) — the pick must be able to TILE the gap.
+_REPAIR_KEEP_PER_NEED = 4
+_REPAIR_GROUP_SIZE = 32
+_REPAIR_MAX_TOTAL_BLOCKS = 16
+
+_NEED_MONTH_RE = re.compile(r"\b(\d{4})-(\d{2})\b")
+
+
+def _need_interval(period: str) -> tuple[str, str] | None:
+    """The [lo, hi] month span of a review need's `period` text ("YYYY-MM",
+    "YYYY-MM..YYYY-MM", or a free label containing such tokens); None if no month parses."""
+    months = [f"{y}-{m}" for y, m in _NEED_MONTH_RE.findall(period)]
+    return (min(months), max(months)) if months else None
+
+
+def _month_idx(month: str) -> int:
+    return int(month[:4]) * 12 + int(month[5:7])
+
+
+def _block_key(ref: BlockRef) -> tuple[str | None, int | None, int | None]:
+    return (ref.page.month, ref.page.page, ref.block_index)
+
+
+def _repair_prefilter(
+    pool: list[SemPoolEntry],
+    period: str,
+    exclude: set[tuple[str | None, int | None, int | None]],
+    cap: int = _REPAIR_GROUP_SIZE,
+) -> list[SemPoolEntry]:
+    """Deterministic candidate narrowing for one need: drop already-used blocks, keep
+    interval-overlap with the gap (no-interval entries pass — recall side), and rank by
+    bulletin-month proximity to the gap, preferring issues at/after the gap start (data for
+    period P prints in issues shortly after P — the boundary-vintage rule)."""
+    span = _need_interval(period)
+    cands = [
+        e
+        for e in pool
+        if _block_key(e.ref) not in exclude
+        and not (
+            span and e.interval and (e.interval[1] < span[0] or e.interval[0] > span[1])
+        )
+    ]
+    if span:
+        lo, hi = _month_idx(span[0]), _month_idx(span[1])
+
+        def rank(e: SemPoolEntry) -> tuple[int, int]:
+            m = e.ref.page.month
+            mi = _month_idx(m) if m else 1 << 30
+            return (0 if mi >= lo else 1, abs(mi - hi))
+
+        cands.sort(key=rank)
+    return cands[:cap]
+
+
+async def _repair_select(
+    ctx: ExecutionContext,
+    question: str,
+    branch: RetrieveBranch,
+    period: str,
+    what: str,
+    cands: list[SemPoolEntry],
+) -> list[SemPoolEntry]:
+    """One boolean-array selection call over the prefiltered candidates for one need.
+    Reuses the block-select system prompt; the user message states what the coverage
+    review found missing so the pick targets the gap, not the broad branch request."""
+    from skunk.page_index.query import PageIndexRetriever  # lazy, mirrors retrieve.py
+
+    lines = []
+    for i, e in enumerate(cands):
+        dates = f"{e.interval[0]}..{e.interval[1]}" if e.interval else "none"
+        line = f"[{i}] dates={dates} | {e.kind} with title: {e.title or '(untitled)'}"
+        if e.cols:
+            line += f" [cols: {', '.join(e.cols)}]"
+        if e.rows_tail:
+            line += f" [last rows: {', '.join(e.rows_tail)}]"
+        if e.summary:
+            line += f" — content summary: {e.summary}"
+        lines.append(line)
+    n = len(cands)
+    user = "\n".join(
+        [
+            f'Research question: "{question}"',
+            f"Retrieval target: {branch.key}",
+            f"REPAIR PASS: a coverage review of the data already extracted found this still "
+            f"MISSING: {what} (period: {period or branch.period or 'unspecified'}). Select "
+            "only blocks that supply the missing values. If no single block covers the whole "
+            "missing period, select the SET of blocks whose data windows JOINTLY tile it — "
+            "every missing month must be covered by some selected block.",
+            f"Candidate blocks ({n}) — mark true the AT MOST {_REPAIR_KEEP_PER_NEED} that "
+            "best supply the MISSING data, false for the rest:\n" + "\n".join(lines),
+        ]
+    )
+
+    def _parse(text: str, _ctx: ExecutionContext) -> list[bool]:
+        return PageIndexRetriever._parse_bool_list(text, _ctx, n=n)
+
+    call: PromptedCall[list[bool]] = PromptedCall(
+        name="extract.repair_select",
+        system_prompt=PageIndexRetriever._BLOCK_SELECT_PROMPT,
+        parse=_parse,
+        default_effort="off",
+        output_instruction=(
+            f"Output ONLY a JSON array of EXACTLY {n} booleans — one per block, in the order "
+            f"given (true=select, false=drop), with AT MOST {_REPAIR_KEEP_PER_NEED} true. "
+            "No prose, no markdown fences."
+        ),
+    )
+    verdicts = await call.call(ctx, user, temperature=0.0)
+    return [e for e, k in zip(cands, verdicts) if k][:_REPAIR_KEEP_PER_NEED]
+
+
 class ExtractOp:
     """The extract operator — question-driven extraction. Owns one instance of
     each call-site extractor and drives the parsed_json → vision tier fallback, with a
-    vision confirmation round over the parsed_json tier's output."""
+    vision confirmation round over the parsed_json tier's output, then the coverage
+    review (shadow / dedup / repair per config)."""
 
     def __init__(self) -> None:
         self._text = TextExtractor()
         self._vision = VisionExtractor()
         self._confirm = VisualValidator()
+        self._review = CoverageReview()
 
     async def run(
         self,
         blocks: list[BlockRef],
         ctx: ExecutionContext,
         branch: RetrieveBranch,
+        sem_pool: list[SemPoolEntry] | None = None,
     ) -> list[AnnotatedValue]:
-        """Extract from the branch's retrieved blocks. The text tier feeds each block's pages whole
-        (scoped by the selected blocks' metadata); the vision tier renders those same pages."""
+        """Extract from the branch's retrieved blocks, then review. `sem_pool` is the
+        branch's sem-filter candidate pool — when `extract_review_repair` is on and the
+        review flags missing coverage, one add-only repair round re-selects from it and
+        extracts the additions."""
+        entries = await self._extract_once(blocks, ctx, branch)
+        if not ctx.config.extract_review_shadow:
+            return entries
+        entries, verdict = await self._review.run_shadow(
+            ctx.question, branch, entries, ctx
+        )
+        if (
+            ctx.config.extract_review_repair
+            and verdict is not None
+            and not verdict["complete"]
+            and sem_pool
+        ):
+            try:
+                entries = await self._repair(
+                    blocks, ctx, branch, entries, verdict["missing"], sem_pool
+                )
+            except Exception as e:  # noqa: BLE001 — repair must never break the branch
+                ctx.emit(f"repair_failed error={e!r}")
+        return entries
+
+    async def _extract_once(
+        self,
+        blocks: list[BlockRef],
+        ctx: ExecutionContext,
+        branch: RetrieveBranch,
+    ) -> list[AnnotatedValue]:
+        """One tier sweep over `blocks` (no review). The text tier feeds each block's pages
+        whole (scoped by the selected blocks' metadata); the vision tier renders those same
+        pages."""
         if not blocks:
             raise StepFailed("extract", "No blocks to extract from")
 
@@ -820,3 +1200,63 @@ class ExtractOp:
             f"tier_result tier=vision descriptions={[e.description for e in entries]!r}"
         )
         return entries
+
+    async def _repair(
+        self,
+        blocks: list[BlockRef],
+        ctx: ExecutionContext,
+        branch: RetrieveBranch,
+        entries: list[AnnotatedValue],
+        missing: list[dict],
+        sem_pool: list[SemPoolEntry],
+    ) -> list[AnnotatedValue]:
+        """One add-only repair round: per flagged need, deterministically prefilter the
+        pool, one selection call, then a single extract sweep over all newly picked blocks;
+        the new entries are merged onto `entries`. Bounded by the _REPAIR_* constants; any
+        sub-step failure degrades to returning `entries` unchanged."""
+        budget = _REPAIR_MAX_TOTAL_BLOCKS - len(blocks)
+        if budget <= 0:
+            ctx.emit(f"repair_skipped reason=block_budget n_blocks={len(blocks)}")
+            return entries
+        used = {_block_key(b) for b in blocks}
+        picked: list[SemPoolEntry] = []
+        for need in missing[:_REPAIR_MAX_NEEDS]:
+            period = str(need.get("period", ""))
+            what = str(need.get("what", ""))
+            cands = _repair_prefilter(sem_pool, period, exclude=used)
+            if not cands:
+                ctx.emit(
+                    f"repair_need period={period!r} what={what[:90]!r} candidates=0 picked=0"
+                )
+                continue
+            try:
+                sel = await _repair_select(
+                    ctx, ctx.question, branch, period, what, cands
+                )
+            except ParseError as e:
+                ctx.emit(f"repair_select_failed error={e.detail!r}")
+                continue
+            for s in sel:
+                key = _block_key(s.ref)
+                if key not in used:
+                    used.add(key)
+                    picked.append(s)
+            ctx.emit(
+                f"repair_need period={period!r} what={what[:90]!r} "
+                f"candidates={len(cands)} picked={[f'{s.ref.page.month}:{s.ref.page.page}#{s.ref.block_index}' for s in sel]!r}"
+            )
+        picked = picked[:budget]
+        if not picked:
+            ctx.emit("repair_done added_blocks=0 added_entries=0")
+            return entries
+        new_blocks = [p.ref for p in picked]
+        try:
+            extra = await self._extract_once(new_blocks, ctx, branch)
+        except StepFailed as e:
+            ctx.emit(f"repair_extract_failed error={str(e)!r}")
+            return entries
+        ctx.emit(
+            f"repair_done added_blocks={len(new_blocks)} added_entries={len(extra)} "
+            f"descriptions={[x.description for x in extra]!r}"
+        )
+        return entries + extra

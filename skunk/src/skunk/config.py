@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from skunk.common import BlockRef, Effort, PageRef
+    from skunk.common import BlockRef, Effort, PageRef, SemPoolEntry
 
 
 # Default corpus locations (overridable via env / explicit construction — see the
@@ -77,11 +77,17 @@ class SkunkConfig:
     # Ablation: golden page refs bypass the retrieve operator (eval runs only).
     golden_pages: list[PageRef] | None = field(default=None, repr=False)
 
-    # Replay: the page-index blocks `block_select` chose, injected alongside `golden_pages`
-    # when replaying a block-aware retrieval cache (`--retrieval-cache`). Lets extract block-scope
-    # exactly as the live run did, bypassing retrieve. None on live runs and for `--golden` /
-    # search-agent caches (no blocks) — extract then reads whole pages. (eval runs only)
+    # Replay (pool-less cache only): the final blocks to inject verbatim alongside
+    # `golden_pages`, bypassing retrieve AND block selection. Used for search-agent /
+    # pre-pool caches that carry no survivor pool. None on live runs, `--golden`, and
+    # survivor-pool replay (which runs block selection — see `cached_sem_pool`). (eval only)
     cached_blocks: list[BlockRef] | None = field(default=None, repr=False)
+
+    # Replay (survivor cache): the UID's sem-filter survivor pool from the cache
+    # (`"sem_pool"` key). When set, retrieve is bypassed and this pool is handed to block
+    # selection (the selection agent or the tournament, per config) — so a replay can
+    # iterate on SELECTION, not just extract/compute. None on live runs. (eval runs only)
+    cached_sem_pool: list[SemPoolEntry] | None = field(default=None, repr=False)
 
     # Retrieve dispatch: "page_index" (ToC pick → year filter → coarse summary filter →
     # block selection, the default) or "search_agent" (iterative ChromaDB + LLM loop).
@@ -134,12 +140,54 @@ class SkunkConfig:
     # (env: SKUNK_SEMFILTER_MODEL, SKUNK_SEMFILTER_BATCH)
     semfilter_batch_size: int = 32
 
+    # Question explainer: inject LLM-generated concept references into compute. OFF by
+    # default — the explainer injected wrong conventions on the dev audit (UID0042
+    # reversed Zipf regression, UID0097 "nominal capital") and is disabled pending an
+    # A/B; re-enable per-run with SKUNK_QUESTION_EXPLAINER=1.
+    question_explainer: bool = False
+
+    # Selection agent: replace block_select → extract → review with one iterative
+    # MultiTurnAgent per retrieve branch that browses the sem-filter survivor pool,
+    # extracts from chosen blocks (extraction as a tool), and returns the SELECTED
+    # entries. Experimental. (env: SKUNK_SELECTION_AGENT=1)
+    selection_agent: bool = False
+    # Step budget for that agent's tool loop. (env: SKUNK_SELECT_AGENT_MAX_STEPS)
+    select_agent_max_steps: int = 14
+    # Per-LLM-call caps for the selection agent's OWN generation (NOT its extract
+    # sub-calls, which go through the sync path). Mirrors the search agent: without a
+    # combined thinking+visible cap, Flash thrashed to ~63K thinking tokens / ~285s per
+    # step on large pools and emitted no parseable tool call (parse-retry death spiral).
+    # (env: SKUNK_SELECT_AGENT_MAX_OUTPUT_TOKENS, SKUNK_SELECT_AGENT_TIMEOUT_S)
+    select_agent_max_output_tokens: int = 8192
+    select_agent_request_timeout_s: float = 150.0
+
     # Extract: skip the parsed-text (OCR) tier entirely and read values straight off the rendered
     # page images (vision tier). Default OFF — parsed text first, vision as the fallback tier.
     # Vision-only is robust to OCR corruption on dense scanned tables (it recovered single-cell
     # OCR misses on the dev set) but costs more and can run away on thinking-only pro models;
     # enable per-run with SKUNK_EXTRACT_VISION_ONLY=1 when OCR quality is the binding issue.
     extract_vision_only: bool = False
+
+    # Extract: SHADOW coverage review. After a branch's entries are final (post vision
+    # validation), one extra call audits coverage (all requested periods present?) and
+    # duplicates. Shadow only: the verdict is emitted to the event stream and the original
+    # entries are returned unchanged — it never alters the run. Kill switch:
+    # SKUNK_EXTRACT_REVIEW=0.
+    extract_review_shadow: bool = True
+
+    # Extract: ACT on the review's duplicate verdict — entries in any `drop` list are
+    # removed before the branch returns (missing-coverage flags stay log-only). Requires
+    # the review itself to be on. Experimental. (env: SKUNK_EXTRACT_REVIEW_DEDUP=1)
+    extract_review_dedup: bool = False
+
+    # Extract: ACT on the review's missing-coverage verdict — repair the branch by
+    # re-selecting blocks for each flagged gap from the branch's sem-filter candidate pool
+    # (deterministic interval/proximity prefilter + one selection call per need), then
+    # extracting only the new blocks and merging. One round, add-only, bounded (see
+    # extract.py _REPAIR_* constants). Requires the review to be on and a pool (live
+    # page-index runs, or replays of a pool-bearing cache).
+    # (env: SKUNK_EXTRACT_REVIEW_REPAIR=1)
+    extract_review_repair: bool = False
 
     # Build: the `vision_rescan` stage always re-reads `parse_broken` pages (mangled parses). Pages
     # flagged `has_unparsed_graphics` that are CHART-ONLY (a chart/figure with no table on the page,
@@ -200,8 +248,29 @@ class SkunkConfig:
                 "SKUNK_PROMPT_OVERRIDES", "config/prompts/treasury_bulletin.yaml"
             ),
             semfilter_batch_size=int(os.environ.get("SKUNK_SEMFILTER_BATCH", "32")),
-            extract_vision_only=os.environ.get("SKUNK_EXTRACT_VISION_ONLY", "0") not in ("", "0"),
-            vision_rescan_charts=os.environ.get("SKUNK_VISION_RESCAN_CHARTS", "") not in ("", "0"),
+            question_explainer=os.environ.get("SKUNK_QUESTION_EXPLAINER", "0")
+            not in ("", "0"),
+            selection_agent=os.environ.get("SKUNK_SELECTION_AGENT", "0")
+            not in ("", "0"),
+            select_agent_max_steps=int(
+                os.environ.get("SKUNK_SELECT_AGENT_MAX_STEPS", "14")
+            ),
+            select_agent_max_output_tokens=int(
+                os.environ.get("SKUNK_SELECT_AGENT_MAX_OUTPUT_TOKENS", "8192")
+            ),
+            select_agent_request_timeout_s=float(
+                os.environ.get("SKUNK_SELECT_AGENT_TIMEOUT_S", "150")
+            ),
+            extract_vision_only=os.environ.get("SKUNK_EXTRACT_VISION_ONLY", "0")
+            not in ("", "0"),
+            extract_review_shadow=os.environ.get("SKUNK_EXTRACT_REVIEW", "1")
+            not in ("", "0"),
+            extract_review_dedup=os.environ.get("SKUNK_EXTRACT_REVIEW_DEDUP", "0")
+            not in ("", "0"),
+            extract_review_repair=os.environ.get("SKUNK_EXTRACT_REVIEW_REPAIR", "0")
+            not in ("", "0"),
+            vision_rescan_charts=os.environ.get("SKUNK_VISION_RESCAN_CHARTS", "")
+            not in ("", "0"),
             retriever=os.environ.get("SKUNK_RETRIEVER", "page_index"),  # type: ignore[arg-type]
             chromadb_dir=os.environ.get("SKUNK_CHROMADB_DIR", "cache/chromadb"),
             chromadb_collection=os.environ.get(
@@ -212,9 +281,15 @@ class SkunkConfig:
             ),
             emb_model_id=os.environ.get("SKUNK_EMB_MODEL", "gemini-embedding-001"),
             agent_max_steps=int(os.environ.get("SKUNK_AGENT_MAX_STEPS", "20")),
-            agent_max_pages_per_tool_call=int(os.environ.get("SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL", "20")),
-            search_agent_max_output_tokens=int(os.environ.get("SKUNK_SEARCH_MAX_OUTPUT_TOKENS", "4096")),
-            search_agent_request_timeout_s=float(os.environ.get("SKUNK_SEARCH_TIMEOUT_S", "120")),
+            agent_max_pages_per_tool_call=int(
+                os.environ.get("SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL", "20")
+            ),
+            search_agent_max_output_tokens=int(
+                os.environ.get("SKUNK_SEARCH_MAX_OUTPUT_TOKENS", "4096")
+            ),
+            search_agent_request_timeout_s=float(
+                os.environ.get("SKUNK_SEARCH_TIMEOUT_S", "120")
+            ),
             lookup_max_steps=int(os.environ.get("SKUNK_LOOKUP_MAX_STEPS", "4")),
             lookup_tools=_parse_csv(os.environ.get("SKUNK_LOOKUP_TOOLS", "")),
             agent_model_id=os.environ.get("SKUNK_AGENT_MODEL") or None,

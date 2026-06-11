@@ -19,9 +19,9 @@ from skunk.common import (
     BlockRef,
     ExecutionContext,
     PageRef,
+    SemPoolEntry,
     chunk,
     parse_json_response,
-    traced_step,
 )
 from skunk.errors import StepFailed, ParseError
 from skunk.plan import RetrieveBranch
@@ -575,12 +575,11 @@ SAME ORDER given: `true` to SELECT the block, `false` to drop it. No more than t
         self,
         ctx: ExecutionContext,
         branches: list[RetrieveBranch],
-    ) -> list[list[BlockRef] | StepFailed]:
-        """Retrieve for every branch in one pass and narrow with block selection. Phases:
-        (1) one question-driven ToC pick shared across branches, then a per-branch year/as_of
-        date filter; (2) one semantic-filter sweep over the deduped union; (3) block selection
-        per branch in parallel — a selection failure falls back to the semantic-filter output
-        for that branch rather than failing it. Output is BLOCK-granular, aligned to `branches`."""
+    ) -> list[list[BlockRef]]:
+        """Phases (1) and (2) only: ToC pick → year filter → semantic filter.
+        Returns the sem-filter survivor blocks per branch, aligned to `branches`.
+        No block selection — the caller (orchestrator) runs tournament selection or
+        selection-agent as a separate step."""
         # Phase 1 — one unified ToC pick (question only), then each branch's own date filter.
         chapter_pages = await self._pick_chapters(branches=branches, ctx=ctx)
         cand = [self._year_filter(chapter_pages, b, ctx) for b in branches]
@@ -610,56 +609,7 @@ SAME ORDER given: `true` to SELECT the block, `false` to drop it. No more than t
             )
             branch_blocks.append(block_refs)
 
-        # Phase 3 — block selection per branch in parallel
-        pdf_dir = str(ctx.config.pdf_dir)
-
-        async def _select(
-            block_refs: list[BlockRef], branch: RetrieveBranch
-        ) -> list[BlockRef]:
-            if not block_refs:
-                return block_refs
-            member_refs = list(
-                dict.fromkeys(r for b in block_refs for r in b.member_refs)
-            )
-            selected = await traced_step(
-                ctx,
-                "block_select",
-                lambda: self.select_blocks(
-                    member_refs, pdf_dir, ctx, ctx.question, branch
-                ),
-            )
-            if not selected:
-                # No fallback. block_select rejecting every candidate means the target
-                # isn't in this branch's pages (e.g. an external series mis-routed to a
-                # retrieve branch). Fail the branch so compute hits MissingData and the
-                # replanner re-routes — never dump the full uncapped semfilter set into
-                # extract (that path produced a ~1000-page vision call → 1 GiB 400).
-                raise StepFailed(
-                    "retrieve",
-                    f"block_select selected no blocks for branch {branch.key!r}",
-                )
-            return selected
-
-        settled = await asyncio.gather(
-            *(_select(brs, b) for brs, b in zip(branch_blocks, branches)),
-            return_exceptions=True,
-        )
-        out: list[list[BlockRef] | StepFailed] = []
-        for branch, r in zip(branches, settled):
-            if isinstance(r, StepFailed):
-                out.append(r)
-            elif isinstance(r, BaseException):
-                # block_select itself errored — surface as a failed branch (→ replan),
-                # not a fallback to the full uncapped candidate set.
-                ctx.emit(f"block_select_failed key={branch.key!r} error={str(r)!r}")
-                out.append(
-                    StepFailed(
-                        "retrieve", f"block_select error for {branch.key!r}: {r}"
-                    )
-                )
-            else:
-                out.append(r)
-        return out
+        return branch_blocks
 
     async def _pick_blocks(
         self,
@@ -768,6 +718,79 @@ SAME ORDER given: `true` to SELECT the block, `false` to drop it. No more than t
         )
         return chosen, rounds
 
+    @staticmethod
+    def pool_for_blocks(
+        blocks: list[BlockRef], pdf_dir: str | Path
+    ) -> list[SemPoolEntry]:
+        """Pool entries for exactly `blocks` (no selection): a specific block maps to its
+        own entry; a whole-page block (`block_index=None`) expands to every block on its
+        anchor's catalog row. Deduped on (anchor, block_index). Static — needs only the
+        page store, so the selection agent can rebuild a pool without loading the tree."""
+        store = get_page_store(str(pdf_dir))
+        out: list[SemPoolEntry] = []
+        seen: set[tuple[PageRef, int]] = set()
+        for b in blocks:
+            row = store.catalog_row(b.page)
+            if row is None:
+                continue
+            idxs = (
+                [b.block_index]
+                if b.block_index is not None and b.block_index < len(row.content_blocks)
+                else range(len(row.content_blocks))
+            )
+            for bi in idxs:
+                key = (row.ref, bi)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(
+                    PageIndexRetriever._pool_entry(row, bi, row.content_blocks[bi])
+                )
+        return out
+
+    def build_sem_pool(
+        self, refs: list[PageRef], pdf_dir: str | Path
+    ) -> list[SemPoolEntry]:
+        """The repair pool for `refs` without running any selection: anchor-resolve the
+        refs (same prologue as `select_blocks`) and emit every content block as a
+        `SemPoolEntry`. Used by the eval harness to dump pools at sem-filter cost."""
+        store = get_page_store(str(pdf_dir))
+        rows: list[PageCatalogRow] = []
+        seen: set[PageRef] = set()
+        for ref in refs:
+            row = store.catalog_row(ref)
+            if row is None or row.ref in seen:
+                continue
+            seen.add(row.ref)
+            rows.append(row)
+        return [
+            self._pool_entry(row, bi, block)
+            for row in rows
+            for bi, block in enumerate(row.content_blocks)
+        ]
+
+    @staticmethod
+    def _pool_entry(row: PageCatalogRow, bi: int, block: ContentBlock) -> SemPoolEntry:
+        """A self-contained repair-pool entry for one candidate block."""
+        return SemPoolEntry(
+            ref=BlockRef(
+                page=row.ref,
+                block_index=bi,
+                member_refs=tuple(row.block_refs(block)),
+                block=None,
+            ),
+            interval=(
+                (row.date_interval[0], row.date_interval[1])
+                if row.date_interval
+                else None
+            ),
+            kind=block.kind,
+            title=block.title,
+            summary=block.summary,
+            cols=tuple(block.column_headers[:12]),
+            rows_tail=tuple(block.row_headers[-8:]),
+        )
+
     async def select_blocks(
         self,
         refs: list[PageRef],
@@ -775,10 +798,11 @@ SAME ORDER given: `true` to SELECT the block, `false` to drop it. No more than t
         ctx: ExecutionContext,
         question: str,
         branch: RetrieveBranch,
-    ) -> list[BlockRef]:
+    ) -> tuple[list[BlockRef], list[SemPoolEntry]]:
         """Tournament-reduce `refs` to the branch's blocks. Uses `get_page_store` to resolve
-        continuation refs to their anchor rows. Returns `[]` if no ref resolves to a catalog
-        block.
+        continuation refs to their anchor rows. Returns `(selected, pool)` where `pool` is
+        every candidate block as a `SemPoolEntry` (the repair pool — what extract's coverage
+        repair re-selects from). `([], [])` if no ref resolves to a catalog block.
 
         Block selection runs PER PERIOD: one sub-selection per period entry (over the blocks whose
         data span overlaps that entry), each capped at `_KEEP`, and unions the winners. A branch
@@ -803,7 +827,10 @@ SAME ORDER given: `true` to SELECT the block, `false` to drop it. No more than t
                 all_blocks[bid] = (row, bi, block)
 
         if not all_blocks:
-            return []
+            return [], []
+        pool = [
+            self._pool_entry(row, bi, block) for row, bi, block in all_blocks.values()
+        ]
 
         items = list(all_blocks.items())
         n0 = len(items)
@@ -830,7 +857,9 @@ SAME ORDER given: `true` to SELECT the block, `false` to drop it. No more than t
         # with no parseable period runs a single selection over all candidates. There is no global
         # re-narrowing pass over the union — each period keeps its own blocks.
         parts: list[
-            tuple[str | None, list[tuple[str, tuple[PageCatalogRow, int, ContentBlock]]]]
+            tuple[
+                str | None, list[tuple[str, tuple[PageCatalogRow, int, ContentBlock]]]
+            ]
         ]
         if entries:
             parts = [(e.label, p) for e in entries if (p := _entry_part(e))]
@@ -842,7 +871,12 @@ SAME ORDER given: `true` to SELECT the block, `false` to drop it. No more than t
         results = await asyncio.gather(
             *(
                 self._tournament(
-                    ctx, part, question, branch, final_keep=self._KEEP, period_label=label
+                    ctx,
+                    part,
+                    question,
+                    branch,
+                    final_keep=self._KEEP,
+                    period_label=label,
                 )
                 for label, part in parts
             )
@@ -871,4 +905,4 @@ SAME ORDER given: `true` to SELECT the block, `false` to drop it. No more than t
             f"block_select key={branch.key!r} candidates={n0} rounds={rounds} "
             f"selected_blocks={len(selected)} top_k={cap}"
         )
-        return selected
+        return selected, pool

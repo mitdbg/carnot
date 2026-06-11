@@ -33,7 +33,13 @@ _ENV = Environment(
 
 @dataclass(frozen=True)
 class TextBlock:
+    """A text observation block. `text` is the full record kept in the trajectory and
+    the trace viewer. `llm_text`, when set, is shown to the model IN PLACE of `text` —
+    the seam for a tool that must persist a large observation (e.g. every extracted
+    cell) but show the LLM only a compact summary. None ⇒ the model sees `text`."""
+
     text: str
+    llm_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -58,6 +64,15 @@ class ImageBlock:
 
 
 Block = TextBlock | ChunkBlock | ImageBlock
+
+
+def _llm_text(b: Block) -> str:
+    """The LLM-facing text of a block: a `TextBlock`'s `llm_text` summary when set,
+    else the block's full `text`. Only the model render (`_render_for_llm`) routes
+    through here — persistence and the trace viewer always use the full `text`."""
+    if isinstance(b, TextBlock) and b.llm_text is not None:
+        return b.llm_text
+    return b.text
 
 
 def _block_to_jsonable(b: Block) -> dict:
@@ -313,7 +328,7 @@ Requirements for the final answer:
         rendered: list[dict] = []
         for msg in self.messages:
             visible = [b for b in msg["blocks"] if self._block_is_visible(b)]
-            parts = [b.text for b in visible if b.text]
+            parts = [t for b in visible if (t := _llm_text(b))]
             if not parts:
                 continue
             entry: dict = {"role": msg["role"], "content": "\n\n".join(parts)}

@@ -52,6 +52,7 @@ def _summarize_annotated(e: AnnotatedValue) -> dict:
     """One `AnnotatedValue` as a JSON-able dict for the trace viewer's node summary."""
     return {
         "description": e.description,
+        "qualifiers": e.qualifiers,
         "unit": e.unit,
         "value_kind": e.kind,
         "value": e.value,
