@@ -9,7 +9,10 @@ from skunk.errors import MissingData, ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.common import AnnotatedValue, ExecutionContext, input_values_desc
 from skunk.pyexec import exec_python_with_env
-from skunk.question_explainer import ConceptExplanation
+from skunk.question_explainer import (
+    PRECOMPUTED_CONCEPT_REFERENCES,
+    ConceptExplanation,
+)
 
 
 class MissingDataSignal(BaseModel):
@@ -151,11 +154,16 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
         `prev_code`/`prev_failure` describe only the most-recent failed attempt —
         accumulating older ones dilutes the issue to fix."""
         user_msg = f"Question:\n{ctx.question}\n\n"
-        if concept_explanations:
-            block = "\n\n".join(
-                f"### {c.concept}\n{c.explanation}"
-                for c in concept_explanations
-            )
+        ref_blocks = [
+            f"### {c.concept}\n{c.explanation}" for c in concept_explanations
+        ]
+        # Optional fixed cheat-sheet of canonical formulas, appended AFTER the
+        # question-specific concepts so the per-question explanation still leads.
+        # Gated for A/B testing (config.compute_precomputed_concept_refs).
+        if ctx.config.compute_precomputed_concept_refs:
+            ref_blocks.append(PRECOMPUTED_CONCEPT_REFERENCES)
+        if ref_blocks:
+            block = "\n\n".join(ref_blocks)
             user_msg += f"## Concept references\n{block}\n\n"
         user_msg += f"input_values =\n{input_values_desc(input_values)}"
         if prev_failure:
