@@ -60,6 +60,14 @@ class SkunkConfig:
 
     # Compute operator
     compute_max_attempts: int = 3
+    # Append a fixed cheat-sheet of canonical formulas for named / ambiguous operations
+    # (`question_explainer.PRECOMPUTED_CONCEPT_REFERENCES`) to the compute `## Concept
+    # references` block, after the question_explainer's per-question concepts. Pins one
+    # convention per operation (Zipf orientation, Box-Cox form, percentile type, pop-vs-
+    # sample std, …) so codegen stops picking wrong variants. Default OFF (explainer
+    # concepts alone); flip per-run to A/B its effect on compute accuracy.
+    # (env: SKUNK_PRECOMPUTED_CONCEPT_REFS=1)
+    compute_precomputed_concept_refs: bool = False
 
     # Replan-on-MissingData loop. Total compute invocations ≤ recovery_max_rounds + 1.
     recovery_max_rounds: int = 2
@@ -231,6 +239,10 @@ class SkunkConfig:
                 "SKUNK_PROMPT_OVERRIDES", "config/prompts/treasury_bulletin.yaml"
             ),
             semfilter_batch_size=int(os.environ.get("SKUNK_SEMFILTER_BATCH", "32")),
+            compute_precomputed_concept_refs=os.environ.get(
+                "SKUNK_PRECOMPUTED_CONCEPT_REFS", "0"
+            )
+            not in ("", "0"),
             extract_vision_only=os.environ.get("SKUNK_EXTRACT_VISION_ONLY", "0")
             not in ("", "0"),
             vision_rescan_charts=os.environ.get("SKUNK_VISION_RESCAN_CHARTS", "")
