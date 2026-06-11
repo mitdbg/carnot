@@ -6,6 +6,10 @@ const app = document.getElementById("app");
 const lastEvent = document.getElementById("lastEvent");
 const roundTimerMetric = document.getElementById("roundTimerMetric");
 const roundTimer = document.getElementById("roundTimer");
+const extractionModal = document.getElementById("extractionModal");
+const extractionModalTitle = document.getElementById("extractionModalTitle");
+const extractionModalBody = document.getElementById("extractionModalBody");
+let reasoningModalBranches = [];
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, c => ({
@@ -146,26 +150,150 @@ function formatReasoningValue(value) {
   return JSON.stringify(value, null, 2);
 }
 
+function retrieveNodeHtml(branch) {
+  const searched = branch.searched || {};
+  if (branch.kind !== "retrieve") {
+    return `<strong>${esc(searched.target || "External lookup")}</strong>
+      ${searched.src ? `<span class="flow-detail">${esc(searched.src)}</span>` : ""}`;
+  }
+  return `<strong>${esc(searched.key || "Retrieve")}</strong>
+    ${searched.period ? `<span class="flow-detail">${esc(searched.period)}</span>` : ""}
+    ${searched.as_of ? `<span class="flow-detail">as of ${esc(searched.as_of)}</span>` : ""}
+    ${searched.visual_only === true ? `<span class="flow-badge">visual only</span>` : ""}`;
+}
+
+function extractedSourceDocsHtml(entry) {
+  if (!entry?.bulletin || !Array.isArray(entry.pages) || !entry.pages.length) return "";
+  return `<div class="value-sources">
+    ${entry.pages.map(page => sourceDocHtml(
+      `Treasury Bulletin ${entry.bulletin} PDF page ${page}`
+    )).join("")}
+  </div>`;
+}
+
+function extractedValueHtml(entry) {
+  const kind = entry?.value_kind || entry?.type;
+  const unit = entry?.unit ? String(entry.unit) : "";
+  if (kind === "scalar") {
+    return `<div class="extracted-scalar">
+      ${entry.description ? `<span>${esc(entry.description)}</span>` : ""}
+      <strong>${esc(entry.value)}${unit ? ` ${esc(unit)}` : ""}</strong>
+      ${extractedSourceDocsHtml(entry)}
+    </div>`;
+  }
+  if (kind === "vector" && entry.value && typeof entry.value === "object") {
+    const title = [entry.description, unit].filter(Boolean).join(" · ");
+    return `<div class="extracted-vector">
+      ${title ? `<strong class="vector-title">${esc(title)}</strong>` : ""}
+      <table>
+        <tbody>
+          ${Object.entries(entry.value).map(([label, value]) => `
+            <tr><th>${esc(label)}</th><td>${esc(value)}</td></tr>
+          `).join("")}
+        </tbody>
+      </table>
+      ${extractedSourceDocsHtml(entry)}
+    </div>`;
+  }
+  if (kind === "table" && entry.value && typeof entry.value === "object") {
+    const rows = Object.entries(entry.value);
+    const columns = [...new Set(rows.flatMap(([, row]) => (
+      row && typeof row === "object" ? Object.keys(row) : []
+    )))];
+    const title = [entry.description, unit].filter(Boolean).join(" · ");
+    return `<div class="extracted-vector">
+      ${title ? `<strong class="vector-title">${esc(title)}</strong>` : ""}
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>${esc(entry.row_name || "")}</th>${columns.map(column => `<th>${esc(column)}</th>`).join("")}</tr></thead>
+          <tbody>
+            ${rows.map(([label, row]) => `<tr>
+              <th>${esc(label)}</th>
+              ${columns.map(column => `<td>${esc(row?.[column] ?? "")}</td>`).join("")}
+            </tr>`).join("")}
+          </tbody>
+        </table>
+      </div>
+      ${extractedSourceDocsHtml(entry)}
+    </div>`;
+  }
+  return `<pre class="value-fallback">${esc(formatReasoningValue(entry))}</pre>`;
+}
+
+function sourcePageCardHtml(source) {
+  const label = `Treasury Bulletin ${source.bulletin} PDF page ${source.page}`;
+  return `<a class="extraction-card source-card" href="/api/source/${encodeURIComponent(source.bulletin)}#page=${Number(source.page)}" target="_blank" rel="noopener noreferrer">
+    <span class="flow-kicker">Source page</span>
+    <strong>${esc(label)}</strong>
+  </a>`;
+}
+
+function blockCardHtml(block, branchIndex, blockIndex) {
+  const title = block.title || (block.block_index === null ? "Whole page" : `Block ${block.block_index}`);
+  const continuationPages = (block.member_pages || []).filter(source => (
+    source.bulletin !== block.bulletin || source.page !== block.page
+  ));
+  return `<button type="button" class="extraction-card block-card" onclick="openExtractionModal(${branchIndex},${blockIndex})">
+    <span class="flow-kicker">${esc(block.kind || "block")} · page ${esc(block.page)} · index ${esc(block.block_index ?? "whole page")}</span>
+    <strong>${esc(title)}</strong>
+    ${continuationPages.length ? `<span class="block-field"><b>Continues</b>${continuationPages.map(source => `${source.bulletin} p.${source.page}`).join(", ")}</span>` : ""}
+  </button>`;
+}
+
+function extractionNodeHtml(branch, branchIndex) {
+  const blocks = Array.isArray(branch.blocks) ? branch.blocks : [];
+  if (!blocks.length) {
+    return `<span class="flow-empty">No selected block metadata captured.</span>`;
+  }
+  const pageRows = [];
+  const rowsByPage = new Map();
+  blocks.forEach((block, blockIndex) => {
+    const key = `${block.bulletin}:${block.page}`;
+    if (!rowsByPage.has(key)) {
+      const row = {
+        source: { bulletin: block.bulletin, page: block.page },
+        blocks: [],
+      };
+      rowsByPage.set(key, row);
+      pageRows.push(row);
+    }
+    rowsByPage.get(key).blocks.push({ block, blockIndex });
+  });
+  return `<div class="page-extraction-list">
+    ${pageRows.map(row => `
+      <div class="page-extraction-row">
+        ${sourcePageCardHtml(row.source)}
+        <div class="page-block-list">
+          ${row.blocks.map(({ block, blockIndex }) => blockCardHtml(block, branchIndex, blockIndex)).join("")}
+        </div>
+      </div>
+    `).join("")}
+  </div>`;
+}
+
 function reasoningVisual(reasoning, answer) {
   const payload = parseReasoningPayload(reasoning);
   if (!payload) return "";
   const branches = payload.branches || [];
+  reasoningModalBranches = branches;
   const code = payload.python_code || "";
   const attempts = payload.python_attempts || [];
   return `<section class="reasoning-shell">
     <div class="label">Reasoning Flow</div>
     <div class="reasoning-flow">
       <div class="flow-branches">
-      ${branches.map(branch => `
+      ${branches.map((branch, branchIndex) => `
         <article class="flow-lane ${esc(branch.status || "ok")}">
           <div class="flow-node search-node">
             <span class="flow-kicker">${esc((branch.kind || "branch").replace("_", " "))} ${esc(branch.branch_id)}</span>
-            <strong>${esc(formatReasoningValue(branch.searched) || "No search detail")}</strong>
+            ${retrieveNodeHtml(branch)}
           </div>
           <div class="flow-arrow" aria-hidden="true"></div>
           <div class="flow-node value-node">
-            <span class="flow-kicker">${esc(branch.output_step || "extracted values")}</span>
-            <strong>${esc(formatReasoningValue(branch.output) || "No value captured")}</strong>
+            <span class="flow-kicker">${esc(branch.output_step || "selected blocks")}</span>
+            ${branch.kind === "retrieve"
+              ? extractionNodeHtml(branch, branchIndex)
+              : `<strong>${esc(formatReasoningValue(branch.output) || "No value captured")}</strong>`}
           </div>
         </article>
       `).join("")}
@@ -183,6 +311,31 @@ function reasoningVisual(reasoning, answer) {
       </div>
     </div>
   </section>`;
+}
+
+function openExtractionModal(branchIndex, blockIndex) {
+  const branch = reasoningModalBranches[branchIndex];
+  const block = branch?.blocks?.[blockIndex];
+  if (!branch || !block) return;
+  const values = branch.output?.type === "values" && Array.isArray(branch.output.values)
+    ? branch.output.values.filter(value => (
+        value.source_block_page === block.page
+        && (value.source_block_index ?? null) === (block.block_index ?? null)
+      ))
+    : [];
+  extractionModalTitle.textContent = block.title
+    || (block.block_index === null ? `Whole page ${block.page}` : `Block ${block.block_index}`);
+  extractionModalBody.innerHTML = `
+    ${block.summary ? `<p class="block-summary">${esc(block.summary)}</p>` : ""}
+    ${values.length
+      ? `<div class="modal-values">${values.map(extractedValueHtml).join("")}</div>`
+      : `<div class="empty">No extracted values were mapped to this block.</div>`}
+  `;
+  extractionModal.showModal();
+}
+
+function closeExtractionModal() {
+  extractionModal.close();
 }
 
 function taskElapsedSeconds(task) {
@@ -407,6 +560,8 @@ window.directAnswer = (assignmentId, version) => run(command("/api/human-answers
   source_docs: document.getElementById(`sources_${assignmentId}`).value.split("\n").map(x => x.trim()).filter(Boolean),
 }));
 window.selectTask = selectTask;
+window.openExtractionModal = openExtractionModal;
+window.closeExtractionModal = closeExtractionModal;
 
 hydrate();
 connect();

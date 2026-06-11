@@ -1,3 +1,9 @@
+# Agents confs
+*/.codex
+*/.github
+*/.chats
+*/.claude
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

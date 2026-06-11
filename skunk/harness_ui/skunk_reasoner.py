@@ -218,12 +218,14 @@ def _structured_reasoning_payload(events: list[dict], source_docs: list[str]) ->
         steps = branch_steps.get(branch_id, [])
         last_step = steps[-1] if steps else None
         last_step_data = last_step.get("data") if isinstance(last_step, dict) and isinstance(last_step.get("data"), dict) else {}
+        output = last_step_data.get("summary") or last_step_data.get("error") or None
         branches.append(
             {
                 "branch_id": branch_id,
                 "kind": branch.get("kind", "branch"),
                 "searched": _branch_search_details(branch),
-                "output": last_step_data.get("summary") or last_step_data.get("error") or None,
+                "blocks": output.get("blocks", []) if isinstance(output, dict) else [],
+                "output": output,
                 "output_step": last_step.get("op") if isinstance(last_step, dict) else None,
                 "status": "failed" if last_step_data.get("error") else "ok",
             }

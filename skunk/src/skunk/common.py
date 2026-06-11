@@ -409,6 +409,8 @@ class AnnotatedValue(BaseModel):
     )
     requested_period: str | None = None  # branch.period — data window requested
     retrieve_key: str | None = None  # branch.key — concept this datum serves
+    source_block_page: int | None = None
+    source_block_index: int | None = None
 
     @model_validator(mode="after")
     def _check_shape(self) -> AnnotatedValue:
@@ -698,6 +700,7 @@ async def traced_step[T](
     fn: Callable[[], Awaitable[T]],
     *,
     branch_id: int | None = None,
+    summary_metadata: dict[str, Any] | None = None,
 ) -> T:
     """Run `fn` inside a `ctx.step` frame and emit a boundary event with elapsed time."""
     from skunk.errors import MissingData, StepFailed
@@ -717,13 +720,16 @@ async def traced_step[T](
             )
             raise
         elapsed = round(time.perf_counter() - t0, 3)
+        summary = summarize_value(result)
+        if summary_metadata:
+            summary.update(summary_metadata)
         ctx.emit(
             f"step elapsed_s={elapsed} output={describe_value(result)!r}",
             kind="step",
             data={
                 "branch_id": branch_id,
                 "elapsed_s": elapsed,
-                "summary": summarize_value(result),
+                "summary": summary,
             },
         )
     return result

@@ -33,5 +33,15 @@
   <div id="lastEvent" class="event">Connecting...</div>
   <div id="app">Connecting...</div>
 </main>
+<dialog id="extractionModal" class="extraction-modal">
+  <div class="modal-head">
+    <div>
+      <span class="flow-kicker">Extraction Results</span>
+      <strong id="extractionModalTitle">Selected block</strong>
+    </div>
+    <button type="button" onclick="closeExtractionModal()">Close</button>
+  </div>
+  <div id="extractionModalBody" class="modal-body"></div>
+</dialog>
 </body>
 </html>

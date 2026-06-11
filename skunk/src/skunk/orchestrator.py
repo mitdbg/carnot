@@ -262,6 +262,35 @@ class Orchestrator:
                     self._ctx, "extract",
                     lambda: self._extract.run(doc, self._ctx, branch),
                     branch_id=bid,
+                    summary_metadata={
+                        "blocks": [
+                            {
+                                "bulletin": block_ref.page.month,
+                                "page": block_ref.page.page,
+                                "block_index": block_ref.block_index,
+                                "member_pages": [
+                                    {"bulletin": ref.month, "page": ref.page}
+                                    for ref in block_ref.member_refs
+                                ],
+                                "kind": block_ref.block.kind if block_ref.block else None,
+                                "title": block_ref.block.title if block_ref.block else None,
+                                "column_headers": (
+                                    block_ref.block.column_headers
+                                    if block_ref.block
+                                    else []
+                                ),
+                                "row_headers": (
+                                    block_ref.block.row_headers
+                                    if block_ref.block
+                                    else []
+                                ),
+                                "summary": (
+                                    block_ref.block.summary if block_ref.block else None
+                                ),
+                            }
+                            for block_ref in doc
+                        ]
+                    },
                 )
             return await traced_step(
                 self._ctx, "lookup_external",
