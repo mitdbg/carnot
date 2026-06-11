@@ -143,10 +143,16 @@ class RetrieveOp:
         return refs
 
     def _ensure_resources(self, config: SkunkConfig):
-        # Single-flight: parallel branches must not race to open ChromaDB.
+        # Single-flight: neither parallel branches (same op) nor parallel UID
+        # workers (eval's thread pool, each with its own RetrieveOp) must race to
+        # open ChromaDB. Concurrent `PersistentClient` construction against the
+        # same SQLite fails with "Could not connect to tenant default_tenant", so
+        # construction is serialized + cached process-wide by
+        # `_get_shared_resources`. The resources are read-only + shared; only the
+        # per-branch SearchAgent built around them holds mutable state.
         with self._resources_lock:
             if self._resources is None:
-                self._resources = _build_resources(config)
+                self._resources = _get_shared_resources(config)
             return self._resources
 
     def _page_index(self):
@@ -155,6 +161,33 @@ class RetrieveOp:
         if self._page_index_retriever is None:
             self._page_index_retriever = PageIndexRetriever()
         return self._page_index_retriever
+
+
+# Process-wide ChromaDB/document-map cache. The vector DB is a large read-only
+# SQLite (tens of GB); constructing a `chromadb.PersistentClient` against it is not
+# safe to do concurrently — parallel first-opens race on the tenant-bootstrap SELECT
+# and fail with "Could not connect to tenant default_tenant". The eval runs many UIDs
+# through one ThreadPoolExecutor, each UID with its own RetrieveOp, so we cache the
+# opened collection + document map process-wide and single-flight construction under
+# one global lock. The resources are read-only, so sharing the collection across
+# worker threads is safe (and avoids N in-memory copies of the document map).
+_SHARED_RESOURCES_LOCK = threading.Lock()
+_SHARED_RESOURCES: dict[tuple[str, str, str], tuple] = {}
+
+
+def _get_shared_resources(config: SkunkConfig):
+    """Process-wide single-flight wrapper over `_build_resources`, keyed by the
+    ChromaDB dir + collection + clean-page-map path. Serializes ChromaDB opens
+    across all RetrieveOps (i.e. across all UID worker threads)."""
+    key = (
+        str(Path(config.chromadb_dir).resolve()),
+        config.chromadb_collection,
+        str(Path(config.clean_page_map_path).resolve()),
+    )
+    with _SHARED_RESOURCES_LOCK:
+        if key not in _SHARED_RESOURCES:
+            _SHARED_RESOURCES[key] = _build_resources(config)
+        return _SHARED_RESOURCES[key]
 
 
 def _build_resources(config: SkunkConfig):

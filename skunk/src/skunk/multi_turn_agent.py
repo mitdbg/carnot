@@ -8,7 +8,7 @@ from typing import Any, Protocol
 
 from jinja2 import Environment, StrictUndefined
 
-from skunk.common import Effort, ExecutionContext
+from skunk.common import B64Image, Effort, ExecutionContext
 from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.local_python_executor import CodeOutput, LocalPythonExecutor
@@ -43,7 +43,21 @@ class ChunkBlock:
     text: str
 
 
-Block = TextBlock | ChunkBlock
+@dataclass(frozen=True)
+class ImageBlock:
+    """An image observation (e.g. a rendered page) the agent can "view". `text` is the
+    caption shown in the flattened text stream; `image` carries the base64 payload that
+    `_render_for_llm` lifts into the message's `images` list for the multimodal LLM call.
+    The raw base64 is deliberately kept out of the JSON-able trajectory (see
+    `_block_to_jsonable`)."""
+
+    doc_id: str
+    figure_id: str | int | None
+    image: B64Image
+    text: str
+
+
+Block = TextBlock | ChunkBlock | ImageBlock
 
 
 def _block_to_jsonable(b: Block) -> dict:
@@ -56,6 +70,17 @@ def _block_to_jsonable(b: Block) -> dict:
             "chunk_id": b.chunk_id,
             "doc_id": b.doc_id,
             "text": b.text,
+        }
+    if isinstance(b, ImageBlock):
+        # Reference only — the base64 payload would bloat the trajectory JSON and the
+        # trace-viewer event, so we record just enough to identify the image.
+        return {
+            "type": "image",
+            "doc_id": b.doc_id,
+            "figure_id": b.figure_id,
+            "mime": b.image.mime,
+            "caption": b.text,
+            "bytes": len(b.image.data),
         }
     return {"type": "text", "text": b.text}
 
@@ -155,6 +180,14 @@ class MultiTurnAgent(ABC):
     briefing: str
     final_answer_doc: str
     default_effort: Effort = "medium"
+
+    # Per-step generation caps, threaded to `PromptedCall.call` → the LLM stream.
+    # Both None → provider defaults (uncapped output, no wall-clock timeout),
+    # preserving behaviour for every agent that doesn't opt in. `SearchAgent` sets
+    # these to bound runaway generations (output ran to the 65535-token ceiling,
+    # 200–800s per call) and to cap genuinely hung requests.
+    max_output_tokens: int | None = None
+    request_timeout_s: float | None = None
 
     _SYSTEM_TEMPLATE = """\
 {{ briefing }}
@@ -273,16 +306,21 @@ Requirements for the final answer:
         return blocks
 
     def _render_for_llm(self) -> list[dict]:
-        """Flatten the trajectory to `{role, content}`, dropping invisible blocks
-        and any message left empty after redaction."""
+        """Flatten the trajectory to `{role, content}` (+ optional `images`), dropping
+        invisible blocks and any message left empty after redaction. `ImageBlock`s
+        contribute their caption to `content` and their base64 payload to an `images`
+        list the multimodal LLM path consumes (text-only callers ignore it)."""
         rendered: list[dict] = []
         for msg in self.messages:
-            parts = [
-                b.text for b in msg["blocks"] if b.text and self._block_is_visible(b)
-            ]
+            visible = [b for b in msg["blocks"] if self._block_is_visible(b)]
+            parts = [b.text for b in visible if b.text]
             if not parts:
                 continue
-            rendered.append({"role": msg["role"], "content": "\n\n".join(parts)})
+            entry: dict = {"role": msg["role"], "content": "\n\n".join(parts)}
+            images = [b.image for b in visible if isinstance(b, ImageBlock)]
+            if images:
+                entry["images"] = images
+            rendered.append(entry)
         return rendered
 
     def messages_to_jsonable(self) -> list[dict]:
@@ -494,7 +532,9 @@ Requirements for the final answer:
         if self._backend is None:
             self._last_logprobs = None
             return await self._prompt.call(
-                ctx, messages=trimmed, should_stop=_has_complete_block
+                ctx, messages=trimmed, should_stop=_has_complete_block,
+                max_output_tokens=self.max_output_tokens,
+                timeout_s=self.request_timeout_s,
             )
         # Backend path (e.g. Tinker rollouts): prepend the assembled system
         # prompt, sample one turn synchronously (the rollout owns its thread +

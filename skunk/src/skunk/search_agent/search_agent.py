@@ -25,10 +25,10 @@ import os
 
 from chromadb.api.models.Collection import Collection
 
-from skunk.common import ExecutionContext, make_genai_client
+from skunk.common import B64Image, ExecutionContext, make_genai_client
 from skunk.config import SkunkConfig
 from skunk.local_python_executor import CodeOutput
-from skunk.multi_turn_agent import Block, ChunkBlock, MultiTurnAgent, TextBlock
+from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent, TextBlock
 from skunk.search_agent.base import Retriever
 from skunk.search_agent.search_tools import (
     EMPTY_RESULT_MESSAGE,
@@ -36,11 +36,13 @@ from skunk.search_agent.search_tools import (
     PRUNE_RESULT_TAG,
     READ_DOCUMENT_RESULT_TAG,
     SEARCH_RESULT_TAG,
+    VIEW_FIGURE_RESULT_TAG,
     EmbeddingClient,
     GrepCorpusTool,
     PruneTool,
     ReadDocumentTool,
     SearchCorpusTool,
+    ViewFigureTool,
 )
 
 
@@ -105,6 +107,13 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         self.document_map = document_map
         self.emb_client, self.emb_model_id = _make_embedding_client(config.emb_model_id)
 
+        # Bound each search-step LLM call: cap output (was uncapped → runaway
+        # generations streamed to the 65535-token ceiling at 200–800s each) and
+        # impose a hard per-request wall-clock timeout. See SkunkConfig for the
+        # thinking/max_output_tokens interaction caveat.
+        self.max_output_tokens = config.search_agent_max_output_tokens
+        self.request_timeout_s = config.search_agent_request_timeout_s
+
         # Per-question prune state: shared by the search / grep / prune tools and
         # read by `_block_is_visible` for redaction. One SearchAgent per
         # question / branch ⇒ these sets never cross-talk between questions.
@@ -120,6 +129,7 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             ),
             GrepCorpusTool(self.chroma_collection, self._pruned_chunk_ids, self._pruned_doc_ids),
             ReadDocumentTool(self.document_map, config.agent_max_pages_per_tool_call),
+            ViewFigureTool(self.document_map, config.pdf_dir),
             PruneTool(self._pruned_chunk_ids, self._pruned_doc_ids),
         ]
         super().__init__(
@@ -183,6 +193,22 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
                 ChunkBlock(chunk_id=None, doc_id=d["doc_id"], text=d["text"])
                 for d in output["docs"]
             )
+            return blocks
+
+        if isinstance(output, dict) and output.get(VIEW_FIGURE_RESULT_TAG):
+            if output.get("error"):
+                blocks.append(TextBlock(f"[error]\n{output['error']}"))
+            else:
+                caption = (
+                    f"[full-page image of doc_id={output['doc_id']} "
+                    f"(contains <figure id={output['figure_id']}>)]"
+                )
+                blocks.append(ImageBlock(
+                    doc_id=output["doc_id"],
+                    figure_id=output["figure_id"],
+                    image=B64Image(mime=output["mime"], data=output["data"]),
+                    text=caption,
+                ))
             return blocks
 
         if isinstance(output, dict) and output.get(PRUNE_RESULT_TAG):

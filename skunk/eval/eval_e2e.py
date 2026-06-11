@@ -260,14 +260,15 @@ async def _run_one_question(
             orch.result.failure_reason = (
                 f"MissingData: {e.reason}" if isinstance(e, MissingData) else str(e)
             )
-        wall_s = time.perf_counter() - t0
+        latency_s = time.perf_counter() - t0
+        cost_usd = _events_cost(ctx.events)
         result = orch.result
         plan_obj = orch.current_plan
 
         if verbose:
             if plan_obj is not None:
                 print(f"[e2e] Plan: {plan_obj.model_dump_json()}")
-            print(f"[e2e] wall_s={wall_s:.3f}")
+            print(f"[e2e] latency_s={latency_s:.3f} cost_usd={cost_usd or '—'}")
 
         if trace_path is not None:
             plan_dump = plan_obj.model_dump_json() if plan_obj else "(unavailable)"
@@ -292,6 +293,8 @@ async def _run_one_question(
                 "answer": None,
                 "failed": True,
                 "reason": result.failure_reason,
+                "latency_s": round(latency_s, 3),
+                "cost_usd": cost_usd,
                 "retrieved_blocks": retrieved_blocks,
             }
         return {
@@ -299,6 +302,8 @@ async def _run_one_question(
             "answer": result.answer,
             "failed": result.failed,
             "reason": result.failure_reason,
+            "latency_s": round(latency_s, 3),
+            "cost_usd": cost_usd,
             "retrieved_blocks": retrieved_blocks,
         }
     finally:
@@ -325,10 +330,10 @@ REPORT_FIELDS = [
     "golden_pages",
     "failed",
     "reason",
+    # Wall-clock seconds to plan + execute the query, measured in-process (see _run_one_question).
+    "latency_s",
     # n_hit/n_gold — retrieved pages (post block-select) that intersect the gold pages.
     "retrieval_recall",
-    # Wall-clock span of the UID's trace log (first→last event), seconds.
-    "latency_s",
     # USD billed for this UID's generation calls (see PRICES; thinking billed at output).
     "cost_usd",
 ]
@@ -342,44 +347,29 @@ PRICES = {
 _CALL_RE = re.compile(
     r"call call_site=\S+ model=(\S+) .*?in_tok=(\d+) out_tok=(\d+) think_tok=(\S+)"
 )
-_TS_RE = re.compile(r"^(\d{2}):(\d{2}):(\d{2}) ")
 
 
-def _log_cost_latency(log_path: str | None) -> tuple[str, str]:
-    """Aggregate a UID's generation cost (USD) and wall-clock latency (s) from its trace
-    `.log` by summing `call` events (per PRICES) and spanning the first→last timestamp.
-    Returns ('', '') when the log is absent (e.g. --no-traces) or unparseable — those
-    columns are simply left blank, matching the merged report's optional metrics."""
-    if not log_path or not Path(log_path).exists():
-        return "", ""
+def _events_cost(events: list[dict]) -> str:
+    """Sum a UID's generation cost (USD) from its in-memory `call` events (per PRICES;
+    thinking billed at the output rate). Reads `ctx.events`, which is always captured
+    regardless of `--no-traces`, so cost is available even when no log is written.
+    Returns '' when no priced `call` events were seen (e.g. golden/replay bypass, or a
+    model absent from PRICES)."""
     cost = 0.0
-    first_ts = last_ts = None
     saw_call = False
-    for line in Path(log_path).open():
-        m = _TS_RE.match(line)
-        if m:
-            h, mi, s = map(int, m.groups())
-            ts = h * 3600 + mi * 60 + s
-            if first_ts is None:
-                first_ts = ts
-            last_ts = ts
-        c = _CALL_RE.search(line)
-        if c:
-            model, i, o, t = c.group(1), int(c.group(2)), int(c.group(3)), c.group(4)
-            t = 0 if t == "None" else int(t)
-            price = PRICES.get(model)
-            if price is None:
-                continue
-            pin, pout = price
-            cost += i * pin + (o + t) * pout
-            saw_call = True
-    latency = ""
-    if first_ts is not None and last_ts is not None:
-        span = last_ts - first_ts
-        if span < 0:  # crossed midnight
-            span += 24 * 3600
-        latency = str(span)
-    return (f"{cost:.4f}" if saw_call else ""), latency
+    for evt in events:
+        c = _CALL_RE.search(evt.get("message", ""))
+        if not c:
+            continue
+        model, i, o, t = c.group(1), int(c.group(2)), int(c.group(3)), c.group(4)
+        t = 0 if t == "None" else int(t)
+        price = PRICES.get(model)
+        if price is None:
+            continue
+        pin, pout = price
+        cost += i * pin + (o + t) * pout
+        saw_call = True
+    return f"{cost:.4f}" if saw_call else ""
 
 
 def _retrieval_recall(retrieved_blocks: list, gold_pages: list[PageRef] | None) -> str:
@@ -534,6 +524,9 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
             "answer": None,
             "failed": True,
             "reason": f"Uncaught: {type(e).__name__}: {e}",
+            # The exception escaped before _run_one_question measured the run.
+            "latency_s": None,
+            "cost_usd": "",
             "retrieved_blocks": [],
         }
 
@@ -565,16 +558,17 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
         "golden_pages": " ".join(f"{p.month}:{p.page}" for p in gold_report_pages),
         "reason": result.get("reason") or "",
         "retrieval_recall": _retrieval_recall(retrieved_blocks, cfg.golden_report.get(uid)),
-        # latency_s / cost_usd are filled in main() from the UID's trace log once it's
-        # flushed (left blank under --no-traces).
-        "latency_s": "",
-        "cost_usd": "",
+        # Wall-clock seconds to plan + execute the query, and USD billed for its generation
+        # calls — both measured in-process by _run_one_question (no trace log needed, so they
+        # are populated under --no-traces too). latency_s is None if the run aborted before
+        # timing; cost_usd is '' when no priced calls ran.
+        "latency_s": result.get("latency_s"),
+        "cost_usd": result.get("cost_usd") or "",
         # Internal helper keys — dropped from the CSV by extrasaction="ignore"; consumed by
-        # main() for the accuracy tally, retrieval cache, and per-UID cost/latency backfill.
+        # main() for the accuracy tally and retrieval cache.
         "correct": correct,
         "failed": result["failed"],
         "retrieved_blocks": retrieved_blocks,
-        "_log_path": log_path,
     }
 
 
@@ -823,11 +817,6 @@ def main() -> None:
                 results[futures[fut]] = fut.result()
 
     rows = [r for r in results if r is not None]
-
-    # Backfill per-UID cost / latency from the now-flushed trace logs (cheap post-hoc
-    # parse — see _log_cost_latency). Blank under --no-traces.
-    for r in rows:
-        r["cost_usd"], r["latency_s"] = _log_cost_latency(r.get("_log_path"))
 
     out = report_path
     with out.open("w", newline="", encoding="utf-8") as f:
