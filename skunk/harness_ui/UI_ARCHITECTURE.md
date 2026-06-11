@@ -163,7 +163,7 @@ permissive CORS configuration.
 
 - Allocates a new immutable `worker_id` UUID for every new client connection.
 - Stores the optional user-supplied `display_name` when Save is pressed.
-- Tracks the connection session and presence for that ephemeral worker.
+- Tracks connection status and last-seen timestamps for that ephemeral worker.
 - Produces mnemonic UI labels such as `Treasury Tables (a13f)`.
 - Resolves the full worker UUID for assignment ownership checks.
 
@@ -183,10 +183,10 @@ those remain the responsibility of the Human Work Broker and atomic Task Registr
   - Transitions the task to `AWAIT_HUMAN`.
   - On claim, transitions intervention to `CLAIMED` (exclusive - cannot be claimed by another worker while active).
   - On release, returns intervention to `PENDING`.
-  - On resolve, sets the response fields and transitions intervention to `RESOLVED`.
+  - On resolve, sets the response fields and any retrieval directives, then transitions intervention to `RESOLVED`.
   - When all interventions for the active attempt are resolved (none remain `PENDING` or `CLAIMED`), transitions the task back to `PROCESSING` and resumes the waiting agent worker.
   - Cleans up and cancels all pending waiters on round close or server shutdown.
-- For mandatory `missing_data` requests, the broker stores the provided `guidance` dict on the `HumanIntervention` record and emits `replan_pending` and `replan` orchestration events at the appropriate lifecycle points.
+- For mandatory `missing_data` requests, the broker stores the provided `guidance` dict on the `HumanIntervention` record; the orchestrator emits `human_pending` before awaiting the human response and `replan` after applying the later plan diff.
 
 ### submission_coordinator.py
 
@@ -238,7 +238,7 @@ AnswerCandidate
 - answer_text: str
 - reasoning: str
 - source_docs: list[str]
-- submission_type: SubmissionType (AGENT | HUMAN)
+- submission_type: str ("agent" | "human")
 - created_at: datetime
 
 FailureRecord
@@ -252,22 +252,16 @@ FailureRecord
 HumanWorker
 - worker_id: uuid
 - display_name: str | None
-- created_at: datetime
-- updated_at: datetime
-
-HumanWorkerSession
-- session_id: uuid
-- worker_id: uuid
 - connected_at: datetime
 - last_seen_at: datetime
-- status: SessionStatus (CONNECTED | DISCONNECTED)
+- connected: bool
 
 HumanAssignment
 - assignment_id: uuid
 - task_id: str
 - worker_id: uuid
 - task_version: int
-- source_kind: AssignmentSource (READY | FAILED)
+- source_kind: str ("READY" | "FAILED")
 - assigned_at: datetime
 - completed_at: datetime | None
 - status: AssignmentStatus (ACTIVE | RELEASED | COMPLETED | SUPERSEDED)
@@ -282,9 +276,10 @@ HumanIntervention
 - source_docs: list[str]
 - status: HumanInterventionStatus (PENDING | CLAIMED | RESOLVED | CANCELLED)
 - claimed_by: uuid | None
-- guidance: dict | None              # populated for mandatory missing_data requests
+- guidance: dict                     # populated for mandatory missing_data requests, empty otherwise
 - response: str | None
 - response_source_docs: list[str]
+- response_retrieval_directives: list[dict]
 - created_at: datetime
 - claimed_at: datetime | None
 - resolved_at: datetime | None
@@ -293,7 +288,7 @@ SubmissionRecord
 - local_submission_id: uuid
 - task_id: str
 - candidate_id: uuid
-- submission_type: SubmissionType
+- submission_type: str
 - status: SubmissionStatus (PENDING | ACCEPTED | REJECTED | SCORED)
 - cup_submission_id: str | None
 - rejection_reason: str | None
@@ -344,8 +339,7 @@ while the round remains active.
 
 When auto-submit is enabled, a generated candidate may move directly from
 `READY` to `SUBMITTING` without a human assignment. Auto-submit uses the same
-validation, idempotency, deadline checks, and Submission Coordinator as manual
-submission.
+validation, deadline checks, and Submission Coordinator as manual submission.
 
 Cup rejection, scoring, and accepted-with-immediate-score feedback are stored
 on the task and automatically appended to the context of any later reasoning
@@ -463,7 +457,6 @@ sequenceDiagram
 - Worker threads use a thread-safe registry boundary. They post completions to
   the async server event loop via an internal async queue, and the event loop
   processes them and broadcasts updates.
-- Mutating HTTP commands carry idempotency keys.
 - Human interventions have exclusive claim: a `PENDING` intervention may be
   claimed by exactly one worker; while `CLAIMED`, no other worker may claim it.
   Only the claiming worker may release or resolve it. Round close and server
@@ -518,11 +511,12 @@ async def human_intervention_handler(
     - `context`: additional background for the human (may be None).
     - `source_docs`: documents or references related to the request.
     - `guidance`: optional dict used for mandatory missing_data requests.
-                  When present, contains keys: recovery_round, partial_plan,
-                  gathered_values, failed_branches, likely_pages, missing, reason.
+                  When present, contains keys such as recovery_round,
+                  previous_round_plan, partial_plan, gathered_values,
+                  failed_branches, likely_pages, missing, reason.
 
-    Returns a dict with keys "response" (str) and "source_docs" (list[str])
-    once a human resolves the intervention.
+    Returns a dict with keys "response" (str), "source_docs" (list[str]), and
+    "retrieval_directives" (list[dict]) once a human resolves the intervention.
     """
 ```
 
@@ -539,12 +533,11 @@ the keyword argument or the pool does not inject it), the `MissingData`
 exception is re-raised and no replan occurs.
 
 Before awaiting the human, the orchestrator emits a plan event labeled
-`replan_pending` carrying the `recovery_round` from the `guidance` dict.
-After resolution and applying the diff, it emits a `replan` event carrying the
-same `recovery_round`. The reasoning summarizer counts unique `recovery_round`
-values across both `replan_pending` and `replan` events, so the Replans
-counter increments while `AWAIT_HUMAN` and does not double-count after
-resolution.
+`human_pending` carrying the `recovery_round` from the `guidance` dict. After
+resolution and applying the diff, it emits a `replan` event carrying the same
+`recovery_round`. The reasoning summarizer counts unique `recovery_round`
+values across pending-human and applied replan events, so the Replans counter
+increments while `AWAIT_HUMAN` and does not double-count after resolution.
 
 The mandatory request's `source_docs` are populated from likely retrieved
 pages, prioritizing pages already attached to gathered values and then
@@ -556,8 +549,8 @@ newly run search-agent retrieval and external lookup branches also expose
 `request_human` for optional additional granular requests. These can have
 kinds like `"pdf_extraction"` or `"external_lookup"`. These are optional and
 the reasoner may decide to call them or not. They are not mandatory for
-recovery. The `RequestHumanTool` sends `None` for the `guidance` argument for
-these optional model-created requests.
+recovery. The `RequestHumanTool` sends no guidance for these optional
+model-created requests, so their serialized `guidance` is empty.
 
 **Async execution model:**
 When the reasoner's `solve()` is `async`, the agent worker thread schedules
@@ -620,26 +613,26 @@ Intervention endpoints behave as follows:
   `claimed_by = requesting worker UUID`. Fails with HTTP 409 (TaskConflict) if already claimed.
 - `release`: sets status back to `PENDING` and clears `claimed_by`. Fails
   with HTTP 409 if not the claiming worker.
-- `resolve`: accepts a JSON body `{"response": string, "source_docs": list[str]}`,
-  sets the intervention status to `RESOLVED`, stores the response data, and
-  triggers the transition back to `PROCESSING` if no other interventions
-  remain pending or claimed.
+- `resolve`: accepts a JSON body with `response`, `source_docs`, and optional
+  `retrieval_directives` entries such as
+  `{"branch_id": 0, "documents": ["Treasury Bulletin 1986-06 PDF"]}`. It sets
+  the intervention status to `RESOLVED`, stores the response data, and triggers
+  the transition back to `PROCESSING` if no other interventions remain pending
+  or claimed.
 
-The WebSocket is server-push only:
+The WebSocket is server-push only and broadcasts complete state snapshots:
 
 ```text
-state_snapshot         # full state on connection (includes interventions)
-task_created           # new task added
-task_updated           # task status changed
-worker_updated         # display name changed
-assignment_created     # new assignment
-assignment_updated     # assignment status changed
-round_updated          # round info changed
-submission_updated     # submission status changed
-score_updated          # score event received
+{
+  "worker": current worker record for this socket,
+  "round": current round state,
+  "tasks": all task records,
+  "workers": all known human worker records
+}
 ```
 
-(The server broadcasts complete snapshots; no separate intervention events are sent.)
+No separate event-type envelopes are sent; clients replace their local state
+with each snapshot.
 
 ### Intervention Card Display (Client UI)
 
@@ -653,7 +646,7 @@ displays the following fields before claim/resolution:
 - **Failed Branches**: each entry in `failed_branches` is displayed with its branch identifier and error.
 
 For optional requests (`kind` other than `"missing_data"), the `guidance`
-field is `None` and these sections are omitted.
+field is empty and these sections are omitted.
 
 The task's Replans metric falls back to the pending intervention's
 `recovery_round` when no completed candidate reasoning exists.
@@ -669,9 +662,9 @@ The task's Replans metric falls back to the pending intervention's
 
 ### events.py
 
-- Defines WebSocket event types and serialization.
-- Manages connected client sessions for push notifications.
-- Broadcasts state changes to all connected clients.
+- Manages connected WebSocket clients for push notifications.
+- Sends a worker-specific full state snapshot on connect.
+- Broadcasts full state snapshots to all connected clients after changes.
 
 ### competition_adapter.py
 
@@ -686,11 +679,10 @@ The task's Replans metric falls back to the pending intervention's
 
 - Defines all data classes:
   `QuestionTask`, `Attempt`, `AnswerCandidate`, `FailureRecord`,
-  `HumanWorker`, `HumanWorkerSession`, `HumanAssignment`, `SubmissionRecord`,
-  `HumanIntervention`
+  `HumanWorker`, `HumanAssignment`, `SubmissionRecord`, `HumanIntervention`
 - Defines enums:
-  `TaskStatus`, `SubmissionType`, `SessionStatus`, `AssignmentStatus`,
-  `SubmissionStatus`, `HumanInterventionStatus`
+  `TaskStatus`, `AssignmentStatus`, `SubmissionStatus`,
+  `HumanInterventionStatus`
 - Provides helper methods for status transitions.
 
 ### task_registry.py
@@ -708,8 +700,9 @@ The task's Replans metric falls back to the pending intervention's
   - Agent Task Queue (task IDs for agent processing)
   - Ready Answer Queue (task IDs with agent success)
   - Failed Task Queue (task IDs with agent failures)
-- Provides thread-safe enqueue and dequeue operations.
-- Provides requeue for retries.
+- Provides thread-safe enqueue operations; worker threads dequeue directly from
+  the underlying bounded queues.
+- Retries are re-enqueued onto the Agent Task Queue.
 
 ### agent_worker_pool.py
 
@@ -729,7 +722,7 @@ The task's Replans metric falls back to the pending intervention's
 
 ### human_worker_registry.py
 
-- Manages in-memory store of `HumanWorker` and `HumanWorkerSession` records.
+- Manages in-memory store of `HumanWorker` records.
 - Creates new worker UUID for each client WebSocket connection.
 - Handles display name updates.
 - Tracks connection status.
@@ -748,13 +741,14 @@ It does not track intervention claims; the HumanWorkBroker handles claim ownersh
   - Creates `HumanIntervention` records in the TaskRegistry, including storing
     the provided `guidance` dict (for mandatory `missing_data` requests).
   - Transitions task to `AWAIT_HUMAN`.
-  - Handles claim, release, and resolve operations from API.
+  - Handles claim, release, and resolve operations from API, including
+    retrieval directives returned with a human resolution.
   - Monitors resolution status and transitions back to `PROCESSING` when all
     interventions for the active attempt are resolved (none remain `PENDING` or `CLAIMED`).
   - Cancels pending interventions on round close or shutdown (marks them `CANCELLED`).
-- For mandatory `missing_data` requests, the broker coordinates with the
-  orchestrator to emit `replan_pending` and `replan` plan events carrying the
-  `recovery_round` from the `guidance`.
+- For mandatory `missing_data` requests, the broker stores and returns the
+  guidance that lets the orchestrator emit `human_pending` and `replan` plan
+  events carrying the `recovery_round`.
 
 ### submission_coordinator.py
 
@@ -811,7 +805,7 @@ or fabricates reasoning or sources.
 
 ## 13. Implementation Status and Verification
 
-### Passed Tests (8 focused unit/integration tests in harness_ui/tests/test_skunk_server.py)
+### Passed Tests (focused unit/integration tests in harness_ui/tests/test_skunk_server.py)
 
 1. First human action supersedes sibling: concurrent claims on the same READY task; first submit moves task to SUBMITTING and marks other assignments SUPERSEDED.
 2. Retry and Cup feedback attach to next attempt: retry creates a new attempt whose feedback field is set; on next agent solve the prompt includes prior feedback.
@@ -819,28 +813,31 @@ or fabricates reasoning or sources.
 4. Worker registry mnemonic names: a worker's display_name is saved via PUT; registry returns mnemonic labels like "Name (abcd)".
 5. Agent worker pool success and failure: pool thread processes a task; on success a candidate is stored and task goes READY; on failure a failure record is stored and task goes FAILED.
 6. API save-name/claim/retry: HTTP endpoints function correctly: PUT saves name, POST /api/assignments creates assignment, POST /api/retries enqueues retry.
-7. Client page controls: the client HTML/JS renders task overview, claim button, submit/retry buttons, and display name form.
-8. Auto-submit with immediate score feedback: an auto-submitted candidate transitions READY -> SUBMITTING -> SUBMITTED; the accepted response stores `correct` and `points_awarded` and appends Cup feedback, but the task remains SUBMITTED; only a later `submission_scored` WebSocket event transitions it to SCORED.
+7. API allows submission without a claim for flows that call `POST /api/submissions` with only a task ID.
+8. Client page controls and source-document helpers: the client HTML/JS renders task overview, claim button, submit/retry buttons, display name form, corpus document listing, and source page routes.
+9. Reasoning payload and source-doc extraction: structured trace payloads are rendered into branch cards/code views and source documents are read from structured step provenance.
+10. Auto-submit with immediate score feedback: an auto-submitted candidate transitions READY -> SUBMITTING -> SUBMITTED; the accepted response stores `correct` and `points_awarded` and appends Cup feedback, but the task remains SUBMITTED; only a later `submission_scored` WebSocket event transitions it to SCORED.
 
 ### Additional Verification Coverage (Human Interventions)
 
-9. Multiple requests resume only after all resolve: a `PROCESSING` task with two `PENDING` interventions stays `AWAIT_HUMAN` until both are resolved; the agent worker resumes only after the last one completes.
-10. Exclusive claim/release/owner checks: a `PENDING` intervention can be claimed by exactly one worker; a second claim attempt returns 409 (TaskConflict). Only the claiming worker may release (returns to `PENDING`) or resolve (stores response); attempted release/resolve by a different worker returns 409.
-11. Broker waiter structured response: the human_intervention_handler returns the human's response as a dict with keys "response" and "source_docs"; the agent orchestrator receives them as a normal observation.
-12. Round-close cancellation: when the round closes while a task is `AWAIT_HUMAN` with pending interventions, the broker cancels all pending and claimed interventions, the agent waiter receives a `RuntimeError('human intervention was cancelled')`, and the task transitions to `CANCELLED`.
-13. API claim/resolve/serialization: `POST /api/interventions/{id}/claim` and `/resolve` work as specified; the state snapshot includes `human_interventions` with all fields serialized.
+11. Multiple requests resume only after all resolve: a `PROCESSING` task with two `PENDING` interventions stays `AWAIT_HUMAN` until both are resolved; the agent worker resumes only after the last one completes.
+12. Exclusive claim/release/owner checks: a `PENDING` intervention can be claimed by exactly one worker; a second claim attempt returns 409 (TaskConflict). Only the claiming worker may release (returns to `PENDING`) or resolve (stores response); attempted release/resolve by a different worker returns 409.
+13. Broker waiter structured response: the human_intervention_handler returns the human's response as a dict with keys "response", "source_docs", and "retrieval_directives"; the agent orchestrator receives them as a normal observation.
+14. Round-close cancellation: when the round closes while a task is `AWAIT_HUMAN` with pending interventions, the broker cancels all pending and claimed interventions, the agent waiter receives a `RuntimeError('human intervention was cancelled')`, and the task transitions to `CANCELLED`.
+15. API claim/resolve/serialization: `POST /api/interventions/{id}/claim` and `/resolve` work as specified; the state snapshot includes `human_interventions` with all fields serialized.
 
 ### Additional Verification (Mandatory MissingData Handling)
 
-14. Mandatory MissingData before replan: when the orchestrator catches a recoverable `MissingData` and a `human_intervention_handler` is configured, it calls the handler with `kind="missing_data"`, waits for resolution, and then replans. The resolved response is added to subsequent replanner and compute inputs as an `AnnotatedValue`. The task transitions through `AWAIT_HUMAN` and back to `PROCESSING`, eventually reaching `READY`.
-15. No-handler no-replan: when no `human_intervention_handler` is configured (the reasoner does not accept the keyword argument or the pool does not inject it), a `MissingData` exception is re-raised, the task transitions to `FAILED`, and no replan occurs.
-16. Worker AWAIT_HUMAN-to-READY after mandatory MissingData: a worker thread that initiated a `missing_data` intervention and waits via `asyncio.run_coroutine_threadsafe` correctly resumes after the intervention is resolved, and the task completes to `READY`.
+16. Mandatory MissingData before replan: when the orchestrator catches a recoverable `MissingData` and a `human_intervention_handler` is configured, it calls the handler with `kind="missing_data"`, waits for resolution, and then replans. The resolved response is added to subsequent replanner and compute inputs as an `AnnotatedValue`. The task transitions through `AWAIT_HUMAN` and back to `PROCESSING`, eventually reaching `READY`.
+17. Document-only human feedback can rerun targeted retrieval before replanning, merge new values into prior branch outcomes, and consume the current recovery round before a structural replan.
+18. No-handler no-replan: when no `human_intervention_handler` is configured (the reasoner does not accept the keyword argument or the pool does not inject it), a `MissingData` exception is re-raised, the task transitions to `FAILED`, and no replan occurs.
+19. Worker AWAIT_HUMAN-to-READY after mandatory MissingData: a worker thread that initiated a `missing_data` intervention and waits via `asyncio.run_coroutine_threadsafe` correctly resumes after the intervention is resolved, and the task completes to `READY`.
 
 ### Additional Verification (Guidance and Replan Events)
 
-17. One-count pending and applied replan events: the orchestrator emits exactly one `replan_pending` event (before awaiting human) and one `replan` event (after resolution) for each mandatory `missing_data` intervention, each carrying the same `recovery_round`. The reasoning summarizer counts unique `recovery_round` values, so the Replans counter increments once while `AWAIT_HUMAN` and does not double-count after the `replan` event.
-18. Likely-page guidance in source_docs: the mandatory `missing_data` request includes `source_docs` populated from the `likely_pages` field of `guidance`, prioritizing pages already attached to gathered values and then deduplicating retrieved BlockRef member pages, capped at eight entries.
-19. Guidance serialization in state snapshot: the `guidance` dict from a mandatory `missing_data` intervention is included in the serialized `HumanIntervention` within the WebSocket state snapshot, with all keys (`recovery_round`, `partial_plan`, `gathered_values`, `failed_branches`, `likely_pages`, `missing`, `reason`) present as JSON objects.
+20. One-count pending and applied replan events: the orchestrator emits one pending-human plan event before awaiting human and one `replan` event after resolution for each mandatory `missing_data` intervention, each carrying the same `recovery_round`. The reasoning summarizer counts unique `recovery_round` values, so the Replans counter increments once while `AWAIT_HUMAN` and does not double-count after the `replan` event.
+21. Likely-page guidance in source_docs: the mandatory `missing_data` request includes `source_docs` populated from the `likely_pages` field of `guidance`, prioritizing pages already attached to gathered values and then deduplicating retrieved BlockRef member pages, capped at eight entries.
+22. Guidance serialization in state snapshot: the `guidance` dict from a mandatory `missing_data` intervention is included in the serialized `HumanIntervention` within the WebSocket state snapshot, with keys such as `recovery_round`, `previous_round_plan`, `partial_plan`, `gathered_values`, `failed_branches`, `likely_pages`, `missing`, and `reason` present as JSON objects.
 
 ### Manual Verification
 
