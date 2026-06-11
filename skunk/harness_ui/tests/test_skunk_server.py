@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from types import SimpleNamespace
+
+import fitz
 import httpx
 import pytest  # type: ignore[import-not-found]
 from fastapi import FastAPI
@@ -22,6 +25,12 @@ from skunk_server.human_worker_registry import HumanWorkerRegistry
 from skunk_server.task_queues import TaskQueues
 from skunk_server.task_registry import TaskConflict, TaskRegistry
 from skunk_server.submission_coordinator import SubmissionCoordinator
+from skunk_reasoner import (
+    SKUNK_ROOT,
+    _set_default_env,
+    _source_docs_from_events,
+    _structured_reasoning_payload,
+)
 
 
 def _ready_task(registry: TaskRegistry, question_id: str = "q1"):
@@ -119,6 +128,14 @@ def test_worker_registry_names_are_mnemonic() -> None:
     assert first.mnemonic == f"Treasury Tables ({first.worker_id[:4]})"
 
 
+def test_reasoner_defaults_page_index_to_repo_cache(monkeypatch) -> None:
+    monkeypatch.delenv("SKUNK_PAGE_INDEX_DIR", raising=False)
+
+    _set_default_env()
+
+    assert os.environ["SKUNK_PAGE_INDEX_DIR"] == str(SKUNK_ROOT / "cache/build_v3")
+
+
 def test_agent_worker_pool_success_and_failure() -> None:
     async def run() -> None:
         loop = asyncio.get_running_loop()
@@ -142,7 +159,10 @@ def test_agent_worker_pool_success_and_failure() -> None:
                 await asyncio.sleep(0.02)
             assert success_task.status == TaskStatus.READY
             assert success_task.latest_candidate is not None
-            assert success_events == [(success_task.task_id, "ready")]
+            assert success_events == [
+                (success_task.task_id, "processing"),
+                (success_task.task_id, "ready"),
+            ]
         finally:
             success_pool.stop()
 
@@ -265,6 +285,64 @@ def test_client_page_contains_server_and_controls() -> None:
     assert "client.js" in response.text
 
 
+def test_client_lists_corpus_documents_newest_first(tmp_path) -> None:
+    pdf_dir = tmp_path / "pdfs"
+    pdf_dir.mkdir()
+    for filename in (
+        "treasury_bulletin_1985_12.pdf",
+        "treasury_bulletin_1986_06.pdf",
+        "treasury_bulletin_1987_13.pdf",
+        "other_document_1985.pdf",
+    ):
+        (pdf_dir / filename).write_bytes(b"%PDF-1.4\n")
+    app = create_client_app("http://example.test:8787", pdf_dir=pdf_dir)
+
+    async def run() -> httpx.Response:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),  # type: ignore[arg-type]
+            base_url="http://test",
+        ) as client:
+            return await client.get("/api/corpus-documents")
+
+    response = asyncio.run(run())
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {
+            "id": "1986-06",
+            "title": "Treasury Bulletin, June 1986",
+            "filename": "treasury_bulletin_1986_06.pdf",
+            "reference": "Treasury Bulletin 1986-06 PDF",
+        },
+        {
+            "id": "1985-12",
+            "title": "Treasury Bulletin, December 1985",
+            "filename": "treasury_bulletin_1985_12.pdf",
+            "reference": "Treasury Bulletin 1985-12 PDF",
+        },
+    ]
+
+
+def test_client_lists_no_documents_for_missing_or_empty_corpus(tmp_path) -> None:
+    async def fetch(pdf_dir) -> httpx.Response:
+        app = create_client_app("http://example.test:8787", pdf_dir=pdf_dir)
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),  # type: ignore[arg-type]
+            base_url="http://test",
+        ) as client:
+            return await client.get("/api/corpus-documents")
+
+    missing_response = asyncio.run(fetch(tmp_path / "missing"))
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    empty_response = asyncio.run(fetch(empty_dir))
+
+    assert missing_response.status_code == 200
+    assert missing_response.json() == []
+    assert empty_response.status_code == 200
+    assert empty_response.json() == []
+
+
 def test_client_source_route_serves_pdf_pages(tmp_path) -> None:
     pdf_dir = tmp_path / "pdfs"
     pdf_dir.mkdir()
@@ -284,6 +362,125 @@ def test_client_source_route_serves_pdf_pages(tmp_path) -> None:
     assert response.headers["content-type"].startswith("application/pdf")
     assert response.headers["content-disposition"].startswith("inline")
     assert response.content.startswith(b"%PDF-1.4")
+
+
+def test_client_source_page_route_renders_and_caches_png(tmp_path) -> None:
+    pdf_dir = tmp_path / "pdfs"
+    cache_root = tmp_path / "page-cache"
+    pdf_dir.mkdir()
+    pdf_path = pdf_dir / "treasury_bulletin_2026_06.pdf"
+    with fitz.open() as document:
+        page = document.new_page(width=200, height=300)
+        page.insert_text((30, 50), "Requested page")
+        document.save(pdf_path)
+    app = create_client_app(
+        "http://example.test:8787",
+        pdf_dir=pdf_dir,
+        page_cache_root=cache_root,
+    )
+
+    async def run() -> tuple[httpx.Response, httpx.Response]:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),  # type: ignore[arg-type]
+            base_url="http://test",
+        ) as client:
+            first = await client.get("/api/source/2026-06/page/1.png")
+            second = await client.get("/api/source/2026-06/page/1.png")
+            return first, second
+
+    first, second = asyncio.run(run())
+    cached_page = cache_root / "renders/2026-06/1.png"
+    assert first.status_code == 200
+    assert first.headers["content-type"].startswith("image/png")
+    assert first.content.startswith(b"\x89PNG\r\n\x1a\n")
+    assert second.content == first.content
+    assert cached_page.read_bytes() == first.content
+
+
+def test_client_source_page_route_rejects_invalid_pages(tmp_path) -> None:
+    pdf_dir = tmp_path / "pdfs"
+    pdf_dir.mkdir()
+    app = create_client_app(
+        "http://example.test:8787",
+        pdf_dir=pdf_dir,
+        page_cache_root=tmp_path / "page-cache",
+    )
+
+    async def run() -> tuple[httpx.Response, httpx.Response]:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),  # type: ignore[arg-type]
+            base_url="http://test",
+        ) as client:
+            invalid_page = await client.get("/api/source/2026-06/page/0.png")
+            missing_page = await client.get("/api/source/2026-06/page/1.png")
+            return invalid_page, missing_page
+
+    invalid_page, missing_page = asyncio.run(run())
+    assert invalid_page.status_code == 400
+    assert missing_page.status_code == 404
+
+
+def test_reasoning_payload_includes_branch_cards_and_code() -> None:
+    events = [
+        {
+            "kind": "plan",
+            "data": {
+                "label": "initial",
+                "branches": [
+                    {"branch_id": 0, "kind": "retrieve", "key": "inflation", "period": "1954-02", "as_of": "1954-02"},
+                    {"branch_id": 1, "kind": "lookup_external", "target": "cpi", "src": "fred"},
+                ],
+            },
+        },
+        {
+            "kind": "step",
+            "op": "extract",
+            "data": {"branch_id": 0, "summary": {"type": "values", "values": [{"description": "inflation"}]}},
+        },
+        {
+            "kind": "step",
+            "op": "lookup_external",
+            "data": {"branch_id": 1, "summary": {"type": "scalar", "value": 3.1}},
+        },
+        {
+            "kind": "step",
+            "op": "compute",
+            "data": {"attempt": 1, "code": "result = '42'"},
+        },
+    ]
+
+    payload = _structured_reasoning_payload(events, ["Treasury Bulletin 1954-02 PDF page 4"])
+
+    assert payload["summary"]["branch_count"] == 2
+    assert payload["branches"][0]["searched"]["key"] == "inflation"
+    assert payload["branches"][1]["searched"]["target"] == "cpi"
+    assert payload["python_code"] == "result = '42'"
+
+
+def test_source_docs_are_read_from_structured_step_provenance() -> None:
+    events = [
+        {
+            "kind": "step",
+            "op": "extract",
+            "data": {
+                "summary": {
+                    "type": "values",
+                    "values": [
+                        {
+                            "description": "reported value",
+                            "bulletin": "1954-02",
+                            "pages": [4, 5],
+                        }
+                    ],
+                }
+            },
+        }
+    ]
+
+    assert _source_docs_from_events(events) == [
+        "Treasury Bulletin 1954-02 PDF page 4",
+        "Treasury Bulletin 1954-02 PDF page 5",
+    ]
 
 
 def test_auto_submit_records_immediate_score_feedback() -> None:

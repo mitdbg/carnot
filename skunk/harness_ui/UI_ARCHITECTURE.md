@@ -46,6 +46,8 @@
 |                  |                           |                             |                    |
 |                  |                           | Assigns ready/failed work   |                    |
 |                  |                           | to one or more workers      |                    |
+|                  |                           | Handles human interventions |                    |
+|                  |                           | and request_human handling  |                    |
 |                  +--------------+------------+--------------+---------------+                    |
 |                  |                            |                            |                    |
 |                  |                            v                            v                    |
@@ -54,8 +56,8 @@
 |                  |           |                           | |                             |      |
 |                  |           | Validates manual or auto  | | Worker UUIDs, sessions,     |      |
 |                  |           | submissions, delegates to | | display names, presence     |      |
-|                  |           | competition_adapter       | +-----------------------------+      |
-|                  |           +---------------------------+                                      |
+|                  |           | competition_adapter       | |                             |      |
+|                  |           +---------------------------+ +-----------------------------+      |
 |                  |                                                                             |
 |  +------------------------------------------------------------------------------------------+   |
 |  | server.py                                                                                |   |
@@ -86,6 +88,7 @@ and skunk_client.
 - Assigns ready and failed tasks to one or more human workers.
 - Validates and forwards manual or configured automatic submissions.
 - Publishes state changes to connected clients.
+- Manages human intervention lifecycle (requests, claims, resolution).
 
 The server does not render reasoning itself, fabricate missing reasoning, or
 allow clients to contact the Competition Server or orchestrators directly.
@@ -106,6 +109,14 @@ It contains no queue scheduling or human-workflow policy.
 - Invoke `skunk_reasoner.solve(prompt)` where prompt includes retry feedback
   and available Cup rejection or scoring feedback appended by the server for
   backward compatibility.
+- When the orchestrator or reasoner encounters a recoverable `MissingData`, it
+  **must** call the configured `human_intervention_handler` (if one is provided)
+  with `kind="missing_data"` and await a response before replanning. If no
+  handler is configured, the `MissingData` is re-raised and no replan occurs.
+- Additionally, during the first internal recovery round after `MissingData`,
+  newly run search-agent retrieval and external lookup branches may expose
+  `request_human` for optional additional granular requests (e.g.,
+  `pdf_extraction`, `external_lookup`).
 - Store an `AnswerCandidate` on success.
 - Normalize exceptions into a `FailureRecord`.
 - Post completions back to the server event loop via a thread-safe async queue.
@@ -134,6 +145,13 @@ claimed by multiple workers:
 The first valid action atomically transitions the task. Other active
 assignments for the old task version become `SUPERSEDED`.
 
+Additionally, the client displays an "Await Human" summary count and status area
+for each task that is in `AWAIT_HUMAN` processing. Request cards show the
+kind, instructions, context, and source document links. Each request card
+has a Claim button (if status is `PENDING`) and, if claimed by the current
+worker, a Release button and response controls (text area for response,
+textarea for one source reference per line, and a Resolve button).
+
 Clients are thin interfaces. They do not own durable task state, Cup
 credentials, or reasoning runtimes.
 
@@ -149,8 +167,40 @@ permissive CORS configuration.
 - Produces mnemonic UI labels such as `Treasury Tables (a13f)`.
 - Resolves the full worker UUID for assignment ownership checks.
 
-It does not assign tasks or decide which human action wins; those remain the
-responsibility of the Human Work Broker and atomic Task Registry transitions.
+It does not assign tasks, decide which human action wins, or track intervention claims;
+those remain the responsibility of the Human Work Broker and atomic Task Registry transitions.
+
+### Human Work Broker (extended)
+
+- Handles assignment creation when human claims a task.
+- Processes retry requests with feedback.
+- Processes direct human answer submissions.
+- Validates assignment ownership and task version.
+- Coordinates with TaskRegistry for atomic transitions.
+- Manages `request_human` intervention lifecycle:
+  - Receives intervention requests from agent workers (via the task's bound handler).
+  - Creates a `HumanIntervention` record in the task.
+  - Transitions the task to `AWAIT_HUMAN`.
+  - On claim, transitions intervention to `CLAIMED` (exclusive - cannot be claimed by another worker while active).
+  - On release, returns intervention to `PENDING`.
+  - On resolve, sets the response fields and transitions intervention to `RESOLVED`.
+  - When all interventions for the active attempt are resolved (none remain `PENDING` or `CLAIMED`), transitions the task back to `PROCESSING` and resumes the waiting agent worker.
+  - Cleans up and cancels all pending waiters on round close or server shutdown.
+- For mandatory `missing_data` requests, the broker stores the provided `guidance` dict on the `HumanIntervention` record and emits `replan_pending` and `replan` orchestration events at the appropriate lifecycle points.
+
+### submission_coordinator.py
+
+- Validates submission requests (deadline checks, protocol limits).
+- Handles both manual submission and auto-submit configuration.
+- Dispatches to CompetitionAdapter for Cup communication.
+- Stores submission records on success or failure.
+
+### server.py
+
+- Composition root: creates all modules with dependency injection.
+- Manages process startup: initializes queues, pools, adapters.
+- Manages shutdown: graceful worker thread termination, cleanup.
+- Configures and starts the FastAPI application.
 
 ## 3. Authoritative Records
 
@@ -170,6 +220,7 @@ QuestionTask
 - version: int
 - created_at: datetime
 - updated_at: datetime
+- human_interventions: list[HumanIntervention]
 
 Attempt
 - attempt_id: uuid
@@ -221,6 +272,23 @@ HumanAssignment
 - completed_at: datetime | None
 - status: AssignmentStatus (ACTIVE | RELEASED | COMPLETED | SUPERSEDED)
 
+HumanIntervention
+- intervention_id: uuid
+- task_id: str
+- attempt_id: uuid
+- kind: str                          # e.g. "missing_data", "pdf_extraction", "external_lookup"
+- instructions: str
+- context: str | None
+- source_docs: list[str]
+- status: HumanInterventionStatus (PENDING | CLAIMED | RESOLVED | CANCELLED)
+- claimed_by: uuid | None
+- guidance: dict | None              # populated for mandatory missing_data requests
+- response: str | None
+- response_source_docs: list[str]
+- created_at: datetime
+- claimed_at: datetime | None
+- resolved_at: datetime | None
+
 SubmissionRecord
 - local_submission_id: uuid
 - task_id: str
@@ -247,6 +315,8 @@ stateDiagram-v2
     RETRY_QUEUED --> PROCESSING: agent claims
     PROCESSING --> READY: answer candidate
     PROCESSING --> FAILED: execution failure
+    PROCESSING --> AWAIT_HUMAN: agent issues request_human
+    AWAIT_HUMAN --> PROCESSING: all interventions resolved
 
     READY --> READY: assign human worker
     READY --> SUBMITTING: first valid submit or auto-submit
@@ -264,6 +334,7 @@ stateDiagram-v2
     FAILED --> CANCELLED: round closes
     QUEUED --> CANCELLED: round closes
     RETRY_QUEUED --> CANCELLED: round closes
+    AWAIT_HUMAN --> CANCELLED: round closes
 ```
 
 A Cup business rejection or a transport/network failure during submission
@@ -284,6 +355,13 @@ Human assignments do not change the task from `READY` or `FAILED`. An action
 must include its `assignment_id` and observed `task_version`. The first valid
 action advances the task and marks other active assignments for that version
 as `SUPERSEDED`.
+
+A human intervention (request) transitions `PROCESSING` to `AWAIT_HUMAN`. The
+task stays in `AWAIT_HUMAN` as long as at least one `PENDING` or `CLAIMED`
+intervention exists for the active attempt. When all such interventions are
+`RESOLVED` (not `CANCELLED`), the task returns to `PROCESSING` and the waiting
+agent worker resumes. If the round closes while in `AWAIT_HUMAN`, the task
+transitions to `CANCELLED` and all interventions are marked `CANCELLED`.
 
 ## 5. Normal Submission Flow
 
@@ -386,6 +464,11 @@ sequenceDiagram
   the async server event loop via an internal async queue, and the event loop
   processes them and broadcasts updates.
 - Mutating HTTP commands carry idempotency keys.
+- Human interventions have exclusive claim: a `PENDING` intervention may be
+  claimed by exactly one worker; while `CLAIMED`, no other worker may claim it.
+  Only the claiming worker may release or resolve it. Round close and server
+  shutdown cancel all pending and claimed interventions, waking any waiting
+  agent workers with a cancellation signal.
 
 ## 8. Reasoner Contract
 
@@ -411,6 +494,99 @@ worker loop. Workers can invoke either a synchronous or async `solve()`
 depending on the underlying orchestrator; the interface is compatible with
 both.
 
+### Human Intervention Extension
+
+For orchestrators or reasoners that support human-in-the-loop requests, the
+Agent Worker pool injects an async `human_intervention_handler` function into
+the reasoner's execution context. This handler is provided only if the
+reasoner accepts a keyword argument named `human_intervention_handler`;
+prompt-only reasoners are unaffected.
+
+```python
+async def human_intervention_handler(
+    kind: str,
+    instructions: str,
+    context: str | None,
+    source_docs: list[str],
+    guidance: dict | None = None
+) -> dict[str, Any]:
+    """
+    Called by the reasoner to request human assistance.
+
+    - `kind`: a label like "missing_data", "pdf_extraction", or "external_lookup".
+    - `instructions`: what the human should do.
+    - `context`: additional background for the human (may be None).
+    - `source_docs`: documents or references related to the request.
+    - `guidance`: optional dict used for mandatory missing_data requests.
+                  When present, contains keys: recovery_round, partial_plan,
+                  gathered_values, failed_branches, likely_pages, missing, reason.
+
+    Returns a dict with keys "response" (str) and "source_docs" (list[str])
+    once a human resolves the intervention.
+    """
+```
+
+**Mandatory MissingData handling:**
+When the orchestrator or reasoner catches a recoverable `MissingData` (e.g., a
+failed identifier lookup), it **must** call the configured
+`human_intervention_handler` with `kind="missing_data"` and await the
+response before replanning. This request includes the failure reason and
+missing identifiers in `instructions`. It places the task in `AWAIT_HUMAN`
+through the broker. The resolved response (the human's answer) is then added
+to subsequent replanner and compute inputs as an `AnnotatedValue`. If no
+`human_intervention_handler` is configured (i.e., the reasoner does not accept
+the keyword argument or the pool does not inject it), the `MissingData`
+exception is re-raised and no replan occurs.
+
+Before awaiting the human, the orchestrator emits a plan event labeled
+`replan_pending` carrying the `recovery_round` from the `guidance` dict.
+After resolution and applying the diff, it emits a `replan` event carrying the
+same `recovery_round`. The reasoning summarizer counts unique `recovery_round`
+values across both `replan_pending` and `replan` events, so the Replans
+counter increments while `AWAIT_HUMAN` and does not double-count after
+resolution.
+
+The mandatory request's `source_docs` are populated from likely retrieved
+pages, prioritizing pages already attached to gathered values and then
+deduplicating retrieved BlockRef member pages, capped at eight.
+
+**Optional additional requests during first internal recovery round:**
+Separately, during the first internal `MissingData` recovery round only,
+newly run search-agent retrieval and external lookup branches also expose
+`request_human` for optional additional granular requests. These can have
+kinds like `"pdf_extraction"` or `"external_lookup"`. These are optional and
+the reasoner may decide to call them or not. They are not mandatory for
+recovery. The `RequestHumanTool` sends `None` for the `guidance` argument for
+these optional model-created requests.
+
+**Async execution model:**
+When the reasoner's `solve()` is `async`, the agent worker thread schedules
+the coroutine on the server's asyncio loop via
+`asyncio.run_coroutine_threadsafe()` and waits for the result using
+`future.result()`. This design keeps the human intervention APIs and the
+suspended reasoner on the same asyncio loop, allowing the handler to
+correctly await human resolution events that are processed on that loop.
+
+If the reasoner's `human_intervention_handler` is called (whether for
+mandatory `missing_data` or optional requests), it:
+
+1. Creates a `HumanIntervention` record with status `PENDING`, storing the
+   provided `guidance` dict (if any) in the record.
+2. Transitions the task to `AWAIT_HUMAN` via the Task Registry.
+3. Waits (asynchronously) until the intervention is resolved or cancelled.
+4. On resolution, returns a dict with the human's response and any attached
+   source documents.
+5. On cancellation (e.g., round close or shutdown), raises a
+   `RuntimeError('human intervention was cancelled')` that the reasoner should
+   handle gracefully.
+
+Only the first internal `MissingData` recovery round (per attempt) exposes
+`request_human` for the optional additional branches; subsequent missing data
+may be handled locally. The `MultiTurnAgent` orchestrator awaits the handler
+and receives the response as a normal observation. The `AgentWorkerPool`
+injects the handler; `RequestHumanTool` invokes it; the pool does not intercept
+tool calls directly.
+
 ## 9. Client Protocol
 
 HTTP is authoritative for commands:
@@ -425,6 +601,9 @@ POST /api/assignments/{assignment_id}/release  # release a claim
 POST /api/submissions        # submit an AGENT candidate
 POST /api/retries            # request retry with feedback
 POST /api/human-answers      # submit a direct human answer
+POST /api/interventions/{intervention_id}/claim   # claim a PENDING intervention
+POST /api/interventions/{intervention_id}/release # release a CLAIMED intervention
+POST /api/interventions/{intervention_id}/resolve # submit response and resolve
 ```
 
 The server creates a new worker UUID when the client WebSocket connection is
@@ -435,10 +614,21 @@ the task overview's Claim button and is valid only for `READY` or `FAILED`
 tasks. Assignments and task views include both the UUID and the mnemonic label
 `Treasury Tables (a13f)`.
 
+Intervention endpoints behave as follows:
+
+- `claim`: sets the intervention status to `CLAIMED` and records
+  `claimed_by = requesting worker UUID`. Fails with HTTP 409 (TaskConflict) if already claimed.
+- `release`: sets status back to `PENDING` and clears `claimed_by`. Fails
+  with HTTP 409 if not the claiming worker.
+- `resolve`: accepts a JSON body `{"response": string, "source_docs": list[str]}`,
+  sets the intervention status to `RESOLVED`, stores the response data, and
+  triggers the transition back to `PROCESSING` if no other interventions
+  remain pending or claimed.
+
 The WebSocket is server-push only:
 
 ```text
-state_snapshot         # full state on connection
+state_snapshot         # full state on connection (includes interventions)
 task_created           # new task added
 task_updated           # task status changed
 worker_updated         # display name changed
@@ -448,6 +638,25 @@ round_updated          # round info changed
 submission_updated     # submission status changed
 score_updated          # score event received
 ```
+
+(The server broadcasts complete snapshots; no separate intervention events are sent.)
+
+### Intervention Card Display (Client UI)
+
+For mandatory `missing_data` interventions, the client intervention card
+displays the following fields before claim/resolution:
+
+- **Recovery round**: the `recovery_round` value from `guidance`.
+- **Likely Source Pages**: clickable PDF links for each page in the `likely_pages` list from `guidance`.
+- **Partial Plan**: the `partial_plan` dict from `guidance`, formatted as a nested list.
+- **Gathered Values**: each entry in `gathered_values` is displayed with its description, value, unit, bulletin, and pages.
+- **Failed Branches**: each entry in `failed_branches` is displayed with its branch identifier and error.
+
+For optional requests (`kind` other than `"missing_data"), the `guidance`
+field is `None` and these sections are omitted.
+
+The task's Replans metric falls back to the pending intervention's
+`recovery_round` when no completed candidate reasoning exists.
 
 ## 10. Endpoints and Module Responsibilities
 
@@ -477,10 +686,11 @@ score_updated          # score event received
 
 - Defines all data classes:
   `QuestionTask`, `Attempt`, `AnswerCandidate`, `FailureRecord`,
-  `HumanWorker`, `HumanWorkerSession`, `HumanAssignment`, `SubmissionRecord`
+  `HumanWorker`, `HumanWorkerSession`, `HumanAssignment`, `SubmissionRecord`,
+  `HumanIntervention`
 - Defines enums:
   `TaskStatus`, `SubmissionType`, `SessionStatus`, `AssignmentStatus`,
-  `SubmissionStatus`
+  `SubmissionStatus`, `HumanInterventionStatus`
 - Provides helper methods for status transitions.
 
 ### task_registry.py
@@ -489,6 +699,7 @@ score_updated          # score event received
 - Implements atomic state transitions with version checking.
 - Creates and queries tasks, attempts, candidates, failures, submissions.
 - Manages assignment lifecycle (create, supersede, complete).
+- Manages intervention lifecycle (create, claim, release, resolve, cancel).
 - Thread-safe access via locking.
 
 ### task_queues.py
@@ -505,9 +716,16 @@ score_updated          # score event received
 - Launches and manages worker threads.
 - Worker threads claim task IDs from Agent Task Queue.
 - Each worker invokes `skunk_reasoner.solve(prompt)`.
+- When the reasoner accepts the `human_intervention_handler` keyword argument,
+  the worker injects a task-bound handler that communicates with the
+  HumanWorkBroker. The pool does not intercept tool calls directly.
 - On success, stores `AnswerCandidate` and enqueues to Ready Answer Queue.
 - On failure, stores `FailureRecord` and enqueues to Failed Task Queue.
 - Posts completions to async event loop via thread-safe async queue.
+- For async `solve()` invocations, the worker schedules the coroutine on the
+  server's asyncio loop using `asyncio.run_coroutine_threadsafe()` and blocks
+  the thread on the resulting `Future`. This ensures the handler's wait for
+  human resolution runs on the same loop that processes resolution events.
 
 ### human_worker_registry.py
 
@@ -517,6 +735,8 @@ score_updated          # score event received
 - Tracks connection status.
 - Produces mnemonic labels.
 
+It does not track intervention claims; the HumanWorkBroker handles claim ownership.
+
 ### human_work_broker.py
 
 - Handles assignment creation when human claims a task.
@@ -524,6 +744,17 @@ score_updated          # score event received
 - Processes direct human answer submissions.
 - Validates assignment ownership and task version.
 - Coordinates with TaskRegistry for atomic transitions.
+- Manages `request_human` lifecycle:
+  - Creates `HumanIntervention` records in the TaskRegistry, including storing
+    the provided `guidance` dict (for mandatory `missing_data` requests).
+  - Transitions task to `AWAIT_HUMAN`.
+  - Handles claim, release, and resolve operations from API.
+  - Monitors resolution status and transitions back to `PROCESSING` when all
+    interventions for the active attempt are resolved (none remain `PENDING` or `CLAIMED`).
+  - Cancels pending interventions on round close or shutdown (marks them `CANCELLED`).
+- For mandatory `missing_data` requests, the broker coordinates with the
+  orchestrator to emit `replan_pending` and `replan` plan events carrying the
+  `recovery_round` from the `guidance`.
 
 ### submission_coordinator.py
 
@@ -571,6 +802,9 @@ or fabricates reasoning or sources.
 - Only the first valid action for a task version may transition the task.
 - UI assignment labels include the saved display name and a short UUID suffix;
   assignment ownership checks always use the full immutable UUID.
+- Intervention claims are exclusive: only one worker may hold a `CLAIMED`
+  intervention at a time, and only that worker may release or resolve it.
+  Conflict responses use HTTP 409 (TaskConflict).
 - Internal errors and tracebacks are sanitized before being sent to clients.
 - In-memory only: state is lost on server restart. No SQLite or other
   persistence is implemented.
@@ -587,6 +821,26 @@ or fabricates reasoning or sources.
 6. API save-name/claim/retry: HTTP endpoints function correctly: PUT saves name, POST /api/assignments creates assignment, POST /api/retries enqueues retry.
 7. Client page controls: the client HTML/JS renders task overview, claim button, submit/retry buttons, and display name form.
 8. Auto-submit with immediate score feedback: an auto-submitted candidate transitions READY -> SUBMITTING -> SUBMITTED; the accepted response stores `correct` and `points_awarded` and appends Cup feedback, but the task remains SUBMITTED; only a later `submission_scored` WebSocket event transitions it to SCORED.
+
+### Additional Verification Coverage (Human Interventions)
+
+9. Multiple requests resume only after all resolve: a `PROCESSING` task with two `PENDING` interventions stays `AWAIT_HUMAN` until both are resolved; the agent worker resumes only after the last one completes.
+10. Exclusive claim/release/owner checks: a `PENDING` intervention can be claimed by exactly one worker; a second claim attempt returns 409 (TaskConflict). Only the claiming worker may release (returns to `PENDING`) or resolve (stores response); attempted release/resolve by a different worker returns 409.
+11. Broker waiter structured response: the human_intervention_handler returns the human's response as a dict with keys "response" and "source_docs"; the agent orchestrator receives them as a normal observation.
+12. Round-close cancellation: when the round closes while a task is `AWAIT_HUMAN` with pending interventions, the broker cancels all pending and claimed interventions, the agent waiter receives a `RuntimeError('human intervention was cancelled')`, and the task transitions to `CANCELLED`.
+13. API claim/resolve/serialization: `POST /api/interventions/{id}/claim` and `/resolve` work as specified; the state snapshot includes `human_interventions` with all fields serialized.
+
+### Additional Verification (Mandatory MissingData Handling)
+
+14. Mandatory MissingData before replan: when the orchestrator catches a recoverable `MissingData` and a `human_intervention_handler` is configured, it calls the handler with `kind="missing_data"`, waits for resolution, and then replans. The resolved response is added to subsequent replanner and compute inputs as an `AnnotatedValue`. The task transitions through `AWAIT_HUMAN` and back to `PROCESSING`, eventually reaching `READY`.
+15. No-handler no-replan: when no `human_intervention_handler` is configured (the reasoner does not accept the keyword argument or the pool does not inject it), a `MissingData` exception is re-raised, the task transitions to `FAILED`, and no replan occurs.
+16. Worker AWAIT_HUMAN-to-READY after mandatory MissingData: a worker thread that initiated a `missing_data` intervention and waits via `asyncio.run_coroutine_threadsafe` correctly resumes after the intervention is resolved, and the task completes to `READY`.
+
+### Additional Verification (Guidance and Replan Events)
+
+17. One-count pending and applied replan events: the orchestrator emits exactly one `replan_pending` event (before awaiting human) and one `replan` event (after resolution) for each mandatory `missing_data` intervention, each carrying the same `recovery_round`. The reasoning summarizer counts unique `recovery_round` values, so the Replans counter increments once while `AWAIT_HUMAN` and does not double-count after the `replan` event.
+18. Likely-page guidance in source_docs: the mandatory `missing_data` request includes `source_docs` populated from the `likely_pages` field of `guidance`, prioritizing pages already attached to gathered values and then deduplicating retrieved BlockRef member pages, capped at eight entries.
+19. Guidance serialization in state snapshot: the `guidance` dict from a mandatory `missing_data` intervention is included in the serialized `HumanIntervention` within the WebSocket state snapshot, with all keys (`recovery_round`, `partial_plan`, `gathered_values`, `failed_branches`, `likely_pages`, `missing`, `reason`) present as JSON objects.
 
 ### Manual Verification
 

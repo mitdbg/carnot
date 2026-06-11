@@ -17,8 +17,12 @@ from skunk_server.domain import AnswerCandidate, Attempt, FailureRecord
 from skunk_server.task_queues import TaskQueues
 from skunk_server.task_registry import TaskRegistry
 
-Reasoner = Callable[[str], AgentAnswer | dict[str, Any] | Any]
+Reasoner = Callable[..., AgentAnswer | dict[str, Any] | Any]
 CompletionCallback = Callable[[str, str], None]
+HumanRequester = Callable[
+    [str, str, str, str, str | None, list[str], dict[str, Any] | None],
+    Any,
+]
 
 
 class AgentWorkerPool:
@@ -28,11 +32,24 @@ class AgentWorkerPool:
         queues: TaskQueues,
         reasoner: Reasoner,
         max_workers: int,
+        human_requester: HumanRequester | None = None,
     ) -> None:
         self._registry = registry
         self._queues = queues
         self._reasoner = reasoner
         self._max_workers = max(1, max_workers)
+        self._human_requester = human_requester
+        try:
+            parameters = inspect.signature(reasoner).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        self._reasoner_accepts_human = (
+            "human_intervention_handler" in parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        )
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -79,15 +96,47 @@ class AgentWorkerPool:
             if attempt is None:
                 self._queues.agent.task_done()
                 continue
+            if self._loop is not None and self._on_completion is not None:
+                self._loop.call_soon_threadsafe(
+                    self._on_completion,
+                    task_id,
+                    "processing",
+                )
             outcome = "failed"
             try:
                 task = self._registry.get(task_id)
                 if task is None:
                     continue
                 prompt = self._reasoner_prompt(task.prompt, attempt)
-                raw = self._reasoner(prompt)
+                if self._human_requester is not None and self._reasoner_accepts_human:
+                    async def request_human(
+                        kind: str,
+                        instructions: str,
+                        context: str | None,
+                        source_docs: list[str],
+                        guidance: dict[str, Any] | None = None,
+                    ) -> dict[str, Any]:
+                        return await self._human_requester(
+                            task_id,
+                            attempt.attempt_id,
+                            kind,
+                            instructions,
+                            context,
+                            source_docs,
+                            guidance,
+                        )
+
+                    raw = self._reasoner(
+                        prompt,
+                        human_intervention_handler=request_human,
+                    )
+                else:
+                    raw = self._reasoner(prompt)
                 if inspect.isawaitable(raw):
-                    raw = asyncio.run(raw)
+                    if self._loop is None:
+                        raw = asyncio.run(raw)
+                    else:
+                        raw = asyncio.run_coroutine_threadsafe(raw, self._loop).result()
                 answer, reasoning, source_docs = self._normalize_answer(raw)
                 candidate = AnswerCandidate(
                     attempt_id=attempt.attempt_id,

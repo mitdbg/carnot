@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from skunk.lookup_tools import DEFAULT_PRIORITIZATION, resolve_lookup_tools
 from skunk.common import AnnotatedValue, ExecutionContext
+from skunk.human_intervention import RequestHumanTool
 from skunk.multi_turn_agent import MultiTurnAgent, Tool
 from skunk.plan import LookupBranch
 
@@ -71,9 +72,12 @@ Tool steps have `math`, `statistics`, `datetime`, `numpy as np`,
 
 class LookupExternalOp:
     async def run(self, ctx: ExecutionContext, branch: LookupBranch) -> list[AnnotatedValue]:
+        tools = resolve_lookup_tools(ctx.config)
+        if ctx.human_intervention_enabled and ctx.human_intervention_handler is not None:
+            tools = [*tools, RequestHumanTool(ctx.human_intervention_handler)]
         agent = LookupAgent(
             max_steps=ctx.config.lookup_max_steps,
-            tools=resolve_lookup_tools(ctx.config),
+            tools=tools,
             max_parallel_tool_calls=ctx.config.lookup_max_parallel_tool_calls,
         )
         user_msg = branch.model_dump_json(
