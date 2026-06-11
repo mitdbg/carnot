@@ -223,34 +223,27 @@ to every target.
     _BLOCK_SELECT_PROMPT = """\
 You select which already-filtered Treasury Bulletin content blocks actually carry the data the given retrieval
 target needs, in the context of the question. Candidate blocks are one per line. Each line starts with its
-`block_id` `YYYY_MM_page#block` — the leading `YYYY_MM` is the ISSUE (the bulletin's publication month) the block
-appears in — then `dates=`, the time span the block's DATA covers, then a
-compact summary (title, column/row labels) — NOT the numbers.
+`block_id`, then `dates=`, the time span the block's data covers, then a compact summary (title, column/row labels) — NOT the numbers.
 
-Return ONLY the blocks that most directly report the target's data, best-first, and never more
-than the cap stated in the request — fewer when fewer are appropriate. Apply the rules below
-IN ORDER — when two rules disagree, the earlier one wins:
+Judge EACH block and mark `true` only the ones that most directly report the target's data and `false` for every other block.
+Respect the cap given, and return fewer blocks when fewer fit. Apply the rules below when deciding:
   - If the question pins a specific source ("as reported in the <Month Year> Bulletin", "as of <date>"), select
-    blocks that best match that source; the explicit wording overrides the generic data period.
-  - Otherwise prefer the block whose title / headers / `dates=` span match the target most precisely. Beware of the EXACT scope
-    of the target: a row/column label that wraps the concept in extra words — "<concept> and
+    blocks that best match that source.
+  - Otherwise prefer the block whose title / headers / date range  match the target most precisely. Beware of the EXACT
+    scope of the target: a row/column label that wraps the concept in extra words — "<concept> and
     related activities", "<concept>, including …", etc. — names a BROADER aggregate and will have different values from
     the bare concept. Prefer the block that reports exactly the asked scope.
-  - When the same figure is restated across many issues, prefer the most recent issue unless the question
-    explicitly asks for a version.
-  - One block per statistic per period of the data period; fewer than the cap is
-    better than padding with reprints.
+  - When the same figure is restated across many issues, prefer the most recent issue that covers all of the required
+    period unless the question explicitly asks for a version.
 
 ## Output
 
-A single JSON object, no prose, no markdown fences, listing the selected ids (best first, no
-more than the requested cap) under "block_ids":
-  {"block_ids": ["2001_06_41#0"]}
-Use each `block_id` exactly as it appears."""
+A single bare JSON array of booleans — no prose, no markdown fences — one entry per candidate block, in the
+SAME ORDER given: `true` to SELECT the block, `false` to drop it. No more than the requested cap may be `true`.
+  [true, false, false, ...]"""
 
-    _GROUP_SIZE = 64  # blocks per tournament call
-    _KEEP = 4  # blocks kept per group; output cap for a single-interval branch
-    _KEEP_PER_INTERVAL = 2  # output cap per interval of a multi-interval (comma) period
+    _GROUP_SIZE = 32  # blocks per selection call
+    _KEEP = 4  # uniform cap: blocks kept per group AND final blocks kept per period
 
     # -- construction ----------------------------------------------------------
 
@@ -700,44 +693,32 @@ Use each `block_id` exactly as it appears."""
         parts = [f'Research question: "{question}"', f"Retrieval target: {branch.key}"]
         if period_label or branch.period:
             parts.append(f"Data period: {period_label or branch.period}")
-        if isinstance(branch.as_of, str) and branch.as_of:
-            # Whole-branch pin only; per-entry (list) pins surface through each
-            # tournament's period_label instead.
-            parts.append(
-                f"Reported in / as of (issue pinned by the plan): {branch.as_of}"
-            )
-        parts.append(f"Candidate blocks — return at most {keep}:\n" + "\n".join(lines))
+        n = len(items)
+        parts.append(
+            f"Candidate blocks ({n}) — mark true the AT MOST {keep} that best report the target, "
+            "false for the rest:\n" + "\n".join(lines)
+        )
         user = "\n".join(parts)
 
-        valid_ids = {bid for bid, _ in items}
+        def _parse(text: str, _ctx: ExecutionContext) -> list[bool]:
+            # Parity-checked boolean array (one true/false per block); a wrong length
+            # ParseErrors → PromptedCall retries.
+            return self._parse_bool_list(text, _ctx, n=n)
 
-        def _parse(text: str, _ctx: ExecutionContext) -> list[str]:
-            obj = parse_json_response(text)
-            ids = obj.get("block_ids") if isinstance(obj, dict) else None
-            if isinstance(ids, str):
-                ids = [ids]
-            if not isinstance(ids, list):
-                raise ParseError(text, 'expected {"block_ids": [...]}')
-            for i in ids:
-                if str(i) not in valid_ids:
-                    raise ParseError(
-                        text,
-                        f"unknown block_id {str(i)!r} — return only ids from the candidate list",
-                    )
-            return list(dict.fromkeys(str(i) for i in ids))[:keep]
-
-        call: PromptedCall[list[str]] = PromptedCall(
+        call: PromptedCall[list[bool]] = PromptedCall(
             name="block_select",
             system_prompt=self._BLOCK_SELECT_PROMPT,
             parse=_parse,
-            # Thinking OFF: validated no recall regression vs medium, ~10x faster per call.
-            default_effort="off",
+            default_effort="off",  # per-block boolean keep/drop, thinking off
             output_instruction=(
-                f'Output ONLY a JSON object {{"block_ids": [...]}} with AT MOST {keep} '
-                "ids, best first (or an empty list if none fit) — no prose."
+                f"Output ONLY a JSON array of EXACTLY {n} booleans — one per block, in the order "
+                f"given (true=select, false=drop), with AT MOST {keep} true. No prose, no markdown fences."
             ),
         )
-        return await call.call(ctx, user, temperature=0.0)
+        verdicts = await call.call(ctx, user, temperature=0.0)
+        # Keep the selected (true) ids in input order, capped at `keep` (defensive — the prompt
+        # already asks for ≤keep true; truncation only bites if the model over-selects).
+        return [bid for (bid, _), keep_it in zip(items, verdicts) if keep_it][:keep]
 
     async def _tournament(
         self,
@@ -799,12 +780,11 @@ Use each `block_id` exactly as it appears."""
         continuation refs to their anchor rows. Returns `[]` if no ref resolves to a catalog
         block.
 
-        A single-interval (or unpinned) period runs ONE tournament capped at `_KEEP`. A
-        multi-interval period (comma-separated) runs one tournament PER interval — over the
-        blocks whose data span overlaps that interval — each capped at `_KEEP_PER_INTERVAL`,
-        and unions the winners. A flat per-branch cap would let one interval's blocks crowd
-        out another's (and makes >_KEEP-interval questions unsatisfiable); there is
-        deliberately no global re-narrowing pass over the union."""
+        Block selection runs PER PERIOD: one sub-selection per period entry (over the blocks whose
+        data span overlaps that entry), each capped at `_KEEP`, and unions the winners. A branch
+        with no parseable period runs a single selection over all candidates. A flat per-branch cap
+        would let one period's blocks crowd out another's; there is deliberately no global
+        re-narrowing pass over the union."""
         store = get_page_store(str(pdf_dir))
 
         rows: list[PageCatalogRow] = []
@@ -845,47 +825,36 @@ Use each `block_id` exactly as it appears."""
                 )
             ]
 
-        if entries and len(entries) > 1:
-            parts: list[
-                tuple[str, list[tuple[str, tuple[PageCatalogRow, int, ContentBlock]]]]
-            ] = []
-            for e in entries:
-                part = _entry_part(e)
-                if part:
-                    parts.append((e.label, part))
-            results = await asyncio.gather(
-                *(
-                    self._tournament(
-                        ctx,
-                        part,
-                        question,
-                        branch,
-                        final_keep=self._KEEP_PER_INTERVAL,
-                        period_label=label,
-                    )
-                    for label, part in parts
-                )
-            )
-            for (label, part), (ids, _) in zip(parts, results):
-                ctx.emit(
-                    f"block_select_interval interval={label!r} "
-                    f"candidates={len(part)} selected={len(ids)}"
-                )
-            rounds = max((r for _, r in results), default=0)
-            chosen = list(dict.fromkeys(bid for ids, _ in results for bid in ids))
-            cap = self._KEEP_PER_INTERVAL * len(parts)
+        # Block selection runs PER PERIOD: one sub-selection per period entry (restricted to the
+        # candidates whose data span overlaps it), each capped at `_KEEP`, then unioned. A branch
+        # with no parseable period runs a single selection over all candidates. There is no global
+        # re-narrowing pass over the union — each period keeps its own blocks.
+        parts: list[
+            tuple[str | None, list[tuple[str, tuple[PageCatalogRow, int, ContentBlock]]]]
+        ]
+        if entries:
+            parts = [(e.label, p) for e in entries if (p := _entry_part(e))]
+            if not parts:  # no candidate overlaps any entry (unlikely post year-filter)
+                parts = [(entries[0].label, items)]
         else:
-            # Single entry (or no parseable period): one tournament. The label is
-            # rendered from the entry so a pinned period shows as prose, not raw `@`.
-            chosen, rounds = await self._tournament(
-                ctx,
-                items,
-                question,
-                branch,
-                final_keep=self._KEEP,
-                period_label=entries[0].label if entries else None,
+            parts = [(None, items)]
+
+        results = await asyncio.gather(
+            *(
+                self._tournament(
+                    ctx, part, question, branch, final_keep=self._KEEP, period_label=label
+                )
+                for label, part in parts
             )
-            cap = self._KEEP
+        )
+        for (label, part), (ids, _) in zip(parts, results):
+            ctx.emit(
+                f"block_select_interval interval={label!r} "
+                f"candidates={len(part)} selected={len(ids)}"
+            )
+        rounds = max((r for _, r in results), default=0)
+        chosen = list(dict.fromkeys(bid for ids, _ in results for bid in ids))
+        cap = self._KEEP * len(parts)
 
         selected = []
         for bid in chosen:
