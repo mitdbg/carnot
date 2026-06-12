@@ -300,6 +300,9 @@ def _goal_key(x) -> int | None:
 class SelectAgent(MultiTurnAgent):
     name = "select_agent"
     default_effort = "medium"
+    # Non-greedy turns: temp-0 selection commits deterministically to the same
+    # blocks (and checker retries regenerate near-verbatim); 0.7 buys exploration.
+    temperature = 0.7
 
     briefing = """\
 You select which content blocks an extraction step should read to fulfill a
@@ -311,9 +314,10 @@ consecutive issues, sometimes with revisions.
 
 Pay attention to the original question's wording: match the exact series with every qualifier, total vs subtotal, unit,
 and time basis. The goals are paraphrases and should be take less literally. When searching, be efficient with steps 
-and emit batched calls. Commit when you are convinced that the goal is met. Report [] when you are certain that no
-title carries the requested data. Output only a handful of blocks per goal. Your 8 most recent observations are
-visible; never reference block numbers you can no longer see.
+and emit batched calls. Commit when you are convinced that the goal is met. When steps run low, commit the most
+plausible blocks found so far rather than exhausting the budget — a plausible commit beats no commit. Report [] only
+when you are certain that no title carries the requested data. Output only a handful of blocks per goal. Your 8 most
+recent observations are visible; never reference block numbers you can no longer see.
 
 Notes:
 - A label wrapping the concept in extra words ("... and related activities",
@@ -323,9 +327,10 @@ Notes:
 - A block's date span unions all rows, annual rows included; confirm with
   inspect_blocks that the needed dates exist as rows at the needed granularity and your selections cover the entire
   requested period.
-- When multiple reprints exist, you should prefer the latest that carries all the requested data, but you must inspect
-  the row labels to confirm that the needed dates exist as rows at the needed granularity and work your backwards if the
-  later issue does not carry the data.
+- When multiple reprints exist, prefer the first print that carries all the requested data, then check a few reprints
+  past it: when a later issue reprints that exact table with revised values, commit the revised reprint instead — not
+  both, and never a different table. You must inspect the row labels to confirm that the needed dates exist as rows at
+  the needed granularity and work your way forwards if the first print does not carry the data.
 - Favor whole-table coverage: a single block whose rows span the entire requested period beats a patchwork of partial
   windows. Assemble from multiple blocks only when no single print carries the whole period, and then tile reprints of
   the same table — never a mix of different tables.
@@ -422,7 +427,7 @@ Requirements for the final answer:
             if len(nums) > _MAX_COMMIT:
                 return (
                     f"G{num} commits {len(nums)} blocks — that is a sweep, not a selection; commit at most "
-                    f"{_MAX_COMMIT}: the latest covering print per period plus genuine alternatives"
+                    f"{_MAX_COMMIT}: one chosen print per period plus genuine alternatives"
                 )
         if any(not nums for nums in provided.values()) and not str(payload.get("why", "")).strip():
             return "an empty goal requires a 'why' explaining what is missing"
@@ -533,9 +538,10 @@ labels; a missing unit is incomplete coverage even when the series matches.
 When the question describes the source of the data (published in, reported
 by, etc.), entries from issues that do not fit the description are wrong
 coverage. Check duplicates — the same series, scope, and period under several
-entry ids; keep the source the question specifies, else the latest print that
-carries all the requested data. Different periods of one series are
-complements, not duplicates.
+entry ids; keep the source the question specifies, else the first print that
+carries all the requested data — or a later reprint of that exact table when
+it revises those values. Different periods of one series are complements, not
+duplicates.
 
 Output one JSON object, nothing else:
 {"complete": true|false,
@@ -872,9 +878,9 @@ async def _check_and_repair(
             else []
         ),
         "Before committing, inspect row labels to confirm the missing dates exist "
-        "as rows at the needed granularity; when the reprint you tried does not "
-        "carry them, work your way backwards through earlier issues (or the issues "
-        "published just after the missing dates) to one that does.",
+        "as rows at the needed granularity; when the print you tried does not "
+        "carry them, work your way forwards from the issues published just after "
+        "the missing dates to one that does.",
         "Emit a new final answer covering only the goals above (same JSON format); "
         "the other goals' selections stand. You may call list_blocks first.",
     ]

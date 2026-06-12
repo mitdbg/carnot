@@ -189,6 +189,11 @@ class MultiTurnAgent(ABC):
     max_output_tokens: int | None = None
     request_timeout_s: float | None = None
 
+    # Per-step sampling temperature, threaded to `PromptedCall.call` → `astream`.
+    # 0.0 keeps the historical greedy behaviour; agents that benefit from
+    # exploration across turns (e.g. SelectAgent) raise it on their subclass.
+    temperature: float = 0.0
+
     _SYSTEM_TEMPLATE = """\
 {{ briefing }}
 
@@ -387,8 +392,9 @@ Requirements for the final answer:
                 warned = True
                 left = self.max_steps - step + 1
                 warn = (
-                    f"Only {left} of {self.max_steps} steps remain. You should focus your remaining on"
-                    f"your most promising lead and avoid wasting time on exploration."
+                    f"Only {left} of {self.max_steps} steps remain. Stop exploring and finalize: "
+                    f"commit the most plausible answer you have found so far — a plausible commit "
+                    f"beats running out of steps with nothing."
                 )
                 self.messages.append({"role": "user", "blocks": [TextBlock(warn)]})
                 ctx.emit(f"steps_low_warning left={left}")
@@ -542,6 +548,7 @@ Requirements for the final answer:
             self._last_logprobs = None
             return await self._prompt.call(
                 ctx, messages=trimmed, should_stop=_has_complete_block,
+                temperature=self.temperature,
                 max_output_tokens=self.max_output_tokens,
                 timeout_s=self.request_timeout_s,
             )

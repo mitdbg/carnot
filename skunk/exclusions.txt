@@ -27,3 +27,6 @@ UID0013   # OLS intercept over-precision at rounding boundary (-184.1416 -> .142
 UID0245   # "Fisher Ideal symmetric growth rate": Fisher-scalar -0.107 (ours, pct) vs mid-point -0.113 (gold, fraction); same printed values; 0220/0113 family
 UID0110   # geomean of "quarterly percent change at an annual rate": gold de-annualizes by /4 (0.69, would be 0.68 if compounding-correct); direct geomean of printed values = 2.74; year 2017 robust either way
 UID0237   # "mid-point normalized difference ... in billions of dollars" self-contradictory: ratio 0.03 (gold) vs raw diff 122.02 B (ours), same two cells of OFS-1; 0148/0221 family
+UID0028   # railroad retirement Feb 1964 receipts: dedicated table prints 92.1, trust summary prints 92 (whole millions); neither named; 0057/0130 family
+UID0219   # holdings cells identical across 2013-06/09 prints; gap = unpinned BEA GDP series (annual vs Q1) + period count (9 vs 9.75y); 4.1/4.2/4.3 all defensible
+UID0244   # USD-CAD Dec-1959 monthly-avg rate source/precision unpinned (FRED starts 1971); same printed 530 USD diff; rate 0.95100 vs 0.95117; 0221 family

@@ -91,9 +91,9 @@ _MODEL_RPM: dict[str, float] | None = None
 # Built-in per-model request caps (provider account limits). Overridable per model via
 # SKUNK_MODEL_RPM ("model=rpm,..."); a model in neither falls back to SKUNK_LLM_RPM.
 _DEFAULT_RPM: dict[str, float] = {
-    "gemini-3.5-flash": 1000.0,
+    "gemini-3.5-flash": 4000.0,
     "gemini-3.1-flash-lite": 4000.0,
-    "gemini-3.1-pro-preview": 150.0,
+    "gemini-3.1-pro-preview": 2000.0,
 }
 
 
@@ -194,17 +194,18 @@ _MODEL_TPM: dict[str, float] | None = None
 
 # Built-in per-model token-per-minute caps (provider account limits). Overridable per model
 # via SKUNK_MODEL_TPM ("model=tpm,..."); a model in neither is unthrottled (None) and paced
-# by RPM alone (e.g. Pro).
+# by RPM alone.
 _DEFAULT_TPM: dict[str, float] = {
     "gemini-3.5-flash": 10_000_000.0,
     "gemini-3.1-flash-lite": 25_000_000.0,
+    "gemini-3.1-pro-preview": 8_000_000.0,
 }
 
 
 def _llm_model_tpm(model: str) -> float | None:
     """Per-minute *token* cap for `model`, parsed once from `SKUNK_MODEL_TPM`
     ("model=tpm,..."), else its `_DEFAULT_TPM`. Returns None (no throttle) when neither
-    sets it — so the TPM bucket is inert for unlisted models (e.g. Pro, paced by RPM)."""
+    sets it — so the TPM bucket is inert for unlisted models (paced by RPM alone)."""
     global _MODEL_TPM
     if _MODEL_TPM is None:
         out: dict[str, float] = {}

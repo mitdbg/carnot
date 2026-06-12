@@ -388,6 +388,7 @@ REPORT_FIELDS = [
 PRICES = {
     "gemini-3.5-flash": (0.30e-6, 2.50e-6),
     "gemini-3.1-flash-lite": (0.10e-6, 0.40e-6),
+    "gemini-3.1-pro-preview": (2.00e-6, 12.00e-6),
 }
 _CALL_RE = re.compile(
     r"call call_site=\S+ model=(\S+) .*?in_tok=(\d+) out_tok=(\d+) think_tok=(\S+)"

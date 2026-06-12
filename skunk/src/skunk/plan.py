@@ -358,7 +358,7 @@ by the question's wording. External lookups are injected at replan if needed.
     )
 
     async def plan(self, question: str, ctx: ExecutionContext) -> Plan:
-        return await self._prompt.call(ctx, f"Question: {question}", temperature=0.0)
+        return await self._prompt.call(ctx, f"Question: {question}", temperature=0.4)
 
     @staticmethod
     def _failed_section(

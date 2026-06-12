@@ -189,6 +189,7 @@ class PromptedCall[T]:
                     system=system,
                     messages=messages,
                     model=model,
+                    temperature=temperature,
                     should_stop=should_stop,
                     effort=eff,
                     ctx=ctx,
