@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest  # type: ignore[import-not-found]
@@ -9,7 +10,7 @@ import pytest  # type: ignore[import-not-found]
 from cup_kit.agent_runtime import AgentAnswer
 from skunk_server.agent_worker_pool import AgentWorkerPool
 from skunk_server.domain import AnswerCandidate, TaskStatus
-from skunk_server.submission_coordinator import SubmissionCoordinator
+from skunk_server.submission_coordinator import DEADLINE_SUBMIT_LEAD_S, SubmissionCoordinator
 from skunk_server.task_queues import TaskQueues
 from skunk_server.task_registry import TaskRegistry
 from skunk_reasoner import (
@@ -229,39 +230,91 @@ def test_cancelled_run_dumps_partial_trace(tmp_path, monkeypatch) -> None:
     assert payload["events"]  # partial trace was captured
 
 
-def test_auto_submit_records_immediate_score_feedback() -> None:
+class _AcceptingAdapter:
+    async def submit(self, _submission, _candidate):
+        return SimpleNamespace(
+            accepted=True,
+            submission_id="cup-submission",
+            tokens_remaining=2,
+            score=SimpleNamespace(correct=False, points_awarded=0.0),
+        )
+
+
+async def _wait_for_submitted(task, ticks: int = 200) -> None:
+    for _ in range(ticks):
+        if task.status == TaskStatus.SUBMITTED:
+            break
+        await asyncio.sleep(0.01)
+
+
+def test_completion_in_final_window_submits_immediately() -> None:
     registry = TaskRegistry()
     queues = TaskQueues()
-    task = _ready_task(registry, "auto")
-
-    class FakeAdapter:
-        async def submit(self, _submission, _candidate):
-            return SimpleNamespace(
-                accepted=True,
-                submission_id="cup-submission",
-                tokens_remaining=2,
-                score=SimpleNamespace(correct=False, points_awarded=0.0),
-            )
+    # Deadline already inside the final auto-submit window: a freshly-READY answer must submit
+    # immediately rather than waiting for the (already-fired) sweep.
+    registry.update_round(
+        round_num=1,
+        status="ACTIVE",
+        ends_at=datetime.now(timezone.utc) + timedelta(seconds=DEADLINE_SUBMIT_LEAD_S - 2),
+    )
+    task = _ready_task(registry, "final-window")
 
     async def run() -> None:
-        coordinator = SubmissionCoordinator(
-            registry,
-            queues,
-            FakeAdapter(),  # type: ignore[arg-type]
-            lambda: None,
-            auto_submit=True,
-        )
+        coordinator = SubmissionCoordinator(registry, queues, _AcceptingAdapter(), lambda: None)  # type: ignore[arg-type]
         coordinator.handle_agent_completion(task.task_id, "ready")
-        for _ in range(100):
-            if task.status == TaskStatus.SUBMITTED:
-                break
-            await asyncio.sleep(0.01)
+        await _wait_for_submitted(task)
 
     asyncio.run(run())
 
     assert task.status == TaskStatus.SUBMITTED
     assert task.submissions[-1].status == "ACCEPTED"
     assert task.cup_feedback[-1] == "Cup score: correct=False, points_awarded=0.0"
+
+
+def test_completion_outside_final_window_defers_to_sweep() -> None:
+    registry = TaskRegistry()
+    queues = TaskQueues()
+    # Deadline far in the future: a READY answer is NOT auto-submitted on completion; it waits
+    # for the manual button or the pre-deadline sweep.
+    registry.update_round(
+        round_num=1,
+        status="ACTIVE",
+        ends_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    task = _ready_task(registry, "deferred")
+
+    async def run() -> None:
+        coordinator = SubmissionCoordinator(registry, queues, _AcceptingAdapter(), lambda: None)  # type: ignore[arg-type]
+        coordinator.handle_agent_completion(task.task_id, "ready")
+        await asyncio.sleep(0.1)
+
+    asyncio.run(run())
+
+    assert task.status == TaskStatus.READY
+    assert not task.submissions
+
+
+def test_deadline_sweep_submits_un_submitted_ready_task() -> None:
+    registry = TaskRegistry()
+    queues = TaskQueues()
+    # Sweep fires DEADLINE_SUBMIT_LEAD_S before the deadline; set it just past the lead so the
+    # scheduled sleep is tiny.
+    registry.update_round(
+        round_num=1,
+        status="ACTIVE",
+        ends_at=datetime.now(timezone.utc) + timedelta(seconds=DEADLINE_SUBMIT_LEAD_S + 0.1),
+    )
+    task = _ready_task(registry, "sweep")
+
+    async def run() -> None:
+        coordinator = SubmissionCoordinator(registry, queues, _AcceptingAdapter(), lambda: None)  # type: ignore[arg-type]
+        coordinator.on_round_active(1)
+        await _wait_for_submitted(task)
+
+    asyncio.run(run())
+
+    assert task.status == TaskStatus.SUBMITTED
+    assert task.submissions[-1].status == "ACCEPTED"
 
 
 def test_reasoning_payload_includes_branch_cards_and_code() -> None:

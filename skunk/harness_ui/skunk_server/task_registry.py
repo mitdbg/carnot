@@ -13,6 +13,8 @@ from skunk_server.domain import (
     AnswerCandidate,
     Attempt,
     FailureRecord,
+    HumanReview,
+    HumanReviewStatus,
     QuestionTask,
     RoundState,
     SubmissionRecord,
@@ -131,10 +133,15 @@ class TaskRegistry:
             self._set_status(task, TaskStatus.PROCESSING)
             return attempt
 
-    def complete_attempt(self, task_id: str, attempt_id: str, candidate: AnswerCandidate) -> bool:
+    def complete_attempt(
+        self, task_id: str, attempt_id: str, candidate: AnswerCandidate
+    ) -> bool:
         with self._lock:
             task = self._require_task(task_id)
-            if task.current_attempt_id != attempt_id or task.status != TaskStatus.PROCESSING:
+            if (
+                task.current_attempt_id != attempt_id
+                or task.status != TaskStatus.PROCESSING
+            ):
                 return False
             task.attempts[-1].completed_at = utc_now()
             task.answer_candidates.append(candidate)
@@ -142,10 +149,15 @@ class TaskRegistry:
             self._set_status(task, TaskStatus.READY)
             return True
 
-    def fail_attempt(self, task_id: str, attempt_id: str, failure: FailureRecord) -> bool:
+    def fail_attempt(
+        self, task_id: str, attempt_id: str, failure: FailureRecord
+    ) -> bool:
         with self._lock:
             task = self._require_task(task_id)
-            if task.current_attempt_id != attempt_id or task.status != TaskStatus.PROCESSING:
+            if (
+                task.current_attempt_id != attempt_id
+                or task.status != TaskStatus.PROCESSING
+            ):
                 return False
             task.attempts[-1].completed_at = utc_now()
             task.failures.append(failure)
@@ -172,7 +184,9 @@ class TaskRegistry:
             task = self._tasks.get(task_id)
             if task is None:
                 return []
-            attempt = next((a for a in task.attempts if a.attempt_id == attempt_id), None)
+            attempt = next(
+                (a for a in task.attempts if a.attempt_id == attempt_id), None
+            )
             if attempt is None:
                 return []
             seq = self._event_seq.get(task_id, 0)
@@ -186,7 +200,9 @@ class TaskRegistry:
             task.updated_at = utc_now()
             return compacted
 
-    def append_attempt_event(self, task_id: str, attempt_id: str, event: dict) -> dict | None:
+    def append_attempt_event(
+        self, task_id: str, attempt_id: str, event: dict
+    ) -> dict | None:
         stored = self.append_attempt_events(task_id, attempt_id, [event])
         return stored[0] if stored else None
 
@@ -214,7 +230,9 @@ class TaskRegistry:
         with self._lock:
             task = self._require_task(task_id)
             if task.status != TaskStatus.READY:
-                raise TaskConflict(f"task is not ready for submission; status={task.status}")
+                raise TaskConflict(
+                    f"task is not ready for submission; status={task.status}"
+                )
             candidate = task.latest_candidate
             if candidate is None:
                 raise TaskConflict("task has no answer candidate")
@@ -304,6 +322,129 @@ class TaskRegistry:
                     return task
             return None
 
+    # ---- Optimistic human reviews ------------------------------------------------------
+
+    def create_review(
+        self,
+        task_id: str,
+        attempt_id: str,
+        kind: str,
+        instructions: str,
+        context: str | None,
+        source_docs: list[str],
+        guidance: dict[str, Any] | None,
+    ) -> HumanReview:
+        """Open a human review on a running task (the optimistic path keeps the LLM answer; this
+        just records something a human MAY correct later). Returns the review."""
+        with self._lock:
+            task = self._require_task(task_id)
+            review = HumanReview(
+                task_id=task_id,
+                attempt_id=attempt_id,
+                kind=kind,
+                instructions=instructions,
+                context=context,
+                source_docs=list(source_docs),
+                guidance=dict(guidance or {}),
+            )
+            task.reviews.append(review)
+            task.updated_at = utc_now()
+            return review
+
+    def set_recompute_state(self, task_id: str, state: dict[str, Any]) -> None:
+        """Stash the snapshot (orchestrator.RecomputeState JSON) that produced the latest answer,
+        so a resolved review can revise it without re-planning. No-op if the task is gone."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is not None:
+                task.recompute_state = state
+                task.updated_at = utc_now()
+
+    def resolve_review(
+        self,
+        review_id: str,
+        response: str,
+        source_docs: list[str],
+    ) -> tuple[QuestionTask, HumanReview]:
+        """Record a human's correction (or accept-as-is when `response` is empty). Idempotent
+        guard: re-resolving a non-open review raises `TaskConflict`."""
+        with self._lock:
+            task, review = self._find_review(review_id)
+            if review.status != HumanReviewStatus.OPEN:
+                raise TaskConflict(f"review is not open; status={review.status}")
+            review.status = HumanReviewStatus.RESOLVED
+            review.response = response
+            review.response_source_docs = list(source_docs)
+            review.resolved_at = utc_now()
+            task.updated_at = utc_now()
+            return task, review
+
+    def resolved_overrides(self, task_id: str) -> dict[int, str]:
+        """Accumulated human corrections for a task: `branch_id -> raw response JSON`, across all
+        RESOLVED reviews with a non-empty response (accept-as-is reviews contribute nothing). A
+        recompute applies all of them onto the cached snapshot, so later edits never lose earlier
+        ones."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return {}
+            out: dict[int, str] = {}
+            for review in task.reviews:
+                if review.status != HumanReviewStatus.RESOLVED:
+                    continue
+                if not (review.response or "").strip():
+                    continue
+                bid = review.guidance.get("branch_id")
+                if isinstance(bid, int):
+                    out[bid] = review.response  # later reviews on a branch win
+            return out
+
+    def add_revised_candidate(
+        self, task_id: str, candidate: AnswerCandidate
+    ) -> QuestionTask | None:
+        """Append a recompute's revised answer and make it (re)submittable, unless the task is
+        already terminal for this round (SCORED/CANCELLED → record only, best-effort no-op)."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return None
+            task.answer_candidates.append(candidate)
+            if task.status in {
+                TaskStatus.READY,
+                TaskStatus.SUBMITTED,
+                TaskStatus.SUBMITTING,
+                TaskStatus.FAILED,
+            }:
+                self._set_status(task, TaskStatus.READY)
+            else:
+                task.version += 1
+                task.updated_at = utc_now()
+            return task
+
+    def cancel_active_reviews(self, round_num: int | None = None) -> list[str]:
+        """Close every OPEN review (optionally limited to one round) — called on round close /
+        shutdown so the UI clears its overlay. Returns the cancelled review ids."""
+        cancelled: list[str] = []
+        with self._lock:
+            for task in self._tasks.values():
+                if round_num is not None and task.round_num != round_num:
+                    continue
+                for review in task.reviews:
+                    if review.status == HumanReviewStatus.OPEN:
+                        review.status = HumanReviewStatus.CANCELLED
+                        review.resolved_at = utc_now()
+                        cancelled.append(review.review_id)
+                if cancelled:
+                    task.updated_at = utc_now()
+        return cancelled
+
+    def _find_review(self, review_id: str) -> tuple[QuestionTask, HumanReview]:
+        for task in self._tasks.values():
+            for review in task.reviews:
+                if review.review_id == review_id:
+                    return task, review
+        raise KeyError(review_id)
+
     def close_round(self, round_num: int, status: str) -> None:
         with self._lock:
             self._round.round_num = round_num
@@ -319,6 +460,12 @@ class TaskRegistry:
                     TaskStatus.CANCELLED,
                 }:
                     self._set_status(task, TaskStatus.CANCELLED)
+                # Close any open reviews for the round so the UI clears its overlay.
+                if task.round_num == round_num:
+                    for review in task.reviews:
+                        if review.status == HumanReviewStatus.OPEN:
+                            review.status = HumanReviewStatus.CANCELLED
+                            review.resolved_at = utc_now()
         # Free any worker still blocked on this round's reasoners (outside the lock — the
         # callback schedules cancellation on each worker's own loop).
         if self._round_close_callback is not None:
@@ -336,7 +483,9 @@ class TaskRegistry:
         return task
 
     @staticmethod
-    def _find_submission(task: QuestionTask, local_submission_id: str) -> SubmissionRecord:
+    def _find_submission(
+        task: QuestionTask, local_submission_id: str
+    ) -> SubmissionRecord:
         for submission in task.submissions:
             if submission.local_submission_id == local_submission_id:
                 return submission

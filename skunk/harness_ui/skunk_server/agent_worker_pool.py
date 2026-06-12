@@ -59,7 +59,10 @@ class _EventBatcher:
         with self._lock:
             self._buf.append(event)
             now = time.monotonic()
-            if len(self._buf) < self._FLUSH_N and (now - self._last_flush) < self._FLUSH_INTERVAL_S:
+            if (
+                len(self._buf) < self._FLUSH_N
+                and (now - self._last_flush) < self._FLUSH_INTERVAL_S
+            ):
                 return
             batch, self._buf = self._buf, []
             self._last_flush = now
@@ -74,9 +77,13 @@ class _EventBatcher:
         self._flush(batch)
 
     def _flush(self, batch: list[dict]) -> None:
-        stored = self._registry.append_attempt_events(self._task_id, self._attempt_id, batch)
+        stored = self._registry.append_attempt_events(
+            self._task_id, self._attempt_id, batch
+        )
         if stored and self._loop is not None and self._publish is not None:
-            self._loop.call_soon_threadsafe(self._publish, self._task_id, self._attempt_id, stored)
+            self._loop.call_soon_threadsafe(
+                self._publish, self._task_id, self._attempt_id, stored
+            )
 
 
 class AgentWorkerPool:
@@ -86,21 +93,32 @@ class AgentWorkerPool:
         queues: TaskQueues,
         reasoner: Reasoner,
         max_workers: int,
+        human_broker: Any | None = None,
     ) -> None:
         self._registry = registry
         self._queues = queues
         self._reasoner = reasoner
         self._max_workers = max(1, max_workers)
+        self._human_broker = human_broker
         try:
             parameters = inspect.signature(reasoner).parameters
         except (TypeError, ValueError):
             parameters = {}
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
         self._reasoner_accepts_trace = (
-            "trace_event_handler" in parameters
-            or any(
-                parameter.kind == inspect.Parameter.VAR_KEYWORD
-                for parameter in parameters.values()
-            )
+            "trace_event_handler" in parameters or accepts_kwargs
+        )
+        # Optimistic human-review hooks: register opens reviews mid-run; the sink captures the
+        # recompute snapshot after a successful compute. Injected only if the reasoner accepts
+        # them (so a bare reasoner still runs).
+        self._reasoner_accepts_review = (
+            "human_review_register" in parameters or accepts_kwargs
+        )
+        self._reasoner_accepts_recompute_sink = (
+            "recompute_sink" in parameters or accepts_kwargs
         )
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
@@ -111,7 +129,9 @@ class AgentWorkerPool:
         # closing round can cancel its still-running reasoners and free the workers. Each
         # worker runs its reasoner on its OWN event loop (see `_worker_loop`), so the
         # future and the loop that owns it are both recorded for cross-thread cancellation.
-        self._inflight: dict[str, tuple[int, asyncio.AbstractEventLoop, asyncio.Future]] = {}
+        self._inflight: dict[
+            str, tuple[int, asyncio.AbstractEventLoop, asyncio.Future]
+        ] = {}
         self._inflight_lock = threading.Lock()
 
     def start(
@@ -208,7 +228,11 @@ class AgentWorkerPool:
             # Coalesce trace events into batches (registry append + main-loop publish happen
             # per-batch, not per-event) to keep the GIL free for the reasoner's corpus tools.
             batcher = _EventBatcher(
-                self._registry, self._loop, self._publish_event, task_id, attempt.attempt_id
+                self._registry,
+                self._loop,
+                self._publish_event,
+                task_id,
+                attempt.attempt_id,
             )
             outcome = "failed"
             try:
@@ -221,6 +245,21 @@ class AgentWorkerPool:
                     # Stream every orchestrator event to the task's SSE subscribers; the
                     # batcher buffers them and flushes on the worker's own loop / tool thread.
                     reasoner_kwargs["trace_event_handler"] = batcher.add
+                if self._reasoner_accepts_review and self._human_broker is not None:
+                    # Open optimistic reviews mid-run (fire-and-forget; the branch keeps going).
+                    aid = attempt.attempt_id
+                    reasoner_kwargs["human_review_register"] = (
+                        lambda kind, instr, ctx_q, docs, guid, _t=task_id, _a=aid: (
+                            self._human_broker.register_review(
+                                _t, _a, kind, instr, ctx_q, docs, guid
+                            )
+                        )
+                    )
+                if self._reasoner_accepts_recompute_sink:
+                    # Capture the recompute snapshot so a resolved review can revise the answer.
+                    reasoner_kwargs["recompute_sink"] = lambda state, _t=task_id: (
+                        self._registry.set_recompute_state(_t, state)
+                    )
                 raw = self._reasoner(prompt, **reasoner_kwargs)
                 if inspect.isawaitable(raw):
                     future = asyncio.ensure_future(raw, loop=worker_loop)
@@ -238,7 +277,9 @@ class AgentWorkerPool:
                     reasoning=reasoning,
                     source_docs=source_docs,
                 )
-                if self._registry.complete_attempt(task_id, attempt.attempt_id, candidate):
+                if self._registry.complete_attempt(
+                    task_id, attempt.attempt_id, candidate
+                ):
                     self._queues.enqueue_ready(task_id)
                     outcome = "ready"
             except asyncio.CancelledError:
@@ -259,7 +300,9 @@ class AgentWorkerPool:
                 batcher.flush()  # deliver any events buffered since the last flush
                 self._queues.agent.task_done()
                 if self._loop is not None and self._on_completion is not None:
-                    self._loop.call_soon_threadsafe(self._on_completion, task_id, outcome)
+                    self._loop.call_soon_threadsafe(
+                        self._on_completion, task_id, outcome
+                    )
 
     @staticmethod
     def _reasoner_prompt(prompt: str, attempt: Attempt) -> str:

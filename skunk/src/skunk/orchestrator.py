@@ -8,19 +8,25 @@ from skunk.compute import ComputeOp
 from skunk.config import SkunkConfig
 from skunk.errors import MissingData, StepFailed
 from skunk.extract import ExtractOp
-from skunk.human import BrokerChannel, ConsoleChannel, HumanAssist
+from skunk.human import (
+    BrokerChannel,
+    ConsoleChannel,
+    HumanAssist,
+    apply_semantic_override,
+)
 from skunk.lookup_external import LookupExternalOp
 from skunk.common import (
     AnnotatedValue,
     BlockRef,
     ExecutionContext,
     HumanInterventionHandler,
+    HumanReviewRegister,
     traced_step,
 )
 from skunk.llm_client import LLMClient
 from skunk.plan import Branch, Plan, PlanDiff, Planner, RetrieveBranch
 from skunk.prompted_call import PromptOverride
-from skunk.question_explainer import QuestionExplainer
+from skunk.question_explainer import ConceptExplanation, QuestionExplainer
 from skunk.retrieve import RetrieveOp
 from skunk.result import ExecutionResult
 
@@ -31,6 +37,72 @@ class BranchOutcome:
     entries: list[AnnotatedValue] | None
     error: StepFailed | None
     blocks: list[BlockRef] = field(default_factory=list)
+
+
+@dataclass
+class RecomputeState:
+    """The minimal snapshot needed to revise an answer after a human review resolves, WITHOUT
+    re-planning or re-retrieving: the per-branch extracted entries (keyed by stable branch id),
+    any extra (human-recovery) entries, and the concept explanations compute was given. A
+    recompute swaps a branch's entries for the human's correction and re-runs ONLY compute —
+    deterministic and cheap, so the revision reflects exactly the human's edit (no planner drift).
+    """
+
+    question: str
+    order: list[int]
+    entries_by_branch: dict[int, list[AnnotatedValue]]
+    extra_entries: list[AnnotatedValue]
+    explanations: list[ConceptExplanation]
+
+    def to_jsonable(self) -> dict:
+        return {
+            "question": self.question,
+            "order": list(self.order),
+            "entries_by_branch": {
+                str(bid): [e.model_dump(mode="json") for e in entries]
+                for bid, entries in self.entries_by_branch.items()
+            },
+            "extra_entries": [e.model_dump(mode="json") for e in self.extra_entries],
+            "explanations": [c.model_dump() for c in self.explanations],
+        }
+
+    @classmethod
+    def from_jsonable(cls, data: dict) -> RecomputeState:
+        return cls(
+            question=str(data["question"]),
+            order=[int(b) for b in data.get("order", [])],
+            entries_by_branch={
+                int(bid): [AnnotatedValue.model_validate(e) for e in entries]
+                for bid, entries in data.get("entries_by_branch", {}).items()
+            },
+            extra_entries=[
+                AnnotatedValue.model_validate(e) for e in data.get("extra_entries", [])
+            ],
+            explanations=[
+                ConceptExplanation.model_validate(c)
+                for c in data.get("explanations", [])
+            ],
+        )
+
+
+async def recompute_answer(
+    state: RecomputeState,
+    overrides: dict[int, list[AnnotatedValue]],
+    ctx: ExecutionContext,
+) -> str:
+    """Re-run ONLY compute over the first attempt's per-branch entries with human `overrides`
+    (keyed by branch id) swapped in — the deterministic revision path. The human's edited
+    semantic fields are overlaid onto the cached entries (provenance preserved); branches with
+    no override keep their original entries. No re-plan / re-retrieve / re-extract."""
+    merged: list[AnnotatedValue] = []
+    for bid in state.order:
+        cached = state.entries_by_branch.get(bid, [])
+        if bid in overrides:
+            merged.extend(apply_semantic_override(overrides[bid], cached))
+        else:
+            merged.extend(cached)
+    merged.extend(state.extra_entries)
+    return await ComputeOp().run(merged, ctx, concept_explanations=state.explanations)
 
 
 def _merge_branch_outcome(previous: BranchOutcome, new: BranchOutcome) -> BranchOutcome:
@@ -69,6 +141,7 @@ class Orchestrator:
         prompt_overrides: tuple[PromptOverride, ...] = (),
         llm_client: LLMClient | None = None,
         human_intervention_handler: HumanInterventionHandler | None = None,
+        human_review_register: HumanReviewRegister | None = None,
     ):
         self._ctx = ExecutionContext(
             question=question,
@@ -79,6 +152,7 @@ class Orchestrator:
             prompt_overrides=prompt_overrides,
             llm_client=llm_client,
             human_intervention_handler=human_intervention_handler,
+            human_review_register=human_review_register,
         )
         self._current_plan: Plan | None = None
         # Stable per-question branch identity. `_branch_ids[i]` is the id of the
@@ -113,10 +187,20 @@ class Orchestrator:
         # `retrieved_blocks` so the eval harness can cache and replay a run without re-paying
         # retrieval. Empty under golden/replay bypass (retrieve never runs).
         self._retrieved_blocks: list[BlockRef] = []
+        # Snapshot for an optimistic-review recompute (the per-branch entries that produced the
+        # answer); set on every successful compute, None until then. The server stores it on the
+        # task so a later human resolve can revise the answer via `recompute_answer`.
+        self._recompute_state: RecomputeState | None = None
 
     @property
     def ctx(self) -> ExecutionContext:
         return self._ctx
+
+    @property
+    def recompute_state(self) -> RecomputeState | None:
+        """The snapshot needed to revise this answer after a human review resolves (None until a
+        compute has succeeded). See `RecomputeState` / `recompute_answer`."""
+        return self._recompute_state
 
     @property
     def retrieved_blocks(self) -> list[BlockRef]:
@@ -173,6 +257,7 @@ class Orchestrator:
                         concept_explanations=explanations,
                     ),
                 )
+                self._capture_recompute_state(outcomes, human_entries, explanations)
                 return self._result.answer
             except MissingData as e:
                 attempt += 1
@@ -325,11 +410,7 @@ class Orchestrator:
                                 if branch.kind == "retrieve"
                                 else "lookup_external"
                             ),
-                            "status": (
-                                "failed"
-                                if outcome.error is not None
-                                else "ok"
-                            ),
+                            "status": ("failed" if outcome.error is not None else "ok"),
                             "execution_status": (
                                 "executed"
                                 if branch_id in self._last_executed_branch_ids
@@ -452,9 +533,7 @@ class Orchestrator:
                             document_scopes=retrieval_directives,
                         )
                         outcomes = list(outcomes)
-                        for position, outcome in zip(
-                            rerun_positions, rerun_outcomes
-                        ):
+                        for position, outcome in zip(rerun_positions, rerun_outcomes):
                             outcomes[position] = _merge_branch_outcome(
                                 outcomes[position], outcome
                             )
@@ -487,7 +566,12 @@ class Orchestrator:
                     human_entries.append(human_entry)
                     human_resolutions.append(list(missing))
                 entries = [
-                    *[entry for outcome in outcomes if outcome.entries for entry in outcome.entries],
+                    *[
+                        entry
+                        for outcome in outcomes
+                        if outcome.entries
+                        for entry in outcome.entries
+                    ],
                     *human_entries,
                 ]
                 self._ctx.emit(
@@ -508,13 +592,15 @@ class Orchestrator:
                 )
                 try:
                     self._result.answer = await traced_step(
-                        self._ctx, "compute",
+                        self._ctx,
+                        "compute",
                         lambda: self._compute.run(
                             entries,
                             self._ctx,
                             concept_explanations=explanations,
                         ),
                     )
+                    self._capture_recompute_state(outcomes, human_entries, explanations)
                     return self._result.answer
                 except MissingData as post_human_error:
                     reason = post_human_error.reason
@@ -701,6 +787,36 @@ class Orchestrator:
                     self._retrieved_blocks.append(blk)
         return docs
 
+    def _capture_recompute_state(
+        self,
+        outcomes: list[BranchOutcome],
+        human_entries: list[AnnotatedValue],
+        explanations: list[ConceptExplanation],
+    ) -> None:
+        """Snapshot the per-branch entries (keyed by stable branch id) + recovery entries +
+        explanations that produced this answer, so a later human-review resolve can recompute."""
+        self._recompute_state = RecomputeState(
+            question=self._ctx.question,
+            order=list(self._branch_ids),
+            entries_by_branch={
+                bid: list(outcome.entries or [])
+                for bid, outcome in zip(self._branch_ids, outcomes)
+            },
+            extra_entries=list(human_entries),
+            explanations=list(explanations),
+        )
+
+    def _review_mode(self) -> str:
+        """How a wanted human review is serviced for this run:
+        - "optimistic": register an open review and keep the LLM result (server, non-blocking);
+        - "skip":       a register hook is wired but optimistic mode is off — don't review
+          (never block a server worker on the console);
+        - "blocking":   no register hook (local CLI) — await the human on the console as before.
+        """
+        if self._ctx.human_review_register is None:
+            return "blocking"
+        return "optimistic" if self._ctx.config.human_optimistic else "skip"
+
     async def _run_branches(
         self,
         branches: list[Branch],
@@ -716,8 +832,7 @@ class Orchestrator:
             [cast(RetrieveBranch, branches[i]) for i in retrieve_pos],
             [branch_ids[i] for i in retrieve_pos],
             document_scopes=[
-                (document_scopes or {}).get(branch_ids[i])
-                for i in retrieve_pos
+                (document_scopes or {}).get(branch_ids[i]) for i in retrieve_pos
             ],
         )
         docs_by_pos: dict[int, list[BlockRef] | StepFailed] = dict(
@@ -748,8 +863,12 @@ class Orchestrator:
                                     {"bulletin": ref.month, "page": ref.page}
                                     for ref in block_ref.member_refs
                                 ],
-                                "kind": block_ref.block.kind if block_ref.block else None,
-                                "title": block_ref.block.title if block_ref.block else None,
+                                "kind": block_ref.block.kind
+                                if block_ref.block
+                                else None,
+                                "title": block_ref.block.title
+                                if block_ref.block
+                                else None,
                                 "column_headers": (
                                     block_ref.block.column_headers
                                     if block_ref.block
@@ -771,17 +890,38 @@ class Orchestrator:
                 # Human verifies/produces the extracted value(s) (figure or OCR/table read)
                 # only when the policy opts in — no step (or prompt) on the default path.
                 if self._human.wants_verify(branch, entries, self._ctx):
-                    entries = await traced_step(
-                        self._ctx,
-                        "human_verify",
-                        lambda: self._human.verify_extract(
-                            entries, doc, branch, self._ctx
-                        ),
-                        branch_id=bid,
-                    )
+                    mode = self._review_mode()
+                    if mode == "optimistic":
+                        # Register an open review and keep the LLM entries — the question
+                        # completes without blocking; a human resolve drives a recompute later.
+                        self._human.register_verify(
+                            entries, doc, branch, bid, self._ctx
+                        )
+                    elif mode == "blocking":
+                        entries = await traced_step(
+                            self._ctx,
+                            "human_verify",
+                            lambda: self._human.verify_extract(
+                                entries, doc, branch, self._ctx
+                            ),
+                            branch_id=bid,
+                        )
+                    # mode == "skip": review wanted but optimistic off on the server — no-op.
                 return entries
-            # Human performs the external lookup when the flag is on; else the lookup agent.
-            if self._human.wants_lookup(branch, self._ctx):
+            # External lookup. Optimistic: always run the lookup agent, then register a review
+            # of its result (the human confirms/corrects). Blocking (local CLI): the human
+            # performs the lookup in place when the flag is on; else the agent does.
+            mode = self._review_mode()
+            if self._human.wants_lookup(branch, self._ctx) and mode == "optimistic":
+                entries = await traced_step(
+                    self._ctx,
+                    "lookup_external",
+                    lambda: self._lookup.run(self._ctx, branch),
+                    branch_id=bid,
+                )
+                self._human.register_lookup(entries, branch, bid, self._ctx)
+                return entries
+            if self._human.wants_lookup(branch, self._ctx) and mode == "blocking":
                 return await traced_step(
                     self._ctx,
                     "human_lookup",
@@ -800,9 +940,7 @@ class Orchestrator:
             return_exceptions=True,
         )
         outcomes: list[BranchOutcome] = []
-        for pos, (bid, branch, res) in enumerate(
-            zip(branch_ids, branches, results)
-        ):
+        for pos, (bid, branch, res) in enumerate(zip(branch_ids, branches, results)):
             selected = docs_by_pos.get(pos)
             blocks = selected if isinstance(selected, list) else []
             if isinstance(res, StepFailed):

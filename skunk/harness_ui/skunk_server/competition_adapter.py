@@ -36,6 +36,12 @@ class CompetitionAdapter:
         self._queues = queues
         self._publish_status = publish_status
         self._reconnect_backoff_s = reconnect_backoff_s
+        # Notified (on the main loop) with the round number whenever a round is/stays ACTIVE,
+        # so the submission coordinator can (re)schedule its pre-deadline auto-submit sweep.
+        self._on_round_active: Callable[[int], None] | None = None
+
+    def set_round_active_callback(self, callback: Callable[[int], None]) -> None:
+        self._on_round_active = callback
 
     async def listen(self) -> None:
         while True:
@@ -68,11 +74,17 @@ class CompetitionAdapter:
                             )
                         elif event.type == "round_state":
                             if event.status == RoundStatus.ACTIVE:
+                                # Preserve the stored deadline: update_round always assigns
+                                # ends_at, so re-pass the current value or this bare refresh
+                                # would null the deadline the auto-submit sweep depends on.
                                 self._registry.update_round(
                                     round_num=event.round_num,
                                     status=event.status.value,
+                                    ends_at=self._registry.round_state().ends_at,
                                     event=f"round state {event.status.value}",
                                 )
+                                if self._on_round_active is not None:
+                                    self._on_round_active(event.round_num)
                             else:
                                 self._registry.close_round(event.round_num, event.status.value)
                             self._publish_status()
@@ -143,6 +155,8 @@ class CompetitionAdapter:
                 )
                 if created:
                     self._queues.enqueue_agent(task.task_id)
+            if self._on_round_active is not None:
+                self._on_round_active(round_num)
         else:
             self._registry.close_round(round_num, status.value)
         self._publish_status()

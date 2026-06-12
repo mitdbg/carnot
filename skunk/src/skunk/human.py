@@ -47,6 +47,48 @@ from skunk.plan import Branch, LookupBranch, RetrieveBranch
 # `LookupAgent.final_answer_doc` documents, so the human and the model speak one format.
 _FIELDS = ("description", "value", "unit", "kind", "index_name", "row_name", "col_name")
 
+
+def apply_semantic_override(
+    edited: list[AnnotatedValue], base: list[AnnotatedValue]
+) -> list[AnnotatedValue]:
+    """Overlay a human's edited semantic fields (`_FIELDS`) onto the original extracted
+    entries, preserving each `base` entry's machine provenance (bulletin/pages/vintage). Pairs
+    positionally; a human entry past the end of `base` is kept as-is (provenance-less). Used by
+    the recompute path so a corrected value still sorts/filters by publication date downstream."""
+    out: list[AnnotatedValue] = []
+    for i, ev in enumerate(edited):
+        if i < len(base):
+            out.append(base[i].model_copy(update={f: getattr(ev, f) for f in _FIELDS}))
+        else:
+            out.append(ev)
+    return out
+
+
+def _pagerefs_to_docstrings(refs: list[PageRef]) -> list[str]:
+    """The UI's canonical source-doc strings for a set of page refs — its source-page viewer
+    (`/api/source/{month}/page/{page}.png`) renders them. Shared by the blocking broker and the
+    optimistic registration path so both speak one format."""
+    return [
+        f"Treasury Bulletin {p.month} PDF page {p.page}"
+        for p in refs
+        if p.month is not None and p.page is not None
+    ]
+
+
+def _branch_identity(branch: Branch) -> dict:
+    """The branch's structural identity, carried in a review's guidance so a later recompute can
+    target the right branch. Mirrors the `searched` block of the missing-data guidance."""
+    if isinstance(branch, RetrieveBranch):
+        return {
+            "kind": "retrieve",
+            "key": branch.key,
+            "period": branch.period,
+            "as_of": branch.as_of,
+            "visual_only": branch.visual_only,
+        }
+    return {"kind": "lookup_external", "target": branch.target, "src": branch.src}
+
+
 # Serializes console prompts across parallel branches — two `asyncio.gather`'d branches must
 # never interleave on stdin. Module-level so every channel instance shares one lock.
 _PROMPT_LOCK = asyncio.Lock()
@@ -82,6 +124,13 @@ def _candidates_json(candidates: list[AnnotatedValue]) -> str:
     return json.dumps(
         [c.model_dump(include=set(_FIELDS)) for c in candidates], indent=2
     )
+
+
+def parse_human_values(raw: str) -> list[AnnotatedValue]:
+    """Public parser for a human's typed/submitted JSON (one object or a list) into
+    `AnnotatedValue`s — used by the recompute path to turn a review's response into branch
+    overrides. Raises `ParseError` on anything malformed."""
+    return _parse_reply(raw)
 
 
 def _parse_reply(raw: str) -> list[AnnotatedValue]:
@@ -252,9 +301,13 @@ class HumanAssistPolicy:
     ) -> bool:
         # Figure questions (visual_only) gate on human_figure — the model reads charts
         # unreliably so the human produces the answer. Everything else gates on
-        # human_verify_extract — the human confirms/corrects an OCR/table read.
+        # human_verify_extract — the human confirms/corrects an OCR/table read — but only
+        # for vector/table-shaped reads: scalar extractions are cheap to trust and not worth a
+        # human's attention, so they never open a review regardless of the flag.
         if branch.visual_only:
             return cfg.human_figure
+        if all(e.kind == "scalar" for e in entries):
+            return False
         return cfg.human_verify_extract
 
     def human_lookup(self, branch: LookupBranch, cfg) -> bool:
@@ -343,3 +396,79 @@ class HumanAssist:
             ),
             ctx,
         )
+
+    # ---- Optimistic (non-blocking) registration ----------------------------------------
+    # These open a human review and return immediately; the branch keeps the LLM result and
+    # the question completes. A human resolve later drives a server-side recompute. Each is a
+    # no-op when no register hook is wired (local CLI), so the caller can invoke unconditionally.
+
+    def register_verify(
+        self,
+        entries: list[AnnotatedValue],
+        blocks: list,
+        branch: RetrieveBranch,
+        bid: int,
+        ctx: ExecutionContext,
+    ) -> str | None:
+        """Open a review of the model's extracted value(s) against the source page(s), carrying
+        the branch identity (keyed by `bid`) so a resolve can recompute. Assumes the caller
+        already gated on `wants_verify`."""
+        register = ctx.human_review_register
+        if register is None:
+            return None
+        task = "figure" if branch.visual_only else "verify_extract"
+        refs = _blocks_to_pagerefs(blocks)
+        instruction = (
+            "This answer must be read off the figure/chart on the page(s) below — the "
+            "model is unreliable here. Give the correct value(s)."
+            if branch.visual_only
+            else "Confirm or correct the value(s) the model extracted, checking them "
+            "against the source page(s) below."
+        )
+        guidance = {
+            "task": task,
+            "branch_id": bid,
+            "branch": _branch_identity(branch),
+            "candidates": [c.model_dump(include=set(_FIELDS)) for c in entries],
+            "fields": list(_FIELDS),
+        }
+        review_id = register(
+            task, instruction, ctx.question, _pagerefs_to_docstrings(refs), guidance
+        )
+        ctx.emit(
+            f"human_review_registered task={task} branch_id={bid} "
+            f"review_id={review_id} candidates={len(entries)} n_pages={len(refs)}",
+            kind="user",
+        )
+        return review_id
+
+    def register_lookup(
+        self,
+        entries: list[AnnotatedValue],
+        branch: LookupBranch,
+        bid: int,
+        ctx: ExecutionContext,
+    ) -> str | None:
+        """Open a review of the lookup agent's value(s) for an external lookup, so a human can
+        confirm/correct them. `entries` are the agent's result (the review's candidates)."""
+        register = ctx.human_review_register
+        if register is None:
+            return None
+        instruction = (
+            f"Confirm or correct the value(s) found for this external lookup:\n  target: "
+            f"{branch.target}\n  source hint: {branch.src or '(any authoritative source)'}"
+        )
+        guidance = {
+            "task": "lookup",
+            "branch_id": bid,
+            "branch": _branch_identity(branch),
+            "candidates": [c.model_dump(include=set(_FIELDS)) for c in entries],
+            "fields": list(_FIELDS),
+        }
+        review_id = register("lookup", instruction, ctx.question, [], guidance)
+        ctx.emit(
+            f"human_review_registered task=lookup branch_id={bid} "
+            f"review_id={review_id} candidates={len(entries)}",
+            kind="user",
+        )
+        return review_id

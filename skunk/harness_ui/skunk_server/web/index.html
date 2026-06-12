@@ -6,6 +6,7 @@
   <title>Skunk Agent Console</title>
   <link rel="stylesheet" href="/static/client.css">
   <script defer src="/static/trace_flow.js"></script>
+  <script defer src="/static/review_overlay.js"></script>
   <script defer src="/static/client.js"></script>
 </head>
 <body>
@@ -13,6 +14,7 @@
   <div class="topbar">
     <h1>Skunk Agent Console</h1>
     <div class="meta">
+      <span class="pill timer">Time Remaining <strong id="roundTimer">--:--</strong></span>
       <span class="pill">Connection <strong id="connection">-</strong></span>
       <span class="pill">Round <strong id="roundNum">-</strong></span>
       <span class="pill">Round Status <strong id="roundStatus">-</strong></span>
@@ -21,16 +23,8 @@
   </div>
 </header>
 <main>
-  <section class="summary">
-    <div id="roundTimerMetric" class="metric timer"><span>Time Remaining</span><strong id="roundTimer">--:--</strong></div>
-    <div class="metric"><span>Total</span><strong id="mTotal">0</strong></div>
-    <div class="metric"><span>Running</span><strong id="mRunning">0</strong></div>
-    <div class="metric"><span>Ready</span><strong id="mReady">0</strong></div>
-    <div class="metric"><span>Submitted</span><strong id="mSubmitted">0</strong></div>
-    <div class="metric"><span>Failed</span><strong id="mFailed">0</strong></div>
-    <div class="metric"><span>Cancelled</span><strong id="mCancelled">0</strong></div>
-  </section>
   <div id="app">Connecting...</div>
 </main>
+<div id="reviewOverlay" hidden></div>
 </body>
 </html>

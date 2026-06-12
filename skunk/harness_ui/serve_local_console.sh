@@ -9,9 +9,10 @@
 #   REASONER=dummy_agent:solve ./serve_local_console.sh        # no-LLM smoke test
 #   SKUNK_HUMAN_VERIFY_EXTRACT=1 ./serve_local_console.sh      # try the HITL gates
 #
-# Launcher knobs (all optional, env or .env): REASONER, AUTO_SUBMIT, CONCURRENCY,
-# PYTHON_BIN, SKUNK_CONSOLE_QUESTIONS, SKUNK_CONSOLE_HOST, and the three
-# SKUNK_CONSOLE_*_PORT vars. Defaults are below.
+# Launcher knobs (all optional, env or .env): REASONER, CONCURRENCY, PYTHON_BIN,
+# SKUNK_CONSOLE_QUESTIONS, SKUNK_CONSOLE_HOST, and the three SKUNK_CONSOLE_*_PORT
+# vars. Defaults are below. (Submission is manual + a deadline sweep that submits any
+# still-READY answer just before the round closes — there is no auto-submit toggle.)
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -49,7 +50,6 @@ ROUND_SECONDS="${SKUNK_CONSOLE_ROUND_SECONDS:-3600}"
 CONCURRENCY="${SKUNK_CONCURRENCY:-15}"
 REASONER="${REASONER:-skunk_reasoner:solve}"
 CUP_TEAM_TOKEN="${CUP_TEAM_TOKEN:-anything}"
-AUTO_SUBMIT="${AUTO_SUBMIT:-false}"
 QUESTIONS="${SKUNK_CONSOLE_QUESTIONS:-$SKUNK_DIR/officeqa-cup-kit-v0.1.5/practice_questions.json}"
 
 # Python interpreter: explicit PYTHON_BIN, else the repo venv, else PATH python3.
@@ -85,12 +85,9 @@ cd "$SKUNK_DIR"
   --round-seconds "$ROUND_SECONDS" --questions "$QUESTIONS" &
 practice_pid=$!
 
-auto_submit_flag="--no-auto-submit"
-[[ "$AUTO_SUBMIT" == "true" ]] && auto_submit_flag="--auto-submit"
-
 "$PYTHON_BIN" -m skunk_server.server --host "$HOST" --port "$SKUNK_SERVER_PORT" \
   --cup-base-url "$CUP_BASE_URL" --team-token "$CUP_TEAM_TOKEN" \
-  --reasoner "$REASONER" --concurrency "$CONCURRENCY" "$auto_submit_flag" &
+  --reasoner "$REASONER" --concurrency "$CONCURRENCY" &
 server_pid=$!
 
 # Tear both servers down on exit/Ctrl-C. SIGTERM first for a graceful uvicorn shutdown

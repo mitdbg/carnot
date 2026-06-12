@@ -43,16 +43,31 @@ function badgeLabel(task) {
   }
   return task.status;
 }
-function counts(all) {
-  const by = (fn) => all.filter(fn).length;
-  return {
-    total: all.length,
-    running: by((t) => t.status === "PROCESSING"),
-    ready: by((t) => t.status === "READY"),
-    submitted: by((t) => ["SUBMITTED", "SCORED"].includes(t.status)),
-    failed: by((t) => t.status === "FAILED"),
-    cancelled: by((t) => t.status === "CANCELLED"),
-  };
+
+// Task-list ordering: questions needing attention float up, finished/dead ones sink.
+// FAILED -> READY -> PROCESSING -> queued -> SUBMITTING -> SUBMITTED/SCORED -> CANCELLED.
+const STATUS_RANK = {
+  FAILED: 0,
+  READY: 1,
+  PROCESSING: 2,
+  QUEUED: 3,
+  RECEIVED: 3,
+  SUBMITTING: 4,
+  SUBMITTED: 5,
+  SCORED: 5,
+  CANCELLED: 6,
+};
+const statusRank = (task) => (STATUS_RANK[task.status] ?? 9);
+
+// Tasks with open human reviews jump to the very top of the queue — above FAILED — so the
+// operator sees what's waiting on them first.
+const reviewCount = (task) => (task.reviews || []).length;
+const reviewRank = (task) => (reviewCount(task) > 0 ? 0 : 1);
+
+// Whether a submission has been scored, and if so whether it was correct (null until known).
+function feedbackFor(task) {
+  if (task.correct == null) return null;
+  return { correct: !!task.correct, points: task.points };
 }
 
 // ── round timer ──────────────────────────────────────────────────────────────
@@ -89,13 +104,6 @@ function renderStatus() {
   document.getElementById("roundStatus").textContent = round.status || "-";
   document.getElementById("resubmitsLeft").textContent = round.resubmits_left ?? "-";
   updateRoundTimer();
-  const c = counts(tasks);
-  document.getElementById("mTotal").textContent = c.total;
-  document.getElementById("mRunning").textContent = c.running;
-  document.getElementById("mReady").textContent = c.ready;
-  document.getElementById("mSubmitted").textContent = c.submitted;
-  document.getElementById("mFailed").textContent = c.failed;
-  document.getElementById("mCancelled").textContent = c.cancelled;
 
   const rounds = [...new Set(tasks.map((t) => t.round_num))].sort((a, b) => a - b);
   if (round.round_num != null && round.round_num !== lastRoundNum) {
@@ -105,7 +113,9 @@ function renderStatus() {
   if (selectedRoundTab == null || !rounds.includes(selectedRoundTab)) {
     selectedRoundTab = rounds.length ? rounds[rounds.length - 1] : null;
   }
-  const visible = tasks.filter((t) => t.round_num === selectedRoundTab);
+  const visible = tasks
+    .filter((t) => t.round_num === selectedRoundTab)
+    .sort((a, b) => reviewRank(a) - reviewRank(b) || statusRank(a) - statusRank(b) || String(a.question_id).localeCompare(String(b.question_id)));
 
   document.getElementById("roundTabs").innerHTML = rounds.length > 1
     ? rounds.map((r) => `<button class="round-tab ${r === selectedRoundTab ? "active" : ""}" onclick="selectRoundTab(${Number(r)})">Round ${esc(r)}</button>`).join("")
@@ -117,7 +127,11 @@ function renderStatus() {
           <div class="row-title">R${esc(task.round_num)} / ${esc(task.question_id)}</div>
           <div class="row-preview">${esc(task.prompt || "")}</div>
         </div>
-        <span class="status ${badgeClass(task)}">${esc(badgeLabel(task))}</span>
+        <div class="row-side">
+          <span class="status ${badgeClass(task)}">${esc(badgeLabel(task))}</span>
+          ${reviewCount(task) ? `<span class="row-review" onclick="openReview('${js(task.task_id)}', event)">Review (${reviewCount(task)})</span>` : ""}
+          ${task.status === "READY" ? `<span class="row-submit" onclick="submitTask('${js(task.task_id)}', event)">Submit</span>` : ""}
+        </div>
       </button>`).join("")
     : `<div class="empty">No tasks yet.</div>`;
 
@@ -145,6 +159,57 @@ function updateDetailHeader() {
     if (st) st.textContent = badgeLabel(task);
     if (ans) ans.textContent = task.answer || "—";
   }
+  renderDetailActions(task);
+}
+
+// ── manual submission ──────────────────────────────────────────────────────────
+// The Submit button (READY tasks) and the per-task scored feedback live in the detail
+// panel; status/feedback changes arrive over the status SSE stream and refresh through
+// updateDetailHeader -> renderDetailActions.
+function renderDetailActions(task) {
+  const host = document.getElementById("dActions");
+  if (!host) return;
+  if (!task) { host.innerHTML = ""; return; }
+  let html = "";
+  if (task.status === "READY") {
+    html += `<button class="primary" onclick="submitTask('${js(task.task_id)}', event)">Submit Answer</button>`;
+  } else if (task.status === "SUBMITTING") {
+    html += `<span class="detail-feedback pending">Submitting…</span>`;
+  }
+  const fb = feedbackFor(task);
+  if (fb) {
+    const pts = fb.points != null ? ` (${fb.correct ? "+" : ""}${fb.points} pts)` : "";
+    html += fb.correct
+      ? `<span class="detail-feedback correct">Correct${pts}</span>`
+      : `<span class="detail-feedback incorrect">Incorrect${pts}</span>`;
+  }
+  host.innerHTML = html;
+}
+
+async function submitTask(taskId, event) {
+  if (event) { event.stopPropagation(); event.preventDefault(); }
+  try {
+    const resp = await fetch(`/api/submit/${encodeURIComponent(taskId)}`, { method: "POST" });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || !data.ok) flashSubmitError(taskId, data.error || `submit failed (${resp.status})`);
+  } catch (err) {
+    flashSubmitError(taskId, String(err));
+  }
+  // On success the status SSE stream pushes SUBMITTING -> SUBMITTED/SCORED and the UI refreshes.
+}
+window.submitTask = submitTask;
+
+function flashSubmitError(taskId, message) {
+  const host = taskId === selectedTaskId ? document.getElementById("dActions") : null;
+  if (host) {
+    const note = document.createElement("span");
+    note.className = "detail-feedback error";
+    note.textContent = message;
+    host.appendChild(note);
+    setTimeout(() => note.remove(), 6000);
+  } else {
+    alert(`Submit failed for ${taskId}: ${message}`);
+  }
 }
 
 // ── task selection + trace streaming ────────────────────────────────────────────
@@ -166,7 +231,9 @@ function selectTask(taskId) {
       <div><span class="k">Status</span><strong id="dStatus">${esc(task ? badgeLabel(task) : "-")}</strong></div>
       <div><span class="k">Answer</span><strong id="dAnswer">${esc(task?.answer || "—")}</strong></div>
     </div>
+    <div id="dActions" class="detail-actions"></div>
     <div id="trace" class="trace-host"></div>`;
+  renderDetailActions(task);
 
   // refresh list highlight without a full status re-render
   document.querySelectorAll("#taskList .task-row").forEach((row) => row.classList.remove("selected"));
@@ -175,8 +242,19 @@ function selectTask(taskId) {
 
   taskSource = new EventSource(`/api/stream/${encodeURIComponent(taskId)}`);
   taskSource.onmessage = (e) => onTraceEvent(taskId, JSON.parse(e.data));
+
+  // Selecting a task that has open reviews drops straight into the review overlay (no extra
+  // click), so the operator is immersed immediately.
+  if (reviewCount(task)) ReviewOverlay.open(taskId);
 }
 window.selectTask = selectTask;
+
+// The Review button on a task row opens the overlay without disturbing the current trace view.
+function openReview(taskId, event) {
+  if (event) { event.stopPropagation(); event.preventDefault(); }
+  ReviewOverlay.open(taskId);
+}
+window.openReview = openReview;
 
 function selectRoundTab(roundNum) {
   selectedRoundTab = roundNum;
@@ -212,6 +290,9 @@ function connectStatus() {
     const data = JSON.parse(e.data);
     round = data.round || {};
     tasks = data.tasks || [];
+    // Keep the overlay's task data fresh BEFORE rendering, so a review resolved/cancelled
+    // elsewhere drops out live and any auto-open during renderStatus sees current reviews.
+    ReviewOverlay.syncTasks(tasks);
     renderStatus();
   };
   source.onerror = () => {

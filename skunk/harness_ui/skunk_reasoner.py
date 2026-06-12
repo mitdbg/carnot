@@ -42,11 +42,15 @@ async def solve(
     *,
     human_intervention_handler=None,
     trace_event_handler=None,
+    human_review_register=None,
+    recompute_sink=None,
 ) -> AgentAnswer:
     return await SkunkReasoner().solve(
         prompt,
         human_intervention_handler=human_intervention_handler,
         trace_event_handler=trace_event_handler,
+        human_review_register=human_review_register,
+        recompute_sink=recompute_sink,
     )
 
 
@@ -55,12 +59,43 @@ async def solve_with_trace(
     *,
     human_intervention_handler=None,
     trace_event_handler=None,
+    human_review_register=None,
+    recompute_sink=None,
 ) -> tuple[AgentAnswer, list[dict]]:
     return await SkunkReasoner().solve_with_trace(
         prompt,
         human_intervention_handler=human_intervention_handler,
         trace_event_handler=trace_event_handler,
+        human_review_register=human_review_register,
+        recompute_sink=recompute_sink,
     )
+
+
+async def recompute(state: dict, overrides: dict) -> str:
+    """Revise an answer after a human review resolves: re-run ONLY compute over the first
+    attempt's cached entries (`state`, an orchestrator.RecomputeState JSON) with the human's
+    corrections (`overrides`: branch_id -> raw response JSON) swapped in. No re-plan / retrieve /
+    extract — deterministic and cheap. Returns the revised answer text."""
+    from skunk import SkunkConfig
+    from skunk.common import ExecutionContext
+    from skunk.human import parse_human_values
+    from skunk.orchestrator import RecomputeState, recompute_answer
+
+    _set_default_env()
+    config = SkunkConfig.from_env()
+    if not Path(config.prompt_overrides_path).is_absolute():
+        config.prompt_overrides_path = str(SKUNK_ROOT / config.prompt_overrides_path)
+    snapshot = RecomputeState.from_jsonable(state)
+    parsed = {
+        int(branch_id): parse_human_values(response)
+        for branch_id, response in overrides.items()
+        if (response or "").strip()
+    }
+    ctx = ExecutionContext(question=snapshot.question, config=config)
+    try:
+        return await recompute_answer(snapshot, parsed, ctx)
+    finally:
+        ctx.close()
 
 
 class SkunkReasoner:
@@ -74,11 +109,15 @@ class SkunkReasoner:
         *,
         human_intervention_handler=None,
         trace_event_handler=None,
+        human_review_register=None,
+        recompute_sink=None,
     ) -> AgentAnswer:
         answer, _events = await self.solve_with_trace(
             prompt,
             human_intervention_handler=human_intervention_handler,
             trace_event_handler=trace_event_handler,
+            human_review_register=human_review_register,
+            recompute_sink=recompute_sink,
         )
         return answer
 
@@ -88,11 +127,15 @@ class SkunkReasoner:
         *,
         human_intervention_handler=None,
         trace_event_handler=None,
+        human_review_register=None,
+        recompute_sink=None,
     ) -> tuple[AgentAnswer, list[dict]]:
         answer, events = await self.execute(
             prompt,
             human_intervention_handler=human_intervention_handler,
             trace_event_handler=trace_event_handler,
+            human_review_register=human_review_register,
+            recompute_sink=recompute_sink,
         )
         source_docs = self.source_docs_from_events(events)
         return (
@@ -110,16 +153,28 @@ class SkunkReasoner:
         *,
         human_intervention_handler=None,
         trace_event_handler=None,
+        human_review_register=None,
+        recompute_sink=None,
     ) -> tuple[str, list[dict]]:
-        from skunk import MissingData, Orchestrator, SkunkConfig, StepFailed, load_prompt_overrides
+        from skunk import (
+            MissingData,
+            Orchestrator,
+            SkunkConfig,
+            StepFailed,
+            load_prompt_overrides,
+        )
 
         _set_default_env()
         config = SkunkConfig.from_env()
         if not Path(config.prompt_overrides_path).is_absolute():
-            config.prompt_overrides_path = str(SKUNK_ROOT / config.prompt_overrides_path)
+            config.prompt_overrides_path = str(
+                SKUNK_ROOT / config.prompt_overrides_path
+            )
 
         overrides_path = Path(config.prompt_overrides_path)
-        prompt_overrides = load_prompt_overrides(overrides_path) if overrides_path.exists() else ()
+        prompt_overrides = (
+            load_prompt_overrides(overrides_path) if overrides_path.exists() else ()
+        )
 
         # Master switch for ALL human-in-the-loop behavior — the verify/figure/lookup gates
         # AND the broker recovery flow both hinge on the handler being present. Default ON
@@ -134,13 +189,16 @@ class SkunkReasoner:
             "on",
         }:
             human_intervention_handler = None
+            human_review_register = None
 
         orch = Orchestrator(
             prompt,
             config=config,
             prompt_overrides=prompt_overrides,
-            verbose=os.environ.get("SKUNK_CONSOLE_VERBOSE", "").lower() in {"1", "true", "yes"},
+            verbose=os.environ.get("SKUNK_CONSOLE_VERBOSE", "").lower()
+            in {"1", "true", "yes"},
             human_intervention_handler=human_intervention_handler,
+            human_review_register=human_review_register,
         )
         if trace_event_handler is not None:
             original_emit = orch.ctx.emit
@@ -176,6 +234,13 @@ class SkunkReasoner:
                 )
                 raise
             _dump_console_trace(prompt, orch.ctx, answer=answer)
+            # Hand the recompute snapshot to the server so a later human-review resolve can
+            # revise this answer without re-planning (see human_work_broker).
+            if recompute_sink is not None and orch.recompute_state is not None:
+                try:
+                    recompute_sink(orch.recompute_state.to_jsonable())
+                except Exception:
+                    pass  # snapshot capture is best-effort; never fail the answer over it
             return answer, list(orch.ctx.events)
         finally:
             orch.ctx.close()
@@ -243,10 +308,14 @@ def _dump_console_trace(
 
 
 def _reasoning_summary(events: list[dict], source_docs: list[str]) -> str:
-    return json.dumps(_structured_reasoning_payload(events, source_docs), ensure_ascii=False)
+    return json.dumps(
+        _structured_reasoning_payload(events, source_docs), ensure_ascii=False
+    )
 
 
-def _structured_reasoning_payload(events: list[dict], source_docs: list[str]) -> dict[str, Any]:
+def _structured_reasoning_payload(
+    events: list[dict], source_docs: list[str]
+) -> dict[str, Any]:
     branches_by_id: dict[int, dict[str, Any]] = {}
     branch_order: list[int] = []
     branch_steps: dict[int, list[dict[str, Any]]] = {}
@@ -303,7 +372,9 @@ def _structured_reasoning_payload(events: list[dict], source_docs: list[str]) ->
             code = data.get("code")
             attempt = data.get("attempt")
             if not isinstance(code, str) or not code:
-                match = re.match(r"codegen_code attempt=(\d+) code=(.*)", message, re.DOTALL)
+                match = re.match(
+                    r"codegen_code attempt=(\d+) code=(.*)", message, re.DOTALL
+                )
                 if match:
                     attempt = int(match.group(1))
                     try:
@@ -322,7 +393,9 @@ def _structured_reasoning_payload(events: list[dict], source_docs: list[str]) ->
             continue
 
         if message.startswith("exec_failed"):
-            match = re.match(r"exec_failed attempt=(\d+) error=(.*)", message, re.DOTALL)
+            match = re.match(
+                r"exec_failed attempt=(\d+) error=(.*)", message, re.DOTALL
+            )
             if match:
                 attempt = int(match.group(1))
                 for item in reversed(compute_attempts):
@@ -355,7 +428,11 @@ def _structured_reasoning_payload(events: list[dict], source_docs: list[str]) ->
             continue
         steps = branch_steps.get(branch_id, [])
         last_step = steps[-1] if steps else None
-        last_step_data = last_step.get("data") if isinstance(last_step, dict) and isinstance(last_step.get("data"), dict) else {}
+        last_step_data = (
+            last_step.get("data")
+            if isinstance(last_step, dict) and isinstance(last_step.get("data"), dict)
+            else {}
+        )
         output = last_step_data.get("summary") or last_step_data.get("error") or None
         branches.append(
             {
@@ -364,7 +441,9 @@ def _structured_reasoning_payload(events: list[dict], source_docs: list[str]) ->
                 "searched": _branch_search_details(branch),
                 "blocks": output.get("blocks", []) if isinstance(output, dict) else [],
                 "output": output,
-                "output_step": last_step.get("op") if isinstance(last_step, dict) else None,
+                "output_step": last_step.get("op")
+                if isinstance(last_step, dict)
+                else None,
                 "status": "failed" if last_step_data.get("error") else "ok",
             }
         )
@@ -423,11 +502,17 @@ def _source_docs_from_events(events: list[dict]) -> list[str]:
                     if isinstance(month, str) and isinstance(page, int):
                         _append_doc(docs, seen, month, str(page))
         msg = str(evt.get("message", ""))
-        for month, page in re.findall(r"PageRef\([^)]*month=([0-9]{4}-[0-9]{2})[^)]*page=(\d+)", msg):
+        for month, page in re.findall(
+            r"PageRef\([^)]*month=([0-9]{4}-[0-9]{2})[^)]*page=(\d+)", msg
+        ):
             _append_doc(docs, seen, month, page)
-        for month, page in re.findall(r"'bulletin': '([0-9]{4}-[0-9]{2})', 'page': (\d+)", msg):
+        for month, page in re.findall(
+            r"'bulletin': '([0-9]{4}-[0-9]{2})', 'page': (\d+)", msg
+        ):
             _append_doc(docs, seen, month, page)
-        for month, page in re.findall(r'"bulletin": "([0-9]{4}-[0-9]{2})", "page": (\d+)', msg):
+        for month, page in re.findall(
+            r'"bulletin": "([0-9]{4}-[0-9]{2})", "page": (\d+)', msg
+        ):
             _append_doc(docs, seen, month, page)
     return docs[:64]
 

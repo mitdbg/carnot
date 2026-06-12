@@ -45,6 +45,16 @@ HumanInterventionHandler = Callable[
     Awaitable[dict[str, Any]],
 ]
 
+# Optimistic review registration: same (task, instruction, question, source_docs, guidance)
+# shape as the blocking handler, but synchronous and fire-and-forget — it opens a human review
+# on the server and returns a review id (or None) WITHOUT suspending the branch. The branch
+# keeps the LLM result; a human resolve later drives a server-side recompute. Wired only under
+# the competition server (the broker injects it); None for a local CLI run.
+HumanReviewRegister = Callable[
+    [str, str, str | None, list[str], dict[str, Any] | None],
+    str | None,
+]
+
 
 @dataclass(frozen=True)
 class PendingHumanIntervention:
@@ -89,7 +99,9 @@ def render_page_b64(
     with fitz.open(pdf_path) as doc:
         pix = doc[int(page) - 1].get_pixmap(matrix=mat)
     if fmt == "jpg":
-        data = pix.tobytes("jpg", jpg_quality=jpg_quality if jpg_quality is not None else 95)
+        data = pix.tobytes(
+            "jpg", jpg_quality=jpg_quality if jpg_quality is not None else 95
+        )
         mime = "image/jpeg"
     else:
         data = pix.tobytes("png")
@@ -223,8 +235,8 @@ def get_rate_limiter(name: str, rate_per_min: float | None = None) -> _RateLimit
 # task that rebinds the frame is isolated from its siblings. Operator steps don't
 # nest (the orchestrator opens exactly one per traced call), so this holds a
 # single frame, not a stack.
-_step_frame: contextvars.ContextVar[tuple[int, str, int | None] | None] = contextvars.ContextVar(
-    "skunk_step_frame", default=None
+_step_frame: contextvars.ContextVar[tuple[int, str, int | None] | None] = (
+    contextvars.ContextVar("skunk_step_frame", default=None)
 )
 
 
@@ -579,6 +591,10 @@ class ExecutionContext:
     ] = ()  # corpus/few_shot/lesson overrides; operators pick out their own entries by name
     human_intervention_handler: HumanInterventionHandler | None = None
     human_intervention_enabled: bool = False
+    # Optimistic, non-blocking review registration (server only). When set, the verify/lookup
+    # gates open an open review and keep the LLM result instead of awaiting the human — see
+    # `HumanReviewRegister` and `HumanAssist.register_verify`/`register_lookup`.
+    human_review_register: HumanReviewRegister | None = None
 
     def __post_init__(self) -> None:
         if self.llm_client is None:

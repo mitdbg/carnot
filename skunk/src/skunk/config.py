@@ -188,6 +188,12 @@ class SkunkConfig:
     human_figure: bool = False
     human_verify_extract: bool = False
     human_lookup: bool = False
+    # Optimistic human review (broker/server only): instead of the branch awaiting the human
+    # inline, the orchestrator *registers* an open review and continues with the LLM result so
+    # the question completes (READY/submittable) without blocking. A human resolve later revises
+    # the answer (see orchestrator recompute path). No-op for the blocking ConsoleChannel.
+    # (env: SKUNK_HUMAN_OPTIMISTIC=1)
+    human_optimistic: bool = False
 
     def __post_init__(self) -> None:
         # Route per-stage models through the override registry so `PromptedCall` resolves them
@@ -253,6 +259,8 @@ class SkunkConfig:
             human_verify_extract=os.environ.get("SKUNK_HUMAN_VERIFY_EXTRACT", "0")
             not in ("", "0"),
             human_lookup=os.environ.get("SKUNK_HUMAN_LOOKUP", "0") not in ("", "0"),
+            human_optimistic=os.environ.get("SKUNK_HUMAN_OPTIMISTIC", "0")
+            not in ("", "0"),
             retriever=os.environ.get("SKUNK_RETRIEVER", "page_index"),  # type: ignore[arg-type]
             chromadb_dir=os.environ.get("SKUNK_CHROMADB_DIR", "cache/chromadb"),
             chromadb_collection=os.environ.get(

@@ -21,6 +21,7 @@ from skunk_server.api import install_routes
 from skunk_server.competition_adapter import CompetitionAdapter
 from skunk_server.domain import to_jsonable
 from skunk_server.hub import StreamHub
+from skunk_server.human_work_broker import HumanWorkBroker
 from skunk_server.submission_coordinator import SubmissionCoordinator
 from skunk_server.task_queues import TaskQueues
 from skunk_server.task_registry import TaskRegistry
@@ -35,7 +36,6 @@ class ServerConfig:
     reasoner_ref: str = "skunk_reasoner:solve"
     concurrency: int = 3
     queue_size: int = 200
-    auto_submit: bool = False
     reconnect_backoff_s: float = 1.0
 
 
@@ -57,6 +57,19 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
                 "status": task.status.value,
                 "answer": candidate.answer_text if candidate else None,
                 "points": submission.points_awarded if submission else None,
+                "correct": submission.correct if submission else None,
+                # Open human reviews drive the sidebar bump + the review overlay. Small lists,
+                # so the whole payload (instruction + candidates + page refs) rides the snapshot.
+                "reviews": [
+                    {
+                        "review_id": review.review_id,
+                        "kind": review.kind,
+                        "instructions": review.instructions,
+                        "source_docs": review.source_docs,
+                        "guidance": review.guidance,
+                    }
+                    for review in task.open_reviews
+                ],
             }
 
         return {
@@ -78,13 +91,22 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
         queues,
         adapter,
         hub.publish_status,
-        config.auto_submit,
     )
-    pool = AgentWorkerPool(registry, queues, loaded_reasoner, config.concurrency)
+    adapter.set_round_active_callback(coordinator.on_round_active)
+    # Optimistic human-review broker: registers open reviews mid-run and, on resolve, recomputes
+    # the answer (re-running only compute) via the reasoner module's `recompute` entry point.
+    recompute_fn = _load_recompute(config.reasoner_ref) if reasoner is None else None
+    broker = HumanWorkBroker(
+        registry, recompute_fn, coordinator.submit_ready, hub.publish_status
+    )
+    pool = AgentWorkerPool(
+        registry, queues, loaded_reasoner, config.concurrency, human_broker=broker
+    )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         loop = asyncio.get_running_loop()
+        broker.start(loop)
         pool.start(loop, coordinator.handle_agent_completion, hub.publish_event)
         listener = asyncio.create_task(adapter.listen())
         try:
@@ -95,6 +117,7 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
                 await listener
             except asyncio.CancelledError:
                 pass
+            broker.cancel_all()
             pool.stop()
 
     app = FastAPI(title="Skunk Server", lifespan=lifespan)
@@ -103,7 +126,23 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
     app.state.queues = queues
     app.state.hub = hub
     app.state.coordinator = coordinator
+    app.state.broker = broker
     return app
+
+
+def _load_recompute(reasoner_ref: str):
+    """Resolve the reasoner module's `recompute` entry point (used to revise an answer after a
+    human review). Returns None if the module doesn't define one — reviews still open and
+    resolve, they just don't trigger a recompute."""
+    module_name = reasoner_ref.split(":", 1)[0]
+    try:
+        return load_reasoner(f"{module_name}:recompute")
+    except Exception:
+        logger.warning(
+            "reasoner module %s has no `recompute`; human-review revisions disabled",
+            module_name,
+        )
+        return None
 
 
 def load_reasoner(ref: str) -> Reasoner:
@@ -122,24 +161,29 @@ def load_reasoner(ref: str) -> Reasoner:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Skunk competition coordination server")
+    parser = argparse.ArgumentParser(
+        description="Skunk competition coordination server"
+    )
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--cup-base-url", default=os.environ.get("CUP_BASE_URL", ""))
     parser.add_argument("--team-token", default=os.environ.get("CUP_TEAM_TOKEN", ""))
-    parser.add_argument("--reasoner", default=os.environ.get("SKUNK_REASONER", "skunk_reasoner:solve"))
-    parser.add_argument("--concurrency", type=int, default=int(os.environ.get("SKUNK_CONCURRENCY", "3")))
-    parser.add_argument("--queue-size", type=int, default=int(os.environ.get("SKUNK_QUEUE_SIZE", "200")))
     parser.add_argument(
-        "--auto-submit",
-        action=argparse.BooleanOptionalAction,
-        default=os.environ.get("SKUNK_AUTO_SUBMIT", "").lower() in {"1", "true", "yes"},
+        "--reasoner", default=os.environ.get("SKUNK_REASONER", "skunk_reasoner:solve")
+    )
+    parser.add_argument(
+        "--concurrency", type=int, default=int(os.environ.get("SKUNK_CONCURRENCY", "3"))
+    )
+    parser.add_argument(
+        "--queue-size", type=int, default=int(os.environ.get("SKUNK_QUEUE_SIZE", "200"))
     )
     return parser.parse_args()
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
     args = parse_args()
     if not args.cup_base_url:
         raise SystemExit("CUP_BASE_URL or --cup-base-url is required")
@@ -151,13 +195,14 @@ def main() -> None:
         reasoner_ref=args.reasoner,
         concurrency=max(1, args.concurrency),
         queue_size=max(1, args.queue_size),
-        auto_submit=args.auto_submit,
     )
     # Cap graceful shutdown: the monitoring UI holds open SSE responses
     # (status_frames / event_frames loop forever and the browser EventSource never
     # disconnects), so without a deadline uvicorn waits indefinitely for them to close
     # on Ctrl-C and never reaches the lifespan teardown that stops the worker pool.
-    uvicorn.run(create_app(config), host=args.host, port=args.port, timeout_graceful_shutdown=5)
+    uvicorn.run(
+        create_app(config), host=args.host, port=args.port, timeout_graceful_shutdown=5
+    )
 
 
 if __name__ == "__main__":
