@@ -60,6 +60,7 @@ class Attempt:
     feedback: str | None = None
     context_feedback: list[str] = field(default_factory=list)
     previous_attempt_ids: list[str] = field(default_factory=list)
+    events: list[dict[str, Any]] = field(default_factory=list)
     attempt_id: str = field(default_factory=new_id)
     started_at: datetime = field(default_factory=utc_now)
     completed_at: datetime | None = None

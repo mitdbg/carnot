@@ -54,6 +54,13 @@ class AgentWorkerPool:
                 for parameter in parameters.values()
             )
         )
+        self._reasoner_accepts_trace = (
+            "trace_event_handler" in parameters
+            or any(
+                parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        )
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -133,6 +140,7 @@ class AgentWorkerPool:
                 if task is None:
                     continue
                 prompt = self._reasoner_prompt(task.prompt, attempt)
+                reasoner_kwargs: dict[str, Any] = {}
                 if self._human_requester is not None and self._reasoner_accepts_human:
                     async def request_human(
                         kind: str,
@@ -151,12 +159,21 @@ class AgentWorkerPool:
                             guidance,
                         )
 
-                    raw = self._reasoner(
-                        prompt,
-                        human_intervention_handler=request_human,
-                    )
-                else:
-                    raw = self._reasoner(prompt)
+                    reasoner_kwargs["human_intervention_handler"] = request_human
+                if self._reasoner_accepts_trace:
+                    def trace_event_handler(event: dict[str, Any]) -> None:
+                        if not self._should_stream_event(event):
+                            return
+                        if self._registry.append_attempt_event(task_id, attempt.attempt_id, event):
+                            if self._loop is not None and self._on_completion is not None:
+                                self._loop.call_soon_threadsafe(
+                                    self._on_completion,
+                                    task_id,
+                                    "event",
+                                )
+
+                    reasoner_kwargs["trace_event_handler"] = trace_event_handler
+                raw = self._reasoner(prompt, **reasoner_kwargs)
                 if inspect.isawaitable(raw):
                     if self._loop is None:
                         raw = asyncio.run(raw)
@@ -208,6 +225,21 @@ class AgentWorkerPool:
         if not context:
             return prompt
         return prompt + "\n\n" + "\n\n".join(context)
+
+    @staticmethod
+    def _should_stream_event(event: dict[str, Any]) -> bool:
+        kind = event.get("kind")
+        message = str(event.get("message", ""))
+        if kind in {"plan", "step", "error"}:
+            return True
+        if event.get("level") == "warning":
+            return True
+        return message.startswith((
+            "human_",
+            "mandatory_human_intervention_",
+            "replan_",
+            "codegen_missing_data",
+        ))
 
     @staticmethod
     def _normalize_answer(raw: Any) -> tuple[str, str, list[str]]:

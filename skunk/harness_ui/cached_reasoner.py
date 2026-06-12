@@ -32,7 +32,13 @@ def _load_artifact() -> dict[str, Any]:
 
 
 class CachedSkunkReasoner(SkunkReasoner):
-    async def execute(self, prompt: str) -> tuple[str, list[dict]]:
+    async def execute(
+        self,
+        prompt: str,
+        *,
+        human_intervention_handler=None,
+        trace_event_handler=None,
+    ) -> tuple[str, list[dict]]:
         artifact = _load_artifact()
         results = artifact["results"]
         matched_prompt = prompt if prompt in results else None
@@ -53,12 +59,35 @@ class CachedSkunkReasoner(SkunkReasoner):
         events = result.get("events")
         if not isinstance(events, list):
             raise ValueError("Cached Skunk execution has no event trace")
+        if trace_event_handler is not None:
+            for event in events:
+                trace_event_handler(
+                    dict(event) if isinstance(event, dict) else {"message": str(event)}
+                )
         return str(result["answer"]), events
 
 
-async def solve(prompt: str) -> AgentAnswer:
-    return await CachedSkunkReasoner().solve(prompt)
+async def solve(
+    prompt: str,
+    *,
+    human_intervention_handler=None,
+    trace_event_handler=None,
+) -> AgentAnswer:
+    return await CachedSkunkReasoner().solve(
+        prompt,
+        human_intervention_handler=human_intervention_handler,
+        trace_event_handler=trace_event_handler,
+    )
 
 
-async def solve_with_trace(prompt: str) -> tuple[AgentAnswer, list[dict]]:
-    return await CachedSkunkReasoner().solve_with_trace(prompt)
+async def solve_with_trace(
+    prompt: str,
+    *,
+    human_intervention_handler=None,
+    trace_event_handler=None,
+) -> tuple[AgentAnswer, list[dict]]:
+    return await CachedSkunkReasoner().solve_with_trace(
+        prompt,
+        human_intervention_handler=human_intervention_handler,
+        trace_event_handler=trace_event_handler,
+    )

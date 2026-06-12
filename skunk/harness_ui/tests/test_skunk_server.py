@@ -233,6 +233,83 @@ def test_round_close_frees_worker_for_next_round() -> None:
     asyncio.run(run())
 
 
+def test_agent_worker_pool_streams_trace_events_to_attempt() -> None:
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        registry = TaskRegistry()
+        queues = TaskQueues()
+        task, _ = registry.create_task(1, "trace", "Question")
+        events: list[tuple[str, str]] = []
+
+        def reasoner(_prompt: str, *, trace_event_handler=None):
+            assert trace_event_handler is not None
+            trace_event_handler(
+                {
+                    "message": "large assistant payload",
+                    "kind": "assistant",
+                    "op": "planner",
+                    "data": {"content": "x" * 10_000},
+                    "t": 0.05,
+                }
+            )
+            trace_event_handler(
+                {
+                    "message": "planner started",
+                    "kind": "plan",
+                    "op": "planner",
+                    "t": 0.1,
+                }
+            )
+            trace_event_handler(
+                {
+                    "message": "step elapsed_s=1.0 output='ok'",
+                    "kind": "step",
+                    "op": "planner",
+                    "t": 1.0,
+                }
+            )
+            return AgentAnswer("42", "Reasoning from worker thread.", [])
+
+        pool = AgentWorkerPool(
+            registry,
+            queues,
+            reasoner,
+            1,
+        )
+        pool.start(loop, lambda task_id, outcome: events.append((task_id, outcome)))
+        queues.enqueue_agent(task.task_id)
+        try:
+            for _ in range(100):
+                if (
+                    task.status == TaskStatus.READY
+                    and len(task.attempts[0].events) == 2
+                    and (task.task_id, "ready") in events
+                ):
+                    break
+                await asyncio.sleep(0.02)
+            assert task.status == TaskStatus.READY
+            assert task.attempts[0].events == [
+                {
+                    "message": "planner started",
+                    "kind": "plan",
+                    "op": "planner",
+                    "t": 0.1,
+                },
+                {
+                    "message": "step elapsed_s=1.0 output='ok'",
+                    "kind": "step",
+                    "op": "planner",
+                    "t": 1.0,
+                },
+            ]
+            assert (task.task_id, "event") in events
+            assert events[-1] == (task.task_id, "ready")
+        finally:
+            pool.stop()
+
+    asyncio.run(run())
+
+
 def test_cancelled_run_dumps_partial_trace(tmp_path, monkeypatch) -> None:
     # A run cancelled at round close should still write its (partial) trace, marked
     # "cancelled", and must re-raise the cancellation rather than swallow it.
@@ -530,11 +607,17 @@ def test_reasoning_payload_includes_branch_cards_and_code() -> None:
             "op": "compute",
             "data": {"attempt": 1, "code": "result = '42'"},
         },
+        {
+            "kind": "observation",
+            "message": "human_directed_retrieval",
+            "data": {"directives": [{"branch_id": 0, "bulletins": ["1954-02"]}]},
+        },
     ]
 
     payload = _structured_reasoning_payload(events, ["Treasury Bulletin 1954-02 PDF page 4"])
 
     assert payload["summary"]["branch_count"] == 2
+    assert payload["summary"]["human_directed_retrieval"] is True
     assert payload["branches"][0]["searched"]["key"] == "inflation"
     assert payload["branches"][1]["searched"]["target"] == "cpi"
     assert payload["python_code"] == "result = '42'"

@@ -360,6 +360,211 @@ def test_document_only_feedback_reruns_targeted_retrieval_before_replanning() ->
     ]
 
 
+def test_document_feedback_adds_to_prior_branch_values() -> None:
+    class Planner(_Planner):
+        async def replan(self, *_args, **_kwargs) -> PlanDiff:
+            raise AssertionError("merged old and new values should satisfy compute")
+
+    class Compute:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.seen_descriptions: list[list[str]] = []
+
+        async def run(self, entries, _ctx, *, concept_explanations):
+            self.calls += 1
+            descriptions = [entry.description for entry in entries]
+            self.seen_descriptions.append(descriptions)
+            if self.calls == 1:
+                raise MissingData("need missing month", ["1985-Feb"])
+            assert "Already extracted month" in descriptions
+            assert "Human-directed missing month" in descriptions
+            return "final"
+
+    async def human_handler(_kind, _instructions, _context, _source_docs, _guidance):
+        return {
+            "response": "",
+            "source_docs": ["Treasury Bulletin 1985-12 PDF"],
+            "retrieval_directives": [
+                {
+                    "branch_id": 0,
+                    "documents": ["Treasury Bulletin 1985-12 PDF"],
+                }
+            ],
+        }
+
+    async def run_branches(branches, _branch_ids, *, document_scopes=None):
+        if document_scopes:
+            return [
+                BranchOutcome(
+                    branch=branches[0],
+                    entries=[
+                        AnnotatedValue(
+                            description="Human-directed missing month",
+                            value={"1985-Feb": {"outlays": 10}},
+                            kind="table",
+                            row_name="month",
+                            col_name="measure",
+                            bulletin="1985-12",
+                        )
+                    ],
+                    error=None,
+                )
+            ]
+        return [
+            BranchOutcome(
+                branch=branches[0],
+                entries=[
+                        AnnotatedValue(
+                            description="Already extracted month",
+                            value={"1985-Jan": {"outlays": 9}},
+                            kind="table",
+                            row_name="month",
+                            col_name="measure",
+                            bulletin="1985-12",
+                        )
+                ],
+                error=None,
+            )
+        ]
+
+    orchestrator = Orchestrator(
+        "q1",
+        llm_client=object(),  # type: ignore[arg-type]
+        human_intervention_handler=human_handler,
+    )
+    orchestrator._planner = Planner()
+    orchestrator._explainer = _Explainer()
+    compute = Compute()
+    orchestrator._compute = compute
+    orchestrator._run_branches = run_branches  # type: ignore[method-assign]
+
+    try:
+        result = asyncio.run(orchestrator.execute())
+    finally:
+        orchestrator.ctx.close()
+
+    assert result == "final"
+    assert compute.seen_descriptions == [
+        ["Already extracted month"],
+        ["Already extracted month", "Human-directed missing month"],
+    ]
+
+
+def test_document_annotation_consumes_round_before_structural_replan() -> None:
+    branch_runs: list[
+        tuple[list[RetrieveBranch], list[int], dict[int, list[str]] | None]
+    ] = []
+    handler_calls = 0
+
+    class Planner(_Planner):
+        async def replan(
+            self,
+            _ctx,
+            _plan,
+            entries,
+            _failed,
+            reason,
+            missing,
+            human_resolutions,
+        ) -> PlanDiff:
+            self.replan_calls.append(
+                (
+                    list(entries),
+                    reason,
+                    list(missing),
+                    list(human_resolutions),
+                )
+            )
+            return PlanDiff(
+                drop=[0],
+                add=[RetrieveBranch(key="replacement value")],
+            )
+
+    class Compute:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def run(self, entries, _ctx, *, concept_explanations):
+            self.calls += 1
+            if self.calls == 1:
+                raise MissingData("need value", ["value"])
+            if self.calls == 2:
+                raise MissingData("annotated retry was insufficient", ["value"])
+            assert entries[-1].description == "Replacement value"
+            return "final"
+
+    async def human_handler(
+        _kind, _instructions, _context, _source_docs, _guidance
+    ):
+        nonlocal handler_calls
+        handler_calls += 1
+        return {
+            "response": "",
+            "source_docs": ["Treasury Bulletin 1986-06 PDF"],
+            "retrieval_directives": [
+                {
+                    "branch_id": 0,
+                    "documents": ["Treasury Bulletin 1986-06 PDF"],
+                }
+            ],
+        }
+
+    async def run_branches(branches, branch_ids, *, document_scopes=None):
+        branch_runs.append((list(branches), list(branch_ids), document_scopes))
+        branch = branches[0]
+        if branch.key == "replacement value":
+            return [
+                BranchOutcome(
+                    branch=branch,
+                    entries=[
+                        AnnotatedValue(
+                            description="Replacement value",
+                            value="100",
+                        )
+                    ],
+                    error=None,
+                )
+            ]
+        return [BranchOutcome(branch=branch, entries=[], error=None)]
+
+    orchestrator = Orchestrator(
+        "q1",
+        llm_client=object(),  # type: ignore[arg-type]
+        human_intervention_handler=human_handler,
+    )
+    planner = Planner()
+    orchestrator._planner = planner
+    orchestrator._explainer = _Explainer()
+    orchestrator._compute = Compute()
+    orchestrator._run_branches = run_branches  # type: ignore[method-assign]
+
+    try:
+        result = asyncio.run(orchestrator.execute())
+    finally:
+        orchestrator.ctx.close()
+
+    assert result == "final"
+    assert handler_calls == 1
+    assert [
+        ([branch.key for branch in branches], branch_ids, scopes)
+        for branches, branch_ids, scopes in branch_runs
+    ] == [
+        (["value"], [0], None),
+        (["value"], [0], {0: ["1986-06"]}),
+        (["replacement value"], [1], None),
+    ]
+    assert branch_runs[1][0][0] == branch_runs[0][0][0]
+    assert len(planner.replan_calls) == 1
+    assert planner.replan_calls[0][1] == "annotated retry was insufficient"
+    replan_pending = [
+        event
+        for event in orchestrator.ctx.events
+        if event["kind"] == "plan"
+        and event["data"].get("label") == "replan_pending"
+    ]
+    assert replan_pending[-1]["data"]["recovery_round"] == 2
+
+
 def test_page_index_human_scope_uses_only_selected_bulletins(tmp_path) -> None:
     retriever = object.__new__(PageIndexRetriever)
     rows = [

@@ -44,6 +44,13 @@ from .store import get_page_store
 _MONTH_RE = re.compile(r"\d{4}-\d{2}")
 
 
+def _sample_pages(refs: list[PageRef], limit: int = 5) -> list[dict[str, str | int | None]]:
+    return [
+        {"bulletin": ref.month, "page": ref.page}
+        for ref in refs[:limit]
+    ]
+
+
 class _PeriodEntry(NamedTuple):
     lo: str  # inclusive YYYY-MM data-span start
     hi: str  # inclusive YYYY-MM data-span end
@@ -417,7 +424,10 @@ Use each `block_id` exactly as it appears."""
         )
         picked = await pick_call.call(ctx, user, temperature=0.0)
         out = [ref for ch in picked for ref in pages[ch]]
-        ctx.emit(f"pick_chapters era={era.span} picked={picked!r} pages={len(out)}")
+        ctx.emit(
+            f"pick_chapters era={era.span} picked={picked!r} pages={len(out)}",
+            data={"pages": len(out), "sample_pages": _sample_pages(out)},
+        )
         return out
 
     def _year_filter(
@@ -458,7 +468,15 @@ Use each `block_id` exactly as it appears."""
             kept = [ref for ref in kept if _passes(ref)]
         ctx.emit(
             f"year_filter as_of={branch.as_of!r} period={branch.period!r} "
-            f"kept={len(kept)}/{len(candidates)}"
+            f"kept={len(kept)}/{len(candidates)}",
+            data={
+                "key": branch.key,
+                "period": branch.period,
+                "as_of": branch.as_of,
+                "input_pages": len(candidates),
+                "kept_pages": len(kept),
+                "sample_pages": _sample_pages(kept),
+            },
         )
         return kept
 
@@ -549,7 +567,16 @@ Use each `block_id` exactly as it appears."""
         n_blocks = sum(len(rows) for _, rows in groups)
         ctx.emit(
             f"semantic_filter kept={n_kept}/{len(pages)} "
-            f"blocks_kept={n_blocks_kept} blocks={n_blocks}"
+            f"blocks_kept={n_blocks_kept} blocks={n_blocks}",
+            data={
+                "input_pages": len(pages),
+                "kept_pages": n_kept,
+                "input_blocks": n_blocks,
+                "kept_blocks": n_blocks_kept,
+                "sample_pages": _sample_pages(
+                    [pk for pk in pages if not verdict[pk] or any(verdict[pk])]
+                ),
+            },
         )
         return verdict
 
@@ -611,7 +638,13 @@ Use each `block_id` exactly as it appears."""
                 )
                 ctx.emit(
                     f"human_document_scope key={branch.key!r} "
-                    f"bulletins={scope!r} pages={len(refs)}"
+                    f"bulletins={scope!r} pages={len(refs)}",
+                    data={
+                        "key": branch.key,
+                        "bulletins": scope,
+                        "pages": len(refs),
+                        "sample_pages": _sample_pages(refs),
+                    },
                 )
                 cand.append(refs)
             else:
@@ -638,7 +671,19 @@ Use each `block_id` exactly as it appears."""
             b = branches[i]
             ctx.emit(
                 f"page_index_retrieve key={b.key!r} period={b.period!r} as_of={b.as_of!r} "
-                f"catalog_size={self._catalog_size} anchor_count={len(kept_pages)} block_count={len(block_refs)} "
+                f"catalog_size={self._catalog_size} anchor_count={len(kept_pages)} block_count={len(block_refs)} ",
+                data={
+                    "key": b.key,
+                    "period": b.period,
+                    "as_of": b.as_of,
+                    "catalog_size": self._catalog_size,
+                    "anchor_count": len(kept_pages),
+                    "block_count": len(block_refs),
+                    "sample_pages": _sample_pages(kept_pages),
+                    "sample_block_pages": _sample_pages(
+                        [block_ref.page for block_ref in block_refs]
+                    ),
+                },
             )
             branch_blocks.append(block_refs)
 
@@ -942,6 +987,14 @@ Use each `block_id` exactly as it appears."""
             )
         ctx.emit(
             f"block_select key={branch.key!r} candidates={n0} rounds={rounds} "
-            f"selected_blocks={len(selected)} top_k={cap}"
+            f"selected_blocks={len(selected)} top_k={cap}",
+            data={
+                "key": branch.key,
+                "candidates": n0,
+                "rounds": rounds,
+                "selected_blocks": len(selected),
+                "top_k": cap,
+                "sample_pages": _sample_pages([block_ref.page for block_ref in selected]),
+            },
         )
         return selected

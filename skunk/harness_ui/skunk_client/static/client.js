@@ -2,6 +2,7 @@ const SERVER = document.body.dataset.serverUrl || document.documentElement.datas
 let state = { worker: null, round: {}, tasks: [], workers: [] };
 let workerId = null;
 let selectedTaskId = null;
+let taskEventTraceOpen = false;
 const app = document.getElementById("app");
 const lastEvent = document.getElementById("lastEvent");
 const roundTimerMetric = document.getElementById("roundTimerMetric");
@@ -307,8 +308,12 @@ function reasoningVisual(reasoning, answer) {
   reasoningModalBranches.push(...branches);
   const code = payload.python_code || "";
   const attempts = payload.python_attempts || [];
+  const label = payload.summary?.human_directed_retrieval
+    && !Number(payload.summary?.replan_count || 0)
+    ? "Extended Retrieval After Human Feedback"
+    : "Reasoning Flow";
   return `<section class="reasoning-shell">
-    <div class="label">Reasoning Flow</div>
+    <div class="label">${esc(label)}</div>
     <div class="reasoning-flow">
       <div class="flow-branches">
       ${branches.map((branch, branchIndex) => `
@@ -628,6 +633,59 @@ function formatDuration(seconds) {
     : `${String(minutes).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
 }
 
+function taskTraceEvents(task) {
+  return (task.attempts || []).flatMap(attempt => (
+    (attempt.events || []).map((event, index) => ({
+      ...event,
+      attempt_number: attempt.attempt_number,
+      attempt_event_index: index + 1,
+    }))
+  ));
+}
+
+function eventTimeLabel(event) {
+  return Number.isFinite(Number(event.t))
+    ? `+${Number(event.t).toFixed(3)}s`
+    : formatClock(event.created_at);
+}
+
+function eventSummaryText(event) {
+  const parts = [];
+  if (event.op) parts.push(event.op);
+  if (event.kind && event.kind !== event.op) parts.push(event.kind);
+  const prefix = parts.length ? `${parts.join(" / ")}: ` : "";
+  return `${prefix}${event.message || "event"}`;
+}
+
+function eventLineHtml(event) {
+  return `<span class="event-time">${esc(eventTimeLabel(event))}</span>
+    <span class="event-attempt">attempt ${esc(event.attempt_number || "-")}</span>
+    <span class="event-message">${esc(eventSummaryText(event))}</span>`;
+}
+
+function eventTraceHtml(task) {
+  const events = taskTraceEvents(task);
+  if (!events.length) {
+    return `<div class="task-event-trace empty-trace">No trace events yet.</div>`;
+  }
+  const latest = events[events.length - 1];
+  const previous = events.slice(0, -1).reverse();
+  return `<details class="task-event-trace" ${taskEventTraceOpen ? "open" : ""} ontoggle="setTaskEventTraceOpen(this.open)">
+    <summary>
+      ${eventLineHtml(latest)}
+      <span class="event-count">${esc(events.length)} event${events.length === 1 ? "" : "s"}</span>
+    </summary>
+    <div class="event-history">
+      ${previous.length ? previous.map(event => `
+        <article class="event-history-item">
+          <div class="event-history-line">${eventLineHtml(event)}</div>
+          <pre>${esc(JSON.stringify(event, null, 2))}</pre>
+        </article>
+      `).join("") : `<div class="event-history-empty">No previous events.</div>`}
+    </div>
+  </details>`;
+}
+
 function updateRoundTimer() {
   const deadline = state?.round?.ends_at ? Date.parse(state.round.ends_at) : NaN;
   roundTimerMetric.classList.remove("warning", "expired");
@@ -643,6 +701,7 @@ function updateRoundTimer() {
 
 function selectTask(taskId) {
   selectedTaskId = taskId;
+  taskEventTraceOpen = false;
   render();
 }
 
@@ -852,6 +911,14 @@ function interventionHtml(intervention) {
     ? guidance.missing.map(value => String(value).trim()).filter(Boolean)
     : [];
   const verifyTask = VERIFY_KINDS.includes(intervention.kind);
+  const contextText = String(intervention.context || "").trim();
+  const questionText = contextText.replace(/^Question:\s*/i, "").trim();
+  const failureReasonMatch = String(intervention.instructions || "").match(
+    /Failure reason:\s*([\s\S]*?)(?:\nMissing values:|$)/i,
+  );
+  const agentError = String(
+    guidance.reason || (failureReasonMatch ? failureReasonMatch[1] : ""),
+  ).trim();
   const guidanceHtml = Object.keys(guidance).length
     ? `<div class="intervention-guidance">
         ${guidance.recovery_round
@@ -879,26 +946,29 @@ function interventionHtml(intervention) {
           : ""}
       </div>`
     : "";
+  // Verify/figure/lookup show the model's candidate(s) in place of the recovery guidance blob.
+  const detailBlock = verifyTask ? verifyPreviewHtml(intervention) : guidanceHtml;
+  const requestContextBody = intervention.kind === "missing_data"
+    ? `${questionText ? `<div class="request-question"><span>Question</span><p>${esc(questionText)}</p></div>` : ""}
+      ${agentError ? `<p class="agent-error"><strong>Agent Error:</strong> ${esc(agentError)}</p>` : ""}
+      ${requestedSources}
+      ${guidanceHtml}`
+    : `<p class="request-instructions">${esc(intervention.instructions)}</p>
+      ${contextText ? `<p class="intervention-context">${esc(contextText)}</p>` : ""}
+      ${requestedSources}
+      ${detailBlock}`;
   const missingSummary = missingValues.length && !isMine
     ? `<div class="missing-information">
         <div class="label">Missing Information</div>
         ${missingValues.map(value => `<div class="missing-information-item">${esc(value)}</div>`).join("")}
       </div>`
     : "";
-  // Verify/figure/lookup show the model's candidate(s) in place of the recovery guidance blob.
-  const detailBlock = verifyTask ? verifyPreviewHtml(intervention) : guidanceHtml;
   const requestContext = missingValues.length
     ? `<details class="request-context">
         <summary>Request context</summary>
-        <p>${esc(intervention.instructions)}</p>
-        ${intervention.context ? `<p class="intervention-context">${esc(intervention.context)}</p>` : ""}
-        ${requestedSources}
-        ${detailBlock}
+        ${requestContextBody}
       </details>`
-    : `<p>${esc(intervention.instructions)}</p>
-      ${intervention.context ? `<p class="intervention-context">${esc(intervention.context)}</p>` : ""}
-      ${requestedSources}
-      ${detailBlock}`;
+    : requestContextBody;
   let controls = "";
   if (intervention.status === "PENDING" && workerId) {
     controls = `<button class="primary" onclick="claimIntervention('${js(intervention.intervention_id)}')">Claim Request</button>`;
@@ -1020,8 +1090,9 @@ function renderDetail(task) {
       <div><span>Replans</span><strong>${esc(replanDisplay)}</strong></div>
     </div>`;
   return `<div class="detail-body">
+    ${eventTraceHtml(task)}
     <p class="prompt">R${esc(task.round_num)} / ${esc(task.question_id)}</p>
-    <div class="label">Prompt</div><pre>${esc(task.prompt)}</pre>
+    <div class="label">Prompt</div><div class="task-question">${esc(task.prompt)}</div>
     ${taskMeta}
     ${answerSection}
     ${previousRoundFlow}
@@ -1246,6 +1317,7 @@ window.resolveIntervention = (interventionId, options = {}) => {
   ));
 };
 window.selectTask = selectTask;
+window.setTaskEventTraceOpen = open => { taskEventTraceOpen = open; };
 window.openExtractionModal = openExtractionModal;
 window.openSourcePage = openSourcePage;
 window.closeExtractionModal = closeExtractionModal;

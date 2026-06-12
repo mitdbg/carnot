@@ -19,8 +19,13 @@ from skunk_server.domain import (
     SubmissionRecord,
     SubmissionStatus,
     TaskStatus,
+    to_jsonable,
     utc_now,
 )
+
+MAX_ATTEMPT_EVENTS = 80
+MAX_EVENT_MESSAGE_CHARS = 240
+MAX_EVENT_DATA_CHARS = 2000
 
 
 class TaskConflict(ValueError):
@@ -153,6 +158,23 @@ class TaskRegistry:
             task.current_attempt_id = None
             self._set_status(task, TaskStatus.FAILED)
             return True
+
+    def append_attempt_event(
+        self,
+        task_id: str,
+        attempt_id: str,
+        event: dict,
+    ) -> bool:
+        with self._lock:
+            task = self._require_task(task_id)
+            for attempt in task.attempts:
+                if attempt.attempt_id == attempt_id:
+                    attempt.events.append(_compact_event(event))
+                    if len(attempt.events) > MAX_ATTEMPT_EVENTS:
+                        del attempt.events[:len(attempt.events) - MAX_ATTEMPT_EVENTS]
+                    task.updated_at = utc_now()
+                    return True
+            return False
 
     def create_intervention(
         self,
@@ -602,3 +624,24 @@ class TaskRegistry:
             if submission.local_submission_id == local_submission_id:
                 return submission
         raise KeyError(local_submission_id)
+
+
+def _compact_event(event: dict) -> dict:
+    compact: dict = {}
+    for key in ("message", "kind", "op", "level", "step_idx", "t"):
+        if key in event:
+            compact[key] = event[key]
+    if "message" in compact:
+        compact["message"] = str(compact["message"])[:MAX_EVENT_MESSAGE_CHARS]
+    data = event.get("data")
+    if isinstance(data, dict) and data:
+        compact["data"] = _compact_event_data(data)
+    return to_jsonable(compact)
+
+
+def _compact_event_data(data: dict) -> dict | str:
+    compact = to_jsonable(data)
+    rendered = str(compact)
+    if len(rendered) <= MAX_EVENT_DATA_CHARS:
+        return compact
+    return f"{rendered[:MAX_EVENT_DATA_CHARS]}... [truncated]"
