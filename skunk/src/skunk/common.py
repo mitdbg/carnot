@@ -384,6 +384,9 @@ class SemPoolEntry:
     rows_tail: tuple[
         str, ...
     ] = ()  # trailing row headers — shows the data window's end
+    rows: tuple[
+        str, ...
+    ] = ()  # FULL row headers — shows granularity (annual vs monthly rows) and window
 
 
 VALUE_KIND_VOCAB: frozenset[str] = frozenset({"scalar", "vector", "table"})

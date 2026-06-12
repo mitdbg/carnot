@@ -245,6 +245,8 @@ class PromptedCall[T]:
                 ctx=ctx,
                 call_site=self.name,
                 model=model,
+                max_output_tokens=max_output_tokens,
+                timeout_s=timeout_s,
             )
             ctx.emit(
                 f"assistant call_site={self.name} chars={len(resp.text)}",

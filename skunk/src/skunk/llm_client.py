@@ -196,7 +196,7 @@ _MODEL_TPM: dict[str, float] | None = None
 # via SKUNK_MODEL_TPM ("model=tpm,..."); a model in neither is unthrottled (None) and paced
 # by RPM alone (e.g. Pro).
 _DEFAULT_TPM: dict[str, float] = {
-    "gemini-3.5-flash": 4_000_000.0,
+    "gemini-3.5-flash": 10_000_000.0,
     "gemini-3.1-flash-lite": 25_000_000.0,
 }
 
@@ -302,10 +302,13 @@ class LLMClient:
         ctx: "ExecutionContext | None" = None,
         call_site: str = "llm",
         model: str | None = None,
+        max_output_tokens: int | None = None,
+        timeout_s: float | None = None,
     ) -> LLMResponse:
-        """Async twin of `call` for the request path."""
+        """Async twin of `call` for the request path. `max_output_tokens` /
+        `timeout_s` mirror `astream`'s caps (None → provider default / no cap)."""
         args = (system, user, images, temperature, effort, ctx, call_site,
-                model or self._config.llm_model)
+                model or self._config.llm_model, max_output_tokens, timeout_s)
         if self._config.llm_provider == "openrouter":
             return await self._acall_openrouter(*args)
         return await self._acall_gemini(*args)
@@ -528,12 +531,18 @@ class LLMClient:
         ctx: ExecutionContext | None,
         call_site: str = "llm",
         model: str | None = None,
+        max_output_tokens: int | None = None,
+        timeout_s: float | None = None,
     ) -> LLMResponse:
         """Async twin of `_call_gemini` — uses `client.aio.models.generate_content`."""
         client = self._get_gemini_client()
         parts = self._gemini_parts(user, images)
         model = model or self._config.llm_model
-        gen_config = self._gemini_config(system, temperature, effort, model)
+        gen_config = self._gemini_config(
+            system, temperature, effort, model,
+            max_output_tokens if max_output_tokens is not None else 65535,
+            timeout_s,
+        )
 
         async def do() -> LLMResponse:
             # TPM throttle (opt-in via SKUNK_MODEL_TPM): meter input tokens so
@@ -549,9 +558,15 @@ class LLMClient:
                 tpm_lim = get_async_tpm_limiter(model, tpm)
                 await tpm_lim.acquire(est)
             t0 = time.monotonic()
-            api_resp = await client.aio.models.generate_content(
+            # Hard wall-clock cap mirroring the streaming path: the http_options
+            # timeout in `gen_config` bounds reads, wait_for bounds the whole call.
+            coro = client.aio.models.generate_content(
                 model=model, contents=parts, config=gen_config,
             )
+            if timeout_s is not None:
+                api_resp = await asyncio.wait_for(coro, timeout_s)
+            else:
+                api_resp = await coro
             latency_s = time.monotonic() - t0
             usage = api_resp.usage_metadata
             output_text = (api_resp.text or "").strip()
@@ -868,6 +883,8 @@ class LLMClient:
         ctx: ExecutionContext | None,
         call_site: str = "llm",
         model: str | None = None,
+        max_output_tokens: int | None = None,
+        timeout_s: float | None = None,
     ) -> LLMResponse:
         """Async twin of `_call_openrouter` — uses `client.chat.send_async`."""
         client = self._get_openrouter_client()
@@ -886,11 +903,13 @@ class LLMClient:
                 est = _estimate_prompt_tokens(system, user)
                 tpm_lim = get_async_tpm_limiter(model, tpm)
                 await tpm_lim.acquire(est)
+            extra = {"max_tokens": max_output_tokens} if max_output_tokens is not None else {}
             t0 = time.monotonic()
-            resp = await client.chat.send_async(
+            coro = client.chat.send_async(
                 model=model, messages=messages, stream=False, # type: ignore
-                temperature=temperature, reasoning=reasoning, # type: ignore
+                temperature=temperature, reasoning=reasoning, **extra, # type: ignore
             )
+            resp = await (asyncio.wait_for(coro, timeout_s) if timeout_s is not None else coro)
             latency_s = time.monotonic() - t0
             output_text = self._openrouter_text(resp).strip()
             toks = self._usage_tokens_openrouter(getattr(resp, "usage", None))

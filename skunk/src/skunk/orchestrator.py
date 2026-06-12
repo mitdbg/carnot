@@ -311,22 +311,37 @@ class Orchestrator:
         )
         pools_by_pos: dict[int, list[SemPoolEntry]] = dict(zip(retrieve_pos, pools))
 
+        # Selection-agent path: select → extract → check runs as ONE shared pipeline
+        # over all retrieve branches (the checker is cross-branch), launched as a task
+        # so lookup branches proceed concurrently. Each retrieve tail awaits the shared
+        # task and picks out its branch's result. The pipeline does its own per-branch
+        # traced_steps, so the tail doesn't wrap it again.
+        pipeline: asyncio.Task | None = None
+        if self._ctx.config.selection_agent and retrieve_pos:
+            from skunk.select_agent import run_select_pipeline
+
+            pipeline = asyncio.create_task(
+                run_select_pipeline(
+                    self._ctx,
+                    [cast(RetrieveBranch, branches[i]) for i in retrieve_pos],
+                    [docs_by_pos[i] for i in retrieve_pos],
+                    [pools_by_pos.get(i, []) for i in retrieve_pos],
+                    [branch_ids[i] for i in retrieve_pos],
+                )
+            )
+
         async def _tail(pos: int) -> list[AnnotatedValue]:
             branch, bid = branches[pos], branch_ids[pos]
             if branch.kind == "retrieve":
+                if pipeline is not None:
+                    res = (await pipeline)[retrieve_pos.index(pos)]
+                    if isinstance(res, StepFailed):
+                        raise res
+                    return res
                 doc = docs_by_pos[pos]
                 if isinstance(doc, StepFailed):
                     raise doc
                 pool = pools_by_pos.get(pos, [])
-                if self._ctx.config.selection_agent:
-                    from skunk.select_agent import run_select_agent
-
-                    return await traced_step(
-                        self._ctx,
-                        "select_agent",
-                        lambda: run_select_agent(self._ctx, branch, doc, pool),
-                        branch_id=bid,
-                    )
                 return await traced_step(
                     self._ctx,
                     "extract",

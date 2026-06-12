@@ -130,6 +130,10 @@ no commentary, no second block, no fence around (b):
          "description": "<one-line explanation>"}
       Never fabricate values to avoid this path — if a required value
       isn't in `input_values`, emit (b).
+      Real-world reference data (exchange rates, deflators, CPI, GDP,
+      population, market prices) is DATA, not knowledge: if the question
+      needs it and no entry carries it, emit (b) — never supply it from
+      memory, however well-known (e.g. a parity FX rate).
 
 Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
 """
@@ -193,6 +197,16 @@ class ComputeOp:
         recover by gathering more data and replanning."""
         # No "starting" boundary emit — the orchestrator's trace records this
         # step's boundary; the plan is the planner step's output.
+
+        # Source pages behind the values reaching compute (post-retry/replan) — the
+        # final-stage survivor set for per-stage recall (eval/stage_report.py).
+        src_pages = sorted(
+            {f"{e.bulletin}:{p}" for e in input_values if e.bulletin for p in e.pages}
+        )
+        ctx.emit(
+            f"compute_inputs n_values={len(input_values)} n_pages={len(src_pages)}",
+            data={"pages": src_pages},
+        )
 
         prev_code: str | None = None
         prev_failure: str | None = None

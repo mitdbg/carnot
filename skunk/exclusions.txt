@@ -24,3 +24,5 @@ UID0213   # "CPI-U for those years": annual-average (gold) vs December monthly (
 UID0220   # "absolute percent difference": relative-to-base 31.2 (ours) vs symmetric 27.0 (gold), gold's own page+values
 UID0226   # sample vs population std on the question-named column (ddof=1 5678.4 vs ddof=0 4636.4, sqrt(3/2) apart); 0201 family
 UID0013   # OLS intercept over-precision at rounding boundary (-184.1416 -> .142 vs gold .143); 0111 family, asymmetric (only ours reproduces)
+UID0245   # "Fisher Ideal symmetric growth rate": Fisher-scalar -0.107 (ours, pct) vs mid-point -0.113 (gold, fraction); same printed values; 0220/0113 family
+UID0110   # geomean of "quarterly percent change at an annual rate": gold de-annualizes by /4 (0.69, would be 0.68 if compounding-correct); direct geomean of printed values = 2.74; year 2017 robust either way

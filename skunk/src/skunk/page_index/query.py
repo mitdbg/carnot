@@ -229,10 +229,7 @@ Judge EACH block and mark `true` only the ones that most directly report the tar
 Respect the cap given, and return fewer blocks when fewer fit. Apply the rules below when deciding:
   - If the question pins a specific source ("as reported in the <Month Year> Bulletin", "as of <date>"), select
     blocks that best match that source.
-  - Otherwise prefer the block whose title / headers / date range  match the target most precisely. Beware of the EXACT
-    scope of the target: a row/column label that wraps the concept in extra words — "<concept> and
-    related activities", "<concept>, including …", etc. — names a BROADER aggregate and will have different values from
-    the bare concept. Prefer the block that reports exactly the asked scope.
+  - Otherwise prefer the block whose title / headers / date range  match the target most precisely. 
   - When the same figure is restated across many issues, prefer the most recent issue that covers all of the required
     period unless the question explicitly asks for a version.
 
@@ -366,6 +363,12 @@ SAME ORDER given: `true` to SELECT the block, `false` to drop it. No more than t
                 if ref not in seen:
                     seen.add(ref)
                     out.append(ref)
+        # Survivor identities (not just counts) so per-stage recall/elimination is
+        # computable post-hoc from events.jsonl (eval/stage_report.py).
+        ctx.emit(
+            f"toc_pick_pages n={len(out)}",
+            data={"pages": [f"{r.month}:{r.page}" for r in out]},
+        )
         return out
 
     async def _pick_era_chapters(
@@ -451,7 +454,8 @@ SAME ORDER given: `true` to SELECT the block, `false` to drop it. No more than t
             kept = [ref for ref in kept if _passes(ref)]
         ctx.emit(
             f"year_filter as_of={branch.as_of!r} period={branch.period!r} "
-            f"kept={len(kept)}/{len(candidates)}"
+            f"kept={len(kept)}/{len(candidates)}",
+            data={"pages": [f"{r.month}:{r.page}" for r in kept]},
         )
         return kept
 
@@ -537,12 +541,13 @@ SAME ORDER given: `true` to SELECT the block, `false` to drop it. No more than t
 
         for d in await asyncio.gather(*[_one_batch(b) for b in batches]):
             verdict.update(d)
-        n_kept = sum(1 for pk in pages if not verdict[pk] or any(verdict[pk]))
+        kept_refs = [pk for pk in pages if not verdict[pk] or any(verdict[pk])]
         n_blocks_kept = sum(sum(verdict[pk]) for pk in pages)
         n_blocks = sum(len(rows) for _, rows in groups)
         ctx.emit(
-            f"semantic_filter kept={n_kept}/{len(pages)} "
-            f"blocks_kept={n_blocks_kept} blocks={n_blocks}"
+            f"semantic_filter kept={len(kept_refs)}/{len(pages)} "
+            f"blocks_kept={n_blocks_kept} blocks={n_blocks}",
+            data={"pages": [f"{r.month}:{r.page}" for r in kept_refs]},
         )
         return verdict
 
@@ -789,6 +794,7 @@ SAME ORDER given: `true` to SELECT the block, `false` to drop it. No more than t
             summary=block.summary,
             cols=tuple(block.column_headers[:12]),
             rows_tail=tuple(block.row_headers[-8:]),
+            rows=tuple(block.row_headers),
         )
 
     async def select_blocks(

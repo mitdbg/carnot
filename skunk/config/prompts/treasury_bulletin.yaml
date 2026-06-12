@@ -37,7 +37,7 @@ overrides:
       pin them directly.
 
   - section: corpus
-    targets: [extract.text, extract.vision]
+    targets: [extract.multimodal, extract.text, extract.vision]
     content: |
       The pages you receive are from the U.S. Treasury Monthly Bulletins.
 
@@ -271,7 +271,7 @@ overrides:
   # Extract lessons
   # ---------------------------------------------------------------------
   - section: lessons
-    targets: [extract.text, extract.vision]
+    targets: [extract.multimodal, extract.text, extract.vision]
     content: >
       Unit and scale come from the printed page — column header, caption,
       parenthetical legend, footnote like "(In millions of dollars)".
@@ -280,7 +280,7 @@ overrides:
       rescale or convert foreign currency to USD — leave it native.
 
   - section: lessons
-    targets: [extract.text, extract.vision]
+    targets: [extract.multimodal, extract.text, extract.vision]
     content: >
       Watch for qualifier-mismatched rows. Treasury tables stack rows whose
       labels differ by a single subtle modifier — "Total Public Debt

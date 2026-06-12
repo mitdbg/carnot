@@ -194,6 +194,7 @@ def _pool_to_json(p: SemPoolEntry) -> dict:
         "summary": p.summary,
         "cols": list(p.cols),
         "rows_tail": list(p.rows_tail),
+        "rows": list(p.rows),
     }
 
 
@@ -206,6 +207,7 @@ def _pool_from_json(e: dict) -> SemPoolEntry:
         summary=e.get("summary"),
         cols=tuple(e.get("cols") or ()),
         rows_tail=tuple(e.get("rows_tail") or ()),
+        rows=tuple(e.get("rows") or ()),
     )
 
 

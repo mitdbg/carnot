@@ -146,20 +146,32 @@ class SkunkConfig:
     # A/B; re-enable per-run with SKUNK_QUESTION_EXPLAINER=1.
     question_explainer: bool = False
 
-    # Selection agent: replace block_select → extract → review with one iterative
-    # MultiTurnAgent per retrieve branch that browses the sem-filter survivor pool,
-    # extracts from chosen blocks (extraction as a tool), and returns the SELECTED
-    # entries. Experimental. (env: SKUNK_SELECTION_AGENT=1)
+    # Selection pipeline: replace block_select → extract → review with select →
+    # extract → check (see select_agent.py module docstring): ONE summaries-only
+    # MultiTurnAgent per question browses the union sem-filter survivor pool and
+    # commits a few blocks per retrieval goal; each unique block is then read once
+    # by the vision tier for all its goals; one checker call audits completeness /
+    # duplicates and may resume the selector with revised targets.
+    # Experimental. (env: SKUNK_SELECTION_AGENT=1)
     selection_agent: bool = False
-    # Step budget for that agent's tool loop. (env: SKUNK_SELECT_AGENT_MAX_STEPS)
-    select_agent_max_steps: int = 14
-    # Per-LLM-call caps for the selection agent's OWN generation (NOT its extract
-    # sub-calls, which go through the sync path). Mirrors the search agent: without a
-    # combined thinking+visible cap, Flash thrashed to ~63K thinking tokens / ~285s per
-    # step on large pools and emitted no parseable tool call (parse-retry death spiral).
+    # BASE step budget for the selector's tool loop — covers up to 3 goals; the
+    # pipeline adds +2 steps per goal beyond the 3rd (4 goals → 10).
+    # (env: SKUNK_SELECT_AGENT_MAX_STEPS)
+    select_agent_max_steps: int = 8
+    # Per-LLM-call caps for the selector's own turns and the checker call. Mirrors the
+    # search agent: without a combined thinking+visible cap, Flash thrashed to ~63K
+    # thinking tokens / ~285s per step on large pools and emitted no parseable tool
+    # call (parse-retry death spiral).
     # (env: SKUNK_SELECT_AGENT_MAX_OUTPUT_TOKENS, SKUNK_SELECT_AGENT_TIMEOUT_S)
     select_agent_max_output_tokens: int = 8192
     select_agent_request_timeout_s: float = 150.0
+
+    # Per-call caps for the extract tiers (multimodal/vision). Uncapped, individual Flash/Pro
+    # extract calls hung for 260-480s and returned garbage that then burned a parse retry;
+    # a hard timeout fails fast into the retry, which typically completes in seconds.
+    # (env: SKUNK_EXTRACT_MAX_OUTPUT_TOKENS, SKUNK_EXTRACT_TIMEOUT_S)
+    extract_max_output_tokens: int = 8192
+    extract_request_timeout_s: float = 150.0
 
     # Extract: skip the parsed-text (OCR) tier entirely and read values straight off the rendered
     # page images (vision tier). Default OFF — parsed text first, vision as the fallback tier.
@@ -204,18 +216,20 @@ class SkunkConfig:
         # block_select=off), overridable via SKUNK_EFFORT_OVERRIDES.
         # - semfilter: the cheap coarse filter runs on flash-lite.
         # - block_select: flash — block selection is a cheap read (thinking off).
-        # - extract.{text,vision,confirm}: Pro — value extraction off dense scanned tables is the
-        #   accuracy-binding read, so it gets the strong model with medium thinking.
+        # - extract.{multimodal,vision,text}: flash, medium thinking. Pro is the stronger read
+        #   on dense scanned tables but its 8M input-tok/min quota + 380s latency tails choke the
+        #   parallel select-agent fan-out; pin Pro back per-run via SKUNK_MODEL_OVERRIDES. The
+        #   default path is `multimodal` (text + image in one call); `vision` is the fallback.
         # - compute.codegen: flash — codegen/reasoning over the extracted values (high thinking).
         # - replanner: flash — recovering a failed plan runs flash at medium thinking; the initial
         #   planner also runs flash (the common path).
         # Everything else (planner, toc_pick, …) runs on the base `llm_model` (flash).
         self.model_overrides.setdefault("semfilter", "gemini-3.1-flash-lite")
         self.model_overrides.setdefault("block_select", "gemini-3.5-flash")
-        self.model_overrides.setdefault("extract.text", "gemini-3.1-pro-preview")
-        self.model_overrides.setdefault("extract.vision", "gemini-3.1-pro-preview")
-        self.model_overrides.setdefault("extract.confirm", "gemini-3.1-pro-preview")
-        self.model_overrides.setdefault("compute.codegen", "gemini-3.5-flash")
+        self.model_overrides.setdefault("extract.multimodal", "gemini-3.5-flash")
+        self.model_overrides.setdefault("extract.text", "gemini-3.5-flash")
+        self.model_overrides.setdefault("extract.vision", "gemini-3.5-flash")
+        self.model_overrides.setdefault("compute.codegen", "gemini-3.1-pro-preview")
         self.model_overrides.setdefault("replanner", "gemini-3.5-flash")
 
     @classmethod
@@ -253,13 +267,19 @@ class SkunkConfig:
             selection_agent=os.environ.get("SKUNK_SELECTION_AGENT", "0")
             not in ("", "0"),
             select_agent_max_steps=int(
-                os.environ.get("SKUNK_SELECT_AGENT_MAX_STEPS", "14")
+                os.environ.get("SKUNK_SELECT_AGENT_MAX_STEPS", "8")
             ),
             select_agent_max_output_tokens=int(
                 os.environ.get("SKUNK_SELECT_AGENT_MAX_OUTPUT_TOKENS", "8192")
             ),
             select_agent_request_timeout_s=float(
                 os.environ.get("SKUNK_SELECT_AGENT_TIMEOUT_S", "150")
+            ),
+            extract_max_output_tokens=int(
+                os.environ.get("SKUNK_EXTRACT_MAX_OUTPUT_TOKENS", "8192")
+            ),
+            extract_request_timeout_s=float(
+                os.environ.get("SKUNK_EXTRACT_TIMEOUT_S", "150")
             ),
             extract_vision_only=os.environ.get("SKUNK_EXTRACT_VISION_ONLY", "0")
             not in ("", "0"),

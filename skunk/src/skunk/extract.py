@@ -187,22 +187,6 @@ def _stamp_provenance(
     ]
 
 
-_PROVENANCE_FIELDS = ("bulletin", "pages", "as_of", "requested_period", "retrieve_key")
-
-
-def _carry_provenance(
-    corrected: list[AnnotatedValue], originals: list[AnnotatedValue]
-) -> list[AnnotatedValue]:
-    """Copy machine provenance from each original entry onto its confirm-round replacement.
-    The confirm model only re-reads digits and returns semantic fields, so the parsed reply
-    carries default (empty) provenance — restore the original's, which confirm never changes.
-    `corrected` is position-aligned with `originals` (the parse hook guarantees this)."""
-    return [
-        c.model_copy(update={f: getattr(o, f) for f in _PROVENANCE_FIELDS})
-        for c, o in zip(corrected, originals)
-    ]
-
-
 def _cells_with_path(entry: AnnotatedValue) -> Iterator[tuple[tuple[str, ...], Any]]:
     """Yield (key_path, primitive_cell) for every cell in `entry.value`."""
     if entry.kind == "scalar":
@@ -364,6 +348,28 @@ month from the first endpoint through the last, both endpoints included."""
                 lines.append(cls._block_meta_line(ref.page, block))
         return "\n".join(lines)
 
+    @classmethod
+    def _scoped_metadata(
+        cls,
+        anchor: PageRef,
+        prov_refs: list[PageRef],
+        block_idxs: list[int | None],
+        ctx: ExecutionContext,
+    ) -> str:
+        """Metadata to orient the read: the SELECTED blocks' lines when every block in the group
+        is specific, else (a whole-page block is present) the pages' full metadata."""
+        row = get_page_store(str(ctx.config.pdf_dir)).catalog_row(anchor)
+        if row is not None:
+            cblocks = row.content_blocks
+            specific = [
+                bi for bi in block_idxs if bi is not None and 0 <= bi < len(cblocks)
+            ]
+            if specific and len(specific) == len(block_idxs):
+                return "\n".join(
+                    cls._block_meta_line(anchor.page, cblocks[bi]) for bi in specific
+                )
+        return cls._page_metadata(prov_refs, ctx)
+
     async def _extract_content(
         self,
         content: str,
@@ -456,21 +462,7 @@ month from the first endpoint through the last, both endpoints included."""
             return []
         content = "\n\n".join(text for _, text in pages)
         prov_refs = [r for r, _ in pages]
-        row = get_page_store(str(ctx.config.pdf_dir)).catalog_row(anchor)
-        specific = [
-            bi
-            for bi in block_idxs
-            if bi is not None and row is not None and 0 <= bi < len(row.content_blocks)
-        ]
-        # Focused block metadata when every block is specific; otherwise (a whole-page block in the
-        # group) fall back to the pages' full metadata.
-        if specific and len(specific) == len(block_idxs):
-            metadata = "\n".join(
-                self._block_meta_line(anchor.page, row.content_blocks[bi])  # type: ignore[union-attr]
-                for bi in specific
-            )
-        else:
-            metadata = self._page_metadata(prov_refs, ctx)
+        metadata = self._scoped_metadata(anchor, prov_refs, block_idxs, ctx)
         ctx.emit(
             f"block_scoped page={str(anchor)} n_pages={len(pages)} "
             f"n_blocks={len(block_idxs)} chars={len(content)}"
@@ -537,9 +529,12 @@ month from the first endpoint through the last, both endpoints included."""
         images: list[B64Image],
         rendered_refs: list[PageRef],
         ctx: ExecutionContext,
+        looking_for: str | None = None,
     ) -> list[AnnotatedValue]:
         """One T=0 vision call over the rendered page images. The numbered image list
-        maps each attachment back to its source page so the LLM can't conflate them."""
+        maps each attachment back to its source page so the LLM can't conflate them.
+        `looking_for` overrides the single-key opening line — the seam for a caller
+        whose one page read serves SEVERAL retrieval goals at once."""
         period = f" for the period {branch.period}" if branch.period else ""
         image_lines = [
             f"Image {i + 1}: PDF page {ref.page} of the {ref.month} Treasury Bulletin"
@@ -547,7 +542,7 @@ month from the first endpoint through the last, both endpoints included."""
         ]
         user_msg = "\n\n".join(
             [
-                f"You are looking for {branch.key}{period}.",
+                looking_for or f"You are looking for {branch.key}{period}.",
                 f'For full context, this lookup serves to help answer the question: "{question}"',
                 "Images attached, in order:\n" + "\n".join(image_lines),
             ]
@@ -555,7 +550,9 @@ month from the first endpoint through the last, both endpoints included."""
         ctx.emit(f"vision_call tier=vision n_images={len(images)}")
         try:
             entries = await self._prompt.call(
-                ctx, user_msg, images=images, temperature=0.0
+                ctx, user_msg, images=images, temperature=0.0,
+                max_output_tokens=ctx.config.extract_max_output_tokens,
+                timeout_s=ctx.config.extract_request_timeout_s,
             )
         except ParseError as e:
             ctx.emit(f"extract_parse_failed tier=vision error={e.detail!r}")
@@ -568,131 +565,39 @@ month from the first endpoint through the last, both endpoints included."""
         return _stamp_provenance(entries, rendered_refs, branch)
 
 
-def _entry_semantic_dict(e: AnnotatedValue) -> dict[str, Any]:
-    """The shape/value fields of an entry (no machine provenance) for the confirm prompt —
-    what the model needs to locate the cell and re-read its digits."""
-    d: dict[str, Any] = {"description": e.description, "kind": e.kind, "value": e.value}
-    if e.unit:
-        d["unit"] = e.unit
-    if e.qualifiers:
-        d["qualifiers"] = e.qualifiers
-    for name in ("index_name", "row_name", "col_name"):
-        v = getattr(e, name)
-        if v is not None:
-            d[name] = v
-    return d
-
-
-def _key_diff(orig_keys: list[str], got_keys: list[str], label: str) -> list[str]:
-    """Set-difference between two key lists (order-independent — reordering is harmless)."""
-    missing = sorted(set(orig_keys) - set(got_keys))
-    added = sorted(set(got_keys) - set(orig_keys))
-    msgs: list[str] = []
-    if missing:
-        msgs.append(f"{label}: dropped {missing!r}")
-    if added:
-        msgs.append(f"{label}: added {added!r}")
-    return msgs
-
-
-def _confirm_structure_diff(orig: AnnotatedValue, got: AnnotatedValue) -> list[str]:
-    """Structural differences between a confirm-round entry and its original — everything
-    except the primitive cell VALUES. An empty list means a legitimate digits-only
-    correction. `got` is already shape-valid (the caller ran `_parse_extract_response`),
-    so its `value` matches its `kind`."""
-    diffs: list[str] = []
-    if got.description != orig.description:
-        diffs.append(f"description changed to {got.description!r}")
-    if got.kind != orig.kind:
-        # Once kind differs the value shapes aren't comparable; report just that.
-        return diffs + [f"kind changed {orig.kind} -> {got.kind}"]
-    if got.unit != orig.unit:
-        diffs.append(f"unit changed {orig.unit!r} -> {got.unit!r}")
-    if orig.qualifiers and got.qualifiers != orig.qualifiers:
-        diffs.append(f"qualifiers changed {orig.qualifiers!r} -> {got.qualifiers!r}")
-    for name in ("index_name", "row_name", "col_name"):
-        if getattr(got, name) != getattr(orig, name):
-            diffs.append(
-                f"{name} changed {getattr(orig, name)!r} -> {getattr(got, name)!r}"
-            )
-    ov, gv = orig.value, got.value
-    if orig.kind == "scalar":
-        o_list, g_list = isinstance(ov, list), isinstance(gv, list)
-        if o_list != g_list:
-            diffs.append(
-                f"scalar shape changed ({'list' if o_list else 'single'} -> "
-                f"{'list' if g_list else 'single'})"
-            )
-        elif o_list and len(ov) != len(gv):
-            diffs.append(f"scalar list length changed {len(ov)} -> {len(gv)}")
-    elif orig.kind == "vector":
-        diffs.extend(_key_diff(list(ov), list(gv), "vector keys"))
-    else:  # table
-        diffs.extend(_key_diff(list(ov), list(gv), "table rows"))
-        for rk in ov:
-            if rk in gv:
-                diffs.extend(_key_diff(list(ov[rk]), list(gv[rk]), f"row {rk!r} cols"))
-    return diffs
-
-
-def _make_confirm_parse(
-    originals: list[AnnotatedValue],
-) -> Callable[[str, ExecutionContext], list[AnnotatedValue]]:
-    """Build the confirm-round parse hook: shape-validate via `_parse_extract_response`,
-    then enforce that the reply is a digits-only correction of `originals` — the same
-    number of entries, in the same order, each preserving its description, kind, unit,
-    dimension names, and the keys/shape of its value. Only primitive cell values may
-    differ. Any structural drift is a spec violation the model should fix, so raise
-    `ParseError` (→ `call()` re-prompts) naming the offending entries. `originals` is
-    captured per call, so this is built fresh for each confirm round."""
-
-    def parse(raw: str, ctx: ExecutionContext) -> list[AnnotatedValue]:
-        entries = _parse_extract_response(raw, ctx)
-        if len(entries) != len(originals):
-            raise ParseError(
-                raw,
-                f"returned {len(entries)} entries but exactly {len(originals)} were given "
-                "— return the same entries in the same order, correcting only digits",
-            )
-        violations: list[str] = []
-        for i, (orig, got) in enumerate(zip(originals, entries)):
-            for msg in _confirm_structure_diff(orig, got):
-                violations.append(f"entry[{i}] {orig.description!r}: {msg}")
-        if violations:
-            raise ParseError(
-                raw,
-                "these entries changed something other than digits — keep each entry's "
-                "description, kind, unit, dimension names, and value keys/shape identical, "
-                "fixing only the digits inside cell values:\n" + "\n".join(violations),
-            )
-        return entries
-
-    return parse
-
-
-class VisualValidator:
-    """Vision confirmation round. The parsed-text (OCR) tier can corrupt digits; this re-reads
-    each emitted value off the rendered page images and corrects only what the image plainly
-    contradicts. Frames the task as correction (not approval) and forces a fresh read before
-    comparison, to blunt the natural confirmation bias of a check-this pass."""
+class MultimodalExtractor:
+    """Single-pass extraction over BOTH a page's text and its rendered image — the collapse of
+    the former text-tier + vision-confirm two-call sequence into one call. The model uses the
+    (OCR-noisy) page text + catalog metadata to read the LAYOUT (which column/row a value sits
+    under, which table, the period/units) and reads the actual DIGITS off the image, which is
+    ground truth; where text and image disagree, the image wins. One call per anchor-page group,
+    fanned out — mirroring the text tier's grouping so each entry's source page (and thus its
+    provenance) is unambiguous. Falls back gracefully: a page with no text extracts from the
+    image alone, and a page that won't render extracts from text alone."""
 
     _PREAMBLE = """\
-The values below were transcribed from page TEXT that may contain OCR
-errors (misread digits, dropped decimals, misaligned rows/columns). The rendered page images are
-the GROUND TRUTH. Correct OCR digit mistakes — and nothing else.
+You retrieve printed values to fulfill a specific lookup, working from BOTH
+the text and the rendered image of the same page(s). Each user message
+describes the lookup — what to find and (when stated) the period — then the
+full-context question this lookup supports, then PAGE METADATA (a structured
+summary of each table/figure on the page: its title, column/row labels, and a
+short description), then the page TEXT, and finally the page IMAGE(s), attached
+in the order listed.
 
-Each user message gives a numbered list identifying each attached image
-(and its source page), and a JSON array of the transcribed values. The
-images arrive as attachments in that order.
+The page text is flattened — its columns and rows are hard to read — and may
+carry OCR errors: misread digits, dropped decimals, rows or columns shifted out
+of alignment. The IMAGE is the GROUND TRUTH for the digits. Use the text and
+metadata to read the LAYOUT — which column/row a value sits under, which table
+it belongs to, the period and the units — and read the actual DIGITS off the
+image. When the text and the image disagree on a digit, trust the image.
 
-For EACH entry, locate its cell(s) on the image by description / row +
-column label / period, read the digits, and overwrite only the digits the
-image contradicts. Transcribe numbers exactly as printed — every digit and
-decimal place. If a transcribed value already matches the image, return it
-unchanged.
-
-You may ONLY change digits inside cell values. Do NOT change any description, kind, unit,
-index_name / row_name / col_name, or the keys or shape of any value."""
+Emit one entry per distinct row that could plausibly satisfy the lookup —
+including cases where multiple rows partially match. Do not compute or
+transform — extract only what is printed. Choose the AnnotatedValue shape
+(scalar / vector / table) that fits the data on the page; pick the smallest
+shape that captures every relevant value. A period written `YYYY-MM..YYYY-MM`
+is an INCLUSIVE range: extract every month from the first endpoint through the
+last, both endpoints included."""
 
     _SYSTEM = _PREAMBLE + "\n\n" + EXTRACT_COMMON_PROMPT
 
@@ -701,111 +606,101 @@ index_name / row_name / col_name, or the keys or shape of any value."""
         question: str,
         branch: RetrieveBranch,
         blocks: list[BlockRef],
-        entries: list[AnnotatedValue],
         ctx: ExecutionContext,
     ) -> list[AnnotatedValue]:
-        """Re-read `entries` against their source page images and return the corrected set.
-        Fans out ONE confirm call per source page(-group): each call shows only the page(s)
-        a subset of entries came from and re-reads only those entries — mirroring the text
-        tier's per-page extraction, so the model never has to map an entry across unrelated
-        page images. Conservative per group: a group whose page won't render, or whose reply
-        is empty/unparseable, passes its entries through unchanged."""
-        groups = self._group_by_source(entries, blocks)
-        ctx.emit(f"confirm_fan_out n_groups={len(groups)} n_entries={len(entries)}")
-        results = await asyncio.gather(
+        """Extract from the selected blocks, one combined text+image call per anchor page (its
+        blocks' member pages fed whole, both as text and as rendered images). Whole-page blocks
+        (`block_index=None`, golden / search-agent) flow through the same path."""
+        groups = TextExtractor._block_groups(blocks)
+        ctx.emit(
+            f"fan_out tier=multimodal n_groups={len(groups)} n_blocks={len(blocks)} "
+            f"group_sizes={[len(idxs) for _, _, idxs in groups]}"
+        )
+        per_group = await asyncio.gather(
             *[
-                self._confirm_group(question, branch, refs, members, ctx)
-                for refs, members in groups
+                self._extract_group(a, m, idxs, branch, question, ctx)
+                for a, m, idxs in groups
             ]
         )
-        # Scatter each group's corrected entries back to their original positions.
-        out = list(entries)
-        for (_, members), corrected in zip(groups, results):
-            for (idx, _), new in zip(members, corrected):
-                out[idx] = new
-        return out
+        entries = [e for kept in per_group for e in kept]
+        if not entries:
+            ctx.emit("tier_empty tier=multimodal reason=no_entries")
+        return entries
 
-    @staticmethod
-    def _group_by_source(
-        entries: list[AnnotatedValue], blocks: list[BlockRef]
-    ) -> list[tuple[list[PageRef], list[tuple[int, AnnotatedValue]]]]:
-        """Partition `(index, entry)` pairs by the entry's stamped source page(s) — the unit
-        a single confirm call re-reads. Entries lacking page provenance (`pages=()`) share one
-        fallback group rendered against all retrieved pages (best-effort, the old behavior)."""
-        fallback = tuple(_blocks_to_pagerefs(blocks))
-        groups: dict[tuple[PageRef, ...], list[tuple[int, AnnotatedValue]]] = {}
-        for i, e in enumerate(entries):
-            if e.pages and e.bulletin:
-                refs = tuple(PageRef(month=e.bulletin, page=p) for p in e.pages)
-            else:
-                refs = fallback
-            groups.setdefault(refs, []).append((i, e))
-        return [(list(refs), members) for refs, members in groups.items()]
-
-    async def _confirm_group(
+    async def _extract_group(
         self,
-        question: str,
+        anchor: PageRef,
+        member_refs: list[PageRef],
+        block_idxs: list[int | None],
         branch: RetrieveBranch,
-        refs: list[PageRef],
-        members: list[tuple[int, AnnotatedValue]],
+        question: str,
         ctx: ExecutionContext,
     ) -> list[AnnotatedValue]:
-        """Confirm one page-group: render `refs`, re-read just these entries off them, and
-        return the corrected entries (aligned with `members`). Passes the entries through
-        unchanged on any render/parse failure."""
-        originals = [e for _, e in members]
-        images, rendered_refs = _render_pages_b64(refs, ctx)
-        if not images:
-            ctx.emit("confirm_skipped reason=no_images")
-            return originals
+        """One combined call over an anchor page's blocks: feed the pages' full text AND their
+        rendered images, scoped by the selected blocks' metadata. Provenance is stamped from
+        every page the group fed (text or image). Parsing is shape-only (`_parse_extract_response`,
+        no verbatim-text check): the image is ground truth, so a digit need not match the OCR text."""
+        pages = TextExtractor._fetch_page_texts(member_refs, ctx)
+        images, rendered_refs = _render_pages_b64(member_refs, ctx)
+        if not pages and not images:
+            ctx.emit(
+                f"group_skipped tier=multimodal reason=no_text_no_image "
+                f"refs={[str(r) for r in member_refs]!r}"
+            )
+            return []
+        content = "\n\n".join(text for _, text in pages)
+        # Provenance from every page that contributed (text or image), deduped in member order;
+        # falls back to the group's member pages when somehow neither produced a ref.
+        prov_refs = list(
+            dict.fromkeys([r for r, _ in pages] + rendered_refs)
+        ) or list(member_refs)
+        metadata = TextExtractor._scoped_metadata(anchor, prov_refs, block_idxs, ctx)
         period = f" for the period {branch.period}" if branch.period else ""
         image_lines = [
             f"Image {i + 1}: PDF page {ref.page} of the {ref.month} Treasury Bulletin"
             for i, ref in enumerate(rendered_refs)
         ]
-        payload = json.dumps(
-            [_entry_semantic_dict(e) for e in originals], ensure_ascii=False
-        )
         user_msg = "\n\n".join(
             [
-                f"You are confirming values for {branch.key}{period}.",
+                f"You are looking for {branch.key}{period}.",
                 f'For full context, this lookup serves to help answer the question: "{question}"',
-                "Images attached, in order:\n" + "\n".join(image_lines),
-                "Transcribed values to confirm:\n" + payload,
+                *(
+                    [
+                        f"Page metadata (context to interpret the layout — not a source of values):\n{metadata}"
+                    ]
+                    if metadata
+                    else []
+                ),
+                *([f"Page text:\n{content}"] if content else []),
+                *(
+                    ["Images attached, in order:\n" + "\n".join(image_lines)]
+                    if images
+                    else []
+                ),
             ]
         )
-        ctx.emit(f"confirm_call n_images={len(images)} n_entries={len(originals)}")
-        # Per-call prompt: the parse hook enforces a digits-only correction of THESE entries
-        # (same count/order/structure), so the reply aligns position-for-position with them.
         prompt: PromptedCall[list[AnnotatedValue]] = PromptedCall(
-            name="extract.confirm",
+            name="extract.multimodal",
             system_prompt=self._SYSTEM,
             default_effort="medium",
-            parse=_make_confirm_parse(originals),
+            parse=_parse_extract_response,
             output_instruction=_EXTRACT_OUTPUT_INSTRUCTION,
         )
-        try:
-            corrected = await prompt.call(ctx, user_msg, images=images, temperature=0.0)
-        except ParseError as e:
-            ctx.emit(f"confirm_kept_original reason=parse_failed error={e.detail!r}")
-            return originals
-        if not corrected:
-            ctx.emit("confirm_kept_original reason=empty_reply")
-            return originals
-        # Confirm never changes provenance — carry the originals' onto the digit-corrected copies.
-        corrected = _carry_provenance(corrected, originals)
-        n_changed = 0
-        for orig, e in zip(originals, corrected):
-            if orig.value != e.value:
-                n_changed += 1
-                ctx.emit(
-                    f"confirm_changed description={e.description!r} "
-                    f"before={orig.value!r} after={e.value!r}"
-                )
         ctx.emit(
-            f"confirm_done n_changed={n_changed} n_in={len(originals)} n_out={len(corrected)}"
+            f"multimodal_call page={str(anchor)} n_pages={len(pages)} "
+            f"n_images={len(images)} n_blocks={len(block_idxs)} chars={len(content)}"
         )
-        return corrected
+        try:
+            entries = await prompt.call(
+                ctx, user_msg, images=images or None, temperature=0.0,
+                max_output_tokens=ctx.config.extract_max_output_tokens,
+                timeout_s=ctx.config.extract_request_timeout_s,
+            )
+        except ParseError as e:
+            ctx.emit(f"extract_parse_failed tier=multimodal error={e.detail!r}")
+            return []
+        ctx.emit(f"extracted tier=multimodal n_entries={len(entries)}")
+        return _stamp_provenance(entries, prov_refs, branch)
 
 
 def _truncate_keys(keys: list[str], cap: int = 30) -> str:
@@ -1117,15 +1012,13 @@ async def _repair_select(
 
 
 class ExtractOp:
-    """The extract operator — question-driven extraction. Owns one instance of
-    each call-site extractor and drives the parsed_json → vision tier fallback, with a
-    vision confirmation round over the parsed_json tier's output, then the coverage
-    review (shadow / dedup / repair per config)."""
+    """The extract operator — question-driven extraction. Drives the multimodal tier (text +
+    rendered image in one call, layout from text + digits from the image) with the pure-vision
+    tier as fallback, then the coverage review (shadow / dedup / repair per config)."""
 
     def __init__(self) -> None:
-        self._text = TextExtractor()
+        self._multimodal = MultimodalExtractor()
         self._vision = VisionExtractor()
-        self._confirm = VisualValidator()
         self._review = CoverageReview()
 
     async def run(
@@ -1165,24 +1058,21 @@ class ExtractOp:
         ctx: ExecutionContext,
         branch: RetrieveBranch,
     ) -> list[AnnotatedValue]:
-        """One tier sweep over `blocks` (no review). The text tier feeds each block's pages
-        whole (scoped by the selected blocks' metadata); the vision tier renders those same
-        pages."""
+        """One tier sweep over `blocks` (no review). The multimodal tier feeds each block's pages
+        whole — text AND rendered image together — so a single call reads layout from the text and
+        digits from the image. The pure-vision tier is the fallback (visual_only charts, the
+        `extract_vision_only` override, or a multimodal pass that found nothing)."""
         if not blocks:
             raise StepFailed("extract", "No blocks to extract from")
 
-        # parsed_json tier first (skipped for visual_only charts/figures, or entirely when
-        # `extract_vision_only` forces straight-to-vision); fall through to the vision tier
+        # Multimodal tier first (skipped for visual_only charts/figures, or entirely when
+        # `extract_vision_only` forces straight-to-vision); fall through to the pure-vision tier
         # when it finds nothing.
         if not branch.visual_only and not ctx.config.extract_vision_only:
-            entries = await self._text.run(ctx.question, branch, blocks, ctx)
+            entries = await self._multimodal.run(ctx.question, branch, blocks, ctx)
             if entries:
-                # Vision confirmation round — correct OCR digit errors against the rendered pages.
-                entries = await self._confirm.run(
-                    ctx.question, branch, blocks, entries, ctx
-                )
                 ctx.emit(
-                    f"tier_result tier=parsed_json descriptions={[e.description for e in entries]!r}"
+                    f"tier_result tier=multimodal descriptions={[e.description for e in entries]!r}"
                 )
                 return entries
 
