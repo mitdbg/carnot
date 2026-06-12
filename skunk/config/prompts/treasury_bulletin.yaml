@@ -250,14 +250,16 @@ overrides:
       The values in `input_values` were extracted from U.S. Treasury Monthly
       Bulletin pages.
 
-  # Shared unit vocabulary — emitted by compute and lookup_external alike.
+  # Unit vocabulary — lookup_external emits these tokens; compute sees them on
+  # lookup entries alongside natural-language units on corpus-extracted entries.
   - section: corpus
     targets: [compute.codegen, lookup_external]
     content: |
-      Unit tokens for this corpus: `usd`, `usd_thousands`, `usd_millions`,
-      `usd_billions`, `pct`, `count`, `year`, `rate`, `fx_rate`, `cpi`, `text`.
-      Foreign currency follows `<iso3>_<scale>` (e.g. `jpy_billions`,
-      `gbp_millions`).
+      Unit tokens for externally looked-up values: `usd`, `usd_thousands`,
+      `usd_millions`, `usd_billions`, `pct`, `count`, `year`, `rate`,
+      `fx_rate`, `cpi`, `text`; foreign currency follows `<iso3>_<scale>`
+      (e.g. `jpy_billions`). Corpus-extracted entries instead carry
+      natural-language units (e.g. "millions of dollars").
 
   - section: corpus
     targets: [lookup_external]
@@ -276,8 +278,8 @@ overrides:
       Unit and scale come from the printed page — column header, caption,
       parenthetical legend, footnote like "(In millions of dollars)".
       Never guess from magnitude: if the page shows "74" under a "billions
-      of yen" header, emit value=74 and unit=jpy_billions. Do not silently
-      rescale or convert foreign currency to USD — leave it native.
+      of yen" header, emit value=74 and unit="billions of yen". Do not
+      silently rescale or convert foreign currency to USD — leave it native.
 
   - section: lessons
     targets: [extract.multimodal, extract.text, extract.vision]
@@ -315,24 +317,24 @@ overrides:
       - |
         ### Example (closed-form, two scalars)
         Q: Absolute percent change in national defense expenditures between CY1940 and CY1953.
-        input_values: two scalars — [0] national defense expenditures for CY1940, [1] same for CY1953, both unit=usd_millions.
+        input_values: two scalars — [0] national defense expenditures for CY1940, [1] same for CY1953, both unit "millions of dollars".
         Why this shape: Identify each entry in the input_values block, reference it by index, apply (B-A)/A·100, abs(), format. No unit conversion needed (same scale).
         Output:
         ```python
-        a = input_values[0].value  # national defense expenditures, CY1940
-        b = input_values[1].value  # national defense expenditures, CY1953
+        a = input_values[0].frame.iat[0, 0]  # national defense expenditures, CY1940
+        b = input_values[1].frame.iat[0, 0]  # national defense expenditures, CY1953
         result = f'{abs((b - a) / a * 100):.2f}'
         ```
 
       - |
         ### Example (FX conversion)
         Q: JPY net options position in millions of USD, mid-March 2016.
-        input_values: [0] scalar value=2300 unit=jpy_billions, [1] scalar unit=fx_rate description="JPY per USD spot, 2016-03".
+        input_values: [0] scalar value=2300 unit "billions of yen", [1] scalar unit=fx_rate description="JPY per USD spot, 2016-03".
         Why this shape: Foreign currency → find the fx_rate entry in the block, read direction from its description ("JPY per USD" → divide), then rescale billions → millions.
         Output:
         ```python
-        jpy_b = input_values[0].value  # 2300, jpy_billions
-        rate  = input_values[1].value  # JPY per USD spot → divide
+        jpy_b = input_values[0].frame.iat[0, 0]  # 2300, billions of yen
+        rate  = input_values[1].frame.iat[0, 0]  # JPY per USD spot → divide
         usd_m = jpy_b * 1000 / rate
         result = f'{usd_m:,.2f}'
         ```
@@ -358,15 +360,14 @@ overrides:
         {"target": "U.S. CPI-U annual average for 1953 (base 2020=100)",
          "src": "Bureau of Labor Statistics"}
         ```
-        Why this shape: `src` pins BLS — query the BLS CPI series via the BLS tool, then commit ONE scalar value at the publisher's full printed precision. There is no separate source field — fold it into the description.
+        Why this shape: `src` pins BLS — query the BLS CPI series via the BLS tool, then commit one scalar value at the publisher's full printed precision, with the source folded into the description.
         Step (one tool call):
         ```python
         fetch_bls({"seriesid": ["CUUR0000SA0"], "startyear": "1953", "endyear": "1953"})
         ```
-        Commit (after reading the observation):
-        ```python
-        final_answer({
-            "description": "U.S. CPI-U annual average, 1953, rebased to 2020=100 (BLS)",
-            "value": 14.4, "unit": "cpi"})
+        Commit (after reading the observation — the final answer is a json block, not a tool call):
+        ```json
+        {"description": "U.S. CPI-U annual average, 1953, rebased to 2020=100 (BLS)",
+         "value": 14.4, "unit": "cpi"}
         ```
 

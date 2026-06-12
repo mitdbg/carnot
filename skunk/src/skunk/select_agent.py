@@ -294,70 +294,46 @@ class SelectAgent(MultiTurnAgent):
     default_effort = "medium"
 
     briefing = """\
-You SELECT which content blocks should be read to fulfill a set of retrieval
-GOALS for one research question, from one shared pool of candidate U.S. Treasury
-Bulletin content blocks (tables/charts, one per bulletin page region). You never
-see page contents — you work entirely from catalog summaries: block titles,
-issue dates, data-date spans, column labels, and row labels. The blocks you commit are read
-downstream by an extraction step. The user message gives the research question,
-the numbered goals (each a concept, period(s), optional pinned issue), and the
-candidate pool as a list of the UNIQUE table/chart titles in it (keyed T1, T2, …),
-each with how many issues reprinted it and the data-date span it covers. The same
-table is typically reprinted across consecutive issues, sometimes with revisions;
-several goals often live in the same table.
+You select which content blocks an extraction step should read to fulfill a set
+of retrieval goals for one research question. You work entirely from catalog
+summaries — titles, issue dates, data spans, column and row labels — never page
+contents. The user message gives the question, the numbered goals (concept,
+period, optional pinned issue), and the candidate pool as a list of unique
+table/chart titles (T1, T2, ...) with reprint counts and data spans; the same
+table is typically reprinted across consecutive issues, sometimes with
+revisions, and several goals often live in the same table.
 
-First, read the QUESTION's own wording and pin down what each goal's series must
-satisfy: the precise series and EVERY qualifier on it ("subject to limitation",
-"interest-bearing", "held by the public", gross vs net, issued vs outstanding),
-TOTAL vs a named subtotal/component, the unit/scale, and the time basis (calendar
-vs fiscal year, the exact as-of date or period). Goals are shorthand; the
-question's wording governs.
+Read the question's own wording first and pin down what each goal's series must
+satisfy: the exact series and every qualifier on it (e.g. "subject to
+limitation", gross vs net, issued vs outstanding), total vs a named subtotal,
+the unit, and the time basis. Goals are shorthand; the question's wording
+governs.
 
-Your step budget is TINY — a normal run is 2-4 steps. Browse in parallel, commit
-early:
-1. Step 1: expand every title that could carry ANY goal's concept, all at once —
-   one list_blocks([...]) with every Tn, or several print(list_blocks(...)) calls
-   (e.g. different `period=` filters) in the SAME python block. Never spend a step
-   on a single title.
-2. One follow-up step to settle what the sweep left open: inspect_blocks the
-   shortlisted candidates (batch every goal's shortlist into the one step,
-   alongside any remaining expansions).
-3. COMMIT. The moment every goal is either covered or established missing, emit
-   the final answer. A goal whose series no title in the pool could carry is
-   SETTLED — report it [] and move on; never spend steps hunting for it across
-   unrelated tables, and never re-emit thoughts without a tool call.
-
-Your 4 MOST RECENT observations are visible — older outputs are hidden. Never
-reference block numbers you can no longer see; re-request a block list if it
-has scrolled out of view.
+A normal run is 2-4 steps: (1) expand every plausibly relevant title in one
+batched list_blocks call; (2) inspect_blocks the shortlisted candidates,
+batching all goals into one step; (3) commit. A goal whose series no title in
+the pool could carry is settled — report it [] and move on. Your 4 most recent
+observations are visible; never reference block numbers you can no longer see.
 
 Choosing blocks, per goal:
-- Use title wording and column labels to keep only tables that plausibly print the
-  exact asked series; a title whose columns lack the series is OUT.
-- Per requested period/date, commit the block from the LATEST issue whose data span
-  covers it — a later issue's print supersedes earlier ones (revisions) — unless the
-  goal pins a source issue (as_of) or the question asks for the original /
-  contemporaneous figure.
-- COVERAGE is not GRANULARITY: dates= unions ALL rows, annual/fiscal-year rows
-  included, so a span covering the period does NOT mean rows at the needed
-  granularity exist. inspect_blocks your shortlist — a goal needing monthly
-  figures needs month rows for those months. Monthly rows typically cover only
-  the ~12 months before the issue date; for a monthly series spanning years,
-  TILE commits across issues — one block per ~12-month window, each the latest
-  print whose rows show that window's months — never a single late reprint.
-- On checker feedback that months are missing, commit blocks from issues dated
-  just AFTER the missing months; re-committing the same or a later reprint
-  cannot help.
-- One block usually covers several requested dates (and often several goals);
-  prefer ONE block covering them all over one block per date — but only when
-  inspect_blocks shows every requested date at the needed granularity.
-- When two different titles could carry the series and the summaries cannot settle
-  it, commit the best block of EACH — that is the only reason to add candidates.
+- Keep only tables whose title or column labels plausibly print the asked
+  series.
+- Match the exact scope: a label that wraps the concept in extra words ("... and
+  related activities", "..., including ...") names a broader aggregate with
+  different values; prefer the block reporting exactly the asked scope.
+- Per requested date, commit the block from the latest issue whose span covers
+  it (later prints supersede earlier ones), unless the goal pins a source issue
+  or the question asks for the contemporaneous figure.
+- Coverage is not granularity: a block's date span unions all rows, including
+  annual/fiscal-year rows. Verify with inspect_blocks that the dates you need
+  exist as rows. Monthly rows usually cover only the ~12 months before the
+  issue date, so a monthly series spanning years needs one block per ~12-month
+  window, tiled across issues. If the checker reports missing months, commit
+  blocks from issues dated just after those months, not another late reprint.
+- Prefer one block covering several dates/goals over one per date — but only
+  when inspect_blocks shows every date at the needed granularity.
+- When two titles could both carry the series, commit the best block of each.
 - A handful of blocks per goal, never a sweep of every reprint.
-- Beware of the EXACT
-    scope of the target: a row/column label that wraps the concept in extra words — "<concept> and
-    related activities", "<concept>, including …", etc. — names a BROADER aggregate and will have different values from
-    the bare concept. Prefer the block that reports exactly the asked scope.
 """
 
     final_answer_doc = """\
@@ -550,30 +526,24 @@ An entry listed under several goals was read once for all of them — that is NO
 duplication.
 
 Check two things:
-1. COMPLETENESS — every goal's requested concept and period(s) is covered by at
-   least one entry whose description/qualifiers/labels match the question's wording
+1. Completeness — every goal's concept and period is covered by at least one
+   entry whose description/qualifiers/labels match the question's wording
    (series, every qualifier, total vs subtotal, time basis).
-2. DUPLICATES — the same datum appears under several entry ids: the same series and
-   scope AND covering the same period(s). Keep the one that best fits the source the
-   question specifies; if it specifies none, prefer the most up-to-date print (latest
-   issue). Same-series entries covering DIFFERENT periods are COMPLEMENTS, not
-   duplicates — a goal's range is often satisfied only by several prints together
-   (e.g. one entry for 1947, another for 1950); keep all of them.
+2. Duplicates — the same series, scope, and period under several entry ids.
+   Keep the one matching the source the question specifies, else the latest
+   print. Same-series entries covering different periods are complements, not
+   duplicates; keep all of them.
 
-Output ONE JSON object, nothing else:
+Output one JSON object, nothing else:
 {"complete": true|false,
  "drop": ["E3", ...],
  "retry": [{"goal": <goal number>, "target": "<revised one-line retrieval target>"}]}
-- "drop": entry ids that are duplicates of a kept entry — nothing else. Dropping
-  must never shrink coverage: before listing an id, confirm every period it covers
-  is still covered by a kept entry of the same series. When unsure, keep. An entry
-  that fails the question's wording is a coverage problem — handle it via "retry"
-  (and complete=false), not "drop".
-- "retry": goals whose coverage is missing or wrong. "target" REWRITES that goal's
-  retrieval target — the series wording, issue, or period filter the selector
-  should look for instead. Retry sparingly — only when the gap is plausibly
-  fixable from the pool. A goal the selector already reported as absent from the
-  pool must NOT be retried.
+- "drop": only duplicates of a kept entry. Dropping must never shrink coverage;
+  when unsure, keep. An entry that fails the question's wording is a coverage
+  problem — handle it via "retry" (and complete=false), not "drop".
+- "retry": goals whose coverage is missing or wrong; "target" rewrites the
+  goal's retrieval target. Retry sparingly — only when the gap is plausibly
+  fixable from the pool, and never for a goal already reported absent.
 - Nothing to fix: {"complete": true, "drop": [], "retry": []}"""
 
 
@@ -882,8 +852,8 @@ async def _check_and_repair(
         return
     empty_blocks = sorted(n for n, ents in extracted.items() if not ents)
     feedback = [
-        "Checker feedback after extraction: the goals below are not yet correctly "
-        "covered. Their targets are REVISED as follows — re-select for them:",
+        "Checker feedback: the goals below are not yet correctly covered; "
+        "re-select for their revised targets:",
         *(f"  G{n}: {t}" for n, t in sorted(targets.items()) if t),
         "Blocks already selected and extracted (their values are kept): "
         + ", ".join(
@@ -891,14 +861,13 @@ async def _check_and_repair(
         ),
         *(
             [
-                f"Blocks already read that contained NO relevant values: {empty_blocks} "
-                "— re-committing these cannot help; pick DIFFERENT blocks (e.g. a "
-                "neighboring block of the same title/issue, or another title)."
+                f"Blocks already read that contained no relevant values: {empty_blocks} "
+                "— commit different blocks."
             ]
             if empty_blocks
             else []
         ),
-        "Emit a NEW final answer covering ONLY the goals above (same JSON format); "
+        "Emit a new final answer covering only the goals above (same JSON format); "
         "the other goals' selections stand. You may call list_blocks first.",
     ]
     try:

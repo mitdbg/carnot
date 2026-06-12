@@ -251,13 +251,13 @@ description   natural-language label that uniquely identifies the
               page's verbatim row text / column header / caption phrase
               so the downstream consumer can map it back to the page.
 
-qualifiers    the page's verbatim fragments that LOCATE and DISCRIMINATE
+qualifiers    the page's verbatim fragments that locate and discriminate
               this datum: the exact column header the value(s) sit under,
               the row label, any footnote markers on the value or its
               row/column (e.g. "2/", "p", "r"), the table title when
               several similar tables share the page. Copy the fragments
               verbatim; separate with " | ". Two entries reading
-              different cells MUST differ in description or qualifiers.
+              different cells must differ in description or qualifiers.
               "" only when the page offers no such discriminators.
 
 index_name    (vector only) name of the varying dimension.
@@ -284,22 +284,18 @@ _EXTRACT_OUTPUT_INSTRUCTION = (
 class TextExtractor:
     _PREAMBLE = """\
 You retrieve printed values from page text to fulfill a specific lookup.
-Each user message describes the lookup — what to find and (when stated)
-the period — followed by the full-context question this lookup supports,
-then PAGE METADATA (a structured summary of each table/figure on the
-page: its title, column/row labels, and a short description) and finally
-the page text to draw values from. The page text is flattened, so its
-columns and rows can be hard to read; use the metadata to make sense of
-the layout — which column/row a value sits under, which table it belongs
-to, what the period and units are. Emit one entry per distinct row that
-could plausibly satisfy the lookup — including cases where multiple rows
-partially match. Do not compute or transform — extract only what is
-printed. Every numeric value emitted MUST appear in the PAGE TEXT
-verbatim (the metadata is context, not a source of values). Choose the
-AnnotatedValue shape (scalar / vector / table) that fits the data on the
-page; pick the smallest shape that captures every relevant value.
-A period written `YYYY-MM..YYYY-MM` is an INCLUSIVE range: extract every
-month from the first endpoint through the last, both endpoints included."""
+Each user message describes the lookup — what to find and, when stated, the
+period — then the full question the lookup serves, then page metadata (a
+structured summary of each table/figure: title, column/row labels, short
+description), and finally the page text to draw values from. The page text is
+flattened and its columns can be hard to read; use the metadata to work out
+the layout — which column/row a value sits under, which table it belongs to,
+the period and units. Emit one entry per distinct row that could plausibly
+satisfy the lookup, including partial matches. Do not compute or transform;
+every numeric value you emit must appear verbatim in the page text (the
+metadata is context, not a source of values). A period written
+`YYYY-MM..YYYY-MM` is an inclusive range: extract every month from the first
+endpoint through the last."""
 
     _SYSTEM = _PREAMBLE + "\n\n" + EXTRACT_COMMON_PROMPT
 
@@ -500,19 +496,16 @@ month from the first endpoint through the last, both endpoints included."""
 
 class VisionExtractor:
     _PREAMBLE = """\
-You retrieve visible values from rendered page images to fulfill a
-specific lookup. Each user message describes the lookup — what to find
-and (when stated) the period — followed by the full-context question
-this lookup supports, then a numbered list identifying each attached
-image. The page images themselves arrive as attachments in the same
-order as the list. Emit every visible value that could plausibly satisfy
-the lookup. Do not compute or transform — extract only what is visible.
-Every printed numeric value emitted MUST be visibly printed on the page.
-The only exception is when the question asks for visual understanding
-(e.g., count of bars exceeding a threshold). Choose the AnnotatedValue
-shape (scalar / vector / table) that fits the data on the page.
-A period written `YYYY-MM..YYYY-MM` is an INCLUSIVE range: extract every
-month from the first endpoint through the last, both endpoints included."""
+You retrieve visible values from rendered page images to fulfill a specific
+lookup. Each user message describes the lookup — what to find and, when
+stated, the period — then the full question the lookup serves, then a numbered
+list identifying each attached image (attached in that order). Emit every
+visible value that could plausibly satisfy the lookup. Do not compute or
+transform; every numeric value you emit must be visibly printed on the page,
+except when the question asks for visual understanding of a chart (e.g. a
+count of bars above a threshold). A period written `YYYY-MM..YYYY-MM` is an
+inclusive range: extract every month from the first endpoint through the
+last."""
 
     _prompt = PromptedCall(
         name="extract.vision",
@@ -576,28 +569,20 @@ class MultimodalExtractor:
     image alone, and a page that won't render extracts from text alone."""
 
     _PREAMBLE = """\
-You retrieve printed values to fulfill a specific lookup, working from BOTH
+You retrieve printed values to fulfill a specific lookup, working from both
 the text and the rendered image of the same page(s). Each user message
-describes the lookup — what to find and (when stated) the period — then the
-full-context question this lookup supports, then PAGE METADATA (a structured
-summary of each table/figure on the page: its title, column/row labels, and a
-short description), then the page TEXT, and finally the page IMAGE(s), attached
-in the order listed.
-
-The page text is flattened — its columns and rows are hard to read — and may
-carry OCR errors: misread digits, dropped decimals, rows or columns shifted out
-of alignment. The IMAGE is the GROUND TRUTH for the digits. Use the text and
-metadata to read the LAYOUT — which column/row a value sits under, which table
-it belongs to, the period and the units — and read the actual DIGITS off the
-image. When the text and the image disagree on a digit, trust the image.
-
-Emit one entry per distinct row that could plausibly satisfy the lookup —
-including cases where multiple rows partially match. Do not compute or
-transform — extract only what is printed. Choose the AnnotatedValue shape
-(scalar / vector / table) that fits the data on the page; pick the smallest
-shape that captures every relevant value. A period written `YYYY-MM..YYYY-MM`
-is an INCLUSIVE range: extract every month from the first endpoint through the
-last, both endpoints included."""
+describes the lookup — what to find and, when stated, the period — then the
+full question the lookup serves, then page metadata (title, column/row labels,
+short description per table/figure), then the page text, and finally the page
+image(s), attached in the order listed. The page text is flattened and may
+carry OCR errors; the image is the ground truth for digits. Use the text and
+metadata to read the layout — which column/row a value sits under, which table
+it belongs to, the period and units — and read the digits off the image; when
+they disagree, trust the image. Emit one entry per distinct row that could
+plausibly satisfy the lookup, including partial matches. Do not compute or
+transform — extract only what is printed. A period written `YYYY-MM..YYYY-MM`
+is an inclusive range: extract every month from the first endpoint through the
+last."""
 
     _SYSTEM = _PREAMBLE + "\n\n" + EXTRACT_COMMON_PROMPT
 
@@ -814,17 +799,17 @@ extracted entries (description, unit, shape, source issue/pages, values).
 
 Decide two things:
 
-1. COVERAGE. The entries must contain the requested values for EVERY requested period,
+1. Coverage. The entries must contain the requested values for every requested period,
    at the granularity the request implies (monthly / quarterly / annual / single as-of
    date). List every requested period or value no entry provides.
-   - A fiscal-year or annual figure does NOT satisfy a request for specific months.
+   - A fiscal-year or annual figure does not satisfy a request for specific months.
    - A value from any issue counts — unless `as_of` pins the issue, then only entries
      from that issue count.
-   - Flag only values the request needs. Do not invent nice-to-haves.
-2. DUPLICATES. Group entries reporting the SAME series for the SAME period(s) — e.g. one
-   table reprinted in consecutive issues. Per group keep ONE entry: the one from the
+   - Flag only values the request needs.
+2. Duplicates. Group entries reporting the same series for the same period(s) — e.g. one
+   table reprinted in consecutive issues. Per group keep one entry: the one from the
    latest bulletin, unless `as_of` pins an issue (then keep that issue's entry).
-   Entries covering different periods of the same series are NOT duplicates. Singleton
+   Entries covering different periods of the same series are not duplicates. Singleton
    entries appear in no group."""
 
     async def run_shadow(

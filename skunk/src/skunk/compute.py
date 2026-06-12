@@ -95,7 +95,7 @@ Always read data through `e.frame`:
              `columns.name == e.col_name`.
 
 For each non-scalar entry the `input_values =` block below shows a schema view:
-the full axis labels (index labels + column names) and per-column dtypes — NOT
+the full axis labels (index labels + column names) and per-column dtypes — not
 the cell values. The full frame is what you get in the exec env; write code
 against it (`.loc[...]`, `.idxmax()`, etc.) using the labels shown.
 Apply unit conversions once over the whole frame (e.g. `df * 1e-6`), never
@@ -106,34 +106,30 @@ cell-by-cell.
 - Pick the entries you need from the `input_values =` block and reference
   them by index (`input_values[7].frame`). Do not re-locate entries at
   runtime by filtering on `.description`.
-- Entries may repeat. Pick the one whose description AND qualifiers best match
+- Entries may repeat. Pick the one whose description and qualifiers best match
   the question's wording — a qualifier word in the question ("subject to
-  limitation", "accepted", "issued", "total outstanding") must match the
-  entry's qualifiers, not just its description.
-  Do NOT use multiple entries for max/min/avg/sum/etc.
-  
+  limitation", "accepted", "issued") must match the entry's qualifiers, not
+  just its description. Do not combine multiple entries for max/min/avg/sum.
+
 ## Output format
 
 Emit exactly one of the two forms below and nothing else — no prose,
 no commentary, no second block, no fence around (b):
 
   (a) Success — a single fenced ```python``` block. Assign the final
-      answer string to `result`. The string contains ONLY the requested
-      answer — no prose, no "Answer:", no question restatement. For a
-      multi-part question, `result` is only the ultimate quantity /
-      identifier asked for, not any intermediate.
-      Carry full precision through every intermediate; round or format only
-      at the latest possible step — the final `result` string — to the
-      decimal places the question states.
+      answer string to `result`. The string contains only the requested
+      answer — no prose, no "Answer:", no question restatement; for a
+      multi-part question, only the ultimate quantity asked for.
+      Carry full precision through every intermediate; round or format
+      only in the final `result` string, to the decimal places the
+      question states.
   (b) Insufficient data — a single bare JSON object:
         {"missing": [<short identifier strings>],
          "description": "<one-line explanation>"}
-      Never fabricate values to avoid this path — if a required value
-      isn't in `input_values`, emit (b).
-      Real-world reference data (exchange rates, deflators, CPI, GDP,
-      population, market prices) is DATA, not knowledge: if the question
-      needs it and no entry carries it, emit (b) — never supply it from
-      memory, however well-known (e.g. a parity FX rate).
+      If a required value is not in `input_values`, emit (b) — never
+      fabricate it. Real-world reference data (exchange rates, deflators,
+      CPI, GDP, population, market prices) is data, not knowledge: if no
+      entry carries it, emit (b) rather than supplying it from memory.
 
 Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
 """

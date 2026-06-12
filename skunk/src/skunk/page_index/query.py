@@ -150,8 +150,8 @@ class PageIndexRetriever:
 
     _CHAPTER_PICK_PROMPT = (
         """\
-For each Treasury Bulletin chapter, decide whether the answer to the question could PLAUSIBLY be
-in it. Judge every chapter independently and return true if you cannot confidently rule it out.
+For each Treasury Bulletin chapter, decide whether the answer to the question could plausibly be
+in it. Judge every chapter independently.
 
 ## Input
 
@@ -164,35 +164,31 @@ A single JSON object:
         + CHAPTER_FIELDS
         + """
 
-Each chapter's `description`, and `examples` should be used for reference, but may not contain the verbatim wording of the question even though
-it contains relevant information. Use semantic understanding to make the judgement.
+`description` and `examples` indicate a chapter's scope but rarely use the question's wording;
+judge semantically.
 
 ## Output
 
-A single bare JSON array of booleans — no prose, no markdown fences — one entry per chapter, in the
-SAME ORDER as the input `chapters`:
+A single bare JSON array of booleans — no prose, no markdown fences — one entry per chapter, in
+the input order:
   [true, false, ...]
 
-Mark a chapter `true` when the answer could plausibly be in it; `false` only when it is clearly
-unrelated. ERR TOWARD true: when in doubt, return `true`. When two chapters are similar or cover
-overlapping topics, return `true` for BOTH — do not guess which one holds the table. Keeping an
-extra chapter is cheap; dropping the one that holds the answer loses it for good.
+Return true when the answer could plausibly be in the chapter; false only when it is clearly
+unrelated. When in doubt, or when two chapters overlap, return true for both.
 """
     )
 
     _SEMFILTER_PROMPT = (
         """\
-You are given a list of RETRIEVAL TARGETS (data concepts a research question needs) and a flat batch
-of CONTENT BLOCKS — each a single table/chart/prose region from a Treasury Bulletin page, tagged
-with its bulletin + page. For EACH block, decide whether it contains data relevant to ANY ONE of the
-targets. You see only a compact SUMMARY per block — its title, column/row labels, dates — not the
-actual numbers. Judge each block INDEPENDENTLY.
+You are given retrieval targets (data concepts a research question needs) and a flat batch of
+content blocks — each a single table/chart/prose region from a Treasury Bulletin page. For each
+block, decide independently whether it holds data relevant to any one of the targets. You see only
+a compact summary per block (title, column/row labels, dates), not the numbers.
 
-A block is relevant to a target when its summary suggests it reports the kind of data that target
-needs for a relevant time period. Match on the DATA SERIES, not on whether the block alone could
-answer some downstream computation: KEEP blocks that hold the raw data series even when they cover
-only PART of the needed time span (the answer is assembled across several issues), and KEEP prose
-blocks whose summary names the relevant instrument/series.
+A block is relevant when its summary suggests it reports the kind of data a target needs for a
+relevant time period. Match on the data series, not on whether the block alone could answer the
+question: keep blocks that hold the series even when they cover only part of the needed span, and
+keep prose blocks whose summary names the relevant instrument or series.
 
 ## Input
 
@@ -215,28 +211,28 @@ A single bare JSON array of booleans — no prose, no markdown fences. One entry
 the block order given:
   [true, false, ...]
 
-Mark a block `true` when its summary fits AT LEAST ONE target; `false` only when clearly unrelated
-to every target.
+True when the summary fits at least one target; false only when clearly unrelated to every target.
 """
     )
 
     _BLOCK_SELECT_PROMPT = """\
-You select which already-filtered Treasury Bulletin content blocks actually carry the data the given retrieval
-target needs, in the context of the question. Candidate blocks are one per line. Each line starts with its
-`block_id`, then `dates=`, the time span the block's data covers, then a compact summary (title, column/row labels) — NOT the numbers.
+You select which already-filtered Treasury Bulletin content blocks most directly carry the given
+retrieval target's data, in the context of the question. Candidates are one per line: `block_id`,
+then `dates=` (the block's data span), then a compact summary (title, column/row labels) — not the
+numbers.
 
-Judge EACH block and mark `true` only the ones that most directly report the target's data and `false` for every other block.
-Respect the cap given, and return fewer blocks when fewer fit. Apply the rules below when deciding:
-  - If the question pins a specific source ("as reported in the <Month Year> Bulletin", "as of <date>"), select
-    blocks that best match that source.
-  - Otherwise prefer the block whose title / headers / date range  match the target most precisely. 
-  - When the same figure is restated across many issues, prefer the most recent issue that covers all of the required
-    period unless the question explicitly asks for a version.
+Rules:
+  - If the question pins a specific source ("as reported in the <Month Year> Bulletin", "as of
+    <date>"), select the blocks that best match that source.
+  - Otherwise prefer blocks whose title, headers, and date range match the target most precisely.
+  - When the same figure is restated across issues, prefer the most recent issue covering the
+    required period unless the question asks for a specific version.
 
 ## Output
 
-A single bare JSON array of booleans — no prose, no markdown fences — one entry per candidate block, in the
-SAME ORDER given: `true` to SELECT the block, `false` to drop it. No more than the requested cap may be `true`.
+A single bare JSON array of booleans — no prose, no markdown fences — one entry per candidate, in
+the order given; `true` selects the block. At most the requested cap may be true; return fewer
+when fewer fit.
   [true, false, false, ...]"""
 
     _GROUP_SIZE = 32  # blocks per selection call

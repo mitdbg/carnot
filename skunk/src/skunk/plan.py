@@ -265,12 +265,12 @@ gathered values and the verbatim question to produce the answer.
 ## Field semantics
 
 retrieve branch fields:
-  key           natural-language phrase describing the data to find. Focus only on a singular, cohesive concept.
-                Favor separate branches for distinct concepts. Examples:
+  key           natural-language phrase describing the data to find — one singular, cohesive
+                concept per branch; favor separate branches for distinct concepts. Examples:
                 "national defense expenditures", "weekly average discount rate for new 91-day bills".
                 Never emit two branches for the same underlying table/statistic worded
-                differently (one auction's bids, allotments, and totals = ONE branch).
-                Same concept over several periods = ONE branch with a comma-separated period.
+                differently (one auction's bids, allotments, and totals = one branch).
+                Same concept over several periods = one branch with a comma-separated period.
   period        The period the data value pertains to as canonical months: a single
                 "YYYY-MM", an inclusive "YYYY-MM..YYYY-MM" range, or a comma-separated
                 list of these ("1940-01..1940-12, 1953-01..1953-12") — expanding fiscal
@@ -287,19 +287,15 @@ retrieve branch fields:
   visual_only   true only if question explicitly asks for visual understanding of charts/figures.
 
 lookup_external branch fields:
-  target        natural-language request for one external value, OR for the same series
-                across consecutive periods (e.g. "U.S. CPI-U for July 1953", or for a
-                multi-period series "TreasuryDirect index ratios for the 2-3/8% Jan-2027
-                TIPS across January-August 2007").
-                When the question needs the same series across N periods, emit ONE branch
-                with a multi-period target. Do NOT split into N separate branches.
-                Strongly prefer the question's exact wording for any identifier it
-                supplies (security descriptor, coupon, maturity, date); reword only
-                the series/source name.
-  src           Set to a publisher name if and only if the question itself NAMES a
-                single, unambiguous external source, copied VERBATIM from the question
-                (an exact span of its text). Never infer a publisher the question does
-                not name. Otherwise null.
+  target        natural-language request for one external value, or for the same series
+                across consecutive periods (e.g. "U.S. CPI-U for July 1953"). The same
+                series across N periods is one branch with a multi-period target, not N
+                branches. Keep the question's exact wording for any identifier it
+                supplies (security descriptor, coupon, maturity, date); reword only the
+                series/source name.
+  src           a publisher name, set if and only if the question itself names a single,
+                unambiguous external source — copied verbatim from the question. Never
+                infer a publisher the question does not name. Otherwise null.
 """
 
     _REPLAN_INSTRUCTIONS = """\
@@ -316,20 +312,17 @@ Return a PlanDiff JSON object with these fields:
                  must be re-fetched differently. Empty list if you drop nothing.
 
 Rules:
-  - A prior branch you wish to keep appear in NEITHER list: leave it
-    alone and its gathered data is reused as-is. Do NOT re-add branches whose
-    data is already in `prev`.
+  - A prior branch you wish to keep appears in neither list: leave it alone and
+    its gathered data is reused as-is. Do not re-add branches whose data is
+    already in `prev`.
   - If data is missing, `add` retrieve/lookup branches that close the gap.
-  - For each FAILED branch you still need, read its "what the attempt found / why
-    it was blocked" note and formulate an alternative query. Pay special attention to whether
-    you are asking for information at the right granularity, and whether you are correctly
-    assuming whether a piece of information is in the corpus or should be fetched externally with
-    the appropriate src.
-  - Added retrieve branches must have null `as_of` — at replan time issue
-    selection is retrieval's job, not the plan's.
+  - For each failed branch you still need, read its "what the attempt found /
+    why it was blocked" note and formulate an alternative query — check that
+    you are asking at the right granularity, and that the value really is (or
+    is not) in the corpus before choosing retrieve vs lookup_external.
+  - Added retrieve branches must have null `as_of`.
   - A non-null lookup_external `src` must name a publisher the question itself
-    names, copied VERBATIM; otherwise leave `src` null and let the lookup pick an
-    authoritative source.
+    names, copied verbatim; otherwise leave `src` null.
 """
 
     # Planner-only addenda, appended to the planner system prompt alone (the replanner
@@ -339,18 +332,17 @@ Rules:
     # everything; lookups are injected at replan). The lookup `src` verbatim rule
     # lives in `_parse_plan_diff`, since lookups are emitted only at replan.
     _VERBATIM_RULE = """\
-##Note
-Each retrieve `key` must be copied VERBATIM from the question: an exact span of the
-question text, in the question's own wording.
+## Retrieve-key rule
+Each retrieve `key` must be copied verbatim from the question: an exact span of
+the question text, in the question's own wording.
 """
 
     _INITIAL_PASS_RULE = """\
-##Initial-pass rule
-This is the FIRST pass: emit ONLY `retrieve` branches — never `lookup_external`.
+## Initial-pass rule
+This is the first pass: emit only `retrieve` branches, never `lookup_external`.
 Assume every value the question needs lives in the Treasury Bulletin corpus,
-including values that look external (CPI, GDP, FX rates): emit a `retrieve` branch
-for each, keyed by the question's wording. If retrieval cannot find a value, an
-external lookup is injected automatically at replan.
+including values that look external (CPI, GDP, FX rates), and key each retrieve
+by the question's wording. External lookups are injected at replan if needed.
 """
 
     # Planner and replanner share the initial-plan instructions (same branch/field

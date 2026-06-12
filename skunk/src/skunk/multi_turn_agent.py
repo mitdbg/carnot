@@ -471,12 +471,13 @@ Requirements for the final answer:
         return await self._terminal_turn(ctx, observations)
 
     _TERMINAL_PROMPT = (
-        "You are out of steps. Do NOT call any tool now — emit exactly ONE ```json``` "
+        "You are out of steps. Do not call any tool now — emit exactly one ```json``` "
         "block, either:\n"
-        "  • COMMIT: if a value already in your observations answers the request, your "
+        "  • commit: if a value already in your observations answers the request, your "
         "best final answer in the required format; or\n"
-        '  • NO RESULT: an envelope {"error": "<note>"} with a 2-4 sentence note describing which tools/series you tried, any '
-        "candidate values you found, and what blocked you."
+        '  • no result: an envelope {"error": "<note>"} with a 2-4 sentence note '
+        "describing which tools/series you tried, any candidate values you found, and "
+        "what blocked you."
     )
 
     async def _terminal_turn(
