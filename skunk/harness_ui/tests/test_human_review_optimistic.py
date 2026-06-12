@@ -12,7 +12,7 @@ from skunk.config import SkunkConfig
 from skunk.human import (
     HumanAssist,
     HumanAssistPolicy,
-    apply_semantic_override,
+    apply_overrides,
 )
 from skunk.page_index.data_model import ContentBlock
 from skunk.plan import LookupBranch, RetrieveBranch
@@ -149,19 +149,41 @@ def test_register_is_noop_without_a_hook() -> None:
         ctx.close()
 
 
-# ── override merge + recompute ──────────────────────────────────────────────────
-def test_apply_semantic_override_preserves_provenance() -> None:
+# ── override apply (source-indexed) + recompute ─────────────────────────────────
+def test_apply_overrides_preserves_provenance_and_structure() -> None:
     base = [
         AnnotatedValue(
-            description="orig", value=1, kind="scalar", bulletin="1954-02", pages=(17,)
+            description="orig",
+            value={"2020": 1.0},
+            kind="vector",
+            index_name="year",
+            unit="pct",
+            bulletin="1954-02",
+            pages=(17,),
         )
     ]
-    edited = [AnnotatedValue(description="fixed", value=99, kind="scalar")]
-    out = apply_semantic_override(edited, base)
-    assert out[0].value == 99
+    # Human edits only description + value (decluttered editor sends _src + editable fields).
+    items = [{"_src": 0, "description": "fixed", "value": {"2020": 9.0}}]
+    out = apply_overrides(items, base)
+    assert out[0].value == {"2020": 9.0}
     assert out[0].description == "fixed"
-    assert out[0].bulletin == "1954-02"  # provenance carried from base
+    # kind/index_name + provenance preserved from base (not sent by the editor).
+    assert out[0].kind == "vector"
+    assert out[0].index_name == "year"
+    assert out[0].bulletin == "1954-02"
     assert out[0].pages == (17,)
+
+
+def test_apply_overrides_drops_deleted_entries() -> None:
+    base = [
+        AnnotatedValue(description="a", value=1, kind="scalar"),
+        AnnotatedValue(description="b", value=2, kind="scalar"),
+        AnnotatedValue(description="c", value=3, kind="scalar"),
+    ]
+    # The human deleted the middle box: only _src 0 and 2 come back.
+    items = [{"_src": 0, "value": 1}, {"_src": 2, "value": 30}]
+    out = apply_overrides(items, base)
+    assert [e.value for e in out] == [1, 30]
 
 
 def test_recompute_answer_applies_override_and_keeps_other_branches(
@@ -196,8 +218,8 @@ def test_recompute_answer_applies_override_and_keeps_other_branches(
         extra_entries=[AnnotatedValue(description="extra", value=9, kind="scalar")],
         explanations=[],
     )
-    # Human corrects only branch 0's value (10 instead of 1).
-    overrides = {0: [AnnotatedValue(description="a", value=10, kind="scalar")]}
+    # Human corrects only branch 0's value (10 instead of 1) via a source-indexed item.
+    overrides = {0: [{"_src": 0, "value": 10}]}
     ctx = ExecutionContext(question="q", config=SkunkConfig(), llm_client=object())  # type: ignore[arg-type]
     try:
         answer = asyncio.run(orch_mod.recompute_answer(state, overrides, ctx))

@@ -129,6 +129,7 @@ function renderStatus() {
         </div>
         <div class="row-side">
           <span class="status ${badgeClass(task)}">${esc(badgeLabel(task))}</span>
+          ${task.revising ? `<span class="row-revising">Revising…</span>` : ""}
           ${reviewCount(task) ? `<span class="row-review" onclick="openReview('${js(task.task_id)}', event)">Review (${reviewCount(task)})</span>` : ""}
           ${task.status === "READY" ? `<span class="row-submit" onclick="submitTask('${js(task.task_id)}', event)">Submit</span>` : ""}
         </div>
@@ -171,6 +172,12 @@ function renderDetailActions(task) {
   if (!host) return;
   if (!task) { host.innerHTML = ""; return; }
   let html = "";
+  if (task.revising) {
+    html += `<span class="detail-feedback revising">Revising answer after review…</span>`;
+  }
+  if (reviewCount(task)) {
+    html += `<button class="primary" onclick="openReview('${js(task.task_id)}', event)">Review (${reviewCount(task)})</button>`;
+  }
   if (task.status === "READY") {
     html += `<button class="primary" onclick="submitTask('${js(task.task_id)}', event)">Submit Answer</button>`;
   } else if (task.status === "SUBMITTING") {

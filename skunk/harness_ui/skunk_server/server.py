@@ -58,6 +58,7 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
                 "answer": candidate.answer_text if candidate else None,
                 "points": submission.points_awarded if submission else None,
                 "correct": submission.correct if submission else None,
+                "revising": task.revising,
                 # Open human reviews drive the sidebar bump + the review overlay. Small lists,
                 # so the whole payload (instruction + candidates + page refs) rides the snapshot.
                 "reviews": [

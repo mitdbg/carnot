@@ -21,6 +21,7 @@ const ReviewOverlay = (function () {
   let pages = [];              // [{month, page}] parsed from the review's source_docs
   let pageIdx = 0;
   let zoom = 1, panX = 0, panY = 0;
+  let fitScale = 1;            // scale that fits the whole page in the viewport (and the min zoom)
 
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[c]));
 
@@ -58,21 +59,36 @@ const ReviewOverlay = (function () {
     if (el) el.hidden = true;
   }
 
-  // Re-read the live snapshot. If the active task's open reviews changed (resolved elsewhere,
-  // cancelled at round close, or the task vanished), reconcile: drop closed ones, and close the
-  // overlay when nothing is left so it never strands on a stale review.
+  // Re-read the live snapshot WITHOUT clobbering the operator's work. Status snapshots arrive
+  // every tick, so we must NOT rebuild the DOM (which would wipe in-progress edits and reset the
+  // page viewer's pan/zoom) while the operator is on a review that's still open. We only act when
+  // the CURRENT review disappeared externally (resolved elsewhere / cancelled at round close):
+  // then advance to the next, or close if none remain. Post-submit advancing is the explicit
+  // render() path in post(), not here.
   function syncTasks(tasks) {
     tasksRef = tasks || [];
     if (!isOpen()) return;
     const task = tasksRef.find((t) => t.task_id === activeTaskId);
     const open = task ? (task.reviews || []) : [];
-    const current = reviews[index];
+    const cur = reviews[index];
+    const curStillOpen = cur && open.some((r) => r.review_id === cur.review_id);
     reviews = open.slice();
     if (!reviews.length) { close(); return; }
-    // Keep showing the same review if it's still open; else clamp into range.
-    const stillThere = current && reviews.findIndex((r) => r.review_id === current.review_id);
-    index = (stillThere != null && stillThere >= 0) ? stillThere : Math.min(index, reviews.length - 1);
+    if (curStillOpen) {
+      // Same review still in progress — keep the live DOM (edits + viewer) intact, just keep our
+      // index pointed at it and refresh the "review N of M" counter text in place.
+      index = reviews.findIndex((r) => r.review_id === cur.review_id);
+      updateCount();
+      return;
+    }
+    // The current review vanished out from under us → advance (or clamp) and rebuild once.
+    index = Math.min(index, reviews.length - 1);
     render();
+  }
+
+  function updateCount() {
+    const el = root() && root().querySelector(".review-count");
+    if (el) el.textContent = `review ${index + 1} of ${reviews.length}`;
   }
 
   function current() { return reviews[index] || null; }
@@ -83,54 +99,62 @@ const ReviewOverlay = (function () {
     return Array.isArray(g.candidates) ? g.candidates : [];
   }
 
+  // One value box, decluttered: only description / unit / value are editable; kind, index_name,
+  // row_name, col_name and machine provenance are preserved from the original extraction via the
+  // `_src` index (the card's data-src). A ✕ removes the box entirely (the value is then dropped
+  // from what's fed to the recompute). `i` is the value's ORIGINAL index in the candidate list.
   function candidateRow(c, i) {
     const valueStr = (c.value && typeof c.value === "object") ? JSON.stringify(c.value, null, 2) : String(c.value ?? "");
     const kind = c.kind || "scalar";
-    return `<div class="review-cand" data-i="${i}">
+    const meta = kind === "scalar" ? "" : `<span class="review-cand-kind">${esc(kind)}${c.index_name ? " · " + esc(c.index_name) : ""}</span>`;
+    return `<div class="review-cand" data-src="${i}">
+      <div class="review-cand-head">
+        ${meta}
+        <button class="review-cand-del" title="Remove this value" onclick="ReviewOverlay.deleteCard(${i})">✕</button>
+      </div>
       <label class="review-field"><span>description</span>
         <input type="text" data-f="description" value="${esc(c.description ?? "")}"></label>
+      <label class="review-field"><span>unit</span>
+        <input type="text" data-f="unit" value="${esc(c.unit ?? "")}"></label>
       <label class="review-field"><span>value</span>
-        <textarea data-f="value" rows="${kind === "scalar" ? 1 : 3}">${esc(valueStr)}</textarea></label>
-      <div class="review-field-row">
-        <label class="review-field"><span>unit</span>
-          <input type="text" data-f="unit" value="${esc(c.unit ?? "")}"></label>
-        <label class="review-field"><span>kind</span>
-          <select data-f="kind">
-            ${["scalar", "vector", "table"].map((k) => `<option value="${k}" ${k === kind ? "selected" : ""}>${k}</option>`).join("")}
-          </select></label>
-      </div>
-      <div class="review-field-row">
-        <label class="review-field"><span>index_name</span>
-          <input type="text" data-f="index_name" value="${esc(c.index_name ?? "")}"></label>
-        <label class="review-field"><span>row_name</span>
-          <input type="text" data-f="row_name" value="${esc(c.row_name ?? "")}"></label>
-        <label class="review-field"><span>col_name</span>
-          <input type="text" data-f="col_name" value="${esc(c.col_name ?? "")}"></label>
-      </div>
+        <textarea data-f="value" class="review-value" oninput="ReviewOverlay.autosize(this)">${esc(valueStr)}</textarea></label>
     </div>`;
   }
 
-  // Read the edited rows back into AnnotatedValue field objects (positionally aligned with the
-  // shown candidates, so the recompute overlays them onto the cached entries by index).
+  // Read the surviving value boxes back into source-indexed override items
+  // ({_src, description, unit, value}); deleted boxes are simply absent. The recompute overlays
+  // the edited fields onto the cached entry at `_src`, preserving its structure + provenance.
   function collectEdited() {
     const rows = root().querySelectorAll(".review-cand");
     const out = [];
     for (const row of rows) {
-      const obj = {};
+      const src = Number(row.getAttribute("data-src"));
+      const obj = { _src: Number.isFinite(src) ? src : null };
       for (const el of row.querySelectorAll("[data-f]")) {
         const f = el.getAttribute("data-f");
         let v = el.value;
         if (f === "value") {
           const t = v.trim();
           try { v = JSON.parse(t); } catch { v = t; }  // primitives parse (5, "x"); objects too
-        } else if (v === "") {
-          v = (f === "index_name" || f === "row_name" || f === "col_name") ? null : "";
         }
         obj[f] = v;
       }
       out.push(obj);
     }
     return out;
+  }
+
+  function deleteCard(srcIndex) {
+    const card = root() && root().querySelector(`.review-cand[data-src="${srcIndex}"]`);
+    if (card) card.remove();
+  }
+
+  // Grow a value textarea to fit its content (so a 12-month vector shows fully), capped so a huge
+  // table still scrolls instead of taking the whole panel.
+  function autosize(ta) {
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = Math.min(ta.scrollHeight + 2, Math.round(window.innerHeight * 0.4)) + "px";
   }
 
   // ── page viewer ──────────────────────────────────────────────────────────────
@@ -140,13 +164,28 @@ const ReviewOverlay = (function () {
     const label = root().querySelector(".review-page-label");
     if (label && pages.length) label.textContent = `${pages[pageIdx].month}  p.${pages[pageIdx].page}  (${pageIdx + 1}/${pages.length})`;
   }
+  // Fit the loaded page to the viewport and center it. Called on each image load (natural size is
+  // only known then); the fit scale also becomes the minimum zoom so the whole page is reachable.
+  function fitPage() {
+    const vp = root() && root().querySelector(".review-viewport");
+    const img = root() && root().querySelector(".review-page-img");
+    if (!vp || !img || !img.naturalWidth) return;
+    const vw = vp.clientWidth, vh = vp.clientHeight;
+    fitScale = Math.min(vw / img.naturalWidth, vh / img.naturalHeight) || 1;
+    zoom = fitScale;
+    panX = (vw - img.naturalWidth * zoom) / 2;
+    panY = (vh - img.naturalHeight * zoom) / 2;
+    applyTransform();
+  }
   function setPage(i) {
     if (!pages.length) return;
     pageIdx = Math.max(0, Math.min(pages.length - 1, i));
-    zoom = 1; panX = 0; panY = 0;
     const img = root().querySelector(".review-page-img");
-    if (img) img.src = `/api/source/${pages[pageIdx].month}/page/${pages[pageIdx].page}.png`;
-    applyTransform();
+    if (img) {
+      img.onload = fitPage;                  // fit once the new page's natural size is known
+      img.src = `/api/source/${pages[pageIdx].month}/page/${pages[pageIdx].page}.png`;
+      if (img.complete && img.naturalWidth) fitPage();  // cached image: onload may not refire
+    }
   }
   function wireViewer() {
     const vp = root().querySelector(".review-viewport");
@@ -156,7 +195,7 @@ const ReviewOverlay = (function () {
       const rect = vp.getBoundingClientRect();
       const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
       const factor = Math.exp(-e.deltaY * 0.0015);          // trackpad pinch sends ctrlKey+wheel
-      const next = Math.max(1, Math.min(8, zoom * factor));
+      const next = Math.max(fitScale, Math.min(8, zoom * factor));  // can't zoom past full-page
       // keep the point under the cursor stationary while zooming
       panX = cx - (cx - panX) * (next / zoom);
       panY = cy - (cy - panY) * (next / zoom);
@@ -177,10 +216,11 @@ const ReviewOverlay = (function () {
     if (!review) { close(); return; }
     el.hidden = false;
     pages = parsePages(review.source_docs);
-    pageIdx = 0; zoom = 1; panX = 0; panY = 0;
+    pageIdx = 0; zoom = 1; panX = 0; panY = 0; fitScale = 1;
     const task = tasksRef.find((t) => t.task_id === activeTaskId);
     const title = task ? `R${esc(task.round_num)} / ${esc(task.question_id)}` : esc(activeTaskId);
     const kindLabel = { lookup: "External Lookup", figure: "Visual QA", verify_extract: "Extract Validation" }[review.kind] || review.kind;
+    const ctx = contextLine(review);
     const cands = candidates(review);
     const editor = cands.length
       ? cands.map(candidateRow).join("")
@@ -210,6 +250,7 @@ const ReviewOverlay = (function () {
         <div class="review-body">
           <div class="review-left">
             <div class="review-prompt">${esc(task?.prompt || "")}</div>
+            ${ctx ? `<div class="review-context">${esc(ctx)}</div>` : ""}
             <div class="review-instructions">${esc(review.instructions || "")}</div>
             <div class="review-editor">${editor}</div>
             <div class="review-actions">
@@ -222,6 +263,16 @@ const ReviewOverlay = (function () {
         </div>
       </div>`;
     if (pages.length) { wireViewer(); setPage(0); }
+    el.querySelectorAll(".review-value").forEach(autosize);  // fit each value box to its content
+  }
+
+  // A one-line "what this value is about" hint from the branch identity, so terse per-value
+  // descriptions still carry the question's context.
+  function contextLine(review) {
+    const b = (review.guidance || {}).branch || {};
+    if (b.kind === "lookup_external") return b.target ? `Lookup: ${b.target}` : "";
+    if (b.key) return `Looking for: ${b.key}${b.period ? ` · period ${b.period}` : ""}`;
+    return "";
   }
 
   function showError(msg) {
@@ -272,7 +323,7 @@ const ReviewOverlay = (function () {
 
   return {
     open, close, isOpen, syncTasks,
-    submit, acceptAsIs, requestExit,
+    submit, acceptAsIs, requestExit, deleteCard, autosize,
     prevPage: () => setPage(pageIdx - 1),
     nextPage: () => setPage(pageIdx + 1),
   };

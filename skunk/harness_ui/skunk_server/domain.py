@@ -133,6 +133,9 @@ class QuestionTask:
     # The snapshot (JSON form of orchestrator.RecomputeState) that produced the latest answer;
     # a resolved review recomputes from it. None until the first attempt completes a compute.
     recompute_state: dict[str, Any] | None = None
+    # True while a resolved review's recompute is running in the background (the answer is being
+    # revised) — surfaced in the UI so a resolve doesn't look like it did nothing.
+    revising: bool = False
     round_ends_at: datetime | None = None
     version: int = 0
     created_at: datetime = field(default_factory=utc_now)

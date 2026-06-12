@@ -958,3 +958,41 @@ textarea { width: 100%; min-height: 55px; }
   .review-body { flex-direction: column; }
   .review-panel.with-viewer .review-left { flex: 0 0 auto; border-right: none; border-bottom: 1px solid var(--line); }
 }
+
+/* ── Review polish: revising chip, context line, decluttered value cards ──────── */
+/* A status-row chip, same footprint as .row-submit / .row-review so the column never overlaps. */
+.row-revising {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--blue);
+  background: var(--blue-bg);
+  border: 1px solid var(--border2);
+  animation: review-pulse 1.4s ease-in-out infinite;
+}
+.detail-feedback.revising { color: var(--blue); font-size: 12px; }
+@keyframes review-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+.review-context {
+  font-size: 12px;
+  color: var(--accent-2);
+  background: var(--blue-bg);
+  border: 1px solid var(--border2);
+  border-radius: 6px;
+  padding: 6px 10px;
+}
+.review-cand-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 18px; }
+.review-cand-kind { font-size: 11px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.04em; }
+.review-cand-del {
+  margin-left: auto;
+  background: transparent; border: 1px solid var(--border2); color: var(--muted);
+  width: 24px; height: 24px; border-radius: 5px; cursor: pointer; font-size: 12px; line-height: 1;
+}
+.review-cand-del:hover { color: var(--bad); border-color: var(--bad); }
+.review-value { max-height: 40vh; overflow-y: auto; }

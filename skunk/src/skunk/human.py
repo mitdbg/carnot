@@ -48,19 +48,30 @@ from skunk.plan import Branch, LookupBranch, RetrieveBranch
 _FIELDS = ("description", "value", "unit", "kind", "index_name", "row_name", "col_name")
 
 
-def apply_semantic_override(
-    edited: list[AnnotatedValue], base: list[AnnotatedValue]
+# The fields a human edits in the review overlay (the rest — kind/index_name/row_name/col_name
+# and machine provenance — are preserved from the original extraction via `_src`).
+_EDITABLE_FIELDS = ("description", "unit", "value")
+
+
+def apply_overrides(
+    items: list[dict], base: list[AnnotatedValue]
 ) -> list[AnnotatedValue]:
-    """Overlay a human's edited semantic fields (`_FIELDS`) onto the original extracted
-    entries, preserving each `base` entry's machine provenance (bulletin/pages/vintage). Pairs
-    positionally; a human entry past the end of `base` is kept as-is (provenance-less). Used by
-    the recompute path so a corrected value still sorts/filters by publication date downstream."""
+    """Build a branch's revised entries from the human's edited review items, source-indexed so
+    deletes/reorders are honored and provenance is preserved. Each item is
+    `{"_src": <original index | None>, "description"?, "unit"?, "value"?}`:
+      - `_src` in range → overlay the present editable fields onto `base[_src]` (keeps that
+        entry's kind/index_name/row_name/col_name + machine provenance);
+      - otherwise → construct a fresh `AnnotatedValue` from the given fields (a value the human
+        added, rare).
+    A `base` entry whose index never appears was deleted by the human and is dropped."""
     out: list[AnnotatedValue] = []
-    for i, ev in enumerate(edited):
-        if i < len(base):
-            out.append(base[i].model_copy(update={f: getattr(ev, f) for f in _FIELDS}))
+    for item in items:
+        src = item.get("_src")
+        fields = {f: item[f] for f in _EDITABLE_FIELDS if f in item}
+        if isinstance(src, int) and 0 <= src < len(base):
+            out.append(base[src].model_copy(update=fields))
         else:
-            out.append(ev)
+            out.append(AnnotatedValue.model_validate(fields))
     return out
 
 
@@ -124,13 +135,6 @@ def _candidates_json(candidates: list[AnnotatedValue]) -> str:
     return json.dumps(
         [c.model_dump(include=set(_FIELDS)) for c in candidates], indent=2
     )
-
-
-def parse_human_values(raw: str) -> list[AnnotatedValue]:
-    """Public parser for a human's typed/submitted JSON (one object or a list) into
-    `AnnotatedValue`s — used by the recompute path to turn a review's response into branch
-    overrides. Raises `ParseError` on anything malformed."""
-    return _parse_reply(raw)
 
 
 def _parse_reply(raw: str) -> list[AnnotatedValue]:

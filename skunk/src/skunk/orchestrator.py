@@ -12,7 +12,7 @@ from skunk.human import (
     BrokerChannel,
     ConsoleChannel,
     HumanAssist,
-    apply_semantic_override,
+    apply_overrides,
 )
 from skunk.lookup_external import LookupExternalOp
 from skunk.common import (
@@ -87,18 +87,19 @@ class RecomputeState:
 
 async def recompute_answer(
     state: RecomputeState,
-    overrides: dict[int, list[AnnotatedValue]],
+    overrides: dict[int, list[dict]],
     ctx: ExecutionContext,
 ) -> str:
     """Re-run ONLY compute over the first attempt's per-branch entries with human `overrides`
-    (keyed by branch id) swapped in — the deterministic revision path. The human's edited
-    semantic fields are overlaid onto the cached entries (provenance preserved); branches with
-    no override keep their original entries. No re-plan / re-retrieve / re-extract."""
+    (keyed by branch id) applied — the deterministic revision path. Each override is the human's
+    source-indexed review items for that branch; `apply_overrides` rebuilds the branch's entries
+    from them (honoring edits, deletes, and provenance). Branches with no override keep their
+    original entries. No re-plan / re-retrieve / re-extract."""
     merged: list[AnnotatedValue] = []
     for bid in state.order:
         cached = state.entries_by_branch.get(bid, [])
         if bid in overrides:
-            merged.extend(apply_semantic_override(overrides[bid], cached))
+            merged.extend(apply_overrides(overrides[bid], cached))
         else:
             merged.extend(cached)
     merged.extend(state.extra_entries)
@@ -247,6 +248,11 @@ class Orchestrator:
                 *[e for o in outcomes if o.entries for e in o.entries],
                 *human_entries,
             ]
+            # Snapshot BEFORE compute so a human review can revise even a task whose compute
+            # fails (the snapshot holds the branch entries; re-running compute over a human's
+            # correction may then succeed). Captured each loop iteration to reflect the latest
+            # entries/recovery state.
+            self._capture_recompute_state(outcomes, human_entries, explanations)
             try:
                 self._result.answer = await traced_step(
                     self._ctx,
@@ -257,7 +263,6 @@ class Orchestrator:
                         concept_explanations=explanations,
                     ),
                 )
-                self._capture_recompute_state(outcomes, human_entries, explanations)
                 return self._result.answer
             except MissingData as e:
                 attempt += 1
@@ -590,6 +595,7 @@ class Orchestrator:
                         "missing": missing,
                     },
                 )
+                self._capture_recompute_state(outcomes, human_entries, explanations)
                 try:
                     self._result.answer = await traced_step(
                         self._ctx,
@@ -600,7 +606,6 @@ class Orchestrator:
                             concept_explanations=explanations,
                         ),
                     )
-                    self._capture_recompute_state(outcomes, human_entries, explanations)
                     return self._result.answer
                 except MissingData as post_human_error:
                     reason = post_human_error.reason
@@ -808,14 +813,14 @@ class Orchestrator:
 
     def _review_mode(self) -> str:
         """How a wanted human review is serviced for this run:
-        - "optimistic": register an open review and keep the LLM result (server, non-blocking);
-        - "skip":       a register hook is wired but optimistic mode is off — don't review
-          (never block a server worker on the console);
+        - "optimistic": a register hook is wired (under the competition server) — register an
+          open review and keep the LLM result, non-blocking. Whether a review is wanted at all
+          is the per-stage policy's job (the SKUNK_HUMAN_* gates); this only picks the transport.
         - "blocking":   no register hook (local CLI) — await the human on the console as before.
         """
         if self._ctx.human_review_register is None:
             return "blocking"
-        return "optimistic" if self._ctx.config.human_optimistic else "skip"
+        return "optimistic"
 
     async def _run_branches(
         self,
@@ -906,7 +911,6 @@ class Orchestrator:
                             ),
                             branch_id=bid,
                         )
-                    # mode == "skip": review wanted but optimistic off on the server — no-op.
                 return entries
             # External lookup. Optimistic: always run the lookup agent, then register a review
             # of its result (the human confirms/corrects). Blocking (local CLI): the human

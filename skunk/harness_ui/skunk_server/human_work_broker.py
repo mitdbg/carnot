@@ -93,49 +93,70 @@ class HumanWorkBroker:
             and task.recompute_state is not None
             and self._recompute_fn is not None
         ):
+            self._registry.set_revising(task.task_id, True)  # UI shows "Revising…"
             self._schedule(self._recompute_and_record(task.task_id, review.attempt_id))
         self._notify()
         return task, review
 
     async def _recompute_and_record(self, task_id: str, attempt_id: str) -> None:
-        task = self._registry.get(task_id)
-        if task is None or task.recompute_state is None:
-            return
-        overrides = self._registry.resolved_overrides(task_id)
-        if not overrides:
-            return
         try:
-            answer = await self._recompute_fn(task.recompute_state, overrides)
-        except Exception:
-            logger.exception("recompute failed for %s", task_id)
-            return
-        # Source docs the human consulted, for the revised candidate's provenance.
-        seen: set[str] = set()
-        revised_docs: list[str] = []
-        for review in task.reviews:
-            for doc in [*review.source_docs, *review.response_source_docs]:
-                if doc and doc not in seen:
-                    seen.add(doc)
-                    revised_docs.append(doc)
-        candidate = AnswerCandidate(
-            attempt_id=attempt_id,
-            answer_text=answer,
-            reasoning="Revised after human review",
-            source_docs=revised_docs[:64],
-            submission_type="human-revised",
-        )
-        updated = self._registry.add_revised_candidate(task_id, candidate)
-        self._notify()
-        # Best-effort resubmit: only while the round is open and the task is (re)submittable.
-        if (
-            updated is not None
-            and updated.status == TaskStatus.READY
-            and self._registry.round_state().status == "ACTIVE"
-        ):
+            task = self._registry.get(task_id)
+            if task is None or task.recompute_state is None:
+                return
+            overrides = self._registry.resolved_overrides(task_id)
+            if not overrides:
+                return
             try:
-                await self._submit_fn(task_id)
+                answer = await self._recompute_fn(task.recompute_state, overrides)
             except Exception:
-                logger.exception("best-effort resubmit failed for %s", task_id)
+                logger.exception("recompute failed for %s", task_id)
+                return
+            # Source docs the human consulted, for the revised candidate's provenance.
+            seen: set[str] = set()
+            revised_docs: list[str] = []
+            for review in task.reviews:
+                for doc in [*review.source_docs, *review.response_source_docs]:
+                    if doc and doc not in seen:
+                        seen.add(doc)
+                        revised_docs.append(doc)
+            # Submission type stays "agent" (the default) — the answer is still mostly
+            # LLM-generated; the human only corrected a value. As an AGENT submission, Cup
+            # enforces a reasoning floor (AGENT_MIN_REASONING_CHARS=100), so the revised
+            # candidate must carry a substantial reasoning: a note about the human revision
+            # prepended to the prior answer's reasoning (the original structured payload). The
+            # note alone clears the floor, so this is valid even for a task that had no prior
+            # candidate (e.g. a FAILED attempt the human is fixing).
+            prior = task.latest_candidate
+            prior_reasoning = (
+                prior.reasoning if prior and prior.reasoning else ""
+            ).strip()
+            note = (
+                "Answer revised through human-in-the-loop review: a human reviewer confirmed or "
+                "corrected the extracted/looked-up value(s) against the source pages, and the "
+                "computation was re-run over the corrected inputs."
+            )
+            reasoning = f"{note}\n\n{prior_reasoning}" if prior_reasoning else note
+            candidate = AnswerCandidate(
+                attempt_id=attempt_id,
+                answer_text=answer,
+                reasoning=reasoning,
+                source_docs=(revised_docs or (prior.source_docs if prior else []))[:64],
+            )
+            updated = self._registry.add_revised_candidate(task_id, candidate)
+            # Best-effort resubmit: only while the round is open and the task is (re)submittable.
+            if (
+                updated is not None
+                and updated.status == TaskStatus.READY
+                and self._registry.round_state().status == "ACTIVE"
+            ):
+                try:
+                    await self._submit_fn(task_id)
+                except Exception:
+                    logger.exception("best-effort resubmit failed for %s", task_id)
+        finally:
+            # Clear the revising flag on every path (success, no-op, or failure) and refresh.
+            self._registry.set_revising(task_id, False)
+            self._notify()
 
     def cancel_all(self) -> None:
         self._registry.cancel_active_reviews()

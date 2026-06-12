@@ -72,7 +72,12 @@ def test_resolve_triggers_recompute_and_best_effort_submit() -> None:
 
         revised = registry.get(task.task_id)
         assert revised.latest_candidate.answer_text == "REVISED"
-        assert revised.latest_candidate.submission_type == "human-revised"
+        # Revised answers submit as the normal "agent" type (still mostly LLM-generated).
+        assert revised.latest_candidate.submission_type == "agent"
+        # As an AGENT submission, Cup rejects reasoning shorter than 100 chars — the revised
+        # candidate must clear that floor even when there's no prior reasoning to carry forward.
+        assert len(revised.latest_candidate.reasoning) >= 100
+        assert revised.revising is False  # cleared after the recompute completes
         assert revised.status == TaskStatus.READY
         assert submitted == [task.task_id]  # best-effort resubmit fired (round ACTIVE)
         assert recompute_calls[0][1] == {

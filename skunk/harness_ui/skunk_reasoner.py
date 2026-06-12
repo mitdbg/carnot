@@ -78,7 +78,6 @@ async def recompute(state: dict, overrides: dict) -> str:
     extract — deterministic and cheap. Returns the revised answer text."""
     from skunk import SkunkConfig
     from skunk.common import ExecutionContext
-    from skunk.human import parse_human_values
     from skunk.orchestrator import RecomputeState, recompute_answer
 
     _set_default_env()
@@ -86,11 +85,17 @@ async def recompute(state: dict, overrides: dict) -> str:
     if not Path(config.prompt_overrides_path).is_absolute():
         config.prompt_overrides_path = str(SKUNK_ROOT / config.prompt_overrides_path)
     snapshot = RecomputeState.from_jsonable(state)
-    parsed = {
-        int(branch_id): parse_human_values(response)
-        for branch_id, response in overrides.items()
-        if (response or "").strip()
-    }
+    # Each override is the human's source-indexed review items (a JSON list of
+    # {_src, description?, unit?, value?}); recompute_answer applies them per branch.
+    parsed: dict[int, list[dict]] = {}
+    for branch_id, response in overrides.items():
+        if not (response or "").strip():
+            continue
+        items = json.loads(response)
+        if isinstance(items, dict):
+            items = [items]
+        if isinstance(items, list):
+            parsed[int(branch_id)] = [i for i in items if isinstance(i, dict)]
     ctx = ExecutionContext(question=snapshot.question, config=config)
     try:
         return await recompute_answer(snapshot, parsed, ctx)
@@ -214,6 +219,18 @@ class SkunkReasoner:
                 trace_event_handler(dict(orch.ctx.events[-1]))
 
             orch.ctx.emit = emit_and_forward  # type: ignore[method-assign]
+
+        def ship_snapshot() -> None:
+            # Hand the recompute snapshot to the server so a later human-review resolve can
+            # revise this answer without re-planning (see human_work_broker). Shipped on BOTH
+            # the success and failure paths: a task whose compute failed still has a snapshot of
+            # its branch entries, so a human correction can re-run compute and possibly fix it.
+            if recompute_sink is not None and orch.recompute_state is not None:
+                try:
+                    recompute_sink(orch.recompute_state.to_jsonable())
+                except Exception:
+                    pass  # best-effort; never fail the answer over it
+
         try:
             try:
                 answer = await orch.execute()
@@ -221,6 +238,7 @@ class SkunkReasoner:
                 # Dump the trace BEFORE re-raising so failures (the interesting case for
                 # debugging MissingData / StepFailed) are inspectable offline.
                 _dump_console_trace(prompt, orch.ctx, error=f"{type(e).__name__}: {e}")
+                ship_snapshot()
                 raise RuntimeError(f"Skunk failed: {e}") from e
             except asyncio.CancelledError:
                 # Round closed → the worker pool cancelled this run to free the worker.
@@ -234,13 +252,7 @@ class SkunkReasoner:
                 )
                 raise
             _dump_console_trace(prompt, orch.ctx, answer=answer)
-            # Hand the recompute snapshot to the server so a later human-review resolve can
-            # revise this answer without re-planning (see human_work_broker).
-            if recompute_sink is not None and orch.recompute_state is not None:
-                try:
-                    recompute_sink(orch.recompute_state.to_jsonable())
-                except Exception:
-                    pass  # snapshot capture is best-effort; never fail the answer over it
+            ship_snapshot()
             return answer, list(orch.ctx.events)
         finally:
             orch.ctx.close()

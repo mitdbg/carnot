@@ -360,6 +360,17 @@ class TaskRegistry:
                 task.recompute_state = state
                 task.updated_at = utc_now()
 
+    def set_revising(self, task_id: str, revising: bool) -> None:
+        """Flag/unflag a task as having an in-flight recompute (the answer is being revised),
+        so the UI can show a 'Revising…' indicator. No-op if the task is gone."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is not None and task.revising != revising:
+                task.revising = revising
+                self._set_status(
+                    task, task.status
+                )  # bump version/updated_at, status unchanged
+
     def resolve_review(
         self,
         review_id: str,

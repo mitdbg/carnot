@@ -280,11 +280,17 @@ never round, truncate, or drop trailing digits.
 
 ## Field semantics
 
-description   natural-language label that uniquely identifies the
-              datum (series + period + sub-category + any other
-              distinguishing context). For the label text, use the
-              page's verbatim row text / column header / caption phrase
-              so the downstream consumer can map it back to the page.
+description   a self-contained, human-readable label that says WHAT this
+              datum is — the series, what it measures, the sub-category,
+              and the timeframe — so a reader who sees only the
+              description understands it without the surrounding context.
+              Prefer "national defense expenditures, monthly, 1940" over a
+              bare "National defense". Ground it in the page's verbatim row
+              text / column header / caption phrase (so it maps back to the
+              page), but expand abbreviations and add the series/timeframe
+              the row sits under. For a vector/table, describe the whole
+              series (the per-key dimension is named by index_name /
+              row_name / col_name), not one cell.
               
 index_name    (vector only) name of the varying dimension.
 
@@ -589,9 +595,7 @@ month from the first endpoint through the last, both endpoints included."""
             output_instruction=_EXTRACT_OUTPUT_INSTRUCTION,
         )
         try:
-            entries = await prompt.call(
-                ctx, user_msg, images=images, temperature=0.0
-            )
+            entries = await prompt.call(ctx, user_msg, images=images, temperature=0.0)
         except ParseError as e:
             ctx.emit(f"extract_parse_failed tier=vision error={e.detail!r}")
             entries = []
