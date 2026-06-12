@@ -20,28 +20,12 @@ def new_id() -> str:
 class TaskStatus(StrEnum):
     RECEIVED = "RECEIVED"
     QUEUED = "QUEUED"
-    RETRY_QUEUED = "RETRY_QUEUED"
     PROCESSING = "PROCESSING"
-    AWAIT_HUMAN = "AWAIT_HUMAN"
     READY = "READY"
     FAILED = "FAILED"
     SUBMITTING = "SUBMITTING"
     SUBMITTED = "SUBMITTED"
     SCORED = "SCORED"
-    CANCELLED = "CANCELLED"
-
-
-class AssignmentStatus(StrEnum):
-    ACTIVE = "ACTIVE"
-    RELEASED = "RELEASED"
-    COMPLETED = "COMPLETED"
-    SUPERSEDED = "SUPERSEDED"
-
-
-class HumanInterventionStatus(StrEnum):
-    PENDING = "PENDING"
-    CLAIMED = "CLAIMED"
-    RESOLVED = "RESOLVED"
     CANCELLED = "CANCELLED"
 
 
@@ -57,7 +41,6 @@ class Attempt:
     task_id: str
     attempt_number: int
     worker_id: str
-    feedback: str | None = None
     context_feedback: list[str] = field(default_factory=list)
     previous_attempt_ids: list[str] = field(default_factory=list)
     events: list[dict[str, Any]] = field(default_factory=list)
@@ -88,52 +71,6 @@ class FailureRecord:
 
 
 @dataclass
-class HumanWorker:
-    worker_id: str = field(default_factory=new_id)
-    display_name: str | None = None
-    connected_at: datetime = field(default_factory=utc_now)
-    last_seen_at: datetime = field(default_factory=utc_now)
-    connected: bool = True
-
-    @property
-    def mnemonic(self) -> str:
-        name = self.display_name or "Human Worker"
-        return f"{name} ({self.worker_id[:4]})"
-
-
-@dataclass
-class HumanAssignment:
-    task_id: str
-    worker_id: str
-    task_version: int
-    source_kind: str
-    assignment_id: str = field(default_factory=new_id)
-    assigned_at: datetime = field(default_factory=utc_now)
-    completed_at: datetime | None = None
-    status: AssignmentStatus = AssignmentStatus.ACTIVE
-
-
-@dataclass
-class HumanIntervention:
-    task_id: str
-    attempt_id: str
-    kind: str
-    instructions: str
-    context: str | None = None
-    source_docs: list[str] = field(default_factory=list)
-    guidance: dict[str, Any] = field(default_factory=dict)
-    intervention_id: str = field(default_factory=new_id)
-    status: HumanInterventionStatus = HumanInterventionStatus.PENDING
-    claimed_by: str | None = None
-    response: str | None = None
-    response_source_docs: list[str] = field(default_factory=list)
-    response_retrieval_directives: list[dict[str, Any]] = field(default_factory=list)
-    created_at: datetime = field(default_factory=utc_now)
-    claimed_at: datetime | None = None
-    resolved_at: datetime | None = None
-
-
-@dataclass
 class SubmissionRecord:
     task_id: str
     candidate_id: str
@@ -158,11 +95,8 @@ class QuestionTask:
     attempts: list[Attempt] = field(default_factory=list)
     answer_candidates: list[AnswerCandidate] = field(default_factory=list)
     failures: list[FailureRecord] = field(default_factory=list)
-    assignments: list[HumanAssignment] = field(default_factory=list)
-    human_interventions: list[HumanIntervention] = field(default_factory=list)
     submissions: list[SubmissionRecord] = field(default_factory=list)
     cup_feedback: list[str] = field(default_factory=list)
-    pending_retry_feedback: str | None = None
     round_ends_at: datetime | None = None
     version: int = 0
     created_at: datetime = field(default_factory=utc_now)

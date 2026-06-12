@@ -1,260 +1,82 @@
-"""FastAPI routes for human workers and server state."""
+"""FastAPI routes: the static monitoring UI and the two SSE streams."""
 
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from pydantic import BaseModel, Field
+from fastapi import FastAPI
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
-from skunk_server.domain import to_jsonable
-from skunk_server.events import EventHub
-from skunk_server.human_work_broker import HumanWorkBroker
-from skunk_server.human_worker_registry import HumanWorkerRegistry
-from skunk_server.submission_coordinator import SubmissionCoordinator
-from skunk_server.task_registry import TaskConflict, TaskRegistry
+from skunk_server.hub import HEARTBEAT_INTERVAL_S, StreamHub, sse_frame
+from skunk_server.task_registry import TaskRegistry
 
-
-class WorkerUpdate(BaseModel):
-    display_name: str = Field(max_length=80)
-
-
-class AssignmentRequest(BaseModel):
-    worker_id: str
-    task_id: str
+WEB_DIR = Path(__file__).resolve().parent / "web"
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",  # disable proxy buffering so frames flush immediately
+    "Connection": "keep-alive",
+}
 
 
-class AssignmentRelease(BaseModel):
-    worker_id: str
+async def status_frames(hub: StreamHub, heartbeat: float = HEARTBEAT_INTERVAL_S):
+    """SSE frames for the always-on status stream: the compact snapshot on connect, then
+    whatever `publish_status` fans out. A `: ping` comment keeps idle connections alive."""
+    queue = hub.add_status_sub()
+    try:
+        yield sse_frame(hub.status_snapshot())
+        while True:
+            try:
+                yield await asyncio.wait_for(queue.get(), heartbeat)
+            except TimeoutError:
+                yield ": ping\n\n"
+    finally:
+        hub.remove_status_sub(queue)
 
 
-class SubmissionRequest(BaseModel):
-    worker_id: str | None = None
-    assignment_id: str | None = None
-    task_id: str
-    task_version: int | None = None
-
-
-class RetryRequest(BaseModel):
-    worker_id: str
-    assignment_id: str
-    task_version: int
-    feedback: str
-
-
-class HumanAnswerRequest(BaseModel):
-    worker_id: str
-    assignment_id: str
-    task_version: int
-    answer_text: str
-    reasoning: str = ""
-    source_docs: list[str] = Field(default_factory=list)
-
-
-class InterventionClaimRequest(BaseModel):
-    worker_id: str
-
-
-class InterventionResolveRequest(BaseModel):
-    worker_id: str
-    response: str = ""
-    source_docs: list[str] = Field(default_factory=list)
-    retrieval_directives: list[dict[str, Any]] = Field(default_factory=list)
-
-
-def install_routes(
-    app: FastAPI,
+async def event_frames(
     registry: TaskRegistry,
-    workers: HumanWorkerRegistry,
-    broker: HumanWorkBroker,
-    coordinator: SubmissionCoordinator,
-    events: EventHub,
-) -> None:
-    @app.get("/api/state")
-    async def state() -> dict[str, Any]:
-        return snapshot(registry, workers)
-
-    @app.get("/api/tasks")
-    async def tasks() -> list[dict[str, Any]]:
-        return [to_jsonable(task) for task in registry.list_tasks()]
-
-    @app.get("/api/tasks/{task_id:path}")
-    async def task_detail(task_id: str) -> dict[str, Any]:
-        task = registry.get(task_id)
-        if task is None:
-            raise HTTPException(status_code=404, detail="task not found")
-        return to_jsonable(task)
-
-    @app.put("/api/workers/{worker_id}")
-    async def save_worker(worker_id: str, body: WorkerUpdate) -> dict[str, Any]:
-        try:
-            worker = workers.save_display_name(worker_id, body.display_name)
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail="worker not found") from error
-        await events.broadcast()
-        return to_jsonable(worker)
-
-    @app.post("/api/assignments")
-    async def create_assignment(body: AssignmentRequest) -> dict[str, Any]:
-        try:
-            assignment = broker.claim(body.worker_id, body.task_id)
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail="worker or task not found") from error
-        except TaskConflict as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-        await events.broadcast()
-        return to_jsonable(assignment)
-
-    @app.post("/api/assignments/{assignment_id}/release")
-    async def release_assignment(
-        assignment_id: str,
-        body: AssignmentRelease,
-    ) -> dict[str, Any]:
-        try:
-            assignment = broker.release(body.worker_id, assignment_id)
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail="assignment not found") from error
-        except TaskConflict as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-        await events.broadcast()
-        return to_jsonable(assignment)
-
-    @app.post("/api/submissions")
-    async def submit_candidate(body: SubmissionRequest) -> dict[str, str]:
-        try:
-            await coordinator.submit_ready(
-                body.task_id,
-                assignment_id=body.assignment_id,
-                worker_id=body.worker_id,
-                task_version=body.task_version,
-            )
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail="task or assignment not found") from error
-        except (TaskConflict, ValueError) as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-        return {"status": "submitted"}
-
-    @app.post("/api/retries")
-    async def retry(body: RetryRequest) -> dict[str, Any]:
-        try:
-            task = broker.retry(
-                body.worker_id,
-                body.assignment_id,
-                body.task_version,
-                body.feedback,
-            )
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail="task or assignment not found") from error
-        except (TaskConflict, ValueError) as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-        await events.broadcast()
-        return to_jsonable(task)
-
-    @app.post("/api/human-answers")
-    async def human_answer(body: HumanAnswerRequest) -> dict[str, str]:
-        try:
-            task, candidate = broker.direct_answer(
-                body.worker_id,
-                body.assignment_id,
-                body.task_version,
-                body.answer_text,
-                body.reasoning,
-                body.source_docs,
-            )
-            await coordinator.submit_human_candidate(task.task_id, candidate)
-        except KeyError as error:
-            raise HTTPException(status_code=404, detail="task or assignment not found") from error
-        except (TaskConflict, ValueError) as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-        return {"status": "submitted"}
-
-    @app.post("/api/interventions/{intervention_id}/claim")
-    async def claim_intervention(
-        intervention_id: str,
-        body: InterventionClaimRequest,
-    ) -> dict[str, Any]:
-        try:
-            intervention = broker.claim_intervention(
-                body.worker_id,
-                intervention_id,
-            )
-        except KeyError as error:
-            raise HTTPException(
-                status_code=404,
-                detail="worker or human intervention not found",
-            ) from error
-        except TaskConflict as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-        await events.broadcast()
-        return to_jsonable(intervention)
-
-    @app.post("/api/interventions/{intervention_id}/release")
-    async def release_intervention(
-        intervention_id: str,
-        body: InterventionClaimRequest,
-    ) -> dict[str, Any]:
-        try:
-            intervention = broker.release_intervention(
-                body.worker_id,
-                intervention_id,
-            )
-        except KeyError as error:
-            raise HTTPException(
-                status_code=404,
-                detail="human intervention not found",
-            ) from error
-        except TaskConflict as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-        await events.broadcast()
-        return to_jsonable(intervention)
-
-    @app.post("/api/interventions/{intervention_id}/resolve")
-    async def resolve_intervention(
-        intervention_id: str,
-        body: InterventionResolveRequest,
-    ) -> dict[str, Any]:
-        try:
-            task, intervention = broker.resolve_intervention(
-                body.worker_id,
-                intervention_id,
-                body.response,
-                body.source_docs,
-                body.retrieval_directives,
-            )
-        except KeyError as error:
-            raise HTTPException(
-                status_code=404,
-                detail="human intervention not found",
-            ) from error
-        except (TaskConflict, ValueError) as error:
-            raise HTTPException(status_code=409, detail=str(error)) from error
-        await events.broadcast()
-        return {
-            "task": to_jsonable(task),
-            "intervention": to_jsonable(intervention),
-        }
-
-    @app.websocket("/ws")
-    async def websocket_endpoint(websocket: WebSocket) -> None:
-        worker = workers.create_worker()
-        await events.connect(websocket, worker.worker_id)
-        try:
-            while True:
-                await websocket.receive_text()
-        except WebSocketDisconnect:
-            workers.disconnect(worker.worker_id)
-            await events.disconnect(websocket)
-            await events.broadcast()
+    hub: StreamHub,
+    task_id: str,
+    heartbeat: float = HEARTBEAT_INTERVAL_S,
+):
+    """SSE frames for one task's trace: backfill existing events, then forward live ones.
+    The subscriber is registered BEFORE the backfill snapshot so nothing is missed; any live
+    event whose seq was already in the backfill is skipped so nothing is duplicated."""
+    queue = hub.add_event_sub(task_id)
+    try:
+        backfill, _next_seq = registry.snapshot_task_events(task_id)
+        seen_through = -1
+        for seq, attempt_id, event in backfill:
+            seen_through = max(seen_through, seq)
+            yield sse_frame({"attempt_id": attempt_id, "event": event})
+        while True:
+            try:
+                attempt_id, event = await asyncio.wait_for(queue.get(), heartbeat)
+            except TimeoutError:
+                yield ": ping\n\n"
+                continue
+            if event.get("seq", -1) <= seen_through:
+                continue  # already delivered during backfill
+            yield sse_frame({"attempt_id": attempt_id, "event": event})
+    finally:
+        hub.remove_event_sub(task_id, queue)
 
 
-def snapshot(
-    registry: TaskRegistry,
-    workers: HumanWorkerRegistry,
-    worker_id: str | None = None,
-) -> dict[str, Any]:
-    return {
-        "worker": to_jsonable(workers.get(worker_id)) if worker_id else None,
-        "round": to_jsonable(registry.round_state()),
-        "tasks": [to_jsonable(task) for task in registry.list_tasks()],
-        "workers": [to_jsonable(worker) for worker in workers.list_workers()],
-    }
+def install_routes(app: FastAPI, registry: TaskRegistry, hub: StreamHub) -> None:
+    app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
+
+    @app.get("/")
+    async def index() -> FileResponse:
+        return FileResponse(WEB_DIR / "index.html")
+
+    @app.get("/api/stream")
+    async def status_stream() -> StreamingResponse:
+        return StreamingResponse(status_frames(hub), media_type="text/event-stream", headers=SSE_HEADERS)
+
+    @app.get("/api/stream/{task_id:path}")
+    async def task_event_stream(task_id: str) -> StreamingResponse:
+        return StreamingResponse(
+            event_frames(registry, hub, task_id), media_type="text/event-stream", headers=SSE_HEADERS
+        )

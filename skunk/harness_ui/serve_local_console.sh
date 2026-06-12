@@ -43,7 +43,6 @@ fi
 HOST="${SKUNK_CONSOLE_HOST:-127.0.0.1}"
 CUP_PORT="${SKUNK_CONSOLE_CUP_PORT:-8765}"
 SKUNK_SERVER_PORT="${SKUNK_CONSOLE_SERVER_PORT:-8787}"
-SKUNK_CLIENT_PORT="${SKUNK_CONSOLE_CLIENT_PORT:-8790}"
 ROUND_SECONDS="${SKUNK_CONSOLE_ROUND_SECONDS:-3600}"
 # Question-execution parallelism = questions released per round (always 15). Override
 # with SKUNK_CONCURRENCY.
@@ -94,26 +93,30 @@ auto_submit_flag="--no-auto-submit"
   --reasoner "$REASONER" --concurrency "$CONCURRENCY" "$auto_submit_flag" &
 server_pid=$!
 
-# Point the client at the PDFs (from .env) so the verify/figure intervention cards
-# can render source pages. client_args is always non-empty (bash 3.2 set -u safe).
-client_args=(--host "$HOST" --port "$SKUNK_CLIENT_PORT" --server-url "$SKUNK_SERVER_URL")
-[[ -n "${OFFICEQA_PDF_DIR:-}" ]] && client_args+=(--pdf-dir "$OFFICEQA_PDF_DIR")
-"$PYTHON_BIN" -m skunk_client.client "${client_args[@]}" &
-client_pid=$!
-
-trap 'kill "$practice_pid" "$server_pid" "$client_pid" 2>/dev/null || true' EXIT INT TERM
+# Tear both servers down on exit/Ctrl-C. SIGTERM first for a graceful uvicorn shutdown
+# (it now has a 5s graceful-shutdown deadline), then SIGKILL any survivor — the reasoner
+# offloads blocking tool/code work onto non-daemon thread-pool threads that can't be
+# interrupted, so without the hard kill a wedged worker could still keep a server alive.
+shutdown() {
+  trap '' INT TERM                                          # don't re-enter while tearing down
+  kill -TERM "$practice_pid" "$server_pid" 2>/dev/null || true
+  for _ in $(seq 1 8); do
+    kill -0 "$practice_pid" 2>/dev/null || kill -0 "$server_pid" 2>/dev/null || break
+    sleep 1
+  done
+  kill -KILL "$practice_pid" "$server_pid" 2>/dev/null || true
+}
+trap shutdown EXIT INT TERM
 
 echo "Practice API: $CUP_BASE_URL"
-echo "Skunk Server: $SKUNK_SERVER_URL"
-echo "Skunk Client: http://${HOST}:${SKUNK_CLIENT_PORT}"
+echo "Console UI:   $SKUNK_SERVER_URL   (skunk_server serves the monitoring UI)"
 echo "Reasoner:     $REASONER"
 echo "Python:       $PYTHON_BIN"
 echo "Questions:    $QUESTIONS"
 
-# Block until any one process exits, then the trap tears the others down.
+# Block until either process exits, then the trap tears the other down.
 # (Poll loop instead of `wait -n` so this works on macOS's stock bash 3.2.)
 while kill -0 "$practice_pid" 2>/dev/null \
-   && kill -0 "$server_pid" 2>/dev/null \
-   && kill -0 "$client_pid" 2>/dev/null; do
+   && kill -0 "$server_pid" 2>/dev/null; do
   sleep 1
 done

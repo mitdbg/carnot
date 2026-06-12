@@ -15,14 +15,12 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 
 from skunk_server.agent_worker_pool import AgentWorkerPool, Reasoner
-from skunk_server.api import install_routes, snapshot
+from skunk_server.api import install_routes
 from skunk_server.competition_adapter import CompetitionAdapter
-from skunk_server.events import EventHub
-from skunk_server.human_work_broker import HumanWorkBroker
-from skunk_server.human_worker_registry import HumanWorkerRegistry
+from skunk_server.domain import to_jsonable
+from skunk_server.hub import StreamHub
 from skunk_server.submission_coordinator import SubmissionCoordinator
 from skunk_server.task_queues import TaskQueues
 from skunk_server.task_registry import TaskRegistry
@@ -44,42 +42,50 @@ class ServerConfig:
 def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAPI:
     registry = TaskRegistry()
     queues = TaskQueues(config.queue_size)
-    workers = HumanWorkerRegistry()
-    broker = HumanWorkBroker(registry, queues, workers)
     loaded_reasoner = reasoner or load_reasoner(config.reasoner_ref)
 
-    def state_snapshot(worker_id: str | None = None) -> dict[str, Any]:
-        return snapshot(registry, workers, worker_id)
+    def status_snapshot() -> dict[str, Any]:
+        # Compact, events-free status: small enough to re-send whole on every change.
+        def summary(task) -> dict[str, Any]:
+            candidate = task.latest_candidate
+            submission = task.submissions[-1] if task.submissions else None
+            return {
+                "task_id": task.task_id,
+                "round_num": task.round_num,
+                "question_id": task.question_id,
+                "prompt": task.prompt,
+                "status": task.status.value,
+                "answer": candidate.answer_text if candidate else None,
+                "points": submission.points_awarded if submission else None,
+            }
 
-    events = EventHub(state_snapshot)
+        return {
+            "round": to_jsonable(registry.round_state()),
+            "tasks": [summary(task) for task in registry.list_tasks()],
+        }
+
+    hub = StreamHub(status_snapshot)
     adapter = CompetitionAdapter(
         config.cup_base_url,
         config.cup_team_token,
         registry,
         queues,
-        events.broadcast,
+        hub.publish_status,
         config.reconnect_backoff_s,
     )
     coordinator = SubmissionCoordinator(
         registry,
         queues,
         adapter,
-        events.broadcast,
+        hub.publish_status,
         config.auto_submit,
     )
-    pool = AgentWorkerPool(
-        registry,
-        queues,
-        loaded_reasoner,
-        config.concurrency,
-        human_requester=broker.request_intervention,
-    )
+    pool = AgentWorkerPool(registry, queues, loaded_reasoner, config.concurrency)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         loop = asyncio.get_running_loop()
-        broker.start(loop, events.broadcast)
-        pool.start(loop, coordinator.handle_agent_completion)
+        pool.start(loop, coordinator.handle_agent_completion, hub.publish_event)
         listener = asyncio.create_task(adapter.listen())
         try:
             yield
@@ -89,23 +95,14 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
                 await listener
             except asyncio.CancelledError:
                 pass
-            broker.cancel_all()
             pool.stop()
 
     app = FastAPI(title="Skunk Server", lifespan=lifespan)
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-    install_routes(app, registry, workers, broker, coordinator, events)
+    install_routes(app, registry, hub)
     app.state.registry = registry
     app.state.queues = queues
-    app.state.workers = workers
-    app.state.broker = broker
+    app.state.hub = hub
     app.state.coordinator = coordinator
-    app.state.events = events
     return app
 
 
@@ -156,7 +153,11 @@ def main() -> None:
         queue_size=max(1, args.queue_size),
         auto_submit=args.auto_submit,
     )
-    uvicorn.run(create_app(config), host=args.host, port=args.port)
+    # Cap graceful shutdown: the monitoring UI holds open SSE responses
+    # (status_frames / event_frames loop forever and the browser EventSource never
+    # disconnects), so without a deadline uvicorn waits indefinitely for them to close
+    # on Ctrl-C and never reaches the lifespan teardown that stops the worker pool.
+    uvicorn.run(create_app(config), host=args.host, port=args.port, timeout_graceful_shutdown=5)
 
 
 if __name__ == "__main__":

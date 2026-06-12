@@ -1,18 +1,18 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="ascii">
+  <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Skunk Client</title>
-  <link rel="stylesheet" href="{{ url_for('static', path='client.css') }}">
-  <script defer src="{{ url_for('static', path='client.js') }}"></script>
+  <title>Skunk Agent Console</title>
+  <link rel="stylesheet" href="/static/client.css">
+  <script defer src="/static/trace_flow.js"></script>
+  <script defer src="/static/client.js"></script>
 </head>
-<body data-server-url="{{ server_url | e }}">
+<body>
 <header>
   <div class="topbar">
-    <h1>Skunk Human Console</h1>
+    <h1>Skunk Agent Console</h1>
     <div class="meta">
-      <span class="pill">Server <strong id="serverUrl">-</strong></span>
       <span class="pill">Connection <strong id="connection">-</strong></span>
       <span class="pill">Round <strong id="roundNum">-</strong></span>
       <span class="pill">Round Status <strong id="roundStatus">-</strong></span>
@@ -25,24 +25,12 @@
     <div id="roundTimerMetric" class="metric timer"><span>Time Remaining</span><strong id="roundTimer">--:--</strong></div>
     <div class="metric"><span>Total</span><strong id="mTotal">0</strong></div>
     <div class="metric"><span>Running</span><strong id="mRunning">0</strong></div>
-    <div class="metric"><span>Await Human</span><strong id="mAwaitHuman">0</strong></div>
     <div class="metric"><span>Ready</span><strong id="mReady">0</strong></div>
     <div class="metric"><span>Submitted</span><strong id="mSubmitted">0</strong></div>
     <div class="metric"><span>Failed</span><strong id="mFailed">0</strong></div>
-    <div class="metric"><span>Completed</span><strong id="mCompleted">0</strong></div>
+    <div class="metric"><span>Cancelled</span><strong id="mCancelled">0</strong></div>
   </section>
-  <div id="lastEvent" class="event">Connecting...</div>
   <div id="app">Connecting...</div>
 </main>
-<dialog id="extractionModal" class="extraction-modal">
-  <div class="modal-head">
-    <div>
-      <span id="extractionModalKicker" class="flow-kicker">Extraction Results</span>
-      <strong id="extractionModalTitle">Selected block</strong>
-    </div>
-    <button type="button" onclick="closeExtractionModal()">Close</button>
-  </div>
-  <div id="extractionModalBody" class="modal-body"></div>
-</dialog>
 </body>
 </html>

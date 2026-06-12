@@ -223,7 +223,7 @@ def get_rate_limiter(name: str, rate_per_min: float | None = None) -> _RateLimit
 # task that rebinds the frame is isolated from its siblings. Operator steps don't
 # nest (the orchestrator opens exactly one per traced call), so this holds a
 # single frame, not a stack.
-_step_frame: contextvars.ContextVar[tuple[int, str] | None] = contextvars.ContextVar(
+_step_frame: contextvars.ContextVar[tuple[int, str, int | None] | None] = contextvars.ContextVar(
     "skunk_step_frame", default=None
 )
 
@@ -614,25 +614,27 @@ class ExecutionContext:
             self._logfile = None
 
     @contextmanager
-    def step(self, op: str):
+    def step(self, op: str, branch_id: int | None = None):
         """Open an observability step (a span) for one operator call, yielding its
         allocated `step_idx`. Every `emit` inside the block is auto-stamped with
-        `(step_idx, op)` via the `_step_frame` ContextVar, so callees emit without
-        knowing their step. The ctx allocates the index; the caller does not pass
-        one in. Steps don't nest, so this rebinds a single frame (set/reset) rather
-        than pushing a stack, and the contextmanager guarantees the frame is reset
-        on every exit path. Per-task isolation comes from the ContextVar — see
-        `_step_frame`."""
+        `(step_idx, op, branch_id)` via the `_step_frame` ContextVar, so callees emit
+        without knowing their step — and per-branch steps (retrieve/extract/lookup) stamp
+        their `branch_id` onto every event, so the trace viewer can group a rollout under
+        its branch *while it streams*, not only once the boundary `step` event lands. The
+        ctx allocates the index; the caller does not pass one in. Steps don't nest, so this
+        rebinds a single frame (set/reset) rather than pushing a stack, and the
+        contextmanager guarantees the frame is reset on every exit path. Per-task isolation
+        comes from the ContextVar — see `_step_frame`."""
         step_idx = self._next_step_idx
         self._next_step_idx += 1
-        token = _step_frame.set((step_idx, op))
+        token = _step_frame.set((step_idx, op, branch_id))
         try:
             yield step_idx
         finally:
             _step_frame.reset(token)
 
-    def _current_step(self) -> tuple[int | None, str | None]:
-        return _step_frame.get() or (None, None)
+    def _current_step(self) -> tuple[int | None, str | None, int | None]:
+        return _step_frame.get() or (None, None, None)
 
     def emit(
         self,
@@ -679,7 +681,7 @@ class ExecutionContext:
         filename); the shared console prepends it so interleaved lines stay
         attributable.
         """
-        step_idx, op = self._current_step()
+        step_idx, op, branch_id = self._current_step()
         if level is None:
             level = (
                 "warning" if ("_failed" in message or "error=" in message) else "info"
@@ -695,6 +697,10 @@ class ExecutionContext:
             # console already carries a wall-clock HH:MM:SS).
             "t": round(time.monotonic() - self._t0, 3),
         }
+        # Per-branch steps stamp branch_id on every event so the viewer can group a live
+        # rollout under its branch before the boundary `step` event arrives.
+        if branch_id is not None:
+            evt["branch_id"] = branch_id
         if data is not None:
             evt["data"] = data
         self.events.append(evt)
@@ -719,7 +725,7 @@ async def traced_step[T](
     from skunk.result import describe_value, summarize_value
 
     t0 = time.perf_counter()
-    with ctx.step(op_name):
+    with ctx.step(op_name, branch_id=branch_id):
         try:
             result = await fn()
         except (StepFailed, MissingData) as e:
