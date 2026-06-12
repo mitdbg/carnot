@@ -189,6 +189,89 @@ def test_agent_worker_pool_success_and_failure() -> None:
     asyncio.run(run())
 
 
+def test_round_close_frees_worker_for_next_round() -> None:
+    # A round closing must cancel its still-running reasoners so the (single) worker is
+    # freed for the next round, instead of staying blocked on un-cancellable in-flight work.
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        registry = TaskRegistry()
+        queues = TaskQueues()
+
+        async def reasoner(prompt: str):
+            if "block" in prompt:
+                await asyncio.sleep(3600)  # round-1 question: never returns on its own
+            return AgentAnswer("42", "Reasoning from the next round's worker.", [])
+
+        pool = AgentWorkerPool(registry, queues, reasoner, 1)  # one worker on purpose
+        pool.start(loop, lambda _task_id, _outcome: None)
+        r1, _ = registry.create_task(1, "blocker", "block this round-1 question")
+        r2, _ = registry.create_task(2, "fast", "answer this round-2 question")
+        try:
+            queues.enqueue_agent(r1.task_id)
+            for _ in range(200):
+                if r1.status == TaskStatus.PROCESSING:
+                    break
+                await asyncio.sleep(0.02)
+            assert r1.status == TaskStatus.PROCESSING
+
+            queues.enqueue_agent(r2.task_id)
+            await asyncio.sleep(0.1)
+            assert r2.status == TaskStatus.QUEUED  # worker still blocked on round 1
+
+            registry.close_round(1, "CLOSED")  # cancels round 1's reasoner, frees the worker
+
+            for _ in range(200):
+                if r2.status == TaskStatus.READY:
+                    break
+                await asyncio.sleep(0.02)
+            assert r1.status == TaskStatus.CANCELLED
+            assert r2.status == TaskStatus.READY  # the freed worker ran round 2
+            assert r2.latest_candidate is not None
+        finally:
+            pool.stop()
+
+    asyncio.run(run())
+
+
+def test_cancelled_run_dumps_partial_trace(tmp_path, monkeypatch) -> None:
+    # A run cancelled at round close should still write its (partial) trace, marked
+    # "cancelled", and must re-raise the cancellation rather than swallow it.
+    import json
+
+    import skunk
+    import skunk_reasoner as sr
+
+    class _FakeCtx:
+        def __init__(self) -> None:
+            self.events = [{"message": "plan label=initial branches=1", "kind": "plan"}]
+
+        def close(self) -> None:
+            pass
+
+    class _FakeOrch:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.ctx = _FakeCtx()
+
+        async def execute(self):
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(skunk, "Orchestrator", _FakeOrch)
+    monkeypatch.setenv("SKUNK_CONSOLE_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv("SKUNK_PROMPT_OVERRIDES", str(tmp_path / "nonexistent.yaml"))
+
+    async def run() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await sr.SkunkReasoner().execute("a cancelled question about defense outlays")
+
+    asyncio.run(run())
+
+    files = list(tmp_path.glob("*.json"))
+    assert len(files) == 1
+    payload = json.loads(files[0].read_text())
+    assert payload["status"] == "cancelled"
+    assert payload["events"]  # partial trace was captured
+
+
 class _FakeCoordinator:
     def __init__(self) -> None:
         self.submissions: list[dict[str, object]] = []

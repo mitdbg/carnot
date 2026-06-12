@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
 import os
 import re
@@ -131,7 +132,22 @@ class SkunkReasoner:
             try:
                 answer = await orch.execute()
             except (MissingData, StepFailed) as e:
+                # Dump the trace BEFORE re-raising so failures (the interesting case for
+                # debugging MissingData / StepFailed) are inspectable offline.
+                _dump_console_trace(prompt, orch.ctx, error=f"{type(e).__name__}: {e}")
                 raise RuntimeError(f"Skunk failed: {e}") from e
+            except asyncio.CancelledError:
+                # Round closed → the worker pool cancelled this run to free the worker.
+                # Dump the partial trace (how far it got before the deadline) for inspection,
+                # then propagate the cancellation — never swallow it.
+                _dump_console_trace(
+                    prompt,
+                    orch.ctx,
+                    error="CancelledError: round closed before completion",
+                    status="cancelled",
+                )
+                raise
+            _dump_console_trace(prompt, orch.ctx, answer=answer)
             return answer, list(orch.ctx.events)
         finally:
             orch.ctx.close()
@@ -158,6 +174,44 @@ class SkunkReasoner:
     @staticmethod
     def append_doc(docs: list[str], seen: set[str], month: str, page: str) -> None:
         _append_doc(docs, seen, month, page)
+
+
+def _dump_console_trace(
+    prompt: str,
+    ctx,
+    *,
+    answer: str | None = None,
+    error: str | None = None,
+    status: str | None = None,
+) -> None:
+    """Best-effort per-question trace dump for the competition console (the UI path,
+    unlike `eval_e2e.py`, otherwise persists nothing). Writes `<prompt-slug>-<hash>.json`
+    — the full prompt, status, answer/error, and the question's event stream — into
+    `SKUNK_CONSOLE_TRACE_DIR` when that env var is set (the launcher points it at a
+    per-run dir). `status` overrides the inferred ok/failed (e.g. "cancelled" for a run
+    abandoned at round close). Never raises: a trace-dump failure must not break the run."""
+    import hashlib
+
+    trace_dir = os.environ.get("SKUNK_CONSOLE_TRACE_DIR")
+    if not trace_dir:
+        return
+    try:
+        out_dir = Path(trace_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:8]
+        slug = re.sub(r"[^a-z0-9]+", "-", prompt.lower())[:60].strip("-") or "question"
+        payload = {
+            "prompt": prompt,
+            "status": status or ("failed" if error is not None else "ok"),
+            "error": error,
+            "answer": answer,
+            "events": list(ctx.events),
+        }
+        (out_dir / f"{slug}-{digest}.json").write_text(
+            json.dumps(payload, indent=2, default=str)
+        )
+    except Exception:
+        pass  # best-effort only
 
 
 def _reasoning_summary(events: list[dict], source_docs: list[str]) -> str:

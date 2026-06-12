@@ -35,12 +35,19 @@ class TaskRegistry:
         self._round = RoundState()
         self._lock = threading.RLock()
         self._intervention_cancel_callback: Callable[[list[str]], None] | None = None
+        self._round_close_callback: Callable[[int], None] | None = None
 
     def set_intervention_cancel_callback(
         self,
         callback: Callable[[list[str]], None],
     ) -> None:
         self._intervention_cancel_callback = callback
+
+    def set_round_close_callback(self, callback: Callable[[int], None]) -> None:
+        """Register a hook fired when a round closes — the agent worker pool uses it to
+        cancel that round's still-running reasoners so the workers are freed for the next
+        round (rather than staying blocked on un-cancellable in-flight work)."""
+        self._round_close_callback = callback
 
     def create_task(
         self,
@@ -508,6 +515,10 @@ class TaskRegistry:
                     self._set_status(task, TaskStatus.CANCELLED)
         if cancelled and self._intervention_cancel_callback is not None:
             self._intervention_cancel_callback(cancelled)
+        # Free any worker still blocked on this round's reasoners (outside the lock — the
+        # callback cancels concurrent futures / schedules loop work).
+        if self._round_close_callback is not None:
+            self._round_close_callback(round_num)
 
     def _validate_action(
         self,

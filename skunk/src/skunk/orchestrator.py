@@ -163,7 +163,28 @@ class Orchestrator:
                 reason, missing = e.reason, e.missing
                 handler = self._ctx.human_intervention_handler
                 if handler is None:
-                    raise
+                    # No human handler → autonomously replan (the pre-HITL-merge behavior)
+                    # rather than hard-failing on the first MissingData. Bounded by
+                    # recovery_max_rounds exactly like the human-assisted path below; the
+                    # planner replans from the failure reason / missing fields with no
+                    # human-provided resolutions.
+                    failed = [(o.branch, o.error) for o in outcomes if o.error]
+                    diff = await traced_step(
+                        self._ctx,
+                        "replanner",
+                        lambda: self._planner.replan(
+                            self._ctx, plan, entries, failed, reason, missing, []
+                        ),
+                    )
+                    plan, outcomes = await self._apply_diff(plan, outcomes, diff)
+                    self._emit_plan(
+                        plan,
+                        "replan",
+                        reason=reason,
+                        missing=missing,
+                        recovery_round=attempt,
+                    )
+                    continue
                 self._emit_plan(
                     plan,
                     "human_pending",

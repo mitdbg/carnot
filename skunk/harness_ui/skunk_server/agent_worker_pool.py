@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import inspect
+import logging
 import queue
 import threading
 import traceback
@@ -16,6 +18,8 @@ from cup_kit.protocol import MAX_SOURCE_DOC_REF_CHARS
 from skunk_server.domain import AnswerCandidate, Attempt, FailureRecord
 from skunk_server.task_queues import TaskQueues
 from skunk_server.task_registry import TaskRegistry
+
+logger = logging.getLogger(__name__)
 
 Reasoner = Callable[..., AgentAnswer | dict[str, Any] | Any]
 CompletionCallback = Callable[[str, str], None]
@@ -54,6 +58,10 @@ class AgentWorkerPool:
         self._stop = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._on_completion: CompletionCallback | None = None
+        # In-flight reasoner futures by task_id → (round_num, future), so a closing round
+        # can cancel its still-running reasoners and free the workers.
+        self._inflight: dict[str, tuple[int, concurrent.futures.Future]] = {}
+        self._inflight_lock = threading.Lock()
 
     def start(
         self,
@@ -62,6 +70,7 @@ class AgentWorkerPool:
     ) -> None:
         self._loop = loop
         self._on_completion = on_completion
+        self._registry.set_round_close_callback(self.cancel_round)
         for index in range(self._max_workers):
             thread = threading.Thread(
                 target=self._worker_loop,
@@ -70,6 +79,22 @@ class AgentWorkerPool:
             )
             thread.start()
             self._threads.append(thread)
+
+    def cancel_round(self, round_num: int) -> int:
+        """Cancel every still-running reasoner for `round_num`. Each cancelled future makes
+        its worker's blocking `.result()` raise immediately, so the worker is freed for the
+        next round even though the underlying agent could not be interrupted in place. Safe
+        to call repeatedly (a closing round emits CLOSED then RESULTS)."""
+        with self._inflight_lock:
+            futures = [f for (rn, f) in self._inflight.values() if rn == round_num]
+        cancelled = sum(1 for f in futures if f.cancel())
+        if cancelled:
+            logger.info(
+                "round %s closed: cancelled %d in-flight agent run(s) to free workers",
+                round_num,
+                cancelled,
+            )
+        return cancelled
 
     def stop(self) -> None:
         self._stop.set()
@@ -136,7 +161,14 @@ class AgentWorkerPool:
                     if self._loop is None:
                         raw = asyncio.run(raw)
                     else:
-                        raw = asyncio.run_coroutine_threadsafe(raw, self._loop).result()
+                        future = asyncio.run_coroutine_threadsafe(raw, self._loop)
+                        with self._inflight_lock:
+                            self._inflight[task_id] = (task.round_num, future)
+                        try:
+                            raw = future.result()
+                        finally:
+                            with self._inflight_lock:
+                                self._inflight.pop(task_id, None)
                 answer, reasoning, source_docs = self._normalize_answer(raw)
                 candidate = AnswerCandidate(
                     attempt_id=attempt.attempt_id,
@@ -147,6 +179,11 @@ class AgentWorkerPool:
                 if self._registry.complete_attempt(task_id, attempt.attempt_id, candidate):
                     self._queues.enqueue_ready(task_id)
                     outcome = "ready"
+            except concurrent.futures.CancelledError:
+                # The round closed and `cancel_round` cancelled this reasoner to free the
+                # worker. The task is already CANCELLED in the registry, so don't record a
+                # failure — just fall through and pick up the next round's work.
+                outcome = "cancelled"
             except Exception as error:
                 failure = FailureRecord(
                     attempt_id=attempt.attempt_id,

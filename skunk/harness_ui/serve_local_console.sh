@@ -45,7 +45,9 @@ CUP_PORT="${SKUNK_CONSOLE_CUP_PORT:-8765}"
 SKUNK_SERVER_PORT="${SKUNK_CONSOLE_SERVER_PORT:-8787}"
 SKUNK_CLIENT_PORT="${SKUNK_CONSOLE_CLIENT_PORT:-8790}"
 ROUND_SECONDS="${SKUNK_CONSOLE_ROUND_SECONDS:-3600}"
-CONCURRENCY="${SKUNK_CONCURRENCY:-5}"
+# Question-execution parallelism = questions released per round (always 15). Override
+# with SKUNK_CONCURRENCY.
+CONCURRENCY="${SKUNK_CONCURRENCY:-15}"
 REASONER="${REASONER:-skunk_reasoner:solve}"
 CUP_TEAM_TOKEN="${CUP_TEAM_TOKEN:-anything}"
 AUTO_SUBMIT="${AUTO_SUBMIT:-false}"
@@ -63,6 +65,16 @@ fi
 export CUP_BASE_URL="http://${HOST}:${CUP_PORT}"
 export CUP_TEAM_TOKEN
 export SKUNK_SERVER_URL="http://${HOST}:${SKUNK_SERVER_PORT}"
+
+# Per-run trace dir: the reasoner dumps each question's event stream here (the UI path
+# otherwise persists nothing — see skunk_reasoner._dump_console_trace). Set it to empty
+# in the env to disable, or to a fixed path to override the timestamped default.
+if [[ -z "${SKUNK_CONSOLE_TRACE_DIR+x}" ]]; then
+  export SKUNK_CONSOLE_TRACE_DIR="$SKUNK_DIR/logs/console/$(date +%Y%m%d_%H%M%S)"
+fi
+# Create it up front (the reasoner also mkdirs lazily, but this makes the dir visible
+# immediately and fails fast on a bad path). Skipped when set empty to disable tracing.
+[[ -n "${SKUNK_CONSOLE_TRACE_DIR:-}" ]] && mkdir -p "$SKUNK_CONSOLE_TRACE_DIR"
 
 # Relative paths in .env (e.g. SKUNK_CHROMADB_DIR=.chromadb) resolve against the
 # process cwd, and the corpus caches live under the skunk repo dir — so run the

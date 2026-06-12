@@ -4,8 +4,6 @@ import asyncio
 import sys
 import types
 
-import pytest
-
 from skunk.common import AnnotatedValue, BlockRef, ExecutionContext, PageRef
 from skunk.config import SkunkConfig
 from skunk.errors import MissingData, StepFailed
@@ -494,21 +492,38 @@ def test_replanner_prompt_maps_human_resolution_to_input() -> None:
     assert "missing:     ['new value']" in prompt.message
 
 
-def test_missing_data_without_handler_does_not_replan() -> None:
+def test_missing_data_without_handler_replans_autonomously() -> None:
+    # With no human handler the orchestrator falls back to autonomous replanning
+    # (the pre-HITL-merge behavior) instead of hard-failing on the first MissingData.
     planner = _Planner()
+
+    class Compute:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def run(self, _entries, _ctx, *, concept_explanations):
+            self.calls += 1
+            if self.calls == 1:
+                raise MissingData("need value", ["value"])
+            return "final"
+
+    compute = Compute()
     orchestrator = Orchestrator(
         "q1",
         llm_client=object(),  # type: ignore[arg-type]
     )
     orchestrator._planner = planner
     orchestrator._explainer = _Explainer()
-    orchestrator._compute = _Compute()
+    orchestrator._compute = compute  # type: ignore[assignment]
     orchestrator._run_branches = _empty_branches  # type: ignore[method-assign]
 
     try:
-        with pytest.raises(MissingData, match="need value"):
-            asyncio.run(orchestrator.execute())
+        result = asyncio.run(orchestrator.execute())
     finally:
         orchestrator.ctx.close()
 
-    assert planner.replan_calls == []
+    assert result == "final"
+    assert compute.calls == 2  # recovered on the second compute after one replan
+    # Exactly one autonomous replan, carrying no human-provided resolutions.
+    assert len(planner.replan_calls) == 1
+    assert planner.replan_calls[0][3] == []

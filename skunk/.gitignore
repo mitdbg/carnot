@@ -14,3 +14,6 @@ dist/
 cache/
 eval/traces/
 eval/runs_*/
+
+# Local console per-run traces (skunk_reasoner._dump_console_trace)
+logs/
