@@ -257,10 +257,10 @@ You are a query planner. Given a question, emit a JSON plan that, when executed,
   ]
 }
 
-Branches run in parallel. A `retrieve` branch pulls information from the corpus.
-A `lookup_external` branch fetches a single value from outside the corpus. Use 'lookup_external' only when you are sure the corpus does not contain the answer,
-when the question explicitly asks for an external lookup from a source, or when previous lookups in the corpus failed. A final compute step reads the
-gathered values and the verbatim question to produce the answer.
+Branches run in parallel; a final compute step reads the gathered values and the
+verbatim question to produce the answer. `retrieve` pulls from the corpus. Use
+`lookup_external` only when the corpus cannot contain the value, the question
+asks for an external source, or prior corpus retrieval failed.
 
 ## Field semantics
 
@@ -271,19 +271,16 @@ retrieve branch fields:
                 Never emit two branches for the same underlying table/statistic worded
                 differently (one auction's bids, allotments, and totals = one branch).
                 Same concept over several periods = one branch with a comma-separated period.
-  period        The period the data value pertains to as canonical months: a single
-                "YYYY-MM", an inclusive "YYYY-MM..YYYY-MM" range, or a comma-separated
-                list of these ("1940-01..1940-12, 1953-01..1953-12") — expanding fiscal
-                years, calendar years, and quarters to month ranges. Null when the
-                question doesn't pin a data period.
-  as_of         The exact ISSUE (publication month) values must be read from — only
-                when the question explicitly names a file. A single "YYYY-MM"
-                applies to the whole branch. When the named issue applies to only some
-                period entries, give an array aligned 1:1 with the comma-separated
-                period entries, null for unpinned slots:
-                period "1980-10..1981-09, 1979-10..1980-09" with as_of [null, "1981-11"]
-                = FY1981 unpinned, FY1980 as printed in the November 1981 issue.
-                Null (common case).
+  period        the period the data pertains to, as canonical months: "YYYY-MM", an
+                inclusive "YYYY-MM..YYYY-MM" range, or a comma-separated list of these —
+                expand fiscal years, calendar years, and quarters to month ranges. Null
+                when the question doesn't pin a data period.
+  as_of         the issue (publication month) values must be read from — only when the
+                question explicitly names one. A single "YYYY-MM" applies to the whole
+                branch; when the named issue applies to only some period entries, give
+                an array aligned 1:1 with them, null for unpinned slots (period
+                "1980-10..1981-09, 1979-10..1980-09" with as_of [null, "1981-11"]).
+                Null otherwise (common case).
   visual_only   true only if question explicitly asks for visual understanding of charts/figures.
 
 lookup_external branch fields:
@@ -299,30 +296,24 @@ lookup_external branch fields:
 """
 
     _REPLAN_INSTRUCTIONS = """\
-You are now replanning: a plan you produced could not be completed. Revise it by
-emitting a DIFF against the prior plan — not a whole new plan. The same
-branch/field semantics above still apply to any branch you add.
+You are replanning: a plan you produced could not be completed. Emit a diff
+against the prior plan, not a new plan; the branch/field semantics above apply
+to any branch you add.
 
-Return a PlanDiff JSON object with these fields:
-  add            list of NEW branches to run (same retrieve/lookup_external
-                 schema as a plan branch). Empty list if you add nothing.
-  drop           list of prior-branch INDICES (from the numbered prior_plan.branches
-                 list in the question) to remove. Removing a branch also discards the
-                 data it gathered, so drop a branch only when its data is wrong or
-                 must be re-fetched differently. Empty list if you drop nothing.
+Return a PlanDiff JSON object:
+  add    new branches to run (same schema as plan branches); [] if none.
+  drop   prior-branch indices (from the numbered prior_plan.branches list) to
+         remove; dropping discards that branch's gathered data. [] if none.
 
 Rules:
-  - A prior branch you wish to keep appears in neither list: leave it alone and
-    its gathered data is reused as-is. Do not re-add branches whose data is
-    already in `prev`.
-  - If data is missing, `add` retrieve/lookup branches that close the gap.
-  - For each failed branch you still need, read its "what the attempt found /
-    why it was blocked" note and formulate an alternative query — check that
-    you are asking at the right granularity, and that the value really is (or
-    is not) in the corpus before choosing retrieve vs lookup_external.
+  - A branch in neither list is kept and its gathered data reused; do not
+    re-add branches whose data is already in `prev`.
+  - For each failed branch you still need, read its failure note and reword —
+    check the granularity asked for, and whether the value really is in the
+    corpus (retrieve) or external (lookup_external).
   - Added retrieve branches must have null `as_of`.
-  - A non-null lookup_external `src` must name a publisher the question itself
-    names, copied verbatim; otherwise leave `src` null.
+  - A non-null lookup_external `src` must be a publisher named verbatim in the
+    question; otherwise null.
 """
 
     # Planner-only addenda, appended to the planner system prompt alone (the replanner

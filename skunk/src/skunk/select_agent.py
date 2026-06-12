@@ -12,9 +12,10 @@ Three phases per question:
    which print/issue/table to read is its whole job, and it must do so from the
    catalog summaries alone.
 2. EXTRACT (downstream). The committed blocks are organized FIRST: each unique
-   block is read ONCE by the pure-vision tier, and when several goals committed
-   the same block, that one call's opening line lists ALL of them — one page
-   read serves every goal. No per-goal entry copies are made: each block's
+   block is read ONCE — text tier plus a vision confirmation round (OCR digit
+   correction only), falling back to pure vision — and when several goals
+   committed the same block, that one call's opening line lists ALL of them —
+   one page read serves every goal. No per-goal entry copies are made: each block's
    entries are attributed to the first goal that committed it (`owner`), other
    committers are merely marked covered, so compute sees each datum exactly
    once. Branch identity is irrelevant at this point — goals are re-drafted on
@@ -52,7 +53,9 @@ from skunk.common import (
 )
 from skunk.errors import ParseError, StepFailed
 from skunk.extract import (
+    TextExtractor,
     VisionExtractor,
+    VisualValidator,
     _blocks_to_pagerefs,
     _render_pages_b64,
 )
@@ -133,6 +136,9 @@ def _block_line(pool: list[SemPoolEntry], num: int, show_cols: bool = True) -> s
     line = f"  block {num} — {_ident(e)}  dates={dates}"
     if show_cols and e.cols:
         line += f"  [cols: {', '.join(e.cols)}]"
+    rows = e.rows or e.rows_tail
+    if rows:
+        line += f"  [rows tail: {', '.join(rows[-3:])}]"
     return line
 
 
@@ -163,13 +169,11 @@ class ListBlocksTool(Tool):
     name = "list_blocks"
     doc = """\
 ### list_blocks(titles: int | list[int], period: str = "")
-Expand title group(s) from the candidate list into their member blocks (the same table
-reprinted across issues), oldest first. `titles` is one Tn number or a LIST of them —
-expand every title you are considering in ONE call rather than one per step. `period`
-("YYYY-MM" or "YYYY-MM..YYYY-MM") keeps only blocks whose data span overlaps it.
-Returns each block's GLOBAL number — the numbers your final answer commits — plus its
-issue, page, data span, and column labels (at most 40 blocks per title; use `period=`
-to narrow, and inspect_blocks for row-level detail).
+Expand title group(s) into their member blocks, oldest first; batch every title of
+interest into one call. `period` ("YYYY-MM" or "YYYY-MM..YYYY-MM") keeps only blocks
+whose data span overlaps it. Returns, per title, a content summary, then each block's
+global number (the numbers your final answer commits), issue, page, data span, column
+labels, and tail row labels; at most 40 blocks per title.
 
 ```python
 list_blocks([12, 31, 47], period="1962-04")
@@ -215,6 +219,9 @@ list_blocks([12, 31, 47], period="1962-04")
             shared = len(col_sets) == 1 and next(iter(col_sets))
             if shared:
                 head += f"\n  all blocks have cols: {', '.join(shared)}"
+            summ = next((s.pool[n - 1].summary for n in kept if s.pool[n - 1].summary), None)
+            if summ:
+                head += f"\n  summary: {summ if len(summ) <= 240 else summ[:240] + '…'}"
             shown = kept
             if len(shown) > 40:
                 head += f"\n  (showing the latest 40 of {len(shown)} — narrow with period=)"
@@ -228,10 +235,9 @@ class InspectBlocksTool(Tool):
     name = "inspect_blocks"
     doc = """\
 ### inspect_blocks(blocks: int | list[int])
-Full detail for up to 8 specific blocks (GLOBAL numbers from list_blocks): issue, page,
-data span, every column label, and every row label. Row labels show GRANULARITY — whether
-a period exists as monthly rows or only as an annual/fiscal-year row. Verify a
-shortlisted block actually prints the months you need BEFORE committing it.
+Full detail for up to 8 blocks (global numbers from list_blocks): issue, page, data
+span, full summary, all column and row labels. The row labels show whether a period
+exists as monthly rows or only as an annual/fiscal-year row — check before committing.
 
 ```python
 inspect_blocks([645, 338])
@@ -260,6 +266,8 @@ inspect_blocks([645, 338])
             part = f"block {n} — {_ident(e)}  dates={dates}"
             if e.title:
                 part += f"\n  title: {e.title}"
+            if e.summary:
+                part += f"\n  summary: {e.summary}"
             if e.cols:
                 part += f"\n  cols: {', '.join(e.cols)}"
             rows = e.rows or e.rows_tail
@@ -294,46 +302,33 @@ class SelectAgent(MultiTurnAgent):
     default_effort = "medium"
 
     briefing = """\
-You select which content blocks an extraction step should read to fulfill a set
-of retrieval goals for one research question. You work entirely from catalog
-summaries — titles, issue dates, data spans, column and row labels — never page
-contents. The user message gives the question, the numbered goals (concept,
-period, optional pinned issue), and the candidate pool as a list of unique
-table/chart titles (T1, T2, ...) with reprint counts and data spans; the same
-table is typically reprinted across consecutive issues, sometimes with
-revisions, and several goals often live in the same table.
+You select which content blocks an extraction step should read to fulfill a
+set of retrieval goals for one research question, given
+metadata for each page (titles, issue dates, data spans, summaries, column/row
+labels). The user message gives the question, the numbered goals (retrieval target, period),
+and the pool as a list of unique table/chart titles (T1, T2, ...); the same table is reprinted across
+consecutive issues, sometimes with revisions.
 
-Read the question's own wording first and pin down what each goal's series must
-satisfy: the exact series and every qualifier on it (e.g. "subject to
-limitation", gross vs net, issued vs outstanding), total vs a named subtotal,
-the unit, and the time basis. Goals are shorthand; the question's wording
-governs.
+Pay attention to the original question's wording: match the exact series with every qualifier, total vs subtotal, unit,
+and time basis. The goals are paraphrases and should be take less literally. When searching, be efficient with steps 
+and emit batched calls. Commit when you are convinced that the goal is met. Report [] when you are certain that no
+title carries the requested data. Output only a handful of blocks per goal. Your 8 most recent observations are
+visible; never reference block numbers you can no longer see.
 
-A normal run is 2-4 steps: (1) expand every plausibly relevant title in one
-batched list_blocks call; (2) inspect_blocks the shortlisted candidates,
-batching all goals into one step; (3) commit. A goal whose series no title in
-the pool could carry is settled — report it [] and move on. Your 4 most recent
-observations are visible; never reference block numbers you can no longer see.
-
-Choosing blocks, per goal:
-- Keep only tables whose title or column labels plausibly print the asked
-  series.
-- Match the exact scope: a label that wraps the concept in extra words ("... and
-  related activities", "..., including ...") names a broader aggregate with
-  different values; prefer the block reporting exactly the asked scope.
-- Per requested date, commit the block from the latest issue whose span covers
-  it (later prints supersede earlier ones), unless the goal pins a source issue
-  or the question asks for the contemporaneous figure.
-- Coverage is not granularity: a block's date span unions all rows, including
-  annual/fiscal-year rows. Verify with inspect_blocks that the dates you need
-  exist as rows. Monthly rows usually cover only the ~12 months before the
-  issue date, so a monthly series spanning years needs one block per ~12-month
-  window, tiled across issues. If the checker reports missing months, commit
-  blocks from issues dated just after those months, not another late reprint.
-- Prefer one block covering several dates/goals over one per date — but only
-  when inspect_blocks shows every date at the needed granularity.
-- When two titles could both carry the series, commit the best block of each.
-- A handful of blocks per goal, never a sweep of every reprint.
+Notes:
+- A label wrapping the concept in extra words ("... and related activities",
+  "..., including ...") is a broader aggregate; prefer the exact asked scope.
+- When the question describes the source of the data (published in, reported by, etc.), emit issues that fit the
+  description and discard the rest.
+- A block's date span unions all rows, annual rows included; confirm with
+  inspect_blocks that the needed dates exist as rows at the needed granularity and your selections cover the entire
+  requested period.
+- When multiple reprints exist, you should prefer the latest that carries all the requested data, but you must inspect
+  the row labels to confirm that the needed dates exist as rows at the needed granularity and work your backwards if the
+  later issue does not carry the data.
+- Favor whole-table coverage: a single block whose rows span the entire requested period beats a patchwork of partial
+  windows. Assemble from multiple blocks only when no single print carries the whole period, and then tile reprints of
+  the same table — never a mix of different tables.
 """
 
     final_answer_doc = """\
@@ -343,10 +338,10 @@ Choosing blocks, per goal:
 - An empty list means the pool genuinely lacks that goal's data; `why` must then
   say exactly what is missing."""
 
-    # The 4 most recent tool observations stay visible (older ones collapse to a
+    # The 8 most recent tool observations stay visible (older ones collapse to a
     # placeholder): enough to shortlist via list_blocks, verify via inspect_blocks,
     # and still see both when committing, without unbounded context growth.
-    visible_observations = 4
+    visible_observations = 8
 
     # Same contract as the base template, except a python step may issue SEVERAL
     # tool calls at once (print each) — the step budget is tiny, so the agent is
@@ -435,9 +430,12 @@ Requirements for the final answer:
 
 
 # ---------------------------------------------------------------------------
-# Downstream extraction — pure vision, one read per block serving ALL its goals
+# Downstream extraction — text tier + vision confirmation round (OCR digit
+# correction only), pure vision as fallback; one read per block serving ALL its goals
 # ---------------------------------------------------------------------------
 
+_TEXT = TextExtractor()
+_CONFIRM = VisualValidator()
 _VISION = VisionExtractor()
 
 
@@ -485,31 +483,34 @@ def _synth_branch(goals: list[_Goal]) -> RetrieveBranch:
 async def _extract_block(
     ctx: ExecutionContext, state: _SelectState, num: int, goals: list[_Goal]
 ) -> list[AnnotatedValue]:
-    """One block's pure-vision read serving EVERY goal that committed it: the call's
-    opening line lists all the goals, so a single page read extracts for each. Output
-    and timeout caps come from the extract tier itself."""
+    """One block's read serving EVERY goal that committed it: the call's opening line
+    lists all the goals, so a single page read extracts for each. Same tier order as
+    `ExtractOp`: text tier first, then the vision confirmation round (OCR digit
+    correction only) over its output; pure vision as the fallback — for visual_only
+    goals, the `extract_vision_only` override, or a text pass that found nothing.
+    Output and timeout caps come from the extract tier itself."""
     ref = state.pool[num - 1].ref
+    branch = goals[0].branch if len(goals) == 1 else _synth_branch(goals)
+    looking = None
+    if len(goals) > 1:
+        lines = []
+        for g in goals:
+            line = f"- {g.branch.key}"
+            if g.branch.period:
+                line += f" (for the period {g.branch.period})"
+            lines.append(line)
+        looking = "You are looking for ALL of the following:\n" + "\n".join(lines)
+    if not branch.visual_only and not ctx.config.extract_vision_only:
+        entries = await _TEXT.run(
+            ctx.question, branch, [ref], ctx, looking_for=looking
+        )
+        if entries:
+            return await _CONFIRM.run(ctx.question, branch, [ref], entries, ctx)
     images, rendered_refs = _render_pages_b64(_blocks_to_pagerefs([ref]), ctx)
     if not images:
         return []
-    if len(goals) == 1:
-        return await _VISION.run(
-            ctx.question, goals[0].branch, images, rendered_refs, ctx
-        )
-    lines = []
-    for g in goals:
-        line = f"- {g.branch.key}"
-        if g.branch.period:
-            line += f" (for the period {g.branch.period})"
-        lines.append(line)
-    looking = "You are looking for ALL of the following:\n" + "\n".join(lines)
     return await _VISION.run(
-        ctx.question,
-        _synth_branch(goals),
-        images,
-        rendered_refs,
-        ctx,
-        looking_for=looking,
+        ctx.question, branch, images, rendered_refs, ctx, looking_for=looking
     )
 
 
@@ -518,32 +519,35 @@ async def _extract_block(
 # ---------------------------------------------------------------------------
 
 _CHECK_SYSTEM = """\
-You audit the data gathered for one research question before computation. The
-question was split into retrieval goals; for each goal you see its target, the
-blocks the selector committed, and the entries extracted from them as schema
-views (description, qualifiers, provenance, shape, axis labels — not cell values).
-An entry listed under several goals was read once for all of them — that is NOT
-duplication.
+You audit the data gathered for one research question before computation. For
+each retrieval goal you see its target, the committed blocks, and the entries
+extracted from them as schema views (no cell values). An entry listed under
+several goals was read once for all of them; that is not duplication.
 
-Check two things:
-1. Completeness — every goal's concept and period is covered by at least one
-   entry whose description/qualifiers/labels match the question's wording
-   (series, every qualifier, total vs subtotal, time basis).
-2. Duplicates — the same series, scope, and period under several entry ids.
-   Keep the one matching the source the question specifies, else the latest
-   print. Same-series entries covering different periods are complements, not
-   duplicates; keep all of them.
+Pay attention to the original question's wording: an entry covers a goal only
+when it matches the exact series with every qualifier, total vs subtotal,
+unit, and time basis. The goals are paraphrases and should be taken less
+literally. Check that the entries cover the entire requested period — each
+month/quarter/year of a goal's period must appear among the entries' index
+labels; a missing unit is incomplete coverage even when the series matches.
+When the question describes the source of the data (published in, reported
+by, etc.), entries from issues that do not fit the description are wrong
+coverage. Check duplicates — the same series, scope, and period under several
+entry ids; keep the source the question specifies, else the latest print that
+carries all the requested data. Different periods of one series are
+complements, not duplicates.
 
 Output one JSON object, nothing else:
 {"complete": true|false,
  "drop": ["E3", ...],
  "retry": [{"goal": <goal number>, "target": "<revised one-line retrieval target>"}]}
-- "drop": only duplicates of a kept entry. Dropping must never shrink coverage;
-  when unsure, keep. An entry that fails the question's wording is a coverage
-  problem — handle it via "retry" (and complete=false), not "drop".
+- "drop": only duplicates of a kept entry; never shrink coverage; when unsure,
+  keep. An entry that fails the question's wording is a coverage problem —
+  "retry" (with complete=false), not "drop".
 - "retry": goals whose coverage is missing or wrong; "target" rewrites the
-  goal's retrieval target. Retry sparingly — only when the gap is plausibly
-  fixable from the pool, and never for a goal already reported absent.
+  goal's retrieval target, naming exactly what is missing (the series and the
+  specific months). Retry sparingly, only when fixable from the pool, and
+  never for a goal already reported absent.
 - Nothing to fix: {"complete": true, "drop": [], "retry": []}"""
 
 
@@ -867,6 +871,10 @@ async def _check_and_repair(
             if empty_blocks
             else []
         ),
+        "Before committing, inspect row labels to confirm the missing dates exist "
+        "as rows at the needed granularity; when the reprint you tried does not "
+        "carry them, work your way backwards through earlier issues (or the issues "
+        "published just after the missing dates) to one that does.",
         "Emit a new final answer covering only the goals above (same JSON format); "
         "the other goals' selections stand. You may call list_blocks first.",
     ]

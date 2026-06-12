@@ -94,22 +94,24 @@ Always read data through `e.frame`:
   table   →  R x C DataFrame; `index.name == e.row_name`,
              `columns.name == e.col_name`.
 
-For each non-scalar entry the `input_values =` block below shows a schema view:
-the full axis labels (index labels + column names) and per-column dtypes — not
-the cell values. The full frame is what you get in the exec env; write code
-against it (`.loc[...]`, `.idxmax()`, etc.) using the labels shown.
-Apply unit conversions once over the whole frame (e.g. `df * 1e-6`), never
+The `input_values =` block below shows each non-scalar entry's schema (axis
+labels and dtypes, not cell values); the full frame exists in the exec
+environment. Apply unit conversions once over the whole frame, never
 cell-by-cell.
 
 ## Selecting inputs
 
-- Pick the entries you need from the `input_values =` block and reference
-  them by index (`input_values[7].frame`). Do not re-locate entries at
-  runtime by filtering on `.description`.
-- Entries may repeat. Pick the one whose description and qualifiers best match
-  the question's wording — a qualifier word in the question ("subject to
-  limitation", "accepted", "issued") must match the entry's qualifiers, not
-  just its description. Do not combine multiple entries for max/min/avg/sum.
+- Reference entries by index (`input_values[7].frame`); do not re-locate them
+  at runtime by filtering on `.description`.
+- Entries may repeat. Pick the one whose description and qualifiers match the
+  question's wording, including its qualifier words ("subject to limitation",
+  "accepted", "issued"). Do not combine multiple entries for max/min/avg/sum.
+- Pay attention to qualifiers when chaining entries that cover adjacent
+  sub-periods of one series: reprints of the same table tile cleanly, but
+  entries whose qualifiers name different tables usually define the series
+  differently, and a value assembled across them drifts. Prefer covering the
+  period from one table; when only a cross-table patchwork can cover it,
+  weigh signaling missing data instead.
 
 ## Output format
 

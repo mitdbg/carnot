@@ -166,7 +166,7 @@ class SkunkConfig:
     select_agent_max_output_tokens: int = 8192
     select_agent_request_timeout_s: float = 150.0
 
-    # Per-call caps for the extract tiers (multimodal/vision). Uncapped, individual Flash/Pro
+    # Per-call caps for the extract tiers (text/confirm/vision). Uncapped, individual Flash/Pro
     # extract calls hung for 260-480s and returned garbage that then burned a parse retry;
     # a hard timeout fails fast into the retry, which typically completes in seconds.
     # (env: SKUNK_EXTRACT_MAX_OUTPUT_TOKENS, SKUNK_EXTRACT_TIMEOUT_S)
@@ -216,18 +216,19 @@ class SkunkConfig:
         # block_select=off), overridable via SKUNK_EFFORT_OVERRIDES.
         # - semfilter: the cheap coarse filter runs on flash-lite.
         # - block_select: flash — block selection is a cheap read (thinking off).
-        # - extract.{multimodal,vision,text}: flash, medium thinking. Pro is the stronger read
+        # - extract.{text,confirm,vision}: flash, medium thinking. Pro is the stronger read
         #   on dense scanned tables but its 8M input-tok/min quota + 380s latency tails choke the
         #   parallel select-agent fan-out; pin Pro back per-run via SKUNK_MODEL_OVERRIDES. The
-        #   default path is `multimodal` (text + image in one call); `vision` is the fallback.
+        #   default path is `text` followed by the `confirm` vision round (OCR digit correction
+        #   only); `vision` is the fallback.
         # - compute.codegen: flash — codegen/reasoning over the extracted values (high thinking).
         # - replanner: flash — recovering a failed plan runs flash at medium thinking; the initial
         #   planner also runs flash (the common path).
         # Everything else (planner, toc_pick, …) runs on the base `llm_model` (flash).
         self.model_overrides.setdefault("semfilter", "gemini-3.1-flash-lite")
         self.model_overrides.setdefault("block_select", "gemini-3.5-flash")
-        self.model_overrides.setdefault("extract.multimodal", "gemini-3.5-flash")
         self.model_overrides.setdefault("extract.text", "gemini-3.5-flash")
+        self.model_overrides.setdefault("extract.confirm", "gemini-3.5-flash")
         self.model_overrides.setdefault("extract.vision", "gemini-3.5-flash")
         self.model_overrides.setdefault("compute.codegen", "gemini-3.1-pro-preview")
         self.model_overrides.setdefault("replanner", "gemini-3.5-flash")
