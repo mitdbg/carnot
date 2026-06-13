@@ -60,9 +60,27 @@ const STATUS_RANK = {
 const statusRank = (task) => (STATUS_RANK[task.status] ?? 9);
 
 // Tasks with open human reviews jump to the very top of the queue — above FAILED — so the
-// operator sees what's waiting on them first.
+// operator sees what's waiting on them first. Within review tasks, order by the cheapest/most
+// time-sensitive kind: external lookup, then visual QA (figure), then extract validation.
 const reviewCount = (task) => (task.reviews || []).length;
-const reviewRank = (task) => (reviewCount(task) > 0 ? 0 : 1);
+const REVIEW_KIND_RANK = { lookup: 0, figure: 1, verify_extract: 2 };
+const REVIEW_KIND_LABEL = { lookup: "Lookup", figure: "Visual QA", verify_extract: "Extract" };
+// Best (lowest) kind-rank among a task's open reviews; 99 for tasks with no reviews so they
+// sink below every review task while keeping their normal status ordering among themselves.
+const reviewKindRank = (task) => {
+  const rs = task.reviews || [];
+  if (!rs.length) return 99;
+  return Math.min(...rs.map((r) => REVIEW_KIND_RANK[r.kind] ?? 3));
+};
+// One colored chip per review kind present on the task (e.g. "Lookup", "Visual QA (2)").
+function reviewChips(task) {
+  const byKind = {};
+  for (const r of (task.reviews || [])) byKind[r.kind] = (byKind[r.kind] || 0) + 1;
+  return Object.keys(REVIEW_KIND_RANK)
+    .filter((k) => byKind[k])
+    .map((k) => `<span class="row-review kind-${esc(k)}" onclick="openReview('${js(task.task_id)}', event)">${esc(REVIEW_KIND_LABEL[k])}${byKind[k] > 1 ? ` (${byKind[k]})` : ""}</span>`)
+    .join("");
+}
 
 // Whether a submission has been scored, and if so whether it was correct (null until known).
 function feedbackFor(task) {
@@ -115,7 +133,7 @@ function renderStatus() {
   }
   const visible = tasks
     .filter((t) => t.round_num === selectedRoundTab)
-    .sort((a, b) => reviewRank(a) - reviewRank(b) || statusRank(a) - statusRank(b) || String(a.question_id).localeCompare(String(b.question_id)));
+    .sort((a, b) => reviewKindRank(a) - reviewKindRank(b) || statusRank(a) - statusRank(b) || String(a.question_id).localeCompare(String(b.question_id)));
 
   document.getElementById("roundTabs").innerHTML = rounds.length > 1
     ? rounds.map((r) => `<button class="round-tab ${r === selectedRoundTab ? "active" : ""}" onclick="selectRoundTab(${Number(r)})">Round ${esc(r)}</button>`).join("")
@@ -130,7 +148,7 @@ function renderStatus() {
         <div class="row-side">
           <span class="status ${badgeClass(task)}">${esc(badgeLabel(task))}</span>
           ${task.revising ? `<span class="row-revising">Revising…</span>` : ""}
-          ${reviewCount(task) ? `<span class="row-review" onclick="openReview('${js(task.task_id)}', event)">Review (${reviewCount(task)})</span>` : ""}
+          ${reviewChips(task)}
           ${task.status === "READY" ? `<span class="row-submit" onclick="submitTask('${js(task.task_id)}', event)">Submit</span>` : ""}
         </div>
       </button>`).join("")

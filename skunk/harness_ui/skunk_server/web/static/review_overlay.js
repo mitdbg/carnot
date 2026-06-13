@@ -25,6 +25,11 @@ const ReviewOverlay = (function () {
 
   const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[c]));
 
+  // Order reviews within a question by kind: external lookup, then visual QA, then extract —
+  // so auto-advancing walks them in the same priority the task list uses.
+  const KIND_RANK = { lookup: 0, figure: 1, verify_extract: 2 };
+  const sortReviews = (rs) => rs.slice().sort((a, b) => (KIND_RANK[a.kind] ?? 3) - (KIND_RANK[b.kind] ?? 3));
+
   function root() { return document.getElementById("reviewOverlay"); }
 
   function parsePages(sourceDocs) {
@@ -46,7 +51,7 @@ const ReviewOverlay = (function () {
     const task = tasksRef.find((t) => t.task_id === taskId);
     if (!task || !(task.reviews || []).length) return;
     activeTaskId = taskId;
-    reviews = task.reviews.slice();
+    reviews = sortReviews(task.reviews);
     index = 0;
     render();
   }
@@ -72,7 +77,7 @@ const ReviewOverlay = (function () {
     const open = task ? (task.reviews || []) : [];
     const cur = reviews[index];
     const curStillOpen = cur && open.some((r) => r.review_id === cur.review_id);
-    reviews = open.slice();
+    reviews = sortReviews(open);
     if (!reviews.length) { close(); return; }
     if (curStillOpen) {
       // Same review still in progress — keep the live DOM (edits + viewer) intact, just keep our
@@ -241,7 +246,7 @@ const ReviewOverlay = (function () {
       <div class="review-panel ${pages.length ? "with-viewer" : ""}">
         <div class="review-head">
           <div>
-            <span class="review-kind">${esc(kindLabel)}</span>
+            <span class="review-kind kind-${esc(review.kind)}">${esc(kindLabel)}</span>
             <span class="review-task">${title}</span>
             <span class="review-count">review ${index + 1} of ${reviews.length}</span>
           </div>

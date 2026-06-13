@@ -171,29 +171,19 @@ def _src_verbatim_violations(branches: Iterable[Branch], question: str) -> list[
 
 def _parse_plan(raw: str, ctx: ExecutionContext) -> Plan:
     """The initial planner's parse hook. Validates the reply as a `Plan`, then:
-    (1) forbids `lookup_external` — the first pass is retrieve-only, every value is
-    assumed to live in the corpus, and external lookups are injected only at replan
-    when retrieval cannot find a value; (2) enforces well-formed `as_of` pins (list
-    parity with `period`); (3) enforces that every retrieve `key` is copied VERBATIM
-    from the question text (modulo case/unicode/whitespace) — the planner must name
-    retrieval targets in the question's own words rather than substituting an
-    invented table name (the failure mode behind UID0042 and UID0085). Violations
-    raise `ParseError` so the retry loop re-emits.
+    (1) enforces well-formed `as_of` pins (list parity with `period`); (2) enforces
+    that every retrieve `key` is copied VERBATIM from the question text (modulo
+    case/unicode/whitespace) — the planner must name retrieval targets in the
+    question's own words rather than substituting an invented table name (the failure
+    mode behind UID0042 and UID0085). Violations raise `ParseError` so the retry loop
+    re-emits.
 
-    The key-verbatim check is INITIAL-plan only — `_parse_plan_diff` does not apply
-    it, since rewording a failed key is exactly why we replan. The lookup `src`
-    verbatim rule lives in `_parse_plan_diff` instead, because lookups are emitted
-    only at replan."""
+    `lookup_external` IS allowed on the initial plan (the planner decides per the
+    prompt's guidance — prefer the corpus, lookup when the value clearly isn't in it or
+    the question names an external source). The key-verbatim check is INITIAL-plan only —
+    `_parse_plan_diff` does not apply it, since rewording a failed key is exactly why we
+    replan. The lookup `src` verbatim rule lives in `_parse_plan_diff` instead."""
     plan = _json_parser(Plan)(raw, ctx)
-    lookups = [b for b in plan.branches if isinstance(b, LookupBranch)]
-    if lookups:
-        raise ParseError(
-            raw,
-            "lookup_external is not allowed on the initial plan: assume every value "
-            "the question needs is in the corpus and emit a retrieve branch for it "
-            "(external lookups are added automatically at replan if retrieval fails). "
-            f"Re-emit these as retrieve branches: {[b.target for b in lookups]!r}",
-        )
     for b in plan.branches:
         if isinstance(b, RetrieveBranch) and (problem := _as_of_problem(b)):
             raise ParseError(raw, f"branch {b.key!r}: {problem}")
@@ -339,9 +329,9 @@ Rules:
     # Planner-only addenda, appended to the planner system prompt alone (the replanner
     # gets `_REPLAN_INSTRUCTIONS` instead). `_VERBATIM_RULE`: retrieve keys must be
     # question spans — a failed key is exactly what the replanner reformulates, so it
-    # is exempt. `_INITIAL_PASS_RULE`: no lookup_external on the first pass (retrieve
-    # everything; lookups are injected at replan). The lookup `src` verbatim rule
-    # lives in `_parse_plan_diff`, since lookups are emitted only at replan.
+    # is exempt. `_INITIAL_PASS_RULE`: prefer the corpus, but `lookup_external` IS
+    # allowed on the first pass (the planner judges per branch). The lookup `src`
+    # verbatim rule lives in `_parse_plan_diff`, since lookups are emitted only at replan.
     _VERBATIM_RULE = """\
 ##Note
 Each retrieve `key` must be copied VERBATIM from the question: an exact span of the
@@ -349,12 +339,12 @@ question text, in the question's own wording.
 """
 
     _INITIAL_PASS_RULE = """\
-##Initial-pass rule
-This is the FIRST pass: emit ONLY `retrieve` branches — never `lookup_external`.
-Assume every value the question needs lives in the Treasury Bulletin corpus,
-including values that look external (CPI, GDP, FX rates): emit a `retrieve` branch
-for each, keyed by the question's wording. If retrieval cannot find a value, an
-external lookup is injected automatically at replan.
+##Corpus-first rule
+Prefer the Treasury Bulletin corpus. Most values the question needs live there, INCLUDING
+ones that look external (CPI, GDP, FX rates) — emit a `retrieve` branch for those, keyed by
+the question's wording. Use a `lookup_external` branch on this first pass only when the value
+is clearly outside the corpus or the question explicitly names an external source; if a
+retrieve later fails, an external lookup is also added at replan.
 """
 
     # Planner and replanner share the initial-plan instructions (same branch/field

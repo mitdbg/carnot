@@ -159,8 +159,10 @@ def _parse_step(text: str, _: ExecutionContext) -> _StepOutput:
     if not blocks:
         raise ParseError(
             raw=text,
-            detail="no fenced block — emit ```python``` block(s) (tool calls) "
-            "or ONE ```json``` block (final answer).",
+            detail="Your reply had no fenced block, so nothing ran. Reasoning/prose alone "
+            "is not an action. Re-issue your intended action now as a fenced block: a "
+            "```python``` block (a single tool call) to act, or ONE ```json``` block to "
+            "give your final answer.",
         )
     # A single json block is the final answer; parse it as data.
     if len(blocks) == 1 and blocks[0][0].lower() == "json":
@@ -251,27 +253,38 @@ class MultiTurnAgent(ABC):
 
 {{ tools_doc }}
 
-{% if max_parallel_tool_calls > 1 -%}
-You have ≤{{ max_steps }} steps. On each step, output either:
-  - between 1 and {{ max_parallel_tool_calls }} ```python``` blocks, each containing a
-    single tool call. When you emit more than one, they are executed **in parallel** and
-    their outputs are returned together as one batched observation — use this to issue
-    several independent tool calls at once (e.g. searches for different sub-topics). Do
-    not exceed {{ max_parallel_tool_calls }} blocks; extra ones are dropped. The parallel
-    blocks share no state, so a block must not depend on another's result.
-  - a single ```json``` block containing your final answer — emit this once, when you are
-    ready to finish. It is parsed as data (not executed), so write plain JSON
-    literals (no Python, no variables, no trailing commas).
+## How to act
 
-Your final answer must be emitted in a step **by itself** (do not combine the ```json```
-block with tool calls).
+You act ONLY by emitting fenced code blocks. **Every reply MUST contain at least one
+fenced block.** A reply that is only reasoning or prose, with no fenced block, is not a
+valid action: it changes nothing and wastes one of your limited steps. Do any brief
+thinking *before* the block, then always finish your reply with the block(s).
+
+A tool call is a ```python``` block whose body is a single call, opened by a line that is
+exactly three backticks then `python`, and closed by a line of three backticks:
+
+```python
+some_tool(arg="value", count=10)
+```
+
+{% if max_parallel_tool_calls > 1 -%}
+You have ≤{{ max_steps }} steps. On each step, emit ONE of these:
+  - 1 to {{ max_parallel_tool_calls }} ```python``` blocks, each a single tool call. Emit
+    more than one to run them **in parallel** — their outputs come back together as one
+    batched observation; use this for independent calls (e.g. different sub-topics or time
+    periods). Do not exceed {{ max_parallel_tool_calls }} blocks (extras are dropped), and
+    since parallel blocks share no state, no block may depend on another's result.
+  - exactly one ```json``` block — your final answer. Emit it once, when you are ready to
+    finish, in a step **by itself** (never alongside ```python``` blocks). It is parsed as
+    data, not executed, so write plain JSON literals (no Python, no variables, no trailing
+    commas).
 {%- else -%}
-You have ≤{{ max_steps }} steps. On each step, output exactly ONE fenced block:
-  - a ```python``` block containing a single tool call — the tool will be executed and its output appears
-    as your next observation; or
-  - a ```json``` block containing your final answer — emit this once, when you are
-    ready to finish. It is parsed as data (not executed), so write plain JSON
-    literals (no Python, no variables, no trailing commas).
+You have ≤{{ max_steps }} steps. On each step, emit exactly ONE fenced block:
+  - a ```python``` block containing a single tool call — it is executed and its output
+    becomes your next observation; or
+  - a ```json``` block containing your final answer — emit it once, when you are ready to
+    finish. It is parsed as data, not executed, so write plain JSON literals (no Python, no
+    variables, no trailing commas).
 {%- endif %}
 
 Requirements for the final answer:
