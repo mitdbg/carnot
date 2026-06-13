@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
+from dataclasses import asdict
 from datetime import datetime
+from enum import StrEnum
+from typing import Any
 
 from skunk_server.domain import (
     AnswerCandidate,
-    AssignmentStatus,
     Attempt,
     FailureRecord,
-    HumanAssignment,
+    HumanReview,
+    HumanReviewStatus,
     QuestionTask,
     RoundState,
     SubmissionRecord,
@@ -18,6 +22,14 @@ from skunk_server.domain import (
     TaskStatus,
     utc_now,
 )
+
+MAX_ATTEMPT_EVENTS = 2000
+MAX_EVENT_MESSAGE_CHARS = 4000
+# Total budget (chars) for an event's `data` payload. Corpus observations are huge (search
+# results / extracted blocks can be ~1MB), but the trace viewer truncates display anyway and
+# the durable per-question dump keeps the full event. Capping here keeps the live registry /
+# SSE-stream payload small so the per-event JSON work stays off the GIL the corpus tools need.
+MAX_EVENT_DATA_CHARS = 16000
 
 
 class TaskConflict(ValueError):
@@ -27,9 +39,18 @@ class TaskConflict(ValueError):
 class TaskRegistry:
     def __init__(self) -> None:
         self._tasks: dict[str, QuestionTask] = {}
-        self._assignments: dict[str, HumanAssignment] = {}
+        # Per-task monotonic event counter. `seq` is stamped into each stored event so the
+        # SSE backfill can dedup against live events (and survive event-list trimming).
+        self._event_seq: dict[str, int] = {}
         self._round = RoundState()
         self._lock = threading.RLock()
+        self._round_close_callback: Callable[[int], None] | None = None
+
+    def set_round_close_callback(self, callback: Callable[[int], None]) -> None:
+        """Register a hook fired when a round closes — the agent worker pool uses it to
+        cancel that round's still-running reasoners so the workers are freed for the next
+        round (rather than staying blocked on un-cancellable in-flight work)."""
+        self._round_close_callback = callback
 
     def create_task(
         self,
@@ -98,26 +119,29 @@ class TaskRegistry:
     def begin_attempt(self, task_id: str, worker_id: str) -> Attempt | None:
         with self._lock:
             task = self._require_task(task_id)
-            if task.status not in {TaskStatus.QUEUED, TaskStatus.RETRY_QUEUED}:
+            if task.status != TaskStatus.QUEUED:
                 return None
             attempt = Attempt(
                 task_id=task_id,
                 attempt_number=len(task.attempts) + 1,
                 worker_id=worker_id,
-                feedback=task.pending_retry_feedback,
                 context_feedback=list(task.cup_feedback),
                 previous_attempt_ids=[item.attempt_id for item in task.attempts],
             )
-            task.pending_retry_feedback = None
             task.attempts.append(attempt)
             task.current_attempt_id = attempt.attempt_id
             self._set_status(task, TaskStatus.PROCESSING)
             return attempt
 
-    def complete_attempt(self, task_id: str, attempt_id: str, candidate: AnswerCandidate) -> bool:
+    def complete_attempt(
+        self, task_id: str, attempt_id: str, candidate: AnswerCandidate
+    ) -> bool:
         with self._lock:
             task = self._require_task(task_id)
-            if task.current_attempt_id != attempt_id or task.status != TaskStatus.PROCESSING:
+            if (
+                task.current_attempt_id != attempt_id
+                or task.status != TaskStatus.PROCESSING
+            ):
                 return False
             task.attempts[-1].completed_at = utc_now()
             task.answer_candidates.append(candidate)
@@ -125,10 +149,15 @@ class TaskRegistry:
             self._set_status(task, TaskStatus.READY)
             return True
 
-    def fail_attempt(self, task_id: str, attempt_id: str, failure: FailureRecord) -> bool:
+    def fail_attempt(
+        self, task_id: str, attempt_id: str, failure: FailureRecord
+    ) -> bool:
         with self._lock:
             task = self._require_task(task_id)
-            if task.current_attempt_id != attempt_id or task.status != TaskStatus.PROCESSING:
+            if (
+                task.current_attempt_id != attempt_id
+                or task.status != TaskStatus.PROCESSING
+            ):
                 return False
             task.attempts[-1].completed_at = utc_now()
             task.failures.append(failure)
@@ -136,108 +165,74 @@ class TaskRegistry:
             self._set_status(task, TaskStatus.FAILED)
             return True
 
-    def create_assignment(self, task_id: str, worker_id: str) -> HumanAssignment:
+    def append_attempt_events(
+        self,
+        task_id: str,
+        attempt_id: str,
+        events: list[dict],
+    ) -> list[dict]:
+        """Append a batch of trace events to an attempt and return the stored (compacted,
+        seq-stamped) events — empty if the task/attempt is gone. The CPU-heavy compaction
+        runs OUTSIDE the lock; the lock is taken once per batch only to stamp the per-task
+        monotonic `seq` and extend the list. Batching keeps both the global lock and the
+        main-loop publish wakeup off the per-event hot path (see `AgentWorkerPool`'s
+        batcher), so the GIL stays free for the reasoner's corpus tools."""
+        if not events:
+            return []
+        compacted = [_compact_event(event) for event in events]  # heavy walk, lock-free
         with self._lock:
-            task = self._require_task(task_id)
-            if task.status not in {TaskStatus.READY, TaskStatus.FAILED}:
-                raise TaskConflict(f"task is not claimable; status={task.status}")
-            for assignment in task.assignments:
-                if assignment.worker_id == worker_id and assignment.status == AssignmentStatus.ACTIVE:
-                    return assignment
-            assignment = HumanAssignment(
-                task_id=task_id,
-                worker_id=worker_id,
-                task_version=task.version,
-                source_kind=task.status.value,
+            task = self._tasks.get(task_id)
+            if task is None:
+                return []
+            attempt = next(
+                (a for a in task.attempts if a.attempt_id == attempt_id), None
             )
-            task.assignments.append(assignment)
-            self._assignments[assignment.assignment_id] = assignment
+            if attempt is None:
+                return []
+            seq = self._event_seq.get(task_id, 0)
+            for event in compacted:
+                event["seq"] = seq
+                seq += 1
+            self._event_seq[task_id] = seq
+            attempt.events.extend(compacted)
+            if len(attempt.events) > MAX_ATTEMPT_EVENTS:
+                del attempt.events[: len(attempt.events) - MAX_ATTEMPT_EVENTS]
             task.updated_at = utc_now()
-            return assignment
+            return compacted
 
-    def release_assignment(self, assignment_id: str, worker_id: str) -> HumanAssignment:
-        with self._lock:
-            assignment = self._require_assignment(assignment_id)
-            if assignment.worker_id != worker_id:
-                raise TaskConflict("assignment belongs to another worker")
-            if assignment.status != AssignmentStatus.ACTIVE:
-                raise TaskConflict(f"assignment is not active; status={assignment.status}")
-            assignment.status = AssignmentStatus.RELEASED
-            assignment.completed_at = utc_now()
-            return assignment
+    def append_attempt_event(
+        self, task_id: str, attempt_id: str, event: dict
+    ) -> dict | None:
+        stored = self.append_attempt_events(task_id, attempt_id, [event])
+        return stored[0] if stored else None
 
-    def retry_from_assignment(
+    def snapshot_task_events(
         self,
-        assignment_id: str,
-        worker_id: str,
-        task_version: int,
-        feedback: str,
-    ) -> QuestionTask:
-        cleaned = feedback.strip()
-        if not cleaned:
-            raise ValueError("retry feedback must not be empty")
+        task_id: str,
+    ) -> tuple[list[tuple[int, str, dict]], int]:
+        """Return [(seq, attempt_id, event), ...] across all attempts in order plus the
+        next seq, read atomically. The SSE event stream replays this then forwards live
+        events with a higher seq."""
         with self._lock:
-            task, assignment = self._validate_action(assignment_id, worker_id, task_version)
-            self._finish_assignment(task, assignment)
-            task.pending_retry_feedback = cleaned
-            self._set_status(task, TaskStatus.RETRY_QUEUED)
-            return task
-
-    def human_answer_from_assignment(
-        self,
-        assignment_id: str,
-        worker_id: str,
-        task_version: int,
-        answer_text: str,
-        reasoning: str,
-        source_docs: list[str],
-    ) -> tuple[QuestionTask, AnswerCandidate]:
-        cleaned = answer_text.strip()
-        if not cleaned:
-            raise ValueError("answer must not be empty")
-        with self._lock:
-            task, assignment = self._validate_action(assignment_id, worker_id, task_version)
-            if assignment.source_kind != TaskStatus.FAILED.value:
-                raise TaskConflict("direct human answers are only valid for failed tasks")
-            self._finish_assignment(task, assignment)
-            attempt = Attempt(
-                task_id=task.task_id,
-                attempt_number=len(task.attempts) + 1,
-                worker_id=worker_id,
-                previous_attempt_ids=[item.attempt_id for item in task.attempts],
-                completed_at=utc_now(),
-            )
-            candidate = AnswerCandidate(
-                attempt_id=attempt.attempt_id,
-                answer_text=cleaned,
-                reasoning=reasoning,
-                source_docs=source_docs,
-                submission_type="human",
-            )
-            task.attempts.append(attempt)
-            task.answer_candidates.append(candidate)
-            self._set_status(task, TaskStatus.SUBMITTING)
-            return task, candidate
+            task = self._tasks.get(task_id)
+            if task is None:
+                return [], 0
+            out: list[tuple[int, str, dict]] = []
+            for attempt in task.attempts:
+                for event in attempt.events:
+                    out.append((event.get("seq", 0), attempt.attempt_id, event))
+            return out, self._event_seq.get(task_id, 0)
 
     def begin_candidate_submission(
         self,
         task_id: str,
-        *,
-        assignment_id: str | None = None,
-        worker_id: str | None = None,
-        task_version: int | None = None,
     ) -> tuple[QuestionTask, AnswerCandidate, SubmissionRecord]:
         with self._lock:
             task = self._require_task(task_id)
-            if assignment_id is not None:
-                if worker_id is None or task_version is None:
-                    raise ValueError("worker_id and task_version are required")
-                task, assignment = self._validate_action(assignment_id, worker_id, task_version)
-                if assignment.source_kind != TaskStatus.READY.value:
-                    raise TaskConflict("generated candidate submission requires a READY assignment")
-                self._finish_assignment(task, assignment)
-            elif task.status != TaskStatus.READY:
-                raise TaskConflict(f"task is not ready for auto-submit; status={task.status}")
+            if task.status != TaskStatus.READY:
+                raise TaskConflict(
+                    f"task is not ready for submission; status={task.status}"
+                )
             candidate = task.latest_candidate
             if candidate is None:
                 raise TaskConflict("task has no answer candidate")
@@ -249,32 +244,6 @@ class TaskRegistry:
             task.submissions.append(submission)
             self._set_status(task, TaskStatus.SUBMITTING)
             return task, candidate, submission
-
-    def begin_candidate_submission_after_human_answer(
-        self,
-        task_id: str,
-    ) -> SubmissionRecord:
-        with self._lock:
-            task = self._require_task(task_id)
-            if task.status != TaskStatus.SUBMITTING:
-                raise TaskConflict(f"task is not submitting; status={task.status}")
-            candidate = task.latest_candidate
-            if candidate is None or candidate.submission_type != "human":
-                raise TaskConflict("task has no direct human answer")
-            if any(
-                item.candidate_id == candidate.candidate_id
-                and item.status == SubmissionStatus.PENDING
-                for item in task.submissions
-            ):
-                raise TaskConflict("human answer already has a pending submission")
-            submission = SubmissionRecord(
-                task_id=task_id,
-                candidate_id=candidate.candidate_id,
-                submission_type=candidate.submission_type,
-            )
-            task.submissions.append(submission)
-            task.updated_at = utc_now()
-            return submission
 
     def record_submission_accepted(
         self,
@@ -353,49 +322,165 @@ class TaskRegistry:
                     return task
             return None
 
+    # ---- Optimistic human reviews ------------------------------------------------------
+
+    def create_review(
+        self,
+        task_id: str,
+        attempt_id: str,
+        kind: str,
+        instructions: str,
+        context: str | None,
+        source_docs: list[str],
+        guidance: dict[str, Any] | None,
+    ) -> HumanReview:
+        """Open a human review on a running task (the optimistic path keeps the LLM answer; this
+        just records something a human MAY correct later). Returns the review."""
+        with self._lock:
+            task = self._require_task(task_id)
+            review = HumanReview(
+                task_id=task_id,
+                attempt_id=attempt_id,
+                kind=kind,
+                instructions=instructions,
+                context=context,
+                source_docs=list(source_docs),
+                guidance=dict(guidance or {}),
+            )
+            task.reviews.append(review)
+            task.updated_at = utc_now()
+            return review
+
+    def set_recompute_state(self, task_id: str, state: dict[str, Any]) -> None:
+        """Stash the snapshot (orchestrator.RecomputeState JSON) that produced the latest answer,
+        so a resolved review can revise it without re-planning. No-op if the task is gone."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is not None:
+                task.recompute_state = state
+                task.updated_at = utc_now()
+
+    def set_revising(self, task_id: str, revising: bool) -> None:
+        """Flag/unflag a task as having an in-flight recompute (the answer is being revised),
+        so the UI can show a 'Revising…' indicator. No-op if the task is gone."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is not None and task.revising != revising:
+                task.revising = revising
+                self._set_status(
+                    task, task.status
+                )  # bump version/updated_at, status unchanged
+
+    def resolve_review(
+        self,
+        review_id: str,
+        response: str,
+        source_docs: list[str],
+    ) -> tuple[QuestionTask, HumanReview]:
+        """Record a human's correction (or accept-as-is when `response` is empty). Idempotent
+        guard: re-resolving a non-open review raises `TaskConflict`."""
+        with self._lock:
+            task, review = self._find_review(review_id)
+            if review.status != HumanReviewStatus.OPEN:
+                raise TaskConflict(f"review is not open; status={review.status}")
+            review.status = HumanReviewStatus.RESOLVED
+            review.response = response
+            review.response_source_docs = list(source_docs)
+            review.resolved_at = utc_now()
+            task.updated_at = utc_now()
+            return task, review
+
+    def resolved_overrides(self, task_id: str) -> dict[int, str]:
+        """Accumulated human corrections for a task: `branch_id -> raw response JSON`, across all
+        RESOLVED reviews with a non-empty response (accept-as-is reviews contribute nothing). A
+        recompute applies all of them onto the cached snapshot, so later edits never lose earlier
+        ones."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return {}
+            out: dict[int, str] = {}
+            for review in task.reviews:
+                if review.status != HumanReviewStatus.RESOLVED:
+                    continue
+                if not (review.response or "").strip():
+                    continue
+                bid = review.guidance.get("branch_id")
+                if isinstance(bid, int):
+                    out[bid] = review.response  # later reviews on a branch win
+            return out
+
+    def add_revised_candidate(
+        self, task_id: str, candidate: AnswerCandidate
+    ) -> QuestionTask | None:
+        """Append a recompute's revised answer and make it (re)submittable, unless the task is
+        already terminal for this round (SCORED/CANCELLED → record only, best-effort no-op)."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return None
+            task.answer_candidates.append(candidate)
+            if task.status in {
+                TaskStatus.READY,
+                TaskStatus.SUBMITTED,
+                TaskStatus.SUBMITTING,
+                TaskStatus.FAILED,
+            }:
+                self._set_status(task, TaskStatus.READY)
+            else:
+                task.version += 1
+                task.updated_at = utc_now()
+            return task
+
+    def cancel_active_reviews(self, round_num: int | None = None) -> list[str]:
+        """Close every OPEN review (optionally limited to one round) — called on round close /
+        shutdown so the UI clears its overlay. Returns the cancelled review ids."""
+        cancelled: list[str] = []
+        with self._lock:
+            for task in self._tasks.values():
+                if round_num is not None and task.round_num != round_num:
+                    continue
+                for review in task.reviews:
+                    if review.status == HumanReviewStatus.OPEN:
+                        review.status = HumanReviewStatus.CANCELLED
+                        review.resolved_at = utc_now()
+                        cancelled.append(review.review_id)
+                if cancelled:
+                    task.updated_at = utc_now()
+        return cancelled
+
+    def _find_review(self, review_id: str) -> tuple[QuestionTask, HumanReview]:
+        for task in self._tasks.values():
+            for review in task.reviews:
+                if review.review_id == review_id:
+                    return task, review
+        raise KeyError(review_id)
+
     def close_round(self, round_num: int, status: str) -> None:
         with self._lock:
             self._round.round_num = round_num
             self._round.status = status
             self._round.last_event = f"round state {status}"
             for task in self._tasks.values():
+                # CANCELLED marks tasks that never got an answer submitted before the round
+                # closed. Tasks that were already submitted/scored keep their terminal state
+                # (and their points) so the monitor can still see what each one earned.
                 if task.round_num == round_num and task.status not in {
+                    TaskStatus.SUBMITTED,
                     TaskStatus.SCORED,
                     TaskStatus.CANCELLED,
                 }:
                     self._set_status(task, TaskStatus.CANCELLED)
-
-    def _validate_action(
-        self,
-        assignment_id: str,
-        worker_id: str,
-        task_version: int,
-    ) -> tuple[QuestionTask, HumanAssignment]:
-        assignment = self._require_assignment(assignment_id)
-        task = self._require_task(assignment.task_id)
-        if assignment.worker_id != worker_id:
-            raise TaskConflict("assignment belongs to another worker")
-        if assignment.status != AssignmentStatus.ACTIVE:
-            raise TaskConflict(f"assignment is not active; status={assignment.status}")
-        if assignment.task_version != task_version or task.version != task_version:
-            raise TaskConflict("assignment targets a stale task version")
-        expected = TaskStatus(assignment.source_kind)
-        if task.status != expected:
-            raise TaskConflict(f"task is no longer actionable; status={task.status}")
-        return task, assignment
-
-    def _finish_assignment(self, task: QuestionTask, winner: HumanAssignment) -> None:
-        now = utc_now()
-        winner.status = AssignmentStatus.COMPLETED
-        winner.completed_at = now
-        for assignment in task.assignments:
-            if (
-                assignment.assignment_id != winner.assignment_id
-                and assignment.task_version == winner.task_version
-                and assignment.status == AssignmentStatus.ACTIVE
-            ):
-                assignment.status = AssignmentStatus.SUPERSEDED
-                assignment.completed_at = now
+                # Close any open reviews for the round so the UI clears its overlay.
+                if task.round_num == round_num:
+                    for review in task.reviews:
+                        if review.status == HumanReviewStatus.OPEN:
+                            review.status = HumanReviewStatus.CANCELLED
+                            review.resolved_at = utc_now()
+        # Free any worker still blocked on this round's reasoners (outside the lock — the
+        # callback schedules cancellation on each worker's own loop).
+        if self._round_close_callback is not None:
+            self._round_close_callback(round_num)
 
     def _set_status(self, task: QuestionTask, status: TaskStatus) -> None:
         task.status = status
@@ -408,15 +493,59 @@ class TaskRegistry:
             raise KeyError(task_id)
         return task
 
-    def _require_assignment(self, assignment_id: str) -> HumanAssignment:
-        assignment = self._assignments.get(assignment_id)
-        if assignment is None:
-            raise KeyError(assignment_id)
-        return assignment
-
     @staticmethod
-    def _find_submission(task: QuestionTask, local_submission_id: str) -> SubmissionRecord:
+    def _find_submission(
+        task: QuestionTask, local_submission_id: str
+    ) -> SubmissionRecord:
         for submission in task.submissions:
             if submission.local_submission_id == local_submission_id:
                 return submission
         raise KeyError(local_submission_id)
+
+
+def _compact_event(event: dict) -> dict:
+    """Compact one raw event for the registry/stream. `seq` is stamped later under the lock
+    (see `append_attempt_events`). The `data` payload is converted to JSON-friendly form and
+    capped to `MAX_EVENT_DATA_CHARS` total in a single short-circuiting walk."""
+    compact: dict = {}
+    for key in ("message", "kind", "op", "level", "step_idx", "t", "branch_id"):
+        if key in event:
+            compact[key] = event[key]
+    if "message" in compact:
+        compact["message"] = str(compact["message"])[:MAX_EVENT_MESSAGE_CHARS]
+    data = event.get("data")
+    if isinstance(data, dict) and data:
+        compact["data"] = _clip_jsonable(data, [MAX_EVENT_DATA_CHARS])
+    return compact
+
+
+def _clip_jsonable(value: Any, budget: list[int]) -> Any:
+    """JSON-ify and total-budget-cap in one pass. `budget` is a 1-element mutable counter of
+    remaining chars; strings are clipped to fit and, once exhausted, list tails are dropped
+    (with a marker) so a huge corpus observation costs ~budget to walk, not its full size."""
+    if isinstance(value, str):
+        if budget[0] <= 0:
+            return ""
+        if len(value) > budget[0]:
+            clipped = value[: budget[0]] + "… [truncated]"
+            budget[0] = 0
+            return clipped
+        budget[0] -= len(value)
+        return value
+    if isinstance(value, dict):
+        return {str(key): _clip_jsonable(item, budget) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        out: list[Any] = []
+        for index, item in enumerate(value):
+            if budget[0] <= 0:
+                out.append(f"… [{len(value) - index} more truncated]")
+                break
+            out.append(_clip_jsonable(item, budget))
+        return out
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, StrEnum):
+        return value.value
+    if hasattr(value, "__dataclass_fields__"):
+        return _clip_jsonable(asdict(value), budget)
+    return value

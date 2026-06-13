@@ -763,5 +763,8 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     app, _state, _stop = build_app(cfg)
-    uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="warning")
+    # Cap graceful shutdown: teams hold an open /v1/team/events WebSocket whose handler
+    # loops on `await ws.receive_text()` and never returns on its own, so without a
+    # deadline uvicorn waits forever for it to close on Ctrl-C.
+    uvicorn.run(app, host=cfg.host, port=cfg.port, log_level="warning", timeout_graceful_shutdown=5)
     return 0

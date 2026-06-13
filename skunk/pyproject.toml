@@ -10,7 +10,9 @@ requires-python = ">=3.12"
 dependencies = [
     "beautifulsoup4",
     "chromadb>=1.4.0",
+    "fastapi",
     "google-genai",
+    "httpx",
     "jinja2",
     "openrouter",
     "pandas",
@@ -21,6 +23,8 @@ dependencies = [
     "numpy",
     "statsmodels",
     "tavily-python",
+    "uvicorn",
+    "websockets",
     "pandas-stubs==3.0.3.260530",
 ]
 

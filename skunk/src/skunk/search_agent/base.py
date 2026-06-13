@@ -19,9 +19,11 @@ class Retriever(ABC):
         branch_key: str | None = None,
         branch_period: str | None = None,
         branch_as_of: str | None = None,
+        required_bulletins: list[str] | None = None,
     ) -> list[str]:
         """
         Retrieve a list of items (page keys) relevant to `question`. Optional branch
         hints (`branch_key` / `branch_period` / `branch_as_of`) narrow the search.
+        `required_bulletins` is a hard document scope supplied by a human.
         """
         ...

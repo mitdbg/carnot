@@ -104,6 +104,7 @@ def _parse_extract_response(raw: str, ctx: ExecutionContext) -> list[AnnotatedVa
 
 def _make_text_parse(
     content: str,
+    allowed_blocks: set[tuple[int, int | None]],
 ) -> Callable[[str, ExecutionContext], list[AnnotatedValue]]:
     """Build the text-tier parse hook: shape-validate via `_parse_extract_response`,
     then verify every emitted cell appears verbatim in `content` (the source page text).
@@ -115,6 +116,12 @@ def _make_text_parse(
         entries = _parse_extract_response(raw, ctx)
         violations: list[str] = []
         for e in entries:
+            source_block = (e.source_block_page, e.source_block_index)
+            if e.source_block_page is None or source_block not in allowed_blocks:
+                violations.append(
+                    f"{e.description!r}: source block {source_block!r} is not one of "
+                    f"{sorted(allowed_blocks, key=lambda item: (item[0], item[1] is None, item[1] or -1))!r}"
+                )
             for path, v in _cells_with_path(e):
                 if not _cell_in_text(v, content):
                     loc = "/".join(path) if path else e.description
@@ -124,6 +131,32 @@ def _make_text_parse(
                 raw,
                 "these values do NOT appear verbatim in the page text — extract only "
                 "printed values, transcribing every digit exactly:\n"
+                + "\n".join(violations),
+            )
+        return entries
+
+    return parse
+
+
+def _make_block_parse(
+    allowed_blocks: set[tuple[int, int | None]],
+) -> Callable[[str, ExecutionContext], list[AnnotatedValue]]:
+    """Build a parse hook that requires every value to name one selected block."""
+
+    def parse(raw: str, ctx: ExecutionContext) -> list[AnnotatedValue]:
+        entries = _parse_extract_response(raw, ctx)
+        violations = []
+        for e in entries:
+            source_block = (e.source_block_page, e.source_block_index)
+            if e.source_block_page is None or source_block not in allowed_blocks:
+                violations.append(
+                    f"{e.description!r}: source block {source_block!r} is not one of "
+                    f"{sorted(allowed_blocks, key=lambda item: (item[0], item[1] is None, item[1] or -1))!r}"
+                )
+        if violations:
+            raise ParseError(
+                raw,
+                "each entry must identify the selected block that supplied it:\n"
                 + "\n".join(violations),
             )
         return entries
@@ -162,7 +195,15 @@ def _stamp_provenance(
     ]
 
 
-_PROVENANCE_FIELDS = ("bulletin", "pages", "as_of", "requested_period", "retrieve_key")
+_PROVENANCE_FIELDS = (
+    "bulletin",
+    "pages",
+    "as_of",
+    "requested_period",
+    "retrieve_key",
+    "source_block_page",
+    "source_block_index",
+)
 
 
 def _carry_provenance(
@@ -221,13 +262,16 @@ relevant is found). Pick the shape that best preserves the page structure:
 - table   when both rows and columns vary
 
   scalar: {"description":"...","kind":"scalar",
-           "value":<num|str>,"unit":"..."}
+           "value":<num|str>,"unit":"...",
+           "source_block_page":<int>,"source_block_index":<int|null>}
   vector: {"description":"...","kind":"vector",
            "index_name":"<dim>",
-           "value":{"<index>":<value>,...},"unit":"..."}
+           "value":{"<index>":<value>,...},"unit":"...",
+           "source_block_page":<int>,"source_block_index":<int|null>}
   table:  {"description":"...","kind":"table",
            "row_name":"<dim>","col_name":"<dim>",
-           "value":{"<row>":{"<col>":<value>,...},...},"unit":"..."}
+           "value":{"<row>":{"<col>":<value>,...},...},"unit":"...",
+           "source_block_page":<int>,"source_block_index":<int|null>}
 
 Cells should be simple number or string — no nested cells.
 
@@ -236,11 +280,17 @@ never round, truncate, or drop trailing digits.
 
 ## Field semantics
 
-description   natural-language label that uniquely identifies the
-              datum (series + period + sub-category + any other
-              distinguishing context). For the label text, use the
-              page's verbatim row text / column header / caption phrase
-              so the downstream consumer can map it back to the page.
+description   a self-contained, human-readable label that says WHAT this
+              datum is — the series, what it measures, the sub-category,
+              and the timeframe — so a reader who sees only the
+              description understands it without the surrounding context.
+              Prefer "national defense expenditures, monthly, 1940" over a
+              bare "National defense". Ground it in the page's verbatim row
+              text / column header / caption phrase (so it maps back to the
+              page), but expand abbreviations and add the series/timeframe
+              the row sits under. For a vector/table, describe the whole
+              series (the per-key dimension is named by index_name /
+              row_name / col_name), not one cell.
               
 index_name    (vector only) name of the varying dimension.
 
@@ -252,6 +302,11 @@ unit          natural-language label for the printed scale and base,
               not a measurement (e.g. a name or other string answer).
               Every cell in a vector/table shares one unit — apply any
               conversion once over the whole payload, never cell-by-cell.
+
+source_block_page / source_block_index
+              copy the page and index from the single `[block page=... index=...]`
+              metadata entry that supplied this value. Use JSON null for a
+              whole-page block whose index is shown as null.
 """
 
 
@@ -304,7 +359,7 @@ month from the first endpoint through the last, both endpoints included."""
         return pages
 
     @staticmethod
-    def _block_meta_line(page: int | None, block: Any) -> str:
+    def _block_meta_line(page: int | None, block_index: int | None, block: Any) -> str:
         """One metadata line for a content block — title, kind, column/row labels, and the
         block summary (NO numeric values) — to help the model read the flattened page text."""
         parts = [f"{block.kind}: {block.title or '(untitled)'}"]
@@ -314,7 +369,8 @@ month from the first endpoint through the last, both endpoints included."""
             parts.append(f"rows: {', '.join(block.row_headers)}")
         if block.summary:
             parts.append(block.summary)
-        return f"- page {page}: " + " | ".join(parts)
+        index = "null" if block_index is None else str(block_index)
+        return f"- [block page={page} index={index}] " + " | ".join(parts)
 
     @classmethod
     def _page_metadata(cls, refs: list[PageRef], ctx: ExecutionContext) -> str:
@@ -327,7 +383,7 @@ month from the first endpoint through the last, both endpoints included."""
             if row is None:
                 continue
             for block in row.content_blocks:
-                lines.append(cls._block_meta_line(ref.page, block))
+                lines.append(cls._block_meta_line(ref.page, None, block))
         return "\n".join(lines)
 
     async def _extract_content(
@@ -335,6 +391,7 @@ month from the first endpoint through the last, both endpoints included."""
         content: str,
         prov_refs: list[PageRef],
         metadata: str,
+        allowed_blocks: set[tuple[int, int | None]],
         branch: RetrieveBranch,
         question: str,
         ctx: ExecutionContext,
@@ -365,7 +422,7 @@ month from the first endpoint through the last, both endpoints included."""
             name="extract.text",
             system_prompt=self._SYSTEM,
             default_effort="medium",
-            parse=_make_text_parse(content),
+            parse=_make_text_parse(content, allowed_blocks),
             output_instruction=_EXTRACT_OUTPUT_INSTRUCTION,
         )
         try:
@@ -432,17 +489,19 @@ month from the first endpoint through the last, both endpoints included."""
         # group) fall back to the pages' full metadata.
         if specific and len(specific) == len(block_idxs):
             metadata = "\n".join(
-                self._block_meta_line(anchor.page, row.content_blocks[bi])  # type: ignore[union-attr]
+                self._block_meta_line(anchor.page, bi, row.content_blocks[bi])  # type: ignore[union-attr]
                 for bi in specific
             )
+            allowed_blocks = {(int(anchor.page), bi) for bi in specific}
         else:
             metadata = self._page_metadata(prov_refs, ctx)
+            allowed_blocks = {(int(anchor.page), None)}
         ctx.emit(
             f"block_scoped page={str(anchor)} n_pages={len(pages)} "
             f"n_blocks={len(block_idxs)} chars={len(content)}"
         )
         return await self._extract_content(
-            content, prov_refs, metadata, branch, question, ctx
+            content, prov_refs, metadata, allowed_blocks, branch, question, ctx
         )
 
     async def run(
@@ -488,18 +547,11 @@ shape (scalar / vector / table) that fits the data on the page.
 A period written `YYYY-MM..YYYY-MM` is an INCLUSIVE range: extract every
 month from the first endpoint through the last, both endpoints included."""
 
-    _prompt = PromptedCall(
-        name="extract.vision",
-        system_prompt=_PREAMBLE + "\n\n" + EXTRACT_COMMON_PROMPT,
-        default_effort="medium",
-        parse=_parse_extract_response,
-        output_instruction=_EXTRACT_OUTPUT_INSTRUCTION,
-    )
-
     async def run(
         self,
         question: str,
         branch: RetrieveBranch,
+        blocks: list[BlockRef],
         images: list[B64Image],
         rendered_refs: list[PageRef],
         ctx: ExecutionContext,
@@ -511,18 +563,39 @@ month from the first endpoint through the last, both endpoints included."""
             f"Image {i + 1}: PDF page {ref.page} of the {ref.month} Treasury Bulletin"
             for i, ref in enumerate(rendered_refs)
         ]
+        block_lines = []
+        allowed_blocks: set[tuple[int, int | None]] = set()
+        for block_ref in blocks:
+            page = int(block_ref.page.page)
+            allowed_blocks.add((page, block_ref.block_index))
+            if block_ref.block is None:
+                block_lines.append(f"- [block page={page} index=null] whole page")
+            else:
+                block_lines.append(
+                    TextExtractor._block_meta_line(
+                        page,
+                        block_ref.block_index,
+                        block_ref.block,
+                    )
+                )
         user_msg = "\n\n".join(
             [
                 f"You are looking for {branch.key}{period}.",
                 f'For full context, this lookup serves to help answer the question: "{question}"',
                 "Images attached, in order:\n" + "\n".join(image_lines),
+                "Selected blocks:\n" + "\n".join(block_lines),
             ]
         )
         ctx.emit(f"vision_call tier=vision n_images={len(images)}")
+        prompt: PromptedCall[list[AnnotatedValue]] = PromptedCall(
+            name="extract.vision",
+            system_prompt=self._PREAMBLE + "\n\n" + EXTRACT_COMMON_PROMPT,
+            default_effort="medium",
+            parse=_make_block_parse(allowed_blocks),
+            output_instruction=_EXTRACT_OUTPUT_INSTRUCTION,
+        )
         try:
-            entries = await self._prompt.call(
-                ctx, user_msg, images=images, temperature=0.0
-            )
+            entries = await prompt.call(ctx, user_msg, images=images, temperature=0.0)
         except ParseError as e:
             ctx.emit(f"extract_parse_failed tier=vision error={e.detail!r}")
             entries = []
@@ -544,6 +617,8 @@ def _entry_semantic_dict(e: AnnotatedValue) -> dict[str, Any]:
         v = getattr(e, name)
         if v is not None:
             d[name] = v
+    d["source_block_page"] = e.source_block_page
+    d["source_block_index"] = e.source_block_index
     return d
 
 
@@ -573,6 +648,11 @@ def _confirm_structure_diff(orig: AnnotatedValue, got: AnnotatedValue) -> list[s
     if got.unit != orig.unit:
         diffs.append(f"unit changed {orig.unit!r} -> {got.unit!r}")
     for name in ("index_name", "row_name", "col_name"):
+        if getattr(got, name) != getattr(orig, name):
+            diffs.append(
+                f"{name} changed {getattr(orig, name)!r} -> {getattr(got, name)!r}"
+            )
+    for name in ("source_block_page", "source_block_index"):
         if getattr(got, name) != getattr(orig, name):
             diffs.append(
                 f"{name} changed {getattr(orig, name)!r} -> {getattr(got, name)!r}"
@@ -654,7 +734,8 @@ decimal place. If a transcribed value already matches the image, return it
 unchanged.
 
 You may ONLY change digits inside cell values. Do NOT change any description, kind, unit,
-index_name / row_name / col_name, or the keys or shape of any value."""
+index_name / row_name / col_name, source_block_page / source_block_index, or the keys or
+shape of any value."""
 
     _SYSTEM = _PREAMBLE + "\n\n" + EXTRACT_COMMON_PROMPT
 
@@ -812,7 +893,7 @@ class ExtractOp:
             _blocks_to_pagerefs(blocks), ctx, strict=True
         )
         entries = await self._vision.run(
-            ctx.question, branch, images, rendered_refs, ctx
+            ctx.question, branch, blocks, images, rendered_refs, ctx
         )
         if not entries:
             raise StepFailed("extract", "no relevant values found across tiers")

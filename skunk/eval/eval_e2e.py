@@ -317,13 +317,10 @@ REPORT_FIELDS = [
     # finer failure-mode triage (compute / retrieval / lookup) the merged report carries
     # is a manual pass over `wrong`/`fail`.
     "category",
-    # Free-text annotation. Auto-seeded with the failure reason for `fail` rows; blank
-    # otherwise (a human refines it during triage).
-    "note",
     # The question text + `gold_answer`/`golden_pages`, mirrored under the trace viewer's
     # expected column names so `eval/trace_viewer/` renders without per-schema patches:
     # `golden_pages` is space-separated `month:page` tokens, and `failed`/`reason` are
-    # derived from `category`/`note` for its pass/fail badge.
+    # the trace viewer's pass/fail badge fields.
     "question",
     "predicted",
     "gold_answer",
@@ -547,9 +544,6 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
     return {
         "uid": uid,
         "category": category,
-        # Seed `note` with the failure reason so `fail` rows are self-describing; correct/
-        # wrong rows start blank for manual triage.
-        "note": (result["reason"] or "") if result["failed"] else "",
         # Trace-viewer mirror columns (see REPORT_FIELDS). `golden_pages` uses the viewer's
         # `month:page` token form; `failed`/`reason` feed its pass/fail badge.
         "question": question,

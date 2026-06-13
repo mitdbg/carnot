@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 from skunk.config import SkunkConfig
 from skunk.errors import StepFailed
-from skunk.common import BlockRef, ExecutionContext, PageRef, page_key_to_pageref
+from skunk.common import BlockRef, ExecutionContext, PageRef, page_key_to_pageref, traced_step
 from skunk.plan import RetrieveBranch
 
 if TYPE_CHECKING:
@@ -60,18 +60,48 @@ class RetrieveOp:
                     f"unknown retriever {other!r}; expected 'search_agent' or 'page_index_old'",
                 )
 
+
     async def run_all(
-        self, ctx: ExecutionContext, branches: list[RetrieveBranch]
+        self,
+        ctx: ExecutionContext,
+        branches: list[RetrieveBranch],
+        branch_ids: list[int] | None = None,
+        *,
+        document_scopes: list[list[str] | None] | None = None,
     ) -> list[list[BlockRef] | StepFailed]:
         """Retrieve for several branches at once, result aligned to `branches`. A slot is
         that branch's blocks or a `StepFailed` — a single branch failing does not
-        sink its siblings. A whole-sweep failure (unknown retriever, missing index) raises."""
+        sink its siblings. A whole-sweep failure (unknown retriever, missing index) raises.
+
+        `branch_ids` (search-agent backend only) aligns each branch to its stable id so its
+        retrieve runs in a per-branch `traced_step`: the rollout + the returned pages then
+        attach to that branch in the trace viewer. The page-index backend is a single shared
+        sweep, so it owns no per-branch step here (the orchestrator traces the whole phase)."""
         if ctx.config.golden_pages is not None:
             return [self._golden_blocks(ctx) for _ in branches]
+        scopes = document_scopes or [None] * len(branches)
         match str(ctx.config.retriever):
             case "search_agent":
+                ids = branch_ids if branch_ids is not None else [None] * len(branches)
+
+                async def _one(
+                    b: RetrieveBranch, bid: int | None, scope: list[str] | None
+                ) -> list[BlockRef]:
+                    # Per-branch `retrieve` step (branch_id=bid) so the SearchAgent rollout
+                    # and its `pages` summary group under this branch in the viewer. `scope`
+                    # (human-required bulletins, if any) hard-scopes the agent's corpus.
+                    refs = await traced_step(
+                        ctx, "retrieve",
+                        lambda: self._run_search_agent(ctx, b, required_bulletins=scope),
+                        branch_id=bid,
+                    )
+                    return _whole_page_blocks(refs)
+
                 settled = await asyncio.gather(
-                    *(self._run_search_agent(ctx, b) for b in branches),
+                    *(
+                        _one(b, bid, scope)
+                        for b, bid, scope in zip(branches, ids, scopes)
+                    ),
                     return_exceptions=True,
                 )
                 out: list[list[BlockRef] | StepFailed] = []
@@ -81,10 +111,16 @@ class RetrieveOp:
                     elif isinstance(r, BaseException):
                         raise r
                     else:
-                        out.append(_whole_page_blocks(r))
+                        out.append(r)
                 return out
             case "page_index":
-                return list(await self._page_index().retrieve_all(ctx, branches))
+                return list(
+                    await self._page_index().retrieve_all(
+                        ctx,
+                        branches,
+                        document_scopes=scopes,
+                    )
+                )
             case other:
                 raise StepFailed(
                     "retrieve",
@@ -103,7 +139,11 @@ class RetrieveOp:
         return _whole_page_blocks(pages)
 
     async def _run_search_agent(
-        self, ctx: ExecutionContext, branch: RetrieveBranch
+        self,
+        ctx: ExecutionContext,
+        branch: RetrieveBranch,
+        *,
+        required_bulletins: list[str] | None = None,
     ) -> list[PageRef]:
         from skunk.search_agent import SearchAgent
 
@@ -112,6 +152,12 @@ class RetrieveOp:
             config=ctx.config,
             document_map=document_map,
             chroma_collection=collection,
+            human_intervention_handler=(
+                ctx.human_intervention_handler
+                if ctx.human_intervention_enabled
+                else None
+            ),
+            required_bulletins=required_bulletins,
         )
         # The agent hint is free text; render a per-entry pin list to its pinned months.
         as_of_hint = (
@@ -125,12 +171,17 @@ class RetrieveOp:
             branch_key=branch.key,
             branch_period=branch.period,
             branch_as_of=as_of_hint,
+            required_bulletins=required_bulletins,
         )
         refs: list[PageRef] = []
         bad: list[str] = []
         for key in page_keys:
             try:
-                refs.append(page_key_to_pageref(key))
+                ref = page_key_to_pageref(key)
+                if required_bulletins and ref.month not in required_bulletins:
+                    bad.append(key)
+                    continue
+                refs.append(ref)
             except ValueError:
                 bad.append(key)
         if bad:

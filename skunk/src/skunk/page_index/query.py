@@ -44,6 +44,13 @@ from .store import get_page_store
 _MONTH_RE = re.compile(r"\d{4}-\d{2}")
 
 
+def _sample_pages(refs: list[PageRef], limit: int = 5) -> list[dict[str, str | int | None]]:
+    return [
+        {"bulletin": ref.month, "page": ref.page}
+        for ref in refs[:limit]
+    ]
+
+
 class _PeriodEntry(NamedTuple):
     lo: str  # inclusive YYYY-MM data-span start
     hi: str  # inclusive YYYY-MM data-span end
@@ -417,7 +424,10 @@ Use each `block_id` exactly as it appears."""
         )
         picked = await pick_call.call(ctx, user, temperature=0.0)
         out = [ref for ch in picked for ref in pages[ch]]
-        ctx.emit(f"pick_chapters era={era.span} picked={picked!r} pages={len(out)}")
+        ctx.emit(
+            f"pick_chapters era={era.span} picked={picked!r} pages={len(out)}",
+            data={"pages": len(out), "sample_pages": _sample_pages(out)},
+        )
         return out
 
     def _year_filter(
@@ -458,7 +468,15 @@ Use each `block_id` exactly as it appears."""
             kept = [ref for ref in kept if _passes(ref)]
         ctx.emit(
             f"year_filter as_of={branch.as_of!r} period={branch.period!r} "
-            f"kept={len(kept)}/{len(candidates)}"
+            f"kept={len(kept)}/{len(candidates)}",
+            data={
+                "key": branch.key,
+                "period": branch.period,
+                "as_of": branch.as_of,
+                "input_pages": len(candidates),
+                "kept_pages": len(kept),
+                "sample_pages": _sample_pages(kept),
+            },
         )
         return kept
 
@@ -549,7 +567,16 @@ Use each `block_id` exactly as it appears."""
         n_blocks = sum(len(rows) for _, rows in groups)
         ctx.emit(
             f"semantic_filter kept={n_kept}/{len(pages)} "
-            f"blocks_kept={n_blocks_kept} blocks={n_blocks}"
+            f"blocks_kept={n_blocks_kept} blocks={n_blocks}",
+            data={
+                "input_pages": len(pages),
+                "kept_pages": n_kept,
+                "input_blocks": n_blocks,
+                "kept_blocks": n_blocks_kept,
+                "sample_pages": _sample_pages(
+                    [pk for pk in pages if not verdict[pk] or any(verdict[pk])]
+                ),
+            },
         )
         return verdict
 
@@ -582,6 +609,8 @@ Use each `block_id` exactly as it appears."""
         self,
         ctx: ExecutionContext,
         branches: list[RetrieveBranch],
+        *,
+        document_scopes: list[list[str] | None] | None = None,
     ) -> list[list[BlockRef] | StepFailed]:
         """Retrieve for every branch in one pass and narrow with block selection. Phases:
         (1) one question-driven ToC pick shared across branches, then a per-branch year/as_of
@@ -589,8 +618,37 @@ Use each `block_id` exactly as it appears."""
         per branch in parallel — a selection failure falls back to the semantic-filter output
         for that branch rather than failing it. Output is BLOCK-granular, aligned to `branches`."""
         # Phase 1 — one unified ToC pick (question only), then each branch's own date filter.
-        chapter_pages = await self._pick_chapters(branches=branches, ctx=ctx)
-        cand = [self._year_filter(chapter_pages, b, ctx) for b in branches]
+        scopes = document_scopes or [None] * len(branches)
+        unscoped = [branch for branch, scope in zip(branches, scopes) if not scope]
+        chapter_pages = (
+            await self._pick_chapters(branches=unscoped, ctx=ctx)
+            if unscoped
+            else []
+        )
+        cand = []
+        for branch, scope in zip(branches, scopes):
+            if scope:
+                refs = sorted(
+                    (
+                        ref
+                        for ref in self._catalog
+                        if ref.month in set(scope)
+                    ),
+                    key=lambda ref: (ref.month or "", ref.page or 0),
+                )
+                ctx.emit(
+                    f"human_document_scope key={branch.key!r} "
+                    f"bulletins={scope!r} pages={len(refs)}",
+                    data={
+                        "key": branch.key,
+                        "bulletins": scope,
+                        "pages": len(refs),
+                        "sample_pages": _sample_pages(refs),
+                    },
+                )
+                cand.append(refs)
+            else:
+                cand.append(self._year_filter(chapter_pages, branch, ctx))
 
         wanted: dict[PageRef, set[int]] = {}
         for i, refs in enumerate(cand):
@@ -613,7 +671,19 @@ Use each `block_id` exactly as it appears."""
             b = branches[i]
             ctx.emit(
                 f"page_index_retrieve key={b.key!r} period={b.period!r} as_of={b.as_of!r} "
-                f"catalog_size={self._catalog_size} anchor_count={len(kept_pages)} block_count={len(block_refs)} "
+                f"catalog_size={self._catalog_size} anchor_count={len(kept_pages)} block_count={len(block_refs)} ",
+                data={
+                    "key": b.key,
+                    "period": b.period,
+                    "as_of": b.as_of,
+                    "catalog_size": self._catalog_size,
+                    "anchor_count": len(kept_pages),
+                    "block_count": len(block_refs),
+                    "sample_pages": _sample_pages(kept_pages),
+                    "sample_block_pages": _sample_pages(
+                        [block_ref.page for block_ref in block_refs]
+                    ),
+                },
             )
             branch_blocks.append(block_refs)
 
@@ -644,6 +714,12 @@ Use each `block_id` exactly as it appears."""
                 raise StepFailed(
                     "retrieve",
                     f"block_select selected no blocks for branch {branch.key!r}",
+                    details={
+                        "considered_pages": [
+                            {"bulletin": ref.month, "page": ref.page}
+                            for ref in member_refs
+                        ]
+                    },
                 )
             return selected
 
@@ -652,7 +728,7 @@ Use each `block_id` exactly as it appears."""
             return_exceptions=True,
         )
         out: list[list[BlockRef] | StepFailed] = []
-        for branch, r in zip(branches, settled):
+        for branch_index, (branch, r) in enumerate(zip(branches, settled)):
             if isinstance(r, StepFailed):
                 out.append(r)
             elif isinstance(r, BaseException):
@@ -661,7 +737,18 @@ Use each `block_id` exactly as it appears."""
                 ctx.emit(f"block_select_failed key={branch.key!r} error={str(r)!r}")
                 out.append(
                     StepFailed(
-                        "retrieve", f"block_select error for {branch.key!r}: {r}"
+                        "retrieve",
+                        f"block_select error for {branch.key!r}: {r}",
+                        details={
+                            "considered_pages": [
+                                {"bulletin": ref.month, "page": ref.page}
+                                for ref in dict.fromkeys(
+                                    member
+                                    for block_ref in branch_blocks[branch_index]
+                                    for member in block_ref.member_refs
+                                )
+                            ]
+                        },
                     )
                 )
             else:
@@ -900,6 +987,14 @@ Use each `block_id` exactly as it appears."""
             )
         ctx.emit(
             f"block_select key={branch.key!r} candidates={n0} rounds={rounds} "
-            f"selected_blocks={len(selected)} top_k={cap}"
+            f"selected_blocks={len(selected)} top_k={cap}",
+            data={
+                "key": branch.key,
+                "candidates": n0,
+                "rounds": rounds,
+                "selected_blocks": len(selected),
+                "top_k": cap,
+                "sample_pages": _sample_pages([block_ref.page for block_ref in selected]),
+            },
         )
         return selected
