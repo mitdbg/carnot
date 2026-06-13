@@ -17,12 +17,12 @@ from skunk.lookup_external import LookupExternalOp
 from skunk.common import (
     AnnotatedValue,
     BlockRef,
+    BranchRetrieval,
     ExecutionContext,
     Final,
     HumanInterventionHandler,
     HumanReviewRegister,
     NeedsMore,
-    SemPoolEntry,
     traced_step,
 )
 from skunk.llm_client import LLMClient
@@ -202,13 +202,9 @@ class Orchestrator:
         self._result = ExecutionResult(question=question)
         # Deduped union of every BlockRef the retrieve phase produced this question (first-seen
         # order, accumulated across the initial sweep and any replan sweeps). Exposed via
-        # `retrieved_blocks` so the eval harness can cache and replay a run without re-paying
-        # retrieval. Empty under golden/replay bypass (retrieve never runs).
+        # `retrieved_blocks` for the eval harness's `likely_pages` / retrieval-recall reporting.
+        # Empty under golden bypass (retrieve never runs).
         self._retrieved_blocks: list[BlockRef] = []
-        # Deduped union of every branch's sem-filter candidate pool (same lifecycle as
-        # `_retrieved_blocks`). Exposed via `sem_pool` so the eval harness can persist it
-        # into the retrieval cache for replayable coverage repair.
-        self._sem_pool: list[SemPoolEntry] = []
         # Snapshot for an optimistic-review recompute (the per-branch entries that produced the
         # answer); set on every compute attempt, None until then. The server stores it on the
         # task so a later human resolve can revise the answer via `recompute_answer`.
@@ -221,14 +217,8 @@ class Orchestrator:
     @property
     def retrieved_blocks(self) -> list[BlockRef]:
         """Deduped union of blocks from every retrieve sweep this question (empty under
-        golden/replay bypass). Pages are derivable via each block's `member_refs`."""
+        golden bypass). Pages are derivable via each block's `member_refs`."""
         return self._retrieved_blocks
-
-    @property
-    def sem_pool(self) -> list[SemPoolEntry]:
-        """Deduped union of sem-filter candidate pools across retrieve sweeps (empty under
-        golden/replay bypass and on the search-agent path)."""
-        return self._sem_pool
 
     @property
     def recompute_state(self) -> RecomputeState | None:
@@ -269,10 +259,10 @@ class Orchestrator:
         finally:
             explain_task.cancel()
 
-        # Recovery state: the value POOL is what compute sees — compute's explicit
-        # `keep` whitelist + committed computed intermediates + each sweep's new
-        # values; everything compute does not keep is dropped. ATTEMPTS records
-        # every branch's fate across sweeps. Branch outcomes don't outlive their
+        # Recovery state: the value POOL is what compute sees. On a NeedsMore the next pool
+        # is exactly what compute chose to keep (re-stated inputs + any partial computation,
+        # drop-by-default); each replan sweep then appends its newly gathered values. ATTEMPTS
+        # records every branch's fate across sweeps. Branch outcomes don't outlive their
         # sweep — the pool is the only data carried across rounds.
         pool: list[AnnotatedValue] = [
             e for o in outcomes if o.entries for e in o.entries
@@ -309,20 +299,13 @@ class Orchestrator:
                     self._result.answer = outcome.answer
                     return outcome.answer
                 needs = outcome
-                keep_set = set(needs.keep)
-                discarded = [e for i, e in enumerate(pool) if i not in keep_set]
-                pool = [e for i, e in enumerate(pool) if i in keep_set] + list(
-                    needs.committed
-                )
+                # Drop-by-default: the next pool IS exactly what compute chose to keep
+                # (re-stated inputs + any partial computation); everything else is dropped.
+                prev_size = len(pool)
+                pool = list(needs.keep)
                 self._ctx.emit(
-                    f"pool_update round={round_idx} "
-                    f"kept={len(pool) - len(needs.committed)} "
-                    f"discarded={len(discarded)} committed={len(needs.committed)} "
-                    f"pool_size={len(pool)}",
-                    data={
-                        "discarded": [e.description for e in discarded],
-                        "committed": [e.description for e in needs.committed],
-                    },
+                    f"pool_update round={round_idx} prev={prev_size} kept={len(pool)}",
+                    data={"kept": [e.description for e in pool]},
                 )
             else:
                 # Replan sweep produced zero new values: compute on an unchanged pool is a
@@ -394,10 +377,7 @@ class Orchestrator:
                         self._result.answer = outcome.answer
                         return outcome.answer
                     needs = outcome
-                    keep_set = set(needs.keep)
-                    pool = [e for i, e in enumerate(pool) if i in keep_set] + list(
-                        needs.committed
-                    )
+                    pool = list(needs.keep)
                     reason, missing = needs.missing_reason, needs.missing
 
             # Map each human-provided value still in the pool to the missing ids it resolved,
@@ -799,20 +779,19 @@ class Orchestrator:
         branches: list[RetrieveBranch],
         branch_ids: list[int],
         document_scopes: list[list[str] | None] | None = None,
-    ) -> tuple[list[list[BlockRef] | StepFailed], list[list[SemPoolEntry]]]:
+    ) -> list[BranchRetrieval | StepFailed]:
         """Unified multi-scan retrieve for every retrieve branch at once: their candidate
         pages are deduped and the LLM semantic filter scans each unique page at most once,
         judging it against all branches' targets, then routes the survivors back per branch.
-        On the page-index path the survivors are left whole — the block-selection
-        tournament (`run_select_pipeline`) narrows them downstream. Returns each branch's blocks in
-        input order, or — if the whole sweep fails — the `StepFailed` to attribute to every
-        retrieve branch. `branch_ids` lets the search-agent backend emit a per-branch `retrieve`
-        step; `document_scopes` hard-scopes a branch's corpus to human-required bulletins (HITL).
+        Returns one normalized `BranchRetrieval` per branch (or the `StepFailed` to attribute
+        to it) — `RetrieveOp.run_all` owns all backend dispatch and the `pre_selected` flag.
+        `branch_ids` lets the search-agent backend emit a per-branch `retrieve` step;
+        `document_scopes` hard-scopes a branch's corpus to human-required bulletins (HITL).
         The shared page-index `retrieve` sweep carries no `branch_id`."""
         if not branches:
-            return [], []
+            return []
         try:
-            sem_survivors, base_pools = await traced_step(
+            results = await traced_step(
                 self._ctx,
                 "retrieve",
                 lambda: self._retrieve.run_all(
@@ -820,48 +799,20 @@ class Orchestrator:
                 ),
             )
         except StepFailed as e:
-            return [e] * len(branches), [[] for _ in branches]
+            return [e] * len(branches)
 
-        # Page-index path: survivors pass through whole — the selection agent narrows them.
-        # golden / search-agent paths return final blocks from run_all.
-        if (
-            str(self._ctx.config.retriever) == "page_index"
-            and self._ctx.config.golden_pages is None
-        ):
-            docs: list[list[BlockRef] | StepFailed] = [
-                StepFailed(
-                    "retrieve",
-                    f"semantic filter kept no blocks for branch {b.key!r}",
-                )
-                if not brs
-                else brs
-                for b, brs in zip(branches, sem_survivors)
-            ]
-            pools = self._retrieve.build_survivor_pools(
-                self._ctx, cast(list[list[BlockRef]], sem_survivors)
-            )
-        else:
-            docs = sem_survivors
-            pools = base_pools
-
-        # Accumulate the deduped block + pool unions (cache seam). Replan sweeps extend the
-        # same lists, so rebuild the seen-sets from the current lists each call rather than
-        # carrying persistent sets that would outlive the sweep they were built for.
+        # Accumulate the deduped block union (for `likely_pages` / retrieval-recall reporting).
+        # Replan sweeps extend the same list, so rebuild the seen-set from the current list each
+        # call rather than carrying a persistent set that would outlive the sweep it was built for.
         seen_blocks = set(self._retrieved_blocks)
-        for doc in docs:
-            if isinstance(doc, StepFailed):
+        for r in results:
+            if isinstance(r, StepFailed):
                 continue
-            for blk in doc:
+            for blk in r.blocks:
                 if blk not in seen_blocks:
                     seen_blocks.add(blk)
                     self._retrieved_blocks.append(blk)
-        seen_pool = {e.ref for e in self._sem_pool}
-        for pool in pools:
-            for entry in pool:
-                if entry.ref not in seen_pool:
-                    seen_pool.add(entry.ref)
-                    self._sem_pool.append(entry)
-        return docs, pools
+        return results
 
     async def _run_branches(
         self,
@@ -877,39 +828,44 @@ class Orchestrator:
         # bulletins — the HITL "annotate this branch's source documents" recovery action.
         self._last_executed_branch_ids = set(branch_ids)
         retrieve_pos = [i for i, b in enumerate(branches) if b.kind == "retrieve"]
-        docs, pools = await self._run_retrieve_phase(
+        retrievals = await self._run_retrieve_phase(
             [cast(RetrieveBranch, branches[i]) for i in retrieve_pos],
             [branch_ids[i] for i in retrieve_pos],
             document_scopes=[
                 (document_scopes or {}).get(branch_ids[i]) for i in retrieve_pos
             ],
         )
-        docs_by_pos: dict[int, list[BlockRef] | StepFailed] = dict(
-            zip(retrieve_pos, docs)
+        retr_by_pos: dict[int, BranchRetrieval | StepFailed] = dict(
+            zip(retrieve_pos, retrievals)
         )
-        pools_by_pos: dict[int, list[SemPoolEntry]] = dict(zip(retrieve_pos, pools))
 
         # Select → extract runs as ONE shared pipeline over all retrieve branches,
         # launched as a task so lookup branches proceed concurrently. Each retrieve
-        # tail awaits the shared task and picks out its branch's result. The pipeline
-        # does its own per-branch traced_steps, so the tail doesn't wrap it again.
+        # tail awaits the shared task and picks out its branch's result. Selection and
+        # extraction are two stages (`run_select` then `run_extract`); each does its own
+        # per-branch traced_steps, so the tail doesn't wrap them again.
         pipeline: asyncio.Task | None = None
         if retrieve_pos:
-            from skunk.block_select import run_select_pipeline
+            from skunk.block_extract import run_extract
+            from skunk.block_select import run_select
 
-            pipeline = asyncio.create_task(
-                run_select_pipeline(
-                    self._ctx,
-                    [cast(RetrieveBranch, branches[i]) for i in retrieve_pos],
-                    [docs_by_pos[i] for i in retrieve_pos],
-                    [pools_by_pos.get(i, []) for i in retrieve_pos],
-                    [branch_ids[i] for i in retrieve_pos],
+            sub_branches = [cast(RetrieveBranch, branches[i]) for i in retrieve_pos]
+            sub_ids = [branch_ids[i] for i in retrieve_pos]
+            sub_retrievals = [retr_by_pos[i] for i in retrieve_pos]
+
+            async def _select_extract() -> list[list[AnnotatedValue] | StepFailed]:
+                selections = await run_select(
+                    self._ctx, sub_branches, sub_retrievals, sub_ids
                 )
-            )
+                return await run_extract(
+                    self._ctx, sub_branches, selections, sub_ids
+                )
+
+            pipeline = asyncio.create_task(_select_extract())
 
         def _branch_blocks(pos: int) -> list[BlockRef]:
-            doc = docs_by_pos.get(pos)
-            return doc if isinstance(doc, list) else []
+            r = retr_by_pos.get(pos)
+            return list(r.blocks) if isinstance(r, BranchRetrieval) else []
 
         async def _tail(pos: int) -> list[AnnotatedValue]:
             branch, bid = branches[pos], branch_ids[pos]

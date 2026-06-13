@@ -412,6 +412,18 @@ class SemPoolEntry:
     ] = ()  # FULL row headers — shows granularity (annual vs monthly rows) and window
 
 
+@dataclass(frozen=True)
+class BranchRetrieval:
+    """One retrieve branch's normalized result — the single retrieval contract every
+    backend produces. `blocks` are the blocks to feed selection/extract; `pre_selected`
+    True (golden / search-agent) means they are already final, so the selection tournament
+    is skipped and every block is extracted. Produced solely by `RetrieveOp.run_all`; no
+    downstream layer inspects `config.retriever`."""
+
+    blocks: tuple[BlockRef, ...]
+    pre_selected: bool
+
+
 VALUE_KIND_VOCAB: frozenset[str] = frozenset({"scalar", "vector", "table"})
 
 
@@ -534,13 +546,13 @@ class Final:
 
 @dataclass(frozen=True)
 class NeedsMore:
-    """Compute judged its inputs insufficient. `keep` indexes into the input_values
-    compute was called with (pool entries to retain across the recovery round);
-    `committed` are new computed-intermediate values to add to the pool;
-    `missing_reason`/`missing` describe what to gather next."""
+    """Compute judged its inputs insufficient. `keep` is the values to carry into the next
+    recovery round — the inputs the model chose to retain RE-STATED plus any partial
+    computation it performed, all as provenance-free `AnnotatedValue`s. Drop-by-default:
+    anything the model did not put in `keep` is gone. `missing_reason`/`missing` describe
+    what to gather next."""
 
-    keep: list[int]
-    committed: list[AnnotatedValue]
+    keep: list[AnnotatedValue]
     missing_reason: str
     missing: list[str]
 

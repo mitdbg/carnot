@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from skunk.common import BlockRef, Effort, PageRef, SemPoolEntry
+    from skunk.common import Effort, PageRef
 
 
 # Default corpus locations (overridable via env / explicit construction — see the
@@ -89,18 +89,6 @@ class SkunkConfig:
 
     # Ablation: golden page refs bypass the retrieve operator (eval runs only).
     golden_pages: list[PageRef] | None = field(default=None, repr=False)
-
-    # Replay (pool-less cache only): the final blocks to inject verbatim alongside
-    # `golden_pages`, bypassing retrieve. Used for search-agent / pre-pool caches that
-    # carry no survivor pool. None on live runs, `--golden`, and survivor-pool replay
-    # (which runs the selection agent — see `cached_sem_pool`). (eval only)
-    cached_blocks: list[BlockRef] | None = field(default=None, repr=False)
-
-    # Replay (survivor cache): the UID's sem-filter survivor pool from the cache
-    # (`"sem_pool"` key). When set, retrieve is bypassed and this pool is handed to the
-    # selection agent — so a replay can iterate on SELECTION, not just extract/compute.
-    # None on live runs. (eval runs only)
-    cached_sem_pool: list[SemPoolEntry] | None = field(default=None, repr=False)
 
     # Retrieve dispatch: "page_index" (ToC pick → year filter → coarse summary filter,
     # the default) or "search_agent" (iterative ChromaDB + LLM loop). Either way the

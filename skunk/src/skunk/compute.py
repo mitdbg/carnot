@@ -31,56 +31,37 @@ class MissingDataSignal(BaseModel):
     missing: list[str] = []
 
 
-def _parse_codegen(raw: str) -> str | MissingDataSignal:
-    """Parse a codegen reply into a Python code string (forms (a)/(c)) or a
-    `MissingDataSignal` (form (b), a `{`-leading JSON object). Malformed JSON or
-    empty code → `ParseError`. Not a `PromptedCall` parse hook — called after
-    `call()` returns so the prompt layer never sees it; `ComputeOp.run()` catches
-    the `ParseError` and retries."""
-    # Strip fences first so `{`-dispatch works for both bare and ```json-wrapped JSON.
+def _parse_codegen(raw: str) -> str:
+    """Parse a codegen reply into a Python code string. Empty / un-fenced / bare-JSON →
+    `ParseError`. Not a `PromptedCall` parse hook — called after `call()` returns so the
+    prompt layer never sees it; `ComputeOp.run()` catches the `ParseError` and retries."""
     s = strip_code_fence(raw).strip()
-
-    if s.startswith("{"):
-        try:
-            return MissingDataSignal.model_validate_json(s)
-        except ValidationError as e:
-            raise ParseError(
-                raw=raw,
-                detail=(
-                    f"malformed missing-data JSON — {e}\n"
-                    "Output ONLY a fenced ```python``` block (form (a) or (c)) OR a "
-                    'bare JSON {"missing": [...], "description": "..."} object (form (b)).'
-                ),
-            )
-
-    if not s:
+    if not s or s.startswith("{"):
         raise ParseError(
             raw=raw,
             detail=(
-                "empty or un-fenced code.\n"
-                "Output ONLY a fenced ```python``` block (form (a) or (c)) OR a "
-                'bare JSON {"missing": [...], "description": "..."} object (form (b)).'
+                "expected a fenced ```python``` block — emit (a) success (assign `result`) "
+                "or (b) missing data (assign `keep` and `missing`). Do not emit a bare "
+                "JSON object."
             ),
         )
     return s
 
 
 def _coerce_prim(v: Any) -> Any:
-    """Unwrap numpy scalars (the usual product of pandas arithmetic) so committed
+    """Unwrap numpy scalars (the usual product of pandas arithmetic) so kept
     values pass `AnnotatedValue`'s primitive-cell validation."""
     return v.item() if isinstance(v, np.generic) else v
 
 
-def _needs_more_from_env(
-    env: dict[str, Any], input_values: list[AnnotatedValue], round_idx: int
-) -> NeedsMore:
-    """Validate a partial-progress (form (c)) exec environment into a `NeedsMore`.
-    `missing` must validate as `MissingDataSignal`; `keep` is REQUIRED — the explicit
-    whitelist of entries that survive into the next round (everything else is dropped);
-    `committed` values are wrapped as provenance-free `AnnotatedValue`s whose
-    description marks them as computed intermediates. Raises `ValueError` with a
-    fix-it detail on any malformed shape — fed back to the next codegen attempt
-    via `prev_failure`."""
+def _needs_more_from_env(env: dict[str, Any]) -> NeedsMore:
+    """Validate a missing-data exec environment into a `NeedsMore`. `missing` must validate
+    as `MissingDataSignal`. `keep` (optional, default `{}`) is the model's drop-by-default
+    choice of what to carry into the next round, a `{name: value}` dict where each value is
+    EITHER an `input_values` entry — carried verbatim so its provenance (bulletin/pages/
+    as_of) survives — OR a freshly computed scalar / [scalars] / flat {label: scalar} dict,
+    which becomes a provenance-free `AnnotatedValue` marked "computed". Anything not in `keep`
+    is dropped. Raises `ValueError` with a fix-it detail on any malformed shape."""
     try:
         signal = MissingDataSignal.model_validate(env["missing"])
     except ValidationError as e:
@@ -88,38 +69,26 @@ def _needs_more_from_env(
             f'`missing` must be {{"missing": [...], "description": "..."}} — {e}'
         )
 
-    if "keep" not in env:
+    keep_raw = env.get("keep", {})
+    if not isinstance(keep_raw, dict) or not all(isinstance(k, str) for k in keep_raw):
         raise ValueError(
-            "`keep` is required for partial progress: the explicit list of "
-            "input_values indices to carry into the next round — everything not "
-            "listed is dropped. Use [] to carry nothing forward."
+            "`keep` must be a dict keyed by str names — each value is either an "
+            "`input_values` entry (carried with its source) or a computed scalar / "
+            "[scalars] / flat {label: scalar} dict. Omit or use {} to carry nothing."
         )
-    keep = env["keep"]
-    if not (
-        isinstance(keep, list)
-        and all(isinstance(i, int) and not isinstance(i, bool) for i in keep)
-    ):
-        raise ValueError("`keep` must be a list of ints (indices into input_values)")
-    bad = [i for i in keep if not 0 <= i < len(input_values)]
-    if bad:
-        raise ValueError(
-            f"`keep` indices out of range for input_values"
-            f"[0..{len(input_values) - 1}]: {bad!r}"
-        )
-
-    committed_raw = env.get("committed", {})
-    if not isinstance(committed_raw, dict) or not all(
-        isinstance(k, str) for k in committed_raw
-    ):
-        raise ValueError("`committed` must be a dict keyed by str names")
-    committed: list[AnnotatedValue] = []
-    for name, v in committed_raw.items():
-        desc = f"computed intermediate (round {round_idx}): {name}"
+    keep: list[AnnotatedValue] = []
+    for name, v in keep_raw.items():
+        if isinstance(v, AnnotatedValue):
+            # A re-stated input entry — carry it verbatim so provenance survives.
+            keep.append(v)
+            continue
+        # Otherwise a value the model computed — provenance-free, marked "computed".
         try:
             if isinstance(v, dict):
                 payload = {str(k): _coerce_prim(c) for k, c in v.items()}
                 entry = AnnotatedValue(
-                    description=desc, value=payload, kind="vector", index_name="label"
+                    description=name, value=payload, kind="vector",
+                    index_name="label", notes="computed",
                 )
             else:
                 payload = (
@@ -127,24 +96,23 @@ def _needs_more_from_env(
                     if isinstance(v, list)
                     else _coerce_prim(v)
                 )
-                entry = AnnotatedValue(description=desc, value=payload, kind="scalar")
+                entry = AnnotatedValue(
+                    description=name, value=payload, kind="scalar", notes="computed"
+                )
         except ValidationError as e:
             raise ValueError(
-                f"committed[{name!r}]: value must be a scalar, list of scalars, or "
-                f"flat {{label: scalar}} dict — {e}"
+                f"keep[{name!r}]: value must be an `input_values` entry, a scalar, a "
+                f"list of scalars, or a flat {{label: scalar}} dict — {e}"
             )
-        committed.append(entry)
+        keep.append(entry)
     return NeedsMore(
-        keep=keep,
-        committed=committed,
-        missing_reason=signal.description,
-        missing=signal.missing,
+        keep=keep, missing_reason=signal.description, missing=signal.missing
     )
 
 
 class Codegen:
     _SYSTEM_PROMPT = """\
-You write Python that produces the final answer string, or emit a structured missing-data signal.
+You write Python that either produces the final answer string, or — when the inputs are not enough — keeps the values still worth using and signals what is missing.
 
 ## Inputs
 - The user's question — the authoritative statement of what to compute,
@@ -212,39 +180,32 @@ cell-by-cell.
 
 ## Output format
 
-Emit exactly one of the three forms below and nothing else — no prose,
-no commentary, no second block, no fence around (b):
+Emit exactly one of the two forms below as a single fenced ```python``` block
+and nothing else — no prose, no commentary, no second block:
 
-  (a) Success — a single fenced ```python``` block. Assign the final
-      answer string to `result`. The string contains only the requested
-      answer — no prose, no "Answer:", no question restatement; for a
-      multi-part question, only the ultimate quantity asked for.
-      Carry full precision through every intermediate; round or format
-      only in the final `result` string, to the decimal places the
-      question states.
-  (b) Insufficient data, no computable progress — a single bare JSON object:
-        {"missing": [<short identifier strings>],
-         "description": "<one-line explanation>"}
-      If a required value is not in `input_values`, never fabricate it.
-      Real-world reference data (exchange rates, deflators, CPI, GDP,
-      population, market prices) is data, not knowledge: if no entry
-      carries it, signal missing rather than supplying it from memory.
-  (c) Partial progress — a single fenced ```python``` block that does
-      NOT assign `result` and instead assigns:
-        missing   = {"missing": [...], "description": "..."}    # required
-        committed = {name: scalar or flat {label: scalar} dict} # optional
-        keep      = [indices into input_values to retain]       # required
-      Use (c) when computation over the gathered values narrows what is
-      missing — e.g. derive the qualifying month from a gathered series,
-      commit it, and name only that month's value as missing. Committed
-      values come back next round as new input_values entries; name them
-      self-descriptively, unit included. `keep` is the explicit whitelist
-      for the next round: every entry NOT listed is dropped for good.
-      Keep exactly the entries you will combine with the missing data
-      (committed values carry forward automatically); keep = [] carries
-      nothing forward.
-      The fabrication rule of (b) applies: commit only values COMPUTED
-      from input_values, never from memory.
+  (a) Success — assign the final answer string to `result`. The string contains
+      only the requested answer — no prose, no "Answer:", no question
+      restatement; for a multi-part question, only the ultimate quantity asked
+      for. Carry full precision through every intermediate; round or format only
+      in the final `result` string, to the decimal places the question states.
+
+  (b) Missing data — when you cannot finish from `input_values` alone. Do NOT
+      assign `result`; instead assign both:
+        keep    = {name: value}   # each value: an input_values entry OR a computed value
+        missing = {"missing": [<short identifier strings>], "description": "<one-line reason>"}
+      First do as much as you can, then signal. `keep` is drop-by-default —
+      anything you do not put in it is dropped for good and never reaches the next
+      round (use `keep = {}` only to start over):
+        - to retain an input you will reuse, REFERENCE the whole entry so its
+          source survives:  keep["..."] = input_values[i]   (NOT input_values[i].value)
+        - for a value you derived, assign the raw number / [list] / {label: value}
+          dict:  keep["..."] = <value>   (recorded as "computed", no source pages)
+        - state what is missing: the short identifiers + a one-line reason.
+      Name computed values self-descriptively, unit included. Never fabricate: keep
+      only values present in `input_values` or COMPUTED from them, never from
+      memory. Real-world reference data (exchange rates, deflators, CPI, GDP,
+      population, market prices) is data, not knowledge — if no input carries it,
+      list it under `missing` rather than supplying it.
 
 Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
 """
@@ -268,9 +229,9 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
         concept_explanations: Sequence[ConceptExplanation] = (),
         *,
         effort: Effort | None = None,
-    ) -> str | MissingDataSignal:
-        """One LLM call returning the generated code, or the form-(b) give-up signal.
-        Raises `ParseError` (caller retries with the detail echoed back).
+    ) -> str:
+        """One LLM call returning the generated code (form (a) success or form (b) missing
+        data). Raises `ParseError` (caller retries with the detail echoed back).
         `prev_code`/`prev_failure` describe only the most-recent failed attempt —
         accumulating older ones dilutes the issue to fix."""
         user_msg = f"Question:\n{ctx.question}\n\n"
@@ -352,11 +313,14 @@ class ComputeOp:
     def _vote(
         self, results: Sequence[Final | NeedsMore | BaseException], ctx: ExecutionContext
     ) -> Final | NeedsMore:
-        """Commit the majority answer across best-of-N trials. `Final` answers vote
-        (most frequent wins; ties broken by first-seen via `Counter.most_common`).
-        `NeedsMore` outcomes abstain — one is returned only when NO trial produced a
-        `Final`. If every trial raised `StepFailed`, re-raise the first; any other
-        exception (programming error / cancellation) is re-raised immediately."""
+        """Vote across best-of-N trials. Each distinct `Final` answer competes with a single
+        pooled MISSING-DATA candidate — all `NeedsMore` trials count equally toward it. Most
+        frequent wins; a tie NEVER breaks in favor of missing-data (an actual answer beats a
+        give-up at equal votes). When missing-data wins, the `NeedsMore` trials are combined:
+        their `keep` values are UNIONed (nothing any trial asked to keep is dropped) and the
+        reason is rendered per trial ("agent 1: …, agent 2: …"). If every trial raised
+        `StepFailed`, re-raise the first; any other exception
+        (programming error / cancellation) is re-raised immediately."""
         finals: list[Final] = []
         needs: list[NeedsMore] = []
         failures: list[StepFailed] = []
@@ -370,25 +334,46 @@ class ComputeOp:
             elif isinstance(r, BaseException):
                 raise r
 
-        if finals:
-            counts = Counter(f.answer for f in finals)
-            winner, votes = counts.most_common(1)[0]
+        if not finals and not needs:
+            ctx.emit(f"compute_vote_all_failed n_trials={len(results)}")
+            raise failures[0]
+
+        final_counts = Counter(f.answer for f in finals)
+        best_answer, best_votes = (
+            final_counts.most_common(1)[0] if final_counts else (None, 0)
+        )
+        # Missing-data wins only by a STRICT majority over the top answer — at a tie the
+        # answer wins (never break in favor of missing-data).
+        if best_answer is not None and len(needs) <= best_votes:
             ctx.emit(
                 f"compute_vote n_trials={len(results)} n_final={len(finals)} "
                 f"n_needs_more={len(needs)} n_failed={len(failures)} "
-                f"winner_votes={votes} answer={winner!r}",
-                data={"counts": dict(counts)},
+                f"winner_votes={best_votes} answer={best_answer!r}",
+                data={"counts": dict(final_counts)},
             )
-            return next(f for f in finals if f.answer == winner)
-        if needs:
-            ctx.emit(
-                f"compute_vote_needs_more n_trials={len(results)} "
-                f"n_needs_more={len(needs)} n_failed={len(failures)} "
-                f"missing={needs[0].missing!r} description={needs[0].missing_reason!r}"
-            )
-            return needs[0]
-        ctx.emit(f"compute_vote_all_failed n_trials={len(results)}")
-        raise failures[0]
+            return next(f for f in finals if f.answer == best_answer)
+
+        # Missing-data wins (or no trial finalized): combine every `NeedsMore` trial. UNION
+        # their kept values (dedup identical ones) so nothing any trial chose to keep is
+        # dropped, and render the reasons per agent.
+        keep: list[AnnotatedValue] = []
+        seen: set[str] = set()
+        for n in needs:
+            for e in n.keep:
+                key = e.model_dump_json()
+                if key not in seen:
+                    seen.add(key)
+                    keep.append(e)
+        missing = list(dict.fromkeys(m for n in needs for m in n.missing))
+        reason = "\n".join(
+            f"agent {i}: {n.missing_reason}" for i, n in enumerate(needs, 1)
+        )
+        ctx.emit(
+            f"compute_vote_needs_more n_trials={len(results)} n_final={len(finals)} "
+            f"n_needs_more={len(needs)} n_failed={len(failures)} "
+            f"best_final_votes={best_votes} n_keep={len(keep)} missing={missing!r}"
+        )
+        return NeedsMore(keep=keep, missing_reason=reason, missing=missing)
 
     async def _run_trial(
         self,
@@ -422,19 +407,6 @@ class ComputeOp:
                     f"detail={e.detail!r}"
                 )
                 continue
-            if isinstance(code, MissingDataSignal):
-                # Trust the give-up signal (form (b)): keep everything, commit nothing.
-                ctx.emit(
-                    f"compute_needs_more trial={trial_idx} attempt={try_idx + 1} "
-                    f"n_keep={len(input_values)} n_committed=0 "
-                    f"missing={code.missing!r} description={code.description!r}"
-                )
-                return NeedsMore(
-                    keep=list(range(len(input_values))),
-                    committed=[],
-                    missing_reason=code.description,
-                    missing=code.missing,
-                )
 
             ctx.emit(f"codegen_code trial={trial_idx} attempt={try_idx + 1} code={code!r}")
             try:
@@ -458,24 +430,24 @@ class ComputeOp:
                 return Final(result)
             if "missing" in env:
                 try:
-                    needs = _needs_more_from_env(env, input_values, round_idx)
+                    needs = _needs_more_from_env(env)
                 except ValueError as e:
                     prev_code = code
-                    prev_failure = f"partial-progress block malformed: {e}"
+                    prev_failure = f"missing-data block malformed: {e}"
                     ctx.emit(
                         f"compute_partial_malformed trial={trial_idx} "
                         f"attempt={try_idx + 1} detail={str(e)!r}"
                     )
                     continue
                 ctx.emit(
-                    f"compute_needs_more trial={trial_idx} attempt={try_idx + 1} "
-                    f"n_keep={len(needs.keep)} n_committed={len(needs.committed)} "
+                    f"compute_needs_more round={round_idx} trial={trial_idx} "
+                    f"attempt={try_idx + 1} n_keep={len(needs.keep)} "
                     f"missing={needs.missing!r} description={needs.missing_reason!r}"
                 )
                 return needs
             prev_code = code
             prev_failure = (
-                "code set neither `result` nor `missing` — emit form (a), (b), or (c)"
+                "code set neither `result` nor `missing` — emit form (a) or (b)"
             )
             ctx.emit(f"exec_no_output trial={trial_idx} attempt={try_idx + 1}")
 
