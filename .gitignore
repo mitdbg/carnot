@@ -1,3 +1,16 @@
+# Data
+skunk/extracted_tables
+skunk/.codex
+skunk/.vscode
+skunk/.github
+skunk/.claude
+
+.codex
+.chats
+.vscode
+.github
+.claude
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -14,6 +27,7 @@ dist/
 downloads/
 eggs/
 .eggs/
+
 # lib/
 lib64/
 parts/

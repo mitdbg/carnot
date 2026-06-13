@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Table Review</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --line: #cfd7df;
+      --line-strong: #9eabb8;
+      --text: #18212b;
+      --muted: #637282;
+      --accent: #146c73;
+      --accent-soft: #dceff0;
+      --danger: #8f3434;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: var(--text);
+      background: var(--bg);
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    .app {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      height: 100vh;
+      min-height: 560px;
+    }
+
+    .toolbar {
+      display: grid;
+      grid-template-columns: auto minmax(190px, 1fr) minmax(210px, 330px) minmax(220px, 420px) auto auto;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .brand {
+      font-weight: 700;
+      font-size: 15px;
+      white-space: nowrap;
+    }
+
+    .select,
+    .search {
+      width: 100%;
+      height: 34px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--text);
+      padding: 0 10px;
+      min-width: 0;
+    }
+
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .zoom {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      justify-self: end;
+    }
+
+    .icon-button {
+      width: 34px;
+      height: 34px;
+      border: 1px solid var(--line-strong);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--text);
+      cursor: pointer;
+      font-weight: 700;
+      line-height: 1;
+    }
+
+    .icon-button:hover {
+      background: var(--accent-soft);
+      border-color: var(--accent);
+    }
+
+    .icon-button:disabled {
+      cursor: not-allowed;
+      color: var(--line-strong);
+      background: #f3f5f7;
+      border-color: var(--line);
+    }
+
+    .table-nav {
+      display: grid;
+      grid-template-columns: 34px minmax(0, 1fr) 34px;
+      align-items: center;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .table-label {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
+      text-align: center;
+    }
+
+    .workspace {
+      display: grid;
+      grid-template-columns: minmax(320px, 48%) minmax(360px, 52%);
+      min-height: 0;
+    }
+
+    .panel {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      min-height: 0;
+      background: var(--panel);
+      border-right: 1px solid var(--line);
+    }
+
+    .right-stack {
+      display: grid;
+      grid-template-rows: 1fr 1fr;
+      min-height: 0;
+    }
+
+    .right-stack .panel {
+      border-right: 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .right-stack .panel:last-child {
+      border-bottom: 0;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 38px;
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--line);
+      background: #f9fafb;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .meta {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+      font-weight: 500;
+      font-size: 12px;
+    }
+
+    .panel-body {
+      min-height: 0;
+      overflow: auto;
+    }
+
+    .image-body {
+      position: relative;
+      background: #e8edf1;
+      padding: 12px;
+      cursor: grab;
+      overscroll-behavior: contain;
+      scroll-behavior: auto;
+      user-select: none;
+    }
+
+    .image-body.is-panning {
+      cursor: grabbing;
+    }
+
+    .image-stage {
+      position: relative;
+      width: calc(var(--zoom, 1) * 100%);
+      min-width: 120px;
+      margin: 0 auto;
+    }
+
+    .image-stage img {
+      display: block;
+      max-width: none;
+      width: 100%;
+      height: auto;
+      box-shadow: 0 1px 5px rgba(24, 33, 43, 0.18);
+      background: #fff;
+      user-select: none;
+      -webkit-user-drag: none;
+    }
+
+    .bbox {
+      position: absolute;
+      border: 3px solid #e03b2f;
+      background: rgba(224, 59, 47, 0.13);
+      box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.75), 0 0 12px rgba(224, 59, 47, 0.35);
+      pointer-events: none;
+    }
+
+    .empty {
+      margin: 18px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .error {
+      color: var(--danger);
+    }
+
+    .fragment {
+      padding: 10px;
+      border-bottom: 1px solid #e6ebef;
+    }
+
+    .fragment-label {
+      margin-bottom: 7px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+
+    .fragment pre {
+      margin: 0;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+    }
+
+    .table-wrap {
+      overflow: auto;
+      max-width: 100%;
+    }
+
+    .table-wrap table {
+      border-collapse: collapse;
+      width: max-content;
+      min-width: 100%;
+      font-size: 12px;
+      line-height: 1.35;
+      background: #fff;
+    }
+
+    .table-wrap th,
+    .table-wrap td {
+      border: 1px solid #b8c3cc;
+      padding: 5px 7px;
+      vertical-align: top;
+      text-align: left;
+    }
+
+    .table-wrap th {
+      background: #eef4f5;
+      color: #111820;
+      font-weight: 700;
+    }
+
+    @media (max-width: 860px) {
+      .app {
+        height: auto;
+        min-height: 100vh;
+      }
+
+      .toolbar {
+        grid-template-columns: 1fr;
+        align-items: stretch;
+      }
+
+      .zoom {
+        justify-self: start;
+      }
+
+      .workspace {
+        grid-template-columns: 1fr;
+        grid-template-rows: 60vh 80vh;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="toolbar">
+      <div class="brand">Table Review</div>
+      <select id="itemSelect" class="select" aria-label="Table page"></select>
+      <div class="table-nav" aria-label="Table navigation">
+        <button id="prevTable" class="icon-button" type="button" title="Previous table">&lt;</button>
+        <div id="tableLabel" class="table-label">No table</div>
+        <button id="nextTable" class="icon-button" type="button" title="Next table">&gt;</button>
+      </div>
+      <input id="searchInput" class="search" type="search" placeholder="Filter by bulletin, page, or table text">
+      <label class="toggle">
+        <input id="showAllInput" type="checkbox">
+        All catalog pages
+      </label>
+      <div class="zoom" aria-label="Image zoom controls">
+        <button id="zoomOut" class="icon-button" type="button" title="Zoom out">-</button>
+        <button id="zoomIn" class="icon-button" type="button" title="Zoom in">+</button>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="panel">
+        <div class="panel-header">
+          <span>PDF Image</span>
+          <span id="imageMeta" class="meta"></span>
+        </div>
+        <div id="imagePanel" class="panel-body image-body"></div>
+      </section>
+
+      <div class="right-stack">
+        <section class="panel">
+          <div class="panel-header">
+            <span>Original Extract</span>
+            <span id="originalMeta" class="meta"></span>
+          </div>
+          <div id="originalPanel" class="panel-body"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <span>Cleaned Extract</span>
+            <span id="cleanedMeta" class="meta"></span>
+          </div>
+          <div id="cleanedPanel" class="panel-body"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const itemSelect = document.getElementById("itemSelect");
+    const prevTable = document.getElementById("prevTable");
+    const nextTable = document.getElementById("nextTable");
+    const tableLabel = document.getElementById("tableLabel");
+    const searchInput = document.getElementById("searchInput");
+    const showAllInput = document.getElementById("showAllInput");
+    const imagePanel = document.getElementById("imagePanel");
+    const originalPanel = document.getElementById("originalPanel");
+    const cleanedPanel = document.getElementById("cleanedPanel");
+    const imageMeta = document.getElementById("imageMeta");
+    const originalMeta = document.getElementById("originalMeta");
+    const cleanedMeta = document.getElementById("cleanedMeta");
+    const zoomIn = document.getElementById("zoomIn");
+    const zoomOut = document.getElementById("zoomOut");
+
+    const BBOX_PADDING_X = 12;
+    const BBOX_PADDING_Y = 10;
+    const BBOX_VIEWPORT_FILL = 0.86;
+
+    let items = [];
+    let filteredItems = [];
+    let currentPayload = null;
+    let selectedTableIndex = 0;
+    let zoom = 1;
+    let panStart = null;
+
+    function clampZoom(value) {
+      return Math.min(4, Math.max(0.35, Math.round(value * 100) / 100));
+    }
+
+    function applyZoom(nextZoom, anchorX = imagePanel.clientWidth / 2, anchorY = imagePanel.clientHeight / 2) {
+      const previousZoom = zoom;
+      zoom = clampZoom(nextZoom);
+      if (zoom === previousZoom) {
+        return;
+      }
+
+      const scrollLeft = imagePanel.scrollLeft;
+      const scrollTop = imagePanel.scrollTop;
+      const ratio = zoom / previousZoom;
+      imagePanel.style.setProperty("--zoom", zoom);
+      imagePanel.scrollLeft = (scrollLeft + anchorX) * ratio - anchorX;
+      imagePanel.scrollTop = (scrollTop + anchorY) * ratio - anchorY;
+    }
+
+    function resetImageView() {
+      zoom = 1;
+      imagePanel.style.setProperty("--zoom", zoom);
+      imagePanel.scrollLeft = 0;
+      imagePanel.scrollTop = 0;
+    }
+
+    function itemLabel(item) {
+      const image = item.image_available ? "" : " no image";
+      return `${item.bulletin} p.${item.page} - ${item.table_count} table(s)${image}`;
+    }
+
+    function applyFilter() {
+      const query = searchInput.value.trim().toLowerCase();
+      filteredItems = query
+        ? items.filter((item) => {
+            const haystack = `${item.bulletin} ${item.page} ${item.summary || ""}`.toLowerCase();
+            return haystack.includes(query);
+          })
+        : [...items];
+
+      itemSelect.replaceChildren();
+      for (const item of filteredItems) {
+        const option = document.createElement("option");
+        option.value = item.id;
+        option.textContent = itemLabel(item);
+        itemSelect.appendChild(option);
+      }
+      if (filteredItems.length) {
+        itemSelect.value = filteredItems[0].id;
+        loadSelectedPage();
+      } else {
+        imagePanel.innerHTML = '<div class="empty">No matching pages.</div>';
+        originalPanel.innerHTML = "";
+        cleanedPanel.innerHTML = "";
+      }
+    }
+
+    async function loadItems() {
+      itemSelect.disabled = true;
+      const includeMissing = showAllInput.checked ? "1" : "0";
+      const response = await fetch(`/api/items?include_missing_images=${includeMissing}`);
+      const payload = await response.json();
+      items = payload.items || [];
+      itemSelect.disabled = false;
+      applyFilter();
+    }
+
+    function renderFragments(container, payload) {
+      container.replaceChildren();
+      if (payload.error) {
+        const node = document.createElement("div");
+        node.className = "empty error";
+        node.textContent = payload.error;
+        container.appendChild(node);
+        return;
+      }
+      const fragments = payload.fragments || [];
+      if (!fragments.length) {
+        const node = document.createElement("div");
+        node.className = "empty";
+        node.textContent = "No extracted content for this page.";
+        container.appendChild(node);
+        return;
+      }
+      for (const fragment of fragments) {
+        const wrapper = document.createElement("section");
+        wrapper.className = "fragment";
+        const label = document.createElement("div");
+        label.className = "fragment-label";
+        label.textContent = fragment.type || fragment.kind || "text";
+        wrapper.appendChild(label);
+        if (fragment.kind === "table") {
+          const tableWrap = document.createElement("div");
+          tableWrap.className = "table-wrap";
+          tableWrap.innerHTML = fragment.content;
+          wrapper.appendChild(tableWrap);
+        } else {
+          const pre = document.createElement("pre");
+          pre.textContent = fragment.content || "";
+          wrapper.appendChild(pre);
+        }
+        container.appendChild(wrapper);
+      }
+    }
+
+    function renderTable(container, table, emptyText) {
+      container.replaceChildren();
+      if (!table || !table.content) {
+        const node = document.createElement("div");
+        node.className = "empty";
+        node.textContent = emptyText;
+        container.appendChild(node);
+        return;
+      }
+
+      const wrapper = document.createElement("section");
+      wrapper.className = "fragment";
+      const label = document.createElement("div");
+      label.className = "fragment-label";
+      label.textContent = table.label || `Table ${(table.index || 0) + 1}`;
+      wrapper.appendChild(label);
+
+      const tableWrap = document.createElement("div");
+      tableWrap.className = "table-wrap";
+      tableWrap.innerHTML = table.content;
+      wrapper.appendChild(tableWrap);
+      container.appendChild(wrapper);
+    }
+
+    function bboxStyle(bbox, img) {
+      if (!bbox || bbox.length !== 4 || !img || !img.naturalWidth || !img.naturalHeight) {
+        return null;
+      }
+      const x1 = Math.max(0, bbox[0] - BBOX_PADDING_X);
+      const y1 = Math.max(0, bbox[1] - BBOX_PADDING_Y);
+      const x2 = Math.min(img.naturalWidth, bbox[2] + BBOX_PADDING_X);
+      const y2 = Math.min(img.naturalHeight, bbox[3] + BBOX_PADDING_Y);
+      return {
+        left: `${(x1 / img.naturalWidth) * 100}%`,
+        top: `${(y1 / img.naturalHeight) * 100}%`,
+        width: `${((x2 - x1) / img.naturalWidth) * 100}%`,
+        height: `${((y2 - y1) / img.naturalHeight) * 100}%`,
+      };
+    }
+
+    function drawSelectedBbox(table) {
+      const stage = imagePanel.querySelector(".image-stage");
+      const img = imagePanel.querySelector("img");
+      const existing = imagePanel.querySelector(".bbox");
+      if (existing) {
+        existing.remove();
+      }
+      const style = bboxStyle(table?.bbox, img);
+      if (!stage || !style) {
+        return;
+      }
+      const box = document.createElement("div");
+      box.className = "bbox";
+      box.style.left = style.left;
+      box.style.top = style.top;
+      box.style.width = style.width;
+      box.style.height = style.height;
+      stage.appendChild(box);
+    }
+
+    function zoomToSelectedBbox(table) {
+      const stage = imagePanel.querySelector(".image-stage");
+      const img = imagePanel.querySelector("img");
+      const bbox = table?.bbox;
+      if (!stage || !img || !bbox || bbox.length !== 4 || !img.naturalWidth || !img.naturalHeight) {
+        return;
+      }
+
+      requestAnimationFrame(() => {
+        const x1 = Math.max(0, bbox[0] - BBOX_PADDING_X);
+        const y1 = Math.max(0, bbox[1] - BBOX_PADDING_Y);
+        const x2 = Math.min(img.naturalWidth, bbox[2] + BBOX_PADDING_X);
+        const y2 = Math.min(img.naturalHeight, bbox[3] + BBOX_PADDING_Y);
+        const bboxWidth = Math.max(1, x2 - x1);
+        const bboxHeight = Math.max(1, y2 - y1);
+        const fitByWidth = (BBOX_VIEWPORT_FILL * img.naturalWidth) / bboxWidth;
+        const fitByHeight = (BBOX_VIEWPORT_FILL * imagePanel.clientHeight * img.naturalWidth)
+          / (bboxHeight * imagePanel.clientWidth);
+        zoom = clampZoom(Math.min(fitByWidth, fitByHeight));
+        imagePanel.style.setProperty("--zoom", zoom);
+
+        requestAnimationFrame(() => {
+          const updatedStage = imagePanel.querySelector(".image-stage");
+          if (!updatedStage) {
+            return;
+          }
+          const centerX = updatedStage.offsetLeft + ((x1 + x2) / 2 / img.naturalWidth) * updatedStage.offsetWidth;
+          const centerY = updatedStage.offsetTop + ((y1 + y2) / 2 / img.naturalHeight) * updatedStage.offsetHeight;
+          imagePanel.scrollLeft = Math.max(0, centerX - imagePanel.clientWidth / 2);
+          imagePanel.scrollTop = Math.max(0, centerY - imagePanel.clientHeight / 2);
+        });
+      });
+    }
+
+    function updateTableView() {
+      const tables = currentPayload?.tables || [];
+      if (selectedTableIndex >= tables.length) {
+        selectedTableIndex = Math.max(0, tables.length - 1);
+      }
+      const table = tables[selectedTableIndex];
+      prevTable.disabled = selectedTableIndex <= 0;
+      nextTable.disabled = selectedTableIndex >= tables.length - 1;
+      if (!table) {
+        tableLabel.textContent = "No table";
+        originalPanel.innerHTML = '<div class="empty">No table selected.</div>';
+        cleanedPanel.innerHTML = '<div class="empty">No table selected.</div>';
+        drawSelectedBbox(null);
+        return;
+      }
+      tableLabel.textContent = `${selectedTableIndex + 1} / ${tables.length}: ${table.label}`;
+      imageMeta.textContent = `${currentPayload.bulletin} p.${currentPayload.page} - ${table.label}`;
+      renderTable(originalPanel, table.original, "Original table not found for this index.");
+      renderTable(cleanedPanel, table.cleaned, "Cleaned table not found for this index.");
+      drawSelectedBbox(table);
+      zoomToSelectedBbox(table);
+    }
+
+    async function loadSelectedPage() {
+      const item = filteredItems.find((candidate) => candidate.id === itemSelect.value);
+      if (!item) {
+        return;
+      }
+      imageMeta.textContent = `${item.bulletin} p.${item.page}`;
+      originalMeta.textContent = "";
+      cleanedMeta.textContent = "";
+      imagePanel.innerHTML = '<div class="empty">Loading...</div>';
+      originalPanel.innerHTML = '<div class="empty">Loading...</div>';
+      cleanedPanel.innerHTML = '<div class="empty">Loading...</div>';
+
+      const response = await fetch(`/api/page?bulletin=${encodeURIComponent(item.bulletin)}&page=${item.page}`);
+      const payload = await response.json();
+      currentPayload = payload;
+
+      imagePanel.replaceChildren();
+      resetImageView();
+      if (payload.image_url) {
+        const stage = document.createElement("div");
+        stage.className = "image-stage";
+        const img = document.createElement("img");
+        img.src = payload.image_url;
+        img.alt = `${payload.bulletin} page ${payload.page}`;
+        img.addEventListener("load", updateTableView, { once: true });
+        stage.appendChild(img);
+        imagePanel.appendChild(stage);
+      } else {
+        imagePanel.innerHTML = '<div class="empty">No rendered page image available.</div>';
+      }
+
+      originalMeta.textContent = payload.original?.source_file || "";
+      cleanedMeta.textContent = payload.cleaned?.source_file || "";
+      selectedTableIndex = 0;
+      updateTableView();
+    }
+
+    itemSelect.addEventListener("change", loadSelectedPage);
+    prevTable.addEventListener("click", () => {
+      selectedTableIndex = Math.max(0, selectedTableIndex - 1);
+      updateTableView();
+    });
+    nextTable.addEventListener("click", () => {
+      const tables = currentPayload?.tables || [];
+      selectedTableIndex = Math.min(tables.length - 1, selectedTableIndex + 1);
+      updateTableView();
+    });
+    searchInput.addEventListener("input", applyFilter);
+    showAllInput.addEventListener("change", loadItems);
+    zoomIn.addEventListener("click", () => {
+      applyZoom(zoom * 1.2);
+    });
+    zoomOut.addEventListener("click", () => {
+      applyZoom(zoom / 1.2);
+    });
+    imagePanel.addEventListener("wheel", (event) => {
+      if (!imagePanel.querySelector("img")) {
+        return;
+      }
+      event.preventDefault();
+      const rect = imagePanel.getBoundingClientRect();
+      const anchorX = event.clientX - rect.left;
+      const anchorY = event.clientY - rect.top;
+      const factor = event.deltaY < 0 ? 1.12 : 1 / 1.12;
+      applyZoom(zoom * factor, anchorX, anchorY);
+    }, { passive: false });
+    imagePanel.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || !imagePanel.querySelector("img")) {
+        return;
+      }
+      panStart = {
+        x: event.clientX,
+        y: event.clientY,
+        left: imagePanel.scrollLeft,
+        top: imagePanel.scrollTop,
+      };
+      imagePanel.classList.add("is-panning");
+      imagePanel.setPointerCapture(event.pointerId);
+    });
+    imagePanel.addEventListener("pointermove", (event) => {
+      if (!panStart) {
+        return;
+      }
+      imagePanel.scrollLeft = panStart.left - (event.clientX - panStart.x);
+      imagePanel.scrollTop = panStart.top - (event.clientY - panStart.y);
+    });
+    imagePanel.addEventListener("pointerup", (event) => {
+      panStart = null;
+      imagePanel.classList.remove("is-panning");
+      if (imagePanel.hasPointerCapture(event.pointerId)) {
+        imagePanel.releasePointerCapture(event.pointerId);
+      }
+    });
+    imagePanel.addEventListener("pointercancel", () => {
+      panStart = null;
+      imagePanel.classList.remove("is-panning");
+    });
+
+    loadItems().catch((error) => {
+      imagePanel.innerHTML = `<div class="empty error">${error}</div>`;
+    });
+  </script>
+</body>
+</html>
