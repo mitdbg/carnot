@@ -1,10 +1,9 @@
 # Prompt overrides for the U.S. Treasury Monthly Bulletin corpus.
 #
 # Each entry adds a corpus blurb, a list of few-shot example strings, or a list
-# of lessons to one or more target agents. Agents fish out their own entries
-# at prompt-build time. See src/skunk/prompt_overrides.py for the schema
-# and src/skunk/planner.py / src/skunk/subagents/*.py for how the entries
-# are consumed.
+# of lessons to one or more target agents (targets are `PromptedCall` names).
+# Agents fish out their own entries at prompt-build time. See
+# src/skunk/prompted_call.py for the schema and how entries are consumed.
 #
 # Few-shots are pre-formatted strings: whatever you write here lands verbatim
 # under the agent's "## Few-shot examples" header, separated by blank lines.
@@ -22,6 +21,14 @@ overrides:
       list of these), never natural language — expand fiscal years, calendar
       years, and quarters to months yourself per the date conventions below.
 
+  # Publication cadence — issue choice (planner/replanner pins, selection-agent
+  # vintage decisions) must name months an issue actually exists for.
+  - section: corpus
+    targets: [planner, replanner, select_agent]
+    content: |
+      Publication cadence: one bulletin per month from 1939 through 1982;
+      quarterly from 1983 on — issues exist only for months 03, 06, 09, 12.
+
   # Shared date math — the planner expands question dates; the page-index build
   # agents resolve dates printed on a page. Same conventions, stated once.
   - section: corpus
@@ -37,9 +44,27 @@ overrides:
       pin them directly.
 
   - section: corpus
-    targets: [extract.text, extract.vision]
+    targets: [extract.text, extract.vision, extract.confirm]
     content: |
       The pages you receive are from the U.S. Treasury Monthly Bulletins.
+
+  # Selection agent — corpus blurb + selection lessons (lifted from the inline
+  # briefing in src/skunk/select_agent.py; the briefing keeps only the
+  # corpus-independent task mechanics).
+  - section: corpus
+    targets: [select_agent]
+    content: |
+      The blocks are from the U.S. Treasury Monthly Bulletins; the same table
+      is reprinted across consecutive issues, sometimes with revisions.
+
+  - section: lessons
+    targets: [select_agent]
+    content: |
+      A label wrapping the concept in extra words ("... and related activities", "..., including ...") is a broader aggregate; prefer the exact asked scope.
+      When the question describes the source of the data (published in, reported by, etc.), commit issues that fit the description and discard the rest.
+      When multiple reprints exist, prefer the first print that carries all the requested data, then check a few reprints past it: when a later issue reprints that exact table with revised values, commit the revised reprint instead — not both, and never a different table. You must inspect the row labels to confirm that the needed dates exist as rows at the needed granularity and work your way forwards if the first print does not carry the data.
+      Favor whole-table coverage: a single block whose rows span the entire requested period beats a patchwork of partial windows. Assemble from multiple blocks only when no single print carries the whole period, and then tile reprints of the same table — never a mix of different tables.
+      When the question compares or combines several periods, commit blocks that carry ALL of them on the SAME time basis — all annual rows or all monthly rows, never an annual total for one period and a monthly breakdown for another. Inspect row labels to confirm the basis before committing.
 
   # Renders under the search-agent SYSTEM prompt's `## Dataset` header.
   # Lifted from the abandoned `officeqa_special_notes` blob in the old
@@ -270,6 +295,20 @@ overrides:
       do not carry directly.
 
   # ---------------------------------------------------------------------
+  # Compute lessons
+  # ---------------------------------------------------------------------
+  - section: lessons
+    targets: [compute.codegen]
+    content: >
+      Distinguish a maturity-schedule flow from an outstanding stock. A figure
+      keyed to a maturing period (a "by maturing month/maturity" row, even under
+      an "amount outstanding" column) is the amount maturing IN that period. The
+      total outstanding as of a date is the sum of that period and every later
+      maturity (the not-yet-matured remainder), declining over time. For "total
+      outstanding as of <date>", sum forward from that date; do not use the
+      single maturing-period figure.
+
+  # ---------------------------------------------------------------------
   # Extract lessons
   # ---------------------------------------------------------------------
   - section: lessons
@@ -296,17 +335,6 @@ overrides:
       When the only row present is a near-match (the exact series is not on
       the page), still emit it, but make the qualifier difference explicit
       in `description` — never present it as the exact series.
-
-  # ---------------------------------------------------------------------
-  # Compute lessons.
-  # ---------------------------------------------------------------------
-  - section: lessons
-    targets: [compute.codegen]
-    content: >
-      Prefer a printed total/summary row over re-aggregating its
-      components when both are present in `input_values`. Bulletin tables
-      print their own totals; the printed figure is authoritative and
-      avoids rounding drift from summing parts.
 
   # ---------------------------------------------------------------------
   # Few-shots for compute executors.
@@ -347,27 +375,4 @@ overrides:
         Output (literal, no fence in your reply):
         {"missing": ["cpi:1953", "cpi:2020"], "description": "no CPI series in input_values to convert nominal CY1953 to 2020 dollars"}
 
-  # ---------------------------------------------------------------------
-  # Few-shots for lookup_external.
-  # ---------------------------------------------------------------------
-  - section: few_shots
-    targets: [lookup_external]
-    content:
-      - |
-        ### Example (publisher pinned by `src`)
-        Request:
-        ```json
-        {"target": "U.S. CPI-U annual average for 1953 (base 2020=100)",
-         "src": "Bureau of Labor Statistics"}
-        ```
-        Why this shape: `src` pins BLS — query the BLS CPI series via the BLS tool, then commit one scalar value at the publisher's full printed precision, with the source folded into the description.
-        Step (one tool call):
-        ```python
-        fetch_bls({"seriesid": ["CUUR0000SA0"], "startyear": "1953", "endyear": "1953"})
-        ```
-        Commit (after reading the observation — the final answer is a json block, not a tool call):
-        ```json
-        {"description": "U.S. CPI-U annual average, 1953, rebased to 2020=100 (BLS)",
-         "value": 14.4, "unit": "cpi"}
-        ```
 

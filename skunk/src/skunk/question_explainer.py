@@ -96,4 +96,4 @@ class QuestionExplainer:
     )
 
     async def run(self, ctx: ExecutionContext, *, question: str) -> list[ConceptExplanation]:
-        return await self._prompt.call(ctx, f"Question:\n{question}")
+        return await self._prompt.call(ctx, f"Question:\n{question}", temperature=0.4)

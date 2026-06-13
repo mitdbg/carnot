@@ -60,6 +60,11 @@ class SkunkConfig:
 
     # Compute operator
     compute_max_attempts: int = 3
+    # Best-of-N: run this many independent codegen→exec trials per compute call (in
+    # parallel) and commit the most frequent answer (ties broken arbitrarily). MissingData
+    # outcomes abstain from the vote — a NeedsMore is returned only when EVERY trial
+    # signals it. 1 = single-trial (today's behavior). (env: SKUNK_COMPUTE_BEST_OF_N)
+    compute_best_of_n: int = 5
 
     # Replan-on-MissingData loop. Total compute invocations ≤ recovery_max_rounds + 1.
     recovery_max_rounds: int = 2
@@ -78,20 +83,20 @@ class SkunkConfig:
     golden_pages: list[PageRef] | None = field(default=None, repr=False)
 
     # Replay (pool-less cache only): the final blocks to inject verbatim alongside
-    # `golden_pages`, bypassing retrieve AND block selection. Used for search-agent /
-    # pre-pool caches that carry no survivor pool. None on live runs, `--golden`, and
-    # survivor-pool replay (which runs block selection — see `cached_sem_pool`). (eval only)
+    # `golden_pages`, bypassing retrieve. Used for search-agent / pre-pool caches that
+    # carry no survivor pool. None on live runs, `--golden`, and survivor-pool replay
+    # (which runs the selection agent — see `cached_sem_pool`). (eval only)
     cached_blocks: list[BlockRef] | None = field(default=None, repr=False)
 
     # Replay (survivor cache): the UID's sem-filter survivor pool from the cache
-    # (`"sem_pool"` key). When set, retrieve is bypassed and this pool is handed to block
-    # selection (the selection agent or the tournament, per config) — so a replay can
-    # iterate on SELECTION, not just extract/compute. None on live runs. (eval runs only)
+    # (`"sem_pool"` key). When set, retrieve is bypassed and this pool is handed to the
+    # selection agent — so a replay can iterate on SELECTION, not just extract/compute.
+    # None on live runs. (eval runs only)
     cached_sem_pool: list[SemPoolEntry] | None = field(default=None, repr=False)
 
-    # Retrieve dispatch: "page_index" (ToC pick → year filter → coarse summary filter →
-    # block selection, the default) or "search_agent" (iterative ChromaDB + LLM loop).
-    # (env: SKUNK_RETRIEVER)
+    # Retrieve dispatch: "page_index" (ToC pick → year filter → coarse summary filter,
+    # the default) or "search_agent" (iterative ChromaDB + LLM loop). Either way the
+    # selection agent narrows the candidates downstream. (env: SKUNK_RETRIEVER)
     retriever: Literal["search_agent", "page_index"] = "page_index"
 
     # Search-agent corpus artifacts (built offline; agent fails fast if missing).
@@ -140,33 +145,16 @@ class SkunkConfig:
     # (env: SKUNK_SEMFILTER_MODEL, SKUNK_SEMFILTER_BATCH)
     semfilter_batch_size: int = 32
 
-    # Question explainer: inject LLM-generated concept references into compute. OFF by
-    # default — the explainer injected wrong conventions on the dev audit (UID0042
-    # reversed Zipf regression, UID0097 "nominal capital") and is disabled pending an
-    # A/B; re-enable per-run with SKUNK_QUESTION_EXPLAINER=1.
-    question_explainer: bool = False
-
-    # Selection pipeline: replace block_select → extract → review with select →
-    # extract → check (see select_agent.py module docstring): ONE summaries-only
-    # MultiTurnAgent per question browses the union sem-filter survivor pool and
-    # commits a few blocks per retrieval goal; each unique block is then read once
-    # by the vision tier for all its goals; one checker call audits completeness /
-    # duplicates and may resume the selector with revised targets.
-    # Experimental. (env: SKUNK_SELECTION_AGENT=1)
-    selection_agent: bool = False
-    # BASE step budget for the selector's tool loop — covers up to 3 goals; the
-    # pipeline adds +2 steps per goal beyond the 3rd (4 goals → 10).
-    # (env: SKUNK_SELECT_AGENT_MAX_STEPS)
-    select_agent_max_steps: int = 8
-    # Per-LLM-call caps for the selector's own turns and the checker call. Mirrors the
-    # search agent: without a combined thinking+visible cap, Flash thrashed to ~63K
-    # thinking tokens / ~285s per step on large pools and emitted no parseable tool
-    # call (parse-retry death spiral).
+    # Per-LLM-call caps for the external-lookup agent's turns (named for the retired
+    # selection agent that shared them). Mirrors the search agent: without a combined
+    # thinking+visible cap, Flash thrashed to ~63K thinking tokens / ~285s per step
+    # and emitted no parseable tool call (parse-retry death spiral). Selection
+    # itself (skunk.block_select) is bounded PromptedCalls, not an agent loop.
     # (env: SKUNK_SELECT_AGENT_MAX_OUTPUT_TOKENS, SKUNK_SELECT_AGENT_TIMEOUT_S)
     select_agent_max_output_tokens: int = 8192
     select_agent_request_timeout_s: float = 150.0
 
-    # Per-call caps for the extract tiers (text/confirm/vision). Uncapped, individual Flash/Pro
+    # Per-call caps for the extract tiers (text/vision). Uncapped, individual Flash/Pro
     # extract calls hung for 260-480s and returned garbage that then burned a parse retry;
     # a hard timeout fails fast into the retry, which typically completes in seconds.
     # (env: SKUNK_EXTRACT_MAX_OUTPUT_TOKENS, SKUNK_EXTRACT_TIMEOUT_S)
@@ -180,27 +168,6 @@ class SkunkConfig:
     # enable per-run with SKUNK_EXTRACT_VISION_ONLY=1 when OCR quality is the binding issue.
     extract_vision_only: bool = False
 
-    # Extract: SHADOW coverage review. After a branch's entries are final (post vision
-    # validation), one extra call audits coverage (all requested periods present?) and
-    # duplicates. Shadow only: the verdict is emitted to the event stream and the original
-    # entries are returned unchanged — it never alters the run. Kill switch:
-    # SKUNK_EXTRACT_REVIEW=0.
-    extract_review_shadow: bool = True
-
-    # Extract: ACT on the review's duplicate verdict — entries in any `drop` list are
-    # removed before the branch returns (missing-coverage flags stay log-only). Requires
-    # the review itself to be on. Experimental. (env: SKUNK_EXTRACT_REVIEW_DEDUP=1)
-    extract_review_dedup: bool = False
-
-    # Extract: ACT on the review's missing-coverage verdict — repair the branch by
-    # re-selecting blocks for each flagged gap from the branch's sem-filter candidate pool
-    # (deterministic interval/proximity prefilter + one selection call per need), then
-    # extracting only the new blocks and merging. One round, add-only, bounded (see
-    # extract.py _REPAIR_* constants). Requires the review to be on and a pool (live
-    # page-index runs, or replays of a pool-bearing cache).
-    # (env: SKUNK_EXTRACT_REVIEW_REPAIR=1)
-    extract_review_repair: bool = False
-
     # Build: the `vision_rescan` stage always re-reads `parse_broken` pages (mangled parses). Pages
     # flagged `has_unparsed_graphics` that are CHART-ONLY (a chart/figure with no table on the page,
     # so its data is otherwise lost) are re-read only when this is on. That set is the bulk of the
@@ -212,23 +179,19 @@ class SkunkConfig:
         # Route per-stage models through the override registry so `PromptedCall` resolves them
         # like every other call-site. Defaulted here unless a run pins them explicitly
         # (SKUNK_MODEL_OVERRIDES=stage=… or, for the filter, SKUNK_SEMFILTER_MODEL). Efforts
-        # come from each call-site's `default_effort` (compute=high; planner/replanner/extract=medium;
-        # block_select=off), overridable via SKUNK_EFFORT_OVERRIDES.
+        # come from each call-site's `default_effort` (compute=high; planner/replanner/extract=medium),
+        # overridable via SKUNK_EFFORT_OVERRIDES.
         # - semfilter: the cheap coarse filter runs on flash-lite.
-        # - block_select: flash — block selection is a cheap read (thinking off).
-        # - extract.{text,confirm,vision}: flash, medium thinking. Pro is the stronger read
+        # - extract.{text,vision}: flash, medium thinking. Pro is the stronger read
         #   on dense scanned tables but its 8M input-tok/min quota + 380s latency tails choke the
         #   parallel select-agent fan-out; pin Pro back per-run via SKUNK_MODEL_OVERRIDES. The
-        #   default path is `text` followed by the `confirm` vision round (OCR digit correction
-        #   only); `vision` is the fallback.
+        #   default path is the `text` tier; `vision` is the fallback.
         # - compute.codegen: flash — codegen/reasoning over the extracted values (high thinking).
         # - replanner: flash — recovering a failed plan runs flash at medium thinking; the initial
         #   planner also runs flash (the common path).
         # Everything else (planner, toc_pick, …) runs on the base `llm_model` (flash).
         self.model_overrides.setdefault("semfilter", "gemini-3.1-flash-lite")
-        self.model_overrides.setdefault("block_select", "gemini-3.5-flash")
         self.model_overrides.setdefault("extract.text", "gemini-3.5-flash")
-        self.model_overrides.setdefault("extract.confirm", "gemini-3.5-flash")
         self.model_overrides.setdefault("extract.vision", "gemini-3.5-flash")
         self.model_overrides.setdefault("compute.codegen", "gemini-3.1-pro-preview")
         self.model_overrides.setdefault("replanner", "gemini-3.5-flash")
@@ -255,6 +218,7 @@ class SkunkConfig:
             llm_retry_initial_delay_s=float(
                 os.environ.get("SKUNK_LLM_RETRY_INITIAL_DELAY", "1.0")
             ),
+            compute_best_of_n=int(os.environ.get("SKUNK_COMPUTE_BEST_OF_N", "5")),
             parsed_json_dir=Path(
                 os.environ.get("OFFICEQA_PARSED_JSON_DIR") or _DEFAULT_PARSED_JSON_DIR
             ),
@@ -263,13 +227,6 @@ class SkunkConfig:
                 "SKUNK_PROMPT_OVERRIDES", "config/prompts/treasury_bulletin.yaml"
             ),
             semfilter_batch_size=int(os.environ.get("SKUNK_SEMFILTER_BATCH", "32")),
-            question_explainer=os.environ.get("SKUNK_QUESTION_EXPLAINER", "0")
-            not in ("", "0"),
-            selection_agent=os.environ.get("SKUNK_SELECTION_AGENT", "0")
-            not in ("", "0"),
-            select_agent_max_steps=int(
-                os.environ.get("SKUNK_SELECT_AGENT_MAX_STEPS", "8")
-            ),
             select_agent_max_output_tokens=int(
                 os.environ.get("SKUNK_SELECT_AGENT_MAX_OUTPUT_TOKENS", "8192")
             ),
@@ -283,12 +240,6 @@ class SkunkConfig:
                 os.environ.get("SKUNK_EXTRACT_TIMEOUT_S", "150")
             ),
             extract_vision_only=os.environ.get("SKUNK_EXTRACT_VISION_ONLY", "0")
-            not in ("", "0"),
-            extract_review_shadow=os.environ.get("SKUNK_EXTRACT_REVIEW", "1")
-            not in ("", "0"),
-            extract_review_dedup=os.environ.get("SKUNK_EXTRACT_REVIEW_DEDUP", "0")
-            not in ("", "0"),
-            extract_review_repair=os.environ.get("SKUNK_EXTRACT_REVIEW_REPAIR", "0")
             not in ("", "0"),
             vision_rescan_charts=os.environ.get("SKUNK_VISION_RESCAN_CHARTS", "")
             not in ("", "0"),

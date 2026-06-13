@@ -92,6 +92,7 @@ _MODEL_RPM: dict[str, float] | None = None
 # SKUNK_MODEL_RPM ("model=rpm,..."); a model in neither falls back to SKUNK_LLM_RPM.
 _DEFAULT_RPM: dict[str, float] = {
     "gemini-3.5-flash": 4000.0,
+    "gemini-3-flash-preview": 4000.0,  # fine-grained filter scan model — separate quota bucket, same RPM as 3.5-flash
     "gemini-3.1-flash-lite": 4000.0,
     "gemini-3.1-pro-preview": 2000.0,
 }
@@ -197,6 +198,7 @@ _MODEL_TPM: dict[str, float] | None = None
 # by RPM alone.
 _DEFAULT_TPM: dict[str, float] = {
     "gemini-3.5-flash": 10_000_000.0,
+    "gemini-3-flash-preview": 10_000_000.0,  # fine-grained filter scan model — separate quota bucket, same TPM as 3.5-flash
     "gemini-3.1-flash-lite": 25_000_000.0,
     "gemini-3.1-pro-preview": 8_000_000.0,
 }
@@ -243,6 +245,8 @@ class LLMResponse:
     # Cached (prompt-cache hit) input tokens, when the provider reports them.
     # Subset of input_tokens; None when unknown.
     cache_input_tokens: int | None = None
+    # Thinking/reasoning tokens (billed at the output rate); None when unreported.
+    thinking_tokens: int | None = None
 
 
 def _make_openrouter_client() -> "OpenRouter":
@@ -518,6 +522,7 @@ class LLMClient:
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
                 cache_input_tokens=toks.get("cache_input_tokens"),
+                thinking_tokens=toks.get("thinking_tokens"),
             )
 
         return self._retry_call(do, model)
@@ -587,6 +592,7 @@ class LLMClient:
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
                 cache_input_tokens=toks.get("cache_input_tokens"),
+                thinking_tokens=toks.get("thinking_tokens"),
             )
 
         return await self._aretry_call(do, model)
@@ -672,6 +678,7 @@ class LLMClient:
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
                 cache_input_tokens=toks.get("cache_input_tokens"),
+                thinking_tokens=toks.get("thinking_tokens"),
             )
 
         return self._retry_call(do, model_id)
@@ -779,6 +786,7 @@ class LLMClient:
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
                 cache_input_tokens=toks.get("cache_input_tokens"),
+                thinking_tokens=toks.get("thinking_tokens"),
             )
 
         return await self._aretry_call(do, model_id)
@@ -870,6 +878,7 @@ class LLMClient:
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
                 cache_input_tokens=toks.get("cache_input_tokens"),
+                thinking_tokens=toks.get("thinking_tokens"),
             )
 
         return self._retry_call(do, model)
@@ -929,6 +938,7 @@ class LLMClient:
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
                 cache_input_tokens=toks.get("cache_input_tokens"),
+                thinking_tokens=toks.get("thinking_tokens"),
             )
 
         return await self._aretry_call(do, model)
@@ -1002,6 +1012,7 @@ class LLMClient:
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
                 cache_input_tokens=toks.get("cache_input_tokens"),
+                thinking_tokens=toks.get("thinking_tokens"),
             )
 
         return self._retry_call(do, model_id)
@@ -1062,6 +1073,7 @@ class LLMClient:
                 input_tokens=toks["input_tokens"],
                 output_tokens=toks["output_tokens"],
                 cache_input_tokens=toks.get("cache_input_tokens"),
+                thinking_tokens=toks.get("thinking_tokens"),
             )
 
         return await self._aretry_call(do, model_id)

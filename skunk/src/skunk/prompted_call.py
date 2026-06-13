@@ -3,12 +3,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 import yaml
 
 from skunk.common import B64Image, Effort, ExecutionContext
 from skunk.errors import ParseError
+
+if TYPE_CHECKING:
+    from skunk.llm_client import LLMResponse
 
 
 Section = Literal["corpus", "few_shots", "lessons"]
@@ -166,9 +169,12 @@ class PromptedCall[T]:
         should_stop: Callable[[str], bool] | None = None,
         max_output_tokens: int | None = None,
         timeout_s: float | None = None,
+        on_response: Callable[[LLMResponse], None] | None = None,
     ) -> T:
         """Assemble the prompt, resolve effort, invoke the LLM, then parse into a
-        typed result.
+        typed result. `on_response` (when given) observes every raw `LLMResponse`
+        — one per attempt, parse-retries included — so call-sites can record
+        per-call latency/token stats without re-deriving them from the envelope log.
 
         Single-shot (default): assembles system+user, calls `acall`, retries on
         `ParseError` up to `max_parse_retries` times.
@@ -197,6 +203,8 @@ class PromptedCall[T]:
                     max_output_tokens=max_output_tokens,
                     timeout_s=timeout_s,
                 )
+                if on_response is not None:
+                    on_response(resp)
                 try:
                     return self._parse(resp.text, ctx)
                 except ParseError as e:
@@ -231,12 +239,12 @@ class PromptedCall[T]:
         attempt = 0
         retry: ParseError | None = None
         while True:
-            # First attempt honors the caller's temperature (usually 0.0 for determinism);
-            # parse-retries ESCALATE it. A temp-0 reply that won't parse tends to regenerate
-            # verbatim even when re-prompted with the error, so nudging temperature — not just
-            # re-asking — is what actually breaks a degenerate output (e.g. prose-as-JSON, an
-            # unescaped backslash). 0.0 → 0.4 → 0.6 → 0.8, capped at 1.0.
-            attempt_temp = temperature if attempt == 0 else min(1.0, 0.4 + 0.2 * (attempt - 1))
+            # First attempt honors the caller's temperature; parse-retries run at 1.0.
+            # A low-temp reply that won't parse tends to regenerate verbatim even when
+            # re-prompted with the error, so jumping to full temperature — not just
+            # re-asking — is what actually breaks a degenerate output (e.g.
+            # prose-as-JSON, an unescaped backslash).
+            attempt_temp = temperature if attempt == 0 else 1.0
             resp = await ctx.llm_client.acall(
                 system,
                 self._compose_user(user, retry),
@@ -249,6 +257,8 @@ class PromptedCall[T]:
                 max_output_tokens=max_output_tokens,
                 timeout_s=timeout_s,
             )
+            if on_response is not None:
+                on_response(resp)
             ctx.emit(
                 f"assistant call_site={self.name} chars={len(resp.text)}",
                 kind="assistant",
@@ -257,7 +267,7 @@ class PromptedCall[T]:
             try:
                 return self._parse(resp.text, ctx)
             except ParseError as e:
-                if attempt >= self._max_parse_retries:
+                if attempt >= self._max_parse_retries or not e.retryable:
                     raise
                 ctx.emit(
                     f"parse_retry call_site={self.name} attempt={attempt + 1} "

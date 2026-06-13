@@ -1,13 +1,10 @@
-"""Page-index query path: retrieval (`PageIndexRetriever`) and block selection.
+"""Page-index query path: retrieval (`PageIndexRetriever`).
 
 `PageIndexRetriever.retrieve_all` runs all branches at once: per-era ToC chapter pick →
 year filter → one coarse semantic filter over the deduped union. The filter judges per
 CONTENT BLOCK (flat list, one boolean each) against the branch RETRIEVAL TARGETS; a page
-is kept iff any block fits any target. Output is BLOCK-granular (`BlockRef`).
-
-`PageIndexRetriever.select_blocks` is the precision stage that follows: a tournament
-reduction over the semantic filter's survivors, narrowing each branch to at most `_KEEP`
-blocks."""
+is kept iff any block fits any target. Output is BLOCK-granular (`BlockRef`); the
+block-selection tournament (`skunk.block_select`) narrows the survivors downstream."""
 
 import json
 import asyncio
@@ -20,7 +17,6 @@ from skunk.common import (
     ExecutionContext,
     PageRef,
     SemPoolEntry,
-    chunk,
     parse_json_response,
 )
 from skunk.errors import StepFailed, ParseError
@@ -47,26 +43,16 @@ _MONTH_RE = re.compile(r"\d{4}-\d{2}")
 class _PeriodEntry(NamedTuple):
     lo: str  # inclusive YYYY-MM data-span start
     hi: str  # inclusive YYYY-MM data-span end
-    pin: str | None  # YYYY-MM ISSUE this span's value is pinned to, or None
-
-    @property
-    def span(self) -> str:
-        return self.lo if self.lo == self.hi else f"{self.lo}..{self.hi}"
 
     @property
     def label(self) -> str:
-        return (
-            f"{self.span} (as reported in the {self.pin} issue)"
-            if self.pin
-            else self.span
-        )
+        return self.lo if self.lo == self.hi else f"{self.lo}..{self.hi}"
 
 
 def _to_entries(period: str | None) -> list[_PeriodEntry] | None:
     """Parse a period string into entries: a comma-list of `YYYY-MM` months /
     `YYYY-MM..YYYY-MM` ranges. Returns None when empty or malformed (callers then
-    no-op the filter). Pins arrive separately on `branch.as_of` — see
-    `_branch_entries`."""
+    no-op the filter)."""
     if not period:
         return None
     try:
@@ -80,33 +66,15 @@ def _to_entries(period: str | None) -> list[_PeriodEntry] | None:
                 raise ValueError(f"not YYYY-MM: {part!r}")
             if lo > hi:
                 raise ValueError(f"range start > end: {part!r}")
-            out.append(_PeriodEntry(lo, hi, None))
+            out.append(_PeriodEntry(lo, hi))
         return out or None
     except ValueError:
         return None
 
 
 def _branch_entries(branch: RetrieveBranch) -> list[_PeriodEntry] | None:
-    """The branch's period entries with per-entry issue pins attached from a list
-    `as_of` (aligned 1:1 with the entries, None slots = unpinned; parity is enforced
-    at plan parse time, so a mismatch here just leaves entries unpinned). A scalar
-    `as_of` is a whole-branch publication filter, applied separately."""
-    entries = _to_entries(branch.period)
-    if entries and isinstance(branch.as_of, list) and len(branch.as_of) == len(entries):
-        entries = [
-            e._replace(pin=pin) if pin and _MONTH_RE.fullmatch(pin) else e
-            for e, pin in zip(entries, branch.as_of)
-        ]
-    return entries
-
-
-def _scalar_as_of_intervals(
-    as_of: str | list[str | None] | None,
-) -> list[tuple[str, str]] | None:
-    """Publication-month intervals of a WHOLE-BRANCH (scalar) `as_of`. A list `as_of`
-    is per-entry pins — handled via `_branch_entries`, never as a branch-wide filter
-    (it would exclude the pages serving the unpinned entries)."""
-    return None if isinstance(as_of, list) else _to_intervals(as_of)
+    """The branch's parsed period entries."""
+    return _to_entries(branch.period)
 
 
 def _to_intervals(period: str | None) -> list[tuple[str, str]] | None:
@@ -143,8 +111,8 @@ def _batch_by_size(
 
 
 class PageIndexRetriever:
-    """Orchestrates retrieval (ToC chapter pick → year filter → semantic filter) and block
-    selection (tournament precision stage). The artifact is loaded once at construction."""
+    """Orchestrates retrieval (ToC chapter pick → year filter → semantic filter). The
+    artifact is loaded once at construction."""
 
     # -- prompts ---------------------------------------------------------------
 
@@ -214,29 +182,6 @@ the block order given:
 True when the summary fits at least one target; false only when clearly unrelated to every target.
 """
     )
-
-    _BLOCK_SELECT_PROMPT = """\
-You select which already-filtered Treasury Bulletin content blocks most directly carry the given
-retrieval target's data, in the context of the question. Candidates are one per line: `block_id`,
-then `dates=` (the block's data span), then a compact summary (title, column/row labels) — not the
-numbers.
-
-Rules:
-  - If the question pins a specific source ("as reported in the <Month Year> Bulletin", "as of
-    <date>"), select the blocks that best match that source.
-  - Otherwise prefer blocks whose title, headers, and date range match the target most precisely.
-  - When the same figure is restated across issues, prefer the most recent issue covering the
-    required period unless the question asks for a specific version.
-
-## Output
-
-A single bare JSON array of booleans — no prose, no markdown fences — one entry per candidate, in
-the order given; `true` selects the block. At most the requested cap may be true; return fewer
-when fewer fit.
-  [true, false, false, ...]"""
-
-    _GROUP_SIZE = 32  # blocks per selection call
-    _KEEP = 4  # uniform cap: blocks kept per group AND final blocks kept per period
 
     # -- construction ----------------------------------------------------------
 
@@ -312,18 +257,8 @@ when fewer fit.
     # -- retrieval stages ------------------------------------------------------
 
     def _eras_for_branch(self, branch: RetrieveBranch) -> list[EraTree]:
-        """Eras whose ToC to scan. `as_of` pins a publication month (scan only containing eras);
-        `period` prunes eras whose span ends before the period starts; neither keeps all eras."""
-        as_of_iv = _scalar_as_of_intervals(branch.as_of)
-        if as_of_iv:
-            lo = min(x[0][:7] for x in as_of_iv)
-            hi = max(x[1][:7] for x in as_of_iv)
-            kept = [
-                e
-                for e in self._tree.eras
-                if not (e.span[1][:7] < lo or e.span[0][:7] > hi)
-            ]
-            return kept or self._tree.eras
+        """Eras whose ToC to scan: `period` prunes eras whose span ends before the
+        period starts; no period keeps all eras."""
         intervals = _to_intervals(branch.period)
         if not intervals:
             return self._tree.eras
@@ -344,7 +279,7 @@ when fewer fit.
         """One unified ToC pick for the whole question, shared by every branch. Picks chapters
         from the branch-spanning eras conditioned ONLY on the original question text (not any
         branch's concept/period); returns the deduped union of candidate pages, which each
-        branch then narrows by its own period/as_of in `_year_filter`."""
+        branch then narrows by its own period in `_year_filter`."""
         eras = self._eras_for_branches(branches)
         ctx.emit(
             f"pick_chapters_eras eras={len(eras)}/{len(self._tree.eras)} branches={len(branches)}"
@@ -407,51 +342,45 @@ when fewer fit.
             ensure_ascii=False,
             indent=1,
         )
-        picked = await pick_call.call(ctx, user, temperature=0.0)
+        picked = await pick_call.call(ctx, user, temperature=0.4)
         out = [ref for ch in picked for ref in pages[ch]]
-        ctx.emit(f"pick_chapters era={era.span} picked={picked!r} pages={len(out)}")
+        ctx.emit(
+            f"pick_chapters era={era.span} picked={picked!r} pages={len(out)}",
+            data={
+                "era": list(era.span),
+                "picked": picked,
+                "n_chapters": len(names),
+                "pages": len(out),
+            },
+        )
         return out
 
     def _year_filter(
         self, candidates: list[PageRef], branch: RetrieveBranch, ctx: ExecutionContext
     ) -> list[PageRef]:
-        # as_of filters by PUBLICATION month; period filters by DATA span. Both apply when set.
+        # period filters by DATA span; a candidate passes on ANY entry.
         kept = list(candidates)
-        as_of_intervals = _scalar_as_of_intervals(branch.as_of)
-        if as_of_intervals:
-            kept = [
-                ref
-                for ref in kept
-                if ref.month and _overlaps((ref.month, ref.month), as_of_intervals)
-            ]
         entries = _branch_entries(branch)
         if entries:
-            # A candidate passes on ANY entry: an unpinned entry wants data-span
-            # overlap; a pinned entry wants the page PUBLISHED in the pinned issue
-            # (and a missing date_interval doesn't disqualify pages of the named
-            # issue — the pin already narrows to one bulletin).
+
             def _passes(ref: PageRef) -> bool:
                 row = self._catalog.get(ref)
-                if row is None:
+                if row is None or row.date_interval is None:
                     return False
-                for e in entries:
-                    if e.pin is not None:
-                        if ref.month == e.pin and (
-                            row.date_interval is None
-                            or _overlaps(row.date_interval, [(e.lo, e.hi)])
-                        ):
-                            return True
-                    elif row.date_interval is not None and _overlaps(
-                        row.date_interval, [(e.lo, e.hi)]
-                    ):
-                        return True
-                return False
+                return any(
+                    _overlaps(row.date_interval, [(e.lo, e.hi)]) for e in entries
+                )
 
             kept = [ref for ref in kept if _passes(ref)]
         ctx.emit(
-            f"year_filter as_of={branch.as_of!r} period={branch.period!r} "
+            f"year_filter key={branch.key!r} period={branch.period!r} "
             f"kept={len(kept)}/{len(candidates)}",
-            data={"pages": [f"{r.month}:{r.page}" for r in kept]},
+            data={
+                "key": branch.key,
+                "period": branch.period,
+                "total": len(candidates),
+                "pages": [f"{r.month}:{r.page}" for r in kept],
+            },
         )
         return kept
 
@@ -543,7 +472,13 @@ when fewer fit.
         ctx.emit(
             f"semantic_filter kept={len(kept_refs)}/{len(pages)} "
             f"blocks_kept={n_blocks_kept} blocks={n_blocks}",
-            data={"pages": [f"{r.month}:{r.page}" for r in kept_refs]},
+            data={
+                "total": len(pages),
+                "blocks_kept": n_blocks_kept,
+                "blocks": n_blocks,
+                "n_calls": len(batches),
+                "pages": [f"{r.month}:{r.page}" for r in kept_refs],
+            },
         )
         return verdict
 
@@ -579,8 +514,8 @@ when fewer fit.
     ) -> list[list[BlockRef]]:
         """Phases (1) and (2) only: ToC pick → year filter → semantic filter.
         Returns the sem-filter survivor blocks per branch, aligned to `branches`.
-        No block selection — the caller (orchestrator) runs tournament selection or
-        selection-agent as a separate step."""
+        No block selection — the caller (orchestrator) runs the selection agent
+        as a separate step."""
         # Phase 1 — one unified ToC pick (question only), then each branch's own date filter.
         chapter_pages = await self._pick_chapters(branches=branches, ctx=ctx)
         cand = [self._year_filter(chapter_pages, b, ctx) for b in branches]
@@ -605,119 +540,12 @@ when fewer fit.
             ]
             b = branches[i]
             ctx.emit(
-                f"page_index_retrieve key={b.key!r} period={b.period!r} as_of={b.as_of!r} "
+                f"page_index_retrieve key={b.key!r} period={b.period!r} "
                 f"catalog_size={self._catalog_size} anchor_count={len(kept_pages)} block_count={len(block_refs)} "
             )
             branch_blocks.append(block_refs)
 
         return branch_blocks
-
-    async def _pick_blocks(
-        self,
-        ctx: ExecutionContext,
-        items: list[tuple[str, tuple[PageCatalogRow, int, ContentBlock]]],
-        question: str,
-        branch: RetrieveBranch,
-        *,
-        keep: int,
-        period_label: str | None = None,
-    ) -> list[str]:
-        """One tournament group call. Returns at most `keep` block ids, best-first.
-        `period_label` overrides the displayed data period (set when selecting for one
-        interval of a multi-interval period)."""
-        lines = []
-        for bid, (row, _bi, block) in items:
-            dates = (
-                f"{row.date_interval[0]}..{row.date_interval[1]}"
-                if row.date_interval
-                else "none"
-            )
-            line = f"[{bid}] dates={dates} | {block.kind} with title: {block.title or '(untitled)'}"
-            if block.column_headers:
-                line += f" [cols: {', '.join(block.column_headers)}]"
-            if block.row_headers:
-                line += f" [rows: {', '.join(block.row_headers)}]"
-            if block.summary:
-                line += f" — content summary: {block.summary}"
-            lines.append(line)
-
-        parts = [f'Research question: "{question}"', f"Retrieval target: {branch.key}"]
-        if period_label or branch.period:
-            parts.append(f"Data period: {period_label or branch.period}")
-        n = len(items)
-        parts.append(
-            f"Candidate blocks ({n}) — mark true the AT MOST {keep} that best report the target, "
-            "false for the rest:\n" + "\n".join(lines)
-        )
-        user = "\n".join(parts)
-
-        def _parse(text: str, _ctx: ExecutionContext) -> list[bool]:
-            # Parity-checked boolean array (one true/false per block); a wrong length
-            # ParseErrors → PromptedCall retries.
-            return self._parse_bool_list(text, _ctx, n=n)
-
-        call: PromptedCall[list[bool]] = PromptedCall(
-            name="block_select",
-            system_prompt=self._BLOCK_SELECT_PROMPT,
-            parse=_parse,
-            default_effort="off",  # per-block boolean keep/drop, thinking off
-            output_instruction=(
-                f"Output ONLY a JSON array of EXACTLY {n} booleans — one per block, in the order "
-                f"given (true=select, false=drop), with AT MOST {keep} true. No prose, no markdown fences."
-            ),
-        )
-        verdicts = await call.call(ctx, user, temperature=0.0)
-        # Keep the selected (true) ids in input order, capped at `keep` (defensive — the prompt
-        # already asks for ≤keep true; truncation only bites if the model over-selects).
-        return [bid for (bid, _), keep_it in zip(items, verdicts) if keep_it][:keep]
-
-    async def _tournament(
-        self,
-        ctx: ExecutionContext,
-        blocks: list[tuple[str, tuple[PageCatalogRow, int, ContentBlock]]],
-        question: str,
-        branch: RetrieveBranch,
-        *,
-        final_keep: int,
-        period_label: str | None = None,
-    ) -> tuple[list[str], int]:
-        """Tournament-reduce `blocks` to at most `final_keep` ids, best-first: while the
-        field exceeds one group, keep the best `_KEEP` of each `_GROUP_SIZE` group, then one
-        precision call over the survivors. Returns `(chosen_ids, rounds)`."""
-        by_id = dict(blocks)
-        current = blocks
-        rounds = 0
-        while len(current) > self._GROUP_SIZE:
-            rounds += 1
-            groups = chunk(current, self._GROUP_SIZE)
-            results = await asyncio.gather(
-                *(
-                    self._pick_blocks(
-                        ctx,
-                        g,
-                        question,
-                        branch,
-                        keep=self._KEEP,
-                        period_label=period_label,
-                    )
-                    for g in groups
-                )
-            )
-            survivor_ids = list(dict.fromkeys(bid for ids in results for bid in ids))
-            ctx.emit(
-                f"block_select_round round={rounds} groups={len(groups)} "
-                f"in={len(current)} survivors={len(survivor_ids)}"
-            )
-            current = [(bid, by_id[bid]) for bid in survivor_ids]
-            if not current:
-                break
-
-        if not current:
-            return [], rounds
-        chosen = await self._pick_blocks(
-            ctx, current, question, branch, keep=final_keep, period_label=period_label
-        )
-        return chosen, rounds
 
     @staticmethod
     def pool_for_blocks(
@@ -752,8 +580,8 @@ when fewer fit.
     def build_sem_pool(
         self, refs: list[PageRef], pdf_dir: str | Path
     ) -> list[SemPoolEntry]:
-        """The repair pool for `refs` without running any selection: anchor-resolve the
-        refs (same prologue as `select_blocks`) and emit every content block as a
+        """The pool for `refs` without running any selection: anchor-resolve the
+        refs to their catalog rows and emit every content block as a
         `SemPoolEntry`. Used by the eval harness to dump pools at sem-filter cost."""
         store = get_page_store(str(pdf_dir))
         rows: list[PageCatalogRow] = []
@@ -772,7 +600,7 @@ when fewer fit.
 
     @staticmethod
     def _pool_entry(row: PageCatalogRow, bi: int, block: ContentBlock) -> SemPoolEntry:
-        """A self-contained repair-pool entry for one candidate block."""
+        """A self-contained pool entry for one candidate block."""
         return SemPoolEntry(
             ref=BlockRef(
                 page=row.ref,
@@ -792,119 +620,3 @@ when fewer fit.
             rows_tail=tuple(block.row_headers[-8:]),
             rows=tuple(block.row_headers),
         )
-
-    async def select_blocks(
-        self,
-        refs: list[PageRef],
-        pdf_dir: str | Path,
-        ctx: ExecutionContext,
-        question: str,
-        branch: RetrieveBranch,
-    ) -> tuple[list[BlockRef], list[SemPoolEntry]]:
-        """Tournament-reduce `refs` to the branch's blocks. Uses `get_page_store` to resolve
-        continuation refs to their anchor rows. Returns `(selected, pool)` where `pool` is
-        every candidate block as a `SemPoolEntry` (the repair pool — what extract's coverage
-        repair re-selects from). `([], [])` if no ref resolves to a catalog block.
-
-        Block selection runs PER PERIOD: one sub-selection per period entry (over the blocks whose
-        data span overlaps that entry), each capped at `_KEEP`, and unions the winners. A branch
-        with no parseable period runs a single selection over all candidates. A flat per-branch cap
-        would let one period's blocks crowd out another's; there is deliberately no global
-        re-narrowing pass over the union."""
-        store = get_page_store(str(pdf_dir))
-
-        rows: list[PageCatalogRow] = []
-        seen_anchors: set[PageRef] = set()
-        for ref in refs:
-            row = store.catalog_row(ref)
-            if row is None or row.ref in seen_anchors:
-                continue
-            seen_anchors.add(row.ref)
-            rows.append(row)
-
-        all_blocks: dict[str, tuple[PageCatalogRow, int, ContentBlock]] = {}
-        for row in rows:
-            for bi, block in enumerate(row.content_blocks):
-                bid = f"{row.bulletin.replace('-', '_')}_{row.page}#{bi}"
-                all_blocks[bid] = (row, bi, block)
-
-        if not all_blocks:
-            return [], []
-        pool = [
-            self._pool_entry(row, bi, block) for row, bi, block in all_blocks.values()
-        ]
-
-        items = list(all_blocks.items())
-        n0 = len(items)
-        entries = _branch_entries(branch)
-
-        def _entry_part(
-            e: _PeriodEntry,
-        ) -> list[tuple[str, tuple[PageCatalogRow, int, ContentBlock]]]:
-            # A pinned entry's pool is the pinned ISSUE's blocks only; an unpinned
-            # entry's pool is everything whose data span overlaps (no-interval pages
-            # join every pool).
-            return [
-                it
-                for it in items
-                if (e.pin is None or it[1][0].bulletin == e.pin)
-                and (
-                    it[1][0].date_interval is None
-                    or _overlaps(it[1][0].date_interval, [(e.lo, e.hi)])
-                )
-            ]
-
-        # Block selection runs PER PERIOD: one sub-selection per period entry (restricted to the
-        # candidates whose data span overlaps it), each capped at `_KEEP`, then unioned. A branch
-        # with no parseable period runs a single selection over all candidates. There is no global
-        # re-narrowing pass over the union — each period keeps its own blocks.
-        parts: list[
-            tuple[
-                str | None, list[tuple[str, tuple[PageCatalogRow, int, ContentBlock]]]
-            ]
-        ]
-        if entries:
-            parts = [(e.label, p) for e in entries if (p := _entry_part(e))]
-            if not parts:  # no candidate overlaps any entry (unlikely post year-filter)
-                parts = [(entries[0].label, items)]
-        else:
-            parts = [(None, items)]
-
-        results = await asyncio.gather(
-            *(
-                self._tournament(
-                    ctx,
-                    part,
-                    question,
-                    branch,
-                    final_keep=self._KEEP,
-                    period_label=label,
-                )
-                for label, part in parts
-            )
-        )
-        for (label, part), (ids, _) in zip(parts, results):
-            ctx.emit(
-                f"block_select_interval interval={label!r} "
-                f"candidates={len(part)} selected={len(ids)}"
-            )
-        rounds = max((r for _, r in results), default=0)
-        chosen = list(dict.fromkeys(bid for ids, _ in results for bid in ids))
-        cap = self._KEEP * len(parts)
-
-        selected = []
-        for bid in chosen:
-            row, bi, block = all_blocks[bid]
-            selected.append(
-                BlockRef(
-                    page=row.ref,
-                    block_index=bi,
-                    member_refs=tuple(row.block_refs(block)),
-                    block=block,
-                )
-            )
-        ctx.emit(
-            f"block_select key={branch.key!r} candidates={n0} rounds={rounds} "
-            f"selected_blocks={len(selected)} top_k={cap}"
-        )
-        return selected, pool

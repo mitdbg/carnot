@@ -3,8 +3,8 @@
 `RetrieveOp` turns a `RetrieveBranch` into the pages that answer it:
 - golden bypass — returns `ctx.config.golden_pages` verbatim (eval ablation).
 - `search_agent` — iterative ChromaDB + LLM loop under `skunk.search_agent`.
-- `page_index` — ToC pick → year filter → semantic filter → block selection
-  (all within `PageIndexRetriever.retrieve_all`).
+- `page_index` — ToC pick → year filter → semantic filter (all within
+  `PageIndexRetriever.retrieve_all`); the selection agent narrows downstream.
 
 The two real backends are built lazily.
 """
@@ -73,20 +73,20 @@ class RetrieveOp:
         """Retrieve for several branches at once, both results aligned to `branches`. A docs
         slot is that branch's blocks or a `StepFailed` — a single branch failing does not
         sink its siblings. The second list is each branch's sem-filter candidate pool
-        (page-index path only; empty elsewhere), retained for extract's coverage repair.
+        (page-index path only; empty elsewhere), the selection agent's candidate set.
         A whole-sweep failure (unknown retriever, missing index) raises."""
         if ctx.config.cached_sem_pool is not None:
             # Survivor-cache replay: skip the (expensive) semantic filter and hand every
             # branch the cached sem-filter survivor union as its candidate set + pool, so
-            # block selection (agent or tournament) runs over it downstream exactly as on a
-            # live run — NOT a final-blocks bypass. UID-level: every branch gets the same
+            # the selection agent runs over it downstream exactly as on a live run — NOT a
+            # final-blocks bypass. UID-level: every branch gets the same
             # union, as branch structure may differ from the run that wrote the cache.
             pool = ctx.config.cached_sem_pool
             blocks = [e.ref for e in pool]
             return [list(blocks) for _ in branches], [list(pool) for _ in branches]
         if ctx.config.golden_pages is not None:
             # Final-blocks bypass: --golden, or a pool-less retrieval cache (search-agent /
-            # pre-pool) whose selected blocks are injected verbatim, skipping block selection.
+            # pre-pool) whose selected blocks are injected verbatim (no retrieval narrowing).
             return [self._golden_blocks(ctx) for _ in branches], [
                 [] for _ in branches
             ]
@@ -136,18 +136,11 @@ class RetrieveOp:
             document_map=document_map,
             chroma_collection=collection,
         )
-        # The agent hint is free text; render a per-entry pin list to its pinned months.
-        as_of_hint = (
-            ", ".join(m for m in branch.as_of if m) or None
-            if isinstance(branch.as_of, list)
-            else branch.as_of
-        )
         page_keys = await agent.retrieve(
             ctx,
             ctx.question,
             branch_key=branch.key,
             branch_period=branch.period,
-            branch_as_of=as_of_hint,
         )
         refs: list[PageRef] = []
         bad: list[str] = []
@@ -189,11 +182,6 @@ class RetrieveOp:
             PageIndexRetriever.pool_for_blocks(brs, pdf_dir) if brs else []
             for brs in branch_blocks
         ]
-
-    @property
-    def page_index_retriever(self):
-        """The lazily-built PageIndexRetriever. Passed to block_select."""
-        return self._page_index()
 
     def _page_index(self):
         from skunk.page_index.query import PageIndexRetriever

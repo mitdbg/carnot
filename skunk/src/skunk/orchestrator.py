@@ -6,17 +6,18 @@ from typing import cast
 from skunk.compute import ComputeOp
 from skunk.config import SkunkConfig
 from skunk.errors import MissingData, StepFailed
-from skunk.extract import ExtractOp
 from skunk.lookup_external import LookupExternalOp
 from skunk.common import (
     AnnotatedValue,
     BlockRef,
     ExecutionContext,
+    Final,
+    NeedsMore,
     SemPoolEntry,
     traced_step,
 )
 from skunk.llm_client import LLMClient
-from skunk.plan import Branch, Plan, PlanDiff, Planner, RetrieveBranch
+from skunk.plan import AttemptRecord, Branch, Plan, Planner, RetrieveBranch
 from skunk.prompted_call import PromptOverride
 from skunk.question_explainer import QuestionExplainer
 from skunk.retrieve import RetrieveOp
@@ -56,15 +57,14 @@ class Orchestrator:
         )
         self._current_plan: Plan | None = None
         # Stable per-question branch identity. `_branch_ids[i]` is the id of the
-        # current plan's branch `i`; a replan carries kept branches' ids forward and
-        # allocates fresh ids for added branches (`PlanDiff.apply` makes new branch
-        # COPIES, so positional indices are not stable across revisions). The trace
-        # viewer keys plan-branch ↔ operator-step on this id to render revision tabs.
+        # current sweep's branch `i`; every sweep (initial or replan) allocates
+        # fresh ids — branch identity dies at the end of its sweep, and a plan
+        # event's branches belong to that revision only. The trace viewer keys
+        # plan-branch ↔ operator-step on this id to render revision tabs.
         self._branch_ids: list[int] = []
         self._next_branch_id = 0
         self._planner = Planner()
         self._retrieve = RetrieveOp(self._ctx.config)
-        self._extract = ExtractOp()
         self._lookup = LookupExternalOp()
         self._explainer = QuestionExplainer()
         self._compute = ComputeOp()
@@ -97,6 +97,9 @@ class Orchestrator:
 
     @property
     def current_plan(self) -> Plan | None:
+        """The latest plan revision. After a replan this holds only that sweep's
+        branches (replans compose fresh plans; earlier revisions live in the
+        `kind="plan"` events)."""
         return self._current_plan
 
     @property
@@ -104,16 +107,12 @@ class Orchestrator:
         return self._result
 
     async def execute(self) -> str:
-        explain_task = (
-            asyncio.create_task(
-                traced_step(
-                    self._ctx,
-                    "question_explainer",
-                    lambda: self._explainer.run(self._ctx, question=self._ctx.question),
-                )
+        explain_task = asyncio.create_task(
+            traced_step(
+                self._ctx,
+                "question_explainer",
+                lambda: self._explainer.run(self._ctx, question=self._ctx.question),
             )
-            if self._ctx.config.question_explainer
-            else None
         )
         try:
             plan = await traced_step(
@@ -124,49 +123,98 @@ class Orchestrator:
             self._branch_ids = self._alloc_branch_ids(len(plan.branches))
             self._emit_plan(plan, "initial")
             outcomes = await self._run_branches(plan.branches, self._branch_ids)
-            explanations = await explain_task if explain_task is not None else ()
+            explanations = await explain_task
         finally:
-            if explain_task is not None:
-                explain_task.cancel()
+            explain_task.cancel()
 
-        attempt = 0
+        # Recovery state: the value POOL is what compute sees — compute's explicit
+        # `keep` whitelist + committed computed intermediates + each sweep's new
+        # values; everything compute does not keep is dropped. ATTEMPTS records
+        # every branch's fate across sweeps. Branch outcomes don't outlive their
+        # sweep — the pool is the only data carried across rounds.
+        pool: list[AnnotatedValue] = [
+            e for o in outcomes if o.entries for e in o.entries
+        ]
+        attempts = [
+            AttemptRecord(0, o.branch, len(o.entries or []), o.error) for o in outcomes
+        ]
+        needs: NeedsMore | None = None
+        round_idx = 0
+        sweep_added = True  # the initial sweep always reaches compute
+
         while True:
             self._current_plan = plan
-            entries = [e for o in outcomes if o.entries for e in o.entries]
-            try:
-                self._result.answer = await traced_step(
+            if sweep_added or needs is None:
+                outcome = await traced_step(
                     self._ctx,
                     "compute",
                     lambda: self._compute.run(
-                        entries,
+                        pool,
                         self._ctx,
                         concept_explanations=explanations,
+                        round_idx=round_idx,
                     ),
                 )
-                return self._result.answer
-            except MissingData as e:
-                attempt += 1
-                if attempt > self._ctx.config.recovery_max_rounds:
-                    # recovery budget exhausted
-                    raise
-                # Bind before the lambda: Python deletes the `except` variable on
-                # block exit, and the lambda is also opaque to ruff's use analysis.
-                reason, missing = e.reason, e.missing
-                failed = [(o.branch, o.error) for o in outcomes if o.error]
-                diff = await traced_step(
+                if isinstance(outcome, Final):
+                    self._result.answer = outcome.answer
+                    return outcome.answer
+                needs = outcome
+                keep_set = set(needs.keep)
+                discarded = [e for i, e in enumerate(pool) if i not in keep_set]
+                pool = [e for i, e in enumerate(pool) if i in keep_set] + list(
+                    needs.committed
+                )
+                self._ctx.emit(
+                    f"pool_update round={round_idx} "
+                    f"kept={len(pool) - len(needs.committed)} "
+                    f"discarded={len(discarded)} committed={len(needs.committed)} "
+                    f"pool_size={len(pool)}",
+                    data={
+                        "discarded": [e.description for e in discarded],
+                        "committed": [e.description for e in needs.committed],
+                    },
+                )
+            else:
+                # Replan sweep produced zero new values: compute on an unchanged
+                # pool is a known no-op, so reuse the prior NeedsMore and go
+                # straight to the next replan (the new failure diagnostics are
+                # already in `attempts`). Still consumes a recovery round.
+                self._ctx.emit(
+                    f"compute_short_circuit round={round_idx} missing={needs.missing!r}"
+                )
+
+            round_idx += 1
+            if round_idx > self._ctx.config.recovery_max_rounds:
+                self._ctx.emit(
+                    f"recovery_exhausted rounds={round_idx - 1} "
+                    f"missing={needs.missing!r}"
+                )
+                raise MissingData(needs.missing_reason, needs.missing)
+
+            # Bind before the lambda (opaque to ruff's use analysis).
+            reason, missing = needs.missing_reason, needs.missing
+            plan = await traced_step(
+                self._ctx,
+                "replanner",
+                lambda: self._planner.replan(
                     self._ctx,
-                    "replanner",
-                    lambda: self._planner.replan(
-                        self._ctx,
-                        plan,
-                        entries,
-                        failed,
-                        reason,
-                        missing,
-                    ),
-                )
-                plan, outcomes = await self._apply_diff(plan, outcomes, diff)
-                self._emit_plan(plan, "replan", reason=reason, missing=missing)
+                    pool,
+                    attempts,
+                    reason,
+                    missing,
+                ),
+            )
+            ids = self._alloc_branch_ids(len(plan.branches))
+            self._branch_ids = ids
+            self._emit_plan(plan, "replan", reason=reason, missing=missing)
+            outcomes = await self._run_branches(plan.branches, ids)
+            attempts += [
+                AttemptRecord(round_idx, o.branch, len(o.entries or []), o.error)
+                for o in outcomes
+            ]
+            new_entries = [e for o in outcomes if o.entries for e in o.entries]
+            pool += new_entries
+            sweep_added = bool(new_entries)
 
     def _alloc_branch_ids(self, n: int) -> list[int]:
         """Allocate `n` fresh, monotonically-increasing branch ids (stable for the
@@ -174,26 +222,6 @@ class Orchestrator:
         ids = list(range(self._next_branch_id, self._next_branch_id + n))
         self._next_branch_id += n
         return ids
-
-    async def _apply_diff(
-        self, plan: Plan, outcomes: list[BranchOutcome], diff: PlanDiff
-    ) -> tuple[Plan, list[BranchOutcome]]:
-        """Apply a replan `PlanDiff`, keeping `outcomes[i]` aligned with the rewritten
-        `plan.branches[i]`. `PlanDiff.apply` does the pure plan rewrite and reports
-        which prior indices were KEPT; the orchestrator carries those branches'
-        already-gathered outcomes forward, runs the added branches, and appends them.
-        Compute therefore never sees data from a dropped branch. Stable branch ids
-        ride along: kept branches keep theirs, added branches get fresh ones."""
-        new_plan, kept = diff.apply(plan)
-        dropped = sorted(set(range(len(plan.branches))) - set(kept))
-        if dropped:
-            self._ctx.emit(f"replan_dropped n_dropped={len(dropped)} indices={dropped}")
-        kept_outcomes = [outcomes[i] for i in kept]
-        kept_ids = [self._branch_ids[i] for i in kept]
-        added_ids = self._alloc_branch_ids(len(diff.add))
-        self._branch_ids = [*kept_ids, *added_ids]
-        new_outcomes = await self._run_branches(diff.add, added_ids) if diff.add else []
-        return new_plan, [*kept_outcomes, *new_outcomes]
 
     def _emit_plan(
         self,
@@ -230,9 +258,9 @@ class Orchestrator:
         """Unified multi-scan retrieve for every retrieve branch at once: their candidate
         pages are deduped and the LLM semantic filter scans each unique page at most once,
         judging it against all branches' targets, then routes the survivors back per branch.
-        On the page-index path the survivors are then narrowed by tournament block selection
-        (or left whole for the selection-agent path). Returns each branch's blocks in input
-        order, or — if the whole sweep fails — the `StepFailed` to attribute to every
+        On the page-index path the survivors are left whole — the block-selection
+        tournament (`run_select_pipeline`) narrows them downstream. Returns each branch's blocks in
+        input order, or — if the whole sweep fails — the `StepFailed` to attribute to every
         retrieve branch. The shared `retrieve` sweep carries no `branch_id`."""
         if not branches:
             return [], []
@@ -245,34 +273,24 @@ class Orchestrator:
         except StepFailed as e:
             return [e] * len(branches), [[] for _ in branches]
 
-        # Block selection: tournament or selection-agent, page-index only.
-        # golden / search-agent paths return final blocks from run_all; no further selection.
+        # Page-index path: survivors pass through whole — the selection agent narrows them.
+        # golden / search-agent paths return final blocks from run_all.
         if (
             str(self._ctx.config.retriever) == "page_index"
             and self._ctx.config.golden_pages is None
         ):
-            if self._ctx.config.selection_agent:
-                docs: list[list[BlockRef] | StepFailed] = [
-                    StepFailed(
-                        "retrieve",
-                        f"semantic filter kept no blocks for branch {b.key!r}",
-                    )
-                    if not brs
-                    else brs
-                    for b, brs in zip(branches, sem_survivors)
-                ]
-                pools = self._retrieve.build_survivor_pools(
-                    self._ctx, cast(list[list[BlockRef]], sem_survivors)
+            docs: list[list[BlockRef] | StepFailed] = [
+                StepFailed(
+                    "retrieve",
+                    f"semantic filter kept no blocks for branch {b.key!r}",
                 )
-            else:
-                from skunk.block_select import run_block_select
-
-                docs, pools = await run_block_select(
-                    self._ctx,
-                    branches,
-                    cast(list[list[BlockRef]], sem_survivors),
-                    self._retrieve.page_index_retriever,
-                )
+                if not brs
+                else brs
+                for b, brs in zip(branches, sem_survivors)
+            ]
+            pools = self._retrieve.build_survivor_pools(
+                self._ctx, cast(list[list[BlockRef]], sem_survivors)
+            )
         else:
             docs = sem_survivors
             pools = base_pools
@@ -311,14 +329,13 @@ class Orchestrator:
         )
         pools_by_pos: dict[int, list[SemPoolEntry]] = dict(zip(retrieve_pos, pools))
 
-        # Selection-agent path: select → extract → check runs as ONE shared pipeline
-        # over all retrieve branches (the checker is cross-branch), launched as a task
-        # so lookup branches proceed concurrently. Each retrieve tail awaits the shared
-        # task and picks out its branch's result. The pipeline does its own per-branch
-        # traced_steps, so the tail doesn't wrap it again.
+        # Select → extract runs as ONE shared pipeline over all retrieve branches,
+        # launched as a task so lookup branches proceed concurrently. Each retrieve
+        # tail awaits the shared task and picks out its branch's result. The pipeline
+        # does its own per-branch traced_steps, so the tail doesn't wrap it again.
         pipeline: asyncio.Task | None = None
-        if self._ctx.config.selection_agent and retrieve_pos:
-            from skunk.select_agent import run_select_pipeline
+        if retrieve_pos:
+            from skunk.block_select import run_select_pipeline
 
             pipeline = asyncio.create_task(
                 run_select_pipeline(
@@ -333,21 +350,11 @@ class Orchestrator:
         async def _tail(pos: int) -> list[AnnotatedValue]:
             branch, bid = branches[pos], branch_ids[pos]
             if branch.kind == "retrieve":
-                if pipeline is not None:
-                    res = (await pipeline)[retrieve_pos.index(pos)]
-                    if isinstance(res, StepFailed):
-                        raise res
-                    return res
-                doc = docs_by_pos[pos]
-                if isinstance(doc, StepFailed):
-                    raise doc
-                pool = pools_by_pos.get(pos, [])
-                return await traced_step(
-                    self._ctx,
-                    "extract",
-                    lambda: self._extract.run(doc, self._ctx, branch, sem_pool=pool),
-                    branch_id=bid,
-                )
+                assert pipeline is not None
+                res = (await pipeline)[retrieve_pos.index(pos)]
+                if isinstance(res, StepFailed):
+                    raise res
+                return res
             return await traced_step(
                 self._ctx,
                 "lookup_external",

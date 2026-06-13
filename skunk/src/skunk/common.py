@@ -236,8 +236,11 @@ _KIND_BY_PREFIX: dict[str, str] = {
     "terminal_commit": "note",
     "steps_low_warning": "note",
     "parallel_branch_failed": "error",
-    "replan_dropped": "note",
-    "codegen_missing": "note",
+    "compute_needs_more": "note",
+    "compute_partial_malformed": "note",
+    "pool_update": "note",
+    "compute_short_circuit": "note",
+    "recovery_exhausted": "error",
 }
 
 
@@ -405,17 +408,18 @@ class AnnotatedValue(BaseModel):
     `.frame` exposes the payload as a uniform `pd.DataFrame` so downstream code
     needn't branch on `kind`.
 
-    `qualifiers` is LLM-authored at extract time: the verbatim source-text
-    fragments that locate and discriminate the datum on its page — the column
-    header it was read under, row label, footnote markers, print flags (p/r).
-    Downstream selection matches these against the question's qualifier words
-    when several look-alike entries compete. Empty for external lookups and
-    older payloads.
+    `notes` is LLM-authored at extract time: prose capturing the page's textual
+    context that bears on the question — footnotes, headnotes, comments, scope
+    caveats, break-in-series notes, and the meaning of any print flags (p/r) —
+    summarized as it pertains to the question, preferring the page's original
+    wording. It is one note for the whole payload (a vector/table shares it), so
+    it is context, not a per-cell discriminator; per-datum disambiguation lives
+    in `description`. Empty for external lookups.
 
-    Provenance (`bulletin`/`pages`/`as_of`/`requested_period`/`retrieve_key`) is
+    Provenance (`bulletin`/`pages`/`requested_period`/`retrieve_key`) is
     machine-stamped from the extract inputs — the source page refs and the
     retrieve branch — NOT authored by the LLM. It is absent (None/empty) for
-    external lookups and for older payloads. `bulletin` is the issue the value
+    external lookups. `bulletin` is the issue the value
     was printed in ("YYYY-MM", lexically sortable = chronological); downstream
     compute uses it to sort/filter by publication date — e.g. to pick the
     latest non-revised vintage across several bulletins, where the LLM-written
@@ -427,7 +431,7 @@ class AnnotatedValue(BaseModel):
     description: str
     value: Any
     unit: str = ""
-    qualifiers: str = ""
+    notes: str = ""
     kind: Literal["scalar", "vector", "table"] = "scalar"
     index_name: str | None = None
     row_name: str | None = None
@@ -437,9 +441,6 @@ class AnnotatedValue(BaseModel):
     # LLM-written. Defaults keep external lookups and old payloads valid.
     bulletin: str | None = None  # source issue "YYYY-MM" (publication date)
     pages: tuple[int, ...] = ()  # source PDF page(s); () when unattributable
-    as_of: str | list[str | None] | None = (
-        None  # branch.as_of — pinned vintage requested (a list = per-period-entry pins)
-    )
     requested_period: str | None = None  # branch.period — data window requested
     retrieve_key: str | None = None  # branch.key — concept this datum serves
 
@@ -502,6 +503,26 @@ class AnnotatedValue(BaseModel):
         return df
 
 
+@dataclass(frozen=True)
+class Final:
+    """Compute produced the answer."""
+
+    answer: str
+
+
+@dataclass(frozen=True)
+class NeedsMore:
+    """Compute judged its inputs insufficient. `keep` indexes into the input_values
+    compute was called with (pool entries to retain across the recovery round);
+    `committed` are new computed-intermediate values to add to the pool;
+    `missing_reason`/`missing` describe what to gather next."""
+
+    keep: list[int]
+    committed: list[AnnotatedValue]
+    missing_reason: str
+    missing: list[str]
+
+
 _PAD = "         "  # 9-space continuation indent for an entry's detail lines
 
 
@@ -513,8 +534,6 @@ def _provenance_str(e: AnnotatedValue) -> str:
         parts.append(f"bulletin={e.bulletin!r}")
     if e.pages:
         parts.append(f"pages={list(e.pages)!r}")
-    if e.as_of:
-        parts.append(f"as_of={e.as_of!r}")
     if e.requested_period:
         parts.append(f"requested_period={e.requested_period!r}")
     if e.retrieve_key:
@@ -532,8 +551,8 @@ def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
     )
     prov = _provenance_str(e)
     prov_lines = [f"{_PAD}provenance: {prov}"] if prov else []
-    if e.qualifiers:
-        prov_lines.insert(0, f"{_PAD}qualifiers: {e.qualifiers!r}")
+    if e.notes:
+        prov_lines.insert(0, f"{_PAD}notes: {e.notes!r}")
     if e.kind == "scalar":
         return [
             head,

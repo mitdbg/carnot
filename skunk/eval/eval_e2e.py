@@ -36,8 +36,8 @@ Retrieval cache: every real run auto-writes its retrieve output (the deduped pag
 union per UID) to <run-dir>/retrieval_cache.json. Point `--retrieval-cache <path>`
 at one to replay it — the cached pages are injected golden-style (bypassing
 retrieve) so you can tune extract/compute without re-paying retrieval. Cached pages
-are the retrieve phase's output after block_select — i.e. exactly the pages extract
-read on the original run. `--golden` and `--retrieval-cache` are mutually exclusive
+are the retrieve phase's output — i.e. exactly the pages handed to selection/extract
+on the original run. `--golden` and `--retrieval-cache` are mutually exclusive
 (two page sources).
 """
 
@@ -144,11 +144,11 @@ def load_golden(csv_path: str | Path) -> dict[str, list[PageRef]]:
 # Every real run auto-writes its actual retrieve output to <run-dir>/retrieval_cache.json:
 # per UID the sem-filter survivor pool (`sem_pool`) plus the deduped block union (`blocks`).
 # A later run with `--retrieval-cache <path>` bypasses the expensive retrieve sweep:
-#   - page-index cache (has `sem_pool`): the survivor pool is injected and block selection
-#     (the selection agent OR the tournament, per config) runs over it at runtime — so a
-#     replay can iterate on SELECTION, extract, and compute, only retrieve is fixed.
-#   - pool-less cache (search-agent / pre-pool): the `blocks` are replayed as final,
-#     bypassing block selection too (iterate on extract/compute only).
+#   - page-index cache (has `sem_pool`): the survivor pool is injected and the selection
+#     agent runs over it at runtime — so a replay can iterate on SELECTION, extract, and
+#     compute, only retrieve is fixed.
+#   - pool-less cache (search-agent / pre-pool): the `blocks` are replayed as final
+#     (iterate on extract/compute only).
 # Cache JSON per UID:
 #   {"blocks": [{"month","page","block_index","members":[...]}...], "sem_pool": [...]}
 
@@ -386,7 +386,8 @@ REPORT_FIELDS = [
 # USD per token (input, output); thinking tokens billed at the output rate. Copied from
 # scripts/analyze_trace.py — keep the two in sync if Gemini pricing changes.
 PRICES = {
-    "gemini-3.5-flash": (0.30e-6, 2.50e-6),
+    "gemini-3.5-flash": (1.50e-6, 9.00e-6),  # list price (was 0.30/2.50 — stale gemini-2.5-flash rate)
+    "gemini-3-flash-preview": (0.50e-6, 3.00e-6),  # list price (verified ai.google.dev + OpenRouter, 2026-06)
     "gemini-3.1-flash-lite": (0.10e-6, 0.40e-6),
     "gemini-3.1-pro-preview": (2.00e-6, 12.00e-6),
 }
@@ -528,9 +529,9 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
             )
             return None
         if cached.sem_pool:
-            # Survivor cache: inject the sem-filter survivor pool and let block selection
-            # (the selection agent or the tournament, per config) run over it at runtime —
-            # so a cached run can iterate on selection, not just extract/compute. The pool's
+            # Survivor cache: inject the sem-filter survivor pool and let the selection
+            # agent run over it at runtime — so a cached run can iterate on selection,
+            # not just extract/compute. The pool's
             # presence triggers the retrieve bypass (no golden_pages / cached_blocks needed).
             cached_sem_pool = cached.sem_pool
         else:

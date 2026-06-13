@@ -30,3 +30,5 @@ UID0237   # "mid-point normalized difference ... in billions of dollars" self-co
 UID0028   # railroad retirement Feb 1964 receipts: dedicated table prints 92.1, trust summary prints 92 (whole millions); neither named; 0057/0130 family
 UID0219   # holdings cells identical across 2013-06/09 prints; gap = unpinned BEA GDP series (annual vs Q1) + period count (9 vs 9.75y); 4.1/4.2/4.3 all defensible
 UID0244   # USD-CAD Dec-1959 monthly-avg rate source/precision unpinned (FRED starts 1971); same printed 530 USD diff; rate 0.95100 vs 0.95117; 0221 family
+UID0062   # Army FY1947 revised across prints (7,425 in 1948-04 vs 6,911 in 1952-12); AF-charged-to-Army qualifier satisfied by both; gold mixes prints; 0194 family
+UID0175   # variance sample-vs-population: question says "sample calendar months" -> sample var ddof=1 (0.00164, ours) defensible; gold uses population var ddof=0 (0.00137); identical 6 cells from 1947-02:87, differ only by /n vs /(n-1)

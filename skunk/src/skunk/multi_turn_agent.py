@@ -190,9 +190,11 @@ class MultiTurnAgent(ABC):
     request_timeout_s: float | None = None
 
     # Per-step sampling temperature, threaded to `PromptedCall.call` → `astream`.
-    # 0.0 keeps the historical greedy behaviour; agents that benefit from
-    # exploration across turns (e.g. SelectAgent) raise it on their subclass.
-    temperature: float = 0.0
+    # 1.0 per Gemini 3.x guidance: thinking-enabled calls below 1.0 can trap the
+    # model in a degenerate reasoning loop that burns the whole output budget
+    # (https://ai.google.dev/gemini-api/docs/gemini-3). Subclasses may still
+    # override (e.g. SelectAgent).
+    temperature: float = 1.0
 
     _SYSTEM_TEMPLATE = """\
 {{ briefing }}
