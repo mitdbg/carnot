@@ -35,7 +35,6 @@ from skunk.config import SkunkConfig
 from skunk.human_intervention import RequestHumanTool
 from skunk.local_python_executor import CodeOutput
 from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent, TextBlock
-from skunk.search_agent.base import Retriever
 from skunk.search_agent.search_tools import (
     EMPTY_RESULT_MESSAGE,
     GREP_RESULT_TAG,
@@ -67,7 +66,7 @@ def _make_embedding_client(emb_model_id: str) -> tuple[EmbeddingClient, str]:
     return OpenRouter(api_key=os.environ["OPENROUTER_API_KEY"]), emb_model_id
 
 
-class SearchAgent(MultiTurnAgent, Retriever):
+class SearchAgent(MultiTurnAgent):
     name = "search_agent"
     # Larger than the MultiTurnAgent default — search chains accumulate many
     # page-content observations across a 20-step ceiling.

@@ -1,9 +1,9 @@
 """Tournament-style block selection over semantic-filter survivor blocks.
 
-`run_select_pipeline` is the precision stage between `retrieve` and `compute`: for each
-retrieve branch it reduces the branch's sem-filter survivor pool to the blocks an
-extraction step should read, then reads each unique block once (text tier + vision
-fallback) for every branch that selected it.
+`run_select` is the precision stage between `retrieve` and `compute`: for each retrieve
+branch it reduces the branch's sem-filter survivor pool to the blocks an extraction step
+should read. Its selected blocks are then read by `block_extract.run_extract` — selection
+hands off SELECTED blocks and knows nothing about how they are extracted.
 
 Selection runs PER PERIOD ENTRY (one sub-selection per entry of the branch's period,
 restricted to the candidates whose data span overlaps it). Every LLM call is the SAME
@@ -23,20 +23,13 @@ import re
 from collections import Counter
 
 from skunk.common import (
-    AnnotatedValue,
-    BlockRef,
+    BranchRetrieval,
     ExecutionContext,
     SemPoolEntry,
     traced_step,
 )
 from skunk.errors import StepFailed
-from skunk.extract import (
-    TextExtractor,
-    VisionExtractor,
-    _blocks_to_pagerefs,
-    _render_pages_b64,
-)
-from skunk.page_index.query import _branch_entries, _overlaps
+from skunk.page_index.query import PageIndexRetriever, _branch_entries, _overlaps
 from skunk.plan import RetrieveBranch
 from skunk.prompted_call import PromptedCall
 
@@ -61,13 +54,6 @@ def _block_id(e: SemPoolEntry) -> str:
 
 def _ident(e: SemPoolEntry) -> str:
     return f"{e.ref.page.month} p.{e.ref.page.page}"
-
-
-def _page_keys(e: SemPoolEntry) -> set[str]:
-    """Every `month:page` key the entry stands for (anchor + merged member pages)."""
-    return {f"{e.ref.page.month}:{e.ref.page.page}"} | {
-        f"{m.month}:{m.page}" for m in e.ref.member_refs
-    }
 
 
 def _canon_title(raw: str | None) -> str:
@@ -137,28 +123,6 @@ def _block_line(num: int, e: SemPoolEntry) -> str:
     if e.summary:
         line += f"\n    summary: {e.summary}"
     return line
-
-
-def _hydrate_rows(
-    pool: list[SemPoolEntry], ctx: ExecutionContext
-) -> list[SemPoolEntry]:
-    """Backfill full row headers from the page catalog for entries built before
-    `rows` existed (e.g. replayed retrieval caches)."""
-    from dataclasses import replace
-
-    from skunk.page_index.store import get_page_store
-
-    store = get_page_store(str(ctx.config.pdf_dir))
-    out: list[SemPoolEntry] = []
-    for e in pool:
-        if not e.rows and e.ref.block_index is not None:
-            row = store.catalog_row(e.ref.page)
-            if row is not None and 0 <= e.ref.block_index < len(row.content_blocks):
-                e = replace(
-                    e, rows=tuple(row.content_blocks[e.ref.block_index].row_headers)
-                )
-        out.append(e)
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -244,8 +208,6 @@ async def _select_call(
     parser is parity-checked against the batch's block count. Emits one structured
     `block_select_call` event (inputs + verdicts + latency/tokens) — the unit the
     trace viewer's tournament visualization renders."""
-    from skunk.page_index.query import PageIndexRetriever
-
     listing, flat = _render_candidates(groups, pool)
     n = len(flat)
     parts = _selection_header(ctx, branch, period_label)
@@ -395,113 +357,50 @@ async def _select_for_branch(
 
 
 # ---------------------------------------------------------------------------
-# Downstream extraction — text tier, pure vision fallback; one read per block
-# serving ALL its branches
-# ---------------------------------------------------------------------------
-
-_TEXT = TextExtractor()
-_VISION = VisionExtractor()
-
-
-def _synth_branch(branches: list[RetrieveBranch]) -> RetrieveBranch:
-    """One stamp-bearing branch for a multi-branch page read. Branch identity is
-    irrelevant at extraction, so the call-level provenance fields carry the union of
-    the requesting branches."""
-    keys = list(dict.fromkeys(b.key for b in branches))
-    periods = list(dict.fromkeys(p for b in branches if (p := b.period)))
-    return RetrieveBranch(
-        key="; ".join(keys),
-        period=", ".join(periods) or None,
-        visual_only=any(b.visual_only for b in branches),
-    )
-
-
-async def _extract_block(
-    ctx: ExecutionContext,
-    ref: BlockRef,
-    branches: list[RetrieveBranch],
-) -> list[AnnotatedValue]:
-    """One block's read serving EVERY branch that selected it: the call's opening line
-    lists all their targets, so a single page read extracts for each. Text tier first,
-    pure vision as the fallback — for visual_only branches, the `extract_vision_only`
-    override, or a text pass that found nothing."""
-    branch = branches[0] if len(branches) == 1 else _synth_branch(branches)
-    looking = None
-    if len(branches) > 1:
-        lines = []
-        for b in branches:
-            line = f"- {b.key}"
-            if b.period:
-                line += f" (for the period {b.period})"
-            lines.append(line)
-        looking = "You are looking for ALL of the following:\n" + "\n".join(lines)
-    if not branch.visual_only and not ctx.config.extract_vision_only:
-        entries = await _TEXT.run(
-            ctx.question, branch, [ref], ctx, looking_for=looking
-        )
-        if entries:
-            return entries
-    images, rendered_refs = _render_pages_b64(_blocks_to_pagerefs([ref]), ctx)
-    if not images:
-        return []
-    return await _VISION.run(
-        ctx.question, branch, images, rendered_refs, ctx, looking_for=looking
-    )
-
-
-# ---------------------------------------------------------------------------
-# The pipeline
+# The selection pipeline
 # ---------------------------------------------------------------------------
 
 
-async def run_select_pipeline(
+async def run_select(
     ctx: ExecutionContext,
     branches: list[RetrieveBranch],
-    docs: list[list[BlockRef] | StepFailed],
-    pools: list[list[SemPoolEntry]],
+    retrievals: list[BranchRetrieval | StepFailed],
     branch_ids: list[int],
-) -> list[list[AnnotatedValue] | StepFailed]:
-    """Select → extract for all retrieve branches of one question: per-branch
-    narrowing rounds + final selection call over the branch's survivor pool, then one
-    organized extraction sweep (each unique block read once, its entries owned by the
-    FIRST branch that selected it — compute must see each datum exactly once). Returns
-    one result per branch (its entries, or the `StepFailed` to attribute to it)."""
-    results: list[list[AnnotatedValue] | StepFailed | None] = [None] * len(branches)
+) -> list[list[SemPoolEntry] | StepFailed]:
+    """Select the blocks an extraction step should read, for every retrieve branch of one
+    question: build each branch's candidate pool, then run the per-period narrowing
+    tournament over it (or, for `pre_selected` retrievals, keep the whole pool). Returns one
+    slot per branch aligned to `branches` — the selected `SemPoolEntry`s, or the `StepFailed`
+    to attribute to it. `block_extract.run_extract` reads the selected blocks."""
+    results: list[list[SemPoolEntry] | StepFailed | None] = [None] * len(branches)
 
+    # The candidate pool is built HERE, once, for every backend — the page store is the
+    # canonical blocks→pool builder. `pre_selected` retrievals (golden / search-agent) skip
+    # the tournament below and extract every block; live page-index blocks run selection.
     branch_pools: dict[int, list[SemPoolEntry]] = {}
-    for pos, (branch, doc, pool) in enumerate(zip(branches, docs, pools)):
-        if isinstance(doc, StepFailed):
-            results[pos] = doc
+    for pos, (branch, retrieval) in enumerate(zip(branches, retrievals)):
+        if isinstance(retrieval, StepFailed):
+            results[pos] = retrieval
             continue
-        pool_entries = pool
-        if not pool_entries:
-            from skunk.page_index.query import PageIndexRetriever
-
-            pool_entries = PageIndexRetriever.pool_for_blocks(
-                doc, str(ctx.config.pdf_dir)
-            )
+        pool_entries = PageIndexRetriever.pool_for_blocks(
+            list(retrieval.blocks), str(ctx.config.pdf_dir)
+        )
         if not pool_entries:
             results[pos] = StepFailed(
                 "retrieve",
                 f"semantic filter kept no blocks for branch {branch.key!r}",
             )
             continue
-        branch_pools[pos] = _hydrate_rows(pool_entries, ctx)
-    if not branch_pools:
-        return [
-            r if r is not None else StepFailed("block_select", "no candidate pool")
-            for r in results
-        ]
+        branch_pools[pos] = pool_entries
 
-    selections: dict[int, list[SemPoolEntry]] = {}
     # Golden / search-agent blocks are ALREADY final — bypass the tournament entirely and
-    # extract every block. Golden's whole point is PERFECT retrieval straight into extract;
+    # keep every block. Golden's whole point is PERFECT retrieval straight into extract;
     # running selection there would contaminate the extract+compute ceiling and (under the
     # keep cap) could drop gold pages. Selection only applies on the live page-index path.
-    if ctx.config.golden_pages is not None or str(ctx.config.retriever) != "page_index":
-        for pos in sorted(branch_pools):
-            selections[pos] = branch_pools[pos]
-    else:
+    if any(isinstance(r, BranchRetrieval) and r.pre_selected for r in retrievals):
+        for pos in branch_pools:
+            results[pos] = branch_pools[pos]
+    elif branch_pools:
         async def _select(pos: int) -> list[SemPoolEntry]:
             pool = branch_pools[pos]
 
@@ -536,70 +435,9 @@ async def run_select_pipeline(
                     "retrieve", f"block_select error for {branches[pos].key!r}: {r}"
                 )
             else:
-                selections[pos] = r
+                results[pos] = r
 
-    # Organized extraction: each unique block read ONCE, mapped to EVERY branch that
-    # selected it; entries attributed to the first selecting branch (`owner`).
-    want: dict[str, tuple[SemPoolEntry, list[int]]] = {}
-    for pos in sorted(selections):
-        for e in selections[pos]:
-            bid = _block_id(e)
-            if bid in want:
-                want[bid][1].append(pos)
-            else:
-                want[bid] = (e, [pos])
-    n_req = sum(len(v) for v in selections.values())
-    ctx.emit(
-        f"select_extract n_requested={n_req} n_reads={len(want)} "
-        f"n_already_read={n_req - len(want)}"
-    )
-
-    extracted: dict[str, list[AnnotatedValue]] = {}
-
-    async def _extract_phase() -> None:
-        reads = await asyncio.gather(
-            *(
-                _extract_block(ctx, e.ref, [branches[p] for p in poss])
-                for e, poss in want.values()
-            ),
-            return_exceptions=True,
-        )
-        for bid, res in zip(want, reads):
-            if isinstance(res, BaseException):
-                ctx.emit(f"select_extract_failed block={bid} error={str(res)!r}")
-                extracted[bid] = []
-            else:
-                extracted[bid] = res
-
-    if want:
-        await traced_step(ctx, "extract", _extract_phase)
-
-    for pos in sorted(selections):
-        bids = [_block_id(e) for e in selections[pos]]
-        owned = [
-            v
-            for bid in bids
-            if want[bid][1][0] == pos
-            for v in extracted.get(bid, [])
-        ]
-        covered = any(extracted.get(bid) for bid in bids)
-        if covered or owned:
-            results[pos] = owned
-        else:
-            results[pos] = StepFailed(
-                "extract",
-                f"selected blocks yielded no data for {branches[pos].key!r}",
-            )
-        sel_pages = sorted(
-            set().union(*(_page_keys(e) for e in selections[pos]))
-            if selections[pos] else set()
-        )
-        ctx.emit(
-            f"select_pipeline_branch branch_id={branch_ids[pos]} "
-            f"n_blocks={len(bids)} n_entries={len(owned)} covered={covered}",
-            data={"branch_id": branch_ids[pos], "pages": sel_pages},
-        )
     return [
-        r if r is not None else StepFailed("block_select", "branch produced no result")
+        r if r is not None else StepFailed("block_select", "no candidate pool")
         for r in results
     ]

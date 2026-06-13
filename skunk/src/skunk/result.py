@@ -45,10 +45,7 @@ def describe_value(v: Any) -> str:
     if isinstance(v, Final):
         return f"str: {v.answer!r}"
     if isinstance(v, NeedsMore):
-        return (
-            f"needs_more n_keep={len(v.keep)} n_committed={len(v.committed)} "
-            f"missing={v.missing!r}"
-        )
+        return f"needs_more n_keep={len(v.keep)} missing={v.missing!r}"
     if isinstance(v, list):
         return f"list({len(v)} branches)"
     s = repr(v)
@@ -98,8 +95,7 @@ def summarize_value(v: Any) -> dict:
             "type": "needs_more",
             "missing": v.missing,
             "missing_reason": v.missing_reason,
-            "keep": v.keep,
-            "committed": [_summarize_annotated(e) for e in v.committed],
+            "keep": [_summarize_annotated(e) for e in v.keep],
         }
     if isinstance(v, list) and v and isinstance(v[0], SemPoolEntry):
         seen: dict[tuple, None] = {}
