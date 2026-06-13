@@ -36,8 +36,8 @@ Retrieval cache: every real run auto-writes its retrieve output (the deduped pag
 union per UID) to <run-dir>/retrieval_cache.json. Point `--retrieval-cache <path>`
 at one to replay it — the cached pages are injected golden-style (bypassing
 retrieve) so you can tune extract/compute without re-paying retrieval. Cached pages
-are the retrieve phase's output after block_select — i.e. exactly the pages extract
-read on the original run. `--golden` and `--retrieval-cache` are mutually exclusive
+are the retrieve phase's output — i.e. exactly the pages handed to selection/extract
+on the original run. `--golden` and `--retrieval-cache` are mutually exclusive
 (two page sources).
 """
 
@@ -52,7 +52,7 @@ import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 
 import pandas as pd
@@ -83,6 +83,7 @@ from skunk import (  # noqa: E402
 )
 
 from skunk.trace import configure_obs  # noqa: E402
+from skunk.common import SemPoolEntry  # noqa: E402
 from skunk.page_index.query import BlockRef  # noqa: E402
 
 from eval.util import dump_trace  # noqa: E402
@@ -141,18 +142,25 @@ def load_golden(csv_path: str | Path) -> dict[str, list[PageRef]]:
 # ---------------------------------------------------------------------------
 #
 # Every real run auto-writes its actual retrieve output to <run-dir>/retrieval_cache.json:
-# per UID the deduped union of blocks `block_select` chose (whole-page blocks on the
-# search-agent path). A later run with `--retrieval-cache <path>` loads it and injects the
-# blocks, bypassing the expensive retrieve operator so you can iterate on extract/compute.
+# per UID the sem-filter survivor pool (`sem_pool`) plus the deduped block union (`blocks`).
+# A later run with `--retrieval-cache <path>` bypasses the expensive retrieve sweep:
+#   - page-index cache (has `sem_pool`): the survivor pool is injected and the selection
+#     agent runs over it at runtime — so a replay can iterate on SELECTION, extract, and
+#     compute, only retrieve is fixed.
+#   - pool-less cache (search-agent / pre-pool): the `blocks` are replayed as final
+#     (iterate on extract/compute only).
 # Cache JSON per UID:
-#   {"blocks": [{"month","page","block_index","members":[...]}...]}
+#   {"blocks": [{"month","page","block_index","members":[...]}...], "sem_pool": [...]}
 
 
 @dataclass(frozen=True)
 class CachedRetrieval:
-    """One UID's cached retrieve output: the deduped block union for that UID."""
+    """One UID's cached retrieve output: the deduped block union for that UID, plus the
+    sem-filter candidate pool (empty for caches written before pools existed) so coverage
+    repair can re-select on replay."""
 
     blocks: list[BlockRef]
+    sem_pool: list[SemPoolEntry] = dc_field(default_factory=list)
 
 
 def _block_to_json(b: BlockRef) -> dict:
@@ -177,14 +185,42 @@ def _block_from_json(e: dict) -> BlockRef:
     )
 
 
+def _pool_to_json(p: SemPoolEntry) -> dict:
+    return {
+        **_block_to_json(p.ref),
+        "interval": list(p.interval) if p.interval else None,
+        "kind": p.kind,
+        "title": p.title,
+        "summary": p.summary,
+        "cols": list(p.cols),
+        "rows_tail": list(p.rows_tail),
+        "rows": list(p.rows),
+    }
+
+
+def _pool_from_json(e: dict) -> SemPoolEntry:
+    return SemPoolEntry(
+        ref=_block_from_json(e),
+        interval=tuple(e["interval"]) if e.get("interval") else None,  # type: ignore[arg-type]
+        kind=e.get("kind", "table"),
+        title=e.get("title"),
+        summary=e.get("summary"),
+        cols=tuple(e.get("cols") or ()),
+        rows_tail=tuple(e.get("rows_tail") or ()),
+        rows=tuple(e.get("rows") or ()),
+    )
+
+
 def write_retrieval_cache(path: Path, by_uid: dict[str, CachedRetrieval]) -> None:
-    """Serialize uid → blocks to JSON."""
+    """Serialize uid → blocks (+ sem pool when present) to JSON."""
     import json
 
-    payload = {
-        uid: {"blocks": [_block_to_json(b) for b in cr.blocks]}
-        for uid, cr in by_uid.items()
-    }
+    payload: dict[str, dict] = {}
+    for uid, cr in by_uid.items():
+        entry: dict = {"blocks": [_block_to_json(b) for b in cr.blocks]}
+        if cr.sem_pool:
+            entry["sem_pool"] = [_pool_to_json(p) for p in cr.sem_pool]
+        payload[uid] = entry
     path.write_text(json.dumps(payload, indent=2))
 
 
@@ -194,7 +230,10 @@ def load_retrieval_cache(path: str | Path) -> dict[str, CachedRetrieval]:
     with open(path) as f:
         payload = json.load(f)
     return {
-        uid: CachedRetrieval(blocks=[_block_from_json(b) for b in entry["blocks"]])
+        uid: CachedRetrieval(
+            blocks=[_block_from_json(b) for b in entry["blocks"]],
+            sem_pool=[_pool_from_json(p) for p in entry.get("sem_pool", [])],
+        )
         for uid, entry in payload.items()
     }
 
@@ -210,6 +249,7 @@ async def _run_one_question(
     uid: str | None = None,
     golden_pages: list[PageRef] | None = None,
     cached_blocks: list[BlockRef] | None = None,
+    cached_sem_pool: list[SemPoolEntry] | None = None,
     trace_path: str | None = None,
     log_path: str | None = None,
 ) -> dict:
@@ -223,9 +263,19 @@ async def _run_one_question(
             )
 
     config = SkunkConfig.from_env()
+    # Hermetic eval: human-in-the-loop is for the competition server, never for an automated
+    # benchmark run. Force every human-review path off regardless of the environment
+    # (SKUNK_HUMAN_* env vars `from_env` may have read), so a stray flag can't silently
+    # human-gate or stall a run. The intervention/review HANDLERS are already None (never
+    # passed to the Orchestrator below); these are the config FLAGS that would request them.
+    config.human_figure = False
+    config.human_verify_extract = False
+    config.human_lookup = False
     config.golden_pages = golden_pages
-    # Block-aware replay: inject the cached blocks so extract block-scopes as the live run did.
+    # Block-aware replay: inject the cached blocks so extract block-scopes as the live run did,
+    # and the cached sem pool so coverage repair can re-select on replay.
     config.cached_blocks = cached_blocks
+    config.cached_sem_pool = cached_sem_pool
 
     overrides_path = Path(config.prompt_overrides_path)
     prompt_overrides = (
@@ -283,9 +333,10 @@ async def _run_one_question(
                 model=config.llm_model,
             )
 
-        # The retrieve sweep's deduped blocks — empty under golden/replay bypass (retrieve
-        # never ran). Surfaced so the harness can cache them for later replay.
+        # The retrieve sweep's deduped blocks + sem pool — empty under golden/replay bypass
+        # (retrieve never ran). Surfaced so the harness can cache them for later replay.
         retrieved_blocks = list(orch.retrieved_blocks)
+        sem_pool = list(orch.sem_pool)
 
         if failure is not None:
             return {
@@ -296,6 +347,7 @@ async def _run_one_question(
                 "latency_s": round(latency_s, 3),
                 "cost_usd": cost_usd,
                 "retrieved_blocks": retrieved_blocks,
+                "sem_pool": sem_pool,
             }
         return {
             "question": question,
@@ -305,6 +357,7 @@ async def _run_one_question(
             "latency_s": round(latency_s, 3),
             "cost_usd": cost_usd,
             "retrieved_blocks": retrieved_blocks,
+            "sem_pool": sem_pool,
         }
     finally:
         ctx.close()
@@ -338,8 +391,10 @@ REPORT_FIELDS = [
 # USD per token (input, output); thinking tokens billed at the output rate. Copied from
 # scripts/analyze_trace.py — keep the two in sync if Gemini pricing changes.
 PRICES = {
-    "gemini-3.5-flash": (0.30e-6, 2.50e-6),
+    "gemini-3.5-flash": (1.50e-6, 9.00e-6),  # list price (was 0.30/2.50 — stale gemini-2.5-flash rate)
+    "gemini-3-flash-preview": (0.50e-6, 3.00e-6),  # list price (verified ai.google.dev + OpenRouter, 2026-06)
     "gemini-3.1-flash-lite": (0.10e-6, 0.40e-6),
+    "gemini-3.1-pro-preview": (2.00e-6, 12.00e-6),
 }
 _CALL_RE = re.compile(
     r"call call_site=\S+ model=(\S+) .*?in_tok=(\d+) out_tok=(\d+) think_tok=(\S+)"
@@ -461,14 +516,15 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
 
     golden_pages = None
     cached_blocks = None
+    cached_sem_pool = None
     if cfg.golden_lookup is not None:
         golden_pages = cfg.golden_lookup.get(uid, [])
         if not golden_pages:
             print(f"[e2e] WARNING: no golden pages for {uid!r}")
     elif cfg.cached_lookup is not None:
-        # Replay: inject the cached retrieve output for this UID — pages golden-style and the
-        # selected blocks for block-scoped extract. A UID absent from the cache can't be
-        # replayed without paying for retrieval, which the cache exists to avoid — skip it loudly.
+        # Replay: inject the cached retrieve output for this UID, bypassing the expensive
+        # retrieve sweep. A UID absent from the cache can't be replayed without paying for
+        # retrieval, which the cache exists to avoid — skip it loudly.
         cached = cfg.cached_lookup.get(uid)
         if cached is None:
             print(
@@ -477,16 +533,24 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
                 file=sys.stderr,
             )
             return None
-        cached_blocks = cached.blocks
-        # Derive golden_pages from blocks to trigger the retrieve bypass; pages are the
-        # deduped union of each block's member_refs.
-        seen: set[PageRef] = set()
-        golden_pages = []
-        for b in cached_blocks:
-            for r in b.member_refs:
-                if r not in seen:
-                    seen.add(r)
-                    golden_pages.append(r)
+        if cached.sem_pool:
+            # Survivor cache: inject the sem-filter survivor pool and let the selection
+            # agent run over it at runtime — so a cached run can iterate on selection,
+            # not just extract/compute. The pool's
+            # presence triggers the retrieve bypass (no golden_pages / cached_blocks needed).
+            cached_sem_pool = cached.sem_pool
+        else:
+            # Pool-less cache (search-agent / pre-pool): replay the selected blocks as final,
+            # bypassing block selection too. golden_pages (the deduped member-ref union)
+            # triggers the bypass.
+            cached_blocks = cached.blocks
+            seen: set[PageRef] = set()
+            golden_pages = []
+            for b in cached_blocks:
+                for r in b.member_refs:
+                    if r not in seen:
+                        seen.add(r)
+                        golden_pages.append(r)
 
     trace_path = log_path = None
     if cfg.trace_dir:
@@ -499,6 +563,7 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
             verbose=cfg.verbose,
             golden_pages=golden_pages,
             cached_blocks=cached_blocks,
+            cached_sem_pool=cached_sem_pool,
             uid=uid,
             trace_path=trace_path,
             log_path=log_path,
@@ -536,7 +601,9 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
         print(f"[e2e] {uid} FAILED: {result['reason']}")
     else:
         mark = "✓" if correct else "✗"
-        print(f"[e2e] {uid} Answer: {result['answer']}  [{mark} vs gold: {gold_answer!r}]")
+        print(
+            f"[e2e] {uid} Answer: {result['answer']}  [{mark} vs gold: {gold_answer!r}]"
+        )
 
     retrieved_blocks = result.get("retrieved_blocks", [])
     category = "correct" if correct else ("fail" if result["failed"] else "wrong")
@@ -551,7 +618,9 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
         "gold_answer": gold_answer,
         "golden_pages": " ".join(f"{p.month}:{p.page}" for p in gold_report_pages),
         "reason": result.get("reason") or "",
-        "retrieval_recall": _retrieval_recall(retrieved_blocks, cfg.golden_report.get(uid)),
+        "retrieval_recall": _retrieval_recall(
+            retrieved_blocks, cfg.golden_report.get(uid)
+        ),
         # Wall-clock seconds to plan + execute the query, and USD billed for its generation
         # calls — both measured in-process by _run_one_question (no trace log needed, so they
         # are populated under --no-traces too). latency_s is None if the run aborted before
@@ -563,6 +632,7 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
         "correct": correct,
         "failed": result["failed"],
         "retrieved_blocks": retrieved_blocks,
+        "sem_pool": result.get("sem_pool") or [],
     }
 
 
@@ -823,7 +893,9 @@ def main() -> None:
     # Every run auto-caches its real retrieve output for later replay. Golden / replay
     # runs bypass retrieve so they produce no blocks — nothing to write.
     cache_by_uid = {
-        r["uid"]: CachedRetrieval(blocks=r["retrieved_blocks"])
+        r["uid"]: CachedRetrieval(
+            blocks=r["retrieved_blocks"], sem_pool=r.get("sem_pool") or []
+        )
         for r in rows
         if r.get("retrieved_blocks")
     }

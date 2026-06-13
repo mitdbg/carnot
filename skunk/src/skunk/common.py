@@ -256,8 +256,11 @@ _KIND_BY_PREFIX: dict[str, str] = {
     "terminal_commit": "note",
     "steps_low_warning": "note",
     "parallel_branch_failed": "error",
-    "replan_dropped": "note",
-    "codegen_missing": "note",
+    "compute_needs_more": "note",
+    "compute_partial_malformed": "note",
+    "pool_update": "note",
+    "compute_short_circuit": "note",
+    "recovery_exhausted": "error",
 }
 
 
@@ -386,6 +389,29 @@ class BlockRef:
     block: ContentBlock | None = field(default=None, compare=False)
 
 
+@dataclass(frozen=True)
+class SemPoolEntry:
+    """One sem_filter-surviving content block, kept after block selection as the repair
+    candidate pool. Self-contained (interval + display metadata copied out of the catalog
+    row) so the extract-side repair pass can re-rank and re-select without catalog access —
+    which also makes it serializable into the eval retrieval cache for replay."""
+
+    ref: BlockRef  # anchor + members; block=None is fine (extract reads pages whole)
+    interval: (
+        tuple[str, str] | None
+    )  # the anchor page's data interval ("YYYY-MM" lo/hi)
+    kind: str = "table"
+    title: str | None = None
+    summary: str | None = None
+    cols: tuple[str, ...] = ()
+    rows_tail: tuple[
+        str, ...
+    ] = ()  # trailing row headers — shows the data window's end
+    rows: tuple[
+        str, ...
+    ] = ()  # FULL row headers — shows granularity (annual vs monthly rows) and window
+
+
 VALUE_KIND_VOCAB: frozenset[str] = frozenset({"scalar", "vector", "table"})
 
 
@@ -402,10 +428,18 @@ class AnnotatedValue(BaseModel):
     `.frame` exposes the payload as a uniform `pd.DataFrame` so downstream code
     needn't branch on `kind`.
 
-    Provenance (`bulletin`/`pages`/`as_of`/`requested_period`/`retrieve_key`) is
+    `notes` is LLM-authored at extract time: prose capturing the page's textual
+    context that bears on the question — footnotes, headnotes, comments, scope
+    caveats, break-in-series notes, and the meaning of any print flags (p/r) —
+    summarized as it pertains to the question, preferring the page's original
+    wording. It is one note for the whole payload (a vector/table shares it), so
+    it is context, not a per-cell discriminator; per-datum disambiguation lives
+    in `description`. Empty for external lookups.
+
+    Provenance (`bulletin`/`pages`/`requested_period`/`retrieve_key`) is
     machine-stamped from the extract inputs — the source page refs and the
     retrieve branch — NOT authored by the LLM. It is absent (None/empty) for
-    external lookups and for older payloads. `bulletin` is the issue the value
+    external lookups. `bulletin` is the issue the value
     was printed in ("YYYY-MM", lexically sortable = chronological); downstream
     compute uses it to sort/filter by publication date — e.g. to pick the
     latest non-revised vintage across several bulletins, where the LLM-written
@@ -417,6 +451,7 @@ class AnnotatedValue(BaseModel):
     description: str
     value: Any
     unit: str = ""
+    notes: str = ""
     kind: Literal["scalar", "vector", "table"] = "scalar"
     index_name: str | None = None
     row_name: str | None = None
@@ -426,9 +461,6 @@ class AnnotatedValue(BaseModel):
     # LLM-written. Defaults keep external lookups and old payloads valid.
     bulletin: str | None = None  # source issue "YYYY-MM" (publication date)
     pages: tuple[int, ...] = ()  # source PDF page(s); () when unattributable
-    as_of: str | list[str | None] | None = (
-        None  # branch.as_of — pinned vintage requested (a list = per-period-entry pins)
-    )
     requested_period: str | None = None  # branch.period — data window requested
     retrieve_key: str | None = None  # branch.key — concept this datum serves
     source_block_page: int | None = None
@@ -493,6 +525,26 @@ class AnnotatedValue(BaseModel):
         return df
 
 
+@dataclass(frozen=True)
+class Final:
+    """Compute produced the answer."""
+
+    answer: str
+
+
+@dataclass(frozen=True)
+class NeedsMore:
+    """Compute judged its inputs insufficient. `keep` indexes into the input_values
+    compute was called with (pool entries to retain across the recovery round);
+    `committed` are new computed-intermediate values to add to the pool;
+    `missing_reason`/`missing` describe what to gather next."""
+
+    keep: list[int]
+    committed: list[AnnotatedValue]
+    missing_reason: str
+    missing: list[str]
+
+
 _PAD = "         "  # 9-space continuation indent for an entry's detail lines
 
 
@@ -504,8 +556,6 @@ def _provenance_str(e: AnnotatedValue) -> str:
         parts.append(f"bulletin={e.bulletin!r}")
     if e.pages:
         parts.append(f"pages={list(e.pages)!r}")
-    if e.as_of:
-        parts.append(f"as_of={e.as_of!r}")
     if e.requested_period:
         parts.append(f"requested_period={e.requested_period!r}")
     if e.retrieve_key:
@@ -523,6 +573,8 @@ def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
     )
     prov = _provenance_str(e)
     prov_lines = [f"{_PAD}provenance: {prov}"] if prov else []
+    if e.notes:
+        prov_lines.insert(0, f"{_PAD}notes: {e.notes!r}")
     if e.kind == "scalar":
         return [
             head,
@@ -539,7 +591,7 @@ def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
             f"kind=table, row_name={e.row_name!r}, col_name={e.col_name!r}, "
             f"unit={e.unit!r}, shape=({n_rows}, {n_cols})"
         )
-    lines = [head, f"{_PAD}{meta}"]
+    lines = [head, f"{_PAD}{meta}", *prov_lines]
     if n_rows == 0:
         lines.append(f"{_PAD}frame: (empty)")
         return lines

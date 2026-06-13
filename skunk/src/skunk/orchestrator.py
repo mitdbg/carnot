@@ -7,7 +7,6 @@ from typing import cast
 from skunk.compute import ComputeOp
 from skunk.config import SkunkConfig
 from skunk.errors import MissingData, StepFailed
-from skunk.extract import ExtractOp
 from skunk.human import (
     BrokerChannel,
     ConsoleChannel,
@@ -19,12 +18,22 @@ from skunk.common import (
     AnnotatedValue,
     BlockRef,
     ExecutionContext,
+    Final,
     HumanInterventionHandler,
     HumanReviewRegister,
+    NeedsMore,
+    SemPoolEntry,
     traced_step,
 )
 from skunk.llm_client import LLMClient
-from skunk.plan import Branch, Plan, PlanDiff, Planner, RetrieveBranch
+from skunk.plan import (
+    AttemptRecord,
+    Branch,
+    LookupBranch,
+    Plan,
+    Planner,
+    RetrieveBranch,
+)
 from skunk.prompted_call import PromptOverride
 from skunk.question_explainer import ConceptExplanation, QuestionExplainer
 from skunk.retrieve import RetrieveOp
@@ -94,7 +103,8 @@ async def recompute_answer(
     (keyed by branch id) applied — the deterministic revision path. Each override is the human's
     source-indexed review items for that branch; `apply_overrides` rebuilds the branch's entries
     from them (honoring edits, deletes, and provenance). Branches with no override keep their
-    original entries. No re-plan / re-retrieve / re-extract."""
+    original entries. No re-plan / re-retrieve / re-extract. One compute pass: a `Final` yields
+    the revised answer, an unresolved `NeedsMore` surfaces as `MissingData`."""
     merged: list[AnnotatedValue] = []
     for bid in state.order:
         cached = state.entries_by_branch.get(bid, [])
@@ -103,10 +113,17 @@ async def recompute_answer(
         else:
             merged.extend(cached)
     merged.extend(state.extra_entries)
-    return await ComputeOp().run(merged, ctx, concept_explanations=state.explanations)
+    outcome = await ComputeOp().run(
+        merged, ctx, concept_explanations=state.explanations
+    )
+    if isinstance(outcome, Final):
+        return outcome.answer
+    raise MissingData(outcome.missing_reason, outcome.missing)
 
 
 def _merge_branch_outcome(previous: BranchOutcome, new: BranchOutcome) -> BranchOutcome:
+    """Merge a human-directed re-retrieval's outcome into a branch's prior outcome: take the
+    new outcome on any failure, else union both sets of entries + blocks (deduped)."""
     if previous.error is not None or previous.entries is None:
         return new
     if new.error is not None or new.entries is None:
@@ -157,23 +174,23 @@ class Orchestrator:
         )
         self._current_plan: Plan | None = None
         # Stable per-question branch identity. `_branch_ids[i]` is the id of the
-        # current plan's branch `i`; a replan carries kept branches' ids forward and
-        # allocates fresh ids for added branches (`PlanDiff.apply` makes new branch
-        # COPIES, so positional indices are not stable across revisions). The trace
-        # viewer keys plan-branch ↔ operator-step on this id to render revision tabs.
+        # current sweep's branch `i`; every sweep (initial or replan) allocates
+        # fresh ids — branch identity dies at the end of its sweep, and a plan
+        # event's branches belong to that revision only. The trace viewer keys
+        # plan-branch ↔ operator-step on this id to render revision tabs.
         self._branch_ids: list[int] = []
         self._next_branch_id = 0
+        # Branch ids actually executed in the latest sweep (vs carried forward) — drives the
+        # `execution_status` the HITL guidance shows a reviewer.
         self._last_executed_branch_ids: set[int] = set()
         self._planner = Planner()
         self._retrieve = RetrieveOp(self._ctx.config)
-        self._extract = ExtractOp()
         self._lookup = LookupExternalOp()
         # Human-in-the-loop middleware (inert unless a SKUNK_HUMAN_* flag is set). Gates on
         # ctx.config per call, so constructing it unconditionally is free when disabled.
         # Channel by transport: under the competition server a handler is present → route
         # human requests through the async broker/web UI; for a local CLI run fall back to
-        # the blocking console. (Selecting by handler-presence also keeps the SKUNK_HUMAN_*
-        # flags from hanging a server worker on stdin.)
+        # the blocking console.
         human_channel = (
             BrokerChannel(self._ctx.human_intervention_handler)
             if self._ctx.human_intervention_handler is not None
@@ -188,8 +205,12 @@ class Orchestrator:
         # `retrieved_blocks` so the eval harness can cache and replay a run without re-paying
         # retrieval. Empty under golden/replay bypass (retrieve never runs).
         self._retrieved_blocks: list[BlockRef] = []
+        # Deduped union of every branch's sem-filter candidate pool (same lifecycle as
+        # `_retrieved_blocks`). Exposed via `sem_pool` so the eval harness can persist it
+        # into the retrieval cache for replayable coverage repair.
+        self._sem_pool: list[SemPoolEntry] = []
         # Snapshot for an optimistic-review recompute (the per-branch entries that produced the
-        # answer); set on every successful compute, None until then. The server stores it on the
+        # answer); set on every compute attempt, None until then. The server stores it on the
         # task so a later human resolve can revise the answer via `recompute_answer`.
         self._recompute_state: RecomputeState | None = None
 
@@ -198,19 +219,29 @@ class Orchestrator:
         return self._ctx
 
     @property
-    def recompute_state(self) -> RecomputeState | None:
-        """The snapshot needed to revise this answer after a human review resolves (None until a
-        compute has succeeded). See `RecomputeState` / `recompute_answer`."""
-        return self._recompute_state
-
-    @property
     def retrieved_blocks(self) -> list[BlockRef]:
         """Deduped union of blocks from every retrieve sweep this question (empty under
         golden/replay bypass). Pages are derivable via each block's `member_refs`."""
         return self._retrieved_blocks
 
     @property
+    def sem_pool(self) -> list[SemPoolEntry]:
+        """Deduped union of sem-filter candidate pools across retrieve sweeps (empty under
+        golden/replay bypass and on the search-agent path)."""
+        return self._sem_pool
+
+    @property
+    def recompute_state(self) -> RecomputeState | None:
+        """Snapshot of the per-branch entries that produced the answer (None until the first
+        compute attempt). The server stores it so a later human-review resolve can revise the
+        answer deterministically via `recompute_answer`. See `RecomputeState`."""
+        return self._recompute_state
+
+    @property
     def current_plan(self) -> Plan | None:
+        """The latest plan revision. After a replan this holds only that sweep's
+        branches (replans compose fresh plans; earlier revisions live in the
+        `kind="plan"` events)."""
         return self._current_plan
 
     @property
@@ -232,443 +263,186 @@ class Orchestrator:
                 lambda: self._planner.plan(self._ctx.question, self._ctx),
             )
             self._branch_ids = self._alloc_branch_ids(len(plan.branches))
-            self._last_executed_branch_ids = set(self._branch_ids)
             self._emit_plan(plan, "initial")
             outcomes = await self._run_branches(plan.branches, self._branch_ids)
             explanations = await explain_task
         finally:
             explain_task.cancel()
 
-        attempt = 0
+        # Recovery state: the value POOL is what compute sees — compute's explicit
+        # `keep` whitelist + committed computed intermediates + each sweep's new
+        # values; everything compute does not keep is dropped. ATTEMPTS records
+        # every branch's fate across sweeps. Branch outcomes don't outlive their
+        # sweep — the pool is the only data carried across rounds.
+        pool: list[AnnotatedValue] = [
+            e for o in outcomes if o.entries for e in o.entries
+        ]
+        attempts = [
+            AttemptRecord(0, o.branch, len(o.entries or []), o.error) for o in outcomes
+        ]
+        # Human-recovery state: values a human supplied during mandatory intervention
+        # (kept in the pool like any other gathered value), and the missing-id lists each
+        # resolved — threaded to the replanner so it treats those ids as answered.
         human_entries: list[AnnotatedValue] = []
         human_resolutions: list[list[str]] = []
+        needs: NeedsMore | None = None
+        round_idx = 0
+        sweep_added = True  # the initial sweep always reaches compute
+
         while True:
             self._current_plan = plan
-            entries = [
-                *[e for o in outcomes if o.entries for e in o.entries],
-                *human_entries,
-            ]
             # Snapshot BEFORE compute so a human review can revise even a task whose compute
-            # fails (the snapshot holds the branch entries; re-running compute over a human's
-            # correction may then succeed). Captured each loop iteration to reflect the latest
-            # entries/recovery state.
+            # fails (re-running compute over a human correction may then succeed).
             self._capture_recompute_state(outcomes, human_entries, explanations)
-            try:
-                self._result.answer = await traced_step(
+            if sweep_added or needs is None:
+                outcome = await traced_step(
                     self._ctx,
                     "compute",
                     lambda: self._compute.run(
-                        entries,
+                        pool,
                         self._ctx,
                         concept_explanations=explanations,
+                        round_idx=round_idx,
                     ),
                 )
-                return self._result.answer
-            except MissingData as e:
-                attempt += 1
-                if attempt > self._ctx.config.recovery_max_rounds:
-                    # recovery budget exhausted
-                    raise
-                # Bind before the lambda: Python deletes the `except` variable on
-                # block exit, and the lambda is also opaque to ruff's use analysis.
-                reason, missing = e.reason, e.missing
-                handler = self._ctx.human_intervention_handler
-                if handler is None:
-                    # No human handler → autonomously replan (the pre-HITL-merge behavior)
-                    # rather than hard-failing on the first MissingData. Bounded by
-                    # recovery_max_rounds exactly like the human-assisted path below; the
-                    # planner replans from the failure reason / missing fields with no
-                    # human-provided resolutions.
-                    failed = [(o.branch, o.error) for o in outcomes if o.error]
-                    diff = await traced_step(
-                        self._ctx,
-                        "replanner",
-                        lambda: self._planner.replan(
-                            self._ctx, plan, entries, failed, reason, missing, []
-                        ),
+                if isinstance(outcome, Final):
+                    self._result.answer = outcome.answer
+                    return outcome.answer
+                needs = outcome
+                keep_set = set(needs.keep)
+                discarded = [e for i, e in enumerate(pool) if i not in keep_set]
+                pool = [e for i, e in enumerate(pool) if i in keep_set] + list(
+                    needs.committed
+                )
+                self._ctx.emit(
+                    f"pool_update round={round_idx} "
+                    f"kept={len(pool) - len(needs.committed)} "
+                    f"discarded={len(discarded)} committed={len(needs.committed)} "
+                    f"pool_size={len(pool)}",
+                    data={
+                        "discarded": [e.description for e in discarded],
+                        "committed": [e.description for e in needs.committed],
+                    },
+                )
+            else:
+                # Replan sweep produced zero new values: compute on an unchanged pool is a
+                # known no-op, so reuse the prior NeedsMore and go straight to the next
+                # replan (the new failure diagnostics are already in `attempts`). Still
+                # consumes a recovery round. Emit an EMPTY `compute` step (no model call)
+                # anyway so the trace viewer gets one compute node per plan revision — its
+                # revision tabs are keyed to the compute-delimited segments, so a skipped
+                # compute would drop a tab.
+                async def _short_circuit(_round: int = round_idx, _needs: NeedsMore = needs) -> None:
+                    self._ctx.emit(
+                        f"compute_short_circuit round={_round} missing={_needs.missing!r}"
                     )
-                    plan, outcomes = await self._apply_diff(plan, outcomes, diff)
-                    self._emit_plan(
-                        plan,
-                        "replan",
-                        reason=reason,
-                        missing=missing,
-                        recovery_round=attempt,
-                    )
-                    continue
+
+                await traced_step(self._ctx, "compute", _short_circuit)
+
+            round_idx += 1
+            if round_idx > self._ctx.config.recovery_max_rounds:
+                self._ctx.emit(
+                    f"recovery_exhausted rounds={round_idx - 1} "
+                    f"missing={needs.missing!r}"
+                )
+                raise MissingData(needs.missing_reason, needs.missing)
+
+            # Bind before the lambda (opaque to ruff's use analysis).
+            reason, missing = needs.missing_reason, needs.missing
+
+            # === HITL: mandatory human intervention on missing data ===
+            # When a handler is wired, ask the human for the missing data (and optionally let
+            # them scope a branch's source documents for a re-retrieval) BEFORE spending a
+            # replan. If their input alone resolves compute, return without replanning.
+            handler = self._ctx.human_intervention_handler
+            if handler is not None:
                 self._emit_plan(
                     plan,
                     "human_pending",
                     reason=reason,
                     missing=missing,
-                    recovery_round=attempt,
+                    recovery_round=round_idx,
                 )
-                likely_pages: list[dict[str, str | int | None]] = []
-                seen_pages: set[tuple[str | None, int | None]] = set()
-                for entry in entries:
-                    for page in entry.pages:
-                        key = (entry.bulletin, page)
-                        if key not in seen_pages:
-                            seen_pages.add(key)
-                            likely_pages.append(
-                                {"bulletin": entry.bulletin, "page": page}
-                            )
-                for block in self._retrieved_blocks:
-                    for ref in block.member_refs:
-                        key = (ref.month, ref.page)
-                        if key not in seen_pages:
-                            seen_pages.add(key)
-                            likely_pages.append(
-                                {"bulletin": ref.month, "page": ref.page}
-                            )
-                likely_pages = likely_pages[:8]
-                source_docs = [
-                    f"Treasury Bulletin {page['bulletin']} PDF page {page['page']}"
-                    for page in likely_pages
-                    if page["bulletin"] and page["page"] is not None
-                ]
-                guidance = {
-                    "recovery_round": attempt,
-                    "previous_round_plan": [
-                        {
-                            "branch_id": branch_id,
-                            **branch.model_dump(mode="json"),
-                            "searched": (
-                                {
-                                    "key": branch.key,
-                                    "period": branch.period,
-                                    "as_of": branch.as_of,
-                                    "visual_only": branch.visual_only,
-                                }
-                                if branch.kind == "retrieve"
-                                else {
-                                    "target": branch.target,
-                                    "src": branch.src,
-                                }
-                            ),
-                            "blocks": [
-                                {
-                                    "bulletin": block_ref.page.month,
-                                    "page": block_ref.page.page,
-                                    "block_index": block_ref.block_index,
-                                    "member_pages": [
-                                        {"bulletin": ref.month, "page": ref.page}
-                                        for ref in block_ref.member_refs
-                                    ],
-                                    "kind": (
-                                        block_ref.block.kind
-                                        if block_ref.block
-                                        else None
-                                    ),
-                                    "title": (
-                                        block_ref.block.title
-                                        if block_ref.block
-                                        else None
-                                    ),
-                                    "column_headers": (
-                                        block_ref.block.column_headers
-                                        if block_ref.block
-                                        else []
-                                    ),
-                                    "row_headers": (
-                                        block_ref.block.row_headers
-                                        if block_ref.block
-                                        else []
-                                    ),
-                                    "summary": (
-                                        block_ref.block.summary
-                                        if block_ref.block
-                                        else None
-                                    ),
-                                }
-                                for block_ref in outcome.blocks
-                            ],
-                            "output": (
-                                {
-                                    "type": "values",
-                                    "values": [
-                                        {
-                                            "description": entry.description,
-                                            "unit": entry.unit,
-                                            "value_kind": entry.kind,
-                                            "value": entry.value,
-                                            "index_name": entry.index_name,
-                                            "row_name": entry.row_name,
-                                            "col_name": entry.col_name,
-                                            "bulletin": entry.bulletin,
-                                            "pages": list(entry.pages),
-                                            "source_block_page": (
-                                                entry.source_block_page
-                                            ),
-                                            "source_block_index": (
-                                                entry.source_block_index
-                                            ),
-                                        }
-                                        for entry in outcome.entries
-                                    ],
-                                }
-                                if outcome.entries is not None
-                                else None
-                            ),
-                            "output_step": (
-                                "extract"
-                                if branch.kind == "retrieve"
-                                else "lookup_external"
-                            ),
-                            "status": ("failed" if outcome.error is not None else "ok"),
-                            "execution_status": (
-                                "executed"
-                                if branch_id in self._last_executed_branch_ids
-                                else "carried_forward"
-                            ),
-                            "outcome_status": (
-                                "failed" if outcome.error is not None else "succeeded"
-                            ),
-                            "error": (
-                                str(outcome.error)
-                                if outcome.error is not None
-                                else None
-                            ),
-                            "considered_pages": (
-                                outcome.error.details.get("considered_pages", [])
-                                if outcome.error is not None
-                                else []
-                            ),
-                        }
-                        for branch_id, branch, outcome in zip(
-                            self._branch_ids, plan.branches, outcomes
-                        )
-                    ],
-                    "partial_plan": [
-                        {
-                            "branch_id": branch_id,
-                            **branch.model_dump(mode="json"),
-                        }
-                        for branch_id, branch in zip(self._branch_ids, plan.branches)
-                    ],
-                    "gathered_values": [
-                        {
-                            "description": entry.description,
-                            "value": entry.value,
-                            "unit": entry.unit,
-                            "bulletin": entry.bulletin,
-                            "pages": list(entry.pages),
-                        }
-                        for entry in entries
-                    ],
-                    "failed_branches": [
-                        {
-                            "branch_id": branch_id,
-                            "branch": outcome.branch.model_dump(mode="json"),
-                            "error": str(outcome.error),
-                            "considered_pages": outcome.error.details.get(
-                                "considered_pages", []
-                            ),
-                        }
-                        for branch_id, outcome in zip(self._branch_ids, outcomes)
-                        if outcome.error is not None
-                    ],
-                    "likely_pages": likely_pages,
-                    "missing": missing,
-                    "reason": reason,
-                }
-                instructions = (
-                    "Provide the missing information needed to answer the question. "
-                    f"Failure reason: {reason}"
-                )
-                if missing:
-                    instructions += f"\nMissing values: {', '.join(missing)}"
-                response = await handler(
-                    "missing_data",
-                    instructions,
-                    f"Question: {self._ctx.question}",
-                    source_docs,
-                    guidance,
-                )
-                response_text = str(response.get("response", "")).strip()
-                retrieval_directives: dict[int, list[str]] = {}
-                current_retrieve_ids = {
-                    branch_id
-                    for branch_id, branch in zip(self._branch_ids, plan.branches)
-                    if branch.kind == "retrieve"
-                }
-                for item in response.get("retrieval_directives", []):
-                    if not isinstance(item, dict):
-                        continue
-                    branch_id = item.get("branch_id")
-                    documents = item.get("documents")
-                    if (
-                        not isinstance(branch_id, int)
-                        or branch_id not in current_retrieve_ids
-                        or not isinstance(documents, list)
-                    ):
-                        continue
-                    bulletins = []
-                    for document in documents:
-                        match = re.fullmatch(
-                            r"Treasury Bulletin (\d{4}-(?:0[1-9]|1[0-2])) PDF",
-                            str(document).strip(),
-                        )
-                        if match and match.group(1) not in bulletins:
-                            bulletins.append(match.group(1))
-                    if bulletins:
-                        retrieval_directives[branch_id] = bulletins
-                if not response_text and not retrieval_directives:
-                    raise RuntimeError("human intervention returned an empty response")
-                response_sources = [
-                    str(item).strip()
-                    for item in response.get("source_docs", [])
-                    if str(item).strip()
-                ]
-                if retrieval_directives:
-                    rerun_positions = [
-                        i
-                        for i, (branch_id, branch) in enumerate(
-                            zip(self._branch_ids, plan.branches)
-                        )
-                        if branch_id in retrieval_directives
-                        and branch.kind == "retrieve"
-                    ]
-                    if rerun_positions:
-                        rerun_branches = [plan.branches[i] for i in rerun_positions]
-                        rerun_ids = [self._branch_ids[i] for i in rerun_positions]
-                        rerun_outcomes = await self._run_branches(
-                            rerun_branches,
-                            rerun_ids,
-                            document_scopes=retrieval_directives,
-                        )
-                        outcomes = list(outcomes)
-                        for position, outcome in zip(rerun_positions, rerun_outcomes):
-                            outcomes[position] = _merge_branch_outcome(
-                                outcomes[position], outcome
-                            )
-                        self._last_executed_branch_ids = set(rerun_ids)
-                        self._ctx.emit(
-                            "human_directed_retrieval",
-                            kind="observation",
-                            data={
-                                "directives": [
-                                    {
-                                        "branch_id": branch_id,
-                                        "bulletins": retrieval_directives[branch_id],
-                                    }
-                                    for branch_id in rerun_ids
-                                ]
-                            },
-                        )
-                if response_text:
-                    description = (
-                        f"Human-provided value for: {', '.join(missing)}"
-                        if missing
-                        else f"Human-provided information for: {reason}"
-                    )
-                    if response_sources:
-                        description += f" (sources: {', '.join(response_sources)})"
-                    human_entry = AnnotatedValue(
-                        description=description,
-                        value=response_text,
-                    )
-                    human_entries.append(human_entry)
-                    human_resolutions.append(list(missing))
-                entries = [
-                    *[
-                        entry
-                        for outcome in outcomes
-                        if outcome.entries
-                        for entry in outcome.entries
-                    ],
+                entries_snapshot = [
+                    *[e for o in outcomes if o.entries for e in o.entries],
                     *human_entries,
                 ]
-                self._ctx.emit(
-                    "mandatory_human_intervention_resolved",
-                    kind="observation",
-                    data={
-                        "response": response_text,
-                        "source_docs": response_sources,
-                        "retrieval_directives": [
-                            {
-                                "branch_id": branch_id,
-                                "bulletins": bulletins,
-                            }
-                            for branch_id, bulletins in retrieval_directives.items()
-                        ],
-                        "missing": missing,
-                    },
+                outcomes, directed_entries, human_entry = (
+                    await self._request_missing_from_human(
+                        handler, plan, outcomes, entries_snapshot, reason, missing, round_idx
+                    )
                 )
-                self._capture_recompute_state(outcomes, human_entries, explanations)
-                try:
-                    self._result.answer = await traced_step(
+                pool += directed_entries
+                if human_entry is not None:
+                    pool.append(human_entry)
+                    human_entries.append(human_entry)
+                    human_resolutions.append(list(missing))
+                if directed_entries or human_entry is not None:
+                    # Try compute over the human-augmented pool before spending a replan.
+                    self._capture_recompute_state(outcomes, human_entries, explanations)
+                    outcome = await traced_step(
                         self._ctx,
                         "compute",
                         lambda: self._compute.run(
-                            entries,
+                            pool,
                             self._ctx,
                             concept_explanations=explanations,
+                            round_idx=round_idx,
                         ),
                     )
-                    return self._result.answer
-                except MissingData as post_human_error:
-                    reason = post_human_error.reason
-                    missing = post_human_error.missing
-                    if retrieval_directives:
-                        self._ctx.emit(
-                            "human_annotation_retry_incomplete",
-                            kind="observation",
-                            data={
-                                "recovery_round": attempt,
-                                "branch_ids": sorted(retrieval_directives),
-                                "reason": reason,
-                                "missing": missing,
-                            },
-                        )
-                        # A branch annotation is itself the recovery action for this
-                        # round: it reruns the same stable branch with updated retrieval
-                        # context. Only a later, unannotated round may structurally
-                        # rewrite the plan.
-                        attempt += 1
-                        if attempt > self._ctx.config.recovery_max_rounds:
-                            raise
+                    if isinstance(outcome, Final):
+                        self._result.answer = outcome.answer
+                        return outcome.answer
+                    needs = outcome
+                    keep_set = set(needs.keep)
+                    pool = [e for i, e in enumerate(pool) if i in keep_set] + list(
+                        needs.committed
+                    )
+                    reason, missing = needs.missing_reason, needs.missing
 
-                self._emit_plan(
-                    plan,
-                    "replan_pending",
-                    reason=reason,
-                    missing=missing,
-                    recovery_round=attempt,
-                )
-                failed = [(o.branch, o.error) for o in outcomes if o.error]
-                first_human_index = len(entries) - len(human_entries)
-                human_resolution_refs = [
-                    (first_human_index + i, resolved_missing)
-                    for i, resolved_missing in enumerate(human_resolutions)
-                ]
-                diff = await traced_step(
+            # Map each human-provided value still in the pool to the missing ids it resolved,
+            # so the replanner treats those ids as answered (identity-keyed: keep-filtering
+            # retains the same objects, so id() survives across rounds).
+            pool_pos = {id(e): i for i, e in enumerate(pool)}
+            human_resolution_refs = [
+                (pool_pos[id(he)], resolved)
+                for he, resolved in zip(human_entries, human_resolutions)
+                if id(he) in pool_pos
+            ]
+
+            plan = await traced_step(
+                self._ctx,
+                "replanner",
+                lambda: self._planner.replan(
                     self._ctx,
-                    "replanner",
-                    lambda: self._planner.replan(
-                        self._ctx,
-                        plan,
-                        entries,
-                        failed,
-                        reason,
-                        missing,
-                        human_resolution_refs,
-                    ),
-                )
-                self._ctx.human_intervention_enabled = (
-                    attempt == 1 and self._ctx.human_intervention_handler is not None
-                )
-                try:
-                    plan, outcomes = await self._apply_diff(plan, outcomes, diff)
-                finally:
-                    self._ctx.human_intervention_enabled = False
-                self._emit_plan(
-                    plan,
-                    "replan",
-                    reason=reason,
-                    missing=missing,
-                    recovery_round=attempt,
-                )
+                    pool,
+                    attempts,
+                    reason,
+                    missing,
+                    human_resolution_refs,
+                ),
+            )
+            ids = self._alloc_branch_ids(len(plan.branches))
+            self._branch_ids = ids
+            self._emit_plan(
+                plan, "replan", reason=reason, missing=missing, recovery_round=round_idx
+            )
+            # The first replan may surface in-agent `request_human` help (figure / search
+            # tool), gated to round 1 like the pre-merge HITL path.
+            self._ctx.human_intervention_enabled = (
+                round_idx == 1 and handler is not None
+            )
+            try:
+                outcomes = await self._run_branches(plan.branches, ids)
+            finally:
+                self._ctx.human_intervention_enabled = False
+            attempts += [
+                AttemptRecord(round_idx, o.branch, len(o.entries or []), o.error)
+                for o in outcomes
+            ]
+            new_entries = [e for o in outcomes if o.entries for e in o.entries]
+            pool += new_entries
+            sweep_added = bool(new_entries)
 
     def _alloc_branch_ids(self, n: int) -> list[int]:
         """Allocate `n` fresh, monotonically-increasing branch ids (stable for the
@@ -676,27 +450,6 @@ class Orchestrator:
         ids = list(range(self._next_branch_id, self._next_branch_id + n))
         self._next_branch_id += n
         return ids
-
-    async def _apply_diff(
-        self, plan: Plan, outcomes: list[BranchOutcome], diff: PlanDiff
-    ) -> tuple[Plan, list[BranchOutcome]]:
-        """Apply a replan `PlanDiff`, keeping `outcomes[i]` aligned with the rewritten
-        `plan.branches[i]`. `PlanDiff.apply` does the pure plan rewrite and reports
-        which prior indices were KEPT; the orchestrator carries those branches'
-        already-gathered outcomes forward, runs the added branches, and appends them.
-        Compute therefore never sees data from a dropped branch. Stable branch ids
-        ride along: kept branches keep theirs, added branches get fresh ones."""
-        new_plan, kept = diff.apply(plan)
-        dropped = sorted(set(range(len(plan.branches))) - set(kept))
-        if dropped:
-            self._ctx.emit(f"replan_dropped n_dropped={len(dropped)} indices={dropped}")
-        kept_outcomes = [outcomes[i] for i in kept]
-        kept_ids = [self._branch_ids[i] for i in kept]
-        added_ids = self._alloc_branch_ids(len(diff.add))
-        self._branch_ids = [*kept_ids, *added_ids]
-        self._last_executed_branch_ids = set(added_ids)
-        new_outcomes = await self._run_branches(diff.add, added_ids) if diff.add else []
-        return new_plan, [*kept_outcomes, *new_outcomes]
 
     def _emit_plan(
         self,
@@ -730,67 +483,17 @@ class Orchestrator:
             data=data,
         )
 
-    async def _run_retrieve_phase(
-        self,
-        branches: list[RetrieveBranch],
-        branch_ids: list[int],
-        document_scopes: list[list[str] | None] | None = None,
-    ) -> list[list[BlockRef] | StepFailed]:
-        """Unified multi-scan retrieve for every retrieve branch at once: their candidate
-        pages are deduped and the LLM semantic filter scans each unique page at most once,
-        judging it against all branches' targets, then routes the survivors back per branch.
-        On the page-index path the routed survivors are further narrowed by the backend's
-        intrinsic `block_select` stage before they are returned. Returns each branch's
-        blocks in input order, or — if the whole sweep fails — the `StepFailed` to
-        attribute to every retrieve branch so each replans on its own.
-
-        Tracing is backend-aware: the page-index sweep spans all branches, so it is one
-        phase `retrieve` step with no `branch_id`; the search-agent backend runs an
-        independent agent per branch, so `run_all` emits a per-branch `retrieve` step (each
-        carrying its `branch_id` + retrieved `pages`) and we do not add a phase step here."""
-        if not branches:
-            return []
-        try:
-            if (
-                str(self._ctx.config.retriever) == "search_agent"
-                and self._ctx.config.golden_pages is None
-            ):
-                docs: list[list[BlockRef] | StepFailed] = list(
-                    await self._retrieve.run_all(
-                        self._ctx,
-                        branches,
-                        branch_ids,
-                        document_scopes=document_scopes,
-                    )
-                )
-            else:
-                docs = list(
-                    await traced_step(
-                        self._ctx,
-                        "retrieve",
-                        lambda: self._retrieve.run_all(
-                            self._ctx,
-                            branches,
-                            branch_ids,
-                            document_scopes=document_scopes,
-                        ),
-                    )
-                )
-        except StepFailed as e:
-            return [e] * len(branches)
-
-        # Accumulate the deduped block union (cache seam). Replan sweeps extend the same
-        # list, so rebuild the seen-set from the current list each call rather than carrying
-        # a persistent set that would outlive the sweep it was built for.
-        seen_blocks = set(self._retrieved_blocks)
-        for doc in docs:
-            if isinstance(doc, StepFailed):
-                continue
-            for blk in doc:
-                if blk not in seen_blocks:
-                    seen_blocks.add(blk)
-                    self._retrieved_blocks.append(blk)
-        return docs
+    def _review_mode(self) -> str:
+        """How a wanted human review is serviced for this run:
+        - "optimistic": a register hook is wired (under the competition server) — register an
+          open review and keep the LLM result, non-blocking. Whether a review is wanted at all
+          is the per-stage policy's job (the SKUNK_HUMAN_* gates); this only picks the transport.
+        - "blocking":   no register hook (local CLI) — await the human on the console / async
+          broker as before.
+        """
+        if self._ctx.human_review_register is None:
+            return "blocking"
+        return "optimistic"
 
     def _capture_recompute_state(
         self,
@@ -811,16 +514,354 @@ class Orchestrator:
             explanations=list(explanations),
         )
 
-    def _review_mode(self) -> str:
-        """How a wanted human review is serviced for this run:
-        - "optimistic": a register hook is wired (under the competition server) — register an
-          open review and keep the LLM result, non-blocking. Whether a review is wanted at all
-          is the per-stage policy's job (the SKUNK_HUMAN_* gates); this only picks the transport.
-        - "blocking":   no register hook (local CLI) — await the human on the console as before.
-        """
-        if self._ctx.human_review_register is None:
-            return "blocking"
-        return "optimistic"
+    def _missing_data_guidance(
+        self,
+        plan: Plan,
+        outcomes: list[BranchOutcome],
+        entries: list[AnnotatedValue],
+        reason: str,
+        missing: list[str],
+        round_idx: int,
+    ) -> tuple[dict, list[dict[str, str | int | None]]]:
+        """Build the rich per-branch context a human reviewer needs to supply missing data,
+        plus the `likely_pages` (the question's gathered + retrieved source pages, capped)."""
+        likely_pages: list[dict[str, str | int | None]] = []
+        seen_pages: set[tuple[str | None, int | None]] = set()
+        for entry in entries:
+            for page in entry.pages:
+                key = (entry.bulletin, page)
+                if key not in seen_pages:
+                    seen_pages.add(key)
+                    likely_pages.append({"bulletin": entry.bulletin, "page": page})
+        for block in self._retrieved_blocks:
+            for ref in block.member_refs:
+                key = (ref.month, ref.page)
+                if key not in seen_pages:
+                    seen_pages.add(key)
+                    likely_pages.append({"bulletin": ref.month, "page": ref.page})
+        likely_pages = likely_pages[:8]
+
+        def _blocks_payload(blocks: list[BlockRef]) -> list[dict]:
+            return [
+                {
+                    "bulletin": block_ref.page.month,
+                    "page": block_ref.page.page,
+                    "block_index": block_ref.block_index,
+                    "member_pages": [
+                        {"bulletin": ref.month, "page": ref.page}
+                        for ref in block_ref.member_refs
+                    ],
+                    "kind": block_ref.block.kind if block_ref.block else None,
+                    "title": block_ref.block.title if block_ref.block else None,
+                    "column_headers": (
+                        block_ref.block.column_headers if block_ref.block else []
+                    ),
+                    "row_headers": (
+                        block_ref.block.row_headers if block_ref.block else []
+                    ),
+                    "summary": block_ref.block.summary if block_ref.block else None,
+                }
+                for block_ref in blocks
+            ]
+
+        guidance = {
+            "recovery_round": round_idx,
+            "previous_round_plan": [
+                {
+                    "branch_id": branch_id,
+                    **branch.model_dump(mode="json"),
+                    "searched": (
+                        {
+                            "key": branch.key,
+                            "period": branch.period,
+                            "as_of": branch.as_of,
+                            "visual_only": branch.visual_only,
+                        }
+                        if branch.kind == "retrieve"
+                        else {"target": branch.target, "src": branch.src}
+                    ),
+                    "blocks": _blocks_payload(outcome.blocks),
+                    "output": (
+                        {
+                            "type": "values",
+                            "values": [
+                                {
+                                    "description": entry.description,
+                                    "unit": entry.unit,
+                                    "value_kind": entry.kind,
+                                    "value": entry.value,
+                                    "index_name": entry.index_name,
+                                    "row_name": entry.row_name,
+                                    "col_name": entry.col_name,
+                                    "bulletin": entry.bulletin,
+                                    "pages": list(entry.pages),
+                                    "source_block_page": entry.source_block_page,
+                                    "source_block_index": entry.source_block_index,
+                                }
+                                for entry in outcome.entries
+                            ],
+                        }
+                        if outcome.entries is not None
+                        else None
+                    ),
+                    "output_step": (
+                        "extract" if branch.kind == "retrieve" else "lookup_external"
+                    ),
+                    "status": ("failed" if outcome.error is not None else "ok"),
+                    "execution_status": (
+                        "executed"
+                        if branch_id in self._last_executed_branch_ids
+                        else "carried_forward"
+                    ),
+                    "outcome_status": (
+                        "failed" if outcome.error is not None else "succeeded"
+                    ),
+                    "error": (
+                        str(outcome.error) if outcome.error is not None else None
+                    ),
+                    "considered_pages": (
+                        outcome.error.details.get("considered_pages", [])
+                        if outcome.error is not None
+                        else []
+                    ),
+                }
+                for branch_id, branch, outcome in zip(
+                    self._branch_ids, plan.branches, outcomes
+                )
+            ],
+            "partial_plan": [
+                {"branch_id": branch_id, **branch.model_dump(mode="json")}
+                for branch_id, branch in zip(self._branch_ids, plan.branches)
+            ],
+            "gathered_values": [
+                {
+                    "description": entry.description,
+                    "value": entry.value,
+                    "unit": entry.unit,
+                    "bulletin": entry.bulletin,
+                    "pages": list(entry.pages),
+                }
+                for entry in entries
+            ],
+            "failed_branches": [
+                {
+                    "branch_id": branch_id,
+                    "branch": outcome.branch.model_dump(mode="json"),
+                    "error": str(outcome.error),
+                    "considered_pages": outcome.error.details.get(
+                        "considered_pages", []
+                    ),
+                }
+                for branch_id, outcome in zip(self._branch_ids, outcomes)
+                if outcome.error is not None
+            ],
+            "likely_pages": likely_pages,
+            "missing": missing,
+            "reason": reason,
+        }
+        return guidance, likely_pages
+
+    async def _request_missing_from_human(
+        self,
+        handler: HumanInterventionHandler,
+        plan: Plan,
+        outcomes: list[BranchOutcome],
+        entries: list[AnnotatedValue],
+        reason: str,
+        missing: list[str],
+        round_idx: int,
+    ) -> tuple[list[BranchOutcome], list[AnnotatedValue], AnnotatedValue | None]:
+        """Ask the human for the missing data (mandatory intervention). Optionally re-runs
+        human-directed retrieval (scoping named branches to named bulletins), merging the
+        result into `outcomes`. Returns the updated outcomes, any new pool entries from the
+        directed retrieval, and an optional human-authored `AnnotatedValue`. Raises on an
+        empty response."""
+        guidance, likely_pages = self._missing_data_guidance(
+            plan, outcomes, entries, reason, missing, round_idx
+        )
+        source_docs = [
+            f"Treasury Bulletin {page['bulletin']} PDF page {page['page']}"
+            for page in likely_pages
+            if page["bulletin"] and page["page"] is not None
+        ]
+        instructions = (
+            "Provide the missing information needed to answer the question. "
+            f"Failure reason: {reason}"
+        )
+        if missing:
+            instructions += f"\nMissing values: {', '.join(missing)}"
+        response = await handler(
+            "missing_data",
+            instructions,
+            f"Question: {self._ctx.question}",
+            source_docs,
+            guidance,
+        )
+        response_text = str(response.get("response", "")).strip()
+        current_retrieve_ids = {
+            branch_id
+            for branch_id, branch in zip(self._branch_ids, plan.branches)
+            if branch.kind == "retrieve"
+        }
+        retrieval_directives: dict[int, list[str]] = {}
+        for item in response.get("retrieval_directives", []):
+            if not isinstance(item, dict):
+                continue
+            branch_id = item.get("branch_id")
+            documents = item.get("documents")
+            if (
+                not isinstance(branch_id, int)
+                or branch_id not in current_retrieve_ids
+                or not isinstance(documents, list)
+            ):
+                continue
+            bulletins: list[str] = []
+            for document in documents:
+                match = re.fullmatch(
+                    r"Treasury Bulletin (\d{4}-(?:0[1-9]|1[0-2])) PDF",
+                    str(document).strip(),
+                )
+                if match and match.group(1) not in bulletins:
+                    bulletins.append(match.group(1))
+            if bulletins:
+                retrieval_directives[branch_id] = bulletins
+        if not response_text and not retrieval_directives:
+            raise RuntimeError("human intervention returned an empty response")
+        response_sources = [
+            str(item).strip()
+            for item in response.get("source_docs", [])
+            if str(item).strip()
+        ]
+
+        new_entries: list[AnnotatedValue] = []
+        if retrieval_directives:
+            rerun_positions = [
+                i
+                for i, (branch_id, branch) in enumerate(
+                    zip(self._branch_ids, plan.branches)
+                )
+                if branch_id in retrieval_directives and branch.kind == "retrieve"
+            ]
+            if rerun_positions:
+                rerun_branches = [plan.branches[i] for i in rerun_positions]
+                rerun_ids = [self._branch_ids[i] for i in rerun_positions]
+                rerun_outcomes = await self._run_branches(
+                    rerun_branches,
+                    rerun_ids,
+                    document_scopes=retrieval_directives,
+                )
+                outcomes = list(outcomes)
+                for position, rerun in zip(rerun_positions, rerun_outcomes):
+                    merged = _merge_branch_outcome(outcomes[position], rerun)
+                    outcomes[position] = merged
+                    for e in rerun.entries or []:
+                        new_entries.append(e)
+                self._last_executed_branch_ids = set(rerun_ids)
+                self._ctx.emit(
+                    "human_directed_retrieval",
+                    kind="observation",
+                    data={
+                        "directives": [
+                            {"branch_id": bid, "bulletins": retrieval_directives[bid]}
+                            for bid in rerun_ids
+                        ]
+                    },
+                )
+
+        human_entry: AnnotatedValue | None = None
+        if response_text:
+            description = (
+                f"Human-provided value for: {', '.join(missing)}"
+                if missing
+                else f"Human-provided information for: {reason}"
+            )
+            if response_sources:
+                description += f" (sources: {', '.join(response_sources)})"
+            human_entry = AnnotatedValue(description=description, value=response_text)
+
+        self._ctx.emit(
+            "mandatory_human_intervention_resolved",
+            kind="observation",
+            data={
+                "response": response_text,
+                "source_docs": response_sources,
+                "retrieval_directives": [
+                    {"branch_id": bid, "bulletins": bulletins}
+                    for bid, bulletins in retrieval_directives.items()
+                ],
+                "missing": missing,
+            },
+        )
+        return outcomes, new_entries, human_entry
+
+    async def _run_retrieve_phase(
+        self,
+        branches: list[RetrieveBranch],
+        branch_ids: list[int],
+        document_scopes: list[list[str] | None] | None = None,
+    ) -> tuple[list[list[BlockRef] | StepFailed], list[list[SemPoolEntry]]]:
+        """Unified multi-scan retrieve for every retrieve branch at once: their candidate
+        pages are deduped and the LLM semantic filter scans each unique page at most once,
+        judging it against all branches' targets, then routes the survivors back per branch.
+        On the page-index path the survivors are left whole — the block-selection
+        tournament (`run_select_pipeline`) narrows them downstream. Returns each branch's blocks in
+        input order, or — if the whole sweep fails — the `StepFailed` to attribute to every
+        retrieve branch. `branch_ids` lets the search-agent backend emit a per-branch `retrieve`
+        step; `document_scopes` hard-scopes a branch's corpus to human-required bulletins (HITL).
+        The shared page-index `retrieve` sweep carries no `branch_id`."""
+        if not branches:
+            return [], []
+        try:
+            sem_survivors, base_pools = await traced_step(
+                self._ctx,
+                "retrieve",
+                lambda: self._retrieve.run_all(
+                    self._ctx, branches, branch_ids, document_scopes=document_scopes
+                ),
+            )
+        except StepFailed as e:
+            return [e] * len(branches), [[] for _ in branches]
+
+        # Page-index path: survivors pass through whole — the selection agent narrows them.
+        # golden / search-agent paths return final blocks from run_all.
+        if (
+            str(self._ctx.config.retriever) == "page_index"
+            and self._ctx.config.golden_pages is None
+        ):
+            docs: list[list[BlockRef] | StepFailed] = [
+                StepFailed(
+                    "retrieve",
+                    f"semantic filter kept no blocks for branch {b.key!r}",
+                )
+                if not brs
+                else brs
+                for b, brs in zip(branches, sem_survivors)
+            ]
+            pools = self._retrieve.build_survivor_pools(
+                self._ctx, cast(list[list[BlockRef]], sem_survivors)
+            )
+        else:
+            docs = sem_survivors
+            pools = base_pools
+
+        # Accumulate the deduped block + pool unions (cache seam). Replan sweeps extend the
+        # same lists, so rebuild the seen-sets from the current lists each call rather than
+        # carrying persistent sets that would outlive the sweep they were built for.
+        seen_blocks = set(self._retrieved_blocks)
+        for doc in docs:
+            if isinstance(doc, StepFailed):
+                continue
+            for blk in doc:
+                if blk not in seen_blocks:
+                    seen_blocks.add(blk)
+                    self._retrieved_blocks.append(blk)
+        seen_pool = {e.ref for e in self._sem_pool}
+        for pool in pools:
+            for entry in pool:
+                if entry.ref not in seen_pool:
+                    seen_pool.add(entry.ref)
+                    self._sem_pool.append(entry)
+        return docs, pools
 
     async def _run_branches(
         self,
@@ -831,9 +872,12 @@ class Orchestrator:
     ) -> list[BranchOutcome]:
         # Global retrieve phase: all retrieve branches share one deduped semantic-filter
         # sweep, then each branch's routed refs feed its own extract. Lookup branches are
-        # independent and run in the per-branch tail below.
+        # independent and run in the per-branch tail below. `document_scopes` (keyed by
+        # stable branch id) hard-scopes a retrieve branch's corpus to human-required
+        # bulletins — the HITL "annotate this branch's source documents" recovery action.
+        self._last_executed_branch_ids = set(branch_ids)
         retrieve_pos = [i for i, b in enumerate(branches) if b.kind == "retrieve"]
-        docs = await self._run_retrieve_phase(
+        docs, pools = await self._run_retrieve_phase(
             [cast(RetrieveBranch, branches[i]) for i in retrieve_pos],
             [branch_ids[i] for i in retrieve_pos],
             document_scopes=[
@@ -843,93 +887,78 @@ class Orchestrator:
         docs_by_pos: dict[int, list[BlockRef] | StepFailed] = dict(
             zip(retrieve_pos, docs)
         )
+        pools_by_pos: dict[int, list[SemPoolEntry]] = dict(zip(retrieve_pos, pools))
+
+        # Select → extract runs as ONE shared pipeline over all retrieve branches,
+        # launched as a task so lookup branches proceed concurrently. Each retrieve
+        # tail awaits the shared task and picks out its branch's result. The pipeline
+        # does its own per-branch traced_steps, so the tail doesn't wrap it again.
+        pipeline: asyncio.Task | None = None
+        if retrieve_pos:
+            from skunk.block_select import run_select_pipeline
+
+            pipeline = asyncio.create_task(
+                run_select_pipeline(
+                    self._ctx,
+                    [cast(RetrieveBranch, branches[i]) for i in retrieve_pos],
+                    [docs_by_pos[i] for i in retrieve_pos],
+                    [pools_by_pos.get(i, []) for i in retrieve_pos],
+                    [branch_ids[i] for i in retrieve_pos],
+                )
+            )
+
+        def _branch_blocks(pos: int) -> list[BlockRef]:
+            doc = docs_by_pos.get(pos)
+            return doc if isinstance(doc, list) else []
 
         async def _tail(pos: int) -> list[AnnotatedValue]:
             branch, bid = branches[pos], branch_ids[pos]
             if branch.kind == "retrieve":
-                # Already post-block-select: `_run_retrieve_phase` returned the branch's blocks
-                # (page-index selections, or whole-page blocks for golden / search-agent). Extract
-                # reads those and feeds each block's pages whole.
-                doc = docs_by_pos[pos]
-                if isinstance(doc, StepFailed):
-                    raise doc
-                entries = await traced_step(
-                    self._ctx,
-                    "extract",
-                    lambda: self._extract.run(doc, self._ctx, branch),
-                    branch_id=bid,
-                    summary_metadata={
-                        "blocks": [
-                            {
-                                "bulletin": block_ref.page.month,
-                                "page": block_ref.page.page,
-                                "block_index": block_ref.block_index,
-                                "member_pages": [
-                                    {"bulletin": ref.month, "page": ref.page}
-                                    for ref in block_ref.member_refs
-                                ],
-                                "kind": block_ref.block.kind
-                                if block_ref.block
-                                else None,
-                                "title": block_ref.block.title
-                                if block_ref.block
-                                else None,
-                                "column_headers": (
-                                    block_ref.block.column_headers
-                                    if block_ref.block
-                                    else []
-                                ),
-                                "row_headers": (
-                                    block_ref.block.row_headers
-                                    if block_ref.block
-                                    else []
-                                ),
-                                "summary": (
-                                    block_ref.block.summary if block_ref.block else None
-                                ),
-                            }
-                            for block_ref in doc
-                        ]
-                    },
-                )
-                # Human verifies/produces the extracted value(s) (figure or OCR/table read)
+                assert pipeline is not None
+                res = (await pipeline)[retrieve_pos.index(pos)]
+                if isinstance(res, StepFailed):
+                    raise res
+                # Human verifies / produces the extracted value(s) (figure or OCR/table read)
                 # only when the policy opts in — no step (or prompt) on the default path.
-                if self._human.wants_verify(branch, entries, self._ctx):
-                    mode = self._review_mode()
-                    if mode == "optimistic":
+                if self._human.wants_verify(
+                    cast(RetrieveBranch, branch), res, self._ctx
+                ):
+                    blocks = _branch_blocks(pos)
+                    if self._review_mode() == "optimistic":
                         # Register an open review and keep the LLM entries — the question
-                        # completes without blocking; a human resolve drives a recompute later.
+                        # completes without blocking; a human resolve drives a recompute.
                         self._human.register_verify(
-                            entries, doc, branch, bid, self._ctx
+                            res, blocks, cast(RetrieveBranch, branch), bid, self._ctx
                         )
-                    elif mode == "blocking":
-                        entries = await traced_step(
+                    else:
+                        res = await traced_step(
                             self._ctx,
                             "human_verify",
                             lambda: self._human.verify_extract(
-                                entries, doc, branch, self._ctx
+                                res, blocks, cast(RetrieveBranch, branch), self._ctx
                             ),
                             branch_id=bid,
                         )
-                return entries
-            # External lookup. Optimistic: always run the lookup agent, then register a review
-            # of its result (the human confirms/corrects). Blocking (local CLI): the human
-            # performs the lookup in place when the flag is on; else the agent does.
+                return res
+            # External lookup. Optimistic: run the lookup agent, then register a review of
+            # its result. Blocking (local CLI): the human performs the lookup in place when
+            # the flag is on; else the agent does.
+            lookup_branch = cast("LookupBranch", branch)
             mode = self._review_mode()
-            if self._human.wants_lookup(branch, self._ctx) and mode == "optimistic":
+            if self._human.wants_lookup(lookup_branch, self._ctx) and mode == "optimistic":
                 entries = await traced_step(
                     self._ctx,
                     "lookup_external",
                     lambda: self._lookup.run(self._ctx, branch),
                     branch_id=bid,
                 )
-                self._human.register_lookup(entries, branch, bid, self._ctx)
+                self._human.register_lookup(entries, lookup_branch, bid, self._ctx)
                 return entries
-            if self._human.wants_lookup(branch, self._ctx) and mode == "blocking":
+            if self._human.wants_lookup(lookup_branch, self._ctx) and mode == "blocking":
                 return await traced_step(
                     self._ctx,
                     "human_lookup",
-                    lambda: self._human.human_lookup(branch, self._ctx),
+                    lambda: self._human.human_lookup(lookup_branch, self._ctx),
                     branch_id=bid,
                 )
             return await traced_step(
@@ -944,9 +973,10 @@ class Orchestrator:
             return_exceptions=True,
         )
         outcomes: list[BranchOutcome] = []
-        for pos, (bid, branch, res) in enumerate(zip(branch_ids, branches, results)):
-            selected = docs_by_pos.get(pos)
-            blocks = selected if isinstance(selected, list) else []
+        for pos, (bid, (branch, res)) in enumerate(
+            zip(branch_ids, zip(branches, results))
+        ):
+            blocks = _branch_blocks(pos)
             if isinstance(res, StepFailed):
                 self._ctx.emit(
                     f"parallel_branch_failed branch_id={bid} error={str(res)!r}",
@@ -954,10 +984,7 @@ class Orchestrator:
                 )
                 outcomes.append(
                     BranchOutcome(
-                        branch=branch,
-                        entries=None,
-                        error=res,
-                        blocks=blocks,
+                        branch=branch, entries=None, error=res, blocks=blocks
                     )
                 )
             elif isinstance(res, BaseException):
@@ -965,10 +992,7 @@ class Orchestrator:
             else:
                 outcomes.append(
                     BranchOutcome(
-                        branch=branch,
-                        entries=res,
-                        error=None,
-                        blocks=blocks,
+                        branch=branch, entries=res, error=None, blocks=blocks
                     )
                 )
         return outcomes

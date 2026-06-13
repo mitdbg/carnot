@@ -61,19 +61,21 @@ def _new_executor(
 
 
 def exec_python_with_env(
-    code: str, local_vars: dict[str, Any] | None = None,
+    code: str, local_vars: dict[str, Any] | None = None, *, require_result: bool = True,
 ) -> tuple[dict[str, Any], Any]:
-    """Exec `code` and return `(post-exec state, state["result"])`. The state lets the
-    caller read auxiliary variables the code set alongside `result`."""
+    """Exec `code` and return `(post-exec state, state.get("result"))`. The state lets the
+    caller read auxiliary variables the code set alongside `result`. `require_result=False`
+    tolerates code that sets no `result` (compute's partial-progress form, where the code
+    sets `missing`/`committed`/`keep` instead)."""
     code = strip_code_fences(code)
     ex = _new_executor(local_vars or {})
     try:
         ex(code)
     except InterpreterError as e:
         raise StepFailed("pyexec", str(e)) from e
-    if "result" not in ex.state:
+    if require_result and "result" not in ex.state:
         raise StepFailed("pyexec", f"Code did not set `result`:\n{code}")
-    return ex.state, ex.state["result"]
+    return ex.state, ex.state.get("result")
 
 
 def exec_python_capture_stdout(

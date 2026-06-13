@@ -246,6 +246,13 @@ class MultiTurnAgent(ABC):
     max_output_tokens: int | None = None
     request_timeout_s: float | None = None
 
+    # Per-step sampling temperature, threaded to `PromptedCall.call` → `astream`.
+    # 1.0 per Gemini 3.x guidance: thinking-enabled calls below 1.0 can trap the
+    # model in a degenerate reasoning loop that burns the whole output budget
+    # (https://ai.google.dev/gemini-api/docs/gemini-3). Subclasses may still
+    # override (e.g. SelectAgent).
+    temperature: float = 1.0
+
     _SYSTEM_TEMPLATE = """\
 {{ briefing }}
 
@@ -530,8 +537,13 @@ Requirements for the final answer:
             out.append(entry)
         return out
 
-    async def call(self, ctx: ExecutionContext, user: str, **_) -> Any:
-        """Run the multi-turn loop, returning the parsed json final-answer payload. Extra
+    async def call(
+        self, ctx: ExecutionContext, user: str, *, resume: bool = False, **_
+    ) -> Any:
+        """Run the multi-turn loop, returning the parsed json final-answer payload.
+        `resume=True` appends `user` to the existing trajectory (with a fresh step
+        budget) instead of starting over — the seam for a reviewer sending the agent
+        back with feedback without it re-deriving everything it already saw. Extra
         kwargs are ignored (signature compat with single-shot calls)."""
         # Persistent sandbox for single-call steps — cross-step interpreter state survives
         # here. Parallel batches use one fresh executor per block (see `_execute_codes`).
@@ -540,7 +552,10 @@ Requirements for the final answer:
 
         # Full block trajectory (no system message; call() assembles it each turn).
         # `_render_for_llm()` produces the redacted, flattened view sent to the model.
-        self.messages = [{"role": "user", "blocks": [TextBlock(user)]}]
+        if resume and self.messages:
+            self.messages.append({"role": "user", "blocks": [TextBlock(user)]})
+        else:
+            self.messages = [{"role": "user", "blocks": [TextBlock(user)]}]
         observations: list[str] = []
 
         # Capture the system prompt + opening question into the event stream so the
@@ -569,8 +584,9 @@ Requirements for the final answer:
                 warned = True
                 left = self.max_steps - step + 1
                 warn = (
-                    f"Only {left} of {self.max_steps} steps remain. You should focus your remaining on"
-                    f"your most promising lead and avoid wasting time on exploration."
+                    f"Only {left} of {self.max_steps} steps remain. Stop exploring and finalize: "
+                    f"commit the most plausible answer you have found so far — a plausible commit "
+                    f"beats running out of steps with nothing."
                 )
                 self.messages.append({"role": "user", "blocks": [TextBlock(warn)]})
                 ctx.emit(f"steps_low_warning left={left}")
@@ -677,12 +693,13 @@ Requirements for the final answer:
         return await self._terminal_turn(ctx, observations)
 
     _TERMINAL_PROMPT = (
-        "You are out of steps. Do NOT call any tool now — emit exactly ONE ```json``` "
+        "You are out of steps. Do not call any tool now — emit exactly one ```json``` "
         "block, either:\n"
-        "  • COMMIT: if a value already in your observations answers the request, your "
+        "  • commit: if a value already in your observations answers the request, your "
         "best final answer in the required format; or\n"
-        '  • NO RESULT: an envelope {"error": "<note>"} with a 2-4 sentence note describing which tools/series you tried, any '
-        "candidate values you found, and what blocked you."
+        '  • no result: an envelope {"error": "<note>"} with a 2-4 sentence note '
+        "describing which tools/series you tried, any candidate values you found, and "
+        "what blocked you."
     )
 
     async def _terminal_turn(
@@ -748,6 +765,7 @@ Requirements for the final answer:
             self._last_logprobs = None
             return await self._prompt.call(
                 ctx, messages=trimmed, should_stop=self._should_stop,
+                temperature=self.temperature,
                 max_output_tokens=self.max_output_tokens,
                 timeout_s=self.request_timeout_s,
             )

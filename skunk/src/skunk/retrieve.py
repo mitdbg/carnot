@@ -3,8 +3,8 @@
 `RetrieveOp` turns a `RetrieveBranch` into the pages that answer it:
 - golden bypass — returns `ctx.config.golden_pages` verbatim (eval ablation).
 - `search_agent` — iterative ChromaDB + LLM loop under `skunk.search_agent`.
-- `page_index` — ToC pick → year filter → semantic filter → block selection
-  (all within `PageIndexRetriever.retrieve_all`).
+- `page_index` — ToC pick → year filter → semantic filter (all within
+  `PageIndexRetriever.retrieve_all`); the selection agent narrows downstream.
 
 The two real backends are built lazily.
 """
@@ -19,7 +19,14 @@ from typing import TYPE_CHECKING
 
 from skunk.config import SkunkConfig
 from skunk.errors import StepFailed
-from skunk.common import BlockRef, ExecutionContext, PageRef, page_key_to_pageref, traced_step
+from skunk.common import (
+    BlockRef,
+    ExecutionContext,
+    PageRef,
+    SemPoolEntry,
+    page_key_to_pageref,
+    traced_step,
+)
 from skunk.plan import RetrieveBranch
 
 if TYPE_CHECKING:
@@ -53,7 +60,8 @@ class RetrieveOp:
             case "search_agent":
                 return _whole_page_blocks(await self._run_search_agent(ctx, branch))
             case "page_index":
-                return (await self._page_index().retrieve_all(ctx, [branch]))[0]
+                survivors = await self._page_index().retrieve_all(ctx, [branch])
+                return survivors[0]
             case other:
                 raise StepFailed(
                     "retrieve",
@@ -68,17 +76,34 @@ class RetrieveOp:
         branch_ids: list[int] | None = None,
         *,
         document_scopes: list[list[str] | None] | None = None,
-    ) -> list[list[BlockRef] | StepFailed]:
-        """Retrieve for several branches at once, result aligned to `branches`. A slot is
-        that branch's blocks or a `StepFailed` — a single branch failing does not
-        sink its siblings. A whole-sweep failure (unknown retriever, missing index) raises.
+    ) -> tuple[list[list[BlockRef] | StepFailed], list[list[SemPoolEntry]]]:
+        """Retrieve for several branches at once, both results aligned to `branches`. A docs
+        slot is that branch's blocks or a `StepFailed` — a single branch failing does not
+        sink its siblings. The second list is each branch's sem-filter candidate pool
+        (page-index path only; empty elsewhere), the selection agent's candidate set.
+        A whole-sweep failure (unknown retriever, missing index) raises.
 
         `branch_ids` (search-agent backend only) aligns each branch to its stable id so its
         retrieve runs in a per-branch `traced_step`: the rollout + the returned pages then
         attach to that branch in the trace viewer. The page-index backend is a single shared
-        sweep, so it owns no per-branch step here (the orchestrator traces the whole phase)."""
+        sweep, so it owns no per-branch step here (the orchestrator traces the whole phase).
+        `document_scopes` (search-agent backend) hard-scopes a branch's corpus to a set of
+        bulletins (HITL human-required documents)."""
+        if ctx.config.cached_sem_pool is not None:
+            # Survivor-cache replay: skip the (expensive) semantic filter and hand every
+            # branch the cached sem-filter survivor union as its candidate set + pool, so
+            # the selection agent runs over it downstream exactly as on a live run — NOT a
+            # final-blocks bypass. UID-level: every branch gets the same
+            # union, as branch structure may differ from the run that wrote the cache.
+            pool = ctx.config.cached_sem_pool
+            blocks = [e.ref for e in pool]
+            return [list(blocks) for _ in branches], [list(pool) for _ in branches]
         if ctx.config.golden_pages is not None:
-            return [self._golden_blocks(ctx) for _ in branches]
+            # Final-blocks bypass: --golden, or a pool-less retrieval cache (search-agent /
+            # pre-pool) whose selected blocks are injected verbatim (no retrieval narrowing).
+            return [self._golden_blocks(ctx) for _ in branches], [
+                [] for _ in branches
+            ]
         scopes = document_scopes or [None] * len(branches)
         match str(ctx.config.retriever):
             case "search_agent":
@@ -112,15 +137,14 @@ class RetrieveOp:
                         raise r
                     else:
                         out.append(r)
-                return out
+                return out, [[] for _ in branches]
             case "page_index":
-                return list(
-                    await self._page_index().retrieve_all(
-                        ctx,
-                        branches,
-                        document_scopes=scopes,
-                    )
+                survivors = await self._page_index().retrieve_all(
+                    ctx,
+                    branches,
+                    document_scopes=scopes,
                 )
+                return list(survivors), [[] for _ in branches]
             case other:
                 raise StepFailed(
                     "retrieve",
@@ -159,7 +183,8 @@ class RetrieveOp:
             ),
             required_bulletins=required_bulletins,
         )
-        # The agent hint is free text; render a per-entry pin list to its pinned months.
+        # `as_of` is a SOFT hint to the search agent only (block_select owns issue choice);
+        # render a per-entry pin list to its pinned months as free text.
         as_of_hint = (
             ", ".join(m for m in branch.as_of if m) or None
             if isinstance(branch.as_of, list)
@@ -205,6 +230,18 @@ class RetrieveOp:
             if self._resources is None:
                 self._resources = _get_shared_resources(config)
             return self._resources
+
+    def build_survivor_pools(
+        self, ctx: ExecutionContext, branch_blocks: list[list[BlockRef]]
+    ) -> list[list[SemPoolEntry]]:
+        """Build SemPoolEntry pools from sem-filter survivor blocks (selection-agent path)."""
+        from skunk.page_index.query import PageIndexRetriever
+
+        pdf_dir = str(ctx.config.pdf_dir)
+        return [
+            PageIndexRetriever.pool_for_blocks(brs, pdf_dir) if brs else []
+            for brs in branch_blocks
+        ]
 
     def _page_index(self):
         from skunk.page_index.query import PageIndexRetriever

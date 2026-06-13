@@ -80,6 +80,10 @@ class LookupExternalOp:
             tools=tools,
             max_parallel_tool_calls=ctx.config.lookup_max_parallel_tool_calls,
         )
+        # Cap each agent turn like SearchAgent/SelectAgent: an uncapped lookup turn
+        # hung 250s+ (thinking-only generation) and stalled the whole question.
+        agent.max_output_tokens = ctx.config.select_agent_max_output_tokens
+        agent.request_timeout_s = ctx.config.select_agent_request_timeout_s
         user_msg = branch.model_dump_json(
             include={"target", "src"}, indent=2, exclude_none=True,
         )
