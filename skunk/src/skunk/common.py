@@ -40,6 +40,26 @@ if TYPE_CHECKING:
 Effort = Literal["off", "minimal", "low", "medium", "high"]
 EFFORT_VALUES = ("off", "minimal", "low", "medium", "high")
 
+HumanInterventionHandler = Callable[
+    [str, str, str | None, list[str], dict[str, Any] | None],
+    Awaitable[dict[str, Any]],
+]
+
+# Optimistic review registration: same (task, instruction, question, source_docs, guidance)
+# shape as the blocking handler, but synchronous and fire-and-forget — it opens a human review
+# on the server and returns a review id (or None) WITHOUT suspending the branch. The branch
+# keeps the LLM result; a human resolve later drives a server-side recompute. Wired only under
+# the competition server (the broker injects it); None for a local CLI run.
+HumanReviewRegister = Callable[
+    [str, str, str | None, list[str], dict[str, Any] | None],
+    str | None,
+]
+
+
+@dataclass(frozen=True)
+class PendingHumanIntervention:
+    response: Awaitable[dict[str, Any]]
+
 
 @dataclass
 class B64Image:
@@ -215,8 +235,8 @@ def get_rate_limiter(name: str, rate_per_min: float | None = None) -> _RateLimit
 # task that rebinds the frame is isolated from its siblings. Operator steps don't
 # nest (the orchestrator opens exactly one per traced call), so this holds a
 # single frame, not a stack.
-_step_frame: contextvars.ContextVar[tuple[int, str] | None] = contextvars.ContextVar(
-    "skunk_step_frame", default=None
+_step_frame: contextvars.ContextVar[tuple[int, str, int | None] | None] = (
+    contextvars.ContextVar("skunk_step_frame", default=None)
 )
 
 
@@ -443,6 +463,8 @@ class AnnotatedValue(BaseModel):
     pages: tuple[int, ...] = ()  # source PDF page(s); () when unattributable
     requested_period: str | None = None  # branch.period — data window requested
     retrieve_key: str | None = None  # branch.key — concept this datum serves
+    source_block_page: int | None = None
+    source_block_index: int | None = None
 
     @model_validator(mode="after")
     def _check_shape(self) -> AnnotatedValue:
@@ -619,6 +641,12 @@ class ExecutionContext:
     prompt_overrides: tuple[
         PromptOverride, ...
     ] = ()  # corpus/few_shot/lesson overrides; operators pick out their own entries by name
+    human_intervention_handler: HumanInterventionHandler | None = None
+    human_intervention_enabled: bool = False
+    # Optimistic, non-blocking review registration (server only). When set, the verify/lookup
+    # gates open an open review and keep the LLM result instead of awaiting the human — see
+    # `HumanReviewRegister` and `HumanAssist.register_verify`/`register_lookup`.
+    human_review_register: HumanReviewRegister | None = None
 
     def __post_init__(self) -> None:
         if self.llm_client is None:
@@ -654,25 +682,27 @@ class ExecutionContext:
             self._logfile = None
 
     @contextmanager
-    def step(self, op: str):
+    def step(self, op: str, branch_id: int | None = None):
         """Open an observability step (a span) for one operator call, yielding its
         allocated `step_idx`. Every `emit` inside the block is auto-stamped with
-        `(step_idx, op)` via the `_step_frame` ContextVar, so callees emit without
-        knowing their step. The ctx allocates the index; the caller does not pass
-        one in. Steps don't nest, so this rebinds a single frame (set/reset) rather
-        than pushing a stack, and the contextmanager guarantees the frame is reset
-        on every exit path. Per-task isolation comes from the ContextVar — see
-        `_step_frame`."""
+        `(step_idx, op, branch_id)` via the `_step_frame` ContextVar, so callees emit
+        without knowing their step — and per-branch steps (retrieve/extract/lookup) stamp
+        their `branch_id` onto every event, so the trace viewer can group a rollout under
+        its branch *while it streams*, not only once the boundary `step` event lands. The
+        ctx allocates the index; the caller does not pass one in. Steps don't nest, so this
+        rebinds a single frame (set/reset) rather than pushing a stack, and the
+        contextmanager guarantees the frame is reset on every exit path. Per-task isolation
+        comes from the ContextVar — see `_step_frame`."""
         step_idx = self._next_step_idx
         self._next_step_idx += 1
-        token = _step_frame.set((step_idx, op))
+        token = _step_frame.set((step_idx, op, branch_id))
         try:
             yield step_idx
         finally:
             _step_frame.reset(token)
 
-    def _current_step(self) -> tuple[int | None, str | None]:
-        return _step_frame.get() or (None, None)
+    def _current_step(self) -> tuple[int | None, str | None, int | None]:
+        return _step_frame.get() or (None, None, None)
 
     def emit(
         self,
@@ -719,7 +749,7 @@ class ExecutionContext:
         filename); the shared console prepends it so interleaved lines stay
         attributable.
         """
-        step_idx, op = self._current_step()
+        step_idx, op, branch_id = self._current_step()
         if level is None:
             level = (
                 "warning" if ("_failed" in message or "error=" in message) else "info"
@@ -735,6 +765,10 @@ class ExecutionContext:
             # console already carries a wall-clock HH:MM:SS).
             "t": round(time.monotonic() - self._t0, 3),
         }
+        # Per-branch steps stamp branch_id on every event so the viewer can group a live
+        # rollout under its branch before the boundary `step` event arrives.
+        if branch_id is not None:
+            evt["branch_id"] = branch_id
         if data is not None:
             evt["data"] = data
         self.events.append(evt)
@@ -752,13 +786,14 @@ async def traced_step[T](
     fn: Callable[[], Awaitable[T]],
     *,
     branch_id: int | None = None,
+    summary_metadata: dict[str, Any] | None = None,
 ) -> T:
     """Run `fn` inside a `ctx.step` frame and emit a boundary event with elapsed time."""
     from skunk.errors import MissingData, StepFailed
     from skunk.result import describe_value, summarize_value
 
     t0 = time.perf_counter()
-    with ctx.step(op_name):
+    with ctx.step(op_name, branch_id=branch_id):
         try:
             result = await fn()
         except (StepFailed, MissingData) as e:
@@ -771,13 +806,16 @@ async def traced_step[T](
             )
             raise
         elapsed = round(time.perf_counter() - t0, 3)
+        summary = summarize_value(result)
+        if summary_metadata:
+            summary.update(summary_metadata)
         ctx.emit(
             f"step elapsed_s={elapsed} output={describe_value(result)!r}",
             kind="step",
             data={
                 "branch_id": branch_id,
                 "elapsed_s": elapsed,
-                "summary": summarize_value(result),
+                "summary": summary,
             },
         )
     return result

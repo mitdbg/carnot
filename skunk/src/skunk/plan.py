@@ -47,6 +47,9 @@ class RetrieveBranch(BaseModel):
     period: str | None = (
         None  # YYYY-MM month/range/comma-list the DATA pertains to ("2013-06", "2022-10..2023-09", "1940-01..1940-12, 1953-01..1953-12"); None if unpinned
     )
+    as_of: str | list[str | None] | None = (
+        None  # bulletin ISSUE (publication month) to prefer values from. SOFT hint only — retrieval does NOT hard-filter on it (issue/print choice is selection's job); used as a search-agent hint and stamped onto extracted values as provenance. A single "YYYY-MM" hints the whole branch; a list hints per period entry (aligned 1:1 with the comma-separated `period`, None for unpinned slots)
+    )
     visual_only: bool = False
 
 
@@ -113,6 +116,7 @@ You are a query planner. Given a question, emit a JSON plan that, when executed,
     {"kind": "retrieve",
      "key": "<natural-language lookup string>",
      "period": "<str | null>",
+     "as_of": "<YYYY-MM | [YYYY-MM | null, ...] | null>",
      "visual_only": <bool>},
     {"kind": "lookup_external",
      "target": "<natural-language request for a single value>",
@@ -138,6 +142,10 @@ retrieve branch fields:
                 inclusive "YYYY-MM..YYYY-MM" range, or a comma-separated list of these —
                 expand fiscal years, calendar years, and quarters to month ranges. Null
                 when the question doesn't pin a data period.
+  as_of         the bulletin ISSUE (publication month, "YYYY-MM") to prefer values from,
+                only when the question names a specific print/vintage; else null. A SOFT
+                hint — selection still chooses the issue — so do not guess. A list aligns
+                1:1 with the comma-separated `period` entries (null for unpinned slots).
   visual_only   true only if question explicitly asks for visual understanding of charts/figures.
 
 lookup_external branch fields:
@@ -171,6 +179,10 @@ Rules:
     home for the value.
   - When a committed computed intermediate pins the period of a missing
     value, set the new branch's `period` to exactly that period.
+  - Human-provided resolutions explicitly map prior missing identifiers to
+    entries already in the kept value pool. Treat those identifiers as resolved
+    by those entries; do not request them again unless the latest missing-data
+    signal still names them (meaning the supplied information was insufficient).
 """
 
     # Planner and replanner share the initial-plan instructions (same branch/field
@@ -229,6 +241,7 @@ Rules:
         attempts: list[AttemptRecord],
         missing_reason: str,
         missing: list[str],
+        human_resolutions: list[tuple[int, list[str]]] | None = None,
     ) -> Plan:
         parts = [
             f"Question: {ctx.question}",
@@ -237,4 +250,13 @@ Rules:
             self._attempts_section(attempts),
             f"What compute says is missing:\n  description: {missing_reason}\n  missing:     {missing!r}",
         ]
+        if human_resolutions:
+            resolved = "\n".join(
+                f"  - prior missing {resolved_missing!r} -> input_values[{input_index}]"
+                for input_index, resolved_missing in human_resolutions
+            )
+            parts.append(
+                "Human-provided resolutions (explicit mapping to available inputs):\n"
+                f"{resolved}"
+            )
         return await self._replan_prompt.call(ctx, "\n\n".join(parts), temperature=0.4)

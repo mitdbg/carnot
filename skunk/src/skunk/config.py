@@ -65,6 +65,14 @@ class SkunkConfig:
     # outcomes abstain from the vote — a NeedsMore is returned only when EVERY trial
     # signals it. 1 = single-trial (today's behavior). (env: SKUNK_COMPUTE_BEST_OF_N)
     compute_best_of_n: int = 5
+    # Append a fixed cheat-sheet of canonical formulas for named / ambiguous operations
+    # (`question_explainer.PRECOMPUTED_CONCEPT_REFERENCES`) to the compute `## Concept
+    # references` block, after the question_explainer's per-question concepts. Pins one
+    # convention per operation (Zipf orientation, Box-Cox form, percentile type, pop-vs-
+    # sample std, …) so codegen stops picking wrong variants. Default OFF (explainer
+    # concepts alone); flip per-run to A/B its effect on compute accuracy.
+    # (env: SKUNK_PRECOMPUTED_CONCEPT_REFS=1)
+    compute_precomputed_concept_refs: bool = False
 
     # Replan-on-MissingData loop. Total compute invocations ≤ recovery_max_rounds + 1.
     recovery_max_rounds: int = 2
@@ -113,6 +121,14 @@ class SkunkConfig:
     agent_max_steps: int = 20
     agent_max_pages_per_tool_call: int = 20
 
+    # Hard cap on the rendered size of a single `grep_corpus` observation, in *tokens*
+    # (`grep_corpus` defaults to limit=None = "every matching chunk", so one broad pattern
+    # could dump ~200K+ tokens into the context in one shot — that ballooned a request past
+    # the model's input ceiling and 400'd it repeatedly). Over-budget hits are dropped with a
+    # note telling the agent to narrow its pattern / pass `limit`. Token→char conversion uses
+    # ~4 chars/token (see GrepCorpusTool). (env: SKUNK_GREP_MAX_OUTPUT_TOKENS)
+    grep_max_output_tokens: int = 200_000
+
     # Search-agent per-LLM-call caps (RetrieveOp only). On Gemini 3.x
     # `max_output_tokens` is a COMBINED thinking+visible budget, so keep it above the
     # effort tier's thinking spend (medium ≈ 2.5K, high ≈ 16K thinking tokens) or the
@@ -123,9 +139,16 @@ class SkunkConfig:
     search_agent_max_output_tokens: int = 4096
     search_agent_request_timeout_s: float = 120.0
 
+    # Max tool calls the search agent may issue in a single step (executed in parallel).
+    # 1 disables parallelism (one tool call per step). (env: SKUNK_SEARCH_MAX_PARALLEL_TOOL_CALLS)
+    search_agent_max_parallel_tool_calls: int = 3
+
     # Step cap for the lookup_external agent (terminates earlier via its final-answer JSON block).
     # (env: SKUNK_LOOKUP_MAX_STEPS)
     lookup_max_steps: int = 4
+    # Max tool calls the lookup agent may issue in a single step (executed in parallel).
+    # 1 disables parallelism. (env: SKUNK_LOOKUP_MAX_PARALLEL_TOOL_CALLS)
+    lookup_max_parallel_tool_calls: int = 3
     # Active lookup tools by name (see `lookup_tools._REGISTRY`); None → all tools.
     # (env: SKUNK_LOOKUP_TOOLS — comma-separated, e.g. "fetch_fred,tavily_search")
     lookup_tools: list[str] | None = None
@@ -174,6 +197,24 @@ class SkunkConfig:
     # vision working set (~6k pages corpus-wide) and low-value for table-centric queries, so chart
     # re-reading is an opt-in phase, default off. (env: SKUNK_VISION_RESCAN_CHARTS=1)
     vision_rescan_charts: bool = False
+
+    # Human-in-the-loop: route specific sub-tasks to a person instead of (or after) the
+    # model. Three independent toggles, all default OFF (zero behavior change when unset);
+    # the policy/channel wiring lives in `human.py` and is enforced at the orchestrator
+    # dispatch seam, so no operator or planner code changes when these flip. Transport is
+    # chosen by handler presence: under the competition server these route through the async
+    # broker/web UI (non-blocking — a worker resolves each request); for a local CLI run with
+    # no handler they fall back to the blocking console, so target a handful of UIDs, not a sweep.
+    # - human_figure: for `visual_only` retrieve branches (chart/figure questions the
+    #   vision model reads unreliably), show the human the rendered page(s) + the model's
+    #   candidate and take their answer. (env: SKUNK_HUMAN_FIGURE=1)
+    # - human_verify_extract: for non-visual extractions, the human confirms/corrects the
+    #   extracted value(s) against the rendered source page(s). (env: SKUNK_HUMAN_VERIFY_EXTRACT=1)
+    # - human_lookup: every lookup_external branch is performed by the human instead of the
+    #   LookupAgent. (env: SKUNK_HUMAN_LOOKUP=1)
+    human_figure: bool = False
+    human_verify_extract: bool = False
+    human_lookup: bool = False
 
     def __post_init__(self) -> None:
         # Route per-stage models through the override registry so `PromptedCall` resolves them
@@ -239,10 +280,18 @@ class SkunkConfig:
             extract_request_timeout_s=float(
                 os.environ.get("SKUNK_EXTRACT_TIMEOUT_S", "150")
             ),
+            compute_precomputed_concept_refs=os.environ.get(
+                "SKUNK_PRECOMPUTED_CONCEPT_REFS", "0"
+            )
+            not in ("", "0"),
             extract_vision_only=os.environ.get("SKUNK_EXTRACT_VISION_ONLY", "0")
             not in ("", "0"),
             vision_rescan_charts=os.environ.get("SKUNK_VISION_RESCAN_CHARTS", "")
             not in ("", "0"),
+            human_figure=os.environ.get("SKUNK_HUMAN_FIGURE", "0") not in ("", "0"),
+            human_verify_extract=os.environ.get("SKUNK_HUMAN_VERIFY_EXTRACT", "0")
+            not in ("", "0"),
+            human_lookup=os.environ.get("SKUNK_HUMAN_LOOKUP", "0") not in ("", "0"),
             retriever=os.environ.get("SKUNK_RETRIEVER", "page_index"),  # type: ignore[arg-type]
             chromadb_dir=os.environ.get("SKUNK_CHROMADB_DIR", "cache/chromadb"),
             chromadb_collection=os.environ.get(
@@ -256,13 +305,22 @@ class SkunkConfig:
             agent_max_pages_per_tool_call=int(
                 os.environ.get("SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL", "20")
             ),
+            grep_max_output_tokens=int(
+                os.environ.get("SKUNK_GREP_MAX_OUTPUT_TOKENS", "200000")
+            ),
             search_agent_max_output_tokens=int(
                 os.environ.get("SKUNK_SEARCH_MAX_OUTPUT_TOKENS", "4096")
             ),
             search_agent_request_timeout_s=float(
                 os.environ.get("SKUNK_SEARCH_TIMEOUT_S", "120")
             ),
+            search_agent_max_parallel_tool_calls=int(
+                os.environ.get("SKUNK_SEARCH_MAX_PARALLEL_TOOL_CALLS", "3")
+            ),
             lookup_max_steps=int(os.environ.get("SKUNK_LOOKUP_MAX_STEPS", "4")),
+            lookup_max_parallel_tool_calls=int(
+                os.environ.get("SKUNK_LOOKUP_MAX_PARALLEL_TOOL_CALLS", "3")
+            ),
             lookup_tools=_parse_csv(os.environ.get("SKUNK_LOOKUP_TOOLS", "")),
             agent_model_id=os.environ.get("SKUNK_AGENT_MODEL") or None,
         )

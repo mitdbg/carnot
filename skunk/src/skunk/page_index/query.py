@@ -40,6 +40,13 @@ from .store import get_page_store
 _MONTH_RE = re.compile(r"\d{4}-\d{2}")
 
 
+def _sample_pages(refs: list[PageRef], limit: int = 5) -> list[dict[str, str | int | None]]:
+    return [
+        {"bulletin": ref.month, "page": ref.page}
+        for ref in refs[:limit]
+    ]
+
+
 class _PeriodEntry(NamedTuple):
     lo: str  # inclusive YYYY-MM data-span start
     hi: str  # inclusive YYYY-MM data-span end
@@ -511,14 +518,47 @@ True when the summary fits at least one target; false only when clearly unrelate
         self,
         ctx: ExecutionContext,
         branches: list[RetrieveBranch],
+        *,
+        document_scopes: list[list[str] | None] | None = None,
     ) -> list[list[BlockRef]]:
-        """Phases (1) and (2) only: ToC pick → year filter → semantic filter.
+        """Phases (1) and (2) only: ToC pick → year/scope filter → semantic filter.
         Returns the sem-filter survivor blocks per branch, aligned to `branches`.
         No block selection — the caller (orchestrator) runs the selection agent
-        as a separate step."""
+        as a separate step. `document_scopes` hard-scopes a branch's candidates to a
+        set of bulletins (HITL human-required documents); a scoped branch skips the
+        ToC/year filter and takes every page of those bulletins as its candidates."""
         # Phase 1 — one unified ToC pick (question only), then each branch's own date filter.
-        chapter_pages = await self._pick_chapters(branches=branches, ctx=ctx)
-        cand = [self._year_filter(chapter_pages, b, ctx) for b in branches]
+        scopes = document_scopes or [None] * len(branches)
+        unscoped = [branch for branch, scope in zip(branches, scopes) if not scope]
+        chapter_pages = (
+            await self._pick_chapters(branches=unscoped, ctx=ctx)
+            if unscoped
+            else []
+        )
+        cand = []
+        for branch, scope in zip(branches, scopes):
+            if scope:
+                refs = sorted(
+                    (
+                        ref
+                        for ref in self._catalog
+                        if ref.month in set(scope)
+                    ),
+                    key=lambda ref: (ref.month or "", ref.page or 0),
+                )
+                ctx.emit(
+                    f"human_document_scope key={branch.key!r} "
+                    f"bulletins={scope!r} pages={len(refs)}",
+                    data={
+                        "key": branch.key,
+                        "bulletins": scope,
+                        "pages": len(refs),
+                        "sample_pages": _sample_pages(refs),
+                    },
+                )
+                cand.append(refs)
+            else:
+                cand.append(self._year_filter(chapter_pages, branch, ctx))
 
         wanted: dict[PageRef, set[int]] = {}
         for i, refs in enumerate(cand):

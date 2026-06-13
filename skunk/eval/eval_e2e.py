@@ -263,6 +263,14 @@ async def _run_one_question(
             )
 
     config = SkunkConfig.from_env()
+    # Hermetic eval: human-in-the-loop is for the competition server, never for an automated
+    # benchmark run. Force every human-review path off regardless of the environment
+    # (SKUNK_HUMAN_* env vars `from_env` may have read), so a stray flag can't silently
+    # human-gate or stall a run. The intervention/review HANDLERS are already None (never
+    # passed to the Orchestrator below); these are the config FLAGS that would request them.
+    config.human_figure = False
+    config.human_verify_extract = False
+    config.human_lookup = False
     config.golden_pages = golden_pages
     # Block-aware replay: inject the cached blocks so extract block-scopes as the live run did,
     # and the cached sem pool so coverage repair can re-select on replay.
@@ -362,13 +370,10 @@ REPORT_FIELDS = [
     # finer failure-mode triage (compute / retrieval / lookup) the merged report carries
     # is a manual pass over `wrong`/`fail`.
     "category",
-    # Free-text annotation. Auto-seeded with the failure reason for `fail` rows; blank
-    # otherwise (a human refines it during triage).
-    "note",
     # The question text + `gold_answer`/`golden_pages`, mirrored under the trace viewer's
     # expected column names so `eval/trace_viewer/` renders without per-schema patches:
     # `golden_pages` is space-separated `month:page` tokens, and `failed`/`reason` are
-    # derived from `category`/`note` for its pass/fail badge.
+    # the trace viewer's pass/fail badge fields.
     "question",
     "predicted",
     "gold_answer",
@@ -606,9 +611,6 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
     return {
         "uid": uid,
         "category": category,
-        # Seed `note` with the failure reason so `fail` rows are self-describing; correct/
-        # wrong rows start blank for manual triage.
-        "note": (result["reason"] or "") if result["failed"] else "",
         # Trace-viewer mirror columns (see REPORT_FIELDS). `golden_pages` uses the viewer's
         # `month:page` token form; `failed`/`reason` feed its pass/fail badge.
         "question": question,

@@ -2,27 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-import httpx
+
 import pytest  # type: ignore[import-not-found]
-from fastapi import FastAPI
 
 from cup_kit.agent_runtime import AgentAnswer
-from skunk_client.client import create_app as create_client_app
 from skunk_server.agent_worker_pool import AgentWorkerPool
-from skunk_server.api import install_routes, snapshot
-from skunk_server.domain import (
-    AnswerCandidate,
-    AssignmentStatus,
-    FailureRecord,
-    TaskStatus,
-)
-from skunk_server.events import EventHub
-from skunk_server.human_work_broker import HumanWorkBroker
-from skunk_server.human_worker_registry import HumanWorkerRegistry
+from skunk_server.domain import AnswerCandidate, TaskStatus
+from skunk_server.submission_coordinator import DEADLINE_SUBMIT_LEAD_S, SubmissionCoordinator
 from skunk_server.task_queues import TaskQueues
-from skunk_server.task_registry import TaskConflict, TaskRegistry
-from skunk_server.submission_coordinator import SubmissionCoordinator
+from skunk_server.task_registry import TaskRegistry
 from skunk_reasoner import (
     SKUNK_ROOT,
     _set_default_env,
@@ -42,88 +32,6 @@ def _ready_task(registry: TaskRegistry, question_id: str = "q1"):
     )
     assert registry.complete_attempt(task.task_id, attempt.attempt_id, candidate)
     return task
-
-
-def test_first_human_action_wins_and_supersedes_sibling() -> None:
-    registry = TaskRegistry()
-    task = _ready_task(registry)
-    first = registry.create_assignment(task.task_id, "worker-1")
-    second = registry.create_assignment(task.task_id, "worker-2")
-
-    registry.retry_from_assignment(
-        first.assignment_id,
-        first.worker_id,
-        first.task_version,
-        "Check the cited source.",
-    )
-
-    assert task.status == TaskStatus.RETRY_QUEUED
-    assert first.status == AssignmentStatus.COMPLETED
-    assert second.status == AssignmentStatus.SUPERSEDED
-    with pytest.raises(TaskConflict):
-        registry.retry_from_assignment(
-            second.assignment_id,
-            second.worker_id,
-            second.task_version,
-            "This action is stale.",
-        )
-
-
-def test_retry_feedback_and_cup_feedback_reach_next_attempt() -> None:
-    registry = TaskRegistry()
-    task = _ready_task(registry)
-    assignment = registry.create_assignment(task.task_id, "worker")
-    task.cup_feedback.append("Cup score: correct=False, points_awarded=0")
-    registry.retry_from_assignment(
-        assignment.assignment_id,
-        assignment.worker_id,
-        assignment.task_version,
-        "Try a different interpretation.",
-    )
-
-    attempt = registry.begin_attempt(task.task_id, "agent-2")
-
-    assert attempt is not None
-    assert attempt.feedback == "Try a different interpretation."
-    assert attempt.context_feedback == ["Cup score: correct=False, points_awarded=0"]
-    assert task.pending_retry_feedback is None
-
-
-def test_failed_task_accepts_direct_human_answer() -> None:
-    registry = TaskRegistry()
-    task, _ = registry.create_task(1, "failed", "Question")
-    attempt = registry.begin_attempt(task.task_id, "agent")
-    assert attempt is not None
-    registry.fail_attempt(
-        task.task_id,
-        attempt.attempt_id,
-        FailureRecord(attempt.attempt_id, "RuntimeError", "model failed"),
-    )
-    assignment = registry.create_assignment(task.task_id, "human")
-
-    task, candidate = registry.human_answer_from_assignment(
-        assignment.assignment_id,
-        "human",
-        assignment.task_version,
-        "Final human answer",
-        "Reviewed manually.",
-        [],
-    )
-
-    assert task.status == TaskStatus.SUBMITTING
-    assert candidate.submission_type == "human"
-    assert assignment.status == AssignmentStatus.COMPLETED
-
-
-def test_worker_registry_names_are_mnemonic() -> None:
-    workers = HumanWorkerRegistry()
-    first = workers.create_worker()
-    second = workers.create_worker()
-
-    workers.save_display_name(first.worker_id, "Treasury Tables")
-
-    assert first.worker_id != second.worker_id
-    assert first.mnemonic == f"Treasury Tables ({first.worker_id[:4]})"
 
 
 def test_reasoner_defaults_page_index_to_repo_cache(monkeypatch) -> None:
@@ -148,7 +56,11 @@ def test_agent_worker_pool_success_and_failure() -> None:
             lambda _prompt: AgentAnswer("42", "Reasoning from worker thread.", []),
             1,
         )
-        success_pool.start(loop, lambda task_id, outcome: success_events.append((task_id, outcome)))
+        success_pool.start(
+            loop,
+            lambda task_id, outcome: success_events.append((task_id, outcome)),
+            lambda *_: None,
+        )
         success_queues.enqueue_agent(success_task.task_id)
         try:
             for _ in range(100):
@@ -172,7 +84,7 @@ def test_agent_worker_pool_success_and_failure() -> None:
             raise RuntimeError("simulated failure")
 
         failure_pool = AgentWorkerPool(failure_registry, failure_queues, fail, 1)
-        failure_pool.start(loop, lambda _task_id, _outcome: None)
+        failure_pool.start(loop, lambda _task_id, _outcome: None, lambda *_: None)
         failure_queues.enqueue_agent(failure_task.task_id)
         try:
             for _ in range(100):
@@ -187,121 +99,222 @@ def test_agent_worker_pool_success_and_failure() -> None:
     asyncio.run(run())
 
 
-class _FakeCoordinator:
-    def __init__(self) -> None:
-        self.submissions: list[dict[str, object]] = []
-
-    async def submit_ready(self, task_id: str, **kwargs) -> None:
-        self.submissions.append({"task_id": task_id, **kwargs})
-        return None
-
-    async def submit_human_candidate(self, *_args, **_kwargs) -> None:
-        return None
-
-
-def test_api_save_name_claim_and_retry() -> None:
-    registry = TaskRegistry()
-    queues = TaskQueues()
-    workers = HumanWorkerRegistry()
-    broker = HumanWorkBroker(registry, queues, workers)
-    task = _ready_task(registry, "api")
-    worker = workers.create_worker()
-    events = EventHub(lambda worker_id=None: snapshot(registry, workers, worker_id))
-    app = FastAPI()
-    install_routes(app, registry, workers, broker, _FakeCoordinator(), events)  # type: ignore[arg-type]
-
+def test_round_close_frees_worker_for_next_round() -> None:
+    # A round closing must cancel its still-running reasoners so the (single) worker is
+    # freed for the next round, instead of staying blocked on un-cancellable in-flight work.
     async def run() -> None:
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app),  # type: ignore[arg-type]
-            base_url="http://test",
-        ) as client:
-            response = await client.put(
-                f"/api/workers/{worker.worker_id}",
-                json={"display_name": "Treasury Tables"},
-            )
-            assert response.status_code == 200
-            response = await client.post(
-                "/api/assignments",
-                json={"worker_id": worker.worker_id, "task_id": task.task_id},
-            )
-            assert response.status_code == 200
-            assignment = response.json()
-            response = await client.post(
-                "/api/retries",
-                json={
-                    "worker_id": worker.worker_id,
-                    "assignment_id": assignment["assignment_id"],
-                    "task_version": assignment["task_version"],
-                    "feedback": "Try again.",
-                },
-            )
-            assert response.status_code == 200
-            assert response.json()["status"] == TaskStatus.RETRY_QUEUED
+        loop = asyncio.get_running_loop()
+        registry = TaskRegistry()
+        queues = TaskQueues()
+
+        async def reasoner(prompt: str):
+            if "block" in prompt:
+                await asyncio.sleep(3600)  # round-1 question: never returns on its own
+            return AgentAnswer("42", "Reasoning from the next round's worker.", [])
+
+        pool = AgentWorkerPool(registry, queues, reasoner, 1)  # one worker on purpose
+        pool.start(loop, lambda _task_id, _outcome: None, lambda *_: None)
+        r1, _ = registry.create_task(1, "blocker", "block this round-1 question")
+        r2, _ = registry.create_task(2, "fast", "answer this round-2 question")
+        try:
+            queues.enqueue_agent(r1.task_id)
+            for _ in range(200):
+                if r1.status == TaskStatus.PROCESSING:
+                    break
+                await asyncio.sleep(0.02)
+            assert r1.status == TaskStatus.PROCESSING
+
+            queues.enqueue_agent(r2.task_id)
+            await asyncio.sleep(0.1)
+            assert r2.status == TaskStatus.QUEUED  # worker still blocked on round 1
+
+            registry.close_round(1, "CLOSED")  # cancels round 1's reasoner, frees the worker
+
+            for _ in range(200):
+                if r2.status == TaskStatus.READY:
+                    break
+                await asyncio.sleep(0.02)
+            assert r1.status == TaskStatus.CANCELLED
+            assert r2.status == TaskStatus.READY  # the freed worker ran round 2
+            assert r2.latest_candidate is not None
+        finally:
+            pool.stop()
 
     asyncio.run(run())
 
 
-def test_api_allows_submission_without_claim() -> None:
+def test_agent_worker_pool_streams_trace_events() -> None:
+    # Trace events are appended to the attempt (stamped with a per-task seq) and published to
+    # the task's event-stream subscribers — not routed through the completion callback.
+    async def run() -> None:
+        loop = asyncio.get_running_loop()
+        registry = TaskRegistry()
+        queues = TaskQueues()
+        task, _ = registry.create_task(1, "trace", "Question")
+        published: list[tuple[str, str, list[dict]]] = []  # publish_event delivers batches
+
+        def reasoner(_prompt: str, *, trace_event_handler=None):
+            assert trace_event_handler is not None
+            trace_event_handler({"message": "planner started", "kind": "plan", "op": "planner", "t": 0.1})
+            trace_event_handler({"message": "step done", "kind": "step", "op": "planner", "t": 1.0})
+            return AgentAnswer("42", "Reasoning from worker thread.", [])
+
+        pool = AgentWorkerPool(registry, queues, reasoner, 1)
+        pool.start(
+            loop,
+            lambda _task_id, _outcome: None,
+            lambda task_id, attempt_id, events: published.append((task_id, attempt_id, events)),
+        )
+        queues.enqueue_agent(task.task_id)
+
+        def flat() -> list[dict]:
+            return [event for (_t, _a, events) in published for event in events]
+
+        try:
+            for _ in range(100):
+                if task.status == TaskStatus.READY and len(flat()) == 2:
+                    break
+                await asyncio.sleep(0.02)
+            assert task.status == TaskStatus.READY
+            assert [event["message"] for event in flat()] == ["planner started", "step done"]
+            assert [event["seq"] for event in flat()] == [0, 1]
+            # The same events back-fill from the registry with matching seq.
+            backfill, next_seq = registry.snapshot_task_events(task.task_id)
+            assert next_seq == 2
+            assert [(seq, event["message"]) for (seq, _a, event) in backfill] == [
+                (0, "planner started"),
+                (1, "step done"),
+            ]
+        finally:
+            pool.stop()
+
+    asyncio.run(run())
+
+
+def test_cancelled_run_dumps_partial_trace(tmp_path, monkeypatch) -> None:
+    # A run cancelled at round close should still write its (partial) trace, marked
+    # "cancelled", and must re-raise the cancellation rather than swallow it.
+    import json
+
+    import skunk
+    import skunk_reasoner as sr
+
+    class _FakeCtx:
+        def __init__(self) -> None:
+            self.events = [{"message": "plan label=initial branches=1", "kind": "plan"}]
+
+        def close(self) -> None:
+            pass
+
+    class _FakeOrch:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.ctx = _FakeCtx()
+
+        async def execute(self):
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(skunk, "Orchestrator", _FakeOrch)
+    monkeypatch.setenv("SKUNK_CONSOLE_TRACE_DIR", str(tmp_path))
+    monkeypatch.setenv("SKUNK_PROMPT_OVERRIDES", str(tmp_path / "nonexistent.yaml"))
+
+    async def run() -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await sr.SkunkReasoner().execute("a cancelled question about defense outlays")
+
+    asyncio.run(run())
+
+    files = list(tmp_path.glob("*.json"))
+    assert len(files) == 1
+    payload = json.loads(files[0].read_text())
+    assert payload["status"] == "cancelled"
+    assert payload["events"]  # partial trace was captured
+
+
+class _AcceptingAdapter:
+    async def submit(self, _submission, _candidate):
+        return SimpleNamespace(
+            accepted=True,
+            submission_id="cup-submission",
+            tokens_remaining=2,
+            score=SimpleNamespace(correct=False, points_awarded=0.0),
+        )
+
+
+async def _wait_for_submitted(task, ticks: int = 200) -> None:
+    for _ in range(ticks):
+        if task.status == TaskStatus.SUBMITTED:
+            break
+        await asyncio.sleep(0.01)
+
+
+def test_completion_in_final_window_submits_immediately() -> None:
     registry = TaskRegistry()
     queues = TaskQueues()
-    workers = HumanWorkerRegistry()
-    broker = HumanWorkBroker(registry, queues, workers)
-    task = _ready_task(registry, "direct-submit")
-    events = EventHub(lambda worker_id=None: snapshot(registry, workers, worker_id))
-    fake = _FakeCoordinator()
-    app = FastAPI()
-    install_routes(app, registry, workers, broker, fake, events)  # type: ignore[arg-type]
+    # Deadline already inside the final auto-submit window: a freshly-READY answer must submit
+    # immediately rather than waiting for the (already-fired) sweep.
+    registry.update_round(
+        round_num=1,
+        status="ACTIVE",
+        ends_at=datetime.now(timezone.utc) + timedelta(seconds=DEADLINE_SUBMIT_LEAD_S - 2),
+    )
+    task = _ready_task(registry, "final-window")
 
-    async def run() -> httpx.Response:
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app),  # type: ignore[arg-type]
-            base_url="http://test",
-        ) as client:
-            return await client.post(
-                "/api/submissions",
-                json={"task_id": task.task_id},
-            )
+    async def run() -> None:
+        coordinator = SubmissionCoordinator(registry, queues, _AcceptingAdapter(), lambda: None)  # type: ignore[arg-type]
+        coordinator.handle_agent_completion(task.task_id, "ready")
+        await _wait_for_submitted(task)
 
-    response = asyncio.run(run())
-    assert response.status_code == 200
-    assert fake.submissions == [{"task_id": task.task_id, "assignment_id": None, "worker_id": None, "task_version": None}]
+    asyncio.run(run())
+
+    assert task.status == TaskStatus.SUBMITTED
+    assert task.submissions[-1].status == "ACCEPTED"
+    assert task.cup_feedback[-1] == "Cup score: correct=False, points_awarded=0.0"
 
 
-def test_client_page_contains_server_and_controls() -> None:
-    app = create_client_app("http://example.test:8787")
-    async def run():
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app),  # type: ignore[arg-type]
-            base_url="http://test",
-        ) as client:
-            return await client.get("/")
+def test_completion_outside_final_window_defers_to_sweep() -> None:
+    registry = TaskRegistry()
+    queues = TaskQueues()
+    # Deadline far in the future: a READY answer is NOT auto-submitted on completion; it waits
+    # for the manual button or the pre-deadline sweep.
+    registry.update_round(
+        round_num=1,
+        status="ACTIVE",
+        ends_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    task = _ready_task(registry, "deferred")
 
-    response = asyncio.run(run())
-    assert response.status_code == 200
-    assert "http://example.test:8787" in response.text
-    assert "client.css" in response.text
-    assert "client.js" in response.text
+    async def run() -> None:
+        coordinator = SubmissionCoordinator(registry, queues, _AcceptingAdapter(), lambda: None)  # type: ignore[arg-type]
+        coordinator.handle_agent_completion(task.task_id, "ready")
+        await asyncio.sleep(0.1)
+
+    asyncio.run(run())
+
+    assert task.status == TaskStatus.READY
+    assert not task.submissions
 
 
-def test_client_source_route_serves_pdf_pages(tmp_path) -> None:
-    pdf_dir = tmp_path / "pdfs"
-    pdf_dir.mkdir()
-    pdf_path = pdf_dir / "treasury_bulletin_2026_06.pdf"
-    pdf_path.write_bytes(b"%PDF-1.4\n%test\n")
-    app = create_client_app("http://example.test:8787", pdf_dir=pdf_dir)
+def test_deadline_sweep_submits_un_submitted_ready_task() -> None:
+    registry = TaskRegistry()
+    queues = TaskQueues()
+    # Sweep fires DEADLINE_SUBMIT_LEAD_S before the deadline; set it just past the lead so the
+    # scheduled sleep is tiny.
+    registry.update_round(
+        round_num=1,
+        status="ACTIVE",
+        ends_at=datetime.now(timezone.utc) + timedelta(seconds=DEADLINE_SUBMIT_LEAD_S + 0.1),
+    )
+    task = _ready_task(registry, "sweep")
 
-    async def run() -> httpx.Response:
-        async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app),  # type: ignore[arg-type]
-            base_url="http://test",
-        ) as client:
-            return await client.get("/api/source/2026-06")
+    async def run() -> None:
+        coordinator = SubmissionCoordinator(registry, queues, _AcceptingAdapter(), lambda: None)  # type: ignore[arg-type]
+        coordinator.on_round_active(1)
+        await _wait_for_submitted(task)
 
-    response = asyncio.run(run())
-    assert response.status_code == 200
-    assert response.headers["content-type"].startswith("application/pdf")
-    assert response.headers["content-disposition"].startswith("inline")
-    assert response.content.startswith(b"%PDF-1.4")
+    asyncio.run(run())
+
+    assert task.status == TaskStatus.SUBMITTED
+    assert task.submissions[-1].status == "ACCEPTED"
 
 
 def test_reasoning_payload_includes_branch_cards_and_code() -> None:
@@ -331,11 +344,17 @@ def test_reasoning_payload_includes_branch_cards_and_code() -> None:
             "op": "compute",
             "data": {"attempt": 1, "code": "result = '42'"},
         },
+        {
+            "kind": "observation",
+            "message": "human_directed_retrieval",
+            "data": {"directives": [{"branch_id": 0, "bulletins": ["1954-02"]}]},
+        },
     ]
 
     payload = _structured_reasoning_payload(events, ["Treasury Bulletin 1954-02 PDF page 4"])
 
     assert payload["summary"]["branch_count"] == 2
+    assert payload["summary"]["human_directed_retrieval"] is True
     assert payload["branches"][0]["searched"]["key"] == "inflation"
     assert payload["branches"][1]["searched"]["target"] == "cpi"
     assert payload["python_code"] == "result = '42'"
@@ -365,38 +384,3 @@ def test_source_docs_are_read_from_structured_step_provenance() -> None:
         "Treasury Bulletin 1954-02 PDF page 4",
         "Treasury Bulletin 1954-02 PDF page 5",
     ]
-
-
-def test_auto_submit_records_immediate_score_feedback() -> None:
-    registry = TaskRegistry()
-    queues = TaskQueues()
-    task = _ready_task(registry, "auto")
-
-    class FakeAdapter:
-        async def submit(self, _submission, _candidate):
-            return SimpleNamespace(
-                accepted=True,
-                submission_id="cup-submission",
-                tokens_remaining=2,
-                score=SimpleNamespace(correct=False, points_awarded=0.0),
-            )
-
-    async def run() -> None:
-        coordinator = SubmissionCoordinator(
-            registry,
-            queues,
-            FakeAdapter(),  # type: ignore[arg-type]
-            lambda: asyncio.sleep(0),
-            auto_submit=True,
-        )
-        coordinator.handle_agent_completion(task.task_id, "ready")
-        for _ in range(100):
-            if task.status == TaskStatus.SUBMITTED:
-                break
-            await asyncio.sleep(0.01)
-
-    asyncio.run(run())
-
-    assert task.status == TaskStatus.SUBMITTED
-    assert task.submissions[-1].status == "ACCEPTED"
-    assert task.cup_feedback[-1] == "Cup score: correct=False, points_awarded=0.0"

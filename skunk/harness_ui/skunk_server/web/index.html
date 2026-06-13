@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Skunk Agent Console</title>
+  <link rel="stylesheet" href="/static/client.css">
+  <script defer src="/static/trace_flow.js"></script>
+  <script defer src="/static/review_overlay.js"></script>
+  <script defer src="/static/client.js"></script>
+</head>
+<body>
+<header>
+  <div class="topbar">
+    <h1>Skunk Agent Console</h1>
+    <div class="meta">
+      <span class="pill timer">Time Remaining <strong id="roundTimer">--:--</strong></span>
+      <span class="pill">Connection <strong id="connection">-</strong></span>
+      <span class="pill">Round <strong id="roundNum">-</strong></span>
+      <span class="pill">Round Status <strong id="roundStatus">-</strong></span>
+      <span class="pill">Resubmits <strong id="resubmitsLeft">-</strong></span>
+    </div>
+  </div>
+</header>
+<main>
+  <div id="app">Connecting...</div>
+</main>
+<div id="reviewOverlay" hidden></div>
+</body>
+</html>

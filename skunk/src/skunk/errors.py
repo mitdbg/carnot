@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 
 class StepFailed(Exception):
     """Terminal failure from a plan step.
@@ -13,11 +15,18 @@ class StepFailed(Exception):
     untruncated up to the replanner so it can pivot to a workable source/kind;
     operators that don't produce one (extract, plain compute) leave it None and
     the consumers degrade gracefully."""
-    def __init__(self, op: str, reason: str, diagnostic: str | None = None):
+    def __init__(
+        self,
+        op: str,
+        reason: str,
+        diagnostic: str | None = None,
+        details: dict[str, Any] | None = None,
+    ):
         super().__init__(f"[{op}] {reason}")
         self.op = op
         self.reason = reason
         self.diagnostic = diagnostic
+        self.details = dict(details or {})
 
 
 class ParseError(StepFailed):

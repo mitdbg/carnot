@@ -136,7 +136,12 @@ class TaskSolverAgent(MultiTurnAgent):
         max_steps: int = 30,
         model_context_window: int = 1_000_000,
     ) -> None:
-        super().__init__([], max_steps=max_steps, system_prompt_override=system_prompt)
+        # Single tool call per step: this agent builds up state across steps in one
+        # persistent sandbox, which parallel batches (fresh executor per block) would break.
+        super().__init__(
+            [], max_steps=max_steps, max_parallel_tool_calls=1,
+            system_prompt_override=system_prompt,
+        )
         # Large doc context is packed into the first user message; size the
         # trajectory budget to the model window so it is not trimmed away.
         self.context_budget_chars = model_context_window * _CHARS_PER_TOKEN_ESTIMATE
