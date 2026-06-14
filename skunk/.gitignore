@@ -12,6 +12,7 @@ dist/
 
 # generated / cached
 cache/
+build_v3/
 eval/traces/
 eval/runs_*/
 

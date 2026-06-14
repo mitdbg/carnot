@@ -3,7 +3,7 @@
 // with a dimmed backdrop (the round timer in the header stays visible behind it) and walks the
 // operator through that task's reviews one at a time. Each review is one of three kinds:
 //   lookup         -> instruction + a value field (confirm/correct an external lookup)
-//   figure         -> page viewer + a value field (read the answer off a chart)
+//   figure         -> page viewer + a pre-filled AnnotatedValue JSON template (read it off the chart)
 //   verify_extract -> page viewer + an editable table/list of the model's extracted values
 // Submitting POSTs the edited values to /api/reviews/<id>/resolve; the overlay then advances to
 // the task's next open review, and closes (back to the main UI) after the last one. "X" exits
@@ -19,6 +19,7 @@ const ReviewOverlay = (function () {
 
   // viewer state
   let pages = [];              // [{month, page}] parsed from the review's source_docs
+  let pageValues = [];         // [{month,page,values:[desc,...]}] from guidance — value(s) per page
   let pageIdx = 0;
   let zoom = 1, panX = 0, panY = 0;
   let fitScale = 1;            // scale that fits the whole page in the viewport (and the min zoom)
@@ -104,6 +105,17 @@ const ReviewOverlay = (function () {
     return Array.isArray(g.candidates) ? g.candidates : [];
   }
 
+  // The figure (Visual QA) editor: a pre-filled AnnotatedValue JSON template the human edits while
+  // reading the chart, built server-side with `description` set to the retrieval target. The
+  // model's chart read is unreliable, so we DON'T anchor the human with confirm/correct cards here.
+  // Fall back to a minimal scalar template keyed on the branch's retrieval target if absent.
+  function figureTemplate(review) {
+    const g = review.guidance || {};
+    if (typeof g.value_template === "string") return g.value_template;
+    const target = (g.branch && g.branch.key) || "";
+    return JSON.stringify({ description: target, value: "", unit: "" }, null, 2);
+  }
+
   // One value box, decluttered: only description / unit / value are editable; kind, index_name,
   // row_name, col_name and machine provenance are preserved from the original extraction via the
   // `_src` index (the card's data-src). A ✕ removes the box entirely (the value is then dropped
@@ -123,6 +135,7 @@ const ReviewOverlay = (function () {
         <input type="text" data-f="unit" value="${esc(c.unit ?? "")}"></label>
       <label class="review-field"><span>value</span>
         <textarea data-f="value" class="review-value" oninput="ReviewOverlay.autosize(this)">${esc(valueStr)}</textarea></label>
+      ${c.notes ? `<div class="review-cand-notes"><span class="review-notes-label">notes</span>${esc(c.notes)}</div>` : ""}
     </div>`;
   }
 
@@ -167,7 +180,12 @@ const ReviewOverlay = (function () {
     const img = root().querySelector(".review-page-img");
     if (img) img.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`;
     const label = root().querySelector(".review-page-label");
-    if (label && pages.length) label.textContent = `${pages[pageIdx].month}  p.${pages[pageIdx].page}  (${pageIdx + 1}/${pages.length})`;
+    if (label && pages.length) {
+      const pg = pages[pageIdx];
+      const pv = pageValues.find((v) => v.month === pg.month && Number(v.page) === Number(pg.page));
+      const vals = pv && (pv.values || []).length ? `  —  ${pv.values.join(", ")}` : "";
+      label.textContent = `Treasury Bulletin ${pg.month}  ·  p.${pg.page}  (${pageIdx + 1}/${pages.length})${vals}`;
+    }
   }
   // Fit the loaded page to the viewport and center it. Called on each image load (natural size is
   // only known then); the fit scale also becomes the minimum zoom so the whole page is reachable.
@@ -221,15 +239,35 @@ const ReviewOverlay = (function () {
     if (!review) { close(); return; }
     el.hidden = false;
     pages = parsePages(review.source_docs);
+    pageValues = (review.guidance && review.guidance.page_values) || [];
     pageIdx = 0; zoom = 1; panX = 0; panY = 0; fitScale = 1;
     const task = tasksRef.find((t) => t.task_id === activeTaskId);
     const title = task ? `R${esc(task.round_num)} / ${esc(task.question_id)}` : esc(activeTaskId);
-    const kindLabel = { lookup: "External Lookup", figure: "Visual QA", verify_extract: "Extract Validation" }[review.kind] || review.kind;
+    const kindLabel = { lookup: "External Lookup", figure: "Visual QA", verify_extract: "Extract Validation", missing_data: "Missing Data" }[review.kind] || review.kind;
+    // missing_data is a "provide the value(s) the run couldn't find" request — not a validation of
+    // model candidates — so it has no candidates and gets its own framing (header + no accept-as-is).
+    const isMissing = review.kind === "missing_data";
+    // figure (Visual QA): the model's chart read is unreliable, so the human authors the answer in a
+    // pre-filled AnnotatedValue JSON template (description = retrieval target) instead of cards.
+    const isFigure = review.kind === "figure";
     const ctx = contextLine(review);
     const cands = candidates(review);
-    const editor = cands.length
-      ? cands.map(candidateRow).join("")
-      : candidateRow({ description: "", value: "", kind: "scalar" }, 0);
+    // Each kind picks its editor: missing_data → free-form replan instruction; figure → JSON
+    // template textarea; everything else → editable value cards (confirm/correct the model's read).
+    let editor, editorLabel;
+    if (isMissing) {
+      editor = `<textarea id="missingDataInput" class="review-missing-input" rows="4"
+           placeholder="Tell the replanner what to do differently — e.g. which series/table/bulletin to read, how to interpret the question, or where the value actually lives."></textarea>`;
+      editorLabel = `<div class="review-section-label">Instruction for the replanner</div>`;
+    } else if (isFigure) {
+      editor = `<textarea id="figureJsonInput" class="review-json-input" spellcheck="false" rows="8">${esc(figureTemplate(review))}</textarea>`;
+      editorLabel = `<div class="review-section-label">AnnotatedValue — read the value(s) off the chart</div>`;
+    } else {
+      editor = cands.length
+        ? cands.map(candidateRow).join("")
+        : candidateRow({ description: "", value: "", kind: "scalar" }, 0);
+      editorLabel = "";
+    }
     const viewer = pages.length ? `
       <div class="review-viewer">
         <div class="review-viewer-bar">
@@ -257,10 +295,11 @@ const ReviewOverlay = (function () {
             <div class="review-prompt">${esc(task?.prompt || "")}</div>
             ${ctx ? `<div class="review-context">${esc(ctx)}</div>` : ""}
             <div class="review-instructions">${esc(review.instructions || "")}</div>
+            ${editorLabel}
             <div class="review-editor">${editor}</div>
             <div class="review-actions">
               <button class="review-submit primary" onclick="ReviewOverlay.submit()">Submit</button>
-              <button class="review-accept" onclick="ReviewOverlay.acceptAsIs()" title="Keep the model's answer unchanged">Accept as-is</button>
+              ${isMissing ? "" : `<button class="review-accept" onclick="ReviewOverlay.acceptAsIs()" title="Keep the model's answer unchanged">Accept as-is</button>`}
               <span class="review-error" id="reviewError"></span>
             </div>
           </div>
@@ -274,7 +313,12 @@ const ReviewOverlay = (function () {
   // A one-line "what this value is about" hint from the branch identity, so terse per-value
   // descriptions still carry the question's context.
   function contextLine(review) {
-    const b = (review.guidance || {}).branch || {};
+    const g = review.guidance || {};
+    if (review.kind === "missing_data") {
+      const miss = (Array.isArray(g.missing) ? g.missing : []).filter(Boolean);
+      return miss.length ? `Missing: ${miss.join(", ")}` : "";
+    }
+    const b = g.branch || {};
     if (b.kind === "lookup_external") return b.target ? `Lookup: ${b.target}` : "";
     if (b.key) return `Looking for: ${b.key}${b.period ? ` · period ${b.period}` : ""}`;
     return "";
@@ -311,6 +355,24 @@ const ReviewOverlay = (function () {
   function submit() {
     const review = current();
     if (!review) return;
+    if (review.kind === "missing_data") {
+      // Free-form instruction → sent as the raw response; the server injects it into the replan prompt.
+      const ta = root().querySelector("#missingDataInput");
+      const text = (ta ? ta.value : "").trim();
+      if (!text) { showError("Enter an instruction for the replanner."); return; }
+      post(review, text);
+      return;
+    }
+    if (review.kind === "figure") {
+      // The edited AnnotatedValue JSON template → sent raw (already source-indexed for recompute).
+      // Validate it parses before sending so a typo surfaces here, not in a silent recompute failure.
+      const ta = root().querySelector("#figureJsonInput");
+      const text = (ta ? ta.value : "").trim();
+      if (!text) { showError("Fill in the value(s) read off the chart."); return; }
+      try { JSON.parse(text); } catch (err) { showError("Not valid JSON: " + err.message); return; }
+      post(review, text);
+      return;
+    }
     let edited;
     try { edited = collectEdited(); } catch (err) { showError(String(err)); return; }
     post(review, JSON.stringify(edited));

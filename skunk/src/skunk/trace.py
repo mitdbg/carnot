@@ -26,8 +26,10 @@ triggers it lazily on first `ExecutionContext` construction). It is idempotent.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
+import os
 import sys
 import threading
 from datetime import datetime
@@ -43,8 +45,18 @@ _config_lock = threading.Lock()
 # JSONL sink: a process-global file handle guarded by a lock (the eval runs ~32
 # questions concurrently in one process, all writing to one run-wide file; each
 # line carries its own `uid`/`step_idx`, so a single file is unambiguous).
+#
+# The handle is large-buffered and `write_jsonl` does NOT flush per event — across ~32
+# concurrent question threads a per-event flush is thousands of write syscalls, each
+# releasing/re-acquiring the GIL and contending on `_jsonl_lock`. Instead a single
+# background thread flushes every ~250 ms (and `atexit` flushes the tail), trading ≤250 ms
+# of durability for collapsing those syscalls into a handful. Mirrors the console's FileSink.
 _jsonl_fh: TextIO | None = None
 _jsonl_lock = threading.Lock()
+_JSONL_BUFFER_BYTES = 1 << 20  # large buffer so a big event rarely auto-flushes mid-write
+_jsonl_flush_interval_s = float(os.environ.get("SKUNK_TRACE_FLUSH_S", "0.25"))
+_jsonl_stop = threading.Event()
+_jsonl_flusher: threading.Thread | None = None
 
 
 def truncate(s: str, cap: int, suffix: str = "…") -> str:
@@ -109,7 +121,10 @@ def configure_obs(*, jsonl_path: str | None = None) -> None:
         if _configured:
             # Allow a later call to attach a JSONL sink even if rendering is set.
             if jsonl_path and _jsonl_fh is None:
-                _jsonl_fh = open(jsonl_path, "a", encoding="utf-8")  # noqa: SIM115
+                _jsonl_fh = open(  # noqa: SIM115
+                    jsonl_path, "a", buffering=_JSONL_BUFFER_BYTES, encoding="utf-8"
+                )
+                _ensure_jsonl_flusher()
             return
 
         handler = logging.StreamHandler(sys.stdout)
@@ -124,7 +139,10 @@ def configure_obs(*, jsonl_path: str | None = None) -> None:
         logging.getLogger("skunk").setLevel(logging.INFO)
 
         if jsonl_path:
-            _jsonl_fh = open(jsonl_path, "a", encoding="utf-8")  # noqa: SIM115
+            _jsonl_fh = open(  # noqa: SIM115
+                jsonl_path, "a", buffering=_JSONL_BUFFER_BYTES, encoding="utf-8"
+            )
+            _ensure_jsonl_flusher()
 
         _configured = True
 
@@ -139,11 +157,40 @@ def get_logger(name: str | None = None) -> logging.Logger:
 
 
 def write_jsonl(event: dict) -> None:
-    """Append one full (untruncated) event as a JSON line to the durable sink.
-    No-op when no sink is configured. Thread-safe across concurrent questions."""
+    """Append one full (untruncated) event as a JSON line to the durable sink. No-op when no
+    sink is configured. Thread-safe across concurrent questions. Buffered — NOT flushed here;
+    the background flusher (or `atexit`) pushes it to disk within `_jsonl_flush_interval_s`."""
     if _jsonl_fh is None:
         return
     line = json.dumps(event, default=str, ensure_ascii=False)
     with _jsonl_lock:
         _jsonl_fh.write(line + "\n")
-        _jsonl_fh.flush()
+
+
+def flush_jsonl() -> None:
+    """Flush the buffered JSONL sink to disk. Called by the background flusher and at exit."""
+    if _jsonl_fh is None:
+        return
+    with _jsonl_lock:
+        try:
+            _jsonl_fh.flush()
+        except (OSError, ValueError):  # ValueError if the handle was closed
+            pass
+
+
+def _jsonl_flush_loop() -> None:
+    # Wake every interval; Event.wait returns True only when stop is set → exit.
+    while not _jsonl_stop.wait(_jsonl_flush_interval_s):
+        flush_jsonl()
+
+
+def _ensure_jsonl_flusher() -> None:
+    """Start the single background flusher (once) and register a final flush at exit. Called
+    under `_config_lock` from `configure_obs` right after the sink is opened."""
+    global _jsonl_flusher
+    if _jsonl_flusher is None:
+        _jsonl_flusher = threading.Thread(
+            target=_jsonl_flush_loop, name="skunk-jsonl-flush", daemon=True
+        )
+        _jsonl_flusher.start()
+        atexit.register(flush_jsonl)  # write the buffered tail on a clean exit

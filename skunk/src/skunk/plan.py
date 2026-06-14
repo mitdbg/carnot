@@ -5,6 +5,7 @@ Branches are a discriminated union keyed by `kind` (`retrieve` / `lookup_externa
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Annotated, Literal, Union
@@ -36,9 +37,36 @@ def _strip_non_empty(v: str) -> str:
 NonEmptyStr = Annotated[str, AfterValidator(_strip_non_empty)]
 
 
+_MONTH_RE = re.compile(r"\d{4}-\d{2}")
+
+
+def _canonical_month(v: str) -> str:
+    v = v.strip()
+    if not _MONTH_RE.fullmatch(v):
+        raise ValueError(f"must be a canonical YYYY-MM month, got {v!r}")
+    return v
+
+
+MonthStr = Annotated[str, AfterValidator(_canonical_month)]
+
+
+class PagePin(BaseModel):
+    """A hard positional pin: an explicit page of a specific bulletin issue. BOTH fields are
+    required — a pin with only one is meaningless. `page` is the number AS THE QUESTION STATES
+    IT, ambiguous between the printed footer label and the PDF index; retrieval resolves both
+    interpretations and leaves the choice to downstream. Present only on page-addressed
+    questions ("on page 5 of the September 1990 Bulletin")."""
+
+    model_config = ConfigDict(frozen=True)
+
+    bulletin: MonthStr  # "YYYY-MM" — the issue the page is in
+    page: int = Field(ge=1)  # 1-based page number, exactly as written in the question
+
+
 class RetrieveBranch(BaseModel):
     """A corpus-retrieval branch. `visual_only` skips the parsed-text tier
-    downstream and goes straight to vision."""
+    downstream and goes straight to vision. `page_pin`, when set, addresses the data by an
+    explicit page of a specific issue rather than by content/period."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -47,8 +75,8 @@ class RetrieveBranch(BaseModel):
     period: str | None = (
         None  # YYYY-MM month/range/comma-list the DATA pertains to ("2013-06", "2022-10..2023-09", "1940-01..1940-12, 1953-01..1953-12"); None if unpinned
     )
-    as_of: str | list[str | None] | None = (
-        None  # bulletin ISSUE (publication month) to prefer values from. SOFT hint only — retrieval does NOT hard-filter on it (issue/print choice is selection's job); used as a search-agent hint and stamped onto extracted values as provenance. A single "YYYY-MM" hints the whole branch; a list hints per period entry (aligned 1:1 with the comma-separated `period`, None for unpinned slots)
+    page_pin: PagePin | None = (
+        None  # set only for page-addressed questions; resolves to a specific issue+page, bypassing content retrieval
     )
     visual_only: bool = False
 
@@ -116,7 +144,7 @@ You are a query planner. Given a question, emit a JSON plan that, when executed,
     {"kind": "retrieve",
      "key": "<natural-language lookup string>",
      "period": "<str | null>",
-     "as_of": "<YYYY-MM | [YYYY-MM | null, ...] | null>",
+     "page_pin": {"bulletin": "<YYYY-MM>", "page": <int>} | null,
      "visual_only": <bool>},
     {"kind": "lookup_external",
      "target": "<natural-language request for a single value>",
@@ -139,14 +167,19 @@ retrieve branch fields:
                 Never emit two branches for the same underlying table/statistic worded
                 differently (one auction's bids, allotments, and totals = one branch).
                 Same concept over several periods = one branch with a comma-separated period.
-  period        the period the data pertains to, as canonical months: "YYYY-MM", an
+  period        the period the DATA pertains to, as canonical months: "YYYY-MM", an
                 inclusive "YYYY-MM..YYYY-MM" range, or a comma-separated list of these —
                 expand fiscal years, calendar years, and quarters to month ranges. Null
-                when the question doesn't pin a data period.
-  as_of         the bulletin ISSUE (publication month, "YYYY-MM") to prefer values from,
-                only when the question names a specific print/vintage; else null. A SOFT
-                hint — selection still chooses the issue — so do not guess. A list aligns
-                1:1 with the comma-separated `period` entries (null for unpinned slots).
+                when the question doesn't pin a data period. A named publication/print
+                issue ("as reported in the September 2012 Bulletin") is NOT the period and
+                is NOT encoded in the plan — selection chooses which issue to read.
+  page_pin      set ONLY when the question addresses data by an explicit page NUMBER of a
+                specific issue ("on page 5 of the September 1990 Bulletin"). Both fields
+                required: {"bulletin": "YYYY-MM" (the issue), "page": <int> (the number
+                exactly as written)}. The page number is taken as-is — retrieval resolves
+                both the printed-label and the PDF-index page and leaves the choice
+                downstream, so do not convert it. Null for normal content/period retrieval;
+                put what to read on that page in `key`.
   visual_only   true only if question explicitly asks for visual understanding of charts/figures.
 
 lookup_external branch fields:
@@ -243,6 +276,7 @@ Rules:
         missing_reason: str,
         missing: list[str],
         human_resolutions: list[tuple[int, list[str]]] | None = None,
+        human_guidance: str | None = None,
     ) -> Plan:
         parts = [
             f"Question: {ctx.question}",
@@ -259,5 +293,13 @@ Rules:
             parts.append(
                 "Human-provided resolutions (explicit mapping to available inputs):\n"
                 f"{resolved}"
+            )
+        if human_guidance and human_guidance.strip():
+            # Free-form operator instruction from the missing-data review — authoritative
+            # direction for THIS replan (which series/table/bulletin to use, how to read the
+            # question). Follow it.
+            parts.append(
+                "Operator instruction for this replan (free-form, authoritative — follow it):\n"
+                f"{human_guidance.strip()}"
             )
         return await self._replan_prompt.call(ctx, "\n\n".join(parts), temperature=0.4)

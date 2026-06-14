@@ -43,7 +43,8 @@ fi
 # --- Launcher knobs (override via environment / .env) ---
 HOST="${SKUNK_CONSOLE_HOST:-127.0.0.1}"
 CUP_PORT="${SKUNK_CONSOLE_CUP_PORT:-8765}"
-SKUNK_SERVER_PORT="${SKUNK_CONSOLE_SERVER_PORT:-8787}"
+SKUNK_SERVER_PORT="${SKUNK_CONSOLE_SERVER_PORT:-8787}"   # backend (agent) — localhost only
+WEB_PORT="${SKUNK_CONSOLE_WEB_PORT:-8788}"               # web (browser-facing) — the UI
 ROUND_SECONDS="${SKUNK_CONSOLE_ROUND_SECONDS:-3600}"
 # Question-execution parallelism = questions released per round (always 15). Override
 # with SKUNK_CONCURRENCY.
@@ -63,7 +64,16 @@ fi
 
 export CUP_BASE_URL="http://${HOST}:${CUP_PORT}"
 export CUP_TEAM_TOKEN
+# Backend (agent) URL — the web process proxies command routes here; never browser-facing.
 export SKUNK_SERVER_URL="http://${HOST}:${SKUNK_SERVER_PORT}"
+
+# Per-run filesystem stream dir: the split backend (FileSink) writes status.json + a single
+# shared events.jsonl here and the web process (FileTailer) tails it back into its SSE hub.
+# Override by setting SKUNK_STREAM_DIR in the env; else a timestamped dir under the repo.
+if [[ -z "${SKUNK_STREAM_DIR:-}" ]]; then
+  export SKUNK_STREAM_DIR="$SKUNK_DIR/logs/console/stream/$(date +%Y%m%d_%H%M%S)"
+fi
+mkdir -p "$SKUNK_STREAM_DIR"
 
 # Per-run trace dir: the reasoner dumps each question's event stream here (the UI path
 # otherwise persists nothing — see skunk_reasoner._dump_console_trace). Set it to empty
@@ -85,35 +95,50 @@ cd "$SKUNK_DIR"
   --round-seconds "$ROUND_SECONDS" --questions "$QUESTIONS" &
 practice_pid=$!
 
+# Backend (agent) process: runs the worker pool + command routes, bound to localhost, and
+# writes the browser firehose to $SKUNK_STREAM_DIR. Serves no browsers.
 "$PYTHON_BIN" -m skunk_server.server --host "$HOST" --port "$SKUNK_SERVER_PORT" \
   --cup-base-url "$CUP_BASE_URL" --team-token "$CUP_TEAM_TOKEN" \
-  --reasoner "$REASONER" --concurrency "$CONCURRENCY" &
+  --reasoner "$REASONER" --concurrency "$CONCURRENCY" \
+  --stream-dir "$SKUNK_STREAM_DIR" &
 server_pid=$!
 
-# Tear both servers down on exit/Ctrl-C. SIGTERM first for a graceful uvicorn shutdown
-# (it now has a 5s graceful-shutdown deadline), then SIGKILL any survivor — the reasoner
+# Web (browser-facing) process: serves the UI + SSE by tailing $SKUNK_STREAM_DIR and proxies
+# command routes to the backend. This is the only port a browser should hit.
+"$PYTHON_BIN" -m skunk_server.web_app --host "$HOST" --port "$WEB_PORT" \
+  --backend-url "$SKUNK_SERVER_URL" --stream-dir "$SKUNK_STREAM_DIR" &
+web_pid=$!
+
+WEB_URL="http://${HOST}:${WEB_PORT}"
+
+# Tear all three servers down on exit/Ctrl-C. SIGTERM first for a graceful uvicorn shutdown
+# (each has a 5s graceful-shutdown deadline), then SIGKILL any survivor — the reasoner
 # offloads blocking tool/code work onto non-daemon thread-pool threads that can't be
 # interrupted, so without the hard kill a wedged worker could still keep a server alive.
 shutdown() {
   trap '' INT TERM                                          # don't re-enter while tearing down
-  kill -TERM "$practice_pid" "$server_pid" 2>/dev/null || true
+  kill -TERM "$practice_pid" "$server_pid" "$web_pid" 2>/dev/null || true
   for _ in $(seq 1 8); do
-    kill -0 "$practice_pid" 2>/dev/null || kill -0 "$server_pid" 2>/dev/null || break
+    kill -0 "$practice_pid" 2>/dev/null || kill -0 "$server_pid" 2>/dev/null \
+      || kill -0 "$web_pid" 2>/dev/null || break
     sleep 1
   done
-  kill -KILL "$practice_pid" "$server_pid" 2>/dev/null || true
+  kill -KILL "$practice_pid" "$server_pid" "$web_pid" 2>/dev/null || true
 }
 trap shutdown EXIT INT TERM
 
 echo "Practice API: $CUP_BASE_URL"
-echo "Console UI:   $SKUNK_SERVER_URL   (skunk_server serves the monitoring UI)"
+echo "Console UI:   $WEB_URL   (web process serves the monitoring UI)"
+echo "Backend:      $SKUNK_SERVER_URL   (agent process, localhost only)"
+echo "Stream dir:   $SKUNK_STREAM_DIR"
 echo "Reasoner:     $REASONER"
 echo "Python:       $PYTHON_BIN"
 echo "Questions:    $QUESTIONS"
 
-# Block until either process exits, then the trap tears the other down.
+# Block until any process exits, then the trap tears the others down.
 # (Poll loop instead of `wait -n` so this works on macOS's stock bash 3.2.)
 while kill -0 "$practice_pid" 2>/dev/null \
-   && kill -0 "$server_pid" 2>/dev/null; do
+   && kill -0 "$server_pid" 2>/dev/null \
+   && kill -0 "$web_pid" 2>/dev/null; do
   sleep 1
 done

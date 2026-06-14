@@ -20,7 +20,7 @@ from skunk.common import (
     parse_json_response,
 )
 from skunk.errors import StepFailed, ParseError
-from skunk.plan import RetrieveBranch
+from skunk.plan import PagePin, RetrieveBranch
 from skunk.prompted_call import PromptedCall
 
 from .data_model import (
@@ -514,6 +514,43 @@ True when the summary fits at least one target; false only when clearly unrelate
             if keep
         ]
 
+    def _resolve_page_pin(self, pin: PagePin, ctx: ExecutionContext) -> list[PageRef]:
+        """Resolve a `page_pin` to candidate pages, returning BOTH interpretations of its
+        (ambiguous) page number so downstream decides which is meant:
+          (a) the printed-label page(s) — catalog rows in the pinned issue whose `printed_page`
+              equals the stated number (0..n; usually 1, but a corrected reprint can repeat a
+              label), and
+          (b) the PDF-index page — `PageRef(issue, page)` when it's a catalog row (0..1).
+        Deduped (printed first, then a distinct PDF page), in page order. Empty when neither
+        resolves — the caller turns that into a `StepFailed` so the branch replans."""
+        want = str(pin.page)
+        printed = sorted(
+            (
+                ref
+                for ref, row in self._catalog.items()
+                if ref.month == pin.bulletin
+                and row.printed_page is not None
+                and row.printed_page.strip() == want
+            ),
+            key=lambda r: (r.page or 0),
+        )
+        pdf_ref = PageRef(month=pin.bulletin, page=pin.page)
+        pages = list(printed)
+        if pdf_ref in self._catalog and pdf_ref not in pages:
+            pages.append(pdf_ref)
+        ctx.emit(
+            f"page_pin_resolve bulletin={pin.bulletin} page={pin.page} "
+            f"printed={[r.page for r in printed]} pdf={pdf_ref.page if pdf_ref in self._catalog else None} "
+            f"resolved={len(pages)}",
+            data={
+                "bulletin": pin.bulletin,
+                "page": pin.page,
+                "printed_pages": [r.page for r in printed],
+                "pdf_page": pdf_ref.page if pdf_ref in self._catalog else None,
+            },
+        )
+        return pages
+
     async def retrieve_all(
         self,
         ctx: ExecutionContext,
@@ -527,17 +564,30 @@ True when the summary fits at least one target; false only when clearly unrelate
         as a separate step. `document_scopes` hard-scopes a branch's candidates to a
         set of bulletins (HITL human-required documents); a scoped branch skips the
         ToC/year filter and takes every page of those bulletins as its candidates."""
-        # Phase 1 — one unified ToC pick (question only), then each branch's own date filter.
+        # A `page_pin` branch is a pure positional FETCH: it bypasses ToC pick / year / semantic
+        # filter entirely and resolves straight to its issue+page (both interpretations). Resolve
+        # pins up front so pinned branches drop out of the content-retrieval phases below.
         scopes = document_scopes or [None] * len(branches)
-        unscoped = [branch for branch, scope in zip(branches, scopes) if not scope]
+        pinned: list[list[PageRef] | None] = [
+            self._resolve_page_pin(b.page_pin, ctx) if b.page_pin is not None else None
+            for b in branches
+        ]
+        # Phase 1 — one unified ToC pick (question only), then each branch's own date filter.
+        unscoped = [
+            branch
+            for branch, scope, pin in zip(branches, scopes, pinned)
+            if not scope and pin is None
+        ]
         chapter_pages = (
             await self._pick_chapters(branches=unscoped, ctx=ctx)
             if unscoped
             else []
         )
         cand = []
-        for branch, scope in zip(branches, scopes):
-            if scope:
+        for branch, scope, pin in zip(branches, scopes, pinned):
+            if pin is not None:
+                cand.append(pin)
+            elif scope:
                 refs = sorted(
                     (
                         ref
@@ -560,25 +610,40 @@ True when the summary fits at least one target; false only when clearly unrelate
             else:
                 cand.append(self._year_filter(chapter_pages, branch, ctx))
 
+        # Phase 2 — semantic filter over the content-addressed candidates only (pinned branches
+        # are fetched whole, never filtered).
         wanted: dict[PageRef, set[int]] = {}
         for i, refs in enumerate(cand):
+            if pinned[i] is not None:
+                continue
             for ref in refs:
                 wanted.setdefault(ref, set()).add(i)
         unique = sorted(wanted, key=lambda r: (r.month or "", r.page or 0))
-
-        # Phase 2 — semantic filter
         verdict = await self._semantic_filter(unique, branches, ctx)
 
         # Route per branch
         branch_blocks: list[list[BlockRef]] = []
         for i, refs in enumerate(cand):
+            b = branches[i]
+            if pinned[i] is not None:
+                # Pure fetch: every resolved page in full (whole-page refs), no filtering — both
+                # the printed-label and PDF-index page go downstream for the caller to decide.
+                block_refs = [br for ref in refs for br in self._block_refs_for(ref, [])]
+                pin_label = (
+                    f"{b.page_pin.bulletin}:{b.page_pin.page}" if b.page_pin else "?"
+                )
+                ctx.emit(
+                    f"page_pin_retrieve key={b.key!r} pin={pin_label} "
+                    f"pages={[f'{r.month}:{r.page}' for r in refs]} block_count={len(block_refs)}"
+                )
+                branch_blocks.append(block_refs)
+                continue
             kept_pages = [ref for ref in refs if not verdict[ref] or any(verdict[ref])]
             block_refs = [
                 br
                 for ref in kept_pages
                 for br in self._block_refs_for(ref, verdict[ref])
             ]
-            b = branches[i]
             ctx.emit(
                 f"page_index_retrieve key={b.key!r} period={b.period!r} "
                 f"catalog_size={self._catalog_size} anchor_count={len(kept_pages)} block_count={len(block_refs)} "

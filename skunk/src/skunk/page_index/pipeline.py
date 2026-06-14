@@ -10,25 +10,24 @@ per-bulletin (`BulletinStage`); two are whole-corpus reductions:
 
   1. `scan`        (`build/scans/<b>.json`)    — one `scan_page` LLM call per non-empty page
      → its `PageScan` (role, blocks, dates) + per-page errors.
-  2. `prerender`   (`build/renders/<b>/<p>.png`, reduction) — pre-render the pages `vision_rescan`
-     will LLM-scan (flagged + not yet re-read) into the image cache `PageStore` serves (no LLM);
-     warms the critical-path render for the next stage + query-time vision.
-  3. `vision_rescan` (reduction)               — re-scan each page the text scan flagged
+  2. `vision_rescan` (reduction)               — re-scan each page the text scan flagged
      (`has_unparsed_graphics` / `parse_broken`) from its rendered PDF IMAGE, overwriting that
      page's record in the scan file in place (one `vision_scan_page` LLM call per flagged page).
-  4. `table_merge` (reduction)                 — link each label-less table fragment (a block
+     Pages render through the shared `renders/` image cache; warm it ahead of time with the
+     standalone `skunk.page_index.prep.render_corpus` tool (cold pages are rendered on demand).
+  3. `table_merge` (reduction)                 — link each label-less table fragment (a block
      with NO row/column labels: a continued table's bare data rows, or a footnotes spillover)
      to its parent block via one flash call per candidate, annotating the scan file in place
      (`extra_pages` on the parent / `merged_into` on the fragment; see `table_merge.py`).
-  5. `toc`         (`build/toc/<b>.json`)      — coalesce the scan's `toc` pages, then one
+  4. `toc`         (`build/toc/<b>.json`)      — coalesce the scan's `toc` pages, then one
      `outline_issue` call extracts the chapter outline AND flags non-ToCs (`is_toc`).
-  6. `reconstruct_toc` (reduction)             — fill each ToC-less issue's outline from its
+  5. `reconstruct_toc` (reduction)             — fill each ToC-less issue's outline from its
      section-divider pages, using neighbors' real ToCs as reference (overwrites its toc file).
-  7. `place`       (`build/place/<b>.json`)    — file each content page under its chapter.
-  8. `catalog`     (`build/catalog/<b>.jsonl`) — the slim query-facing per-page rows.
-  9. `page_store`  (`build/pages/<b>.json`)    — per catalog row, its page's JSON text
+  6. `place`       (`build/place/<b>.json`)    — file each content page under its chapter.
+  7. `catalog`     (`build/catalog/<b>.jsonl`) — the slim query-facing per-page rows.
+  8. `page_store`  (`build/pages/<b>.json`)    — per catalog row, its page's JSON text
      (reusing `chop_bulletin`) + figure descriptors; the content source the query path reads.
- 10. `era_merge`   (`concept_tree.json`, reduction) — segment the timeline into eras, then
+  9. `era_merge`   (`concept_tree.json`, reduction) — segment the timeline into eras, then
      build each era's canonical table of contents.
 
 There is deliberately NO page-level continuation merge: the scan's `is_continuation` flag is
@@ -73,7 +72,7 @@ from .data_model import PAGES_SUBDIR, RENDERS_SUBDIR, TREE_FILE, PageCatalogRow
 from .eras import build_concept_tree
 from .scan import PageScan, scan_page, vision_scan_page
 from .table_merge import apply_merge, find_candidates, resolve_parent
-from .store import read_cached_image, render_cache_path, render_to_cache
+from .store import read_cached_image, render_to_cache
 from .toc_index import (
     TocHierarchy,
     coalesce_toc_ranges,
@@ -102,9 +101,6 @@ _CALL_RE = re.compile(r"in_tok=(\d+) out_tok=(\d+)")
 
 # How often (in completed bulletins) a stage writes progress + re-checks guards.
 _PROGRESS_EVERY = 24
-
-# Pre-render progress cadence (in pages — the prerender unit is a page, not a bulletin).
-_PRERENDER_PROGRESS_EVERY = 500
 
 
 # ---------------------------------------------------------------------------
@@ -445,64 +441,6 @@ def _is_flagged(scan: dict, *, include_charts: bool) -> bool:
     return False
 
 
-class PreRenderStage(Stage):
-    """Pre-render the vision tier's working set into the `renders/` image cache that
-    `PageStore.image` serves, so `vision_rescan` (and query-time vision reads) get a warm PNG
-    instead of paying render latency on the LLM call's critical path. Scope is exactly the pages
-    `vision_rescan` will LLM-scan — flagged (`has_unparsed_graphics` / `parse_broken`) AND not yet
-    `vision_rescanned` — NOT every page. Resume: a page whose PNG already exists is skipped."""
-
-    name = "prerender"
-
-    async def run(self, bctx: BuildContext) -> dict:
-        renders_dir = bctx.paths.root / RENDERS_SUBDIR
-        targets: list[tuple[str, int]] = []
-        for b in bctx.bulletins:
-            path = bctx.paths.bulletin_file(_SCANS_SUBDIR, b)
-            if not path.exists():
-                continue
-            data = json.loads(path.read_text())
-            if data.get(
-                "vision_rescanned"
-            ):  # legacy bulletin-level: vision_rescan migrates it,
-                continue  # doesn't LLM-scan its pages → nothing to warm
-            for p, s in data["scans"].items():
-                if (
-                    _is_flagged(s, include_charts=bctx.config.vision_rescan_charts)
-                    and not s.get("vision_rescanned")
-                    and not render_cache_path(renders_dir, b, int(p)).exists()
-                ):
-                    targets.append((b, int(p)))
-        log.info(
-            f"[{self.name}] {len(targets)} vision pages to pre-render -> {renders_dir}"
-        )
-        if not targets:
-            return {}
-
-        agg: dict[str, int] = defaultdict(int)
-        done = 0
-
-        async def one(bulletin: str, page: int) -> None:
-            nonlocal done
-            # Rendering is offloaded to a thread so the event loop stays responsive. PyMuPDF is
-            # GIL-serialized, so renders don't truly run in parallel — fine for this build step.
-            status = await asyncio.to_thread(
-                render_to_cache,
-                bulletin,
-                page,
-                str(bctx.config.pdf_dir),
-                str(renders_dir),
-            )
-            agg[status] += 1
-            done += 1
-            if done % _PRERENDER_PROGRESS_EVERY == 0 or done == len(targets):
-                bctx.write_progress(self.name, done, len(targets), agg)
-                log.info(f"[{self.name}] {done}/{len(targets)} | {dict(agg)}")
-
-        await asyncio.gather(*[one(b, p) for b, p in targets])
-        return dict(agg)
-
-
 def _patch_catalog_inline(
     bctx: BuildContext, bulletin: str, scans: dict[str, dict], revised: list[int]
 ) -> None:
@@ -611,7 +549,7 @@ class VisionRescanStage(Stage):
 
                     async def rescan_one(page: int) -> None:
                         # Render through the shared `renders/` cache, cache-first: a page the
-                        # prerender stage already warmed is just read back; a cold one is
+                        # `render_corpus` prep tool already warmed is just read back; a cold one is
                         # rendered+cached here. Offloaded to a thread so the event loop keeps
                         # driving in-flight LLM calls. Same PNG the query-time vision tier reads
                         # via `PageStore`.
@@ -900,6 +838,7 @@ def _catalog_row(bulletin: str, page: int, scan: dict) -> PageCatalogRow | None:
     return PageCatalogRow(
         bulletin=bulletin,
         page=page,
+        printed_page=scan.get("printed_page"),
         # Fragments the table_merge pass linked to a parent block don't ship — the parent's
         # row covers them (its block carries the fragment's page in `extra_pages`).
         content_blocks=[
@@ -1159,7 +1098,6 @@ class EraMergeStage(Stage):
 # stages (`BulletinStage`) and the reductions share the same `Stage.run` interface.
 PIPELINE: tuple[Stage, ...] = (
     ScanStage(),
-    PreRenderStage(),
     VisionRescanStage(),
     TableMergeStage(),
     TocStage(),

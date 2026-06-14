@@ -50,8 +50,9 @@ class HumanReview:
     read, or an external lookup). Registered while the task runs WITHOUT blocking it; a resolve
     carries the human's corrected value(s) back as a JSON `response`, which drives a recompute.
     `guidance` carries the review payload the UI needs: `task` (verify_extract/figure/lookup),
-    `branch_id` (the recompute target), `branch` identity, `candidates` (the model's values), and
-    `fields` (the editable field set)."""
+    `branch_id` (the recompute target), `branch` identity, `candidates` (the model's values),
+    `fields` (the editable field set), `page_values` (per-page value attribution for the viewer),
+    and — for figure reviews — `value_template` (a pre-filled AnnotatedValue JSON the human edits)."""
 
     task_id: str
     attempt_id: str
@@ -75,7 +76,6 @@ class Attempt:
     worker_id: str
     context_feedback: list[str] = field(default_factory=list)
     previous_attempt_ids: list[str] = field(default_factory=list)
-    events: list[dict[str, Any]] = field(default_factory=list)
     attempt_id: str = field(default_factory=new_id)
     started_at: datetime = field(default_factory=utc_now)
     completed_at: datetime | None = None

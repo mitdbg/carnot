@@ -16,7 +16,7 @@ overrides:
     targets: [planner, replanner]
     content: |
       Questions are answered against the U.S. Treasury Monthly Bulletins,
-      a 696-document corpus spanning 1939–2025. Emit period and as_of as
+      a 696-document corpus spanning 1939–2025. Emit period as
       canonical month ranges (YYYY-MM, YYYY-MM..YYYY-MM, or a comma-separated
       list of these), never natural language — expand fiscal years, calendar
       years, and quarters to months yourself per the date conventions below.
@@ -136,7 +136,7 @@ overrides:
   - section: lessons
     targets: [replanner]
     content: |
-      When replanning, carefully review as_of first and prefer dropping it if its choice could have caused lookup failure. Only switch to external lookup if you are convinced that the retrieval term was correct and the corpus does not contain the information requested
+      When replanning, only switch to external lookup if you are convinced that the retrieval term was correct and the corpus does not contain the information requested. Prefer rewording the retrieval key or correcting the data period first.
   # ---------------------------------------------------------------------
   # Planner few-shots. Each entry is a pre-formatted block that lands
   # verbatim under the planner's "## Few-shot examples" header.
@@ -145,7 +145,7 @@ overrides:
     targets: [planner]
     content:
       - |
-        ### Example (plain date range, NO bulletin named → period only; leave as_of null — do NOT infer a "vintage" issue from the data years. Same concept, two periods → ONE branch, comma-separated period)
+        ### Example (plain date range → period is the DATA window; do NOT treat the data years as a publication "vintage". Same concept, two periods → ONE branch, comma-separated period)
         Q: Absolute percent change in national defense expenditures between CY1940 and CY1953, rounded to hundredths.
         Plan:
         ```json
@@ -173,44 +173,43 @@ overrides:
         ```
 
       - |
-        ### Example (named issue ≠ data window → as_of and period DIFFER)
+        ### Example (a named publication issue is NOT the period — period is the DATA month, 1985-12, not the September 1990 issue the value is printed in; selection picks the issue. Chart read → visual_only)
         Q: Read the total debt held by the public for December 1985 from the chart in the September 1990 Treasury Bulletin.
         Plan:
         ```json
         {
           "branches": [
             {"kind": "retrieve", "key": "total debt held by the public",
-             "period": "1985-12", "as_of": "1990-09",
-             "visual_only": true}
+             "period": "1985-12", "visual_only": true}
           ]
         }
         ```
 
       - |
-        ### Example (named issue applies to ONE period entry only → as_of array aligned with period entries, null = unpinned)
-        Q: Difference between net interest outlays in FY1981 and the FY1980 figure as printed in the November 1981 Bulletin.
-        Plan:
-        ```json
-        {
-          "branches": [
-            {"kind": "retrieve", "key": "net interest outlays",
-             "period": "1980-10..1981-09, 1979-10..1980-09",
-             "as_of": [null, "1981-11"]}
-          ]
-        }
-        ```
-
-      - |
-        ### Example (vintage: data period ≠ report date; reprinted GDP via retrieve. Two concepts × two periods → TWO branches, comma-separated periods)
+        ### Example (the named "September 2012" issue is the PUBLICATION date, NOT the period — period is the DATA window (FY2008, FY2010); selection chooses which issue to read. Two concepts × two periods → TWO branches, comma-separated periods)
         Q: Using the figures reported in the September 2012 Treasury Bulletin, what was the change in federal debt held by the public as a percent of GDP between the end of fiscal year 2008 and fiscal year 2010?
         Plan:
         ```json
         {
           "branches": [
             {"kind": "retrieve", "key": "federal debt held by the public",
-             "period": "2007-10..2008-09, 2009-10..2010-09", "as_of": "2012-09"},
+             "period": "2007-10..2008-09, 2009-10..2010-09"},
             {"kind": "retrieve", "key": "GDP",
-             "period": "2007-10..2008-09, 2009-10..2010-09", "as_of": "2012-09"}
+             "period": "2007-10..2008-09, 2009-10..2010-09"}
+          ]
+        }
+        ```
+
+      - |
+        ### Example (question pins an explicit PAGE of a specific issue → page_pin {bulletin, page}; the page number is taken as written (we resolve both the printed-label and PDF-index page). No period — the pin determines location. Reading a chart → visual_only; put what to read in key.)
+        Q: On page 12 of the March 1985 Treasury Bulletin, how many bars in the chart rise above $50 billion?
+        Plan:
+        ```json
+        {
+          "branches": [
+            {"kind": "retrieve", "key": "chart of bars above $50 billion",
+             "page_pin": {"bulletin": "1985-03", "page": 12},
+             "visual_only": true}
           ]
         }
         ```

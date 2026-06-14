@@ -23,6 +23,7 @@ from skunk.common import (
     HumanInterventionHandler,
     HumanReviewRegister,
     NeedsMore,
+    SemPoolEntry,
     traced_step,
 )
 from skunk.llm_client import LLMClient
@@ -337,6 +338,9 @@ class Orchestrator:
             # When a handler is wired, ask the human for the missing data (and optionally let
             # them scope a branch's source documents for a re-retrieval) BEFORE spending a
             # replan. If their input alone resolves compute, return without replanning.
+            # Free-form operator instruction from the missing-data review, threaded into the
+            # replanner prompt below (the human guides the replan rather than only supplying a value).
+            human_guidance: str | None = None
             handler = self._ctx.human_intervention_handler
             if handler is not None:
                 self._emit_plan(
@@ -357,6 +361,7 @@ class Orchestrator:
                 )
                 pool += directed_entries
                 if human_entry is not None:
+                    human_guidance = str(human_entry.value)
                     pool.append(human_entry)
                     human_entries.append(human_entry)
                     human_resolutions.append(list(missing))
@@ -400,6 +405,7 @@ class Orchestrator:
                     reason,
                     missing,
                     human_resolution_refs,
+                    human_guidance=human_guidance,
                 ),
             )
             ids = self._alloc_branch_ids(len(plan.branches))
@@ -554,7 +560,6 @@ class Orchestrator:
                         {
                             "key": branch.key,
                             "period": branch.period,
-                            "as_of": branch.as_of,
                             "visual_only": branch.visual_only,
                         }
                         if branch.kind == "retrieve"
@@ -854,11 +859,43 @@ class Orchestrator:
             sub_retrievals = [retr_by_pos[i] for i in retrieve_pos]
 
             async def _select_extract() -> list[list[AnnotatedValue] | StepFailed]:
-                selections = await run_select(
-                    self._ctx, sub_branches, sub_retrievals, sub_ids
-                )
+                from skunk.page_index.query import PageIndexRetriever
+
+                # A retrieval that is already FINAL — golden, search-agent, or a page-pin
+                # fetch (`BranchRetrieval.pre_selected`) — skips block_select entirely: its
+                # blocks ARE the selection. Only live page-index retrievals run the selection
+                # tournament. block_select itself is selection-only; the decision lives here.
+                selections: list[list[SemPoolEntry] | StepFailed | None] = [
+                    None
+                ] * len(sub_branches)
+                live_pos: list[int] = []
+                for i, r in enumerate(sub_retrievals):
+                    if isinstance(r, StepFailed):
+                        selections[i] = r
+                    elif r.pre_selected:
+                        pool = PageIndexRetriever.pool_for_blocks(
+                            list(r.blocks), str(self._ctx.config.pdf_dir)
+                        )
+                        selections[i] = pool or StepFailed(
+                            "retrieve",
+                            f"retrieval produced no blocks for branch {sub_branches[i].key!r}",
+                        )
+                    else:
+                        live_pos.append(i)
+                if live_pos:
+                    live = await run_select(
+                        self._ctx,
+                        [sub_branches[i] for i in live_pos],
+                        [sub_retrievals[i] for i in live_pos],
+                        [sub_ids[i] for i in live_pos],
+                    )
+                    for j, i in enumerate(live_pos):
+                        selections[i] = live[j]
                 return await run_extract(
-                    self._ctx, sub_branches, selections, sub_ids
+                    self._ctx,
+                    sub_branches,
+                    cast(list[list[SemPoolEntry] | StepFailed], selections),
+                    sub_ids,
                 )
 
             pipeline = asyncio.create_task(_select_extract())

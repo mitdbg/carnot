@@ -132,17 +132,15 @@ def _block_line(num: int, e: SemPoolEntry) -> str:
 
 _SELECT_PROMPT = """\
 You select the content blocks an extraction step should read to fulfill one retrieval
-goal of a research question. Each candidate is one table/chart/prose block from a
-Treasury Bulletin page, described by catalog metadata (issue, page, data-date span,
-column and row labels, summary), grouped by table title. You may be shown the whole
-candidate set or one slice of it; kept blocks re-compete in later rounds, and the
-final round's keeps are read by extraction.
+goal of a research question. Each candidate is one table/chart/prose block from a source page,
+described by catalog metadata (issue, page, data-date span, column and row labels, summary), grouped by
+table title.
 
-Drop a block ONLY on one of these grounds:
+Drop a block 1 on one of these grounds:
 1. Different series: nothing in the block — title, column labels, row labels, or
    summary — carries the target series.
 2. Covered: another KEPT print of the SAME table already contains all the information
-   this block contributes to the question, so it adds nothing.
+   this block contributes to the question and is a better match to the rules below.
 
 Rules for what you keep:
 - Match the original question's exact wording — the precise series with every
@@ -151,15 +149,14 @@ Rules for what you keep:
 - Confirm in the row labels that the requested dates exist as rows at the needed
   granularity (monthly rows vs an annual/fiscal-year roll-up).
 - Recurring series: the same table recurs across consecutive issues with a shifting
-  data window, sometimes with revisions. Keep the FEWEST prints whose windows together
+  data window, sometimes with revisions. Keep the fewest prints whose windows together
   cover the requested period at the needed granularity — one print when one suffices,
   else a tiling of the same table reaching the period's first and last months.
 - If the question pins a specific source ("as reported in the <Month Year> Bulletin", "as
   of <date>"), select the blocks that best match that source.
-- When the same figure is restated across issues, prefer the most recent issue covering the
-  required period unless the question asks for a specific version.
-- When the question compares or combines several periods, keep all of them on the
-  SAME time basis."""
+- When the same figure is restated across issues, pick the one that best matches the original question's exact wording.
+  When all else is equal, prefer the most recent issue.
+"""
 
 
 def _render_candidates(
@@ -393,14 +390,12 @@ async def run_select(
             continue
         branch_pools[pos] = pool_entries
 
-    # Golden / search-agent blocks are ALREADY final — bypass the tournament entirely and
-    # keep every block. Golden's whole point is PERFECT retrieval straight into extract;
-    # running selection there would contaminate the extract+compute ceiling and (under the
-    # keep cap) could drop gold pages. Selection only applies on the live page-index path.
-    if any(isinstance(r, BranchRetrieval) and r.pre_selected for r in retrievals):
-        for pos in branch_pools:
-            results[pos] = branch_pools[pos]
-    elif branch_pools:
+    # Every branch reaching here is a LIVE page-index retrieval that needs narrowing. Already
+    # final retrievals — golden, search-agent, and page-pin fetches — bypass selection
+    # upstream (the orchestrator extracts their blocks directly), so they never arrive here:
+    # running the tournament on them would contaminate the extract+compute ceiling and, under
+    # the keep cap, could drop guaranteed-correct pages. Run the tournament per branch pool.
+    if branch_pools:
         async def _select(pos: int) -> list[SemPoolEntry]:
             pool = branch_pools[pos]
 

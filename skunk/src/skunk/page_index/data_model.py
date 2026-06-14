@@ -82,6 +82,10 @@ class PageCatalogRow(BaseModel):
 
     bulletin: str  # "YYYY-MM"
     page: int  # 1-based PDF page index
+    # The page's own printed footer label ("5", "A-1"); None when unlabeled. Carried from the
+    # scan so a page-pin can resolve a question's stated page number against the printed label
+    # (the planner's `page_pin`), not just the PDF index. Optional → old catalogs load as None.
+    printed_page: str | None = None
 
     content_blocks: list[ContentBlock] = Field(default_factory=list)
     # `YYYY-MM` `(low, high)` data span from the scan; read by the year filter.

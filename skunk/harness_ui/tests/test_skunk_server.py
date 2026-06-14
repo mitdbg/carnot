@@ -143,15 +143,16 @@ def test_round_close_frees_worker_for_next_round() -> None:
     asyncio.run(run())
 
 
-def test_agent_worker_pool_streams_trace_events() -> None:
-    # Trace events are appended to the attempt (stamped with a per-task seq) and published to
-    # the task's event-stream subscribers — not routed through the completion callback.
+def test_agent_worker_pool_writes_trace_events() -> None:
+    # Each trace event is written straight to the task's file via the EventWriter, inline on the
+    # worker thread (no batcher, no main-loop hop). The pool hands the writer the RAW event; seq
+    # stamping + compaction are the FileSink/web's job, not the pool's.
     async def run() -> None:
         loop = asyncio.get_running_loop()
         registry = TaskRegistry()
         queues = TaskQueues()
         task, _ = registry.create_task(1, "trace", "Question")
-        published: list[tuple[str, str, list[dict]]] = []  # publish_event delivers batches
+        written: list[tuple[str, str, dict]] = []  # write_event delivers ONE event at a time
 
         def reasoner(_prompt: str, *, trace_event_handler=None):
             assert trace_event_handler is not None
@@ -163,28 +164,20 @@ def test_agent_worker_pool_streams_trace_events() -> None:
         pool.start(
             loop,
             lambda _task_id, _outcome: None,
-            lambda task_id, attempt_id, events: published.append((task_id, attempt_id, events)),
+            lambda task_id, attempt_id, event: written.append((task_id, attempt_id, event)),
         )
         queues.enqueue_agent(task.task_id)
 
-        def flat() -> list[dict]:
-            return [event for (_t, _a, events) in published for event in events]
-
         try:
             for _ in range(100):
-                if task.status == TaskStatus.READY and len(flat()) == 2:
+                if task.status == TaskStatus.READY and len(written) == 2:
                     break
                 await asyncio.sleep(0.02)
             assert task.status == TaskStatus.READY
-            assert [event["message"] for event in flat()] == ["planner started", "step done"]
-            assert [event["seq"] for event in flat()] == [0, 1]
-            # The same events back-fill from the registry with matching seq.
-            backfill, next_seq = registry.snapshot_task_events(task.task_id)
-            assert next_seq == 2
-            assert [(seq, event["message"]) for (seq, _a, event) in backfill] == [
-                (0, "planner started"),
-                (1, "step done"),
-            ]
+            assert [t for (t, _a, _e) in written] == [task.task_id, task.task_id]
+            assert [e["message"] for (_t, _a, e) in written] == ["planner started", "step done"]
+            # the pool forwards the event RAW — no seq injected by the pool (that is FileSink's job).
+            assert all("seq" not in e for (_t, _a, e) in written)
         finally:
             pool.stop()
 
@@ -324,7 +317,7 @@ def test_reasoning_payload_includes_branch_cards_and_code() -> None:
             "data": {
                 "label": "initial",
                 "branches": [
-                    {"branch_id": 0, "kind": "retrieve", "key": "inflation", "period": "1954-02", "as_of": "1954-02"},
+                    {"branch_id": 0, "kind": "retrieve", "key": "inflation", "period": "1954-02"},
                     {"branch_id": 1, "kind": "lookup_external", "target": "cpi", "src": "fred"},
                 ],
             },

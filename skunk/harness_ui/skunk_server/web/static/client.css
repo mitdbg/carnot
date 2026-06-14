@@ -832,6 +832,27 @@ textarea { width: 100%; min-height: 55px; }
 .trace-flow .chip-none { color: var(--text3); border-style: dashed; }
 
 .trace-flow .trace-empty { color: var(--text3); font-style: italic; font-size: 11px; }
+.trace-flow .hint { color: var(--text3); font-size: 12px; padding: 8px 2px; }
+
+/* retrieval funnel stages (page_index path) */
+.trace-flow .stage { border: 1px solid var(--border2); border-radius: 6px; background: var(--bg1); margin: 6px 0; }
+.trace-flow .stage > summary { list-style: none; cursor: pointer; padding: 7px 10px; display: flex; gap: 9px; align-items: center; flex-wrap: wrap; }
+.trace-flow .stage > summary::-webkit-details-marker { display: none; }
+.trace-flow .stage-name { font-size: 10px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: var(--blue); min-width: 84px; }
+.trace-flow .stage-stat { font-size: 12px; color: var(--text2); }
+.trace-flow .stage-body { padding: 4px 10px 9px; border-top: 1px solid var(--border); }
+
+/* block-select tournament (page_index selection) */
+.trace-flow .round-row { margin: 8px 0; }
+.trace-flow .round-label { font-size: 10px; font-weight: 700; letter-spacing: 0.8px; text-transform: uppercase; color: var(--text3); margin-bottom: 5px; }
+.trace-flow .tcalls { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-start; }
+.trace-flow .tcall { border: 1px solid var(--border2); border-radius: 5px; background: var(--bg2); flex: 0 1 auto; min-width: 150px; max-width: 100%; }
+.trace-flow .tcall > summary { list-style: none; cursor: pointer; padding: 5px 9px; font-family: ui-monospace, monospace; font-size: 11px; color: var(--text); white-space: nowrap; }
+.trace-flow .tcall > summary::-webkit-details-marker { display: none; }
+.trace-flow .tcall-meta { color: var(--text3); font-size: 10px; }
+.trace-flow .tcall-body { border-top: 1px solid var(--border); padding: 5px 9px; max-height: 320px; overflow: auto; }
+.trace-flow .tblock { font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 560px; }
+.trace-flow .tblock.dropped { color: var(--text3); }
 
 /* read-only detail panel */
 .detail-body .task-head { font-family: ui-monospace, monospace; font-weight: 600; color: var(--text); margin-bottom: 10px; }
@@ -883,6 +904,7 @@ textarea { width: 100%; min-height: 55px; }
 .row-review.kind-lookup { background: var(--blue); color: #00121f; }
 .row-review.kind-figure { background: var(--purple); color: #14001f; }
 .row-review.kind-verify_extract { background: var(--yellow); color: #1f1a00; }
+.row-review.kind-missing_data { background: var(--bad); color: #1f0000; }
 
 #reviewOverlay { position: fixed; inset: 0; z-index: 1000; }
 #reviewOverlay[hidden] { display: none; }
@@ -914,6 +936,22 @@ textarea { width: 100%; min-height: 55px; }
 .review-kind.kind-lookup { color: var(--blue); }
 .review-kind.kind-figure { color: var(--purple); }
 .review-kind.kind-verify_extract { color: var(--yellow); }
+.review-kind.kind-missing_data { color: var(--bad); }
+/* Section header inside the review editor (e.g. "Instruction for the replanner" for missing_data). */
+.review-section-label { font-size: 11px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.04em; margin: 8px 0 2px; }
+/* Free-form instruction box for a missing_data review (replaces the structured value cards). */
+.review-missing-input {
+  width: 100%; background: var(--bg3); border: 1px solid var(--border2); color: var(--ink);
+  border-radius: 6px; padding: 8px 10px; font-size: 13px; font-family: inherit; line-height: 1.45;
+  resize: vertical; min-height: 90px;
+}
+/* Pre-filled AnnotatedValue JSON template for a figure review (read the value off the chart). */
+.review-json-input {
+  width: 100%; background: var(--bg3); border: 1px solid var(--border2); color: var(--ink);
+  border-radius: 6px; padding: 8px 10px; font-size: 12px; line-height: 1.5;
+  font-family: ui-monospace, monospace; tab-size: 2; white-space: pre;
+  resize: vertical; min-height: 120px;
+}
 .review-task { color: var(--ink); font-weight: 600; margin-right: 10px; }
 .review-count { color: var(--muted); font-size: 12px; }
 .review-close {
@@ -942,6 +980,16 @@ textarea { width: 100%; min-height: 55px; }
   border-radius: 5px; padding: 6px 8px; font-size: 13px; font-family: inherit; width: 100%;
 }
 .review-cand textarea { resize: vertical; min-height: 34px; font-family: ui-monospace, monospace; }
+/* Read-only LLM-authored extract notes (page context for the value) — not editable. */
+.review-cand-notes {
+  font-size: 12px; line-height: 1.45; color: var(--text2);
+  background: var(--bg2); border-left: 2px solid var(--border2);
+  border-radius: 0 5px 5px 0; padding: 6px 8px; white-space: pre-wrap;
+}
+.review-notes-label {
+  display: block; font-size: 11px; color: var(--text3);
+  text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 3px;
+}
 .review-actions { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
 .review-submit, .review-accept {
   border-radius: 6px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
