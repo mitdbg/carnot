@@ -110,6 +110,21 @@ class SkunkConfig:
     agent_max_steps: int = 20
     agent_max_pages_per_tool_call: int = 20
 
+    # Step budget for a RESUMED search agent — when a planner-chosen resume op hands a retrieve
+    # branch the planner's feedback to keep searching (see Orchestrator._resume_one).
+    # The initial search gets the full `agent_max_steps`; each resume gets this smaller budget
+    # so a branch that keeps failing to find data can't keep buying full fresh 20-step rounds.
+    # (env: SKUNK_AGENT_RESUME_MAX_STEPS)
+    agent_resume_max_steps: int = 10
+
+    # Hard cap on NON-progressing attempts (parse-misfires — prose with no runnable action
+    # block — and exec-machinery failures) before the agent aborts. These attempts do NOT
+    # count against `agent_max_steps`, so genuine search progress always gets its full step
+    # budget; this knob just stops a model that never emits a valid action from looping
+    # forever. Total LLM calls per run are bounded by agent_max_steps + agent_max_misfires.
+    # (env: SKUNK_AGENT_MAX_MISFIRES)
+    agent_max_misfires: int = 6
+
     # Hard cap on the rendered size of a single `grep_corpus` observation, in *tokens*
     # (`grep_corpus` defaults to limit=None = "every matching chunk", so one broad pattern
     # could dump ~200K+ tokens into the context in one shot — that ballooned a request past
@@ -117,6 +132,15 @@ class SkunkConfig:
     # note telling the agent to narrow its pattern / pass `limit`. Token→char conversion uses
     # ~4 chars/token (see GrepCorpusTool). (env: SKUNK_GREP_MAX_OUTPUT_TOKENS)
     grep_max_output_tokens: int = 200_000
+
+    # Hard cap on the rendered size of a single `read_document` observation, in *chars*
+    # (`read_document` dumps the full cleaned text of up to `agent_max_pages_per_tool_call`
+    # pages; on the dense Treasury tables one over-broad call could otherwise push a request
+    # past the model's ~1M-token input ceiling and 400 it). Over-budget output is truncated
+    # with a note telling the agent to read fewer doc_ids per call. Char-based (not tokens) to
+    # avoid the chars/token estimate error on numeric tables.
+    # (env: SKUNK_READ_DOCUMENT_MAX_OUTPUT_CHARS)
+    read_document_max_output_chars: int = 400_000
 
     # Search-agent per-LLM-call caps (RetrieveOp only). On Gemini 3.x
     # `max_output_tokens` is a COMBINED thinking+visible budget, so keep it above the
@@ -128,16 +152,9 @@ class SkunkConfig:
     search_agent_max_output_tokens: int = 4096
     search_agent_request_timeout_s: float = 120.0
 
-    # Max tool calls the search agent may issue in a single step (executed in parallel).
-    # 1 disables parallelism (one tool call per step). (env: SKUNK_SEARCH_MAX_PARALLEL_TOOL_CALLS)
-    search_agent_max_parallel_tool_calls: int = 3
-
     # Step cap for the lookup_external agent (terminates earlier via its final-answer JSON block).
     # (env: SKUNK_LOOKUP_MAX_STEPS)
     lookup_max_steps: int = 4
-    # Max tool calls the lookup agent may issue in a single step (executed in parallel).
-    # 1 disables parallelism. (env: SKUNK_LOOKUP_MAX_PARALLEL_TOOL_CALLS)
-    lookup_max_parallel_tool_calls: int = 3
     # Active lookup tools by name (see `lookup_tools._REGISTRY`); None → all tools.
     # (env: SKUNK_LOOKUP_TOOLS — comma-separated, e.g. "fetch_fred,tavily_search")
     lookup_tools: list[str] | None = None
@@ -263,11 +280,18 @@ class SkunkConfig:
             ),
             emb_model_id=os.environ.get("SKUNK_EMB_MODEL", "gemini-embedding-001"),
             agent_max_steps=int(os.environ.get("SKUNK_AGENT_MAX_STEPS", "20")),
+            agent_resume_max_steps=int(
+                os.environ.get("SKUNK_AGENT_RESUME_MAX_STEPS", "10")
+            ),
+            agent_max_misfires=int(os.environ.get("SKUNK_AGENT_MAX_MISFIRES", "6")),
             agent_max_pages_per_tool_call=int(
                 os.environ.get("SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL", "20")
             ),
             grep_max_output_tokens=int(
                 os.environ.get("SKUNK_GREP_MAX_OUTPUT_TOKENS", "200000")
+            ),
+            read_document_max_output_chars=int(
+                os.environ.get("SKUNK_READ_DOCUMENT_MAX_OUTPUT_CHARS", "400000")
             ),
             search_agent_max_output_tokens=int(
                 os.environ.get("SKUNK_SEARCH_MAX_OUTPUT_TOKENS", "4096")
@@ -275,13 +299,7 @@ class SkunkConfig:
             search_agent_request_timeout_s=float(
                 os.environ.get("SKUNK_SEARCH_TIMEOUT_S", "120")
             ),
-            search_agent_max_parallel_tool_calls=int(
-                os.environ.get("SKUNK_SEARCH_MAX_PARALLEL_TOOL_CALLS", "3")
-            ),
             lookup_max_steps=int(os.environ.get("SKUNK_LOOKUP_MAX_STEPS", "4")),
-            lookup_max_parallel_tool_calls=int(
-                os.environ.get("SKUNK_LOOKUP_MAX_PARALLEL_TOOL_CALLS", "3")
-            ),
             lookup_tools=_parse_csv(os.environ.get("SKUNK_LOOKUP_TOOLS", "")),
             agent_model_id=os.environ.get("SKUNK_AGENT_MODEL") or None,
         )

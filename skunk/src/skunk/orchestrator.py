@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 from dataclasses import dataclass, field
-from typing import cast
+from typing import TYPE_CHECKING, cast
 from skunk.compute import ComputeOp
 from skunk.config import SkunkConfig
 from skunk.errors import MissingData, StepFailed
@@ -29,6 +29,9 @@ from skunk.prompted_call import PromptOverride
 from skunk.question_explainer import ConceptExplanation, QuestionExplainer
 from skunk.retrieve import RetrieveOp
 from skunk.result import ExecutionResult
+
+if TYPE_CHECKING:
+    from skunk.search_agent import SearchAgent
 
 
 @dataclass
@@ -188,6 +191,11 @@ class Orchestrator:
         # `retrieved_blocks` so the eval harness can cache and replay a run without re-paying
         # retrieval. Empty under golden/replay bypass (retrieve never runs).
         self._retrieved_blocks: list[BlockRef] = []
+        # Live SearchAgent per retrieve branch, keyed by stable branch id (search_agent backend
+        # only). Registered as each branch's agent is built (see RetrieveOp._run_search_agent) so
+        # that on a downstream MissingData we can resume the SAME agent with the missing-data
+        # feedback and a fresh step budget — instead of replanning a brand-new agent from scratch.
+        self._retrieve_agents: dict[int, "SearchAgent"] = {}
         # Snapshot for an optimistic-review recompute (the per-branch entries that produced the
         # answer); set on every successful compute, None until then. The server stores it on the
         # task so a later human resolve can revise the answer via `recompute_answer`.
@@ -274,11 +282,10 @@ class Orchestrator:
                 reason, missing = e.reason, e.missing
                 handler = self._ctx.human_intervention_handler
                 if handler is None:
-                    # No human handler → autonomously replan (the pre-HITL-merge behavior)
-                    # rather than hard-failing on the first MissingData. Bounded by
-                    # recovery_max_rounds exactly like the human-assisted path below; the
-                    # planner replans from the failure reason / missing fields with no
-                    # human-provided resolutions.
+                    # Autonomously replan. The planner returns a PlanDiff that may add/drop
+                    # branches AND/OR resume an existing retrieve branch with its own feedback
+                    # (`_apply_diff` runs the resumes against the retained agents). Bounded by
+                    # recovery_max_rounds exactly like the human-assisted path below.
                     failed = [(o.branch, o.error) for o in outcomes if o.error]
                     diff = await traced_step(
                         self._ctx,
@@ -683,18 +690,48 @@ class Orchestrator:
         """Apply a replan `PlanDiff`, keeping `outcomes[i]` aligned with the rewritten
         `plan.branches[i]`. `PlanDiff.apply` does the pure plan rewrite and reports
         which prior indices were KEPT; the orchestrator carries those branches'
-        already-gathered outcomes forward, runs the added branches, and appends them.
-        Compute therefore never sees data from a dropped branch. Stable branch ids
-        ride along: kept branches keep theirs, added branches get fresh ones."""
+        already-gathered outcomes forward, runs any planner-chosen `resume` ops against the
+        kept branches' retained agents, runs the added branches, and appends them. Compute
+        therefore never sees data from a dropped branch. Stable branch ids ride along: kept
+        branches keep theirs, added branches get fresh ones."""
         new_plan, kept = diff.apply(plan)
         dropped = sorted(set(range(len(plan.branches))) - set(kept))
         if dropped:
             self._ctx.emit(f"replan_dropped n_dropped={len(dropped)} indices={dropped}")
         kept_outcomes = [outcomes[i] for i in kept]
         kept_ids = [self._branch_ids[i] for i in kept]
+
+        # Planner-chosen resume: continue a kept retrieve branch's own agent with the
+        # planner's feedback (in parallel), replacing that branch's outcome in place. Resume
+        # ops on a dropped branch, an unknown index, or a branch with no retained agent (e.g.
+        # a lookup branch) are skipped with a note rather than failing the recovery round.
+        kept_pos_by_prior = {prior_i: j for j, prior_i in enumerate(kept)}
+        resume_targets: list[tuple[int, int, str]] = []  # (kept_pos, branch_id, feedback)
+        for op in diff.resume:
+            j = kept_pos_by_prior.get(op.index)
+            bid = kept_ids[j] if j is not None else None
+            if j is None or bid not in self._retrieve_agents:
+                self._ctx.emit(
+                    f"resume_skipped index={op.index} "
+                    f"reason={'dropped/unknown index' if j is None else 'no retained agent'!r}"
+                )
+                continue
+            resume_targets.append((j, bid, op.feedback))
+        if resume_targets:
+            resumed = await asyncio.gather(
+                *(
+                    self._resume_one(kept_outcomes[j], self._retrieve_agents[bid], fb, bid)
+                    for j, bid, fb in resume_targets
+                )
+            )
+            for (j, _, _), outcome in zip(resume_targets, resumed):
+                kept_outcomes[j] = outcome
+
         added_ids = self._alloc_branch_ids(len(diff.add))
         self._branch_ids = [*kept_ids, *added_ids]
-        self._last_executed_branch_ids = set(added_ids)
+        self._last_executed_branch_ids = set(added_ids) | {
+            bid for _, bid, _ in resume_targets
+        }
         new_outcomes = await self._run_branches(diff.add, added_ids) if diff.add else []
         return new_plan, [*kept_outcomes, *new_outcomes]
 
@@ -761,6 +798,7 @@ class Orchestrator:
                         branches,
                         branch_ids,
                         document_scopes=document_scopes,
+                        agent_sink=self._retrieve_agents,
                     )
                 )
             else:
@@ -791,6 +829,79 @@ class Orchestrator:
                     seen_blocks.add(blk)
                     self._retrieved_blocks.append(blk)
         return docs
+
+    @staticmethod
+    def _extract_summary_metadata(doc: list[BlockRef]) -> dict:
+        """Per-block metadata attached to an `extract` step for the trace viewer."""
+        return {
+            "blocks": [
+                {
+                    "bulletin": block_ref.page.month,
+                    "page": block_ref.page.page,
+                    "block_index": block_ref.block_index,
+                    "member_pages": [
+                        {"bulletin": ref.month, "page": ref.page}
+                        for ref in block_ref.member_refs
+                    ],
+                    "kind": block_ref.block.kind if block_ref.block else None,
+                    "title": block_ref.block.title if block_ref.block else None,
+                    "column_headers": (
+                        block_ref.block.column_headers if block_ref.block else []
+                    ),
+                    "row_headers": (
+                        block_ref.block.row_headers if block_ref.block else []
+                    ),
+                    "summary": block_ref.block.summary if block_ref.block else None,
+                }
+                for block_ref in doc
+            ]
+        }
+
+    async def _resume_one(
+        self, prior: BranchOutcome, agent: "SearchAgent", feedback: str, bid: int
+    ) -> BranchOutcome:
+        """Continue one retrieve branch's `agent` with the planner's `feedback` (fresh, smaller
+        step budget), re-run extract over the UNION of its prior + newly-found blocks, and
+        return the replacement outcome. A resume/extract failure keeps the entries + blocks the
+        branch already had (so a previously successful branch never loses data it found) while
+        carrying the new error."""
+        branch = prior.branch
+        try:
+            new_blocks = await traced_step(
+                self._ctx,
+                "retrieve",
+                lambda: self._retrieve.resume_search_agent(self._ctx, agent, feedback),
+                branch_id=bid,
+            )
+        except StepFailed as e:
+            return BranchOutcome(
+                branch=branch, entries=prior.entries, error=e, blocks=prior.blocks
+            )
+        # Union prior + resumed blocks (first-seen order), and extend the deduped
+        # corpus-wide union the cache/replay seam reads from.
+        union: list[BlockRef] = list(prior.blocks)
+        seen = set(union)
+        corpus_seen = set(self._retrieved_blocks)
+        for blk in new_blocks:
+            if blk not in seen:
+                seen.add(blk)
+                union.append(blk)
+            if blk not in corpus_seen:
+                corpus_seen.add(blk)
+                self._retrieved_blocks.append(blk)
+        try:
+            entries = await traced_step(
+                self._ctx,
+                "extract",
+                lambda: self._extract.run(union, self._ctx, branch),
+                branch_id=bid,
+                summary_metadata=self._extract_summary_metadata(union),
+            )
+        except StepFailed as e:
+            return BranchOutcome(
+                branch=branch, entries=prior.entries, error=e, blocks=union
+            )
+        return BranchOutcome(branch=branch, entries=entries, error=None, blocks=union)
 
     def _capture_recompute_state(
         self,
@@ -858,39 +969,7 @@ class Orchestrator:
                     "extract",
                     lambda: self._extract.run(doc, self._ctx, branch),
                     branch_id=bid,
-                    summary_metadata={
-                        "blocks": [
-                            {
-                                "bulletin": block_ref.page.month,
-                                "page": block_ref.page.page,
-                                "block_index": block_ref.block_index,
-                                "member_pages": [
-                                    {"bulletin": ref.month, "page": ref.page}
-                                    for ref in block_ref.member_refs
-                                ],
-                                "kind": block_ref.block.kind
-                                if block_ref.block
-                                else None,
-                                "title": block_ref.block.title
-                                if block_ref.block
-                                else None,
-                                "column_headers": (
-                                    block_ref.block.column_headers
-                                    if block_ref.block
-                                    else []
-                                ),
-                                "row_headers": (
-                                    block_ref.block.row_headers
-                                    if block_ref.block
-                                    else []
-                                ),
-                                "summary": (
-                                    block_ref.block.summary if block_ref.block else None
-                                ),
-                            }
-                            for block_ref in doc
-                        ]
-                    },
+                    summary_metadata=self._extract_summary_metadata(doc),
                 )
                 # Human verifies/produces the extracted value(s) (figure or OCR/table read)
                 # only when the policy opts in — no step (or prompt) on the default path.

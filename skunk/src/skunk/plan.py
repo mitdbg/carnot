@@ -72,6 +72,17 @@ class Plan(BaseModel):
     branches: list[Branch] = Field(min_length=1)
 
 
+class ResumeOp(BaseModel):
+    """A replan instruction to continue an existing retrieve branch's search (by prior
+    index) with planner-authored `feedback`, instead of dropping/re-adding it. The branch
+    is kept as-is in the plan; only its retained agent re-runs (see Orchestrator._apply_diff)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    index: int  # prior-plan branch index to resume (must be a kept retrieve branch)
+    feedback: NonEmptyStr  # instruction handed to that branch's search agent
+
+
 class PlanDiff(BaseModel):
     """A replan result expressed as a delta against the prior plan."""
 
@@ -79,8 +90,11 @@ class PlanDiff(BaseModel):
 
     add: list[Branch] = Field(default_factory=list)
     drop: list[int] = Field(default_factory=list)
+    resume: list[ResumeOp] = Field(default_factory=list)
 
     def apply(self, plan: Plan) -> tuple[Plan, list[int]]:
+        # `resume` doesn't change plan structure — a resumed branch is simply kept; only its
+        # agent re-runs (the orchestrator handles that). So apply() only walks drop/add.
         drop = {i for i in self.drop if 0 <= i < len(plan.branches)}
         kept = [i for i in range(len(plan.branches)) if i not in drop]
         new_plan = plan.model_copy(
@@ -204,8 +218,8 @@ def _parse_plan_diff(raw: str, ctx: ExecutionContext) -> PlanDiff:
     outright, so issue choice is left to retrieval. Added retrieve `key`s are EXEMPT
     from the verbatim check (rewording a failed key is the point of replanning), but
     a non-null lookup `src` must still name a publisher the question itself names
-    (else null) — that rule lives here because lookups are emitted only at replan.
-    Violations raise `ParseError`, and the retry loop has the model re-emit."""
+    (else null). A branch may not appear in both `drop` and `resume`. Violations raise
+    `ParseError`, and the retry loop has the model re-emit."""
     diff = _json_parser(PlanDiff)(raw, ctx)
     pinned = [
         b.key
@@ -224,6 +238,16 @@ def _parse_plan_diff(raw: str, ctx: ExecutionContext) -> PlanDiff:
             "a non-null lookup_external `src` must name a publisher the question "
             "itself names, copied verbatim (case/whitespace-insensitive); set `src` "
             f"to null when the question names no source: {src_bad!r}",
+        )
+    # A branch can't be both resumed and dropped — that's contradictory. (Index/kind
+    # validity is checked at apply time, where the prior plan is in scope.)
+    drop_set = set(diff.drop)
+    both = sorted({op.index for op in diff.resume} & drop_set)
+    if both:
+        raise ParseError(
+            raw,
+            f"branch indices appear in both `drop` and `resume`: {both!r} — resume a "
+            "branch to keep searching it, or drop it; not both",
         )
     return diff
 
@@ -248,8 +272,10 @@ You are a query planner. Given a question, emit a JSON plan that, when executed,
 }
 
 Branches run in parallel. A `retrieve` branch pulls information from the corpus.
-A `lookup_external` branch fetches a single value from outside the corpus. Use 'lookup_external' only when you are sure the corpus does not contain the answer,
-when the question explicitly asks for an external lookup from a source, or when previous lookups in the corpus failed. A final compute step reads the
+A `lookup_external` branch fetches a single value from outside the corpus. Choose per value:
+prefer a `retrieve` branch whenever the data could reasonably be expected to exist in the
+corpus; use a `lookup_external` branch for a value that is unlikely to be in the corpus, or
+when the question explicitly names an external source. A final compute step reads the
 gathered values and the verbatim question to produce the answer.
 
 ## Field semantics
@@ -304,11 +330,22 @@ Return a PlanDiff JSON object with these fields:
                  list in the question) to remove. Removing a branch also discards the
                  data it gathered, so drop a branch only when its data is wrong or
                  must be re-fetched differently. Empty list if you drop nothing.
+  resume         list of {"index": <prior-branch index>, "feedback": "<instruction>"}.
+                 Re-runs an existing RETRIEVE branch's search, continuing from what it
+                 already found (its prior data is kept), with your `feedback` as the
+                 instruction and a smaller step budget. Use it when a kept retrieve branch
+                 found PART of what's needed — tell it specifically what is still missing —
+                 or to redirect its search. Only retrieve branches can be resumed. Empty
+                 list if you resume nothing.
 
 Rules:
-  - A prior branch you wish to keep appear in NEITHER list: leave it
+  - A prior branch you wish to keep unchanged appears in NONE of the three lists: leave it
     alone and its gathered data is reused as-is. Do NOT re-add branches whose
     data is already in `prev`.
+  - Choose per missing item: `resume` a retrieve branch that is on the right track but
+    incomplete; `drop` a retrieve branch and `add` a `lookup_external` when its search
+    showed the value is not in the corpus; `add` a new retrieve/lookup branch for a value
+    no prior branch covered. A branch may not be in both `drop` and `resume`.
   - Human-provided resolutions explicitly map prior missing identifiers to
     `input_values` entries. Treat those identifiers as resolved by those entries.
     Do not request them again unless the latest missing-data signal still names
@@ -329,9 +366,9 @@ Rules:
     # Planner-only addenda, appended to the planner system prompt alone (the replanner
     # gets `_REPLAN_INSTRUCTIONS` instead). `_VERBATIM_RULE`: retrieve keys must be
     # question spans — a failed key is exactly what the replanner reformulates, so it
-    # is exempt. `_INITIAL_PASS_RULE`: prefer the corpus, but `lookup_external` IS
-    # allowed on the first pass (the planner judges per branch). The lookup `src`
-    # verbatim rule lives in `_parse_plan_diff`, since lookups are emitted only at replan.
+    # is exempt. `_INITIAL_PASS_RULE`: a corpus-biased but per-value source choice —
+    # `retrieve` and `lookup_external` are both first-class on the initial plan. The lookup
+    # `src` verbatim rule lives in `_parse_plan_diff` (it only matters for a non-null src).
     _VERBATIM_RULE = """\
 ##Note
 Each retrieve `key` must be copied VERBATIM from the question: an exact span of the
@@ -339,12 +376,12 @@ question text, in the question's own wording.
 """
 
     _INITIAL_PASS_RULE = """\
-##Corpus-first rule
-Prefer the Treasury Bulletin corpus. Most values the question needs live there, INCLUDING
-ones that look external (CPI, GDP, FX rates) — emit a `retrieve` branch for those, keyed by
-the question's wording. Use a `lookup_external` branch on this first pass only when the value
-is clearly outside the corpus or the question explicitly names an external source; if a
-retrieve later fails, an external lookup is also added at replan.
+##Source-selection rule
+Decide retrieve vs lookup_external per value, on this initial plan. Prefer a `retrieve`
+branch whenever the data could reasonably be expected to exist in the corpus. Use a
+`lookup_external` branch for a value that is unlikely to be in the corpus, or when the
+question explicitly names an external source. Do not default every value to `retrieve` and
+defer external lookups to a later pass.
 """
 
     # Planner and replanner share the initial-plan instructions (same branch/field

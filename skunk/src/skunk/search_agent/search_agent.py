@@ -22,6 +22,7 @@ The three tools that read/write prune state share the agent's per-question
 from __future__ import annotations
 
 import os
+from typing import Any
 
 from chromadb.api.models.Collection import Collection
 
@@ -70,8 +71,11 @@ def _make_embedding_client(emb_model_id: str) -> tuple[EmbeddingClient, str]:
 class SearchAgent(MultiTurnAgent, Retriever):
     name = "search_agent"
     # Larger than the MultiTurnAgent default — search chains accumulate many
-    # page-content observations across a 20-step ceiling.
-    context_budget_chars: int = 500_000 * 4  # ~500K tokens × 4 char/token
+    # page-content observations across a 20-step ceiling. Char budget, but the model limit is
+    # in TOKENS (~1.05M for gemini-3.5-flash): the Treasury tables are dense numerics at only
+    # ~1.5 chars/token, so keep this conservative — 1.3M chars ≈ 870K tokens, leaving headroom
+    # for the system prompt + output under the input ceiling (a higher budget 400'd requests).
+    context_budget_chars: int = 1_300_000
     warn_steps_remaining = 2
 
     briefing = (
@@ -85,11 +89,8 @@ class SearchAgent(MultiTurnAgent, Retriever):
         "retrieving relevant documents for the remainder of the question. "
         "You do not need to retrieve everything in a single tool call: use early steps to "
         "explore documents of potential relevance, then refine your searches in later steps "
-        "based on what you find. When a step has several independent searches to run (e.g. "
-        "different sub-topics or time periods), issue them as parallel `search_corpus` / "
-        "`grep_corpus` calls in one step rather than one at a time. Use `prune(...)` "
-        "aggressively on chunks and docs you have ruled out, to keep later searches focused "
-        "and your context window manageable."
+        "based on what you find. Use `prune(...)` aggressively on chunks and docs you have "
+        "ruled out, to keep later searches focused and your context window manageable."
     )
 
     final_answer_doc = """\
@@ -170,7 +171,11 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
                 config.grep_max_output_tokens,
                 required_filter,
             ),
-            ReadDocumentTool(self.document_map, config.agent_max_pages_per_tool_call),
+            ReadDocumentTool(
+                self.document_map,
+                config.agent_max_pages_per_tool_call,
+                config.read_document_max_output_chars,
+            ),
             ViewFigureTool(self.document_map, config.pdf_dir),
             PruneTool(self._pruned_chunk_ids, self._pruned_doc_ids),
         ]
@@ -178,7 +183,8 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             tools.append(RequestHumanTool(human_intervention_handler))
         super().__init__(
             tools, max_steps=config.agent_max_steps,
-            max_parallel_tool_calls=config.search_agent_max_parallel_tool_calls,
+            max_resume_steps=config.agent_resume_max_steps,
+            max_misfires=config.agent_max_misfires,
             system_prompt_override=system_prompt_override,
             generation_backend=generation_backend,
             sampling_params=sampling_params,
@@ -302,6 +308,17 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
                 + ", ".join(required_bulletins)
             )
         payload = await self.call(ctx, "\n".join(parts))
+        return self._page_keys_from_payload(payload)
+
+    async def resume_retrieve(self, ctx: ExecutionContext, feedback: str) -> list[str]:
+        """Continue this agent (after a prior `retrieve()`) with `feedback` describing the
+        data a downstream compute step still needs, on a fresh step budget. Returns the
+        page keys from its new final answer (mirrors `retrieve()`'s payload handling)."""
+        payload = await self.resume(ctx, feedback)
+        return self._page_keys_from_payload(payload)
+
+    @staticmethod
+    def _page_keys_from_payload(payload: Any) -> list[str]:
         keys = payload.get("page_keys") or []
         if isinstance(keys, str):
             return [keys]

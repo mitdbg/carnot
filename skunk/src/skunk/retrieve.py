@@ -24,6 +24,7 @@ from skunk.plan import RetrieveBranch
 
 if TYPE_CHECKING:
     from skunk.page_index.query import BlockRef
+    from skunk.search_agent import SearchAgent
 
 
 # TODO: this is just a hack to make blocks work with search agents. We should probably fix this at some point
@@ -68,6 +69,7 @@ class RetrieveOp:
         branch_ids: list[int] | None = None,
         *,
         document_scopes: list[list[str] | None] | None = None,
+        agent_sink: dict[int, "SearchAgent"] | None = None,
     ) -> list[list[BlockRef] | StepFailed]:
         """Retrieve for several branches at once, result aligned to `branches`. A slot is
         that branch's blocks or a `StepFailed` — a single branch failing does not
@@ -90,9 +92,15 @@ class RetrieveOp:
                     # Per-branch `retrieve` step (branch_id=bid) so the SearchAgent rollout
                     # and its `pages` summary group under this branch in the viewer. `scope`
                     # (human-required bulletins, if any) hard-scopes the agent's corpus.
+                    # The agent is registered in `agent_sink` (keyed by branch id) BEFORE it
+                    # runs, so a later planner-chosen resume op can continue it with feedback
+                    # whether it succeeds or fails (see Orchestrator._resume_one).
                     refs = await traced_step(
                         ctx, "retrieve",
-                        lambda: self._run_search_agent(ctx, b, required_bulletins=scope),
+                        lambda: self._run_search_agent(
+                            ctx, b, required_bulletins=scope,
+                            agent_sink=agent_sink, branch_id=bid,
+                        ),
                         branch_id=bid,
                     )
                     return _whole_page_blocks(refs)
@@ -144,6 +152,8 @@ class RetrieveOp:
         branch: RetrieveBranch,
         *,
         required_bulletins: list[str] | None = None,
+        agent_sink: dict[int, "SearchAgent"] | None = None,
+        branch_id: int | None = None,
     ) -> list[PageRef]:
         from skunk.search_agent import SearchAgent
 
@@ -159,6 +169,11 @@ class RetrieveOp:
             ),
             required_bulletins=required_bulletins,
         )
+        # Register the live agent up front (keyed by branch id) so the orchestrator can
+        # resume it with downstream missing-data feedback — whether this call succeeds or
+        # raises (e.g. "max steps without accepted final answer").
+        if agent_sink is not None and branch_id is not None:
+            agent_sink[branch_id] = agent
         # The agent hint is free text; render a per-entry pin list to its pinned months.
         as_of_hint = (
             ", ".join(m for m in branch.as_of if m) or None
@@ -173,6 +188,33 @@ class RetrieveOp:
             branch_as_of=as_of_hint,
             required_bulletins=required_bulletins,
         )
+        return self._page_keys_to_refs(ctx, page_keys, required_bulletins=required_bulletins)
+
+    async def resume_search_agent(
+        self,
+        ctx: ExecutionContext,
+        agent: "SearchAgent",
+        feedback: str,
+        *,
+        required_bulletins: list[str] | None = None,
+    ) -> list[BlockRef]:
+        """Continue a previously-run SearchAgent with the planner's resume `feedback` on a
+        fresh (smaller) step budget, and wrap its new page keys as whole-page `BlockRef`s
+        ready for extract. Mirrors `_run_search_agent`'s page-key→ref tail; raises the same
+        `StepFailed` if the resumed run yields nothing usable (or hits max steps again)."""
+        page_keys = await agent.resume_retrieve(ctx, feedback)
+        refs = self._page_keys_to_refs(ctx, page_keys, required_bulletins=required_bulletins)
+        return _whole_page_blocks(refs)
+
+    def _page_keys_to_refs(
+        self,
+        ctx: ExecutionContext,
+        page_keys: list[str],
+        *,
+        required_bulletins: list[str] | None = None,
+    ) -> list[PageRef]:
+        """Validate a SearchAgent's `page_keys` final answer into `PageRef`s: drop unparseable
+        keys and (when scoped) any outside `required_bulletins`, and fail loudly if none survive."""
         refs: list[PageRef] = []
         bad: list[str] = []
         for key in page_keys:
