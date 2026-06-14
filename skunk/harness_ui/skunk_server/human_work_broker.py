@@ -26,13 +26,16 @@ import threading
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from skunk_server.domain import AnswerCandidate, HumanReview, QuestionTask
-from skunk_server.task_registry import TaskRegistry
+from skunk_server.domain import AnswerCandidate, HumanReview, HumanReviewStatus, QuestionTask
+from skunk_server.task_registry import TaskConflict, TaskRegistry
 
 logger = logging.getLogger(__name__)
 
 # (recompute_state_json, {branch_id: raw_response_json}) -> revised answer text.
 RecomputeFn = Callable[[dict[str, Any], dict[int, str]], Awaitable[str]]
+# (candidates, feedback, source_docs) -> refined candidates. The reviewer's natural-language
+# feedback applied to the displayed extraction JSONs (with source page text as grounding).
+RefineFn = Callable[[list[dict], str, list[str]], Awaitable[list[dict]]]
 
 # How often the background sweeper clears review locks whose holder stopped heart-beating.
 LOCK_SWEEP_INTERVAL_S = 5.0
@@ -44,9 +47,11 @@ class HumanWorkBroker:
         registry: TaskRegistry,
         recompute_fn: RecomputeFn | None,
         publish_status: Callable[[], None],
+        refine_fn: RefineFn | None = None,
     ) -> None:
         self._registry = registry
         self._recompute_fn = recompute_fn
+        self._refine_fn = refine_fn
         self._publish_status = publish_status
         self._loop: asyncio.AbstractEventLoop | None = None
         # Blocking transport: review_id -> (worker_loop, future). The branch coroutine (on a
@@ -245,6 +250,65 @@ class HumanWorkBroker:
         finally:
             # Clear the revising flag on every path (success, no-op, or failure) and refresh.
             self._registry.set_revising(task_id, False)
+            self._notify()
+
+    # ---- Refine: LLM revision of extracted candidates from NL feedback -----------------
+
+    def refine_review(
+        self,
+        review_id: str,
+        feedback: str,
+        candidates: list[dict],
+    ) -> tuple[QuestionTask, HumanReview]:
+        """Kick off a background LLM revision of an OPEN verify_extract review's extracted
+        candidates from the reviewer's natural-language `feedback`. `candidates` is the JSONs
+        currently displayed to the reviewer (their hand-edits already overlaid); we persist them
+        as the review's candidates first (so the displayed state survives even if the overlay
+        closes), then schedule the refine. Raises TaskConflict if the review isn't OPEN, is
+        already refining, or refine is disabled."""
+        task, review = self._registry.find_review(review_id)  # KeyError if gone
+        if review.status != HumanReviewStatus.OPEN:
+            raise TaskConflict(f"review is not open; status={review.status}")
+        if review.refining:
+            raise TaskConflict("a refine is already running for this review")
+        if self._refine_fn is None:
+            raise TaskConflict("refine is disabled")
+        # Capture the displayed JSONs as the review's candidates, then flag + schedule.
+        self._registry.set_review_candidates(review_id, candidates)
+        self._registry.set_review_refining(review_id, True)
+        self._schedule(self._refine_and_record(review_id, feedback))
+        self._notify()
+        return task, review
+
+    async def _refine_and_record(self, review_id: str, feedback: str) -> None:
+        try:
+            try:
+                _task, review = self._registry.find_review(review_id)
+            except KeyError:
+                return
+            if self._refine_fn is None or review.status != HumanReviewStatus.OPEN:
+                return
+            candidates = list(review.guidance.get("candidates") or [])
+            source_docs = list(review.source_docs)
+            try:
+                refined = await self._refine_fn(candidates, feedback, source_docs)
+            except Exception:
+                logger.exception("refine failed for review %s", review_id)
+                return
+            # Re-stamp `_src` so the downstream resolve/recompute still maps each card onto its
+            # cached entry: honor an explicit `_src` from the model, else fall back to position.
+            stamped: list[dict] = []
+            for pos, item in enumerate(refined):
+                if not isinstance(item, dict):
+                    continue
+                out = dict(item)
+                src = out.get("_src")
+                out["_src"] = src if isinstance(src, int) else pos
+                stamped.append(out)
+            self._registry.set_review_candidates(review_id, stamped)
+        finally:
+            # Clear the refining flag on every path (success, no-op, or failure) and refresh.
+            self._registry.set_review_refining(review_id, False)
             self._notify()
 
     def cancel_all(self) -> None:

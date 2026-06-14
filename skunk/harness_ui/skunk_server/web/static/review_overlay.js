@@ -44,6 +44,13 @@ const ReviewOverlay = (function () {
   let submitting = false;
   let heartbeatTimer = null;   // setInterval handle refreshing the review lock while open
 
+  // Natural-language refine state. `lastRefining` tracks the current review's `refining` flag
+  // across status snapshots so we can detect when a backend refine starts (show spinner) or
+  // finishes (re-render the cards with the LLM's result). `preRefineCandidates` is the displayed
+  // state captured at Apply time, used to power the one-click Undo after a refine lands.
+  let lastRefining = false;
+  let preRefineCandidates = null;
+
   // viewer state
   let pages = [];              // [{month, page}] parsed from the review's source_docs
   let pageValues = [];         // [{month,page,values:[desc,...]}] from guidance — value(s) per page
@@ -143,6 +150,8 @@ const ReviewOverlay = (function () {
     activeTaskId = taskId;
     reviews = sortReviews(task.reviews);
     index = 0;
+    preRefineCandidates = null;
+    lastRefining = !!(current() && current().refining);  // so a reopen mid-refine shows the spinner
     startHeartbeat();
     render();
   }
@@ -178,6 +187,17 @@ const ReviewOverlay = (function () {
     // index pointed at it and refresh the "review N of M" counter text in place.
     reviews = sortReviews(open);
     index = reviews.findIndex((r) => r.review_id === cur.review_id);
+    // A backend refine flipped state: re-render (the refine deliberately replaces the cards).
+    // Going busy → show the spinner; busy → done → render the LLM's revised candidates + a toast
+    // with Undo. Steady state (no change) preserves the live DOM so manual edits aren't wiped.
+    const nowRefining = !!(reviews[index] && reviews[index].refining);
+    if (nowRefining !== lastRefining) {
+      const completed = lastRefining && !nowRefining;
+      lastRefining = nowRefining;
+      render();
+      if (completed) showRefineToast();
+      return;
+    }
     updateCount();
   }
 
@@ -206,54 +226,91 @@ const ReviewOverlay = (function () {
   }
 
   // One value box, decluttered: only description / unit / value are editable; kind, index_name,
-  // row_name, col_name and machine provenance are preserved from the original extraction via the
-  // `_src` index (the card's data-src). A ✕ removes the box entirely (the value is then dropped
-  // from what's fed to the recompute). `i` is the value's ORIGINAL index in the candidate list.
+  // row_name, col_name and machine provenance are preserved from the original extraction. The
+  // card is self-contained: `data-full` carries the whole source candidate (incl. its `_src`,
+  // the cached-entry index the recompute overlays onto) so re-renders / undo / refine never have
+  // to map cards back to an array. `data-src` mirrors `_src` for the resolve path ("" = a value
+  // the human/LLM added, with no cached entry). `i` is the card's render position; `_src` rides
+  // along from the candidate so it survives a refine that reorders/adds/drops entries.
   function candidateRow(c, i) {
     const valueStr = (c.value && typeof c.value === "object") ? JSON.stringify(c.value, null, 2) : String(c.value ?? "");
     const kind = c.kind || "scalar";
     const meta = kind === "scalar" ? "" : `<span class="review-cand-kind">${esc(kind)}${c.index_name ? " · " + esc(c.index_name) : ""}</span>`;
-    return `<div class="review-cand" data-src="${i}">
+    const hasSrc = c && Object.prototype.hasOwnProperty.call(c, "_src");
+    const srcVal = hasSrc ? c._src : i;                       // null stays null (an added value)
+    const srcAttr = (srcVal === null || srcVal === undefined) ? "" : String(srcVal);
+    const full = Object.assign({}, c, { _src: (srcVal === undefined ? i : srcVal) });
+    return `<div class="review-cand" data-src="${srcAttr}" data-full="${esc(JSON.stringify(full))}">
       <div class="review-cand-head">
         ${meta}
-        <button class="review-cand-del" title="Remove this value" onclick="ReviewOverlay.deleteCard(${i})">✕</button>
+        <button class="review-cand-del" title="Remove this value" onclick="ReviewOverlay.deleteCard(this)">✕</button>
       </div>
+      ${c.source ? `<div class="review-cand-source"><span class="review-cand-source-label">source</span><span class="review-cand-source-name">${esc(c.source)}</span></div>` : ""}
       <label class="review-field"><span>description</span>
         <input type="text" data-f="description" value="${esc(c.description ?? "")}"></label>
       <label class="review-field"><span>unit</span>
         <input type="text" data-f="unit" value="${esc(c.unit ?? "")}"></label>
       <label class="review-field"><span>value</span>
         <textarea data-f="value" class="review-value" oninput="ReviewOverlay.autosize(this)">${esc(valueStr)}</textarea></label>
-      ${c.source ? `<div class="review-cand-source"><span class="review-notes-label">source</span>${esc(c.source)}</div>` : ""}
       ${c.notes ? `<div class="review-cand-notes"><span class="review-notes-label">notes</span>${esc(c.notes)}</div>` : ""}
     </div>`;
   }
 
+  // Build the editable card list HTML from a candidates array (one card per value, a single empty
+  // scalar when there are none). Shared by the main render and the undo path.
+  function renderCards(cands) {
+    return (cands && cands.length)
+      ? cands.map(candidateRow).join("")
+      : candidateRow({ description: "", value: "", kind: "scalar" }, 0);
+  }
+
+  // The edited value of one card: its `value` box parsed (primitives like 5/"x" and objects),
+  // description + unit as text.
+  function readEditedFields(row) {
+    const out = {};
+    for (const el of row.querySelectorAll("[data-f]")) {
+      const f = el.getAttribute("data-f");
+      let v = el.value;
+      if (f === "value") {
+        const t = v.trim();
+        try { v = JSON.parse(t); } catch { v = t; }  // primitives parse (5, "x"); objects too
+      }
+      out[f] = v;
+    }
+    return out;
+  }
+
   // Read the surviving value boxes back into source-indexed override items
   // ({_src, description, unit, value}); deleted boxes are simply absent. The recompute overlays
-  // the edited fields onto the cached entry at `_src`, preserving its structure + provenance.
+  // the edited fields onto the cached entry at `_src` (`""` data-src → null → a fresh value).
   function collectEdited() {
     const rows = root().querySelectorAll(".review-cand");
     const out = [];
     for (const row of rows) {
-      const src = Number(row.getAttribute("data-src"));
-      const obj = { _src: Number.isFinite(src) ? src : null };
-      for (const el of row.querySelectorAll("[data-f]")) {
-        const f = el.getAttribute("data-f");
-        let v = el.value;
-        if (f === "value") {
-          const t = v.trim();
-          try { v = JSON.parse(t); } catch { v = t; }  // primitives parse (5, "x"); objects too
-        }
-        obj[f] = v;
-      }
+      const raw = row.getAttribute("data-src");
+      const src = (raw === "" || raw === null) ? NaN : Number(raw);
+      const obj = Object.assign({ _src: Number.isFinite(src) ? src : null }, readEditedFields(row));
       out.push(obj);
     }
     return out;
   }
 
-  function deleteCard(srcIndex) {
-    const card = root() && root().querySelector(`.review-cand[data-src="${srcIndex}"]`);
+  // Read the surviving cards back as FULL candidate objects (the whole source candidate from
+  // `data-full`, with the human's edits overlaid). This is what the natural-language refine sends
+  // so the LLM sees the complete JSONs (kind/shape/_src), not just the editable subset.
+  function collectFullCandidates() {
+    const rows = root().querySelectorAll(".review-cand");
+    const out = [];
+    for (const row of rows) {
+      let full = {};
+      try { full = JSON.parse(row.getAttribute("data-full") || "{}"); } catch { full = {}; }
+      out.push(Object.assign(full, readEditedFields(row)));
+    }
+    return out;
+  }
+
+  function deleteCard(btn) {
+    const card = btn && btn.closest && btn.closest(".review-cand");
     if (card) card.remove();
   }
 
@@ -353,11 +410,25 @@ const ReviewOverlay = (function () {
       editor = `<textarea id="figureJsonInput" class="review-json-input" spellcheck="false" rows="8">${esc(figureTemplate(review))}</textarea>`;
       editorLabel = `<div class="review-section-label">AnnotatedValue — read the value(s) off the chart</div>`;
     } else {
-      editor = cands.length
-        ? cands.map(candidateRow).join("")
-        : candidateRow({ description: "", value: "", kind: "scalar" }, 0);
+      editor = renderCards(cands);
       editorLabel = "";
     }
+    // verify_extract gets a natural-language feedback box: the reviewer describes a correction
+    // (e.g. an off-by-one-year shift) and an LLM revises ALL the candidate JSONs at once. The
+    // refine runs async on the backend (review.refining drives the spinner), so reopening a review
+    // mid-refine shows the in-progress state; completion re-renders the cards via syncTasks.
+    const isExtract = review.kind === "verify_extract";
+    const busy = !!review.refining;
+    const refineSection = isExtract ? `
+      <div class="review-refine">
+        <div class="review-section-label">Revise with natural-language feedback</div>
+        <textarea id="refineFeedback" class="review-refine-input" rows="3" ${busy ? "disabled" : ""}
+          placeholder="Describe a correction for the LLM to apply across the values — e.g. 'every value is the next year's figure; shift them all back one year.'"></textarea>
+        <div class="review-refine-actions">
+          <button class="review-refine-btn" onclick="ReviewOverlay.refine()" ${busy ? "disabled" : ""}>${busy ? "✨ Updating extraction…" : "Apply feedback"}</button>
+          <span class="review-refine-status ${busy ? "is-busy" : ""}">${busy ? "Working… you can leave and come back." : ""}</span>
+        </div>
+      </div>` : "";
     const viewer = pages.length ? `
       <div class="review-viewer">
         <div class="review-viewer-bar">
@@ -387,6 +458,7 @@ const ReviewOverlay = (function () {
             <div class="review-instructions">${esc(review.instructions || "")}</div>
             ${editorLabel}
             <div class="review-editor">${editor}</div>
+            ${refineSection}
             <div class="review-actions">
               <button class="review-submit primary" onclick="ReviewOverlay.submit()">Submit</button>
               ${isMissing ? "" : `<button class="review-accept" onclick="ReviewOverlay.acceptAsIs()" title="Keep the model's answer unchanged">Accept as-is</button>`}
@@ -472,6 +544,69 @@ const ReviewOverlay = (function () {
     if (review) post(review, "");   // empty response = keep the model's answer, no recompute
   }
 
+  // ── natural-language refine ────────────────────────────────────────────────────
+  // Send the displayed JSONs + the reviewer's feedback to the backend, which revises them with an
+  // LLM (async). We don't close or block here: the status snapshot flips review.refining, and
+  // syncTasks drives the spinner + the re-render with the result. preRefineCandidates is stashed
+  // so the post-refine toast can offer a one-click Undo (purely client-side, off the live DOM).
+  async function refine() {
+    const review = current();
+    if (!review || review.kind !== "verify_extract") return;
+    const ta = root().querySelector("#refineFeedback");
+    const feedback = (ta ? ta.value : "").trim();
+    if (!feedback) { showError("Enter feedback describing the correction."); return; }
+    let candidatesPayload;
+    try { candidatesPayload = collectFullCandidates(); } catch (err) { showError(String(err)); return; }
+    preRefineCandidates = candidatesPayload;
+    const btn = root().querySelector(".review-refine-btn");
+    if (btn) { btn.disabled = true; btn.textContent = "✨ Updating extraction…"; }
+    showError("");
+    try {
+      const resp = await fetch(`/api/reviews/${encodeURIComponent(review.review_id)}/refine`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ feedback, candidates: candidatesPayload }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || !data.ok) {
+        showError(data.error || `refine failed (${resp.status})`);
+        if (btn) { btn.disabled = false; btn.textContent = "Apply feedback"; }
+        return;
+      }
+      // Success: the backend set review.refining=true and published; syncTasks takes over from
+      // here (spinner now, revised cards + toast on completion). Nothing more to do.
+    } catch (err) {
+      showError(String(err));
+      if (btn) { btn.disabled = false; btn.textContent = "Apply feedback"; }
+    }
+  }
+
+  // Restore the pre-refine cards straight into the editor DOM (the submission source of truth),
+  // so Undo survives later status snapshots without a server round-trip.
+  function undoRefine() {
+    if (!preRefineCandidates) return;
+    const ed = root() && root().querySelector(".review-editor");
+    if (ed) {
+      ed.innerHTML = renderCards(preRefineCandidates);
+      ed.querySelectorAll(".review-value").forEach(autosize);
+    }
+    const toast = root() && root().querySelector(".review-refine-toast");
+    if (toast) toast.remove();
+  }
+
+  function showRefineToast() {
+    const left = root() && root().querySelector(".review-left");
+    if (!left) return;
+    const existing = left.querySelector(".review-refine-toast");
+    if (existing) existing.remove();
+    const toast = document.createElement("div");
+    toast.className = "review-refine-toast";
+    toast.innerHTML = `<span class="review-toast-msg">✨ Extraction updated from your feedback.</span>
+      <button class="review-toast-undo" onclick="ReviewOverlay.undoRefine()">Undo</button>
+      <button class="review-toast-dismiss" title="Dismiss" onclick="this.parentNode.remove()">✕</button>`;
+    left.insertBefore(toast, left.firstChild);
+  }
+
   function requestExit(event) {
     // Click on the dimmed backdrop exits without committing (same as the ✕).
     if (event && event.target && event.target.classList.contains("review-backdrop")) close();
@@ -486,6 +621,7 @@ const ReviewOverlay = (function () {
   return {
     open, close, isOpen, syncTasks,
     submit, acceptAsIs, requestExit, deleteCard, autosize,
+    refine, undoRefine,
     prevPage: () => setPage(pageIdx - 1),
     nextPage: () => setPage(pageIdx + 1),
   };

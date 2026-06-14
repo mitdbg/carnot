@@ -23,11 +23,12 @@ let traceFrame = null;                // pending rAF handle for coalesced trace 
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[c]));
 const js = (s) => String(s ?? "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 
-// This browser's review-lock identity (set by review_overlay.js, which loads first).
-const CLIENT_ID = window.CLIENT_ID;
 // True when another operator holds this task's review lock — their client is annotating it, so
-// its action buttons (Review + Submit) are greyed out for everyone else.
-const lockedByOther = (task) => !!task.locked_by && task.locked_by !== CLIENT_ID;
+// its action buttons (Review + Submit) are greyed out for everyone else. This browser's lock
+// identity is defined in review_overlay.js (loads first) and exposed as window.CLIENT_ID; we read
+// it off window rather than re-declaring it, since these are classic scripts sharing one global
+// scope (a second top-level `const CLIENT_ID` would be an illegal redeclaration).
+const lockedByOther = (task) => !!task.locked_by && task.locked_by !== window.CLIENT_ID;
 
 // ── status badges ────────────────────────────────────────────────────────────
 function badgeClass(task) {
@@ -73,6 +74,10 @@ const statusRank = (task) => (STATUS_RANK[task.status] ?? 9);
 // operator sees what's waiting on them first. Within review tasks, order by the cheapest/most
 // time-sensitive kind: external lookup, then visual QA (figure), then extract validation.
 const reviewCount = (task) => (task.reviews || []).length;
+// True while any of a task's reviews has an in-flight LLM refine of its extracted candidates
+// (the natural-language feedback path), so the list/detail can show an "Updating extraction…"
+// indicator even after the reviewer navigates away from the overlay.
+const isRefining = (task) => (task.reviews || []).some((r) => r.refining);
 // missing_data (a mandatory "provide the missing value(s)" intervention after a NeedsMore) blocks
 // the whole run, so it's the most urgent.
 const REVIEW_KIND_RANK = { missing_data: 0, lookup: 1, figure: 2, verify_extract: 3 };
@@ -162,20 +167,23 @@ function renderStatus() {
   document.getElementById("taskCount").textContent = String(visible.length);
   document.getElementById("taskList").innerHTML = visible.length
     ? visible.map((task) => `<button class="task-row ${task.task_id === selectedTaskId ? "selected" : ""}" onclick="selectTask('${js(task.task_id)}')">
-        <div class="row-main">
-          <div class="row-title">R${esc(task.round_num)} / ${esc(task.question_id)}</div>
-          <div class="row-preview">${esc(task.prompt || "")}</div>
-        </div>
-        <div class="row-side">
-          <span class="status ${badgeClass(task)}">${esc(badgeLabel(task))}</span>
-          ${task.revising ? `<span class="row-revising">Revising…</span>` : ""}
-          ${lockedByOther(task) ? `<span class="row-locked" title="Locked by another reviewer">🔒 In review</span>` : ""}
-          ${reviewChips(task)}
-          ${task.status === "READY"
-            ? (lockedByOther(task)
-                ? `<span class="row-submit locked-out" title="Locked by another reviewer">Submit</span>`
-                : `<span class="row-submit" onclick="submitTask('${js(task.task_id)}', event)">Submit</span>`)
-            : ""}
+        <div class="row-inner">
+          <div class="row-main">
+            <div class="row-title">R${esc(task.round_num)} / ${esc(task.question_id)}</div>
+            <div class="row-preview">${esc(task.prompt || "")}</div>
+          </div>
+          <div class="row-side">
+            <span class="status ${badgeClass(task)}">${esc(badgeLabel(task))}</span>
+            ${task.revising ? `<span class="row-revising">Revising…</span>` : ""}
+            ${isRefining(task) ? `<span class="row-refining">Updating extraction…</span>` : ""}
+            ${lockedByOther(task) ? `<span class="row-locked" title="Locked by another reviewer">🔒 In review</span>` : ""}
+            ${reviewChips(task)}
+            ${task.status === "READY"
+              ? (lockedByOther(task)
+                  ? `<span class="row-submit locked-out" title="Locked by another reviewer">Submit</span>`
+                  : `<span class="row-submit" onclick="submitTask('${js(task.task_id)}', event)">Submit</span>`)
+              : ""}
+          </div>
         </div>
       </button>`).join("")
     : `<div class="empty">No tasks yet.</div>`;
@@ -219,6 +227,9 @@ function renderDetailActions(task) {
   let html = "";
   if (task.revising) {
     html += `<span class="detail-feedback revising">Revising answer after review…</span>`;
+  }
+  if (isRefining(task)) {
+    html += `<span class="detail-feedback refining">Updating extraction from your feedback…</span>`;
   }
   if (reviewCount(task)) {
     html += locked

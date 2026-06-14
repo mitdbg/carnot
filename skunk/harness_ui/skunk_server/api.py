@@ -45,6 +45,13 @@ class ReviewResolveBody(BaseModel):
     source_docs: list[str] = Field(default_factory=list)
 
 
+class ReviewRefineBody(BaseModel):
+    feedback: str  # the reviewer's natural-language instruction for revising the extraction
+    candidates: list[dict] = Field(
+        default_factory=list
+    )  # the JSONs currently displayed (hand-edits already overlaid)
+
+
 class ReviewLockBody(BaseModel):
     client_id: str  # the browser's stable per-session id holding/releasing the review lock
 
@@ -184,6 +191,28 @@ def install_command_routes(app: FastAPI) -> None:
         return JSONResponse(
             {"ok": True, "review": to_jsonable(review), "task_id": task.task_id}
         )
+
+    @app.post("/api/reviews/{review_id}/refine")
+    async def refine_review(review_id: str, body: ReviewRefineBody) -> JSONResponse:
+        # Kick off a background LLM revision of the review's extracted candidates from the
+        # reviewer's natural-language feedback. Returns immediately; the refined candidates
+        # arrive via the status snapshot when the background job completes.
+        broker = app.state.broker
+        if broker is None:
+            return JSONResponse(
+                {"ok": False, "error": "reviews disabled"}, status_code=404
+            )
+        try:
+            _task, review = broker.refine_review(
+                review_id, body.feedback, body.candidates
+            )
+        except KeyError:
+            return JSONResponse(
+                {"ok": False, "error": "review not found"}, status_code=404
+            )
+        except TaskConflict as error:  # not open / already refining / refine disabled
+            return JSONResponse({"ok": False, "error": str(error)}, status_code=409)
+        return JSONResponse({"ok": True, "review": to_jsonable(review)})
 
     @app.post("/api/reviews/lock/{task_id:path}")
     async def acquire_review_lock(task_id: str, body: ReviewLockBody) -> JSONResponse:

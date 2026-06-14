@@ -94,6 +94,10 @@ def create_app(stream_dir: str, backend_url: str) -> FastAPI:
     async def resolve_review(review_id: str, request: Request) -> Response:
         return await _proxy(request, "POST", f"/api/reviews/{review_id}/resolve")
 
+    @app.post("/api/reviews/{review_id}/refine")
+    async def refine_review(review_id: str, request: Request) -> Response:
+        return await _proxy(request, "POST", f"/api/reviews/{review_id}/refine")
+
     @app.post("/api/reviews/lock/{task_id:path}")
     async def acquire_review_lock(task_id: str, request: Request) -> Response:
         return await _proxy(request, "POST", f"/api/reviews/lock/{task_id}")

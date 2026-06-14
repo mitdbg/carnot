@@ -34,15 +34,9 @@ def _vector():
     )
 
 
-# ── kind-gated verify trigger ──────────────────────────────────────────────────
-def test_scalar_extracts_never_open_a_review() -> None:
-    cfg = SkunkConfig(human_verify_extract=True)
-    pol = HumanAssistPolicy()
-    assert pol.verify_extract(RetrieveBranch(key="x"), [_scalar()], cfg) is False
-
-
-@pytest.mark.parametrize("entry", [_table(), _vector()])
-def test_table_and_vector_extracts_open_a_review(entry) -> None:
+# ── verify trigger gates only on the flag, not the value shape ──────────────────
+@pytest.mark.parametrize("entry", [_scalar(), _table(), _vector()])
+def test_all_extract_kinds_open_a_review_when_flag_on(entry) -> None:
     cfg = SkunkConfig(human_verify_extract=True)
     pol = HumanAssistPolicy()
     assert pol.verify_extract(RetrieveBranch(key="x"), [entry], cfg) is True

@@ -372,14 +372,11 @@ class HumanAssistPolicy:
         cfg,
     ) -> bool:
         # Figure questions (visual_only) gate on human_figure — the model reads charts
-        # unreliably so the human produces the answer. Everything else gates on
-        # human_verify_extract — the human confirms/corrects an OCR/table read — but only
-        # for vector/table-shaped reads: scalar extractions are cheap to trust and not worth a
-        # human's attention, so they never open a review regardless of the flag.
+        # unreliably so the human produces the answer. Every other extraction gates on
+        # human_verify_extract — the human confirms/corrects the OCR/table read, regardless
+        # of value shape (scalar/vector/table all get the same review).
         if branch.visual_only:
             return cfg.human_figure
-        if all(e.kind == "scalar" for e in entries):
-            return False
         return cfg.human_verify_extract
 
     def human_lookup(self, branch: LookupBranch, cfg) -> bool:

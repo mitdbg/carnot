@@ -65,6 +65,10 @@ class HumanReview:
     status: HumanReviewStatus = HumanReviewStatus.OPEN
     response: str | None = None
     response_source_docs: list[str] = field(default_factory=list)
+    # True while an LLM is revising this review's extracted candidates from a reviewer's
+    # natural-language feedback (the async "refine" path). Surfaced in the status snapshot so the
+    # overlay + task list can show an "Updating extraction…" indicator. verify_extract only.
+    refining: bool = False
     created_at: datetime = field(default_factory=utc_now)
     resolved_at: datetime | None = None
 

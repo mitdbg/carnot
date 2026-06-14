@@ -127,7 +127,7 @@ async def run_extract(
 
     extracted: dict[str, list[AnnotatedValue]] = {}
 
-    async def _extract_phase() -> None:
+    async def _extract_phase() -> list[AnnotatedValue]:
         reads = await asyncio.gather(
             *(
                 _extract_block(ctx, e.ref, [branches[p] for p in poss])
@@ -141,6 +141,9 @@ async def run_extract(
                 extracted[bid] = []
             else:
                 extracted[bid] = res
+        # Return the flattened reads so the traced "extract" step boundary summarizes the
+        # values it produced; returning None makes the trace viewer render the step "(none)".
+        return [v for vs in extracted.values() for v in vs]
 
     if want:
         await traced_step(ctx, "extract", _extract_phase)

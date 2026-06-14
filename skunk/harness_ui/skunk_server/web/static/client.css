@@ -167,12 +167,11 @@ main {
 }
 .task-row {
   width: 100%;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 10px;
-  /* start (not center): let the row grow to fit a multi-chip side column instead of the
-     chips overflowing the fixed min-height and colliding with the next row. */
-  align-items: start;
+  /* The <button> is a plain BLOCK, not the flex container: a <button> doesn't reliably grow
+     to its flex content's height (min-height wins) in every engine, which let the chip row
+     overflow the bottom and collide with the next row. The real column layout lives on the
+     inner div (.row-inner) below, which grows normally; the button just grows to contain it. */
+  display: block;
   padding: 12px 14px;
   border: 0;
   border-bottom: 1px solid var(--line);
@@ -185,6 +184,11 @@ main {
 }
 .task-row:hover,
 .task-row.selected { background: var(--bg3); }
+/* Column layout: title/preview stack on top, the status chips flow in a full-width row
+   beneath them and wrap onto as many lines as needed — no matter how many of Lookup /
+   Extract / Visual QA / In Review / Revising / Updating / Submit / Failed are present at
+   once. A div grows to its content, so the chips always have room within the row. */
+.row-inner { display: flex; flex-direction: column; gap: 8px; }
 .row-main { min-width: 0; }
 .row-title { font-weight: 750; margin-bottom: 3px; }
 .row-preview {
@@ -217,15 +221,15 @@ main {
 .status.cancelled { color: var(--text3); background: var(--bg3); }
 .status.claimed { color: var(--accent-2); background: var(--blue-bg); }
 .row-side {
+  /* Full-width chip row beneath the title/preview. Wraps onto as many lines as needed;
+     the parent flex column grows to contain every line, so chips never overlap the next
+     row. Right-aligned to keep the status weight on the right edge as before. */
   display: flex;
-  /* Wrap chips horizontally right-to-left so multiple (status + review kinds + Submit +
-     Revising) flow onto as many lines as needed and never stack on top of one another. */
   flex-direction: row;
   flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: 6px;
-  max-width: 190px;
 }
 /* Inline Submit on READY rows. It's a <span> (the row itself is the <button>); the click
    handler stopPropagation()s so submitting doesn't also select the task. */
@@ -986,11 +990,19 @@ textarea { width: 100%; min-height: 55px; }
   background: var(--bg2); border-left: 2px solid var(--border2);
   border-radius: 0 5px 5px 0; padding: 6px 8px; white-space: pre-wrap;
 }
-/* Read-only source/publisher of an external-lookup value — not editable. */
+/* Read-only source/publisher of an external-lookup value — not editable. Shown on
+   top of the card, larger/bolder than the editable fields so provenance reads first. */
 .review-cand-source {
-  font-size: 12px; line-height: 1.45; color: var(--text2);
-  background: var(--bg2); border-left: 2px solid var(--accent);
-  border-radius: 0 5px 5px 0; padding: 6px 8px; white-space: pre-wrap;
+  display: flex; align-items: baseline; gap: 8px;
+  background: var(--bg2); border-left: 3px solid var(--accent);
+  border-radius: 0 5px 5px 0; padding: 8px 10px; margin-bottom: 4px; white-space: pre-wrap;
+}
+.review-cand-source-label {
+  font-size: 11px; color: var(--text3);
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.review-cand-source-name {
+  font-size: 16px; font-weight: 700; color: var(--ink); line-height: 1.3;
 }
 .review-notes-label {
   display: block; font-size: 11px; color: var(--text3);
@@ -1004,6 +1016,43 @@ textarea { width: 100%; min-height: 55px; }
 .review-submit.primary { background: var(--accent); border-color: var(--accent); color: #003300; }
 .review-submit:hover, .review-accept:hover { filter: brightness(1.1); }
 .review-error { color: var(--bad); font-size: 12px; }
+
+/* ── Natural-language refine (verify_extract): feedback box + post-refine toast ──── */
+.review-refine {
+  display: flex; flex-direction: column; gap: 6px;
+  border-top: 1px dashed var(--line); padding-top: 10px; margin-top: 2px;
+}
+.review-refine-input {
+  width: 100%; background: var(--bg3); border: 1px solid var(--border2); color: var(--ink);
+  border-radius: 6px; padding: 8px 10px; font-size: 13px; font-family: inherit; line-height: 1.45;
+  resize: vertical; min-height: 64px;
+}
+.review-refine-input:disabled { opacity: 0.6; cursor: not-allowed; }
+.review-refine-actions { display: flex; align-items: center; gap: 10px; }
+.review-refine-btn {
+  border-radius: 6px; padding: 7px 14px; font-size: 13px; font-weight: 600; cursor: pointer;
+  border: 1px solid var(--border2); background: var(--bg3); color: var(--ink); white-space: nowrap;
+}
+.review-refine-btn:hover:not(:disabled) { filter: brightness(1.1); }
+.review-refine-btn:disabled { opacity: 0.7; cursor: progress; }
+.review-refine-status { font-size: 12px; color: var(--muted); }
+.review-refine-status.is-busy { color: var(--warn); animation: review-pulse 1.4s ease-in-out infinite; }
+/* Post-refine banner with one-click undo, prepended to the editor column. */
+.review-refine-toast {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--yellow-bg); border: 1px solid var(--warn); color: var(--ink);
+  border-radius: 6px; padding: 8px 10px; font-size: 13px;
+}
+.review-toast-msg { flex: 1; }
+.review-toast-undo {
+  border-radius: 5px; padding: 4px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+  border: 1px solid var(--border2); background: var(--bg3); color: var(--ink);
+}
+.review-toast-undo:hover { filter: brightness(1.1); }
+.review-toast-dismiss {
+  background: transparent; border: none; color: var(--muted); cursor: pointer; font-size: 13px;
+}
+.review-toast-dismiss:hover { color: var(--ink); }
 
 .review-viewer { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--bg); }
 .review-viewer-bar {
@@ -1050,6 +1099,24 @@ textarea { width: 100%; min-height: 55px; }
   animation: review-pulse 1.4s ease-in-out infinite;
 }
 .detail-feedback.revising { color: var(--blue); font-size: 12px; }
+/* Same chip footprint as .row-revising; warm tone to distinguish an extraction refine (an LLM
+   reworking the candidates) from a compute recompute (.row-revising, blue). */
+.row-refining {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--warn);
+  background: var(--yellow-bg);
+  border: 1px solid var(--border2);
+  animation: review-pulse 1.4s ease-in-out infinite;
+}
+.detail-feedback.refining { color: var(--warn); font-size: 12px; }
 @keyframes review-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
 
 /* ── Review lock (another operator is annotating this UID) ──────────────────────── */

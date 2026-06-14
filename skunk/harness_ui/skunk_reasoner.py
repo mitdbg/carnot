@@ -103,6 +103,113 @@ async def recompute(state: dict, overrides: dict) -> str:
         ctx.close()
 
 
+# Char budget for the source page text grounding fed to the refine call (bounds latency/cost).
+_REFINE_PAGE_TEXT_BUDGET = 20000
+_SOURCE_DOC_RE = re.compile(r"Treasury Bulletin (\d{4}-\d{2}) PDF page (\d+)")
+
+_REFINE_SYSTEM_PROMPT = (
+    "You revise a set of OCR/table extractions ('candidates') for one question, applying a "
+    "human reviewer's natural-language feedback. Each candidate is a JSON object with fields: "
+    "`description` (identifies the value), `value` (a primitive, a list, or a nested object per "
+    "`kind`), `unit`, `kind` ('scalar' | 'vector' | 'table'), and the optional shape labels "
+    "`index_name` / `row_name` / `col_name`, plus `notes` / `source`. Each candidate also carries "
+    "`_src`, the index of the source extraction it came from — you MUST preserve `_src` on every "
+    "candidate you return so the system can map your edit back to the original.\n\n"
+    "Apply the reviewer's feedback to produce the corrected candidates. For a per-entry transform "
+    "(e.g. 'every value is the next year's figure — shift them all back one year'), keep the same "
+    "candidates, order, and `_src` values, changing only the affected fields. Only add a candidate "
+    "(with `_src` set to null) or drop one (omit it) if the feedback explicitly calls for it. Do "
+    "not invent values: when source page text is provided, ground your corrections in it. Keep "
+    "`value` shapes consistent with each candidate's `kind`."
+)
+
+_REFINE_OUTPUT_INSTRUCTION = (
+    "Output ONLY a JSON array of the corrected candidate objects (each keeping its `_src`) — no "
+    "markdown fences, no prose."
+)
+
+
+def _parse_refine_response(text: str, _ctx: Any) -> list[dict]:
+    from skunk.common import parse_json_response
+    from skunk.errors import ParseError
+
+    data = parse_json_response(text)
+    if data is None:
+        raise ParseError(text, "not valid JSON")
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list) or not all(isinstance(i, dict) for i in data):
+        raise ParseError(text, "expected a JSON array of candidate objects")
+    return data
+
+
+def _source_page_text(source_docs: list[str]) -> str:
+    """Concatenate the text of the source pages referenced by a review's `source_docs`, in
+    first-seen order, truncated to a char budget. Empty string if none are resolvable."""
+    from skunk import SkunkConfig
+    from skunk.common import PageRef
+    from skunk.page_index.store import get_page_store
+
+    config = SkunkConfig.from_env()
+    store = get_page_store(str(config.pdf_dir))
+    seen: set[tuple[str, int]] = set()
+    chunks: list[str] = []
+    total = 0
+    for doc in source_docs:
+        match = _SOURCE_DOC_RE.search(str(doc))
+        if not match:
+            continue
+        month, page = match.group(1), int(match.group(2))
+        if (month, page) in seen:
+            continue
+        seen.add((month, page))
+        text = store.text(PageRef(month=month, page=page))
+        if not text:
+            continue
+        header = f"--- Treasury Bulletin {month} page {page} ---\n"
+        chunks.append(header + text)
+        total += len(header) + len(text)
+        if total >= _REFINE_PAGE_TEXT_BUDGET:
+            break
+    joined = "\n\n".join(chunks)
+    return joined[:_REFINE_PAGE_TEXT_BUDGET]
+
+
+async def refine(
+    candidates: list[dict], feedback: str, source_docs: list[str]
+) -> list[dict]:
+    """Revise a verify_extract review's extracted `candidates` from a reviewer's natural-language
+    `feedback`, grounded in the source page text. Returns the corrected candidate dicts (each
+    preserving its `_src`). The async LLM-feedback path behind the review overlay's feedback box."""
+    from skunk import SkunkConfig
+    from skunk.common import ExecutionContext
+    from skunk.prompted_call import PromptedCall
+
+    _set_default_env()
+    config = SkunkConfig.from_env()
+    if not Path(config.prompt_overrides_path).is_absolute():
+        config.prompt_overrides_path = str(SKUNK_ROOT / config.prompt_overrides_path)
+    page_text = await asyncio.to_thread(_source_page_text, source_docs)
+    user_parts = [
+        "Current extractions (JSON):\n" + json.dumps(candidates, indent=2),
+        "Reviewer feedback:\n" + feedback,
+    ]
+    if page_text:
+        user_parts.append("Source page text (for grounding):\n" + page_text)
+    prompt: PromptedCall[list[dict]] = PromptedCall(
+        name="review.refine",
+        system_prompt=_REFINE_SYSTEM_PROMPT,
+        default_effort="low",
+        parse=_parse_refine_response,
+        output_instruction=_REFINE_OUTPUT_INSTRUCTION,
+    )
+    ctx = ExecutionContext(question=feedback, config=config)
+    try:
+        return await prompt.call(ctx, "\n\n".join(user_parts), temperature=0.0)
+    finally:
+        ctx.close()
+
+
 class SkunkReasoner:
     @staticmethod
     def set_default_env() -> None:

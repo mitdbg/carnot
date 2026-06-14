@@ -324,6 +324,34 @@ class TaskRegistry:
             task.updated_at = utc_now()
             return task, review
 
+    def set_review_refining(self, review_id: str, refining: bool) -> None:
+        """Flag/unflag a review as having an in-flight LLM refine of its extracted candidates,
+        so the UI can show an 'Updating extraction…' indicator. Bumps the task version so the
+        status republishes. No-op if the review/task is gone."""
+        with self._lock:
+            try:
+                task, review = self._find_review(review_id)
+            except KeyError:
+                return
+            if review.refining != refining:
+                review.refining = refining
+                self._set_status(task, task.status)  # bump version, status unchanged
+
+    def set_review_candidates(self, review_id: str, candidates: list[dict[str, Any]]) -> None:
+        """Replace an OPEN review's extracted candidates with an LLM-refined set (the result of
+        the natural-language feedback path), bumping the task version so the new cards reach the
+        overlay. Skips a review that's no longer OPEN (resolved/cancelled mid-refine) and no-ops
+        if the review/task is gone."""
+        with self._lock:
+            try:
+                task, review = self._find_review(review_id)
+            except KeyError:
+                return
+            if review.status != HumanReviewStatus.OPEN:
+                return
+            review.guidance["candidates"] = candidates
+            self._set_status(task, task.status)  # bump version, status unchanged
+
     def resolved_overrides(self, task_id: str) -> dict[int, str]:
         """Accumulated human corrections for a task: `branch_id -> raw response JSON`, across all
         RESOLVED reviews with a non-empty response (accept-as-is reviews contribute nothing). A
@@ -438,6 +466,11 @@ class TaskRegistry:
                     self._set_status(task, task.status)
                     cleared.append(task.task_id)
         return cleared
+
+    def find_review(self, review_id: str) -> tuple[QuestionTask, HumanReview]:
+        """Public, locked lookup of a review (and its task) by id. Raises KeyError if absent."""
+        with self._lock:
+            return self._find_review(review_id)
 
     def _find_review(self, review_id: str) -> tuple[QuestionTask, HumanReview]:
         for task in self._tasks.values():

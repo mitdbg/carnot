@@ -110,7 +110,10 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
     # Optimistic human-review broker: registers open reviews mid-run and, on resolve, recomputes
     # the answer (re-running only compute) via the reasoner module's `recompute` entry point.
     recompute_fn = _load_recompute(config.reasoner_ref) if reasoner is None else None
-    broker = HumanWorkBroker(registry, recompute_fn, sink.publish_status)
+    refine_fn = _load_refine(config.reasoner_ref) if reasoner is None else None
+    broker = HumanWorkBroker(
+        registry, recompute_fn, sink.publish_status, refine_fn=refine_fn
+    )
     pool = AgentWorkerPool(
         registry,
         queues,
@@ -164,6 +167,21 @@ def _load_recompute(reasoner_ref: str):
     except Exception:
         logger.warning(
             "reasoner module %s has no `recompute`; human-review revisions disabled",
+            module_name,
+        )
+        return None
+
+
+def _load_refine(reasoner_ref: str):
+    """Resolve the reasoner module's `refine` entry point (used to revise extracted candidates
+    from a reviewer's natural-language feedback). Returns None if the module doesn't define one —
+    reviews still open and resolve, the NL-feedback button is just inert."""
+    module_name = reasoner_ref.split(":", 1)[0]
+    try:
+        return load_reasoner(f"{module_name}:refine")
+    except Exception:
+        logger.warning(
+            "reasoner module %s has no `refine`; review NL-feedback disabled",
             module_name,
         )
         return None
