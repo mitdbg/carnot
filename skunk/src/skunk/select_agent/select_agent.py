@@ -34,7 +34,7 @@ from skunk.multi_turn_agent import (
     MultiTurnAgent,
     TextBlock,
 )
-from skunk.page_index.data_model import CATALOG_ROW_FIELDS, PageCatalogRow
+from skunk.page_index.data_model import PageCatalogRow
 from skunk.page_index.store import PageStore
 from skunk.select_agent.select_tools import (
     EMPTY_GREP_MESSAGE,
@@ -50,30 +50,7 @@ from skunk.select_agent.select_tools import (
     ReadDocumentTool,
     SearchCorpusTool,
     ViewFigureTool,
-    block_id,
 )
-
-
-def _render_candidate(entry: SemPoolEntry) -> tuple[str, str, str]:
-    """One flagged candidate rendered as `(block_id, doc_id, line)`. Mirrors
-    `select_tools.render_block_line` so the seed and `search_corpus` results read alike."""
-    doc_id = pageref_to_doc_key(entry.ref.page)
-    bi = entry.ref.block_index if entry.ref.block_index is not None else 0
-    bid = block_id(doc_id, bi)
-    dates = f"{entry.interval[0]}..{entry.interval[1]}" if entry.interval else "none"
-    line = (
-        f"[{bid}] {entry.ref.page.month} p.{entry.ref.page.page}  dates={dates}  "
-        f"{entry.kind}: {entry.title or '(untitled)'}"
-    )
-    cols = list(entry.cols)
-    rows = list(entry.rows or entry.rows_tail)
-    if cols:
-        line += f"\n    cols: {', '.join(cols)}"
-    if rows:
-        line += f"\n    rows: {', '.join(rows)}"
-    if entry.summary:
-        line += f"\n    summary: {entry.summary}"
-    return bid, doc_id, line
 
 
 class SelectAgent(MultiTurnAgent):
@@ -84,38 +61,28 @@ class SelectAgent(MultiTurnAgent):
     warn_steps_remaining = 2
 
     briefing = (
-        "You are the SELECTION stage of a research-question pipeline over the U.S. Treasury "
-        "Bulletin corpus. An extraction step will read the pages you select and pull the "
-        "numbers from them, so your job is to choose the SMALLEST set of pages that together "
-        "carry the data the question needs — with the exact series, qualifiers, unit, and "
-        "time basis it asks for.\n\n"
-        "A first-pass retrieval has already FLAGGED the most-likely candidate blocks; they "
-        "appear as your first observation, each with its block id, source page, data-date "
-        "span, table title, column/row labels, and a short summary (no numbers). Treat the "
-        "flagged set as high-precision and start there. You ALSO have full-corpus reach: "
-        "`search_corpus` queries the catalog of every page in the corpus, so use it to find "
-        "additional candidates only when the flagged set is insufficient (e.g. to reach an "
-        "earlier/later reprint that completes a period). Use `read_document` to confirm a "
-        "candidate's text before committing, `view_figure` for chart pages, and `prune` "
-        "aggressively on candidates you rule out to keep your context focused.\n\n"
-        "## Catalog schema\n\n"
-        + CATALOG_ROW_FIELDS
-        + "\n\n## Selection rules\n\n"
+        "You are a helpful assistant for retrieving relevant information from a large "
+        "collection of documents. You will be given a question, and a shortlist of candidate "
+        "pages that likely (but not always) carry relevant information. Some questions require "
+        "looking up information that is not contained in the corpus; that is handled by a "
+        "separate agent, so you should only focus on retrieving relevant documents for the "
+        "remainder of the question. You do not need to retrieve everything in a single tool "
+        "call: use early steps to explore documents of potential relevance, then refine your "
+        "searches in later steps based on what you find. Use `prune(...)` aggressively on "
+        "pages and blocks you have ruled out, to keep later searches focused and your context "
+        "window manageable.\n\n"
+        "## Hints\n\n"
         "- Match the question's EXACT wording — the precise series with every qualifier, "
-        "total vs subtotal, unit, and time basis. The flagged summaries are paraphrases; the "
+        "total vs subtotal, unit, and time basis. The catalog summaries are paraphrases; the "
         "question governs.\n"
-        "- Confirm the requested dates exist as rows at the needed granularity (monthly rows "
+        "- Confirm the requested dates exist at the needed granularity (monthly rows "
         "vs an annual / fiscal-year roll-up).\n"
-        "- Recurring series: the same table recurs across consecutive issues with a shifting "
-        "data window (sometimes revised). Keep the FEWEST prints whose windows together cover "
-        "the requested period at the needed granularity — one print when one suffices, else a "
-        "tiling of the same table reaching the period's first and last months.\n"
+        "-  Most questions should be answered by the most "
+        "contemporaneous print, but you must check for later revisions. Revisions are "
+        "clearly marked as such on the pages or notes. Otherwise, later prints may contain changes in "
+        "accounting methods or classifications, and must not be used.\n"
         "- If the question pins a source (\"as reported in the <Month Year> Bulletin\", \"as of "
-        "<date>\"), select the blocks that best match it. When the same figure is restated "
-        "across issues and all else is equal, prefer the most recent issue.\n"
-        "- Drop a candidate when nothing in it — title, labels, or summary — could carry the "
-        "target series, or when a kept print of the same table already contains everything it "
-        "would contribute."
+        "<date>\"), select the blocks that best match it.\n"
     )
 
     final_answer_doc = """\
@@ -178,17 +145,24 @@ do not invent pages."""
     # ------------------------------------------------------------------
 
     def _seed_blocks(self) -> list[Block]:
-        """The flagged candidates as the opening (pruneable) observation."""
-        blocks: list[Block] = [
+        """The candidate PAGES (distinct, deduped) as the opening observation — page ids
+        only, no summaries. Deliberately just a list: first-pass retrieval flags pages that
+        very likely hold the right table, and the agent discovers everything else through its
+        tools (read_document / search_corpus / grep_corpus)."""
+        seen: list[str] = []
+        seen_set: set[str] = set()
+        for entry in self._candidates:
+            doc_id = pageref_to_doc_key(entry.ref.page)
+            if doc_id not in seen_set:
+                seen_set.add(doc_id)
+                seen.append(doc_id)
+        return [
             TextBlock(
-                f"Flagged candidates from first-pass retrieval ({len(self._candidates)} "
-                "block(s)), most likely to be relevant — start here:"
+                f"Candidate pages from first-pass retrieval ({len(seen)}). With high "
+                "probability the right table is in one of these pages, and they are likely "
+                f"excellent starting points:\n{', '.join(seen)}"
             )
         ]
-        for entry in self._candidates:
-            bid, doc_id, line = _render_candidate(entry)
-            blocks.append(ChunkBlock(chunk_id=bid, doc_id=doc_id, text=line))
-        return blocks
 
     def _block_is_visible(self, block: Block) -> bool:
         if isinstance(block, ChunkBlock):
@@ -303,20 +277,10 @@ do not invent pages."""
             )
         return None
 
-    async def retrieve(
-        self,
-        ctx: ExecutionContext,
-        question: str,
-        *,
-        branch_key: str | None = None,
-        branch_period: str | None = None,
-    ) -> list[str]:
-        parts = [f"Question: {question}"]
-        if branch_key:
-            parts.append(f"Selection target: {branch_key}")
-        if branch_period:
-            parts.append(f"Time period (of the data): {branch_period}")
-        payload = await self.call(ctx, "\n".join(parts))
+    async def retrieve(self, ctx: ExecutionContext, question: str) -> list[str]:
+        """One rollout for the whole question (no per-branch hints) — the full question
+        carries every series/period the selected pages must cover."""
+        payload = await self.call(ctx, f"Question: {question}")
         return self._page_keys_from_payload(payload)
 
     @staticmethod

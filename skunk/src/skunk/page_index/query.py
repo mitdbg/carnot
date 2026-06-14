@@ -160,11 +160,6 @@ content blocks — each a single table/chart/prose region from a Treasury Bullet
 block, decide independently whether it holds data relevant to any one of the targets. You see only
 a compact summary per block (title, column/row labels, dates), not the numbers.
 
-A block is relevant when its summary suggests it reports the kind of data a target needs for a
-relevant time period. Match on the data series, not on whether the block alone could answer the
-question: keep blocks that hold the series even when they cover only part of the needed span, and
-keep prose blocks whose summary names the relevant instrument or series.
-
 ## Input
 
 A numbered list of `targets` (each a concept, optionally with the `period` its data covers), then a

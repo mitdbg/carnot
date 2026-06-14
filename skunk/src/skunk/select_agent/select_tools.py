@@ -32,7 +32,7 @@ from collections import defaultdict
 
 from skunk.common import PageRef, page_key_to_pageref, pageref_to_doc_key
 from skunk.multi_turn_agent import Tool
-from skunk.page_index.data_model import ContentBlock, PageCatalogRow
+from skunk.page_index.data_model import CATALOG_ROW_FIELDS, ContentBlock, PageCatalogRow
 from skunk.page_index.store import PageStore
 
 SEARCH_RESULT_TAG = "__search_result__"
@@ -189,7 +189,8 @@ class SearchCorpusTool(Tool):
         ]
         return {SEARCH_RESULT_TAG: True, "chunks": chunks}
 
-    doc = """\
+    doc = (
+        """\
 ### search_corpus(query: str | None = None, top_k: int = 50, metadata_filter: dict | None = None)
 A METADATA search over the structured catalog summaries of the WHOLE corpus (every page of every bulletin) — use it to look beyond the flagged candidates (e.g. to find an earlier/later reprint that tiles a period, or a page a stage-1 filter missed). There are no embeddings: `query` is matched lexically against each block's title, summary, and column/row labels, and results are ranked by how many query terms hit. Each result is one catalog block, labelled with its block id and page; it shows the summary only — `read_document` the page to see the actual text. Already-pruned pages/blocks are excluded.
 
@@ -201,7 +202,12 @@ A METADATA search over the structured catalog summaries of the WHOLE corpus (eve
 ```python
 # tables reporting on 1940 data, anywhere in the corpus, matching "public debt"
 search_corpus("public debt", top_k=30, metadata_filter={"kind": "table", "date_from": "1940-01", "date_to": "1940-12"})
-```"""
+```
+
+Each result is one catalog block from a page. The catalog schema:
+"""
+        + CATALOG_ROW_FIELDS
+    )
 
 
 class GrepCorpusTool(Tool):
