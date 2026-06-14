@@ -84,5 +84,10 @@ class StreamHub:
             if not subs:
                 del self._event_subs[task_id]
 
+    def active_event_task_ids(self) -> list[str]:
+        """Task ids with ≥1 live event subscriber. Lets the file tailer decide which jsonl
+        files to open without reaching into `_event_subs` directly."""
+        return list(self._event_subs.keys())
+
     def status_snapshot(self) -> dict[str, Any]:
         return self._status_provider()

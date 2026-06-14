@@ -25,6 +25,9 @@ const js = (s) => String(s ?? "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 
 // ── status badges ────────────────────────────────────────────────────────────
 function badgeClass(task) {
+  // An open human review means the task is waiting on the operator — surface that as the badge
+  // (it would otherwise read PROCESSING/READY and hide that you're the blocker).
+  if ((task.reviews || []).length) return "await-human";
   switch (task.status) {
     case "SUBMITTED":
     case "SCORED":
@@ -38,6 +41,7 @@ function badgeClass(task) {
   }
 }
 function badgeLabel(task) {
+  if ((task.reviews || []).length) return "⚠ NEEDS REVIEW";
   if ((task.status === "SUBMITTED" || task.status === "SCORED") && task.points != null) {
     return `${task.status} (${task.points} pts)`;
   }
@@ -63,8 +67,10 @@ const statusRank = (task) => (STATUS_RANK[task.status] ?? 9);
 // operator sees what's waiting on them first. Within review tasks, order by the cheapest/most
 // time-sensitive kind: external lookup, then visual QA (figure), then extract validation.
 const reviewCount = (task) => (task.reviews || []).length;
-const REVIEW_KIND_RANK = { lookup: 0, figure: 1, verify_extract: 2 };
-const REVIEW_KIND_LABEL = { lookup: "Lookup", figure: "Visual QA", verify_extract: "Extract" };
+// missing_data (a mandatory "provide the missing value(s)" intervention after a NeedsMore) blocks
+// the whole run, so it's the most urgent.
+const REVIEW_KIND_RANK = { missing_data: 0, lookup: 1, figure: 2, verify_extract: 3 };
+const REVIEW_KIND_LABEL = { missing_data: "Needs Data", lookup: "Lookup", figure: "Visual QA", verify_extract: "Extract" };
 // Best (lowest) kind-rank among a task's open reviews; 99 for tasks with no reviews so they
 // sink below every review task while keeping their normal status ordering among themselves.
 const reviewKindRank = (task) => {
@@ -72,13 +78,15 @@ const reviewKindRank = (task) => {
   if (!rs.length) return 99;
   return Math.min(...rs.map((r) => REVIEW_KIND_RANK[r.kind] ?? 3));
 };
-// One colored chip per review kind present on the task (e.g. "Lookup", "Visual QA (2)").
+// One colored chip per review kind present on the task (e.g. "Needs Data", "Visual QA (2)").
+// Renders EVERY kind present (ordered by urgency) — an unknown/new kind falls back to its raw
+// name rather than being silently dropped, so a task never looks review-free when it isn't.
 function reviewChips(task) {
   const byKind = {};
   for (const r of (task.reviews || [])) byKind[r.kind] = (byKind[r.kind] || 0) + 1;
-  return Object.keys(REVIEW_KIND_RANK)
-    .filter((k) => byKind[k])
-    .map((k) => `<span class="row-review kind-${esc(k)}" onclick="openReview('${js(task.task_id)}', event)">${esc(REVIEW_KIND_LABEL[k])}${byKind[k] > 1 ? ` (${byKind[k]})` : ""}</span>`)
+  return Object.keys(byKind)
+    .sort((a, b) => (REVIEW_KIND_RANK[a] ?? 9) - (REVIEW_KIND_RANK[b] ?? 9))
+    .map((k) => `<span class="row-review kind-${esc(k)}" onclick="openReview('${js(task.task_id)}', event)">${esc(REVIEW_KIND_LABEL[k] || k)}${byKind[k] > 1 ? ` (${byKind[k]})` : ""}</span>`)
     .join("");
 }
 

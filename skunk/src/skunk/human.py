@@ -53,6 +53,14 @@ _FIELDS = ("description", "value", "unit", "kind", "index_name", "row_name", "co
 _EDITABLE_FIELDS = ("description", "unit", "value")
 
 
+def _candidate_dicts(entries: list[AnnotatedValue]) -> list[dict]:
+    """The model's values for the review UI: the editable field set PLUS read-only `notes` — the
+    LLM's extract-time page context (footnotes, headnotes, print-flag meaning, scope/break-in-series
+    caveats) for each value, so a reviewer sees what the page said about it. Display-only: the human
+    edits only `_EDITABLE_FIELDS`; kind/provenance/notes ride back untouched via `_src`."""
+    return [c.model_dump(include=set(_FIELDS) | {"notes"}) for c in entries]
+
+
 def apply_overrides(
     items: list[dict], base: list[AnnotatedValue]
 ) -> list[AnnotatedValue]:
@@ -84,6 +92,34 @@ def _pagerefs_to_docstrings(refs: list[PageRef]) -> list[str]:
         for p in refs
         if p.month is not None and p.page is not None
     ]
+
+
+def _value_page_attribution(
+    entries: list[AnnotatedValue],
+) -> tuple[list[PageRef], list[dict]]:
+    """Map each extracted VALUE back to the actual page(s) it was read from — every
+    `AnnotatedValue` carries its own machine-stamped `bulletin`+`pages` — so a review shows ONLY
+    those pages, not the whole sem-filter survivor pool, and can label each page with the value(s)
+    that came from it. Returns `(refs, page_values)` where `page_values` is
+    `[{"month","page","values":[description,...]}]` in page order. `([], [])` when no entry is
+    attributable (e.g. a multi-bulletin extract left provenance empty) — the caller then falls
+    back to the block pool so the viewer is never empty."""
+    refs: list[PageRef] = []
+    page_values: list[dict] = []
+    by_key: dict[tuple[str, int], list[str]] = {}
+    for entry in entries:
+        if not entry.bulletin or not entry.pages:
+            continue
+        for page in entry.pages:
+            key = (entry.bulletin, page)
+            descs = by_key.get(key)
+            if descs is None:
+                by_key[key] = descs = []  # same list object lands in page_values below
+                refs.append(PageRef(month=entry.bulletin, page=page))
+                page_values.append({"month": entry.bulletin, "page": page, "values": descs})
+            if entry.description and entry.description not in descs:
+                descs.append(entry.description)
+    return refs, page_values
 
 
 def _branch_identity(branch: Branch) -> dict:
@@ -118,6 +154,9 @@ class HumanRequest:
     instruction: str
     candidates: list[AnnotatedValue]
     pages: list[PageRef] = field(default_factory=list)
+    # Per-page value attribution [{month,page,values:[desc,...]}] — which extracted value(s) came
+    # from each page, so the viewer can caption a page with its bulletin + value(s).
+    page_values: list[dict] = field(default_factory=list)
     branch: Branch | None = None
 
 
@@ -258,8 +297,9 @@ class BrokerChannel:
         ]
         guidance = {
             "task": req.task,
-            "candidates": [c.model_dump(include=set(_FIELDS)) for c in req.candidates],
+            "candidates": _candidate_dicts(req.candidates),
             "fields": list(_FIELDS),
+            "page_values": req.page_values,
         }
         ctx.emit(
             f"human_request task={req.task} candidates={len(req.candidates)} "
@@ -353,7 +393,11 @@ class HumanAssist:
         """Show the rendered source page(s) + the model's candidates and return the human's
         answer, re-stamped with the branch/page provenance the operators stamp. Assumes the
         caller already gated on `wants_verify`."""
-        refs = _blocks_to_pagerefs(blocks)
+        # Show ONLY the pages the values were actually read from (per-value provenance), not the
+        # whole survivor pool; fall back to the pool when nothing is attributable.
+        refs, page_values = _value_page_attribution(entries)
+        if not refs:
+            refs, page_values = _blocks_to_pagerefs(blocks), []
         instruction = (
             "This answer must be read off the figure/chart on the page(s) below — the "
             "model is unreliable here. Give the correct value(s)."
@@ -372,6 +416,7 @@ class HumanAssist:
                 instruction=instruction,
                 candidates=entries,
                 pages=refs,
+                page_values=page_values,
                 branch=branch,
             ),
             ctx,
@@ -421,7 +466,11 @@ class HumanAssist:
         if register is None:
             return None
         task = "figure" if branch.visual_only else "verify_extract"
-        refs = _blocks_to_pagerefs(blocks)
+        # Show ONLY the pages the values were actually read from (per-value provenance), not the
+        # whole survivor pool; fall back to the pool when nothing is attributable.
+        refs, page_values = _value_page_attribution(entries)
+        if not refs:
+            refs, page_values = _blocks_to_pagerefs(blocks), []
         instruction = (
             "This answer must be read off the figure/chart on the page(s) below — the "
             "model is unreliable here. Give the correct value(s)."
@@ -433,8 +482,9 @@ class HumanAssist:
             "task": task,
             "branch_id": bid,
             "branch": _branch_identity(branch),
-            "candidates": [c.model_dump(include=set(_FIELDS)) for c in entries],
+            "candidates": _candidate_dicts(entries),
             "fields": list(_FIELDS),
+            "page_values": page_values,
         }
         review_id = register(
             task, instruction, ctx.question, _pagerefs_to_docstrings(refs), guidance
@@ -466,7 +516,7 @@ class HumanAssist:
             "task": "lookup",
             "branch_id": bid,
             "branch": _branch_identity(branch),
-            "candidates": [c.model_dump(include=set(_FIELDS)) for c in entries],
+            "candidates": _candidate_dicts(entries),
             "fields": list(_FIELDS),
         }
         review_id = register("lookup", instruction, ctx.question, [], guidance)

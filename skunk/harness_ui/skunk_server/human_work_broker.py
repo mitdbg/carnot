@@ -1,21 +1,27 @@
-"""Optimistic human-review coordination (single-operator, slim).
+"""Human-review coordination (single-operator, slim). Two transports share one review lifecycle:
 
-The pipeline runs WITHOUT blocking on a human: as a task executes, table/vector extracts,
-figure reads, and external lookups register an open `HumanReview` (via `register_review`,
-wrapped into the agent's `human_review_register` hook). The task completes optimistically and
-becomes submittable. When the operator resolves a review in the web UI (`resolve_review`), the
-broker schedules a background RECOMPUTE: it re-runs only `compute` over the first attempt's
-cached entries with the human's correction swapped in (no re-plan / re-retrieve), records the
-revised answer as a superseding candidate, and best-effort resubmits if the round is still open.
+- OPTIMISTIC (default, `register_review` → the agent's `human_review_register` hook): the pipeline
+  runs WITHOUT blocking. As a task executes, extracts/figure-reads/lookups register an open
+  `HumanReview`; the task completes optimistically and becomes submittable. When the operator
+  resolves in the web UI (`resolve_review`), the broker schedules a background RECOMPUTE — re-runs
+  only `compute` over the first attempt's cached entries with the correction swapped in (no
+  re-plan / re-retrieve), records the revised answer as a superseding candidate, and best-effort
+  resubmits if the round is still open. Reviews are advisory (the LLM answer already stands).
 
-This deliberately drops the old claim/release/assignment/worker-registry machinery — there is
-one operator, and reviews are advisory (the LLM answer already stands).
+- BLOCKING (`await_intervention` → the agent's `human_intervention_handler`, wired when
+  `SKUNK_HUMAN_BLOCKING` is set): the branch SUSPENDS on the review until a human resolves it,
+  then the response rides back to the orchestrator, which corrects the value inline and runs
+  compute (no recompute — the correction happens before compute). `resolve_review` auto-detects a
+  pending blocking review and wakes its branch instead of recomputing.
+
+This deliberately drops the old claim/release/assignment/worker-registry machinery.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -43,6 +49,11 @@ class HumanWorkBroker:
         self._submit_fn = submit_fn
         self._publish_status = publish_status
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Blocking transport: review_id -> (worker_loop, future). The branch coroutine (on a
+        # worker loop) awaits the future; `resolve_review` (server loop) sets its result
+        # cross-loop. Empty unless `await_intervention` is wired (SKUNK_HUMAN_BLOCKING).
+        self._pending: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Future]] = {}
+        self._pending_lock = threading.Lock()
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
@@ -77,6 +88,42 @@ class HumanWorkBroker:
         self._notify()
         return review.review_id
 
+    # ---- Blocking transport (awaited on a worker loop) ---------------------------------
+
+    async def await_intervention(
+        self,
+        task_id: str,
+        attempt_id: str,
+        kind: str,
+        instructions: str,
+        context: str | None,
+        source_docs: list[str] | None,
+        guidance: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Open a review and SUSPEND this branch until a human resolves it in the web UI, then
+        return the human's response (`{"response": <raw>}`, empty = accept-as-is) to the
+        orchestrator. Awaited on the worker's event loop, so only this branch's coroutine
+        suspends — the loop keeps running every other branch/question. Wired (instead of
+        `register_review`) when blocking is enabled."""
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        try:
+            review = self._registry.create_review(
+                task_id, attempt_id, kind, instructions, context, list(source_docs or []), guidance
+            )
+        except KeyError:
+            return {"response": ""}  # task vanished (round closing) — accept the model as-is
+        with self._pending_lock:
+            self._pending[review.review_id] = (loop, fut)
+        self._notify()
+        try:
+            response = await fut
+        except asyncio.CancelledError:
+            with self._pending_lock:
+                self._pending.pop(review.review_id, None)
+            raise
+        return {"response": response}
+
     # ---- Resolution (called from the server loop, via the API route) -------------------
 
     def resolve_review(
@@ -86,7 +133,24 @@ class HumanWorkBroker:
         source_docs: list[str],
     ) -> tuple[QuestionTask, HumanReview]:
         task, review = self._registry.resolve_review(review_id, response, source_docs)
-        # A non-empty correction on a task that completed a compute → recompute in the
+        with self._pending_lock:
+            pending = self._pending.pop(review_id, None)
+        if pending is not None:
+            # BLOCKING review: wake the suspended branch with the human's response (NO recompute —
+            # the branch corrects the value inline). Set the result on the loop that owns the future.
+            worker_loop, fut = pending
+
+            def _fulfill() -> None:
+                if not fut.done():
+                    fut.set_result(response)
+
+            try:
+                worker_loop.call_soon_threadsafe(_fulfill)
+            except RuntimeError:
+                pass  # worker loop already gone (round torn down) — the branch was cancelled
+            self._notify()
+            return task, review
+        # OPTIMISTIC: a non-empty correction on a task that completed a compute → recompute in the
         # background. Accept-as-is (empty response) keeps the optimistic answer untouched.
         if (
             (response or "").strip()
@@ -160,6 +224,16 @@ class HumanWorkBroker:
 
     def cancel_all(self) -> None:
         self._registry.cancel_active_reviews()
+        # Wake any branches suspended on a blocking review so they unblock (CancelledError)
+        # instead of hanging until process exit.
+        with self._pending_lock:
+            pending = list(self._pending.values())
+            self._pending.clear()
+        for worker_loop, fut in pending:
+            try:
+                worker_loop.call_soon_threadsafe(fut.cancel)
+            except RuntimeError:
+                pass
         self._notify()
 
     # ---- internals ---------------------------------------------------------------------
