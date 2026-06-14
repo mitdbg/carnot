@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections import Counter
 from collections.abc import Sequence
 from typing import Any
@@ -46,6 +47,16 @@ def _parse_codegen(raw: str) -> str:
             ),
         )
     return s
+
+
+# A standalone NaN/inf token in the answer string means a non-finite `result`
+# (str(float("nan")) == "nan", and f-strings format nan/inf into composite answers like
+# "[nan, nan]"). Word-boundary guards keep it from tripping on substrings of real answers
+# ("Nanjing", "infants"); a bare "infinity" in an answer is itself non-finite, so catching
+# it is correct.
+_NONFINITE_RE = re.compile(
+    r"(?<![A-Za-z0-9])[+-]?(nan|inf(?:inity)?)(?![A-Za-z0-9])", re.IGNORECASE
+)
 
 
 def _coerce_prim(v: Any) -> Any:
@@ -154,10 +165,10 @@ Always read data through `e.frame`:
   table   →  R x C DataFrame; `index.name == e.row_name`,
              `columns.name == e.col_name`.
 
-The `input_values =` block below shows each non-scalar entry's schema (axis
-labels and dtypes, not cell values); the full frame exists in the exec
-environment. Apply unit conversions once over the whole frame, never
-cell-by-cell.
+The `input_values =` block below shows each non-scalar entry's full frame (axis
+labels, dtypes, and every cell); the same frame also exists in the exec
+environment. Read the cells to spot NaN / "n/a" values and handle them before
+aggregating. Apply unit conversions once over the whole frame, never cell-by-cell.
 
 ## Selecting inputs
 
@@ -189,6 +200,10 @@ and nothing else — no prose, no commentary, no second block:
       restatement; for a multi-part question, only the ultimate quantity asked
       for. Carry full precision through every intermediate; round or format only
       in the final `result` string, to the decimal places the question states.
+      Never emit a non-finite answer: if a computation yields NaN or infinity — NaN
+      cells in the inputs ("n/a"), or division by an empty/zero quantity — do not
+      format it into `result`. Drop or skip those cells before aggregating; if the
+      inputs genuinely cannot support a finite answer, use form (b) missing instead.
 
   (b) Missing data — when you cannot finish from `input_values` alone. Do NOT
       assign `result`; instead assign both:
@@ -425,6 +440,21 @@ class ComputeOp:
 
             if "result" in env:
                 result = str(env["result"])
+                if _NONFINITE_RE.search(result):
+                    prev_code = code
+                    prev_failure = (
+                        f"`result` is non-finite ({result!r}). A NaN/inf answer means the "
+                        "computation is undefined — typically NaN cells in the inputs "
+                        "(e.g. 'n/a'), or division by an empty/zero quantity. Never emit "
+                        "nan/inf as the answer: drop or skip the NaN cells before "
+                        "aggregating, or — if the inputs genuinely cannot support the "
+                        "answer — emit form (b) missing instead."
+                    )
+                    ctx.emit(
+                        f"exec_result_nonfinite trial={trial_idx} "
+                        f"attempt={try_idx + 1} text={result!r}"
+                    )
+                    continue
                 ctx.emit(
                     f"exec_result trial={trial_idx} attempt={try_idx + 1} text={result!r}"
                 )

@@ -602,11 +602,11 @@ def _join_labels(labels: list[str]) -> str:
 
 
 def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
-    """Schema view of one `AnnotatedValue`: the meta line, then (for non-scalars) the
-    index labels — load-bearing, they're what generated code keys `.loc[...]` on, and
-    aren't otherwise in the prompt (the middle is elided for very long axes; see
-    `_join_labels`). Scalars show in full. A `provenance:` line carries the
-    machine-stamped source fields when present."""
+    """Full view of one `AnnotatedValue`: the meta line (kind/shape/dtypes), then — for
+    non-scalars — the entire frame rendered cell-by-cell via `df.to_string()`. Values are
+    included (not just the schema) so generated code can see NaN / "n/a" cells, sanity-check
+    magnitudes, and key `.loc[...]` on the real labels. Scalars show in full. A
+    `provenance:` line carries the machine-stamped source fields when present."""
     head = (
         f"  input_values[{i}]  description: {(e.description or '(no description)')!r}"
     )
@@ -642,16 +642,19 @@ def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
         dtypes = ", ".join(str(t) for t in df.dtypes)
         lines.append(f"{_PAD}columns: [{cols}]   dtypes: [{dtypes}]")
 
-    labels = [str(x) for x in df.index]
-    lines.append(f"{_PAD}index ({len(labels)} labels): [{_join_labels(labels)}]")
+    # The whole frame, values included — the agent reads the actual cells (NaN/'n/a',
+    # magnitudes, exact labels), not just the schema. The full frame also lives in the
+    # exec env for the generated code to operate on.
+    lines.append(f"{_PAD}frame:")
+    lines.extend(f"{_PAD}  {ln}" for ln in df.to_string().splitlines())
     return lines
 
 
 def input_values_desc(input_values: list[AnnotatedValue]) -> str:
-    """Render `input_values` for the codegen / re-planner prompts as a
-    **schema view** — axis labels + dtypes, NOT a cell dump. Generated code operates
-    on the frames symbolically (full frames live in the exec env), so it needs the
-    labels (to write selections), not the interior grid."""
+    """Render `input_values` for the codegen / re-planner prompts as a **full view** —
+    meta (axis labels, dtypes) plus the entire frame rendered cell-by-cell, so the agent
+    reads the actual data (NaN/'n/a' cells, magnitudes, exact labels), not just the schema.
+    The full frames also live in the exec env for the generated code to operate on."""
     lines = [f"input_values ({len(input_values)} entries)"]
     for i, e in enumerate(input_values):
         lines.extend(_describe_entry(i, e))
