@@ -2,20 +2,22 @@
 // Read-only monitoring console. Two SSE streams from the same origin:
 //   GET /api/stream            -> compact {round, tasks[]} status, re-sent on any change
 //   GET /api/stream/<task_id>  -> the selected task's trace events (backfill, then live)
-// Status updates patch the header/metrics/task-list in place; trace events append to the
-// selected task's per-attempt buffers and re-render ONLY the #trace container (which
-// preserves expanded <details> across renders). The two never touch each other's DOM, so
-// streaming events never collapse what you've opened.
+// The status stream renders a fixed 5-column grid of task cards (sorted by UID, never reordered
+// by status). Clicking a card opens a full-screen DETAIL OVERLAY with that task's prompt/answer/
+// actions + live trace; clicking a review tag on a card opens the REVIEW OVERLAY at that review.
+// Trace events only touch the detail overlay's #trace container (which preserves expanded
+// <details> across renders), so streaming never collapses what you've opened.
 
 const app = document.getElementById("app");
 let round = {};
 let tasks = [];                       // latest status snapshot's task summaries
-let selectedTaskId = null;
 let selectedRoundTab = null;
 let lastRoundNum = null;
 
-// Selected task's live trace, accumulated from its event stream.
-let taskSource = null;                // EventSource for the selected task's events
+// Detail overlay: the task whose detail/trace modal is open (null = closed). Its live trace is
+// accumulated from that task's event stream.
+let detailTaskId = null;
+let taskSource = null;                // EventSource for the open task's events
 let attemptOrder = [];                // attempt_ids in first-seen order
 const attemptBuffers = new Map();     // attempt_id -> events[]
 let traceFrame = null;                // pending rAF handle for coalesced trace renders
@@ -24,17 +26,14 @@ const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<
 const js = (s) => String(s ?? "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 
 // True when another operator holds this task's review lock — their client is annotating it, so
-// its action buttons (Review + Submit) are greyed out for everyone else. This browser's lock
-// identity is defined in review_overlay.js (loads first) and exposed as window.CLIENT_ID; we read
-// it off window rather than re-declaring it, since these are classic scripts sharing one global
-// scope (a second top-level `const CLIENT_ID` would be an illegal redeclaration).
+// its review/submit actions are greyed out for everyone else. This browser's lock identity is
+// defined in review_overlay.js (loads first) and exposed as window.CLIENT_ID.
 const lockedByOther = (task) => !!task.locked_by && task.locked_by !== window.CLIENT_ID;
 
-// ── status badges ────────────────────────────────────────────────────────────
+// ── status badge ───────────────────────────────────────────────────────────────
+// One status tag per task. Review state is shown by the separate review-kind tags, NOT folded
+// into the status, so the badge always reads the real lifecycle state.
 function badgeClass(task) {
-  // An open human review means the task is waiting on the operator — surface that as the badge
-  // (it would otherwise read PROCESSING/READY and hide that you're the blocker).
-  if ((task.reviews || []).length) return "await-human";
   switch (task.status) {
     case "SUBMITTED":
     case "SCORED":
@@ -48,51 +47,28 @@ function badgeClass(task) {
   }
 }
 function badgeLabel(task) {
-  if ((task.reviews || []).length) return "⚠ NEEDS REVIEW";
   if ((task.status === "SUBMITTED" || task.status === "SCORED") && task.points != null) {
     return `${task.status} (${task.points} pts)`;
   }
   return task.status;
 }
 
-// Task-list ordering: questions needing attention float up, finished/dead ones sink.
-// FAILED -> READY -> PROCESSING -> queued -> SUBMITTING -> SUBMITTED/SCORED -> CANCELLED.
-const STATUS_RANK = {
-  FAILED: 0,
-  READY: 1,
-  PROCESSING: 2,
-  QUEUED: 3,
-  RECEIVED: 3,
-  SUBMITTING: 4,
-  SUBMITTED: 5,
-  SCORED: 5,
-  CANCELLED: 6,
-};
-const statusRank = (task) => (STATUS_RANK[task.status] ?? 9);
-
-// Tasks with open human reviews jump to the very top of the queue — above FAILED — so the
-// operator sees what's waiting on them first. Within review tasks, order by the cheapest/most
-// time-sensitive kind: external lookup, then visual QA (figure), then extract validation.
+// ── review kinds ─────────────────────────────────────────────────────────────────
 const reviewCount = (task) => (task.reviews || []).length;
 // True while any of a task's reviews has an in-flight LLM refine of its extracted candidates
-// (the natural-language feedback path), so the list/detail can show an "Updating extraction…"
-// indicator even after the reviewer navigates away from the overlay.
+// (the natural-language feedback path), surfaced as an "Updating" indicator.
 const isRefining = (task) => (task.reviews || []).some((r) => r.refining);
 // missing_data (a mandatory "provide the missing value(s)" intervention after a NeedsMore) blocks
-// the whole run, so it's the most urgent.
+// the whole run, so it's the most urgent; then lookup, visual QA (figure), extract validation.
 const REVIEW_KIND_RANK = { missing_data: 0, lookup: 1, figure: 2, verify_extract: 3 };
 const REVIEW_KIND_LABEL = { missing_data: "Needs Data", lookup: "Lookup", figure: "Visual QA", verify_extract: "Extract" };
-// Best (lowest) kind-rank among a task's open reviews; 99 for tasks with no reviews so they
-// sink below every review task while keeping their normal status ordering among themselves.
-const reviewKindRank = (task) => {
-  const rs = task.reviews || [];
-  if (!rs.length) return 99;
-  return Math.min(...rs.map((r) => REVIEW_KIND_RANK[r.kind] ?? 3));
-};
-// One colored chip per review kind present on the task (e.g. "Needs Data", "Visual QA (2)").
-// Renders EVERY kind present (ordered by urgency) — an unknown/new kind falls back to its raw
-// name rather than being silently dropped, so a task never looks review-free when it isn't.
-function reviewChips(task) {
+// Fuller labels for the detail overlay's per-kind review buttons (the cards use the short ones).
+const REVIEW_BUTTON_LABEL = { missing_data: "Provide Missing Data", lookup: "External Lookup", figure: "Visual QA", verify_extract: "Extract" };
+
+// One clickable tag per open review kind on a card (e.g. "Extract", "Visual QA (2)"), ordered by
+// urgency. Clicking a tag opens the review overlay directly at that kind (stopPropagation so the
+// card's own click — which opens the detail overlay — doesn't also fire). Greyed when locked.
+function cardKindTags(task) {
   const locked = lockedByOther(task);
   const byKind = {};
   for (const r of (task.reviews || [])) byKind[r.kind] = (byKind[r.kind] || 0) + 1;
@@ -100,10 +76,9 @@ function reviewChips(task) {
     .sort((a, b) => (REVIEW_KIND_RANK[a] ?? 9) - (REVIEW_KIND_RANK[b] ?? 9))
     .map((k) => {
       const label = `${esc(REVIEW_KIND_LABEL[k] || k)}${byKind[k] > 1 ? ` (${byKind[k]})` : ""}`;
-      // Locked by another reviewer → greyed, no click; otherwise opens the overlay (grabs the lock).
       return locked
-        ? `<span class="row-review kind-${esc(k)} locked-out" title="Locked by another reviewer">${label}</span>`
-        : `<span class="row-review kind-${esc(k)}" onclick="openReview('${js(task.task_id)}', event)">${label}</span>`;
+        ? `<span class="tag kind-${esc(k)} locked-out" title="Locked by another reviewer">${label}</span>`
+        : `<span class="tag kind-${esc(k)}" onclick="openReview('${js(task.task_id)}', '${js(k)}', event)">${label}</span>`;
     })
     .join("");
 }
@@ -114,7 +89,7 @@ function feedbackFor(task) {
   return { correct: !!task.correct, points: task.points };
 }
 
-// ── round timer ──────────────────────────────────────────────────────────────
+// ── round timer ──────────────────────────────────────────────────────────────────
 function updateRoundTimer() {
   const el = document.getElementById("roundTimer");
   if (!el) return;
@@ -128,20 +103,32 @@ setInterval(updateRoundTimer, 1000);
 
 // ── skeleton (built once) ──────────────────────────────────────────────────────
 function buildSkeleton() {
-  app.innerHTML = `<section class="workspace">
-    <aside class="list-panel">
-      <div class="panel-head"><div class="panel-title">Tasks</div><span class="pill"><strong id="taskCount">0</strong></span></div>
-      <div id="roundTabs" class="round-tabs"></div>
-      <div id="taskList" class="task-list"></div>
-    </aside>
-    <section class="detail-panel">
-      <div class="panel-head"><div class="panel-title">Task Details</div><span id="detailBadge" class="status queued">none</span></div>
-      <div id="detail" class="detail-body"><div class="detail-empty">Select a task to follow its trace.</div></div>
-    </section>
-  </section>`;
+  // Cards fill the page directly (no panel chrome / "Tasks" header).
+  app.innerHTML = `<div id="roundTabs" class="round-tabs"></div>
+    <div id="taskGrid" class="task-grid"></div>`;
 }
 
-// ── status rendering (never touches #trace) ─────────────────────────────────────
+// ── task card ──────────────────────────────────────────────────────────────────
+// Fixed-size card: UID + a single status tag + open review-kind tags + indicators. Sized (in CSS,
+// with overflow:hidden) for the worst case so a tag can never bleed past the card. Clicking the
+// card body opens the detail overlay; review-kind tags open the review overlay (see cardKindTags).
+function taskCardHTML(task) {
+  const indicators = [
+    task.revising ? `<span class="tag ind ind-revising">Revising</span>` : "",
+    isRefining(task) ? `<span class="tag ind ind-refining">Updating</span>` : "",
+    lockedByOther(task) ? `<span class="tag ind ind-lock" title="Locked by another reviewer">🔒 In review</span>` : "",
+  ].join("");
+  return `<div class="task-card ${task.task_id === detailTaskId ? "selected" : ""}" onclick="openDetail('${js(task.task_id)}')">
+    <div class="card-uid">${esc(task.question_id)}</div>
+    <div class="card-tags">
+      <span class="tag status ${badgeClass(task)}">${esc(badgeLabel(task))}</span>
+      ${cardKindTags(task)}
+      ${indicators}
+    </div>
+  </div>`;
+}
+
+// ── status rendering ───────────────────────────────────────────────────────────
 function renderStatus() {
   document.getElementById("connection").textContent = round.connection_status || "-";
   document.getElementById("roundNum").textContent = round.round_num ?? "-";
@@ -157,75 +144,101 @@ function renderStatus() {
   if (selectedRoundTab == null || !rounds.includes(selectedRoundTab)) {
     selectedRoundTab = rounds.length ? rounds[rounds.length - 1] : null;
   }
+  // Sorted by UID and NOT by status, so a card never moves under you as its status changes.
   const visible = tasks
     .filter((t) => t.round_num === selectedRoundTab)
-    .sort((a, b) => reviewKindRank(a) - reviewKindRank(b) || statusRank(a) - statusRank(b) || String(a.question_id).localeCompare(String(b.question_id)));
+    .sort((a, b) => String(a.question_id).localeCompare(String(b.question_id)));
 
   document.getElementById("roundTabs").innerHTML = rounds.length > 1
     ? rounds.map((r) => `<button class="round-tab ${r === selectedRoundTab ? "active" : ""}" onclick="selectRoundTab(${Number(r)})">Round ${esc(r)}</button>`).join("")
     : "";
-  document.getElementById("taskCount").textContent = String(visible.length);
-  document.getElementById("taskList").innerHTML = visible.length
-    ? visible.map((task) => {
-        // Secondary chips (review kinds, Submit, Revising/Updating, lock) only appear on some
-        // rows; the status badge always does. Keep the status inline on the title line (top-right,
-        // unambiguously inside its own row) and drop the action chips onto a wrapping line below
-        // ONLY when there are any — so a plain PROCESSING row stays a tidy two lines.
-        const sideChips = [
-          task.revising ? `<span class="row-revising">Revising…</span>` : "",
-          isRefining(task) ? `<span class="row-refining">Updating extraction…</span>` : "",
-          lockedByOther(task) ? `<span class="row-locked" title="Locked by another reviewer">🔒 In review</span>` : "",
-          reviewChips(task),
-          task.status === "READY"
-            ? (lockedByOther(task)
-                ? `<span class="row-submit locked-out" title="Locked by another reviewer">Submit</span>`
-                : `<span class="row-submit" onclick="submitTask('${js(task.task_id)}', event)">Submit</span>`)
-            : "",
-        ].join("");
-        return `<button class="task-row ${task.task_id === selectedTaskId ? "selected" : ""}" onclick="selectTask('${js(task.task_id)}')">
-        <div class="row-inner">
-          <div class="row-head">
-            <div class="row-title">R${esc(task.round_num)} / ${esc(task.question_id)}</div>
-            <span class="status ${badgeClass(task)}">${esc(badgeLabel(task))}</span>
-          </div>
-          <div class="row-preview">${esc(task.prompt || "")}</div>
-          ${sideChips.trim() ? `<div class="row-side">${sideChips}</div>` : ""}
-        </div>
-      </button>`;
-      }).join("")
+  document.getElementById("taskGrid").innerHTML = visible.length
+    ? visible.map(taskCardHTML).join("")
     : `<div class="empty">No tasks yet.</div>`;
 
-  // Auto-follow the first task if nothing is selected; else patch the open detail header.
-  if (!selectedTaskId && visible.length) {
-    selectTask(visible[0].task_id);
-  } else if (selectedTaskId && !visible.some((t) => t.task_id === selectedTaskId)) {
-    // Selected task left the visible round; keep the stream but reflect it's not in view.
-    updateDetailHeader();
-  } else {
-    updateDetailHeader();
-  }
+  // Keep an open detail overlay's header/actions fresh (its trace is driven by its own stream).
+  if (detailTaskId) refreshDetail();
 }
 
-function updateDetailHeader() {
-  const task = tasks.find((t) => t.task_id === selectedTaskId);
+// ── detail overlay ──────────────────────────────────────────────────────────────
+function detailRoot() { return document.getElementById("detailOverlay"); }
+
+function openDetail(taskId) {
+  if (taskId === detailTaskId) return;
+  // reset trace state for the newly-opened task
+  if (taskSource) { taskSource.close(); taskSource = null; }
+  attemptOrder = [];
+  attemptBuffers.clear();
+  detailTaskId = taskId;
+
+  const task = tasks.find((t) => t.task_id === taskId);
+  const el = detailRoot();
+  el.innerHTML = `
+    <div class="detail-backdrop" onclick="closeDetailBackdrop(event)"></div>
+    <div class="detail-panel">
+      <div class="detail-head">
+        <div class="detail-head-title">
+          <span class="detail-task">R${esc(task?.round_num ?? "?")} / ${esc(task?.question_id ?? taskId)}</span>
+          <span id="detailBadge" class="status ${task ? badgeClass(task) : "queued"}">${esc(task ? badgeLabel(task) : "-")}</span>
+        </div>
+        <button class="detail-close" title="Close" onclick="closeDetail()">✕</button>
+      </div>
+      <div class="detail-scroll">
+        <div class="prompt-label">PROMPT</div>
+        <div class="prompt-text">${esc(task?.prompt || "")}</div>
+        <div class="answer-row">
+          <div><span class="k">Status</span><strong id="dStatus">${esc(task ? badgeLabel(task) : "-")}</strong></div>
+          <div><span class="k">Answer</span><strong id="dAnswer">${esc(task?.answer || "—")}</strong></div>
+        </div>
+        <div id="dActions" class="detail-actions"></div>
+        <div id="trace" class="trace-host"></div>
+      </div>
+    </div>`;
+  el.hidden = false;
+  renderDetailActions(task);
+  renderTrace();
+  // refresh the grid's selected highlight without waiting for the next status tick
+  document.querySelectorAll("#taskGrid .task-card").forEach((c) => c.classList.remove("selected"));
+
+  taskSource = new EventSource(`/api/stream/${encodeURIComponent(taskId)}`);
+  taskSource.onmessage = (e) => onTraceEvent(taskId, JSON.parse(e.data));
+}
+window.openDetail = openDetail;
+
+function closeDetail() {
+  if (taskSource) { taskSource.close(); taskSource = null; }
+  detailTaskId = null;
+  attemptOrder = [];
+  attemptBuffers.clear();
+  const el = detailRoot();
+  if (el) { el.hidden = true; el.innerHTML = ""; }
+  renderStatus();  // drop the card's selected highlight
+}
+window.closeDetail = closeDetail;
+
+function closeDetailBackdrop(event) {
+  if (event && event.target && event.target.classList.contains("detail-backdrop")) closeDetail();
+}
+window.closeDetailBackdrop = closeDetailBackdrop;
+
+// Patch the open overlay's header + actions in place from the latest snapshot (its trace is live
+// off its own stream). No-op if it's closed.
+function refreshDetail() {
+  const task = tasks.find((t) => t.task_id === detailTaskId);
   const badge = document.getElementById("detailBadge");
   if (badge) {
     badge.textContent = task ? badgeLabel(task) : "none";
     badge.className = `status ${task ? badgeClass(task) : "queued"}`;
   }
-  if (task) {
-    const st = document.getElementById("dStatus");
-    const ans = document.getElementById("dAnswer");
-    if (st) st.textContent = badgeLabel(task);
-    if (ans) ans.textContent = task.answer || "—";
-  }
+  const st = document.getElementById("dStatus");
+  const ans = document.getElementById("dAnswer");
+  if (st) st.textContent = task ? badgeLabel(task) : "-";
+  if (ans) ans.textContent = task?.answer || "—";
   renderDetailActions(task);
 }
 
-// ── manual submission ──────────────────────────────────────────────────────────
-// The Submit button (READY tasks) and the per-task scored feedback live in the detail
-// panel; status/feedback changes arrive over the status SSE stream and refresh through
-// updateDetailHeader -> renderDetailActions.
+// The Review (open overlay) + Submit buttons and the per-task feedback live in the detail overlay;
+// changes arrive over the status SSE stream and refresh through refreshDetail.
 function renderDetailActions(task) {
   const host = document.getElementById("dActions");
   if (!host) return;
@@ -238,11 +251,19 @@ function renderDetailActions(task) {
   if (isRefining(task)) {
     html += `<span class="detail-feedback refining">Updating extraction from your feedback…</span>`;
   }
-  if (reviewCount(task)) {
-    html += locked
-      ? `<button class="primary" disabled title="Locked by another reviewer">Review (${reviewCount(task)})</button>`
-      : `<button class="primary" onclick="openReview('${js(task.task_id)}', event)">Review (${reviewCount(task)})</button>`;
-  }
+  // One button per outstanding review KIND (e.g. "External Lookup", "Extract"), ordered by
+  // urgency, so the reviewer picks which to do first. Each opens the overlay straight to that kind.
+  const byKind = {};
+  for (const r of (task.reviews || [])) byKind[r.kind] = (byKind[r.kind] || 0) + 1;
+  html += Object.keys(byKind)
+    .sort((a, b) => (REVIEW_KIND_RANK[a] ?? 9) - (REVIEW_KIND_RANK[b] ?? 9))
+    .map((k) => {
+      const label = `${REVIEW_BUTTON_LABEL[k] || k}${byKind[k] > 1 ? ` (${byKind[k]})` : ""}`;
+      return locked
+        ? `<button class="primary" disabled title="Locked by another reviewer">${esc(label)}</button>`
+        : `<button class="primary" onclick="openReview('${js(task.task_id)}', '${js(k)}', event)">${esc(label)}</button>`;
+    })
+    .join("");
   if (task.status === "READY") {
     html += locked
       ? `<button class="primary" disabled title="Locked by another reviewer">Submit Answer</button>`
@@ -263,6 +284,7 @@ function renderDetailActions(task) {
   host.innerHTML = html;
 }
 
+// ── manual submission ──────────────────────────────────────────────────────────
 async function submitTask(taskId, event) {
   if (event) { event.stopPropagation(); event.preventDefault(); }
   try {
@@ -277,7 +299,7 @@ async function submitTask(taskId, event) {
 window.submitTask = submitTask;
 
 function flashSubmitError(taskId, message) {
-  const host = taskId === selectedTaskId ? document.getElementById("dActions") : null;
+  const host = taskId === detailTaskId ? document.getElementById("dActions") : null;
   if (host) {
     const note = document.createElement("span");
     note.className = "detail-feedback error";
@@ -289,47 +311,12 @@ function flashSubmitError(taskId, message) {
   }
 }
 
-// ── task selection + trace streaming ────────────────────────────────────────────
-function selectTask(taskId) {
-  if (taskId === selectedTaskId) return;
-  selectedTaskId = taskId;
-  // reset trace state for the newly-selected task
-  if (taskSource) { taskSource.close(); taskSource = null; }
-  attemptOrder = [];
-  attemptBuffers.clear();
-
-  const task = tasks.find((t) => t.task_id === taskId);
-  const detail = document.getElementById("detail");
-  detail.innerHTML = `
-    <div class="task-head">R${esc(task?.round_num ?? "?")} / ${esc(task?.question_id ?? taskId)}</div>
-    <div class="prompt-label">PROMPT</div>
-    <div class="prompt-text">${esc(task?.prompt || "")}</div>
-    <div class="answer-row">
-      <div><span class="k">Status</span><strong id="dStatus">${esc(task ? badgeLabel(task) : "-")}</strong></div>
-      <div><span class="k">Answer</span><strong id="dAnswer">${esc(task?.answer || "—")}</strong></div>
-    </div>
-    <div id="dActions" class="detail-actions"></div>
-    <div id="trace" class="trace-host"></div>`;
-  renderDetailActions(task);
-
-  // refresh list highlight without a full status re-render
-  document.querySelectorAll("#taskList .task-row").forEach((row) => row.classList.remove("selected"));
-  updateDetailHeader();
-  renderTrace();
-
-  taskSource = new EventSource(`/api/stream/${encodeURIComponent(taskId)}`);
-  taskSource.onmessage = (e) => onTraceEvent(taskId, JSON.parse(e.data));
-
-  // Selecting a task only shows its trace (read-only) — it no longer auto-opens the review
-  // overlay, so merely inspecting a question doesn't grab its review lock. The operator opens the
-  // reviewer explicitly via the Review button / review chip, which is what acquires the lock.
-}
-window.selectTask = selectTask;
-
-// The Review button on a task row opens the overlay without disturbing the current trace view.
-function openReview(taskId, event) {
+// ── review overlay open ──────────────────────────────────────────────────────────
+// kind (optional) jumps the overlay straight to that review kind (a card's review tag); null opens
+// the task's first review (the detail overlay's Review button).
+function openReview(taskId, kind, event) {
   if (event) { event.stopPropagation(); event.preventDefault(); }
-  ReviewOverlay.open(taskId);
+  ReviewOverlay.open(taskId, kind || undefined);
 }
 window.openReview = openReview;
 
@@ -339,8 +326,14 @@ function selectRoundTab(roundNum) {
 }
 window.selectRoundTab = selectRoundTab;
 
+// Esc closes the detail overlay (the review overlay manages its own dismissal).
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && detailTaskId && !ReviewOverlay.isOpen()) closeDetail();
+});
+
+// ── trace streaming (drives the detail overlay's #trace) ─────────────────────────
 function onTraceEvent(taskId, msg) {
-  if (taskId !== selectedTaskId) return; // a stale stream that hasn't closed yet
+  if (taskId !== detailTaskId) return; // a stale stream that hasn't closed yet
   const { attempt_id, event } = msg;
   let buf = attemptBuffers.get(attempt_id);
   if (!buf) { buf = []; attemptBuffers.set(attempt_id, buf); attemptOrder.push(attempt_id); }
@@ -353,10 +346,10 @@ function flushTrace() {
 }
 function renderTrace() {
   const host = document.getElementById("trace");
-  if (!host || !selectedTaskId) return;
-  TraceFlow.captureOpen(selectedTaskId, host); // snapshot open <details> before rebuild
+  if (!host || !detailTaskId) return;
+  TraceFlow.captureOpen(detailTaskId, host); // snapshot open <details> before rebuild
   const attempts = attemptOrder.map((id) => ({ attempt_id: id, events: attemptBuffers.get(id) || [] }));
-  host.innerHTML = TraceFlow.html(selectedTaskId, attempts);
+  host.innerHTML = TraceFlow.html(detailTaskId, attempts);
 }
 TraceFlow.onChange = renderTrace; // setRev / toggleEvent re-render through here
 
@@ -367,8 +360,8 @@ function connectStatus() {
     const data = JSON.parse(e.data);
     round = data.round || {};
     tasks = data.tasks || [];
-    // Keep the overlay's task data fresh BEFORE rendering, so a review resolved/cancelled
-    // elsewhere drops out live and any auto-open during renderStatus sees current reviews.
+    // Keep the review overlay's task data fresh BEFORE rendering so a review resolved/cancelled
+    // elsewhere drops out live.
     ReviewOverlay.syncTasks(tasks);
     renderStatus();
   };

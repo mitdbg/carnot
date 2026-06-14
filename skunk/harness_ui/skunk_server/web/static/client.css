@@ -33,24 +33,24 @@
   --blue-bg: #001524;
   --purple-bg: #150022;
 }
-html, body { min-height: 100%; }
+html, body { height: 100%; }
+/* Fluid full-height shell: header is the first flex child (always on top), the rest fills the
+   viewport and scrolls internally — so the console fits any window/zoom with no width cap. */
 body {
   margin: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
   background: var(--bg);
   color: var(--ink);
   font: 14px/1.45 Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 header {
-  position: sticky;
-  top: 0;
-  z-index: 3;
   background: rgba(13, 13, 13, 0.92);
   backdrop-filter: blur(12px);
   border-bottom: 1px solid var(--line);
 }
 .topbar {
-  max-width: 1480px;
-  margin: 0 auto;
   padding: 14px 20px;
   display: grid;
   grid-template-columns: minmax(260px, 1fr) auto;
@@ -82,9 +82,11 @@ h1 {
 }
 .pill strong { color: var(--ink); font-weight: 700; margin-left: 4px; }
 main {
-  max-width: 1480px;
-  margin: 0 auto;
-  padding: 16px 20px 32px;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 12px 16px;
 }
 /* Round timer lives in the header. It is the most important live value, so give it a
    slightly louder pill than the rest of the meta row. */
@@ -107,34 +109,11 @@ main {
   box-shadow: var(--shadow);
   margin-bottom: 12px;
 }
-.workspace {
-  display: grid;
-  grid-template-columns: minmax(320px, 440px) minmax(0, 1fr);
-  gap: 12px;
-  align-items: stretch;
-  min-height: calc(100vh - 240px);
-}
-.list-panel,
-.detail-panel {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  box-shadow: var(--shadow);
-  overflow: hidden;
-}
-.panel-head {
+#app {
+  flex: 1;
+  min-height: 0;
   display: flex;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 12px 14px;
-  border-bottom: 1px solid var(--line);
-  background: var(--bg1);
-  align-items: center;
-}
-.panel-title,
-.task-id {
-  font-weight: 750;
-  word-break: break-word;
+  flex-direction: column;
 }
 .round-tabs {
   display: flex;
@@ -144,6 +123,7 @@ main {
   background: var(--bg1);
   overflow-x: auto;
 }
+.round-tabs:empty { display: none; }
 .round-tab {
   border: 1px solid var(--line);
   background: var(--bg1);
@@ -161,45 +141,38 @@ main {
   background: var(--accent);
   border-color: var(--accent);
 }
-.task-list {
-  max-height: calc(100vh - 292px);
+/* Auto-fill grid of task cards: fixed-size cards, as many columns per row as the window allows,
+   filling the page width. Cards are sorted by UID and never reorder on status. The grid is the
+   flex-filling scroll region under the header. overflow:hidden on each card guarantees a status/
+   review tag can never bleed past the card boundary. */
+.task-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 10px;
+  padding: 12px;
+  align-content: start;
+  flex: 1;
+  min-height: 0;
   overflow: auto;
 }
-.task-row {
-  width: 100%;
-  /* The <button> is a plain BLOCK, not the flex container: a <button> doesn't reliably grow
-     to its flex content's height (min-height wins) in every engine, which let the chip row
-     overflow the bottom and collide with the next row. The real column layout lives on the
-     inner div (.row-inner) below, which grows normally; the button just grows to contain it. */
-  display: block;
-  padding: 12px 14px;
-  border: 0;
-  border-bottom: 1px solid var(--line);
-  border-radius: 0;
-  background: var(--panel);
-  color: var(--ink);
-  text-align: left;
+.task-grid > .empty { grid-column: 1 / -1; }
+.task-card {
+  height: 112px;            /* fixed; sized for the worst case (status + 4 kinds + 3 indicators) */
+  box-sizing: border-box;
+  overflow: hidden;         /* hard guarantee: a tag can never escape the card boundary */
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--bg1);
   cursor: pointer;
-  min-height: 76px;
 }
-.task-row:hover,
-.task-row.selected { background: var(--bg3); }
-/* Column layout on the inner div (a <button> doesn't reliably grow to flex content): the
-   title + status share the top line, the preview sits below, and any action chips (Lookup /
-   Extract / Visual QA / In Review / Revising / Updating / Submit) wrap onto a line beneath. */
-.row-inner { display: flex; flex-direction: column; gap: 6px; }
-/* Title line: question id on the left, status badge pinned top-right INSIDE the row so it can
-   never read as belonging to the next task. flex-start keeps the badge level with the first
-   title line even when a long id wraps. */
-.row-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
-.row-title { font-weight: 750; flex: 1; min-width: 0; }
-.row-preview {
-  color: var(--muted);
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-}
+.task-card:hover { background: var(--bg3); }
+.task-card.selected { border-color: var(--accent); }
+.card-uid { font-weight: 750; font-family: ui-monospace, monospace; font-size: 13px; }
+.card-tags { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 4px; overflow: hidden; }
 .status {
   display: inline-flex;
   align-items: center;
@@ -222,34 +195,36 @@ main {
 .status.submitted-zero { color: var(--bad); background: var(--red-bg); }
 .status.cancelled { color: var(--text3); background: var(--bg3); }
 .status.claimed { color: var(--accent-2); background: var(--blue-bg); }
-.row-side {
-  /* Full-width chip row beneath the title/preview. Wraps onto as many lines as needed;
-     the parent flex column grows to contain every line, so chips never overlap the next
-     row. Right-aligned to keep the status weight on the right edge as before. */
-  display: flex;
-  flex-direction: row;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 6px;
-}
-/* Inline Submit on READY rows. It's a <span> (the row itself is the <button>); the click
-   handler stopPropagation()s so submitting doesn't also select the task. */
-.row-submit {
+/* Compact card tags (status + review kinds + indicators). Defined AFTER .status so a card's
+   status tag (class "tag status <state>") takes this compact sizing while still drawing its
+   colour from the .status.<state> rule above. */
+.tag {
   display: inline-flex;
   align-items: center;
-  height: 22px;
-  padding: 2px 10px;
+  height: 19px;
+  max-width: 100%;
+  padding: 1px 7px;
   border-radius: 999px;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
-  cursor: pointer;
-  color: var(--bg1, #001a00);
-  background: var(--accent);
-  border: 1px solid var(--accent);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border: 1px solid var(--line);
 }
-.row-submit:hover { filter: brightness(1.1); }
+/* Review-kind tags are clickable (open that review directly). */
+.tag.kind-verify_extract { color: var(--yellow); background: var(--yellow-bg); cursor: pointer; }
+.tag.kind-lookup { color: var(--blue); background: var(--blue-bg); cursor: pointer; }
+.tag.kind-figure { color: var(--purple); background: var(--purple-bg); cursor: pointer; }
+.tag.kind-missing_data { color: var(--bad); background: var(--red-bg); cursor: pointer; }
+.tag[class*="kind-"]:hover { filter: brightness(1.15); }
+/* Non-clickable state indicators. */
+.tag.ind-revising { color: var(--blue); background: var(--blue-bg); }
+.tag.ind-refining { color: var(--warn); background: var(--yellow-bg); }
+.tag.ind-lock { color: var(--text3); background: var(--bg3); }
+.tag.locked-out { opacity: 0.55; cursor: not-allowed; filter: grayscale(0.6); }
 .intervention-list {
   display: grid;
   gap: 12px;
@@ -494,19 +469,29 @@ main {
 .corpus-document-empty.failed {
   color: var(--bad);
 }
-.detail-body {
-  padding: 14px;
-  max-height: calc(100vh - 292px);
-  overflow: auto;
+/* Detail/trace modal overlay (opened by clicking a task card). Mirrors the review overlay's
+   dimmed-backdrop + centered-panel pattern; lower z-index so the review overlay stacks above it. */
+#detailOverlay { position: fixed; inset: 0; z-index: 900; }
+#detailOverlay[hidden] { display: none; }
+.detail-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.6); }
+.detail-panel {
+  position: absolute; inset: 4vh 4vw;
+  display: flex; flex-direction: column;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: 10px; box-shadow: var(--shadow); overflow: hidden;
 }
-.detail-empty {
-  min-height: calc(100vh - 292px);
-  display: grid;
-  place-items: center;
-  padding: 24px;
-  color: var(--muted);
-  text-align: center;
+.detail-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 16px; border-bottom: 1px solid var(--line); background: var(--bg1);
 }
+.detail-head-title { display: flex; align-items: center; gap: 12px; }
+.detail-task { font-weight: 750; font-family: ui-monospace, monospace; }
+.detail-close {
+  background: transparent; border: 1px solid var(--border2); color: var(--muted);
+  width: 30px; height: 30px; border-radius: 6px; cursor: pointer; font-size: 15px;
+}
+.detail-close:hover { color: var(--ink); border-color: var(--ink); }
+.detail-scroll { flex: 1; overflow: auto; padding: 16px; }
 .prompt {
   margin: 0 0 12px;
   color: var(--ink);
@@ -765,10 +750,7 @@ textarea { width: 100%; min-height: 55px; }
 @media (max-width: 820px) {
   .topbar { grid-template-columns: 1fr; }
   .meta { justify-content: flex-start; }
-  .workspace { grid-template-columns: 1fr; }
-  .task-list,
-  .detail-body,
-  .detail-empty { max-height: none; min-height: auto; }
+  .task-grid { max-height: none; }
   .task-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .task-meta .answer-metric { grid-column: 1 / -1; }
 }
@@ -860,13 +842,12 @@ textarea { width: 100%; min-height: 55px; }
 .trace-flow .tblock { font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 560px; }
 .trace-flow .tblock.dropped { color: var(--text3); }
 
-/* read-only detail panel */
-.detail-body .task-head { font-family: ui-monospace, monospace; font-weight: 600; color: var(--text); margin-bottom: 10px; }
-.detail-body .prompt-label { font-size: 10px; letter-spacing: .08em; color: var(--text3); }
-.detail-body .prompt-text { color: var(--text); line-height: 1.5; margin: 4px 0 12px; }
-.detail-body .answer-row { display: flex; gap: 24px; flex-wrap: wrap; padding: 10px 12px; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; }
-.detail-body .answer-row .k { display: block; font-size: 10px; letter-spacing: .08em; color: var(--text3); margin-bottom: 2px; }
-.detail-body .answer-row strong { color: var(--good); font-family: ui-monospace, monospace; }
+/* read-only detail/trace overlay body */
+.detail-scroll .prompt-label { font-size: 10px; letter-spacing: .08em; color: var(--text3); }
+.detail-scroll .prompt-text { color: var(--text); line-height: 1.5; margin: 4px 0 12px; }
+.detail-scroll .answer-row { display: flex; gap: 24px; flex-wrap: wrap; padding: 10px 12px; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; }
+.detail-scroll .answer-row .k { display: block; font-size: 10px; letter-spacing: .08em; color: var(--text3); margin-bottom: 2px; }
+.detail-scroll .answer-row strong { color: var(--good); font-family: ui-monospace, monospace; }
 /* Manual-submit button + scored feedback below the answer row. */
 .detail-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; margin-bottom: 14px; }
 .detail-actions:empty { display: none; }
@@ -885,33 +866,11 @@ textarea { width: 100%; min-height: 55px; }
 .detail-feedback.incorrect { color: var(--bad); background: var(--red-bg); border-color: var(--bad); }
 .detail-feedback.pending { color: var(--warn); background: var(--yellow-bg); }
 .detail-feedback.error { color: var(--bad); background: var(--red-bg); border-color: var(--bad); }
-.detail-body .trace-host { display: block; }
+.detail-scroll .trace-host { display: block; }
 
 /* ── Human-review overlay ───────────────────────────────────────────────────────
    Full-viewport, dimmed backdrop over the whole app (the header timer stays visible
-   behind the shadow). The .row-review chip in the task list opens it. */
-.row-review {
-  display: inline-flex;
-  align-items: center;
-  height: 22px;
-  padding: 2px 10px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 700;
-  text-transform: uppercase;
-  white-space: nowrap;
-  cursor: pointer;
-  color: var(--bg);
-  background: var(--yellow);
-  border: 1px solid transparent;
-}
-.row-review:hover { filter: brightness(1.1); }
-/* Per-kind colors so the queue distinguishes lookups vs visual-QA vs extract at a glance. */
-.row-review.kind-lookup { background: var(--blue); color: #00121f; }
-.row-review.kind-figure { background: var(--purple); color: #14001f; }
-.row-review.kind-verify_extract { background: var(--yellow); color: #1f1a00; }
-.row-review.kind-missing_data { background: var(--bad); color: #1f0000; }
-
+   behind the shadow). A card's review-kind tag opens it. */
 #reviewOverlay { position: fixed; inset: 0; z-index: 1000; }
 #reviewOverlay[hidden] { display: none; }
 .review-backdrop {
@@ -923,8 +882,8 @@ textarea { width: 100%; min-height: 55px; }
   position: absolute;
   top: 50%; left: 50%;
   transform: translate(-50%, -50%);
-  width: min(1280px, 94vw);
-  height: min(880px, 90vh);
+  width: min(1500px, 96vw);
+  height: min(960px, 92vh);
   display: flex; flex-direction: column;
   background: var(--panel);
   border: 1px solid var(--border2);
@@ -1019,6 +978,8 @@ textarea { width: 100%; min-height: 55px; }
 .review-submit:hover, .review-accept:hover { filter: brightness(1.1); }
 .review-error { color: var(--bad); font-size: 12px; }
 
+/* The action controls (refine box + Submit/Accept) render both above and below the editor. */
+.review-controls { display: flex; flex-direction: column; gap: 10px; }
 /* ── Natural-language refine (verify_extract): feedback box + post-refine toast ──── */
 .review-refine {
   display: flex; flex-direction: column; gap: 6px;
@@ -1083,46 +1044,14 @@ textarea { width: 100%; min-height: 55px; }
   .review-panel.with-viewer .review-left { flex: 0 0 auto; border-right: none; border-bottom: 1px solid var(--line); }
 }
 
-/* ── Review polish: revising chip, context line, decluttered value cards ──────── */
-/* A status-row chip, same footprint as .row-submit / .row-review so the column never overlaps. */
-.row-revising {
-  display: inline-flex;
-  align-items: center;
-  height: 22px;
-  padding: 2px 10px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 700;
-  text-transform: uppercase;
-  white-space: nowrap;
-  color: var(--blue);
-  background: var(--blue-bg);
-  border: 1px solid var(--border2);
-  animation: review-pulse 1.4s ease-in-out infinite;
-}
+/* ── Review polish: revising/refining feedback, context line, value cards ──────── */
 .detail-feedback.revising { color: var(--blue); font-size: 12px; }
-/* Same chip footprint as .row-revising; warm tone to distinguish an extraction refine (an LLM
-   reworking the candidates) from a compute recompute (.row-revising, blue). */
-.row-refining {
-  display: inline-flex;
-  align-items: center;
-  height: 22px;
-  padding: 2px 10px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 700;
-  text-transform: uppercase;
-  white-space: nowrap;
-  color: var(--warn);
-  background: var(--yellow-bg);
-  border: 1px solid var(--border2);
-  animation: review-pulse 1.4s ease-in-out infinite;
-}
 .detail-feedback.refining { color: var(--warn); font-size: 12px; }
+/* Pulse — also used by the review overlay's "Updating extraction…" status. */
 @keyframes review-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
 
 /* ── Review lock (another operator is annotating this UID) ──────────────────────── */
-/* Greyed, un-clickable variant of the row-review / row-submit action chips. */
+/* Greyed, un-clickable variant of the action chips / card review tags. */
 .locked-out {
   cursor: not-allowed;
   pointer-events: none;
@@ -1130,21 +1059,6 @@ textarea { width: 100%; min-height: 55px; }
   filter: grayscale(1);
 }
 button.primary[disabled] { opacity: 0.4; cursor: not-allowed; filter: grayscale(1); }
-/* Lock indicator chip in the task row, same footprint as the other row-side chips. */
-.row-locked {
-  display: inline-flex;
-  align-items: center;
-  height: 22px;
-  padding: 2px 10px;
-  border-radius: 999px;
-  font-size: 11px;
-  font-weight: 700;
-  text-transform: uppercase;
-  white-space: nowrap;
-  color: var(--muted);
-  background: var(--blue-bg);
-  border: 1px solid var(--border2);
-}
 
 .review-context {
   font-size: 12px;

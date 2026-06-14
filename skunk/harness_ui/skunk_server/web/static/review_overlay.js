@@ -140,7 +140,9 @@ const ReviewOverlay = (function () {
     if (heartbeatTimer !== null) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
   }
 
-  async function open(taskId) {
+  // `kind` (optional) jumps straight to that review kind (a card's review-kind tag); falls back
+  // to the first review when absent (the detail overlay's Review button).
+  async function open(taskId, kind) {
     const task = tasksRef.find((t) => t.task_id === taskId);
     if (!task || !(task.reviews || []).length) return;
     // Acquire the per-UID lock BEFORE showing anything, so two operators can't open the same
@@ -149,16 +151,18 @@ const ReviewOverlay = (function () {
     if (!held) { alert("This question is being reviewed by someone else."); return; }
     activeTaskId = taskId;
     reviews = sortReviews(task.reviews);
-    index = 0;
+    index = kind ? Math.max(0, reviews.findIndex((r) => r.kind === kind)) : 0;
     preRefineCandidates = null;
     lastRefining = !!(current() && current().refining);  // so a reopen mid-refine shows the spinner
     startHeartbeat();
+    window.addEventListener("resize", onViewerResize);  // re-fit the page on window/zoom change
     render();
   }
 
   function close() {
     const taskId = activeTaskId;
     stopHeartbeat();
+    window.removeEventListener("resize", onViewerResize);
     activeTaskId = null;
     reviews = [];
     index = 0;
@@ -166,6 +170,11 @@ const ReviewOverlay = (function () {
     if (el) el.hidden = true;
     releaseLock(taskId);  // free the lock for other operators (idempotent if we didn't hold it)
   }
+
+  // Re-fit the current page when the window resizes or the browser zoom changes, so the operator
+  // never has to manually zoom per screen. rAF-coalesced via scheduleFit; resets pan/zoom (the
+  // intent on a viewport-size change).
+  function onViewerResize() { if (isOpen() && pages.length) scheduleFit(); }
 
   // Re-read the live snapshot WITHOUT clobbering the operator's work. Status snapshots arrive
   // every tick, so we must NOT rebuild the DOM (which would wipe in-progress edits and reset the
@@ -334,27 +343,37 @@ const ReviewOverlay = (function () {
       label.textContent = `Treasury Bulletin ${pg.month}  ·  p.${pg.page}  (${pageIdx + 1}/${pages.length})${vals}`;
     }
   }
-  // Fit the loaded page to the viewport and center it. Called on each image load (natural size is
-  // only known then); the fit scale also becomes the minimum zoom so the whole page is reachable.
+  // Fit the loaded page to the viewport and center it; the fit scale also becomes the minimum
+  // zoom so the whole page is always reachable. Returns false (so scheduleFit retries) when the
+  // viewport or image isn't measurable yet — the prior `|| 1` fallback on a 0-sized viewport is
+  // what produced the blown-up "ridiculously zoomed" open.
   function fitPage() {
     const vp = root() && root().querySelector(".review-viewport");
     const img = root() && root().querySelector(".review-page-img");
-    if (!vp || !img || !img.naturalWidth) return;
+    if (!vp || !img) return false;
     const vw = vp.clientWidth, vh = vp.clientHeight;
-    fitScale = Math.min(vw / img.naturalWidth, vh / img.naturalHeight) || 1;
+    if (!vw || !vh || !img.naturalWidth || !img.naturalHeight) return false;  // not laid out yet
+    fitScale = Math.min(vw / img.naturalWidth, vh / img.naturalHeight);
     zoom = fitScale;
     panX = (vw - img.naturalWidth * zoom) / 2;
     panY = (vh - img.naturalHeight * zoom) / 2;
     applyTransform();
+    return true;
+  }
+  // Fit on the next frame (after the panel + image have laid out), retrying a few frames until the
+  // viewport/image are measurable. Used on open, page change, and window resize / browser-zoom.
+  function scheduleFit(tries) {
+    tries = tries == null ? 12 : tries;
+    requestAnimationFrame(() => { if (!fitPage() && tries > 0) scheduleFit(tries - 1); });
   }
   function setPage(i) {
     if (!pages.length) return;
     pageIdx = Math.max(0, Math.min(pages.length - 1, i));
     const img = root().querySelector(".review-page-img");
     if (img) {
-      img.onload = fitPage;                  // fit once the new page's natural size is known
+      img.onload = () => scheduleFit();      // fit once the new page's natural size is known
       img.src = `/api/source/${pages[pageIdx].month}/page/${pages[pageIdx].page}.png`;
-      if (img.complete && img.naturalWidth) fitPage();  // cached image: onload may not refire
+      scheduleFit();                          // cached image / already-laid-out: fit post-layout
     }
   }
   function wireViewer() {
@@ -376,6 +395,35 @@ const ReviewOverlay = (function () {
     vp.addEventListener("mousedown", (e) => { dragging = true; sx = e.clientX - panX; sy = e.clientY - panY; vp.classList.add("is-panning"); });
     window.addEventListener("mousemove", (e) => { if (!dragging) return; panX = e.clientX - sx; panY = e.clientY - sy; applyTransform(); });
     window.addEventListener("mouseup", () => { dragging = false; vp.classList.remove("is-panning"); });
+  }
+
+  // The action controls, rendered both above and below the editor. For verify_extract this
+  // includes the natural-language feedback box (the LLM revises all candidate JSONs at once;
+  // `review.refining` drives the busy/spinner state). Submit always; Accept-as-is unless
+  // missing_data. Uses CLASSES (not ids) since it appears twice — refine()/submit()/showError
+  // operate across both copies.
+  function controlsBar(review) {
+    const isMissing = review.kind === "missing_data";
+    const isExtract = review.kind === "verify_extract";
+    const busy = !!review.refining;
+    const refine = isExtract ? `
+      <div class="review-refine">
+        <div class="review-section-label">Revise with natural-language feedback</div>
+        <textarea class="review-refine-input" rows="3" ${busy ? "disabled" : ""}
+          placeholder="Describe a correction for the LLM to apply across the values — e.g. 'every value is the next year's figure; shift them all back one year.'"></textarea>
+        <div class="review-refine-actions">
+          <button class="review-refine-btn" onclick="ReviewOverlay.refine()" ${busy ? "disabled" : ""}>${busy ? "✨ Updating extraction…" : "Apply feedback"}</button>
+          <span class="review-refine-status ${busy ? "is-busy" : ""}">${busy ? "Working… you can leave and come back." : ""}</span>
+        </div>
+      </div>` : "";
+    return `<div class="review-controls">
+      ${refine}
+      <div class="review-actions">
+        <button class="review-submit primary" onclick="ReviewOverlay.submit()">Submit</button>
+        ${isMissing ? "" : `<button class="review-accept" onclick="ReviewOverlay.acceptAsIs()" title="Keep the model's answer unchanged">Accept as-is</button>`}
+        <span class="review-error"></span>
+      </div>
+    </div>`;
   }
 
   // ── render ───────────────────────────────────────────────────────────────────
@@ -413,22 +461,11 @@ const ReviewOverlay = (function () {
       editor = renderCards(cands);
       editorLabel = "";
     }
-    // verify_extract gets a natural-language feedback box: the reviewer describes a correction
-    // (e.g. an off-by-one-year shift) and an LLM revises ALL the candidate JSONs at once. The
-    // refine runs async on the backend (review.refining drives the spinner), so reopening a review
-    // mid-refine shows the in-progress state; completion re-renders the cards via syncTasks.
-    const isExtract = review.kind === "verify_extract";
-    const busy = !!review.refining;
-    const refineSection = isExtract ? `
-      <div class="review-refine">
-        <div class="review-section-label">Revise with natural-language feedback</div>
-        <textarea id="refineFeedback" class="review-refine-input" rows="3" ${busy ? "disabled" : ""}
-          placeholder="Describe a correction for the LLM to apply across the values — e.g. 'every value is the next year's figure; shift them all back one year.'"></textarea>
-        <div class="review-refine-actions">
-          <button class="review-refine-btn" onclick="ReviewOverlay.refine()" ${busy ? "disabled" : ""}>${busy ? "✨ Updating extraction…" : "Apply feedback"}</button>
-          <span class="review-refine-status ${busy ? "is-busy" : ""}">${busy ? "Working… you can leave and come back." : ""}</span>
-        </div>
-      </div>` : "";
+    // The controls (NL-feedback box for verify_extract + Submit + Accept-as-is) are rendered BOTH
+    // above and below the editor, so a long JSON list can be acted on without scrolling to the
+    // bottom. The editor itself stays single in the middle.
+    const topControls = isMissing ? "" : controlsBar(review);
+    const bottomControls = controlsBar(review);
     const viewer = pages.length ? `
       <div class="review-viewer">
         <div class="review-viewer-bar">
@@ -456,14 +493,10 @@ const ReviewOverlay = (function () {
             <div class="review-prompt">${esc(task?.prompt || "")}</div>
             ${ctx ? `<div class="review-context">${esc(ctx)}</div>` : ""}
             <div class="review-instructions">${esc(review.instructions || "")}</div>
+            ${topControls}
             ${editorLabel}
             <div class="review-editor">${editor}</div>
-            ${refineSection}
-            <div class="review-actions">
-              <button class="review-submit primary" onclick="ReviewOverlay.submit()">Submit</button>
-              ${isMissing ? "" : `<button class="review-accept" onclick="ReviewOverlay.acceptAsIs()" title="Keep the model's answer unchanged">Accept as-is</button>`}
-              <span class="review-error" id="reviewError"></span>
-            </div>
+            ${bottomControls}
           </div>
           ${viewer}
         </div>
@@ -487,8 +520,8 @@ const ReviewOverlay = (function () {
   }
 
   function showError(msg) {
-    const e = document.getElementById("reviewError");
-    if (e) e.textContent = msg;
+    const r = root();
+    if (r) r.querySelectorAll(".review-error").forEach((e) => { e.textContent = msg; });
   }
 
   async function post(review, response) {
@@ -549,17 +582,23 @@ const ReviewOverlay = (function () {
   // LLM (async). We don't close or block here: the status snapshot flips review.refining, and
   // syncTasks drives the spinner + the re-render with the result. preRefineCandidates is stashed
   // so the post-refine toast can offer a one-click Undo (purely client-side, off the live DOM).
+  // The feedback box + Apply button appear twice (top and bottom). Read whichever copy the
+  // reviewer typed in; disable both Apply buttons while the refine is in flight.
+  function refineButtons() { return [...root().querySelectorAll(".review-refine-btn")]; }
+  function setRefineBusy(busy) {
+    refineButtons().forEach((b) => { b.disabled = busy; b.textContent = busy ? "✨ Updating extraction…" : "Apply feedback"; });
+  }
+
   async function refine() {
     const review = current();
     if (!review || review.kind !== "verify_extract") return;
-    const ta = root().querySelector("#refineFeedback");
-    const feedback = (ta ? ta.value : "").trim();
+    const feedback = [...root().querySelectorAll(".review-refine-input")]
+      .map((i) => i.value.trim()).find((v) => v) || "";
     if (!feedback) { showError("Enter feedback describing the correction."); return; }
     let candidatesPayload;
     try { candidatesPayload = collectFullCandidates(); } catch (err) { showError(String(err)); return; }
     preRefineCandidates = candidatesPayload;
-    const btn = root().querySelector(".review-refine-btn");
-    if (btn) { btn.disabled = true; btn.textContent = "✨ Updating extraction…"; }
+    setRefineBusy(true);
     showError("");
     try {
       const resp = await fetch(`/api/reviews/${encodeURIComponent(review.review_id)}/refine`, {
@@ -570,14 +609,14 @@ const ReviewOverlay = (function () {
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok || !data.ok) {
         showError(data.error || `refine failed (${resp.status})`);
-        if (btn) { btn.disabled = false; btn.textContent = "Apply feedback"; }
+        setRefineBusy(false);
         return;
       }
       // Success: the backend set review.refining=true and published; syncTasks takes over from
       // here (spinner now, revised cards + toast on completion). Nothing more to do.
     } catch (err) {
       showError(String(err));
-      if (btn) { btn.disabled = false; btn.textContent = "Apply feedback"; }
+      setRefineBusy(false);
     }
   }
 
