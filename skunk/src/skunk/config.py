@@ -218,7 +218,7 @@ class SkunkConfig:
         # Route per-stage models through the override registry so `PromptedCall` resolves them
         # like every other call-site. Defaulted here unless a run pins them explicitly
         # (SKUNK_MODEL_OVERRIDES=stage=… or, for the filter, SKUNK_SEMFILTER_MODEL). Efforts
-        # come from each call-site's `default_effort` (compute=high; planner/replanner/extract=medium),
+        # come from each call-site's `default_effort` (compute=high, planner=high; replanner/extract=medium),
         # overridable via SKUNK_EFFORT_OVERRIDES.
         # - semfilter: the cheap coarse filter runs on flash-lite.
         # - extract.{text,vision}: flash, medium thinking. Pro is the stronger read
@@ -226,13 +226,17 @@ class SkunkConfig:
         #   parallel select-agent fan-out; pin Pro back per-run via SKUNK_MODEL_OVERRIDES. The
         #   default path is the `text` tier; `vision` is the fallback.
         # - compute.codegen: flash — codegen/reasoning over the extracted values (high thinking).
-        # - replanner: flash — recovering a failed plan runs flash at medium thinking; the initial
-        #   planner also runs flash (the common path).
-        # Everything else (planner, toc_pick, …) runs on the base `llm_model` (flash).
+        # - replanner: flash — recovering a failed plan runs flash at medium thinking.
+        # - planner: 3.1 Pro at high thinking. The initial plan's decomposition quality
+        #   (branch coverage, operator routing, period fidelity) is worth the per-question
+        #   cost — the flash planner systematically dropped/misrouted branches that Pro/high
+        #   gets right (plan-probe 2026-06-14: 19/20 known-bad dev plans fixed).
+        # Everything else (toc_pick, …) runs on the base `llm_model` (flash).
         self.model_overrides.setdefault("semfilter", "gemini-3.1-flash-lite")
         self.model_overrides.setdefault("extract.text", "gemini-3.5-flash")
         self.model_overrides.setdefault("extract.vision", "gemini-3.5-flash")
         self.model_overrides.setdefault("compute.codegen", "gemini-3.1-pro-preview")
+        self.model_overrides.setdefault("planner", "gemini-3.1-pro-preview")
         self.model_overrides.setdefault("replanner", "gemini-3.5-flash")
 
     @classmethod

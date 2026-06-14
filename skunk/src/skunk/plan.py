@@ -228,7 +228,7 @@ Rules:
     _prompt = PromptedCall(
         name="planner",
         system_prompt=_INITIAL_PLAN_PROMPT,
-        default_effort="medium",
+        default_effort="high",
         parse=_parse_plan,
         output_instruction="Output the Plan as a single bare JSON object — no markdown fences, no prose.",
     )
