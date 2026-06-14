@@ -7,7 +7,7 @@ import asyncio
 
 import pytest
 
-from skunk.common import AnnotatedValue, BlockRef, ExecutionContext, PageRef
+from skunk.common import AnnotatedValue, BlockRef, ExecutionContext, Final, PageRef
 from skunk.config import SkunkConfig
 from skunk.human import (
     HumanAssist,
@@ -115,7 +115,6 @@ def test_register_verify_passes_branch_identity_and_candidates() -> None:
         "kind": "retrieve",
         "key": "total receipts",
         "period": "1954-02",
-        "as_of": None,
         "visual_only": False,
     }
     assert g["candidates"][0]["value"] == {"r": {"c": 1}}
@@ -196,7 +195,7 @@ def test_recompute_answer_applies_override_and_keeps_other_branches(
     class FakeCompute:
         async def run(self, entries, ctx, concept_explanations=()):
             seen["entries"] = list(entries)
-            return "ANSWER=" + ",".join(str(e.value) for e in entries)
+            return Final("ANSWER=" + ",".join(str(e.value) for e in entries))
 
     monkeypatch.setattr(orch_mod, "ComputeOp", FakeCompute)
 

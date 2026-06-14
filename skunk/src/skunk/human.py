@@ -122,6 +122,25 @@ def _value_page_attribution(
     return refs, page_values
 
 
+def _figure_value_template(branch: RetrieveBranch, entries: list[AnnotatedValue]) -> str:
+    """The figure path's editor: a pre-filled `AnnotatedValue` JSON the human edits while reading
+    the chart. The model's chart reads are unreliable, so they must NOT anchor the human as confirm-
+    or-correct cards do — instead the box states the job. `description` is the RETRIEVAL TARGET
+    (`branch.key`, the concept the value must serve), so it says what to read off the page, not what
+    the model guessed. Each item keeps `_src` (its candidate index) so a recompute overlays the
+    human's value onto that entry and preserves its kind + machine provenance; the model's value
+    rides along as a shape scaffold the human overwrites. With no candidates it's a single fresh
+    scalar. Pretty-printed JSON (an object for the fresh case, a list when scaffolded)."""
+    target = branch.key or ""
+    if not entries:
+        return json.dumps({"description": target, "value": "", "unit": ""}, indent=2)
+    items = [
+        {"_src": i, "description": target, "value": e.value, "unit": e.unit, "kind": e.kind}
+        for i, e in enumerate(entries)
+    ]
+    return json.dumps(items, indent=2)
+
+
 def _branch_identity(branch: Branch) -> dict:
     """The branch's structural identity, carried in a review's guidance so a later recompute can
     target the right branch. Mirrors the `searched` block of the missing-data guidance."""
@@ -130,7 +149,6 @@ def _branch_identity(branch: Branch) -> dict:
             "kind": "retrieve",
             "key": branch.key,
             "period": branch.period,
-            "as_of": branch.as_of,
             "visual_only": branch.visual_only,
         }
     return {"kind": "lookup_external", "target": branch.target, "src": branch.src}
@@ -157,6 +175,9 @@ class HumanRequest:
     # Per-page value attribution [{month,page,values:[desc,...]}] — which extracted value(s) came
     # from each page, so the viewer can caption a page with its bulletin + value(s).
     page_values: list[dict] = field(default_factory=list)
+    # Figure task only: a pre-filled AnnotatedValue JSON template (description = retrieval target)
+    # the human edits while reading the chart, in place of confirm/correct candidate cards.
+    value_template: str | None = None
     branch: Branch | None = None
 
 
@@ -248,7 +269,12 @@ class ConsoleChannel:
         print(req.instruction)
         for i, p in enumerate(image_paths, 1):
             print(f"  image {i}/{len(image_paths)}: {p}")
-        if req.candidates:
+        if req.value_template is not None:
+            # Figure path: the pre-filled template (description = retrieval target) is what to edit,
+            # not the model's unreliable read.
+            print("\nTemplate to fill (description = retrieval target):")
+            print(req.value_template)
+        elif req.candidates:
             print("\nModel's current answer:")
             print(_candidates_json(req.candidates))
         print(
@@ -301,6 +327,8 @@ class BrokerChannel:
             "fields": list(_FIELDS),
             "page_values": req.page_values,
         }
+        if req.value_template is not None:
+            guidance["value_template"] = req.value_template
         ctx.emit(
             f"human_request task={req.task} candidates={len(req.candidates)} "
             f"n_pages={len(source_docs)} via=broker",
@@ -417,6 +445,9 @@ class HumanAssist:
                 candidates=entries,
                 pages=refs,
                 page_values=page_values,
+                value_template=(
+                    _figure_value_template(branch, entries) if branch.visual_only else None
+                ),
                 branch=branch,
             ),
             ctx,
@@ -486,6 +517,10 @@ class HumanAssist:
             "fields": list(_FIELDS),
             "page_values": page_values,
         }
+        if branch.visual_only:
+            # Figure path: hand the human a pre-filled AnnotatedValue JSON template to read the
+            # value off the chart, instead of confirm/correct cards built on the unreliable read.
+            guidance["value_template"] = _figure_value_template(branch, entries)
         review_id = register(
             task, instruction, ctx.question, _pagerefs_to_docstrings(refs), guidance
         )

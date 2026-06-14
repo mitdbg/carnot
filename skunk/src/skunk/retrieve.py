@@ -123,15 +123,25 @@ class RetrieveOp:
                     branches,
                     document_scopes=scopes,
                 )
-                return [
-                    StepFailed(
-                        "retrieve",
-                        f"semantic filter kept no blocks for branch {b.key!r}",
-                    )
-                    if not brs
-                    else BranchRetrieval(blocks=tuple(brs), pre_selected=False)
-                    for b, brs in zip(branches, survivors)
-                ]
+                results: list[BranchRetrieval | StepFailed] = []
+                for b, brs in zip(branches, survivors):
+                    if not brs:
+                        reason = (
+                            f"page_pin {b.page_pin.bulletin}:{b.page_pin.page} resolved to no catalog page"
+                            if b.page_pin is not None
+                            else f"semantic filter kept no blocks for branch {b.key!r}"
+                        )
+                        results.append(StepFailed("retrieve", reason))
+                    else:
+                        # A page-pinned branch is a deterministic positional FETCH: mark it
+                        # pre_selected so block_select keeps both resolved pages whole instead
+                        # of dropping them on a topic mismatch — they go straight to extract.
+                        results.append(
+                            BranchRetrieval(
+                                blocks=tuple(brs), pre_selected=b.page_pin is not None
+                            )
+                        )
+                return results
             case other:
                 raise StepFailed(
                     "retrieve",
@@ -159,19 +169,11 @@ class RetrieveOp:
             ),
             required_bulletins=required_bulletins,
         )
-        # `as_of` is a SOFT hint to the search agent only (block_select owns issue choice);
-        # render a per-entry pin list to its pinned months as free text.
-        as_of_hint = (
-            ", ".join(m for m in branch.as_of if m) or None
-            if isinstance(branch.as_of, list)
-            else branch.as_of
-        )
         page_keys = await agent.retrieve(
             ctx,
             ctx.question,
             branch_key=branch.key,
             branch_period=branch.period,
-            branch_as_of=as_of_hint,
             required_bulletins=required_bulletins,
         )
         refs: list[PageRef] = []

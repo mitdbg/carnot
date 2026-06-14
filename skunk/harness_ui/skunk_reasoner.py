@@ -480,7 +480,6 @@ def _branch_search_details(branch: dict[str, Any]) -> dict[str, Any]:
         return {
             "key": branch.get("key"),
             "period": branch.get("period"),
-            "as_of": branch.get("as_of"),
             "visual_only": branch.get("visual_only"),
         }
     return {
