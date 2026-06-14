@@ -575,6 +575,26 @@ def _provenance_str(e: AnnotatedValue) -> str:
     return " ".join(parts)
 
 
+# Above this many axis labels, `_join_labels` elides the middle: a pathological frame
+# (e.g. a multi-decade monthly series, 1000s of rows) would otherwise render thousands of
+# labels into one untrimmed prompt line and push the codegen / replan request past the
+# model's input-token ceiling. Generated code can still read the full `.frame.index` at
+# runtime, so eliding the middle here loses nothing for selection logic.
+_MAX_RENDERED_LABELS = 200
+_LABEL_EDGE = 100
+
+
+def _join_labels(labels: list[str]) -> str:
+    """Comma-join axis labels, eliding the middle when there are more than
+    `_MAX_RENDERED_LABELS` so one frame can't blow up the prompt size."""
+    if len(labels) <= _MAX_RENDERED_LABELS:
+        return ", ".join(labels)
+    elided = len(labels) - 2 * _LABEL_EDGE
+    head = ", ".join(labels[:_LABEL_EDGE])
+    tail = ", ".join(labels[-_LABEL_EDGE:])
+    return f"{head}, … ({elided} of {len(labels)} labels elided) …, {tail}"
+
+
 def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
     """Full view of one `AnnotatedValue`: the meta line (kind/shape/dtypes), then — for
     non-scalars — the entire frame rendered cell-by-cell via `df.to_string()`. Values are
@@ -612,7 +632,7 @@ def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
     if e.kind == "vector":
         lines.append(f"{_PAD}dtype: {df.dtypes.iloc[0]}")
     else:
-        cols = ", ".join(str(c) for c in df.columns)
+        cols = _join_labels([str(c) for c in df.columns])
         dtypes = ", ".join(str(t) for t in df.dtypes)
         lines.append(f"{_PAD}columns: [{cols}]   dtypes: [{dtypes}]")
 

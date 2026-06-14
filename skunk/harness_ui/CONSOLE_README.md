@@ -3,9 +3,15 @@
 ## Quick Start
 
 ```bash
-cd /home/gerardo/carnot/skunk/harness_ui
-REASONER=dummy_agent:solve ./serve_local_console.sh
+cd harness_ui
+# Terminal 1 — the Cup question/scoring server (Databricks plays this role in the real Cup):
+./run_practice_server.sh --questions /tmp/q.json   # generate q.json with make_practice_questions.py
+# Terminal 2 — our solution (agent backend + web UI), defaults to the local practice server above:
+REASONER=dummy_agent:solve ./run_solution.sh
 ```
+
+For the real competition, skip `run_practice_server.sh` and point the solution at the host's Cup:
+`./run_solution.sh --cup-base-url https://cup.databricks.example --team-token "$TOKEN"`.
 
 - Access the UI at `http://localhost:8790`
 - The dummy agent simulates 1-5 seconds processing delay per question
@@ -21,7 +27,7 @@ The launcher spawns exactly three long-running processes:
 
 ## Launcher Variables
 
-All variables are defined inside `serve_local_console.sh` unless overridden via environment:
+All variables are defined inside `run_solution.sh` / `run_practice_server.sh` unless overridden via environment:
 
 | Variable        | Purpose                        | Default (script)              |
 |-----------------|--------------------------------|-------------------------------|
@@ -133,4 +139,4 @@ declared in `harness_ui/requirements.txt`.
 
 ## Notes
 
-- The legacy `competition_console.py` is retained in the repository but is **not launched** by `serve_local_console.sh`.
+- The legacy `competition_console.py` is retained in the repository but is **not launched** by `run_solution.sh`.

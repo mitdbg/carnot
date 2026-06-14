@@ -73,9 +73,10 @@ modules remain the boundary between the Competition Server and Skunk Server.
 Each labeled box corresponds to one actual Python file.
 
 The legacy `harness_ui/competition_console.py` is retained in the repository
-but is no longer the active entry point. The `serve_local_console.sh` script
-now launches the three-process architecture: practice_server, skunk_server,
-and skunk_client.
+but is no longer the active entry point. The three-process architecture is now
+launched by two scripts: `run_practice_server.sh` (the Cup question/scoring
+server — the role Databricks plays in the real Cup) and `run_solution.sh` (our
+agent backend + web UI).
 
 ## 2. Component Responsibilities
 
@@ -879,7 +880,7 @@ harness_ui/
   competition_console.py     # legacy monolithic implementation (retained)
 ```
 
-The three-process architecture is launched by `serve_local_console.sh`:
-`practice_server.py` (Cup substitute),
-`python -m skunk_server.server` (new core),
-and `python -m skunk_client.client` (UI process).
+The three-process architecture is launched by two scripts —
+`run_practice_server.sh` runs `practice_server.py` (Cup substitute), and
+`run_solution.sh` runs `python -m skunk_server.server` (new core)
+and `python -m skunk_server.web_app` (UI process).
