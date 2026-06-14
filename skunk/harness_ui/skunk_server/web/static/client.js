@@ -166,26 +166,33 @@ function renderStatus() {
     : "";
   document.getElementById("taskCount").textContent = String(visible.length);
   document.getElementById("taskList").innerHTML = visible.length
-    ? visible.map((task) => `<button class="task-row ${task.task_id === selectedTaskId ? "selected" : ""}" onclick="selectTask('${js(task.task_id)}')">
+    ? visible.map((task) => {
+        // Secondary chips (review kinds, Submit, Revising/Updating, lock) only appear on some
+        // rows; the status badge always does. Keep the status inline on the title line (top-right,
+        // unambiguously inside its own row) and drop the action chips onto a wrapping line below
+        // ONLY when there are any — so a plain PROCESSING row stays a tidy two lines.
+        const sideChips = [
+          task.revising ? `<span class="row-revising">Revising…</span>` : "",
+          isRefining(task) ? `<span class="row-refining">Updating extraction…</span>` : "",
+          lockedByOther(task) ? `<span class="row-locked" title="Locked by another reviewer">🔒 In review</span>` : "",
+          reviewChips(task),
+          task.status === "READY"
+            ? (lockedByOther(task)
+                ? `<span class="row-submit locked-out" title="Locked by another reviewer">Submit</span>`
+                : `<span class="row-submit" onclick="submitTask('${js(task.task_id)}', event)">Submit</span>`)
+            : "",
+        ].join("");
+        return `<button class="task-row ${task.task_id === selectedTaskId ? "selected" : ""}" onclick="selectTask('${js(task.task_id)}')">
         <div class="row-inner">
-          <div class="row-main">
+          <div class="row-head">
             <div class="row-title">R${esc(task.round_num)} / ${esc(task.question_id)}</div>
-            <div class="row-preview">${esc(task.prompt || "")}</div>
-          </div>
-          <div class="row-side">
             <span class="status ${badgeClass(task)}">${esc(badgeLabel(task))}</span>
-            ${task.revising ? `<span class="row-revising">Revising…</span>` : ""}
-            ${isRefining(task) ? `<span class="row-refining">Updating extraction…</span>` : ""}
-            ${lockedByOther(task) ? `<span class="row-locked" title="Locked by another reviewer">🔒 In review</span>` : ""}
-            ${reviewChips(task)}
-            ${task.status === "READY"
-              ? (lockedByOther(task)
-                  ? `<span class="row-submit locked-out" title="Locked by another reviewer">Submit</span>`
-                  : `<span class="row-submit" onclick="submitTask('${js(task.task_id)}', event)">Submit</span>`)
-              : ""}
           </div>
+          <div class="row-preview">${esc(task.prompt || "")}</div>
+          ${sideChips.trim() ? `<div class="row-side">${sideChips}</div>` : ""}
         </div>
-      </button>`).join("")
+      </button>`;
+      }).join("")
     : `<div class="empty">No tasks yet.</div>`;
 
   // Auto-follow the first task if nothing is selected; else patch the open detail header.

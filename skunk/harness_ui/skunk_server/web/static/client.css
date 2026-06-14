@@ -184,13 +184,15 @@ main {
 }
 .task-row:hover,
 .task-row.selected { background: var(--bg3); }
-/* Column layout: title/preview stack on top, the status chips flow in a full-width row
-   beneath them and wrap onto as many lines as needed — no matter how many of Lookup /
-   Extract / Visual QA / In Review / Revising / Updating / Submit / Failed are present at
-   once. A div grows to its content, so the chips always have room within the row. */
-.row-inner { display: flex; flex-direction: column; gap: 8px; }
-.row-main { min-width: 0; }
-.row-title { font-weight: 750; margin-bottom: 3px; }
+/* Column layout on the inner div (a <button> doesn't reliably grow to flex content): the
+   title + status share the top line, the preview sits below, and any action chips (Lookup /
+   Extract / Visual QA / In Review / Revising / Updating / Submit) wrap onto a line beneath. */
+.row-inner { display: flex; flex-direction: column; gap: 6px; }
+/* Title line: question id on the left, status badge pinned top-right INSIDE the row so it can
+   never read as belonging to the next task. flex-start keeps the badge level with the first
+   title line even when a long id wraps. */
+.row-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.row-title { font-weight: 750; flex: 1; min-width: 0; }
 .row-preview {
   color: var(--muted);
   overflow: hidden;
