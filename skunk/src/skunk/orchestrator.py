@@ -21,6 +21,7 @@ from skunk.common import (
     ExecutionContext,
     Final,
     HumanInterventionHandler,
+    HumanReviewDiscard,
     HumanReviewRegister,
     NeedsMore,
     SemPoolEntry,
@@ -161,6 +162,7 @@ class Orchestrator:
         llm_client: LLMClient | None = None,
         human_intervention_handler: HumanInterventionHandler | None = None,
         human_review_register: HumanReviewRegister | None = None,
+        human_reviews_discard: HumanReviewDiscard | None = None,
     ):
         self._ctx = ExecutionContext(
             question=question,
@@ -172,6 +174,7 @@ class Orchestrator:
             llm_client=llm_client,
             human_intervention_handler=human_intervention_handler,
             human_review_register=human_review_register,
+            human_reviews_discard=human_reviews_discard,
         )
         self._current_plan: Plan | None = None
         # Stable per-question branch identity. `_branch_ids[i]` is the id of the
@@ -394,6 +397,17 @@ class Orchestrator:
                 for he, resolved in zip(human_entries, human_resolutions)
                 if id(he) in pool_pos
             ]
+
+            # Taking a replan: discard this round's still-open optimistic reviews. The replan
+            # composes fresh branches (new ids) and supersedes the ones those reviews were opened
+            # against, so a pending correction is moot — clear it from the UI rather than let it
+            # linger. The human's replan guidance (the blocking missing-data response above) is now
+            # authoritative; we start the next round clean. (A review the human already resolved is
+            # RESOLVED, not OPEN, so it's left untouched; its stale branch id never matches the
+            # final snapshot's, so it can't drive a recompute later.)
+            if self._ctx.human_reviews_discard is not None:
+                self._ctx.human_reviews_discard()
+                self._ctx.emit("human_reviews_discarded reason=replan", kind="user")
 
             plan = await traced_step(
                 self._ctx,

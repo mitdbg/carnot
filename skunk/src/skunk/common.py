@@ -55,6 +55,12 @@ HumanReviewRegister = Callable[
     str | None,
 ]
 
+# Discard all of this question's still-open optimistic reviews — called when the orchestrator
+# takes a replan, since the replan supersedes the branches those reviews belong to. Fire-and-
+# forget (the server cancels them and refreshes the UI). Wired only alongside
+# `HumanReviewRegister`; None for a local CLI run or a blocking-transport run.
+HumanReviewDiscard = Callable[[], None]
+
 
 @dataclass(frozen=True)
 class PendingHumanIntervention:
@@ -690,6 +696,9 @@ class ExecutionContext:
     # gates open an open review and keep the LLM result instead of awaiting the human — see
     # `HumanReviewRegister` and `HumanAssist.register_verify`/`register_lookup`.
     human_review_register: HumanReviewRegister | None = None
+    # Discard this question's still-open optimistic reviews on a replan (server only) — see
+    # `HumanReviewDiscard`. Wired alongside `human_review_register`.
+    human_reviews_discard: HumanReviewDiscard | None = None
 
     def __post_init__(self) -> None:
         if self.llm_client is None:
