@@ -23,6 +23,12 @@ let traceFrame = null;                // pending rAF handle for coalesced trace 
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[c]));
 const js = (s) => String(s ?? "").replace(/\\/g, "\\\\").replace(/'/g, "\\'");
 
+// This browser's review-lock identity (set by review_overlay.js, which loads first).
+const CLIENT_ID = window.CLIENT_ID;
+// True when another operator holds this task's review lock — their client is annotating it, so
+// its action buttons (Review + Submit) are greyed out for everyone else.
+const lockedByOther = (task) => !!task.locked_by && task.locked_by !== CLIENT_ID;
+
 // ── status badges ────────────────────────────────────────────────────────────
 function badgeClass(task) {
   // An open human review means the task is waiting on the operator — surface that as the badge
@@ -82,11 +88,18 @@ const reviewKindRank = (task) => {
 // Renders EVERY kind present (ordered by urgency) — an unknown/new kind falls back to its raw
 // name rather than being silently dropped, so a task never looks review-free when it isn't.
 function reviewChips(task) {
+  const locked = lockedByOther(task);
   const byKind = {};
   for (const r of (task.reviews || [])) byKind[r.kind] = (byKind[r.kind] || 0) + 1;
   return Object.keys(byKind)
     .sort((a, b) => (REVIEW_KIND_RANK[a] ?? 9) - (REVIEW_KIND_RANK[b] ?? 9))
-    .map((k) => `<span class="row-review kind-${esc(k)}" onclick="openReview('${js(task.task_id)}', event)">${esc(REVIEW_KIND_LABEL[k] || k)}${byKind[k] > 1 ? ` (${byKind[k]})` : ""}</span>`)
+    .map((k) => {
+      const label = `${esc(REVIEW_KIND_LABEL[k] || k)}${byKind[k] > 1 ? ` (${byKind[k]})` : ""}`;
+      // Locked by another reviewer → greyed, no click; otherwise opens the overlay (grabs the lock).
+      return locked
+        ? `<span class="row-review kind-${esc(k)} locked-out" title="Locked by another reviewer">${label}</span>`
+        : `<span class="row-review kind-${esc(k)}" onclick="openReview('${js(task.task_id)}', event)">${label}</span>`;
+    })
     .join("");
 }
 
@@ -156,8 +169,13 @@ function renderStatus() {
         <div class="row-side">
           <span class="status ${badgeClass(task)}">${esc(badgeLabel(task))}</span>
           ${task.revising ? `<span class="row-revising">Revising…</span>` : ""}
+          ${lockedByOther(task) ? `<span class="row-locked" title="Locked by another reviewer">🔒 In review</span>` : ""}
           ${reviewChips(task)}
-          ${task.status === "READY" ? `<span class="row-submit" onclick="submitTask('${js(task.task_id)}', event)">Submit</span>` : ""}
+          ${task.status === "READY"
+            ? (lockedByOther(task)
+                ? `<span class="row-submit locked-out" title="Locked by another reviewer">Submit</span>`
+                : `<span class="row-submit" onclick="submitTask('${js(task.task_id)}', event)">Submit</span>`)
+            : ""}
         </div>
       </button>`).join("")
     : `<div class="empty">No tasks yet.</div>`;
@@ -197,17 +215,25 @@ function renderDetailActions(task) {
   const host = document.getElementById("dActions");
   if (!host) return;
   if (!task) { host.innerHTML = ""; return; }
+  const locked = lockedByOther(task);
   let html = "";
   if (task.revising) {
     html += `<span class="detail-feedback revising">Revising answer after review…</span>`;
   }
   if (reviewCount(task)) {
-    html += `<button class="primary" onclick="openReview('${js(task.task_id)}', event)">Review (${reviewCount(task)})</button>`;
+    html += locked
+      ? `<button class="primary" disabled title="Locked by another reviewer">Review (${reviewCount(task)})</button>`
+      : `<button class="primary" onclick="openReview('${js(task.task_id)}', event)">Review (${reviewCount(task)})</button>`;
   }
   if (task.status === "READY") {
-    html += `<button class="primary" onclick="submitTask('${js(task.task_id)}', event)">Submit Answer</button>`;
+    html += locked
+      ? `<button class="primary" disabled title="Locked by another reviewer">Submit Answer</button>`
+      : `<button class="primary" onclick="submitTask('${js(task.task_id)}', event)">Submit Answer</button>`;
   } else if (task.status === "SUBMITTING") {
     html += `<span class="detail-feedback pending">Submitting…</span>`;
+  }
+  if (locked) {
+    html += `<span class="detail-feedback">🔒 Locked by another reviewer</span>`;
   }
   const fb = feedbackFor(task);
   if (fb) {
@@ -276,9 +302,9 @@ function selectTask(taskId) {
   taskSource = new EventSource(`/api/stream/${encodeURIComponent(taskId)}`);
   taskSource.onmessage = (e) => onTraceEvent(taskId, JSON.parse(e.data));
 
-  // Selecting a task that has open reviews drops straight into the review overlay (no extra
-  // click), so the operator is immersed immediately.
-  if (reviewCount(task)) ReviewOverlay.open(taskId);
+  // Selecting a task only shows its trace (read-only) — it no longer auto-opens the review
+  // overlay, so merely inspecting a question doesn't grab its review lock. The operator opens the
+  // reviewer explicitly via the Review button / review chip, which is what acquires the lock.
 }
 window.selectTask = selectTask;
 

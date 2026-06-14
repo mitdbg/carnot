@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 # (recompute_state_json, {branch_id: raw_response_json}) -> revised answer text.
 RecomputeFn = Callable[[dict[str, Any], dict[int, str]], Awaitable[str]]
 
+# How often the background sweeper clears review locks whose holder stopped heart-beating.
+LOCK_SWEEP_INTERVAL_S = 5.0
+
 
 class HumanWorkBroker:
     def __init__(
@@ -84,6 +87,37 @@ class HumanWorkBroker:
             return None  # task vanished (round closed) — nothing to review
         self._notify()
         return review.review_id
+
+    # ---- Per-UID review lock -----------------------------------------------------------
+
+    def acquire_review_lock(self, task_id: str, client_id: str) -> tuple[bool, str | None]:
+        """Take (or refresh) the review lock for `client_id`. Returns `(acquired, holder)`;
+        republishes status only when the holder actually changed, so the client's periodic
+        heartbeat (which re-acquires) doesn't spam every browser."""
+        try:
+            acquired, holder, changed = self._registry.acquire_review_lock(task_id, client_id)
+        except KeyError:
+            return False, None  # task vanished (round closed)
+        if changed:
+            self._notify()
+        return acquired, holder
+
+    def release_review_lock(self, task_id: str, client_id: str) -> bool:
+        """Release the lock held by `client_id` (idempotent). Republishes when it actually
+        cleared so other clients see the task free up."""
+        released = self._registry.release_review_lock(task_id, client_id)
+        if released:
+            self._notify()
+        return released
+
+    async def run_lock_sweeper(self, interval_s: float = LOCK_SWEEP_INTERVAL_S) -> None:
+        """Periodically clear review locks whose holder stopped heart-beating (closed tab /
+        crash) and republish so other clients see those tasks free up. Started for the lifetime
+        of the backend; exits cleanly on cancellation at teardown."""
+        while True:
+            await asyncio.sleep(interval_s)
+            if self._registry.sweep_review_locks():
+                self._notify()
 
     # ---- Blocking transport (awaited on a worker loop) ---------------------------------
 

@@ -136,6 +136,7 @@ You write Python that either produces the final answer string, or — when the i
   .kind          "scalar" | "vector" | "table"  (rarely needed; prefer .frame)
   .index_name    (vector)   .row_name / .col_name (table)
   .value         raw payload — only use if you specifically need the dict/list form
+  .source             publisher/origin of an external-lookup value (empty for corpus extracts)
   .bulletin           source issue "YYYY-MM" the value was printed in
   .pages              source PDF page number(s)
   .requested_period   data window the value was retrieved for

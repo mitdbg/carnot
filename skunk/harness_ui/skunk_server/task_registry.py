@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from skunk_server.domain import (
@@ -23,6 +23,12 @@ from skunk_server.domain import (
 
 class TaskConflict(ValueError):
     """Raised when a command targets a stale or no-longer-actionable task."""
+
+
+# How long a review lock survives without a heartbeat. The web client re-acquires (heartbeats)
+# every ~7s while the overlay is open; this leaves room for a couple of missed beats before a
+# holder that closed its tab / crashed is considered gone and the task frees up.
+REVIEW_LOCK_TTL_S = 20.0
 
 
 class TaskRegistry:
@@ -376,6 +382,62 @@ class TaskRegistry:
                 if cancelled:
                     task.updated_at = utc_now()
         return cancelled
+
+    # ---- Per-UID review lock -----------------------------------------------------------
+
+    def acquire_review_lock(
+        self, task_id: str, client_id: str
+    ) -> tuple[bool, str | None, bool]:
+        """Take (or refresh) the per-task review lock for `client_id`. Succeeds if the lock is
+        free, expired, or already held by this client; refreshes the lease on every success, so
+        the same call doubles as the heartbeat. Returns `(acquired, current_holder, changed)`
+        where `changed` is True only when the holder actually changed — a same-client refresh
+        leaves `changed=False` so heartbeats don't churn the status stream. Raises KeyError if
+        the task is gone (round torn down)."""
+        with self._lock:
+            task = self._require_task(task_id)
+            now = utc_now()
+            holder = task.active_lock_holder(now)
+            if holder is not None and holder != client_id:
+                return False, holder, False
+            changed = task.review_lock_holder != client_id
+            task.review_lock_holder = client_id
+            task.review_lock_expires_at = now + timedelta(seconds=REVIEW_LOCK_TTL_S)
+            if changed:
+                self._set_status(task, task.status)  # bump version → republished to others
+            else:
+                task.updated_at = now  # refresh lease bookkeeping without a version bump
+            return True, client_id, changed
+
+    def release_review_lock(self, task_id: str, client_id: str) -> bool:
+        """Release the lock if `client_id` holds it (idempotent no-op otherwise). Returns whether
+        a lock was actually cleared, so the caller can decide to republish."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.review_lock_holder != client_id:
+                return False
+            task.review_lock_holder = None
+            task.review_lock_expires_at = None
+            self._set_status(task, task.status)
+            return True
+
+    def sweep_review_locks(self) -> list[str]:
+        """Clear every lock whose lease has lapsed (holder stopped heart-beating). Returns the
+        task ids cleared so the caller republishes — otherwise other clients wouldn't see the
+        task free up until the next unrelated status change."""
+        cleared: list[str] = []
+        with self._lock:
+            now = utc_now()
+            for task in self._tasks.values():
+                if (
+                    task.review_lock_holder is not None
+                    and task.active_lock_holder(now) is None
+                ):
+                    task.review_lock_holder = None
+                    task.review_lock_expires_at = None
+                    self._set_status(task, task.status)
+                    cleared.append(task.task_id)
+        return cleared
 
     def _find_review(self, review_id: str) -> tuple[QuestionTask, HumanReview]:
         for task in self._tasks.values():

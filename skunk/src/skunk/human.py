@@ -57,8 +57,8 @@ def _candidate_dicts(entries: list[AnnotatedValue]) -> list[dict]:
     """The model's values for the review UI: the editable field set PLUS read-only `notes` — the
     LLM's extract-time page context (footnotes, headnotes, print-flag meaning, scope/break-in-series
     caveats) for each value, so a reviewer sees what the page said about it. Display-only: the human
-    edits only `_EDITABLE_FIELDS`; kind/provenance/notes ride back untouched via `_src`."""
-    return [c.model_dump(include=set(_FIELDS) | {"notes"}) for c in entries]
+    edits only `_EDITABLE_FIELDS`; kind/provenance/notes/source ride back untouched via `_src`."""
+    return [c.model_dump(include=set(_FIELDS) | {"notes", "source"}) for c in entries]
 
 
 def apply_overrides(

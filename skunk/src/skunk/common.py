@@ -448,6 +448,11 @@ class AnnotatedValue(BaseModel):
     it is context, not a per-cell discriminator; per-datum disambiguation lives
     in `description`. Empty for external lookups.
 
+    `source` is the LLM-authored publisher/origin of an external lookup's value
+    (e.g. the data provider the lookup agent pulled it from) — the external-lookup
+    analog of the machine-stamped corpus provenance below, which it cannot fill.
+    Empty for corpus extracts (whose provenance is `bulletin`/`pages`).
+
     Provenance (`bulletin`/`pages`/`requested_period`/`retrieve_key`) is
     machine-stamped from the extract inputs — the source page refs and the
     retrieve branch — NOT authored by the LLM. It is absent (None/empty) for
@@ -464,6 +469,7 @@ class AnnotatedValue(BaseModel):
     value: Any
     unit: str = ""
     notes: str = ""
+    source: str = ""  # external-lookup publisher (LLM-authored); empty for corpus extracts
     kind: Literal["scalar", "vector", "table"] = "scalar"
     index_name: str | None = None
     row_name: str | None = None

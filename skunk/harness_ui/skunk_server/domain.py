@@ -136,6 +136,12 @@ class QuestionTask:
     # True while a resolved review's recompute is running in the background (the answer is being
     # revised) — surfaced in the UI so a resolve doesn't look like it did nothing.
     revising: bool = False
+    # Per-UID human-review lock: the client_id currently annotating this task (None = free) and
+    # when its lease lapses. A holder that stops heart-beating (closed tab / crash) frees the
+    # task once `review_lock_expires_at` passes. Purely UI coordination — never consulted by the
+    # optimistic agent path; it only gates which browser may open the review overlay.
+    review_lock_holder: str | None = None
+    review_lock_expires_at: datetime | None = None
     round_ends_at: datetime | None = None
     version: int = 0
     created_at: datetime = field(default_factory=utc_now)
@@ -148,6 +154,19 @@ class QuestionTask:
     @property
     def open_reviews(self) -> list[HumanReview]:
         return [r for r in self.reviews if r.status == HumanReviewStatus.OPEN]
+
+    def active_lock_holder(self, now: datetime | None = None) -> str | None:
+        """The client_id holding the review lock, or None if unset or its lease has lapsed.
+        Single source of truth for the lock TTL rule (reused by the registry and the status
+        snapshot)."""
+        if self.review_lock_holder is None:
+            return None
+        if (
+            self.review_lock_expires_at is not None
+            and self.review_lock_expires_at <= (now or utc_now())
+        ):
+            return None
+        return self.review_lock_holder
 
 
 @dataclass
