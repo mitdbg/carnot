@@ -170,7 +170,9 @@ main {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 10px;
-  align-items: center;
+  /* start (not center): let the row grow to fit a multi-chip side column instead of the
+     chips overflowing the fixed min-height and colliding with the next row. */
+  align-items: start;
   padding: 12px 14px;
   border: 0;
   border-bottom: 1px solid var(--line);
@@ -216,9 +218,14 @@ main {
 .status.claimed { color: var(--accent-2); background: var(--blue-bg); }
 .row-side {
   display: flex;
-  flex-direction: column;
-  align-items: flex-end;
+  /* Wrap chips horizontally right-to-left so multiple (status + review kinds + Submit +
+     Revising) flow onto as many lines as needed and never stack on top of one another. */
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
   gap: 6px;
+  max-width: 190px;
 }
 /* Inline Submit on READY rows. It's a <span> (the row itself is the <button>); the click
    handler stopPropagation()s so submitting doesn't also select the task. */

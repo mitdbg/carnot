@@ -5,8 +5,9 @@ figure reads, and external lookups register an open `HumanReview` (via `register
 wrapped into the agent's `human_review_register` hook). The task completes optimistically and
 becomes submittable. When the operator resolves a review in the web UI (`resolve_review`), the
 broker schedules a background RECOMPUTE: it re-runs only `compute` over the first attempt's
-cached entries with the human's correction swapped in (no re-plan / re-retrieve), records the
-revised answer as a superseding candidate, and best-effort resubmits if the round is still open.
+cached entries with the human's correction swapped in (no re-plan / re-retrieve) and records the
+revised answer as a superseding candidate. It never submits — nothing is sent optimistically; the
+revised answer waits for an operator click or the deadline sweep, like any other READY answer.
 
 This deliberately drops the old claim/release/assignment/worker-registry machinery — there is
 one operator, and reviews are advisory (the LLM answer already stands).
@@ -19,15 +20,13 @@ import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from skunk_server.domain import AnswerCandidate, HumanReview, QuestionTask, TaskStatus
+from skunk_server.domain import AnswerCandidate, HumanReview, QuestionTask
 from skunk_server.task_registry import TaskRegistry
 
 logger = logging.getLogger(__name__)
 
 # (recompute_state_json, {branch_id: raw_response_json}) -> revised answer text.
 RecomputeFn = Callable[[dict[str, Any], dict[int, str]], Awaitable[str]]
-# task_id -> None; best-effort resubmit of the latest (revised) candidate.
-SubmitFn = Callable[[str], Awaitable[None]]
 
 
 class HumanWorkBroker:
@@ -35,12 +34,10 @@ class HumanWorkBroker:
         self,
         registry: TaskRegistry,
         recompute_fn: RecomputeFn | None,
-        submit_fn: SubmitFn,
         publish_status: Callable[[], None],
     ) -> None:
         self._registry = registry
         self._recompute_fn = recompute_fn
-        self._submit_fn = submit_fn
         self._publish_status = publish_status
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -142,17 +139,11 @@ class HumanWorkBroker:
                 reasoning=reasoning,
                 source_docs=(revised_docs or (prior.source_docs if prior else []))[:64],
             )
-            updated = self._registry.add_revised_candidate(task_id, candidate)
-            # Best-effort resubmit: only while the round is open and the task is (re)submittable.
-            if (
-                updated is not None
-                and updated.status == TaskStatus.READY
-                and self._registry.round_state().status == "ACTIVE"
-            ):
-                try:
-                    await self._submit_fn(task_id)
-                except Exception:
-                    logger.exception("best-effort resubmit failed for %s", task_id)
+            # Record the revised answer as the new latest candidate and leave the task READY.
+            # We deliberately do NOT submit here: nothing is ever submitted optimistically.
+            # The revised answer waits for an explicit operator click or the deadline sweep
+            # (SubmissionCoordinator), the same as any other READY answer.
+            self._registry.add_revised_candidate(task_id, candidate)
         finally:
             # Clear the revising flag on every path (success, no-op, or failure) and refresh.
             self._registry.set_revising(task_id, False)

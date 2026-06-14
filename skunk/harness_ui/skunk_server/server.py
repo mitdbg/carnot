@@ -97,9 +97,7 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
     # Optimistic human-review broker: registers open reviews mid-run and, on resolve, recomputes
     # the answer (re-running only compute) via the reasoner module's `recompute` entry point.
     recompute_fn = _load_recompute(config.reasoner_ref) if reasoner is None else None
-    broker = HumanWorkBroker(
-        registry, recompute_fn, coordinator.submit_ready, hub.publish_status
-    )
+    broker = HumanWorkBroker(registry, recompute_fn, hub.publish_status)
     pool = AgentWorkerPool(
         registry, queues, loaded_reasoner, config.concurrency, human_broker=broker
     )

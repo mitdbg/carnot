@@ -1,5 +1,5 @@
 """Slim optimistic-review broker: registering an open review mid-run, resolving it into a
-background recompute that supersedes the answer, best-effort resubmit, and round-close cancel."""
+background recompute that supersedes the answer (without submitting), and round-close cancel."""
 
 from __future__ import annotations
 
@@ -25,21 +25,17 @@ def _ready_task(registry: TaskRegistry, recompute_state=None):
     return task, attempt
 
 
-def test_resolve_triggers_recompute_and_best_effort_submit() -> None:
+def test_resolve_triggers_recompute_without_submitting() -> None:
     async def scenario():
         registry = TaskRegistry()
         registry.update_round(round_num=1, status="ACTIVE")
-        submitted: list[str] = []
         recompute_calls: list[tuple] = []
 
         async def recompute_fn(state, overrides):
             recompute_calls.append((state, overrides))
             return "REVISED"
 
-        async def submit_fn(task_id):
-            submitted.append(task_id)
-
-        broker = HumanWorkBroker(registry, recompute_fn, submit_fn, lambda: None)
+        broker = HumanWorkBroker(registry, recompute_fn, lambda: None)
         broker.start(asyncio.get_running_loop())
 
         task, attempt = _ready_task(
@@ -78,8 +74,10 @@ def test_resolve_triggers_recompute_and_best_effort_submit() -> None:
         # candidate must clear that floor even when there's no prior reasoning to carry forward.
         assert len(revised.latest_candidate.reasoning) >= 100
         assert revised.revising is False  # cleared after the recompute completes
+        # The revised answer is left READY (submittable) but NOT submitted: nothing is sent
+        # optimistically, even with the round ACTIVE — it waits for an operator click / sweep.
         assert revised.status == TaskStatus.READY
-        assert submitted == [task.task_id]  # best-effort resubmit fired (round ACTIVE)
+        assert revised.submissions == []  # no submission attempted by the broker
         assert recompute_calls[0][1] == {
             2: json.dumps([{"description": "d", "value": 43, "kind": "scalar"}])
         }
@@ -98,10 +96,7 @@ def test_accept_as_is_does_not_recompute() -> None:
             recompute_calls.append(overrides)
             return "REVISED"
 
-        async def submit_fn(task_id):
-            pass
-
-        broker = HumanWorkBroker(registry, recompute_fn, submit_fn, lambda: None)
+        broker = HumanWorkBroker(registry, recompute_fn, lambda: None)
         broker.start(asyncio.get_running_loop())
         task, attempt = _ready_task(
             registry,
@@ -137,7 +132,7 @@ def test_accept_as_is_does_not_recompute() -> None:
 def test_cancel_all_closes_open_reviews() -> None:
     async def scenario():
         registry = TaskRegistry()
-        broker = HumanWorkBroker(registry, None, None, lambda: None)  # type: ignore[arg-type]
+        broker = HumanWorkBroker(registry, None, lambda: None)
         broker.start(asyncio.get_running_loop())
         task, attempt = _ready_task(registry)
         broker.register_review(
@@ -162,7 +157,7 @@ def test_pool_injects_register_and_recompute_sink_hooks() -> None:
         loop = asyncio.get_running_loop()
         registry = TaskRegistry()
         queues = TaskQueues()
-        broker = HumanWorkBroker(registry, None, None, lambda: None)  # type: ignore[arg-type]
+        broker = HumanWorkBroker(registry, None, lambda: None)
         broker.start(loop)
 
         def reasoner(
