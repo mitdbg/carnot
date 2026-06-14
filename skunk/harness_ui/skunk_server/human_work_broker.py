@@ -311,6 +311,14 @@ class HumanWorkBroker:
             self._registry.set_review_refining(review_id, False)
             self._notify()
 
+    def discard_reviews(self, task_id: str) -> None:
+        """Cancel one task's still-open optimistic reviews — called from a worker loop when the
+        orchestrator takes a replan (the replan supersedes the branches those reviews belong to).
+        Safe from a worker thread: the registry is locked and the status publish is scheduled on
+        the server loop."""
+        if self._registry.cancel_task_reviews(task_id):
+            self._notify()
+
     def cancel_all(self) -> None:
         self._registry.cancel_active_reviews()
         # Wake any branches suspended on a blocking review so they unblock (CancelledError)

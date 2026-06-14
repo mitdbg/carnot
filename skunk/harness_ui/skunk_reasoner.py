@@ -266,6 +266,7 @@ class SkunkReasoner:
         human_intervention_handler=None,
         trace_event_handler=None,
         human_review_register=None,
+        human_reviews_discard=None,
         recompute_sink=None,
     ) -> tuple[str, list[dict]]:
         from skunk import (
@@ -302,6 +303,7 @@ class SkunkReasoner:
         }:
             human_intervention_handler = None
             human_review_register = None
+            human_reviews_discard = None
 
         orch = Orchestrator(
             prompt,
@@ -311,6 +313,7 @@ class SkunkReasoner:
             in {"1", "true", "yes"},
             human_intervention_handler=human_intervention_handler,
             human_review_register=human_review_register,
+            human_reviews_discard=human_reviews_discard,
         )
         if trace_event_handler is not None:
             original_emit = orch.ctx.emit

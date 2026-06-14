@@ -69,6 +69,9 @@ class AgentWorkerPool:
         self._reasoner_accepts_recompute_sink = (
             "recompute_sink" in parameters or accepts_kwargs
         )
+        self._reasoner_accepts_review_discard = (
+            "human_reviews_discard" in parameters or accepts_kwargs
+        )
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -192,22 +195,32 @@ class AgentWorkerPool:
                 if self._human_broker is not None:
                     broker: Any = self._human_broker
                     aid = attempt.attempt_id
-                    if self._human_blocking and self._reasoner_accepts_intervention:
-                        # BLOCKING: the branch suspends on the human (web UI) before compute. Wire
-                        # ONLY the intervention handler — leaving `human_review_register` unset is
-                        # what makes the orchestrator pick the blocking transport.
+                    # The replan barrier ALWAYS blocks on the human via the intervention handler:
+                    # a replan means compute produced no answer to submit, so optimism is never
+                    # valid there. Wire it regardless of `human_blocking` (in blocking mode it ALSO
+                    # serves the inline extract-verify suspend). Leaving `human_review_register`
+                    # unset under blocking is what makes the orchestrator pick the blocking
+                    # transport for the verify/lookup seams too.
+                    if self._reasoner_accepts_intervention:
                         reasoner_kwargs["human_intervention_handler"] = (
                             lambda task, instr, q, docs, guid, _t=task_id, _a=aid: (
                                 broker.await_intervention(_t, _a, task, instr, q, docs, guid)
                             )
                         )
-                    elif self._reasoner_accepts_review:
-                        # OPTIMISTIC (default): open a review mid-run (fire-and-forget; keep going).
+                    if not self._human_blocking and self._reasoner_accepts_review:
+                        # OPTIMISTIC (default) extract/lookup verify: open a review mid-run
+                        # (fire-and-forget; keep going). The replan path stays blocking via the
+                        # handler above; on a replan the orchestrator discards these via the hook
+                        # below, since the replan supersedes the branches they belong to.
                         reasoner_kwargs["human_review_register"] = (
                             lambda kind, instr, ctx_q, docs, guid, _t=task_id, _a=aid: (
                                 broker.register_review(_t, _a, kind, instr, ctx_q, docs, guid)
                             )
                         )
+                        if self._reasoner_accepts_review_discard:
+                            reasoner_kwargs["human_reviews_discard"] = (
+                                lambda _t=task_id: broker.discard_reviews(_t)
+                            )
                 if self._reasoner_accepts_recompute_sink:
                     # Capture the recompute snapshot so a resolved review can revise the answer.
                     reasoner_kwargs["recompute_sink"] = lambda state, _t=task_id: (
