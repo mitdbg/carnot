@@ -23,8 +23,9 @@ class LookupAgent(MultiTurnAgent):
 A JSON object with these keys (literals only — copy values out of your
 observations; you cannot reference variables here):
 
-  {"description": "<names the value + its source>", "value": <...>,
+  {"description": "<names the value>", "value": <...>,
    "unit": "<e.g. pct, usd, fx_rate>",
+   "source": "<publisher/origin of the value>",
    "kind": "scalar" | "vector" | "table",
    "index_name": "<dim>",                      # vector only
    "row_name": "<dim>", "col_name": "<dim>"}   # table only
@@ -33,15 +34,16 @@ Use `kind="vector"` — `value` a dict keyed by the period/label, with
 `index_name` — whenever the answer is a series the downstream step will rank,
 select, or aggregate (e.g. "which year did X peak"). Use a plain scalar (or a
 list) only when the labels don't matter. Cells must be primitive (no nesting).
-Fold the source into `description`. For a long series, `print(json.dumps(...))`
+Put the value's publisher/origin in `source` (not folded into `description`);
+`description` names just the value. For a long series, `print(json.dumps(...))`
 the dict in a tool step first, then copy the printed JSON here.
 ```json
-{"description": "USD to GBP spot rate, 2002-06-30 (MeasuringWorth)",
- "value": 0.6549, "unit": "fx_rate"}
+{"description": "USD to GBP spot rate, 2002-06-30",
+ "value": 0.6549, "unit": "fx_rate", "source": "MeasuringWorth"}
 ```
 ```json
-{"description": "U.S. personal saving rate, 1950-1990 (FRED PSAVERT)",
- "kind": "vector", "index_name": "year",
+{"description": "U.S. personal saving rate, 1950-1990",
+ "kind": "vector", "index_name": "year", "source": "FRED PSAVERT",
  "value": {"1950": 9.4, "1951": 11.1, "1990": 8.5}, "unit": "pct"}
 ```
 

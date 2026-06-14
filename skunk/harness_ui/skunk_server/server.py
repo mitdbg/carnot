@@ -19,7 +19,7 @@ from fastapi import FastAPI
 from skunk_server.agent_worker_pool import AgentWorkerPool, Reasoner
 from skunk_server.api import install_command_routes
 from skunk_server.competition_adapter import CompetitionAdapter
-from skunk_server.domain import to_jsonable
+from skunk_server.domain import to_jsonable, utc_now
 from skunk_server.file_stream import FileSink
 from skunk_server.human_work_broker import HumanWorkBroker
 from skunk_server.submission_coordinator import SubmissionCoordinator
@@ -50,6 +50,8 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
 
     def status_snapshot() -> dict[str, Any]:
         # Compact, events-free status: small enough to re-send whole on every change.
+        now = utc_now()  # shared instant so every task's lock TTL is judged consistently
+
         def summary(task) -> dict[str, Any]:
             candidate = task.latest_candidate
             submission = task.submissions[-1] if task.submissions else None
@@ -63,6 +65,9 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
                 "points": submission.points_awarded if submission else None,
                 "correct": submission.correct if submission else None,
                 "revising": task.revising,
+                # client_id annotating this task (None = free); drives the greyed-out buttons +
+                # lock indicator for every other client. Expired leases read as free.
+                "locked_by": task.active_lock_holder(now),
                 # Open human reviews drive the sidebar bump + the review overlay. Small lists,
                 # so the whole payload (instruction + candidates + page refs) rides the snapshot.
                 "reviews": [
@@ -124,14 +129,18 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
         broker.start(loop)
         pool.start(loop, coordinator.handle_agent_completion, sink.write_event)
         listener = asyncio.create_task(adapter.listen())
+        # Background sweeper that frees review locks whose holder stopped heart-beating.
+        lock_sweeper = asyncio.create_task(broker.run_lock_sweeper())
         try:
             yield
         finally:
             listener.cancel()
-            try:
-                await listener
-            except asyncio.CancelledError:
-                pass
+            lock_sweeper.cancel()
+            for task in (listener, lock_sweeper):
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
             broker.cancel_all()
             pool.stop()
             sink.close()  # close cached per-task append handles

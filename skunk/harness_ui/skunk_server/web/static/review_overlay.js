@@ -5,10 +5,36 @@
 //   lookup         -> instruction + a value field (confirm/correct an external lookup)
 //   figure         -> page viewer + a pre-filled AnnotatedValue JSON template (read it off the chart)
 //   verify_extract -> page viewer + an editable table/list of the model's extracted values
-// Submitting POSTs the edited values to /api/reviews/<id>/resolve; the overlay then advances to
-// the task's next open review, and closes (back to the main UI) after the last one. "X" exits
+// Submitting POSTs the edited values to /api/reviews/<id>/resolve; the overlay then RETURNS to
+// the main UI (one annotation per visit — no auto-advance to the task's next review). "X" exits
 // without committing. The status SSE stream is the source of truth for which reviews are open;
 // `syncTasks` re-reads it each tick so a resolved/cancelled review drops out live.
+//
+// Per-UID lock: opening the overlay acquires this task's review lock in the backend
+// (/api/reviews/lock/<task_id>) so two operators can't annotate the same question at once. While
+// open we heartbeat to keep the lease alive; closing (submit / accept / X / backdrop / tab-close)
+// releases it. A holder that vanishes is freed by the backend's TTL sweep.
+
+// Stable per-browser-session id, used to hold/release the review lock. Defined here (this file is
+// `defer`-loaded before client.js) and exposed so client.js can tell "locked by me" from "locked
+// by someone else".
+const CLIENT_ID = (function () {
+  try {
+    let id = sessionStorage.getItem("skunkClientId");
+    if (!id) {
+      id = (window.crypto && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : `c-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+      sessionStorage.setItem("skunkClientId", id);
+    }
+    return id;
+  } catch (e) {
+    return `c-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+  }
+})();
+window.CLIENT_ID = CLIENT_ID;
+
+const LOCK_HEARTBEAT_MS = 7000;  // re-acquire (refresh the lease) well within the backend TTL
 
 const ReviewOverlay = (function () {
   let activeTaskId = null;
@@ -16,6 +42,7 @@ const ReviewOverlay = (function () {
   let index = 0;               // which review we're showing
   let tasksRef = [];           // latest task snapshots (kept in sync by syncTasks)
   let submitting = false;
+  let heartbeatTimer = null;   // setInterval handle refreshing the review lock while open
 
   // viewer state
   let pages = [];              // [{month, page}] parsed from the review's source_docs
@@ -48,48 +75,110 @@ const ReviewOverlay = (function () {
 
   function isOpen() { return activeTaskId !== null; }
 
-  function open(taskId) {
+  // ── review lock ────────────────────────────────────────────────────────────────
+  // The backend is the source of truth for the lock; the greyed-out buttons in the task list are
+  // only a hint. Re-acquiring with the same client_id refreshes the lease, so acquire IS the
+  // heartbeat. Returns true iff we hold the lock afterward.
+  async function acquireLock(taskId) {
+    try {
+      const resp = await fetch(`/api/reviews/lock/${encodeURIComponent(taskId)}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ client_id: CLIENT_ID }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      return !!(resp.ok && data.ok);
+    } catch (err) {
+      return false;
+    }
+  }
+
+  function releaseLock(taskId) {
+    if (!taskId) return;
+    const body = JSON.stringify({ client_id: CLIENT_ID });
+    // Prefer sendBeacon so a tab-close / navigation still releases the lock; fall back to a
+    // keepalive fetch where sendBeacon is unavailable.
+    try {
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(
+          `/api/reviews/unlock/${encodeURIComponent(taskId)}`,
+          new Blob([body], { type: "application/json" }),
+        );
+        return;
+      }
+    } catch (err) { /* fall through to fetch */ }
+    fetch(`/api/reviews/unlock/${encodeURIComponent(taskId)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      keepalive: true,
+    }).catch(() => {});
+  }
+
+  function startHeartbeat() {
+    stopHeartbeat();
+    heartbeatTimer = setInterval(async () => {
+      if (!isOpen()) return;
+      const held = await acquireLock(activeTaskId);
+      if (!held) {
+        // Lost the lease (expired then taken by someone else) — exit to the main screen.
+        showError("");
+        close();
+        alert("Your review lock expired and this question was handed to another reviewer.");
+      }
+    }, LOCK_HEARTBEAT_MS);
+  }
+
+  function stopHeartbeat() {
+    if (heartbeatTimer !== null) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+  }
+
+  async function open(taskId) {
     const task = tasksRef.find((t) => t.task_id === taskId);
     if (!task || !(task.reviews || []).length) return;
+    // Acquire the per-UID lock BEFORE showing anything, so two operators can't open the same
+    // question at once. If it was grabbed between render and click, bail with a notice.
+    const held = await acquireLock(taskId);
+    if (!held) { alert("This question is being reviewed by someone else."); return; }
     activeTaskId = taskId;
     reviews = sortReviews(task.reviews);
     index = 0;
+    startHeartbeat();
     render();
   }
 
   function close() {
+    const taskId = activeTaskId;
+    stopHeartbeat();
     activeTaskId = null;
     reviews = [];
     index = 0;
     const el = root();
     if (el) el.hidden = true;
+    releaseLock(taskId);  // free the lock for other operators (idempotent if we didn't hold it)
   }
 
   // Re-read the live snapshot WITHOUT clobbering the operator's work. Status snapshots arrive
   // every tick, so we must NOT rebuild the DOM (which would wipe in-progress edits and reset the
-  // page viewer's pan/zoom) while the operator is on a review that's still open. We only act when
-  // the CURRENT review disappeared externally (resolved elsewhere / cancelled at round close):
-  // then advance to the next, or close if none remain. Post-submit advancing is the explicit
-  // render() path in post(), not here.
+  // page viewer's pan/zoom) while the operator is on a review that's still open. We exit to the
+  // main screen if we lost the lock, or if the CURRENT review disappeared externally (resolved
+  // elsewhere / cancelled at round close) — we never auto-advance to another review.
   function syncTasks(tasks) {
     tasksRef = tasks || [];
     if (!isOpen()) return;
     const task = tasksRef.find((t) => t.task_id === activeTaskId);
+    // Lost the lock to another reviewer (lease expired and was reclaimed) → back to main. The
+    // heartbeat is the primary detector; this is a belt-and-suspenders check off the snapshot.
+    if (task && task.locked_by && task.locked_by !== CLIENT_ID) { close(); return; }
     const open = task ? (task.reviews || []) : [];
     const cur = reviews[index];
     const curStillOpen = cur && open.some((r) => r.review_id === cur.review_id);
+    if (!curStillOpen) { close(); return; }  // current review gone → return to main screen
+    // Same review still in progress — keep the live DOM (edits + viewer) intact, just keep our
+    // index pointed at it and refresh the "review N of M" counter text in place.
     reviews = sortReviews(open);
-    if (!reviews.length) { close(); return; }
-    if (curStillOpen) {
-      // Same review still in progress — keep the live DOM (edits + viewer) intact, just keep our
-      // index pointed at it and refresh the "review N of M" counter text in place.
-      index = reviews.findIndex((r) => r.review_id === cur.review_id);
-      updateCount();
-      return;
-    }
-    // The current review vanished out from under us → advance (or clamp) and rebuild once.
-    index = Math.min(index, reviews.length - 1);
-    render();
+    index = reviews.findIndex((r) => r.review_id === cur.review_id);
+    updateCount();
   }
 
   function updateCount() {
@@ -135,6 +224,7 @@ const ReviewOverlay = (function () {
         <input type="text" data-f="unit" value="${esc(c.unit ?? "")}"></label>
       <label class="review-field"><span>value</span>
         <textarea data-f="value" class="review-value" oninput="ReviewOverlay.autosize(this)">${esc(valueStr)}</textarea></label>
+      ${c.source ? `<div class="review-cand-source"><span class="review-notes-label">source</span>${esc(c.source)}</div>` : ""}
       ${c.notes ? `<div class="review-cand-notes"><span class="review-notes-label">notes</span>${esc(c.notes)}</div>` : ""}
     </div>`;
   }
@@ -319,7 +409,7 @@ const ReviewOverlay = (function () {
       return miss.length ? `Missing: ${miss.join(", ")}` : "";
     }
     const b = g.branch || {};
-    if (b.kind === "lookup_external") return b.target ? `Lookup: ${b.target}` : "";
+    if (b.kind === "lookup_external") return b.target ? `Lookup: ${b.target}${b.src ? ` · requested source: ${b.src}` : ""}` : "";
     if (b.key) return `Looking for: ${b.key}${b.period ? ` · period ${b.period}` : ""}`;
     return "";
   }
@@ -341,11 +431,10 @@ const ReviewOverlay = (function () {
       });
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok || !data.ok) { showError(data.error || `resolve failed (${resp.status})`); submitting = false; return; }
-      // Optimistically drop this review locally and advance; the SSE snapshot will confirm.
-      reviews = reviews.filter((r) => r.review_id !== review.review_id);
-      if (index >= reviews.length) index = reviews.length - 1;
+      // One annotation per visit: return to the main screen (and release the lock) — no
+      // auto-advance to the task's next open review. The SSE snapshot will confirm the resolve.
       submitting = false;
-      if (!reviews.length) close(); else render();
+      close();
     } catch (err) {
       showError(String(err));
       submitting = false;
@@ -387,6 +476,12 @@ const ReviewOverlay = (function () {
     // Click on the dimmed backdrop exits without committing (same as the ✕).
     if (event && event.target && event.target.classList.contains("review-backdrop")) close();
   }
+
+  // Release the lock if the tab is closed / navigated away with the overlay still open, so the
+  // task doesn't stay locked until the backend TTL sweep. `pagehide` fires on bfcache too.
+  function releaseOnExit() { if (isOpen()) releaseLock(activeTaskId); }
+  window.addEventListener("pagehide", releaseOnExit);
+  window.addEventListener("beforeunload", releaseOnExit);
 
   return {
     open, close, isOpen, syncTasks,

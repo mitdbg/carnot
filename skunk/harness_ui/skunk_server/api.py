@@ -45,6 +45,10 @@ class ReviewResolveBody(BaseModel):
     source_docs: list[str] = Field(default_factory=list)
 
 
+class ReviewLockBody(BaseModel):
+    client_id: str  # the browser's stable per-session id holding/releasing the review lock
+
+
 async def status_frames(hub: StreamHub, heartbeat: float = HEARTBEAT_INTERVAL_S):
     """SSE frames for the always-on status stream: the compact snapshot on connect, then
     whatever `publish_status` fans out. A `: ping` comment keeps idle connections alive."""
@@ -180,6 +184,29 @@ def install_command_routes(app: FastAPI) -> None:
         return JSONResponse(
             {"ok": True, "review": to_jsonable(review), "task_id": task.task_id}
         )
+
+    @app.post("/api/reviews/lock/{task_id:path}")
+    async def acquire_review_lock(task_id: str, body: ReviewLockBody) -> JSONResponse:
+        # Take (or heartbeat-refresh) the per-UID review lock. `ok=False` means someone else
+        # holds it; `locked_by` is the current holder either way.
+        broker = app.state.broker
+        if broker is None:
+            return JSONResponse(
+                {"ok": False, "error": "reviews disabled"}, status_code=404
+            )
+        ok, holder = broker.acquire_review_lock(task_id, body.client_id)
+        return JSONResponse({"ok": ok, "locked_by": holder})
+
+    @app.post("/api/reviews/unlock/{task_id:path}")
+    async def release_review_lock(task_id: str, body: ReviewLockBody) -> JSONResponse:
+        # Release the lock when the operator exits the review overlay (idempotent).
+        broker = app.state.broker
+        if broker is None:
+            return JSONResponse(
+                {"ok": False, "error": "reviews disabled"}, status_code=404
+            )
+        broker.release_review_lock(task_id, body.client_id)
+        return JSONResponse({"ok": True})
 
     @app.post("/api/submit/{task_id:path}")
     async def submit_task(task_id: str) -> JSONResponse:

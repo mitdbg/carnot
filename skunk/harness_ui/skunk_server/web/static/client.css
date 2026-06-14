@@ -986,6 +986,12 @@ textarea { width: 100%; min-height: 55px; }
   background: var(--bg2); border-left: 2px solid var(--border2);
   border-radius: 0 5px 5px 0; padding: 6px 8px; white-space: pre-wrap;
 }
+/* Read-only source/publisher of an external-lookup value — not editable. */
+.review-cand-source {
+  font-size: 12px; line-height: 1.45; color: var(--text2);
+  background: var(--bg2); border-left: 2px solid var(--accent);
+  border-radius: 0 5px 5px 0; padding: 6px 8px; white-space: pre-wrap;
+}
 .review-notes-label {
   display: block; font-size: 11px; color: var(--text3);
   text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 3px;
@@ -1045,6 +1051,31 @@ textarea { width: 100%; min-height: 55px; }
 }
 .detail-feedback.revising { color: var(--blue); font-size: 12px; }
 @keyframes review-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+/* ── Review lock (another operator is annotating this UID) ──────────────────────── */
+/* Greyed, un-clickable variant of the row-review / row-submit action chips. */
+.locked-out {
+  cursor: not-allowed;
+  pointer-events: none;
+  opacity: 0.4;
+  filter: grayscale(1);
+}
+button.primary[disabled] { opacity: 0.4; cursor: not-allowed; filter: grayscale(1); }
+/* Lock indicator chip in the task row, same footprint as the other row-side chips. */
+.row-locked {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--muted);
+  background: var(--blue-bg);
+  border: 1px solid var(--border2);
+}
 
 .review-context {
   font-size: 12px;
