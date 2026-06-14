@@ -317,7 +317,7 @@ def test_reasoning_payload_includes_branch_cards_and_code() -> None:
             "data": {
                 "label": "initial",
                 "branches": [
-                    {"branch_id": 0, "kind": "retrieve", "key": "inflation", "period": "1954-02", "as_of": "1954-02"},
+                    {"branch_id": 0, "kind": "retrieve", "key": "inflation", "period": "1954-02"},
                     {"branch_id": 1, "kind": "lookup_external", "target": "cpi", "src": "fred"},
                 ],
             },

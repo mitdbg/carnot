@@ -838,6 +838,7 @@ def _catalog_row(bulletin: str, page: int, scan: dict) -> PageCatalogRow | None:
     return PageCatalogRow(
         bulletin=bulletin,
         page=page,
+        printed_page=scan.get("printed_page"),
         # Fragments the table_merge pass linked to a parent block don't ship — the parent's
         # row covers them (its block carries the fragment's page in `extra_pages`).
         content_blocks=[

@@ -137,7 +137,7 @@ def _load_plans() -> dict[str, list[RetrieveBranch]]:
             if b.get("kind") != "retrieve":
                 continue  # lookup_external branches don't touch the page corpus
             branches.append(
-                RetrieveBranch(key=b["key"], period=b.get("period"), as_of=b.get("as_of"))
+                RetrieveBranch(key=b["key"], period=b.get("period"))
             )
         out[rec["uid"]] = branches
     return out

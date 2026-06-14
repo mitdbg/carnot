@@ -285,7 +285,6 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         *,
         branch_key: str | None = None,
         branch_period: str | None = None,
-        branch_as_of: str | None = None,
         required_bulletins: list[str] | None = None,
     ) -> list[str]:
         parts = [f"Question: {question}"]
@@ -293,8 +292,6 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             parts.append(f"Search focus: {branch_key}")
         if branch_period:
             parts.append(f"Time period (of the data): {branch_period}")
-        if branch_as_of:
-            parts.append(f"Reported in / as of: {branch_as_of}")
         if required_bulletins:
             parts.append(
                 "Human-required source bulletins (hard scope): "

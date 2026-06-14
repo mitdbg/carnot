@@ -938,6 +938,13 @@ textarea { width: 100%; min-height: 55px; }
   border-radius: 6px; padding: 8px 10px; font-size: 13px; font-family: inherit; line-height: 1.45;
   resize: vertical; min-height: 90px;
 }
+/* Pre-filled AnnotatedValue JSON template for a figure review (read the value off the chart). */
+.review-json-input {
+  width: 100%; background: var(--bg3); border: 1px solid var(--border2); color: var(--ink);
+  border-radius: 6px; padding: 8px 10px; font-size: 12px; line-height: 1.5;
+  font-family: ui-monospace, monospace; tab-size: 2; white-space: pre;
+  resize: vertical; min-height: 120px;
+}
 .review-task { color: var(--ink); font-weight: 600; margin-right: 10px; }
 .review-count { color: var(--muted); font-size: 12px; }
 .review-close {

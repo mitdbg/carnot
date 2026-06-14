@@ -58,8 +58,8 @@ def _needs_more_from_env(env: dict[str, Any]) -> NeedsMore:
     """Validate a missing-data exec environment into a `NeedsMore`. `missing` must validate
     as `MissingDataSignal`. `keep` (optional, default `{}`) is the model's drop-by-default
     choice of what to carry into the next round, a `{name: value}` dict where each value is
-    EITHER an `input_values` entry — carried verbatim so its provenance (bulletin/pages/
-    as_of) survives — OR a freshly computed scalar / [scalars] / flat {label: scalar} dict,
+    EITHER an `input_values` entry — carried verbatim so its provenance (bulletin/pages)
+    survives — OR a freshly computed scalar / [scalars] / flat {label: scalar} dict,
     which becomes a provenance-free `AnnotatedValue` marked "computed". Anything not in `keep`
     is dropped. Raises `ValueError` with a fix-it detail on any malformed shape."""
     try:
