@@ -1,0 +1,20 @@
+have to clean the data
+
+In total there are 88745 tables (images/corresponding tables)
+
+
+ - feasibility 1:
+	how much does it cost (and time) to feed image + table to an LLM and ask it if there are any mistakes?
+	- what is the accuracy? 
+	
+ - feasibility 2: 
+   Can I load all tables and find all tables with the same name and values across the years? 
+   
+ - feasibility 3:
+   If 2 works can we build mega large SQL tables ?
+   *probably not a good idea
+   
+ - feasibility 4
+   look for tables that have row-value and find all pairs that have row-value with only an edit distance of 1
+   
+   

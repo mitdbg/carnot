@@ -67,10 +67,79 @@ def read_jsonl_latest(path: str, key: str = "table_id") -> dict:
                 row = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            row_key = row.get(key)
+            row_key = row_table_id(row) if key == "table_id" else row.get(key)
             if row_key:
                 latest[row_key] = row
     return latest
+
+
+def row_table_id(row: dict) -> str | None:
+    value = row.get("table_id") or row.get("id")
+    return str(value) if value is not None else None
+
+
+def stable_table_key(row: dict) -> tuple[str, str, str] | None:
+    bulletin = row.get("bulletin")
+    page = row.get("page")
+    table_index = row.get("table_index")
+    if bulletin is None or page is None or table_index is None:
+        return None
+    return str(bulletin), str(page), str(table_index)
+
+
+def completed_lookup(rows: list[dict]) -> set[tuple]:
+    lookup = set()
+    for row in rows:
+        table_id = row_table_id(row)
+        if table_id:
+            lookup.add(("table_id", table_id))
+        key = stable_table_key(row)
+        if key:
+            lookup.add(("stable", *key))
+    return lookup
+
+
+def table_completion_keys(table: dict) -> list[tuple]:
+    keys = []
+    table_id = row_table_id(table)
+    if table_id:
+        keys.append(("table_id", table_id))
+    key = stable_table_key(table)
+    if key:
+        keys.append(("stable", *key))
+    return keys
+
+
+def read_jsonl_file_stats(path: str) -> dict:
+    stats = {
+        "path": path,
+        "exists": os.path.exists(path),
+        "size_bytes": os.path.getsize(path) if os.path.exists(path) else 0,
+        "lines": 0,
+        "valid_json_rows": 0,
+        "invalid_json_rows": 0,
+        "rows_with_table_id": 0,
+        "stage_counts": {},
+    }
+    if not os.path.exists(path):
+        return stats
+    with open(path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            stats["lines"] += 1
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                stats["invalid_json_rows"] += 1
+                continue
+            stats["valid_json_rows"] += 1
+            if row_table_id(row):
+                stats["rows_with_table_id"] += 1
+            stage = row.get("stage")
+            if stage:
+                stats["stage_counts"][stage] = stats["stage_counts"].get(stage, 0) + 1
+    return stats
 
 
 def append_jsonl(path: str, rows: list[dict]) -> None:
@@ -83,6 +152,99 @@ def append_jsonl(path: str, rows: list[dict]) -> None:
             f.write("\n")
         f.flush()
         os.fsync(f.fileno())
+
+
+def recover_outputs_from_raw(output_dir: str) -> dict:
+    raw_path = os.path.join(output_dir, "raw_responses.jsonl")
+    verdicts_path = os.path.join(output_dir, "verdicts.jsonl")
+    correction_tables_path = os.path.join(output_dir, "correction_tables.jsonl")
+    corrections_path = os.path.join(output_dir, "corrections.jsonl")
+    stats = {
+        "raw_rows_scanned": 0,
+        "verdict_rows_recovered": 0,
+        "correction_table_rows_recovered": 0,
+        "correction_rows_recovered": 0,
+    }
+    if not os.path.exists(raw_path):
+        return stats
+
+    raw_by_stage_and_id = {}
+    with open(raw_path) as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            stage = row.get("stage")
+            table_id = row_table_id(row)
+            if stage in ("verdict", "correction") and table_id:
+                raw_by_stage_and_id[(stage, table_id)] = row
+                stats["raw_rows_scanned"] += 1
+
+    verdict_rows_by_id = read_jsonl_latest(verdicts_path)
+    correction_rows_by_id = read_jsonl_latest(correction_tables_path)
+    verdict_completed = completed_lookup(list(verdict_rows_by_id.values()))
+    correction_completed = completed_lookup(list(correction_rows_by_id.values()))
+    correction_keys = set()
+    if os.path.exists(corrections_path):
+        with open(corrections_path) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                table_id = row_table_id(row)
+                correction_index = row.get("correction_index")
+                if table_id and correction_index is not None:
+                    correction_keys.add((table_id, correction_index))
+
+    recovered_verdict_rows = []
+    recovered_correction_table_rows = []
+    recovered_correction_rows = []
+    identity_keys = [
+        "table_id",
+        "bulletin",
+        "year",
+        "month",
+        "page",
+        "table_index",
+        "label",
+        "image_path",
+    ]
+
+    for (stage, table_id), raw_row in raw_by_stage_and_id.items():
+        task = {"identity": {key: raw_row.get(key) for key in identity_keys}}
+        raw_keys = table_completion_keys(raw_row)
+        if stage == "verdict" and not any(key in verdict_completed for key in raw_keys):
+            stage_row, _ = process_verdict_payload(task, raw_row)
+            recovered_verdict_rows.append(stage_row)
+            verdict_rows_by_id[table_id] = stage_row
+            verdict_completed.update(table_completion_keys(stage_row))
+        elif stage == "correction" and not any(key in correction_completed for key in raw_keys):
+            stage_row, correction_rows = process_correction_payload(task, raw_row)
+            recovered_correction_table_rows.append(stage_row)
+            correction_rows_by_id[table_id] = stage_row
+            correction_completed.update(table_completion_keys(stage_row))
+            for correction_row in correction_rows:
+                correction_key = (
+                    correction_row.get("table_id"),
+                    correction_row.get("correction_index"),
+                )
+                if correction_key not in correction_keys:
+                    recovered_correction_rows.append(correction_row)
+                    correction_keys.add(correction_key)
+
+    append_jsonl(verdicts_path, recovered_verdict_rows)
+    append_jsonl(correction_tables_path, recovered_correction_table_rows)
+    append_jsonl(corrections_path, recovered_correction_rows)
+    stats["verdict_rows_recovered"] = len(recovered_verdict_rows)
+    stats["correction_table_rows_recovered"] = len(recovered_correction_table_rows)
+    stats["correction_rows_recovered"] = len(recovered_correction_rows)
+    return stats
 
 
 def write_json(path: str, payload: dict) -> None:
@@ -525,9 +687,10 @@ def process_correction_payload(task: dict, raw_row: dict) -> tuple[dict, list[di
 
 def build_tasks(tables: list[dict], tables_json: str, completed: dict, stage: str) -> list[dict]:
     tasks = []
+    completed_keys = completed_lookup(list(completed.values()))
     for table in tables:
         table_id = table.get("id")
-        if not table_id or table_id in completed:
+        if not table_id or any(key in completed_keys for key in table_completion_keys(table)):
             continue
         parsed_ocr = table.get("parsed_ocr") or ""
         if not parsed_ocr.strip():
@@ -549,6 +712,27 @@ def build_tasks(tables: list[dict], tables_json: str, completed: dict, stage: st
             }
         )
     return tasks
+
+
+def select_error_tables(tables: list[dict], verdict_rows_by_id: dict) -> list[dict]:
+    error_ids = set()
+    error_stable_keys = set()
+    for row in verdict_rows_by_id.values():
+        if row.get("verdict") != "E":
+            continue
+        table_id = row_table_id(row)
+        if table_id:
+            error_ids.add(table_id)
+        key = stable_table_key(row)
+        if key:
+            error_stable_keys.add(key)
+    selected = []
+    for table in tables:
+        table_id = row_table_id(table)
+        key = stable_table_key(table)
+        if (table_id and table_id in error_ids) or (key and key in error_stable_keys):
+            selected.append(table)
+    return selected
 
 
 def load_tables(path: str) -> list[dict]:
@@ -616,13 +800,76 @@ def summarize(output_dir: str, total_tables: int, model: str) -> dict:
     return summary
 
 
+def resume_diagnostics(
+    tables: list[dict],
+    output_dir: str,
+    verdict_rows_by_id: dict,
+    correction_rows_by_id: dict,
+    verdict_tasks: list[dict],
+    correction_tasks: list[dict],
+) -> dict:
+    table_ids = {row_table_id(table) for table in tables if row_table_id(table)}
+    table_stable_keys = {
+        stable_table_key(table) for table in tables if stable_table_key(table)
+    }
+    verdict_ids = {row_table_id(row) for row in verdict_rows_by_id.values() if row_table_id(row)}
+    verdict_stable_keys = {
+        stable_table_key(row)
+        for row in verdict_rows_by_id.values()
+        if stable_table_key(row)
+    }
+    correction_ids = {
+        row_table_id(row)
+        for row in correction_rows_by_id.values()
+        if row_table_id(row)
+    }
+    correction_stable_keys = {
+        stable_table_key(row)
+        for row in correction_rows_by_id.values()
+        if stable_table_key(row)
+    }
+    return {
+        "files": {
+            "raw_responses": read_jsonl_file_stats(
+                os.path.join(output_dir, "raw_responses.jsonl")
+            ),
+            "verdicts": read_jsonl_file_stats(os.path.join(output_dir, "verdicts.jsonl")),
+            "correction_tables": read_jsonl_file_stats(
+                os.path.join(output_dir, "correction_tables.jsonl")
+            ),
+            "corrections": read_jsonl_file_stats(
+                os.path.join(output_dir, "corrections.jsonl")
+            ),
+        },
+        "matches": {
+            "loaded_table_ids": len(table_ids),
+            "loaded_stable_keys": len(table_stable_keys),
+            "verdict_id_overlap": len(table_ids & verdict_ids),
+            "verdict_stable_overlap": len(table_stable_keys & verdict_stable_keys),
+            "correction_id_overlap": len(table_ids & correction_ids),
+            "correction_stable_overlap": len(table_stable_keys & correction_stable_keys),
+        },
+        "samples": {
+            "loaded_table_ids": sorted(table_ids)[:5],
+            "verdict_row_ids": sorted(verdict_ids)[:5],
+            "correction_row_ids": sorted(correction_ids)[:5],
+            "pending_verdict_ids": [
+                task["identity"]["table_id"] for task in verdict_tasks[:10]
+            ],
+            "pending_correction_ids": [
+                task["identity"]["table_id"] for task in correction_tasks[:10]
+            ],
+        },
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run full-corpus OCR cleaning.")
     parser.add_argument("--dev", action="store_true")
     parser.add_argument("--tables-json", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--max-workers", type=int, default=int(os.environ.get("LLM_MAX_WORKERS", "20")))
+    parser.add_argument("--max-workers", type=int, default=int(os.environ.get("LLM_MAX_WORKERS", "64")))
     parser.add_argument("--max-requests-per-minute", type=int, default=int(os.environ.get("LLM_MAX_REQUESTS_PER_MINUTE", "600")))
     parser.add_argument("--max-output-tokens", type=int, default=10000)
     parser.add_argument("--checkpoint-interval", type=int, default=5000)
@@ -630,6 +877,7 @@ def main() -> None:
     parser.add_argument("--cache-path", default=None)
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--stage", choices=["both", "verdict", "correction"], default="both")
+    parser.add_argument("--allow-verdict-after-correction", action="store_true")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
@@ -638,6 +886,7 @@ def main() -> None:
     output_dir = args.output_dir or (DEV_OUTPUT_DIR if args.dev else FULL_OUTPUT_DIR)
     batch_size = args.batch_size or max(1, min(args.checkpoint_interval, args.max_workers * 10))
     os.makedirs(output_dir, exist_ok=True)
+    recovery_stats = recover_outputs_from_raw(output_dir)
 
     tables = load_tables(tables_json)
     if args.limit:
@@ -655,16 +904,19 @@ def main() -> None:
     correction_source = verdict_rows_by_id
     correction_tasks = []
     if args.stage in ("both", "correction"):
-        error_ids = {
-            table_id
-            for table_id, row in correction_source.items()
-            if row.get("verdict") == "E"
-        }
-        correction_tables = [table for table in tables if table.get("id") in error_ids]
+        correction_tables = select_error_tables(tables, correction_source)
         correction_tasks = build_tasks(
             correction_tables, tables_json, correction_rows_by_id, "correction"
         )
 
+    diagnostics = resume_diagnostics(
+        tables,
+        output_dir,
+        verdict_rows_by_id,
+        correction_rows_by_id,
+        verdict_tasks,
+        correction_tasks,
+    )
     plan = {
         "tables_json": tables_json,
         "output_dir": output_dir,
@@ -679,9 +931,29 @@ def main() -> None:
         "pending_correction_tasks": len(correction_tasks),
         "existing_verdict_rows": len(verdict_rows_by_id),
         "existing_correction_rows": len(correction_rows_by_id),
+        "recovery_from_raw": recovery_stats,
+        "resume_diagnostics": diagnostics,
     }
     write_json(os.path.join(output_dir, "run_state.json"), {"updated_at": now_ts(), "plan": plan})
     print(json.dumps(plan, indent=2))
+
+    correction_raw_rows = diagnostics["files"]["raw_responses"]["stage_counts"].get(
+        "correction", 0
+    )
+    correction_started = len(correction_rows_by_id) > 0 or correction_raw_rows > 0
+    if (
+        args.stage == "both"
+        and not args.dry_run
+        and correction_started
+        and verdict_tasks
+        and not args.allow_verdict_after_correction
+    ):
+        raise SystemExit(
+            "Refusing to run pass 1 again because correction-stage output already exists. "
+            "Check resume_diagnostics in the printed plan. Use --stage correction to resume "
+            "only corrections, or --allow-verdict-after-correction if you really intend to "
+            "run pending verdict tasks."
+        )
 
     if args.dry_run:
         summarize(output_dir, len(tables), args.model)
@@ -715,12 +987,7 @@ def main() -> None:
             verdict_rows_by_id = read_jsonl_latest(verdicts_path)
 
         if args.stage == "both":
-            error_ids = {
-                table_id
-                for table_id, row in verdict_rows_by_id.items()
-                if row.get("verdict") == "E"
-            }
-            correction_tables = [table for table in tables if table.get("id") in error_ids]
+            correction_tables = select_error_tables(tables, verdict_rows_by_id)
             correction_rows_by_id = read_jsonl_latest(correction_tables_path)
             correction_tasks = build_tasks(
                 correction_tables, tables_json, correction_rows_by_id, "correction"
