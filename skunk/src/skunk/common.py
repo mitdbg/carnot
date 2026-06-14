@@ -376,6 +376,13 @@ def page_key_to_pageref(key: str) -> PageRef:
     return PageRef(month=f"{year_str}-{month_str}", page=int(page_str))
 
 
+def pageref_to_doc_key(ref: PageRef) -> str:
+    """Render a `PageRef` as the corpus `doc_id` form (`"YYYY_MM_pageid"`) — the inverse of
+    `page_key_to_pageref`. Used to label catalog blocks for the SelectAgent so its page keys
+    round-trip back to `PageRef`s."""
+    return f"{(ref.month or '').replace('-', '_')}_{ref.page}"
+
+
 @dataclass(frozen=True)
 class BlockRef:
     """One retrieved CONTENT BLOCK — the retriever's native output unit. `page` is the anchor

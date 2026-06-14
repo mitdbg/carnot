@@ -76,6 +76,24 @@ figure/graph/plot), or one "prose" block (the narrative text on a page that has 
     and time basis — never the numeric values."""
 
 
+# Prompt blurb for the catalog ROW — the unit `search_corpus` filters/searches over in the
+# SelectAgent. Shares `CONTENT_BLOCK_FIELDS` (above) for the per-block shape; drop it under a
+# prompt's `## Catalog schema` header so the agent knows exactly which fields exist.
+CATALOG_ROW_FIELDS = (
+    """\
+Each catalog row describes ONE source page (one PDF page of one bulletin):
+  - bulletin: the issue the page was printed in, "YYYY-MM" (the publication date).
+  - page: the 1-based PDF page index within that issue.
+  - printed_page: the page's own printed footer label ("5", "A-1"); null when unlabeled.
+  - date_interval: the page's [low, high] "YYYY-MM" DATA span — what period the page REPORTS
+    ON, which is distinct from `bulletin` (a Jan-1941 issue can report CY1940 data).
+  - content_blocks: the page's indexable units (tables/charts/prose), each described below.
+
+"""
+    + CONTENT_BLOCK_FIELDS
+)
+
+
 class PageCatalogRow(BaseModel):
     """One shipped catalog row per retrievable PDF page — the query-facing schema,
     projected from each content page's `PageScan` by the catalog stage."""

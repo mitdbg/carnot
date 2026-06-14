@@ -90,10 +90,14 @@ class SkunkConfig:
     # Ablation: golden page refs bypass the retrieve operator (eval runs only).
     golden_pages: list[PageRef] | None = field(default=None, repr=False)
 
-    # Retrieve dispatch: "page_index" (ToC pick → year filter → coarse summary filter,
-    # the default) or "search_agent" (iterative ChromaDB + LLM loop). Either way the
-    # selection agent narrows the candidates downstream. (env: SKUNK_RETRIEVER)
-    retriever: Literal["search_agent", "page_index"] = "page_index"
+    # Retrieve dispatch (env: SKUNK_RETRIEVER):
+    #   "page_index"       — ToC pick → year filter → coarse summary filter (the default);
+    #                        survivors narrowed by the block-selection tournament downstream.
+    #   "page_index_agent" — same candidate generation, but the SelectAgent (catalog +
+    #                        PageStore, no ChromaDB) does the precision selection over the
+    #                        flagged survivors, emitting final pages (block_select bypassed).
+    #   "search_agent"     — iterative ChromaDB + LLM loop over the whole corpus.
+    retriever: Literal["search_agent", "page_index", "page_index_agent"] = "page_index"
 
     # Search-agent corpus artifacts (built offline; agent fails fast if missing).
     # (env: SKUNK_CHROMADB_DIR, SKUNK_CHROMADB_COLLECTION, SKUNK_CLEAN_PAGE_MAP)

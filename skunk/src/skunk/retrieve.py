@@ -81,7 +81,7 @@ class RetrieveOp:
             )
             blocks = tuple(_whole_page_blocks(pages))
             return [BranchRetrieval(blocks=blocks, pre_selected=True) for _ in branches]
-        scopes = document_scopes or [None] * len(branches)
+        scopes: list[list[str] | None] = document_scopes or [None] * len(branches)
         match str(ctx.config.retriever):
             case "search_agent":
                 ids = branch_ids if branch_ids is not None else [None] * len(branches)
@@ -142,10 +142,73 @@ class RetrieveOp:
                             )
                         )
                 return results
+            case "page_index_agent":
+                # Same candidate generation as `page_index` (one shared ToC + year + sem
+                # filter sweep), then the SelectAgent does the precision selection per branch
+                # over that branch's flagged survivors. Emits `pre_selected=True` blocks, so
+                # the downstream block-selection tournament is bypassed entirely.
+                from skunk.page_index.query import PageIndexRetriever
+                from skunk.page_index.store import get_page_store
+
+                retriever = self._page_index()
+                survivors = await retriever.retrieve_all(
+                    ctx, branches, document_scopes=scopes
+                )
+                catalog = retriever.catalog
+                page_store = get_page_store(str(ctx.config.pdf_dir))
+                ids = branch_ids if branch_ids is not None else [None] * len(branches)
+
+                async def _one_agent(
+                    b: RetrieveBranch, brs: list, bid: int | None
+                ) -> BranchRetrieval:
+                    if not brs:
+                        reason = (
+                            f"page_pin {b.page_pin.bulletin}:{b.page_pin.page} resolved to no catalog page"
+                            if b.page_pin is not None
+                            else f"semantic filter kept no blocks for branch {b.key!r}"
+                        )
+                        raise StepFailed("retrieve", reason)
+                    if b.page_pin is not None:
+                        # Deterministic positional FETCH: bypass the agent, take the resolved
+                        # pages whole (mirrors the page_index path's pinned-branch handling).
+                        return BranchRetrieval(blocks=tuple(brs), pre_selected=True)
+                    pool = PageIndexRetriever.pool_for_blocks(
+                        list(brs), str(ctx.config.pdf_dir)
+                    )
+                    if not pool:
+                        raise StepFailed(
+                            "retrieve",
+                            f"semantic filter kept no blocks for branch {b.key!r}",
+                        )
+                    refs = await traced_step(
+                        ctx, "select_agent",
+                        lambda: self._run_select_agent(ctx, b, pool, catalog, page_store),
+                        branch_id=bid,
+                    )
+                    return BranchRetrieval(
+                        blocks=tuple(_whole_page_blocks(refs)), pre_selected=True
+                    )
+
+                settled = await asyncio.gather(
+                    *(
+                        _one_agent(b, brs, bid)
+                        for b, brs, bid in zip(branches, survivors, ids)
+                    ),
+                    return_exceptions=True,
+                )
+                out: list[BranchRetrieval | StepFailed] = []
+                for r in settled:
+                    if isinstance(r, StepFailed):
+                        out.append(r)
+                    elif isinstance(r, BaseException):
+                        raise r
+                    else:
+                        out.append(r)
+                return out
             case other:
                 raise StepFailed(
                     "retrieve",
-                    f"unknown retriever {other!r}; expected 'search_agent' or 'page_index'",
+                    f"unknown retriever {other!r}; expected 'search_agent', 'page_index', or 'page_index_agent'",
                 )
 
     async def _run_search_agent(
@@ -193,6 +256,44 @@ class RetrieveOp:
             raise StepFailed(
                 "retrieve",
                 f"search_agent returned no usable page keys (raw={page_keys!r})",
+            )
+        return refs
+
+    async def _run_select_agent(
+        self,
+        ctx: ExecutionContext,
+        branch: RetrieveBranch,
+        pool: list,
+        catalog,
+        page_store,
+    ) -> list[PageRef]:
+        from skunk.select_agent import SelectAgent
+
+        agent = SelectAgent(
+            config=ctx.config,
+            catalog=catalog,
+            page_store=page_store,
+            candidates=pool,
+        )
+        page_keys = await agent.retrieve(
+            ctx,
+            ctx.question,
+            branch_key=branch.key,
+            branch_period=branch.period,
+        )
+        refs: list[PageRef] = []
+        bad: list[str] = []
+        for key in page_keys:
+            try:
+                refs.append(page_key_to_pageref(key))
+            except ValueError:
+                bad.append(key)
+        if bad:
+            ctx.emit(f"bad_page_keys n_bad={len(bad)} keys={bad[:5]!r}")
+        if not refs:
+            raise StepFailed(
+                "retrieve",
+                f"select_agent returned no usable page keys (raw={page_keys!r})",
             )
         return refs
 

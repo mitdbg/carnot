@@ -378,6 +378,12 @@ Requirements for the final answer:
     # Trajectory: blocks, redaction, rendering
     # ------------------------------------------------------------------
 
+    def _seed_blocks(self) -> list[Block]:
+        """Observation blocks to inject as the opening user message of a fresh `call()`
+        (not on `resume`). Default: none. The SelectAgent overrides this to seed its
+        stage-1 flagged candidates as a pruneable observation."""
+        return []
+
     def _block_is_visible(self, block: Block) -> bool:
         """Whether `block` appears in the LLM-facing render. Default: always.
         Subclasses (e.g. `SearchAgent`) override to redact pruned `ChunkBlock`s."""
@@ -453,6 +459,12 @@ Requirements for the final answer:
             self.messages.append({"role": "user", "blocks": [TextBlock(user)]})
         else:
             self.messages = [{"role": "user", "blocks": [TextBlock(user)]}]
+            # Opening observation seeded by the subclass (e.g. the SelectAgent's flagged
+            # candidates), injected as a pruneable user message right after the question so
+            # it flows through the same redaction path as a tool result — never the prompt.
+            seed = self._seed_blocks()
+            if seed:
+                self.messages.append({"role": "user", "blocks": seed})
 
         # Capture the system prompt + opening question into the event stream so the
         # trace viewer can show them (the console / `.log` keep only the one-liners —

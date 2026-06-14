@@ -210,6 +210,7 @@ True when the summary fits at least one target; false only when clearly unrelate
             if line
         ]
         self._catalog = {r.ref: r for r in rows}
+        self.catalog = self._catalog  # public read-only alias (the SelectAgent queries it)
         self._catalog_size = sum(
             c.n_pages for era in self._tree.eras for c in era.chapters.values()
         )
