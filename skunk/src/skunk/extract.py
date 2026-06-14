@@ -320,7 +320,7 @@ notes         the page's textual context bearing on the question:
 
 index_name    (vector only) name of the varying dimension.
 
-row_name /col_name      (table only) names of the two varying dimensions.
+row_name/col_name      (table only) names of the two varying dimensions.
 
 unit          the printed scale and base, in natural language
               ("millions of dollars", "percent"); "" for

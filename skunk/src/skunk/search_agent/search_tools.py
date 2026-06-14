@@ -345,8 +345,12 @@ This tool returns the full cleaned text of one or more documents, given their `d
 read_document(["doc_id_1", "doc_id_2"])
 ```"""
 
-    def __init__(self, document_map: dict[str, str], max_pages: int):
+    def __init__(self, document_map: dict[str, str], max_pages: int, max_output_chars: int):
         self._document_map = document_map
+        # Hard cap on the rendered observation size (chars). A `read_document` over many
+        # dense-table pages can otherwise dump 100s of K of tokens in one shot and 400 the
+        # next request (see SkunkConfig.read_document_max_output_chars).
+        self._max_output_chars = max_output_chars
         # Pre-substitute the jinja var: tool `doc`s may flow through a
         # StrictUndefined render, so no `{{ ... }}` may survive here.
         self.doc = self._DOC_TEMPLATE.replace("{{ max_pages }}", str(max_pages))
@@ -354,15 +358,30 @@ read_document(["doc_id_1", "doc_id_2"])
     def __call__(self, doc_id: str | list[str]) -> dict:
         doc_ids = [doc_id] if isinstance(doc_id, str) else list(doc_id)
         docs: list[dict] = []
-        for did in doc_ids:
+        used = 0  # cumulative chars emitted across docs this call
+        for n, did in enumerate(doc_ids):
             text = self._document_map.get(did)
             if text is None:
-                docs.append({
-                    "doc_id": did,
-                    "text": f"=== doc_id={did} ===\n[no such document (or no content in document)]",
-                })
+                body = "[no such document (or no content in document)]"
             else:
-                docs.append({"doc_id": did, "text": f"=== doc_id={did} ===\n{text}"})
+                body = text
+            rendered = f"=== doc_id={did} ===\n{body}"
+            remaining = self._max_output_chars - used
+            if len(rendered) > remaining:
+                # Truncate this doc to what's left, then stop — dropping any further docs with
+                # a note so the agent reads fewer doc_ids (or narrows with search/grep) instead.
+                dropped = len(doc_ids) - n - 1
+                note = (
+                    f"\n[truncated: read_document output exceeded "
+                    f"{self._max_output_chars} chars"
+                    + (f"; {dropped} more requested doc(s) not shown" if dropped else "")
+                    + " — read fewer doc_ids per call, or narrow with search_corpus / "
+                    "grep_corpus]"
+                )
+                docs.append({"doc_id": did, "text": rendered[: max(0, remaining)] + note})
+                break
+            docs.append({"doc_id": did, "text": rendered})
+            used += len(rendered)
         return {READ_DOCUMENT_RESULT_TAG: True, "docs": docs}
 
 

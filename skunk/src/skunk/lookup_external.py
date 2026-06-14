@@ -48,10 +48,8 @@ the dict in a tool step first, then copy the printed JSON here.
 Tool steps have `math`, `statistics`, `datetime`, `numpy as np`,
 `pandas as pd`, `json` in scope (plus the tools above)."""
 
-    def __init__(self, *, max_steps: int, tools: list[Tool], max_parallel_tool_calls: int = 1):
-        super().__init__(
-            tools, max_steps=max_steps, max_parallel_tool_calls=max_parallel_tool_calls
-        )
+    def __init__(self, *, max_steps: int, tools: list[Tool]):
+        super().__init__(tools, max_steps=max_steps)
 
     def validate_final_answer(self, payload: object, observations: list[str]) -> str | None:
         # Shape only — no numeric-grounding check: the agent reaches every value
@@ -78,7 +76,6 @@ class LookupExternalOp:
         agent = LookupAgent(
             max_steps=ctx.config.lookup_max_steps,
             tools=tools,
-            max_parallel_tool_calls=ctx.config.lookup_max_parallel_tool_calls,
         )
         # Cap each agent turn like SearchAgent/SelectAgent: an uncapped lookup turn
         # hung 250s+ (thinking-only generation) and stalled the whole question.
