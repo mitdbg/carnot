@@ -3,8 +3,8 @@
 `RetrieveOp` turns a `RetrieveBranch` into the pages that answer it:
 - golden bypass — returns `ctx.config.golden_pages` verbatim (eval ablation).
 - `search_agent` — iterative ChromaDB + LLM loop under `skunk.search_agent`.
-- `page_index` — ToC pick → year filter → semantic filter → block selection
-  (all within `PageIndexRetriever.retrieve_all`).
+- `page_index` — ToC pick → year filter → semantic filter (all within
+  `PageIndexRetriever.retrieve_all`); the selection agent narrows downstream.
 
 The two real backends are built lazily.
 """
@@ -19,15 +19,20 @@ from typing import TYPE_CHECKING
 
 from skunk.config import SkunkConfig
 from skunk.errors import StepFailed
-from skunk.common import BlockRef, ExecutionContext, PageRef, page_key_to_pageref, traced_step
+from skunk.common import (
+    BlockRef,
+    BranchRetrieval,
+    ExecutionContext,
+    PageRef,
+    page_key_to_pageref,
+    traced_step,
+)
 from skunk.plan import RetrieveBranch
 
 if TYPE_CHECKING:
     from skunk.page_index.query import BlockRef
-    from skunk.search_agent import SearchAgent
 
 
-# TODO: this is just a hack to make blocks work with search agents. We should probably fix this at some point
 def _whole_page_blocks(refs: list[PageRef]) -> list[BlockRef]:
     """Wrap bare page refs (golden / search-agent) as whole-page `BlockRef`s (`block_index=None`),
     so extract reads them the same as page-index blocks — just with no specific block to scope to."""
@@ -41,26 +46,7 @@ class RetrieveOp:
         self._config = config
         self._resources = None  # (Collection, dict[str, str]) — shared across branches
         self._resources_lock = threading.Lock()
-        self._page_index_retriever = (
-            None  # skunk.page_index_old.query.PageIndexRetriever
-        )
-
-    async def run(
-        self, ctx: ExecutionContext, branch: RetrieveBranch
-    ) -> list[BlockRef]:
-        if ctx.config.golden_pages is not None:
-            return self._golden_blocks(ctx)
-        match str(ctx.config.retriever):
-            case "search_agent":
-                return _whole_page_blocks(await self._run_search_agent(ctx, branch))
-            case "page_index":
-                return (await self._page_index().retrieve_all(ctx, [branch]))[0]
-            case other:
-                raise StepFailed(
-                    "retrieve",
-                    f"unknown retriever {other!r}; expected 'search_agent' or 'page_index_old'",
-                )
-
+        self._page_index_retriever = None  # skunk.page_index.query.PageIndexRetriever
 
     async def run_all(
         self,
@@ -69,18 +55,32 @@ class RetrieveOp:
         branch_ids: list[int] | None = None,
         *,
         document_scopes: list[list[str] | None] | None = None,
-        agent_sink: dict[int, "SearchAgent"] | None = None,
-    ) -> list[list[BlockRef] | StepFailed]:
-        """Retrieve for several branches at once, result aligned to `branches`. A slot is
-        that branch's blocks or a `StepFailed` — a single branch failing does not
-        sink its siblings. A whole-sweep failure (unknown retriever, missing index) raises.
+    ) -> list[BranchRetrieval | StepFailed]:
+        """The single retrieval seam: retrieve for several branches at once, one result per
+        branch aligned to `branches`. Each slot is a `BranchRetrieval` (its blocks +
+        `pre_selected`) or a `StepFailed` — a single branch failing does not sink its
+        siblings. A whole-sweep failure (unknown retriever, missing index) raises. This is
+        the ONLY place that dispatches on `config.retriever`:
+
+        - golden bypass (`golden_pages`) → whole-page blocks, `pre_selected=True`.
+        - `search_agent` → agent rollout → page keys → whole-page blocks, `pre_selected=True`.
+        - `page_index` → sem-filter survivor blocks, `pre_selected=False`; an empty survivor
+          list for a branch surfaces as a per-branch `StepFailed`.
 
         `branch_ids` (search-agent backend only) aligns each branch to its stable id so its
         retrieve runs in a per-branch `traced_step`: the rollout + the returned pages then
         attach to that branch in the trace viewer. The page-index backend is a single shared
-        sweep, so it owns no per-branch step here (the orchestrator traces the whole phase)."""
+        sweep, so it owns no per-branch step here (the orchestrator traces the whole phase).
+        `document_scopes` (search-agent backend) hard-scopes a branch's corpus to a set of
+        bulletins (HITL human-required documents)."""
         if ctx.config.golden_pages is not None:
-            return [self._golden_blocks(ctx) for _ in branches]
+            # --golden ablation: inject the benchmark pages verbatim, already final.
+            pages = ctx.config.golden_pages
+            ctx.emit(
+                f"golden_bypass n_pages={len(pages)} refs={[str(r) for r in pages]!r}"
+            )
+            blocks = tuple(_whole_page_blocks(pages))
+            return [BranchRetrieval(blocks=blocks, pre_selected=True) for _ in branches]
         scopes = document_scopes or [None] * len(branches)
         match str(ctx.config.retriever):
             case "search_agent":
@@ -88,22 +88,18 @@ class RetrieveOp:
 
                 async def _one(
                     b: RetrieveBranch, bid: int | None, scope: list[str] | None
-                ) -> list[BlockRef]:
+                ) -> BranchRetrieval:
                     # Per-branch `retrieve` step (branch_id=bid) so the SearchAgent rollout
                     # and its `pages` summary group under this branch in the viewer. `scope`
                     # (human-required bulletins, if any) hard-scopes the agent's corpus.
-                    # The agent is registered in `agent_sink` (keyed by branch id) BEFORE it
-                    # runs, so a later planner-chosen resume op can continue it with feedback
-                    # whether it succeeds or fails (see Orchestrator._resume_one).
                     refs = await traced_step(
                         ctx, "retrieve",
-                        lambda: self._run_search_agent(
-                            ctx, b, required_bulletins=scope,
-                            agent_sink=agent_sink, branch_id=bid,
-                        ),
+                        lambda: self._run_search_agent(ctx, b, required_bulletins=scope),
                         branch_id=bid,
                     )
-                    return _whole_page_blocks(refs)
+                    return BranchRetrieval(
+                        blocks=tuple(_whole_page_blocks(refs)), pre_selected=True
+                    )
 
                 settled = await asyncio.gather(
                     *(
@@ -112,7 +108,7 @@ class RetrieveOp:
                     ),
                     return_exceptions=True,
                 )
-                out: list[list[BlockRef] | StepFailed] = []
+                out: list[BranchRetrieval | StepFailed] = []
                 for r in settled:
                     if isinstance(r, StepFailed):
                         out.append(r)
@@ -122,29 +118,25 @@ class RetrieveOp:
                         out.append(r)
                 return out
             case "page_index":
-                return list(
-                    await self._page_index().retrieve_all(
-                        ctx,
-                        branches,
-                        document_scopes=scopes,
-                    )
+                survivors = await self._page_index().retrieve_all(
+                    ctx,
+                    branches,
+                    document_scopes=scopes,
                 )
+                return [
+                    StepFailed(
+                        "retrieve",
+                        f"semantic filter kept no blocks for branch {b.key!r}",
+                    )
+                    if not brs
+                    else BranchRetrieval(blocks=tuple(brs), pre_selected=False)
+                    for b, brs in zip(branches, survivors)
+                ]
             case other:
                 raise StepFailed(
                     "retrieve",
                     f"unknown retriever {other!r}; expected 'search_agent' or 'page_index'",
                 )
-
-    def _golden_blocks(self, ctx: ExecutionContext) -> list[BlockRef]:
-        """Golden / replay bypass → `BlockRef`s. A block-aware cache replay injects the cached
-        blocks (`config.cached_blocks`) so extract block-scopes as the live run did; plain
-        `--golden` (no blocks) wraps its pages as whole-page blocks."""
-        pages = ctx.config.golden_pages
-        assert pages is not None
-        ctx.emit(f"golden_bypass n_pages={len(pages)} refs={[str(r) for r in pages]!r}")
-        if ctx.config.cached_blocks is not None:
-            return ctx.config.cached_blocks
-        return _whole_page_blocks(pages)
 
     async def _run_search_agent(
         self,
@@ -152,8 +144,6 @@ class RetrieveOp:
         branch: RetrieveBranch,
         *,
         required_bulletins: list[str] | None = None,
-        agent_sink: dict[int, "SearchAgent"] | None = None,
-        branch_id: int | None = None,
     ) -> list[PageRef]:
         from skunk.search_agent import SearchAgent
 
@@ -169,12 +159,8 @@ class RetrieveOp:
             ),
             required_bulletins=required_bulletins,
         )
-        # Register the live agent up front (keyed by branch id) so the orchestrator can
-        # resume it with downstream missing-data feedback — whether this call succeeds or
-        # raises (e.g. "max steps without accepted final answer").
-        if agent_sink is not None and branch_id is not None:
-            agent_sink[branch_id] = agent
-        # The agent hint is free text; render a per-entry pin list to its pinned months.
+        # `as_of` is a SOFT hint to the search agent only (block_select owns issue choice);
+        # render a per-entry pin list to its pinned months as free text.
         as_of_hint = (
             ", ".join(m for m in branch.as_of if m) or None
             if isinstance(branch.as_of, list)
@@ -188,33 +174,6 @@ class RetrieveOp:
             branch_as_of=as_of_hint,
             required_bulletins=required_bulletins,
         )
-        return self._page_keys_to_refs(ctx, page_keys, required_bulletins=required_bulletins)
-
-    async def resume_search_agent(
-        self,
-        ctx: ExecutionContext,
-        agent: "SearchAgent",
-        feedback: str,
-        *,
-        required_bulletins: list[str] | None = None,
-    ) -> list[BlockRef]:
-        """Continue a previously-run SearchAgent with the planner's resume `feedback` on a
-        fresh (smaller) step budget, and wrap its new page keys as whole-page `BlockRef`s
-        ready for extract. Mirrors `_run_search_agent`'s page-key→ref tail; raises the same
-        `StepFailed` if the resumed run yields nothing usable (or hits max steps again)."""
-        page_keys = await agent.resume_retrieve(ctx, feedback)
-        refs = self._page_keys_to_refs(ctx, page_keys, required_bulletins=required_bulletins)
-        return _whole_page_blocks(refs)
-
-    def _page_keys_to_refs(
-        self,
-        ctx: ExecutionContext,
-        page_keys: list[str],
-        *,
-        required_bulletins: list[str] | None = None,
-    ) -> list[PageRef]:
-        """Validate a SearchAgent's `page_keys` final answer into `PageRef`s: drop unparseable
-        keys and (when scoped) any outside `required_bulletins`, and fail loudly if none survive."""
         refs: list[PageRef] = []
         bad: list[str] = []
         for key in page_keys:

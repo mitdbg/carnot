@@ -253,10 +253,11 @@ Requirements for the final answer:
 {{ final_answer_doc }}"""
 
     max_steps: int | None = 8
-    # Step budget for a `resume()` (the initial `call()` always gets the full `max_steps`).
-    # None ⇒ resume reuses `max_steps`; set smaller (e.g. 10) so a branch that keeps coming
-    # back via the orchestrator's missing-data recovery can't keep buying full fresh budgets.
-    max_resume_steps: int | None = None
+    # Per-step sampling temperature, threaded to `PromptedCall.call` → `astream`.
+    # 1.0 per Gemini 3.x guidance: thinking-enabled calls below 1.0 can trap the
+    # model in a degenerate reasoning loop that burns the whole output budget
+    # (https://ai.google.dev/gemini-api/docs/gemini-3). Subclasses may still override.
+    temperature: float = 1.0
     # Hard cap on NON-progressing attempts (parse-misfires / exec-machinery failures) over
     # the whole run. These do NOT consume `max_steps` (only turns that ran a tool call or
     # parsed a final-answer block do); this is the backstop so a model that never emits a
@@ -285,7 +286,6 @@ Requirements for the final answer:
         tools: list[Tool],
         *,
         max_steps: int | None = None,
-        max_resume_steps: int | None = None,
         max_misfires: int | None = None,
         system_prompt_override: str | None = None,
         generation_backend: GenerationBackend | None = None,
@@ -294,8 +294,6 @@ Requirements for the final answer:
     ) -> None:
         self._tools = tools
         self.max_steps = max_steps
-        if max_resume_steps is not None:
-            self.max_resume_steps = max_resume_steps
         if max_misfires is not None:
             self.max_misfires = max_misfires
         # Full block trajectory of the most recent `call()`; rebuilt per call.
@@ -437,16 +435,24 @@ Requirements for the final answer:
             out.append(entry)
         return out
 
-    async def call(self, ctx: ExecutionContext, user: str, **_) -> Any:
-        """Run the multi-turn loop, returning the parsed json final-answer payload. Extra
-        kwargs are ignored (signature compat with single-shot calls)."""
+    async def call(
+        self, ctx: ExecutionContext, user: str, *, resume: bool = False, **_
+    ) -> Any:
+        """Run the multi-turn loop, returning the parsed json final-answer payload.
+        `resume=True` appends `user` to the existing trajectory (with a fresh step budget)
+        instead of starting over — the seam for a reviewer sending the agent back with
+        feedback without it re-deriving everything it already saw. Extra kwargs are ignored
+        (signature compat with single-shot calls)."""
         # Persistent sandbox — cross-step interpreter state survives here. The final answer
         # is parsed outside the sandbox, so it is NOT bound here.
         self._executor = self._build_executor()
 
         # Full block trajectory (no system message; call() assembles it each turn).
         # `_render_for_llm()` produces the redacted, flattened view sent to the model.
-        self.messages = [{"role": "user", "blocks": [TextBlock(user)]}]
+        if resume and self.messages:
+            self.messages.append({"role": "user", "blocks": [TextBlock(user)]})
+        else:
+            self.messages = [{"role": "user", "blocks": [TextBlock(user)]}]
 
         # Capture the system prompt + opening question into the event stream so the
         # trace viewer can show them (the console / `.log` keep only the one-liners —
@@ -460,36 +466,13 @@ Requirements for the final answer:
         ctx.emit(f"question {user!r}", kind="user", data={"text": user})
         return await self._run_loop(ctx, self.max_steps)
 
-    async def resume(self, ctx: ExecutionContext, feedback: str) -> Any:
-        """Continue an already-run agent (its `self.messages` trajectory is preserved) with
-        new `feedback` and a fresh — but typically SMALLER — step budget (`max_resume_steps`,
-        falling back to `max_steps`). Used by a planner-chosen resume op (during replan) to
-        hand a retrieve SearchAgent its targeted feedback and let it keep searching, instead
-        of discarding what it learned. The initial search gets the full `max_steps`; each
-        resume is deliberately bounded tighter so a stuck branch can't keep buying full new
-        budgets. Returns the parsed final-answer payload."""
-        assert self.messages, "resume() requires a prior call()"
-        # Fresh sandbox: the prior call's interpreter state is gone and a new search needs
-        # none of it. The trajectory (self.messages) is deliberately NOT reset.
-        self._executor = self._build_executor()
-        self.messages.append({"role": "user", "blocks": [TextBlock(feedback)]})
-        budget = self.max_resume_steps if self.max_resume_steps is not None else self.max_steps
-        ctx.emit(
-            f"resume_feedback max_steps={budget} {feedback!r}",
-            kind="user",
-            data={"text": feedback},
-        )
-        return await self._run_loop(ctx, budget)
-
     async def _run_loop(self, ctx: ExecutionContext, max_steps: int | None) -> Any:
-        """The shared step loop for `call()` and `resume()`, bounded by the passed `max_steps`
-        (the full budget for `call()`, the smaller resume budget for `resume()`). Assumes
-        `self.messages` and `self._executor` are already established. `step` counts only turns
-        that PROGRESSED (ran a tool call or parsed a final-answer block); parse-misfires /
-        exec-machinery failures advance `turn` but not `step`, so they don't burn the step
-        budget. `turn` is hard-capped at `max_steps + max_misfires` so a never-progressing
-        model still terminates. Returns the validated payload, or hands off to
-        `_terminal_turn()`."""
+        """The step loop, bounded by `max_steps`. Assumes `self.messages` and
+        `self._executor` are already established. `step` counts only turns that PROGRESSED
+        (ran a tool call or parsed a final-answer block); parse-misfires / exec-machinery
+        failures advance `turn` but not `step`, so they don't burn the step budget. `turn`
+        is hard-capped at `max_steps + max_misfires` so a never-progressing model still
+        terminates. Returns the validated payload, or hands off to `_terminal_turn()`."""
         observations: list[str] = []
         # `step` counts only turns that progressed (observation or final answer); `turn`
         # numbers every attempt, including misfired re-prompts (which don't cost a step).
@@ -677,6 +660,7 @@ Requirements for the final answer:
             self._last_logprobs = None
             return await self._prompt.call(
                 ctx, messages=trimmed, should_stop=_stop_at_first_block,
+                temperature=self.temperature,
                 max_output_tokens=self.max_output_tokens,
                 timeout_s=self.request_timeout_s,
             )

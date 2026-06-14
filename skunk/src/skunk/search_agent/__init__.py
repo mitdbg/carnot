@@ -22,7 +22,6 @@ db builder, embedding computation, recall experiment). They are not
 imported by the runtime path.
 """
 
-from skunk.search_agent.base import Retriever
 from skunk.search_agent.search_agent import SearchAgent
 
-__all__ = ["Retriever", "SearchAgent"]
+__all__ = ["SearchAgent"]

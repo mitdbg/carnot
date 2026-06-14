@@ -31,17 +31,23 @@ class StepFailed(Exception):
 
 class ParseError(StepFailed):
     """A `PromptedCall` parser could not parse the model's raw reply. `call()`
-    re-prompts once (echoing `raw` + `detail`); a survivor is terminal."""
-    def __init__(self, raw: str, detail: str):
+    re-prompts once (echoing `raw` + `detail`); a survivor is terminal.
+    `retryable=False` skips the re-prompt entirely — for defects re-prompting
+    cannot fix because the INPUT lacks what the reply needs (e.g. the extract
+    verbatim guard on a corrupt-OCR page), so the caller fails fast to its
+    fallback tier instead of burning escalating-temperature attempts."""
+    def __init__(self, raw: str, detail: str, *, retryable: bool = True):
         super().__init__("parse", detail)
         self.raw = raw
         self.detail = detail
+        self.retryable = retryable
 
 
 class MissingData(Exception):
-    """Compute determined its input is insufficient to produce an answer.
-    `missing` names the data codegen said it needed (empty unless codegen
-    returned the structured missing-JSON form)."""
+    """Terminal recovery failure: the orchestrator exhausted its replan budget
+    and compute still reported insufficient data (`NeedsMore`). Raised only by
+    `Orchestrator.execute()` — compute itself returns the structured signal
+    rather than raising. `missing` names the data compute last said it needed."""
     def __init__(self, reason: str, missing: list[str] | None = None):
         super().__init__(reason)
         self.reason = reason

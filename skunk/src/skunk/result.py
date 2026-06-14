@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from skunk.common import AnnotatedValue, PageRef, page_key_to_pageref
+from skunk.common import AnnotatedValue, Final, NeedsMore, PageRef, SemPoolEntry, page_key_to_pageref
 from skunk.plan import Plan
 
 
@@ -42,6 +42,10 @@ def describe_value(v: Any) -> str:
         return f"[{len(descriptions)} entries: {descriptions}]"
     if isinstance(v, str):
         return f"str: {v!r}"
+    if isinstance(v, Final):
+        return f"str: {v.answer!r}"
+    if isinstance(v, NeedsMore):
+        return f"needs_more n_keep={len(v.keep)} missing={v.missing!r}"
     if isinstance(v, list):
         return f"list({len(v)} branches)"
     s = repr(v)
@@ -52,6 +56,7 @@ def _summarize_annotated(e: AnnotatedValue) -> dict:
     """One `AnnotatedValue` as a JSON-able dict for the trace viewer's node summary."""
     return {
         "description": e.description,
+        "notes": e.notes,
         "unit": e.unit,
         "value_kind": e.kind,
         "value": e.value,
@@ -83,6 +88,20 @@ def summarize_value(v: Any) -> dict:
         return {"type": "values", "values": [_summarize_annotated(e) for e in v]}
     if isinstance(v, str):
         return {"type": "answer", "answer": v}
+    if isinstance(v, Final):
+        return {"type": "answer", "answer": v.answer}
+    if isinstance(v, NeedsMore):
+        return {
+            "type": "needs_more",
+            "missing": v.missing,
+            "missing_reason": v.missing_reason,
+            "keep": [_summarize_annotated(e) for e in v.keep],
+        }
+    if isinstance(v, list) and v and isinstance(v[0], SemPoolEntry):
+        seen: dict[tuple, None] = {}
+        for e in v:
+            seen[(e.ref.page.month, e.ref.page.page)] = None
+        return {"type": "pages", "pages": [{"month": m, "page": p} for m, p in seen]}
     if isinstance(v, list) and v and all(isinstance(x, str) for x in v):
         # The search-agent retriever returns page keys ("YYYY_MM_pageid") rather than
         # PageRefs. Parse them back so the node summary is the same "pages" shape the

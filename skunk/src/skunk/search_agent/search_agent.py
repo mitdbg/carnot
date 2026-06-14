@@ -36,7 +36,6 @@ from skunk.config import SkunkConfig
 from skunk.human_intervention import RequestHumanTool
 from skunk.local_python_executor import CodeOutput
 from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent, TextBlock
-from skunk.search_agent.base import Retriever
 from skunk.search_agent.search_tools import (
     EMPTY_RESULT_MESSAGE,
     GREP_RESULT_TAG,
@@ -68,7 +67,7 @@ def _make_embedding_client(emb_model_id: str) -> tuple[EmbeddingClient, str]:
     return OpenRouter(api_key=os.environ["OPENROUTER_API_KEY"]), emb_model_id
 
 
-class SearchAgent(MultiTurnAgent, Retriever):
+class SearchAgent(MultiTurnAgent):
     name = "search_agent"
     # Larger than the MultiTurnAgent default — search chains accumulate many
     # page-content observations across a 20-step ceiling. Char budget, but the model limit is
@@ -183,7 +182,6 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             tools.append(RequestHumanTool(human_intervention_handler))
         super().__init__(
             tools, max_steps=config.agent_max_steps,
-            max_resume_steps=config.agent_resume_max_steps,
             max_misfires=config.agent_max_misfires,
             system_prompt_override=system_prompt_override,
             generation_backend=generation_backend,
@@ -308,13 +306,6 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
                 + ", ".join(required_bulletins)
             )
         payload = await self.call(ctx, "\n".join(parts))
-        return self._page_keys_from_payload(payload)
-
-    async def resume_retrieve(self, ctx: ExecutionContext, feedback: str) -> list[str]:
-        """Continue this agent (after a prior `retrieve()`) with `feedback` describing the
-        data a downstream compute step still needs, on a fresh step budget. Returns the
-        page keys from its new final answer (mirrors `retrieve()`'s payload handling)."""
-        payload = await self.resume(ctx, feedback)
         return self._page_keys_from_payload(payload)
 
     @staticmethod

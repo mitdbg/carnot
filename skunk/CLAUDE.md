@@ -51,6 +51,10 @@ UID0227, UID0230, UID0238, UID0240.
   `src/skunk/plan.py`, the validator, AND `eval/eval_e2e.py`.
 - **Logging**: one event stream via `ctx.emit(...)`; full rules in `ARCHITECTURE.md` →
   "Logging & observability".
+- **No formatting-only edits.** Do not reformat lines for length, change quote style
+  (single → double), add blank lines between methods, or expand/collapse argument lists
+  unless it is part of a substantive change to that line. Formatting-only diffs pollute
+  `git diff`, make code review harder, and cause merge conflicts.
 
 ## Setup (.env at repo root)
 

@@ -1,0 +1,34 @@
+UID0057   # same statistic printed twice in one issue, off by 1 (rounding); benchmark internally inconsistent
+UID0130   # two tables both labeled "Total Federal securities", off by 1 in last digit
+UID0177   # Subject vs Total-outstanding column never named; miss = not-subject sliver
+UID0005   # question wording matches reclassified table; gold requires contemporaneous print
+UID0102   # vintage ambiguity (quarterly first prints vs Dec reprint) + rounding-target ambiguity
+UID0194   # contemporaneous vs revised print; revised arguably more correct
+UID0113   # relative difference: decimal vs x100 never specified; "percentage points" contradictory
+UID0190   # two official receipt bases (unrevised vs reclassified); neither pinned
+UID0201   # population vs sample Gini; factor of exactly 2 at n=2
+UID0148   # "how many ... in millions of USD" — count vs amount self-contradictory
+UID0228   # output scale (rupees vs millions of rupees) never named; same digits
+UID0221   # absolute difference unit (dollars vs millions) never named; same quantity
+UID0111   # HP-filter trend demanded beyond cross-implementation reproducibility (1e-6 gap)
+UID0101   # arc elasticity over time ill-posed (year-axis coding arbitrary); elements 1-2 match
+UID0120   # answers identical; whitespace-sensitive string scoring artifact (held-out test UID)
+UID0100   # two contradictory rounding rules + unanchored regression index origin (held-out test UID)
+UID0230   # annualization convention sqrt(52) vs sqrt(365/7) unstated (held-out test UID)
+UID0214   # official published one-decimal YoY rate (5.9%) vs full precision from same CPI values (5.932%)
+UID0165   # 1%-tail loss from 4 observations; convention-underdetermined (std variants span 4276-7113)
+UID0069   # ES "for the yield values" vs "portfolio return approach" — one sentence, two contradictory halves
+UID0042   # Zipf exponent: both regression directions textbook-standard (Lotka 1.172 vs rank-size 0.702)
+UID0225   # exact rounding tie 12.595 at requested hundredths; half-up vs float tie-breaking
+UID0213   # "CPI-U for those years": annual-average (gold) vs December monthly (ours), identical balances
+UID0220   # "absolute percent difference": relative-to-base 31.2 (ours) vs symmetric 27.0 (gold), gold's own page+values
+UID0226   # sample vs population std on the question-named column (ddof=1 5678.4 vs ddof=0 4636.4, sqrt(3/2) apart); 0201 family
+UID0013   # OLS intercept over-precision at rounding boundary (-184.1416 -> .142 vs gold .143); 0111 family, asymmetric (only ours reproduces)
+UID0245   # "Fisher Ideal symmetric growth rate": Fisher-scalar -0.107 (ours, pct) vs mid-point -0.113 (gold, fraction); same printed values; 0220/0113 family
+UID0110   # geomean of "quarterly percent change at an annual rate": gold de-annualizes by /4 (0.69, would be 0.68 if compounding-correct); direct geomean of printed values = 2.74; year 2017 robust either way
+UID0237   # "mid-point normalized difference ... in billions of dollars" self-contradictory: ratio 0.03 (gold) vs raw diff 122.02 B (ours), same two cells of OFS-1; 0148/0221 family
+UID0028   # railroad retirement Feb 1964 receipts: dedicated table prints 92.1, trust summary prints 92 (whole millions); neither named; 0057/0130 family
+UID0219   # holdings cells identical across 2013-06/09 prints; gap = unpinned BEA GDP series (annual vs Q1) + period count (9 vs 9.75y); 4.1/4.2/4.3 all defensible
+UID0244   # USD-CAD Dec-1959 monthly-avg rate source/precision unpinned (FRED starts 1971); same printed 530 USD diff; rate 0.95100 vs 0.95117; 0221 family
+UID0062   # Army FY1947 revised across prints (7,425 in 1948-04 vs 6,911 in 1952-12); AF-charged-to-Army qualifier satisfied by both; gold mixes prints; 0194 family
+UID0175   # variance sample-vs-population: question says "sample calendar months" -> sample var ddof=1 (0.00164, ours) defensible; gold uses population var ddof=0 (0.00137); identical 6 cells from 1947-02:87, differ only by /n vs /(n-1)

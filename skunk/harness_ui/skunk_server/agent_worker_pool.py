@@ -7,7 +7,6 @@ import inspect
 import logging
 import queue
 import threading
-import time
 import traceback
 from collections.abc import Callable
 from typing import Any
@@ -27,16 +26,15 @@ EventPublisher = Callable[[str, str, list[dict]], None]
 
 
 class _EventBatcher:
-    """Coalesces a task's trace events into batches, so the global registry lock and the
-    main-loop publish wakeup stay OFF the per-event hot path — one lock acquire + one
-    `call_soon_threadsafe` per ~32 events / 150ms instead of per event. This frees the GIL
-    for the GIL-bound corpus tools (search_corpus/grep_corpus) the reasoner runs; per-event
-    telemetry was starving them and ~doubling per-question latency vs the bare eval harness.
-    `add` is called synchronously from the reasoner (worker loop or a tool thread); the
-    registry append + publish happen at flush time."""
-
-    _FLUSH_N = 32
-    _FLUSH_INTERVAL_S = 0.15
+    """Per-attempt buffer for one task's trace events. `add` (called synchronously from the
+    reasoner — its worker loop or a tool thread) ONLY appends to an UNCAPPED buffer under a
+    short lock; it never flushes. So a burst of corpus-tool events costs one list append each
+    and nothing else on the producer hot path. A single periodic flusher on the main loop
+    (`AgentWorkerPool._flush_loop`) drains every active batcher on a fixed cadence, so the
+    registry lock + main-loop publish wakeup happen at most once per cadence per task,
+    regardless of burst rate — keeping the GIL free for the GIL-bound corpus tools
+    (search_corpus/grep_corpus) the reasoner runs. `flush` is invoked by that periodic flusher
+    and once more by the worker when the attempt ends."""
 
     def __init__(
         self,
@@ -53,27 +51,16 @@ class _EventBatcher:
         self._attempt_id = attempt_id
         self._buf: list[dict] = []
         self._lock = threading.Lock()
-        self._last_flush = time.monotonic()
 
     def add(self, event: dict) -> None:
         with self._lock:
             self._buf.append(event)
-            now = time.monotonic()
-            if (
-                len(self._buf) < self._FLUSH_N
-                and (now - self._last_flush) < self._FLUSH_INTERVAL_S
-            ):
-                return
-            batch, self._buf = self._buf, []
-            self._last_flush = now
-        self._flush(batch)
 
     def flush(self) -> None:
         with self._lock:
             if not self._buf:
                 return
             batch, self._buf = self._buf, []
-            self._last_flush = time.monotonic()
         self._flush(batch)
 
     def _flush(self, batch: list[dict]) -> None:
@@ -87,6 +74,10 @@ class _EventBatcher:
 
 
 class AgentWorkerPool:
+    # Fixed cadence (seconds) at which `_flush_loop` drains every active batcher to the registry
+    # + SSE subscribers. The producer never flushes; this is the ONE place trace events sync.
+    _FLUSH_INTERVAL_S = 0.25
+
     def __init__(
         self,
         registry: TaskRegistry,
@@ -133,6 +124,12 @@ class AgentWorkerPool:
             str, tuple[int, asyncio.AbstractEventLoop, asyncio.Future]
         ] = {}
         self._inflight_lock = threading.Lock()
+        # Active per-attempt event batchers, drained by the periodic `_flush_loop`. Workers
+        # register a batcher when an attempt starts and discard it when the attempt ends; the
+        # flush loop (main loop) iterates a snapshot of this set every `_FLUSH_INTERVAL_S`.
+        self._batchers: set[_EventBatcher] = set()
+        self._batchers_lock = threading.Lock()
+        self._flush_task: asyncio.Task | None = None
 
     def start(
         self,
@@ -144,6 +141,8 @@ class AgentWorkerPool:
         self._on_completion = on_completion
         self._publish_event = publish_event
         self._registry.set_round_close_callback(self.cancel_round)
+        # Single periodic flusher on the main loop — the only place buffered trace events sync.
+        self._flush_task = loop.create_task(self._flush_loop())
         for index in range(self._max_workers):
             thread = threading.Thread(
                 target=self._worker_loop,
@@ -152,6 +151,21 @@ class AgentWorkerPool:
             )
             thread.start()
             self._threads.append(thread)
+
+    async def _flush_loop(self) -> None:
+        """Drain every active batcher to the registry + its SSE subscribers every
+        `_FLUSH_INTERVAL_S`. Runs on the main loop so producer threads only ever append; all the
+        registry-append + publish work is consolidated here on a fixed cadence, independent of
+        how fast events are produced."""
+        try:
+            while not self._stop.is_set():
+                await asyncio.sleep(self._FLUSH_INTERVAL_S)
+                with self._batchers_lock:
+                    batchers = list(self._batchers)
+                for batcher in batchers:
+                    batcher.flush()
+        except asyncio.CancelledError:
+            pass
 
     def cancel_round(self, round_num: int) -> int:
         """Cancel every still-running reasoner for `round_num`. The cancel is scheduled on
@@ -180,6 +194,9 @@ class AgentWorkerPool:
 
     def stop(self) -> None:
         self._stop.set()
+        if self._flush_task is not None:
+            self._flush_task.cancel()
+            self._flush_task = None
         for _ in self._threads:
             try:
                 self._queues.agent.put_nowait("")
@@ -225,8 +242,8 @@ class AgentWorkerPool:
                     task_id,
                     "processing",
                 )
-            # Coalesce trace events into batches (registry append + main-loop publish happen
-            # per-batch, not per-event) to keep the GIL free for the reasoner's corpus tools.
+            # Buffer trace events; the periodic `_flush_loop` drains them on a fixed cadence so
+            # the producer hot path stays a pure append, keeping the GIL free for corpus tools.
             batcher = _EventBatcher(
                 self._registry,
                 self._loop,
@@ -234,6 +251,8 @@ class AgentWorkerPool:
                 task_id,
                 attempt.attempt_id,
             )
+            with self._batchers_lock:
+                self._batchers.add(batcher)
             outcome = "failed"
             try:
                 task = self._registry.get(task_id)
@@ -297,7 +316,9 @@ class AgentWorkerPool:
                 if self._registry.fail_attempt(task_id, attempt.attempt_id, failure):
                     self._queues.enqueue_failed(task_id)
             finally:
-                batcher.flush()  # deliver any events buffered since the last flush
+                with self._batchers_lock:
+                    self._batchers.discard(batcher)
+                batcher.flush()  # final drain for this attempt (the periodic loop won't see it again)
                 self._queues.agent.task_done()
                 if self._loop is not None and self._on_completion is not None:
                     self._loop.call_soon_threadsafe(

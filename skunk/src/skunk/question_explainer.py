@@ -30,14 +30,13 @@ _QUESTION_SYSTEM_PROMPT = """\
 Read the question. Identify any non-obvious mathematical, statistical,
 or domain concepts a code-writing agent must know to answer correctly.
 For each, give a short explanation — only the information the agent
-needs to apply the concept to THIS question.
+needs to apply the concept to this question.
 
 Hard constraints:
-  - Cover ONE formulation per concept — the one the question implies.
-    Do NOT introduce alternative formulas, alternative orientations,
-    or variants the question doesn't mention. If the question doesn't
-    pin a choice, pick the most standard form and stop there. No
-    "alternatively…" / "another approach…" / "or you could…".
+  - Cover one formulation per concept — the one the question implies.
+    Do not introduce alternative formulas, orientations, or variants
+    the question doesn't mention; if the question doesn't pin a
+    choice, pick the most standard form and stop there.
   - Skip trivial operations (sum, average, max, ratio, difference).
     Skip pure unit / scope modifiers ("in millions of dollars",
     "for FY 2023").
@@ -190,4 +189,4 @@ class QuestionExplainer:
     )
 
     async def run(self, ctx: ExecutionContext, *, question: str) -> list[ConceptExplanation]:
-        return await self._prompt.call(ctx, f"Question:\n{question}")
+        return await self._prompt.call(ctx, f"Question:\n{question}", temperature=0.4)

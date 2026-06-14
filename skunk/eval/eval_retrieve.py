@@ -240,13 +240,15 @@ async def _retrieve_uid(
         # One pass over all branches: the filter judges the full target list and the union
         # of candidates is scanned once. A per-branch slot may be a StepFailed (no pages) —
         # attribute it to that branch, keep the rest.
-        # A non-failed slot is now this branch's `list[BlockRef]` (BlockRef-granular
-        # RetrieveOp); recall scores against the physical pages those blocks span.
+        # A non-failed slot is a `BranchRetrieval`; recall scores against the physical pages
+        # its blocks span.
         for slot in await op.run_all(ctx, branches):
             if isinstance(slot, StepFailed):
                 n_failed += 1
             else:
-                retrieved |= _refkeys([r for b in slot for r in b.member_refs])
+                retrieved |= _refkeys(
+                    [r for b in slot.blocks for r in b.member_refs]
+                )
         for evt in ctx.events:
             msg = evt.get("message", "")
             m = _CALL_RE.search(msg)

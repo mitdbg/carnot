@@ -21,24 +21,12 @@ Usage
   # Run only specific UIDs, bypassing retrieve with golden pages
   python -m eval.eval_e2e --csv data/officeqa_pro.csv --uids UID0001,UID0030 --golden
 
-  # Replay a prior run's cached retrieval: skip retrieve, tune extract/compute free
-  python -m eval.eval_e2e --csv data/officeqa_pro.csv \
-      --retrieval-cache eval/traces/<run>/retrieval_cache.json
-
 All outputs (per-question traces, run.log, report.csv, events.jsonl) land in a
 single run directory: eval/traces/<run-name>_<timestamp>/  (gitignored).
 
 `--golden` parses `source_docs?page=N` URLs from --csv and injects them as
 PageRefs, so extract/compute run on exactly the pages the benchmark deems
 relevant. Use it to measure the extract+compute ceiling without retrieval cost.
-
-Retrieval cache: every real run auto-writes its retrieve output (the deduped page
-union per UID) to <run-dir>/retrieval_cache.json. Point `--retrieval-cache <path>`
-at one to replay it — the cached pages are injected golden-style (bypassing
-retrieve) so you can tune extract/compute without re-paying retrieval. Cached pages
-are the retrieve phase's output after block_select — i.e. exactly the pages extract
-read on the original run. `--golden` and `--retrieval-cache` are mutually exclusive
-(two page sources).
 """
 
 from __future__ import annotations
@@ -83,7 +71,6 @@ from skunk import (  # noqa: E402
 )
 
 from skunk.trace import configure_obs  # noqa: E402
-from skunk.page_index.query import BlockRef  # noqa: E402
 
 from eval.util import dump_trace  # noqa: E402
 from skunk.eval.scoring import SCORER_VERSION, score_correct  # noqa: E402
@@ -137,69 +124,6 @@ def load_golden(csv_path: str | Path) -> dict[str, list[PageRef]]:
 
 
 # ---------------------------------------------------------------------------
-# Retrieval cache (real retrieve output → JSON → golden-style replay)
-# ---------------------------------------------------------------------------
-#
-# Every real run auto-writes its actual retrieve output to <run-dir>/retrieval_cache.json:
-# per UID the deduped union of blocks `block_select` chose (whole-page blocks on the
-# search-agent path). A later run with `--retrieval-cache <path>` loads it and injects the
-# blocks, bypassing the expensive retrieve operator so you can iterate on extract/compute.
-# Cache JSON per UID:
-#   {"blocks": [{"month","page","block_index","members":[...]}...]}
-
-
-@dataclass(frozen=True)
-class CachedRetrieval:
-    """One UID's cached retrieve output: the deduped block union for that UID."""
-
-    blocks: list[BlockRef]
-
-
-def _block_to_json(b: BlockRef) -> dict:
-    return {
-        "month": b.page.month,
-        "page": b.page.page,
-        "block_index": b.block_index,
-        "members": [{"month": m.month, "page": m.page} for m in b.member_refs],
-    }
-
-
-def _block_from_json(e: dict) -> BlockRef:
-    """Rebuild a `BlockRef` from cache JSON. `block` (the `ContentBlock`) is left None — extract
-    re-resolves it from the catalog by `(page, block_index)`, so it isn't serialized."""
-    return BlockRef(
-        page=PageRef(month=e["month"], page=e["page"]),
-        block_index=e["block_index"],
-        member_refs=tuple(
-            PageRef(month=m["month"], page=m["page"]) for m in e["members"]
-        ),
-        block=None,
-    )
-
-
-def write_retrieval_cache(path: Path, by_uid: dict[str, CachedRetrieval]) -> None:
-    """Serialize uid → blocks to JSON."""
-    import json
-
-    payload = {
-        uid: {"blocks": [_block_to_json(b) for b in cr.blocks]}
-        for uid, cr in by_uid.items()
-    }
-    path.write_text(json.dumps(payload, indent=2))
-
-
-def load_retrieval_cache(path: str | Path) -> dict[str, CachedRetrieval]:
-    import json
-
-    with open(path) as f:
-        payload = json.load(f)
-    return {
-        uid: CachedRetrieval(blocks=[_block_from_json(b) for b in entry["blocks"]])
-        for uid, entry in payload.items()
-    }
-
-
-# ---------------------------------------------------------------------------
 # Per-question runner
 # ---------------------------------------------------------------------------
 
@@ -209,7 +133,6 @@ async def _run_one_question(
     verbose: bool,
     uid: str | None = None,
     golden_pages: list[PageRef] | None = None,
-    cached_blocks: list[BlockRef] | None = None,
     trace_path: str | None = None,
     log_path: str | None = None,
 ) -> dict:
@@ -223,9 +146,15 @@ async def _run_one_question(
             )
 
     config = SkunkConfig.from_env()
+    # Hermetic eval: human-in-the-loop is for the competition server, never for an automated
+    # benchmark run. Force every human-review path off regardless of the environment
+    # (SKUNK_HUMAN_* env vars `from_env` may have read), so a stray flag can't silently
+    # human-gate or stall a run. The intervention/review HANDLERS are already None (never
+    # passed to the Orchestrator below); these are the config FLAGS that would request them.
+    config.human_figure = False
+    config.human_verify_extract = False
+    config.human_lookup = False
     config.golden_pages = golden_pages
-    # Block-aware replay: inject the cached blocks so extract block-scopes as the live run did.
-    config.cached_blocks = cached_blocks
 
     overrides_path = Path(config.prompt_overrides_path)
     prompt_overrides = (
@@ -283,8 +212,8 @@ async def _run_one_question(
                 model=config.llm_model,
             )
 
-        # The retrieve sweep's deduped blocks — empty under golden/replay bypass (retrieve
-        # never ran). Surfaced so the harness can cache them for later replay.
+        # The retrieve sweep's deduped blocks — empty under golden bypass (retrieve never
+        # ran). Surfaced for the report's retrieval-recall column.
         retrieved_blocks = list(orch.retrieved_blocks)
 
         if failure is not None:
@@ -338,8 +267,10 @@ REPORT_FIELDS = [
 # USD per token (input, output); thinking tokens billed at the output rate. Copied from
 # scripts/analyze_trace.py — keep the two in sync if Gemini pricing changes.
 PRICES = {
-    "gemini-3.5-flash": (0.30e-6, 2.50e-6),
+    "gemini-3.5-flash": (1.50e-6, 9.00e-6),  # list price (was 0.30/2.50 — stale gemini-2.5-flash rate)
+    "gemini-3-flash-preview": (0.50e-6, 3.00e-6),  # list price (verified ai.google.dev + OpenRouter, 2026-06)
     "gemini-3.1-flash-lite": (0.10e-6, 0.40e-6),
+    "gemini-3.1-pro-preview": (2.00e-6, 12.00e-6),
 }
 _CALL_RE = re.compile(
     r"call call_site=\S+ model=(\S+) .*?in_tok=(\d+) out_tok=(\d+) think_tok=(\S+)"
@@ -434,10 +365,6 @@ class EvalConfig:
     csv_path: str
     df_by_uid: pd.DataFrame
     golden_lookup: dict[str, list[PageRef]] | None
-    # Cached real-retrieval output (uid → pages + selected blocks) injected to bypass retrieve
-    # on replay (`--retrieval-cache`): pages golden-style, blocks via `config.cached_blocks` so
-    # extract block-scopes as the live run did. Mutually exclusive with golden_lookup.
-    cached_lookup: dict[str, CachedRetrieval] | None
     # Always-populated golden map for the report's `golden_pages` column (the trace
     # viewer's groundtruth chips), independent of `--golden` injection above.
     golden_report: dict[str, list[PageRef]]
@@ -460,33 +387,10 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
     print(f"\n{'=' * 60}\nUID: {uid}\nQ: {question}")
 
     golden_pages = None
-    cached_blocks = None
     if cfg.golden_lookup is not None:
         golden_pages = cfg.golden_lookup.get(uid, [])
         if not golden_pages:
             print(f"[e2e] WARNING: no golden pages for {uid!r}")
-    elif cfg.cached_lookup is not None:
-        # Replay: inject the cached retrieve output for this UID — pages golden-style and the
-        # selected blocks for block-scoped extract. A UID absent from the cache can't be
-        # replayed without paying for retrieval, which the cache exists to avoid — skip it loudly.
-        cached = cfg.cached_lookup.get(uid)
-        if cached is None:
-            print(
-                f"[e2e] WARNING: {uid!r} not in retrieval cache — skipping "
-                f"(replay can't run retrieve)",
-                file=sys.stderr,
-            )
-            return None
-        cached_blocks = cached.blocks
-        # Derive golden_pages from blocks to trigger the retrieve bypass; pages are the
-        # deduped union of each block's member_refs.
-        seen: set[PageRef] = set()
-        golden_pages = []
-        for b in cached_blocks:
-            for r in b.member_refs:
-                if r not in seen:
-                    seen.add(r)
-                    golden_pages.append(r)
 
     trace_path = log_path = None
     if cfg.trace_dir:
@@ -498,7 +402,6 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
             question=question,
             verbose=cfg.verbose,
             golden_pages=golden_pages,
-            cached_blocks=cached_blocks,
             uid=uid,
             trace_path=trace_path,
             log_path=log_path,
@@ -536,7 +439,9 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
         print(f"[e2e] {uid} FAILED: {result['reason']}")
     else:
         mark = "✓" if correct else "✗"
-        print(f"[e2e] {uid} Answer: {result['answer']}  [{mark} vs gold: {gold_answer!r}]")
+        print(
+            f"[e2e] {uid} Answer: {result['answer']}  [{mark} vs gold: {gold_answer!r}]"
+        )
 
     retrieved_blocks = result.get("retrieved_blocks", [])
     category = "correct" if correct else ("fail" if result["failed"] else "wrong")
@@ -551,7 +456,9 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
         "gold_answer": gold_answer,
         "golden_pages": " ".join(f"{p.month}:{p.page}" for p in gold_report_pages),
         "reason": result.get("reason") or "",
-        "retrieval_recall": _retrieval_recall(retrieved_blocks, cfg.golden_report.get(uid)),
+        "retrieval_recall": _retrieval_recall(
+            retrieved_blocks, cfg.golden_report.get(uid)
+        ),
         # Wall-clock seconds to plan + execute the query, and USD billed for its generation
         # calls — both measured in-process by _run_one_question (no trace log needed, so they
         # are populated under --no-traces too). latency_s is None if the run aborted before
@@ -609,16 +516,6 @@ def main() -> None:
         help="Inject golden pages from --csv instead of running retrieve",
     )
     parser.add_argument(
-        "--retrieval-cache",
-        metavar="PATH",
-        help="Replay a prior run's cached retrieve output: inject each UID's cached "
-        "pages (golden-style) instead of running retrieve, to iterate on "
-        "extract/compute for free. Every real run auto-writes its cache to "
-        "<run-dir>/retrieval_cache.json — point this at one. Without an explicit UID "
-        "selection, the run pool is restricted to the cache's UIDs. Incompatible "
-        "with --golden.",
-    )
-    parser.add_argument(
         "--no-traces",
         action="store_true",
         help="Disable per-question trace files (run dir still created for report.csv).",
@@ -644,15 +541,6 @@ def main() -> None:
         "throttles cross-worker traffic (env: SKUNK_LLM_RPM).",
     )
     args = parser.parse_args()
-
-    # --golden and --retrieval-cache both inject pages (bypassing retrieve); two
-    # page sources can't both win.
-    if args.golden and args.retrieval_cache:
-        print(
-            "[e2e] ABORT: --golden and --retrieval-cache are mutually exclusive.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
 
     # Build the run directory: eval/traces/[<run-name>_]<YYYYMMDD_HHMMSS>/
     import datetime
@@ -693,12 +581,6 @@ def main() -> None:
     df_by_uid = df.set_index("uid")
 
     test_set = _load_test_set()
-
-    cached_lookup = (
-        load_retrieval_cache(args.retrieval_cache) if args.retrieval_cache else None
-    )
-    if cached_lookup is not None:
-        print(f"[e2e] --retrieval-cache: loaded {len(cached_lookup)} cached UID(s).")
 
     if args.dev_set and args.uids:
         print(
@@ -760,17 +642,6 @@ def main() -> None:
     else:
         uids = _pick_uids(df, args.sample, args.uids, exclude=exclude)
 
-    # On replay without an explicit UID list, the cache defines the run pool —
-    # restrict to its UIDs so we don't skip-warn through every uncached UID. An
-    # explicit --uids list is honored as-is (uncached ones skip-warn in process_uid).
-    if cached_lookup is not None and not args.uids:
-        before = len(uids)
-        uids = [u for u in uids if u in cached_lookup]
-        print(
-            f"[e2e] --retrieval-cache: restricted pool to {len(uids)} cached UID(s) "
-            f"(of {before})."
-        )
-
     if test_set and args.include_test_set:
         print(
             f"[e2e] WARNING: --include-test-set is on; the held-out {len(test_set)}-UID test set "
@@ -792,7 +663,6 @@ def main() -> None:
         csv_path=args.csv,
         df_by_uid=df_by_uid,
         golden_lookup=golden_lookup,
-        cached_lookup=cached_lookup,
         golden_report=golden_report,
         trace_dir=trace_dir,
         verbose=args.console,
@@ -815,25 +685,10 @@ def main() -> None:
     out = report_path
     with out.open("w", newline="", encoding="utf-8") as f:
         # extrasaction="ignore" drops the non-column `retrieved_blocks` key (kept on
-        # each row only to build the retrieval cache below).
+        # each row only for the retrieval-recall computation above).
         writer = csv.DictWriter(f, fieldnames=REPORT_FIELDS, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
-
-    # Every run auto-caches its real retrieve output for later replay. Golden / replay
-    # runs bypass retrieve so they produce no blocks — nothing to write.
-    cache_by_uid = {
-        r["uid"]: CachedRetrieval(blocks=r["retrieved_blocks"])
-        for r in rows
-        if r.get("retrieved_blocks")
-    }
-    if cache_by_uid:
-        cache_path = run_dir / "retrieval_cache.json"
-        write_retrieval_cache(cache_path, cache_by_uid)
-        print(
-            f"[e2e] Wrote retrieval cache {cache_path} ({len(cache_by_uid)} UID(s))  "
-            f"— replay with --retrieval-cache {cache_path}"
-        )
 
     n_total = len(rows)
     n_failed = sum(1 for r in rows if r["failed"])

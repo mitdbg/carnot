@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from skunk.common import BlockRef, Effort, PageRef
+    from skunk.common import Effort, PageRef
 
 
 # Default corpus locations (overridable via env / explicit construction — see the
@@ -60,6 +60,11 @@ class SkunkConfig:
 
     # Compute operator
     compute_max_attempts: int = 3
+    # Best-of-N: run this many independent codegen→exec trials per compute call (in
+    # parallel) and commit the most frequent answer (ties broken arbitrarily). MissingData
+    # outcomes abstain from the vote — a NeedsMore is returned only when EVERY trial
+    # signals it. 1 = single-trial (today's behavior). (env: SKUNK_COMPUTE_BEST_OF_N)
+    compute_best_of_n: int = 5
     # Append a fixed cheat-sheet of canonical formulas for named / ambiguous operations
     # (`question_explainer.PRECOMPUTED_CONCEPT_REFERENCES`) to the compute `## Concept
     # references` block, after the question_explainer's per-question concepts. Pins one
@@ -85,15 +90,9 @@ class SkunkConfig:
     # Ablation: golden page refs bypass the retrieve operator (eval runs only).
     golden_pages: list[PageRef] | None = field(default=None, repr=False)
 
-    # Replay: the page-index blocks `block_select` chose, injected alongside `golden_pages`
-    # when replaying a block-aware retrieval cache (`--retrieval-cache`). Lets extract block-scope
-    # exactly as the live run did, bypassing retrieve. None on live runs and for `--golden` /
-    # search-agent caches (no blocks) — extract then reads whole pages. (eval runs only)
-    cached_blocks: list[BlockRef] | None = field(default=None, repr=False)
-
-    # Retrieve dispatch: "page_index" (ToC pick → year filter → coarse summary filter →
-    # block selection, the default) or "search_agent" (iterative ChromaDB + LLM loop).
-    # (env: SKUNK_RETRIEVER)
+    # Retrieve dispatch: "page_index" (ToC pick → year filter → coarse summary filter,
+    # the default) or "search_agent" (iterative ChromaDB + LLM loop). Either way the
+    # selection agent narrows the candidates downstream. (env: SKUNK_RETRIEVER)
     retriever: Literal["search_agent", "page_index"] = "page_index"
 
     # Search-agent corpus artifacts (built offline; agent fails fast if missing).
@@ -109,13 +108,6 @@ class SkunkConfig:
     # Per-question search-agent budget. (env: SKUNK_AGENT_MAX_STEPS, SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL)
     agent_max_steps: int = 20
     agent_max_pages_per_tool_call: int = 20
-
-    # Step budget for a RESUMED search agent — when a planner-chosen resume op hands a retrieve
-    # branch the planner's feedback to keep searching (see Orchestrator._resume_one).
-    # The initial search gets the full `agent_max_steps`; each resume gets this smaller budget
-    # so a branch that keeps failing to find data can't keep buying full fresh 20-step rounds.
-    # (env: SKUNK_AGENT_RESUME_MAX_STEPS)
-    agent_resume_max_steps: int = 10
 
     # Hard cap on NON-progressing attempts (parse-misfires — prose with no runnable action
     # block — and exec-machinery failures) before the agent aborts. These attempts do NOT
@@ -174,6 +166,22 @@ class SkunkConfig:
     # (env: SKUNK_SEMFILTER_MODEL, SKUNK_SEMFILTER_BATCH)
     semfilter_batch_size: int = 32
 
+    # Per-LLM-call caps for the external-lookup agent's turns (named for the retired
+    # selection agent that shared them). Mirrors the search agent: without a combined
+    # thinking+visible cap, Flash thrashed to ~63K thinking tokens / ~285s per step
+    # and emitted no parseable tool call (parse-retry death spiral). Selection
+    # itself (skunk.block_select) is bounded PromptedCalls, not an agent loop.
+    # (env: SKUNK_SELECT_AGENT_MAX_OUTPUT_TOKENS, SKUNK_SELECT_AGENT_TIMEOUT_S)
+    select_agent_max_output_tokens: int = 8192
+    select_agent_request_timeout_s: float = 150.0
+
+    # Per-call caps for the extract tiers (text/vision). Uncapped, individual Flash/Pro
+    # extract calls hung for 260-480s and returned garbage that then burned a parse retry;
+    # a hard timeout fails fast into the retry, which typically completes in seconds.
+    # (env: SKUNK_EXTRACT_MAX_OUTPUT_TOKENS, SKUNK_EXTRACT_TIMEOUT_S)
+    extract_max_output_tokens: int = 8192
+    extract_request_timeout_s: float = 150.0
+
     # Extract: skip the parsed-text (OCR) tier entirely and read values straight off the rendered
     # page images (vision tier). Default OFF — parsed text first, vision as the fallback tier.
     # Vision-only is robust to OCR corruption on dense scanned tables (it recovered single-cell
@@ -210,22 +218,21 @@ class SkunkConfig:
         # Route per-stage models through the override registry so `PromptedCall` resolves them
         # like every other call-site. Defaulted here unless a run pins them explicitly
         # (SKUNK_MODEL_OVERRIDES=stage=… or, for the filter, SKUNK_SEMFILTER_MODEL). Efforts
-        # come from each call-site's `default_effort` (compute=high; planner/replanner/extract=medium;
-        # block_select=off), overridable via SKUNK_EFFORT_OVERRIDES.
+        # come from each call-site's `default_effort` (compute=high; planner/replanner/extract=medium),
+        # overridable via SKUNK_EFFORT_OVERRIDES.
         # - semfilter: the cheap coarse filter runs on flash-lite.
-        # - block_select: flash — block selection is a cheap read (thinking off).
-        # - extract.{text,vision,confirm}: Pro — value extraction off dense scanned tables is the
-        #   accuracy-binding read, so it gets the strong model with medium thinking.
+        # - extract.{text,vision}: flash, medium thinking. Pro is the stronger read
+        #   on dense scanned tables but its 8M input-tok/min quota + 380s latency tails choke the
+        #   parallel select-agent fan-out; pin Pro back per-run via SKUNK_MODEL_OVERRIDES. The
+        #   default path is the `text` tier; `vision` is the fallback.
         # - compute.codegen: flash — codegen/reasoning over the extracted values (high thinking).
         # - replanner: flash — recovering a failed plan runs flash at medium thinking; the initial
         #   planner also runs flash (the common path).
         # Everything else (planner, toc_pick, …) runs on the base `llm_model` (flash).
         self.model_overrides.setdefault("semfilter", "gemini-3.1-flash-lite")
-        self.model_overrides.setdefault("block_select", "gemini-3.5-flash")
-        self.model_overrides.setdefault("extract.text", "gemini-3.1-pro-preview")
-        self.model_overrides.setdefault("extract.vision", "gemini-3.1-pro-preview")
-        self.model_overrides.setdefault("extract.confirm", "gemini-3.1-pro-preview")
-        self.model_overrides.setdefault("compute.codegen", "gemini-3.5-flash")
+        self.model_overrides.setdefault("extract.text", "gemini-3.5-flash")
+        self.model_overrides.setdefault("extract.vision", "gemini-3.5-flash")
+        self.model_overrides.setdefault("compute.codegen", "gemini-3.1-pro-preview")
         self.model_overrides.setdefault("replanner", "gemini-3.5-flash")
 
     @classmethod
@@ -250,6 +257,7 @@ class SkunkConfig:
             llm_retry_initial_delay_s=float(
                 os.environ.get("SKUNK_LLM_RETRY_INITIAL_DELAY", "1.0")
             ),
+            compute_best_of_n=int(os.environ.get("SKUNK_COMPUTE_BEST_OF_N", "5")),
             parsed_json_dir=Path(
                 os.environ.get("OFFICEQA_PARSED_JSON_DIR") or _DEFAULT_PARSED_JSON_DIR
             ),
@@ -258,6 +266,18 @@ class SkunkConfig:
                 "SKUNK_PROMPT_OVERRIDES", "config/prompts/treasury_bulletin.yaml"
             ),
             semfilter_batch_size=int(os.environ.get("SKUNK_SEMFILTER_BATCH", "32")),
+            select_agent_max_output_tokens=int(
+                os.environ.get("SKUNK_SELECT_AGENT_MAX_OUTPUT_TOKENS", "8192")
+            ),
+            select_agent_request_timeout_s=float(
+                os.environ.get("SKUNK_SELECT_AGENT_TIMEOUT_S", "150")
+            ),
+            extract_max_output_tokens=int(
+                os.environ.get("SKUNK_EXTRACT_MAX_OUTPUT_TOKENS", "8192")
+            ),
+            extract_request_timeout_s=float(
+                os.environ.get("SKUNK_EXTRACT_TIMEOUT_S", "150")
+            ),
             compute_precomputed_concept_refs=os.environ.get(
                 "SKUNK_PRECOMPUTED_CONCEPT_REFS", "0"
             )
@@ -280,9 +300,6 @@ class SkunkConfig:
             ),
             emb_model_id=os.environ.get("SKUNK_EMB_MODEL", "gemini-embedding-001"),
             agent_max_steps=int(os.environ.get("SKUNK_AGENT_MAX_STEPS", "20")),
-            agent_resume_max_steps=int(
-                os.environ.get("SKUNK_AGENT_RESUME_MAX_STEPS", "10")
-            ),
             agent_max_misfires=int(os.environ.get("SKUNK_AGENT_MAX_MISFIRES", "6")),
             agent_max_pages_per_tool_call=int(
                 os.environ.get("SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL", "20")
