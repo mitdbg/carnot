@@ -6,18 +6,28 @@ import asyncio
 import base64
 import logging
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from skunk_server.domain import to_jsonable
 from skunk_server.hub import HEARTBEAT_INTERVAL_S, StreamHub, sse_frame
-from skunk_server.task_registry import TaskConflict, TaskRegistry
+from skunk_server.task_registry import TaskConflict
 
 logger = logging.getLogger(__name__)
+
+# (events, next_seq) for one task — `registry.snapshot_task_events` on the backend,
+# the file tailer's `backfill` on the split web process. Same contract either way.
+BackfillFn = Callable[[str], tuple[list[tuple[int, str, dict]], int]]
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
 SSE_HEADERS = {
@@ -51,17 +61,21 @@ async def status_frames(hub: StreamHub, heartbeat: float = HEARTBEAT_INTERVAL_S)
 
 
 async def event_frames(
-    registry: TaskRegistry,
+    backfill_fn: BackfillFn,
     hub: StreamHub,
     task_id: str,
     heartbeat: float = HEARTBEAT_INTERVAL_S,
 ):
     """SSE frames for one task's trace: backfill existing events, then forward live ones.
     The subscriber is registered BEFORE the backfill snapshot so nothing is missed; any live
-    event whose seq was already in the backfill is skipped so nothing is duplicated."""
+    event whose seq was already in the backfill is skipped so nothing is duplicated.
+
+    `backfill_fn(task_id) -> (events, next_seq)` is pluggable so this serves both processes:
+    the backend passes `registry.snapshot_task_events`; the split web process passes the
+    file tailer's `backfill` (same contract, sourced from the jsonl on disk)."""
     queue = hub.add_event_sub(task_id)
     try:
-        backfill, _next_seq = registry.snapshot_task_events(task_id)
+        backfill, _next_seq = backfill_fn(task_id)
         seen_through = -1
         for seq, attempt_id, event in backfill:
             seen_through = max(seen_through, seq)
@@ -79,12 +93,25 @@ async def event_frames(
         hub.remove_event_sub(task_id, queue)
 
 
-def install_routes(app: FastAPI, registry: TaskRegistry, hub: StreamHub) -> None:
+def install_stream_routes(
+    app: FastAPI, backfill_fn: BackfillFn, hub: StreamHub
+) -> None:
+    """Static UI + the two SSE streams. Used by the split web process (with the file
+    tailer's backfill + a file-fed hub); the backend in the split installs none of these."""
     app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
 
     @app.get("/")
-    async def index() -> FileResponse:
-        return FileResponse(WEB_DIR / "index.html")
+    async def index() -> HTMLResponse:
+        # Cache-bust the static refs by the newest static-file mtime so a browser always loads the
+        # CURRENT js/css, not a stale cached copy (the console UI is iterated frequently). The HTML
+        # itself is tiny and served no-cache, so a plain reload always picks up new assets.
+        html = (WEB_DIR / "index.html").read_text()
+        try:
+            version = str(int(max(p.stat().st_mtime for p in (WEB_DIR / "static").glob("*"))))
+        except ValueError:
+            version = "0"
+        html = re.sub(r"(/static/[\w./-]+\.(?:js|css))", r"\1?v=" + version, html)
+        return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
     @app.get("/api/stream")
     async def status_stream() -> StreamingResponse:
@@ -95,10 +122,16 @@ def install_routes(app: FastAPI, registry: TaskRegistry, hub: StreamHub) -> None
     @app.get("/api/stream/{task_id:path}")
     async def task_event_stream(task_id: str) -> StreamingResponse:
         return StreamingResponse(
-            event_frames(registry, hub, task_id),
+            event_frames(backfill_fn, hub, task_id),
             media_type="text/event-stream",
             headers=SSE_HEADERS,
         )
+
+
+def install_command_routes(app: FastAPI) -> None:
+    """Mutating + skunk-backed routes that need the registry/coordinator/broker (read lazily
+    off `app.state`) and the corpus for page rendering. Stay on the backend; the web process
+    reaches them via an httpx proxy."""
 
     @app.get("/api/source/{month}/page/{page}.png")
     async def source_page(month: str, page: int) -> Response:

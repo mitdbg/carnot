@@ -242,6 +242,7 @@ Rules:
         missing_reason: str,
         missing: list[str],
         human_resolutions: list[tuple[int, list[str]]] | None = None,
+        human_guidance: str | None = None,
     ) -> Plan:
         parts = [
             f"Question: {ctx.question}",
@@ -258,5 +259,13 @@ Rules:
             parts.append(
                 "Human-provided resolutions (explicit mapping to available inputs):\n"
                 f"{resolved}"
+            )
+        if human_guidance and human_guidance.strip():
+            # Free-form operator instruction from the missing-data review — authoritative
+            # direction for THIS replan (which series/table/bulletin to use, how to read the
+            # question). Follow it.
+            parts.append(
+                "Operator instruction for this replan (free-form, authoritative — follow it):\n"
+                f"{human_guidance.strip()}"
             )
         return await self._replan_prompt.call(ctx, "\n\n".join(parts), temperature=0.4)

@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
-from dataclasses import asdict
 from datetime import datetime
-from enum import StrEnum
 from typing import Any
 
 from skunk_server.domain import (
@@ -23,15 +21,6 @@ from skunk_server.domain import (
     utc_now,
 )
 
-MAX_ATTEMPT_EVENTS = 2000
-MAX_EVENT_MESSAGE_CHARS = 4000
-# Total budget (chars) for an event's `data` payload. Corpus observations are huge (search
-# results / extracted blocks can be ~1MB), but the trace viewer truncates display anyway and
-# the durable per-question dump keeps the full event. Capping here keeps the live registry /
-# SSE-stream payload small so the per-event JSON work stays off the GIL the corpus tools need.
-MAX_EVENT_DATA_CHARS = 16000
-
-
 class TaskConflict(ValueError):
     """Raised when a command targets a stale or no-longer-actionable task."""
 
@@ -39,9 +28,6 @@ class TaskConflict(ValueError):
 class TaskRegistry:
     def __init__(self) -> None:
         self._tasks: dict[str, QuestionTask] = {}
-        # Per-task monotonic event counter. `seq` is stamped into each stored event so the
-        # SSE backfill can dedup against live events (and survive event-list trimming).
-        self._event_seq: dict[str, int] = {}
         self._round = RoundState()
         self._lock = threading.RLock()
         self._round_close_callback: Callable[[int], None] | None = None
@@ -164,64 +150,6 @@ class TaskRegistry:
             task.current_attempt_id = None
             self._set_status(task, TaskStatus.FAILED)
             return True
-
-    def append_attempt_events(
-        self,
-        task_id: str,
-        attempt_id: str,
-        events: list[dict],
-    ) -> list[dict]:
-        """Append a batch of trace events to an attempt and return the stored (compacted,
-        seq-stamped) events — empty if the task/attempt is gone. The CPU-heavy compaction
-        runs OUTSIDE the lock; the lock is taken once per batch only to stamp the per-task
-        monotonic `seq` and extend the list. Batching keeps both the global lock and the
-        main-loop publish wakeup off the per-event hot path (see `AgentWorkerPool`'s
-        batcher), so the GIL stays free for the reasoner's corpus tools."""
-        if not events:
-            return []
-        compacted = [_compact_event(event) for event in events]  # heavy walk, lock-free
-        with self._lock:
-            task = self._tasks.get(task_id)
-            if task is None:
-                return []
-            attempt = next(
-                (a for a in task.attempts if a.attempt_id == attempt_id), None
-            )
-            if attempt is None:
-                return []
-            seq = self._event_seq.get(task_id, 0)
-            for event in compacted:
-                event["seq"] = seq
-                seq += 1
-            self._event_seq[task_id] = seq
-            attempt.events.extend(compacted)
-            if len(attempt.events) > MAX_ATTEMPT_EVENTS:
-                del attempt.events[: len(attempt.events) - MAX_ATTEMPT_EVENTS]
-            task.updated_at = utc_now()
-            return compacted
-
-    def append_attempt_event(
-        self, task_id: str, attempt_id: str, event: dict
-    ) -> dict | None:
-        stored = self.append_attempt_events(task_id, attempt_id, [event])
-        return stored[0] if stored else None
-
-    def snapshot_task_events(
-        self,
-        task_id: str,
-    ) -> tuple[list[tuple[int, str, dict]], int]:
-        """Return [(seq, attempt_id, event), ...] across all attempts in order plus the
-        next seq, read atomically. The SSE event stream replays this then forwards live
-        events with a higher seq."""
-        with self._lock:
-            task = self._tasks.get(task_id)
-            if task is None:
-                return [], 0
-            out: list[tuple[int, str, dict]] = []
-            for attempt in task.attempts:
-                for event in attempt.events:
-                    out.append((event.get("seq", 0), attempt.attempt_id, event))
-            return out, self._event_seq.get(task_id, 0)
 
     def begin_candidate_submission(
         self,
@@ -501,51 +429,3 @@ class TaskRegistry:
             if submission.local_submission_id == local_submission_id:
                 return submission
         raise KeyError(local_submission_id)
-
-
-def _compact_event(event: dict) -> dict:
-    """Compact one raw event for the registry/stream. `seq` is stamped later under the lock
-    (see `append_attempt_events`). The `data` payload is converted to JSON-friendly form and
-    capped to `MAX_EVENT_DATA_CHARS` total in a single short-circuiting walk."""
-    compact: dict = {}
-    for key in ("message", "kind", "op", "level", "step_idx", "t", "branch_id"):
-        if key in event:
-            compact[key] = event[key]
-    if "message" in compact:
-        compact["message"] = str(compact["message"])[:MAX_EVENT_MESSAGE_CHARS]
-    data = event.get("data")
-    if isinstance(data, dict) and data:
-        compact["data"] = _clip_jsonable(data, [MAX_EVENT_DATA_CHARS])
-    return compact
-
-
-def _clip_jsonable(value: Any, budget: list[int]) -> Any:
-    """JSON-ify and total-budget-cap in one pass. `budget` is a 1-element mutable counter of
-    remaining chars; strings are clipped to fit and, once exhausted, list tails are dropped
-    (with a marker) so a huge corpus observation costs ~budget to walk, not its full size."""
-    if isinstance(value, str):
-        if budget[0] <= 0:
-            return ""
-        if len(value) > budget[0]:
-            clipped = value[: budget[0]] + "… [truncated]"
-            budget[0] = 0
-            return clipped
-        budget[0] -= len(value)
-        return value
-    if isinstance(value, dict):
-        return {str(key): _clip_jsonable(item, budget) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        out: list[Any] = []
-        for index, item in enumerate(value):
-            if budget[0] <= 0:
-                out.append(f"… [{len(value) - index} more truncated]")
-                break
-            out.append(_clip_jsonable(item, budget))
-        return out
-    if isinstance(value, datetime):
-        return value.isoformat()
-    if isinstance(value, StrEnum):
-        return value.value
-    if hasattr(value, "__dataclass_fields__"):
-        return _clip_jsonable(asdict(value), budget)
-    return value

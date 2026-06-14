@@ -22,62 +22,13 @@ logger = logging.getLogger(__name__)
 
 Reasoner = Callable[..., AgentAnswer | dict[str, Any] | Any]
 CompletionCallback = Callable[[str, str], None]
-EventPublisher = Callable[[str, str, list[dict]], None]
-
-
-class _EventBatcher:
-    """Per-attempt buffer for one task's trace events. `add` (called synchronously from the
-    reasoner — its worker loop or a tool thread) ONLY appends to an UNCAPPED buffer under a
-    short lock; it never flushes. So a burst of corpus-tool events costs one list append each
-    and nothing else on the producer hot path. A single periodic flusher on the main loop
-    (`AgentWorkerPool._flush_loop`) drains every active batcher on a fixed cadence, so the
-    registry lock + main-loop publish wakeup happen at most once per cadence per task,
-    regardless of burst rate — keeping the GIL free for the GIL-bound corpus tools
-    (search_corpus/grep_corpus) the reasoner runs. `flush` is invoked by that periodic flusher
-    and once more by the worker when the attempt ends."""
-
-    def __init__(
-        self,
-        registry: TaskRegistry,
-        loop: asyncio.AbstractEventLoop | None,
-        publish: EventPublisher | None,
-        task_id: str,
-        attempt_id: str,
-    ) -> None:
-        self._registry = registry
-        self._loop = loop
-        self._publish = publish
-        self._task_id = task_id
-        self._attempt_id = attempt_id
-        self._buf: list[dict] = []
-        self._lock = threading.Lock()
-
-    def add(self, event: dict) -> None:
-        with self._lock:
-            self._buf.append(event)
-
-    def flush(self) -> None:
-        with self._lock:
-            if not self._buf:
-                return
-            batch, self._buf = self._buf, []
-        self._flush(batch)
-
-    def _flush(self, batch: list[dict]) -> None:
-        stored = self._registry.append_attempt_events(
-            self._task_id, self._attempt_id, batch
-        )
-        if stored and self._loop is not None and self._publish is not None:
-            self._loop.call_soon_threadsafe(
-                self._publish, self._task_id, self._attempt_id, stored
-            )
+# Writes ONE raw trace event straight to the task's file (FileSink.write_event). Called inline
+# on the reasoner worker thread — no batcher, no periodic flusher, no main-loop hop. The agent's
+# entire per-event job is: stamp a cheap seq + append one line. The web process interprets.
+EventWriter = Callable[[str, str, dict], None]
 
 
 class AgentWorkerPool:
-    # Fixed cadence (seconds) at which `_flush_loop` drains every active batcher to the registry
-    # + SSE subscribers. The producer never flushes; this is the ONE place trace events sync.
-    _FLUSH_INTERVAL_S = 0.25
-
     def __init__(
         self,
         registry: TaskRegistry,
@@ -85,12 +36,16 @@ class AgentWorkerPool:
         reasoner: Reasoner,
         max_workers: int,
         human_broker: Any | None = None,
+        human_blocking: bool = False,
     ) -> None:
         self._registry = registry
         self._queues = queues
         self._reasoner = reasoner
         self._max_workers = max(1, max_workers)
         self._human_broker = human_broker
+        # Blocking transport: wire `human_intervention_handler` (branch suspends on the human via
+        # the web UI) instead of the optimistic `human_review_register`. See HumanWorkBroker.
+        self._human_blocking = human_blocking
         try:
             parameters = inspect.signature(reasoner).parameters
         except (TypeError, ValueError):
@@ -108,6 +63,9 @@ class AgentWorkerPool:
         self._reasoner_accepts_review = (
             "human_review_register" in parameters or accepts_kwargs
         )
+        self._reasoner_accepts_intervention = (
+            "human_intervention_handler" in parameters or accepts_kwargs
+        )
         self._reasoner_accepts_recompute_sink = (
             "recompute_sink" in parameters or accepts_kwargs
         )
@@ -115,7 +73,7 @@ class AgentWorkerPool:
         self._stop = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._on_completion: CompletionCallback | None = None
-        self._publish_event: EventPublisher | None = None
+        self._write_event: EventWriter | None = None
         # In-flight reasoner runs by task_id → (round_num, worker_loop, future), so a
         # closing round can cancel its still-running reasoners and free the workers. Each
         # worker runs its reasoner on its OWN event loop (see `_worker_loop`), so the
@@ -124,25 +82,17 @@ class AgentWorkerPool:
             str, tuple[int, asyncio.AbstractEventLoop, asyncio.Future]
         ] = {}
         self._inflight_lock = threading.Lock()
-        # Active per-attempt event batchers, drained by the periodic `_flush_loop`. Workers
-        # register a batcher when an attempt starts and discard it when the attempt ends; the
-        # flush loop (main loop) iterates a snapshot of this set every `_FLUSH_INTERVAL_S`.
-        self._batchers: set[_EventBatcher] = set()
-        self._batchers_lock = threading.Lock()
-        self._flush_task: asyncio.Task | None = None
 
     def start(
         self,
         loop: asyncio.AbstractEventLoop,
         on_completion: CompletionCallback,
-        publish_event: EventPublisher,
+        write_event: EventWriter,
     ) -> None:
         self._loop = loop
         self._on_completion = on_completion
-        self._publish_event = publish_event
+        self._write_event = write_event
         self._registry.set_round_close_callback(self.cancel_round)
-        # Single periodic flusher on the main loop — the only place buffered trace events sync.
-        self._flush_task = loop.create_task(self._flush_loop())
         for index in range(self._max_workers):
             thread = threading.Thread(
                 target=self._worker_loop,
@@ -151,21 +101,6 @@ class AgentWorkerPool:
             )
             thread.start()
             self._threads.append(thread)
-
-    async def _flush_loop(self) -> None:
-        """Drain every active batcher to the registry + its SSE subscribers every
-        `_FLUSH_INTERVAL_S`. Runs on the main loop so producer threads only ever append; all the
-        registry-append + publish work is consolidated here on a fixed cadence, independent of
-        how fast events are produced."""
-        try:
-            while not self._stop.is_set():
-                await asyncio.sleep(self._FLUSH_INTERVAL_S)
-                with self._batchers_lock:
-                    batchers = list(self._batchers)
-                for batcher in batchers:
-                    batcher.flush()
-        except asyncio.CancelledError:
-            pass
 
     def cancel_round(self, round_num: int) -> int:
         """Cancel every still-running reasoner for `round_num`. The cancel is scheduled on
@@ -194,9 +129,6 @@ class AgentWorkerPool:
 
     def stop(self) -> None:
         self._stop.set()
-        if self._flush_task is not None:
-            self._flush_task.cancel()
-            self._flush_task = None
         for _ in self._threads:
             try:
                 self._queues.agent.put_nowait("")
@@ -242,17 +174,6 @@ class AgentWorkerPool:
                     task_id,
                     "processing",
                 )
-            # Buffer trace events; the periodic `_flush_loop` drains them on a fixed cadence so
-            # the producer hot path stays a pure append, keeping the GIL free for corpus tools.
-            batcher = _EventBatcher(
-                self._registry,
-                self._loop,
-                self._publish_event,
-                task_id,
-                attempt.attempt_id,
-            )
-            with self._batchers_lock:
-                self._batchers.add(batcher)
             outcome = "failed"
             try:
                 task = self._registry.get(task_id)
@@ -260,20 +181,33 @@ class AgentWorkerPool:
                     continue
                 prompt = self._reasoner_prompt(task.prompt, attempt)
                 reasoner_kwargs: dict[str, Any] = {}
-                if self._reasoner_accepts_trace:
-                    # Stream every orchestrator event to the task's SSE subscribers; the
-                    # batcher buffers them and flushes on the worker's own loop / tool thread.
-                    reasoner_kwargs["trace_event_handler"] = batcher.add
-                if self._reasoner_accepts_review and self._human_broker is not None:
-                    # Open optimistic reviews mid-run (fire-and-forget; the branch keeps going).
+                if self._reasoner_accepts_trace and self._write_event is not None:
+                    # Write each orchestrator event straight to the task's file, inline on this
+                    # worker thread — the agent stamps a cheap seq and appends one line; the web
+                    # process scans + compacts. No batcher, no main-loop hop.
+                    write = self._write_event
+                    reasoner_kwargs["trace_event_handler"] = (
+                        lambda ev, _t=task_id, _a=attempt.attempt_id: write(_t, _a, ev)
+                    )
+                if self._human_broker is not None:
+                    broker: Any = self._human_broker
                     aid = attempt.attempt_id
-                    reasoner_kwargs["human_review_register"] = (
-                        lambda kind, instr, ctx_q, docs, guid, _t=task_id, _a=aid: (
-                            self._human_broker.register_review(
-                                _t, _a, kind, instr, ctx_q, docs, guid
+                    if self._human_blocking and self._reasoner_accepts_intervention:
+                        # BLOCKING: the branch suspends on the human (web UI) before compute. Wire
+                        # ONLY the intervention handler — leaving `human_review_register` unset is
+                        # what makes the orchestrator pick the blocking transport.
+                        reasoner_kwargs["human_intervention_handler"] = (
+                            lambda task, instr, q, docs, guid, _t=task_id, _a=aid: (
+                                broker.await_intervention(_t, _a, task, instr, q, docs, guid)
                             )
                         )
-                    )
+                    elif self._reasoner_accepts_review:
+                        # OPTIMISTIC (default): open a review mid-run (fire-and-forget; keep going).
+                        reasoner_kwargs["human_review_register"] = (
+                            lambda kind, instr, ctx_q, docs, guid, _t=task_id, _a=aid: (
+                                broker.register_review(_t, _a, kind, instr, ctx_q, docs, guid)
+                            )
+                        )
                 if self._reasoner_accepts_recompute_sink:
                     # Capture the recompute snapshot so a resolved review can revise the answer.
                     reasoner_kwargs["recompute_sink"] = lambda state, _t=task_id: (
@@ -316,9 +250,7 @@ class AgentWorkerPool:
                 if self._registry.fail_attempt(task_id, attempt.attempt_id, failure):
                     self._queues.enqueue_failed(task_id)
             finally:
-                with self._batchers_lock:
-                    self._batchers.discard(batcher)
-                batcher.flush()  # final drain for this attempt (the periodic loop won't see it again)
+                # Events were written inline as they were emitted — nothing to flush here.
                 self._queues.agent.task_done()
                 if self._loop is not None and self._on_completion is not None:
                     self._loop.call_soon_threadsafe(

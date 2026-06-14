@@ -18,6 +18,7 @@ from skunk_server.task_registry import TaskRegistry
 
 logger = logging.getLogger(__name__)
 StatusCallback = Callable[[], None]
+RollCallback = Callable[[int], None]
 
 
 class CompetitionAdapter:
@@ -28,6 +29,7 @@ class CompetitionAdapter:
         registry: TaskRegistry,
         queues: TaskQueues,
         publish_status: StatusCallback,
+        roll_events: RollCallback,
         reconnect_backoff_s: float = 1.0,
     ) -> None:
         self._base_url = base_url
@@ -35,6 +37,8 @@ class CompetitionAdapter:
         self._registry = registry
         self._queues = queues
         self._publish_status = publish_status
+        # Rolls the event log to a fresh per-round file when a round goes ACTIVE (sink.roll_round).
+        self._roll_events = roll_events
         self._reconnect_backoff_s = reconnect_backoff_s
         # Notified (on the main loop) with the round number whenever a round is/stays ACTIVE,
         # so the submission coordinator can (re)schedule its pre-deadline auto-submit sweep.
@@ -146,6 +150,10 @@ class CompetitionAdapter:
             event=event,
         )
         if status == RoundStatus.ACTIVE:
+            # Roll the event log to this round's fresh file BEFORE enqueuing its tasks (so their
+            # first trace events land in the new file) and before the status below announces the
+            # round (so the web finds the file when it reacts). No-op if the round is unchanged.
+            self._roll_events(round_num)
             for question in questions:
                 task, created = self._registry.create_task(
                     question.round_num,

@@ -337,6 +337,9 @@ class Orchestrator:
             # When a handler is wired, ask the human for the missing data (and optionally let
             # them scope a branch's source documents for a re-retrieval) BEFORE spending a
             # replan. If their input alone resolves compute, return without replanning.
+            # Free-form operator instruction from the missing-data review, threaded into the
+            # replanner prompt below (the human guides the replan rather than only supplying a value).
+            human_guidance: str | None = None
             handler = self._ctx.human_intervention_handler
             if handler is not None:
                 self._emit_plan(
@@ -357,6 +360,7 @@ class Orchestrator:
                 )
                 pool += directed_entries
                 if human_entry is not None:
+                    human_guidance = str(human_entry.value)
                     pool.append(human_entry)
                     human_entries.append(human_entry)
                     human_resolutions.append(list(missing))
@@ -400,6 +404,7 @@ class Orchestrator:
                     reason,
                     missing,
                     human_resolution_refs,
+                    human_guidance=human_guidance,
                 ),
             )
             ids = self._alloc_branch_ids(len(plan.branches))
