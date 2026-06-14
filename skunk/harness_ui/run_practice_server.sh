@@ -51,7 +51,7 @@ CUP_PORT="${SKUNK_CONSOLE_CUP_PORT:-8765}"
 ROUND_SECONDS="${SKUNK_CONSOLE_ROUND_SECONDS:-3600}"
 
 # Questions: explicit --questions/SKUNK_CONSOLE_QUESTIONS, else the bundled practice set.
-QUESTIONS="${SKUNK_CONSOLE_QUESTIONS:-$SKUNK_DIR/officeqa-cup-kit-v0.1.5/practice_questions.json}"
+QUESTIONS="${SKUNK_CONSOLE_QUESTIONS:-$HARNESS_DIR/questions/practice_questions.json}"
 if [[ ! -f "$QUESTIONS" ]]; then
   echo "ERROR: questions file not found: $QUESTIONS" >&2
   echo "       generate one with: python3 $HARNESS_DIR/make_practice_questions.py --num 8 --out /tmp/q.json" >&2

@@ -6,4 +6,4 @@ against the real competition server with no code changes — only the
 ``CUP_BASE_URL`` and ``CUP_TEAM_TOKEN`` env vars differ.
 """
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"

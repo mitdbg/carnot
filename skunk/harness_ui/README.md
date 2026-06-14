@@ -100,13 +100,13 @@ python practice_server.py --port 9000
 
 ### Practice with your own questions
 
-The bundled `questions/practice_questions.json` is just a starter set. If you'd
+The bundled `practice_questions.json` is just a starter set. If you'd
 rather practice against your own questions (harder, more on-topic for
 your agent, like the OfficeQA benchmark itself), edit
-`questions/practice_questions.json` or point the server at a separate file:
+`practice_questions.json` or point the server at a separate file:
 
 ```bash
-python practice_server.py --questions questions/my_questions.json
+python practice_server.py --questions my_questions.json
 ```
 
 The file is a small JSON document with rounds and questions. Each
@@ -138,14 +138,14 @@ from.
 To simulate real competition conditions, use **6 rounds** of **15 questions**
 each with **15-minute** windows:
 
-1. Create a `questions/competition_questions.json` with **6 rounds**, **15 questions**
+1. Create a `competition_questions.json` with **6 rounds**, **15 questions**
    per round (90 questions total), using your own OfficeQA-style
    prompts and canonical answers (you can take these from the OfficeQA benchmark).
 
 2. Start the server with a longer round window:
 
 ```bash
-python practice_server.py --questions questions/competition_questions.json --round-seconds 900
+python practice_server.py --questions competition_questions.json --round-seconds 900
 ```
 
 `--round-seconds 900` gives each round a 15-minute window, matching
@@ -172,8 +172,7 @@ practice. Your agent code is identical.
 ├── requirements.txt           # pip deps
 ├── reference_agent.py         # ← you edit AND run this (solve(), _process_round)
 ├── practice_server.py         # ← you run this in a second terminal during practice
-├── questions/
-│   └── practice_questions.json    # the 9 questions the practice server serves
+├── practice_questions.json    # the 9 questions the practice server serves
 ├── cup_kit/                   # library bits (client, scorer, harness internals)
 └── tests/                     # what `python -m pytest tests/` runs
 ```
