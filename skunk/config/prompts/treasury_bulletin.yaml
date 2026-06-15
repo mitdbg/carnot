@@ -320,6 +320,14 @@ overrides:
       outstanding as of <date>", sum forward from that date; do not use the
       single maturing-period figure.
 
+  - section: lessons
+    targets: [compute.codegen]
+    content: >
+      Financial convention presents growth rates, percent changes, shares, and
+      ratios as percentages, not raw decimals. When the question asks for such a
+      figure without pinning the form, report it as a percentage (e.g. a growth
+      rate of 0.1234 → 12.34%), not the bare decimal.
+
   # ---------------------------------------------------------------------
   # Extract lessons
   # ---------------------------------------------------------------------

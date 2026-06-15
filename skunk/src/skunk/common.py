@@ -435,6 +435,10 @@ class BranchRetrieval:
 
     blocks: tuple[BlockRef, ...]
     pre_selected: bool
+    # SelectAgent path only: per-page (doc_id → natural-language retrieval target) the agent
+    # wrote — drives that page's extraction (the `looking_for`) and is stamped onto each
+    # resulting AnnotatedValue's `retrieve_key`. None for every other backend.
+    page_targets: dict[str, str] | None = None
 
 
 VALUE_KIND_VOCAB: frozenset[str] = frozenset({"scalar", "vector", "table"})
@@ -492,8 +496,8 @@ class AnnotatedValue(BaseModel):
     # LLM-written. Defaults keep external lookups and old payloads valid.
     bulletin: str | None = None  # source issue "YYYY-MM" (publication date)
     pages: tuple[int, ...] = ()  # source PDF page(s); () when unattributable
-    requested_period: str | None = None  # branch.period — data window requested
-    retrieve_key: str | None = None  # branch.key — concept this datum serves
+    requested_period: str | None = None  # branch.period — data window requested (empty on the SelectAgent path; dates fold into retrieve_key)
+    retrieve_key: str | None = None  # concept this datum serves — branch.key, or the SelectAgent's per-page NL retrieval target (incl. dates)
     source_block_page: int | None = None
     source_block_index: int | None = None
 
@@ -615,10 +619,11 @@ def _join_labels(labels: list[str]) -> str:
 
 
 def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
-    """Full view of one `AnnotatedValue`: the meta line (kind/shape/dtypes), then — for
-    non-scalars — the entire frame rendered cell-by-cell via `df.to_string()`. Values are
-    included (not just the schema) so generated code can see NaN / "n/a" cells, sanity-check
-    magnitudes, and key `.loc[...]` on the real labels. Scalars show in full. A
+    """Full view of one `AnnotatedValue`: the meta line (kind/shape/dtypes), then the values.
+    A vector renders as two parallel flat lists (`index` + `values`) — easier for the model
+    to read than a 1-column frame; a table renders as the cell-by-cell `df.to_string()` grid.
+    Values are included (not just the schema) so generated code can see NaN / "n/a" cells,
+    sanity-check magnitudes, and key `.loc[...]` on the real labels. Scalars show in full. A
     `provenance:` line carries the machine-stamped source fields when present."""
     head = (
         f"  input_values[{i}]  description: {(e.description or '(no description)')!r}"
@@ -649,15 +654,22 @@ def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
         return lines
 
     if e.kind == "vector":
+        # Two parallel flat lists — far easier for the model to read than a 1-column
+        # frame. `index` and `values` are positionally aligned (same length), and both
+        # elide the middle identically when very long, so the alignment survives.
+        idx = [str(x) for x in df.index]
+        vals = [str(x) for x in df.iloc[:, 0]]
         lines.append(f"{_PAD}dtype: {df.dtypes.iloc[0]}")
-    else:
-        cols = _join_labels([str(c) for c in df.columns])
-        dtypes = ", ".join(str(t) for t in df.dtypes)
-        lines.append(f"{_PAD}columns: [{cols}]   dtypes: [{dtypes}]")
+        lines.append(f"{_PAD}index ({e.index_name}): [{_join_labels(idx)}]")
+        lines.append(f"{_PAD}values: [{_join_labels(vals)}]")
+        return lines
 
-    # The whole frame, values included — the agent reads the actual cells (NaN/'n/a',
-    # magnitudes, exact labels), not just the schema. The full frame also lives in the
-    # exec env for the generated code to operate on.
+    # A true 2-D table reads best as a grid. The whole frame, values included — the agent
+    # reads the actual cells (NaN/'n/a', magnitudes, exact labels), not just the schema.
+    # The full frame also lives in the exec env for the generated code to operate on.
+    cols = _join_labels([str(c) for c in df.columns])
+    dtypes = ", ".join(str(t) for t in df.dtypes)
+    lines.append(f"{_PAD}columns: [{cols}]   dtypes: [{dtypes}]")
     lines.append(f"{_PAD}frame:")
     lines.extend(f"{_PAD}  {ln}" for ln in df.to_string().splitlines())
     return lines

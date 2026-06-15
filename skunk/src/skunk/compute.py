@@ -180,8 +180,12 @@ aggregating. Apply unit conversions once over the whole frame, never cell-by-cel
   is not "savings bonds and savings notes". Match the question's exact series
   even when the broader entry is more convenient to read (printed total row,
   fuller index) — convenience of access never outweighs a series mismatch.
-
-
+- Pay attention to notes when chaining entries that cover adjacent
+  sub-periods of one series: reprints of the same table tile cleanly, but
+  entries whose notes name different tables usually define the series
+  differently, and a value assembled across them drifts. Prefer covering the
+  period from one table; when only a cross-table patchwork can cover it,
+  weigh signaling missing data instead.
 
 ## Output format
 

@@ -218,12 +218,16 @@ def _stamp_provenance(
     entries: list[AnnotatedValue],
     refs: list[PageRef],
     branch: RetrieveBranch,
+    *,
+    retrieve_key: str | None = None,
 ) -> list[AnnotatedValue]:
-    """Copy machine-fact provenance from the source refs + branch onto each entry —
-    never LLM-written. `bulletin`/`pages` are attributable only when every ref in the
-    call shares one bulletin month (otherwise we can't tell which issue a value came
-    from, so they're left empty). Branch fields (`period`/`key`) are call-level
-    and always stamped. The model is frozen, so we rebuild via `model_copy`."""
+    """Copy machine-fact provenance from the source refs onto each entry — never LLM-written.
+    `bulletin`/`pages` are attributable only when every ref in the call shares one bulletin
+    month (otherwise we can't tell which issue a value came from, so they're left empty).
+    `retrieve_key` records the concept this datum serves: the SelectAgent's per-page target
+    when given, else the branch key — in the agent case the target carries the dates, so
+    `requested_period` is left empty (the branch period is dropped). The model is frozen, so we
+    rebuild via `model_copy`."""
     months = {r.month for r in refs if r.month}
     bulletin = next(iter(months)) if len(months) == 1 else None
     pages = (
@@ -236,8 +240,8 @@ def _stamp_provenance(
             update={
                 "bulletin": bulletin,
                 "pages": pages,
-                "requested_period": branch.period,
-                "retrieve_key": branch.key,
+                "requested_period": None if retrieve_key is not None else branch.period,
+                "retrieve_key": retrieve_key if retrieve_key is not None else branch.key,
             }
         )
         for e in entries
@@ -297,7 +301,7 @@ relevant is found). Pick the shape that best preserves the page structure:
 
 Cells should be simple number or string — no nested cells. A numeric cell is
 a bare number: keep print flags (r, p) and footnote markers (2/) out of the
-value; record any that bear on the question in `notes`.
+value; record these instead in `notes`.
 
 Transcribe numbers exactly as printed — every digit and decimal place;
 never round, truncate, or drop trailing digits.
@@ -421,12 +425,14 @@ range."""
         question: str,
         ctx: ExecutionContext,
         looking_for: str | None = None,
+        target: str | None = None,
     ) -> list[AnnotatedValue]:
         """Run one extraction call over `content` (whole-page text OR a block slice), verify
         every emitted cell appears in `content`, and stamp provenance from `prov_refs`. `content`
         is kept on its own message line so the verifier checks emitted cells against the source
         text, not the prompt scaffolding. `looking_for` overrides the single-key opening line —
-        the seam for a caller whose one page read serves SEVERAL retrieval goals at once."""
+        the seam for a caller whose one page read serves SEVERAL retrieval goals at once.
+        `target` (SelectAgent path) is stamped onto each entry's `retrieve_key`."""
         user_msg = "\n\n".join(
             [
                 looking_for
@@ -460,7 +466,7 @@ range."""
             ctx.emit(f"extract_parse_failed tier=parsed_json error={e.detail!r}")
             return []
         ctx.emit(f"extracted tier=parsed_json n_entries={len(parsed)}")
-        return _stamp_provenance(parsed, prov_refs, branch)
+        return _stamp_provenance(parsed, prov_refs, branch, retrieve_key=target)
 
     @staticmethod
     def _block_groups(
@@ -494,6 +500,7 @@ range."""
         question: str,
         ctx: ExecutionContext,
         looking_for: str | None = None,
+        target: str | None = None,
     ) -> list[AnnotatedValue]:
         """Extraction for one anchor page's blocks. The updated page index resolves a block to at
         most two physical pages (its anchor + one table-merge continuation), so we feed those pages'
@@ -515,7 +522,7 @@ range."""
             f"n_blocks={len(block_idxs)} chars={len(content)}"
         )
         return await self._extract_content(
-            content, prov_refs, metadata, branch, question, ctx, looking_for
+            content, prov_refs, metadata, branch, question, ctx, looking_for, target
         )
 
     async def run(
@@ -525,11 +532,13 @@ range."""
         blocks: list[BlockRef],
         ctx: ExecutionContext,
         looking_for: str | None = None,
+        target: str | None = None,
     ) -> list[AnnotatedValue]:
         """Extract from the selected blocks, one extract call per anchor page (its blocks'
         member pages fed whole). Whole-page blocks (`block_index=None`, from golden / search-agent)
         flow through the same path — just with no specific block to focus on. `looking_for`
-        overrides the single-key opening line for multi-goal page reads."""
+        overrides the single-key opening line for multi-goal page reads; `target` (SelectAgent
+        path) is stamped onto each entry's `retrieve_key`."""
         groups = self._block_groups(blocks)
         ctx.emit(
             f"fan_out tier=parsed_json n_groups={len(groups)} n_blocks={len(blocks)} "
@@ -537,7 +546,9 @@ range."""
         )
         per_group = await asyncio.gather(
             *[
-                self._extract_block_group(a, m, idxs, branch, question, ctx, looking_for)
+                self._extract_block_group(
+                    a, m, idxs, branch, question, ctx, looking_for, target
+                )
                 for a, m, idxs in groups
             ]
         )
@@ -575,11 +586,13 @@ A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
         rendered_refs: list[PageRef],
         ctx: ExecutionContext,
         looking_for: str | None = None,
+        target: str | None = None,
     ) -> list[AnnotatedValue]:
         """One vision call over the rendered page images. The numbered image list
         maps each attachment back to its source page so the LLM can't conflate them.
         `looking_for` overrides the single-key opening line — the seam for a caller
-        whose one page read serves SEVERAL retrieval goals at once."""
+        whose one page read serves SEVERAL retrieval goals at once; `target` (SelectAgent
+        path) is stamped onto each entry's `retrieve_key`."""
         period = f" for the period {branch.period}" if branch.period else ""
         image_lines = [
             f"Image {i + 1}: PDF page {ref.page} of the {ref.month} Treasury Bulletin"
@@ -607,5 +620,5 @@ A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
         # several issues (no per-image attribution on the reply), so bulletin/pages
         # land only when all images share one bulletin — the common single-issue
         # branch; multi-issue calls keep bulletin empty.
-        return _stamp_provenance(entries, rendered_refs, branch)
+        return _stamp_provenance(entries, rendered_refs, branch, retrieve_key=target)
 

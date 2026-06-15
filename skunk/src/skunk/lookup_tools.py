@@ -247,9 +247,15 @@ _REGISTRY: dict[str, Tool] = {
 
 # Default prioritization guidance (was the inline paragraph in the agent prompt).
 DEFAULT_PRIORITIZATION = """\
-Commit the first plausible hit: once a tool output contains a number that answers
-the target, your next block is your final-answer ```json``` block. Historical values
-vary slightly across sources — don't keep searching for confirmation."""
+If `src` is pinned, the value must come from that publisher: keep searching until you
+read it from that named source, even if another source offers a close number first.
+Never substitute a different publisher's figure for a pinned source — same-named series
+from BLS/FRED and a pinned publisher can differ, and that difference is the point.
+If `src` is null, commit the first plausible hit: once a tool output contains a number
+that answers the target, your next block is your final-answer ```json``` block. Historical
+values vary slightly across sources — don't keep searching for confirmation.
+When a search returns the right-looking URL but not the full content on it, `fetch_url`
+that URL and read the value off the page rather than re-searching."""
 
 
 def resolve_lookup_tools(config: "SkunkConfig", explicit: list[Tool] | None = None) -> list[Tool]:

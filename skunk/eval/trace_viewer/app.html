@@ -188,7 +188,8 @@ async function boot(){
   runSel.onchange = () => loadRun(runSel.value);
   document.getElementById("show-system").onchange = draw;
   document.getElementById("show-calls").onchange = draw;
-  document.getElementById("q-sel").onchange = () => loadQuestion(document.getElementById("q-sel").value);
+  document.getElementById("q-sel").onchange = () => loadQuestion(document.getElementById("q-sel").value)
+    .catch(e => { document.getElementById("content").innerHTML = `<div class="hint">Error loading question: ${esc(e.message)}</div>`; });
   if(runs.length){ runSel.value = runs[0]; await loadRun(runs[0]); }
   else document.getElementById("content").innerHTML = `<div class="hint">No runs found under eval/traces/.</div>`;
 }

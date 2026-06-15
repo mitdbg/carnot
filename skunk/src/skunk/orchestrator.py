@@ -928,10 +928,13 @@ class Orchestrator:
                     None
                 ] * len(sub_branches)
                 live_pos: list[int] = []
+                page_targets: dict[str, str] = {}
                 for i, r in enumerate(sub_retrievals):
                     if isinstance(r, StepFailed):
                         selections[i] = r
                     elif r.pre_selected:
+                        if r.page_targets:
+                            page_targets.update(r.page_targets)
                         pool = PageIndexRetriever.pool_for_blocks(
                             list(r.blocks), str(self._ctx.config.pdf_dir)
                         )
@@ -955,6 +958,7 @@ class Orchestrator:
                     sub_branches,
                     cast(list[list[SemPoolEntry] | StepFailed], selections),
                     sub_ids,
+                    page_targets=page_targets or None,
                 )
 
             pipeline = asyncio.create_task(_select_extract())

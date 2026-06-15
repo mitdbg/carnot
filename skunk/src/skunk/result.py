@@ -30,6 +30,19 @@ class ExecutionResult:
     failure_reason: str | None = None
 
 
+def _is_refs_targets(v: Any) -> bool:
+    """True for SelectAgent's `(list[PageRef], targets)` return — the one tuple shape
+    the retrieve seam yields, kept distinct so its node summary stays the 'pages' shape
+    the trace viewer renders."""
+    return (
+        isinstance(v, tuple)
+        and len(v) == 2
+        and isinstance(v[0], list)
+        and bool(v[0])
+        and isinstance(v[0][0], PageRef)
+    )
+
+
 def describe_value(v: Any) -> str:
     if v is None:
         return "(none)"
@@ -37,6 +50,8 @@ def describe_value(v: Any) -> str:
         return f"plan with {len(v.branches)} branch(es)"
     if isinstance(v, list) and v and isinstance(v[0], PageRef):
         return f"[{len(v)} page refs]"
+    if _is_refs_targets(v):
+        return f"[{len(v[0])} page refs]"
     if isinstance(v, list) and v and isinstance(v[0], AnnotatedValue):
         descriptions = [e.description for e in v]
         return f"[{len(descriptions)} entries: {descriptions}]"
@@ -83,6 +98,13 @@ def summarize_value(v: Any) -> dict:
         return {
             "type": "pages",
             "pages": [{"month": p.month, "page": p.page} for p in v],
+        }
+    if _is_refs_targets(v):
+        # SelectAgent returns (refs, targets): keep the node's "pages" shape (the
+        # per-page target map is incidental) so the viewer's retrieved-src union works.
+        return {
+            "type": "pages",
+            "pages": [{"month": p.month, "page": p.page} for p in v[0]],
         }
     if isinstance(v, list) and v and isinstance(v[0], AnnotatedValue):
         return {"type": "values", "values": [_summarize_annotated(e) for e in v]}

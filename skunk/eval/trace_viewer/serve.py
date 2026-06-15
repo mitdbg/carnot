@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import pathlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -31,6 +32,20 @@ _APP_HTML = pathlib.Path(__file__).parent / "app.html"
 
 
 # ── Discovery + parsing helpers ─────────────────────────────────────────────
+
+def _scrub_nonfinite(o: object) -> object:
+    """Map non-finite floats (NaN / ±Inf) to None so the output is spec-compliant
+    JSON. Python's json.dumps emits the bare tokens `NaN`/`Infinity`, which the
+    browser's JSON.parse rejects — a single NaN in one event's data otherwise
+    makes the whole question fail to load."""
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {k: _scrub_nonfinite(v) for k, v in o.items()}
+    if isinstance(o, list):
+        return [_scrub_nonfinite(v) for v in o]
+    return o
+
 
 def _events_path(run_dir: pathlib.Path) -> pathlib.Path:
     return run_dir / "traces" / "events.jsonl"
@@ -129,7 +144,7 @@ class _Handler(BaseHTTPRequestHandler):
         return run_dir if run_dir.is_dir() else None
 
     def _send_json(self, data: object, status: int = 200) -> None:
-        body = json.dumps(data).encode()
+        body = json.dumps(_scrub_nonfinite(data)).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

@@ -1,7 +1,7 @@
 """SelectAgent — the precision stage as an iterative agent over the sem-filter survivors.
 
 It mirrors the SearchAgent's architecture (a `MultiTurnAgent`: one fenced block per step,
-a ```json``` final answer of `{"page_keys": [...]}`, a redactable block trajectory) but runs
+a ```json``` final answer of `{"pages": [{"doc_id", "target"}, ...]}`, a redactable block trajectory) but runs
 in a different regime: stage-1 page-index retrieval (ToC + date filter + semantic filter) has
 already flagged the most-likely candidate blocks, which are SEEDED as the agent's opening
 observation. The agent's job is to verify and select among them — reading pages, viewing
@@ -66,35 +66,37 @@ class SelectAgent(MultiTurnAgent):
     visible_observations: int | None = 5
     # Tighter than the search agent's shared budget: selection over a shortlist needs less
     # exploration than open-corpus retrieval.
-    max_steps: int | None = 15
+    max_steps: int | None = 20
 
     briefing = (
         "You are a helpful assistant for retrieving relevant information from a large "
-        "collection of documents. You will be given a question, and a shortlist of candidate "
+        "collection of documents. You will be given a question, a set of tools, and a shortlist of candidate "
         "pages that likely (but not always) carry relevant information. Your ONLY output is a set of page ids: never compute, "
-        "calculate, or answer the question yourself, and never write analysis or calculation "
-        "code. Use early steps to explore documents of potential relevance, then refine your "
-        "searches in later steps based on what you find. Use `prune(...)` aggressively on "
+        "calculate, or answer the question yourself. Use early steps to explore documents of potential relevance, then"
+        "refine your searches in later steps based on what you find. Use `prune(...)` aggressively on "
         "pages and blocks you have ruled out, to keep later searches focused and your context "
         "window manageable. Stop exploration and commit when you have enough information, do not"
-        "wander until your step limit. Some questions require looking up information that is not contained in the"
-        "corpus; if you suspect this from inspecting the likely candidate set, commit just the information you can find"
-        "in the corpus. \n\n"
-        
+        "overthink . Some questions are multi-hop or require looking up external information;"
+        "if you suspect this from inspecting the likely candidate set, commit all information you can find"
+        "in the corpus even if they only help make partial progress. \n\n"
+
+        "Write down thoughts and observations about the what you have seen as code comments in your tool call blocks"
+        "-- examples include summarizing what the previous observation showed, what you concluded, pages you may want "
+        "too revisit later, and why you are making this call, so a human can follow your thoughts\n\n"
+
         "## Hints\n\n"
         "- Match the question's EXACT wording — the precise series with every qualifier, "
-        "total vs subtotal, unit, and time basis. The catalog summaries are paraphrases; the "
-        "question governs.\n"
+        "total vs subtotal, unit, and time basis.\n"
         "- Confirm the requested dates exist at the needed granularity (monthly rows "
         "vs an annual / fiscal-year roll-up).\n"
         "- A statistic usually has a few months of reporting delay, so the first issue "
         "reporting period P is typically dated a few months later than P.\n"
-        "-  Most questions should be answered by the most contemporaneous print, but you should check for later revisions,"
-        " often published under the same series in later prints. Revisions are clearly marked as such on the pages or notes."
-        "Otherwise, later prints may contain changes in accounting methods or classifications, and must not be used.\n"
+        "-  Most questions should be answered by the most contemporaneous print, but you should check for later"
+        " revisions to be sure. Revisions are often published under the same series in later prints and clearly marked"
+        " next to the data or in footnotes. Otherwise, later prints may contain changes in accounting methods or"
+        " classifications, and should not be used.\n"
         "- Multi-period span: when the requested period spans more than one print's data "
-        "window, select the FEWEST prints whose data windows together cover the ENTIRE span, "
-        "tiling consecutive issues with no gap.\n"
+        "window, select precisely the prints whose data windows together cover the entire span\n"
         "- If the question pins a source (\"as reported in the <Month Year> Bulletin\", \"as of "
         "<date>\"), select the blocks that best match it.\n"
         "- A page's `doc_id` (e.g. `1980_04_85`) is its PDF-index key, NOT its printed footer "
@@ -103,14 +105,17 @@ class SelectAgent(MultiTurnAgent):
     )
 
     final_answer_doc = """\
-A JSON object with the `doc_id`s of the pages you selected, under the key "page_keys":
+A JSON object under the key "pages": a list of the pages you selected, each an object with its
+`doc_id` and a `target` — ONE natural-language expression naming exactly what to retrieve from
+that page (the precise series, qualifier, unit, and the dates/periods to pull):
 ```json
-{"page_keys": ["1946_11_41", "1947_01_38"]}
+{"pages": [
+  {"doc_id": "1946_11_41", "target": "gross public debt outstanding, end of month, Jan–Jun 1946"},
+  {"doc_id": "1947_01_38", "target": "gross public debt outstanding, end of month, Jul–Dec 1946"}
+]}
 ```
-Copy each `doc_id` VERBATIM from the candidate listing or a tool result (it is a PDF-index key
-like `1980_04_85`, not a printed page label) — the page you read is the page you must emit; never
-substitute a printed page number or an adjacent id. Select at least one page; if the question's
-data is genuinely on none of them, you are out of luck — do not invent pages."""
+Copy each `doc_id` VERBATIM from the candidate listing or a tool result. The `target` describes WHAT to read and should
+not be an answer or a computation — name the rows/columns and dates to transcribe."""
 
     def __init__(
         self,
@@ -305,13 +310,19 @@ data is genuinely on none of them, you are out of luck — do not invent pages."
     # ------------------------------------------------------------------
 
     def validate_final_answer(self, payload: object, observations: list[str]) -> str | None:
-        if not isinstance(payload, dict) or "page_keys" not in payload:
-            return 'Final answer must be a JSON object with a "page_keys" list.'
-        keys = self._page_keys_from_payload(payload)
-        if not keys:
-            return "Select at least one page (a non-empty page_keys list)."
+        if not isinstance(payload, dict) or "pages" not in payload:
+            return 'Final answer must be a JSON object with a "pages" list.'
+        pages = payload.get("pages")
+        if not isinstance(pages, list) or not pages:
+            return "Select at least one page (a non-empty pages list)."
         bad: list[str] = []
-        for key in keys:
+        no_target: list[str] = []
+        for p in pages:
+            if not isinstance(p, dict) or not p.get("doc_id"):
+                return 'Each entry in "pages" must be an object with "doc_id" and "target".'
+            key = str(p["doc_id"])
+            if not str(p.get("target") or "").strip():
+                no_target.append(key)
             try:
                 ref = page_key_to_pageref(key)
             except ValueError:
@@ -321,20 +332,38 @@ data is genuinely on none of them, you are out of luck — do not invent pages."
                 bad.append(key)
         if bad:
             return (
-                f"These page_keys are not real catalog pages: {bad[:8]}. Use a doc_id exactly "
+                f"These doc_ids are not real catalog pages: {bad[:8]}. Use a doc_id exactly "
                 "as it appears in the candidate listing or search_corpus results."
+            )
+        if no_target:
+            return (
+                f"These pages have no `target`: {no_target[:8]}. Give each page one "
+                "natural-language target naming the series, qualifier, unit, and dates to read."
             )
         return None
 
-    async def retrieve(self, ctx: ExecutionContext, question: str) -> list[str]:
+    async def retrieve(self, ctx: ExecutionContext, question: str) -> list[tuple[str, str]]:
         """One rollout for the whole question (no per-branch hints) — the full question
-        carries every series/period the selected pages must cover."""
+        carries every series/period the selected pages must cover. Returns (doc_id, target)
+        pairs: the per-page retrieval target the agent wrote drives that page's extraction."""
         payload = await self.call(ctx, f"Question: {question}")
-        return self._page_keys_from_payload(payload)
+        return self._pages_from_payload(payload)
 
     @staticmethod
-    def _page_keys_from_payload(payload: Any) -> list[str]:
-        keys = payload.get("page_keys") or [] if isinstance(payload, dict) else []
-        if isinstance(keys, str):
-            return [keys]
-        return [str(k) for k in keys]
+    def _pages_from_payload(payload: Any) -> list[tuple[str, str]]:
+        """(doc_id, target) per selected page, deduped on doc_id (a repeated page's targets
+        are joined with '; '). Tolerates a bare string/list of page_keys for robustness."""
+        raw = payload.get("pages") if isinstance(payload, dict) else None
+        if not isinstance(raw, list):
+            return []
+        merged: dict[str, str] = {}
+        for p in raw:
+            if not isinstance(p, dict) or not p.get("doc_id"):
+                continue
+            doc_id = str(p["doc_id"])
+            target = str(p.get("target") or "").strip()
+            if doc_id in merged and target:
+                merged[doc_id] = f"{merged[doc_id]}; {target}" if merged[doc_id] else target
+            else:
+                merged.setdefault(doc_id, target)
+        return list(merged.items())

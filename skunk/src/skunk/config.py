@@ -148,7 +148,7 @@ class SkunkConfig:
 
     # Step cap for the lookup_external agent (terminates earlier via its final-answer JSON block).
     # (env: SKUNK_LOOKUP_MAX_STEPS)
-    lookup_max_steps: int = 4
+    lookup_max_steps: int = 10
     # Active lookup tools by name (see `lookup_tools._REGISTRY`); None → all tools.
     # (env: SKUNK_LOOKUP_TOOLS — comma-separated, e.g. "fetch_fred,tavily_search")
     lookup_tools: list[str] | None = None
@@ -328,7 +328,7 @@ class SkunkConfig:
             search_agent_request_timeout_s=float(
                 os.environ.get("SKUNK_SEARCH_TIMEOUT_S", "120")
             ),
-            lookup_max_steps=int(os.environ.get("SKUNK_LOOKUP_MAX_STEPS", "4")),
+            lookup_max_steps=int(os.environ.get("SKUNK_LOOKUP_MAX_STEPS", "10")),
             lookup_tools=_parse_csv(os.environ.get("SKUNK_LOOKUP_TOOLS", "")),
             agent_model_id=os.environ.get("SKUNK_AGENT_MODEL") or None,
         )

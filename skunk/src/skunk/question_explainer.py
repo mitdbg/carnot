@@ -42,7 +42,7 @@ PRECOMPUTED_CONCEPTS: list[tuple[str, str]] = [
     ),
     (
         "Continuously compounded (logarithmic) growth rate",
-        "For the growth 'from begin to end' over the whole span, use the CUMULATIVE log change r = ln(end / begin) (report as a percent with x100) — do NOT divide by the number of periods. Divide by n periods (or multiply a per-period change by periods-per-year to annualize) ONLY when the question explicitly asks for a per-period / annualized rate; that per-year rate equals ln(1 + CAGR).",
+        "r = ln(end / begin) / n over n periods; annualize by multiplying the per-period log change by periods-per-year. Relation to CAGR: r = ln(1 + CAGR).",
     ),
     (
         "Annual decay / growth factor",
@@ -94,7 +94,7 @@ PRECOMPUTED_CONCEPTS: list[tuple[str, str]] = [
     ),
     (
         "Expected shortfall / CVaR (historical)",
-        "Run it on a RETURN series: if the inputs are levels / prices / yields, FIRST form the period-over-period returns (or percent changes, as the question specifies) and take expected shortfall of those, not of the raw levels. Expected shortfall at confidence c is then the mean of the outcomes in the worst (1 - c) tail — average all returns at or beyond the VaR cutoff (e.g. the mean of the worst 5% for 95%).",
+        "Expected shortfall at confidence c is the mean of the outcomes in the worst (1 - c) tail — average all returns at or beyond the VaR cutoff (e.g. the mean of the worst 5% for 95%).",
     ),
     (
         "Realized variance / realized volatility",

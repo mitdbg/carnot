@@ -198,7 +198,7 @@ class RetrieveOp:
                             slots[i] = fail
                     else:
                         try:
-                            refs = await traced_step(
+                            refs, targets = await traced_step(
                                 ctx, "select_agent",
                                 lambda: self._run_select_agent(
                                     ctx, pool, catalog, page_store,
@@ -208,6 +208,7 @@ class RetrieveOp:
                             shared = BranchRetrieval(
                                 blocks=tuple(_whole_page_blocks(refs)),
                                 pre_selected=True,
+                                page_targets=targets or None,
                             )
                             for i in agent_positions:
                                 slots[i] = shared
@@ -280,10 +281,12 @@ class RetrieveOp:
         page_store,
         *,
         prior_values: list[AnnotatedValue] | None = None,
-    ) -> list[PageRef]:
+    ) -> tuple[list[PageRef], dict[str, str]]:
         """ONE agent for the whole question over the union of all branches' candidates.
         `prior_values` (replan sweeps) is what earlier attempts already gathered — surfaced
-        to the agent so it selects pages only for the data still missing."""
+        to the agent so it selects pages only for the data still missing. Returns the selected
+        page refs and a (doc_id → retrieval target) map: the per-page natural-language target
+        the agent wrote, which drives that page's extraction."""
         from skunk.select_agent import SelectAgent
 
         agent = SelectAgent(
@@ -293,22 +296,26 @@ class RetrieveOp:
             candidates=pool,
             prior_values=prior_values,
         )
-        page_keys = await agent.retrieve(ctx, ctx.question)
+        pages = await agent.retrieve(ctx, ctx.question)
         refs: list[PageRef] = []
+        targets: dict[str, str] = {}
         bad: list[str] = []
-        for key in page_keys:
+        for key, target in pages:
             try:
                 refs.append(page_key_to_pageref(key))
             except ValueError:
                 bad.append(key)
+                continue
+            if target:
+                targets[key] = target
         if bad:
             ctx.emit(f"bad_page_keys n_bad={len(bad)} keys={bad[:5]!r}")
         if not refs:
             raise StepFailed(
                 "retrieve",
-                f"select_agent returned no usable page keys (raw={page_keys!r})",
+                f"select_agent returned no usable page keys (raw={pages!r})",
             )
-        return refs
+        return refs, targets
 
     def _ensure_resources(self, config: SkunkConfig):
         # Single-flight: neither parallel branches (same op) nor parallel UID

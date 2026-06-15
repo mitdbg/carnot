@@ -22,6 +22,7 @@ from skunk.common import (
     BlockRef,
     ExecutionContext,
     SemPoolEntry,
+    pageref_to_doc_key,
     traced_step,
 )
 from skunk.errors import StepFailed
@@ -61,14 +62,18 @@ async def _extract_block(
     ctx: ExecutionContext,
     ref: BlockRef,
     branches: list[RetrieveBranch],
+    target: str | None = None,
 ) -> list[AnnotatedValue]:
     """One block's read serving EVERY branch that selected it: the call's opening line
     lists all their targets, so a single page read extracts for each. Text tier first,
     pure vision as the fallback — for visual_only branches, the `extract_vision_only`
-    override, or a text pass that found nothing."""
+    override, or a text pass that found nothing. `target` (SelectAgent path) is the agent's
+    per-page retrieval target: it drives the read AND is stamped onto each entry's
+    `retrieve_key` in place of the branch key."""
     branch = branches[0] if len(branches) == 1 else _synth_branch(branches)
-    looking = None
-    if len(branches) > 1:
+    if target:
+        looking: str | None = f"You are looking for {target}."
+    elif len(branches) > 1:
         lines = []
         for b in branches:
             line = f"- {b.key}"
@@ -76,9 +81,11 @@ async def _extract_block(
                 line += f" (for the period {b.period})"
             lines.append(line)
         looking = "You are looking for ALL of the following:\n" + "\n".join(lines)
+    else:
+        looking = None
     if not branch.visual_only and not ctx.config.extract_vision_only:
         entries = await _TEXT.run(
-            ctx.question, branch, [ref], ctx, looking_for=looking
+            ctx.question, branch, [ref], ctx, looking_for=looking, target=target
         )
         if entries:
             return entries
@@ -86,7 +93,7 @@ async def _extract_block(
     if not images:
         return []
     return await _VISION.run(
-        ctx.question, branch, images, rendered_refs, ctx, looking_for=looking
+        ctx.question, branch, images, rendered_refs, ctx, looking_for=looking, target=target
     )
 
 
@@ -95,12 +102,16 @@ async def run_extract(
     branches: list[RetrieveBranch],
     selections: list[list[SemPoolEntry] | StepFailed],
     branch_ids: list[int],
+    page_targets: dict[str, str] | None = None,
 ) -> list[list[AnnotatedValue] | StepFailed]:
     """Read every branch's selected blocks: one organized sweep where each unique block is
     read ONCE, mapped to every branch that selected it, its entries owned by the FIRST such
     branch (compute must see each datum exactly once). `selections` is `run_select`'s output,
     one slot per branch — the selected entries, or a `StepFailed` to carry through. Returns
-    one result per branch (its entries, or the `StepFailed` to attribute to it)."""
+    one result per branch (its entries, or the `StepFailed` to attribute to it).
+    `page_targets` (SelectAgent path) maps a block's anchor `doc_id` to the agent's per-page
+    retrieval target, which drives that block's read and is stamped onto its entries."""
+    targets = page_targets or {}
     results: list[list[AnnotatedValue] | StepFailed | None] = [None] * len(branches)
     sel_by_pos: dict[int, list[SemPoolEntry]] = {}
     for pos, sel in enumerate(selections):
@@ -130,7 +141,12 @@ async def run_extract(
     async def _extract_phase() -> None:
         reads = await asyncio.gather(
             *(
-                _extract_block(ctx, e.ref, [branches[p] for p in poss])
+                _extract_block(
+                    ctx,
+                    e.ref,
+                    [branches[p] for p in poss],
+                    target=targets.get(pageref_to_doc_key(e.ref.page)),
+                )
                 for e, poss in want.values()
             ),
             return_exceptions=True,

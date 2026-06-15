@@ -232,13 +232,14 @@ class MultiTurnAgent(ABC):
 
 You act ONLY by emitting fenced code blocks. **Every reply MUST contain at least one
 fenced block.** A reply that is only reasoning or prose, with no fenced block, is not a
-valid action: it changes nothing and wastes one of your limited steps. Do any brief
-thinking *before* the block, then always finish your reply with the block(s).
+valid action: it changes nothing and wastes one of your limited steps. Write your
+thinking as comments inside the block, and always finish your reply with the block(s).
 
 A tool call is a ```python``` block whose body is a single call, opened by a line that is
 exactly three backticks then `python`, and closed by a line of three backticks:
 
 ```python
+# Observations and rationale you wish to write down
 some_tool(arg="value", count=10)
 ```
 
