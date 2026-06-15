@@ -99,6 +99,19 @@ def _overlaps(
     return any(not (hi < p_lo[:7] or lo > p_hi[:7]) for p_lo, p_hi in period_intervals)
 
 
+# A requested period can POST-DATE the data it refers to — e.g. a security identified by its
+# maturity ("notes maturing July 1984") whose auction happened years earlier. ToC era pruning
+# therefore extends the period's lower bound this many years backward, so the earlier era that
+# actually holds the data is still scanned. (The per-branch `_year_filter` stays strict.)
+_TOC_BACKWARD_SLACK_YEARS = 5
+
+
+def _shift_years(month: str, delta: int) -> str:
+    """Shift a `YYYY-MM` string by `delta` years, clamping the year to a valid 4-digit value."""
+    year = min(9999, max(1, int(month[:4]) + delta))
+    return f"{year:04d}{month[4:]}"
+
+
 def _batch_by_size(
     groups: list[tuple[PageRef, list[dict]]], cap: int
 ) -> list[list[tuple[PageRef, list[dict]]]]:
@@ -261,12 +274,14 @@ True when the summary fits at least one target; false only when clearly unrelate
 
     def _eras_for_branch(self, branch: RetrieveBranch) -> list[EraTree]:
         """Eras whose ToC to scan: `period` prunes eras whose span ends before the
-        period starts; no period keeps all eras."""
+        period start, less a `_TOC_BACKWARD_SLACK_YEARS` slack (a requested period may
+        post-date its data, e.g. a security's maturity); no period keeps all eras."""
         intervals = _to_intervals(branch.period)
         if not intervals:
             return self._tree.eras
         earliest = min(lo[:7] for lo, _ in intervals)
-        kept = [e for e in self._tree.eras if e.span[1][:7] >= earliest]
+        cutoff = _shift_years(earliest, -_TOC_BACKWARD_SLACK_YEARS)
+        kept = [e for e in self._tree.eras if e.span[1][:7] >= cutoff]
         return kept or self._tree.eras
 
     def _eras_for_branches(self, branches: list[RetrieveBranch]) -> list[EraTree]:

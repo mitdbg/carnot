@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import cast
 from skunk.compute import ComputeOp
 from skunk.config import SkunkConfig
+from skunk.data_prep import DataPrepOp
 from skunk.errors import MissingData, StepFailed
 from skunk.human import (
     BrokerChannel,
@@ -203,6 +204,7 @@ class Orchestrator:
         self._human = HumanAssist(channel=human_channel)
         self._explainer = QuestionExplainer()
         self._compute = ComputeOp()
+        self._data_prep = DataPrepOp()
         self._result = ExecutionResult(question=question)
         # Deduped union of every BlockRef the retrieve phase produced this question (first-seen
         # order, accumulated across the initial sweep and any replan sweeps). Exposed via
@@ -267,7 +269,10 @@ class Orchestrator:
         # is exactly what compute chose to keep (re-stated inputs + any partial computation,
         # drop-by-default); each replan sweep then appends its newly gathered values. ATTEMPTS
         # records every branch's fate across sweeps. Branch outcomes don't outlive their
-        # sweep — the pool is the only data carried across rounds.
+        # sweep — the pool is the only data carried across rounds. The data-prep gate
+        # (`_prep_pool`) cleans the pool just before EVERY compute call — initial and every
+        # replan round — so values a replan sweep appends are deduped/coalesced against the
+        # carried set, not only on the first pass.
         pool: list[AnnotatedValue] = [
             e for o in outcomes if o.entries for e in o.entries
         ]
@@ -289,6 +294,7 @@ class Orchestrator:
             # fails (re-running compute over a human correction may then succeed).
             self._capture_recompute_state(outcomes, human_entries, explanations)
             if sweep_added or needs is None:
+                pool = await self._prep_pool(pool, human_entries)
                 outcome = await traced_step(
                     self._ctx,
                     "compute",
@@ -371,6 +377,7 @@ class Orchestrator:
                 if directed_entries or human_entry is not None:
                     # Try compute over the human-augmented pool before spending a replan.
                     self._capture_recompute_state(outcomes, human_entries, explanations)
+                    pool = await self._prep_pool(pool, human_entries)
                     outcome = await traced_step(
                         self._ctx,
                         "compute",
@@ -433,7 +440,9 @@ class Orchestrator:
                 round_idx == 1 and handler is not None
             )
             try:
-                outcomes = await self._run_branches(plan.branches, ids)
+                outcomes = await self._run_branches(
+                    plan.branches, ids, prior_values=pool
+                )
             finally:
                 self._ctx.human_intervention_enabled = False
             attempts += [
@@ -443,6 +452,32 @@ class Orchestrator:
             new_entries = [e for o in outcomes if o.entries for e in o.entries]
             pool += new_entries
             sweep_added = bool(new_entries)
+
+    async def _prep_pool(
+        self,
+        pool: list[AnnotatedValue],
+        human_entries: list[AnnotatedValue],
+    ) -> list[AnnotatedValue]:
+        """Run the data-prep gate over the pool just before a compute call: dedup corpus
+        reprints and coalesce same-series values across everything gathered so far. Only the
+        machine-gathered values are sent to the cleaner; human-supplied entries are passed
+        through VERBATIM (same objects) so the id()-keyed `human_resolution_refs` tracking
+        survives — and because a human value is authoritative, not a reprint to coalesce.
+        Fails safe via `DataPrepOp.run` (returns its input unchanged on any error), so it
+        never starves compute of inputs."""
+        if not pool:
+            return pool
+        human_ids = {id(e) for e in human_entries}
+        machine = [e for e in pool if id(e) not in human_ids]
+        humans = [e for e in pool if id(e) in human_ids]
+        if not machine:
+            return pool
+        cleaned = await traced_step(
+            self._ctx,
+            "data_prep",
+            lambda: self._data_prep.run(machine, self._ctx),
+        )
+        return cleaned + humans
 
     def _alloc_branch_ids(self, n: int) -> list[int]:
         """Allocate `n` fresh, monotonically-increasing branch ids (stable for the
@@ -748,6 +783,7 @@ class Orchestrator:
                     rerun_branches,
                     rerun_ids,
                     document_scopes=retrieval_directives,
+                    prior_values=entries,
                 )
                 outcomes = list(outcomes)
                 for position, rerun in zip(rerun_positions, rerun_outcomes):
@@ -798,6 +834,7 @@ class Orchestrator:
         branches: list[RetrieveBranch],
         branch_ids: list[int],
         document_scopes: list[list[str] | None] | None = None,
+        prior_values: list[AnnotatedValue] | None = None,
     ) -> list[BranchRetrieval | StepFailed]:
         """Unified multi-scan retrieve for every retrieve branch at once: their candidate
         pages are deduped and the LLM semantic filter scans each unique page at most once,
@@ -814,7 +851,11 @@ class Orchestrator:
                 self._ctx,
                 "retrieve",
                 lambda: self._retrieve.run_all(
-                    self._ctx, branches, branch_ids, document_scopes=document_scopes
+                    self._ctx,
+                    branches,
+                    branch_ids,
+                    document_scopes=document_scopes,
+                    prior_values=prior_values,
                 ),
             )
         except StepFailed as e:
@@ -839,12 +880,15 @@ class Orchestrator:
         branch_ids: list[int],
         *,
         document_scopes: dict[int, list[str]] | None = None,
+        prior_values: list[AnnotatedValue] | None = None,
     ) -> list[BranchOutcome]:
         # Global retrieve phase: all retrieve branches share one deduped semantic-filter
         # sweep, then each branch's routed refs feed its own extract. Lookup branches are
         # independent and run in the per-branch tail below. `document_scopes` (keyed by
         # stable branch id) hard-scopes a retrieve branch's corpus to human-required
         # bulletins — the HITL "annotate this branch's source documents" recovery action.
+        # `prior_values` (replan sweeps) is the pool already gathered by earlier attempts —
+        # threaded to the selection agent so it doesn't re-select pages for data in hand.
         self._last_executed_branch_ids = set(branch_ids)
         retrieve_pos = [i for i, b in enumerate(branches) if b.kind == "retrieve"]
         retrievals = await self._run_retrieve_phase(
@@ -853,6 +897,7 @@ class Orchestrator:
             document_scopes=[
                 (document_scopes or {}).get(branch_ids[i]) for i in retrieve_pos
             ],
+            prior_values=prior_values,
         )
         retr_by_pos: dict[int, BranchRetrieval | StepFailed] = dict(
             zip(retrieve_pos, retrievals)

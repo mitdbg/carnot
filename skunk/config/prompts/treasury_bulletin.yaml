@@ -214,6 +214,19 @@ overrides:
         }
         ```
 
+      - |
+        ### Example (the date is a security's MATURITY, not the data date — BOTH set `period` from it (the date-filter window) AND keep the "maturing ..." wording in `key` so selection reads what the date means. The auction may pre-date the maturity; the filter's slack covers that. One auction (bids, tenders, allotments) = ONE branch.)
+        Q: What was the total dollar value of bids submitted for the 2-year Treasury notes maturing at the end of July 1984, and what percent were accepted as noncash rollover tenders?
+        Plan:
+        ```json
+        {
+          "branches": [
+            {"kind": "retrieve", "key": "bids submitted and noncash rollover tenders for the 2-year Treasury notes maturing at the end of July 1984",
+             "period": "1984-07"}
+          ]
+        }
+        ```
+
 
   # ---------------------------------------------------------------------
   # Replanner few-shots. Diff-shaped examples — the replanner emits a PlanDiff

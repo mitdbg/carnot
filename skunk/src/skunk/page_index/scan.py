@@ -73,8 +73,9 @@ PAGE_SCAN_FIELDS = """\
 - has_unparsed_graphics: a content page with a chart/figure whose data is not in its own text/tables.
 - parse_broken: the parsed elements are too mangled to trust — scrambled or merged cells, numbers
   with no row/column labels. When in doubt set this true rather than guessing, and leave blocks empty.
-- date_interval: the [start, end] months the page's DATA covers — each "YYYY-MM", or null when
-  undatable. Resolve fiscal/calendar years against the publication month.
+- date_interval: the [lowest, highest] months the page covers — each "YYYY-MM", or null when
+  undatable. Resolve fiscal/calendar years against the publication month. Any mention of a date, implicit or explict,
+  in data or in prose, counts towards the date. 
 - blocks: the page's content blocks (content pages, plus a divider's one naming block; see below)."""
 
 

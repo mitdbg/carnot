@@ -65,12 +65,10 @@ class SkunkConfig:
     # outcomes abstain from the vote — a NeedsMore is returned only when EVERY trial
     # signals it. 1 = single-trial (today's behavior). (env: SKUNK_COMPUTE_BEST_OF_N)
     compute_best_of_n: int = 5
-    # Append a fixed cheat-sheet of canonical formulas for named / ambiguous operations
-    # (`question_explainer.PRECOMPUTED_CONCEPT_REFERENCES`) to the compute `## Concept
-    # references` block, after the question_explainer's per-question concepts. Pins one
-    # convention per operation (Zipf orientation, Box-Cox form, percentile type, pop-vs-
-    # sample std, …) so codegen stops picking wrong variants. Default OFF (explainer
-    # concepts alone); flip per-run to A/B its effect on compute accuracy.
+    # Bypass the QuestionExplainer's per-question selection and inject the ENTIRE
+    # PRECOMPUTED_CONCEPTS catalog into every compute `## Concept references` block (skips
+    # the selection LLM call). Default OFF (the explainer selects only the relevant
+    # entries); flip per-run to A/B selection vs. full-dump on compute accuracy.
     # (env: SKUNK_PRECOMPUTED_CONCEPT_REFS=1)
     compute_precomputed_concept_refs: bool = False
 
@@ -235,12 +233,18 @@ class SkunkConfig:
         #   (branch coverage, operator routing, period fidelity) is worth the per-question
         #   cost — the flash planner systematically dropped/misrouted branches that Pro/high
         #   gets right (plan-probe 2026-06-14: 19/20 known-bad dev plans fixed).
+        # - select_agent: 3.1 Pro at medium thinking (its inherited default_effort). The
+        #   precision selection (qualifier / tiling / vintage judgment) over the flagged
+        #   candidates; flash systematically mis-selected — gold page in the survivors but
+        #   not picked (deep dive 2026-06-14). Resolved as an agent loop, so this override
+        #   only applies when SKUNK_AGENT_MODEL is unset.
         # Everything else (toc_pick, …) runs on the base `llm_model` (flash).
         self.model_overrides.setdefault("semfilter", "gemini-3.1-flash-lite")
         self.model_overrides.setdefault("extract.text", "gemini-3.5-flash")
         self.model_overrides.setdefault("extract.vision", "gemini-3.5-flash")
         self.model_overrides.setdefault("compute.codegen", "gemini-3.1-pro-preview")
         self.model_overrides.setdefault("planner", "gemini-3.1-pro-preview")
+        self.model_overrides.setdefault("select_agent", "gemini-3.1-pro-preview")
         self.model_overrides.setdefault("replanner", "gemini-3.5-flash")
 
     @classmethod

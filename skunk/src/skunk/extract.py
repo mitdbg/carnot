@@ -305,7 +305,7 @@ never round, truncate, or drop trailing digits.
 ## Field semantics
 
 description   natural-language label uniquely identifying the datum
-              (series + period + sub-category), using the page's
+              (series + period + sub-category), prefer the page's
               verbatim row/column/caption wording.
 
 notes         the page's textual context bearing on the question:
@@ -343,8 +343,7 @@ You retrieve printed values from page text to fulfill a specific lookup. The
 user message gives the lookup (and period, when stated), the question it
 serves, page metadata (each block's title), and the page text. Work out from
 the table markup in the text which column/row a value sits under, the
-period, and the units. Emit one entry per
-distinct row that could plausibly satisfy the lookup, including partial
+period, and the units. Emit all data that could satisfy the lookup, including partial
 matches. Extract only what is printed — never compute or transform; every
 numeric value must appear verbatim in the page text (metadata is context, not
 a source of values). A period `YYYY-MM..YYYY-MM` is an inclusive month

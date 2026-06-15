@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Any
 
 from skunk.common import (
+    AnnotatedValue,
     B64Image,
     ExecutionContext,
     PageRef,
@@ -57,32 +58,48 @@ class SelectAgent(MultiTurnAgent):
     name = "select_agent"
     # Matches the SearchAgent: dense Treasury tables are ~1.5 chars/token, so keep the char
     # budget conservative under the model's ~1M-token input ceiling.
-    context_budget_chars: int = 1_300_000
-    warn_steps_remaining = 2
+    context_budget_chars: int = 1_500_000
+    warn_steps_remaining = 5
+    # Collapse all but the 5 most recent tool results to a placeholder in the render; pruned
+    # corpus content and the agent's own findings are preserved separately (prune state +
+    # any future checkpoint summary), so stale raw observations are the only thing dropped.
+    visible_observations: int | None = 5
+    # Tighter than the search agent's shared budget: selection over a shortlist needs less
+    # exploration than open-corpus retrieval.
+    max_steps: int | None = 15
 
     briefing = (
         "You are a helpful assistant for retrieving relevant information from a large "
         "collection of documents. You will be given a question, and a shortlist of candidate "
-        "pages that likely (but not always) carry relevant information. Some questions require "
-        "looking up information that is not contained in the corpus; that is handled by a "
-        "separate agent, so you should only focus on retrieving relevant documents for the "
-        "remainder of the question. You do not need to retrieve everything in a single tool "
-        "call: use early steps to explore documents of potential relevance, then refine your "
+        "pages that likely (but not always) carry relevant information. Your ONLY output is a set of page ids: never compute, "
+        "calculate, or answer the question yourself, and never write analysis or calculation "
+        "code. Use early steps to explore documents of potential relevance, then refine your "
         "searches in later steps based on what you find. Use `prune(...)` aggressively on "
         "pages and blocks you have ruled out, to keep later searches focused and your context "
-        "window manageable.\n\n"
+        "window manageable. Stop exploration and commit when you have enough information, do not"
+        "wander until your step limit. Some questions require looking up information that is not contained in the"
+        "corpus; if you suspect this from inspecting the likely candidate set, commit just the information you can find"
+        "in the corpus. \n\n"
+        
         "## Hints\n\n"
         "- Match the question's EXACT wording — the precise series with every qualifier, "
         "total vs subtotal, unit, and time basis. The catalog summaries are paraphrases; the "
         "question governs.\n"
         "- Confirm the requested dates exist at the needed granularity (monthly rows "
         "vs an annual / fiscal-year roll-up).\n"
-        "-  Most questions should be answered by the most "
-        "contemporaneous print, but you must check for later revisions. Revisions are "
-        "clearly marked as such on the pages or notes. Otherwise, later prints may contain changes in "
-        "accounting methods or classifications, and must not be used.\n"
+        "- A statistic usually has a few months of reporting delay, so the first issue "
+        "reporting period P is typically dated a few months later than P.\n"
+        "-  Most questions should be answered by the most contemporaneous print, but you should check for later revisions,"
+        " often published under the same series in later prints. Revisions are clearly marked as such on the pages or notes."
+        "Otherwise, later prints may contain changes in accounting methods or classifications, and must not be used.\n"
+        "- Multi-period span: when the requested period spans more than one print's data "
+        "window, select the FEWEST prints whose data windows together cover the ENTIRE span, "
+        "tiling consecutive issues with no gap.\n"
         "- If the question pins a source (\"as reported in the <Month Year> Bulletin\", \"as of "
         "<date>\"), select the blocks that best match it.\n"
+        "- A page's `doc_id` (e.g. `1980_04_85`) is its PDF-index key, NOT its printed footer "
+        "label. Emit the `doc_id` of the page you actually read, copied verbatim from the "
+        "candidate list or a tool result — never a printed page number and never an adjacent id.\n"
     )
 
     final_answer_doc = """\
@@ -90,9 +107,10 @@ A JSON object with the `doc_id`s of the pages you selected, under the key "page_
 ```json
 {"page_keys": ["1946_11_41", "1947_01_38"]}
 ```
-Use each `doc_id` exactly as it appears in the candidate listing / search results. Select at
-least one page; if the question's data is genuinely on none of them, you are out of luck —
-do not invent pages."""
+Copy each `doc_id` VERBATIM from the candidate listing or a tool result (it is a PDF-index key
+like `1980_04_85`, not a printed page label) — the page you read is the page you must emit; never
+substitute a printed page number or an adjacent id. Select at least one page; if the question's
+data is genuinely on none of them, you are out of luck — do not invent pages."""
 
     def __init__(
         self,
@@ -100,10 +118,14 @@ do not invent pages."""
         catalog: dict[PageRef, PageCatalogRow],
         page_store: PageStore,
         candidates: list[SemPoolEntry],
+        prior_values: list[AnnotatedValue] | None = None,
     ):
         self.config = config
         self._catalog = catalog
         self._candidates = candidates
+        # Data earlier replan attempts already gathered (empty on the first sweep). Surfaced
+        # in the seed so the agent doesn't re-select pages for values already in hand.
+        self._prior_values = prior_values or []
 
         # Full text of the flagged pages — the surface grep_corpus searches.
         survivor_texts: dict[str, str] = {}
@@ -136,7 +158,7 @@ do not invent pages."""
         ]
         super().__init__(
             tools,
-            max_steps=config.agent_max_steps,
+            max_steps=self.max_steps,
             max_misfires=config.agent_max_misfires,
         )
 
@@ -148,7 +170,8 @@ do not invent pages."""
         """The candidate PAGES (distinct, deduped) as the opening observation — page ids
         only, no summaries. Deliberately just a list: first-pass retrieval flags pages that
         very likely hold the right table, and the agent discovers everything else through its
-        tools (read_document / search_corpus / grep_corpus)."""
+        tools (read_document / search_corpus / grep_corpus). On a replan sweep, a second block
+        lists the data earlier attempts already gathered, so the agent narrows to what's left."""
         seen: list[str] = []
         seen_set: set[str] = set()
         for entry in self._candidates:
@@ -156,13 +179,39 @@ do not invent pages."""
             if doc_id not in seen_set:
                 seen_set.add(doc_id)
                 seen.append(doc_id)
-        return [
+        blocks: list[Block] = [
             TextBlock(
                 f"Candidate pages from first-pass retrieval ({len(seen)}). With high "
                 "probability the right table is in one of these pages, and they are likely "
                 f"excellent starting points:\n{', '.join(seen)}"
             )
         ]
+        prior = self._prior_values_block()
+        if prior is not None:
+            blocks.append(prior)
+        return blocks
+
+    def _prior_values_block(self) -> Block | None:
+        """One block summarizing what earlier replan attempts already gathered (description +
+        source issue/pages), instructing the agent not to re-select pages just to re-obtain
+        them. None on the first sweep (nothing gathered yet)."""
+        if not self._prior_values:
+            return None
+        lines: list[str] = []
+        for v in self._prior_values:
+            if v.bulletin:
+                pgs = " " + ", ".join(f"p{p}" for p in v.pages) if v.pages else ""
+                src = f" [{v.bulletin}{pgs}]"
+            elif v.source:
+                src = f" [{v.source}]"
+            else:
+                src = ""
+            lines.append(f"- {v.description}{src}")
+        return TextBlock(
+            "Data ALREADY gathered by earlier attempts (it is in hand — do NOT select pages "
+            "solely to re-obtain these; select pages only for the data still missing):\n"
+            + "\n".join(lines)
+        )
 
     def _block_is_visible(self, block: Block) -> bool:
         if isinstance(block, ChunkBlock):

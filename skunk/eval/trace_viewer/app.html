@@ -159,7 +159,7 @@ const KIND = {
   note:        { color:"#888888", bg:"transparent",      label:"NOTE" },
   step:        { color:"#666666", bg:"transparent",      label:"STEP" },
 };
-const OP_COLOR = { planner:"#cc66ff", question_explainer:"#66ccaa", retrieve:"#3399ff", extract:"#e6b800", lookup_external:"#ff9933", compute:"#33cc33", replanner:"#ff66aa" };
+const OP_COLOR = { planner:"#cc66ff", question_explainer:"#66ccaa", retrieve:"#3399ff", select_agent:"#22d3ee", search_agent:"#22d3ee", block_select:"#66ccff", extract:"#e6b800", data_prep:"#7fd4c1", lookup_external:"#ff9933", compute:"#33cc33", replanner:"#ff66aa" };
 const COMPACT_KINDS = new Set(["call", "note", "step"]);
 const TRUNC_CHARS = 40000;   // ~10k tokens — observations longer than this collapse with a click-to-expand
 
@@ -480,6 +480,26 @@ function tournamentHtml(node){
   return parts.join("") + rawEventsHtml(node);
 }
 
+// ── select agent (page-index precision stage) ───────────────────────────────
+// Replaces the block-select tournament under the `page_index_agent` retriever: the
+// SelectAgent verifies/selects among the sem-filter survivors (the funnel's output).
+// Header = the pages it finally selected + golden coverage (selection is where gold is
+// kept or lost), then the agent's reasoning loop (system/user/calls/tool_code/observations).
+function selectAgentHtml(node){
+  const sel = node.summary?.type==="pages" ? (node.summary.pages||[]) : [];
+  const survivors = new Set(sel.map(p=>`${p.month}:${p.page}`));
+  const selChips = sel.length
+    ? sel.map(p=>`<span class="chip chip-retr">${esc(p.month)} p${esc(p.page)}</span>`).join("")
+    : `<span class="chip chip-none">no pages selected</span>`;
+  const loop = node.events.length ? node.events.map(eventHtml).join("") : `<div class="empty">no internal events</div>`;
+  return `<div class="flow-head" style="margin-bottom:6px">
+      <span class="flow-label">selected ${sel.length} page(s)</span>
+      <span style="margin-left:auto">${goldChips(survivors)}</span>
+    </div>
+    <div class="flow-pages" style="margin-bottom:8px">${selChips}</div>
+    ${loop}`;
+}
+
 // ── merged execution flow: cumulative tabs, linearized node flow ─────────────
 // One coherent view: [planner | question_explainer] → branch chains (retrieve→extract
 // / lookup) → compute. Segmented at each `compute` (= one revision / compute attempt);
@@ -523,18 +543,24 @@ function segmentHtml(seg, i, m, sel){
   const compute = seg.filter(n => n.op==="compute");
   const branchNodes = seg.filter(n => n.branchId!=null);
   const retrieves = seg.filter(n => n.branchId==null && n.op==="retrieve");
-  const handledOps = new Set(["planner","question_explainer","replanner","compute","retrieve"]);
+  // page_index_agent precision stage: orchestration-level, follows the retrieve funnel.
+  const selects = seg.filter(n => n.branchId==null && n.op==="select_agent");
+  // data-prep gate: orchestration-level, cleans the extracted value pool just before compute.
+  const dataprep = seg.filter(n => n.branchId==null && n.op==="data_prep");
+  const handledOps = new Set(["planner","question_explainer","replanner","compute","retrieve","select_agent","data_prep"]);
   const others = seg.filter(n => n.branchId==null && !handledOps.has(n.op));
 
   for(const n of replanner) items.push(nodeHtml(n));
   if(setup.length) items.push(`<div class="flow-group"><div class="flow-head"><span class="flow-label">planning${setup.length>1?" · parallel":""}</span></div>${setup.map(nodeHtml).join("")}</div>`);
 
   for(const n of retrieves) items.push(retrieveFunnelHtml(n));
+  for(const n of selects) items.push(nodeHtml(n));
 
   const byBranch = new Map();
   for(const n of branchNodes){ if(!byBranch.has(n.branchId)) byBranch.set(n.branchId, []); byBranch.get(n.branchId).push(n); }
   for(const [bid, bnodes] of byBranch) items.push(branchGroupHtml(bid, bnodes, m, sel));
 
+  for(const n of dataprep) items.push(nodeHtml(n));
   for(const n of others) items.push(nodeHtml(n));
   for(const n of compute) items.push(nodeHtml(n));
   return items.join(arrow());
@@ -585,6 +611,8 @@ function nodeHtml(node){
     ? `<span class="timing">${fsec(node.start)} → ${fsec(node.end)} · Δ ${fsec(node.indiv ?? (node.end-node.start))} · cum ${fsec(node.end)}</span>` : "";
   const body = node.op==="block_select"
     ? tournamentHtml(node)
+    : node.op==="select_agent"
+    ? selectAgentHtml(node)
     : (node.events.length ? node.events.map(eventHtml).join("") : `<div class="empty">no internal events</div>`);
   return `<details class="node ${node.failed?"failed":""}">
     <summary>

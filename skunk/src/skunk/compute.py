@@ -20,10 +20,7 @@ from skunk.common import (
     input_values_desc,
 )
 from skunk.pyexec import exec_python_with_env
-from skunk.question_explainer import (
-    PRECOMPUTED_CONCEPT_REFERENCES,
-    ConceptExplanation,
-)
+from skunk.question_explainer import ConceptExplanation
 
 
 class MissingDataSignal(BaseModel):
@@ -183,12 +180,8 @@ aggregating. Apply unit conversions once over the whole frame, never cell-by-cel
   is not "savings bonds and savings notes". Match the question's exact series
   even when the broader entry is more convenient to read (printed total row,
   fuller index) — convenience of access never outweighs a series mismatch.
-- Pay attention to notes when chaining entries that cover adjacent
-  sub-periods of one series: reprints of the same table tile cleanly, but
-  entries whose notes name different tables usually define the series
-  differently, and a value assembled across them drifts. Prefer covering the
-  period from one table; when only a cross-table patchwork can cover it,
-  weigh signaling missing data instead.
+
+
 
 ## Output format
 
@@ -223,6 +216,13 @@ and nothing else — no prose, no commentary, no second block:
       population, market prices) is data, not knowledge — if no input carries it,
       list it under `missing` rather than supplying it.
 
+      Rules for signaling:
+      - Never signal missing data because an input's `.pages` differ from a page
+        number named in the question. 
+      - DO signal missing data if the supplied data does align with what the question asks for
+        (e.g., data was reported on a different date than what the question asked for, or from a different source),
+        and clearly state this in your signal,
+
 Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
 """
 
@@ -251,14 +251,12 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
         `prev_code`/`prev_failure` describe only the most-recent failed attempt —
         accumulating older ones dilutes the issue to fix."""
         user_msg = f"Question:\n{ctx.question}\n\n"
+        # `concept_explanations` are the canonical references the QuestionExplainer
+        # selected from PRECOMPUTED_CONCEPTS for this question (or the full catalog when
+        # config.compute_precomputed_concept_refs bypasses selection).
         ref_blocks = [
             f"### {c.concept}\n{c.explanation}" for c in concept_explanations
         ]
-        # Optional fixed cheat-sheet of canonical formulas, appended AFTER the
-        # question-specific concepts so the per-question explanation still leads.
-        # Gated for A/B testing (config.compute_precomputed_concept_refs).
-        if ctx.config.compute_precomputed_concept_refs:
-            ref_blocks.append(PRECOMPUTED_CONCEPT_REFERENCES)
         if ref_blocks:
             block = "\n\n".join(ref_blocks)
             user_msg += f"## Concept references\n{block}\n\n"

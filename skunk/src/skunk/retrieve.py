@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from skunk.config import SkunkConfig
 from skunk.errors import StepFailed
 from skunk.common import (
+    AnnotatedValue,
     BlockRef,
     BranchRetrieval,
     ExecutionContext,
@@ -55,6 +56,7 @@ class RetrieveOp:
         branch_ids: list[int] | None = None,
         *,
         document_scopes: list[list[str] | None] | None = None,
+        prior_values: list[AnnotatedValue] | None = None,
     ) -> list[BranchRetrieval | StepFailed]:
         """The single retrieval seam: retrieve for several branches at once, one result per
         branch aligned to `branches`. Each slot is a `BranchRetrieval` (its blocks +
@@ -199,7 +201,8 @@ class RetrieveOp:
                             refs = await traced_step(
                                 ctx, "select_agent",
                                 lambda: self._run_select_agent(
-                                    ctx, pool, catalog, page_store
+                                    ctx, pool, catalog, page_store,
+                                    prior_values=prior_values,
                                 ),
                             )
                             shared = BranchRetrieval(
@@ -275,8 +278,12 @@ class RetrieveOp:
         pool: list,
         catalog,
         page_store,
+        *,
+        prior_values: list[AnnotatedValue] | None = None,
     ) -> list[PageRef]:
-        """ONE agent for the whole question over the union of all branches' candidates."""
+        """ONE agent for the whole question over the union of all branches' candidates.
+        `prior_values` (replan sweeps) is what earlier attempts already gathered — surfaced
+        to the agent so it selects pages only for the data still missing."""
         from skunk.select_agent import SelectAgent
 
         agent = SelectAgent(
@@ -284,6 +291,7 @@ class RetrieveOp:
             catalog=catalog,
             page_store=page_store,
             candidates=pool,
+            prior_values=prior_values,
         )
         page_keys = await agent.retrieve(ctx, ctx.question)
         refs: list[PageRef] = []
