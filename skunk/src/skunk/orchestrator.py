@@ -4,7 +4,7 @@ import asyncio
 import re
 from dataclasses import dataclass, field
 from typing import cast
-from skunk.compute import ComputeOp
+from skunk.compute import make_compute_op
 from skunk.config import SkunkConfig
 from skunk.errors import MissingData, StepFailed
 from skunk.human import (
@@ -115,7 +115,7 @@ async def recompute_answer(
         else:
             merged.extend(cached)
     merged.extend(state.extra_entries)
-    outcome = await ComputeOp().run(
+    outcome = await make_compute_op(ctx.config).run(
         merged, ctx, concept_explanations=state.explanations
     )
     if isinstance(outcome, Final):
@@ -202,7 +202,7 @@ class Orchestrator:
         )
         self._human = HumanAssist(channel=human_channel)
         self._explainer = QuestionExplainer()
-        self._compute = ComputeOp()
+        self._compute = make_compute_op(self._ctx.config)
         self._result = ExecutionResult(question=question)
         # Deduped union of every BlockRef the retrieve phase produced this question (first-seen
         # order, accumulated across the initial sweep and any replan sweeps). Exposed via

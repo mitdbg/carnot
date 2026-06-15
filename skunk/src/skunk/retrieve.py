@@ -235,6 +235,14 @@ _SHARED_RESOURCES_LOCK = threading.Lock()
 _SHARED_RESOURCES: dict[tuple[str, str, str], tuple] = {}
 
 
+def load_corpus_resources(config: SkunkConfig) -> tuple:
+    """Public accessor for the shared `(chroma_collection, document_map)` pair — the
+    process-wide cached, single-flighted corpus resources the search tools need. Used by
+    the search-agent retriever and the multi-turn compute agent (SKUNK_COMPUTE_AGENT=1).
+    Raises `StepFailed` if the chromadb / clean-page-map artifacts are missing."""
+    return _get_shared_resources(config)
+
+
 def _get_shared_resources(config: SkunkConfig):
     """Process-wide single-flight wrapper over `_build_resources`, keyed by the
     ChromaDB dir + collection + clean-page-map path. Serializes ChromaDB opens
