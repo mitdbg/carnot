@@ -99,6 +99,13 @@ class SkunkConfig:
     chromadb_collection: str = "treasury_pages"
     clean_page_map_path: str = "cache/clean_page_map.json"
 
+    # ChromaDB server (HttpClient) the read paths connect to. The embedded PersistentClient
+    # deadlocks under 15-way in-process concurrency; the server owns ChromaDB's concurrency.
+    # Launch it over `chromadb_dir` with `scripts/run_chroma_server.sh`.
+    # (env: SKUNK_CHROMA_SERVER_HOST, SKUNK_CHROMA_SERVER_PORT)
+    chroma_server_host: str = "127.0.0.1"
+    chroma_server_port: int = 8001
+
     # Embedding model for vector_search (must match the stored embeddings).
     # (env: SKUNK_EMB_MODEL)
     emb_model_id: str = "gemini-embedding-001"
@@ -300,6 +307,8 @@ class SkunkConfig:
             clean_page_map_path=os.environ.get(
                 "SKUNK_CLEAN_PAGE_MAP", "cache/clean_page_map.json"
             ),
+            chroma_server_host=os.environ.get("SKUNK_CHROMA_SERVER_HOST", "127.0.0.1"),
+            chroma_server_port=int(os.environ.get("SKUNK_CHROMA_SERVER_PORT", "8001")),
             emb_model_id=os.environ.get("SKUNK_EMB_MODEL", "gemini-embedding-001"),
             agent_max_steps=int(os.environ.get("SKUNK_AGENT_MAX_STEPS", "20")),
             agent_max_misfires=int(os.environ.get("SKUNK_AGENT_MAX_MISFIRES", "6")),
