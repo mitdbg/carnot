@@ -65,20 +65,44 @@ const REVIEW_KIND_LABEL = { replan_approval: "Approve Replan", lookup: "Lookup",
 // Fuller labels for the detail overlay's per-kind review buttons (the cards use the short ones).
 const REVIEW_BUTTON_LABEL = { replan_approval: "Approve Replan", lookup: "External Lookup", figure: "Visual QA", verify_extract: "Extract" };
 
-// One clickable tag per open review kind on a card (e.g. "Extract", "Visual QA (2)"), ordered by
-// urgency. Clicking a tag opens the review overlay directly at that kind (stopPropagation so the
-// card's own click — which opens the detail overlay — doesn't also fire). Greyed when locked.
+// The review entries a task surfaces, ordered by urgency. Extract + lookup are ONE family — never
+// two tags: the verify_extract "pool" review already contains the lookup-derived values (their
+// `external` candidates), so we drop the separate lookup tag and flip the single label to "Lookup"
+// when the reviewable values include an external lookup. Each entry: `openKind` = the review the
+// tag opens, `cls` = its colour class, `label` (when set) overrides the per-call label map.
+function reviewTagEntries(task) {
+  const reviews = task.reviews || [];
+  const byKind = {};
+  for (const r of reviews) byKind[r.kind] = (byKind[r.kind] || 0) + 1;
+  const entries = [];
+  if (byKind.verify_extract || byKind.lookup) {
+    const openKind = byKind.verify_extract ? "verify_extract" : "lookup";
+    // "Lookup" when a standalone lookup review is all there is, or the pool review carries any
+    // external (no-corpus-provenance) value.
+    const isLookup = !byKind.verify_extract
+      || reviews.some((r) => r.kind === "verify_extract"
+        && (((r.guidance && r.guidance.candidates) || []).some((c) => c.external)));
+    entries.push({ openKind, cls: isLookup ? "lookup" : "verify_extract",
+      count: byKind[openKind], label: isLookup ? "Lookup" : "Extract" });
+  }
+  for (const k of Object.keys(byKind)) {
+    if (k === "verify_extract" || k === "lookup") continue;
+    entries.push({ openKind: k, cls: k, count: byKind[k] });
+  }
+  return entries.sort((a, b) => (REVIEW_KIND_RANK[a.openKind] ?? 9) - (REVIEW_KIND_RANK[b.openKind] ?? 9));
+}
+
+// One clickable tag per review entry on a card (e.g. "Extract", "Visual QA (2)"). Clicking a tag
+// opens the review overlay at that entry's kind (stopPropagation so the card's own click — which
+// opens the detail overlay — doesn't also fire). Greyed when locked.
 function cardKindTags(task) {
   const locked = lockedByOther(task);
-  const byKind = {};
-  for (const r of (task.reviews || [])) byKind[r.kind] = (byKind[r.kind] || 0) + 1;
-  return Object.keys(byKind)
-    .sort((a, b) => (REVIEW_KIND_RANK[a] ?? 9) - (REVIEW_KIND_RANK[b] ?? 9))
-    .map((k) => {
-      const label = `${esc(REVIEW_KIND_LABEL[k] || k)}${byKind[k] > 1 ? ` (${byKind[k]})` : ""}`;
+  return reviewTagEntries(task)
+    .map((e) => {
+      const label = `${esc(e.label || REVIEW_KIND_LABEL[e.openKind] || e.openKind)}${e.count > 1 ? ` (${e.count})` : ""}`;
       return locked
-        ? `<span class="tag kind-${esc(k)} locked-out" title="Locked by another reviewer">${label}</span>`
-        : `<span class="tag kind-${esc(k)}" onclick="openReview('${js(task.task_id)}', '${js(k)}', event)">${label}</span>`;
+        ? `<span class="tag kind-${esc(e.cls)} locked-out" title="Locked by another reviewer">${label}</span>`
+        : `<span class="tag kind-${esc(e.cls)}" onclick="openReview('${js(task.task_id)}', '${js(e.openKind)}', event)">${label}</span>`;
     })
     .join("");
 }
@@ -251,17 +275,15 @@ function renderDetailActions(task) {
   if (isRefining(task)) {
     html += `<span class="detail-feedback refining">Updating extraction from your feedback…</span>`;
   }
-  // One button per outstanding review KIND (e.g. "External Lookup", "Extract"), ordered by
-  // urgency, so the reviewer picks which to do first. Each opens the overlay straight to that kind.
-  const byKind = {};
-  for (const r of (task.reviews || [])) byKind[r.kind] = (byKind[r.kind] || 0) + 1;
-  html += Object.keys(byKind)
-    .sort((a, b) => (REVIEW_KIND_RANK[a] ?? 9) - (REVIEW_KIND_RANK[b] ?? 9))
-    .map((k) => {
-      const label = `${REVIEW_BUTTON_LABEL[k] || k}${byKind[k] > 1 ? ` (${byKind[k]})` : ""}`;
+  // One button per review entry, ordered by urgency, so the reviewer picks which to do first.
+  // Extract + lookup are one family (see reviewTagEntries) — a single button whose label reads
+  // "Lookup" when the values include one. Each opens the overlay straight to that entry's kind.
+  html += reviewTagEntries(task)
+    .map((e) => {
+      const label = `${e.label || REVIEW_BUTTON_LABEL[e.openKind] || e.openKind}${e.count > 1 ? ` (${e.count})` : ""}`;
       return locked
         ? `<button class="primary" disabled title="Locked by another reviewer">${esc(label)}</button>`
-        : `<button class="primary" onclick="openReview('${js(task.task_id)}', '${js(k)}', event)">${esc(label)}</button>`;
+        : `<button class="primary" onclick="openReview('${js(task.task_id)}', '${js(e.openKind)}', event)">${esc(label)}</button>`;
     })
     .join("");
   if (task.status === "READY") {

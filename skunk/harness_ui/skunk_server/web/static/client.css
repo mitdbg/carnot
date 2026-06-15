@@ -986,15 +986,15 @@ textarea { width: 100%; min-height: 55px; }
   text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 3px;
 }
 .review-actions { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
-.review-submit, .review-accept {
+.review-submit {
   border-radius: 6px; padding: 8px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
   border: 1px solid var(--border2); background: var(--bg3); color: var(--ink);
 }
 .review-submit.primary { background: var(--accent); border-color: var(--accent); color: #003300; }
-.review-submit:hover, .review-accept:hover { filter: brightness(1.1); }
+.review-submit:hover { filter: brightness(1.1); }
 .review-error { color: var(--bad); font-size: 12px; }
 
-/* The action controls (refine box + Submit/Accept) render both above and below the editor. */
+/* The action controls (refine box + Submit) render both above and below the editor. */
 .review-controls { display: flex; flex-direction: column; gap: 10px; }
 /* ── Natural-language refine (verify_extract): feedback box + post-refine toast ──── */
 .review-refine {

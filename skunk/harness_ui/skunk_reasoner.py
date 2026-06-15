@@ -196,16 +196,19 @@ async def refine(
     ]
     if page_text:
         user_parts.append("Source page text (for grounding):\n" + page_text)
+    # Inline human-in-the-loop fix: pin to Flash (its own quota bucket — Pro's 8M input-tok/min
+    # limit, shared with compute.codegen/planner, was exhausted mid-run and stalled the refine).
+    config.model_overrides["review.refine"] = "gemini-3.5-flash"
     prompt: PromptedCall[list[dict]] = PromptedCall(
         name="review.refine",
         system_prompt=_REFINE_SYSTEM_PROMPT,
-        default_effort="low",
+        default_effort="medium",
         parse=_parse_refine_response,
         output_instruction=_REFINE_OUTPUT_INSTRUCTION,
     )
     ctx = ExecutionContext(question=feedback, config=config)
     try:
-        return await prompt.call(ctx, "\n\n".join(user_parts), temperature=0.0)
+        return await prompt.call(ctx, "\n\n".join(user_parts), temperature=0.4)
     finally:
         ctx.close()
 

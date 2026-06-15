@@ -419,7 +419,11 @@ class HumanAssist:
         return self._policy.verify_extract(branch, entries, ctx.config)
 
     def wants_lookup(self, branch: LookupBranch, ctx: ExecutionContext) -> bool:
-        return self._policy.human_lookup(branch, ctx.config)
+        # Disabled: an external lookup's value(s) are rolled into the data-prep agent's output and
+        # reviewed in the single data-prep pool review (verify_extract), so the per-lookup human
+        # hook (optimistic register_lookup + blocking human_lookup) is redundant. The lookup agent
+        # still runs; only the separate review is suppressed. (`human_lookup` policy flag retained.)
+        return False
 
     def wants_pool_review(self, ctx: ExecutionContext) -> bool:
         """Whether the cleaned data-prep pool gets a human review this round. Gated by the same

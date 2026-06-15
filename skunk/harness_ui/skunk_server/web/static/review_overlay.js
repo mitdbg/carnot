@@ -51,6 +51,13 @@ const ReviewOverlay = (function () {
   let lastRefining = false;
   let preRefineCandidates = null;
 
+  // Baseline for "did the cards change?" on a card-based review (extract/lookup). Captured once
+  // per review (the original model extraction) so a single Submit can resolve empty (accept-as-is,
+  // no recompute) when nothing changed, or send the payload (recompute) when it did. Snapshotting
+  // via collectEdited() keeps the baseline and the submit-time read on the identical normalization.
+  let baselineSig = null;
+  let baselineReviewId = null;
+
   // viewer state
   let pages = [];              // [{month, page}] parsed from the review's source_docs
   let pageValues = [];         // [{month,page,values:[desc,...]}] from guidance — value(s) per page
@@ -153,6 +160,7 @@ const ReviewOverlay = (function () {
     reviews = sortReviews(task.reviews);
     index = kind ? Math.max(0, reviews.findIndex((r) => r.kind === kind)) : 0;
     preRefineCandidates = null;
+    baselineReviewId = null;
     lastRefining = !!(current() && current().refining);  // so a reopen mid-refine shows the spinner
     startHeartbeat();
     window.addEventListener("resize", onViewerResize);  // re-fit the page on window/zoom change
@@ -413,15 +421,15 @@ const ReviewOverlay = (function () {
 
   // The action controls, rendered both above and below the editor. For verify_extract this
   // includes the natural-language feedback box (the LLM revises all candidate JSONs at once;
-  // `review.refining` drives the busy/spinner state). Submit + Accept-as-is. Uses CLASSES (not
-  // ids) since it appears twice — refine()/submit()/showError operate across both copies.
+  // `review.refining` drives the busy/spinner state). A single Submit; submit() decides whether
+  // to resolve empty (accept-as-is, no recompute) or send the payload. Uses CLASSES (not ids)
+  // since it appears twice — refine()/submit()/showError operate across both copies.
   function controlsBar(review) {
     if (review.kind === "replan_approval") {
-      // Approve = resolve empty (execute the proposed plan as-is); Reject = submit feedback (the
-      // orchestrator re-runs the replan with it, then executes without asking again).
+      // Single Submit: empty feedback → resolve empty (execute the proposed plan as-is); feedback
+      // typed → submit it (the orchestrator re-runs the replan with it, then executes).
       return `<div class="review-controls"><div class="review-actions">
-        <button class="review-submit primary" onclick="ReviewOverlay.acceptAsIs()" title="Execute the proposed plan as-is">Approve &amp; execute</button>
-        <button class="review-accept" onclick="ReviewOverlay.submit()" title="Re-plan with your feedback">Reject &amp; re-plan</button>
+        <button class="review-submit primary" onclick="ReviewOverlay.submit()" title="Empty feedback executes the proposed plan as-is; feedback re-plans">Submit</button>
         <span class="review-error"></span>
       </div></div>`;
     }
@@ -440,8 +448,7 @@ const ReviewOverlay = (function () {
     return `<div class="review-controls">
       ${refine}
       <div class="review-actions">
-        <button class="review-submit primary" onclick="ReviewOverlay.submit()">Submit</button>
-        <button class="review-accept" onclick="ReviewOverlay.acceptAsIs()" title="Keep the model's answer unchanged">Accept as-is</button>
+        <button class="review-submit primary" onclick="ReviewOverlay.submit()" title="Unchanged values are kept as-is; edits trigger a recompute">Submit</button>
         <span class="review-error"></span>
       </div>
     </div>`;
@@ -540,9 +547,9 @@ const ReviewOverlay = (function () {
       editor = renderCards(cands);
       editorLabel = "";
     }
-    // The controls (NL-feedback box for verify_extract + Submit + Accept-as-is) are rendered BOTH
-    // above and below the editor, so a long JSON list can be acted on without scrolling to the
-    // bottom. The editor itself stays single in the middle.
+    // The controls (NL-feedback box for verify_extract + Submit) are rendered BOTH above and below
+    // the editor, so a long JSON list can be acted on without scrolling to the bottom. The editor
+    // itself stays single in the middle.
     const topControls = isReplan ? "" : controlsBar(review);
     const bottomControls = controlsBar(review);
     const viewer = pages.length ? `
@@ -582,6 +589,13 @@ const ReviewOverlay = (function () {
       </div>`;
     if (pages.length) { wireViewer(); setPage(0); }
     el.querySelectorAll(".review-value").forEach(autosize);  // fit each value box to its content
+    // Capture the card baseline once per review (the first render = the original model extraction),
+    // so it survives refine re-renders: refined cards then read as "changed" (→ recompute) while an
+    // undo restores the cards back to the baseline (→ accept-as-is). See submit().
+    if (!isReplan && !isFigure && review.review_id !== baselineReviewId) {
+      baselineSig = JSON.stringify(collectEdited());
+      baselineReviewId = review.review_id;
+    }
   }
 
   // A one-line "what this value is about" hint from the branch identity, so terse per-value
@@ -625,35 +639,34 @@ const ReviewOverlay = (function () {
     }
   }
 
+  // Single Submit per review: resolve empty (accept-as-is / approve, no recompute) when nothing
+  // changed, otherwise send the payload (recompute / re-plan). Each kind defines "unchanged".
   function submit() {
     const review = current();
     if (!review) return;
     if (review.kind === "replan_approval") {
-      // Reject path: the feedback is required (Approve is the empty-resolve button instead).
+      // Empty feedback = approve (execute the proposed plan as-is); feedback = re-plan with it.
       const ta = root().querySelector("#replanFeedbackInput");
       const text = (ta ? ta.value : "").trim();
-      if (!text) { showError("Enter feedback for the replanner, or click Approve to execute as-is."); return; }
       post(review, text);
       return;
     }
     if (review.kind === "figure") {
-      // The edited AnnotatedValue JSON template → sent raw (already source-indexed for recompute).
+      // An untouched (or empty) template = accept-as-is; an authored value = submit the JSON.
       // Validate it parses before sending so a typo surfaces here, not in a silent recompute failure.
       const ta = root().querySelector("#figureJsonInput");
       const text = (ta ? ta.value : "").trim();
-      if (!text) { showError("Fill in the value(s) read off the chart."); return; }
+      if (!text || text === figureTemplate(review).trim()) { post(review, ""); return; }
       try { JSON.parse(text); } catch (err) { showError("Not valid JSON: " + err.message); return; }
       post(review, text);
       return;
     }
+    // Cards (extract/lookup): unchanged from the baseline → empty (keep the model's answer, no
+    // recompute); any edit/add/delete/refine → send the payload to trigger a recompute.
     let edited;
     try { edited = collectEdited(); } catch (err) { showError(String(err)); return; }
-    post(review, JSON.stringify(edited));
-  }
-
-  function acceptAsIs() {
-    const review = current();
-    if (review) post(review, "");   // empty response = keep the model's answer, no recompute
+    const sig = JSON.stringify(edited);
+    post(review, sig === baselineSig ? "" : sig);
   }
 
   // ── natural-language refine ────────────────────────────────────────────────────
@@ -738,7 +751,7 @@ const ReviewOverlay = (function () {
 
   return {
     open, close, isOpen, syncTasks,
-    submit, acceptAsIs, requestExit, deleteCard, autosize,
+    submit, requestExit, deleteCard, autosize,
     refine, undoRefine,
     prevPage: () => setPage(pageIdx - 1),
     nextPage: () => setPage(pageIdx + 1),
