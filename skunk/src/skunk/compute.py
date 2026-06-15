@@ -4,12 +4,13 @@ import asyncio
 import re
 from collections import Counter
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from skunk.common import Effort, strip_code_fence
+from skunk.config import SkunkConfig
 from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.common import (
@@ -24,6 +25,9 @@ from skunk.question_explainer import (
     PRECOMPUTED_CONCEPT_REFERENCES,
     ConceptExplanation,
 )
+
+if TYPE_CHECKING:
+    from skunk.compute_agent import ComputeAgentOp
 
 
 class MissingDataSignal(BaseModel):
@@ -65,6 +69,34 @@ def _coerce_prim(v: Any) -> Any:
     return v.item() if isinstance(v, np.generic) else v
 
 
+def annotated_value_from_computed(name: str, v: Any) -> AnnotatedValue:
+    """Build a provenance-free "computed" `AnnotatedValue` from a value the model derived
+    and chose to keep — a raw scalar, a `[scalars]` list, or a flat `{label: scalar}` dict.
+    Shared by the single-shot codegen keep-block (`_needs_more_from_env`) and the multi-turn
+    compute agent's missing-data final answer, so both produce identical keep entries. Raises
+    `ValueError` with a fix-it detail on a malformed shape."""
+    try:
+        if isinstance(v, dict):
+            payload = {str(k): _coerce_prim(c) for k, c in v.items()}
+            return AnnotatedValue(
+                description=name, value=payload, kind="vector",
+                index_name="label", notes="computed",
+            )
+        payload = (
+            [_coerce_prim(c) for c in v]
+            if isinstance(v, list)
+            else _coerce_prim(v)
+        )
+        return AnnotatedValue(
+            description=name, value=payload, kind="scalar", notes="computed"
+        )
+    except ValidationError as e:
+        raise ValueError(
+            f"keep[{name!r}]: value must be an `input_values` entry, a scalar, a "
+            f"list of scalars, or a flat {{label: scalar}} dict — {e}"
+        )
+
+
 def _needs_more_from_env(env: dict[str, Any]) -> NeedsMore:
     """Validate a missing-data exec environment into a `NeedsMore`. `missing` must validate
     as `MissingDataSignal`. `keep` (optional, default `{}`) is the model's drop-by-default
@@ -94,31 +126,33 @@ def _needs_more_from_env(env: dict[str, Any]) -> NeedsMore:
             keep.append(v)
             continue
         # Otherwise a value the model computed — provenance-free, marked "computed".
-        try:
-            if isinstance(v, dict):
-                payload = {str(k): _coerce_prim(c) for k, c in v.items()}
-                entry = AnnotatedValue(
-                    description=name, value=payload, kind="vector",
-                    index_name="label", notes="computed",
-                )
-            else:
-                payload = (
-                    [_coerce_prim(c) for c in v]
-                    if isinstance(v, list)
-                    else _coerce_prim(v)
-                )
-                entry = AnnotatedValue(
-                    description=name, value=payload, kind="scalar", notes="computed"
-                )
-        except ValidationError as e:
-            raise ValueError(
-                f"keep[{name!r}]: value must be an `input_values` entry, a scalar, a "
-                f"list of scalars, or a flat {{label: scalar}} dict — {e}"
-            )
-        keep.append(entry)
+        keep.append(annotated_value_from_computed(name, v))
     return NeedsMore(
         keep=keep, missing_reason=signal.description, missing=signal.missing
     )
+
+
+def build_compute_user_message(
+    ctx: ExecutionContext,
+    input_values: list[AnnotatedValue],
+    concept_explanations: Sequence[ConceptExplanation] = (),
+) -> str:
+    """The shared compute user message: the question, an optional `## Concept references`
+    block (per-question explanations + the precomputed cheat-sheet when gated on), and the
+    full `input_values` view. Used by both the single-shot codegen and the multi-turn compute
+    agent so they present identical inputs."""
+    user_msg = f"Question:\n{ctx.question}\n\n"
+    ref_blocks = [f"### {c.concept}\n{c.explanation}" for c in concept_explanations]
+    # Optional fixed cheat-sheet of canonical formulas, appended AFTER the
+    # question-specific concepts so the per-question explanation still leads.
+    # Gated for A/B testing (config.compute_precomputed_concept_refs).
+    if ctx.config.compute_precomputed_concept_refs:
+        ref_blocks.append(PRECOMPUTED_CONCEPT_REFERENCES)
+    if ref_blocks:
+        block = "\n\n".join(ref_blocks)
+        user_msg += f"## Concept references\n{block}\n\n"
+    user_msg += f"input_values =\n{input_values_desc(input_values)}"
+    return user_msg
 
 
 class Codegen:
@@ -250,19 +284,7 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
         data). Raises `ParseError` (caller retries with the detail echoed back).
         `prev_code`/`prev_failure` describe only the most-recent failed attempt —
         accumulating older ones dilutes the issue to fix."""
-        user_msg = f"Question:\n{ctx.question}\n\n"
-        ref_blocks = [
-            f"### {c.concept}\n{c.explanation}" for c in concept_explanations
-        ]
-        # Optional fixed cheat-sheet of canonical formulas, appended AFTER the
-        # question-specific concepts so the per-question explanation still leads.
-        # Gated for A/B testing (config.compute_precomputed_concept_refs).
-        if ctx.config.compute_precomputed_concept_refs:
-            ref_blocks.append(PRECOMPUTED_CONCEPT_REFERENCES)
-        if ref_blocks:
-            block = "\n\n".join(ref_blocks)
-            user_msg += f"## Concept references\n{block}\n\n"
-        user_msg += f"input_values =\n{input_values_desc(input_values)}"
+        user_msg = build_compute_user_message(ctx, input_values, concept_explanations)
         if prev_failure:
             user_msg += "\n\nYour previous attempt failed."
             if prev_code:
@@ -273,6 +295,72 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
             )
         raw = await self._prompt.call(ctx, user_msg, effort=effort, temperature=1.0)
         return _parse_codegen(raw)
+
+
+def vote_compute_outcomes(
+    results: Sequence[Final | NeedsMore | BaseException], ctx: ExecutionContext
+) -> Final | NeedsMore:
+    """Vote across best-of-N compute trials. Each distinct `Final` answer competes with a single
+    pooled MISSING-DATA candidate — all `NeedsMore` trials count equally toward it. Most
+    frequent wins; a tie NEVER breaks in favor of missing-data (an actual answer beats a
+    give-up at equal votes). When missing-data wins, the `NeedsMore` trials are combined:
+    their `keep` values are UNIONed (nothing any trial asked to keep is dropped) and the
+    reason is rendered per trial ("agent 1: …, agent 2: …"). If every trial raised
+    `StepFailed`, re-raise the first; any other exception (programming error / cancellation)
+    is re-raised immediately. Shared by `ComputeOp` and the multi-turn `ComputeAgentOp`."""
+    finals: list[Final] = []
+    needs: list[NeedsMore] = []
+    failures: list[StepFailed] = []
+    for r in results:
+        if isinstance(r, Final):
+            finals.append(r)
+        elif isinstance(r, NeedsMore):
+            needs.append(r)
+        elif isinstance(r, StepFailed):
+            failures.append(r)
+        elif isinstance(r, BaseException):
+            raise r
+
+    if not finals and not needs:
+        ctx.emit(f"compute_vote_all_failed n_trials={len(results)}")
+        raise failures[0]
+
+    final_counts = Counter(f.answer for f in finals)
+    best_answer, best_votes = (
+        final_counts.most_common(1)[0] if final_counts else (None, 0)
+    )
+    # Missing-data wins only by a STRICT majority over the top answer — at a tie the
+    # answer wins (never break in favor of missing-data).
+    if best_answer is not None and len(needs) <= best_votes:
+        ctx.emit(
+            f"compute_vote n_trials={len(results)} n_final={len(finals)} "
+            f"n_needs_more={len(needs)} n_failed={len(failures)} "
+            f"winner_votes={best_votes} answer={best_answer!r}",
+            data={"counts": dict(final_counts)},
+        )
+        return next(f for f in finals if f.answer == best_answer)
+
+    # Missing-data wins (or no trial finalized): combine every `NeedsMore` trial. UNION
+    # their kept values (dedup identical ones) so nothing any trial chose to keep is
+    # dropped, and render the reasons per agent.
+    keep: list[AnnotatedValue] = []
+    seen: set[str] = set()
+    for n in needs:
+        for e in n.keep:
+            key = e.model_dump_json()
+            if key not in seen:
+                seen.add(key)
+                keep.append(e)
+    missing = list(dict.fromkeys(m for n in needs for m in n.missing))
+    reason = "\n".join(
+        f"agent {i}: {n.missing_reason}" for i, n in enumerate(needs, 1)
+    )
+    ctx.emit(
+        f"compute_vote_needs_more n_trials={len(results)} n_final={len(finals)} "
+        f"n_needs_more={len(needs)} n_failed={len(failures)} "
+        f"best_final_votes={best_votes} n_keep={len(keep)} missing={missing!r}"
+    )
+    return NeedsMore(keep=keep, missing_reason=reason, missing=missing)
 
 
 class ComputeOp:
@@ -329,67 +417,7 @@ class ComputeOp:
     def _vote(
         self, results: Sequence[Final | NeedsMore | BaseException], ctx: ExecutionContext
     ) -> Final | NeedsMore:
-        """Vote across best-of-N trials. Each distinct `Final` answer competes with a single
-        pooled MISSING-DATA candidate — all `NeedsMore` trials count equally toward it. Most
-        frequent wins; a tie NEVER breaks in favor of missing-data (an actual answer beats a
-        give-up at equal votes). When missing-data wins, the `NeedsMore` trials are combined:
-        their `keep` values are UNIONed (nothing any trial asked to keep is dropped) and the
-        reason is rendered per trial ("agent 1: …, agent 2: …"). If every trial raised
-        `StepFailed`, re-raise the first; any other exception
-        (programming error / cancellation) is re-raised immediately."""
-        finals: list[Final] = []
-        needs: list[NeedsMore] = []
-        failures: list[StepFailed] = []
-        for r in results:
-            if isinstance(r, Final):
-                finals.append(r)
-            elif isinstance(r, NeedsMore):
-                needs.append(r)
-            elif isinstance(r, StepFailed):
-                failures.append(r)
-            elif isinstance(r, BaseException):
-                raise r
-
-        if not finals and not needs:
-            ctx.emit(f"compute_vote_all_failed n_trials={len(results)}")
-            raise failures[0]
-
-        final_counts = Counter(f.answer for f in finals)
-        best_answer, best_votes = (
-            final_counts.most_common(1)[0] if final_counts else (None, 0)
-        )
-        # Missing-data wins only by a STRICT majority over the top answer — at a tie the
-        # answer wins (never break in favor of missing-data).
-        if best_answer is not None and len(needs) <= best_votes:
-            ctx.emit(
-                f"compute_vote n_trials={len(results)} n_final={len(finals)} "
-                f"n_needs_more={len(needs)} n_failed={len(failures)} "
-                f"winner_votes={best_votes} answer={best_answer!r}",
-                data={"counts": dict(final_counts)},
-            )
-            return next(f for f in finals if f.answer == best_answer)
-
-        # Missing-data wins (or no trial finalized): combine every `NeedsMore` trial. UNION
-        # their kept values (dedup identical ones) so nothing any trial chose to keep is
-        # dropped, and render the reasons per agent.
-        keep: list[AnnotatedValue] = []
-        seen: set[str] = set()
-        for n in needs:
-            for e in n.keep:
-                key = e.model_dump_json()
-                if key not in seen:
-                    seen.add(key)
-                    keep.append(e)
-        missing = list(dict.fromkeys(m for n in needs for m in n.missing))
-        reason = "\n".join(
-            f"agent {i}: {n.missing_reason}" for i, n in enumerate(needs, 1)
-        )
-        ctx.emit(
-            f"compute_vote_needs_more n_trials={len(results)} n_final={len(finals)} "
-            f"n_needs_more={len(needs)} n_failed={len(failures)} "
-            f"best_final_votes={best_votes} n_keep={len(keep)} missing={missing!r}"
-        )
-        return NeedsMore(keep=keep, missing_reason=reason, missing=missing)
+        return vote_compute_outcomes(results, ctx)
 
     async def _run_trial(
         self,
@@ -486,3 +514,18 @@ class ComputeOp:
             "compute",
             f"no successful exec within budget; last failure: {prev_failure}",
         )
+
+
+def make_compute_op(config: SkunkConfig) -> ComputeOp | ComputeAgentOp:
+    """Pick the compute operator implementation for this run. Default: the single-shot
+    codegen→exec `ComputeOp`. With `config.compute_agent` (env `SKUNK_COMPUTE_AGENT=1`): the
+    multi-turn `ComputeAgentOp` that also calls the corpus tools to contextualize its inputs.
+    Both expose the same `run(input_values, ctx, concept_explanations=(), *, round_idx=0)`
+    signature, so the orchestrator's call sites are agnostic to which is chosen."""
+    if config.compute_agent:
+        # Local import: `compute_agent` imports this module (shared helpers), so a
+        # top-level import would be circular.
+        from skunk.compute_agent import ComputeAgentOp
+
+        return ComputeAgentOp()
+    return ComputeOp()

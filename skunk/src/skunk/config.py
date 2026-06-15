@@ -74,6 +74,21 @@ class SkunkConfig:
     # (env: SKUNK_PRECOMPUTED_CONCEPT_REFS=1)
     compute_precomputed_concept_refs: bool = False
 
+    # Compute as a multi-turn agent instead of the single-shot codegen→exec loop. When on,
+    # `make_compute_op` swaps `ComputeOp` for `ComputeAgentOp`: the agent writes/executes
+    # Python step-by-step over the same pre-loaded `input_values` AND can call the corpus
+    # tools (search_corpus / grep_corpus / read_document / view_figure) — but only to
+    # CONTEXTUALIZE its inputs (resolve a unit/footnote/scope/figure), not to retrieve
+    # primary data from scratch; genuinely-missing data still emits NeedsMore → replan. Both
+    # ops keep best-of-N voting (`compute_best_of_n`). REQUIRES the search-agent corpus
+    # artifacts (chromadb + clean_page_map), like SKUNK_RETRIEVER=search_agent. Default OFF.
+    # (env: SKUNK_COMPUTE_AGENT=1)
+    compute_agent: bool = False
+    # Per-trial step budget for the compute agent (each step is one tool call or python block;
+    # a final-answer json block ends it). Smaller than the search agent's 20 — compute reasons
+    # over already-gathered values, so it needs fewer turns. (env: SKUNK_COMPUTE_AGENT_MAX_STEPS)
+    compute_agent_max_steps: int = 12
+
     # Replan-on-MissingData loop. Total compute invocations ≤ recovery_max_rounds + 1.
     recovery_max_rounds: int = 2
 
@@ -236,6 +251,9 @@ class SkunkConfig:
         self.model_overrides.setdefault("extract.text", "gemini-3.5-flash")
         self.model_overrides.setdefault("extract.vision", "gemini-3.5-flash")
         self.model_overrides.setdefault("compute.codegen", "gemini-3.1-pro-preview")
+        # The multi-turn compute agent (SKUNK_COMPUTE_AGENT=1) runs on the same strong model
+        # as single-shot codegen — its turns reason/compute over the extracted values.
+        self.model_overrides.setdefault("compute.agent", "gemini-3.1-pro-preview")
         self.model_overrides.setdefault("planner", "gemini-3.1-pro-preview")
         self.model_overrides.setdefault("replanner", "gemini-3.5-flash")
 
@@ -262,6 +280,10 @@ class SkunkConfig:
                 os.environ.get("SKUNK_LLM_RETRY_INITIAL_DELAY", "1.0")
             ),
             compute_best_of_n=int(os.environ.get("SKUNK_COMPUTE_BEST_OF_N", "5")),
+            compute_agent=os.environ.get("SKUNK_COMPUTE_AGENT", "0") not in ("", "0"),
+            compute_agent_max_steps=int(
+                os.environ.get("SKUNK_COMPUTE_AGENT_MAX_STEPS", "12")
+            ),
             parsed_json_dir=Path(
                 os.environ.get("OFFICEQA_PARSED_JSON_DIR") or _DEFAULT_PARSED_JSON_DIR
             ),
