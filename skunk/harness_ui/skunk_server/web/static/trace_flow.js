@@ -17,7 +17,7 @@
     note:        { color: "#888888", bg: "transparent",      label: "NOTE" },
     step:        { color: "#666666", bg: "transparent",      label: "STEP" },
   };
-  const OP_COLOR = { planner: "#cc66ff", question_explainer: "#66ccaa", retrieve: "#3399ff", extract: "#e6b800", lookup_external: "#ff9933", compute: "#33cc33", replanner: "#ff66aa" };
+  const OP_COLOR = { planner: "#cc66ff", question_explainer: "#66ccaa", retrieve: "#3399ff", extract: "#e6b800", data_prep: "#7fd4c1", lookup_external: "#ff9933", compute: "#33cc33", replanner: "#ff66aa" };
   const COMPACT_KINDS = new Set(["call", "note", "step"]);
   const TRUNC_CHARS = 40000; // observations longer than this collapse with a click-to-expand
 
@@ -173,7 +173,9 @@
     // doesn't group under a branch — render its funnel (ToC pick → date filter → sem filter)
     // standalone. `others` catches any remaining branch-less op so nothing is silently dropped.
     const retrieves = seg.filter((n) => n.branchId == null && n.op === "retrieve");
-    const handledOps = new Set(["planner", "question_explainer", "replanner", "compute", "retrieve", "block_select"]);
+    // data-prep gate: orchestration-level, cleans the extracted value pool just before compute.
+    const dataprep = seg.filter((n) => n.branchId == null && n.op === "data_prep");
+    const handledOps = new Set(["planner", "question_explainer", "replanner", "compute", "retrieve", "block_select", "data_prep"]);
     const others = seg.filter((n) => n.branchId == null && !handledOps.has(n.op));
 
     for (const n of replanner) items.push(nodeHtml(n, taskId));
@@ -186,6 +188,7 @@
     for (const n of branchNodes) { if (!byBranch.has(n.branchId)) byBranch.set(n.branchId, []); byBranch.get(n.branchId).push(n); }
     for (const [bid, bnodes] of byBranch) items.push(branchGroupHtml(bid, bnodes, m, sel, taskId));
 
+    for (const n of dataprep) items.push(nodeHtml(n, taskId));
     for (const n of others) items.push(nodeHtml(n, taskId));
     for (const n of compute) items.push(nodeHtml(n, taskId));
     return items.join(arrow());

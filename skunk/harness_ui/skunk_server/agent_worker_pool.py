@@ -69,9 +69,6 @@ class AgentWorkerPool:
         self._reasoner_accepts_recompute_sink = (
             "recompute_sink" in parameters or accepts_kwargs
         )
-        self._reasoner_accepts_review_discard = (
-            "human_reviews_discard" in parameters or accepts_kwargs
-        )
         self._threads: list[threading.Thread] = []
         self._stop = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -210,17 +207,12 @@ class AgentWorkerPool:
                     if not self._human_blocking and self._reasoner_accepts_review:
                         # OPTIMISTIC (default) extract/lookup verify: open a review mid-run
                         # (fire-and-forget; keep going). The replan path stays blocking via the
-                        # handler above; on a replan the orchestrator discards these via the hook
-                        # below, since the replan supersedes the branches they belong to.
+                        # handler above.
                         reasoner_kwargs["human_review_register"] = (
                             lambda kind, instr, ctx_q, docs, guid, _t=task_id, _a=aid: (
                                 broker.register_review(_t, _a, kind, instr, ctx_q, docs, guid)
                             )
                         )
-                        if self._reasoner_accepts_review_discard:
-                            reasoner_kwargs["human_reviews_discard"] = (
-                                lambda _t=task_id: broker.discard_reviews(_t)
-                            )
                 if self._reasoner_accepts_recompute_sink:
                     # Capture the recompute snapshot so a resolved review can revise the answer.
                     reasoner_kwargs["recompute_sink"] = lambda state, _t=task_id: (

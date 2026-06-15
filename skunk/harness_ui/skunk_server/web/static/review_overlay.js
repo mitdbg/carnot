@@ -62,7 +62,7 @@ const ReviewOverlay = (function () {
 
   // Order reviews within a question by kind: external lookup, then visual QA, then extract —
   // so auto-advancing walks them in the same priority the task list uses.
-  const KIND_RANK = { lookup: 0, figure: 1, verify_extract: 2 };
+  const KIND_RANK = { lookup: 0, figure: 1, verify_extract: 2, replan_approval: 3 };
   const sortReviews = (rs) => rs.slice().sort((a, b) => (KIND_RANK[a.kind] ?? 3) - (KIND_RANK[b.kind] ?? 3));
 
   function root() { return document.getElementById("reviewOverlay"); }
@@ -245,20 +245,34 @@ const ReviewOverlay = (function () {
     const valueStr = (c.value && typeof c.value === "object") ? JSON.stringify(c.value, null, 2) : String(c.value ?? "");
     const kind = c.kind || "scalar";
     const meta = kind === "scalar" ? "" : `<span class="review-cand-kind">${esc(kind)}${c.index_name ? " · " + esc(c.index_name) : ""}</span>`;
+    // A value with no corpus provenance is an external lookup, not a corpus extract. Badge it
+    // (lookup vs extract) so the human prioritizes verifying it against its cited source rather
+    // than a Bulletin page — they live in the same review, and extract cards still get their PDFs.
+    const isLookup = !!c.external;
+    const typeBadge = isLookup
+      ? `<span class="review-cand-type is-lookup" title="External lookup — verify against the cited source, not a Bulletin page">lookup</span>`
+      : `<span class="review-cand-type is-extract">extract</span>`;
+    // For a lookup, a comment-style annotation on the JSON: what was looked up (target) and where
+    // it came from (src). It sits just above the value box so it reads as an inline JSON comment,
+    // but is NOT inside the editable payload — so it never breaks JSON parsing on submit.
+    const extNote = isLookup
+      ? `<div class="review-cand-extnote">// external lookup — target: ${esc(c.retrieve_key || c.description || "—")}${c.source ? `, src: ${esc(c.source)}` : ", src: (unattributed)"}</div>`
+      : "";
     const hasSrc = c && Object.prototype.hasOwnProperty.call(c, "_src");
     const srcVal = hasSrc ? c._src : i;                       // null stays null (an added value)
     const srcAttr = (srcVal === null || srcVal === undefined) ? "" : String(srcVal);
     const full = Object.assign({}, c, { _src: (srcVal === undefined ? i : srcVal) });
-    return `<div class="review-cand" data-src="${srcAttr}" data-full="${esc(JSON.stringify(full))}">
+    return `<div class="review-cand ${isLookup ? "is-lookup" : ""}" data-src="${srcAttr}" data-full="${esc(JSON.stringify(full))}">
       <div class="review-cand-head">
+        ${typeBadge}
         ${meta}
         <button class="review-cand-del" title="Remove this value" onclick="ReviewOverlay.deleteCard(this)">✕</button>
       </div>
-      ${c.source ? `<div class="review-cand-source"><span class="review-cand-source-label">source</span><span class="review-cand-source-name">${esc(c.source)}</span></div>` : ""}
       <label class="review-field"><span>description</span>
         <input type="text" data-f="description" value="${esc(c.description ?? "")}"></label>
       <label class="review-field"><span>unit</span>
         <input type="text" data-f="unit" value="${esc(c.unit ?? "")}"></label>
+      ${extNote}
       <label class="review-field"><span>value</span>
         <textarea data-f="value" class="review-value" oninput="ReviewOverlay.autosize(this)">${esc(valueStr)}</textarea></label>
       ${c.notes ? `<div class="review-cand-notes"><span class="review-notes-label">notes</span>${esc(c.notes)}</div>` : ""}
@@ -399,11 +413,18 @@ const ReviewOverlay = (function () {
 
   // The action controls, rendered both above and below the editor. For verify_extract this
   // includes the natural-language feedback box (the LLM revises all candidate JSONs at once;
-  // `review.refining` drives the busy/spinner state). Submit always; Accept-as-is unless
-  // missing_data. Uses CLASSES (not ids) since it appears twice — refine()/submit()/showError
-  // operate across both copies.
+  // `review.refining` drives the busy/spinner state). Submit + Accept-as-is. Uses CLASSES (not
+  // ids) since it appears twice — refine()/submit()/showError operate across both copies.
   function controlsBar(review) {
-    const isMissing = review.kind === "missing_data";
+    if (review.kind === "replan_approval") {
+      // Approve = resolve empty (execute the proposed plan as-is); Reject = submit feedback (the
+      // orchestrator re-runs the replan with it, then executes without asking again).
+      return `<div class="review-controls"><div class="review-actions">
+        <button class="review-submit primary" onclick="ReviewOverlay.acceptAsIs()" title="Execute the proposed plan as-is">Approve &amp; execute</button>
+        <button class="review-accept" onclick="ReviewOverlay.submit()" title="Re-plan with your feedback">Reject &amp; re-plan</button>
+        <span class="review-error"></span>
+      </div></div>`;
+    }
     const isExtract = review.kind === "verify_extract";
     const busy = !!review.refining;
     const refine = isExtract ? `
@@ -420,10 +441,69 @@ const ReviewOverlay = (function () {
       ${refine}
       <div class="review-actions">
         <button class="review-submit primary" onclick="ReviewOverlay.submit()">Submit</button>
-        ${isMissing ? "" : `<button class="review-accept" onclick="ReviewOverlay.acceptAsIs()" title="Keep the model's answer unchanged">Accept as-is</button>`}
+        <button class="review-accept" onclick="ReviewOverlay.acceptAsIs()" title="Keep the model's answer unchanged">Accept as-is</button>
         <span class="review-error"></span>
       </div>
     </div>`;
+  }
+
+  // ── replan approval (read-only context + steer feedback) ─────────────────────
+  // The replanner already ran; the human sees the data-prep output, the previous plan, the
+  // compute MissingData, and the PROPOSED plan, then Approves (resolve empty) or Rejects with
+  // feedback (resolve text → the orchestrator re-runs the replan with it injected).
+  function valueShort(val) {
+    if (val == null) return "";
+    if (typeof val === "object") {
+      try { const s = JSON.stringify(val); return s.length > 140 ? s.slice(0, 137) + "…" : s; }
+      catch (e) { return String(val); }
+    }
+    return String(val);
+  }
+  function planBranchesHtml(branches) {
+    if (!Array.isArray(branches) || !branches.length) return `<div class="rp-empty">— none —</div>`;
+    return `<ol class="rp-plan">` + branches.map((b) => {
+      const id = b.branch_id != null ? `<span class="rp-bid">#${esc(b.branch_id)}</span>` : "";
+      if (b.kind === "lookup_external") {
+        return `<li>${id}<span class="rp-kind rp-lookup">lookup</span> <span class="rp-key">${esc(b.target || "")}</span>${b.src ? ` <span class="rp-src">src: ${esc(b.src)}</span>` : ""}</li>`;
+      }
+      const period = b.period ? ` <span class="rp-period">· ${esc(b.period)}</span>` : "";
+      return `<li>${id}<span class="rp-kind rp-retrieve">retrieve</span> <span class="rp-key">${esc(b.key || "")}</span>${period}</li>`;
+    }).join("") + `</ol>`;
+  }
+  function poolValuesHtml(values) {
+    if (!Array.isArray(values) || !values.length) return `<div class="rp-empty">— no values —</div>`;
+    return `<ul class="rp-pool">` + values.map((v) => {
+      const prov = v.bulletin ? ` <span class="rp-prov">${esc(v.bulletin)}${Array.isArray(v.pages) && v.pages.length ? ` p${esc(v.pages.join(","))}` : ""}</span>` : "";
+      const unit = v.unit ? ` <span class="rp-unit">${esc(v.unit)}</span>` : "";
+      return `<li><span class="rp-desc">${esc(v.description || "(value)")}</span> <span class="rp-val">${esc(valueShort(v.value))}</span>${unit}${prov}</li>`;
+    }).join("") + `</ul>`;
+  }
+  function replanApprovalHtml(review) {
+    const g = review.guidance || {};
+    const missing = (Array.isArray(g.missing) ? g.missing : []).filter(Boolean);
+    return `
+      <div class="rp-grid">
+        <section class="rp-sec">
+          <div class="review-section-label">Data-prep output (what compute read)</div>
+          ${poolValuesHtml(g.data_prep_output)}
+        </section>
+        <section class="rp-sec">
+          <div class="review-section-label">Why compute couldn't answer</div>
+          <div class="rp-reason">${esc(g.reason || "")}</div>
+          ${missing.length ? `<div class="rp-missing">Missing: ${esc(missing.join(", "))}</div>` : ""}
+        </section>
+        <section class="rp-sec">
+          <div class="review-section-label">Previous plan</div>
+          ${planBranchesHtml(g.previous_plan)}
+        </section>
+        <section class="rp-sec rp-proposed">
+          <div class="review-section-label">Proposed new plan</div>
+          ${planBranchesHtml(g.proposed_plan)}
+        </section>
+      </div>
+      <div class="review-section-label">If the proposed plan is wrong, tell the replanner what to change (then Reject)</div>
+      <textarea id="replanFeedbackInput" class="review-missing-input" rows="3"
+        placeholder="e.g. keep the 1990 bond branch — don't drop it; read Table FD-1, not the summary."></textarea>`;
   }
 
   // ── render ───────────────────────────────────────────────────────────────────
@@ -438,22 +518,21 @@ const ReviewOverlay = (function () {
     pageIdx = 0; zoom = 1; panX = 0; panY = 0; fitScale = 1;
     const task = tasksRef.find((t) => t.task_id === activeTaskId);
     const title = task ? `R${esc(task.round_num)} / ${esc(task.question_id)}` : esc(activeTaskId);
-    const kindLabel = { lookup: "External Lookup", figure: "Visual QA", verify_extract: "Extract Validation", missing_data: "Missing Data" }[review.kind] || review.kind;
-    // missing_data is a "provide the value(s) the run couldn't find" request — not a validation of
-    // model candidates — so it has no candidates and gets its own framing (header + no accept-as-is).
-    const isMissing = review.kind === "missing_data";
+    const kindLabel = { lookup: "External Lookup", figure: "Visual QA", verify_extract: "Extract Validation", replan_approval: "Replan Approval" }[review.kind] || review.kind;
+    // replan_approval: the proposed plan is already computed; the human approves it or rejects with
+    // steer feedback. Read-only context + a feedback box, no candidates, custom controls.
+    const isReplan = review.kind === "replan_approval";
     // figure (Visual QA): the model's chart read is unreliable, so the human authors the answer in a
     // pre-filled AnnotatedValue JSON template (description = retrieval target) instead of cards.
     const isFigure = review.kind === "figure";
     const ctx = contextLine(review);
     const cands = candidates(review);
-    // Each kind picks its editor: missing_data → free-form replan instruction; figure → JSON
+    // Each kind picks its editor: replan_approval → read-only context + feedback; figure → JSON
     // template textarea; everything else → editable value cards (confirm/correct the model's read).
     let editor, editorLabel;
-    if (isMissing) {
-      editor = `<textarea id="missingDataInput" class="review-missing-input" rows="4"
-           placeholder="Tell the replanner what to do differently — e.g. which series/table/bulletin to read, how to interpret the question, or where the value actually lives."></textarea>`;
-      editorLabel = `<div class="review-section-label">Instruction for the replanner</div>`;
+    if (isReplan) {
+      editor = replanApprovalHtml(review);
+      editorLabel = "";
     } else if (isFigure) {
       editor = `<textarea id="figureJsonInput" class="review-json-input" spellcheck="false" rows="8">${esc(figureTemplate(review))}</textarea>`;
       editorLabel = `<div class="review-section-label">AnnotatedValue — read the value(s) off the chart</div>`;
@@ -464,7 +543,7 @@ const ReviewOverlay = (function () {
     // The controls (NL-feedback box for verify_extract + Submit + Accept-as-is) are rendered BOTH
     // above and below the editor, so a long JSON list can be acted on without scrolling to the
     // bottom. The editor itself stays single in the middle.
-    const topControls = isMissing ? "" : controlsBar(review);
+    const topControls = isReplan ? "" : controlsBar(review);
     const bottomControls = controlsBar(review);
     const viewer = pages.length ? `
       <div class="review-viewer">
@@ -509,7 +588,7 @@ const ReviewOverlay = (function () {
   // descriptions still carry the question's context.
   function contextLine(review) {
     const g = review.guidance || {};
-    if (review.kind === "missing_data") {
+    if (review.kind === "replan_approval") {
       const miss = (Array.isArray(g.missing) ? g.missing : []).filter(Boolean);
       return miss.length ? `Missing: ${miss.join(", ")}` : "";
     }
@@ -549,11 +628,11 @@ const ReviewOverlay = (function () {
   function submit() {
     const review = current();
     if (!review) return;
-    if (review.kind === "missing_data") {
-      // Free-form instruction → sent as the raw response; the server injects it into the replan prompt.
-      const ta = root().querySelector("#missingDataInput");
+    if (review.kind === "replan_approval") {
+      // Reject path: the feedback is required (Approve is the empty-resolve button instead).
+      const ta = root().querySelector("#replanFeedbackInput");
       const text = (ta ? ta.value : "").trim();
-      if (!text) { showError("Enter an instruction for the replanner."); return; }
+      if (!text) { showError("Enter feedback for the replanner, or click Approve to execute as-is."); return; }
       post(review, text);
       return;
     }

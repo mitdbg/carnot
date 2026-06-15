@@ -466,23 +466,6 @@ class TaskRegistry:
                     self._set_status(task, task.status)
                     cleared.append(task.task_id)
         return cleared
-    def cancel_task_reviews(self, task_id: str) -> list[str]:
-        """Close every OPEN review on ONE task — called when the orchestrator takes a replan, so
-        the superseded round's optimistic reviews clear from the UI instead of lingering against
-        branches the replan discards. Returns the cancelled review ids; no-op if the task is gone."""
-        cancelled: list[str] = []
-        with self._lock:
-            task = self._tasks.get(task_id)
-            if task is None:
-                return cancelled
-            for review in task.reviews:
-                if review.status == HumanReviewStatus.OPEN:
-                    review.status = HumanReviewStatus.CANCELLED
-                    review.resolved_at = utc_now()
-                    cancelled.append(review.review_id)
-            if cancelled:
-                task.updated_at = utc_now()
-        return cancelled
 
     def find_review(self, review_id: str) -> tuple[QuestionTask, HumanReview]:
         """Public, locked lookup of a review (and its task) by id. Raises KeyError if absent."""

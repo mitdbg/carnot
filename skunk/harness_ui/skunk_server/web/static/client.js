@@ -58,12 +58,12 @@ const reviewCount = (task) => (task.reviews || []).length;
 // True while any of a task's reviews has an in-flight LLM refine of its extracted candidates
 // (the natural-language feedback path), surfaced as an "Updating" indicator.
 const isRefining = (task) => (task.reviews || []).some((r) => r.refining);
-// missing_data (a mandatory "provide the missing value(s)" intervention after a NeedsMore) blocks
-// the whole run, so it's the most urgent; then lookup, visual QA (figure), extract validation.
-const REVIEW_KIND_RANK = { missing_data: 0, lookup: 1, figure: 2, verify_extract: 3 };
-const REVIEW_KIND_LABEL = { missing_data: "Needs Data", lookup: "Lookup", figure: "Visual QA", verify_extract: "Extract" };
+// replan_approval (a mandatory "approve the proposed replan" gate after a NeedsMore) blocks the
+// whole run, so it's the most urgent; then lookup, visual QA (figure), extract validation.
+const REVIEW_KIND_RANK = { replan_approval: 0, lookup: 1, figure: 2, verify_extract: 3 };
+const REVIEW_KIND_LABEL = { replan_approval: "Approve Replan", lookup: "Lookup", figure: "Visual QA", verify_extract: "Extract" };
 // Fuller labels for the detail overlay's per-kind review buttons (the cards use the short ones).
-const REVIEW_BUTTON_LABEL = { missing_data: "Provide Missing Data", lookup: "External Lookup", figure: "Visual QA", verify_extract: "Extract" };
+const REVIEW_BUTTON_LABEL = { replan_approval: "Approve Replan", lookup: "External Lookup", figure: "Visual QA", verify_extract: "Extract" };
 
 // One clickable tag per open review kind on a card (e.g. "Extract", "Visual QA (2)"), ordered by
 // urgency. Clicking a tag opens the review overlay directly at that kind (stopPropagation so the

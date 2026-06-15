@@ -7,14 +7,14 @@ import asyncio
 
 import pytest
 
-from skunk.common import AnnotatedValue, BlockRef, ExecutionContext, Final, PageRef
+from skunk.common import AnnotatedValue, ExecutionContext, Final
 from skunk.config import SkunkConfig
 from skunk.human import (
+    POOL_REVIEW_BRANCH_ID,
     HumanAssist,
     HumanAssistPolicy,
     apply_overrides,
 )
-from skunk.page_index.data_model import ContentBlock
 from skunk.plan import LookupBranch, RetrieveBranch
 
 
@@ -82,35 +82,33 @@ def _ctx_with_register(captured: list[dict]) -> ExecutionContext:
     )
 
 
-def _table_block() -> BlockRef:
-    page = PageRef(month="1954-02", page=17)
-    return BlockRef(
-        page=page,
-        block_index=2,
-        member_refs=(page,),
-        block=ContentBlock(kind="table", title="Receipts"),
+def _table_with_pages() -> AnnotatedValue:
+    return AnnotatedValue(
+        description="d",
+        value={"r": {"c": 1}},
+        kind="table",
+        row_name="r",
+        col_name="c",
+        bulletin="1954-02",
+        pages=(17,),
     )
 
 
-def test_register_verify_passes_branch_identity_and_candidates() -> None:
+def test_register_pool_review_carries_candidates_and_pulled_pages() -> None:
     captured: list[dict] = []
     ctx = _ctx_with_register(captured)
     assist = HumanAssist()
-    branch = RetrieveBranch(key="total receipts", period="1954-02")
     try:
-        rid = assist.register_verify([_table()], [_table_block()], branch, 3, ctx)
+        rid = assist.register_pool_review([_table_with_pages()], ctx)
     finally:
         ctx.close()
     assert rid == "rev-1"
     g = captured[0]["guidance"]
+    # The single data-prep pool review: verify_extract task, keyed by the sentinel id, no single
+    # branch identity, candidates = the cleaned pool, source docs = the pages the values came from.
     assert captured[0]["task"] == "verify_extract"
-    assert g["branch_id"] == 3
-    assert g["branch"] == {
-        "kind": "retrieve",
-        "key": "total receipts",
-        "period": "1954-02",
-        "visual_only": False,
-    }
+    assert g["branch_id"] == POOL_REVIEW_BRANCH_ID
+    assert g["branch"] == {}
     assert g["candidates"][0]["value"] == {"r": {"c": 1}}
     assert captured[0]["source_docs"] == ["Treasury Bulletin 1954-02 PDF page 17"]
 
@@ -132,12 +130,7 @@ def test_register_lookup_carries_agent_candidates() -> None:
 def test_register_is_noop_without_a_hook() -> None:
     ctx = ExecutionContext(question="q", config=SkunkConfig(), llm_client=object())  # type: ignore[arg-type]
     try:
-        assert (
-            HumanAssist().register_verify(
-                [_table()], [], RetrieveBranch(key="x"), 0, ctx
-            )
-            is None
-        )
+        assert HumanAssist().register_pool_review([_table()], ctx) is None
     finally:
         ctx.close()
 

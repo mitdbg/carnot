@@ -65,12 +65,10 @@ class SkunkConfig:
     # outcomes abstain from the vote — a NeedsMore is returned only when EVERY trial
     # signals it. 1 = single-trial (today's behavior). (env: SKUNK_COMPUTE_BEST_OF_N)
     compute_best_of_n: int = 5
-    # Append a fixed cheat-sheet of canonical formulas for named / ambiguous operations
-    # (`question_explainer.PRECOMPUTED_CONCEPT_REFERENCES`) to the compute `## Concept
-    # references` block, after the question_explainer's per-question concepts. Pins one
-    # convention per operation (Zipf orientation, Box-Cox form, percentile type, pop-vs-
-    # sample std, …) so codegen stops picking wrong variants. Default OFF (explainer
-    # concepts alone); flip per-run to A/B its effect on compute accuracy.
+    # Bypass the QuestionExplainer's per-question selection and inject the ENTIRE
+    # PRECOMPUTED_CONCEPTS catalog into every compute `## Concept references` block (skips
+    # the selection LLM call). Default OFF (the explainer selects only the relevant
+    # entries); flip per-run to A/B selection vs. full-dump on compute accuracy.
     # (env: SKUNK_PRECOMPUTED_CONCEPT_REFS=1)
     compute_precomputed_concept_refs: bool = False
 

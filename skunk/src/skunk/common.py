@@ -55,13 +55,6 @@ HumanReviewRegister = Callable[
     str | None,
 ]
 
-# Discard all of this question's still-open optimistic reviews — called when the orchestrator
-# takes a replan, since the replan supersedes the branches those reviews belong to. Fire-and-
-# forget (the server cancels them and refreshes the UI). Wired only alongside
-# `HumanReviewRegister`; None for a local CLI run or a blocking-transport run.
-HumanReviewDiscard = Callable[[], None]
-
-
 @dataclass(frozen=True)
 class PendingHumanIntervention:
     response: Awaitable[dict[str, Any]]
@@ -580,6 +573,8 @@ def _provenance_str(e: AnnotatedValue) -> str:
         parts.append(f"bulletin={e.bulletin!r}")
     if e.pages:
         parts.append(f"pages={list(e.pages)!r}")
+    if e.source:
+        parts.append(f"source={e.source!r}")
     if e.requested_period:
         parts.append(f"requested_period={e.requested_period!r}")
     if e.retrieve_key:
@@ -691,13 +686,10 @@ class ExecutionContext:
     ] = ()  # corpus/few_shot/lesson overrides; operators pick out their own entries by name
     human_intervention_handler: HumanInterventionHandler | None = None
     human_intervention_enabled: bool = False
-    # Optimistic, non-blocking review registration (server only). When set, the verify/lookup
-    # gates open an open review and keep the LLM result instead of awaiting the human — see
-    # `HumanReviewRegister` and `HumanAssist.register_verify`/`register_lookup`.
+    # Optimistic, non-blocking review registration (server only). When set, the data-prep pool
+    # and lookup gates open a review and keep the LLM result instead of awaiting the human — see
+    # `HumanReviewRegister` and `HumanAssist.register_pool_review`/`register_lookup`.
     human_review_register: HumanReviewRegister | None = None
-    # Discard this question's still-open optimistic reviews on a replan (server only) — see
-    # `HumanReviewDiscard`. Wired alongside `human_review_register`.
-    human_reviews_discard: HumanReviewDiscard | None = None
 
     def __post_init__(self) -> None:
         if self.llm_client is None:

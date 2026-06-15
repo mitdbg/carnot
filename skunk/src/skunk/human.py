@@ -47,6 +47,12 @@ from skunk.plan import Branch, LookupBranch, RetrieveBranch
 # `LookupAgent.final_answer_doc` documents, so the human and the model speak one format.
 _FIELDS = ("description", "value", "unit", "kind", "index_name", "row_name", "col_name")
 
+# Sentinel "branch id" carried in the data-prep pool review's guidance. The optimistic
+# register→resolve→recompute path keys overrides by branch id; the pool review isn't a single
+# branch (data-prep coalesces across all of them), so it owns this reserved id. `recompute_answer`
+# applies the human's edits onto the snapshot stored under it (the whole cleaned pool).
+POOL_REVIEW_BRANCH_ID = -1
+
 
 # The fields a human edits in the review overlay (the rest — kind/index_name/row_name/col_name
 # and machine provenance — are preserved from the original extraction via `_src`).
@@ -54,11 +60,18 @@ _EDITABLE_FIELDS = ("description", "unit", "value")
 
 
 def _candidate_dicts(entries: list[AnnotatedValue]) -> list[dict]:
-    """The model's values for the review UI: the editable field set PLUS read-only `notes` — the
-    LLM's extract-time page context (footnotes, headnotes, print-flag meaning, scope/break-in-series
-    caveats) for each value, so a reviewer sees what the page said about it. Display-only: the human
-    edits only `_EDITABLE_FIELDS`; kind/provenance/notes/source ride back untouched via `_src`."""
-    return [c.model_dump(include=set(_FIELDS) | {"notes", "source"}) for c in entries]
+    """The model's values for the review UI: the editable field set PLUS read-only `notes` (the
+    LLM's extract-time page context), `source`/`retrieve_key` (an external lookup's publisher +
+    target), and an `external` flag. A value with no corpus provenance (no `bulletin`/`pages`) is
+    an external lookup, not a corpus extract — flagged so the UI can label it (priority) and show
+    its target/src instead of a (nonexistent) source page. Display-only: the human edits only
+    `_EDITABLE_FIELDS`; everything else rides back untouched via `_src`."""
+    out: list[dict] = []
+    for c in entries:
+        d = c.model_dump(include=set(_FIELDS) | {"notes", "source", "retrieve_key"})
+        d["external"] = not (c.bulletin or c.pages)
+        out.append(d)
+    return out
 
 
 def apply_overrides(
@@ -408,6 +421,13 @@ class HumanAssist:
     def wants_lookup(self, branch: LookupBranch, ctx: ExecutionContext) -> bool:
         return self._policy.human_lookup(branch, ctx.config)
 
+    def wants_pool_review(self, ctx: ExecutionContext) -> bool:
+        """Whether the cleaned data-prep pool gets a human review this round. Gated by the same
+        flags that gated the former per-extract verify — `human_verify_extract` (non-visual) or
+        `human_figure` (chart/figure reads) — now applied once to the data-prep output (which holds
+        both kinds of value) instead of once per branch."""
+        return ctx.config.human_verify_extract or ctx.config.human_figure
+
     async def verify_extract(
         self,
         entries: list[AnnotatedValue],
@@ -479,51 +499,52 @@ class HumanAssist:
     # the question completes. A human resolve later drives a server-side recompute. Each is a
     # no-op when no register hook is wired (local CLI), so the caller can invoke unconditionally.
 
-    def register_verify(
+    def register_pool_review(
         self,
-        entries: list[AnnotatedValue],
-        blocks: list,
-        branch: RetrieveBranch,
-        bid: int,
+        pool: list[AnnotatedValue],
         ctx: ExecutionContext,
+        *,
+        source_values: list[AnnotatedValue] | None = None,
     ) -> str | None:
-        """Open a review of the model's extracted value(s) against the source page(s), carrying
-        the branch identity (keyed by `bid`) so a resolve can recompute. Assumes the caller
-        already gated on `wants_verify`."""
+        """Open ONE review of the data-prep agent's output — the cleaned value pool compute is
+        about to read — supplied with the PDF page(s) those values were pulled from. Replaces the
+        former per-branch extract reviews: a single review fires per round instead of one per
+        extract. Keyed by the sentinel `POOL_REVIEW_BRANCH_ID` so a resolve recomputes over the
+        human-edited pool via the same register→resolve→recompute path. Assumes the caller gated
+        on `wants_pool_review`; no-op when no register hook is wired (local CLI).
+
+        `source_values` (the PRE-clean pool) is the page-attribution source: data-prep coalesces
+        values across bulletins and collapses `bulletin` to a RANGE ("1985-03..1987-06"), which
+        can't map a page to a single renderable PDF. The pre-clean values still carry one bulletin
+        each, so the viewer resolves their pages. Falls back to `pool` when not given."""
         register = ctx.human_review_register
         if register is None:
             return None
-        task = "figure" if branch.visual_only else "verify_extract"
-        # Show ONLY the pages the values were actually read from (per-value provenance), not the
-        # whole survivor pool; fall back to the pool when nothing is attributable.
-        refs, page_values = _value_page_attribution(entries)
-        if not refs:
-            refs, page_values = _blocks_to_pagerefs(blocks), []
+        # Show the pages the values were pulled from (per-value provenance). Attribute from the
+        # pre-clean values (single bulletin each) so coalesced range-bulletins don't break the
+        # viewer. Lookup-derived values carry no page provenance and simply appear as cards with
+        # no page; that's expected.
+        refs, page_values = _value_page_attribution(
+            source_values if source_values is not None else pool
+        )
         instruction = (
-            "This answer must be read off the figure/chart on the page(s) below — the "
-            "model is unreliable here. Give the correct value(s)."
-            if branch.visual_only
-            else "Confirm or correct the value(s) the model extracted, checking them "
-            "against the source page(s) below."
+            "Review the data the agent cleaned and is about to compute over. Confirm or correct "
+            "the value(s), checking them against the source page(s) below."
         )
         guidance = {
-            "task": task,
-            "branch_id": bid,
-            "branch": _branch_identity(branch),
-            "candidates": _candidate_dicts(entries),
+            "task": "verify_extract",
+            "branch_id": POOL_REVIEW_BRANCH_ID,
+            "branch": {},
+            "candidates": _candidate_dicts(pool),
             "fields": list(_FIELDS),
             "page_values": page_values,
         }
-        if branch.visual_only:
-            # Figure path: hand the human a pre-filled AnnotatedValue JSON template to read the
-            # value off the chart, instead of confirm/correct cards built on the unreliable read.
-            guidance["value_template"] = _figure_value_template(branch, entries)
         review_id = register(
-            task, instruction, ctx.question, _pagerefs_to_docstrings(refs), guidance
+            "verify_extract", instruction, ctx.question, _pagerefs_to_docstrings(refs), guidance
         )
         ctx.emit(
-            f"human_review_registered task={task} branch_id={bid} "
-            f"review_id={review_id} candidates={len(entries)} n_pages={len(refs)}",
+            f"human_review_registered task=verify_extract branch_id={POOL_REVIEW_BRANCH_ID} "
+            f"review_id={review_id} candidates={len(pool)} n_pages={len(refs)}",
             kind="user",
         )
         return review_id

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
-import re
 from dataclasses import dataclass, field
 from typing import cast
 from skunk.compute import ComputeOp
 from skunk.config import SkunkConfig
+from skunk.data_prep import DataPrepOp
 from skunk.errors import MissingData, StepFailed
 from skunk.human import (
+    POOL_REVIEW_BRANCH_ID,
     BrokerChannel,
     ConsoleChannel,
     HumanAssist,
@@ -21,7 +22,6 @@ from skunk.common import (
     ExecutionContext,
     Final,
     HumanInterventionHandler,
-    HumanReviewDiscard,
     HumanReviewRegister,
     NeedsMore,
     SemPoolEntry,
@@ -123,29 +123,6 @@ async def recompute_answer(
     raise MissingData(outcome.missing_reason, outcome.missing)
 
 
-def _merge_branch_outcome(previous: BranchOutcome, new: BranchOutcome) -> BranchOutcome:
-    """Merge a human-directed re-retrieval's outcome into a branch's prior outcome: take the
-    new outcome on any failure, else union both sets of entries + blocks (deduped)."""
-    if previous.error is not None or previous.entries is None:
-        return new
-    if new.error is not None or new.entries is None:
-        return new
-    entries: list[AnnotatedValue] = []
-    seen_entries: set[str] = set()
-    for entry in [*previous.entries, *new.entries]:
-        key = entry.model_dump_json()
-        if key not in seen_entries:
-            seen_entries.add(key)
-            entries.append(entry)
-    blocks = list(dict.fromkeys([*previous.blocks, *new.blocks]))
-    return BranchOutcome(
-        branch=new.branch,
-        entries=entries,
-        error=None,
-        blocks=blocks,
-    )
-
-
 class Orchestrator:
     """One per NL question. The orchestrator drives the work forward by invoking the planner and stepping through the plan.
     It is also responsible for catching any execution errors and replanning when necessary."""
@@ -162,7 +139,6 @@ class Orchestrator:
         llm_client: LLMClient | None = None,
         human_intervention_handler: HumanInterventionHandler | None = None,
         human_review_register: HumanReviewRegister | None = None,
-        human_reviews_discard: HumanReviewDiscard | None = None,
     ):
         self._ctx = ExecutionContext(
             question=question,
@@ -174,7 +150,6 @@ class Orchestrator:
             llm_client=llm_client,
             human_intervention_handler=human_intervention_handler,
             human_review_register=human_review_register,
-            human_reviews_discard=human_reviews_discard,
         )
         self._current_plan: Plan | None = None
         # Stable per-question branch identity. `_branch_ids[i]` is the id of the
@@ -203,6 +178,7 @@ class Orchestrator:
         self._human = HumanAssist(channel=human_channel)
         self._explainer = QuestionExplainer()
         self._compute = ComputeOp()
+        self._data_prep = DataPrepOp()
         self._result = ExecutionResult(question=question)
         # Deduped union of every BlockRef the retrieve phase produced this question (first-seen
         # order, accumulated across the initial sweep and any replan sweeps). Exposed via
@@ -274,21 +250,15 @@ class Orchestrator:
         attempts = [
             AttemptRecord(0, o.branch, len(o.entries or []), o.error) for o in outcomes
         ]
-        # Human-recovery state: values a human supplied during mandatory intervention
-        # (kept in the pool like any other gathered value), and the missing-id lists each
-        # resolved — threaded to the replanner so it treats those ids as answered.
-        human_entries: list[AnnotatedValue] = []
-        human_resolutions: list[list[str]] = []
         needs: NeedsMore | None = None
         round_idx = 0
         sweep_added = True  # the initial sweep always reaches compute
 
         while True:
             self._current_plan = plan
-            # Snapshot BEFORE compute so a human review can revise even a task whose compute
-            # fails (re-running compute over a human correction may then succeed).
-            self._capture_recompute_state(outcomes, human_entries, explanations)
             if sweep_added or needs is None:
+                pre_clean_pool = pool
+                pool = await self._prep_pool(pool)
                 outcome = await traced_step(
                     self._ctx,
                     "compute",
@@ -300,6 +270,18 @@ class Orchestrator:
                     ),
                 )
                 if isinstance(outcome, Final):
+                    # Final answer: NOW snapshot the pool for recompute and open the single human
+                    # review of it. Registering only on success (not before every compute) means a
+                    # superseded/replanning round never has an open pool review — so a human can't
+                    # be mid-edit on a review the orchestrator is about to discard, and the
+                    # recompute snapshot always matches the data behind the answer. Page attribution
+                    # uses the PRE-clean pool (single bulletin each); the cleaned pool's coalesced
+                    # range-bulletins can't resolve to a PDF.
+                    self._capture_recompute_pool(pool, explanations)
+                    if self._human.wants_pool_review(self._ctx):
+                        self._human.register_pool_review(
+                            pool, self._ctx, source_values=pre_clean_pool
+                        )
                     self._result.answer = outcome.answer
                     return outcome.answer
                 needs = outcome
@@ -337,91 +319,38 @@ class Orchestrator:
             # Bind before the lambda (opaque to ruff's use analysis).
             reason, missing = needs.missing_reason, needs.missing
 
-            # === HITL: mandatory human intervention on missing data ===
-            # When a handler is wired, ask the human for the missing data (and optionally let
-            # them scope a branch's source documents for a re-retrieval) BEFORE spending a
-            # replan. If their input alone resolves compute, return without replanning.
-            # Free-form operator instruction from the missing-data review, threaded into the
-            # replanner prompt below (the human guides the replan rather than only supplying a value).
-            human_guidance: str | None = None
+            # === Replan, then HITL approval of the proposed plan ===
+            # Replan FIRST (no human steer) to produce a proposed plan, then — when a handler is
+            # wired — show the human the data-prep output, the previous plan, what compute reported
+            # missing, and the proposed plan, and block for approval. On rejection, re-run the
+            # replan with their feedback injected and execute THAT directly (no second approval).
+            previous_plan = plan
             handler = self._ctx.human_intervention_handler
+
+            async def _replan(guidance: str | None) -> Plan:
+                return await traced_step(
+                    self._ctx,
+                    "replanner",
+                    lambda: self._planner.replan(
+                        self._ctx, pool, attempts, reason, missing, human_guidance=guidance
+                    ),
+                )
+
+            plan = await _replan(None)
             if handler is not None:
                 self._emit_plan(
-                    plan,
+                    previous_plan,
                     "human_pending",
                     reason=reason,
                     missing=missing,
                     recovery_round=round_idx,
                 )
-                entries_snapshot = [
-                    *[e for o in outcomes if o.entries for e in o.entries],
-                    *human_entries,
-                ]
-                outcomes, directed_entries, human_entry = (
-                    await self._request_missing_from_human(
-                        handler, plan, outcomes, entries_snapshot, reason, missing, round_idx
-                    )
+                feedback = await self._request_replan_approval(
+                    handler, previous_plan, plan, pool, reason, missing, round_idx
                 )
-                pool += directed_entries
-                if human_entry is not None:
-                    human_guidance = str(human_entry.value)
-                    pool.append(human_entry)
-                    human_entries.append(human_entry)
-                    human_resolutions.append(list(missing))
-                if directed_entries or human_entry is not None:
-                    # Try compute over the human-augmented pool before spending a replan.
-                    self._capture_recompute_state(outcomes, human_entries, explanations)
-                    outcome = await traced_step(
-                        self._ctx,
-                        "compute",
-                        lambda: self._compute.run(
-                            pool,
-                            self._ctx,
-                            concept_explanations=explanations,
-                            round_idx=round_idx,
-                        ),
-                    )
-                    if isinstance(outcome, Final):
-                        self._result.answer = outcome.answer
-                        return outcome.answer
-                    needs = outcome
-                    pool = list(needs.keep)
-                    reason, missing = needs.missing_reason, needs.missing
+                if feedback:
+                    plan = await _replan(feedback)
 
-            # Map each human-provided value still in the pool to the missing ids it resolved,
-            # so the replanner treats those ids as answered (identity-keyed: keep-filtering
-            # retains the same objects, so id() survives across rounds).
-            pool_pos = {id(e): i for i, e in enumerate(pool)}
-            human_resolution_refs = [
-                (pool_pos[id(he)], resolved)
-                for he, resolved in zip(human_entries, human_resolutions)
-                if id(he) in pool_pos
-            ]
-
-            # Taking a replan: discard this round's still-open optimistic reviews. The replan
-            # composes fresh branches (new ids) and supersedes the ones those reviews were opened
-            # against, so a pending correction is moot — clear it from the UI rather than let it
-            # linger. The human's replan guidance (the blocking missing-data response above) is now
-            # authoritative; we start the next round clean. (A review the human already resolved is
-            # RESOLVED, not OPEN, so it's left untouched; its stale branch id never matches the
-            # final snapshot's, so it can't drive a recompute later.)
-            if self._ctx.human_reviews_discard is not None:
-                self._ctx.human_reviews_discard()
-                self._ctx.emit("human_reviews_discarded reason=replan", kind="user")
-
-            plan = await traced_step(
-                self._ctx,
-                "replanner",
-                lambda: self._planner.replan(
-                    self._ctx,
-                    pool,
-                    attempts,
-                    reason,
-                    missing,
-                    human_resolution_refs,
-                    human_guidance=human_guidance,
-                ),
-            )
             ids = self._alloc_branch_ids(len(plan.branches))
             self._branch_ids = ids
             self._emit_plan(
@@ -443,6 +372,25 @@ class Orchestrator:
             new_entries = [e for o in outcomes if o.entries for e in o.entries]
             pool += new_entries
             sweep_added = bool(new_entries)
+
+    async def _prep_pool(
+        self, pool: list[AnnotatedValue]
+    ) -> list[AnnotatedValue]:
+        """Run the data-prep gate over the pool just before a compute call: dedup corpus reprints
+        and coalesce same-series values across everything gathered so far. Fails safe via
+        `DataPrepOp.run` (returns its input unchanged on any error), so it never starves compute of
+        inputs.
+
+        Cleaning runs every round, but the human review of the cleaned pool is opened only once
+        compute reaches a Final answer (see the recovery loop) — so a superseded/replanning round
+        never has an open review the human could be mid-editing."""
+        if not pool:
+            return pool
+        return await traced_step(
+            self._ctx,
+            "data_prep",
+            lambda: self._data_prep.run(pool, self._ctx),
+        )
 
     def _alloc_branch_ids(self, n: int) -> list[int]:
         """Allocate `n` fresh, monotonically-increasing branch ids (stable for the
@@ -495,303 +443,103 @@ class Orchestrator:
             return "blocking"
         return "optimistic"
 
-    def _capture_recompute_state(
+    def _capture_recompute_pool(
         self,
-        outcomes: list[BranchOutcome],
-        human_entries: list[AnnotatedValue],
+        pool: list[AnnotatedValue],
         explanations: list[ConceptExplanation],
     ) -> None:
-        """Snapshot the per-branch entries (keyed by stable branch id) + recovery entries +
-        explanations that produced this answer, so a later human-review resolve can recompute."""
+        """Snapshot the cleaned pool compute reads + explanations that produced this answer, so a
+        resolve of the data-prep pool review can recompute. The pool is stored under the sentinel
+        `POOL_REVIEW_BRANCH_ID`; `recompute_answer` applies the human's edited pool onto it and
+        re-runs ONLY compute (no replan / re-retrieve / re-extract)."""
         self._recompute_state = RecomputeState(
             question=self._ctx.question,
-            order=list(self._branch_ids),
-            entries_by_branch={
-                bid: list(outcome.entries or [])
-                for bid, outcome in zip(self._branch_ids, outcomes)
-            },
-            extra_entries=list(human_entries),
+            order=[POOL_REVIEW_BRANCH_ID],
+            entries_by_branch={POOL_REVIEW_BRANCH_ID: list(pool)},
+            extra_entries=[],
             explanations=list(explanations),
         )
 
-    def _missing_data_guidance(
+    def _replan_approval_guidance(
         self,
-        plan: Plan,
-        outcomes: list[BranchOutcome],
-        entries: list[AnnotatedValue],
+        previous_plan: Plan,
+        proposed_plan: Plan,
+        pool: list[AnnotatedValue],
         reason: str,
         missing: list[str],
         round_idx: int,
-    ) -> tuple[dict, list[dict[str, str | int | None]]]:
-        """Build the rich per-branch context a human reviewer needs to supply missing data,
-        plus the `likely_pages` (the question's gathered + retrieved source pages, capped)."""
-        likely_pages: list[dict[str, str | int | None]] = []
-        seen_pages: set[tuple[str | None, int | None]] = set()
-        for entry in entries:
-            for page in entry.pages:
-                key = (entry.bulletin, page)
-                if key not in seen_pages:
-                    seen_pages.add(key)
-                    likely_pages.append({"bulletin": entry.bulletin, "page": page})
-        for block in self._retrieved_blocks:
-            for ref in block.member_refs:
-                key = (ref.month, ref.page)
-                if key not in seen_pages:
-                    seen_pages.add(key)
-                    likely_pages.append({"bulletin": ref.month, "page": ref.page})
-        likely_pages = likely_pages[:8]
+    ) -> dict:
+        """The payload the replan-approval review renders: the data-prep agent's output (the
+        cleaned pool compute read), the previous plan, what compute reported missing, and the
+        proposed new plan the human is approving. Branch ids are attached to the previous plan
+        (its `self._branch_ids`); the proposed plan has none yet (allocated after approval)."""
 
-        def _blocks_payload(blocks: list[BlockRef]) -> list[dict]:
-            return [
-                {
-                    "bulletin": block_ref.page.month,
-                    "page": block_ref.page.page,
-                    "block_index": block_ref.block_index,
-                    "member_pages": [
-                        {"bulletin": ref.month, "page": ref.page}
-                        for ref in block_ref.member_refs
-                    ],
-                    "kind": block_ref.block.kind if block_ref.block else None,
-                    "title": block_ref.block.title if block_ref.block else None,
-                    "column_headers": (
-                        block_ref.block.column_headers if block_ref.block else []
-                    ),
-                    "row_headers": (
-                        block_ref.block.row_headers if block_ref.block else []
-                    ),
-                    "summary": block_ref.block.summary if block_ref.block else None,
-                }
-                for block_ref in blocks
-            ]
+        def _branches(plan: Plan, *, with_ids: bool) -> list[dict]:
+            if with_ids:
+                return [
+                    {"branch_id": bid, **branch.model_dump(mode="json")}
+                    for bid, branch in zip(self._branch_ids, plan.branches)
+                ]
+            return [branch.model_dump(mode="json") for branch in plan.branches]
 
-        guidance = {
+        return {
             "recovery_round": round_idx,
-            "previous_round_plan": [
-                {
-                    "branch_id": branch_id,
-                    **branch.model_dump(mode="json"),
-                    "searched": (
-                        {
-                            "key": branch.key,
-                            "period": branch.period,
-                            "visual_only": branch.visual_only,
-                        }
-                        if branch.kind == "retrieve"
-                        else {"target": branch.target, "src": branch.src}
-                    ),
-                    "blocks": _blocks_payload(outcome.blocks),
-                    "output": (
-                        {
-                            "type": "values",
-                            "values": [
-                                {
-                                    "description": entry.description,
-                                    "unit": entry.unit,
-                                    "value_kind": entry.kind,
-                                    "value": entry.value,
-                                    "index_name": entry.index_name,
-                                    "row_name": entry.row_name,
-                                    "col_name": entry.col_name,
-                                    "bulletin": entry.bulletin,
-                                    "pages": list(entry.pages),
-                                    "source_block_page": entry.source_block_page,
-                                    "source_block_index": entry.source_block_index,
-                                }
-                                for entry in outcome.entries
-                            ],
-                        }
-                        if outcome.entries is not None
-                        else None
-                    ),
-                    "output_step": (
-                        "extract" if branch.kind == "retrieve" else "lookup_external"
-                    ),
-                    "status": ("failed" if outcome.error is not None else "ok"),
-                    "execution_status": (
-                        "executed"
-                        if branch_id in self._last_executed_branch_ids
-                        else "carried_forward"
-                    ),
-                    "outcome_status": (
-                        "failed" if outcome.error is not None else "succeeded"
-                    ),
-                    "error": (
-                        str(outcome.error) if outcome.error is not None else None
-                    ),
-                    "considered_pages": (
-                        outcome.error.details.get("considered_pages", [])
-                        if outcome.error is not None
-                        else []
-                    ),
-                }
-                for branch_id, branch, outcome in zip(
-                    self._branch_ids, plan.branches, outcomes
-                )
-            ],
-            "partial_plan": [
-                {"branch_id": branch_id, **branch.model_dump(mode="json")}
-                for branch_id, branch in zip(self._branch_ids, plan.branches)
-            ],
-            "gathered_values": [
-                {
-                    "description": entry.description,
-                    "value": entry.value,
-                    "unit": entry.unit,
-                    "bulletin": entry.bulletin,
-                    "pages": list(entry.pages),
-                }
-                for entry in entries
-            ],
-            "failed_branches": [
-                {
-                    "branch_id": branch_id,
-                    "branch": outcome.branch.model_dump(mode="json"),
-                    "error": str(outcome.error),
-                    "considered_pages": outcome.error.details.get(
-                        "considered_pages", []
-                    ),
-                }
-                for branch_id, outcome in zip(self._branch_ids, outcomes)
-                if outcome.error is not None
-            ],
-            "likely_pages": likely_pages,
-            "missing": missing,
             "reason": reason,
+            "missing": missing,
+            "data_prep_output": [
+                entry.model_dump(
+                    mode="json",
+                    include={"description", "value", "unit", "kind", "bulletin", "pages"},
+                )
+                for entry in pool
+            ],
+            "previous_plan": _branches(previous_plan, with_ids=True),
+            "proposed_plan": _branches(proposed_plan, with_ids=False),
         }
-        return guidance, likely_pages
 
-    async def _request_missing_from_human(
+    async def _request_replan_approval(
         self,
         handler: HumanInterventionHandler,
-        plan: Plan,
-        outcomes: list[BranchOutcome],
-        entries: list[AnnotatedValue],
+        previous_plan: Plan,
+        proposed_plan: Plan,
+        pool: list[AnnotatedValue],
         reason: str,
         missing: list[str],
         round_idx: int,
-    ) -> tuple[list[BranchOutcome], list[AnnotatedValue], AnnotatedValue | None]:
-        """Ask the human for the missing data (mandatory intervention). Optionally re-runs
-        human-directed retrieval (scoping named branches to named bulletins), merging the
-        result into `outcomes`. Returns the updated outcomes, any new pool entries from the
-        directed retrieval, and an optional human-authored `AnnotatedValue`. Raises on an
-        empty response."""
-        guidance, likely_pages = self._missing_data_guidance(
-            plan, outcomes, entries, reason, missing, round_idx
+    ) -> str:
+        """Block on the human to approve the proposed replan. Shows the data-prep output, the
+        previous plan, the compute MissingData, and the proposed plan. Returns the steer feedback:
+        an empty string means APPROVE (execute the proposed plan as-is); a non-empty string means
+        REJECT — the caller re-runs the replan with it injected and executes that without asking
+        again."""
+        guidance = self._replan_approval_guidance(
+            previous_plan, proposed_plan, pool, reason, missing, round_idx
         )
-        source_docs = [
-            f"Treasury Bulletin {page['bulletin']} PDF page {page['page']}"
-            for page in likely_pages
-            if page["bulletin"] and page["page"] is not None
-        ]
         instructions = (
-            "Provide the missing information needed to answer the question. "
-            f"Failure reason: {reason}"
+            "Review the proposed plan. Approve it to execute as-is, or reject with feedback "
+            f"telling the replanner what to change. Compute reported: {reason}"
         )
         if missing:
-            instructions += f"\nMissing values: {', '.join(missing)}"
+            instructions += f"\nStill missing: {', '.join(missing)}"
+        self._ctx.emit(
+            f"replan_approval_request round={round_idx} missing={missing!r} "
+            f"proposed_branches={len(proposed_plan.branches)}",
+            kind="user",
+        )
         response = await handler(
-            "missing_data",
+            "replan_approval",
             instructions,
             f"Question: {self._ctx.question}",
-            source_docs,
+            [],
             guidance,
         )
-        response_text = str(response.get("response", "")).strip()
-        current_retrieve_ids = {
-            branch_id
-            for branch_id, branch in zip(self._branch_ids, plan.branches)
-            if branch.kind == "retrieve"
-        }
-        retrieval_directives: dict[int, list[str]] = {}
-        for item in response.get("retrieval_directives", []):
-            if not isinstance(item, dict):
-                continue
-            branch_id = item.get("branch_id")
-            documents = item.get("documents")
-            if (
-                not isinstance(branch_id, int)
-                or branch_id not in current_retrieve_ids
-                or not isinstance(documents, list)
-            ):
-                continue
-            bulletins: list[str] = []
-            for document in documents:
-                match = re.fullmatch(
-                    r"Treasury Bulletin (\d{4}-(?:0[1-9]|1[0-2])) PDF",
-                    str(document).strip(),
-                )
-                if match and match.group(1) not in bulletins:
-                    bulletins.append(match.group(1))
-            if bulletins:
-                retrieval_directives[branch_id] = bulletins
-        if not response_text and not retrieval_directives:
-            raise RuntimeError("human intervention returned an empty response")
-        response_sources = [
-            str(item).strip()
-            for item in response.get("source_docs", [])
-            if str(item).strip()
-        ]
-
-        new_entries: list[AnnotatedValue] = []
-        if retrieval_directives:
-            rerun_positions = [
-                i
-                for i, (branch_id, branch) in enumerate(
-                    zip(self._branch_ids, plan.branches)
-                )
-                if branch_id in retrieval_directives and branch.kind == "retrieve"
-            ]
-            if rerun_positions:
-                rerun_branches = [plan.branches[i] for i in rerun_positions]
-                rerun_ids = [self._branch_ids[i] for i in rerun_positions]
-                rerun_outcomes = await self._run_branches(
-                    rerun_branches,
-                    rerun_ids,
-                    document_scopes=retrieval_directives,
-                )
-                outcomes = list(outcomes)
-                for position, rerun in zip(rerun_positions, rerun_outcomes):
-                    merged = _merge_branch_outcome(outcomes[position], rerun)
-                    outcomes[position] = merged
-                    for e in rerun.entries or []:
-                        new_entries.append(e)
-                self._last_executed_branch_ids = set(rerun_ids)
-                self._ctx.emit(
-                    "human_directed_retrieval",
-                    kind="observation",
-                    data={
-                        "directives": [
-                            {"branch_id": bid, "bulletins": retrieval_directives[bid]}
-                            for bid in rerun_ids
-                        ]
-                    },
-                )
-
-        human_entry: AnnotatedValue | None = None
-        if response_text:
-            description = (
-                f"Human-provided value for: {', '.join(missing)}"
-                if missing
-                else f"Human-provided information for: {reason}"
-            )
-            if response_sources:
-                description += f" (sources: {', '.join(response_sources)})"
-            human_entry = AnnotatedValue(description=description, value=response_text)
-
+        feedback = str(response.get("response", "")).strip()
         self._ctx.emit(
-            "mandatory_human_intervention_resolved",
+            f"replan_approval_resolved round={round_idx} "
+            f"decision={'rejected' if feedback else 'approved'}",
             kind="observation",
-            data={
-                "response": response_text,
-                "source_docs": response_sources,
-                "retrieval_directives": [
-                    {"branch_id": bid, "bulletins": bulletins}
-                    for bid, bulletins in retrieval_directives.items()
-                ],
-                "missing": missing,
-            },
         )
-        return outcomes, new_entries, human_entry
+        return feedback
 
     async def _run_retrieve_phase(
         self,
@@ -925,27 +673,24 @@ class Orchestrator:
                 res = (await pipeline)[retrieve_pos.index(pos)]
                 if isinstance(res, StepFailed):
                     raise res
-                # Human verifies / produces the extracted value(s) (figure or OCR/table read)
-                # only when the policy opts in — no step (or prompt) on the default path.
-                if self._human.wants_verify(
-                    cast(RetrieveBranch, branch), res, self._ctx
+                # Optimistic mode reviews the data-prep output once per round (see
+                # `_prep_pool`), not each extract. Blocking mode (local CLI) still verifies the
+                # value(s) per branch in place when the policy opts in.
+                if (
+                    self._review_mode() == "blocking"
+                    and self._human.wants_verify(
+                        cast(RetrieveBranch, branch), res, self._ctx
+                    )
                 ):
                     blocks = _branch_blocks(pos)
-                    if self._review_mode() == "optimistic":
-                        # Register an open review and keep the LLM entries — the question
-                        # completes without blocking; a human resolve drives a recompute.
-                        self._human.register_verify(
-                            res, blocks, cast(RetrieveBranch, branch), bid, self._ctx
-                        )
-                    else:
-                        res = await traced_step(
-                            self._ctx,
-                            "human_verify",
-                            lambda: self._human.verify_extract(
-                                res, blocks, cast(RetrieveBranch, branch), self._ctx
-                            ),
-                            branch_id=bid,
-                        )
+                    res = await traced_step(
+                        self._ctx,
+                        "human_verify",
+                        lambda: self._human.verify_extract(
+                            res, blocks, cast(RetrieveBranch, branch), self._ctx
+                        ),
+                        branch_id=bid,
+                    )
                 return res
             # External lookup. Optimistic: run the lookup agent, then register a review of
             # its result. Blocking (local CLI): the human performs the lookup in place when

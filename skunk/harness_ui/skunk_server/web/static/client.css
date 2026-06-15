@@ -218,7 +218,7 @@ main {
 .tag.kind-verify_extract { color: var(--yellow); background: var(--yellow-bg); cursor: pointer; }
 .tag.kind-lookup { color: var(--blue); background: var(--blue-bg); cursor: pointer; }
 .tag.kind-figure { color: var(--purple); background: var(--purple-bg); cursor: pointer; }
-.tag.kind-missing_data { color: var(--bad); background: var(--red-bg); cursor: pointer; }
+.tag.kind-replan_approval { color: var(--bad); background: var(--red-bg); cursor: pointer; }
 .tag[class*="kind-"]:hover { filter: brightness(1.15); }
 /* Non-clickable state indicators. */
 .tag.ind-revising { color: var(--blue); background: var(--blue-bg); }
@@ -901,10 +901,10 @@ textarea { width: 100%; min-height: 55px; }
 .review-kind.kind-lookup { color: var(--blue); }
 .review-kind.kind-figure { color: var(--purple); }
 .review-kind.kind-verify_extract { color: var(--yellow); }
-.review-kind.kind-missing_data { color: var(--bad); }
-/* Section header inside the review editor (e.g. "Instruction for the replanner" for missing_data). */
+.review-kind.kind-replan_approval { color: var(--bad); }
+/* Section header inside the review editor (e.g. the replan-approval steer-feedback label). */
 .review-section-label { font-size: 11px; color: var(--text3); text-transform: uppercase; letter-spacing: 0.04em; margin: 8px 0 2px; }
-/* Free-form instruction box for a missing_data review (replaces the structured value cards). */
+/* Free-form steer-feedback box for a replan_approval review (reject-with-feedback). */
 .review-missing-input {
   width: 100%; background: var(--bg3); border: 1px solid var(--border2); color: var(--ink);
   border-radius: 6px; padding: 8px 10px; font-size: 13px; font-family: inherit; line-height: 1.45;
@@ -917,6 +917,22 @@ textarea { width: 100%; min-height: 55px; }
   font-family: ui-monospace, monospace; tab-size: 2; white-space: pre;
   resize: vertical; min-height: 120px;
 }
+/* ── replan_approval review: read-only context grid + proposed-plan highlight ── */
+.rp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.rp-sec { background: var(--bg1); border: 1px solid var(--line); border-radius: 8px; padding: 10px; min-width: 0; }
+.rp-sec .review-section-label { margin-top: 0; }
+.rp-proposed { border-color: var(--accent, #22d3ee); box-shadow: 0 0 0 1px var(--accent, #22d3ee) inset; }
+.rp-empty { color: var(--muted); font-size: 12px; font-style: italic; }
+.rp-reason { color: var(--ink); font-size: 13px; line-height: 1.45; }
+.rp-missing { color: var(--warn, #e6b800); font-size: 12px; margin-top: 6px; }
+.rp-plan, .rp-pool { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 4px; }
+.rp-plan li, .rp-pool li { font-size: 12.5px; color: var(--ink); line-height: 1.4; }
+.rp-bid { color: var(--muted); font-size: 11px; margin-right: 4px; }
+.rp-kind { font-size: 10px; text-transform: uppercase; letter-spacing: 0.03em; padding: 1px 5px; border-radius: 4px; margin-right: 4px; }
+.rp-retrieve { background: rgba(51,153,255,0.18); color: #3399ff; }
+.rp-lookup { background: rgba(255,153,51,0.18); color: #ff9933; }
+.rp-period, .rp-src, .rp-prov, .rp-unit { color: var(--muted); font-size: 11.5px; }
+.rp-val { color: var(--accent, #33cc33); font-variant-numeric: tabular-nums; }
 .review-task { color: var(--ink); font-weight: 600; margin-right: 10px; }
 .review-count { color: var(--muted); font-size: 12px; }
 .review-close {
@@ -945,25 +961,25 @@ textarea { width: 100%; min-height: 55px; }
   border-radius: 5px; padding: 6px 8px; font-size: 13px; font-family: inherit; width: 100%;
 }
 .review-cand textarea { resize: vertical; min-height: 34px; font-family: ui-monospace, monospace; }
+/* External-lookup vs corpus-extract badge in the card head — lookups get the orange accent so a
+   reviewer prioritizes verifying them against their cited source, not a Bulletin page. */
+.review-cand-type {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+  padding: 1px 7px; border-radius: 999px; line-height: 1.6; margin-right: auto;
+}
+.review-cand-type.is-extract { background: var(--bg3); color: var(--text3); border: 1px solid var(--border2); }
+.review-cand-type.is-lookup { background: rgba(255,153,51,0.16); color: #ff9933; border: 1px solid rgba(255,153,51,0.5); }
+.review-cand.is-lookup { border-color: rgba(255,153,51,0.45); }
+/* Comment-style external annotation (target + src) sitting just above the value JSON. */
+.review-cand-extnote {
+  font-family: ui-monospace, monospace; font-size: 12px; color: #ff9933;
+  white-space: pre-wrap; word-break: break-word; opacity: 0.92; margin: 2px 0 -2px;
+}
 /* Read-only LLM-authored extract notes (page context for the value) — not editable. */
 .review-cand-notes {
   font-size: 12px; line-height: 1.45; color: var(--text2);
   background: var(--bg2); border-left: 2px solid var(--border2);
   border-radius: 0 5px 5px 0; padding: 6px 8px; white-space: pre-wrap;
-}
-/* Read-only source/publisher of an external-lookup value — not editable. Shown on
-   top of the card, larger/bolder than the editable fields so provenance reads first. */
-.review-cand-source {
-  display: flex; align-items: baseline; gap: 8px;
-  background: var(--bg2); border-left: 3px solid var(--accent);
-  border-radius: 0 5px 5px 0; padding: 8px 10px; margin-bottom: 4px; white-space: pre-wrap;
-}
-.review-cand-source-label {
-  font-size: 11px; color: var(--text3);
-  text-transform: uppercase; letter-spacing: 0.04em;
-}
-.review-cand-source-name {
-  font-size: 16px; font-weight: 700; color: var(--ink); line-height: 1.3;
 }
 .review-notes-label {
   display: block; font-size: 11px; color: var(--text3);
