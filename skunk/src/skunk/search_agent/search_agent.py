@@ -21,6 +21,7 @@ The three tools that read/write prune state share the agent's per-question
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import TYPE_CHECKING, Any
 
@@ -121,9 +122,12 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
     ):
         self.config = config
         self.chroma_collection = chroma_collection
-        # Set per-call (in `call`) so the page_index tool — built before retrieve(ctx) runs —
-        # can reach the live ExecutionContext. One SearchAgent per question/branch, so safe.
+        # Set per-call (in `retrieve`) so the page_index tool — built before retrieve(ctx)
+        # runs — can reach the live ExecutionContext and the agent's main event loop. The
+        # tool runs in a worker thread but must drive the async retriever ON this loop (the
+        # LLM client's async objects are bound to it). One SearchAgent per question/branch.
         self._ctx: ExecutionContext | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
         required_doc_prefixes = {
             bulletin.replace("-", "_") + "_"
             for bulletin in required_bulletins or []
@@ -195,6 +199,7 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
                     page_index_retriever,
                     config.pdf_dir,
                     lambda: self._require_ctx(),
+                    lambda: self._require_loop(),
                     config.read_document_max_output_chars // PageIndexSearchTool._CHARS_PER_TOKEN,
                     required_bulletins=required_bulletins,
                 )
@@ -216,6 +221,13 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         if self._ctx is None:
             raise RuntimeError("page_index_search called before retrieve() set the context")
         return self._ctx
+
+    def _require_loop(self) -> asyncio.AbstractEventLoop:
+        """The agent's main event loop, captured at the top of `retrieve`. The page_index
+        tool schedules the async retriever onto it from its worker thread."""
+        if self._loop is None:
+            raise RuntimeError("page_index_search called before retrieve() captured the loop")
+        return self._loop
 
     # ------------------------------------------------------------------
     # Block rendering / redaction (override the base hooks)
@@ -336,7 +348,9 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         branch_period: str | None = None,
         required_bulletins: list[str] | None = None,
     ) -> list[str]:
-        self._ctx = ctx  # expose to the page_index tool (built before ctx was known)
+        # Expose ctx + the running loop to the page_index tool (built before either existed).
+        self._ctx = ctx
+        self._loop = asyncio.get_running_loop()
         parts = [f"Question: {question}"]
         if branch_key:
             parts.append(f"Search focus: {branch_key}")

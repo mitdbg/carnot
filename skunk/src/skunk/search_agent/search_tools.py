@@ -57,6 +57,8 @@ from skunk.corpus import render_page_b64
 from skunk.multi_turn_agent import Tool
 
 if TYPE_CHECKING:
+    from asyncio import AbstractEventLoop
+
     from skunk.common import ExecutionContext
     from skunk.page_index.query import PageIndexRetriever
 
@@ -510,9 +512,15 @@ class PageIndexSearchTool(Tool):
     """Query the PageIndex (concept-tree → year filter → semantic filter) from inside the
     search loop. Wraps `PageIndexRetriever.retrieve_all` over a single synthetic branch and
     returns the surviving CONTENT BLOCKS as compact catalog summaries (page key, title,
-    summary, data interval, headers). Runs the async retriever via `asyncio.run` — safe here
-    because tool calls execute in a worker thread (see `MultiTurnAgent._execute_code`), and
-    the retriever's rate limiters are threading-based / cross-loop safe."""
+    summary, data interval, headers).
+
+    Tool calls execute in a worker thread (see `MultiTurnAgent._execute_code`), but the
+    retriever's downstream LLM client holds async objects bound to the agent's MAIN event
+    loop (the async TPM limiter, the genai/aiohttp session). So we must NOT spin up a fresh
+    loop here (`asyncio.run`) — that re-enters those objects from a foreign loop and raises
+    "Future attached to a different loop". Instead we schedule the coroutine back onto the
+    main loop via `run_coroutine_threadsafe` and block this thread on the result; the main
+    loop keeps spinning (it is awaiting our `to_thread` call), so it services the work."""
 
     name = "page_index_search"
 
@@ -524,12 +532,14 @@ class PageIndexSearchTool(Tool):
         retriever: PageIndexRetriever,
         pdf_dir: str,
         ctx_getter: Callable[[], ExecutionContext],
+        loop_getter: Callable[[], AbstractEventLoop],
         max_output_tokens: int,
         required_bulletins: list[str] | None = None,
     ):
         self._retriever = retriever
         self._pdf_dir = pdf_dir
         self._ctx_getter = ctx_getter
+        self._loop_getter = loop_getter
         self._max_output_chars = max_output_tokens * self._CHARS_PER_TOKEN
         self._required_bulletins = list(required_bulletins) if required_bulletins else None
 
@@ -543,9 +553,12 @@ class PageIndexSearchTool(Tool):
         # Hard-scope to human-required bulletins when set, matching the vector tools' filter.
         scopes = [self._required_bulletins] if self._required_bulletins else None
         try:
-            per_branch = asyncio.run(
-                self._retriever.retrieve_all(ctx, [branch], document_scopes=scopes)
+            # Run on the agent's main loop (see class docstring), not a fresh one.
+            fut = asyncio.run_coroutine_threadsafe(
+                self._retriever.retrieve_all(ctx, [branch], document_scopes=scopes),
+                self._loop_getter(),
             )
+            per_branch = fut.result()
         except Exception as e:
             return {PAGE_INDEX_RESULT_TAG: True, "results": [], "error": f"page_index_search error: {e}"}
 
