@@ -9,7 +9,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import TextIO
 
-import chromadb
 import pandas as pd
 from chromadb.api.models.Collection import Collection
 
@@ -137,10 +136,16 @@ if __name__ == "__main__":
         help="Number of questions to process in parallel (default: 4).",
     )
     parser.add_argument(
-        "--chroma-dir",
+        "--chroma-host",
         type=str,
-        default=".chromadb",
-        help="Directory where ChromaDB stores its data (default: .chromadb)",
+        default=os.environ.get("SKUNK_CHROMA_SERVER_HOST", "127.0.0.1"),
+        help="ChromaDB server host (default: 127.0.0.1). Start it with scripts/run_chroma_server.sh",
+    )
+    parser.add_argument(
+        "--chroma-port",
+        type=int,
+        default=int(os.environ.get("SKUNK_CHROMA_SERVER_PORT", "8001")),
+        help="ChromaDB server port (default: 8001)",
     )
     parser.add_argument(
         "--chroma-collection-name",
@@ -195,7 +200,9 @@ if __name__ == "__main__":
             document_map[doc_id] = f.read()
 
     # step 2.5: load chromadb collection to ensure it's ready before we start processing questions
-    client = chromadb.PersistentClient(path=args.chroma_dir)
+    from skunk.chroma_client import make_chroma_client
+
+    client = make_chroma_client(args.chroma_host, args.chroma_port)
     collection = client.get_collection(args.chroma_collection_name)
 
     # step 3: restrict to the validation set (or the single --uid smoke-test target),

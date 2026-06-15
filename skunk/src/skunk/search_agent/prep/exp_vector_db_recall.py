@@ -14,11 +14,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import chromadb
 import pandas as pd
 
 from skunk.search_agent.prep.officeqa_eval import (
@@ -105,11 +105,14 @@ def evaluate_collection(
     questions: list[str],
     gt_page_keys: list[list[str]],
     gt_doc_keys: list[list[str]],
-    chroma_path: str,
+    chroma_host: str,
+    chroma_port: int,
     max_k: int,
 ) -> dict:
+    from skunk.chroma_client import make_chroma_client
+
     print(f"\n=== Collection: {collection_name} ===", flush=True)
-    client = chromadb.PersistentClient(path=chroma_path)
+    client = make_chroma_client(chroma_host, chroma_port)
     collection = client.get_collection(collection_name)
 
     embedder = make_embedder(collection_name)
@@ -185,7 +188,17 @@ def evaluate_collection(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", default="officeqa_pro.csv")
-    parser.add_argument("--chroma-path", default=".chromadb")
+    parser.add_argument(
+        "--chroma-host",
+        default=os.environ.get("SKUNK_CHROMA_SERVER_HOST", "127.0.0.1"),
+        help="ChromaDB server host (default: 127.0.0.1). Start it with scripts/run_chroma_server.sh",
+    )
+    parser.add_argument(
+        "--chroma-port",
+        type=int,
+        default=int(os.environ.get("SKUNK_CHROMA_SERVER_PORT", "8001")),
+        help="ChromaDB server port (default: 8001)",
+    )
     parser.add_argument(
         "--collections",
         nargs="+",
@@ -217,7 +230,8 @@ def main() -> None:
     all_results: dict = {
         "config": {
             "csv": args.csv,
-            "chroma_path": args.chroma_path,
+            "chroma_host": args.chroma_host,
+            "chroma_port": args.chroma_port,
             "collections": args.collections,
             "k_values": K_VALUES,
             "num_questions": len(df),
@@ -232,7 +246,8 @@ def main() -> None:
                 questions=questions,
                 gt_page_keys=gt_page_keys,
                 gt_doc_keys=gt_doc_keys,
-                chroma_path=args.chroma_path,
+                chroma_host=args.chroma_host,
+                chroma_port=args.chroma_port,
                 max_k=max_k,
             )
         except Exception as e:  # noqa: BLE001
