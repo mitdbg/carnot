@@ -197,13 +197,12 @@ class RetrieveOp:
         return refs
 
     def _ensure_resources(self, config: SkunkConfig):
-        # Single-flight: neither parallel branches (same op) nor parallel UID
-        # workers (eval's thread pool, each with its own RetrieveOp) must race to
-        # open ChromaDB. Concurrent `PersistentClient` construction against the
-        # same SQLite fails with "Could not connect to tenant default_tenant", so
-        # construction is serialized + cached process-wide by
-        # `_get_shared_resources`. The resources are read-only + shared; only the
-        # per-branch SearchAgent built around them holds mutable state.
+        # Single-flight: neither parallel branches (same op) nor parallel UID workers
+        # (eval's thread pool, each with its own RetrieveOp) need to re-connect to the
+        # ChromaDB server / re-fetch the collection. Connection + collection handle are
+        # serialized + cached process-wide by `_get_shared_resources`. The resources are
+        # read-only + shared; only the per-branch SearchAgent built around them holds
+        # mutable state.
         with self._resources_lock:
             if self._resources is None:
                 self._resources = _get_shared_resources(config)
@@ -217,24 +216,25 @@ class RetrieveOp:
         return self._page_index_retriever
 
 
-# Process-wide ChromaDB/document-map cache. The vector DB is a large read-only
-# SQLite (tens of GB); constructing a `chromadb.PersistentClient` against it is not
-# safe to do concurrently — parallel first-opens race on the tenant-bootstrap SELECT
-# and fail with "Could not connect to tenant default_tenant". The eval runs many UIDs
-# through one ThreadPoolExecutor, each UID with its own RetrieveOp, so we cache the
-# opened collection + document map process-wide and single-flight construction under
-# one global lock. The resources are read-only, so sharing the collection across
-# worker threads is safe (and avoids N in-memory copies of the document map).
+# Process-wide ChromaDB/document-map cache. Reads go through a ChromaDB *server*
+# (HttpClient) — the embedded PersistentClient deadlocks under the eval's 15-way
+# in-process concurrency (worker threads wedge inside ChromaDB's Rust core), whereas
+# the server process owns ChromaDB's concurrency. The eval runs many UIDs through one
+# ThreadPoolExecutor, each with its own RetrieveOp, so we cache the (collection handle,
+# document map) process-wide and single-flight construction under one global lock: this
+# avoids re-connecting / re-fetching the collection per UID and keeps a single in-memory
+# copy of the (read-only) document map shared across worker threads.
 _SHARED_RESOURCES_LOCK = threading.Lock()
-_SHARED_RESOURCES: dict[tuple[str, str, str], tuple] = {}
+_SHARED_RESOURCES: dict[tuple[str, int, str, str], tuple] = {}
 
 
 def _get_shared_resources(config: SkunkConfig):
     """Process-wide single-flight wrapper over `_build_resources`, keyed by the
-    ChromaDB dir + collection + clean-page-map path. Serializes ChromaDB opens
-    across all RetrieveOps (i.e. across all UID worker threads)."""
+    ChromaDB server (host, port) + collection + clean-page-map path. Serializes the
+    connect/collection-fetch across all RetrieveOps (i.e. across all UID worker threads)."""
     key = (
-        str(Path(config.chromadb_dir).resolve()),
+        config.chroma_server_host,
+        config.chroma_server_port,
         config.chromadb_collection,
         str(Path(config.clean_page_map_path).resolve()),
     )
@@ -245,18 +245,10 @@ def _get_shared_resources(config: SkunkConfig):
 
 
 def _build_resources(config: SkunkConfig):
-    import chromadb
+    from skunk.chroma_client import make_chroma_client
 
-    chromadb_dir = Path(config.chromadb_dir)
     clean_page_map_path = Path(config.clean_page_map_path)
 
-    if not chromadb_dir.exists():
-        raise StepFailed(
-            "retrieve",
-            f"chromadb_dir {chromadb_dir!s} does not exist; build the "
-            "vector DB first (see src/skunk/search_agent/prep/) or set "
-            "SKUNK_CHROMADB_DIR / config.chromadb_dir.",
-        )
     if not clean_page_map_path.exists():
         raise StepFailed(
             "retrieve",
@@ -278,14 +270,16 @@ def _build_resources(config: SkunkConfig):
         except OSError:
             continue
 
-    chroma_client = chromadb.PersistentClient(path=str(chromadb_dir))
+    chroma_client = make_chroma_client(
+        config.chroma_server_host, config.chroma_server_port
+    )
     try:
         collection = chroma_client.get_collection(name=config.chromadb_collection)
     except Exception as e:
         raise StepFailed(
             "retrieve",
-            f"chromadb collection {config.chromadb_collection!r} not found "
-            f"under {chromadb_dir!s}: {e}",
+            f"chromadb collection {config.chromadb_collection!r} not found on the "
+            f"server at {config.chroma_server_host}:{config.chroma_server_port}: {e}",
         ) from e
 
     return collection, document_map

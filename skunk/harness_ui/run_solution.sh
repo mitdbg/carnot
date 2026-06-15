@@ -98,6 +98,18 @@ fi
 export PYTHONPATH="${HARNESS_DIR}${PYTHONPATH:+:$PYTHONPATH}"
 cd "$SKUNK_DIR"
 
+# --- Preflight: the ChromaDB server must be up (read paths use HttpClient, not embedded) ---
+# Probe with the same helper the solution uses, so a passing probe guarantees the real
+# connection works. Hard-stop BEFORE spawning any worker if it's down.
+CHROMA_HOST="${SKUNK_CHROMA_SERVER_HOST:-127.0.0.1}"
+CHROMA_PORT="${SKUNK_CHROMA_SERVER_PORT:-8001}"
+if ! "$PYTHON_BIN" -c "from skunk.chroma_client import make_chroma_client; make_chroma_client('${CHROMA_HOST}', int('${CHROMA_PORT}'))" 2>/dev/null; then
+  echo "ERROR: ChromaDB server not reachable at ${CHROMA_HOST}:${CHROMA_PORT}." >&2
+  echo "Start it first in a long-lived tmux:  ./scripts/run_chroma_server.sh" >&2
+  exit 1
+fi
+echo "ChromaDB:   ${CHROMA_HOST}:${CHROMA_PORT}   (server reachable)"
+
 pids=()
 
 # Backend (agent) process: worker pool + command routes, bound to localhost, writes the browser
