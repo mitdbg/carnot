@@ -41,17 +41,24 @@ chunks at render time. These sets are per-question state: the owning
 
 from __future__ import annotations
 
+import asyncio
 import re
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from chromadb.api.models.Collection import Collection
 from google import genai
 from openrouter import OpenRouter
 
-from skunk.common import get_rate_limiter
+from skunk.common import get_rate_limiter, pageref_to_page_key
 from skunk.corpus import render_page_b64
 from skunk.multi_turn_agent import Tool
+
+if TYPE_CHECKING:
+    from skunk.common import ExecutionContext
+    from skunk.page_index.query import PageIndexRetriever
 
 # Tags identifying each tool's structured return payload to the SearchAgent.
 PRUNE_RESULT_TAG = "__prune__"
@@ -59,6 +66,7 @@ SEARCH_RESULT_TAG = "__search_result__"
 GREP_RESULT_TAG = "__grep_result__"
 READ_DOCUMENT_RESULT_TAG = "__read_document_result__"
 VIEW_FIGURE_RESULT_TAG = "__view_figure_result__"
+PAGE_INDEX_RESULT_TAG = "__page_index_result__"
 
 # Embedding clients we know how to query. Gemini embeddings go through
 # `genai.Client`; Qwen (and other OpenRouter-hosted) embeddings are only
@@ -495,4 +503,104 @@ This tool records `chunk_id`s and/or `doc_id`s that you've already inspected and
 ```python
 # mark some chunks and a whole doc as irrelevant
 prune(chunk_ids=["chunk_id_1", "chunk_id_2"], doc_ids=["doc_id_3"])
+```"""
+
+
+class PageIndexSearchTool(Tool):
+    """Query the PageIndex (concept-tree → year filter → semantic filter) from inside the
+    search loop. Wraps `PageIndexRetriever.retrieve_all` over a single synthetic branch and
+    returns the surviving CONTENT BLOCKS as compact catalog summaries (page key, title,
+    summary, data interval, headers). Runs the async retriever via `asyncio.run` — safe here
+    because tool calls execute in a worker thread (see `MultiTurnAgent._execute_code`), and
+    the retriever's rate limiters are threading-based / cross-loop safe."""
+
+    name = "page_index_search"
+
+    # Token→char factor for the output cap (mirrors grep/read; ~4 chars/token).
+    _CHARS_PER_TOKEN = 4
+
+    def __init__(
+        self,
+        retriever: PageIndexRetriever,
+        pdf_dir: str,
+        ctx_getter: Callable[[], ExecutionContext],
+        max_output_tokens: int,
+        required_bulletins: list[str] | None = None,
+    ):
+        self._retriever = retriever
+        self._pdf_dir = pdf_dir
+        self._ctx_getter = ctx_getter
+        self._max_output_chars = max_output_tokens * self._CHARS_PER_TOKEN
+        self._required_bulletins = list(required_bulletins) if required_bulletins else None
+
+    def __call__(self, query: str, period: str | None = None) -> dict:
+        # Imported here (not at module top) to keep the page_index subtree off the import
+        # path of search_agent runs that never enable this tool.
+        from skunk.plan import RetrieveBranch
+
+        ctx = self._ctx_getter()
+        branch = RetrieveBranch(kind="retrieve", key=query, period=period)
+        # Hard-scope to human-required bulletins when set, matching the vector tools' filter.
+        scopes = [self._required_bulletins] if self._required_bulletins else None
+        try:
+            per_branch = asyncio.run(
+                self._retriever.retrieve_all(ctx, [branch], document_scopes=scopes)
+            )
+        except Exception as e:
+            return {PAGE_INDEX_RESULT_TAG: True, "results": [], "error": f"page_index_search error: {e}"}
+
+        blocks = per_branch[0] if per_branch else []
+        # Resolve each surviving block to its self-contained catalog metadata (title /
+        # summary / interval / headers) — the same pool the page_index backend feeds selection.
+        pool = self._retriever.pool_for_blocks(blocks, self._pdf_dir)
+
+        results: list[dict] = []
+        used = 0
+        total = len(pool)
+        truncated = False
+        for entry in pool:
+            try:
+                page_key = pageref_to_page_key(entry.ref.page)
+            except ValueError:
+                continue
+            interval = (
+                f"{entry.interval[0]}..{entry.interval[1]}" if entry.interval else "n/a"
+            )
+            lines = [
+                f"[page_key={page_key}] kind={entry.kind} | {entry.title or '(untitled)'}",
+                f"  reports period: {interval}",
+            ]
+            if entry.summary:
+                lines.append(f"  summary: {entry.summary}")
+            if entry.cols:
+                lines.append(f"  columns: {', '.join(entry.cols)}")
+            if entry.rows_tail:
+                lines.append(f"  row headers (tail): {', '.join(entry.rows_tail)}")
+            text = "\n".join(lines)
+            if results and used + len(text) > self._max_output_chars:
+                truncated = True
+                break
+            results.append({"page_key": page_key, "text": text})
+            used += len(text)
+
+        out: dict = {PAGE_INDEX_RESULT_TAG: True, "results": results}
+        if truncated:
+            cap_k = self._max_output_chars // self._CHARS_PER_TOKEN // 1000
+            out["truncation_note"] = (
+                f"[page_index_search output truncated: showing {len(results)} of {total} "
+                f"block(s) (~{cap_k}k-token cap reached). Add a `period`, or narrow the query.]"
+            )
+        return out
+
+    doc = """\
+### page_index_search(query: str, period: str | None = None)
+This tool queries a separate **concept-aware page index** of the corpus and returns the pages whose tables/charts/prose most plausibly *report on* what you describe — regardless of when the bulletin was published. It is complementary to `search_corpus` (vector similarity) and `grep_corpus` (regex): use it when you want pages by *what data they contain* (e.g. "monthly federal debt subject to limit", "receipts by source"). Internally it picks candidate chapters from a taxonomy, filters by the data period, and runs a semantic filter, so each call costs a few LLM calls — use it deliberately rather than repeatedly.
+
+`query` is a natural-language description of the data to find. `period` optionally restricts results to pages whose *reported data span* overlaps it (NOT publication date): a single month `"YYYY-MM"`, a range `"YYYY-MM..YYYY-MM"`, or a comma-list of either. Omit `period` to search all years.
+
+Each result gives a `page_key` plus the block's title, reported period, summary, and table headers. Pass a `page_key` straight to `read_document(...)` to read the full page, to `view_figure(...)`, or include it in your final `page_keys` answer.
+
+```python
+# find pages reporting monthly public debt for fiscal year 2014
+page_index_search("monthly outstanding public debt subject to statutory limit", period="2013-10..2014-09")
 ```"""

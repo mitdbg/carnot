@@ -158,6 +158,11 @@ class RetrieveOp:
         from skunk.search_agent import SearchAgent
 
         collection, document_map = self._ensure_resources(ctx.config)
+        # Optional: give the agent a `page_index_search` tool backed by the shared, lazily
+        # built PageIndexRetriever (loads the concept tree/catalog once, not per branch).
+        page_index_retriever = (
+            self._page_index() if ctx.config.search_agent_pageindex else None
+        )
         agent = SearchAgent(
             config=ctx.config,
             document_map=document_map,
@@ -168,6 +173,7 @@ class RetrieveOp:
                 else None
             ),
             required_bulletins=required_bulletins,
+            page_index_retriever=page_index_retriever,
         )
         page_keys = await agent.retrieve(
             ctx,

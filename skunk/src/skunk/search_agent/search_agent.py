@@ -22,7 +22,7 @@ The three tools that read/write prune state share the agent's per-question
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from chromadb.api.models.Collection import Collection
 
@@ -39,17 +39,22 @@ from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent
 from skunk.search_agent.search_tools import (
     EMPTY_RESULT_MESSAGE,
     GREP_RESULT_TAG,
+    PAGE_INDEX_RESULT_TAG,
     PRUNE_RESULT_TAG,
     READ_DOCUMENT_RESULT_TAG,
     SEARCH_RESULT_TAG,
     VIEW_FIGURE_RESULT_TAG,
     EmbeddingClient,
     GrepCorpusTool,
+    PageIndexSearchTool,
     PruneTool,
     ReadDocumentTool,
     SearchCorpusTool,
     ViewFigureTool,
 )
+
+if TYPE_CHECKING:
+    from skunk.page_index.query import PageIndexRetriever
 
 
 def _make_embedding_client(emb_model_id: str) -> tuple[EmbeddingClient, str]:
@@ -112,9 +117,13 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         capture_logprobs: bool = False,
         human_intervention_handler: HumanInterventionHandler | None = None,
         required_bulletins: list[str] | None = None,
+        page_index_retriever: PageIndexRetriever | None = None,
     ):
         self.config = config
         self.chroma_collection = chroma_collection
+        # Set per-call (in `call`) so the page_index tool — built before retrieve(ctx) runs —
+        # can reach the live ExecutionContext. One SearchAgent per question/branch, so safe.
+        self._ctx: ExecutionContext | None = None
         required_doc_prefixes = {
             bulletin.replace("-", "_") + "_"
             for bulletin in required_bulletins or []
@@ -178,6 +187,18 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             ViewFigureTool(self.document_map, config.pdf_dir),
             PruneTool(self._pruned_chunk_ids, self._pruned_doc_ids),
         ]
+        # Optional concept-aware retrieval tool (SKUNK_SEARCH_AGENT_PAGEINDEX). Wired only
+        # when the caller passes the shared PageIndexRetriever; reads ctx via `self._ctx`.
+        if page_index_retriever is not None:
+            tools.append(
+                PageIndexSearchTool(
+                    page_index_retriever,
+                    config.pdf_dir,
+                    lambda: self._require_ctx(),
+                    config.read_document_max_output_chars // PageIndexSearchTool._CHARS_PER_TOKEN,
+                    required_bulletins=required_bulletins,
+                )
+            )
         if human_intervention_handler is not None:
             tools.append(RequestHumanTool(human_intervention_handler))
         super().__init__(
@@ -188,6 +209,13 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             sampling_params=sampling_params,
             capture_logprobs=capture_logprobs,
         )
+
+    def _require_ctx(self) -> ExecutionContext:
+        """The live ExecutionContext, set at the top of `retrieve`. Lets the page_index
+        tool (constructed in `__init__`, before ctx exists) reach it at call time."""
+        if self._ctx is None:
+            raise RuntimeError("page_index_search called before retrieve() set the context")
+        return self._ctx
 
     # ------------------------------------------------------------------
     # Block rendering / redaction (override the base hooks)
@@ -247,6 +275,22 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             )
             return blocks
 
+        if isinstance(output, dict) and output.get(PAGE_INDEX_RESULT_TAG):
+            if output.get("error"):
+                blocks.append(TextBlock(f"[error]\n{output['error']}"))
+            elif not output["results"]:
+                blocks.append(TextBlock(EMPTY_RESULT_MESSAGE))
+            else:
+                # One ChunkBlock per surviving block (keyed by page_key so it's citeable /
+                # readable / prunable like read_document output).
+                blocks.extend(
+                    ChunkBlock(chunk_id=None, doc_id=r["page_key"], text=r["text"])
+                    for r in output["results"]
+                )
+            if output.get("truncation_note"):
+                blocks.append(TextBlock(output["truncation_note"]))
+            return blocks
+
         if isinstance(output, dict) and output.get(VIEW_FIGURE_RESULT_TAG):
             if output.get("error"):
                 blocks.append(TextBlock(f"[error]\n{output['error']}"))
@@ -292,6 +336,7 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         branch_period: str | None = None,
         required_bulletins: list[str] | None = None,
     ) -> list[str]:
+        self._ctx = ctx  # expose to the page_index tool (built before ctx was known)
         parts = [f"Question: {question}"]
         if branch_key:
             parts.append(f"Search focus: {branch_key}")

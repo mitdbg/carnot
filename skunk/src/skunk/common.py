@@ -382,6 +382,15 @@ def page_key_to_pageref(key: str) -> PageRef:
     return PageRef(month=f"{year_str}-{month_str}", page=int(page_str))
 
 
+def pageref_to_page_key(ref: PageRef) -> str:
+    """Inverse of `page_key_to_pageref`: render a `PageRef` as a search-agent page key
+    (`"YYYY_MM_page"`). Lets the page-index tool surface results in the search agent's
+    `doc_id` space so they round-trip through `read_document` and the final answer."""
+    if ref.month is None or ref.page is None:
+        raise ValueError(f"PageRef needs both month and page for a page key: {ref!r}")
+    return f"{ref.month.replace('-', '_')}_{ref.page}"
+
+
 @dataclass(frozen=True)
 class BlockRef:
     """One retrieved CONTENT BLOCK — the retriever's native output unit. `page` is the anchor

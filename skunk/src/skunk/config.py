@@ -154,6 +154,14 @@ class SkunkConfig:
     # Agent-loop chat model. None → `llm_model`. (env: SKUNK_AGENT_MODEL)
     agent_model_id: str | None = None
 
+    # Give the search_agent retriever an extra `page_index_search` tool that queries the
+    # PageIndex (concept-tree → year filter → semantic filter) from inside its loop, so the
+    # agent can blend concept-aware retrieval with vector search. Default OFF (zero change to
+    # baseline search_agent runs); only consulted when retriever == "search_agent". Requires
+    # the page_index artifacts to be present, same as the page_index backend.
+    # (env: SKUNK_SEARCH_AGENT_PAGEINDEX=1)
+    search_agent_pageindex: bool = False
+
     # Page-index semantic filter: a single coarse pass over each year-filtered page's
     # metadata summary, scored once against every active branch target at once (a B×K
     # true/false matrix, one row per page, one column per target). The filter runs on a
@@ -323,6 +331,8 @@ class SkunkConfig:
             lookup_max_steps=int(os.environ.get("SKUNK_LOOKUP_MAX_STEPS", "4")),
             lookup_tools=_parse_csv(os.environ.get("SKUNK_LOOKUP_TOOLS", "")),
             agent_model_id=os.environ.get("SKUNK_AGENT_MODEL") or None,
+            search_agent_pageindex=os.environ.get("SKUNK_SEARCH_AGENT_PAGEINDEX", "0")
+            not in ("", "0"),
         )
 
 
