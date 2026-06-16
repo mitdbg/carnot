@@ -48,6 +48,9 @@ CHUNK_TOKENS = 30000
 CHARS_PER_TOKEN = 4
 CHUNK_CHARS = CHUNK_TOKENS * CHARS_PER_TOKEN
 MAX_ATTEMPTS = 6
+# Max chars across all inputs in one batched request (~15k tokens) — keeps each request
+# well within the model context while letting many small elements share one HTTP round-trip.
+BATCH_CHARS_BUDGET = 60000
 
 
 def _make_openrouter_client():
@@ -78,7 +81,10 @@ def _embed_request(client, inputs: list[str]) -> list[np.ndarray]:
             rate.acquire()
             arg = inputs[0] if len(inputs) == 1 else inputs
             resp = client.embeddings.generate(input=arg, model=MODEL_NAME)
-            return [np.asarray(d.embedding, dtype=np.float32) for d in resp.data]
+            # OpenAI-compatible APIs may return data out of order; sort by `index` so the
+            # returned vectors align 1:1 with `inputs` for batched requests.
+            data = sorted(resp.data, key=lambda d: getattr(d, "index", 0))
+            return [np.asarray(d.embedding, dtype=np.float32) for d in data]
         except Exception as e:  # noqa: BLE001 - retry on any transient API error
             if attempt == MAX_ATTEMPTS - 1:
                 raise
@@ -114,6 +120,24 @@ def _partition_bounds(p: int, partition_size: int, n_total: int) -> tuple[int, i
     return start, min(start + partition_size, n_total)
 
 
+def _make_batches(simple: list[int], texts: list[str], max_items: int) -> list[list[int]]:
+    """Group single-chunk element indices into batches bounded by item count and char budget,
+    so each request packs many small elements without exceeding the model context."""
+    batches: list[list[int]] = []
+    cur: list[int] = []
+    cur_chars = 0
+    for i in simple:
+        t = len(texts[i]) or 1
+        if cur and (len(cur) >= max_items or cur_chars + t > BATCH_CHARS_BUDGET):
+            batches.append(cur)
+            cur, cur_chars = [], 0
+        cur.append(i)
+        cur_chars += t
+    if cur:
+        batches.append(cur)
+    return batches
+
+
 def embed_all(
     texts: list[str],
     unique_element_ids: list[str],
@@ -121,8 +145,15 @@ def embed_all(
     n_partitions: int,
     output_dir: str,
     max_workers: int,
+    batch_size: int,
 ) -> None:
-    """Embed in parallel and save partitions incrementally (resume by skipping existing)."""
+    """Embed in parallel and save partitions incrementally (resume by skipping existing).
+
+    Single-chunk elements are packed into one request each (up to ``batch_size`` items /
+    ``BATCH_CHARS_BUDGET`` chars) — one rate-limiter token per *request*, so throughput is no
+    longer one element per round-trip. Oversized elements (needing per-element chunk+average)
+    are embedded individually.
+    """
     n_total = len(texts)
     assert len(unique_element_ids) == n_total
     partition_size = max(1, (n_total + n_partitions - 1) // n_partitions)
@@ -161,17 +192,38 @@ def embed_all(
         if ready:
             _save_partition(p)
 
-    def _task(i: int) -> None:
-        _record(i, embed_text(texts[i], client))
+    def _do_batch(idxs: list[int]) -> list[tuple[int, np.ndarray]]:
+        inputs = [texts[i] if texts[i] else " " for i in idxs]
+        vecs = _embed_request(client, inputs)
+        out: list[tuple[int, np.ndarray]] = []
+        for i, v in zip(idxs, vecs, strict=True):
+            nrm = float(np.linalg.norm(v))
+            if nrm > 0:
+                v = v / nrm
+            out.append((i, v.astype(np.float32)))
+        return out
 
-    print(f"Embedding {len(todo)} elements with {max_workers} workers...")
+    def _do_oversized(i: int) -> list[tuple[int, np.ndarray]]:
+        return [(i, embed_text(texts[i], client))]
+
+    simple = [i for i in todo if len(texts[i]) <= CHUNK_CHARS]
+    oversized = [i for i in todo if len(texts[i]) > CHUNK_CHARS]
+    batches = _make_batches(simple, texts, max(1, batch_size))
+
+    print(f"Embedding {len(todo)} elements: {len(batches)} batches "
+          f"(<= {batch_size} items / {BATCH_CHARS_BUDGET} chars) + {len(oversized)} oversized, "
+          f"{max_workers} workers...")
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = [ex.submit(_task, i) for i in todo]
+        futures = [ex.submit(_do_batch, b) for b in batches]
+        futures += [ex.submit(_do_oversized, i) for i in oversized]
         for fut in as_completed(futures):
-            fut.result()
+            recs = fut.result()
+            for i, emb in recs:
+                _record(i, emb)
             with done_lock:
-                done_count += 1
-                if done_count % log_every == 0 or done_count == len(todo):
+                prev = done_count
+                done_count += len(recs)
+                if done_count // log_every != prev // log_every or done_count == len(todo):
                     print(f"  embedded {done_count}/{len(todo)} ({100 * done_count / len(todo):.1f}%)")
 
 
@@ -181,6 +233,8 @@ def main() -> None:
     parser.add_argument("--output_dir", required=True, help="Directory to save embedding outputs.")
     parser.add_argument("--n_partitions", type=int, default=100, help="Number of .npz partition files.")
     parser.add_argument("--max_workers", type=int, default=16, help="Concurrent embedding requests.")
+    parser.add_argument("--batch_size", type=int, default=64,
+                        help="Max elements packed into one embedding request (1 = per-element).")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -239,6 +293,7 @@ def main() -> None:
         n_partitions=args.n_partitions,
         output_dir=args.output_dir,
         max_workers=args.max_workers,
+        batch_size=args.batch_size,
     )
     print("Embedding complete.")
 
