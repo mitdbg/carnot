@@ -5,7 +5,6 @@ Branches are a discriminated union keyed by `kind` (`retrieve` / `lookup_externa
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Annotated, Literal, Union
@@ -37,29 +36,16 @@ def _strip_non_empty(v: str) -> str:
 NonEmptyStr = Annotated[str, AfterValidator(_strip_non_empty)]
 
 
-_MONTH_RE = re.compile(r"\d{4}-\d{2}")
-
-
-def _canonical_month(v: str) -> str:
-    v = v.strip()
-    if not _MONTH_RE.fullmatch(v):
-        raise ValueError(f"must be a canonical YYYY-MM month, got {v!r}")
-    return v
-
-
-MonthStr = Annotated[str, AfterValidator(_canonical_month)]
-
-
 class PagePin(BaseModel):
-    """A hard positional pin: an explicit page of a specific bulletin issue. BOTH fields are
+    """A hard positional pin: an explicit page of a specific source document. BOTH fields are
     required — a pin with only one is meaningless. `page` is the number AS THE QUESTION STATES
     IT, ambiguous between the printed footer label and the PDF index; retrieval resolves both
     interpretations and leaves the choice to downstream. Present only on page-addressed
-    questions ("on page 5 of the September 1990 Bulletin")."""
+    questions ("on page 5 of the September 1990 issue")."""
 
     model_config = ConfigDict(frozen=True)
 
-    bulletin: MonthStr  # "YYYY-MM" — the issue the page is in
+    doc_id: str  # the source document the page is in, as the question identifies it (resolved to a filename stem downstream)
     page: int = Field(ge=1)  # 1-based page number, exactly as written in the question
 
 
@@ -76,7 +62,7 @@ class RetrieveBranch(BaseModel):
         None  # YYYY-MM month/range/comma-list the DATA pertains to ("2013-06", "2022-10..2023-09", "1940-01..1940-12, 1953-01..1953-12"); None if unpinned
     )
     page_pin: PagePin | None = (
-        None  # set only for page-addressed questions; resolves to a specific issue+page, bypassing content retrieval
+        None  # set only for page-addressed questions; resolves to a specific document+page, bypassing content retrieval
     )
     visual_only: bool = False
 
@@ -144,7 +130,7 @@ You are a query planner. Given a question, emit a JSON plan that, when executed,
     {"kind": "retrieve",
      "key": "<natural-language lookup string>",
      "period": "<str | null>",
-     "page_pin": {"bulletin": "<YYYY-MM>", "page": <int>} | null,
+     "page_pin": {"doc_id": "<source document>", "page": <int>} | null,
      "visual_only": <bool>},
     {"kind": "lookup_external",
      "target": "<natural-language request for a single value>",
@@ -155,8 +141,8 @@ You are a query planner. Given a question, emit a JSON plan that, when executed,
 Branches run in parallel; a final compute step reads the gathered values and the
 verbatim question to produce the answer. Choose per value: prefer a `retrieve` branch
 whenever the data could reasonably be expected to exist in the corpus; use a
-`lookup_external` branch for a value that is unlikely to be in the corpus, or when the
-question names a clear external source.
+`lookup_external` branch only when the question names a clear external source or states
+that the value should be looked up externally.
 
 ## Field semantics
 
@@ -174,12 +160,12 @@ retrieve branch fields:
                 issue ("as reported in the September 2012 Bulletin") is NOT the period and
                 is NOT encoded in the plan — selection chooses which issue to read.
   page_pin      set ONLY when the question addresses data by an explicit page NUMBER of a
-                specific issue ("on page 5 of the September 1990 Bulletin"). Both fields
-                required: {"bulletin": "YYYY-MM" (the issue), "page": <int> (the number
-                exactly as written)}. The page number is taken as-is — retrieval resolves
-                both the printed-label and the PDF-index page and leaves the choice
-                downstream, so do not convert it. Null for normal content/period retrieval;
-                put what to read on that page in `key`.
+                specific document ("on page 5 of the September 1990 issue"). Both fields
+                required: {"doc_id": the source document the page is in, as the question
+                identifies it (issue/year), "page": <int> (the number exactly as written)}.
+                The page number is taken as-is — retrieval resolves both the printed-label
+                and the PDF-index page and leaves the choice downstream, so do not convert
+                it. Null for normal content/period retrieval; put what to read on that page in `key`.
   visual_only   true only if question explicitly asks for visual understanding of charts/figures.
 
 lookup_external branch fields:
@@ -209,8 +195,8 @@ Rules:
   - Read each failed attempt's diagnostic before retrying it: reword the
     key, check the granularity asked for, and whether the value really is
     in the corpus (retrieve) or external (lookup_external).
-  - lookup_external is unrestricted here; use it when the corpus has no
-    home for the value.
+  - lookup_external is permitted only when you have tried to retrieve it from the
+    corpus previously and it failed.
   - When a committed computed intermediate pins the period of a missing
     value, set the new branch's `period` to exactly that period.
   - Human-provided resolutions explicitly map prior missing identifiers to
@@ -296,7 +282,7 @@ Rules:
             )
         if human_guidance and human_guidance.strip():
             # Free-form operator instruction from the missing-data review — authoritative
-            # direction for THIS replan (which series/table/bulletin to use, how to read the
+            # direction for THIS replan (which series/table/document to use, how to read the
             # question). Follow it.
             parts.append(
                 "Operator instruction for this replan (free-form, authoritative — follow it):\n"

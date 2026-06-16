@@ -416,16 +416,17 @@ class AnnotatedValue(BaseModel):
     `source` is the LLM-authored publisher/origin of an external lookup's value
     (e.g. the data provider the lookup agent pulled it from) — the external-lookup
     analog of the machine-stamped corpus provenance below, which it cannot fill.
-    Empty for corpus extracts (whose provenance is `bulletin`/`pages`).
+    Empty for corpus extracts (whose provenance is `doc_id`/`pages`).
 
-    Provenance (`bulletin`/`pages`/`requested_period`/`retrieve_key`) is
+    Provenance (`doc_id`/`pages`/`requested_period`/`retrieve_key`) is
     machine-stamped from the extract inputs — the source page refs and the
     retrieve branch — NOT authored by the LLM. It is absent (None/empty) for
-    external lookups. `bulletin` is the issue the value
-    was printed in ("YYYY-MM", lexically sortable = chronological); downstream
-    compute uses it to sort/filter by publication date — e.g. to pick the
-    latest non-revised vintage across several bulletins, where the LLM-written
-    `description` of the same series+period can be identical across issues.
+    external lookups. `doc_id` is the source document the value was read from,
+    carried as that document's id — its parsed-JSON/PDF filename stem (e.g.
+    "combined_statement__historical__cs-1872"). It identifies the source
+    document, not a date; the data window the value covers lives in
+    `requested_period` (and the page's own data span), so any chronological
+    ordering keys off period, not `doc_id`.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -442,7 +443,7 @@ class AnnotatedValue(BaseModel):
 
     # Provenance — copied from the source page/branch at extract time, never
     # LLM-written. Defaults keep external lookups and old payloads valid.
-    bulletin: str | None = None  # source issue "YYYY-MM" (publication date)
+    doc_id: str | None = None  # source document id (filename stem); None for external lookups
     pages: tuple[int, ...] = ()  # source PDF page(s); () when unattributable
     requested_period: str | None = None  # branch.period — data window requested
     retrieve_key: str | None = None  # branch.key — concept this datum serves
@@ -531,10 +532,10 @@ _PAD = "         "  # 9-space continuation indent for an entry's detail lines
 
 def _provenance_str(e: AnnotatedValue) -> str:
     """One-line provenance for the schema view — only the fields that are set, so
-    external lookups (no bulletin) stay uncluttered. Empty string when nothing is set."""
+    external lookups (no doc_id) stay uncluttered. Empty string when nothing is set."""
     parts: list[str] = []
-    if e.bulletin:
-        parts.append(f"bulletin={e.bulletin!r}")
+    if e.doc_id:
+        parts.append(f"doc_id={e.doc_id!r}")
     if e.pages:
         parts.append(f"pages={list(e.pages)!r}")
     if e.source:

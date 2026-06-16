@@ -51,7 +51,7 @@ class RetrieveOp:
 
         `branch_ids` aligns each branch to its stable id so its retrieve runs in a per-branch
         `traced_step`: the rollout + the returned pages then attach to that branch in the
-        trace viewer. `document_scopes` hard-scopes a branch's corpus to a set of bulletins
+        trace viewer. `document_scopes` hard-scopes a branch's corpus to a set of documents
         (HITL human-required documents)."""
         if ctx.config.golden_pages is not None:
             # --golden ablation: inject the benchmark pages verbatim, already final.
@@ -70,10 +70,10 @@ class RetrieveOp:
                 ) -> BranchRetrieval:
                     # Per-branch `retrieve` step (branch_id=bid) so the SearchAgent rollout
                     # and its `pages` summary group under this branch in the viewer. `scope`
-                    # (human-required bulletins, if any) hard-scopes the agent's corpus.
+                    # (human-required documents, if any) hard-scopes the agent's corpus.
                     refs = await traced_step(
                         ctx, "retrieve",
-                        lambda: self._run_search_agent(ctx, b, required_bulletins=scope),
+                        lambda: self._run_search_agent(ctx, b, required_docs=scope),
                         branch_id=bid,
                     )
                     return BranchRetrieval(pages=tuple(refs))
@@ -105,7 +105,7 @@ class RetrieveOp:
         ctx: ExecutionContext,
         branch: RetrieveBranch,
         *,
-        required_bulletins: list[str] | None = None,
+        required_docs: list[str] | None = None,
     ) -> list[PageRef]:
         from skunk.search_agent import SearchAgent
 
@@ -119,21 +119,21 @@ class RetrieveOp:
                 if ctx.human_intervention_enabled
                 else None
             ),
-            required_bulletins=required_bulletins,
+            required_docs=required_docs,
         )
         page_keys = await agent.retrieve(
             ctx,
             ctx.question,
             branch_key=branch.key,
             branch_period=branch.period,
-            required_bulletins=required_bulletins,
+            required_docs=required_docs,
         )
         refs: list[PageRef] = []
         bad: list[str] = []
         for key in page_keys:
             try:
                 ref = page_key_to_pageref(key)
-                if required_bulletins and ref.month not in required_bulletins:
+                if required_docs and ref.month not in required_docs:
                     bad.append(key)
                     continue
                 refs.append(ref)

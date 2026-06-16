@@ -111,13 +111,13 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         sampling_params: dict | None = None,
         capture_logprobs: bool = False,
         human_intervention_handler: HumanInterventionHandler | None = None,
-        required_bulletins: list[str] | None = None,
+        required_docs: list[str] | None = None,
     ):
         self.config = config
         self.chroma_collection = chroma_collection
         required_doc_prefixes = {
-            bulletin.replace("-", "_") + "_"
-            for bulletin in required_bulletins or []
+            doc.replace("-", "_") + "_"
+            for doc in required_docs or []
         }
         self.document_map = (
             {
@@ -130,15 +130,15 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         )
         self.emb_client, self.emb_model_id = _make_embedding_client(config.emb_model_id)
         required_filter = None
-        if required_bulletins:
+        if required_docs:
             clauses = [
                 {
                     "$and": [
-                        {"year": bulletin[:4]},
-                        {"month": bulletin[5:]},
+                        {"year": doc[:4]},
+                        {"month": doc[5:]},
                     ]
                 }
-                for bulletin in required_bulletins
+                for doc in required_docs
             ]
             required_filter = clauses[0] if len(clauses) == 1 else {"$or": clauses}
 
@@ -290,17 +290,17 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         *,
         branch_key: str | None = None,
         branch_period: str | None = None,
-        required_bulletins: list[str] | None = None,
+        required_docs: list[str] | None = None,
     ) -> list[str]:
         parts = [f"Question: {question}"]
         if branch_key:
             parts.append(f"Search focus: {branch_key}")
         if branch_period:
             parts.append(f"Time period (of the data): {branch_period}")
-        if required_bulletins:
+        if required_docs:
             parts.append(
-                "Human-required source bulletins (hard scope): "
-                + ", ".join(required_bulletins)
+                "Human-required source documents (hard scope): "
+                + ", ".join(required_docs)
             )
         payload = await self.call(ctx, "\n".join(parts))
         return self._page_keys_from_payload(payload)

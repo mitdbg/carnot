@@ -62,14 +62,14 @@ _EDITABLE_FIELDS = ("description", "unit", "value")
 def _candidate_dicts(entries: list[AnnotatedValue]) -> list[dict]:
     """The model's values for the review UI: the editable field set PLUS read-only `notes` (the
     LLM's extract-time page context), `source`/`retrieve_key` (an external lookup's publisher +
-    target), and an `external` flag. A value with no corpus provenance (no `bulletin`/`pages`) is
+    target), and an `external` flag. A value with no corpus provenance (no `doc_id`/`pages`) is
     an external lookup, not a corpus extract — flagged so the UI can label it (priority) and show
     its target/src instead of a (nonexistent) source page. Display-only: the human edits only
     `_EDITABLE_FIELDS`; everything else rides back untouched via `_src`."""
     out: list[dict] = []
     for c in entries:
         d = c.model_dump(include=set(_FIELDS) | {"notes", "source", "retrieve_key"})
-        d["external"] = not (c.bulletin or c.pages)
+        d["external"] = not (c.doc_id or c.pages)
         out.append(d)
     return out
 
@@ -111,25 +111,25 @@ def _value_page_attribution(
     entries: list[AnnotatedValue],
 ) -> tuple[list[PageRef], list[dict]]:
     """Map each extracted VALUE back to the actual page(s) it was read from — every
-    `AnnotatedValue` carries its own machine-stamped `bulletin`+`pages` — so a review shows ONLY
+    `AnnotatedValue` carries its own machine-stamped `doc_id`+`pages` — so a review shows ONLY
     those pages, not the whole sem-filter survivor pool, and can label each page with the value(s)
     that came from it. Returns `(refs, page_values)` where `page_values` is
     `[{"month","page","values":[description,...]}]` in page order. `([], [])` when no entry is
-    attributable (e.g. a multi-bulletin extract left provenance empty) — the caller then falls
+    attributable (e.g. a multi-document extract left provenance empty) — the caller then falls
     back to the block pool so the viewer is never empty."""
     refs: list[PageRef] = []
     page_values: list[dict] = []
     by_key: dict[tuple[str, int], list[str]] = {}
     for entry in entries:
-        if not entry.bulletin or not entry.pages:
+        if not entry.doc_id or not entry.pages:
             continue
         for page in entry.pages:
-            key = (entry.bulletin, page)
+            key = (entry.doc_id, page)
             descs = by_key.get(key)
             if descs is None:
                 by_key[key] = descs = []  # same list object lands in page_values below
-                refs.append(PageRef(month=entry.bulletin, page=page))
-                page_values.append({"month": entry.bulletin, "page": page, "values": descs})
+                refs.append(PageRef(month=entry.doc_id, page=page))
+                page_values.append({"month": entry.doc_id, "page": page, "values": descs})
             if entry.description and entry.description not in descs:
                 descs.append(entry.description)
     return refs, page_values
@@ -186,7 +186,7 @@ class HumanRequest:
     candidates: list[AnnotatedValue]
     pages: list[PageRef] = field(default_factory=list)
     # Per-page value attribution [{month,page,values:[desc,...]}] — which extracted value(s) came
-    # from each page, so the viewer can caption a page with its bulletin + value(s).
+    # from each page, so the viewer can caption a page with its doc_id + value(s).
     page_values: list[dict] = field(default_factory=list)
     # Figure task only: a pre-filled AnnotatedValue JSON template (description = retrieval target)
     # the human edits while reading the chart, in place of confirm/correct candidate cards.
@@ -518,14 +518,14 @@ class HumanAssist:
         on `wants_pool_review`; no-op when no register hook is wired (local CLI).
 
         `source_values` (the PRE-clean pool) is the page-attribution source: data-prep coalesces
-        values across bulletins and collapses `bulletin` to a RANGE ("1985-03..1987-06"), which
-        can't map a page to a single renderable PDF. The pre-clean values still carry one bulletin
-        each, so the viewer resolves their pages. Falls back to `pool` when not given."""
+        values across documents and collapses `doc_id` to a JOINED list, which can't map a page to
+        a single renderable PDF. The pre-clean values still carry one doc_id each, so the viewer
+        resolves their pages. Falls back to `pool` when not given."""
         register = ctx.human_review_register
         if register is None:
             return None
         # Show the pages the values were pulled from (per-value provenance). Attribute from the
-        # pre-clean values (single bulletin each) so coalesced range-bulletins don't break the
+        # pre-clean values (single doc_id each) so coalesced multi-doc values don't break the
         # viewer. Lookup-derived values carry no page provenance and simply appear as cards with
         # no page; that's expected.
         refs, page_values = _value_page_attribution(

@@ -21,6 +21,7 @@ RENDERS_SUBDIR = (
     "renders"  # lazy 200-DPI page-image cache (written on first vision read)
 )
 TREE_FILE = "concept_tree.json"  # era-keyed concept tree (ConceptTree)
+SEARCH_INDEX_FILE = "search_index.sqlite"  # prebuilt FTS5 page index the `search_corpus` tool runs SQL against
 
 
 def page_index_root() -> Path:

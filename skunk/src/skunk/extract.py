@@ -209,21 +209,22 @@ def _stamp_provenance(
     branch: RetrieveBranch,
 ) -> list[AnnotatedValue]:
     """Copy machine-fact provenance from the source refs + branch onto each entry —
-    never LLM-written. `bulletin`/`pages` are attributable only when every ref in the
-    call shares one bulletin month (otherwise we can't tell which issue a value came
-    from, so they're left empty). Branch fields (`period`/`key`) are call-level
-    and always stamped. The model is frozen, so we rebuild via `model_copy`."""
-    months = {r.month for r in refs if r.month}
-    bulletin = next(iter(months)) if len(months) == 1 else None
+    never LLM-written. `doc_id`/`pages` are attributable only when every ref in the
+    call shares one source document (otherwise we can't tell which document a value came
+    from, so they're left empty). `doc_id` is that document's id (filename stem). Branch
+    fields (`period`/`key`) are call-level and always stamped. The model is frozen, so we
+    rebuild via `model_copy`."""
+    source_docs = {r.month for r in refs if r.month}
+    doc_id = next(iter(source_docs)) if len(source_docs) == 1 else None
     pages = (
         tuple(sorted({r.page for r in refs if r.page is not None}))
-        if bulletin is not None
+        if doc_id is not None
         else ()
     )
     return [
         e.model_copy(
             update={
-                "bulletin": bulletin,
+                "doc_id": doc_id,
                 "pages": pages,
                 "requested_period": branch.period,
                 "retrieve_key": branch.key,
@@ -286,7 +287,7 @@ relevant is found). Pick the shape that best preserves the page structure:
 
 Cells should be simple number or string — no nested cells. A numeric cell is
 a bare number: keep print flags (r, p) and footnote markers (2/) out of the
-value; record any that bear on the question in `notes`.
+value; record these instead in `notes`.
 
 Transcribe numbers exactly as printed — every digit and decimal place;
 never round, truncate, or drop trailing digits.
@@ -294,7 +295,7 @@ never round, truncate, or drop trailing digits.
 ## Field semantics
 
 description   natural-language label uniquely identifying the datum
-              (series + period + sub-category), using the page's
+              (series + period + sub-category), prefer the page's
               verbatim row/column/caption wording.
 
 notes         the page's textual context bearing on the question:
@@ -332,8 +333,7 @@ You retrieve printed values from page text to fulfill a specific lookup. The
 user message gives the lookup (and period, when stated), the question it
 serves, page metadata (each block's title), and the page text. Work out from
 the table markup in the text which column/row a value sits under, the
-period, and the units. Emit one entry per
-distinct row that could plausibly satisfy the lookup, including partial
+period, and the units. Emit all data that could satisfy the lookup, including partial
 matches. Extract only what is printed — never compute or transform; every
 numeric value must appear verbatim in the page text (metadata is context, not
 a source of values). A period `YYYY-MM..YYYY-MM` is an inclusive month
@@ -523,12 +523,10 @@ class VisionExtractor:
 You retrieve visible values from rendered page images to fulfill a specific
 lookup. The user message gives the lookup (and period, when stated), the
 question it serves, and a numbered list of the attached images. Emit every
-visible value that could plausibly satisfy the lookup, and ONLY those: never
-transcribe a whole table — emit just the rows/series the lookup and its
-period need. Extract only what is visibly printed — never compute or
-transform — except when the question asks for visual understanding of a
-chart (e.g. counting bars above a threshold).
-A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
+visible value that could plausibly satisfy the lookup, including partial matches.
+When the question asks for visual understanding of a chart (e.g. counting bars above a threshold),
+you may directly answer the question. Otherwise, extract only what is visibly printed — never compute or
+transform. A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
 
     _prompt = PromptedCall(
         name="extract.vision",
@@ -575,9 +573,9 @@ A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
             entries = []
         ctx.emit(f"vision_result tier=vision n_entries={len(entries)}")
         # Stamp provenance from the rendered refs. A single vision call may span
-        # several issues (no per-image attribution on the reply), so bulletin/pages
-        # land only when all images share one bulletin — the common single-issue
-        # branch; multi-issue calls keep bulletin empty.
+        # several documents (no per-image attribution on the reply), so doc_id/pages
+        # land only when all images share one source document — the common single-doc
+        # branch; multi-doc calls keep doc_id empty.
         return _stamp_provenance(entries, rendered_refs, branch)
 
 

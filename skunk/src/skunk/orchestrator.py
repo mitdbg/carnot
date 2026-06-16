@@ -274,8 +274,8 @@ class Orchestrator:
                     # superseded/replanning round never has an open pool review — so a human can't
                     # be mid-edit on a review the orchestrator is about to discard, and the
                     # recompute snapshot always matches the data behind the answer. Page attribution
-                    # uses the PRE-clean pool (single bulletin each); the cleaned pool's coalesced
-                    # range-bulletins can't resolve to a PDF.
+                    # uses the PRE-clean pool (single doc_id each); the cleaned pool's coalesced
+                    # multi-doc values can't resolve to a PDF.
                     self._capture_recompute_pool(pool, explanations)
                     if self._human.wants_pool_review(self._ctx):
                         self._human.register_pool_review(
@@ -488,7 +488,7 @@ class Orchestrator:
             "data_prep_output": [
                 entry.model_dump(
                     mode="json",
-                    include={"description", "value", "unit", "kind", "bulletin", "pages"},
+                    include={"description", "value", "unit", "kind", "doc_id", "pages"},
                 )
                 for entry in pool
             ],
@@ -550,7 +550,7 @@ class Orchestrator:
         one normalized `BranchRetrieval` (its whole pages) per branch — or the `StepFailed` to
         attribute to it. `RetrieveOp.run_all` owns all backend dispatch. `branch_ids` lets the
         search-agent backend emit a per-branch `retrieve` step; `document_scopes` hard-scopes a
-        branch's corpus to human-required bulletins (HITL)."""
+        branch's corpus to human-required documents (HITL)."""
         if not branches:
             return []
         try:
@@ -588,7 +588,7 @@ class Orchestrator:
         # sweep, then each branch's routed refs feed its own extract. Lookup branches are
         # independent and run in the per-branch tail below. `document_scopes` (keyed by
         # stable branch id) hard-scopes a retrieve branch's corpus to human-required
-        # bulletins — the HITL "annotate this branch's source documents" recovery action.
+        # documents — the HITL "annotate this branch's source documents" recovery action.
         self._last_executed_branch_ids = set(branch_ids)
         retrieve_pos = [i for i, b in enumerate(branches) if b.kind == "retrieve"]
         retrievals = await self._run_retrieve_phase(

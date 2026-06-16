@@ -105,9 +105,10 @@ class FredTool(Tool):
 
     doc = """\
 ### fetch_fred(endpoint, params={})
-FRED API (https://fred.stlouisfed.org/docs/api/fred/). `endpoint` is a FRED path,
-`params` its query args; returns parsed JSON. Pull a whole series in one call via
-`frequency`/`aggregation_method`; don't loop single observations.
+FRED API. `endpoint` is a FRED path,
+`params` its query args; auth + `file_type=json` are injected; returns parsed JSON.
+Pull a whole series in one call via `frequency`/`aggregation_method`; don't loop
+single observations.
 ```python
 resp = fetch_fred("series/observations",
                   {"series_id": "PSAVERT", "observation_start": "1959-01-01",
@@ -116,8 +117,35 @@ resp = fetch_fred("series/observations",
 obs = [(o["date"], float(o["value"])) for o in resp["observations"] if o["value"] != "."]
 hits = fetch_fred("series/search", {"search_text": "personal saving rate"})  # find a series_id
 ```
+**Endpoints** you'll use most: `series/observations` (the data values) and
+`series/search` (find a `series_id` from words). Others: `series` (one series'
+metadata), `category/series`, `release/series`, `tags/series`.
+
+**`series/observations` params:**
+- `series_id` (required).
+- `observation_start` / `observation_end`: `YYYY-MM-DD` (defaults: full history).
+- `frequency`: aggregate to a LOWER frequency — `d`, `w`, `bw`, `m`, `q`, `sa`, `a`
+  (default: the series' native frequency; you cannot up-sample above native, e.g. a
+  monthly series can't be requested as `d`).
+- `aggregation_method`: `avg` (default), `sum`, `eop` (end of period) — only takes
+  effect together with `frequency`.
+- `units` (value transform): `lin` (levels, default), `chg`, `ch1` (chg from yr ago),
+  `pch` (% chg), `pc1` (% chg from yr ago), `pca`, `cch`, `cca`, `log`.
+- `sort_order`: `asc` (default) / `desc`. `limit`: 1–100000 (default 100000); `offset`.
+- `output_type`: `1` latest-revised (default), `4` initial-release-only; or pass
+  `vintage_dates` (comma-sep `YYYY-MM-DD`) to get data as it stood on those dates.
+- Returns `{"observations": [{"date","value", ...}, ...]}`; a `value` of `"."` is
+  missing — skip it.
+
+**`series/search` params:** `search_text` (required); `search_type` `full_text`
+(default) or `series_id`; `limit`; `order_by` (e.g. `search_rank`, `popularity`,
+`observation_start`); narrow with `filter_variable`+`filter_value` or `tag_names`.
+Returns `{"seriess": [{"id","title","frequency","units","seasonal_adjustment",
+"observation_start","observation_end","popularity"}, ...]}` — pick the `id`, then
+read it with `series/observations`.
+
 FX/rate spot series (EXUSUK, EXCAUS, DEX*) from ~1971; CPI (CPIAUCSL SA, CPIAUCNS
-NSA) from 1947. Pre-API history returns nothing — use tavily_search / fetch_url."""
+NSA) from 1947. Pre-API history returns nothing."""
 
 
 class BlsTool(Tool):
@@ -138,15 +166,33 @@ class BlsTool(Tool):
 
     doc = """\
 ### fetch_bls(payload)
-BLS Public Data API v2 timeseries/data (https://www.bls.gov/developers/api_signature_v2.htm).
-`payload` is the POST body; returns parsed JSON.
+BLS Public Data API v2 `timeseries/data` endpoint. `payload` is the POST body;
+your `registrationkey` is injected for you; returns parsed JSON.
 ```python
 resp = fetch_bls({"seriesid": ["CUUR0000SA0"], "startyear": "1960",
                   "endyear": "1962", "annualaverage": True})
 data = resp["Results"]["series"][0]["data"]   # [{year, period, periodName, value}, ...]
 ```
-≤20 years and ≤50 series per request (10/25 without a key). CPI-U: CUUR0000SA0
-(NSA) / CUSR0000SA0 (SA); annual average is period "M13" (set annualaverage=True)."""
+**Payload fields:**
+- `seriesid`: list of BLS series IDs (the only required field). IDs are uppercase and
+  may contain `_ - #` but no lowercase/special chars.
+- `startyear` / `endyear`: 4-digit year strings; span ≤20 years per request.
+- `annualaverage`: `True` to include the annual average, returned as a row with
+  `period == "M13"` (`periodName == "Annual"`).
+- `calculations`: `True` adds a `calculations` object per data point with
+  `net_changes` and `pct_changes` over 1/3/6/12-period windows.
+- `catalog`: `True` adds series metadata (where licensed); `aspects`: `True` adds
+  data aspects. `registrationkey` is handled for you (don't set it).
+
+**Response:** `{"status","responseTime","message",
+"Results": {"series": [{"seriesID","data": [...]}]}}`. Each `data` entry is
+`{"year","period","periodName","value","footnotes": [...]}` (+ `calculations` if
+requested). Monthly `period` is `"M01"`–`"M12"`; quarterly `"Q01"`–`"Q04"`; annual
+average `"M13"`. `value` is a string — cast it. `status != "REQUEST_SUCCEEDED"`
+means the query failed; read `message` for why.
+
+**Per-request caps:** ≤50 series and ≤20 years per call — split a wider span across
+calls. CPI-U: `CUUR0000SA0` (NSA) / `CUSR0000SA0` (SA)."""
 
 
 class WorldBankTool(Tool):
@@ -165,15 +211,31 @@ class WorldBankTool(Tool):
 
     doc = """\
 ### fetch_world_bank(path, params={})
-World Bank Indicators API v2 (https://datahelpdesk.worldbank.org/knowledgebase/articles/889392).
-`path` follows `/v2/`, `params` its query args; returns a [metadata, [observations]] list.
+World Bank Indicators API v2 (no key required). `path` follows
+`/v2/`, `params` its query args; `format=json` is injected; returns a
+`[metadata, [observations]]` list.
 ```python
 resp = fetch_world_bank("country/USA/indicator/NY.GDP.MKTP.CD",
                         {"date": "2003:2012", "per_page": 100})
-rows = resp[1]   # [{"date": "2012", "value": 16253970000000.0, ...}, ...]
+meta, rows = resp           # rows: [{"date": "2012", "value": 1.6e13, ...}, ...]
 ```
-Annual data from ~1960; country via ISO-3 codes. Common: NY.GDP.MKTP.CD,
-NY.GDP.MKTP.CN, SP.POP.TOTL, NY.GDP.PCAP.CD."""
+**Path:** `country/{code}/indicator/{indicator}`. `{code}` is an ISO-3 country code
+(or 2-letter), `all`, or several joined by `;` (e.g. `USA;GBR;JPN`). Multiple
+indicators likewise join with `;`. Aggregate regions have their own codes (e.g.
+`WLD` world, `EUU` EU, `OED` OECD).
+
+**Params:** `date` a year or `start:end` range (e.g. `"2003:2012"`); `per_page`
+(default 50, max 32500 — set high to avoid paging) and `page`; `mrv=N` most-recent N
+values; `mrnev=N` most-recent N non-empty; `gapfill=Y`; `frequency` `Y`/`Q`/`M`;
+`source` to pin a specific database.
+
+**Response:** element `[0]` is metadata (`page`, `pages`, `per_page`, `total`); check
+`pages > 1`. Element `[1]` is the observations list, each
+`{"indicator": {"id","value"}, "country": {"id","value"}, "countryiso3code",
+"date","value","unit","obs_status","decimal"}`. `value` is a number or `null`
+(missing); newest year first. Annual data from ~1960. Common indicators:
+`NY.GDP.MKTP.CD` (GDP current US$), `NY.GDP.MKTP.CN` (GDP current LCU),
+`SP.POP.TOTL` (population), `NY.GDP.PCAP.CD` (GDP per capita US$)."""
 
 
 class TavilySearchTool(Tool):
@@ -194,19 +256,31 @@ class TavilySearchTool(Tool):
 
     doc = """\
 ### tavily_search(query, **kwargs)
-Tavily web search (https://docs.tavily.com/api-reference/endpoint/search). `query`
-+ kwargs (max_results [default 10], search_depth, time_range, include_domains,
-exclude_domains, ...); returns JSON. Results are short snippets only (`content`) —
-the exact figure is often NOT in the snippet, so fetch_url a promising hit's `url`
-for the full page text (where data tables live).
+Tavily web search.
+`query` + kwargs; auth is injected and `include_answer` is forced off (its synthesized
+answer can hallucinate numbers — don't rely on it). Returns JSON. Results are short
+snippets only (`content`) — the exact figure is often NOT in the snippet, so fetch_url
+a promising hit's `url` for the full page text.
 ```python
 resp = tavily_search("annual average GBP USD exchange rate 1941",
                      include_domains=["measuringworth.com"])
 for h in resp["results"]:
-    print(h["url"], "—", h["content"])
+    print(h["url"], "—", h["content"], h["score"])
 page = fetch_url(resp["results"][0]["url"])   # full text of the best hit
 ```
-For values the structured APIs lack — pre-1971 FX, pre-API series, one-off figures."""
+**Useful kwargs:**
+- `max_results`: 0–20 (default 10 here). `search_depth`: `basic` (default) or
+  `advanced` (deeper, costs more) — use `advanced` for hard/obscure figures.
+- `include_domains` / `exclude_domains`: lists of domains to whitelist/blacklist —
+  the strongest lever for steering to an authoritative source.
+- `topic`: `general` (default), `news`, or `finance`. `time_range`: `day`/`week`/
+  `month`/`year` (or `d`/`w`/`m`/`y`); or `start_date`/`end_date` as `YYYY-MM-DD`.
+- `include_raw_content=True` returns each hit's cleaned full text inline (`raw_content`),
+  which can save a follow-up `fetch_url`. `chunks_per_source` (1–3, advanced only).
+
+**Response:** `{"query","results": [...], "response_time", ...}`. Each result is
+`{"title","url","content" (snippet),"score" (relevance 0–1),"raw_content" (if
+requested)}`. Results are ranked by `score`; prefer the top hit from a trusted domain."""
 
 
 class FetchUrlTool(Tool):
@@ -230,12 +304,16 @@ class FetchUrlTool(Tool):
         return re.sub(r"\s+", " ", text)[:max_chars]
 
     doc = """\
-### fetch_url(url)
-Fetch a URL → cleaned page text. Soft-fails on errors.
+### fetch_url(url, max_chars=50000)
+Fetch a URL → cleaned visible page text (HTML stripped, nav/scripts/footers dropped,
+prefers `<main>`/`<article>`). Truncated to `max_chars` (default 50000); raise it for
+long pages. Soft-fails: on any error returns a `"[fetch_url error: ...]"` string
+instead of raising, so check for that marker before parsing.
 ```python
 text = fetch_url("https://example.com/historical-rates")
 ```
-Read a specific page found via tavily_search when you need more than the snippet."""
+Read a specific page found via tavily_search when you need more than the snippet.
+Returns plain text only — no JS-rendered content and no tables-as-structure."""
 
 
 # All available lookup tools, keyed by the name the model calls. The final answer
@@ -245,11 +323,26 @@ _REGISTRY: dict[str, Tool] = {
     t.name: t for t in (FredTool(), BlsTool(), WorldBankTool(), TavilySearchTool(), FetchUrlTool())
 }
 
-# Default prioritization guidance (was the inline paragraph in the agent prompt).
+# Source-selection ladder, folded statically into the lookup agent's briefing.
+# Maps a target to the tool to reach for, preferring structured APIs over web search.
 DEFAULT_PRIORITIZATION = """\
-Commit the first plausible hit: once a tool output contains a number that answers
-the target, your next block is your final-answer ```json``` block. Historical values
-vary slightly across sources — don't keep searching for confirmation."""
+Pick the source by what the target is, preferring a structured API (clean, exact
+series) over web search:
+1. U.S. macro & financial series — interest rates, exchange rates, headline CPI/inflation,
+   monetary aggregates, national accounts: `fetch_fred` (find the series_id with
+   `series/search`, then pull `series/observations`).
+2. U.S. labor & granular price detail — CPI components, employment, wages, productivity:
+   `fetch_bls`.
+3. Cross-country / international indicators — GDP, population, other country-level series:
+   `fetch_world_bank`.
+4. Anything not in a structured series above — historical or one-off figures, obscure
+   publishers, a pinned `src` with its own site: `tavily_search`, then `fetch_url` the
+   best hit to read the value off the page (snippets often omit the exact figure; don't
+   re-search when you already have the right URL).
+
+When `src` is pinned, go straight to the tool that reaches that publisher (often
+`tavily_search` + `fetch_url` on its site), even if a structured API carries a
+similar series."""
 
 
 def resolve_lookup_tools(config: "SkunkConfig", explicit: list[Tool] | None = None) -> list[Tool]:

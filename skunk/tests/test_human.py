@@ -96,11 +96,13 @@ def test_candidates_json_drops_provenance():
         value=18,
         unit="count",
         retrieve_key="secret",
-        bulletin="1990-09",
+        doc_id="combined_statement__modern__1990__c10",
     )
     dumped = _candidates_json([av])
     assert (
-        "secret" not in dumped and "1990-09" not in dumped and '"value": 18' in dumped
+        "secret" not in dumped
+        and "combined_statement__modern__1990__c10" not in dumped
+        and '"value": 18' in dumped
     )
 
 
