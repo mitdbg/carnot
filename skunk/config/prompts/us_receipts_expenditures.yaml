@@ -381,6 +381,11 @@ overrides:
       string "nan" is an EMPTY cell, not data; values may be exact dollars with
       cents; one cell can pack several tokens (two appropriation symbols
       "86X4070 86X4072") — keep them verbatim, do not split or invent.
+      Because values are model-transcribed from scans, a figure can carry digit
+      errors (transposed or merged digits, a comma read as a space). When a
+      value feeds a total or the question sums rows, cross-check it against the
+      page's own printed subtotal/total and prefer the reading consistent with
+      the table's arithmetic.
 
   - section: lessons
     targets: [extract.text, extract.vision]
@@ -388,7 +393,10 @@ overrides:
       Watch for qualifier-mismatched rows. These statements stack rows whose
       labels differ by a subtle modifier — "ordinary receipts" vs "total
       receipts", gross vs net, "held by the public" vs "held by Government
-      accounts", total vs a subtotal, a maturing flow vs an outstanding stock.
+      accounts", general vs special vs trust fund, the warrants-issued vs the
+      checks-issued basis, receipts by source (customs / internal revenue /
+      public lands), total vs a subtotal, a maturing flow vs an outstanding
+      stock.
       The lookup is satisfied only by a row matching the requested series
       including EVERY qualifier. Emit each variant as its own entry with the
       page's verbatim row text in `description`; if only a near-match is
