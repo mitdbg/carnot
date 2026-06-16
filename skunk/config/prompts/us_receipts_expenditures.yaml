@@ -1,0 +1,437 @@
+# Prompt overrides for the OfficeQA U.S. Receipts & Expenditures corpus
+# (the "Combined Statement of Receipts and Expenditures of the United States"
+# series, plus the early govinfo receipts-and-expenditures volumes).
+#
+# Each entry adds a corpus blurb, a list of few-shot example strings, or a list
+# of lessons to one or more target agents (targets are `PromptedCall` names).
+# Agents fish out their own entries at prompt-build time. See
+# src/skunk/prompted_call.py for the schema and how entries are consumed.
+#
+# Select this file at runtime via
+#   SKUNK_PROMPT_OVERRIDES=config/prompts/us_receipts_expenditures.yaml
+# (or `config.prompt_overrides_path`; the datagen harness maps the dataset
+# name us-receipts-expenditures -> this file).
+#
+# The PDFs are IMAGE-ONLY scans (no text layer): all element text is OCR/VLM
+# output. Document identity lives in the filename slug; there is no in-document
+# era/section field. See docs/corpus-investigation-artifact.html.
+
+overrides:
+  # ---------------------------------------------------------------------
+  # Corpus blurbs — one per agent that mentions the dataset.
+  # ---------------------------------------------------------------------
+  - section: corpus
+    targets: [planner, replanner]
+    content: |
+      Questions are answered against the U.S. Receipts & Expenditures corpus:
+      the annual "Combined Statement of Receipts and Expenditures of the United
+      States" (fiscal years 1872–2024) plus the early govinfo receipts volumes
+      (publication years ~1793–1893). Emit period as canonical month ranges
+      (YYYY-MM, YYYY-MM..YYYY-MM, or a comma-separated list of these), never
+      natural language — expand fiscal years, calendar years, and quarters to
+      months yourself per the date conventions below. The data is annual
+      (fiscal-year totals and year-end balances), so most periods are whole
+      fiscal years.
+
+  # Publication cadence + coverage — issue/volume choice must target a document
+  # that actually exists for the requested year and concept.
+  - section: corpus
+    targets: [planner, replanner, select_agent]
+    content: |
+      Publication cadence: one volume per year (no monthly/quarterly issues).
+        - govinfo_receipts: annual, publication years ~1793–1893 (with gaps;
+          some years printed more than once; heterogeneous in scope — some
+          whole-government, some a single department such as the Post Office).
+          The bucket year is the PUBLICATION year; the data inside is for the
+          prior 1–2 years.
+        - combined_statement: annual, fiscal years 1872–2024, in three eras —
+          historical (FY1872–FY1994), transition (FY1995–2000),
+          modern (FY2001–FY2024).
+      Fiscal years 1872–1893 appear in BOTH collections; prefer the
+      combined_statement (historical) copy and never commit both. Two SERIES
+      run in parallel: the DETAILED "Combined Statement" / "Appendix" (full
+      line items — use for any specific figure) and the slim "Annual Report"
+      (Treasury's annual financial report, ~1974 on; the transition "annrpt"
+      volumes — summary highlights and financial statements only).
+
+  # Shared date math — the planner expands question dates; the page-index build
+  # agents resolve dates printed on a page. Same conventions, stated once.
+  - section: corpus
+    targets: [planner, replanner, page_scan, page_scan_vision, toc_outline, toc_reconstruct, chapter_merge, era_segment, era_merge]
+    content: |
+      Date conventions. Carefully distinguish (a) the fiscal year a statement
+      REPORTS, (b) the year it was PUBLISHED, and (c) calendar vs fiscal year.
+      Combined_statement documents are keyed by the fiscal year they report;
+      govinfo_receipts documents are keyed by PUBLICATION year and report data
+      for the prior 1–2 years (the 1827 volume reports the year 1825).
+      Calendar year YYYY = YYYY-01..YYYY-12. Quarter Qn YYYY = that quarter's
+      three months. Fiscal year FYy = the 12 months ending in year y:
+      (y-1)-10..y-09 from FY1977 on, (y-1)-07..y-06 through FY1976
+      (FY1968 = 1967-07..1968-06; FY2008 = 2007-10..2008-09). The months
+      1976-07..1976-09 are the FY1976→FY1977 "transition quarter" and belong to
+      NEITHER fiscal year — pin them directly. (This 1976 transition quarter is
+      unrelated to the 1995–2000 "transition" era.)
+
+  - section: corpus
+    targets: [extract.text, extract.vision, extract.confirm]
+    content: |
+      The pages you receive are scanned images from the U.S. Combined Statement
+      of Receipts and Expenditures (or the early govinfo receipts volumes).
+      There is no text layer — the text is OCR-derived; read values exactly as
+      printed and do not "correct" them to expectation.
+
+  - section: corpus
+    targets: [select_agent]
+    content: |
+      The blocks are from the U.S. Combined Statement (and early govinfo
+      receipts volumes). The same figure can appear more than once: in the
+      year-end statement for its own fiscal year, again as a prior-year
+      "comparative" column in the next year's volume, and in both the slim
+      Annual Report (summary) and the detailed Appendix (line item).
+
+  - section: lessons
+    targets: [select_agent]
+    content: |
+      Commit the volume whose REPORTING fiscal year equals the requested data year; for govinfo, that volume was PUBLISHED 1–2 years later, so to find data for year D look in the volume bucketed D+1 or D+2.
+      Prefer the DETAILED Combined Statement / Appendix for any specific line item; the slim Annual Report carries only summary highlights — do not commit it for a figure that needs the detail series.
+      A figure restated as a prior-year comparative column in a later volume is a fallback, not the first choice; if the question asks for the value "as later reported / revised", commit the later restated volume instead — never both.
+      Fiscal years 1872–1893 exist in both govinfo_receipts and combined_statement(historical); commit one (prefer combined_statement) and discard the duplicate.
+      A label wrapping the concept in extra words ("... and related activities", "..., including ...") is a broader aggregate; prefer the exact asked scope, and confirm the row labels carry the needed dates at the needed basis before committing.
+
+  # Renders under the search-agent SYSTEM prompt's `## Dataset` header.
+  # TODO(maintainer): transcribe the exact doc_id/chunk_id string format and the
+  # exact metadata_filter key names from the index build before relying on this
+  # for retrieval — the dimensions here are grounded in the corpus, the precise
+  # keys/format are not yet verified against the indexer.
+  - section: corpus
+    targets: [search_agent]
+    content: |
+      The corpus is the U.S. "Combined Statement of Receipts and Expenditures
+      of the United States" (annual; fiscal years 1872–2024, in three eras:
+      historical FY1872–FY1994, transition FY1995–2000, modern FY2001–FY2024)
+      plus the early govinfo receipts-and-expenditures volumes (annual;
+      publication years ~1793–1893). Each source document is split into pages,
+      and each page is treated as one "document" (its own `doc_id`). The PDFs
+      are image-only scans, so all text/tables are OCR/VLM-extracted.
+
+      ### Identifiers and metadata
+      The exact `doc_id` / `chunk_id` string format and the exact
+      `metadata_filter` key names come from the index build — use them as
+      configured there. The addressing dimensions below are grounded in the
+      corpus (filename slug + parsed page structure); the names shown are the
+      natural ones, so confirm against the index before relying on a clause.
+      In your final answer, `page_keys` holds page-level document ids.
+
+      A page is identified by:
+      - collection: `"combined_statement"` or `"govinfo_receipts"`.
+      - era: `"historical"` | `"transition"` | `"modern"` (combined_statement
+        only; govinfo volumes have no era).
+      - year: 4-digit string — for combined_statement the reported FISCAL year;
+        for govinfo the PUBLICATION year (its data is for ~1–2 years earlier).
+      - section: the section/chapter code (combined_statement only) — `cNN`
+        chapter, `scN` schedule, plus `rta`/`rtb`/`rtc`, `tbb`/`tbj`, `bof`,
+        `coa`, `pre`, `outlay`, `finhigh`, `sur`, `receipt`, `*ltr` (transmittal
+        letters). Modern chapter codes are stable across years; monolithic
+        historical volumes carry NO section code — address them by year.
+      - page index: 0-based position of the page within its document. This is
+        NOT the printed page number (printed numbers are OCR'd, mix Roman and
+        Arabic numerals, and skip values) — filter and cite by the page index.
+      - element type: one of `text`, `title`, `table`, `section_header`,
+        `page_header`, `page_footer`, `page_number`, `footnote`, `figure`,
+        `caption`.
+
+      The index is ChromaDB: filters support equality, `$and`, `$or`, `$in`
+      (no substring/prefix match). Illustrative shape (substitute the index's
+      configured field names):
+      ```python
+      # all pages of the FY2001 Schedule 3
+      {"$and": [{"era": "modern"}, {"year": "2001"}, {"section": "sc3"}]}
+      # the whole FY1968 Combined Statement (monolithic — no section code)
+      {"$and": [{"collection": "combined_statement"}, {"year": "1968"}]}
+      # govinfo data for the year 1825 lives in volumes PUBLISHED ~1826–1827
+      {"$and": [{"collection": "govinfo_receipts"}, {"year": {"$in": ["1826", "1827"]}}]}
+      ```
+
+  # ---------------------------------------------------------------------
+  # Page-index build family — per-page scan, ToC extraction/reconstruction,
+  # and the cross-issue chapter merge + era segmentation. All reason over the
+  # same section taxonomy, so they share this corpus blurb.
+  # ---------------------------------------------------------------------
+  - section: corpus
+    targets: [page_scan, page_scan_vision, toc_outline, toc_reconstruct, chapter_merge, era_segment, era_merge]
+    content: |
+      The pages are from the U.S. Combined Statement of Receipts and
+      Expenditures — annual federal receipts, expenditures, and balances by
+      fund, source, and organizational unit. Two document SERIES exist and are
+      segmented differently:
+        - Detailed "Combined Statement" / "Appendix": stable taxonomy of front
+          matter (transmittal letters → preface → CONTENTS) → PART ONE..FIVE →
+          TABLE A–H → Schedule 1..N → organizational-unit breakdowns. This is
+          the lineage the modern per-chapter files (cNN / scN) descend from;
+          monolithic through the 1970s, pre-split per chapter in the modern era
+          and the 1998–2000 transition "appendix".
+        - Slim "Annual Report" (Treasury's annual financial report, ~1974 on;
+          the FY1990 volume was compiled by the Financial Management Service;
+          the transition "annrpt" volumes): narrative sections only — Preface,
+          Secretary's Letter, Financial Highlights, Financial Review, Financial
+          Statements, Notes.
+      Resolve relative/partial dates against the document's fiscal year
+      (combined_statement) or publication year (govinfo). Segment at the
+      Table/Schedule level (PART/SECTION too coarse, pages too fine); anchor
+      every boundary on `page_id`, never the printed page number.
+
+  - section: lessons
+    targets: [page_scan, page_scan_vision]
+    content: >
+      A cumulative / multi-year contents grid (often at the back of a volume)
+      is NOT that volume's table of contents; label it non_content. The
+      transmittal letters and CONTENTS pages at the front are not body sections.
+      Treat repeated running banners ("SUMMARY STATEMENTS") and "— Continued"
+      headers as continuations, not new sections.
+
+  - section: lessons
+    targets: [toc_outline, toc_reconstruct]
+    content: |
+      ToC presence depends on era/series: 1872–1920 detailed volumes have NO front ToC (segment from in-body ALL-CAPS organizational headings like "INDEPENDENT TREASURY", "MINTS AND ASSAY OFFICES"); 1921–1973 detailed volumes and the slim Annual Reports have a front ToC; 1995–2000 detailed appendices have a front (sometimes also back) ToC; 2001+ documents are pre-split per chapter and need no ToC parse.
+      When a CONTENTS table is present, read it as (section title, printed page) pairs, then resolve each printed page to a `page_id` via the page_number elements (interpolate across unnumbered / Roman front-matter / plate pages). Validated example: a 1968 ToC entry "Table A ... 8" resolves to page_id 18, where the TABLE A title actually appears. Normalize OCR heading variants before matching ("Table A.", "TABLE A —", "Table A - Schedule 8" are one family).
+
+  - section: lessons
+    targets: [era_segment, era_merge, chapter_merge]
+    content: |
+      Respect the FY1976→FY1977 fiscal-basis change (July-start through FY1976, October-start from FY1977) when aligning years across eras; the 1976 transition quarter belongs to no fiscal year.
+      Modern (2001+) and 1998–2000 transition "appendix" documents are already one-chapter-per-file — take the section from the slug, do not re-segment. Align the same section across issues by its printed Table/Schedule label, not by the printed page number.
+
+  # ---------------------------------------------------------------------
+  # Planner lessons — gotchas observed against this corpus.
+  # ---------------------------------------------------------------------
+  - section: lessons
+    targets: [planner, replanner]
+    content: |
+      One concept per `retrieve.key`. If a question names multiple values (two funds, two agencies, two revenue sources, receipts vs expenditures, ...), emit ONE branch per value rather than bundling — branches run in parallel and splitting is cheap.
+      The converse also holds: do not split the same statistic across periods into same-key branches — use one branch with a comma-separated period ("1884-07..1885-06, 1889-07..1890-06").
+      The period is the DATA window, never a publication/"vintage" label. A named volume ("the Combined Statement for FY2013", "the 1827 receipts volume") tells SELECTION which document to read; it does not change the period.
+
+  - section: lessons
+    targets: [replanner]
+    content: |
+      When replanning, only switch to external lookup if you are convinced the
+      retrieval key was correct and the corpus genuinely does not carry the
+      value. Prefer rewording the key (the corpus may file it under a fund or
+      organizational-unit name), widening the year set (publication lag /
+      fiscal-vs-calendar), or correcting the data period first.
+
+  # ---------------------------------------------------------------------
+  # Planner few-shots. Each entry lands verbatim under the planner's
+  # "## Few-shot examples" header.
+  # ---------------------------------------------------------------------
+  - section: few_shots
+    targets: [planner]
+    content:
+      - |
+        ### Example (plain fiscal-year data range, pre-1977 July basis → period is the DATA window; same concept, two periods → ONE branch, comma-separated)
+        Q: Absolute percent change in total ordinary receipts of the United States between fiscal year 1885 and fiscal year 1890, rounded to hundredths.
+        Plan:
+        ```json
+        {
+          "branches": [
+            {"kind": "retrieve", "key": "total ordinary receipts",
+             "period": "1884-07..1885-06, 1889-07..1890-06"}
+          ]
+        }
+        ```
+
+      - |
+        ### Example (publication year is NOT the period — the 1827 volume reports the YEAR 1825; period is the data year, selection picks the 1827 volume)
+        Q: According to the receipts-and-expenditures volume published in 1827, what were the total expenditures of the United States for the year 1825?
+        Plan:
+        ```json
+        {
+          "branches": [
+            {"kind": "retrieve", "key": "total expenditures of the United States",
+             "period": "1825-01..1825-12"}
+          ]
+        }
+        ```
+
+      - |
+        ### Example (fiscal years straddling the FY1977 July→October change — expand each FY on its own basis; the 1976 transition quarter is excluded from both)
+        Q: Change in total budget outlays between fiscal year 1976 and fiscal year 1977.
+        Plan:
+        ```json
+        {
+          "branches": [
+            {"kind": "retrieve", "key": "total budget outlays",
+             "period": "1975-07..1976-06, 1976-10..1977-09"}
+          ]
+        }
+        ```
+
+      - |
+        ### Example (a needed value looks external (CPI) — still emit a retrieve keyed by the question's wording; if the corpus lacks it, the lookup is injected at replan, never emitted here)
+        Q: Real (CPI-adjusted, 2020 dollars) total expenditures of the United States in fiscal year 1953.
+        Plan:
+        ```json
+        {
+          "branches": [
+            {"kind": "retrieve", "key": "total expenditures of the United States",
+             "period": "1952-07..1953-06"},
+            {"kind": "retrieve", "key": "CPI",
+             "period": "1953-01..1953-12"}
+          ]
+        }
+        ```
+
+  # ---------------------------------------------------------------------
+  # Replanner few-shots. Diff-shaped (add/drop), so NOT shared with the planner
+  # few-shots above. lookup_external is a REPLAN-ONLY branch.
+  # ---------------------------------------------------------------------
+  - section: few_shots
+    targets: [replanner]
+    content:
+      - |
+        ### Example (one branch failed — the concept is filed under an organizational unit; drop by index, re-add reworded; keep the branch that succeeded)
+        prior_plan.branches:
+          [0] {"kind": "retrieve", "key": "life-saving service expenditures", "period": "1912-07..1913-06"}
+          [1] {"kind": "retrieve", "key": "total expenditures of the United States", "period": "1912-07..1913-06"}
+        Branch [0] FAILED: no table named "life-saving service expenditures" — the
+        FY1913 detailed statement files it under the Treasury organizational-unit
+        breakdown ("LIFE-SAVING SERVICE", Salaries and expenses). Branch [1]
+        succeeded (in prev).
+        PlanDiff:
+        ```json
+        {
+          "add": [
+            {"kind": "retrieve", "key": "Life-Saving Service, salaries and expenses",
+             "period": "1912-07..1913-06"}
+          ],
+          "drop": [0]
+        }
+        ```
+
+      - |
+        ### Example (a value is not in the corpus → drop the doomed retrieve, inject a lookup_external)
+        prior_plan.branches:
+          [0] {"kind": "retrieve", "key": "total expenditures of the United States", "period": "1952-07..1953-06"}
+          [1] {"kind": "retrieve", "key": "CPI", "period": "1953-01..1953-12"}
+        Branch [1] FAILED: the Combined Statement carries no consumer-price index.
+        Branch [0] succeeded (in prev). What was missing: cpi:1953. The question
+        named no publisher, so leave `src` null.
+        PlanDiff:
+        ```json
+        {
+          "add": [
+            {"kind": "lookup_external",
+             "target": "U.S. CPI-U annual average for 1953 (base 2020=100)"}
+          ],
+          "drop": [1]
+        }
+        ```
+
+  # ---------------------------------------------------------------------
+  # Corpus blurbs for the remaining executors.
+  # ---------------------------------------------------------------------
+  - section: corpus
+    targets: [compute.codegen]
+    content: |
+      The values in `input_values` were extracted from U.S. Combined Statement
+      of Receipts and Expenditures pages (or early govinfo receipts volumes).
+
+  # Unit vocabulary — lookup_external emits these tokens; compute sees them on
+  # lookup entries alongside natural-language units on corpus-extracted entries.
+  - section: corpus
+    targets: [compute.codegen, lookup_external]
+    content: |
+      Unit tokens for externally looked-up values: `usd`, `usd_thousands`,
+      `usd_millions`, `usd_billions`, `pct`, `count`, `year`, `rate`,
+      `fx_rate`, `cpi`, `text`. Corpus-extracted entries instead carry
+      natural-language units printed on the page (e.g. "dollars", "thousands of
+      dollars"); early volumes often print exact dollars-and-cents — do not
+      silently round.
+
+  - section: corpus
+    targets: [lookup_external]
+    content: |
+      Lookups complement, rather than duplicate, the Combined Statement corpus.
+      Typical asks: macro / price series (CPI, GDP, population) and entity or
+      historical facts the receipts-and-expenditures statements do not carry.
+
+  # ---------------------------------------------------------------------
+  # Compute lessons
+  # ---------------------------------------------------------------------
+  - section: lessons
+    targets: [compute.codegen]
+    content: >
+      Distinguish a flow (a year's receipts or expenditures) from a stock (an
+      outstanding balance / the public debt as of a date), and watch the scale
+      printed on the source page — historical volumes report exact dollars while
+      modern ones often report thousands or millions. Confirm both entries are
+      on the SAME basis before combining; never mix an exact-dollar figure with
+      an "in thousands" figure without rescaling, and never compare a
+      fiscal-year total against a calendar-year total.
+
+  # ---------------------------------------------------------------------
+  # Extract lessons
+  # ---------------------------------------------------------------------
+  - section: lessons
+    targets: [extract.text, extract.vision]
+    content: >
+      Unit and scale come from the printed page — column header, caption,
+      parenthetical legend, or footnote ("(In thousands of dollars)"). Never
+      guess from magnitude. Tables are OCR-derived: a cell rendered as the
+      string "nan" is an EMPTY cell, not data; values may be exact dollars with
+      cents; one cell can pack several tokens (two appropriation symbols
+      "86X4070 86X4072") — keep them verbatim, do not split or invent.
+
+  - section: lessons
+    targets: [extract.text, extract.vision]
+    content: >
+      Watch for qualifier-mismatched rows. These statements stack rows whose
+      labels differ by a subtle modifier — "ordinary receipts" vs "total
+      receipts", gross vs net, "held by the public" vs "held by Government
+      accounts", total vs a subtotal, a maturing flow vs an outstanding stock.
+      The lookup is satisfied only by a row matching the requested series
+      including EVERY qualifier. Emit each variant as its own entry with the
+      page's verbatim row text in `description`; if only a near-match is
+      present, still emit it but make the difference explicit — never present it
+      as the exact series. Note a terminology drift across eras: historical
+      volumes are titled "Receipts and Disbursements" and label outflows
+      "disbursements", while govinfo and modern volumes say "expenditures" —
+      treat them as the same series but record the page's verbatim term.
+
+  # ---------------------------------------------------------------------
+  # Few-shots for compute executors.
+  # ---------------------------------------------------------------------
+  - section: few_shots
+    targets: [compute.codegen]
+    content:
+      - |
+        ### Example (closed-form, two scalars, same scale)
+        Q: Absolute percent change in total ordinary receipts between FY1885 and FY1890.
+        input_values: two scalars — [0] total ordinary receipts FY1885, [1] same FY1890, both unit "dollars".
+        Why this shape: reference each entry by index, apply (B-A)/A·100, abs(), format. No unit conversion (same scale).
+        Output:
+        ```python
+        a = input_values[0].frame.iat[0, 0]  # total ordinary receipts, FY1885
+        b = input_values[1].frame.iat[0, 0]  # total ordinary receipts, FY1890
+        result = f'{abs((b - a) / a * 100):.2f}'
+        ```
+
+      - |
+        ### Example (scale mismatch — rescale before combining)
+        Q: FY1968 administrative expenses as a percent of total expenditures.
+        input_values: [0] scalar value=2267125.00 unit "dollars" (admin expenses), [1] scalar unit "thousands of dollars" (total expenditures).
+        Why this shape: the entries are on different scales; bring both to dollars before dividing.
+        Output:
+        ```python
+        admin = input_values[0].frame.iat[0, 0]            # dollars
+        total = input_values[1].frame.iat[0, 0] * 1000     # thousands -> dollars
+        result = f'{admin / total * 100:.2f}'
+        ```
+
+      - |
+        ### Example (missing-data signal — bare JSON, NO fence)
+        Q: Real (CPI-adjusted, 2020 dollars) total expenditures for FY1953.
+        input_values: only the nominal FY1953 scalar; no CPI series.
+        Why this shape: required deflator is not in input_values. Emit the bare missing-data JSON object (NO fence). Never fabricate.
+        Output (literal, no fence in your reply):
+        {"missing": ["cpi:1953", "cpi:2020"], "description": "no CPI series in input_values to convert nominal FY1953 to 2020 dollars"}
