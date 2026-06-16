@@ -73,6 +73,17 @@ with `OPENROUTER_API_KEY`; in that mode `SKUNK_LLM_MODEL` (and any model overrid
 full OpenRouter ids, e.g. `google/gemini-2.5-flash` or `qwen/qwen-2.5-72b-instruct`.
 Embeddings are unaffected (they dispatch on the embedding model id).
 
+**Automatic Gemini→OpenRouter failover** (on by default, auto-inert unless configured):
+a rolling per-second window counts HTTP 429s; when ≥`SKUNK_LLM_FAILOVER_THRESHOLD`
+(default 8) land within `SKUNK_LLM_FAILOVER_WINDOW_S` (default 10s), ALL generation routes
+to OpenRouter. Arm it by setting `OPENROUTER_API_KEY` + `SKUNK_LLM_FAILOVER_MODEL` (a PAID,
+non-`:free` id, e.g. `google/gemini-2.5-flash`); `SKUNK_LLM_FAILOVER_MODEL_MAP`
+(`gemini-3.1-pro-preview=google/gemini-2.5-pro,...`) overrides the target per source model.
+`SKUNK_LLM_FAILOVER=0` disables it. Unconfigured → inert (stays on Gemini, logs a warning).
+It **self-heals**: the window drains by the second, so once 429s stop the count falls back
+under threshold and traffic returns to Gemini (a renewed storm just re-trips it). See
+`llm_client._Rolling429Window` / `_ProviderFailover`.
+
 ## Data corpus (not in this repo)
 
 Treasury Bulletin PDFs at `~/Desktop/officeqa/treasury_bulletin_pdfs/` (~20 GB, 696 files);

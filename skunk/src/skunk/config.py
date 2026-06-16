@@ -45,6 +45,26 @@ class SkunkConfig:
     llm_max_retries: int = 5
     llm_retry_initial_delay_s: float = 1.0
 
+    # Automatic provider failover. Gemini (`llm_provider`) is the front path; a
+    # process-global monitor counts HTTP 429s in a rolling per-second window of
+    # `llm_failover_window_s` seconds, and once `llm_failover_429_threshold` land inside it
+    # ALL generation routes to OpenRouter (`llm_client._ProviderFailover` /
+    # `_Rolling429Window`). It self-heals: the window drains by the second, so once 429s
+    # stop the count falls back under threshold and traffic returns to Gemini. Armed only
+    # when `llm_failover_enabled` AND `OPENROUTER_API_KEY` AND a failover model are set —
+    # otherwise inert (logs a warning, stays on Gemini), so a 429 storm never turns into
+    # hard failures. `llm_failover_model` is the default OpenRouter id used after the trip;
+    # `llm_failover_model_map` ({bare-gemini-id: openrouter-id}) overrides it per model to
+    # preserve the flash/pro split. Use PAID (non-`:free`) ids — a `:free` model caps at
+    # 20 RPM and would worsen a storm.
+    # (env: SKUNK_LLM_FAILOVER, SKUNK_LLM_FAILOVER_THRESHOLD, SKUNK_LLM_FAILOVER_WINDOW_S,
+    #  SKUNK_LLM_FAILOVER_MODEL, SKUNK_LLM_FAILOVER_MODEL_MAP)
+    llm_failover_enabled: bool = True
+    llm_failover_429_threshold: int = 8
+    llm_failover_window_s: float = 10.0
+    llm_failover_model: str | None = None
+    llm_failover_model_map: dict[str, str] = field(default_factory=dict)
+
     # Per call-site effort override: `PromptedCall.name` → Effort tier. Missing key →
     # the call-site's `default_effort`; an explicit `effort=` arg still wins over both.
     # (env: SKUNK_EFFORT_OVERRIDES — comma-separated `name=tier` pairs)
@@ -265,6 +285,18 @@ class SkunkConfig:
             llm_max_retries=int(os.environ.get("SKUNK_LLM_MAX_RETRIES", "5")),
             llm_retry_initial_delay_s=float(
                 os.environ.get("SKUNK_LLM_RETRY_INITIAL_DELAY", "1.0")
+            ),
+            llm_failover_enabled=os.environ.get("SKUNK_LLM_FAILOVER", "1")
+            not in ("", "0"),
+            llm_failover_429_threshold=int(
+                os.environ.get("SKUNK_LLM_FAILOVER_THRESHOLD", "8")
+            ),
+            llm_failover_window_s=float(
+                os.environ.get("SKUNK_LLM_FAILOVER_WINDOW_S", "10.0")
+            ),
+            llm_failover_model=os.environ.get("SKUNK_LLM_FAILOVER_MODEL") or None,
+            llm_failover_model_map=_parse_model_overrides(
+                os.environ.get("SKUNK_LLM_FAILOVER_MODEL_MAP", "")
             ),
             compute_best_of_n=int(os.environ.get("SKUNK_COMPUTE_BEST_OF_N", "5")),
             parsed_json_dir=Path(
