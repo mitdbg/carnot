@@ -10,8 +10,9 @@ experiments are done.
 Inputs (one parsed JSON + one PDF per source file; dirs may contain spaces — quote them):
 - a directory of PDFs (`<file_id>.pdf`)
 - a directory of parsed/unclean element JSONs (`<file_id>.json`) — `document.elements[*]`
-  with `id, type, content, bbox[0].{coord, page_id}`. **`page_id` is 0-indexed** and bbox
-  coords are in **300-DPI pixel space**.
+  with `id, type, content, bbox[0].{coord, page_id}`. **`page_id` is 1-indexed** (matches the
+  PDF viewer's page number; see the `migrate_to_1indexed.py` note below) and bbox coords are
+  in **300-DPI pixel space**.
 
 Identifiers: `file_id` = file stem, `doc_id = f"{file_id}_{page_id}"`,
 `chunk_id = f"{file_id}_{page_id}_{element_id}"`. The corpus is annual, so vector-DB metadata
@@ -75,6 +76,31 @@ Notes:
   int / source / page_id / type; no month) so the agent filters correctly. Pass
   `--few-shot-csv` if `officeqa_pro.csv` isn't at the repo-root default.
 
+## One-off migration: 0-indexed → 1-indexed page_ids
+
+`page_id` is now **1-indexed** (matches the PDF viewer's page number). Early runs produced
+**0-indexed** ids; [`migrate_to_1indexed.py`](migrate_to_1indexed.py) converts already-built
+artifacts in place **without re-embedding** (vectors are independent of `page_id` — only id
+strings + metadata change):
+
+```bash
+python3 -m skunk.dais.migrate_to_1indexed \
+    --parsed-json-dir "officeqa_gdrive/Parsed JSON" \
+    --embeddings-dir dais_embeddings \
+    --cleaned-dir dais_cleaned          # optional
+
+# then rebuild the collection OFFLINE (Chroma server must be down):
+rm -rf .chromadb-dais-slim
+python3 -m skunk.dais.create_vector_db \
+    --embeddings-dir dais_embeddings --collection-name dais-slim \
+    --chroma-path .chromadb-dais-slim
+```
+
+It backs up the JSON dir to `<dir>_0indexed_backup/` and every other artifact to
+`*.0indexed.bak`, and is idempotent (re-running is a no-op once the backups exist). New
+pipeline runs (clean → embed → build) are 1-indexed natively; this script is only for
+artifacts built before the switch and can be deleted afterward.
+
 ## Output
 
 `datagen.py` writes the validated synthetic test set to `--out-dir` (default
@@ -90,9 +116,10 @@ artifacts are produced — this set is for **evaluating** the SearchAgent, not t
 
 ## Verification
 
-- **Step 1 crop correctness**: on a known table page, confirm the rendered `fdoc[page_id]`
-  (0-indexed) and the table crop (at `--bbox-dpi 300`) line up with the table — this validates
-  the page-index and coord-scale handling that differ from the treasury data.
+- **Step 1 crop correctness**: on a known table page, confirm the rendered `fdoc[page_id - 1]`
+  (`page_id` is 1-indexed; PyMuPDF is 0-indexed) and the table crop (at `--bbox-dpi 300`) line
+  up with the table — this validates the page-index and coord-scale handling that differ from
+  the treasury data.
 - **Step 2 parity** (do before a full embedding run): embed one element via OpenRouter and
   compare cosine vs a stored `qwen-v2` vector — expect ≈1.0 (confirms OpenRouter ↔
   SentenceTransformer parity for `qwen/qwen3-embedding-8b`, 4096-dim). Spot-check

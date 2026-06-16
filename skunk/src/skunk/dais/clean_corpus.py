@@ -11,7 +11,8 @@ Combined Statement of Receipts & Expenditures) is table-heavy with little free t
 reordering isn't worth the extra LLM call per page. Pages with no tables make no LLM call.
 
 Dataset specifics (differ from the treasury OfficeQA data this was derived from):
-  * ``page_id`` is **0-indexed** → render ``fdoc[page_id]`` directly.
+  * ``page_id`` is **1-indexed** (matches the PDF viewer's page number) → render
+    ``fdoc[page_id - 1]`` (PyMuPDF is 0-indexed).
   * bbox coords are in **300-DPI pixel space** → coord->point scale is fixed at
     ``--bbox-dpi / 72`` (≈4.17), not estimated.
 
@@ -195,9 +196,9 @@ def _process_document(
     with fitz.open(pdf_path) as fdoc:
         n_pages = fdoc.page_count
         for page_id, elements in todo_pages.items():
-            if page_id < 0 or page_id >= n_pages:  # page_id is 0-indexed
+            if page_id < 1 or page_id > n_pages:  # page_id is 1-indexed
                 continue
-            pg = fdoc[page_id]
+            pg = fdoc[page_id - 1]  # PyMuPDF is 0-indexed
             full_imgs[page_id] = _render_full_page(pg)
             for elt in elements:
                 if elt.get("type") == "table" and elt.get("content"):

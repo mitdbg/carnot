@@ -257,7 +257,7 @@ def main() -> None:
             elt_type = element["type"]
             if elt_type in SKIP_TYPES:
                 continue
-            page_id = element["bbox"][0]["page_id"]
+            page_id = element["bbox"][0]["page_id"]  # 1-indexed (matches the PDF viewer)
             elt_id = element["id"]
             cid = chunk_id_of(file_id, page_id, elt_id)
             raw = element["content"] or ""

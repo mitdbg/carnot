@@ -48,12 +48,16 @@ def file_id_of(path: str | Path) -> str:
 
 
 def doc_id_of(file_id: str, page_id: int | str) -> str:
-    """Document (== page) id, the SearchAgent ``doc_id`` / OfficeQA ``page_key`` analogue."""
+    """Document (== page) id, the SearchAgent ``doc_id`` / OfficeQA ``page_key`` analogue.
+
+    ``page_id`` is **1-indexed** (matches the PDF viewer's page number)."""
     return f"{file_id}_{page_id}"
 
 
 def chunk_id_of(file_id: str, page_id: int | str, element_id: int | str) -> str:
-    """Per-element id, the SearchAgent ``chunk_id`` / OfficeQA ``unique_element_id`` analogue."""
+    """Per-element id, the SearchAgent ``chunk_id`` / OfficeQA ``unique_element_id`` analogue.
+
+    ``page_id`` is **1-indexed** (matches the PDF viewer's page number)."""
     return f"{file_id}_{page_id}_{element_id}"
 
 

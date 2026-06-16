@@ -101,10 +101,10 @@ each report covers a fiscal year. A single year may be split across multiple sou
 ### Identifier formats
 - `file_id`: the source-file stem, e.g. `"combined_statement__modern__2001__c01"` or \
 `"govinfo_receipts__1893__SERIALSET-03108_00_00-002-0256-0000"`.
-- `doc_id`: `"<file_id>_<page_id>"` where `page_id` is the 0-indexed page within that file \
-(NOT the printed page number, which may differ), e.g. `"combined_statement__historical__cs-1872_12"`.
+- `doc_id`: `"<file_id>_<page_id>"` where `page_id` is the 1-indexed page within that file \
+(matches the PDF viewer's page number), e.g. `"combined_statement__historical__cs-1872_12"`.
 - `chunk_id`: `"<file_id>_<page_id>_<element_id>"` (e.g. `"...cs-1872_12_5"` = the 5th element \
-on page index 12).
+on page 12).
 - In your final answer, the `page_keys` list holds `doc_id`s in the format above.
 
 ### Available metadata fields (for use with `metadata_filter`)
@@ -112,7 +112,7 @@ Every chunk has the following metadata you can filter on:
 - `year`: INTEGER fiscal year, e.g. `1872` (supports range filters via `$gte`/`$lte`/`$in`).
 - `source`: string era/source family — one of `"historical"`, `"modern"`, `"transition"`, \
 `"govinfo_receipts"`.
-- `page_id`: integer, the 0-indexed page within its file.
+- `page_id`: integer, the 1-indexed page within its file (matches the PDF viewer).
 - `file_id`: string, the source-file stem (see above).
 - `doc_id`: string, the full page key (see above).
 - `type`: string, the element type (`"text"`, `"title"`, `"table"`, `"section_header"`, ...).
