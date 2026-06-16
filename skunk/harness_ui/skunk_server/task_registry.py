@@ -310,11 +310,13 @@ class TaskRegistry:
         review_id: str,
         response: str,
         source_docs: list[str],
+        client_id: str,
     ) -> tuple[QuestionTask, HumanReview]:
         """Record a human's correction (or accept-as-is when `response` is empty). Idempotent
         guard: re-resolving a non-open review raises `TaskConflict`."""
         with self._lock:
             task, review = self._find_review(review_id)
+            self._require_review_lock(task, client_id)
             if review.status != HumanReviewStatus.OPEN:
                 raise TaskConflict(f"review is not open; status={review.status}")
             review.status = HumanReviewStatus.RESOLVED
@@ -322,6 +324,22 @@ class TaskRegistry:
             review.response_source_docs = list(source_docs)
             review.resolved_at = utc_now()
             task.updated_at = utc_now()
+            return task, review
+
+    def begin_review_refine(
+        self, review_id: str, candidates: list[dict[str, Any]], client_id: str
+    ) -> tuple[QuestionTask, HumanReview]:
+        """Validate lock ownership and mark an OPEN review as refining atomically."""
+        with self._lock:
+            task, review = self._find_review(review_id)
+            self._require_review_lock(task, client_id)
+            if review.status != HumanReviewStatus.OPEN:
+                raise TaskConflict(f"review is not open; status={review.status}")
+            if review.refining:
+                raise TaskConflict("a refine is already running for this review")
+            review.guidance["candidates"] = candidates
+            review.refining = True
+            self._set_status(task, task.status)
             return task, review
 
     def set_review_refining(self, review_id: str, refining: bool) -> None:
@@ -437,6 +455,16 @@ class TaskRegistry:
                 task.updated_at = now  # refresh lease bookkeeping without a version bump
             return True, client_id, changed
 
+    def get_lock_holder(self, task_id: str) -> str | None:
+        with self._lock:
+            task = self._require_task(task_id)
+            return task.active_lock_holder()
+
+    def count_open_reviews(self, task_id: str) -> int:
+        with self._lock:
+            task = self._require_task(task_id)
+            return len(task.open_reviews)
+
     def release_review_lock(self, task_id: str, client_id: str) -> bool:
         """Release the lock if `client_id` holds it (idempotent no-op otherwise). Returns whether
         a lock was actually cleared, so the caller can decide to republish."""
@@ -515,6 +543,14 @@ class TaskRegistry:
         if task is None:
             raise KeyError(task_id)
         return task
+
+    @staticmethod
+    def _require_review_lock(task: QuestionTask, client_id: str) -> None:
+        holder = task.active_lock_holder()
+        if holder is None:
+            raise TaskConflict("task is not locked")
+        if holder != client_id:
+            raise TaskConflict("lock held by another client")
 
     @staticmethod
     def _find_submission(

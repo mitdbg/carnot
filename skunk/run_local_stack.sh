@@ -3,9 +3,9 @@
 # Edit the variables below when you want to switch modes.
 set -euo pipefail
 
-ROOT_DIR="/home/gerardo/carnot/skunk"
-PYTHON_BIN="/home/gerardo/.local/share/mamba/envs/carnot/bin/python"
-CHROMA_BIN="/home/gerardo/.local/share/mamba/envs/carnot/bin/chroma"
+ROOT_DIR="/home/$USER/carnot/skunk"
+PYTHON_BIN="/home/$USER/.local/share/mamba/envs/carnot/bin/python"
+CHROMA_BIN="/home/$USER/.local/share/mamba/envs/carnot/bin/chroma"
 
 HOST="127.0.0.1"
 CUP_PORT="8765"

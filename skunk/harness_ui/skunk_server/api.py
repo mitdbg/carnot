@@ -43,6 +43,7 @@ class ReviewResolveBody(BaseModel):
         ""  # human's corrected AnnotatedValue JSON (empty = accept the model as-is)
     )
     source_docs: list[str] = Field(default_factory=list)
+    client_id: str = Field(..., min_length=1)
 
 
 class ReviewRefineBody(BaseModel):
@@ -50,10 +51,17 @@ class ReviewRefineBody(BaseModel):
     candidates: list[dict] = Field(
         default_factory=list
     )  # the JSONs currently displayed (hand-edits already overlaid)
+    client_id: str = Field(..., min_length=1)
 
 
 class ReviewLockBody(BaseModel):
-    client_id: str  # the browser's stable per-session id holding/releasing the review lock
+    client_id: str = Field(
+        ..., min_length=1
+    )  # the browser's stable per-session id holding/releasing the review lock
+
+
+class SubmitTaskBody(BaseModel):
+    client_id: str = Field(..., min_length=1)
 
 
 async def status_frames(hub: StreamHub, heartbeat: float = HEARTBEAT_INTERVAL_S):
@@ -180,7 +188,7 @@ def install_command_routes(app: FastAPI) -> None:
             )
         try:
             task, review = broker.resolve_review(
-                review_id, body.response, body.source_docs
+                review_id, body.response, body.source_docs, body.client_id
             )
         except KeyError:
             return JSONResponse(
@@ -204,7 +212,7 @@ def install_command_routes(app: FastAPI) -> None:
             )
         try:
             _task, review = broker.refine_review(
-                review_id, body.feedback, body.candidates
+                review_id, body.feedback, body.candidates, body.client_id
             )
         except KeyError:
             return JSONResponse(
@@ -238,11 +246,28 @@ def install_command_routes(app: FastAPI) -> None:
         return JSONResponse({"ok": True})
 
     @app.post("/api/submit/{task_id:path}")
-    async def submit_task(task_id: str) -> JSONResponse:
+    async def submit_task(task_id: str, body: SubmitTaskBody) -> JSONResponse:
         # Manually submit a READY task's latest answer to Cup. The coordinator is assigned to
         # app.state after install_routes runs, so read it lazily here at request time.
         coordinator = app.state.coordinator
+        broker = app.state.broker
         try:
+            if broker is not None:
+                holder = broker.get_lock_holder(task_id)
+                if holder is not None and holder != body.client_id:
+                    return JSONResponse(
+                        {"ok": False, "error": "Task is locked by another user"},
+                        status_code=409,
+                    )
+                open_count = broker.count_open_reviews(task_id)
+                if open_count > 0:
+                    return JSONResponse(
+                        {
+                            "ok": False,
+                            "error": f"{open_count} open review(s) must be resolved first",
+                        },
+                        status_code=409,
+                    )
             await coordinator.submit_ready(task_id)
         except KeyError:
             return JSONResponse(

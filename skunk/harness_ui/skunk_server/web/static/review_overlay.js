@@ -34,6 +34,17 @@ const CLIENT_ID = (function () {
 })();
 window.CLIENT_ID = CLIENT_ID;
 
+window.apiJson = async function apiJson(url, body, options = {}) {
+  const method = options.method || "POST";
+  const headers = Object.assign({ "Content-Type": "application/json" }, options.headers || {});
+  const fetchOptions = Object.assign({}, options, { method, headers });
+  if (body !== null && body !== undefined) fetchOptions.body = JSON.stringify(body);
+  const resp = await fetch(url, fetchOptions);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || !data.ok) throw new Error(data.error || `Request failed (${resp.status})`);
+  return data;
+};
+
 const LOCK_HEARTBEAT_MS = 7000;  // re-acquire (refresh the lease) well within the backend TTL
 
 const ReviewOverlay = (function () {
@@ -95,13 +106,8 @@ const ReviewOverlay = (function () {
   // heartbeat. Returns true iff we hold the lock afterward.
   async function acquireLock(taskId) {
     try {
-      const resp = await fetch(`/api/reviews/lock/${encodeURIComponent(taskId)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ client_id: CLIENT_ID }),
-      });
-      const data = await resp.json().catch(() => ({}));
-      return !!(resp.ok && data.ok);
+      await apiJson(`/api/reviews/lock/${encodeURIComponent(taskId)}`, { client_id: CLIENT_ID });
+      return true;
     } catch (err) {
       return false;
     }
@@ -121,12 +127,8 @@ const ReviewOverlay = (function () {
         return;
       }
     } catch (err) { /* fall through to fetch */ }
-    fetch(`/api/reviews/unlock/${encodeURIComponent(taskId)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-      keepalive: true,
-    }).catch(() => {});
+    apiJson(`/api/reviews/unlock/${encodeURIComponent(taskId)}`, { client_id: CLIENT_ID }, { keepalive: true })
+      .catch(() => {});
   }
 
   function startHeartbeat() {
@@ -622,13 +624,11 @@ const ReviewOverlay = (function () {
     submitting = true;
     showError("");
     try {
-      const resp = await fetch(`/api/reviews/${encodeURIComponent(review.review_id)}/resolve`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ response, source_docs: review.source_docs || [] }),
+      await apiJson(`/api/reviews/${encodeURIComponent(review.review_id)}/resolve`, {
+        response,
+        source_docs: review.source_docs || [],
+        client_id: CLIENT_ID,
       });
-      const data = await resp.json().catch(() => ({}));
-      if (!resp.ok || !data.ok) { showError(data.error || `resolve failed (${resp.status})`); submitting = false; return; }
       // One annotation per visit: return to the main screen (and release the lock) — no
       // auto-advance to the task's next open review. The SSE snapshot will confirm the resolve.
       submitting = false;
@@ -693,21 +693,15 @@ const ReviewOverlay = (function () {
     setRefineBusy(true);
     showError("");
     try {
-      const resp = await fetch(`/api/reviews/${encodeURIComponent(review.review_id)}/refine`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ feedback, candidates: candidatesPayload }),
+      await apiJson(`/api/reviews/${encodeURIComponent(review.review_id)}/refine`, {
+        feedback,
+        candidates: candidatesPayload,
+        client_id: CLIENT_ID,
       });
-      const data = await resp.json().catch(() => ({}));
-      if (!resp.ok || !data.ok) {
-        showError(data.error || `refine failed (${resp.status})`);
-        setRefineBusy(false);
-        return;
-      }
       // Success: the backend set review.refining=true and published; syncTasks takes over from
       // here (spinner now, revised cards + toast on completion). Nothing more to do.
     } catch (err) {
-      showError(String(err));
+      showError(err.message || String(err));
       setRefineBusy(false);
     }
   }

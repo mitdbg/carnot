@@ -77,6 +77,7 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
                         "instructions": review.instructions,
                         "source_docs": review.source_docs,
                         "guidance": review.guidance,
+                        "refining": review.refining,
                     }
                     for review in task.open_reviews
                 ],

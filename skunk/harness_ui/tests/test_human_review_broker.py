@@ -6,9 +6,13 @@ from __future__ import annotations
 import asyncio
 import json
 
+import pytest
+
 from skunk_server.domain import AnswerCandidate, HumanReviewStatus, TaskStatus
 from skunk_server.human_work_broker import HumanWorkBroker
-from skunk_server.task_registry import TaskRegistry
+from skunk_server.task_registry import TaskConflict, TaskRegistry
+
+CLIENT_ID = "tester"
 
 
 def _ready_task(registry: TaskRegistry, recompute_state=None):
@@ -59,9 +63,13 @@ def test_resolve_triggers_recompute_without_submitting() -> None:
         )
         assert rid is not None
         assert len(registry.get(task.task_id).open_reviews) == 1
+        registry.acquire_review_lock(task.task_id, CLIENT_ID)
 
         broker.resolve_review(
-            rid, json.dumps([{"description": "d", "value": 43, "kind": "scalar"}]), []
+            rid,
+            json.dumps([{"description": "d", "value": 43, "kind": "scalar"}]),
+            [],
+            CLIENT_ID,
         )
         # Let the scheduled background recompute run.
         await asyncio.sleep(0.05)
@@ -117,14 +125,44 @@ def test_accept_as_is_does_not_recompute() -> None:
             [],
             {"branch_id": 0},
         )
+        registry.acquire_review_lock(task.task_id, CLIENT_ID)
 
-        broker.resolve_review(rid, "", [])  # empty response = accept-as-is
+        broker.resolve_review(rid, "", [], CLIENT_ID)  # empty response = accept-as-is
         await asyncio.sleep(0.03)
 
         assert recompute_calls == []  # no recompute scheduled
         assert (
             registry.get(task.task_id).latest_candidate.answer_text == "LLM"
         )  # unchanged
+
+    asyncio.run(scenario())
+
+
+def test_resolve_requires_current_lock_holder() -> None:
+    async def scenario():
+        registry = TaskRegistry()
+        broker = HumanWorkBroker(registry, None, lambda: None)
+        broker.start(asyncio.get_running_loop())
+        task, attempt = _ready_task(registry)
+        rid = broker.register_review(
+            task.task_id,
+            attempt.attempt_id,
+            "verify_extract",
+            "i",
+            None,
+            [],
+            {"branch_id": 0},
+        )
+        assert rid is not None
+
+        with pytest.raises(TaskConflict):
+            broker.resolve_review(rid, "", [], CLIENT_ID)
+
+        registry.acquire_review_lock(task.task_id, "other")
+        with pytest.raises(TaskConflict):
+            broker.resolve_review(rid, "", [], CLIENT_ID)
+
+        broker.resolve_review(rid, "", [], "other")
 
     asyncio.run(scenario())
 

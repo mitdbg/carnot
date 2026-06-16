@@ -16,6 +16,8 @@ import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 import httpx
 import uvicorn
@@ -31,9 +33,58 @@ logger = logging.getLogger(__name__)
 # Browser-facing timeout for the backend proxy. The two POSTs (submit/resolve) await Cup /
 # a recompute on the backend loop, so allow a generous read window; a connect failure
 # (backend down) surfaces fast as 502.
-_PROXY_TIMEOUT = httpx.Timeout(60.0, connect=5.0)
+_PROXY_TIMEOUT = httpx.Timeout(
+    float(os.environ.get("SKUNK_WEB_PROXY_TIMEOUT_S", "60")), connect=5.0
+)
 # Hop-by-hop / length headers we must not echo back from the backend response verbatim.
-_DROP_RESPONSE_HEADERS = {"content-length", "transfer-encoding", "connection"}
+_DROP_RESPONSE_HEADERS = {
+    "connection",
+    "content-encoding",
+    "content-length",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+}
+_ALLOWED_REQUEST_HEADERS = {
+    "accept",
+    "authorization",
+    "content-type",
+    "if-modified-since",
+    "if-none-match",
+    "x-request-id",
+}
+_PROXY_ROUTES: list[tuple[str, str, Callable[[dict[str, Any]], str]]] = [
+    ("POST", "/api/submit/{task_id:path}", lambda p: f"/api/submit/{p['task_id']}"),
+    (
+        "POST",
+        "/api/reviews/{review_id}/resolve",
+        lambda p: f"/api/reviews/{p['review_id']}/resolve",
+    ),
+    (
+        "POST",
+        "/api/reviews/{review_id}/refine",
+        lambda p: f"/api/reviews/{p['review_id']}/refine",
+    ),
+    (
+        "POST",
+        "/api/reviews/lock/{task_id:path}",
+        lambda p: f"/api/reviews/lock/{p['task_id']}",
+    ),
+    (
+        "POST",
+        "/api/reviews/unlock/{task_id:path}",
+        lambda p: f"/api/reviews/unlock/{p['task_id']}",
+    ),
+    (
+        "GET",
+        "/api/source/{month}/page/{page}.png",
+        lambda p: f"/api/source/{p['month']}/page/{p['page']}.png",
+    ),
+]
 
 
 def create_app(stream_dir: str, backend_url: str) -> FastAPI:
@@ -61,10 +112,11 @@ def create_app(stream_dir: str, backend_url: str) -> FastAPI:
     async def _proxy(request: Request, method: str, path: str) -> Response:
         client: httpx.AsyncClient = app.state.client
         body = await request.body()
-        headers = {}
-        content_type = request.headers.get("content-type")
-        if content_type:
-            headers["content-type"] = content_type
+        headers = {
+            key: value
+            for key, value in request.headers.items()
+            if key.lower() in _ALLOWED_REQUEST_HEADERS
+        }
         try:
             upstream = await client.request(method, path, content=body, headers=headers)
         except httpx.ConnectError:
@@ -86,29 +138,20 @@ def create_app(stream_dir: str, backend_url: str) -> FastAPI:
             media_type=upstream.headers.get("content-type"),
         )
 
-    @app.post("/api/submit/{task_id:path}")
-    async def submit(task_id: str, request: Request) -> Response:
-        return await _proxy(request, "POST", f"/api/submit/{task_id}")
+    def _make_proxy_handler(
+        method: str, backend_path: Callable[[dict[str, Any]], str]
+    ) -> Callable[[Request], Awaitable[Response]]:
+        async def handler(request: Request) -> Response:
+            return await _proxy(request, method, backend_path(request.path_params))
 
-    @app.post("/api/reviews/{review_id}/resolve")
-    async def resolve_review(review_id: str, request: Request) -> Response:
-        return await _proxy(request, "POST", f"/api/reviews/{review_id}/resolve")
+        return handler
 
-    @app.post("/api/reviews/{review_id}/refine")
-    async def refine_review(review_id: str, request: Request) -> Response:
-        return await _proxy(request, "POST", f"/api/reviews/{review_id}/refine")
-
-    @app.post("/api/reviews/lock/{task_id:path}")
-    async def acquire_review_lock(task_id: str, request: Request) -> Response:
-        return await _proxy(request, "POST", f"/api/reviews/lock/{task_id}")
-
-    @app.post("/api/reviews/unlock/{task_id:path}")
-    async def release_review_lock(task_id: str, request: Request) -> Response:
-        return await _proxy(request, "POST", f"/api/reviews/unlock/{task_id}")
-
-    @app.get("/api/source/{month}/page/{page}.png")
-    async def source_page(month: str, page: int, request: Request) -> Response:
-        return await _proxy(request, "GET", f"/api/source/{month}/page/{page}.png")
+    for method, route, backend_path in _PROXY_ROUTES:
+        app.add_api_route(
+            route,
+            _make_proxy_handler(method, backend_path),
+            methods=[method],
+        )
 
     return app
 

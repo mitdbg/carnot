@@ -40,7 +40,17 @@ WARM_COLLECTIONS="$(IFS=,; echo "$*")"   # comma-join the positional args
 CHROMA_PATH="${SKUNK_CHROMADB_DIR:-.chromadb}"
 HOST="${SKUNK_CHROMA_SERVER_HOST:-127.0.0.1}"
 PORT="${SKUNK_CHROMA_SERVER_PORT:-8001}"
-PY="./venv/bin/python"
+
+if [[ -z "${PYTHON_BIN:-}" ]]; then
+  if [[ -x "./venv/bin/python" ]]; then PYTHON_BIN="./venv/bin/python"
+  elif [[ -x "/home/gerardo/.local/share/mamba/envs/carnot/bin/python" ]]; then PYTHON_BIN="/home/gerardo/.local/share/mamba/envs/carnot/bin/python"
+  else PYTHON_BIN="$(command -v python3)"; fi
+fi
+if [[ -z "${CHROMA_BIN:-}" ]]; then
+  if [[ -x "./venv/bin/chroma" ]]; then CHROMA_BIN="./venv/bin/chroma"
+  elif [[ -x "/home/gerardo/.local/share/mamba/envs/carnot/bin/chroma" ]]; then CHROMA_BIN="/home/gerardo/.local/share/mamba/envs/carnot/bin/chroma"
+  else CHROMA_BIN="$(command -v chroma)"; fi
+fi
 
 if [[ ! -d "$CHROMA_PATH" ]]; then
   echo "ERROR: ChromaDB store '$CHROMA_PATH' not found. Build it first (src/skunk/search_agent/prep/)" >&2
@@ -49,7 +59,7 @@ if [[ ! -d "$CHROMA_PATH" ]]; then
 fi
 
 echo "Starting ChromaDB server on ${HOST}:${PORT} over '${CHROMA_PATH}'"
-./venv/bin/chroma run --host "$HOST" --port "$PORT" --path "$CHROMA_PATH" &
+"$CHROMA_BIN" run --host "$HOST" --port "$PORT" --path "$CHROMA_PATH" &
 SERVER_PID=$!
 
 # Kill the server when this script exits (Ctrl-C in the tmux pane, etc.) so it never orphans.
@@ -61,7 +71,7 @@ trap cleanup INT TERM EXIT
 echo "Waiting for the server to accept connections..."
 ready=0
 for _ in $(seq 1 120); do
-  if "$PY" -c "from skunk.chroma_client import make_chroma_client; make_chroma_client('${HOST}', int('${PORT}'))" 2>/dev/null; then
+  if "$PYTHON_BIN" -c "from skunk.chroma_client import make_chroma_client; make_chroma_client('${HOST}', int('${PORT}'))" 2>/dev/null; then
     ready=1; break
   fi
   kill -0 "$SERVER_PID" 2>/dev/null || { echo "ERROR: chroma server exited during startup" >&2; exit 1; }
@@ -72,7 +82,7 @@ done
 # Warm start: load each named collection's HNSW index into memory (best-effort; a missing
 # collection or warm failure must NOT take the server down).
 echo "Warming collection(s): ${WARM_COLLECTIONS} (loads the HNSW index; can take a while cold)"
-"$PY" - "$HOST" "$PORT" "$WARM_COLLECTIONS" <<'PY' || echo "[warm] warning: warm-up failed (continuing; first real query will pay the cold-load)"
+"$PYTHON_BIN" - "$HOST" "$PORT" "$WARM_COLLECTIONS" <<'PY' || echo "[warm] warning: warm-up failed (continuing; first real query will pay the cold-load)"
 import sys
 from skunk.chroma_client import make_chroma_client
 

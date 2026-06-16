@@ -115,6 +115,12 @@ class HumanWorkBroker:
             self._notify()
         return released
 
+    def get_lock_holder(self, task_id: str) -> str | None:
+        return self._registry.get_lock_holder(task_id)
+
+    def count_open_reviews(self, task_id: str) -> int:
+        return self._registry.count_open_reviews(task_id)
+
     async def run_lock_sweeper(self, interval_s: float = LOCK_SWEEP_INTERVAL_S) -> None:
         """Periodically clear review locks whose holder stopped heart-beating (closed tab /
         crash) and republish so other clients see those tasks free up. Started for the lifetime
@@ -167,8 +173,9 @@ class HumanWorkBroker:
         review_id: str,
         response: str,
         source_docs: list[str],
+        client_id: str,
     ) -> tuple[QuestionTask, HumanReview]:
-        task, review = self._registry.resolve_review(review_id, response, source_docs)
+        task, review = self._registry.resolve_review(review_id, response, source_docs, client_id)
         with self._pending_lock:
             pending = self._pending.pop(review_id, None)
         if pending is not None:
@@ -259,6 +266,7 @@ class HumanWorkBroker:
         review_id: str,
         feedback: str,
         candidates: list[dict],
+        client_id: str,
     ) -> tuple[QuestionTask, HumanReview]:
         """Kick off a background LLM revision of an OPEN verify_extract review's extracted
         candidates from the reviewer's natural-language `feedback`. `candidates` is the JSONs
@@ -266,16 +274,10 @@ class HumanWorkBroker:
         as the review's candidates first (so the displayed state survives even if the overlay
         closes), then schedule the refine. Raises TaskConflict if the review isn't OPEN, is
         already refining, or refine is disabled."""
-        task, review = self._registry.find_review(review_id)  # KeyError if gone
-        if review.status != HumanReviewStatus.OPEN:
-            raise TaskConflict(f"review is not open; status={review.status}")
-        if review.refining:
-            raise TaskConflict("a refine is already running for this review")
         if self._refine_fn is None:
             raise TaskConflict("refine is disabled")
         # Capture the displayed JSONs as the review's candidates, then flag + schedule.
-        self._registry.set_review_candidates(review_id, candidates)
-        self._registry.set_review_refining(review_id, True)
+        task, review = self._registry.begin_review_refine(review_id, candidates, client_id)
         self._schedule(self._refine_and_record(review_id, feedback))
         self._notify()
         return task, review
