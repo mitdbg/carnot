@@ -27,24 +27,27 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import base64
 import glob
 import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 from tqdm import tqdm
 
 from skunk.common import B64Image
 from skunk.corpus import _HTML_TAG_RE
 from skunk.dais.dais_common import DaisLLM, chunk_id_of, doc_id_of, file_id_of, pdf_path_for
-# Reuse the (corpus-agnostic) geometry + prompt logic from the OfficeQA table corrector.
+from skunk.dais.render import (
+    group_by_page,
+    load_page_image,
+    load_table_image,
+    png_b64image,
+    render_page_png_bytes,
+    render_table_png_bytes,
+)
+# Reuse the (corpus-agnostic) prompt + bbox logic from the OfficeQA table corrector.
 from skunk.search_agent.prep.table_corrector import (
-    CROP_DPI,
-    CROP_JPG_QUALITY,
-    CROP_PAD_PTS,
-    FULL_PAGE_DPI,
-    FULL_PAGE_JPG_QUALITY,
     SYSTEM_PROMPT,
     TABLE_CORRECTOR_PROMPT,
     _strip_code_fence,
@@ -56,44 +59,6 @@ SERIALIZE_EVERY_N_PAGES = 100
 # Parser bbox coords are pixels at this DPI (see render_officeqa_json_simple.py: "DPI must
 # match the dpi the JSON bboxes were computed at"). coord -> PDF point = coord / (DPI/72).
 DEFAULT_BBOX_DPI = 300
-
-
-def _matrix(dpi: int):
-    import fitz
-
-    return fitz.Matrix(dpi / 72, dpi / 72)
-
-
-def _render_full_page(pg) -> B64Image:
-    """Full-page JPEG used as shared context for every table correction on the page."""
-    pix = pg.get_pixmap(matrix=_matrix(FULL_PAGE_DPI))
-    return B64Image(
-        mime="image/jpeg",
-        data=base64.standard_b64encode(pix.tobytes("jpg", jpg_quality=FULL_PAGE_JPG_QUALITY)).decode(),
-    )
-
-
-def _render_crop(pg, coord, scale) -> B64Image | None:
-    """Tight crop of a table's bbox (parser px -> PDF points via `scale`), None if degenerate."""
-    import fitz
-
-    r = pg.rect
-    x0, y0, x1, y1 = coord
-    clip = fitz.Rect(
-        max(0.0, x0 / scale - CROP_PAD_PTS),
-        max(0.0, y0 / scale - CROP_PAD_PTS),
-        min(r.width, x1 / scale + CROP_PAD_PTS),
-        min(r.height, y1 / scale + CROP_PAD_PTS),
-    )
-    if clip.width <= 2 or clip.height <= 2:
-        return None
-    pix = pg.get_pixmap(matrix=_matrix(CROP_DPI), clip=clip)
-    if pix.width <= 0 or pix.height <= 0:
-        return None
-    return B64Image(
-        mime="image/jpeg",
-        data=base64.standard_b64encode(pix.tobytes("jpg", jpg_quality=CROP_JPG_QUALITY)).decode(),
-    )
 
 
 def _element_text(elt: dict) -> str:
@@ -116,15 +81,6 @@ def _correct_table(full_img: B64Image, crop_img: B64Image | None, table_html: st
         if md:
             return md
     return None
-
-
-def _group_by_page(doc: dict) -> dict[int, list[dict]]:
-    """Map page_id -> elements on that page, preserving parser order."""
-    by_page: dict[int, list[dict]] = {}
-    for elt in doc["document"]["elements"]:
-        page_id = elt["bbox"][0]["page_id"]
-        by_page.setdefault(page_id, []).append(elt)
-    return by_page
 
 
 def _assemble_page(elements: list[dict], corrections: dict[int, str]) -> str:
@@ -162,15 +118,15 @@ def _process_document(
     page_workers: int,
     bbox_dpi: int,
     text_fallback: bool,
+    page_renders_dir: str,
+    table_renders_dir: str,
 ) -> dict:
     """Clean one document. Returns ``{"clean_page_map", "table_map", "errors", "skipped"}``."""
-    import fitz
-
     file_id = file_id_of(json_path)
     with open(json_path) as f:
         doc = json.load(f)
 
-    by_page = _group_by_page(doc)
+    by_page = group_by_page(doc)
     todo_pages = {p: els for p, els in by_page.items() if doc_id_of(file_id, p) not in done_doc_ids}
     clean_page_map: dict[str, list] = {}
     table_map: dict[str, list] = {}
@@ -190,19 +146,44 @@ def _process_document(
 
     scale = bbox_dpi / 72.0
 
-    # --- render every page once (single PDF open); collect per-table crops ---
+    # --- gather page images + table crops: load the pre-rendered PNGs (skunk.dais.render_corpus),
+    # rendering any that are missing once via a single PDF open so this still runs standalone ---
     full_imgs: dict[int, B64Image] = {}
     crop_imgs: dict[tuple[int, int], B64Image | None] = {}
-    with fitz.open(pdf_path) as fdoc:
-        n_pages = fdoc.page_count
+    fdoc = None
+    try:
         for page_id, elements in todo_pages.items():
-            if page_id < 1 or page_id > n_pages:  # page_id is 1-indexed
-                continue
-            pg = fdoc[page_id - 1]  # PyMuPDF is 0-indexed
-            full_imgs[page_id] = _render_full_page(pg)
-            for elt in elements:
-                if elt.get("type") == "table" and elt.get("content"):
-                    crop_imgs[(page_id, elt["id"])] = _render_crop(pg, _union_bbox(elt), scale)
+            tables = [e for e in elements if e.get("type") == "table" and e.get("content")]
+            full = load_page_image(page_renders_dir, file_id, page_id)
+            crops: dict[int, B64Image | None] = {}
+            missing: list[dict] = []
+            for elt in tables:
+                img = load_table_image(table_renders_dir, file_id, page_id, elt["id"])
+                if img is not None:
+                    crops[elt["id"]] = img
+                else:
+                    missing.append(elt)
+
+            if full is None or missing:  # fall back to an inline render for whatever's absent
+                import fitz
+
+                if fdoc is None:
+                    fdoc = fitz.open(pdf_path)
+                if page_id < 1 or page_id > fdoc.page_count:  # page_id is 1-indexed
+                    continue
+                pg = fdoc[page_id - 1]  # PyMuPDF is 0-indexed
+                if full is None:
+                    full = png_b64image(render_page_png_bytes(pg))
+                for elt in missing:
+                    data = render_table_png_bytes(pg, _union_bbox(elt), scale)
+                    crops[elt["id"]] = png_b64image(data) if data is not None else None
+
+            full_imgs[page_id] = full
+            for elt in tables:
+                crop_imgs[(page_id, elt["id"])] = crops.get(elt["id"])
+    finally:
+        if fdoc is not None:
+            fdoc.close()
 
     # --- correct tables (parallel within the document); pages w/o tables skip the LLM ---
     errors = 0
@@ -243,6 +224,10 @@ def main() -> None:
     parser.add_argument("--page-workers", type=int, default=8, help="Table corrections concurrent within a doc.")
     parser.add_argument("--bbox-dpi", type=int, default=DEFAULT_BBOX_DPI,
                         help="DPI the parser bbox pixel coords were computed at (default 300).")
+    parser.add_argument("--page-renders-dir", default=str(Path.home() / "dais" / "page_renders"),
+                        help="Dir of pre-rendered page PNGs from skunk.dais.render_corpus (default ~/dais/page_renders).")
+    parser.add_argument("--table-renders-dir", default=str(Path.home() / "dais" / "table_renders"),
+                        help="Dir of pre-rendered table PNGs from skunk.dais.render_corpus (default ~/dais/table_renders).")
     parser.add_argument("--text-fallback", action="store_true",
                         help="For JSONs with no PDF, emit LLM-free parser-order text (tables HTML-stripped).")
     parser.add_argument("--no-fallback", action="store_true", help="Disable Gemini->OpenRouter LLM fallback.")
@@ -274,7 +259,8 @@ def main() -> None:
     with ThreadPoolExecutor(max_workers=max(1, args.doc_workers)) as pool:
         futures = {
             pool.submit(_process_document, jp, args.pdfs_dir, args.output_dir, llm, done_doc_ids,
-                        args.page_workers, args.bbox_dpi, args.text_fallback): jp
+                        args.page_workers, args.bbox_dpi, args.text_fallback,
+                        args.page_renders_dir, args.table_renders_dir): jp
             for jp in json_files
         }
         with tqdm(total=len(json_files), desc="Cleaning documents", unit="doc") as pbar:
