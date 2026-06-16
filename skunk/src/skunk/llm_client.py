@@ -86,6 +86,21 @@ def _is_retryable(e: BaseException) -> bool:
     return isinstance(e, retryable)
 
 
+def _is_429(e: BaseException) -> bool:
+    """True iff `e` is an HTTP 429 (rate-limit / quota) from either provider SDK — the
+    one signal the failover monitor counts (`_ProviderFailover.record_429`). Mirrors
+    the 429 arm of `_is_retryable`; lazy-imports the OpenRouter error type."""
+    if isinstance(e, genai_errors.APIError):
+        return getattr(e, "code", None) == 429
+    try:
+        from openrouter.errors import OpenRouterError
+    except ImportError:
+        OpenRouterError = ()  # type: ignore[assignment]
+    if isinstance(e, OpenRouterError):
+        return getattr(e, "status_code", None) == 429
+    return False
+
+
 _MODEL_RPM: dict[str, float] | None = None
 
 # Built-in per-model request caps (provider account limits). Overridable per model via
@@ -260,15 +275,204 @@ def _make_openrouter_client() -> "OpenRouter":
     return OpenRouter(api_key=api_key)
 
 
+# ---------------------------------------------------------------------------
+# Automatic Gemini→OpenRouter failover (self-healing).
+#
+# Gemini is the front path. A process-global monitor counts HTTP 429s in a rolling
+# per-second window (`_Rolling429Window`); once `threshold` of them land inside the window
+# it routes ALL generation to OpenRouter. Every call reads the window when picking a
+# provider, so failover is instant for new traffic and needs no broadcast / registry /
+# cancellation of in-flight calls. The provider is re-checked per RETRY ATTEMPT (see
+# `_retry_call`), so a call already on Gemini that 429s after the trip finishes on
+# OpenRouter at its next attempt — no call is ever cancelled.
+#
+# Recovery is built into the window: it DRAINS by the second. Once on OpenRouter no traffic
+# hits Gemini, so no fresh 429s arrive and the per-second buckets age out; when the windowed
+# total falls back under `threshold` the next call flips back to Gemini. No canary probes —
+# if Gemini is still storming, the resumed load simply re-trips. See `SkunkConfig.llm_failover_*`.
+# ---------------------------------------------------------------------------
+
+
+class _Rolling429Window:
+    """A self-draining rolling window of HTTP-429 counts over the last `window_s` seconds,
+    bucketed one count per second. The data structure is maintained COLLABORATIVELY — there
+    is no background thread; each caller advances the ring by the wall-clock seconds elapsed
+    since the last touch, so old seconds age out on their own. All state is private.
+
+    Simple API: `log_429()` records one failure; `check_status()` returns True when the
+    windowed total has reached `threshold` (i.e. the backup provider should be used).
+
+    Thread-safe: mutation/advance happens under a lock; `check_status` short-circuits the
+    lock when it can tell no second has rolled over yet (an atomic int read of the cached
+    epoch), so the per-call hot path is uncontended within a given second."""
+
+    def __init__(self, *, window_s: int, threshold: int) -> None:
+        self._n = max(1, int(window_s))
+        self._threshold = threshold
+        self._buckets = [0] * self._n        # ring of per-second 429 counts
+        self._head = 0                        # index of the current second's bucket
+        self._epoch = int(time.monotonic())   # wall-clock second that `_head` represents
+        self._total = 0                       # cached sum(_buckets) — the windowed count
+        self._lock = threading.Lock()
+
+    def _advance_locked(self, now_s: int) -> None:
+        """Drain the buckets for each whole second elapsed since `_epoch` (caller holds the
+        lock). This is the collaborative maintenance step — whoever touches the window next
+        pays for the seconds that have passed."""
+        steps = now_s - self._epoch
+        if steps <= 0:
+            return
+        if steps >= self._n:  # the whole window has aged out — nothing survives
+            self._buckets = [0] * self._n
+            self._head = 0
+            self._total = 0
+        else:
+            for _ in range(steps):
+                self._head = (self._head + 1) % self._n
+                self._total -= self._buckets[self._head]
+                self._buckets[self._head] = 0
+        self._epoch = now_s
+
+    def log_429(self) -> None:
+        now_s = int(time.monotonic())
+        with self._lock:
+            self._advance_locked(now_s)
+            self._buckets[self._head] += 1
+            self._total += 1
+
+    def check_status(self) -> bool:
+        """True ⇒ the windowed 429 count has reached `threshold` (use the backup)."""
+        now_s = int(time.monotonic())
+        if now_s == self._epoch:  # same second — no drain owed; atomic reads, lock-free
+            return self._total >= self._threshold
+        with self._lock:
+            self._advance_locked(now_s)
+            return self._total >= self._threshold
+
+
+class _ProviderFailover:
+    """Process-global failover policy: owns provider routing + the model map + once-per-
+    transition logging, and delegates all 429 windowing/draining to `_Rolling429Window`.
+    Inert (always routes to the configured provider) when `enabled` is False."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        threshold: int,
+        window_s: float,
+        fallback_model: str | None,
+        model_map: dict[str, str],
+    ) -> None:
+        self._enabled = enabled
+        self._fallback_model = fallback_model
+        self._model_map = dict(model_map)
+        self._window = _Rolling429Window(window_s=int(window_s), threshold=threshold)
+        self._on_backup = False  # last-logged status, so TRIP/RECOVER log once per flip
+        self._log_lock = threading.Lock()
+
+    def record_429(self) -> None:
+        """Record a 429 into the rolling window. No-op when disabled."""
+        if self._enabled:
+            self._window.log_429()
+
+    def route(self, provider: str, model: str) -> tuple[str, str]:
+        """(provider, model) for the next attempt. Disabled — or already targeting
+        openrouter — passes through unchanged. Otherwise, while the window is over threshold
+        Gemini calls become OpenRouter (mapped/fallback model); when it drains back under
+        threshold, traffic returns to Gemini."""
+        if not self._enabled or provider == "openrouter":
+            return provider, model
+        on_backup = self._window.check_status()
+        self._note_transition(on_backup)
+        if on_backup:
+            return "openrouter", self._model_map.get(model, self._fallback_model or model)
+        return provider, model
+
+    def _note_transition(self, on_backup: bool) -> None:
+        """Log TRIPPED / RECOVERED once per actual flip (double-checked under the lock)."""
+        if on_backup == self._on_backup:
+            return
+        with self._log_lock:
+            if on_backup == self._on_backup:
+                return
+            self._on_backup = on_backup
+            if on_backup:
+                log.warning(
+                    "LLM failover TRIPPED: ≥ threshold HTTP 429s in the rolling window — "
+                    "routing ALL generation to OpenRouter (default model=%s); will retry "
+                    "Gemini once the window drains", self._fallback_model,
+                )
+            else:
+                log.warning(
+                    "LLM failover RECOVERED: 429 window drained — routing generation back "
+                    "to Gemini",
+                )
+
+    @property
+    def tripped(self) -> bool:
+        return self._enabled and self._window.check_status()
+
+
+_FAILOVER: _ProviderFailover | None = None
+_FAILOVER_LOCK = threading.Lock()
+
+
+def _warn_free_failover_models(fallback: str | None, model_map: dict[str, str]) -> None:
+    """One-time warning if any failover target is a `:free` OpenRouter id — those cap at
+    ~20 RPM, BELOW the Gemini quota, so a 429 storm would only worsen on them."""
+    free = sorted({m for m in [fallback, *model_map.values()] if m and m.endswith(":free")})
+    if free:
+        log.warning(
+            "LLM failover target(s) %s are `:free` tier (~20 RPM) — too small to absorb "
+            "a 429 storm; configure paid OpenRouter model ids instead.", free,
+        )
+
+
+def get_provider_failover(config: SkunkConfig) -> _ProviderFailover:
+    """Process-wide failover monitor, built from the FIRST config seen and frozen for the
+    run (same first-use-wins contract as `get_rate_limiter`). Armed only when failover is
+    enabled AND `OPENROUTER_API_KEY` AND a failover model are all present; otherwise it's
+    INERT (logs once, never trips) so a 429 storm degrades to retries, never to the hard
+    failure an unconfigured OpenRouter client would raise."""
+    global _FAILOVER
+    with _FAILOVER_LOCK:
+        if _FAILOVER is None:
+            has_key = bool(os.environ.get("OPENROUTER_API_KEY"))
+            armed = bool(config.llm_failover_enabled and has_key and config.llm_failover_model)
+            if config.llm_failover_enabled and not armed:
+                log.warning(
+                    "LLM failover enabled but INERT (%s) — staying on the configured "
+                    "provider with no automatic OpenRouter failover.",
+                    "OPENROUTER_API_KEY not set" if not has_key
+                    else "SKUNK_LLM_FAILOVER_MODEL not set",
+                )
+            if armed:
+                _warn_free_failover_models(config.llm_failover_model, config.llm_failover_model_map)
+            _FAILOVER = _ProviderFailover(
+                enabled=armed,
+                threshold=config.llm_failover_429_threshold,
+                window_s=config.llm_failover_window_s,
+                fallback_model=config.llm_failover_model,
+                model_map=config.llm_failover_model_map,
+            )
+        return _FAILOVER
+
+
 class LLMClient:
     """LLM client. Generation calls route to either the AI Studio Gemini API
-    (`provider=genai`, default) or OpenRouter (`provider=openrouter`); both share
-    the same rate-limit / retry / logging scaffolding. Embeddings stay on Gemini."""
+    (`provider=genai`, default) or OpenRouter (`provider=openrouter`); both share the
+    same rate-limit / retry / logging scaffolding. Under sustained Gemini 429s an
+    automatic latch fails the whole process over to OpenRouter (`_ProviderFailover`),
+    re-decided per retry attempt. Embeddings stay on Gemini."""
 
     def __init__(self, config: SkunkConfig) -> None:
         self._config = config
         self._gemini_client: genai.Client | None = None
         self._openrouter_client: OpenRouter | None = None
+        # Process-global, shared across every LLMClient (one per question) so a 429
+        # storm spanning all in-flight questions is seen as one signal.
+        self._failover = get_provider_failover(config)
 
     def _get_gemini_client(self) -> genai.Client:
         if self._gemini_client is None:
@@ -291,11 +495,13 @@ class LLMClient:
         call_site: str = "llm",
         model: str | None = None,
     ) -> LLMResponse:
-        args = (system, user, images, temperature, effort, ctx, call_site,
-                model or self._config.llm_model)
-        if self._config.llm_provider == "openrouter":
-            return self._call_openrouter(*args)
-        return self._call_gemini(*args)
+        def attempt(provider: str, m: str) -> LLMResponse:
+            args = (system, user, images, temperature, effort, ctx, call_site, m)
+            if provider == "openrouter":
+                return self._call_openrouter_once(*args)
+            return self._call_gemini_once(*args)
+
+        return self._retry_call(attempt, self._config.llm_provider, model or self._config.llm_model)
 
     async def acall(
         self,
@@ -312,65 +518,97 @@ class LLMClient:
     ) -> LLMResponse:
         """Async twin of `call` for the request path. `max_output_tokens` /
         `timeout_s` mirror `astream`'s caps (None → provider default / no cap)."""
-        args = (system, user, images, temperature, effort, ctx, call_site,
-                model or self._config.llm_model, max_output_tokens, timeout_s)
-        if self._config.llm_provider == "openrouter":
-            return await self._acall_openrouter(*args)
-        return await self._acall_gemini(*args)
+        async def attempt(provider: str, m: str) -> LLMResponse:
+            args = (system, user, images, temperature, effort, ctx, call_site, m,
+                    max_output_tokens, timeout_s)
+            if provider == "openrouter":
+                return await self._acall_openrouter_once(*args)
+            return await self._acall_gemini_once(*args)
 
-    def _retry_call(self, do_call: Callable[[], LLMResponse], model: str) -> LLMResponse:
-        """Run `do_call` under `model`'s rate limiter with exponential-backoff
-        retry. `do_call` owns the API invocation, timing, parsing, and success emit."""
-        limiter = get_rate_limiter(f"llm:{model}", rate_per_min=_llm_model_rpm(model))
+        return await self._aretry_call(
+            attempt, self._config.llm_provider, model or self._config.llm_model
+        )
+
+    def _retry_call(
+        self,
+        attempt: Callable[[str, str], LLMResponse],
+        configured_provider: str,
+        model: str,
+    ) -> LLMResponse:
+        """Drive `attempt(provider, model)` with exponential-backoff retry. The
+        provider+model are re-routed through the failover latch ON EACH ATTEMPT (not
+        once up front), so a call that 429s after the latch trips runs its next attempt
+        on OpenRouter — no in-flight call is cancelled. 429s feed `record_429`; the
+        rate-limiter bucket follows the *effective* model. `attempt` owns the API call,
+        timing, parsing, and success emit."""
         max_retries = self._config.llm_max_retries
         delay = self._config.llm_retry_initial_delay_s
 
-        for attempt in range(max_retries + 1):
+        for i in range(max_retries + 1):
+            provider, eff_model = self._failover.route(configured_provider, model)
+            limiter = get_rate_limiter(f"llm:{eff_model}", rate_per_min=_llm_model_rpm(eff_model))
             limiter.acquire()
             try:
-                return do_call()
+                return attempt(provider, eff_model)
             except Exception as e:
+                if _is_429(e):
+                    self._failover.record_429()
                 # Log EVERY failure with its message — including the final one
                 # before we re-raise — so a fatal error is never silent.
-                stop = attempt == max_retries or not _is_retryable(e)
+                stop = i == max_retries or not _is_retryable(e)
+                # Skip the backoff when the next attempt re-routes to a different
+                # (healthy) provider — no reason to wait out a quota we're abandoning.
+                rerouting = not stop and self._failover.route(configured_provider, model)[0] != provider
                 log.warning(
-                    "llm call failed (attempt %d/%d): %s: %s%s",
-                    attempt + 1, max_retries + 1, type(e).__name__, e,
-                    "" if stop else f"; retrying in {delay:.1f}s",
+                    "llm call failed (attempt %d/%d, provider=%s model=%s): %s: %s%s",
+                    i + 1, max_retries + 1, provider, eff_model, type(e).__name__, e,
+                    "" if stop else (
+                        "; re-routing to backup provider" if rerouting else f"; retrying in {delay:.1f}s"
+                    ),
                 )
                 if stop:
                     raise
-                time.sleep(delay)
-                delay *= 2
+                if not rerouting:
+                    time.sleep(delay)
+                    delay *= 2
         raise RuntimeError("unreachable: retry loop fell through")
 
     async def _aretry_call(
-        self, do_call: Callable[[], Awaitable[LLMResponse]], model: str
+        self,
+        attempt: Callable[[str, str], Awaitable[LLMResponse]],
+        configured_provider: str,
+        model: str,
     ) -> LLMResponse:
-        """Async twin of `_retry_call`: awaits `model`'s async rate limiter and the
-        coroutine `do_call`, backing off via `asyncio.sleep` (never blocking the
-        event loop). `do_call` owns the API invocation, timing, parsing, and emit."""
-        limiter = get_rate_limiter(f"llm:{model}", rate_per_min=_llm_model_rpm(model))
+        """Async twin of `_retry_call`: awaits the effective model's async rate limiter
+        and the coroutine `attempt(provider, model)`, backing off via `asyncio.sleep`
+        (never blocking the event loop). Re-routes per attempt and records 429s exactly
+        like the sync path."""
         max_retries = self._config.llm_max_retries
         delay = self._config.llm_retry_initial_delay_s
 
-        for attempt in range(max_retries + 1):
+        for i in range(max_retries + 1):
+            provider, eff_model = self._failover.route(configured_provider, model)
+            limiter = get_rate_limiter(f"llm:{eff_model}", rate_per_min=_llm_model_rpm(eff_model))
             await limiter.acquire_async()
             try:
-                return await do_call()
+                return await attempt(provider, eff_model)
             except Exception as e:
-                # Log EVERY failure with its message — including the final one
-                # before we re-raise — so a fatal error is never silent.
-                stop = attempt == max_retries or not _is_retryable(e)
+                if _is_429(e):
+                    self._failover.record_429()
+                stop = i == max_retries or not _is_retryable(e)
+                rerouting = not stop and self._failover.route(configured_provider, model)[0] != provider
                 log.warning(
-                    "llm call failed (attempt %d/%d): %s: %s%s",
-                    attempt + 1, max_retries + 1, type(e).__name__, e,
-                    "" if stop else f"; retrying in {delay:.1f}s",
+                    "llm call failed (attempt %d/%d, provider=%s model=%s): %s: %s%s",
+                    i + 1, max_retries + 1, provider, eff_model, type(e).__name__, e,
+                    "" if stop else (
+                        "; re-routing to backup provider" if rerouting else f"; retrying in {delay:.1f}s"
+                    ),
                 )
                 if stop:
                     raise
-                await asyncio.sleep(delay)
-                delay *= 2
+                if not rerouting:
+                    await asyncio.sleep(delay)
+                    delay *= 2
         raise RuntimeError("unreachable: retry loop fell through")
 
     def embed(
@@ -483,7 +721,7 @@ class LLMClient:
             "cache_input_tokens": getattr(usage, "cached_content_token_count", None),
         }
 
-    def _call_gemini(
+    def _call_gemini_once(
         self,
         system: str,
         user: str,
@@ -494,7 +732,8 @@ class LLMClient:
         call_site: str = "llm",
         model: str | None = None,
     ) -> LLMResponse:
-        """Single Gemini call. `call_site` attributes the envelope log to the caller."""
+        """One Gemini call (no retry — the retry loop owns that). `call_site`
+        attributes the envelope log to the caller."""
         client = self._get_gemini_client()
         parts = self._gemini_parts(user, images)
         model = model or self._config.llm_model
@@ -525,9 +764,9 @@ class LLMClient:
                 thinking_tokens=toks.get("thinking_tokens"),
             )
 
-        return self._retry_call(do, model)
+        return do()
 
-    async def _acall_gemini(
+    async def _acall_gemini_once(
         self,
         system: str,
         user: str,
@@ -540,7 +779,7 @@ class LLMClient:
         max_output_tokens: int | None = None,
         timeout_s: float | None = None,
     ) -> LLMResponse:
-        """Async twin of `_call_gemini` — uses `client.aio.models.generate_content`."""
+        """Async twin of `_call_gemini_once` — uses `client.aio.models.generate_content`."""
         client = self._get_gemini_client()
         parts = self._gemini_parts(user, images)
         model = model or self._config.llm_model
@@ -595,7 +834,7 @@ class LLMClient:
                 thinking_tokens=toks.get("thinking_tokens"),
             )
 
-        return await self._aretry_call(do, model)
+        return await do()
 
     def stream(
         self,
@@ -616,13 +855,16 @@ class LLMClient:
         defaults to 0.0 — agent loops are deterministic like every other call site.
         `effort` maps onto Gemini's thinking config exactly like the single-shot
         path (`_gemini_config`), so agent loops are tunable like every other call site."""
-        kw = dict(system=system, messages=messages, model=model, should_stop=should_stop,
-                  temperature=temperature, effort=effort, ctx=ctx, call_site=call_site)
-        if self._config.llm_provider == "openrouter":
-            return self._stream_openrouter(**kw) # type: ignore
-        return self._stream_gemini(**kw) # type: ignore
+        def attempt(provider: str, m: str) -> LLMResponse:
+            kw = dict(system=system, messages=messages, model=m, should_stop=should_stop,
+                      temperature=temperature, effort=effort, ctx=ctx, call_site=call_site)
+            if provider == "openrouter":
+                return self._stream_openrouter_once(**kw)  # type: ignore
+            return self._stream_gemini_once(**kw)  # type: ignore
 
-    def _stream_gemini(
+        return self._retry_call(attempt, self._config.llm_provider, model or self._config.llm_model)
+
+    def _stream_gemini_once(
         self,
         *,
         system: str,
@@ -681,7 +923,7 @@ class LLMClient:
                 thinking_tokens=toks.get("thinking_tokens"),
             )
 
-        return self._retry_call(do, model_id)
+        return do()
 
     async def astream(
         self,
@@ -703,14 +945,19 @@ class LLMClient:
         `max_output_tokens` overrides the per-call output cap (None → provider
         default); `timeout_s` enforces a hard per-request wall-clock cap. Both are
         opt-in and currently used only by the search agent (see `MultiTurnAgent`)."""
-        kw = dict(system=system, messages=messages, model=model, should_stop=should_stop,
-                  temperature=temperature, effort=effort, ctx=ctx, call_site=call_site,
-                  max_output_tokens=max_output_tokens, timeout_s=timeout_s)
-        if self._config.llm_provider == "openrouter":
-            return await self._astream_openrouter(**kw) # type: ignore
-        return await self._astream_gemini(**kw) # type: ignore
+        async def attempt(provider: str, m: str) -> LLMResponse:
+            kw = dict(system=system, messages=messages, model=m, should_stop=should_stop,
+                      temperature=temperature, effort=effort, ctx=ctx, call_site=call_site,
+                      max_output_tokens=max_output_tokens, timeout_s=timeout_s)
+            if provider == "openrouter":
+                return await self._astream_openrouter_once(**kw)  # type: ignore
+            return await self._astream_gemini_once(**kw)  # type: ignore
 
-    async def _astream_gemini(
+        return await self._aretry_call(
+            attempt, self._config.llm_provider, model or self._config.llm_model
+        )
+
+    async def _astream_gemini_once(
         self,
         *,
         system: str,
@@ -789,7 +1036,7 @@ class LLMClient:
                 thinking_tokens=toks.get("thinking_tokens"),
             )
 
-        return await self._aretry_call(do, model_id)
+        return await do()
 
     # --- OpenRouter generation path (provider="openrouter") ---
     # Mirrors the Gemini helpers above: same do()/_retry_call shape, same ctx.emit
@@ -836,7 +1083,7 @@ class LLMClient:
             "cache_input_tokens": getattr(details, "cached_tokens", None) if details else None,
         }
 
-    def _call_openrouter(
+    def _call_openrouter_once(
         self,
         system: str,
         user: str,
@@ -847,7 +1094,8 @@ class LLMClient:
         call_site: str = "llm",
         model: str | None = None,
     ) -> LLMResponse:
-        """Single OpenRouter chat call. `call_site` attributes the envelope log."""
+        """One OpenRouter chat call (no retry — the retry loop owns that). `call_site`
+        attributes the envelope log."""
         client = self._get_openrouter_client()
         model = model or self._config.llm_model
         messages: list[dict] = []
@@ -881,9 +1129,9 @@ class LLMClient:
                 thinking_tokens=toks.get("thinking_tokens"),
             )
 
-        return self._retry_call(do, model)
+        return do()
 
-    async def _acall_openrouter(
+    async def _acall_openrouter_once(
         self,
         system: str,
         user: str,
@@ -896,7 +1144,7 @@ class LLMClient:
         max_output_tokens: int | None = None,
         timeout_s: float | None = None,
     ) -> LLMResponse:
-        """Async twin of `_call_openrouter` — uses `client.chat.send_async`."""
+        """Async twin of `_call_openrouter_once` — uses `client.chat.send_async`."""
         client = self._get_openrouter_client()
         model = model or self._config.llm_model
         messages: list[dict] = []
@@ -941,7 +1189,7 @@ class LLMClient:
                 thinking_tokens=toks.get("thinking_tokens"),
             )
 
-        return await self._aretry_call(do, model)
+        return await do()
 
     @staticmethod
     def _openrouter_chat_messages(system: str, messages: list[dict]) -> list[dict]:
@@ -967,7 +1215,7 @@ class LLMClient:
             text += getattr(delta, "content", None) or ""
         return text
 
-    def _stream_openrouter(
+    def _stream_openrouter_once(
         self,
         *,
         system: str,
@@ -1015,9 +1263,9 @@ class LLMClient:
                 thinking_tokens=toks.get("thinking_tokens"),
             )
 
-        return self._retry_call(do, model_id)
+        return do()
 
-    async def _astream_openrouter(
+    async def _astream_openrouter_once(
         self,
         *,
         system: str,
@@ -1031,7 +1279,7 @@ class LLMClient:
         max_output_tokens: int | None = None,
         timeout_s: float | None = None,
     ) -> LLMResponse:
-        """Async twin of `_stream_openrouter` — uses `client.chat.send_async` + `async for`."""
+        """Async twin of `_stream_openrouter_once` — uses `client.chat.send_async` + `async for`."""
         client = self._get_openrouter_client()
         model_id = model or self._config.llm_model
         or_messages = self._openrouter_chat_messages(system, messages)
@@ -1076,4 +1324,4 @@ class LLMClient:
                 thinking_tokens=toks.get("thinking_tokens"),
             )
 
-        return await self._aretry_call(do, model_id)
+        return await do()
