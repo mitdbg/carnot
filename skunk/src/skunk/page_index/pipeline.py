@@ -1104,7 +1104,7 @@ class EraMergeStage(Stage):
 
 
 def build_search_index(rows: Iterable[PageCatalogRow], out: Path) -> int:
-    """Build the read-only SQLite FTS5 index the SelectAgent's `query_index` tool runs SQL
+    """Build the read-only SQLite FTS5 index the SelectAgent's `search_corpus` tool runs SQL
     against: ONE FTS5 table `pages`, one row per catalog PAGE. The single indexed `summary`
     column carries the page's searchable text (block titles + summaries + table headers, for
     MATCH / bm25); the rest are `UNINDEXED` columns the agent filters/selects on (doc_id,

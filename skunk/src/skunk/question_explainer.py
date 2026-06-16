@@ -54,11 +54,15 @@ PRECOMPUTED_CONCEPTS: list[tuple[str, str]] = [
     ),
     (
         "Arc elasticity (midpoint method)",
-        "[(Q2 - Q1) / ((Q1 + Q2) / 2)] / [(P2 - P1) / ((P1 + P2) / 2)] — each percent change uses the average of its two endpoints in the denominator (the factor of 2 cancels). Keep the sign unless the question asks for the absolute value.",
+        "[(Q2 - Q1) / ((Q1 + Q2) / 2)] / [(P2 - P1) / ((P1 + P2) / 2)] — each percent change uses the average of its two endpoints in the denominator (the factor of 2 cancels). Keep the sign unless the question asks for the absolute value. Requires TWO series (Q and P); if the question gives only one series, it wants the midpoint percent change of that series alone — use the next entry, not this ratio.",
+    ),
+    (
+        "Symmetric / midpoint percent change (single series)",
+        "Between two values v1 and v2 the symmetric (midpoint) percent change is (v2 - v1) / ((v1 + v2) / 2): the change over the AVERAGE of the two endpoints, not over v1. It is a one-variable quantity — do NOT divide by the change in any second variable (that is arc elasticity). Report as a decimal unless the question asks for a percent.",
     ),
     (
         "Population vs sample standard deviation / variance",
-        "Population divides by N (numpy default, ddof=0); sample divides by N-1 (ddof=1). Use exactly what the question names: \"population standard deviation\" => ddof=0; a \"sample\" standard deviation or a z-score taken off a sample => ddof=1.",
+        "Population divides by N (numpy default, ddof=0); sample divides by N-1 (ddof=1). Use exactly what the question names; if the question does not name it, prefer population variance",
     ),
     (
         "Coefficient of variation of log growth rates",
@@ -121,6 +125,10 @@ PRECOMPUTED_CONCEPTS: list[tuple[str, str]] = [
         "slope = sum((x - x̄)(y - ȳ)) / sum((x - x̄)²); intercept = ȳ - slope * x̄. Forecast by substituting x into ŷ = intercept + slope * x. Use the exact predictor coding the question specifies (e.g. \"treat 1990 as year 0\").",
     ),
     (
+        "Polynomial (cubic) regression",
+        "Fit with numpy.polyfit(x, y, deg) at the degree the question names (deg=3 for cubic); forecast with numpy.polyval(coeffs, x_new). Use the predictor coding the question specifies and do not transform x unless asked. This is a least-squares polynomial fit, not an interpolating spline.",
+    ),
+    (
         "Pearson correlation coefficient",
         "r = sum((x - x̄)(y - ȳ)) / sqrt(sum((x - x̄)²) * sum((y - ȳ)²)).",
     ),
@@ -138,7 +146,7 @@ PRECOMPUTED_CONCEPTS: list[tuple[str, str]] = [
     ),
     (
         "Fisher Ideal symmetric growth rate",
-        "The Fisher index is the geometric mean of the Laspeyres and Paasche indexes; the symmetric growth between two values uses the index form (growth = Fisher_index - 1), not a plain percent change.",
+        "Between two scalar values v1 (base) and v2, the symmetric growth rate is the midpoint form (v2 - v1) / ((v1 + v2) / 2), equivalently ln(v2 / v1). Do NOT use the plain ratio v2 / v1 - 1 (the Laspeyres/Paasche index ratio degenerates to that for single values and gives the wrong answer). Report as a decimal unless the question asks for a percent.",
     ),
 ]
 

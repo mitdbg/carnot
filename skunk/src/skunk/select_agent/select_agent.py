@@ -6,12 +6,12 @@ in a different regime: stage-1 page-index retrieval (ToC + date filter + semanti
 already flagged the most-likely candidate blocks, which are SEEDED as the agent's opening
 observation. The agent's job is to verify and select among them — reading pages, viewing
 figures, tiling a recurring series across issues — and it has full-corpus reach via
-`query_index` (raw SQL over the prebuilt search index) if the flagged set proves insufficient.
+`search_corpus` (WHERE/ORDER BY/LIMIT over the prebuilt search index) if the flagged set proves insufficient.
 
 No ChromaDB, no embeddings: whole-corpus reach is a prebuilt SQLite FTS5 index the agent
-queries with SQL, and page content is read through the `PageStore`. The selection rules
+queries through `search_corpus`, and page content is read through the `PageStore`. The selection rules
 (exact-qualifier match, tiling, source-pin / most-recent tie-break) are carried over from the
-block-selection tournament.
+retired block-selection tournament.
 """
 
 from __future__ import annotations
@@ -41,13 +41,13 @@ from skunk.page_index.store import PageStore
 from skunk.select_agent.select_tools import (
     EMPTY_GREP_MESSAGE,
     GREP_RESULT_TAG,
-    QUERY_RESULT_TAG,
     READ_DOCUMENT_RESULT_TAG,
+    SEARCH_RESULT_TAG,
     VIEW_FIGURE_RESULT_TAG,
     CatalogView,
     GrepCorpusTool,
-    QueryIndexTool,
     ReadDocumentTool,
+    SearchCorpusTool,
     ViewFigureTool,
 )
 
@@ -75,9 +75,9 @@ class SelectAgent(MultiTurnAgent):
         "if you suspect this from inspecting the likely candidate set, commit all information you can find"
         "in the corpus even if they only help make partial progress. \n\n"
 
-        "Write down thoughts and observations about the what you have seen as code comments in your tool call blocks"
+        "Write down brief thoughts and observations about the what you have seen as code comments in your tool call blocks"
         "-- examples include summarizing what the previous observation showed, what you concluded, pages you may want "
-        "too revisit later, and why you are making this call, so a human can follow your thoughts\n\n"
+        "too revisit later, and why you are making this call. Be concise -- one or two sentences would suffice. \n\n"
 
         "## Hints\n\n"
         "- Match the question's EXACT wording — the precise series with every qualifier, "
@@ -143,7 +143,7 @@ not be an answer or a computation — name the rows/columns and dates to transcr
         self.request_timeout_s = config.search_agent_request_timeout_s
 
         tools = [
-            QueryIndexTool(search_index_path),
+            SearchCorpusTool(search_index_path),
             GrepCorpusTool(self._view, config.grep_max_output_tokens),
             ReadDocumentTool(
                 self._view,
@@ -166,7 +166,7 @@ not be an answer or a computation — name the rows/columns and dates to transcr
         """The candidate PAGES (distinct, deduped) as the opening observation — page ids
         only, no summaries. Deliberately just a list: first-pass retrieval flags pages that
         very likely hold the right table, and the agent discovers everything else through its
-        tools (read_document / query_index / grep_corpus). On a replan sweep, a second block
+        tools (read_document / search_corpus / grep_corpus). On a replan sweep, a second block
         lists the data earlier attempts already gathered, so the agent narrows to what's left."""
         seen: list[str] = []
         seen_set: set[str] = set()
@@ -216,8 +216,8 @@ not be an answer or a computation — name the rows/columns and dates to transcr
             blocks.append(TextBlock(f"[stdout]\n{stdout_s}"))
         output = out.output
 
-        if isinstance(output, dict) and output.get(QUERY_RESULT_TAG):
-            # query_index returns a single rendered result-grid (or `[error] ...`) text.
+        if isinstance(output, dict) and output.get(SEARCH_RESULT_TAG):
+            # search_corpus returns a single rendered result-grid (or `[error] ...`) text.
             blocks.append(TextBlock(output["text"]))
             return blocks
 
@@ -299,7 +299,7 @@ not be an answer or a computation — name the rows/columns and dates to transcr
         if bad:
             return (
                 f"These doc_ids are not real catalog pages: {bad[:8]}. Use a doc_id exactly "
-                "as it appears in the candidate listing or query_index results."
+                "as it appears in the candidate listing or search_corpus results."
             )
         if no_target:
             return (

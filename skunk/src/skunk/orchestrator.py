@@ -840,7 +840,7 @@ class Orchestrator:
         pages are deduped and the LLM semantic filter scans each unique page at most once,
         judging it against all branches' targets, then routes the survivors back per branch.
         Returns one normalized `BranchRetrieval` per branch (or the `StepFailed` to attribute
-        to it) — `RetrieveOp.run_all` owns all backend dispatch and the `pre_selected` flag.
+        to it) — `RetrieveOp.run_all` owns all backend dispatch.
         `branch_ids` lets the search-agent backend emit a per-branch `retrieve` step;
         `document_scopes` hard-scopes a branch's corpus to human-required bulletins (HITL).
         The shared page-index `retrieve` sweep carries no `branch_id`."""
@@ -903,36 +903,32 @@ class Orchestrator:
             zip(retrieve_pos, retrievals)
         )
 
-        # Select → extract runs as ONE shared pipeline over all retrieve branches,
-        # launched as a task so lookup branches proceed concurrently. Each retrieve
-        # tail awaits the shared task and picks out its branch's result. Selection and
-        # extraction are two stages (`run_select` then `run_extract`); each does its own
-        # per-branch traced_steps, so the tail doesn't wrap them again.
+        # Extract runs as ONE shared pass over all retrieve branches, launched as a task so
+        # lookup branches proceed concurrently. Each retrieve tail awaits the shared task and
+        # picks out its branch's result. `run_extract` does its own per-branch traced_steps,
+        # so the tail doesn't wrap it again.
         pipeline: asyncio.Task | None = None
         if retrieve_pos:
             from skunk.block_extract import run_extract
-            from skunk.block_select import run_select
 
             sub_branches = [cast(RetrieveBranch, branches[i]) for i in retrieve_pos]
             sub_ids = [branch_ids[i] for i in retrieve_pos]
             sub_retrievals = [retr_by_pos[i] for i in retrieve_pos]
 
-            async def _select_extract() -> list[list[AnnotatedValue] | StepFailed]:
+            async def _extract() -> list[list[AnnotatedValue] | StepFailed]:
                 from skunk.page_index.query import PageIndexRetriever
 
-                # A retrieval that is already FINAL — golden, search-agent, or a page-pin
-                # fetch (`BranchRetrieval.pre_selected`) — skips block_select entirely: its
-                # blocks ARE the selection. Only live page-index retrievals run the selection
-                # tournament. block_select itself is selection-only; the decision lives here.
+                # Every retrieval is already FINAL — its blocks ARE the selection (golden,
+                # search-agent, page-pin fetch, or the SelectAgent's picks). Build each
+                # branch's extract pool straight from its blocks.
                 selections: list[list[SemPoolEntry] | StepFailed | None] = [
                     None
                 ] * len(sub_branches)
-                live_pos: list[int] = []
                 page_targets: dict[str, str] = {}
                 for i, r in enumerate(sub_retrievals):
                     if isinstance(r, StepFailed):
                         selections[i] = r
-                    elif r.pre_selected:
+                    else:
                         if r.page_targets:
                             page_targets.update(r.page_targets)
                         pool = PageIndexRetriever.pool_for_blocks(
@@ -942,17 +938,6 @@ class Orchestrator:
                             "retrieve",
                             f"retrieval produced no blocks for branch {sub_branches[i].key!r}",
                         )
-                    else:
-                        live_pos.append(i)
-                if live_pos:
-                    live = await run_select(
-                        self._ctx,
-                        [sub_branches[i] for i in live_pos],
-                        [sub_retrievals[i] for i in live_pos],
-                        [sub_ids[i] for i in live_pos],
-                    )
-                    for j, i in enumerate(live_pos):
-                        selections[i] = live[j]
                 return await run_extract(
                     self._ctx,
                     sub_branches,
@@ -961,7 +946,7 @@ class Orchestrator:
                     page_targets=page_targets or None,
                 )
 
-            pipeline = asyncio.create_task(_select_extract())
+            pipeline = asyncio.create_task(_extract())
 
         def _branch_blocks(pos: int) -> list[BlockRef]:
             r = retr_by_pos.get(pos)

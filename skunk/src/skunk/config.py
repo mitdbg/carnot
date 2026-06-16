@@ -89,13 +89,11 @@ class SkunkConfig:
     golden_pages: list[PageRef] | None = field(default=None, repr=False)
 
     # Retrieve dispatch (env: SKUNK_RETRIEVER):
-    #   "page_index"       — ToC pick → year filter → coarse summary filter (the default);
-    #                        survivors narrowed by the block-selection tournament downstream.
-    #   "page_index_agent" — same candidate generation, but the SelectAgent (catalog +
-    #                        PageStore, no ChromaDB) does the precision selection over the
-    #                        flagged survivors, emitting final pages (block_select bypassed).
-    #   "search_agent"     — iterative ChromaDB + LLM loop over the whole corpus.
-    retriever: Literal["search_agent", "page_index", "page_index_agent"] = "page_index"
+    #   "page_index"   — ToC pick → year filter → coarse summary filter (the default); the
+    #                    SelectAgent (catalog + PageStore, no ChromaDB) does the precision
+    #                    selection over the flagged survivors, emitting final pages.
+    #   "search_agent" — iterative ChromaDB + LLM loop over the whole corpus.
+    retriever: Literal["search_agent", "page_index"] = "page_index"
 
     # Search-agent corpus artifacts (built offline; agent fails fast if missing).
     # (env: SKUNK_CHROMADB_DIR, SKUNK_CHROMADB_COLLECTION, SKUNK_CLEAN_PAGE_MAP)
@@ -169,10 +167,9 @@ class SkunkConfig:
     semfilter_batch_size: int = 32
 
     # Per-LLM-call caps for the external-lookup agent's turns (named for the retired
-    # selection agent that shared them). Mirrors the search agent: without a combined
-    # thinking+visible cap, Flash thrashed to ~63K thinking tokens / ~285s per step
-    # and emitted no parseable tool call (parse-retry death spiral). Selection
-    # itself (skunk.block_select) is bounded PromptedCalls, not an agent loop.
+    # block-selection tournament that shared them). Mirrors the search agent: without a
+    # combined thinking+visible cap, Flash thrashed to ~63K thinking tokens / ~285s per step
+    # and emitted no parseable tool call (parse-retry death spiral).
     # (env: SKUNK_SELECT_AGENT_MAX_OUTPUT_TOKENS, SKUNK_SELECT_AGENT_TIMEOUT_S)
     select_agent_max_output_tokens: int = 8192
     select_agent_request_timeout_s: float = 150.0

@@ -1,22 +1,19 @@
-"""Organized extraction over selected blocks — the stage after `block_select`.
+"""Organized extraction over selected blocks — the stage after `retrieve`.
 
-`run_extract` takes each retrieve branch's SELECTED blocks (`block_select.run_select`'s
-output) and reads them into `AnnotatedValue`s. Its one job beyond calling the extractor
+`run_extract` takes each retrieve branch's selected blocks (the final pages `RetrieveOp`
+emits) and reads them into `AnnotatedValue`s. Its one job beyond calling the extractor
 tiers is a cross-branch invariant: a block selected by several branches is **read once**
 and its entries are **attributed once** — to the first branch that selected it — so compute
 sees each datum exactly once. The unit of work ("unique selected block across all branches")
 only exists once every branch's selection is known, which is why this is a sweep over all
 branches rather than a per-branch step.
 
-Each unique block is read text-tier-first with a pure-vision fallback (`_extract_block`).
-This module owns no selection logic; it shares only block identity (`_block_id`) with
-`block_select`, so the two agree on what "the same block" means."""
+Each unique block is read text-tier-first with a pure-vision fallback (`_extract_block`)."""
 
 from __future__ import annotations
 
 import asyncio
 
-from skunk.block_select import _block_id
 from skunk.common import (
     AnnotatedValue,
     BlockRef,
@@ -36,6 +33,13 @@ from skunk.plan import RetrieveBranch
 
 _TEXT = TextExtractor()
 _VISION = VisionExtractor()
+
+
+def _block_id(e: SemPoolEntry) -> str:
+    """Stable identity for a content block — the unit deduped across branches so a block
+    selected by several branches is read and attributed exactly once."""
+    bi = e.ref.block_index
+    return f"{e.ref.page.month}:{e.ref.page.page}#{'w' if bi is None else bi}"
 
 
 def _page_keys(e: SemPoolEntry) -> set[str]:
@@ -106,8 +110,8 @@ async def run_extract(
 ) -> list[list[AnnotatedValue] | StepFailed]:
     """Read every branch's selected blocks: one organized sweep where each unique block is
     read ONCE, mapped to every branch that selected it, its entries owned by the FIRST such
-    branch (compute must see each datum exactly once). `selections` is `run_select`'s output,
-    one slot per branch — the selected entries, or a `StepFailed` to carry through. Returns
+    branch (compute must see each datum exactly once). `selections` is one slot per branch —
+    the selected entries (the retrieval's final blocks), or a `StepFailed` to carry through. Returns
     one result per branch (its entries, or the `StepFailed` to attribute to it).
     `page_targets` (SelectAgent path) maps a block's anchor `doc_id` to the agent's per-page
     retrieval target, which drives that block's read and is stamped onto its entries."""

@@ -2,11 +2,12 @@
 
 The SelectAgent is the precision stage that runs over the page-index sem-filter
 survivors. Unlike the SearchAgent it has NO ChromaDB and NO embeddings: whole-corpus reach
-is a prebuilt **SQLite FTS5 index** the agent queries with raw SQL, and page CONTENT is read
-on demand through the `PageStore` (the same source extract reads). The four tools:
+is a prebuilt **SQLite FTS5 index** the agent queries through a fixed-column search tool, and
+page CONTENT is read on demand through the `PageStore` (the same source extract reads). The four tools:
 
-  - `query_index`   — run a read-only SQL SELECT against the corpus search index (one FTS5
-    table `pages`): full-text rank with MATCH / bm25, filter on metadata, LIMIT for top-K.
+  - `search_corpus` — query the corpus search index (one FTS5 table `pages`): the agent supplies
+    only the `WHERE` / `ORDER BY` / `LIMIT` clauses and the tool always returns `doc_id, bulletin,
+    title` (full-text rank with MATCH / bm25, filter on metadata) — triage on title, then confirm.
   - `grep_corpus`   — a regex over the full TEXT of pages (the exact string the summaries
     can't give); defaults to the flagged subset, or pass `doc_ids` to grep any pages.
   - `read_document` — the full text of any page(s), via `PageStore.text`.
@@ -26,17 +27,16 @@ from collections import defaultdict
 
 from skunk.common import page_key_to_pageref
 from skunk.multi_turn_agent import Tool
-from skunk.page_index.data_model import CATALOG_ROW_FIELDS
 from skunk.page_index.store import PageStore
 
-QUERY_RESULT_TAG = "__query_result__"
+SEARCH_RESULT_TAG = "__search_result__"
 GREP_RESULT_TAG = "__grep_result__"
 READ_DOCUMENT_RESULT_TAG = "__read_document_result__"
 VIEW_FIGURE_RESULT_TAG = "__view_figure_result__"
 
 EMPTY_GREP_MESSAGE = (
     "No matches in the searched pages' text. By default grep_corpus searches only the flagged "
-    "candidate pages; pass doc_ids=[...] (e.g. pages found via query_index) to grep others."
+    "candidate pages; pass doc_ids=[...] (e.g. pages found via search_corpus) to grep others."
 )
 
 
@@ -100,33 +100,50 @@ def _render_rows(columns: list[str], rows: list[tuple], truncated: bool, max_cha
     note = ""
     if len(text) > max_chars:
         text = text[:max_chars]
-        note = "\n[... output clipped; SELECT fewer/narrower columns]"
+        note = "\n[... output clipped; narrow your WHERE or lower LIMIT]"
     if truncated:
         note += f"\n[showing first {len(rows)} rows; add or lower LIMIT for a complete set]"
     return text + note
 
 
-class QueryIndexTool(Tool):
-    name = "query_index"
+class SearchCorpusTool(Tool):
+    name = "search_corpus"
+    _COLUMNS = "doc_id, bulletin, title"  # the ONLY columns this tool ever returns
     _MAX_ROWS = 50  # hard cap on rows returned, regardless of the query's LIMIT
-    _MAX_CHARS = 30_000  # char cap on the rendered result text
+    _MAX_CHARS = 30_000  # char cap on the rendered result text (a backstop)
     _TIMEOUT_S = 5.0  # wall-clock budget per query (a pathological scan is interrupted)
+    # Reject anything that would break out of the single assembled SELECT — statement
+    # separators and SQL comments. The read-only `immutable` connection already blocks writes;
+    # this keeps the fixed `SELECT doc_id, bulletin, title` column contract intact.
+    _FORBIDDEN = re.compile(r";|--|/\*")
 
     def __init__(self, search_index_path: str):
         self._index_path = str(search_index_path)
 
-    def __call__(self, sql: str) -> dict:
-        s = (sql or "").strip().rstrip(";").strip()
-        if not s:
-            return {QUERY_RESULT_TAG: True, "text": "[error] empty query"}
-        # First keyword must be SELECT/WITH (a usability filter; the read-only `immutable`
-        # connection is the real write guard, and sqlite3 rejects multi-statement strings).
-        toks = s.lstrip("( \t\r\n").split(None, 1)
-        if (toks[0].lower() if toks else "") not in ("select", "with"):
+    def __call__(self, where: str, order_by: str | None = None, limit: int | None = None) -> dict:
+        where_s = (where or "").strip()
+        if not where_s:
             return {
-                QUERY_RESULT_TAG: True,
-                "text": "[error] only a single read-only SELECT/WITH query is allowed",
+                SEARCH_RESULT_TAG: True,
+                "text": "[error] `where` is required, e.g. \"pages MATCH 'public debt' AND has_table=1\"",
             }
+        order_s = (order_by or "").strip()
+        for frag in (where_s, order_s):
+            if frag and self._FORBIDDEN.search(frag):
+                return {
+                    SEARCH_RESULT_TAG: True,
+                    "text": "[error] `where`/`order_by` take a single clause only — no ';', SQL comments, or extra statements",
+                }
+        sql = f"SELECT {self._COLUMNS} FROM pages WHERE {where_s}"
+        if order_s:
+            sql += f" ORDER BY {order_s}"
+        if limit is not None:
+            try:
+                n = int(limit)
+            except (TypeError, ValueError):
+                return {SEARCH_RESULT_TAG: True, "text": "[error] `limit` must be an integer"}
+            if n > 0:
+                sql += f" LIMIT {n}"
         con = _ro_connection(self._index_path)
         # Bound a pathological query with a watchdog that `interrupt()`s from another thread.
         # (A SQLite progress handler would also work, but it calls back into Python every N
@@ -135,53 +152,37 @@ class QueryIndexTool(Tool):
         watchdog.daemon = True
         watchdog.start()
         try:
-            cur = con.execute(s)
+            cur = con.execute(sql)
             columns = [d[0] for d in cur.description] if cur.description else []
             rows = cur.fetchmany(self._MAX_ROWS + 1)
         except sqlite3.Error as e:
-            # SQL / operational errors (incl. multi-statement, write attempts, an interrupt
-            # timeout) are handed back so the agent can fix its query and retry, REPL-style.
-            return {QUERY_RESULT_TAG: True, "text": f"[error] {type(e).__name__}: {e}"}
+            # SQL / operational errors (a bad MATCH/clause, an interrupt timeout) are handed
+            # back so the agent can fix its query and retry, REPL-style.
+            return {SEARCH_RESULT_TAG: True, "text": f"[error] {type(e).__name__}: {e}"}
         finally:
             watchdog.cancel()
         truncated = len(rows) > self._MAX_ROWS
         text = _render_rows(columns, rows[: self._MAX_ROWS], truncated, self._MAX_CHARS)
-        return {QUERY_RESULT_TAG: True, "text": text}
+        return {SEARCH_RESULT_TAG: True, "text": text}
 
-    doc = (
-        """\
-### query_index(sql: str)
-Run ONE read-only SQL SELECT against the corpus search index to find candidate pages beyond your seeded shortlist — full-text rank with MATCH/bm25, filter on metadata, LIMIT for top-K. The index is a single SQLite FTS5 table `pages`, one row per page of every bulletin. Returns the result rows; on a SQL error the message is returned so you can fix the query and retry. Read-only: SELECT/WITH only, no writes.
+    doc = """\
+### search_corpus(where: str, order_by: str | None = None, limit: int | None = None)
+Find candidate pages beyond your seeded shortlist. You write only the SQL `WHERE` clause (required) and optional `ORDER BY` / `LIMIT`; the tool always returns the columns `doc_id, bulletin, title` — triage on the title, then use read_document / grep_corpus to confirm a page actually carries the target series. The index is one SQLite FTS5 table `pages`, one row per page of every bulletin. At most 50 rows are returned.
 
-Schema:
-```sql
-CREATE VIRTUAL TABLE pages USING fts5(
-  summary,             -- searchable text: each block's title, summary, and table row/column headers
-  doc_id   UNINDEXED,  -- the page id, e.g. '1980_04_85' (select pages by this)
-  bulletin UNINDEXED,  -- issue the page was printed in, 'YYYY-MM'
-  page     UNINDEXED,  -- 1-based PDF page within the issue
-  lo UNINDEXED, hi UNINDEXED,  -- the page's DATA span bounds 'YYYY-MM' (what it REPORTS ON; NULL if undatable)
-  has_table UNINDEXED, has_chart UNINDEXED, has_prose UNINDEXED,  -- 1 if the page has a block of that kind
-  title    UNINDEXED   -- the page's primary table title
-);
-```
-Full-text: `WHERE pages MATCH '<q>'` ranked by `bm25(pages)` (more-negative = better, so `ORDER BY bm25(pages)`). MATCH supports `AND` / `OR` / `NOT`, `"exact phrase"`, `prefix*`, `NEAR(a b, 5)`. Date-span overlap = `lo <= '<end>' AND hi >= '<start>'`. At most 50 rows are returned — add LIMIT and select only the columns you need (e.g. doc_id, bulletin, title, summary).
+Columns you can filter / order on:
+- `pages MATCH '<q>'` — full-text over each page's block titles, summaries, and table row/column headers. Supports `AND` / `OR` / `NOT`, `"exact phrase"`, `prefix*`, `NEAR(a b, 5)`. For best-first ranking pass `order_by="bm25(pages)"` (more-negative = better).
+- `bulletin` — issue 'YYYY-MM'.  `page` — 1-based PDF page.  `title` — primary table title.
+- `lo`, `hi` — the page's DATA span bounds 'YYYY-MM' (what it REPORTS ON; NULL if undatable). Date overlap = `lo<='<end>' AND hi>='<start>'`.
+- `has_table`, `has_chart`, `has_prose` — 1 if the page has a block of that kind.
 
-```sql
--- tables about public debt reporting on 1940 data, best matches first
-SELECT doc_id, bulletin, title, summary FROM pages
-WHERE pages MATCH 'public AND debt' AND has_table=1 AND lo<='1940-12' AND hi>='1940-01'
-ORDER BY bm25(pages) LIMIT 20;
--- an exact phrase, any issue
-SELECT doc_id, bulletin, title FROM pages WHERE pages MATCH '"statutory debt limitation"' LIMIT 20;
--- metadata only (no text rank): every page of one issue, in order
-SELECT doc_id, page, title FROM pages WHERE bulletin='1946-11' ORDER BY page;
-```
-
-The `summary` column is built from this catalog schema:
-"""
-        + CATALOG_ROW_FIELDS
-    )
+```python
+# tables about public debt reporting on 1940 data, best matches first
+search_corpus(where="pages MATCH 'public AND debt' AND has_table=1 AND lo<='1940-12' AND hi>='1940-01'", order_by="bm25(pages)", limit=20)
+# an exact phrase, any issue
+search_corpus(where="pages MATCH '\\"statutory debt limitation\\"'", limit=20)
+# every page of one issue, in printed order
+search_corpus(where="bulletin='1946-11'", order_by="page")
+```"""
 
 
 class GrepCorpusTool(Tool):
@@ -209,7 +210,7 @@ class GrepCorpusTool(Tool):
             return {GREP_RESULT_TAG: True, "groups": [], "error": f"bad regex: {e}"}
 
         # Which pages to grep: the explicit `doc_ids` (any page, read via the PageStore — e.g.
-        # pages found with query_index), else the flagged survivor subset.
+        # pages found with search_corpus), else the flagged survivor subset.
         if doc_ids is not None:
             ids = [doc_ids] if isinstance(doc_ids, str) else list(doc_ids)
             texts: dict[str, str] = {}
@@ -270,12 +271,12 @@ class GrepCorpusTool(Tool):
 
     doc = """\
 ### grep_corpus(pattern: str, doc_ids: str | list[str] | None = None, limit: int | None = None)
-A regex search over the FULL TEXT of pages (the exact strings the summaries don't show — a specific series name, footnote, or value). By DEFAULT it searches only the flagged candidate pages; pass `doc_ids=[...]` to grep specific pages instead (any page in the corpus, e.g. ones you found with `query_index`). Returns the matching lines grouped by page (doc_id). Output is capped; a broad pattern is truncated with a note — narrow it or pass `limit=N`.
+A regex search over the FULL TEXT of pages (the exact strings the summaries don't show — a specific series name, footnote, or value). By DEFAULT it searches only the flagged candidate pages; pass `doc_ids=[...]` to grep specific pages instead (any page in the corpus, e.g. ones you found with `search_corpus`). Returns the matching lines grouped by page (doc_id). Output is capped; a broad pattern is truncated with a note — narrow it or pass `limit=N`.
 
 ```python
 # which flagged pages mention this exact series, case-insensitive
 grep_corpus(r"(?i)statutory debt limitation")
-# grep a specific page found via query_index
+# grep a specific page found via search_corpus
 grep_corpus(r"(?i)statutory debt limitation", doc_ids=["1980_04_85"])
 ```"""
 
@@ -284,7 +285,7 @@ class ReadDocumentTool(Tool):
     name = "read_document"
     _DOC_TEMPLATE = """\
 ### read_document(doc_id: str | list[str])
-Returns the full text of one or more pages by `doc_id` — use it to CONFIRM a candidate actually carries the target series at the needed granularity before selecting it. Works for any page in the corpus (flagged or found via query_index). Don't read more than ~{{ max_pages }} pages per call.
+Returns the full text of one or more pages by `doc_id` — use it to CONFIRM a candidate actually carries the target series at the needed granularity before selecting it. Works for any page in the corpus (flagged or found via search_corpus). Don't read more than ~{{ max_pages }} pages per call.
 
 ```python
 read_document(["1946_11_41", "1947_01_38"])

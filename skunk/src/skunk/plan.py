@@ -207,16 +207,10 @@ Rules:
   - DIAGNOSE FIRST: compare the previous plans, the values compute kept,
     and what compute says is missing — work out why the gathering so far
     did not satisfy compute, then emit branches that fix exactly that.
-    Never re-emit an approach that already failed the same way.
-  - Values under "Values compute KEPT" stay available to compute; never
-    emit a branch for data already there. Everything else compute saw was
-    retrieved and dropped as not useful in its current form.
   - Read each failed attempt's diagnostic before retrying it: reword the
     key, check the granularity asked for.
   - lookup_external is permitted only when you have tried to retrieve it from the corpus
     previously and it failed
-  - When a committed computed intermediate pins the period of a missing
-    value, set the new branch's `period` to exactly that period.
   - Human-provided resolutions explicitly map prior missing identifiers to
     entries already in the kept value pool. Treat those identifiers as resolved
     by those entries; do not request them again unless the latest missing-data

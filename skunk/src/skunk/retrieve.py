@@ -1,10 +1,11 @@
-"""retrieve operator — one op over three swappable backends.
+"""retrieve operator — one op over two swappable backends.
 
 `RetrieveOp` turns a `RetrieveBranch` into the pages that answer it:
 - golden bypass — returns `ctx.config.golden_pages` verbatim (eval ablation).
 - `search_agent` — iterative ChromaDB + LLM loop under `skunk.search_agent`.
 - `page_index` — ToC pick → year filter → semantic filter (all within
-  `PageIndexRetriever.retrieve_all`); the selection agent narrows downstream.
+  `PageIndexRetriever.retrieve_all`), then ONE `SelectAgent` does the precision selection
+  over the flagged survivors and emits the final pages.
 
 The two real backends are built lazily.
 """
@@ -35,7 +36,7 @@ if TYPE_CHECKING:
 
 
 def _whole_page_blocks(refs: list[PageRef]) -> list[BlockRef]:
-    """Wrap bare page refs (golden / search-agent) as whole-page `BlockRef`s (`block_index=None`),
+    """Wrap bare page refs (golden / search-agent / select-agent) as whole-page `BlockRef`s (`block_index=None`),
     so extract reads them the same as page-index blocks — just with no specific block to scope to."""
     return [
         BlockRef(page=r, block_index=None, member_refs=(r,), block=None) for r in refs
@@ -59,15 +60,16 @@ class RetrieveOp:
         prior_values: list[AnnotatedValue] | None = None,
     ) -> list[BranchRetrieval | StepFailed]:
         """The single retrieval seam: retrieve for several branches at once, one result per
-        branch aligned to `branches`. Each slot is a `BranchRetrieval` (its blocks +
-        `pre_selected`) or a `StepFailed` — a single branch failing does not sink its
-        siblings. A whole-sweep failure (unknown retriever, missing index) raises. This is
-        the ONLY place that dispatches on `config.retriever`:
+        branch aligned to `branches`. Each slot is a `BranchRetrieval` (its final blocks) or a
+        `StepFailed` — a single branch failing does not sink its siblings. A whole-sweep
+        failure (unknown retriever, missing index) raises. This is the ONLY place that
+        dispatches on `config.retriever`:
 
-        - golden bypass (`golden_pages`) → whole-page blocks, `pre_selected=True`.
-        - `search_agent` → agent rollout → page keys → whole-page blocks, `pre_selected=True`.
-        - `page_index` → sem-filter survivor blocks, `pre_selected=False`; an empty survivor
-          list for a branch surfaces as a per-branch `StepFailed`.
+        - golden bypass (`golden_pages`) → whole-page blocks.
+        - `search_agent` → agent rollout → page keys → whole-page blocks.
+        - `page_index` → ToC + year + sem filter sweep, then ONE `SelectAgent` selects the
+          final pages over the union of every branch's survivors; an empty survivor list for
+          a branch surfaces as a per-branch `StepFailed`.
 
         `branch_ids` (search-agent backend only) aligns each branch to its stable id so its
         retrieve runs in a per-branch `traced_step`: the rollout + the returned pages then
@@ -82,7 +84,7 @@ class RetrieveOp:
                 f"golden_bypass n_pages={len(pages)} refs={[str(r) for r in pages]!r}"
             )
             blocks = tuple(_whole_page_blocks(pages))
-            return [BranchRetrieval(blocks=blocks, pre_selected=True) for _ in branches]
+            return [BranchRetrieval(blocks=blocks) for _ in branches]
         scopes: list[list[str] | None] = document_scopes or [None] * len(branches)
         match str(ctx.config.retriever):
             case "search_agent":
@@ -99,9 +101,7 @@ class RetrieveOp:
                         lambda: self._run_search_agent(ctx, b, required_bulletins=scope),
                         branch_id=bid,
                     )
-                    return BranchRetrieval(
-                        blocks=tuple(_whole_page_blocks(refs)), pre_selected=True
-                    )
+                    return BranchRetrieval(blocks=tuple(_whole_page_blocks(refs)))
 
                 settled = await asyncio.gather(
                     *(
@@ -120,38 +120,12 @@ class RetrieveOp:
                         out.append(r)
                 return out
             case "page_index":
-                survivors = await self._page_index().retrieve_all(
-                    ctx,
-                    branches,
-                    document_scopes=scopes,
-                )
-                results: list[BranchRetrieval | StepFailed] = []
-                for b, brs in zip(branches, survivors):
-                    if not brs:
-                        reason = (
-                            f"page_pin {b.page_pin.bulletin}:{b.page_pin.page} resolved to no catalog page"
-                            if b.page_pin is not None
-                            else f"semantic filter kept no blocks for branch {b.key!r}"
-                        )
-                        results.append(StepFailed("retrieve", reason))
-                    else:
-                        # A page-pinned branch is a deterministic positional FETCH: mark it
-                        # pre_selected so block_select keeps both resolved pages whole instead
-                        # of dropping them on a topic mismatch — they go straight to extract.
-                        results.append(
-                            BranchRetrieval(
-                                blocks=tuple(brs), pre_selected=b.page_pin is not None
-                            )
-                        )
-                return results
-            case "page_index_agent":
-                # Same candidate generation as `page_index` (one shared ToC + year + sem
-                # filter sweep), then ONE SelectAgent — given the full question and the UNION
-                # of every (non-pinned) branch's flagged survivors — selects the pages that
-                # answer the whole question. Its pages are broadcast to every non-pinned
-                # branch as `pre_selected=True` blocks (each branch's extract then pulls its
-                # own series from them), so the block-selection tournament is bypassed. Pinned
-                # branches stay deterministic positional fetches and skip the agent.
+                # ToC + year + sem filter sweep (shared across branches), then ONE SelectAgent
+                # — given the full question and the UNION of every (non-pinned) branch's
+                # flagged survivors — selects the pages that answer the whole question. Its
+                # pages are broadcast to every non-pinned branch (each branch's extract then
+                # pulls its own series from them). Pinned branches stay deterministic positional
+                # fetches and skip the agent.
                 from skunk.page_index.query import PageIndexRetriever
                 from skunk.page_index.store import get_page_store
 
@@ -170,7 +144,7 @@ class RetrieveOp:
                 for i, (b, brs) in enumerate(zip(branches, survivors)):
                     if b.page_pin is not None:
                         slots[i] = (
-                            BranchRetrieval(blocks=tuple(brs), pre_selected=True)
+                            BranchRetrieval(blocks=tuple(brs))
                             if brs
                             else StepFailed(
                                 "retrieve",
@@ -208,7 +182,6 @@ class RetrieveOp:
                             )
                             shared = BranchRetrieval(
                                 blocks=tuple(_whole_page_blocks(refs)),
-                                pre_selected=True,
                                 page_targets=targets or None,
                             )
                             for i in agent_positions:
@@ -223,7 +196,7 @@ class RetrieveOp:
             case other:
                 raise StepFailed(
                     "retrieve",
-                    f"unknown retriever {other!r}; expected 'search_agent', 'page_index', or 'page_index_agent'",
+                    f"unknown retriever {other!r}; expected 'search_agent' or 'page_index'",
                 )
 
     async def _run_search_agent(

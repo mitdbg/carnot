@@ -428,13 +428,10 @@ class SemPoolEntry:
 @dataclass(frozen=True)
 class BranchRetrieval:
     """One retrieve branch's normalized result — the single retrieval contract every
-    backend produces. `blocks` are the blocks to feed selection/extract; `pre_selected`
-    True (golden / search-agent) means they are already final, so the selection tournament
-    is skipped and every block is extracted. Produced solely by `RetrieveOp.run_all`; no
-    downstream layer inspects `config.retriever`."""
+    backend produces. `blocks` are the already-final blocks to feed extract. Produced solely
+    by `RetrieveOp.run_all`; no downstream layer inspects `config.retriever`."""
 
     blocks: tuple[BlockRef, ...]
-    pre_selected: bool
     # SelectAgent path only: per-page (doc_id → natural-language retrieval target) the agent
     # wrote — drives that page's extraction (the `looking_for`) and is stamped onto each
     # resulting AnnotatedValue's `retrieve_key`. None for every other backend.

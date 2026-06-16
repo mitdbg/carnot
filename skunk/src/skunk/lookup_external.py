@@ -11,21 +11,25 @@ class LookupAgent(MultiTurnAgent):
     name = "lookup_external"
     warn_steps_remaining = 1
 
-    briefing = (
-        "You find the external value(s) a request asks for and commit them as one "
-        'result. Each request is a JSON object {"target": "<value(s)>", '
-        '"src": "<source | null>"}. If `src` is non-null, the answer must come from '
-        "that publisher; if null, any authoritative public source is fine. "
-        "Tool steps have `math`, `statistics`, `datetime`, `numpy as np`, `pandas as pd`, `json` in scope (plus the tools above).\n\n"
-        + DEFAULT_PRIORITIZATION
-    )
+    briefing = '''\
+You find the external value(s) a request asks for and commit them as one result. Each request is a JSON object {"target": "<value(s)>", "src": "<source | null>"}.
 
-    final_answer_doc = """\
+`src` sets where the value may come from and how hard you search:
+- Pinned (non-null): the value MUST come from that publisher. Keep searching until you read it from that named source; never substitute another publisher's figure, even one offered first — same-named series (e.g. a BLS/FRED series vs the pinned publisher) can differ, and that difference is the point.
+- Null: any authoritative public source is fine. Commit the first hit you have verified answers the target — historical values vary slightly across sources, so don't keep searching for confirmation.
+
+Before committing, verify the value matches the target's period/date, unit, and geography — a number for the wrong year or basis is the main failure here. For a multi-value target (a series/range or a row×column breakdown) collect the whole set, not the first cell, and emit it as a vector/table.
+
+Tool steps have `math`, `statistics`, `datetime`, `numpy as np`, `pandas as pd`, `json` in scope (plus the tools above).
+
+''' + DEFAULT_PRIORITIZATION
+
+    final_answer_doc = '''\
 A JSON object with these keys (literals only — copy values out of your
 observations; you cannot reference variables here):
 
   {"description": "<names the value>", "value": <...>,
-   "unit": "<e.g. pct, usd, fx_rate>",
+   "unit": "<free-form, e.g. percent, millions of dollars, yen per U.S. dollar>",
    "source": "<publisher/origin of the value>",
    "kind": "scalar" | "vector" | "table",
    "index_name": "<dim>",                      # vector only
@@ -34,15 +38,15 @@ observations; you cannot reference variables here):
 Pick the shape that best fits the requested data. Cells should be simple number or string — no nested cells.
 Put the value's publisher/origin in `source`. Examples:
 ```json
-{"description": "USD to GBP spot rate, 2002-06-30",
- "value": 0.6549, "unit": "fx_rate", "source": "MeasuringWorth"}
+{"description": "USD to GBP spot rate, 2002-06-30 (British pounds per U.S. dollar)",
+ "value": 0.6549, "unit": "British pounds per U.S. dollar", "source": "MeasuringWorth"}
 ```
 ```json
 {"description": "U.S. personal saving rate, 1950-1990",
  "kind": "vector", "index_name": "year", "source": "FRED PSAVERT",
- "value": {"1950": 9.4, "1951": 11.1, "1990": 8.5}, "unit": "pct"}
+ "value": {"1950": 9.4, "1951": 11.1, "1990": 8.5}, "unit": "percent"}
 ```
-"""
+'''
 
     def __init__(self, *, max_steps: int, tools: list[Tool]):
         super().__init__(tools, max_steps=max_steps)

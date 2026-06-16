@@ -4,7 +4,7 @@
 year filter → one coarse semantic filter over the deduped union. The filter judges per
 CONTENT BLOCK (flat list, one boolean each) against the branch RETRIEVAL TARGETS; a page
 is kept iff any block fits any target. Output is BLOCK-granular (`BlockRef`); the
-block-selection tournament (`skunk.block_select`) narrows the survivors downstream."""
+`SelectAgent` (`skunk.select_agent`) does the precision selection over the survivors downstream."""
 
 import json
 import asyncio
@@ -220,7 +220,7 @@ True when the summary fits at least one target; false only when clearly unrelate
         ]
         self._catalog = {r.ref: r for r in rows}
         self.catalog = self._catalog  # public read-only alias (the SelectAgent queries it)
-        # Prebuilt FTS5 search index the SelectAgent's `query_index` tool runs SQL against
+        # Prebuilt FTS5 search index the SelectAgent's `search_corpus` tool runs SQL against
         # (read-only, opened per-thread by the tool). A clear error here beats a cryptic mid-run failure.
         self.search_index_path = root / SEARCH_INDEX_FILE
         if not self.search_index_path.exists():
