@@ -146,6 +146,9 @@ claimed by multiple workers:
 The first valid action atomically transitions the task. Other active
 assignments for the old task version become `SUPERSEDED`.
 
+The task detail overlay is intentionally inset lower in the viewport, with a
+14vh top offset, so the header round timer remains visible above the popup.
+
 Additionally, the client displays an "Await Human" summary count and status area
 for each task that is in `AWAIT_HUMAN` processing. Request cards show the
 kind, instructions, context, and source document links. Each request card

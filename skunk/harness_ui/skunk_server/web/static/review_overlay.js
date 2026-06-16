@@ -45,6 +45,97 @@ window.apiJson = async function apiJson(url, body, options = {}) {
   return data;
 };
 
+const CorpusUI = (function () {
+  const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[c]));
+
+  function confidenceValue(confidence) {
+    if (typeof confidence === "number") return confidence;
+    if (!confidence || typeof confidence !== "object") return null;
+    const value = confidence.min ?? confidence.p10 ?? confidence.median;
+    return typeof value === "number" ? value : null;
+  }
+
+  function confidenceChip(confidence) {
+    const value = confidenceValue(confidence);
+    if (value == null) return "";
+    const pct = Math.round(value * 100);
+    const cls = pct >= 92 ? "confidence-high" : pct >= 80 ? "confidence-mid" : "confidence-low";
+    const label = pct >= 92 ? "High" : pct >= 80 ? "Med" : "Low";
+    return `<span class="tag corpus-tag ${cls}" title="Parsed JSON confidence">${label} ${pct}%</span>`;
+  }
+
+  function docLabel(doc) {
+    if (!doc) return "";
+    const label = doc.label || doc.family || "Source";
+    const era = doc.era ? ` ${doc.era}` : "";
+    const year = doc.year ? ` ${doc.year}` : "";
+    return `${label}${era}${year}`;
+  }
+
+  function docClass(doc) {
+    if (!doc) return "corpus-unknown";
+    if (doc.family === "govinfo_receipts" || doc.ocr_risk === "high") return "corpus-high";
+    if (doc.ocr_risk === "medium" || doc.era === "historical") return "corpus-medium";
+    if (doc.ocr_review_allowed === false) return "corpus-structured";
+    return "corpus-unknown";
+  }
+
+  function summaryTags(summary) {
+    if (!summary) return "";
+    const docs = summary.documents || [];
+    const primary = docs[0];
+    const tags = [];
+    if (primary) {
+      tags.push(`<span class="tag corpus-tag ${docClass(primary)}" title="${esc(primary.source || "")}">${esc(docLabel(primary))}</span>`);
+    } else if ((summary.eras || []).length) {
+      tags.push(`<span class="tag corpus-tag corpus-unknown">${esc(summary.eras.join(", "))}</span>`);
+    }
+    if (summary.ocr_review_blocked) {
+      tags.push(`<span class="tag corpus-tag corpus-blocked" title="Structured source policy: do not ask humans to review OCR content">OCR blocked</span>`);
+    } else if (summary.ocr_review_allowed) {
+      tags.push(`<span class="tag corpus-tag ${summary.ocr_risk === "high" ? "corpus-high" : "corpus-medium"}">OCR review</span>`);
+    }
+    const conf = confidenceChip(summary.confidence);
+    if (conf) tags.push(conf);
+    return tags.join("");
+  }
+
+  function sourcePanel(summary, reason) {
+    if (!summary && !reason) return "";
+    const docs = (summary && summary.documents) || [];
+    const docRows = docs.length
+      ? docs.map((doc) => `<div class="review-source-row">
+          <span class="review-source-name">${esc(docLabel(doc))}</span>
+          <span class="review-source-meta">${esc(doc.structure || "unknown")} · OCR ${esc(doc.ocr_risk || "unknown")}${doc.ocr_review_allowed === false ? " · blocked" : ""}</span>
+        </div>`).join("")
+      : "";
+    const reasonHtml = reason
+      ? `<div class="review-reason"><span>${esc(reason.kind || "review")}</span>${reason.policy ? ` ${esc(reason.policy)}` : ""}</div>`
+      : "";
+    return `<div class="review-sources">
+      <div class="review-source-tags">${summaryTags(summary)}</div>
+      ${reasonHtml}
+      ${docRows}
+    </div>`;
+  }
+
+  function candidateMeta(candidate) {
+    if (!candidate || typeof candidate !== "object") return "";
+    const conf = confidenceChip(candidate.confidence ?? candidate.ocr_confidence ?? candidate.parser_confidence);
+    const source = candidate.document_id || candidate.source_doc || candidate.source || candidate.bulletin || "";
+    const page = Array.isArray(candidate.pages) && candidate.pages.length ? ` p${candidate.pages.join(",")}` : (candidate.page != null ? ` p${candidate.page}` : "");
+    const element = Array.isArray(candidate.element_ids) && candidate.element_ids.length ? ` · ${candidate.element_ids.join(",")}` : (candidate.element_id != null ? ` · element ${candidate.element_id}` : "");
+    const sourceHtml = source || page || element
+      ? `<span class="review-cand-provenance">${esc(`${source}${page}${element}` || "source")}</span>`
+      : "";
+    if (!conf && !sourceHtml) return "";
+    return `<div class="review-cand-meta">${conf}${sourceHtml}</div>`;
+  }
+
+  return { summaryTags, sourcePanel, candidateMeta, confidenceChip };
+})();
+window.CorpusUI = CorpusUI;
+
 const LOCK_HEARTBEAT_MS = 7000;  // re-acquire (refresh the lease) well within the backend TTL
 
 const ReviewOverlay = (function () {
@@ -278,6 +369,7 @@ const ReviewOverlay = (function () {
         ${meta}
         <button class="review-cand-del" title="Remove this value" onclick="ReviewOverlay.deleteCard(this)">✕</button>
       </div>
+      ${CorpusUI.candidateMeta(c)}
       <label class="review-field"><span>description</span>
         <input type="text" data-f="description" value="${esc(c.description ?? "")}"></label>
       <label class="review-field"><span>unit</span>
@@ -536,6 +628,8 @@ const ReviewOverlay = (function () {
     const isFigure = review.kind === "figure";
     const ctx = contextLine(review);
     const cands = candidates(review);
+    const corpusSummary = review.corpus_summary || (review.guidance && review.guidance.corpus_summary) || null;
+    const sourcePanel = CorpusUI.sourcePanel(corpusSummary, review.review_reason);
     // Each kind picks its editor: replan_approval → read-only context + feedback; figure → JSON
     // template textarea; everything else → editable value cards (confirm/correct the model's read).
     let editor, editorLabel;
@@ -579,6 +673,7 @@ const ReviewOverlay = (function () {
         <div class="review-body">
           <div class="review-left">
             <div class="review-prompt">${esc(task?.prompt || "")}</div>
+            ${sourcePanel}
             ${ctx ? `<div class="review-context">${esc(ctx)}</div>` : ""}
             <div class="review-instructions">${esc(review.instructions || "")}</div>
             ${topControls}

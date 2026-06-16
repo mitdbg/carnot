@@ -142,11 +142,13 @@ function taskCardHTML(task) {
     isRefining(task) ? `<span class="tag ind ind-refining">Updating</span>` : "",
     lockedByOther(task) ? `<span class="tag ind ind-lock" title="Locked by another reviewer">🔒 In review</span>` : "",
   ].join("");
+  const corpusTags = window.CorpusUI ? window.CorpusUI.summaryTags(task.corpus_summary) : "";
   return `<div class="task-card ${task.task_id === detailTaskId ? "selected" : ""}" onclick="openDetail('${js(task.task_id)}')">
     <div class="card-uid">${esc(task.question_id)}</div>
     <div class="card-tags">
       <span class="tag status ${badgeClass(task)}">${esc(badgeLabel(task))}</span>
       ${cardKindTags(task)}
+      ${corpusTags}
       ${indicators}
     </div>
   </div>`;
@@ -210,6 +212,7 @@ function openDetail(taskId) {
       <div class="detail-scroll">
         <div class="prompt-label">PROMPT</div>
         <div class="prompt-text">${esc(task?.prompt || "")}</div>
+        <div id="dCorpus" class="detail-corpus">${window.CorpusUI ? window.CorpusUI.summaryTags(task?.corpus_summary) : ""}</div>
         <div class="answer-row">
           <div><span class="k">Status</span><strong id="dStatus">${esc(task ? badgeLabel(task) : "-")}</strong></div>
           <div><span class="k">Answer</span><strong id="dAnswer">${esc(task?.answer || "—")}</strong></div>
@@ -256,8 +259,10 @@ function refreshDetail() {
   }
   const st = document.getElementById("dStatus");
   const ans = document.getElementById("dAnswer");
+  const corpus = document.getElementById("dCorpus");
   if (st) st.textContent = task ? badgeLabel(task) : "-";
   if (ans) ans.textContent = task?.answer || "—";
+  if (corpus) corpus.innerHTML = window.CorpusUI ? window.CorpusUI.summaryTags(task?.corpus_summary) : "";
   renderDetailActions(task);
 }
 
