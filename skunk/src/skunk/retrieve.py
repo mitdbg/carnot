@@ -161,6 +161,7 @@ class RetrieveOp:
                 )
                 catalog = retriever.catalog
                 page_store = get_page_store(str(ctx.config.pdf_dir))
+                search_index_path = str(retriever.search_index_path)
 
                 slots: list[BranchRetrieval | StepFailed | None] = [None] * len(branches)
                 union: list[BlockRef] = []
@@ -201,7 +202,7 @@ class RetrieveOp:
                             refs, targets = await traced_step(
                                 ctx, "select_agent",
                                 lambda: self._run_select_agent(
-                                    ctx, pool, catalog, page_store,
+                                    ctx, pool, catalog, page_store, search_index_path,
                                     prior_values=prior_values,
                                 ),
                             )
@@ -279,6 +280,7 @@ class RetrieveOp:
         pool: list,
         catalog,
         page_store,
+        search_index_path: str,
         *,
         prior_values: list[AnnotatedValue] | None = None,
     ) -> tuple[list[PageRef], dict[str, str]]:
@@ -294,6 +296,7 @@ class RetrieveOp:
             catalog=catalog,
             page_store=page_store,
             candidates=pool,
+            search_index_path=search_index_path,
             prior_values=prior_values,
         )
         pages = await agent.retrieve(ctx, ctx.question)

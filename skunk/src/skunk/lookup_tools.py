@@ -105,7 +105,7 @@ class FredTool(Tool):
 
     doc = """\
 ### fetch_fred(endpoint, params={})
-FRED API (https://fred.stlouisfed.org/docs/api/fred/). `endpoint` is a FRED path,
+FRED API. `endpoint` is a FRED path,
 `params` its query args; returns parsed JSON. Pull a whole series in one call via
 `frequency`/`aggregation_method`; don't loop single observations.
 ```python
@@ -117,7 +117,7 @@ obs = [(o["date"], float(o["value"])) for o in resp["observations"] if o["value"
 hits = fetch_fred("series/search", {"search_text": "personal saving rate"})  # find a series_id
 ```
 FX/rate spot series (EXUSUK, EXCAUS, DEX*) from ~1971; CPI (CPIAUCSL SA, CPIAUCNS
-NSA) from 1947. Pre-API history returns nothing — use tavily_search / fetch_url."""
+NSA) from 1947. Pre-API history returns nothing"""
 
 
 class BlsTool(Tool):
@@ -138,7 +138,7 @@ class BlsTool(Tool):
 
     doc = """\
 ### fetch_bls(payload)
-BLS Public Data API v2 timeseries/data (https://www.bls.gov/developers/api_signature_v2.htm).
+BLS Public Data API v2 timeseries/data.
 `payload` is the POST body; returns parsed JSON.
 ```python
 resp = fetch_bls({"seriesid": ["CUUR0000SA0"], "startyear": "1960",
@@ -165,7 +165,7 @@ class WorldBankTool(Tool):
 
     doc = """\
 ### fetch_world_bank(path, params={})
-World Bank Indicators API v2 (https://datahelpdesk.worldbank.org/knowledgebase/articles/889392).
+World Bank Indicators API v2.
 `path` follows `/v2/`, `params` its query args; returns a [metadata, [observations]] list.
 ```python
 resp = fetch_world_bank("country/USA/indicator/NY.GDP.MKTP.CD",
@@ -194,11 +194,10 @@ class TavilySearchTool(Tool):
 
     doc = """\
 ### tavily_search(query, **kwargs)
-Tavily web search (https://docs.tavily.com/api-reference/endpoint/search). `query`
-+ kwargs (max_results [default 10], search_depth, time_range, include_domains,
+Tavily web search. `query` + kwargs (max_results [default 10], search_depth, time_range, include_domains,
 exclude_domains, ...); returns JSON. Results are short snippets only (`content`) —
 the exact figure is often NOT in the snippet, so fetch_url a promising hit's `url`
-for the full page text (where data tables live).
+for the full page text.
 ```python
 resp = tavily_search("annual average GBP USD exchange rate 1941",
                      include_domains=["measuringworth.com"])
@@ -206,7 +205,7 @@ for h in resp["results"]:
     print(h["url"], "—", h["content"])
 page = fetch_url(resp["results"][0]["url"])   # full text of the best hit
 ```
-For values the structured APIs lack — pre-1971 FX, pre-API series, one-off figures."""
+"""
 
 
 class FetchUrlTool(Tool):

@@ -51,16 +51,19 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import re
+import sqlite3
 import sys
 import time
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
+from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from skunk.common import ExecutionContext, load_env_file
+from skunk.common import ExecutionContext, load_env_file, pageref_to_doc_key
 from skunk.errors import ParseError
 from skunk.config import SkunkConfig
 from skunk.corpus import page_elements, parse_bulletin_filename
@@ -68,7 +71,13 @@ from skunk.llm_client import LLMClient
 from skunk.prompted_call import load_prompt_overrides
 from skunk.trace import configure_obs
 
-from .data_model import PAGES_SUBDIR, RENDERS_SUBDIR, TREE_FILE, PageCatalogRow
+from .data_model import (
+    PAGES_SUBDIR,
+    RENDERS_SUBDIR,
+    SEARCH_INDEX_FILE,
+    TREE_FILE,
+    PageCatalogRow,
+)
 from .eras import build_concept_tree
 from .scan import PageScan, scan_page, vision_scan_page
 from .table_merge import apply_merge, find_candidates, resolve_parent
@@ -1094,6 +1103,116 @@ class EraMergeStage(Stage):
         return {"eras": len(tree["eras"]), "bulletins": len(gather)}
 
 
+def build_search_index(rows: Iterable[PageCatalogRow], out: Path) -> int:
+    """Build the read-only SQLite FTS5 index the SelectAgent's `query_index` tool runs SQL
+    against: ONE FTS5 table `pages`, one row per catalog PAGE. The single indexed `summary`
+    column carries the page's searchable text (block titles + summaries + table headers, for
+    MATCH / bm25); the rest are `UNINDEXED` columns the agent filters/selects on (doc_id,
+    bulletin, page, the `date_interval` bounds `lo`/`hi`, the per-kind `has_*` flags, title).
+
+    One denormalized table (no joins for the agent's SQL); metadata is `UNINDEXED` because the
+    workload is MATCH-driven (filters apply post-match on the small matched set). Built to a
+    temp file then atomically renamed. Returns the page count. No LLM calls — a pure
+    projection of the catalog."""
+    tmp = out.with_name(out.name + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    con = sqlite3.connect(tmp)
+    try:
+        con.executescript(
+            """
+            PRAGMA page_size=8192;
+            PRAGMA journal_mode=OFF;
+            PRAGMA synchronous=OFF;
+            CREATE VIRTUAL TABLE pages USING fts5(
+                summary,
+                doc_id UNINDEXED,
+                bulletin UNINDEXED,
+                page UNINDEXED,
+                lo UNINDEXED,
+                hi UNINDEXED,
+                has_table UNINDEXED,
+                has_chart UNINDEXED,
+                has_prose UNINDEXED,
+                title UNINDEXED
+            );
+            """
+        )
+        batch: list[tuple] = []
+        rowid = 0
+        for row in rows:
+            rowid += 1
+            kinds = {b.kind for b in row.content_blocks}
+            parts: list[str] = []
+            for b in row.content_blocks:
+                if b.title:
+                    parts.append(b.title)
+                if b.summary:
+                    parts.append(b.summary)
+                parts.extend(b.column_headers)
+                parts.extend(b.row_headers)
+            lo = row.date_interval[0][:7] if row.date_interval else None
+            hi = row.date_interval[1][:7] if row.date_interval else None
+            batch.append(
+                (
+                    rowid,
+                    " ".join(parts),
+                    pageref_to_doc_key(row.ref),
+                    row.bulletin,
+                    row.page,
+                    lo,
+                    hi,
+                    int("table" in kinds),
+                    int("chart" in kinds),
+                    int("prose" in kinds),
+                    row.primary_title,
+                )
+            )
+        con.executemany(
+            "INSERT INTO pages(rowid, summary, doc_id, bulletin, page, lo, hi, "
+            "has_table, has_chart, has_prose, title) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            batch,
+        )
+        # Merge the FTS5 index into a single segment — fewer b-tree segments to scan per MATCH
+        # (faster queries) and a smaller file. One-time build cost; pays off on every read.
+        con.execute("INSERT INTO pages(pages) VALUES('optimize')")
+        con.commit()
+    finally:
+        con.close()
+    os.replace(tmp, out)
+    return rowid
+
+
+def _iter_catalog_rows(bctx: BuildContext) -> Iterable[PageCatalogRow]:
+    """Every catalog row across all bulletins (same source the era merge samples), parsed
+    from `catalog/<b>.jsonl`."""
+    for b in bctx.bulletins:
+        p = bctx.paths.bulletin_file(_CATALOG_SUBDIR, b, "jsonl")
+        if not p.exists():
+            continue
+        for line in p.read_text().splitlines():
+            if line:
+                yield PageCatalogRow.from_json(line)
+
+
+class SearchIndexStage(Stage):
+    """Reduction: build the prebuilt SQLite FTS5 search index from every catalog row → write
+    `search_index.sqlite`. Resume = skip when the file already exists; delete it to rebuild
+    after re-running the catalog stage. Pure projection of the catalog, no LLM calls."""
+
+    name = "search_index"
+
+    async def run(self, bctx: BuildContext) -> dict:
+        out = bctx.paths.root / SEARCH_INDEX_FILE
+        if out.exists():
+            log.info(f"[{self.name}] {out.name} exists, skipping")
+            return {}
+        n = build_search_index(_iter_catalog_rows(bctx), out)
+        if not n:
+            log.warning(f"[{self.name}] no catalog rows found; run the catalog stage first")
+        return {"pages": n}
+
+
 # The pipeline, in order. `run_build` calls each stage's `run` and logs its stats; per-bulletin
 # stages (`BulletinStage`) and the reductions share the same `Stage.run` interface.
 PIPELINE: tuple[Stage, ...] = (
@@ -1106,6 +1225,7 @@ PIPELINE: tuple[Stage, ...] = (
     CatalogStage(),
     PageStoreStage(),
     EraMergeStage(),
+    SearchIndexStage(),
 )
 
 

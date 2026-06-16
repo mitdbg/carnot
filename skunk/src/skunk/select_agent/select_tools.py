@@ -1,106 +1,81 @@
 """Tool implementations for the SelectAgent.
 
 The SelectAgent is the precision stage that runs over the page-index sem-filter
-survivors. Unlike the SearchAgent it has NO ChromaDB and NO embeddings: its corpus
-index is the in-memory page-index **catalog** (one `PageCatalogRow` per page, each
-carrying the structured per-block summaries the scan produced), and page CONTENT is
-read on demand through the `PageStore` (the same source extract reads). The five tools
-mirror the SearchAgent's surface, re-pointed at those two stores:
+survivors. Unlike the SearchAgent it has NO ChromaDB and NO embeddings: whole-corpus reach
+is a prebuilt **SQLite FTS5 index** the agent queries with raw SQL, and page CONTENT is read
+on demand through the `PageStore` (the same source extract reads). The four tools:
 
-  - `search_corpus`  — a METADATA search over the structured catalog summaries (whole
-    corpus reach; lexical match over titles/summaries/headers + date/kind/bulletin
-    filters). No vectors.
-  - `grep_corpus`    — a regex over the full TEXT of the SURVIVING pages only (the exact
-    string the LLM summaries can't give); scoped to the flagged subset.
-  - `read_document`  — the full text of any page(s), via `PageStore.text`.
-  - `view_figure`    — the rendered page image, via `PageStore.image`.
-  - `prune`          — record pages / blocks ruled out (excluded from later searches and
-    redacted from the visible context).
+  - `query_index`   — run a read-only SQL SELECT against the corpus search index (one FTS5
+    table `pages`): full-text rank with MATCH / bm25, filter on metadata, LIMIT for top-K.
+  - `grep_corpus`   — a regex over the full TEXT of pages (the exact string the summaries
+    can't give); defaults to the flagged subset, or pass `doc_ids` to grep any pages.
+  - `read_document` — the full text of any page(s), via `PageStore.text`.
+  - `view_figure`   — the rendered page image, via `PageStore.image`.
 
 Structured returns: every tool returns a *tagged dict* (the tag constants discriminate
-the payload shape) so `SelectAgent._blocks_from_output` can turn chunk-bearing payloads
-into redactable `ChunkBlock`s — exactly the SearchAgent contract. Prune state is two
-mutable sets (`pruned_doc_ids` / `pruned_block_ids`) shared by the search/grep/prune
-tools and read by the agent for render-time redaction; `PruneTool` is the single writer.
-One SelectAgent (and tool set) is built per branch, so the sets never cross-talk.
+the payload shape) so `SelectAgent._blocks_from_output` can render each payload. One
+SelectAgent (and tool set) is built per branch.
 """
 
 from __future__ import annotations
 
 import re
+import sqlite3
+import threading
 from collections import defaultdict
 
-from skunk.common import PageRef, page_key_to_pageref, pageref_to_doc_key
+from skunk.common import page_key_to_pageref
 from skunk.multi_turn_agent import Tool
-from skunk.page_index.data_model import CATALOG_ROW_FIELDS, ContentBlock, PageCatalogRow
+from skunk.page_index.data_model import CATALOG_ROW_FIELDS
 from skunk.page_index.store import PageStore
 
-SEARCH_RESULT_TAG = "__search_result__"
+QUERY_RESULT_TAG = "__query_result__"
 GREP_RESULT_TAG = "__grep_result__"
 READ_DOCUMENT_RESULT_TAG = "__read_document_result__"
 VIEW_FIGURE_RESULT_TAG = "__view_figure_result__"
-PRUNE_RESULT_TAG = "__prune__"
 
-EMPTY_RESULT_MESSAGE = "No matching catalog blocks found."
 EMPTY_GREP_MESSAGE = (
-    "No matches in the flagged pages' text (grep searches only the flagged subset; "
-    "use search_corpus to reach pages beyond the flagged set)."
+    "No matches in the searched pages' text. By default grep_corpus searches only the flagged "
+    "candidate pages; pass doc_ids=[...] (e.g. pages found via query_index) to grep others."
 )
 
 
-def block_id(doc_id: str, block_index: int) -> str:
-    """Stable id for one catalog block — the page's doc_id plus its block position
-    (`"1946_11_41#2"`). Carried as a `ChunkBlock.chunk_id` so a `prune` of it redacts the
-    block from the visible context."""
-    return f"{doc_id}#{block_index}"
+# One read-only SQLite connection per worker thread, keyed by db path, lazily opened and
+# reused across questions. The search index is built once and never written at runtime, so we
+# open it `immutable` (SQLite skips ALL locking → lock-free concurrent readers) and keep one
+# connection per thread — sharing a single connection across threads either errors
+# (check_same_thread) or serializes on SQLite's internal mutex, defeating the parallelism.
+_conns = threading.local()
 
-
-def _tokens(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", text.lower())
-
-
-def render_block_line(doc_id: str, row: PageCatalogRow, bi: int, block: ContentBlock) -> str:
-    """One catalog block rendered as a compact candidate line (no numbers): id, issue/page,
-    data span, kind/title, then axis labels and the free-text summary. Shared by the seed
-    listing and `search_corpus` results so the agent sees one consistent shape."""
-    dates = (
-        f"{row.date_interval[0]}..{row.date_interval[1]}" if row.date_interval else "none"
-    )
-    line = (
-        f"[{block_id(doc_id, bi)}] {row.bulletin} p.{row.page}  dates={dates}  "
-        f"{block.kind}: {block.title or '(untitled)'}"
-    )
-    if block.column_headers:
-        line += f"\n    cols: {', '.join(block.column_headers)}"
-    if block.row_headers:
-        line += f"\n    rows: {', '.join(block.row_headers)}"
-    if block.summary:
-        line += f"\n    summary: {block.summary}"
-    return line
+def _ro_connection(path: str) -> sqlite3.Connection:
+    cache: dict[str, sqlite3.Connection] | None = getattr(_conns, "by_path", None)
+    if cache is None:
+        cache = _conns.by_path = {}
+    con = cache.get(path)
+    if con is None:
+        con = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+        # Read-path tuning for a hot, read-only FTS workload: memory-map the whole file so
+        # reads come from the OS page cache (shared across the per-thread connections — mmap
+        # is virtual address space, NOT N× physical RAM), and keep the BM25 `ORDER BY` sort
+        # b-trees in memory.
+        con.execute("PRAGMA mmap_size=536870912")  # 512 MiB ≥ the artifact
+        con.execute("PRAGMA temp_store=MEMORY")
+        con.execute("PRAGMA cache_size=-32000")  # 32 MiB page cache per connection
+        cache[path] = con
+    return con
 
 
 class CatalogView:
-    """Read-only query surface over the loaded page-index catalog + the surviving pages'
-    text + the `PageStore`. Built once per branch and shared by that branch's tools."""
+    """Read-only query surface over the surviving pages' text + the `PageStore`. Built once
+    per branch and shared by that branch's tools (grep / read / view)."""
 
     def __init__(
         self,
-        catalog: dict[PageRef, PageCatalogRow],
         survivor_texts: dict[str, str],
         page_store: PageStore,
     ) -> None:
-        self._catalog = catalog
         self._survivor_texts = survivor_texts  # doc_id -> full page text (flagged pages only)
         self._page_store = page_store
-
-    def iter_blocks(self):
-        """Every catalog block as `(doc_id, row, block_index, block)`, in (bulletin, page)
-        order — the whole-corpus surface `search_corpus` ranks/filters over."""
-        for ref in sorted(self._catalog, key=lambda r: (r.month or "", r.page or 0)):
-            row = self._catalog[ref]
-            doc_id = pageref_to_doc_key(ref)
-            for bi, block in enumerate(row.content_blocks):
-                yield doc_id, row, bi, block
 
     @property
     def survivor_texts(self) -> dict[str, str]:
@@ -111,100 +86,99 @@ class CatalogView:
         return self._page_store
 
 
-def _overlaps_interval(
-    interval: tuple[str, str] | None, lo: str | None, hi: str | None
-) -> bool:
-    """True iff a `(low, high)` YYYY-MM data span overlaps the `[lo, hi]` query window
-    (either bound optional → open-ended)."""
-    if interval is None:
-        return False
-    i_lo, i_hi = interval[0][:7], interval[1][:7]
-    if lo and i_hi < lo[:7]:
-        return False
-    if hi and i_lo > hi[:7]:
-        return False
-    return True
+def _render_rows(columns: list[str], rows: list[tuple], truncated: bool, max_chars: int) -> str:
+    """Render a SQL result set as a compact `col | col` table, char-capped, with a note when
+    rows were dropped (hit the row cap) or the text was clipped."""
+    if not columns:
+        return "[query ran; no columns returned]"
+    if not rows:
+        return "[0 rows]"
+    out = [" | ".join(columns)]
+    for r in rows:
+        out.append(" | ".join("" if v is None else str(v) for v in r))
+    text = "\n".join(out)
+    note = ""
+    if len(text) > max_chars:
+        text = text[:max_chars]
+        note = "\n[... output clipped; SELECT fewer/narrower columns]"
+    if truncated:
+        note += f"\n[showing first {len(rows)} rows; add or lower LIMIT for a complete set]"
+    return text + note
 
 
-class SearchCorpusTool(Tool):
-    name = "search_corpus"
+class QueryIndexTool(Tool):
+    name = "query_index"
+    _MAX_ROWS = 50  # hard cap on rows returned, regardless of the query's LIMIT
+    _MAX_CHARS = 30_000  # char cap on the rendered result text
+    _TIMEOUT_S = 5.0  # wall-clock budget per query (a pathological scan is interrupted)
 
-    def __init__(self, view: CatalogView, pruned_doc_ids: set[str], pruned_block_ids: set[str]):
-        self._view = view
-        self._pruned_doc_ids = pruned_doc_ids
-        self._pruned_block_ids = pruned_block_ids
+    def __init__(self, search_index_path: str):
+        self._index_path = str(search_index_path)
 
-    def __call__(
-        self,
-        query: str | None = None,
-        top_k: int = 50,
-        metadata_filter: dict | None = None,
-    ) -> dict:
-        mf = metadata_filter or {}
-        want_bulletin = mf.get("bulletin")
-        want_kind = mf.get("kind")
-        date_from, date_to = mf.get("date_from"), mf.get("date_to")
-        q_tokens = set(_tokens(query)) if query else set()
-
-        # (-score, ordinal) sort key keeps score-desc then catalog order (a stable tie-break,
-        # since iter_blocks yields in (bulletin, page) order).
-        scored: list[tuple[int, int, str, str, str]] = []  # key fields + (bid, doc_id, line)
-        for ordinal, (doc_id, row, bi, block) in enumerate(self._view.iter_blocks()):
-            bid = block_id(doc_id, bi)
-            if doc_id in self._pruned_doc_ids or bid in self._pruned_block_ids:
-                continue
-            if want_bulletin and row.bulletin != want_bulletin:
-                continue
-            if want_kind and block.kind != want_kind:
-                continue
-            if (date_from or date_to) and not _overlaps_interval(
-                row.date_interval, date_from, date_to
-            ):
-                continue
-            if q_tokens:
-                haystack = set(
-                    _tokens(
-                        " ".join(
-                            [block.title or "", block.summary or ""]
-                            + block.column_headers
-                            + block.row_headers
-                        )
-                    )
-                )
-                score = len(q_tokens & haystack)
-                if score == 0:
-                    continue
-            else:
-                score = 0
-            scored.append(
-                (-score, ordinal, bid, doc_id, render_block_line(doc_id, row, bi, block))
-            )
-
-        scored.sort(key=lambda t: (t[0], t[1]))
-        if not scored:
-            return {SEARCH_RESULT_TAG: True, "chunks": []}
-        chunks = [
-            {"chunk_id": bid, "doc_id": doc_id, "text": line}
-            for _, _, bid, doc_id, line in scored[: max(1, top_k)]
-        ]
-        return {SEARCH_RESULT_TAG: True, "chunks": chunks}
+    def __call__(self, sql: str) -> dict:
+        s = (sql or "").strip().rstrip(";").strip()
+        if not s:
+            return {QUERY_RESULT_TAG: True, "text": "[error] empty query"}
+        # First keyword must be SELECT/WITH (a usability filter; the read-only `immutable`
+        # connection is the real write guard, and sqlite3 rejects multi-statement strings).
+        toks = s.lstrip("( \t\r\n").split(None, 1)
+        if (toks[0].lower() if toks else "") not in ("select", "with"):
+            return {
+                QUERY_RESULT_TAG: True,
+                "text": "[error] only a single read-only SELECT/WITH query is allowed",
+            }
+        con = _ro_connection(self._index_path)
+        # Bound a pathological query with a watchdog that `interrupt()`s from another thread.
+        # (A SQLite progress handler would also work, but it calls back into Python every N
+        # opcodes — reacquiring the GIL and serializing the otherwise-parallel readers.)
+        watchdog = threading.Timer(self._TIMEOUT_S, con.interrupt)
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            cur = con.execute(s)
+            columns = [d[0] for d in cur.description] if cur.description else []
+            rows = cur.fetchmany(self._MAX_ROWS + 1)
+        except sqlite3.Error as e:
+            # SQL / operational errors (incl. multi-statement, write attempts, an interrupt
+            # timeout) are handed back so the agent can fix its query and retry, REPL-style.
+            return {QUERY_RESULT_TAG: True, "text": f"[error] {type(e).__name__}: {e}"}
+        finally:
+            watchdog.cancel()
+        truncated = len(rows) > self._MAX_ROWS
+        text = _render_rows(columns, rows[: self._MAX_ROWS], truncated, self._MAX_CHARS)
+        return {QUERY_RESULT_TAG: True, "text": text}
 
     doc = (
         """\
-### search_corpus(query: str | None = None, top_k: int = 50, metadata_filter: dict | None = None)
-A METADATA search over the structured catalog summaries of the WHOLE corpus (every page of every bulletin) — use it to look beyond the flagged candidates (e.g. to find an earlier/later reprint that tiles a period, or a page a stage-1 filter missed). There are no embeddings: `query` is matched lexically against each block's title, summary, and column/row labels, and results are ranked by how many query terms hit. Each result is one catalog block, labelled with its block id and page; it shows the summary only — `read_document` the page to see the actual text. Already-pruned pages/blocks are excluded.
+### query_index(sql: str)
+Run ONE read-only SQL SELECT against the corpus search index to find candidate pages beyond your seeded shortlist — full-text rank with MATCH/bm25, filter on metadata, LIMIT for top-K. The index is a single SQLite FTS5 table `pages`, one row per page of every bulletin. Returns the result rows; on a SQL error the message is returned so you can fix the query and retry. Read-only: SELECT/WITH only, no writes.
 
-`metadata_filter` keys (all optional, ANDed):
-- `bulletin`: "YYYY-MM" — restrict to one issue.
-- `kind`: "table" | "chart" | "prose".
-- `date_from` / `date_to`: "YYYY-MM" — keep blocks whose DATA span (what the page reports on) overlaps the window.
+Schema:
+```sql
+CREATE VIRTUAL TABLE pages USING fts5(
+  summary,             -- searchable text: each block's title, summary, and table row/column headers
+  doc_id   UNINDEXED,  -- the page id, e.g. '1980_04_85' (select pages by this)
+  bulletin UNINDEXED,  -- issue the page was printed in, 'YYYY-MM'
+  page     UNINDEXED,  -- 1-based PDF page within the issue
+  lo UNINDEXED, hi UNINDEXED,  -- the page's DATA span bounds 'YYYY-MM' (what it REPORTS ON; NULL if undatable)
+  has_table UNINDEXED, has_chart UNINDEXED, has_prose UNINDEXED,  -- 1 if the page has a block of that kind
+  title    UNINDEXED   -- the page's primary table title
+);
+```
+Full-text: `WHERE pages MATCH '<q>'` ranked by `bm25(pages)` (more-negative = better, so `ORDER BY bm25(pages)`). MATCH supports `AND` / `OR` / `NOT`, `"exact phrase"`, `prefix*`, `NEAR(a b, 5)`. Date-span overlap = `lo <= '<end>' AND hi >= '<start>'`. At most 50 rows are returned — add LIMIT and select only the columns you need (e.g. doc_id, bulletin, title, summary).
 
-```python
-# tables reporting on 1940 data, anywhere in the corpus, matching "public debt"
-search_corpus("public debt", top_k=30, metadata_filter={"kind": "table", "date_from": "1940-01", "date_to": "1940-12"})
+```sql
+-- tables about public debt reporting on 1940 data, best matches first
+SELECT doc_id, bulletin, title, summary FROM pages
+WHERE pages MATCH 'public AND debt' AND has_table=1 AND lo<='1940-12' AND hi>='1940-01'
+ORDER BY bm25(pages) LIMIT 20;
+-- an exact phrase, any issue
+SELECT doc_id, bulletin, title FROM pages WHERE pages MATCH '"statutory debt limitation"' LIMIT 20;
+-- metadata only (no text rank): every page of one issue, in order
+SELECT doc_id, page, title FROM pages WHERE bulletin='1946-11' ORDER BY page;
 ```
 
-Each result is one catalog block from a page. The catalog schema:
+The `summary` column is built from this catalog schema:
 """
         + CATALOG_ROW_FIELDS
     )
@@ -218,25 +192,41 @@ class GrepCorpusTool(Tool):
     def __init__(
         self,
         view: CatalogView,
-        pruned_doc_ids: set[str],
         max_output_tokens: int,
     ):
         self._view = view
-        self._pruned_doc_ids = pruned_doc_ids
         self._max_output_chars = max_output_tokens * self._CHARS_PER_TOKEN
 
-    def __call__(self, pattern: str, limit: int | None = None) -> dict:
+    def __call__(
+        self,
+        pattern: str,
+        doc_ids: str | list[str] | None = None,
+        limit: int | None = None,
+    ) -> dict:
         try:
             rx = re.compile(pattern)
         except re.error as e:
             return {GREP_RESULT_TAG: True, "groups": [], "error": f"bad regex: {e}"}
 
-        # Match within each flagged page's full text; return the matching lines per page.
+        # Which pages to grep: the explicit `doc_ids` (any page, read via the PageStore — e.g.
+        # pages found with query_index), else the flagged survivor subset.
+        if doc_ids is not None:
+            ids = [doc_ids] if isinstance(doc_ids, str) else list(doc_ids)
+            texts: dict[str, str] = {}
+            for did in ids:
+                try:
+                    text = self._view.page_store.text(page_key_to_pageref(did))
+                except ValueError:
+                    text = None
+                if text is not None:
+                    texts[did] = text
+        else:
+            texts = self._view.survivor_texts
+
+        # Match within each page's full text; return the matching lines per page.
         grouped: dict[str, list[str]] = defaultdict(list)
         total = 0
-        for doc_id, text in self._view.survivor_texts.items():
-            if doc_id in self._pruned_doc_ids:
-                continue
+        for doc_id, text in texts.items():
             hits = [ln for ln in text.splitlines() if rx.search(ln)]
             if hits:
                 grouped[doc_id] = hits
@@ -279,12 +269,14 @@ class GrepCorpusTool(Tool):
         return result
 
     doc = """\
-### grep_corpus(pattern: str, limit: int | None = None)
-A regex search over the FULL TEXT of the flagged candidate pages (the exact strings the summaries don't show — a specific series name, footnote, or value). It searches ONLY the flagged subset, not the whole corpus; to reach other pages use `search_corpus`, then `read_document`. Returns the matching lines grouped by page (doc_id). Output is capped; a broad pattern is truncated with a note — narrow it or pass `limit=N`. Pruned pages are excluded.
+### grep_corpus(pattern: str, doc_ids: str | list[str] | None = None, limit: int | None = None)
+A regex search over the FULL TEXT of pages (the exact strings the summaries don't show — a specific series name, footnote, or value). By DEFAULT it searches only the flagged candidate pages; pass `doc_ids=[...]` to grep specific pages instead (any page in the corpus, e.g. ones you found with `query_index`). Returns the matching lines grouped by page (doc_id). Output is capped; a broad pattern is truncated with a note — narrow it or pass `limit=N`.
 
 ```python
 # which flagged pages mention this exact series, case-insensitive
 grep_corpus(r"(?i)statutory debt limitation")
+# grep a specific page found via query_index
+grep_corpus(r"(?i)statutory debt limitation", doc_ids=["1980_04_85"])
 ```"""
 
 
@@ -292,7 +284,7 @@ class ReadDocumentTool(Tool):
     name = "read_document"
     _DOC_TEMPLATE = """\
 ### read_document(doc_id: str | list[str])
-Returns the full text of one or more pages by `doc_id` — use it to CONFIRM a candidate actually carries the target series at the needed granularity before selecting it. Works for any page in the corpus (flagged or found via search_corpus). Don't read more than ~{{ max_pages }} pages per call.
+Returns the full text of one or more pages by `doc_id` — use it to CONFIRM a candidate actually carries the target series at the needed granularity before selecting it. Works for any page in the corpus (flagged or found via query_index). Don't read more than ~{{ max_pages }} pages per call.
 
 ```python
 read_document(["1946_11_41", "1947_01_38"])
@@ -382,37 +374,4 @@ When you read a page and see a `<figure id=N>` placeholder (a chart NOT in the t
 
 ```python
 view_figure("2002_12_8", 5)
-```"""
-
-
-class PruneTool(Tool):
-    name = "prune"
-
-    def __init__(self, pruned_doc_ids: set[str], pruned_block_ids: set[str]):
-        self._pruned_doc_ids = pruned_doc_ids
-        self._pruned_block_ids = pruned_block_ids
-
-    def __call__(
-        self,
-        doc_ids: list[str] | None = None,
-        block_ids: list[str] | None = None,
-    ) -> dict:
-        new_docs = set(doc_ids or ()) - self._pruned_doc_ids
-        new_blocks = set(block_ids or ()) - self._pruned_block_ids
-        self._pruned_doc_ids.update(new_docs)
-        self._pruned_block_ids.update(new_blocks)
-        return {
-            PRUNE_RESULT_TAG: True,
-            "new_doc_count": len(new_docs),
-            "new_block_count": len(new_blocks),
-            "total_docs": len(self._pruned_doc_ids),
-            "total_blocks": len(self._pruned_block_ids),
-        }
-
-    doc = """\
-### prune(doc_ids: list[str] | None = None, block_ids: list[str] | None = None)
-Record pages (`doc_id`) and/or blocks (block id, e.g. "1946_11_41#2") you've ruled out. Pruned items are excluded from later `search_corpus` / `grep_corpus` results and dropped from your visible context. Use it aggressively on flagged candidates you've rejected to stay focused.
-
-```python
-prune(block_ids=["1946_11_41#0"], doc_ids=["1947_01_38"])
 ```"""

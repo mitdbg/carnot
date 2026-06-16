@@ -5,12 +5,13 @@ a ```json``` final answer of `{"pages": [{"doc_id", "target"}, ...]}`, a redacta
 in a different regime: stage-1 page-index retrieval (ToC + date filter + semantic filter) has
 already flagged the most-likely candidate blocks, which are SEEDED as the agent's opening
 observation. The agent's job is to verify and select among them — reading pages, viewing
-figures, tiling a recurring series across issues — and it has full-corpus reach via the
-catalog (`search_corpus`) if the flagged set proves insufficient.
+figures, tiling a recurring series across issues — and it has full-corpus reach via
+`query_index` (raw SQL over the prebuilt search index) if the flagged set proves insufficient.
 
-No ChromaDB, no embeddings: the corpus index is the in-memory page-index catalog, page
-content is read through the `PageStore`. The selection rules (exact-qualifier match, tiling,
-source-pin / most-recent tie-break) are carried over from the block-selection tournament.
+No ChromaDB, no embeddings: whole-corpus reach is a prebuilt SQLite FTS5 index the agent
+queries with SQL, and page content is read through the `PageStore`. The selection rules
+(exact-qualifier match, tiling, source-pin / most-recent tie-break) are carried over from the
+block-selection tournament.
 """
 
 from __future__ import annotations
@@ -39,17 +40,14 @@ from skunk.page_index.data_model import PageCatalogRow
 from skunk.page_index.store import PageStore
 from skunk.select_agent.select_tools import (
     EMPTY_GREP_MESSAGE,
-    EMPTY_RESULT_MESSAGE,
     GREP_RESULT_TAG,
-    PRUNE_RESULT_TAG,
+    QUERY_RESULT_TAG,
     READ_DOCUMENT_RESULT_TAG,
-    SEARCH_RESULT_TAG,
     VIEW_FIGURE_RESULT_TAG,
     CatalogView,
     GrepCorpusTool,
-    PruneTool,
+    QueryIndexTool,
     ReadDocumentTool,
-    SearchCorpusTool,
     ViewFigureTool,
 )
 
@@ -60,9 +58,8 @@ class SelectAgent(MultiTurnAgent):
     # budget conservative under the model's ~1M-token input ceiling.
     context_budget_chars: int = 1_500_000
     warn_steps_remaining = 5
-    # Collapse all but the 5 most recent tool results to a placeholder in the render; pruned
-    # corpus content and the agent's own findings are preserved separately (prune state +
-    # any future checkpoint summary), so stale raw observations are the only thing dropped.
+    # Collapse all but the 5 most recent tool results to a placeholder in the render, so
+    # stale raw observations are the only thing dropped (the agent's own findings persist).
     visible_observations: int | None = 5
     # Tighter than the search agent's shared budget: selection over a shortlist needs less
     # exploration than open-corpus retrieval.
@@ -73,9 +70,7 @@ class SelectAgent(MultiTurnAgent):
         "collection of documents. You will be given a question, a set of tools, and a shortlist of candidate "
         "pages that likely (but not always) carry relevant information. Your ONLY output is a set of page ids: never compute, "
         "calculate, or answer the question yourself. Use early steps to explore documents of potential relevance, then"
-        "refine your searches in later steps based on what you find. Use `prune(...)` aggressively on "
-        "pages and blocks you have ruled out, to keep later searches focused and your context "
-        "window manageable. Stop exploration and commit when you have enough information, do not"
+        "refine your searches in later steps based on what you find. Stop exploration and commit when you have enough information, do not"
         "overthink . Some questions are multi-hop or require looking up external information;"
         "if you suspect this from inspecting the likely candidate set, commit all information you can find"
         "in the corpus even if they only help make partial progress. \n\n"
@@ -123,6 +118,7 @@ not be an answer or a computation — name the rows/columns and dates to transcr
         catalog: dict[PageRef, PageCatalogRow],
         page_store: PageStore,
         candidates: list[SemPoolEntry],
+        search_index_path: str,
         prior_values: list[AnnotatedValue] | None = None,
     ):
         self.config = config
@@ -141,25 +137,20 @@ not be an answer or a computation — name the rows/columns and dates to transcr
             text = page_store.text(entry.ref.page)
             if text is not None:
                 survivor_texts[doc_id] = text
-        self._view = CatalogView(catalog, survivor_texts, page_store)
-
-        # Per-question prune state shared by the tools and read for render redaction.
-        self._pruned_doc_ids: set[str] = set()
-        self._pruned_block_ids: set[str] = set()
+        self._view = CatalogView(survivor_texts, page_store)
 
         self.max_output_tokens = config.search_agent_max_output_tokens
         self.request_timeout_s = config.search_agent_request_timeout_s
 
         tools = [
-            SearchCorpusTool(self._view, self._pruned_doc_ids, self._pruned_block_ids),
-            GrepCorpusTool(self._view, self._pruned_doc_ids, config.grep_max_output_tokens),
+            QueryIndexTool(search_index_path),
+            GrepCorpusTool(self._view, config.grep_max_output_tokens),
             ReadDocumentTool(
                 self._view,
                 config.agent_max_pages_per_tool_call,
                 config.read_document_max_output_chars,
             ),
             ViewFigureTool(self._view),
-            PruneTool(self._pruned_doc_ids, self._pruned_block_ids),
         ]
         super().__init__(
             tools,
@@ -175,7 +166,7 @@ not be an answer or a computation — name the rows/columns and dates to transcr
         """The candidate PAGES (distinct, deduped) as the opening observation — page ids
         only, no summaries. Deliberately just a list: first-pass retrieval flags pages that
         very likely hold the right table, and the agent discovers everything else through its
-        tools (read_document / search_corpus / grep_corpus). On a replan sweep, a second block
+        tools (read_document / query_index / grep_corpus). On a replan sweep, a second block
         lists the data earlier attempts already gathered, so the agent narrows to what's left."""
         seen: list[str] = []
         seen_set: set[str] = set()
@@ -218,14 +209,6 @@ not be an answer or a computation — name the rows/columns and dates to transcr
             + "\n".join(lines)
         )
 
-    def _block_is_visible(self, block: Block) -> bool:
-        if isinstance(block, ChunkBlock):
-            if block.chunk_id is not None and block.chunk_id in self._pruned_block_ids:
-                return False
-            if block.doc_id in self._pruned_doc_ids:
-                return False
-        return True
-
     def _blocks_from_output(self, out: CodeOutput) -> list[Block]:
         blocks: list[Block] = []
         stdout_s = (out.logs or "").strip()
@@ -233,16 +216,9 @@ not be an answer or a computation — name the rows/columns and dates to transcr
             blocks.append(TextBlock(f"[stdout]\n{stdout_s}"))
         output = out.output
 
-        if isinstance(output, dict) and output.get(SEARCH_RESULT_TAG):
-            if output.get("error"):
-                blocks.append(TextBlock(f"[error]\n{output['error']}"))
-            elif not output["chunks"]:
-                blocks.append(TextBlock(EMPTY_RESULT_MESSAGE))
-            else:
-                blocks.extend(
-                    ChunkBlock(chunk_id=c["chunk_id"], doc_id=c["doc_id"], text=c["text"])
-                    for c in output["chunks"]
-                )
+        if isinstance(output, dict) and output.get(QUERY_RESULT_TAG):
+            # query_index returns a single rendered result-grid (or `[error] ...`) text.
+            blocks.append(TextBlock(output["text"]))
             return blocks
 
         if isinstance(output, dict) and output.get(GREP_RESULT_TAG):
@@ -288,16 +264,6 @@ not be an answer or a computation — name the rows/columns and dates to transcr
                 )
             return blocks
 
-        if isinstance(output, dict) and output.get(PRUNE_RESULT_TAG):
-            blocks.append(
-                TextBlock(
-                    f"[result]\nPruned {output['new_doc_count']} page(s) and "
-                    f"{output['new_block_count']} block(s). {output['total_docs']} page(s) "
-                    f"and {output['total_blocks']} block(s) now excluded."
-                )
-            )
-            return blocks
-
         result_s = "" if output is None else str(output).strip()
         if result_s and result_s != stdout_s and result_s not in stdout_s:
             blocks.append(TextBlock(f"[result]\n{result_s}"))
@@ -333,7 +299,7 @@ not be an answer or a computation — name the rows/columns and dates to transcr
         if bad:
             return (
                 f"These doc_ids are not real catalog pages: {bad[:8]}. Use a doc_id exactly "
-                "as it appears in the candidate listing or search_corpus results."
+                "as it appears in the candidate listing or query_index results."
             )
         if no_target:
             return (

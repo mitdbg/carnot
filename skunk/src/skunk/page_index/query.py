@@ -27,6 +27,7 @@ from .data_model import (
     CATALOG_SUBDIR,
     CHAPTER_FIELDS,
     CONTENT_BLOCK_FIELDS,
+    SEARCH_INDEX_FILE,
     TREE_FILE,
     ConceptTree,
     ContentBlock,
@@ -219,6 +220,15 @@ True when the summary fits at least one target; false only when clearly unrelate
         ]
         self._catalog = {r.ref: r for r in rows}
         self.catalog = self._catalog  # public read-only alias (the SelectAgent queries it)
+        # Prebuilt FTS5 search index the SelectAgent's `query_index` tool runs SQL against
+        # (read-only, opened per-thread by the tool). A clear error here beats a cryptic mid-run failure.
+        self.search_index_path = root / SEARCH_INDEX_FILE
+        if not self.search_index_path.exists():
+            raise StepFailed(
+                "retrieve",
+                f"search index not built ({self.search_index_path}); run the page-index "
+                "build pipeline (SearchIndexStage) to generate it.",
+            )
         self._catalog_size = sum(
             c.n_pages for era in self._tree.eras for c in era.chapters.values()
         )

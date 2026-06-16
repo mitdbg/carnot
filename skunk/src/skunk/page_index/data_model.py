@@ -20,6 +20,7 @@ RENDERS_SUBDIR = (
     "renders"  # lazy 200-DPI page-image cache (written on first vision read)
 )
 TREE_FILE = "concept_tree.json"  # era-keyed concept tree (ConceptTree)
+SEARCH_INDEX_FILE = "search_index.sqlite"  # prebuilt FTS5 page index the `query_index` tool runs SQL against
 
 
 def page_index_root() -> Path:
@@ -76,8 +77,8 @@ figure/graph/plot), or one "prose" block (the narrative text on a page that has 
     and time basis — never the numeric values."""
 
 
-# Prompt blurb for the catalog ROW — the unit `search_corpus` filters/searches over in the
-# SelectAgent. Shares `CONTENT_BLOCK_FIELDS` (above) for the per-block shape; drop it under a
+# Prompt blurb for the catalog ROW — the unit the SelectAgent's `query_index` searches over
+# (its `summary` column). Shares `CONTENT_BLOCK_FIELDS` (above) for the per-block shape; drop it under a
 # prompt's `## Catalog schema` header so the agent knows exactly which fields exist.
 CATALOG_ROW_FIELDS = (
     """\

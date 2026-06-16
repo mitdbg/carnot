@@ -15,7 +15,8 @@ class LookupAgent(MultiTurnAgent):
         "You find the external value(s) a request asks for and commit them as one "
         'result. Each request is a JSON object {"target": "<value(s)>", '
         '"src": "<source | null>"}. If `src` is non-null, the answer must come from '
-        "that publisher; if null, any authoritative public source is fine.\n\n"
+        "that publisher; if null, any authoritative public source is fine. "
+        "Tool steps have `math`, `statistics`, `datetime`, `numpy as np`, `pandas as pd`, `json` in scope (plus the tools above).\n\n"
         + DEFAULT_PRIORITIZATION
     )
 
@@ -30,13 +31,8 @@ observations; you cannot reference variables here):
    "index_name": "<dim>",                      # vector only
    "row_name": "<dim>", "col_name": "<dim>"}   # table only
 
-Use `kind="vector"` — `value` a dict keyed by the period/label, with
-`index_name` — whenever the answer is a series the downstream step will rank,
-select, or aggregate (e.g. "which year did X peak"). Use a plain scalar (or a
-list) only when the labels don't matter. Cells must be primitive (no nesting).
-Put the value's publisher/origin in `source` (not folded into `description`);
-`description` names just the value. For a long series, `print(json.dumps(...))`
-the dict in a tool step first, then copy the printed JSON here.
+Pick the shape that best fits the requested data. Cells should be simple number or string — no nested cells.
+Put the value's publisher/origin in `source`. Examples:
 ```json
 {"description": "USD to GBP spot rate, 2002-06-30",
  "value": 0.6549, "unit": "fx_rate", "source": "MeasuringWorth"}
@@ -46,9 +42,7 @@ the dict in a tool step first, then copy the printed JSON here.
  "kind": "vector", "index_name": "year", "source": "FRED PSAVERT",
  "value": {"1950": 9.4, "1951": 11.1, "1990": 8.5}, "unit": "pct"}
 ```
-
-Tool steps have `math`, `statistics`, `datetime`, `numpy as np`,
-`pandas as pd`, `json` in scope (plus the tools above)."""
+"""
 
     def __init__(self, *, max_steps: int, tools: list[Tool]):
         super().__init__(tools, max_steps=max_steps)

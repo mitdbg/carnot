@@ -350,8 +350,7 @@ the table markup in the text which column/row a value sits under, the
 period, and the units. Emit all data that could satisfy the lookup, including partial
 matches. Extract only what is printed — never compute or transform; every
 numeric value must appear verbatim in the page text (metadata is context, not
-a source of values). A period `YYYY-MM..YYYY-MM` is an inclusive month
-range."""
+a source of values). A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
 
     _SYSTEM = _PREAMBLE + "\n\n" + EXTRACT_COMMON_PROMPT
 
@@ -563,12 +562,10 @@ class VisionExtractor:
 You retrieve visible values from rendered page images to fulfill a specific
 lookup. The user message gives the lookup (and period, when stated), the
 question it serves, and a numbered list of the attached images. Emit every
-visible value that could plausibly satisfy the lookup, and ONLY those: never
-transcribe a whole table — emit just the rows/series the lookup and its
-period need. Extract only what is visibly printed — never compute or
-transform — except when the question asks for visual understanding of a
-chart (e.g. counting bars above a threshold).
-A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
+visible value that could plausibly satisfy the lookup, including partial matches.
+When the question asks for visual understanding of a chart (e.g. counting bars above a threshold),
+you may directly answer the question. Otherwise, extract only what is visibly printed — never compute or
+transform. A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
 
     _prompt = PromptedCall(
         name="extract.vision",
