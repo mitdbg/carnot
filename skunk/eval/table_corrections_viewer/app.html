@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Table Corrections Viewer</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:#0d0d0d; --bg1:#141414; --bg2:#1a1a1a; --bg3:#202020;
+      --border:#252525; --border2:#2e2e2e;
+      --text:#e0e0e0; --text2:#aaaaaa; --text3:#666666;
+      --green:#33cc33; --yellow:#e6b800; --red:#ff4444; --blue:#3399ff; --purple:#cc66ff;
+      --green-bg:#001a00; --yellow-bg:#242200; --red-bg:#2a0000; --blue-bg:#001524; --purple-bg:#150022;
+    }
+    html, body { background: var(--bg); color: var(--text); font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; font-size: 13px; line-height: 1.5; min-height: 100vh; }
+    #app { max-width: 1800px; margin: 0 auto; padding: 16px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    .header { display:flex; align-items:center; gap:12px; margin-bottom:14px; padding-bottom:12px; border-bottom:1px solid var(--border); }
+    .header-title { font-size:13px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color: var(--green); }
+    .header-sub { font-size:11px; color: var(--text3); }
+    .header-sub b { color: var(--text2); font-weight:600; }
+
+    .card { background: var(--bg2); border:1px solid var(--border); border-radius:6px; padding:14px 16px; margin-bottom:10px; }
+
+    .selectors { display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; }
+    .sel-group { display:flex; flex-direction:column; gap:4px; }
+    .sel-group label { font-size:10px; font-weight:600; letter-spacing:0.8px; text-transform:uppercase; color: var(--text3); }
+    select, input[type=text] { background: var(--bg1); color: var(--text); border:1px solid var(--border2); border-radius:4px; padding:6px 10px; font-size:12px; }
+    select { min-width:130px; cursor:pointer; }
+    select:focus, input[type=text]:focus { outline:none; border-color: var(--green); }
+    .btn { background:var(--bg3); border:1px solid var(--border2); color:var(--text2); font-size:12px; padding:6px 12px; border-radius:4px; cursor:pointer; }
+    .btn:hover { border-color:var(--blue); color:var(--text); }
+    .btn:disabled { opacity:0.35; cursor:default; }
+    .spacer { flex:1; }
+    .count { font-size:11px; color:var(--text3); }
+
+    .kv { display:flex; gap:8px; flex-wrap:wrap; align-items:baseline; }
+    .chip { display:inline-block; font-family: ui-monospace, monospace; font-size:11px; padding:2px 8px; border-radius:10px; border:1px solid var(--border2); margin:2px 5px 2px 0; color: var(--text2); }
+    .chip b { color:var(--text); font-weight:600; }
+
+    /* triptych */
+    .panes { display:grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap:10px; }
+    @media (max-width: 1200px) { .panes { grid-template-columns: 1fr; } }
+    .pane { background: var(--bg2); border:1px solid var(--border); border-radius:6px; display:flex; flex-direction:column; min-width:0; }
+    .pane-head { display:flex; align-items:center; gap:8px; padding:8px 11px; border-bottom:1px solid var(--border); }
+    .pane-name { font-size:10px; font-weight:700; letter-spacing:1.2px; text-transform:uppercase; }
+    .pane.src .pane-name { color: var(--blue); }
+    .pane.html .pane-name { color: var(--yellow); }
+    .pane.md .pane-name { color: var(--green); }
+    .pane-sub { font-size:10px; color:var(--text3); margin-left:auto; }
+    .pane-body { padding:10px 11px; overflow:auto; max-height: calc(100vh - 230px); }
+
+    .pane-body img { width:100%; height:auto; border:1px solid var(--border2); border-radius:4px; display:block; background:#fff; }
+    .img-toggle { margin-bottom:8px; display:flex; gap:6px; }
+    .img-toggle .btn { padding:3px 9px; font-size:11px; }
+    .img-toggle .btn.active { border-color:var(--blue); color:var(--blue); background:var(--blue-bg); }
+
+    /* rendered tables */
+    table.grid { border-collapse: collapse; font-size:11px; font-family: ui-monospace, monospace; min-width:100%; }
+    table.grid td, table.grid th { border:1px solid var(--border2); padding:3px 7px; vertical-align:top; white-space:nowrap; text-align:left; color:var(--text); }
+    table.grid th { background:var(--bg3); color:var(--text2); font-weight:700; }
+    table.grid tr:nth-child(even) td { background: rgba(255,255,255,0.014); }
+
+    .raw-toggle { margin-top:10px; }
+    .raw-toggle summary { cursor:pointer; font-size:10px; font-weight:700; letter-spacing:0.8px; text-transform:uppercase; color:var(--text3); list-style:none; }
+    .raw-toggle summary::-webkit-details-marker { display:none; }
+    .raw-toggle summary::before { content:'▸ '; }
+    .raw-toggle[open] summary::before { content:'▾ '; }
+    .raw { font-family: ui-monospace, monospace; font-size:11px; line-height:1.5; white-space:pre-wrap; word-break:break-word; color:var(--text2); background:var(--bg1); border:1px solid var(--border2); border-radius:4px; padding:8px; margin-top:6px; }
+
+    .hint { color: var(--text3); font-size:12px; padding:18px 4px; }
+    .err { color: var(--red); font-size:12px; padding:8px 4px; font-family: ui-monospace, monospace; }
+    .empty { color: var(--text3); font-style:italic; font-size:11px; }
+    kbd { font-family: ui-monospace, monospace; font-size:10px; background:var(--bg3); border:1px solid var(--border2); border-radius:3px; padding:1px 5px; color:var(--text2); }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div class="header">
+    <span class="header-title">Table Corrections</span>
+    <span class="header-sub" id="dirSub"></span>
+    <span class="spacer"></span>
+    <span class="header-sub">nav: <kbd>←</kbd> <kbd>→</kbd></span>
+  </div>
+
+  <div class="card">
+    <div class="selectors">
+      <div class="sel-group">
+        <label>Bulletin</label>
+        <select id="monthSel"></select>
+      </div>
+      <div class="sel-group">
+        <label>Table</label>
+        <select id="tableSel"></select>
+      </div>
+      <div class="sel-group">
+        <label>Filter key</label>
+        <input type="text" id="filterInput" placeholder="e.g. 1970_06" size="14">
+      </div>
+      <button class="btn" id="prevBtn">← Prev</button>
+      <button class="btn" id="nextBtn">Next →</button>
+      <span class="spacer"></span>
+      <span class="count" id="countLbl"></span>
+    </div>
+  </div>
+
+  <div class="card" id="metaCard" style="display:none">
+    <div class="kv" id="metaKv"></div>
+  </div>
+
+  <div id="main"><div class="hint">Loading…</div></div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let ALL = [];        // all correction summaries
+let VIEW = [];       // current filtered/sorted view
+let idx = -1;        // index into VIEW
+let imgMode = 'crop';
+
+async function jget(url) { const r = await fetch(url); return r.json(); }
+
+function applyFilter() {
+  const month = $('monthSel').value;
+  const q = $('filterInput').value.trim().toLowerCase();
+  VIEW = ALL.filter(c =>
+    (!month || (c.year + '_' + c.month) === month) &&
+    (!q || c.key.toLowerCase().includes(q))
+  );
+  // rebuild table dropdown
+  const ts = $('tableSel');
+  ts.innerHTML = '';
+  VIEW.forEach((c, i) => {
+    const o = document.createElement('option');
+    o.value = i;
+    o.textContent = `${c.year}-${c.month}  ·  page ${c.page_id}  ·  id ${c.element_id}`;
+    ts.appendChild(o);
+  });
+  $('countLbl').textContent = `${VIEW.length} of ${ALL.length} table(s)`;
+  if (VIEW.length) { select(Math.min(Math.max(idx, 0), VIEW.length - 1)); }
+  else { idx = -1; $('main').innerHTML = '<div class="hint">No tables match the current filter.</div>'; $('metaCard').style.display='none'; }
+}
+
+function select(i) {
+  if (i < 0 || i >= VIEW.length) return;
+  idx = i;
+  $('tableSel').value = i;
+  $('prevBtn').disabled = (i <= 0);
+  $('nextBtn').disabled = (i >= VIEW.length - 1);
+  loadDetail(VIEW[i].key);
+}
+
+// ── minimal GitHub-flavored-Markdown table → HTML ──────────────────────────
+function mdTableToHtml(md) {
+  const lines = md.split('\n').map(l => l.trim()).filter(l => l.length);
+  const rows = lines.filter(l => l.startsWith('|') || l.includes('|'));
+  if (rows.length < 2) return null;
+  const isSep = (l) => /^\|?[\s:\-|]+\|?$/.test(l) && l.includes('-');
+  const cells = (l) => {
+    let s = l.trim();
+    if (s.startsWith('|')) s = s.slice(1);
+    if (s.endsWith('|')) s = s.slice(0, -1);
+    return s.split('|').map(c => c.trim());
+  };
+  let sepAt = rows.findIndex((l, i) => i > 0 && isSep(l));
+  if (sepAt === -1) return null;
+  const header = cells(rows[sepAt - 1]);
+  const body = rows.slice(sepAt + 1).filter(l => !isSep(l)).map(cells);
+  const esc = (s) => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const inlineBold = (s) => esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/<br\s*\/?>/gi, '<br>');
+  let h = '<table class="grid"><thead><tr>' + header.map(c => `<th>${inlineBold(c)}</th>`).join('') + '</tr></thead><tbody>';
+  for (const r of body) h += '<tr>' + r.map(c => `<td>${inlineBold(c)}</td>`).join('') + '</tr>';
+  return h + '</tbody></table>';
+}
+
+function imgTag(img) {
+  if (!img) return '<div class="empty">(no image — PDF/page missing)</div>';
+  return `<img src="data:${img.mime};base64,${img.data}" alt="table render">`;
+}
+
+async function loadDetail(key) {
+  $('main').innerHTML = '<div class="hint">Rendering…</div>';
+  const d = await jget('/api/correction?key=' + encodeURIComponent(key));
+  if (d.error) { $('main').innerHTML = `<div class="err">Error: ${d.error}</div>`; return; }
+
+  $('metaCard').style.display = '';
+  $('metaKv').innerHTML =
+    `<span class="chip">key <b>${d.key}</b></span>` +
+    `<span class="chip">bulletin <b>${d.year}-${d.month}</b></span>` +
+    `<span class="chip">page <b>${d.page_id}</b></span>` +
+    `<span class="chip">element id <b>${d.element_id}</b></span>`;
+
+  const mdHtml = mdTableToHtml(d.markdown) || `<div class="empty">(could not parse as a Markdown table — see raw below)</div>`;
+
+  $('main').innerHTML = `
+    <div class="panes">
+      <div class="pane src">
+        <div class="pane-head"><span class="pane-name">PDF source</span><span class="pane-sub">ground truth</span></div>
+        <div class="pane-body">
+          <div class="img-toggle">
+            <button class="btn ${imgMode==='crop'?'active':''}" data-img="crop">Table crop</button>
+            <button class="btn ${imgMode==='full'?'active':''}" data-img="full">Full page</button>
+          </div>
+          <div id="imgHolder">${imgTag(imgMode==='full' ? d.full_image : d.crop_image)}</div>
+        </div>
+      </div>
+      <div class="pane html">
+        <div class="pane-head"><span class="pane-name">Parser HTML</span><span class="pane-sub">original extraction</span></div>
+        <div class="pane-body">
+          ${d.html ? d.html.replace('<table', '<table class="grid"') : '<div class="empty">(no HTML content)</div>'}
+          <details class="raw-toggle"><summary>raw html</summary><div class="raw">${escapeHtml(d.html)}</div></details>
+        </div>
+      </div>
+      <div class="pane md">
+        <div class="pane-head"><span class="pane-name">Corrected Markdown</span><span class="pane-sub">LLM output</span></div>
+        <div class="pane-body">
+          ${mdHtml}
+          <details class="raw-toggle"><summary>raw markdown</summary><div class="raw">${escapeHtml(d.markdown)}</div></details>
+        </div>
+      </div>
+    </div>`;
+
+  // image toggle wiring
+  $('main').querySelectorAll('[data-img]').forEach(b => b.onclick = () => {
+    imgMode = b.dataset.img;
+    $('imgHolder').innerHTML = imgTag(imgMode==='full' ? d.full_image : d.crop_image);
+    $('main').querySelectorAll('[data-img]').forEach(x => x.classList.toggle('active', x.dataset.img === imgMode));
+  });
+}
+
+function escapeHtml(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+function buildMonthOptions() {
+  const months = [...new Set(ALL.map(c => c.year + '_' + c.month))].sort();
+  const ms = $('monthSel');
+  ms.innerHTML = '<option value="">All bulletins</option>' +
+    months.map(m => `<option value="${m}">${m.replace('_','-')}</option>`).join('');
+}
+
+async function init() {
+  const r = await jget('/api/corrections');
+  $('dirSub').innerHTML = `<b>${r.dir || ''}</b>`;
+  ALL = r.corrections || [];
+  if (!ALL.length) {
+    $('main').innerHTML = '<div class="hint">No corrections found. Run <span class="mono">table_corrector.py</span> to populate the corrections dir, then reload.</div>';
+    $('countLbl').textContent = '0 tables';
+    return;
+  }
+  buildMonthOptions();
+  idx = 0;
+  applyFilter();
+
+  $('monthSel').onchange = () => { idx = 0; applyFilter(); };
+  $('filterInput').oninput = () => { idx = 0; applyFilter(); };
+  $('tableSel').onchange = (e) => select(+e.target.value);
+  $('prevBtn').onclick = () => select(idx - 1);
+  $('nextBtn').onclick = () => select(idx + 1);
+  document.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'INPUT') return;
+    if (e.key === 'ArrowLeft') { e.preventDefault(); select(idx - 1); }
+    if (e.key === 'ArrowRight') { e.preventDefault(); select(idx + 1); }
+  });
+}
+
+init();
+</script>
+</body>
+</html>
