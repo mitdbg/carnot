@@ -246,6 +246,10 @@ class AgentWorkerPool:
                 # failure — just fall through and pick up the next round's work.
                 outcome = "cancelled"
             except Exception as error:
+                # The FailureRecord lives only in the registry (not in status.json or the
+                # event log), so without this the traceback is invisible — log it to the
+                # server stdout so a FAILED card is diagnosable.
+                logger.exception("agent run failed for task %s", task_id)
                 failure = FailureRecord(
                     attempt_id=attempt.attempt_id,
                     error_type=type(error).__name__,
