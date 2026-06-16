@@ -158,6 +158,27 @@ _PLACEHOLDER_CELL_RE = re.compile(
     r"|\*+"                             # * / ** (footnote markers)
     r"|-{2,}"                           # -- / --- (dash placeholders)
 )
+# Single whitespace-delimited *token* with no semantic content. Same shapes as
+# _PLACEHOLDER_CELL_RE but matched per token (+ footnote refs like "8/"), so a cell is
+# recognised as a pure value when EVERY token is a placeholder — catching multi-token
+# numerics that _PLACEHOLDER_CELL_RE misses, e.g. dollars+cents "$216,370,286 77" or
+# value+footnote "9,198 2/". Used only when `drop_numeric_cells=True` (see preprocess_text).
+_PLACEHOLDER_TOKEN_RE = re.compile(
+    r"[+\-]?\$?[\d,]+(\.\d+)?%?"   # 1,234 / $1,234.56 / 3.5 / 50% / 77
+    r"|[+\-]?\$?\.\d+%?"            # .6 / $.1
+    r"|[\d,]+/"                      # footnote refs: 8/ 13/ 2/
+    r"|\d[\d,]*[\/\-]\d[\d,]*"       # 4-5 / 283/444
+    r"|\$?-+"                        # - / -- / $- / $--
+    r"|\$+"                          # lone $ (e.g. the "$" of a spaced "$ --" blank value)
+    r"|\*+"                          # * / ** (footnote markers)
+)
+
+
+def _cell_is_all_placeholder(cell: str) -> bool:
+    """True if every whitespace-delimited token in `cell` is a numeric/placeholder token, so
+    the whole cell is a pure value (e.g. "$216,370,286 77", "9,198 2/") carrying no text."""
+    tokens = cell.split()
+    return bool(tokens) and all(_PLACEHOLDER_TOKEN_RE.fullmatch(t) for t in tokens)
 
 
 def page_plain_text(elements: list[dict]) -> str:
@@ -239,18 +260,29 @@ def page_sanitized_text(elements: list[dict]) -> str:
         parts.append(str(txt))
     return "\n".join(parts)
 
-def preprocess_text(text: str, elt_type: str, strip_years: bool = False) -> str:
+def preprocess_text(text: str, elt_type: str, strip_years: bool = False,
+                    drop_numeric_cells: bool = False) -> str:
     """Preprocess element text for embedding: tables → tag-stripped non-placeholder
     cells joined by spaces; others → collapsed newline runs. Always drops dot-leader
-    runs; `strip_years` also removes 1776–2026 year tokens."""
+    runs; `strip_years` also removes 1776–2026 year tokens.
+
+    `drop_numeric_cells` (default False preserves the original single-token behaviour)
+    additionally drops empty cells and any cell whose every whitespace token is numeric/
+    placeholder — so multi-token values like "$216,370,286 77" (dollars+cents) or "9,198 2/"
+    (value+footnote) are removed too, leaving mostly text (headers, row/column names,
+    footnotes). Enabled for the DAIS corpus; off for the OfficeQA `qwen-v2` recipe."""
     if elt_type == "table":
         # inner text of each <td>/<th> cell (HTML-unescaped + tag-stripped),
         # dropping pure-number/placeholder cells (page numbers, dot leaders, …)
         cells = []
         for m in _TD_RE.finditer(text):
             cell = _HTML_TAG_RE.sub("", _html.unescape(m.group(1))).strip()
-            if not _PLACEHOLDER_CELL_RE.fullmatch(cell):
-                cells.append(cell)
+            if drop_numeric_cells:
+                if not cell or _cell_is_all_placeholder(cell):
+                    continue
+            elif _PLACEHOLDER_CELL_RE.fullmatch(cell):
+                continue
+            cells.append(cell)
         text = " ".join(cells)
     else:
         text = _MULTI_NL_RE.sub("\n\n", text)
