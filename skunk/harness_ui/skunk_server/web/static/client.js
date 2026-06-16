@@ -310,11 +310,9 @@ function renderDetailActions(task) {
 async function submitTask(taskId, event) {
   if (event) { event.stopPropagation(); event.preventDefault(); }
   try {
-    const resp = await fetch(`/api/submit/${encodeURIComponent(taskId)}`, { method: "POST" });
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok || !data.ok) flashSubmitError(taskId, data.error || `submit failed (${resp.status})`);
+    await apiJson(`/api/submit/${encodeURIComponent(taskId)}`, { client_id: window.CLIENT_ID });
   } catch (err) {
-    flashSubmitError(taskId, String(err));
+    flashSubmitError(taskId, err.message || String(err));
   }
   // On success the status SSE stream pushes SUBMITTING -> SUBMITTED/SCORED and the UI refreshes.
 }

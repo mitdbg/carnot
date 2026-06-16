@@ -166,6 +166,7 @@ class FileSink:
                 self._handle = None
             self._round_num = round_num
             self._events_path = events_path(self._dir, round_num)
+            self._events_path.touch(exist_ok=True)
             self._seq = 0
 
     def write_event(self, task_id: str, attempt_id: str, event: dict) -> None:
@@ -176,10 +177,11 @@ class FileSink:
         written RAW (uncompacted); the web tailer compacts it for display."""
         self._ensure_flusher()
         with self._lock:
-            event["seq"] = self._seq
+            event_out = dict(event)
+            event_out["seq"] = self._seq
             self._seq += 1
             line = json.dumps(
-                {"task_id": task_id, "attempt_id": attempt_id, "event": event},
+                {"task_id": task_id, "attempt_id": attempt_id, "event": event_out},
                 separators=_COMPACT,
                 default=_json_default,
             )

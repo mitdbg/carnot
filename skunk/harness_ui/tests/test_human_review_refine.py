@@ -13,6 +13,8 @@ from skunk_server.domain import AnswerCandidate
 from skunk_server.human_work_broker import HumanWorkBroker
 from skunk_server.task_registry import TaskConflict, TaskRegistry
 
+CLIENT_ID = "tester"
+
 
 def _review_task(registry: TaskRegistry, candidates):
     """A READY task with one OPEN verify_extract review carrying `candidates` in its guidance."""
@@ -32,6 +34,7 @@ def _review_task(registry: TaskRegistry, candidates):
         ["Treasury Bulletin 1954-02 PDF page 17"],
         {"branch_id": 2, "candidates": candidates},
     )
+    registry.acquire_review_lock(task.task_id, CLIENT_ID)
     return task, review
 
 
@@ -56,7 +59,7 @@ def test_refine_replaces_candidates_and_clears_flag() -> None:
         )
 
         edited = [{"description": "1968", "value": 1969, "kind": "scalar", "_src": 0}]
-        broker.refine_review(review.review_id, "shift back one year", edited)
+        broker.refine_review(review.review_id, "shift back one year", edited, CLIENT_ID)
         # Flag is set synchronously so the UI shows "Updating extraction…" immediately.
         assert registry.find_review(review.review_id)[1].refining is True
 
@@ -86,7 +89,9 @@ def test_refine_stamps_src_when_model_omits_it() -> None:
         broker.start(asyncio.get_running_loop())
         task, review = _review_task(registry, [{"description": "x", "value": 9}])
 
-        broker.refine_review(review.review_id, "fb", [{"description": "x", "value": 9, "_src": 0}])
+        broker.refine_review(
+            review.review_id, "fb", [{"description": "x", "value": 9, "_src": 0}], CLIENT_ID
+        )
         await asyncio.sleep(0.05)
 
         cands = registry.find_review(review.review_id)[1].guidance["candidates"]
@@ -107,7 +112,7 @@ def test_refine_failure_keeps_candidates_and_clears_flag() -> None:
         original = [{"description": "1968", "value": 1969, "kind": "scalar", "_src": 0}]
         task, review = _review_task(registry, list(original))
 
-        broker.refine_review(review.review_id, "fb", original)
+        broker.refine_review(review.review_id, "fb", original, CLIENT_ID)
         await asyncio.sleep(0.05)
 
         _task, done = registry.find_review(review.review_id)
@@ -127,10 +132,10 @@ def test_refine_on_resolved_review_raises() -> None:
         broker = HumanWorkBroker(registry, None, lambda: None, refine_fn=refine_fn)
         broker.start(asyncio.get_running_loop())
         task, review = _review_task(registry, [])
-        registry.resolve_review(review.review_id, "", [])  # now RESOLVED
+        registry.resolve_review(review.review_id, "", [], CLIENT_ID)  # now RESOLVED
 
         with pytest.raises(TaskConflict):
-            broker.refine_review(review.review_id, "fb", [])
+            broker.refine_review(review.review_id, "fb", [], CLIENT_ID)
 
     asyncio.run(scenario())
 
@@ -148,10 +153,10 @@ def test_concurrent_refine_rejected() -> None:
         broker.start(asyncio.get_running_loop())
         task, review = _review_task(registry, [])
 
-        broker.refine_review(review.review_id, "fb", [])  # first refine in flight
+        broker.refine_review(review.review_id, "fb", [], CLIENT_ID)  # first refine in flight
         await asyncio.sleep(0)
         with pytest.raises(TaskConflict):
-            broker.refine_review(review.review_id, "fb2", [])  # rejected while refining
+            broker.refine_review(review.review_id, "fb2", [], CLIENT_ID)  # rejected while refining
         gate.set()
         await asyncio.sleep(0.05)
         assert registry.find_review(review.review_id)[1].refining is False
@@ -166,7 +171,7 @@ def test_refine_disabled_when_no_refine_fn() -> None:
         broker.start(asyncio.get_running_loop())
         task, review = _review_task(registry, [])
         with pytest.raises(TaskConflict):
-            broker.refine_review(review.review_id, "fb", [])
+            broker.refine_review(review.review_id, "fb", [], CLIENT_ID)
 
     asyncio.run(scenario())
 
@@ -185,6 +190,6 @@ def test_registry_refine_setters_open_only_and_bump_version() -> None:
 
     # A resolved (non-OPEN) review ignores a late candidate write.
     registry.set_review_refining(review.review_id, False)
-    registry.resolve_review(review.review_id, "", [])
+    registry.resolve_review(review.review_id, "", [], CLIENT_ID)
     registry.set_review_candidates(review.review_id, [{"description": "z", "value": 3}])
     assert registry.find_review(review.review_id)[1].guidance["candidates"][0]["description"] == "y"
