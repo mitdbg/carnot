@@ -13,11 +13,10 @@ import json
 
 import pytest
 
-from skunk.common import AnnotatedValue, BlockRef, ExecutionContext, PageRef
+from skunk.common import AnnotatedValue, ExecutionContext, PageRef
 from skunk.config import SkunkConfig
 from skunk.errors import ParseError
 from skunk.human import BrokerChannel, HumanAssist, HumanRequest
-from skunk.page_index.data_model import ContentBlock
 from skunk.plan import LookupBranch, RetrieveBranch
 
 
@@ -119,14 +118,8 @@ def test_broker_channel_parse_failure_without_candidates_raises() -> None:
         ctx.close()
 
 
-def _table_block() -> BlockRef:
-    page = PageRef(month="1954-02", page=17)
-    return BlockRef(
-        page=page,
-        block_index=2,
-        member_refs=(page,),
-        block=ContentBlock(kind="table", title="Receipts"),
-    )
+def _source_page() -> PageRef:
+    return PageRef(month="1954-02", page=17)
 
 
 def test_human_assist_verify_extract_restamps_provenance_via_broker() -> None:
@@ -144,7 +137,7 @@ def test_human_assist_verify_extract_restamps_provenance_via_broker() -> None:
     entries = [AnnotatedValue(description="Total receipts", value=42, unit="millions")]
     ctx = _ctx()
     try:
-        out = asyncio.run(assist.verify_extract(entries, [_table_block()], branch, ctx))
+        out = asyncio.run(assist.verify_extract(entries, [_source_page()], branch, ctx))
     finally:
         ctx.close()
 
@@ -169,7 +162,7 @@ def test_human_assist_figure_branch_uses_figure_kind() -> None:
         out = asyncio.run(
             assist.verify_extract(
                 [AnnotatedValue(description="Peak", value=3)],
-                [_table_block()],
+                [_source_page()],
                 branch,
                 ctx,
             )

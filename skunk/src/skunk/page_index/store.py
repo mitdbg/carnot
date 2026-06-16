@@ -1,23 +1,29 @@
 """Page store — the page-index artifact's source of truth for page CONTENT.
 
-The metadata catalog (`catalog/*.jsonl`) says *which* pages answer a query; this store
-serves *what's on them*, with exactly two access paths per page:
+It serves *what's on a page*, with three access paths per page, all keyed by `PageRef`
+(`month` carries the doc-id stem, `page` the 1-based PDF page):
 
-    text(ref)   -> the page's text (read from `pages/<bulletin>.json`)
-    image(ref)  -> the page's rendered image (rendered on demand at 200 DPI, cached to disk)
+    text(ref)    -> the page's text   (read from `pages/<doc_id>.json`)
+    image(ref)   -> the page's image  (rendered on demand at 200 DPI, cached to `renders/`)
+    summary(ref) -> the page's raw `PageScan` (read from `scans/<doc_id>.json`)
 
 It is dumb, directory-backed, and thread-safe — multiple parallel branch workers hit one
-shared instance. Continuation merge is NOT the store's concern: the build writes each anchor
-page's already-merged text (its + folded continuation pages' text, plus the figure note)
-under the anchor's page key, and drops the continuation pages. The store just reads it back.
+shared instance. The store does NOT expand or merge pages: it serves one physical page's
+content. Continuation chains and notes-page expansion are the reader's concern — `extract.py`
+walks the `PageScan` flags (`is_continuation` / `continuation_pages` / `notes_pages`) and
+fetches the dependent pages itself.
 
-On-disk layout under the artifact root (`page_index_root()` / the build's `--build-dir`):
+On-disk layout under the artifact root (`page_index_root()` / `SKUNK_PAGE_INDEX_DIR`,
+pointed at `competition_page_index/`):
 
-    pages/<bulletin>.json          {"<page>": "<text>"}    (written by the `page_store` stage)
-    renders/<bulletin>/<page>.png  200-DPI image cache, written on first `image()` read
+    scans/<doc_id>.json            {"scans": {"<page>": PageScan, ...}, ...}
+    pages/<doc_id>.json            {"<page>": "<text>"}
+    renders/<doc_id>/<page>.png    200-DPI image cache (populated by `scripts/prerender_cache.py`;
+                                   a miss is rendered on demand)
 
-`extract.py` reads text and vision-tier images only through `PageStore`, so the request path
-never touches the corpus parsed-JSON/PDFs directly (the store encapsulates rendering)."""
+`extract.py` reads scans, text, and vision-tier images only through `PageStore`, so the
+request path never touches the corpus parsed-JSON/PDFs directly (the store encapsulates
+rendering)."""
 
 from __future__ import annotations
 
@@ -32,31 +38,14 @@ from skunk.common import B64Image, PageRef, render_page_b64
 from skunk.errors import StepFailed
 
 from .data_model import (
-    CATALOG_SUBDIR,
     PAGES_SUBDIR,
     RENDERS_SUBDIR,
-    PageCatalogRow,
+    SCANS_SUBDIR,
     page_index_root,
 )
+from .scan import PageScan
 
 RENDER_DPI = 200
-
-
-def summarize_row(row: PageCatalogRow) -> str:
-    """Render a catalog row's content blocks as one compact, greppable summary line — the
-    kind/title/headers/summary digest the page-select index shows (no numeric values).
-    Public so callers holding a row can format it without a second catalog lookup."""
-    blocks: list[str] = []
-    for b in row.content_blocks:
-        part = f"{b.kind}: {b.title or '(untitled)'}"
-        if b.column_headers:
-            part += f" [cols: {', '.join(b.column_headers)}]"
-        if b.row_headers:
-            part += f" [rows: {', '.join(b.row_headers)}]"
-        if b.summary:
-            part += f" — {b.summary}"
-        blocks.append(part)
-    return " ;; ".join(blocks) if blocks else "(no content blocks)"
 
 
 class PageStore:
@@ -67,14 +56,12 @@ class PageStore:
 
     def __init__(self, root: Path, pdf_dir: Path | str) -> None:
         self._pages_dir = Path(root) / PAGES_SUBDIR
-        self._catalog_dir = Path(root) / CATALOG_SUBDIR
+        self._scans_dir = Path(root) / SCANS_SUBDIR
         self._renders_dir = Path(root) / RENDERS_SUBDIR
         self._pdf_dir = pdf_dir
         self._lock = threading.Lock()
-        self._text: dict[str, dict[int, str]] = {}  # bulletin -> {page: text}
-        self._catalog: dict[
-            str, dict[int, PageCatalogRow]
-        ] = {}  # bulletin -> {page: anchor row}
+        self._text: dict[str, dict[int, str]] = {}  # doc_id -> {page: text}
+        self._scans: dict[str, dict[int, PageScan]] = {}  # doc_id -> {page: PageScan}
         self._page_locks: dict[str, threading.Lock] = {}  # render key -> lock
 
     # -- text -----------------------------------------------------------------
@@ -107,52 +94,33 @@ class PageStore:
         with self._lock:
             return self._text.setdefault(bulletin, entries)
 
-    # -- catalog summaries ----------------------------------------------------
+    # -- scans ----------------------------------------------------------------
 
-    def catalog_row(self, ref: PageRef) -> PageCatalogRow | None:
-        """The page's catalog row, or None when absent. An anchor page and any of its folded
-        continuation pages both resolve to the anchor's row."""
+    def summary(self, ref: PageRef) -> PageScan | None:
+        """The page's raw `PageScan`, or None when absent — the blocks/continuation/notes
+        metadata extract reads to orient a page and expand it to its dependent pages."""
         if ref.month is None or ref.page is None:
             return None
-        return self._bulletin_catalog(ref.month).get(int(ref.page))
+        return self._doc_scans(ref.month).get(int(ref.page))
 
-    def summary(self, ref: PageRef) -> str | None:
-        """A compact one-line summary of the page's content blocks (titles / headers / block
-        summaries — no numbers), read from the catalog. None when the page has no catalog row."""
-        row = self.catalog_row(ref)
-        return None if row is None else summarize_row(row)
-
-    def _bulletin_catalog(self, bulletin: str) -> dict[int, PageCatalogRow]:
-        """`{page: anchor row}` for one bulletin, loaded once and memoized (thread-safe). Every
-        member page (anchor + folded continuations) keys the anchor's row, so a continuation ref
-        resolves to its anchor. Raises if the catalog was never built; a single missing bulletin
-        file is treated as empty."""
+    def _doc_scans(self, doc_id: str) -> dict[int, PageScan]:
+        """`{page: PageScan}` for one document, loaded once and memoized (thread-safe). Raises if
+        the scans dir was never built; a single missing doc file is treated as empty."""
         with self._lock:
-            cached = self._catalog.get(bulletin)
+            cached = self._scans.get(doc_id)
         if cached is not None:
             return cached
-        if not self._catalog_dir.exists():
+        if not self._scans_dir.exists():
             raise StepFailed(
-                "retrieve",
-                f"catalog not built ({self._catalog_dir} missing); "
+                "extract",
+                f"scans not built ({self._scans_dir} missing); "
                 "run the page-index build pipeline first.",
             )
-        path = self._catalog_dir / f"{bulletin}.jsonl"
-        rows = (
-            [
-                PageCatalogRow.from_json(line)
-                for line in path.read_text().splitlines()
-                if line
-            ]
-            if path.exists()
-            else []
-        )
-        entries: dict[int, PageCatalogRow] = {}
-        for row in rows:
-            for p in row.member_pages:
-                entries[p] = row
+        path = self._scans_dir / f"{doc_id}.json"
+        raw = json.loads(path.read_text()).get("scans", {}) if path.exists() else {}
+        entries = {int(p): PageScan.model_validate(s) for p, s in raw.items()}
         with self._lock:
-            return self._catalog.setdefault(bulletin, entries)
+            return self._scans.setdefault(doc_id, entries)
 
     # -- image (render on demand + cache) -------------------------------------
 

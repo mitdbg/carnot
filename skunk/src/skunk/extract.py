@@ -9,28 +9,17 @@ from typing import Any
 from skunk.common import (
     AnnotatedValue,
     B64Image,
-    BlockRef,
+    BranchRetrieval,
     ExecutionContext,
     PageRef,
     parse_json_response,
+    traced_step,
 )
 from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.plan import RetrieveBranch
-from skunk.page_index.store import get_page_store
-
-
-def _blocks_to_pagerefs(blocks: list[BlockRef]) -> list[PageRef]:
-    """Deduped union (first-seen order) of every block's member pages — the physical pages the
-    vision tier renders for a set of blocks."""
-    seen: set[PageRef] = set()
-    refs: list[PageRef] = []
-    for b in blocks:
-        for r in b.member_refs:
-            if r not in seen:
-                seen.add(r)
-                refs.append(r)
-    return refs
+from skunk.page_index.data_model import continuation_chain
+from skunk.page_index.store import PageStore, get_page_store
 
 
 def _render_pages_b64(
@@ -380,38 +369,16 @@ range."""
     @classmethod
     def _page_metadata(cls, refs: list[PageRef], ctx: ExecutionContext) -> str:
         """Structured summary of every content block on the group's pages. Empty string when no
-        catalog metadata is available."""
+        scan metadata is available."""
         store = get_page_store(str(ctx.config.pdf_dir))
         lines: list[str] = []
         for ref in refs:
-            row = store.catalog_row(ref)
-            if row is None:
+            sc = store.summary(ref)
+            if sc is None:
                 continue
-            for block in row.content_blocks:
+            for block in sc.blocks:
                 lines.append(cls._block_meta_line(ref.page, block))
         return "\n".join(lines)
-
-    @classmethod
-    def _scoped_metadata(
-        cls,
-        anchor: PageRef,
-        prov_refs: list[PageRef],
-        block_idxs: list[int | None],
-        ctx: ExecutionContext,
-    ) -> str:
-        """Metadata to orient the read: the SELECTED blocks' lines when every block in the group
-        is specific, else (a whole-page block is present) the pages' full metadata."""
-        row = get_page_store(str(ctx.config.pdf_dir)).catalog_row(anchor)
-        if row is not None:
-            cblocks = row.content_blocks
-            specific = [
-                bi for bi in block_idxs if bi is not None and 0 <= bi < len(cblocks)
-            ]
-            if specific and len(specific) == len(block_idxs):
-                return "\n".join(
-                    cls._block_meta_line(anchor.page, cblocks[bi]) for bi in specific
-                )
-        return cls._page_metadata(prov_refs, ctx)
 
     async def _extract_content(
         self,
@@ -464,56 +431,61 @@ range."""
         return _stamp_provenance(parsed, prov_refs, branch)
 
     @staticmethod
-    def _block_groups(
-        blocks: list[BlockRef],
-    ) -> list[tuple[PageRef, list[PageRef], list[int | None]]]:
-        """Group blocks by their anchor page (first-seen order), collecting each page's chosen
-        `block_index`es. Returns `(anchor, member_refs, block_idxs)` per page — several blocks on
-        one page collapse to one group (one extract call). `member_refs` is the UNION of those
-        blocks' spans (each block carries its own anchor + table-merge `extra_pages`), so the call
-        feeds every page they touch. A whole-page block contributes `block_index=None`."""
-        order: list[PageRef] = []
-        idxs_by: dict[PageRef, list[int | None]] = {}
-        refs_by: dict[PageRef, list[PageRef]] = {}
-        for b in blocks:
-            if b.page not in idxs_by:
-                idxs_by[b.page] = []
-                refs_by[b.page] = []
-                order.append(b.page)
-            idxs_by[b.page].append(b.block_index)
-            for r in b.member_refs:
-                if r not in refs_by[b.page]:
-                    refs_by[b.page].append(r)
-        return [(p, refs_by[p], idxs_by[p]) for p in order]
+    def _page_groups(
+        pages: list[PageRef], store: "PageStore"
+    ) -> list[tuple[PageRef, list[PageRef]]]:
+        """Expand each unique retrieved page (first-seen order) to the physical pages an extract
+        call must read: its `is_continuation` predecessor chain (the earlier pages carrying the
+        table's column headers) PREPENDED so headers come first, then the page itself (and any
+        folded continuation pages), then its linked `notes_pages` (footnote definitions) appended.
+        So whoever reads a header-less or footnote-citing page also reads the pages it depends on.
+        Returns `(page, refs)` per page — one extract call each."""
+        out: list[tuple[PageRef, list[PageRef]]] = []
+        seen: set[PageRef] = set()
+        for p in pages:
+            if p in seen:
+                continue
+            seen.add(p)
+            # Header-bearing predecessor chain first, so the read sees column headers.
+            refs = list(continuation_chain(p, store.summary))
+            sc = store.summary(p)
+            # The page itself plus any folded continuation pages (the table's tail).
+            members = [p.page, *sc.continuation_pages] if sc is not None else [p.page]
+            for pg in members:
+                r = PageRef(month=p.month, page=pg)
+                if r not in refs:
+                    refs.append(r)
+            if sc is not None:  # linked footnote/notes pages last (auxiliary context)
+                for n in sc.notes_pages:
+                    r = PageRef(month=p.month, page=n)
+                    if r not in refs:
+                        refs.append(r)
+            out.append((p, refs))
+        return out
 
-    async def _extract_block_group(
+    async def _extract_page_group(
         self,
-        anchor: PageRef,
-        member_refs: list[PageRef],
-        block_idxs: list[int | None],
+        page: PageRef,
+        refs: list[PageRef],
         branch: RetrieveBranch,
         question: str,
         ctx: ExecutionContext,
         looking_for: str | None = None,
     ) -> list[AnnotatedValue]:
-        """Extraction for one anchor page's blocks. The updated page index resolves a block to at
-        most two physical pages (its anchor + one table-merge continuation), so we feed those pages'
-        FULL text — no within-page slicing — annotated with the SELECTED blocks' metadata to point
-        the read at the right table(s). Whole-page blocks (`block_index=None`, golden / search-agent)
-        carry no specific block, so they fall back to the page's full metadata. `member_refs` is the
-        pages (the group's blocks' spans, unioned and deduped)."""
-        pages = self._fetch_page_texts(member_refs, ctx)
-        if not pages:
+        """Extraction for one retrieved page: feed its `refs` (the page plus its header-bearing
+        predecessor chain and linked notes pages) FULL text — no within-page slicing — annotated
+        with the pages' full content-block metadata to orient the read at the right table(s)."""
+        texts = self._fetch_page_texts(refs, ctx)
+        if not texts:
             ctx.emit(
-                f"group_skipped tier=parsed_json reason=no_text refs={[str(r) for r in member_refs]!r}"
+                f"group_skipped tier=parsed_json reason=no_text refs={[str(r) for r in refs]!r}"
             )
             return []
-        content = "\n\n".join(text for _, text in pages)
-        prov_refs = [r for r, _ in pages]
-        metadata = self._scoped_metadata(anchor, prov_refs, block_idxs, ctx)
+        content = "\n\n".join(text for _, text in texts)
+        prov_refs = [r for r, _ in texts]
+        metadata = self._page_metadata(prov_refs, ctx)
         ctx.emit(
-            f"block_scoped page={str(anchor)} n_pages={len(pages)} "
-            f"n_blocks={len(block_idxs)} chars={len(content)}"
+            f"page_scoped page={str(page)} n_pages={len(texts)} chars={len(content)}"
         )
         return await self._extract_content(
             content, prov_refs, metadata, branch, question, ctx, looking_for
@@ -523,23 +495,21 @@ range."""
         self,
         question: str,
         branch: RetrieveBranch,
-        blocks: list[BlockRef],
+        pages: list[PageRef],
         ctx: ExecutionContext,
         looking_for: str | None = None,
     ) -> list[AnnotatedValue]:
-        """Extract from the selected blocks, one extract call per anchor page (its blocks'
-        member pages fed whole). Whole-page blocks (`block_index=None`, from golden / search-agent)
-        flow through the same path — just with no specific block to focus on. `looking_for`
-        overrides the single-key opening line for multi-goal page reads."""
-        groups = self._block_groups(blocks)
+        """Extract from the retrieved pages — one extract call per unique page, its dependent
+        pages (header predecessors + notes) fed whole. `looking_for` overrides the single-key
+        opening line for multi-goal page reads."""
+        groups = self._page_groups(pages, get_page_store(str(ctx.config.pdf_dir)))
         ctx.emit(
-            f"fan_out tier=parsed_json n_groups={len(groups)} n_blocks={len(blocks)} "
-            f"group_sizes={[len(idxs) for _, _, idxs in groups]}"
+            f"fan_out tier=parsed_json n_groups={len(groups)} n_pages={len(pages)}"
         )
         per_group = await asyncio.gather(
             *[
-                self._extract_block_group(a, m, idxs, branch, question, ctx, looking_for)
-                for a, m, idxs in groups
+                self._extract_page_group(p, refs, branch, question, ctx, looking_for)
+                for p, refs in groups
             ]
         )
         entries = [e for kept in per_group for e in kept]
@@ -610,3 +580,136 @@ A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
         # branch; multi-issue calls keep bulletin empty.
         return _stamp_provenance(entries, rendered_refs, branch)
 
+
+
+# ---------------------------------------------------------------------------
+# Extraction sweep — read every retrieve branch's pages into AnnotatedValues.
+# (Search-agent / golden retrieval is the sole frontend: a branch's result is a
+# list of whole PageRefs, read directly here — no block/selection translation.)
+# ---------------------------------------------------------------------------
+
+_TEXT = TextExtractor()
+_VISION = VisionExtractor()
+
+
+def _synth_branch(branches: list[RetrieveBranch]) -> RetrieveBranch:
+    """One stamp-bearing branch for a multi-branch page read. Branch identity is irrelevant
+    at extraction, so the call-level provenance fields carry the union of the requesting
+    branches."""
+    keys = list(dict.fromkeys(b.key for b in branches))
+    periods = list(dict.fromkeys(p for b in branches if (p := b.period)))
+    return RetrieveBranch(
+        key="; ".join(keys),
+        period=", ".join(periods) or None,
+        visual_only=any(b.visual_only for b in branches),
+    )
+
+
+async def _extract_page(
+    ctx: ExecutionContext, page: PageRef, branches: list[RetrieveBranch]
+) -> list[AnnotatedValue]:
+    """One page's read serving EVERY branch that retrieved it: the call's opening line lists
+    all their targets, so a single page read extracts for each. Text tier first, pure vision
+    as the fallback — for visual_only branches, the `extract_vision_only` override, or a text
+    pass that found nothing."""
+    branch = branches[0] if len(branches) == 1 else _synth_branch(branches)
+    looking = None
+    if len(branches) > 1:
+        lines = []
+        for b in branches:
+            line = f"- {b.key}"
+            if b.period:
+                line += f" (for the period {b.period})"
+            lines.append(line)
+        looking = "You are looking for ALL of the following:\n" + "\n".join(lines)
+    if not branch.visual_only and not ctx.config.extract_vision_only:
+        entries = await _TEXT.run(ctx.question, branch, [page], ctx, looking_for=looking)
+        if entries:
+            return entries
+    images, rendered_refs = _render_pages_b64([page], ctx)
+    if not images:
+        return []
+    return await _VISION.run(
+        ctx.question, branch, images, rendered_refs, ctx, looking_for=looking
+    )
+
+
+async def run_extract(
+    ctx: ExecutionContext,
+    branches: list[RetrieveBranch],
+    retrievals: list[BranchRetrieval | StepFailed],
+    branch_ids: list[int],
+) -> list[list[AnnotatedValue] | StepFailed]:
+    """Read every branch's retrieved pages into `AnnotatedValue`s in ONE organized sweep. Each
+    unique page is read exactly ONCE, mapped to every branch that retrieved it, its entries
+    attributed to the FIRST such branch — so compute sees each datum once. `retrievals` is one
+    slot per branch (its pages, or a `StepFailed` to carry through). Returns one result per
+    branch (its entries, or the `StepFailed` to attribute to it)."""
+    results: list[list[AnnotatedValue] | StepFailed | None] = [None] * len(branches)
+    pages_by_pos: dict[int, list[PageRef]] = {}
+    for pos, r in enumerate(retrievals):
+        if isinstance(r, StepFailed):
+            results[pos] = r
+        else:
+            pages_by_pos[pos] = list(r.pages)
+
+    # Each unique page read ONCE, mapped to EVERY branch that retrieved it; entries
+    # attributed to the first (lowest-pos) branch — its `owner`.
+    want: dict[PageRef, list[int]] = {}
+    for pos in sorted(pages_by_pos):
+        for p in pages_by_pos[pos]:
+            want.setdefault(p, []).append(pos)
+    n_req = sum(len(v) for v in pages_by_pos.values())
+    ctx.emit(
+        f"select_extract n_requested={n_req} n_reads={len(want)} "
+        f"n_already_read={n_req - len(want)}"
+    )
+
+    extracted: dict[PageRef, list[AnnotatedValue]] = {}
+
+    async def _extract_phase() -> list[AnnotatedValue]:
+        reads = await asyncio.gather(
+            *(
+                _extract_page(ctx, p, [branches[i] for i in poss])
+                for p, poss in want.items()
+            ),
+            return_exceptions=True,
+        )
+        for p, res in zip(want, reads):
+            if isinstance(res, BaseException):
+                ctx.emit(
+                    f"select_extract_failed page={p.month}:{p.page} error={str(res)!r}"
+                )
+                extracted[p] = []
+            else:
+                extracted[p] = res
+        # Return the flattened reads so the traced "extract" step boundary summarizes the
+        # values it produced; returning [] makes the trace viewer render the step "(none)".
+        return [v for vs in extracted.values() for v in vs]
+
+    if want:
+        await traced_step(ctx, "extract", _extract_phase)
+
+    for pos in sorted(pages_by_pos):
+        pages = pages_by_pos[pos]
+        owned = [
+            v for p in pages if want[p][0] == pos for v in extracted.get(p, [])
+        ]
+        covered = any(extracted.get(p) for p in pages)
+        if covered or owned:
+            results[pos] = owned
+        else:
+            results[pos] = StepFailed(
+                "extract",
+                f"retrieved pages yielded no data for {branches[pos].key!r}",
+            )
+        page_keys = sorted({f"{p.month}:{p.page}" for p in pages})
+        ctx.emit(
+            f"select_pipeline_branch branch_id={branch_ids[pos]} "
+            f"n_pages={len(pages)} n_entries={len(owned)} covered={covered}",
+            data={"branch_id": branch_ids[pos], "pages": page_keys},
+        )
+    return [
+        r if r is not None else StepFailed("extract", "branch produced no result")
+        for r in results
+    ]

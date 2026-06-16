@@ -15,10 +15,14 @@ per-bulletin (`BulletinStage`); two are whole-corpus reductions:
      page's record in the scan file in place (one `vision_scan_page` LLM call per flagged page).
      Pages render through the shared `renders/` image cache; warm it ahead of time with the
      standalone `skunk.page_index.prep.render_corpus` tool (cold pages are rendered on demand).
-  3. `table_merge` (reduction)                 — link each label-less table fragment (a block
-     with NO row/column labels: a continued table's bare data rows, or a footnotes spillover)
-     to its parent block via one flash call per candidate, annotating the scan file in place
-     (`extra_pages` on the parent / `merged_into` on the fragment; see `table_merge.py`).
+  3. `continuation_check` (reduction)          — the scan flags header-less pages `is_continuation`
+     (their column headers sit on the previous page). Nothing is merged: the flag is
+     self-describing, so a reader fetches the predecessor chain on access (`continuation_chain`).
+     This stage only repairs over-long chains — a run of >2 consecutive flagged pages gets one
+     flash call that clears the flag on pages that actually stand alone (see `continuation.py`).
+  3b. `notes_link` (reduction)                 — connect each `references_external_notes` data page
+     to the `is_notes_page`(s) that define its footnotes (deterministic sequence heuristic, no
+     LLM), writing `notes_pages` into the scan file; a reader fetches them as `notes_refs`.
   4. `toc`         (`build/toc/<b>.json`)      — coalesce the scan's `toc` pages, then one
      `outline_issue` call extracts the chapter outline AND flags non-ToCs (`is_toc`).
   5. `reconstruct_toc` (reduction)             — fill each ToC-less issue's outline from its
@@ -30,13 +34,14 @@ per-bulletin (`BulletinStage`); two are whole-corpus reductions:
   9. `era_merge`   (`concept_tree.json`, reduction) — segment the timeline into eras, then
      build each era's canonical table of contents.
 
-There is deliberately NO page-level continuation merge: the scan's `is_continuation` flag is
-kept as metadata only. An earlier `merge_continuations` stage folded flagged pages into their
-preceding anchor, but the flag fires on "(Continued)" captions for pages that are fully
-self-contained (in this corpus continued tables restate their headers), so merging glued
-distinct self-readable pages into multi-page anchors — wrecking per-page `date_interval`s
-and ballooning what retrieval hands extract. Every page stands as its own catalog row; the
-rare GENUINE continuations (~50 corpus-wide) are linked at TABLE granularity by `table_merge`.
+There is deliberately NO page merge. Every page stands as its own catalog row; a header-less
+continuation is handled at READ time, not build time — the scan's `is_continuation` flag is
+self-describing, so when a reader accesses a flagged page it also fetches the predecessor chain
+that carries the table's headers (`data_model.continuation_chain`). The build's only role is to
+repair the flag: `continuation_check` prunes over-long chains (a self-contained reprint that the
+scan mis-flagged), and short genuine chains are trusted as-is. An earlier `merge_continuations`
+stage folded flagged pages into a preceding anchor, but that wrecked per-page `date_interval`s
+and ballooned what retrieval hands extract; the self-describing flag avoids both.
 
 Shared machinery — a single `BuildContext` owns the LLM client, the corpus list, the
 process-wide token budget, and the concurrency semaphore. The `Stage` protocol is just
@@ -63,15 +68,16 @@ from pathlib import Path
 from skunk.common import ExecutionContext, load_env_file
 from skunk.errors import ParseError
 from skunk.config import SkunkConfig
-from skunk.corpus import page_elements, parse_bulletin_filename
+from skunk.corpus import page_elements, parse_doc_id
 from skunk.llm_client import LLMClient
 from skunk.prompted_call import load_prompt_overrides
 from skunk.trace import configure_obs
 
+from .continuation import apply_review, find_long_chains, review_chain
 from .data_model import PAGES_SUBDIR, RENDERS_SUBDIR, TREE_FILE, PageCatalogRow
 from .eras import build_concept_tree
+from .notes_link import apply_links, link_notes
 from .scan import PageScan, scan_page, vision_scan_page
-from .table_merge import apply_merge, find_candidates, resolve_parent
 from .store import read_cached_image, render_to_cache
 from .toc_index import (
     TocHierarchy,
@@ -153,6 +159,35 @@ def elements_to_text(elements: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
+# Parsed element type -> content-block kind, for stamping a block's parse confidence from the
+# elements that back it (the scan's tagged-text input drops per-element confidence).
+_KIND_OF_ELEM = {"table": "table", "figure": "chart"}
+
+
+def _block_confidences(elements: list[dict]) -> dict[str, float]:
+    """`{block kind: min element confidence}` for one page. `table`/`figure` map to
+    `table`/`chart`; every other text element maps to `prose`. Kinds whose elements carry no
+    confidence are omitted."""
+    buckets: dict[str, list[float]] = {}
+    for el in elements:
+        c = el.get("confidence")
+        if c is None:
+            continue
+        kind = _KIND_OF_ELEM.get(el.get("type") or "", "prose")
+        buckets.setdefault(kind, []).append(float(c))
+    return {k: min(v) for k, v in buckets.items()}
+
+
+def _stamp_block_confidence(scan: dict, elements: list[dict]) -> None:
+    """Stamp each scanned block's `confidence` (in place) with the min parse confidence of the
+    page elements of its kind — a quality signal the scan LLM can't see in its text input."""
+    by_kind = _block_confidences(elements)
+    for b in scan.get("blocks", []):
+        conf = by_kind.get(b.get("kind"))
+        if conf is not None:
+            b["confidence"] = conf
+
+
 def chop_bulletin(bulletin: str, *, parsed_json_dir: Path | str) -> dict[int, str]:
     """`{1-based PDF page: page_string}` for every page of one bulletin (1..max in
     order; blank pages map to "")."""
@@ -161,16 +196,16 @@ def chop_bulletin(bulletin: str, *, parsed_json_dir: Path | str) -> dict[int, st
 
 
 def discover_bulletins(pdf_dir: Path, only: set[str] | None = None) -> list[str]:
-    """Corpus bulletin ids (sorted YYYY-MM), optionally restricted to the `only` set."""
+    """Corpus document ids (sorted filename stems), optionally restricted to the `only` set.
+    One id per source PDF, e.g. "combined_statement__modern__2024__c40"."""
     out: list[str] = []
     for p in sorted(pdf_dir.iterdir()):
-        try:
-            b = parse_bulletin_filename(p)
-        except ValueError:
+        if p.suffix.lower() != ".pdf":
             continue
-        if only and b not in only:
+        doc = p.stem
+        if only and doc not in only:
             continue
-        out.append(b)
+        out.append(doc)
     return out
 
 
@@ -378,6 +413,9 @@ class ScanStage(BulletinStage):
     ) -> tuple[dict | None, dict]:
         pages = chop_bulletin(bulletin, parsed_json_dir=bctx.config.parsed_json_dir)
         nonempty = {p: t for p, t in pages.items() if t.strip()}
+        _, _, pub_year = parse_doc_id(bulletin)
+        # Per-page parsed elements (1-based page keys), for stamping block parse confidence.
+        elems = page_elements(bulletin, base_dir=bctx.config.parsed_json_dir)
         scans: dict[int, dict] = {}
         errors: dict[int, str] = {}
         deferred: dict[int, str] = {}
@@ -385,9 +423,11 @@ class ScanStage(BulletinStage):
         async def scan_one(page: int, text: str) -> None:
             async with bctx.llm_sem, bctx.unit_ctx() as ctx:
                 try:
-                    scans[page] = (
-                        await scan_page(ctx, text, bulletin=bulletin)
+                    scan = (
+                        await scan_page(ctx, text, doc=bulletin, pub_year=pub_year)
                     ).model_dump(mode="json")
+                    _stamp_block_confidence(scan, elems.get(page, []))
+                    scans[page] = scan
                 except ParseError as e:
                     # The text scan couldn't yield valid output even after its temperature-escalating
                     # retries — a handful of dense numeric tables (e.g. the Foreign Series Securities
@@ -568,8 +608,9 @@ class VisionRescanStage(Stage):
                             return
                         async with bctx.llm_sem, bctx.unit_ctx() as ctx:
                             try:
+                                _, _, pub_year = parse_doc_id(bulletin)
                                 res = await vision_scan_page(
-                                    ctx, img, bulletin=bulletin
+                                    ctx, img, doc=bulletin, pub_year=pub_year
                                 )
                                 res.vision_rescanned = (
                                     True  # per-page marker → resume skips it
@@ -603,54 +644,41 @@ class VisionRescanStage(Stage):
 
 
 # ---------------------------------------------------------------------------
-# Stage: table_merge — link label-less table fragments to their parent block (LLM)
+# Stage: continuation_check — prune over-long is_continuation chains (LLM)
 # ---------------------------------------------------------------------------
 
 
-class TableMergeStage(Stage):
-    """Reduction (after `vision_rescan`, before `toc`): for each table block with NO row and
-    NO column labels — the validated genuine-continuation signal (~50 corpus-wide; every
-    self-contained "(Continued)" reprint restates its labels and is skipped) — one flash call
-    picks the parent block it belongs to, and the scan file is annotated in place
-    (`table_merge.apply_merge`: `extra_pages` on the parent, `merged_into` on the fragment;
-    lossless, nothing deleted). Candidates within a bulletin are judged sequentially in page
-    order so a chained fragment links to the already-resolved root, never to a sibling
-    fragment; bulletins run in parallel.
+class ContinuationCheckStage(Stage):
+    """Reduction (after `vision_rescan`, before `notes_link`): the scan flags a header-less page
+    `is_continuation` (its column headers live on the previous page). Nothing is merged — the
+    flag is self-describing, so at access time a reader fetches the predecessor chain
+    (`data_model.continuation_chain`). This stage only repairs the flag: a run of MORE THAN TWO
+    consecutive flagged pages is usually an over-flag (a self-contained reprint mis-tagged), so
+    one flash call per long run (`continuation.review_chain`) keeps the genuine continuations and
+    clears `is_continuation` on the rest, annotating the scan file in place.
 
-    Skips bulletins still carrying legacy page-level `continuation_pages` (un-merge them
-    first — `scripts/unmerge_rescan.py`). Resume: a successfully processed bulletin is marked
-    `"table_merged"`; a bulletin with any failed call stays unmarked and retries next run
-    (already-applied merges are skipped via their `merged_into`/`extra_pages` annotations).
-    When the bulletin's catalog file already exists (a retrofit over a built corpus), each
-    revised page's catalog row is patched inline, same as `vision_rescan`."""
+    Resume: a successfully processed bulletin is marked `"continuations_checked"`; a bulletin
+    with any failed call stays unmarked and retries next run (already-cleared pages are simply no
+    longer part of a long chain). When the bulletin's catalog file already exists (a retrofit over
+    a built corpus), each cleared page's catalog row is patched inline, same as `vision_rescan`."""
 
-    name = "table_merge"
+    name = "continuation_check"
     workers = 16
 
     async def run(self, bctx: BuildContext) -> dict:
         pending: list[str] = []
-        legacy: list[str] = []
         for b in bctx.bulletins:
             path = bctx.paths.bulletin_file(_SCANS_SUBDIR, b)
             if not path.exists():
                 continue
             data = json.loads(path.read_text())
-            if data.get("table_merged"):
+            if data.get("continuations_checked"):
                 continue
-            scans = data["scans"]
-            if any(s.get("continuation_pages") for s in scans.values()):
-                legacy.append(b)
-                continue
-            if find_candidates(scans):
+            if find_long_chains(data["scans"]):
                 pending.append(b)
-        if legacy:
-            log.warning(
-                f"[{self.name}] {len(legacy)} bulletin(s) still page-merged — skipped; "
-                f"run scripts/unmerge_rescan.py first (e.g. {legacy[:5]})"
-            )
-        log.info(f"[{self.name}] {len(pending)} bulletin(s) with merge candidates")
+        log.info(f"[{self.name}] {len(pending)} bulletin(s) with long continuation chains")
         if not pending:
-            return {"legacy_skipped": len(legacy)} if legacy else {}
+            return {}
 
         sem = asyncio.Semaphore(self.workers)
         agg: dict[str, int] = defaultdict(int)
@@ -665,34 +693,27 @@ class TableMergeStage(Stage):
                 texts = chop_bulletin(
                     bulletin, parsed_json_dir=bctx.config.parsed_json_dir
                 )
-                revised: set[int] = set()
+                cleared: list[int] = []
                 failed = False
-                # Sequential within the bulletin: each applied merge updates `scans`, so the
-                # next candidate's parent listing excludes already-merged fragments.
-                for page, bi in find_candidates(scans):
+                for run in find_long_chains(scans):
                     async with bctx.llm_sem, bctx.unit_ctx() as ctx:
                         try:
-                            parent = await resolve_parent(
-                                ctx, bulletin, scans, page, bi, texts.get(page, "")
-                            )
+                            genuine = await review_chain(ctx, bulletin, run, texts)
                         except Exception as e:  # noqa: BLE001 — record, never abort the batch
                             failed = True
                             agg["failed"] += 1
                             log.warning(
-                                f"[{self.name}] {bulletin} p{page}#{bi} failed: "
+                                f"[{self.name}] {bulletin} chain {run[0]}-{run[-1]} failed: "
                                 f"{type(e).__name__}: {e}"
                             )
                             continue
-                    if parent is None:
-                        agg["standalone"] += 1
-                        continue
-                    apply_merge(scans, (page, bi), parent)
-                    revised.update({page, parent[0]})
-                    agg["merged"] += 1
+                    cleared += apply_review(scans, run, genuine)
+                    agg["chains"] += 1
                 if not failed:
-                    data["table_merged"] = True
+                    data["continuations_checked"] = True
+                agg["cleared"] += len(cleared)
                 _atomic_write_json(path, data)
-                _patch_catalog_inline(bctx, bulletin, scans, sorted(revised))
+                _patch_catalog_inline(bctx, bulletin, scans, sorted(cleared))
                 agg["bulletins"] += 1
                 done += 1
                 if done % _PROGRESS_EVERY == 0 or done == len(pending):
@@ -702,8 +723,57 @@ class TableMergeStage(Stage):
                     )
 
         await asyncio.gather(*[one(b) for b in pending])
-        if legacy:
-            agg["legacy_skipped"] = len(legacy)
+        return dict(agg)
+
+
+# ---------------------------------------------------------------------------
+# Stage: notes_link — link data pages to their footnote/notes pages (no LLM)
+# ---------------------------------------------------------------------------
+
+
+class NotesLinkStage(Stage):
+    """Reduction (after `continuation_check`, before `toc`): connect each
+    `references_external_notes` data page to the `is_notes_page`(s) that define its footnotes,
+    using the deterministic sequence heuristic in `notes_link.link_notes` (a notes page closes
+    the run of referencing pages before it). Writes `notes_pages` into each data page's scan
+    record in place — no LLM, no merge. A reader expands a selected data page to also fetch its
+    `notes_refs` so extract/compute sees the footnote definitions.
+
+    Resume: a processed bulletin is marked `"notes_linked"`. When the bulletin's catalog file
+    already exists, each linked page's catalog row is patched inline, same as `continuation_check`."""
+
+    name = "notes_link"
+    workers = 32
+
+    async def run(self, bctx: BuildContext) -> dict:
+        pending: list[str] = []
+        for b in bctx.bulletins:
+            path = bctx.paths.bulletin_file(_SCANS_SUBDIR, b)
+            if not path.exists():
+                continue
+            data = json.loads(path.read_text())
+            if data.get("notes_linked"):
+                continue
+            if any(s.get("is_notes_page") for s in data["scans"].values()):
+                pending.append(b)
+        log.info(f"[{self.name}] {len(pending)} bulletin(s) with notes pages")
+        if not pending:
+            return {}
+
+        agg: dict[str, int] = defaultdict(int)
+        for done, bulletin in enumerate(pending, start=1):
+            path = bctx.paths.bulletin_file(_SCANS_SUBDIR, bulletin)
+            data = json.loads(path.read_text())
+            scans: dict[str, dict] = data["scans"]
+            linked = apply_links(scans, link_notes(scans))
+            data["notes_linked"] = True
+            _atomic_write_json(path, data)
+            _patch_catalog_inline(bctx, bulletin, scans, linked)
+            agg["bulletins"] += 1
+            agg["linked_pages"] += len(linked)
+            if done % _PROGRESS_EVERY == 0 or done == len(pending):
+                bctx.write_progress(self.name, done, len(pending), agg)
+                log.info(f"[{self.name}] {done}/{len(pending)} | {dict(agg)}")
         return dict(agg)
 
 
@@ -835,16 +905,28 @@ def _catalog_row(bulletin: str, page: int, scan: dict) -> PageCatalogRow | None:
     scan → catalog projection, shared by `CatalogStage` and `vision_rescan`'s inline patch."""
     if scan.get("page_role") != "content":
         return None
+    # Default an unset data span to the document's own publication year, so every shipped page
+    # is at least year-filterable.
+    interval = scan.get("date_interval")
+    if interval is None:
+        _, _, yr = parse_doc_id(bulletin)
+        interval = (yr, yr) if yr is not None else None
     return PageCatalogRow(
-        bulletin=bulletin,
+        source=bulletin,
         page=page,
         printed_page=scan.get("printed_page"),
-        # Fragments the table_merge pass linked to a parent block don't ship — the parent's
-        # row covers them (its block carries the fragment's page in `extra_pages`).
+        # Header-less continuation flag (pruned by `continuation_check`): drives the reader's
+        # backward predecessor fetch (`continuation_chain`). Nothing is merged here.
+        is_continuation=scan.get("is_continuation", False),
+        # Footnote/notes pages linked by `notes_link`; the reader fetches them as `notes_refs`.
+        notes_pages=scan.get("notes_pages", []),
+        # Fragments a legacy table_merge linked to a parent block don't ship — the parent's row
+        # covers them (its block carries the fragment's page in `extra_pages`). Inert for the
+        # current corpus (the pass no longer runs), harmless when `merged_into` is unset.
         content_blocks=[
             b for b in scan.get("blocks", []) if b.get("merged_into") is None
         ],
-        date_interval=scan.get("date_interval"),
+        date_interval=interval,
         continuation_pages=scan.get("continuation_pages", []),
     )
 
@@ -1099,7 +1181,8 @@ class EraMergeStage(Stage):
 PIPELINE: tuple[Stage, ...] = (
     ScanStage(),
     VisionRescanStage(),
-    TableMergeStage(),
+    ContinuationCheckStage(),
+    NotesLinkStage(),
     TocStage(),
     ReconstructTocStage(),
     PlaceStage(),
@@ -1109,9 +1192,9 @@ PIPELINE: tuple[Stage, ...] = (
 )
 
 
-async def run_build(bctx: BuildContext) -> None:
-    """Run every stage in `PIPELINE`, in order, on one event loop."""
-    for stage in PIPELINE:
+async def run_build(bctx: BuildContext, stages: tuple[Stage, ...] = PIPELINE) -> None:
+    """Run `stages` (default: the whole `PIPELINE`), in order, on one event loop."""
+    for stage in stages:
         agg = await stage.run(bctx)
         log.info(
             f"[{stage.name}] complete {dict(agg)} | cumulative ${bctx.cost:.2f} "
@@ -1136,12 +1219,28 @@ def main() -> int:
         "--bulletins",
         type=str,
         default=None,
-        help="Comma-separated YYYY-MM allowlist for dev (default: whole corpus).",
+        help="Comma-separated doc-id (filename-stem) allowlist for dev (default: whole corpus).",
+    )
+    ap.add_argument(
+        "--stages",
+        type=str,
+        default=None,
+        help="Comma-separated stage names to run, in pipeline order (default: all). "
+        f"Available: {', '.join(s.name for s in PIPELINE)}.",
     )
     ap.add_argument(
         "--concurrency", type=int, default=128, help="Max concurrent LLM calls."
     )
     args = ap.parse_args()
+
+    stages = PIPELINE
+    if args.stages:
+        want = {s.strip() for s in args.stages.split(",") if s.strip()}
+        unknown = want - {s.name for s in PIPELINE}
+        if unknown:
+            print(f"unknown stage(s): {sorted(unknown)}", file=sys.stderr)
+            return 1
+        stages = tuple(s for s in PIPELINE if s.name in want)
 
     # Model + per-model RPM/TPM are read from SkunkConfig and the llm_client rate
     # limiter (env SKUNK_LLM_MODEL, SKUNK_MODEL_RPM/TPM, SKUNK_LLM_RPM) — the build
@@ -1174,10 +1273,10 @@ def main() -> int:
         f"concurrency={args.concurrency}"
     )
     log.info(
-        f"{len(bulletins)} bulletins; pipeline: {' → '.join(s.name for s in PIPELINE)}"
+        f"{len(bulletins)} bulletins; pipeline: {' → '.join(s.name for s in stages)}"
     )
 
-    asyncio.run(run_build(bctx))
+    asyncio.run(run_build(bctx, stages))
 
     wall = time.perf_counter() - bctx._t0
     print("\n=== BUILD COMPLETE ===")

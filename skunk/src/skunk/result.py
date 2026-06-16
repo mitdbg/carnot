@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from skunk.common import AnnotatedValue, Final, NeedsMore, PageRef, SemPoolEntry, page_key_to_pageref
+from skunk.common import AnnotatedValue, Final, NeedsMore, PageRef, page_key_to_pageref
 from skunk.plan import Plan
 
 
@@ -62,8 +62,6 @@ def _summarize_annotated(e: AnnotatedValue) -> dict:
         "value": e.value,
         "bulletin": e.bulletin,
         "pages": list(e.pages),
-        "source_block_page": e.source_block_page,
-        "source_block_index": e.source_block_index,
     }
 
 
@@ -97,11 +95,6 @@ def summarize_value(v: Any) -> dict:
             "missing_reason": v.missing_reason,
             "keep": [_summarize_annotated(e) for e in v.keep],
         }
-    if isinstance(v, list) and v and isinstance(v[0], SemPoolEntry):
-        seen: dict[tuple, None] = {}
-        for e in v:
-            seen[(e.ref.page.month, e.ref.page.page)] = None
-        return {"type": "pages", "pages": [{"month": m, "page": p} for m, p in seen]}
     if isinstance(v, list) and v and all(isinstance(x, str) for x in v):
         # The search-agent retriever returns page keys ("YYYY_MM_pageid") rather than
         # PageRefs. Parse them back so the node summary is the same "pages" shape the

@@ -1,12 +1,10 @@
-"""retrieve operator — one op over three swappable backends.
+"""retrieve operator — one op over two swappable backends.
 
 `RetrieveOp` turns a `RetrieveBranch` into the pages that answer it:
 - golden bypass — returns `ctx.config.golden_pages` verbatim (eval ablation).
 - `search_agent` — iterative ChromaDB + LLM loop under `skunk.search_agent`.
-- `page_index` — ToC pick → year filter → semantic filter (all within
-  `PageIndexRetriever.retrieve_all`); the selection agent narrows downstream.
 
-The two real backends are built lazily.
+The search-agent backend is built lazily.
 """
 
 from __future__ import annotations
@@ -15,12 +13,10 @@ import asyncio
 import json
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from skunk.config import SkunkConfig
 from skunk.errors import StepFailed
 from skunk.common import (
-    BlockRef,
     BranchRetrieval,
     ExecutionContext,
     PageRef,
@@ -29,24 +25,12 @@ from skunk.common import (
 )
 from skunk.plan import RetrieveBranch
 
-if TYPE_CHECKING:
-    from skunk.page_index.query import BlockRef
-
-
-def _whole_page_blocks(refs: list[PageRef]) -> list[BlockRef]:
-    """Wrap bare page refs (golden / search-agent) as whole-page `BlockRef`s (`block_index=None`),
-    so extract reads them the same as page-index blocks — just with no specific block to scope to."""
-    return [
-        BlockRef(page=r, block_index=None, member_refs=(r,), block=None) for r in refs
-    ]
-
 
 class RetrieveOp:
     def __init__(self, config: SkunkConfig) -> None:
         self._config = config
         self._resources = None  # (Collection, dict[str, str]) — shared across branches
         self._resources_lock = threading.Lock()
-        self._page_index_retriever = None  # skunk.page_index.query.PageIndexRetriever
 
     async def run_all(
         self,
@@ -57,30 +41,25 @@ class RetrieveOp:
         document_scopes: list[list[str] | None] | None = None,
     ) -> list[BranchRetrieval | StepFailed]:
         """The single retrieval seam: retrieve for several branches at once, one result per
-        branch aligned to `branches`. Each slot is a `BranchRetrieval` (its blocks +
-        `pre_selected`) or a `StepFailed` — a single branch failing does not sink its
-        siblings. A whole-sweep failure (unknown retriever, missing index) raises. This is
-        the ONLY place that dispatches on `config.retriever`:
+        branch aligned to `branches`. Each slot is a `BranchRetrieval` (its pages) or a
+        `StepFailed` — a single branch failing does not sink its siblings. A whole-sweep
+        failure (unknown retriever, missing index) raises. This is the ONLY place that
+        dispatches on `config.retriever`:
 
-        - golden bypass (`golden_pages`) → whole-page blocks, `pre_selected=True`.
-        - `search_agent` → agent rollout → page keys → whole-page blocks, `pre_selected=True`.
-        - `page_index` → sem-filter survivor blocks, `pre_selected=False`; an empty survivor
-          list for a branch surfaces as a per-branch `StepFailed`.
+        - golden bypass (`golden_pages`) → the benchmark pages verbatim.
+        - `search_agent` → agent rollout → page keys → the retrieved pages.
 
-        `branch_ids` (search-agent backend only) aligns each branch to its stable id so its
-        retrieve runs in a per-branch `traced_step`: the rollout + the returned pages then
-        attach to that branch in the trace viewer. The page-index backend is a single shared
-        sweep, so it owns no per-branch step here (the orchestrator traces the whole phase).
-        `document_scopes` (search-agent backend) hard-scopes a branch's corpus to a set of
-        bulletins (HITL human-required documents)."""
+        `branch_ids` aligns each branch to its stable id so its retrieve runs in a per-branch
+        `traced_step`: the rollout + the returned pages then attach to that branch in the
+        trace viewer. `document_scopes` hard-scopes a branch's corpus to a set of bulletins
+        (HITL human-required documents)."""
         if ctx.config.golden_pages is not None:
             # --golden ablation: inject the benchmark pages verbatim, already final.
             pages = ctx.config.golden_pages
             ctx.emit(
                 f"golden_bypass n_pages={len(pages)} refs={[str(r) for r in pages]!r}"
             )
-            blocks = tuple(_whole_page_blocks(pages))
-            return [BranchRetrieval(blocks=blocks, pre_selected=True) for _ in branches]
+            return [BranchRetrieval(pages=tuple(pages)) for _ in branches]
         scopes = document_scopes or [None] * len(branches)
         match str(ctx.config.retriever):
             case "search_agent":
@@ -97,9 +76,7 @@ class RetrieveOp:
                         lambda: self._run_search_agent(ctx, b, required_bulletins=scope),
                         branch_id=bid,
                     )
-                    return BranchRetrieval(
-                        blocks=tuple(_whole_page_blocks(refs)), pre_selected=True
-                    )
+                    return BranchRetrieval(pages=tuple(refs))
 
                 settled = await asyncio.gather(
                     *(
@@ -117,35 +94,10 @@ class RetrieveOp:
                     else:
                         out.append(r)
                 return out
-            case "page_index":
-                survivors = await self._page_index().retrieve_all(
-                    ctx,
-                    branches,
-                    document_scopes=scopes,
-                )
-                results: list[BranchRetrieval | StepFailed] = []
-                for b, brs in zip(branches, survivors):
-                    if not brs:
-                        reason = (
-                            f"page_pin {b.page_pin.bulletin}:{b.page_pin.page} resolved to no catalog page"
-                            if b.page_pin is not None
-                            else f"semantic filter kept no blocks for branch {b.key!r}"
-                        )
-                        results.append(StepFailed("retrieve", reason))
-                    else:
-                        # A page-pinned branch is a deterministic positional FETCH: mark it
-                        # pre_selected so block_select keeps both resolved pages whole instead
-                        # of dropping them on a topic mismatch — they go straight to extract.
-                        results.append(
-                            BranchRetrieval(
-                                blocks=tuple(brs), pre_selected=b.page_pin is not None
-                            )
-                        )
-                return results
             case other:
                 raise StepFailed(
                     "retrieve",
-                    f"unknown retriever {other!r}; expected 'search_agent' or 'page_index'",
+                    f"unknown retriever {other!r}; expected 'search_agent'",
                 )
 
     async def _run_search_agent(
@@ -207,13 +159,6 @@ class RetrieveOp:
             if self._resources is None:
                 self._resources = _get_shared_resources(config)
             return self._resources
-
-    def _page_index(self):
-        from skunk.page_index.query import PageIndexRetriever
-
-        if self._page_index_retriever is None:
-            self._page_index_retriever = PageIndexRetriever()
-        return self._page_index_retriever
 
 
 # Process-wide ChromaDB/document-map cache. Reads go through a ChromaDB *server*

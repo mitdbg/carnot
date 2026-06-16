@@ -40,7 +40,7 @@ from skunk.common import (
     PageRef,
 )
 from skunk.errors import ParseError
-from skunk.extract import _blocks_to_pagerefs, _render_pages_b64, _stamp_provenance
+from skunk.extract import _render_pages_b64, _stamp_provenance
 from skunk.plan import Branch, LookupBranch, RetrieveBranch
 
 # The JSON shape a human types to override the model — the same `AnnotatedValue` field set
@@ -435,7 +435,7 @@ class HumanAssist:
     async def verify_extract(
         self,
         entries: list[AnnotatedValue],
-        blocks: list,
+        pages: list[PageRef],
         branch: RetrieveBranch,
         ctx: ExecutionContext,
     ) -> list[AnnotatedValue]:
@@ -443,10 +443,10 @@ class HumanAssist:
         answer, re-stamped with the branch/page provenance the operators stamp. Assumes the
         caller already gated on `wants_verify`."""
         # Show ONLY the pages the values were actually read from (per-value provenance), not the
-        # whole survivor pool; fall back to the pool when nothing is attributable.
+        # whole retrieved set; fall back to the retrieved pages when nothing is attributable.
         refs, page_values = _value_page_attribution(entries)
         if not refs:
-            refs, page_values = _blocks_to_pagerefs(blocks), []
+            refs, page_values = list(pages), []
         instruction = (
             "This answer must be read off the figure/chart on the page(s) below — the "
             "model is unreliable here. Give the correct value(s)."

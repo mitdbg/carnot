@@ -33,7 +33,6 @@ from skunk.config import SkunkConfig
 if TYPE_CHECKING:
     from skunk.llm_client import LLMClient
     from skunk.prompted_call import PromptOverride
-    from skunk.page_index.data_model import ContentBlock
 
 # Reasoning-effort knob, mapped onto Gemini's `thinking_level` enum. "off" means
 # no thinking; "minimal" is the cheapest thinking tier.
@@ -68,10 +67,10 @@ class B64Image:
     data: str
 
 
-def pdf_path_for(bulletin: str, pdf_dir: Path | str) -> Path:
-    """'1953-06' -> <pdf_dir>/treasury_bulletin_1953_06.pdf. Inverse of the bulletin-id parse."""
-    year, mon = bulletin.split("-")
-    return Path(pdf_dir) / f"treasury_bulletin_{int(year):04d}_{int(mon):02d}.pdf"
+def pdf_path_for(doc: str, pdf_dir: Path | str) -> Path:
+    """The corpus PDF for a doc id: `<pdf_dir>/<doc>.pdf`. `doc` is the filename stem
+    (e.g. "combined_statement__modern__2024__c40") — the same key the page index uses."""
+    return Path(pdf_dir) / f"{doc}.pdf"
 
 
 def render_page_b64(
@@ -340,12 +339,17 @@ class PageRef:
     """Canonical page coordinate. Frozen so it's hashable — usable as a dict key
     and set member (e.g. the page-index catalog is keyed by `PageRef`)."""
 
-    month: str | None = None  # "YYYY-MM" (a.k.a. bulletin in the page index)
+    month: str | None = None  # "YYYY-MM"; in the rekeyed page index this slot holds the doc id
     page: int | None = None  # 1-based PDF page index (canonical)
 
     @property
     def year(self) -> int | None:
-        return int(self.month[:4]) if self.month else None
+        """The calendar year for a `YYYY-MM` slot, or None. Returns None when the slot is not a
+        bare month (the rekeyed page index stores a doc-id stem here — its year is parsed from
+        the stem via `corpus.parse_doc_id`, not from this coordinate)."""
+        if not self.month or not self.month[:4].isdigit():
+            return None
+        return int(self.month[:4])
 
     def __post_init__(self) -> None:
         if self.page is not None and self.month is None:
@@ -376,51 +380,13 @@ def page_key_to_pageref(key: str) -> PageRef:
 
 
 @dataclass(frozen=True)
-class BlockRef:
-    """One retrieved CONTENT BLOCK — the retriever's native output unit. `page` is the anchor
-    page, `block_index` its position in `content_blocks` (None for a page kept wholesale).
-    `member_refs` are the physical pages this block spans (anchor + any table-merge extra pages).
-    `block` is excluded from identity so `BlockRef`s de-dupe on `page`/`block_index`/`member_refs`."""
-
-    page: PageRef
-    block_index: int | None
-    member_refs: tuple[PageRef, ...]
-    block: ContentBlock | None = field(default=None, compare=False)
-
-
-@dataclass(frozen=True)
-class SemPoolEntry:
-    """One sem_filter-surviving content block, kept after block selection as the repair
-    candidate pool. Self-contained (interval + display metadata copied out of the catalog
-    row) so the extract-side repair pass can re-rank and re-select without catalog access —
-    which also makes it serializable into the eval retrieval cache for replay."""
-
-    ref: BlockRef  # anchor + members; block=None is fine (extract reads pages whole)
-    interval: (
-        tuple[str, str] | None
-    )  # the anchor page's data interval ("YYYY-MM" lo/hi)
-    kind: str = "table"
-    title: str | None = None
-    summary: str | None = None
-    cols: tuple[str, ...] = ()
-    rows_tail: tuple[
-        str, ...
-    ] = ()  # trailing row headers — shows the data window's end
-    rows: tuple[
-        str, ...
-    ] = ()  # FULL row headers — shows granularity (annual vs monthly rows) and window
-
-
-@dataclass(frozen=True)
 class BranchRetrieval:
-    """One retrieve branch's normalized result — the single retrieval contract every
-    backend produces. `blocks` are the blocks to feed selection/extract; `pre_selected`
-    True (golden / search-agent) means they are already final, so the selection tournament
-    is skipped and every block is extracted. Produced solely by `RetrieveOp.run_all`; no
-    downstream layer inspects `config.retriever`."""
+    """One retrieve branch's normalized result — the single retrieval contract the
+    search-agent backend (and the golden bypass) produces: the whole pages to extract,
+    as `PageRef`s. Extraction reads each page directly (predecessor/notes expansion and
+    text→vision happen at read time). Produced solely by `RetrieveOp.run_all`."""
 
-    blocks: tuple[BlockRef, ...]
-    pre_selected: bool
+    pages: tuple[PageRef, ...]
 
 
 VALUE_KIND_VOCAB: frozenset[str] = frozenset({"scalar", "vector", "table"})
@@ -480,8 +446,6 @@ class AnnotatedValue(BaseModel):
     pages: tuple[int, ...] = ()  # source PDF page(s); () when unattributable
     requested_period: str | None = None  # branch.period — data window requested
     retrieve_key: str | None = None  # branch.key — concept this datum serves
-    source_block_page: int | None = None
-    source_block_index: int | None = None
 
     @model_validator(mode="after")
     def _check_shape(self) -> AnnotatedValue:

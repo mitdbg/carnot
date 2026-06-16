@@ -108,10 +108,9 @@ class SkunkConfig:
     # Ablation: golden page refs bypass the retrieve operator (eval runs only).
     golden_pages: list[PageRef] | None = field(default=None, repr=False)
 
-    # Retrieve dispatch: "page_index" (ToC pick → year filter → coarse summary filter,
-    # the default) or "search_agent" (iterative ChromaDB + LLM loop). Either way the
-    # selection agent narrows the candidates downstream. (env: SKUNK_RETRIEVER)
-    retriever: Literal["search_agent", "page_index"] = "page_index"
+    # Retrieve dispatch: "search_agent" (iterative ChromaDB + LLM loop) is the sole
+    # backend; golden_pages is a separate eval bypass. (env: SKUNK_RETRIEVER)
+    retriever: Literal["search_agent"] = "search_agent"
 
     # Search-agent corpus artifacts (built offline; agent fails fast if missing).
     # (env: SKUNK_CHROMADB_DIR, SKUNK_CHROMADB_COLLECTION, SKUNK_CLEAN_PAGE_MAP)
@@ -331,7 +330,7 @@ class SkunkConfig:
             human_verify_extract=os.environ.get("SKUNK_HUMAN_VERIFY_EXTRACT", "0")
             not in ("", "0"),
             human_lookup=os.environ.get("SKUNK_HUMAN_LOOKUP", "0") not in ("", "0"),
-            retriever=os.environ.get("SKUNK_RETRIEVER", "page_index"),  # type: ignore[arg-type]
+            retriever=os.environ.get("SKUNK_RETRIEVER", "search_agent"),  # type: ignore[arg-type]
             chromadb_dir=os.environ.get("SKUNK_CHROMADB_DIR", "cache/chromadb"),
             chromadb_collection=os.environ.get(
                 "SKUNK_CHROMADB_COLLECTION", "treasury_pages"

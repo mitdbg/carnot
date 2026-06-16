@@ -212,9 +212,9 @@ async def _run_one_question(
                 model=config.llm_model,
             )
 
-        # The retrieve sweep's deduped blocks — empty under golden bypass (retrieve never
+        # The retrieve sweep's deduped pages — empty under golden bypass (retrieve never
         # ran). Surfaced for the report's retrieval-recall column.
-        retrieved_blocks = list(orch.retrieved_blocks)
+        retrieved_pages = list(orch.retrieved_pages)
 
         if failure is not None:
             return {
@@ -224,7 +224,7 @@ async def _run_one_question(
                 "reason": result.failure_reason,
                 "latency_s": round(latency_s, 3),
                 "cost_usd": cost_usd,
-                "retrieved_blocks": retrieved_blocks,
+                "retrieved_pages": retrieved_pages,
             }
         return {
             "question": question,
@@ -233,7 +233,7 @@ async def _run_one_question(
             "reason": result.failure_reason,
             "latency_s": round(latency_s, 3),
             "cost_usd": cost_usd,
-            "retrieved_blocks": retrieved_blocks,
+            "retrieved_pages": retrieved_pages,
         }
     finally:
         ctx.close()
@@ -300,17 +300,13 @@ def _events_cost(events: list[dict]) -> str:
     return f"{cost:.4f}" if saw_call else ""
 
 
-def _retrieval_recall(retrieved_blocks: list, gold_pages: list[PageRef] | None) -> str:
+def _retrieval_recall(retrieved_pages: list, gold_pages: list[PageRef] | None) -> str:
     """n_hit/n_gold — how many gold pages the retrieve phase actually surfaced (matched on
-    month:page across the blocks' member pages). '' when no gold pages are recorded."""
+    month:page). '' when no gold pages are recorded."""
     if not gold_pages:
         return ""
     gold = {(p.month, p.page) for p in gold_pages}
-    got = {
-        (r.month, r.page)
-        for b in retrieved_blocks
-        for r in getattr(b, "member_refs", ())
-    }
+    got = {(p.month, p.page) for p in retrieved_pages}
     return f"{len(gold & got)}/{len(gold)}"
 
 
@@ -427,7 +423,7 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
             # The exception escaped before _run_one_question measured the run.
             "latency_s": None,
             "cost_usd": "",
-            "retrieved_blocks": [],
+            "retrieved_pages": [],
         }
 
     predicted = result["answer"] if not result["failed"] else ""
@@ -443,7 +439,7 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
             f"[e2e] {uid} Answer: {result['answer']}  [{mark} vs gold: {gold_answer!r}]"
         )
 
-    retrieved_blocks = result.get("retrieved_blocks", [])
+    retrieved_pages = result.get("retrieved_pages", [])
     category = "correct" if correct else ("fail" if result["failed"] else "wrong")
     gold_report_pages = cfg.golden_report.get(uid) or []
     return {
@@ -457,7 +453,7 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
         "golden_pages": " ".join(f"{p.month}:{p.page}" for p in gold_report_pages),
         "reason": result.get("reason") or "",
         "retrieval_recall": _retrieval_recall(
-            retrieved_blocks, cfg.golden_report.get(uid)
+            retrieved_pages, cfg.golden_report.get(uid)
         ),
         # Wall-clock seconds to plan + execute the query, and USD billed for its generation
         # calls — both measured in-process by _run_one_question (no trace log needed, so they
@@ -469,7 +465,7 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
         # main() for the accuracy tally and retrieval cache.
         "correct": correct,
         "failed": result["failed"],
-        "retrieved_blocks": retrieved_blocks,
+        "retrieved_pages": retrieved_pages,
     }
 
 
@@ -684,7 +680,7 @@ def main() -> None:
 
     out = report_path
     with out.open("w", newline="", encoding="utf-8") as f:
-        # extrasaction="ignore" drops the non-column `retrieved_blocks` key (kept on
+        # extrasaction="ignore" drops the non-column `retrieved_pages` key (kept on
         # each row only for the retrieval-recall computation above).
         writer = csv.DictWriter(f, fieldnames=REPORT_FIELDS, extrasaction="ignore")
         writer.writeheader()
