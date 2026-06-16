@@ -19,15 +19,35 @@ from pathlib import Path
 from skunk.common import pdf_path_for, render_page_b64  # noqa: F401
 from skunk.errors import StepFailed
 
-_FILENAME_RE = re.compile(r"treasury_bulletin_(\d{4})_(\d{2})\.pdf$")
+def _year_from_tag(tag: str) -> int | None:
+    """Publication year from one filename tag: a literal 4-digit year if present
+    (`cs-1872`, `2024`), else a 2-digit transition tag (`appendix00`, `annrpt97`)
+    century-mapped (<50 -> 20xx, else 19xx). None when the tag carries no year."""
+    m = re.search(r"1[789]\d{2}|20\d{2}", tag)
+    if m:
+        return int(m.group(0))
+    m = re.search(r"\d{2}", tag)
+    if m:
+        nn = int(m.group(0))
+        return 2000 + nn if nn < 50 else 1900 + nn
+    return None
 
 
-def parse_bulletin_filename(path: str | Path) -> str:
-    """treasury_bulletin_1953_06.pdf  ->  '1953-06'."""
-    m = _FILENAME_RE.search(str(path))
-    if not m:
-        raise ValueError(f"not a treasury bulletin filename: {path}")
-    return f"{m.group(1)}-{m.group(2)}"
+def parse_doc_id(doc: str) -> tuple[str, str | None, int | None]:
+    """Parse a corpus document id (its parsed-JSON/PDF filename stem) into
+    `(source, era, year)`:
+      - source: the publication family — "combined_statement" or "govinfo_receipts".
+      - era: "historical" | "transition" | "modern" for combined_statement; None for govinfo.
+      - year: the document's publication year, or None when the stem encodes none.
+    The page index keys on (doc, page) and carries only the doc `source` stem per page; era
+    and year are inferred from it here so they are never stored redundantly."""
+    parts = doc.split("__")
+    source = parts[0]
+    if source == "govinfo_receipts":
+        return source, None, (_year_from_tag(parts[1]) if len(parts) > 1 else None)
+    if source == "combined_statement" and len(parts) > 2:
+        return source, parts[1], _year_from_tag(parts[2])
+    return source, (parts[1] if len(parts) > 1 else None), None
 
 
 # Directory args below are required, not defaulted: the corpus lives wherever the
@@ -37,37 +57,38 @@ def parse_bulletin_filename(path: str | Path) -> str:
 
 
 @lru_cache(maxsize=64)
-def load_parsed_doc(month: str, base_dir: str) -> dict:
-    """Load a bulletin's parsed-JSON document from `base_dir` (LRU-cached on both args).
+def load_parsed_doc(doc: str, base_dir: str) -> dict:
+    """Load a document's parsed-JSON from `base_dir` (LRU-cached on both args). `doc` is the
+    corpus doc id — the filename stem (e.g. "combined_statement__modern__2024__c40").
     Raises FileNotFoundError if missing; json errors propagate."""
-    year, mon = month.split("-")
-    p = Path(base_dir) / f"treasury_bulletin_{year}_{mon}.json"
+    p = Path(base_dir) / f"{doc}.json"
     if not p.exists():
         raise FileNotFoundError(f"parsed-JSON not found: {p}")
     return json.loads(p.read_text())
 
 
 def page_elements(
-    month: str,
+    doc: str,
     *,
     base_dir: str | Path,
     fill_gaps: bool = False,
 ) -> dict[int, list[dict]]:
     """`{1-based PDF page index → list of parsed-JSON element dicts}`. `fill_gaps=False`
     (default) includes only pages carrying elements; `fill_gaps=True` includes every
-    page `1..max_page` (empty list for blanks) — the dense view the build pipeline wants."""
-    doc = load_parsed_doc(month, str(base_dir))
+    page `1..max_page` (empty list for blanks) — the dense view the build pipeline wants.
+    The parse's `bbox.page_id` is 0-based; we shift it to a 1-based PDF page index here."""
+    parsed = load_parsed_doc(doc, str(base_dir))
 
     by_page: dict[int, list[dict]] = {}
     max_page = 0
-    for el in doc.get("document", {}).get("elements", []):
+    for el in parsed.get("document", {}).get("elements", []):
         bbox = el.get("bbox") or []
         if not bbox:
             continue
         pid = bbox[0].get("page_id")
         if pid is None:
             continue
-        pid = int(pid)
+        pid = int(pid) + 1  # 0-based parse page_id -> 1-based PDF page index
         by_page.setdefault(pid, []).append(el)
         if pid > max_page:
             max_page = pid
