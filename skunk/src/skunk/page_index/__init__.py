@@ -1,9 +1,9 @@
-"""Page-index: an offline-built catalog + page store + the retriever that queries them.
+"""Page-index: an offline-built catalog + page store over the corpus.
 
-Query (per-query) — `query.py`: the `PageIndexRetriever` (loads the
-  artifact, then ToC pick → year filter → semantic filter). Every catalog row is a
-  single physical page (nothing is merged at build time), so a kept row maps
-  straight to the page extract reads / the vision tier renders.
+The query/retrieval path that once read this artifact (`query.py`'s `PageIndexRetriever`)
+has been removed; retrieval is now the search-agent backend (`skunk.search_agent`). What
+remains here is the offline BUILD and the read-time page STORE that `extract.py` reads
+through. Every catalog row is a single physical page (nothing is merged at build time).
 
 Page store — `store.py`: the artifact's source of truth for page CONTENT, with two
   thread-safe access paths — `text(ref)` (read from `pages/<bulletin>.json`) and
@@ -13,14 +13,15 @@ Page store — `store.py`: the artifact's source of truth for page CONTENT, with
   so the request path never touches the corpus parsed-JSON/PDFs directly.
 
 Data model — `data_model.py`: the on-disk artifact schema (catalog row,
-  era-keyed concept tree, filename layout) shared by build and query.
+  era-keyed concept tree, filename layout) shared by build and the page store.
 
 Build (offline) — `pipeline.py`: the end-to-end build pipeline
-  (scan → toc → reconstruct → place → catalog → page_store → era_merge), writing
-  each artifact under one build folder. There is deliberately no continuation-merge
-  pass — the scan's `is_continuation` flag is metadata only (see the pipeline module
-  docstring for why). Domain logic lives alongside: `scan.py` (page scan),
-  `toc_index.py` (per-issue ToC extraction, reconstruction for ToC-less issues,
-  placement), and `eras.py` (era segmentation + per-era canonical chapter build →
-  the concept tree).
+  (scan → continuation_check → notes_link → toc → reconstruct → place → catalog →
+  page_store → era_merge), writing each artifact under one build folder. No page is ever
+  merged: a header-less `is_continuation` page is resolved at READ time by fetching its
+  predecessor chain (`continuation_chain`), and `continuation_check` only prunes over-long
+  chains the scan mis-flagged. Domain logic lives alongside: `scan.py` (page scan),
+  `continuation.py` (chain pruning), `notes_link.py` (data→footnote linking), `toc_index.py`
+  (per-issue ToC extraction, reconstruction for ToC-less issues, placement), and `eras.py`
+  (era segmentation + per-era canonical chapter build → the concept tree).
 """

@@ -3,34 +3,22 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Callable, Iterator
 from typing import Any
 
 from skunk.common import (
     AnnotatedValue,
     B64Image,
-    BlockRef,
+    BranchRetrieval,
     ExecutionContext,
     PageRef,
     parse_json_response,
+    traced_step,
 )
 from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.plan import RetrieveBranch
-from skunk.page_index.store import get_page_store
-
-
-def _blocks_to_pagerefs(blocks: list[BlockRef]) -> list[PageRef]:
-    """Deduped union (first-seen order) of every block's member pages — the physical pages the
-    vision tier renders for a set of blocks."""
-    seen: set[PageRef] = set()
-    refs: list[PageRef] = []
-    for b in blocks:
-        for r in b.member_refs:
-            if r not in seen:
-                seen.add(r)
-                refs.append(r)
-    return refs
+from skunk.page_index.data_model import inherited_column_headers
+from skunk.page_index.store import PageStore, get_page_store
 
 
 def _render_pages_b64(
@@ -181,97 +169,38 @@ def _parse_extract_response(raw: str, ctx: ExecutionContext) -> list[AnnotatedVa
     return entries
 
 
-def _make_text_parse(
-    content: str,
-) -> Callable[[str, ExecutionContext], list[AnnotatedValue]]:
-    """Build the text-tier parse hook: shape-validate via `_parse_extract_response`,
-    then verify every emitted cell appears verbatim in `content` (the source page text).
-    A non-verbatim cell is a transcription/hallucination error the model should fix, so
-    raise `ParseError` (→ `call()` re-prompts) listing the offenders. `content` is
-    captured per call, so this is built fresh for each extract call."""
-
-    def parse(raw: str, ctx: ExecutionContext) -> list[AnnotatedValue]:
-        entries = _parse_extract_response(raw, ctx)
-        violations: list[str] = []
-        for e in entries:
-            for path, v in _cells_with_path(e):
-                if not _cell_in_text(v, content):
-                    loc = "/".join(path) if path else e.description
-                    violations.append(f"{e.description!r} [{loc}] = {v!r}")
-        if violations:
-            # Non-retryable: a verbatim miss on parsed text almost always means the OCR
-            # lacks the digits (corrupt scan), not that the model misformatted — re-prompting
-            # at higher temperature cannot conjure them, so fail straight to the vision tier.
-            raise ParseError(
-                raw,
-                "these values do NOT appear verbatim in the page text — extract only "
-                "printed values, transcribing every digit exactly:\n"
-                + "\n".join(violations),
-                retryable=False,
-            )
-        return entries
-
-    return parse
-
-
 def _stamp_provenance(
     entries: list[AnnotatedValue],
     refs: list[PageRef],
     branch: RetrieveBranch,
+    *,
+    obtained_visually: bool = False,
 ) -> list[AnnotatedValue]:
     """Copy machine-fact provenance from the source refs + branch onto each entry —
-    never LLM-written. `bulletin`/`pages` are attributable only when every ref in the
-    call shares one bulletin month (otherwise we can't tell which issue a value came
-    from, so they're left empty). Branch fields (`period`/`key`) are call-level
-    and always stamped. The model is frozen, so we rebuild via `model_copy`."""
-    months = {r.month for r in refs if r.month}
-    bulletin = next(iter(months)) if len(months) == 1 else None
+    never LLM-written. `doc_id`/`pages` are attributable only when every ref in the
+    call shares one source document (otherwise we can't tell which document a value came
+    from, so they're left empty). `doc_id` is that document's id (filename stem). Branch
+    fields (`period`/`key`) are call-level and always stamped. The model is frozen, so we
+    rebuild via `model_copy`."""
+    source_docs = {r.stem for r in refs if r.stem}
+    doc_id = next(iter(source_docs)) if len(source_docs) == 1 else None
     pages = (
         tuple(sorted({r.page for r in refs if r.page is not None}))
-        if bulletin is not None
+        if doc_id is not None
         else ()
     )
     return [
         e.model_copy(
             update={
-                "bulletin": bulletin,
+                "doc_id": doc_id,
                 "pages": pages,
                 "requested_period": branch.period,
                 "retrieve_key": branch.key,
+                "obtained_visually": obtained_visually,
             }
         )
         for e in entries
     ]
-
-
-def _cells_with_path(entry: AnnotatedValue) -> Iterator[tuple[tuple[str, ...], Any]]:
-    """Yield (key_path, primitive_cell) for every cell in `entry.value`."""
-    if entry.kind == "scalar":
-        yield (), entry.value
-    elif entry.kind == "vector":
-        for k, v in entry.value.items():
-            yield (k,), v
-    elif entry.kind == "table":
-        for rk, row in entry.value.items():
-            for ck, v in row.items():
-                yield (rk, ck), v
-
-
-def _cell_in_text(value: int | float | str, text: str) -> bool:
-    """True if primitive `value` appears verbatim in `text`. Integer-valued numerics
-    also try the comma-formatted form (2582 → "2,582"); strings are case-insensitive."""
-    if isinstance(value, str):
-        return value.strip().lower() in text.lower()
-    candidates: set[str] = {str(value)}
-    is_int_valued = isinstance(value, int) or (
-        isinstance(value, float) and value == int(value)
-    )
-    if is_int_valued:
-        iv = int(value)
-        candidates.add(str(iv))
-        if abs(iv) >= 1000:
-            candidates.add(f"{iv:,}")
-    return any(c in text for c in candidates)
 
 
 # Shared envelope spec (shape + field semantics + output rules) appended to each
@@ -297,15 +226,17 @@ relevant is found). Pick the shape that best preserves the page structure:
 
 Cells should be simple number or string — no nested cells. A numeric cell is
 a bare number: keep print flags (r, p) and footnote markers (2/) out of the
-value; record any that bear on the question in `notes`.
+value; record these instead in `notes`.
 
-Transcribe numbers exactly as printed — every digit and decimal place;
-never round, truncate, or drop trailing digits.
+Transcribe a number's digits exactly — every digit and decimal place; never
+round, truncate, or drop trailing digits. You may normalize only a value's
+FORMAT per the corpus notes (e.g. space-separated cents -> a decimal point),
+never its digits.
 
 ## Field semantics
 
 description   natural-language label uniquely identifying the datum
-              (series + period + sub-category), using the page's
+              (series + period + sub-category), prefer the page's
               verbatim row/column/caption wording.
 
 notes         the page's textual context bearing on the question:
@@ -337,18 +268,47 @@ _EXTRACT_OUTPUT_INSTRUCTION = (
 )
 
 
+def _continuation_context(page: PageRef, ctx: ExecutionContext) -> str:
+    """Extra read context for a header-less continuation page, in place of fetching its
+    predecessor pages: (1) the column grammar inherited from the run head (`inherited_column_headers`)
+    so unlabeled cells can be placed, and (2) the page's OWN block summaries — the account it
+    reports, which a banner-only continuation page's text may not state (its account heading is on
+    an earlier page). Only UNTITLED blocks are summarized: a titled block is already named by the
+    page-metadata line (`- page N: table: <title>`), so repeating its summary here just duplicates
+    that line; an untitled block has no title to show, so its summary is the only account signal.
+    Empty string for a normal (non-continuation) page. Shared by both tiers."""
+    store = get_page_store(str(ctx.config.pdf_dir))
+    sc = store.summary(page)
+    if sc is None or not getattr(sc, "is_continuation", False):
+        return ""
+    lines: list[str] = []
+    inh = inherited_column_headers(page, store.summary)
+    if inh:
+        # Only the column ORDER is inherited (stable across the run); the account is NOT — it can
+        # change mid-run, so it's left to the page's own summaries/titles below, not the head's.
+        cols = inh[2]
+        lines.append(
+            "This page's table opens directly into data columns; its header row is on an earlier "
+            f"page (not reprinted here). Columns, left to right: {cols}."
+        )
+    # Only summarize blocks the page metadata can't already name (untitled ones) — a titled
+    # block's "- page N: table: <title>" line makes its summary here redundant.
+    summaries = [b.summary for b in sc.blocks if b.summary and not b.title]
+    if summaries:
+        lines.append("This page reports: " + " / ".join(summaries))
+    return "\n".join(lines)
+
+
 class TextExtractor:
     _PREAMBLE = """\
 You retrieve printed values from page text to fulfill a specific lookup. The
 user message gives the lookup (and period, when stated), the question it
 serves, page metadata (each block's title), and the page text. Work out from
 the table markup in the text which column/row a value sits under, the
-period, and the units. Emit one entry per
-distinct row that could plausibly satisfy the lookup, including partial
-matches. Extract only what is printed — never compute or transform; every
-numeric value must appear verbatim in the page text (metadata is context, not
-a source of values). A period `YYYY-MM..YYYY-MM` is an inclusive month
-range."""
+period, and the units. Emit all data that could satisfy the lookup, including partial
+matches. Extract only printed values — never compute, derive, or invent one
+(metadata is context, not a source of values). A period `YYYY-MM..YYYY-MM` is
+an inclusive month range."""
 
     _SYSTEM = _PREAMBLE + "\n\n" + EXTRACT_COMMON_PROMPT
 
@@ -380,38 +340,16 @@ range."""
     @classmethod
     def _page_metadata(cls, refs: list[PageRef], ctx: ExecutionContext) -> str:
         """Structured summary of every content block on the group's pages. Empty string when no
-        catalog metadata is available."""
+        scan metadata is available."""
         store = get_page_store(str(ctx.config.pdf_dir))
         lines: list[str] = []
         for ref in refs:
-            row = store.catalog_row(ref)
-            if row is None:
+            sc = store.summary(ref)
+            if sc is None:
                 continue
-            for block in row.content_blocks:
+            for block in sc.blocks:
                 lines.append(cls._block_meta_line(ref.page, block))
         return "\n".join(lines)
-
-    @classmethod
-    def _scoped_metadata(
-        cls,
-        anchor: PageRef,
-        prov_refs: list[PageRef],
-        block_idxs: list[int | None],
-        ctx: ExecutionContext,
-    ) -> str:
-        """Metadata to orient the read: the SELECTED blocks' lines when every block in the group
-        is specific, else (a whole-page block is present) the pages' full metadata."""
-        row = get_page_store(str(ctx.config.pdf_dir)).catalog_row(anchor)
-        if row is not None:
-            cblocks = row.content_blocks
-            specific = [
-                bi for bi in block_idxs if bi is not None and 0 <= bi < len(cblocks)
-            ]
-            if specific and len(specific) == len(block_idxs):
-                return "\n".join(
-                    cls._block_meta_line(anchor.page, cblocks[bi]) for bi in specific
-                )
-        return cls._page_metadata(prov_refs, ctx)
 
     async def _extract_content(
         self,
@@ -443,16 +381,17 @@ range."""
                 content,
             ]
         )
-        # Parse hook validates shape AND verbatim-checks every cell against `content`.
-        # A shape defect raises a retryable ParseError, so `call()` re-prompts (escalating
-        # temperature) before giving up; a verbatim miss raises non-retryable and fails
-        # immediately. Either way the group degrades to empty and the operator falls
-        # through to the vision tier.
+        # Parse hook validates SHAPE only (valid AnnotatedValue array, distinguishable
+        # entries); a shape defect raises a retryable ParseError so `call()` re-prompts
+        # (escalating temperature) before degrading the group to empty. Exact transcription
+        # is a PROMPT-level instruction (like data_prep/compute), NOT a parse-level check —
+        # the old verbatim gate was net-negative, mostly false-rejecting format variants
+        # (comma floats, parenthesized negatives, space-cents) and downgrading good pages.
         prompt: PromptedCall[list[AnnotatedValue]] = PromptedCall(
             name="extract.text",
             system_prompt=self._SYSTEM,
-            default_effort="low",  # verbatim transcription, not reasoning
-            parse=_make_text_parse(content),
+            default_effort="low",  # transcription, not reasoning
+            parse=_parse_extract_response,
             output_instruction=_EXTRACT_OUTPUT_INSTRUCTION,
         )
         try:
@@ -464,56 +403,61 @@ range."""
         return _stamp_provenance(parsed, prov_refs, branch)
 
     @staticmethod
-    def _block_groups(
-        blocks: list[BlockRef],
-    ) -> list[tuple[PageRef, list[PageRef], list[int | None]]]:
-        """Group blocks by their anchor page (first-seen order), collecting each page's chosen
-        `block_index`es. Returns `(anchor, member_refs, block_idxs)` per page — several blocks on
-        one page collapse to one group (one extract call). `member_refs` is the UNION of those
-        blocks' spans (each block carries its own anchor + table-merge `extra_pages`), so the call
-        feeds every page they touch. A whole-page block contributes `block_index=None`."""
-        order: list[PageRef] = []
-        idxs_by: dict[PageRef, list[int | None]] = {}
-        refs_by: dict[PageRef, list[PageRef]] = {}
-        for b in blocks:
-            if b.page not in idxs_by:
-                idxs_by[b.page] = []
-                refs_by[b.page] = []
-                order.append(b.page)
-            idxs_by[b.page].append(b.block_index)
-            for r in b.member_refs:
-                if r not in refs_by[b.page]:
-                    refs_by[b.page].append(r)
-        return [(p, refs_by[p], idxs_by[p]) for p in order]
+    def _page_groups(
+        pages: list[PageRef], store: "PageStore"
+    ) -> list[tuple[PageRef, list[PageRef]]]:
+        """Expand each unique retrieved page (first-seen order) to the physical pages an extract
+        call must read: the page itself (and any folded continuation pages), then its linked
+        `notes_pages` (footnote definitions) appended. A header-less continuation page does NOT
+        pull in its predecessor text — the column grammar it needs is injected as a compact
+        metadata line (`inherited_column_headers`) instead, so a deep continuation reads one page
+        rather than its whole multi-page run. Returns `(page, refs)` per page — one extract call
+        each."""
+        out: list[tuple[PageRef, list[PageRef]]] = []
+        seen: set[PageRef] = set()
+        for p in pages:
+            if p in seen:
+                continue
+            seen.add(p)
+            sc = store.summary(p)
+            # The page itself plus any folded continuation pages (the table's tail).
+            members = [p.page, *sc.continuation_pages] if sc is not None else [p.page]
+            refs = [PageRef(stem=p.stem, page=pg) for pg in members]
+            if sc is not None:  # linked footnote/notes pages last (auxiliary context)
+                for n in sc.notes_pages:
+                    r = PageRef(stem=p.stem, page=n)
+                    if r not in refs:
+                        refs.append(r)
+            out.append((p, refs))
+        return out
 
-    async def _extract_block_group(
+    async def _extract_page_group(
         self,
-        anchor: PageRef,
-        member_refs: list[PageRef],
-        block_idxs: list[int | None],
+        page: PageRef,
+        refs: list[PageRef],
         branch: RetrieveBranch,
         question: str,
         ctx: ExecutionContext,
         looking_for: str | None = None,
     ) -> list[AnnotatedValue]:
-        """Extraction for one anchor page's blocks. The updated page index resolves a block to at
-        most two physical pages (its anchor + one table-merge continuation), so we feed those pages'
-        FULL text — no within-page slicing — annotated with the SELECTED blocks' metadata to point
-        the read at the right table(s). Whole-page blocks (`block_index=None`, golden / search-agent)
-        carry no specific block, so they fall back to the page's full metadata. `member_refs` is the
-        pages (the group's blocks' spans, unioned and deduped)."""
-        pages = self._fetch_page_texts(member_refs, ctx)
-        if not pages:
+        """Extraction for one retrieved page: feed its `refs` (the page plus its linked notes
+        pages) FULL text — no within-page slicing — annotated with the pages' content-block
+        metadata, plus, for a header-less continuation page, the inherited column grammar and the
+        page's own block summaries (`_continuation_context`) in place of its predecessor text."""
+        texts = self._fetch_page_texts(refs, ctx)
+        if not texts:
             ctx.emit(
-                f"group_skipped tier=parsed_json reason=no_text refs={[str(r) for r in member_refs]!r}"
+                f"group_skipped tier=parsed_json reason=no_text refs={[str(r) for r in refs]!r}"
             )
             return []
-        content = "\n\n".join(text for _, text in pages)
-        prov_refs = [r for r, _ in pages]
-        metadata = self._scoped_metadata(anchor, prov_refs, block_idxs, ctx)
+        content = "\n\n".join(text for _, text in texts)
+        prov_refs = [r for r, _ in texts]
+        metadata = self._page_metadata(prov_refs, ctx)
+        cont = _continuation_context(page, ctx)
+        if cont:
+            metadata = f"{cont}\n{metadata}" if metadata else cont
         ctx.emit(
-            f"block_scoped page={str(anchor)} n_pages={len(pages)} "
-            f"n_blocks={len(block_idxs)} chars={len(content)}"
+            f"page_scoped page={str(page)} n_pages={len(texts)} chars={len(content)}"
         )
         return await self._extract_content(
             content, prov_refs, metadata, branch, question, ctx, looking_for
@@ -523,23 +467,21 @@ range."""
         self,
         question: str,
         branch: RetrieveBranch,
-        blocks: list[BlockRef],
+        pages: list[PageRef],
         ctx: ExecutionContext,
         looking_for: str | None = None,
     ) -> list[AnnotatedValue]:
-        """Extract from the selected blocks, one extract call per anchor page (its blocks'
-        member pages fed whole). Whole-page blocks (`block_index=None`, from golden / search-agent)
-        flow through the same path — just with no specific block to focus on. `looking_for`
-        overrides the single-key opening line for multi-goal page reads."""
-        groups = self._block_groups(blocks)
+        """Extract from the retrieved pages — one extract call per unique page, its dependent
+        pages (header predecessors + notes) fed whole. `looking_for` overrides the single-key
+        opening line for multi-goal page reads."""
+        groups = self._page_groups(pages, get_page_store(str(ctx.config.pdf_dir)))
         ctx.emit(
-            f"fan_out tier=parsed_json n_groups={len(groups)} n_blocks={len(blocks)} "
-            f"group_sizes={[len(idxs) for _, _, idxs in groups]}"
+            f"fan_out tier=parsed_json n_groups={len(groups)} n_pages={len(pages)}"
         )
         per_group = await asyncio.gather(
             *[
-                self._extract_block_group(a, m, idxs, branch, question, ctx, looking_for)
-                for a, m, idxs in groups
+                self._extract_page_group(p, refs, branch, question, ctx, looking_for)
+                for p, refs in groups
             ]
         )
         entries = [e for kept in per_group for e in kept]
@@ -553,12 +495,10 @@ class VisionExtractor:
 You retrieve visible values from rendered page images to fulfill a specific
 lookup. The user message gives the lookup (and period, when stated), the
 question it serves, and a numbered list of the attached images. Emit every
-visible value that could plausibly satisfy the lookup, and ONLY those: never
-transcribe a whole table — emit just the rows/series the lookup and its
-period need. Extract only what is visibly printed — never compute or
-transform — except when the question asks for visual understanding of a
-chart (e.g. counting bars above a threshold).
-A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
+visible value that could plausibly satisfy the lookup, including partial matches.
+When the question asks for visual understanding of a chart (e.g. counting bars above a threshold),
+you may directly answer the question. Otherwise, extract only what is visibly printed — never compute,
+derive, or invent. A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
 
     _prompt = PromptedCall(
         name="extract.vision",
@@ -576,20 +516,23 @@ A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
         rendered_refs: list[PageRef],
         ctx: ExecutionContext,
         looking_for: str | None = None,
+        extra_context: str | None = None,
     ) -> list[AnnotatedValue]:
         """One vision call over the rendered page images. The numbered image list
         maps each attachment back to its source page so the LLM can't conflate them.
         `looking_for` overrides the single-key opening line — the seam for a caller
-        whose one page read serves SEVERAL retrieval goals at once."""
+        whose one page read serves SEVERAL retrieval goals at once. `extra_context`
+        carries a header-less continuation page's inherited column grammar / own summaries."""
         period = f" for the period {branch.period}" if branch.period else ""
         image_lines = [
-            f"Image {i + 1}: PDF page {ref.page} of the {ref.month} Treasury Bulletin"
+            f"Image {i + 1}: PDF page {ref.page} of document {ref.stem}"
             for i, ref in enumerate(rendered_refs)
         ]
         user_msg = "\n\n".join(
             [
                 looking_for or f"You are looking for {branch.key}{period}.",
                 f'For full context, this lookup serves to help answer the question: "{question}"',
+                *([extra_context] if extra_context else []),
                 "Images attached, in order:\n" + "\n".join(image_lines),
             ]
         )
@@ -605,8 +548,142 @@ A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
             entries = []
         ctx.emit(f"vision_result tier=vision n_entries={len(entries)}")
         # Stamp provenance from the rendered refs. A single vision call may span
-        # several issues (no per-image attribution on the reply), so bulletin/pages
-        # land only when all images share one bulletin — the common single-issue
-        # branch; multi-issue calls keep bulletin empty.
-        return _stamp_provenance(entries, rendered_refs, branch)
+        # several documents (no per-image attribution on the reply), so doc_id/pages
+        # land only when all images share one source document — the common single-doc
+        # branch; multi-doc calls keep doc_id empty.
+        return _stamp_provenance(entries, rendered_refs, branch, obtained_visually=True)
 
+
+
+# ---------------------------------------------------------------------------
+# Extraction sweep — read every retrieve branch's pages into AnnotatedValues.
+# (Search-agent / golden retrieval is the sole frontend: a branch's result is a
+# list of whole PageRefs, read directly here — no block/selection translation.)
+# ---------------------------------------------------------------------------
+
+_TEXT = TextExtractor()
+_VISION = VisionExtractor()
+
+
+def _synth_branch(branches: list[RetrieveBranch]) -> RetrieveBranch:
+    """One stamp-bearing branch for a multi-branch page read. Branch identity is irrelevant
+    at extraction, so the call-level provenance fields carry the union of the requesting
+    branches."""
+    keys = list(dict.fromkeys(b.key for b in branches))
+    periods = list(dict.fromkeys(p for b in branches if (p := b.period)))
+    return RetrieveBranch(
+        key="; ".join(keys),
+        period=", ".join(periods) or None,
+        visual_only=any(b.visual_only for b in branches),
+    )
+
+
+async def _extract_page(
+    ctx: ExecutionContext, page: PageRef, branches: list[RetrieveBranch]
+) -> list[AnnotatedValue]:
+    """One page's read serving EVERY branch that retrieved it: the call's opening line lists
+    all their targets, so a single page read extracts for each. Text tier first, pure vision
+    as the fallback — for visual_only branches, the `extract_vision_only` override, or a text
+    pass that found nothing."""
+    branch = branches[0] if len(branches) == 1 else _synth_branch(branches)
+    looking = None
+    if len(branches) > 1:
+        lines = []
+        for b in branches:
+            line = f"- {b.key}"
+            if b.period:
+                line += f" (for the period {b.period})"
+            lines.append(line)
+        looking = "You are looking for ALL of the following:\n" + "\n".join(lines)
+    if not branch.visual_only and not ctx.config.extract_vision_only:
+        entries = await _TEXT.run(ctx.question, branch, [page], ctx, looking_for=looking)
+        if entries:
+            return entries
+    images, rendered_refs = _render_pages_b64([page], ctx)
+    if not images:
+        return []
+    return await _VISION.run(
+        ctx.question, branch, images, rendered_refs, ctx, looking_for=looking,
+        extra_context=_continuation_context(page, ctx) or None,
+    )
+
+
+async def run_extract(
+    ctx: ExecutionContext,
+    branches: list[RetrieveBranch],
+    retrievals: list[BranchRetrieval | StepFailed],
+    branch_ids: list[int],
+) -> list[list[AnnotatedValue] | StepFailed]:
+    """Read every branch's retrieved pages into `AnnotatedValue`s in ONE organized sweep. Each
+    unique page is read exactly ONCE, mapped to every branch that retrieved it, its entries
+    attributed to the FIRST such branch — so compute sees each datum once. `retrievals` is one
+    slot per branch (its pages, or a `StepFailed` to carry through). Returns one result per
+    branch (its entries, or the `StepFailed` to attribute to it)."""
+    results: list[list[AnnotatedValue] | StepFailed | None] = [None] * len(branches)
+    pages_by_pos: dict[int, list[PageRef]] = {}
+    for pos, r in enumerate(retrievals):
+        if isinstance(r, StepFailed):
+            results[pos] = r
+        else:
+            pages_by_pos[pos] = list(r.pages)
+
+    # Each unique page read ONCE, mapped to EVERY branch that retrieved it; entries
+    # attributed to the first (lowest-pos) branch — its `owner`.
+    want: dict[PageRef, list[int]] = {}
+    for pos in sorted(pages_by_pos):
+        for p in pages_by_pos[pos]:
+            want.setdefault(p, []).append(pos)
+    n_req = sum(len(v) for v in pages_by_pos.values())
+    ctx.emit(
+        f"select_extract n_requested={n_req} n_reads={len(want)} "
+        f"n_already_read={n_req - len(want)}"
+    )
+
+    extracted: dict[PageRef, list[AnnotatedValue]] = {}
+
+    async def _extract_phase() -> list[AnnotatedValue]:
+        reads = await asyncio.gather(
+            *(
+                _extract_page(ctx, p, [branches[i] for i in poss])
+                for p, poss in want.items()
+            ),
+            return_exceptions=True,
+        )
+        for p, res in zip(want, reads):
+            if isinstance(res, BaseException):
+                ctx.emit(
+                    f"select_extract_failed page={p.stem}:{p.page} error={str(res)!r}"
+                )
+                extracted[p] = []
+            else:
+                extracted[p] = res
+        # Return the flattened reads so the traced "extract" step boundary summarizes the
+        # values it produced; returning [] makes the trace viewer render the step "(none)".
+        return [v for vs in extracted.values() for v in vs]
+
+    if want:
+        await traced_step(ctx, "extract", _extract_phase)
+
+    for pos in sorted(pages_by_pos):
+        pages = pages_by_pos[pos]
+        owned = [
+            v for p in pages if want[p][0] == pos for v in extracted.get(p, [])
+        ]
+        covered = any(extracted.get(p) for p in pages)
+        if covered or owned:
+            results[pos] = owned
+        else:
+            results[pos] = StepFailed(
+                "extract",
+                f"retrieved pages yielded no data for {branches[pos].key!r}",
+            )
+        page_keys = sorted({f"{p.stem}:{p.page}" for p in pages})
+        ctx.emit(
+            f"select_pipeline_branch branch_id={branch_ids[pos]} "
+            f"n_pages={len(pages)} n_entries={len(owned)} covered={covered}",
+            data={"branch_id": branch_ids[pos], "pages": page_keys},
+        )
+    return [
+        r if r is not None else StepFailed("extract", "branch produced no result")
+        for r in results
+    ]

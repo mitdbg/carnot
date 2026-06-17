@@ -157,7 +157,7 @@ main {
 }
 .task-grid > .empty { grid-column: 1 / -1; }
 .task-card {
-  height: 112px;            /* fixed; sized for the worst case (status + 4 kinds + 3 indicators) */
+  height: 128px;            /* fixed; sized for status + review kinds + corpus/risk indicators */
   box-sizing: border-box;
   overflow: hidden;         /* hard guarantee: a tag can never escape the card boundary */
   display: flex;
@@ -225,6 +225,15 @@ main {
 .tag.ind-refining { color: var(--warn); background: var(--yellow-bg); }
 .tag.ind-lock { color: var(--text3); background: var(--bg3); }
 .tag.locked-out { opacity: 0.55; cursor: not-allowed; filter: grayscale(0.6); }
+.tag.corpus-tag { cursor: default; }
+.tag.corpus-structured { color: var(--blue); background: var(--blue-bg); }
+.tag.corpus-medium { color: var(--yellow); background: var(--yellow-bg); }
+.tag.corpus-high { color: var(--bad); background: var(--red-bg); }
+.tag.corpus-blocked { color: var(--text3); background: var(--bg3); }
+.tag.corpus-unknown { color: var(--muted); background: var(--bg3); }
+.tag.confidence-high { color: var(--good); background: var(--green-bg); }
+.tag.confidence-mid { color: var(--warn); background: var(--yellow-bg); }
+.tag.confidence-low { color: var(--bad); background: var(--red-bg); }
 .intervention-list {
   display: grid;
   gap: 12px;
@@ -475,7 +484,7 @@ main {
 #detailOverlay[hidden] { display: none; }
 .detail-backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.6); }
 .detail-panel {
-  position: absolute; inset: 4vh 4vw;
+  position: absolute; inset: 12vh 4vw 4vh 4vw;
   display: flex; flex-direction: column;
   background: var(--panel); border: 1px solid var(--line);
   border-radius: 10px; box-shadow: var(--shadow); overflow: hidden;
@@ -487,8 +496,10 @@ main {
 .detail-head-title { display: flex; align-items: center; gap: 12px; }
 .detail-task { font-weight: 750; font-family: ui-monospace, monospace; }
 .detail-close {
+  display: inline-flex; align-items: center; justify-content: center;
   background: transparent; border: 1px solid var(--border2); color: var(--muted);
   width: 30px; height: 30px; border-radius: 6px; cursor: pointer; font-size: 15px;
+  line-height: 1;
 }
 .detail-close:hover { color: var(--ink); border-color: var(--ink); }
 .detail-scroll { flex: 1; overflow: auto; padding: 16px; }
@@ -938,6 +949,7 @@ textarea { width: 100%; min-height: 55px; }
 .review-close {
   background: transparent; border: 1px solid var(--border2); color: var(--muted);
   width: 30px; height: 30px; border-radius: 6px; cursor: pointer; font-size: 15px;
+  display: grid; place-items: center; padding: 0; line-height: 1;
 }
 .review-close:hover { color: var(--ink); border-color: var(--ink); }
 .review-body { flex: 1; display: flex; min-height: 0; }
@@ -970,6 +982,14 @@ textarea { width: 100%; min-height: 55px; }
 .review-cand-type.is-extract { background: var(--bg3); color: var(--text3); border: 1px solid var(--border2); }
 .review-cand-type.is-lookup { background: rgba(255,153,51,0.16); color: #ff9933; border: 1px solid rgba(255,153,51,0.5); }
 .review-cand.is-lookup { border-color: rgba(255,153,51,0.45); }
+.review-cand-meta {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+  font-size: 11px; color: var(--text3);
+}
+.review-cand-provenance {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: ui-monospace, monospace; color: var(--text2);
+}
 /* Comment-style external annotation (target + src) sitting just above the value JSON. */
 .review-cand-extnote {
   font-family: ui-monospace, monospace; font-size: 12px; color: #ff9933;
@@ -993,6 +1013,32 @@ textarea { width: 100%; min-height: 55px; }
 .review-submit.primary { background: var(--accent); border-color: var(--accent); color: #003300; }
 .review-submit:hover { filter: brightness(1.1); }
 .review-error { color: var(--bad); font-size: 12px; }
+
+.detail-corpus {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 5px; margin-top: 8px;
+}
+.review-sources {
+  display: grid; gap: 7px;
+  background: var(--bg2); border: 1px solid var(--line); border-radius: 6px;
+  padding: 8px 10px;
+}
+.review-source-tags { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; }
+.review-reason {
+  font-size: 12px; color: var(--text2); line-height: 1.35;
+}
+.review-reason span {
+  color: var(--ink); font-weight: 700; text-transform: uppercase; font-size: 11px;
+}
+.review-source-row {
+  display: grid; grid-template-columns: minmax(120px, 1fr) minmax(160px, 1.4fr);
+  gap: 10px; align-items: baseline; font-size: 12px;
+}
+.review-source-name {
+  color: var(--ink); font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.review-source-meta {
+  color: var(--text3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
 
 /* The action controls (refine box + Submit) render both above and below the editor. */
 .review-controls { display: flex; flex-direction: column; gap: 10px; }

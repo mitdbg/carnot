@@ -8,7 +8,7 @@ host execs it in the same sandbox. The code never constructs `AnnotatedValue`s i
 element is a plain dict of value fields the host validates into a fresh `AnnotatedValue`.
 The agent emits dicts (not `input_values[i]` references) because it cleans labels/typos and
 coalesces overlapping prints — the kept value is rarely the original object — and it authors
-each value's provenance (bulletin/pages/...) too: copied from the source entry, or UNIONed
+each value's provenance (doc_id/pages/...) too: copied from the source entry, or UNIONed
 across sources on a coalesce, so source-tracing and vintage selection downstream survive.
 
 The op fails safe: on any parse / exec / validation error after the attempt budget, the
@@ -34,7 +34,7 @@ from skunk.pyexec import exec_python_with_env, strip_code_fences
 
 # The agent emits each kept value as a full dict (it may have cleaned labels/typos or
 # coalesced prints, so it can't pass the original object through). It authors provenance
-# (bulletin/pages/...) too — copied from the source entry, or UNIONed across sources when it
+# (doc_id/pages/...) too — copied from the source entry, or UNIONed across sources when it
 # coalesces — so here, unlike elsewhere, provenance is LLM-written rather than machine-stamped.
 # Allowed keys are exactly `AnnotatedValue`'s fields (kept in sync with the model); any other
 # key is a typo and rejected.
@@ -93,7 +93,7 @@ You clean a pool of already-extracted data values before it is handed to a downs
 
 ## Inputs
 - The question, for context on which values are about to be used and how.
-- `input_values`: list[AnnotatedValue] in the exec environment — the union of everything previous extract/lookup steps gathered. Entries frequently repeat: the same table is reprinted across many monthly bulletins, so the same series+period value appears again and again, sometimes with identical and sometimes with slightly different `description`/`notes`.
+- `input_values`: list[AnnotatedValue] in the exec environment — the union of everything previous extract/lookup steps gathered. Entries may repeat: the same table can be reprinted across documents, so the same series+period value appears again, sometimes with identical and sometimes with slightly different `description`/`notes`.
 
 ## AnnotatedValue API (read-only)
   .description   natural-language label distinguishing this datum from its siblings
@@ -102,7 +102,7 @@ You clean a pool of already-extracted data values before it is handed to a downs
   .unit          natural-language unit, e.g. "millions of dollars", "percent"
   .notes         prose page context — footnotes, caveats, print-flag (p/r) meaning
   .kind          "scalar" | "vector" | "table"
-  .bulletin      source issue "YYYY-MM" the value was printed in (publication date); empty for external lookups
+  .doc_id        source document id (filename stem) the value was read from; empty for external lookups
   .pages         source PDF page number(s); empty for external lookups
   .source        external-lookup publisher (e.g. "FRED", "BEA"); empty for corpus extracts
   .requested_period / .retrieve_key   the data window / concept this datum served
@@ -124,14 +124,14 @@ Emit exactly one fenced ```python``` block assigning `result` — the cleaned li
   {"description": "...", "value": <scalar | vector dict | table dict>, "unit": "...",
    "notes": "...", "kind": "scalar"|"vector"|"table",
    "index_name"/"row_name"/"col_name": ... as the kind requires,
-   "bulletin": "YYYY-MM", "pages": [<int>, ...], "source": "...",
+   "doc_id": "<source document id>", "pages": [<int>, ...], "source": "...",
    "requested_period": "...", "retrieve_key": "..."}
-Always fill the provenance fields (`bulletin`, `pages`, `source`, `requested_period`, `retrieve_key`) yourself, from the input entry/entries a value came from — downstream compute reads them to sort by publication date and trace sources. For a value kept from ONE entry, copy them across. For a value you coalesced from SEVERAL entries, UNION them:
+Always fill the provenance fields (`doc_id`, `pages`, `source`, `requested_period`, `retrieve_key`) yourself, from the input entry/entries a value came from — downstream compute reads them to trace sources. For a value kept from ONE entry, copy them across. For a value you coalesced from SEVERAL entries, UNION them:
   - `pages`: every source page combined (deduped).
-  - `bulletin`: the issues the data was drawn from — a single "YYYY-MM", or "<earliest>..<latest>" when it spans several.
+  - `doc_id`: the source document id the data was drawn from — a single id, or the ids joined with ", " when it spans several documents.
   - `requested_period`: the combined period the merged value now covers.
   - `retrieve_key`: the shared concept key (identical across true coalesce candidates).
-EXTERNAL-LOOKUP values carry no `bulletin`/`pages` — they were fetched from an outside publisher, not a Bulletin page. For those, leave `bulletin` empty and `pages` `[]`, and PRESERVE the `source` (the publisher, e.g. "FRED") verbatim from the input entry. For corpus extracts, leave `source` empty.
+EXTERNAL-LOOKUP values carry no `doc_id`/`pages` — they were fetched from an outside publisher, not a corpus page. For those, leave `doc_id` empty and `pages` `[]`, and PRESERVE the `source` (the publisher, e.g. "FRED") verbatim from the input entry. For corpus extracts, leave `source` empty.
 Reproduce the data exactly — your only changes are removing duplicates, coalescing, and fixing labels/typos.
 """
 

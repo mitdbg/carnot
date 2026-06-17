@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from skunk.common import AnnotatedValue, Final, NeedsMore, PageRef, SemPoolEntry, page_key_to_pageref
+from skunk.common import AnnotatedValue, Final, NeedsMore, PageRef, page_key_to_pageref
 from skunk.plan import Plan
 
 
@@ -60,10 +60,8 @@ def _summarize_annotated(e: AnnotatedValue) -> dict:
         "unit": e.unit,
         "value_kind": e.kind,
         "value": e.value,
-        "bulletin": e.bulletin,
+        "doc_id": e.doc_id,
         "pages": list(e.pages),
-        "source_block_page": e.source_block_page,
-        "source_block_index": e.source_block_index,
     }
 
 
@@ -82,7 +80,7 @@ def summarize_value(v: Any) -> dict:
     if isinstance(v, list) and v and isinstance(v[0], PageRef):
         return {
             "type": "pages",
-            "pages": [{"month": p.month, "page": p.page} for p in v],
+            "pages": [{"stem": p.stem, "page": p.page} for p in v],
         }
     if isinstance(v, list) and v and isinstance(v[0], AnnotatedValue):
         return {"type": "values", "values": [_summarize_annotated(e) for e in v]}
@@ -97,18 +95,13 @@ def summarize_value(v: Any) -> dict:
             "missing_reason": v.missing_reason,
             "keep": [_summarize_annotated(e) for e in v.keep],
         }
-    if isinstance(v, list) and v and isinstance(v[0], SemPoolEntry):
-        seen: dict[tuple, None] = {}
-        for e in v:
-            seen[(e.ref.page.month, e.ref.page.page)] = None
-        return {"type": "pages", "pages": [{"month": m, "page": p} for m, p in seen]}
     if isinstance(v, list) and v and all(isinstance(x, str) for x in v):
         # The search-agent retriever returns page keys ("YYYY_MM_pageid") rather than
         # PageRefs. Parse them back so the node summary is the same "pages" shape the
         # trace viewer renders; fall through to a plain list if any key doesn't parse.
         try:
             refs = [page_key_to_pageref(x) for x in v]
-            return {"type": "pages", "pages": [{"month": p.month, "page": p.page} for p in refs]}
+            return {"type": "pages", "pages": [{"stem": p.stem, "page": p.page} for p in refs]}
         except ValueError:
             pass
     if isinstance(v, list):

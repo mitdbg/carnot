@@ -85,7 +85,7 @@ overrides:
       - `month`: zero-padded string, e.g. `"03"` (only `"03"`, `"06"`, `"09"`, `"12"` from 1983 onward).
       - `page_id`: integer, the index of the page within its bulletin.
       - `doc_id`: string, the full page key (see above).
-      - `type`: string, the element type (`"text"`, `"title"`, `"table"`, ...).
+      - `type`: string, the element type (`"text"`, `"title"`, `"table"`, `"footnote"`, ...).
 
       ### Example `metadata_filter` clauses
       ```python
@@ -201,14 +201,14 @@ overrides:
         ```
 
       - |
-        ### Example (question pins an explicit PAGE of a specific issue → page_pin {bulletin, page}; the page number is taken as written (we resolve both the printed-label and PDF-index page). No period — the pin determines location. Reading a chart → visual_only; put what to read in key.)
+        ### Example (question pins an explicit PAGE of a specific document → page_pin {doc_id, page}; the page number is taken as written (we resolve both the printed-label and PDF-index page). No period — the pin determines location. Reading a chart → visual_only; put what to read in key.)
         Q: On page 12 of the March 1985 Treasury Bulletin, how many bars in the chart rise above $50 billion?
         Plan:
         ```json
         {
           "branches": [
             {"kind": "retrieve", "key": "chart of bars above $50 billion",
-             "page_pin": {"bulletin": "1985-03", "page": 12},
+             "page_pin": {"doc_id": "1985-03", "page": 12},
              "visual_only": true}
           ]
         }
@@ -274,16 +274,16 @@ overrides:
       The values in `input_values` were extracted from U.S. Treasury Monthly
       Bulletin pages.
 
-  # Unit vocabulary — lookup_external emits these tokens; compute sees them on
-  # lookup entries alongside natural-language units on corpus-extracted entries.
+  # Unit convention — free-form natural-language labels on both lookup and
+  # corpus-extracted entries (compute reads them as prose, not codes).
   - section: corpus
     targets: [compute.codegen, lookup_external]
     content: |
-      Unit tokens for externally looked-up values: `usd`, `usd_thousands`,
-      `usd_millions`, `usd_billions`, `pct`, `count`, `year`, `rate`,
-      `fx_rate`, `cpi`, `text`; foreign currency follows `<iso3>_<scale>`
-      (e.g. `jpy_billions`). Corpus-extracted entries instead carry
-      natural-language units (e.g. "millions of dollars").
+      Units are free-form natural-language labels — the same convention for
+      externally looked-up and corpus-extracted values (e.g. "millions of
+      dollars", "percent", "yen per U.S. dollar"). Do not coerce them into
+      codes. For a foreign-currency amount, keep the native unit (e.g.
+      "billions of yen") and state the exchange-rate direction in `description`.
 
   - section: corpus
     targets: [lookup_external]
@@ -356,8 +356,8 @@ overrides:
       - |
         ### Example (FX conversion)
         Q: JPY net options position in millions of USD, mid-March 2016.
-        input_values: [0] scalar value=2300 unit "billions of yen", [1] scalar unit=fx_rate description="JPY per USD spot, 2016-03".
-        Why this shape: Foreign currency → find the fx_rate entry in the block, read direction from its description ("JPY per USD" → divide), then rescale billions → millions.
+        input_values: [0] scalar value=2300 unit "billions of yen", [1] scalar unit "yen per U.S. dollar" description="JPY per USD spot, 2016-03".
+        Why this shape: Foreign currency → find the exchange-rate entry in the block, read direction from its description ("JPY per USD" → divide), then rescale billions → millions.
         Output:
         ```python
         jpy_b = input_values[0].frame.iat[0, 0]  # 2300, billions of yen

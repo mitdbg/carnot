@@ -34,6 +34,104 @@ const CLIENT_ID = (function () {
 })();
 window.CLIENT_ID = CLIENT_ID;
 
+window.apiJson = async function apiJson(url, body, options = {}) {
+  const method = options.method || "POST";
+  const headers = Object.assign({ "Content-Type": "application/json" }, options.headers || {});
+  const fetchOptions = Object.assign({}, options, { method, headers });
+  if (body !== null && body !== undefined) fetchOptions.body = JSON.stringify(body);
+  const resp = await fetch(url, fetchOptions);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok || !data.ok) throw new Error(data.error || `Request failed (${resp.status})`);
+  return data;
+};
+
+const CorpusUI = (function () {
+  const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[c]));
+
+  function confidenceValue(confidence) {
+    if (typeof confidence === "number") return confidence;
+    if (!confidence || typeof confidence !== "object") return null;
+    const value = confidence.min ?? confidence.p10 ?? confidence.median;
+    return typeof value === "number" ? value : null;
+  }
+
+  function confidenceChip(confidence) {
+    const value = confidenceValue(confidence);
+    if (value == null) return "";
+    const pct = Math.round(value * 100);
+    const cls = pct >= 92 ? "confidence-high" : pct >= 80 ? "confidence-mid" : "confidence-low";
+    const label = pct >= 92 ? "High" : pct >= 80 ? "Med" : "Low";
+    return `<span class="tag corpus-tag ${cls}" title="Parsed JSON confidence">${label} ${pct}%</span>`;
+  }
+
+  function docLabel(doc) {
+    if (!doc) return "";
+    const label = doc.label || doc.family || "Source";
+    const era = doc.era ? ` ${doc.era}` : "";
+    const year = doc.year ? ` ${doc.year}` : "";
+    return `${label}${era}${year}`;
+  }
+
+  function docClass(doc) {
+    if (!doc) return "corpus-unknown";
+    if (doc.family === "govinfo_receipts" || doc.ocr_risk === "high") return "corpus-high";
+    if (doc.ocr_risk === "medium" || doc.era === "historical") return "corpus-medium";
+    if (doc.ocr_review_allowed === false) return "corpus-structured";
+    return "corpus-unknown";
+  }
+
+  function showDocTag(doc) {
+    if (!doc) return false;
+    if (doc.family === "combined_statement") return false;
+    if (doc.era === "historical") return false;
+    return true;
+  }
+
+  // Corpus-provenance pills (doc label + OCR review/blocked badge + confidence chip) are
+  // intentionally suppressed: the DAIS corpus is entirely scanned/OCR'd, so the OCR badge is
+  // always present and carries no per-task signal. Cards and the review modal show just the
+  // "Extract" action; the modal's per-document rows + policy reason still carry the detail.
+  // (Kept as a no-op rather than deleting call sites so it can be re-enabled for a mixed corpus.)
+  function summaryTags(_summary) {
+    return "";
+  }
+
+  function sourcePanel(summary, reason) {
+    if (!summary && !reason) return "";
+    const docs = (summary && summary.documents) || [];
+    const docRows = docs.length
+      ? docs.map((doc) => `<div class="review-source-row">
+          <span class="review-source-name">${esc(docLabel(doc))}</span>
+          <span class="review-source-meta">${esc(doc.structure || "unknown")} · OCR ${esc(doc.ocr_risk || "unknown")}${doc.ocr_review_allowed === false ? " · blocked" : ""}</span>
+        </div>`).join("")
+      : "";
+    const reasonHtml = reason
+      ? `<div class="review-reason"><span>${esc(reason.kind || "review")}</span>${reason.policy ? ` ${esc(reason.policy)}` : ""}</div>`
+      : "";
+    return `<div class="review-sources">
+      <div class="review-source-tags">${summaryTags(summary)}</div>
+      ${reasonHtml}
+      ${docRows}
+    </div>`;
+  }
+
+  function candidateMeta(candidate) {
+    if (!candidate || typeof candidate !== "object") return "";
+    const conf = confidenceChip(candidate.confidence ?? candidate.ocr_confidence ?? candidate.parser_confidence);
+    const source = candidate.document_id || candidate.source_doc || candidate.source || candidate.bulletin || "";
+    const page = Array.isArray(candidate.pages) && candidate.pages.length ? ` p${candidate.pages.join(",")}` : (candidate.page != null ? ` p${candidate.page}` : "");
+    const element = Array.isArray(candidate.element_ids) && candidate.element_ids.length ? ` · ${candidate.element_ids.join(",")}` : (candidate.element_id != null ? ` · element ${candidate.element_id}` : "");
+    const sourceHtml = source || page || element
+      ? `<span class="review-cand-provenance">${esc(`${source}${page}${element}` || "source")}</span>`
+      : "";
+    if (!conf && !sourceHtml) return "";
+    return `<div class="review-cand-meta">${conf}${sourceHtml}</div>`;
+  }
+
+  return { summaryTags, sourcePanel, candidateMeta, confidenceChip };
+})();
+window.CorpusUI = CorpusUI;
+
 const LOCK_HEARTBEAT_MS = 7000;  // re-acquire (refresh the lease) well within the backend TTL
 
 const ReviewOverlay = (function () {
@@ -59,8 +157,8 @@ const ReviewOverlay = (function () {
   let baselineReviewId = null;
 
   // viewer state
-  let pages = [];              // [{month, page}] parsed from the review's source_docs
-  let pageValues = [];         // [{month,page,values:[desc,...]}] from guidance — value(s) per page
+  let pages = [];              // [{doc,page}] or legacy [{issue,page}] parsed from source refs
+  let pageValues = [];         // per-page value labels from guidance — value(s) per page
   let pageIdx = 0;
   let zoom = 1, panX = 0, panY = 0;
   let fitScale = 1;            // scale that fits the whole page in the viewport (and the min zoom)
@@ -74,15 +172,38 @@ const ReviewOverlay = (function () {
 
   function root() { return document.getElementById("reviewOverlay"); }
 
-  function parsePages(sourceDocs) {
+  function parsePages(sourceDocs, guidance) {
     const out = [];
     const seen = new Set();
+    const add = (doc, page, legacyIssue) => {
+      const pageNum = Number(page);
+      if (!Number.isInteger(pageNum) || pageNum < 0) return;
+      const docId = String(doc || "").replace(/\.pdf$/i, "").replace(/\.txt$/i, "");
+      if (!docId && !legacyIssue) return;
+      const key = `${docId || legacyIssue || "page"}/${pageNum}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(legacyIssue ? { issue: legacyIssue, page: pageNum } : { doc: docId, page: pageNum });
+    };
     for (const doc of sourceDocs || []) {
-      const m = /Treasury Bulletin (\d{4}-\d{2}) PDF page (\d+)/.exec(String(doc));
-      if (m) {
-        const key = `${m[1]}/${m[2]}`;
-        if (!seen.has(key)) { seen.add(key); out.push({ month: m[1], page: Number(m[2]) }); }
+      if (doc && typeof doc === "object") {
+        add(doc.document_id ?? doc.doc_id ?? doc.source_doc ?? doc.source ?? doc.bulletin ?? doc.file, doc.page ?? doc.pdf_page ?? doc.page_id);
+        continue;
       }
+      const text = String(doc);
+      for (const m of text.matchAll(/(?:^|[/\s])([A-Za-z0-9][A-Za-z0-9_.-]+)_(\d{1,5})(?:\.txt)?\b/g)) {
+        add(m[1], m[2]);
+      }
+      const legacy = /\b((?:18|19|20)\d{2}-(?:0[1-9]|1[0-2]))\b.*?\b(?:pdf\s*)?page\s+(\d{1,4})\b/i.exec(text);
+      if (legacy) add("", legacy[2], legacy[1]);
+      const pageOnly = /\b(?:p(?:age)?|pg|page_id|pdf_page)\s*["']?\s*[:=#.]?\s*(\d{1,5})\b/i.exec(text);
+      if (!legacy && pageOnly) {
+        const pdf = /([A-Za-z0-9][A-Za-z0-9_.-]+)\.pdf\b/i.exec(text);
+        add(pdf ? pdf[1] : "", pageOnly[1]);
+      }
+    }
+    for (const value of (guidance && guidance.page_values) || []) {
+      add(value.document_id ?? value.doc_id ?? value.source_doc ?? value.source ?? value.bulletin ?? value.month, value.page ?? value.pdf_page ?? value.page_id);
     }
     return out;
   }
@@ -95,13 +216,8 @@ const ReviewOverlay = (function () {
   // heartbeat. Returns true iff we hold the lock afterward.
   async function acquireLock(taskId) {
     try {
-      const resp = await fetch(`/api/reviews/lock/${encodeURIComponent(taskId)}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ client_id: CLIENT_ID }),
-      });
-      const data = await resp.json().catch(() => ({}));
-      return !!(resp.ok && data.ok);
+      await apiJson(`/api/reviews/lock/${encodeURIComponent(taskId)}`, { client_id: CLIENT_ID });
+      return true;
     } catch (err) {
       return false;
     }
@@ -121,12 +237,8 @@ const ReviewOverlay = (function () {
         return;
       }
     } catch (err) { /* fall through to fetch */ }
-    fetch(`/api/reviews/unlock/${encodeURIComponent(taskId)}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body,
-      keepalive: true,
-    }).catch(() => {});
+    apiJson(`/api/reviews/unlock/${encodeURIComponent(taskId)}`, { client_id: CLIENT_ID }, { keepalive: true })
+      .catch(() => {});
   }
 
   function startHeartbeat() {
@@ -276,6 +388,7 @@ const ReviewOverlay = (function () {
         ${meta}
         <button class="review-cand-del" title="Remove this value" onclick="ReviewOverlay.deleteCard(this)">✕</button>
       </div>
+      ${CorpusUI.candidateMeta(c)}
       <label class="review-field"><span>description</span>
         <input type="text" data-f="description" value="${esc(c.description ?? "")}"></label>
       <label class="review-field"><span>unit</span>
@@ -360,9 +473,12 @@ const ReviewOverlay = (function () {
     const label = root().querySelector(".review-page-label");
     if (label && pages.length) {
       const pg = pages[pageIdx];
-      const pv = pageValues.find((v) => v.month === pg.month && Number(v.page) === Number(pg.page));
+      const pv = pageValues.find((v) =>
+        Number(v.page ?? v.pdf_page ?? v.page_id) === Number(pg.page)
+        && (!pg.doc || [v.document_id, v.doc_id, v.source_doc, v.source, v.bulletin, v.month].some((x) => String(x || "").replace(/\.pdf$/i, "") === pg.doc))
+      );
       const vals = pv && (pv.values || []).length ? `  —  ${pv.values.join(", ")}` : "";
-      label.textContent = `Treasury Bulletin ${pg.month}  ·  p.${pg.page}  (${pageIdx + 1}/${pages.length})${vals}`;
+      label.textContent = `${pg.doc || pg.issue || "Source"}  ·  p.${pg.page}  (${pageIdx + 1}/${pages.length})${vals}`;
     }
   }
   // Fit the loaded page to the viewport and center it; the fit scale also becomes the minimum
@@ -394,7 +510,9 @@ const ReviewOverlay = (function () {
     const img = root().querySelector(".review-page-img");
     if (img) {
       img.onload = () => scheduleFit();      // fit once the new page's natural size is known
-      img.src = `/api/source/${pages[pageIdx].month}/page/${pages[pageIdx].page}.png`;
+      img.src = pages[pageIdx].doc
+        ? `/api/source-doc/${encodeURIComponent(pages[pageIdx].doc)}/page/${pages[pageIdx].page}.png`
+        : `/api/source/${encodeURIComponent(pages[pageIdx].issue)}/page/${pages[pageIdx].page}.png`;
       scheduleFit();                          // cached image / already-laid-out: fit post-layout
     }
   }
@@ -520,7 +638,7 @@ const ReviewOverlay = (function () {
     const review = current();
     if (!review) { close(); return; }
     el.hidden = false;
-    pages = parsePages(review.source_docs);
+    pages = parsePages(review.source_docs, review.guidance);
     pageValues = (review.guidance && review.guidance.page_values) || [];
     pageIdx = 0; zoom = 1; panX = 0; panY = 0; fitScale = 1;
     const task = tasksRef.find((t) => t.task_id === activeTaskId);
@@ -534,6 +652,8 @@ const ReviewOverlay = (function () {
     const isFigure = review.kind === "figure";
     const ctx = contextLine(review);
     const cands = candidates(review);
+    const corpusSummary = review.corpus_summary || (review.guidance && review.guidance.corpus_summary) || null;
+    const sourcePanel = CorpusUI.sourcePanel(corpusSummary, review.review_reason);
     // Each kind picks its editor: replan_approval → read-only context + feedback; figure → JSON
     // template textarea; everything else → editable value cards (confirm/correct the model's read).
     let editor, editorLabel;
@@ -577,6 +697,7 @@ const ReviewOverlay = (function () {
         <div class="review-body">
           <div class="review-left">
             <div class="review-prompt">${esc(task?.prompt || "")}</div>
+            ${sourcePanel}
             ${ctx ? `<div class="review-context">${esc(ctx)}</div>` : ""}
             <div class="review-instructions">${esc(review.instructions || "")}</div>
             ${topControls}
@@ -622,13 +743,11 @@ const ReviewOverlay = (function () {
     submitting = true;
     showError("");
     try {
-      const resp = await fetch(`/api/reviews/${encodeURIComponent(review.review_id)}/resolve`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ response, source_docs: review.source_docs || [] }),
+      await apiJson(`/api/reviews/${encodeURIComponent(review.review_id)}/resolve`, {
+        response,
+        source_docs: review.source_docs || [],
+        client_id: CLIENT_ID,
       });
-      const data = await resp.json().catch(() => ({}));
-      if (!resp.ok || !data.ok) { showError(data.error || `resolve failed (${resp.status})`); submitting = false; return; }
       // One annotation per visit: return to the main screen (and release the lock) — no
       // auto-advance to the task's next open review. The SSE snapshot will confirm the resolve.
       submitting = false;
@@ -693,21 +812,15 @@ const ReviewOverlay = (function () {
     setRefineBusy(true);
     showError("");
     try {
-      const resp = await fetch(`/api/reviews/${encodeURIComponent(review.review_id)}/refine`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ feedback, candidates: candidatesPayload }),
+      await apiJson(`/api/reviews/${encodeURIComponent(review.review_id)}/refine`, {
+        feedback,
+        candidates: candidatesPayload,
+        client_id: CLIENT_ID,
       });
-      const data = await resp.json().catch(() => ({}));
-      if (!resp.ok || !data.ok) {
-        showError(data.error || `refine failed (${resp.status})`);
-        setRefineBusy(false);
-        return;
-      }
       // Success: the backend set review.refining=true and published; syncTasks takes over from
       // here (spinner now, revised cards + toast on completion). Nothing more to do.
     } catch (err) {
-      showError(String(err));
+      showError(err.message || String(err));
       setRefineBusy(false);
     }
   }

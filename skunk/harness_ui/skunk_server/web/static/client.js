@@ -112,6 +112,16 @@ function feedbackFor(task) {
   if (task.correct == null) return null;
   return { correct: !!task.correct, points: task.points };
 }
+function canResubmit(task) {
+  return !!task
+    && ["SUBMITTED", "SCORED"].includes(task.status)
+    && task.correct === false
+    && task.answer
+    && Number(round.resubmits_left) > 0;
+}
+function canRestart(task) {
+  return !!task && task.status === "FAILED" && !task.answer;
+}
 
 // ── round timer ──────────────────────────────────────────────────────────────────
 function updateRoundTimer() {
@@ -142,11 +152,13 @@ function taskCardHTML(task) {
     isRefining(task) ? `<span class="tag ind ind-refining">Updating</span>` : "",
     lockedByOther(task) ? `<span class="tag ind ind-lock" title="Locked by another reviewer">🔒 In review</span>` : "",
   ].join("");
+  const corpusTags = window.CorpusUI ? window.CorpusUI.summaryTags(task.corpus_summary) : "";
   return `<div class="task-card ${task.task_id === detailTaskId ? "selected" : ""}" onclick="openDetail('${js(task.task_id)}')">
     <div class="card-uid">${esc(task.question_id)}</div>
     <div class="card-tags">
       <span class="tag status ${badgeClass(task)}">${esc(badgeLabel(task))}</span>
       ${cardKindTags(task)}
+      ${corpusTags}
       ${indicators}
     </div>
   </div>`;
@@ -210,6 +222,7 @@ function openDetail(taskId) {
       <div class="detail-scroll">
         <div class="prompt-label">PROMPT</div>
         <div class="prompt-text">${esc(task?.prompt || "")}</div>
+        <div id="dCorpus" class="detail-corpus">${window.CorpusUI ? window.CorpusUI.summaryTags(task?.corpus_summary) : ""}</div>
         <div class="answer-row">
           <div><span class="k">Status</span><strong id="dStatus">${esc(task ? badgeLabel(task) : "-")}</strong></div>
           <div><span class="k">Answer</span><strong id="dAnswer">${esc(task?.answer || "—")}</strong></div>
@@ -256,8 +269,10 @@ function refreshDetail() {
   }
   const st = document.getElementById("dStatus");
   const ans = document.getElementById("dAnswer");
+  const corpus = document.getElementById("dCorpus");
   if (st) st.textContent = task ? badgeLabel(task) : "-";
   if (ans) ans.textContent = task?.answer || "—";
+  if (corpus) corpus.innerHTML = window.CorpusUI ? window.CorpusUI.summaryTags(task?.corpus_summary) : "";
   renderDetailActions(task);
 }
 
@@ -290,8 +305,17 @@ function renderDetailActions(task) {
     html += locked
       ? `<button class="primary" disabled title="Locked by another reviewer">Submit Answer</button>`
       : `<button class="primary" onclick="submitTask('${js(task.task_id)}', event)">Submit Answer</button>`;
+  } else if (canResubmit(task)) {
+    html += locked
+      ? `<button class="primary" disabled title="Locked by another reviewer">Re-submit Answer</button>`
+      : `<button class="primary" onclick="confirmResubmit('${js(task.task_id)}', event)">Re-submit Answer</button>`;
   } else if (task.status === "SUBMITTING") {
     html += `<span class="detail-feedback pending">Submitting…</span>`;
+  }
+  if (canRestart(task)) {
+    html += locked
+      ? `<button disabled title="Locked by another reviewer">re-start</button>`
+      : `<button onclick="restartTask('${js(task.task_id)}', event)">re-start</button>`;
   }
   if (locked) {
     html += `<span class="detail-feedback">🔒 Locked by another reviewer</span>`;
@@ -310,15 +334,37 @@ function renderDetailActions(task) {
 async function submitTask(taskId, event) {
   if (event) { event.stopPropagation(); event.preventDefault(); }
   try {
-    const resp = await fetch(`/api/submit/${encodeURIComponent(taskId)}`, { method: "POST" });
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok || !data.ok) flashSubmitError(taskId, data.error || `submit failed (${resp.status})`);
+    await apiJson(`/api/submit/${encodeURIComponent(taskId)}`, { client_id: window.CLIENT_ID });
   } catch (err) {
-    flashSubmitError(taskId, String(err));
+    flashSubmitError(taskId, err.message || String(err));
   }
   // On success the status SSE stream pushes SUBMITTING -> SUBMITTED/SCORED and the UI refreshes.
 }
 window.submitTask = submitTask;
+
+async function confirmResubmit(taskId, event) {
+  if (event) { event.stopPropagation(); event.preventDefault(); }
+  const ok = confirm(
+    "Really re-submit this answer?\n\nThis may use one of the remaining Cup resubmits. Press OK only if you did not hit this by mistake."
+  );
+  if (!ok) return;
+  await submitTask(taskId);
+}
+window.confirmResubmit = confirmResubmit;
+
+async function restartTask(taskId, event) {
+  if (event) { event.stopPropagation(); event.preventDefault(); }
+  const feedback = prompt("Optional feedback for the fresh attempt:", "") || "";
+  try {
+    await apiJson(`/api/restart/${encodeURIComponent(taskId)}`, {
+      client_id: window.CLIENT_ID,
+      feedback,
+    });
+  } catch (err) {
+    flashSubmitError(taskId, err.message || String(err));
+  }
+}
+window.restartTask = restartTask;
 
 function flashSubmitError(taskId, message) {
   const host = taskId === detailTaskId ? document.getElementById("dActions") : null;

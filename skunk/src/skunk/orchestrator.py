@@ -17,14 +17,13 @@ from skunk.human import (
 from skunk.lookup_external import LookupExternalOp
 from skunk.common import (
     AnnotatedValue,
-    BlockRef,
     BranchRetrieval,
     ExecutionContext,
     Final,
     HumanInterventionHandler,
     HumanReviewRegister,
     NeedsMore,
-    SemPoolEntry,
+    PageRef,
     traced_step,
 )
 from skunk.llm_client import LLMClient
@@ -47,7 +46,7 @@ class BranchOutcome:
     branch: Branch
     entries: list[AnnotatedValue] | None
     error: StepFailed | None
-    blocks: list[BlockRef] = field(default_factory=list)
+    pages: list[PageRef] = field(default_factory=list)
 
 
 @dataclass
@@ -180,11 +179,11 @@ class Orchestrator:
         self._compute = ComputeOp()
         self._data_prep = DataPrepOp()
         self._result = ExecutionResult(question=question)
-        # Deduped union of every BlockRef the retrieve phase produced this question (first-seen
+        # Deduped union of every page the retrieve phase produced this question (first-seen
         # order, accumulated across the initial sweep and any replan sweeps). Exposed via
-        # `retrieved_blocks` for the eval harness's `likely_pages` / retrieval-recall reporting.
+        # `retrieved_pages` for the eval harness's `likely_pages` / retrieval-recall reporting.
         # Empty under golden bypass (retrieve never runs).
-        self._retrieved_blocks: list[BlockRef] = []
+        self._retrieved_pages: list[PageRef] = []
         # Snapshot for an optimistic-review recompute (the per-branch entries that produced the
         # answer); set on every compute attempt, None until then. The server stores it on the
         # task so a later human resolve can revise the answer via `recompute_answer`.
@@ -195,10 +194,10 @@ class Orchestrator:
         return self._ctx
 
     @property
-    def retrieved_blocks(self) -> list[BlockRef]:
-        """Deduped union of blocks from every retrieve sweep this question (empty under
-        golden bypass). Pages are derivable via each block's `member_refs`."""
-        return self._retrieved_blocks
+    def retrieved_pages(self) -> list[PageRef]:
+        """Deduped union of pages from every retrieve sweep this question (empty under
+        golden bypass)."""
+        return self._retrieved_pages
 
     @property
     def recompute_state(self) -> RecomputeState | None:
@@ -275,8 +274,8 @@ class Orchestrator:
                     # superseded/replanning round never has an open pool review — so a human can't
                     # be mid-edit on a review the orchestrator is about to discard, and the
                     # recompute snapshot always matches the data behind the answer. Page attribution
-                    # uses the PRE-clean pool (single bulletin each); the cleaned pool's coalesced
-                    # range-bulletins can't resolve to a PDF.
+                    # uses the PRE-clean pool (single doc_id each); the cleaned pool's coalesced
+                    # multi-doc values can't resolve to a PDF.
                     self._capture_recompute_pool(pool, explanations)
                     if self._human.wants_pool_review(self._ctx):
                         self._human.register_pool_review(
@@ -489,7 +488,7 @@ class Orchestrator:
             "data_prep_output": [
                 entry.model_dump(
                     mode="json",
-                    include={"description", "value", "unit", "kind", "bulletin", "pages"},
+                    include={"description", "value", "unit", "kind", "doc_id", "pages"},
                 )
                 for entry in pool
             ],
@@ -547,14 +546,11 @@ class Orchestrator:
         branch_ids: list[int],
         document_scopes: list[list[str] | None] | None = None,
     ) -> list[BranchRetrieval | StepFailed]:
-        """Unified multi-scan retrieve for every retrieve branch at once: their candidate
-        pages are deduped and the LLM semantic filter scans each unique page at most once,
-        judging it against all branches' targets, then routes the survivors back per branch.
-        Returns one normalized `BranchRetrieval` per branch (or the `StepFailed` to attribute
-        to it) — `RetrieveOp.run_all` owns all backend dispatch and the `pre_selected` flag.
-        `branch_ids` lets the search-agent backend emit a per-branch `retrieve` step;
-        `document_scopes` hard-scopes a branch's corpus to human-required bulletins (HITL).
-        The shared page-index `retrieve` sweep carries no `branch_id`."""
+        """Retrieve for every retrieve branch at once via the search-agent backend, returning
+        one normalized `BranchRetrieval` (its whole pages) per branch — or the `StepFailed` to
+        attribute to it. `RetrieveOp.run_all` owns all backend dispatch. `branch_ids` lets the
+        search-agent backend emit a per-branch `retrieve` step; `document_scopes` hard-scopes a
+        branch's corpus to human-required documents (HITL)."""
         if not branches:
             return []
         try:
@@ -568,17 +564,17 @@ class Orchestrator:
         except StepFailed as e:
             return [e] * len(branches)
 
-        # Accumulate the deduped block union (for `likely_pages` / retrieval-recall reporting).
+        # Accumulate the deduped page union (for `likely_pages` / retrieval-recall reporting).
         # Replan sweeps extend the same list, so rebuild the seen-set from the current list each
         # call rather than carrying a persistent set that would outlive the sweep it was built for.
-        seen_blocks = set(self._retrieved_blocks)
+        seen_pages = set(self._retrieved_pages)
         for r in results:
             if isinstance(r, StepFailed):
                 continue
-            for blk in r.blocks:
-                if blk not in seen_blocks:
-                    seen_blocks.add(blk)
-                    self._retrieved_blocks.append(blk)
+            for p in r.pages:
+                if p not in seen_pages:
+                    seen_pages.add(p)
+                    self._retrieved_pages.append(p)
         return results
 
     async def _run_branches(
@@ -592,7 +588,7 @@ class Orchestrator:
         # sweep, then each branch's routed refs feed its own extract. Lookup branches are
         # independent and run in the per-branch tail below. `document_scopes` (keyed by
         # stable branch id) hard-scopes a retrieve branch's corpus to human-required
-        # bulletins — the HITL "annotate this branch's source documents" recovery action.
+        # documents — the HITL "annotate this branch's source documents" recovery action.
         self._last_executed_branch_ids = set(branch_ids)
         retrieve_pos = [i for i, b in enumerate(branches) if b.kind == "retrieve"]
         retrievals = await self._run_retrieve_phase(
@@ -606,65 +602,25 @@ class Orchestrator:
             zip(retrieve_pos, retrievals)
         )
 
-        # Select → extract runs as ONE shared pipeline over all retrieve branches,
-        # launched as a task so lookup branches proceed concurrently. Each retrieve
-        # tail awaits the shared task and picks out its branch's result. Selection and
-        # extraction are two stages (`run_select` then `run_extract`); each does its own
-        # per-branch traced_steps, so the tail doesn't wrap them again.
+        # Extract runs as ONE shared sweep over all retrieve branches, launched as a task so
+        # lookup branches proceed concurrently. Each retrieve tail awaits the shared task and
+        # picks out its branch's result. Retrievals are whole pages (golden / search-agent);
+        # `run_extract` reads each unique page once and does its own per-branch traced_steps,
+        # so the tail doesn't wrap them again.
         pipeline: asyncio.Task | None = None
         if retrieve_pos:
-            from skunk.block_extract import run_extract
-            from skunk.block_select import run_select
+            from skunk.extract import run_extract
 
             sub_branches = [cast(RetrieveBranch, branches[i]) for i in retrieve_pos]
             sub_ids = [branch_ids[i] for i in retrieve_pos]
             sub_retrievals = [retr_by_pos[i] for i in retrieve_pos]
+            pipeline = asyncio.create_task(
+                run_extract(self._ctx, sub_branches, sub_retrievals, sub_ids)
+            )
 
-            async def _select_extract() -> list[list[AnnotatedValue] | StepFailed]:
-                from skunk.page_index.query import PageIndexRetriever
-
-                # A retrieval that is already FINAL — golden, search-agent, or a page-pin
-                # fetch (`BranchRetrieval.pre_selected`) — skips block_select entirely: its
-                # blocks ARE the selection. Only live page-index retrievals run the selection
-                # tournament. block_select itself is selection-only; the decision lives here.
-                selections: list[list[SemPoolEntry] | StepFailed | None] = [
-                    None
-                ] * len(sub_branches)
-                live_pos: list[int] = []
-                for i, r in enumerate(sub_retrievals):
-                    if isinstance(r, StepFailed):
-                        selections[i] = r
-                    elif r.pre_selected:
-                        pool = PageIndexRetriever.pool_for_blocks(
-                            list(r.blocks), str(self._ctx.config.pdf_dir)
-                        )
-                        selections[i] = pool or StepFailed(
-                            "retrieve",
-                            f"retrieval produced no blocks for branch {sub_branches[i].key!r}",
-                        )
-                    else:
-                        live_pos.append(i)
-                if live_pos:
-                    live = await run_select(
-                        self._ctx,
-                        [sub_branches[i] for i in live_pos],
-                        [sub_retrievals[i] for i in live_pos],
-                        [sub_ids[i] for i in live_pos],
-                    )
-                    for j, i in enumerate(live_pos):
-                        selections[i] = live[j]
-                return await run_extract(
-                    self._ctx,
-                    sub_branches,
-                    cast(list[list[SemPoolEntry] | StepFailed], selections),
-                    sub_ids,
-                )
-
-            pipeline = asyncio.create_task(_select_extract())
-
-        def _branch_blocks(pos: int) -> list[BlockRef]:
+        def _branch_pages(pos: int) -> list[PageRef]:
             r = retr_by_pos.get(pos)
-            return list(r.blocks) if isinstance(r, BranchRetrieval) else []
+            return list(r.pages) if isinstance(r, BranchRetrieval) else []
 
         async def _tail(pos: int) -> list[AnnotatedValue]:
             branch, bid = branches[pos], branch_ids[pos]
@@ -682,12 +638,12 @@ class Orchestrator:
                         cast(RetrieveBranch, branch), res, self._ctx
                     )
                 ):
-                    blocks = _branch_blocks(pos)
+                    pages = _branch_pages(pos)
                     res = await traced_step(
                         self._ctx,
                         "human_verify",
                         lambda: self._human.verify_extract(
-                            res, blocks, cast(RetrieveBranch, branch), self._ctx
+                            res, pages, cast(RetrieveBranch, branch), self._ctx
                         ),
                         branch_id=bid,
                     )
@@ -728,7 +684,7 @@ class Orchestrator:
         for pos, (bid, (branch, res)) in enumerate(
             zip(branch_ids, zip(branches, results))
         ):
-            blocks = _branch_blocks(pos)
+            pages = _branch_pages(pos)
             if isinstance(res, StepFailed):
                 self._ctx.emit(
                     f"parallel_branch_failed branch_id={bid} error={str(res)!r}",
@@ -736,7 +692,7 @@ class Orchestrator:
                 )
                 outcomes.append(
                     BranchOutcome(
-                        branch=branch, entries=None, error=res, blocks=blocks
+                        branch=branch, entries=None, error=res, pages=pages
                     )
                 )
             elif isinstance(res, BaseException):
@@ -744,7 +700,7 @@ class Orchestrator:
             else:
                 outcomes.append(
                     BranchOutcome(
-                        branch=branch, entries=res, error=None, blocks=blocks
+                        branch=branch, entries=res, error=None, pages=pages
                     )
                 )
         return outcomes

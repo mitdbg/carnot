@@ -39,7 +39,7 @@ def test_reasoner_defaults_page_index_to_repo_cache(monkeypatch) -> None:
 
     _set_default_env()
 
-    assert os.environ["SKUNK_PAGE_INDEX_DIR"] == str(SKUNK_ROOT / "cache/build_v3")
+    assert os.environ["SKUNK_PAGE_INDEX_DIR"] == "/home/ubuntu/dais/competition_page_index"
 
 
 def test_agent_worker_pool_success_and_failure() -> None:

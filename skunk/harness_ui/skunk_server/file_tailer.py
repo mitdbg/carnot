@@ -77,20 +77,18 @@ class FileTailer:
         max_seq = -1
         try:
             with open(self._events_file, "rb") as handle:
-                raw = handle.read()
+                for line in handle:
+                    if not line.endswith(b"\n"):
+                        continue
+                    obj = _parse_line(line)
+                    if obj is None or obj.get("task_id") != task_id:
+                        continue
+                    event = _compact_event(obj.get("event") or {})
+                    seq = event.get("seq", 0)
+                    out.append((seq, obj.get("attempt_id", ""), event))
+                    max_seq = max(max_seq, seq)
         except FileNotFoundError:
             return [], 0
-        last_nl = raw.rfind(b"\n")
-        if last_nl == -1:
-            return [], 0
-        for line in raw[: last_nl + 1].split(b"\n"):
-            obj = _parse_line(line)
-            if obj is None or obj.get("task_id") != task_id:
-                continue
-            event = _compact_event(obj.get("event") or {})  # clip for display (web-side work)
-            seq = event.get("seq", 0)
-            out.append((seq, obj.get("attempt_id", ""), event))
-            max_seq = max(max_seq, seq)
         return out, max_seq + 1
 
     # ── poll loop (web main loop) ────────────────────────────────────────────
@@ -145,7 +143,10 @@ class FileTailer:
         """Tail the single shared events.jsonl once and demux each new line to its task's
         subscribers. Skip entirely when nobody is watching (a late subscriber backfills the
         whole file on connect, and the seq-dedup drops anything this live tail replays)."""
-        if self.hub is None or not self.hub.active_event_task_ids():
+        if self.hub is None:
+            return
+        active_ids = set(self.hub.active_event_task_ids())
+        if not active_ids:
             return
         try:
             st = os.stat(self._events_file)
@@ -171,6 +172,8 @@ class FileTailer:
             if obj is None:
                 continue
             task_id = obj.get("task_id", "")
+            if task_id not in active_ids:
+                continue
             event = _compact_event(obj.get("event") or {})  # clip for display (web-side work)
             self.hub.publish_event(task_id, obj.get("attempt_id", ""), [event])
         self._offset = (offset + len(complete), inode)

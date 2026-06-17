@@ -28,6 +28,23 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."   # repo root
 
+# --- Load skunk/.env without clobbering vars already in the environment ---
+# Same idiom as run_solution.sh / run_practice_server.sh, so all three components share one
+# config source (SKUNK_CHROMADB_DIR, SKUNK_CHROMA_SERVER_*). An explicit shell export still wins.
+ENV_FILE="${SKUNK_ENV_FILE:-$(pwd)/.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    line="${line#export }"
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"; val="${line#*=}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    if [[ "$val" == \"*\" || "$val" == \'*\' ]]; then val="${val:1:${#val}-2}"; fi
+    if ! eval "[ -n \"\${$key+x}\" ]"; then export "$key=$val"; fi
+  done < "$ENV_FILE"
+fi
+
 # --- Required: the collection(s) to warm (fail fast, before starting the server) ---
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <collection> [<collection> ...]" >&2

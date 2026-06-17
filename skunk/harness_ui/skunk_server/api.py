@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -36,6 +37,7 @@ SSE_HEADERS = {
     "Connection": "keep-alive",
 }
 _MONTH_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])$")
+_DOC_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 class ReviewResolveBody(BaseModel):
@@ -43,6 +45,7 @@ class ReviewResolveBody(BaseModel):
         ""  # human's corrected AnnotatedValue JSON (empty = accept the model as-is)
     )
     source_docs: list[str] = Field(default_factory=list)
+    client_id: str = Field(..., min_length=1)
 
 
 class ReviewRefineBody(BaseModel):
@@ -50,10 +53,22 @@ class ReviewRefineBody(BaseModel):
     candidates: list[dict] = Field(
         default_factory=list
     )  # the JSONs currently displayed (hand-edits already overlaid)
+    client_id: str = Field(..., min_length=1)
 
 
 class ReviewLockBody(BaseModel):
-    client_id: str  # the browser's stable per-session id holding/releasing the review lock
+    client_id: str = Field(
+        ..., min_length=1
+    )  # the browser's stable per-session id holding/releasing the review lock
+
+
+class SubmitTaskBody(BaseModel):
+    client_id: str = Field(..., min_length=1)
+
+
+class RestartTaskBody(BaseModel):
+    client_id: str = Field(..., min_length=1)
+    feedback: str = ""
 
 
 async def status_frames(hub: StreamHub, heartbeat: float = HEARTBEAT_INTERVAL_S):
@@ -158,7 +173,7 @@ def install_command_routes(app: FastAPI) -> None:
 
             skunk_reasoner.SkunkReasoner.set_default_env()
             store = get_page_store(str(SkunkConfig.from_env().pdf_dir))
-            img = await asyncio.to_thread(store.image, PageRef(month=month, page=page))
+            img = await asyncio.to_thread(store.image, PageRef(stem=month, page=page))
         except Exception:
             logger.exception("source page render failed for %s p%s", month, page)
             return Response(status_code=500)
@@ -167,6 +182,42 @@ def install_command_routes(app: FastAPI) -> None:
         return Response(
             content=base64.b64decode(img.data),
             media_type=img.mime,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    @app.get("/api/source-doc/{doc_id}/page/{page}.png")
+    async def source_doc_page(doc_id: str, page: int) -> Response:
+        # `page` is 1-based (the PDF viewer's page number, as shown in the review label and as
+        # passed by review_overlay.js) — matching the sibling /api/source endpoint and the rest
+        # of the corpus code. PyMuPDF indexes pages 0-based, so subtract 1 when loading.
+        if not _DOC_ID_RE.match(doc_id) or page < 1:
+            return Response(status_code=404)
+        try:
+            import fitz
+
+            pdf_dir = Path(os.environ.get("OFFICEQA_PDF_DIR", ""))
+            pdf_path = pdf_dir / f"{doc_id}.pdf"
+            if not pdf_path.exists():
+                pdf_path = (
+                    Path(__file__).resolve().parents[2]
+                    / "data"
+                    / "dais"
+                    / "pdfs"
+                    / f"{doc_id}.pdf"
+                )
+            if not pdf_path.exists():
+                return Response(status_code=404)
+            with fitz.open(pdf_path) as pdf:
+                if page > len(pdf):
+                    return Response(status_code=404)
+                pix = pdf[page - 1].get_pixmap(matrix=fitz.Matrix(200 / 72, 200 / 72))
+                data = pix.tobytes("png")
+        except Exception:
+            logger.exception("source doc page render failed for %s p%s", doc_id, page)
+            return Response(status_code=500)
+        return Response(
+            content=data,
+            media_type="image/png",
             headers={"Cache-Control": "public, max-age=86400"},
         )
 
@@ -180,7 +231,7 @@ def install_command_routes(app: FastAPI) -> None:
             )
         try:
             task, review = broker.resolve_review(
-                review_id, body.response, body.source_docs
+                review_id, body.response, body.source_docs, body.client_id
             )
         except KeyError:
             return JSONResponse(
@@ -204,7 +255,7 @@ def install_command_routes(app: FastAPI) -> None:
             )
         try:
             _task, review = broker.refine_review(
-                review_id, body.feedback, body.candidates
+                review_id, body.feedback, body.candidates, body.client_id
             )
         except KeyError:
             return JSONResponse(
@@ -238,11 +289,25 @@ def install_command_routes(app: FastAPI) -> None:
         return JSONResponse({"ok": True})
 
     @app.post("/api/submit/{task_id:path}")
-    async def submit_task(task_id: str) -> JSONResponse:
+    async def submit_task(task_id: str, body: SubmitTaskBody) -> JSONResponse:
         # Manually submit a READY task's latest answer to Cup. The coordinator is assigned to
         # app.state after install_routes runs, so read it lazily here at request time.
         coordinator = app.state.coordinator
+        broker = app.state.broker
         try:
+            if broker is not None:
+                holder = broker.get_lock_holder(task_id)
+                if holder is not None and holder != body.client_id:
+                    return JSONResponse(
+                        {"ok": False, "error": "Task is locked by another user"},
+                        status_code=409,
+                    )
+                # NOTE: open reviews intentionally do NOT block manual submission. A reviewer must
+                # always be able to submit the current optimistic answer early (e.g. to bank points
+                # before the round deadline) without first clearing every review. Any reviews left
+                # open stay open; resolving one still recomputes and resubmits as usual. This also
+                # matches the deadline auto-submit sweep, which calls submit_ready() directly and
+                # never consulted this guard.
             await coordinator.submit_ready(task_id)
         except KeyError:
             return JSONResponse(
@@ -257,3 +322,28 @@ def install_command_routes(app: FastAPI) -> None:
             logger.exception("manual submit failed for %s", task_id)
             return JSONResponse({"ok": False, "error": str(error)}, status_code=502)
         return JSONResponse({"ok": True, "task_id": task_id})
+
+    @app.post("/api/restart/{task_id:path}")
+    async def restart_task(task_id: str, body: RestartTaskBody) -> JSONResponse:
+        registry = app.state.registry
+        queues = app.state.queues
+        publish_status = app.state.publish_status
+        broker = app.state.broker
+        try:
+            if broker is not None:
+                holder = broker.get_lock_holder(task_id)
+                if holder is not None and holder != body.client_id:
+                    return JSONResponse(
+                        {"ok": False, "error": "Task is locked by another user"},
+                        status_code=409,
+                    )
+            task = registry.restart_failed_no_answer(task_id, body.feedback)
+            queues.enqueue_agent(task_id)
+            publish_status()
+        except KeyError:
+            return JSONResponse(
+                {"ok": False, "error": "task not found"}, status_code=404
+            )
+        except TaskConflict as error:
+            return JSONResponse({"ok": False, "error": str(error)}, status_code=409)
+        return JSONResponse({"ok": True, "task_id": task.task_id})

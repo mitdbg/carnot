@@ -50,7 +50,7 @@ def dump_trace(
     if golden_pages:
         lines.append(f"Golden pages ({len(golden_pages)}):")
         for g in golden_pages:
-            lines.append(f"  - month={g.month} page={g.page}")
+            lines.append(f"  - month={g.stem} page={g.page}")
     else:
         lines.append("Golden pages: (none)")
     lines.append("")

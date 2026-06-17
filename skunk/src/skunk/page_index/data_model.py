@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Literal
+from typing import Any, Callable, Literal, Protocol
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -15,11 +15,14 @@ from skunk.errors import StepFailed
 
 # Artifact filenames under the build/query root, joined at each call site.
 CATALOG_SUBDIR = "catalog"  # slim shipped rows (PageCatalogRow); query-facing
-PAGES_SUBDIR = "pages"  # per-bulletin page store: anchor -> member texts + figures
+SCANS_SUBDIR = "scans"  # raw per-doc page scans (PageScan): the page store's content source
+PAGES_SUBDIR = "pages"  # raw parsed-JSON page text (legacy; superseded by `cleaned/` as the store's source)
+CLEANED_SUBDIR = "cleaned"  # the page store's text source: flat `<stem>_<page>.txt` cleaned pages
 RENDERS_SUBDIR = (
     "renders"  # lazy 200-DPI page-image cache (written on first vision read)
 )
 TREE_FILE = "concept_tree.json"  # era-keyed concept tree (ConceptTree)
+SEARCH_INDEX_FILE = "search_index.sqlite"  # prebuilt FTS5 page index the `search_corpus` tool runs SQL against
 
 
 def page_index_root() -> Path:
@@ -34,6 +37,22 @@ def page_index_root() -> Path:
     return Path(env)
 
 
+def figure_note(n: int, headings: list[str]) -> str:
+    """The text tier's figure heads-up, or "" when `n == 0`. Figures' plotted data is absent
+    from a page's text, so whoever serves the text appends this so extract can defer to the
+    vision tier instead of scraping a value from prose. One source of truth for the wording,
+    shared by the build (`pipeline._figure_note`, counting parsed-JSON figure elements) and
+    the page store (`store.PageStore.text`, counting a `PageScan`'s chart blocks)."""
+    if n <= 0:
+        return ""
+    headers = "; ".join(h for h in dict.fromkeys(headings) if h) or "(untitled)"
+    return (
+        f"[This page has {n} figure(s)/chart(s) (headings: {headers}) whose plotted data is NOT "
+        f"in the text above. If the value you need appears only in a chart, return [] so the "
+        f"vision tier can read it.]"
+    )
+
+
 class ContentBlock(BaseModel):
     """One detected content block on a page: a table, a chart, or prose. A page
     may carry several."""
@@ -46,6 +65,12 @@ class ContentBlock(BaseModel):
 
     # What the block reports; set by the scan, read by the semantic filter.
     summary: str | None = None
+
+    # Parse quality: the min VLM confidence (0..1) of the parsed elements backing this block,
+    # carried from the corpus parse by the scan stage. Low values flag a noisy parse (old
+    # govinfo scans run ~0.94; clean modern tables ~0.99) — a routing signal for vision rescan
+    # and a caveat for downstream extract. None when the parse carried no confidence.
+    confidence: float | None = None
 
     # Cross-page table merge (the build's `table_merge` pass; the scan LLM never sets
     # these). A table block with NO row and NO column labels is a genuine continuation —
@@ -80,16 +105,30 @@ class PageCatalogRow(BaseModel):
     """One shipped catalog row per retrievable PDF page — the query-facing schema,
     projected from each content page's `PageScan` by the catalog stage."""
 
-    bulletin: str  # "YYYY-MM"
+    # The corpus document this page belongs to, identified by its parsed-JSON/PDF filename
+    # stem (e.g. "combined_statement__modern__2024__c40"). The page index keys on (source,
+    # page); source/era/year/section are all parseable from it (see corpus.parse_doc_id), so
+    # the row carries only `source` and lets readers infer the rest.
+    source: str
     page: int  # 1-based PDF page index
     # The page's own printed footer label ("5", "A-1"); None when unlabeled. Carried from the
     # scan so a page-pin can resolve a question's stated page number against the printed label
     # (the planner's `page_pin`), not just the PDF index. Optional → old catalogs load as None.
     printed_page: str | None = None
+    # True when this page's table is header-less — its column headers live on the PREVIOUS page
+    # and aren't restated here (set by the scan, pruned by the `continuation_check` pass). The
+    # flag is self-describing: when a reader accesses this page it also fetches the predecessor
+    # chain that carries the headers (`continuation_chain`). Nothing is merged or folded.
+    is_continuation: bool = False
+    # Pages whose footnote/notes definitions qualify THIS page's data (set by the `notes_link`
+    # pass: an end-of-section "Footnotes" page this data page cites). A reader expands a selected
+    # data page to also read these — see `notes_refs`. Empty when the page cites no external notes.
+    notes_pages: list[int] = Field(default_factory=list)
 
     content_blocks: list[ContentBlock] = Field(default_factory=list)
-    # `YYYY-MM` `(low, high)` data span from the scan; read by the year filter.
-    date_interval: tuple[str, str] | None = None
+    # `(low, high)` data-year span from the scan (inclusive calendar/fiscal years); read by the
+    # year filter. Defaults to the document's own year when the scan can't narrow it.
+    date_interval: tuple[int, int] | None = None
     # Continuation pages folded into this row by the build's merge pass (the dropped pages
     # this anchor represents). They carry no row of their own; the retriever expands them
     # back into the returned refs so extract reads the full continued table.
@@ -97,8 +136,9 @@ class PageCatalogRow(BaseModel):
 
     @property
     def ref(self) -> PageRef:
-        """This row's canonical page coordinate (the catalog dict key)."""
-        return PageRef(month=self.bulletin, page=self.page)
+        """This row's canonical page coordinate (the catalog dict key). The `month` slot of
+        `PageRef` carries the doc `source` stem — the page index's opaque per-doc key."""
+        return PageRef(stem=self.source, page=self.page)
 
     @property
     def member_pages(self) -> list[int]:
@@ -110,7 +150,14 @@ class PageCatalogRow(BaseModel):
         """This row's member pages as `PageRef`s (a contiguous run). The retriever expands a
         kept anchor into these so extract reads the merged text once (continuation pages carry
         no text of their own) and the vision tier renders every page of the continued table."""
-        return [PageRef(month=self.bulletin, page=p) for p in self.member_pages]
+        return [PageRef(stem=self.source, page=p) for p in self.member_pages]
+
+    def notes_refs(self) -> list[PageRef]:
+        """The notes/footnotes pages whose definitions qualify this page's data (`notes_pages`),
+        as `PageRef`s. A reader appends these to a selected data page so extract/compute sees the
+        footnote definitions; kept distinct from `member_refs` so notes never enter the table's
+        own page span or `date_interval`."""
+        return [PageRef(stem=self.source, page=p) for p in self.notes_pages]
 
     def block_refs(self, block: ContentBlock) -> list[PageRef]:
         """The physical pages ONE block spans: the row's member pages plus the block's own
@@ -118,7 +165,7 @@ class PageCatalogRow(BaseModel):
         expands to — so extract's text tier reads, and its vision tier renders, every page of
         a table that continues across pages, while unmerged blocks stay a single page."""
         pages = list(dict.fromkeys(self.member_pages + list(block.extra_pages)))
-        return [PageRef(month=self.bulletin, page=p) for p in pages]
+        return [PageRef(stem=self.source, page=p) for p in pages]
 
     @property
     def primary_title(self) -> str | None:
@@ -141,12 +188,87 @@ class PageCatalogRow(BaseModel):
         return cls.model_validate_json(line)
 
 
+class _Continuable(Protocol):
+    """Structural type for `continuation_chain`'s lookup result — anything carrying the
+    `is_continuation` flag. Satisfied by both `PageCatalogRow` and the raw `PageScan` the page
+    store now serves, so the walk works regardless of which one the caller hands it."""
+
+    is_continuation: bool
+
+
+def continuation_chain(
+    ref: PageRef, get_row: Callable[[PageRef], "_Continuable | None"]
+) -> list[PageRef]:
+    """The predecessor pages a header-less continuation page needs to be readable — the run of
+    earlier physical pages back to (and including) the header-bearing page that carries its
+    column labels. Walks physical pages backward from `ref`: each step is included; the walk
+    stops once it reaches a page whose row is NOT `is_continuation` (the head) or that has no
+    row. Returns the chain in ascending page order, EXCLUDING `ref` itself; empty when `ref`
+    is not a continuation (or unknown). This is the read-side of the self-describing flag — no
+    page is ever merged at build time; readers fetch the chain on access."""
+    row = get_row(ref)
+    if row is None or not row.is_continuation or ref.page is None:
+        return []
+    chain: list[PageRef] = []
+    page = ref.page
+    while page > 1:
+        page -= 1
+        prev = PageRef(stem=ref.stem, page=page)
+        prow = get_row(prev)
+        if prow is None:
+            break
+        chain.append(prev)
+        if not prow.is_continuation:
+            break  # reached the header-bearing head page
+    chain.reverse()
+    return chain
+
+
+def inherited_column_headers(
+    ref: PageRef, get_summary: Callable[[PageRef], "Any | None"]
+) -> tuple[int, str | None, list[str]] | None:
+    """The column grammar a header-less continuation page inherits from its run HEAD, so a
+    reader can place an unlabeled cell without fetching the predecessor page's text. Returns
+    `(head_page, head_block_title, column_headers)`, or None when `ref` is not a header-less
+    continuation or the head's spilling table carries no captured column headers. Skipped when
+    `ref` carries its OWN column headers (the scan sometimes re-states them on a flagged page —
+    prefer those). Only the column grammar is inherited: it is stable across a run, whereas the
+    ACCOUNT a page reports changes mid-run, so title/summary come from the page's own scan,
+    never the head.
+
+    `get_summary` is the page store's `summary` — its objects expose `is_continuation` and
+    `blocks` (each `kind` / `title` / `column_headers`)."""
+    own = get_summary(ref)
+    if own is None or not getattr(own, "is_continuation", False):
+        return None
+    if any(b.column_headers for b in own.blocks):
+        return None  # the page re-states its own headers; nothing to inherit
+    chain = continuation_chain(ref, get_summary)
+    if not chain or chain[0].page is None:
+        return None
+    head = get_summary(chain[0])
+    if head is None:
+        return None
+    tables = [b for b in head.blocks if b.kind == "table"]
+    if not tables:
+        return None
+    # The table that spilled onto the run is the head's LAST table (bottommost on the page), so
+    # inherit ITS column grammar — not an earlier, unrelated table's. If the scan didn't capture
+    # that table's headers, there is nothing to inherit: return None rather than borrowing a
+    # different table's columns (the old `last table WITH headers` rule silently grabbed an
+    # earlier labeled table, injecting a mismatched grammar onto the continuation page).
+    block = tables[-1]
+    if not block.column_headers:
+        return None
+    return (chain[0].page, block.title, list(block.column_headers))
+
+
 # Prompt blurb for the catalog row the semantic filter sees, one per candidate page (its
 # `content_blocks` are described by `CONTENT_BLOCK_FIELDS`).
 PAGE_CATALOG_ROW_FIELDS = """\
-bulletin: the issue, "YYYY-MM".
+source: the corpus document this page belongs to, its filename stem (e.g. "combined_statement__modern__2024__c40").
 page: the 1-based PDF page index.
-date_interval: the [start, end] months the page's DATA covers — each "YYYY-MM", or null when undatable.
+date_interval: the [start, end] YEARS the page's DATA covers — each an integer year, or null when undatable.
 content_blocks: the page's content blocks (see below)."""
 
 
@@ -171,7 +293,7 @@ class PageRange(BaseModel):
 
     def refs(self) -> list[PageRef]:
         return [
-            PageRef(month=self.bulletin, page=p)
+            PageRef(stem=self.bulletin, page=p)
             for p in range(self.start, self.end + 1)
         ]
 

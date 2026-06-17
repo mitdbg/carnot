@@ -50,6 +50,7 @@ from google import genai
 from openrouter import OpenRouter
 
 from skunk.common import get_rate_limiter
+from skunk.common import page_key_to_pageref
 from skunk.corpus import render_page_b64
 from skunk.multi_turn_agent import Tool
 
@@ -424,17 +425,17 @@ class ViewFigureTool(Tool):
                 VIEW_FIGURE_RESULT_TAG: True,
                 "error": f"no figure with id={figure_id} on doc_id={doc_id}; {hint}",
             }
-        # doc_id is `{year}_{month}_{page_id}`; render_page_b64 wants month as "YYYY-MM".
+        # doc_id is the page key `<stem>_<page>`; resolve to a PageRef for rendering.
         try:
-            year, month, page = doc_id.split("_")
+            ref = page_key_to_pageref(doc_id)
         except ValueError:
             return {
                 VIEW_FIGURE_RESULT_TAG: True,
-                "error": f"doc_id {doc_id!r} is not in the expected '<year>_<month>_<page>' format",
+                "error": f"doc_id {doc_id!r} is not in the expected '<stem>_<page>' format",
             }
         try:
             img = render_page_b64(
-                f"{year}-{month}", int(page),
+                ref.stem, ref.page,
                 pdf_dir=self._pdf_dir, dpi=self._dpi, fmt=self._fmt,
             )
         except Exception as e:

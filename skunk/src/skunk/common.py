@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+import numpy as np
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, model_validator
 from google import genai
@@ -33,7 +34,6 @@ from skunk.config import SkunkConfig
 if TYPE_CHECKING:
     from skunk.llm_client import LLMClient
     from skunk.prompted_call import PromptOverride
-    from skunk.page_index.data_model import ContentBlock
 
 # Reasoning-effort knob, mapped onto Gemini's `thinking_level` enum. "off" means
 # no thinking; "minimal" is the cheapest thinking tier.
@@ -68,10 +68,10 @@ class B64Image:
     data: str
 
 
-def pdf_path_for(bulletin: str, pdf_dir: Path | str) -> Path:
-    """'1953-06' -> <pdf_dir>/treasury_bulletin_1953_06.pdf. Inverse of the bulletin-id parse."""
-    year, mon = bulletin.split("-")
-    return Path(pdf_dir) / f"treasury_bulletin_{int(year):04d}_{int(mon):02d}.pdf"
+def pdf_path_for(doc: str, pdf_dir: Path | str) -> Path:
+    """The corpus PDF for a doc id: `<pdf_dir>/<doc>.pdf`. `doc` is the filename stem
+    (e.g. "combined_statement__modern__2024__c40") — the same key the page index uses."""
+    return Path(pdf_dir) / f"{doc}.pdf"
 
 
 def render_page_b64(
@@ -354,87 +354,54 @@ class PageRef:
     """Canonical page coordinate. Frozen so it's hashable — usable as a dict key
     and set member (e.g. the page-index catalog is keyed by `PageRef`)."""
 
-    month: str | None = None  # "YYYY-MM" (a.k.a. bulletin in the page index)
+    stem: str | None = None  # doc-id stem, e.g. "combined_statement__historical__cs-1872" (search-agent / page-index key)
     page: int | None = None  # 1-based PDF page index (canonical)
 
     @property
     def year(self) -> int | None:
-        return int(self.month[:4]) if self.month else None
+        """The calendar year for a `YYYY-MM` slot, or None. Returns None when the slot is not a
+        bare month (the rekeyed page index stores a doc-id stem here — its year is parsed from
+        the stem via `corpus.parse_doc_id`, not from this coordinate)."""
+        if not self.stem or not self.stem[:4].isdigit():
+            return None
+        return int(self.stem[:4])
 
     def __post_init__(self) -> None:
-        if self.page is not None and self.month is None:
+        if self.page is not None and self.stem is None:
             raise ValueError(
-                f"PageRef with page={self.page} requires month for parsed-JSON lookup"
+                f"PageRef with page={self.page} requires stem for parsed-JSON lookup"
             )
 
     def __repr__(self) -> str:
         parts = []
         if self.year:
             parts.append(f"year={self.year}")
-        if self.month:
-            parts.append(f"month={self.month}")
+        if self.stem:
+            parts.append(f"stem={self.stem}")
         if self.page is not None:
             parts.append(f"page={self.page}")
         return f"PageRef({', '.join(parts)})"
 
 
 def page_key_to_pageref(key: str) -> PageRef:
-    """Parse a search-agent page key (`"YYYY_MM_pageid"` or `"YYYY-MM-pageid"`)
-    into a `PageRef`. Splits on the last separator so the page id is unambiguous."""
-    sep = "_" if "_" in key and key.count("_") >= 2 else "-"
+    """Parse a search-agent page key `"<stem>_<page>"` into a `PageRef`. The doc-id stem (which
+    itself contains underscores, e.g. `"combined_statement__historical__cs-1872"`) goes in the
+    `stem` slot; the trailing integer is the 1-based page index."""
     try:
-        year_str, month_str, page_str = key.rsplit(sep, 2)
+        stem, page_str = key.rsplit("_", 1)
+        return PageRef(stem=stem, page=int(page_str))
     except ValueError as e:
-        raise ValueError(f"page key {key!r} not in YYYY{sep}MM{sep}pageid form") from e
-    return PageRef(month=f"{year_str}-{month_str}", page=int(page_str))
-
-
-@dataclass(frozen=True)
-class BlockRef:
-    """One retrieved CONTENT BLOCK — the retriever's native output unit. `page` is the anchor
-    page, `block_index` its position in `content_blocks` (None for a page kept wholesale).
-    `member_refs` are the physical pages this block spans (anchor + any table-merge extra pages).
-    `block` is excluded from identity so `BlockRef`s de-dupe on `page`/`block_index`/`member_refs`."""
-
-    page: PageRef
-    block_index: int | None
-    member_refs: tuple[PageRef, ...]
-    block: ContentBlock | None = field(default=None, compare=False)
-
-
-@dataclass(frozen=True)
-class SemPoolEntry:
-    """One sem_filter-surviving content block, kept after block selection as the repair
-    candidate pool. Self-contained (interval + display metadata copied out of the catalog
-    row) so the extract-side repair pass can re-rank and re-select without catalog access —
-    which also makes it serializable into the eval retrieval cache for replay."""
-
-    ref: BlockRef  # anchor + members; block=None is fine (extract reads pages whole)
-    interval: (
-        tuple[str, str] | None
-    )  # the anchor page's data interval ("YYYY-MM" lo/hi)
-    kind: str = "table"
-    title: str | None = None
-    summary: str | None = None
-    cols: tuple[str, ...] = ()
-    rows_tail: tuple[
-        str, ...
-    ] = ()  # trailing row headers — shows the data window's end
-    rows: tuple[
-        str, ...
-    ] = ()  # FULL row headers — shows granularity (annual vs monthly rows) and window
+        raise ValueError(f"page key {key!r} not in '<stem>_<page>' form") from e
 
 
 @dataclass(frozen=True)
 class BranchRetrieval:
-    """One retrieve branch's normalized result — the single retrieval contract every
-    backend produces. `blocks` are the blocks to feed selection/extract; `pre_selected`
-    True (golden / search-agent) means they are already final, so the selection tournament
-    is skipped and every block is extracted. Produced solely by `RetrieveOp.run_all`; no
-    downstream layer inspects `config.retriever`."""
+    """One retrieve branch's normalized result — the single retrieval contract the
+    search-agent backend (and the golden bypass) produces: the whole pages to extract,
+    as `PageRef`s. Extraction reads each page directly (predecessor/notes expansion and
+    text→vision happen at read time). Produced solely by `RetrieveOp.run_all`."""
 
-    blocks: tuple[BlockRef, ...]
-    pre_selected: bool
+    pages: tuple[PageRef, ...]
 
 
 VALUE_KIND_VOCAB: frozenset[str] = frozenset({"scalar", "vector", "table"})
@@ -464,16 +431,21 @@ class AnnotatedValue(BaseModel):
     `source` is the LLM-authored publisher/origin of an external lookup's value
     (e.g. the data provider the lookup agent pulled it from) — the external-lookup
     analog of the machine-stamped corpus provenance below, which it cannot fill.
-    Empty for corpus extracts (whose provenance is `bulletin`/`pages`).
+    Empty for corpus extracts (whose provenance is `doc_id`/`pages`).
 
-    Provenance (`bulletin`/`pages`/`requested_period`/`retrieve_key`) is
-    machine-stamped from the extract inputs — the source page refs and the
-    retrieve branch — NOT authored by the LLM. It is absent (None/empty) for
-    external lookups. `bulletin` is the issue the value
-    was printed in ("YYYY-MM", lexically sortable = chronological); downstream
-    compute uses it to sort/filter by publication date — e.g. to pick the
-    latest non-revised vintage across several bulletins, where the LLM-written
-    `description` of the same series+period can be identical across issues.
+    Provenance (`doc_id`/`pages`/`requested_period`/`retrieve_key`/`obtained_visually`)
+    is machine-stamped from the extract inputs — the source page refs and the
+    retrieve branch — NOT authored by the LLM. `obtained_visually` records the
+    machine fact that this value was read by the vision tier (the figure/chart
+    fallback), and gates the human figure ("Visual QA") review; it is internal
+    provenance and never shown to any LLM (it is excluded from every prompt
+    rendering). It is absent (None/empty) for
+    external lookups. `doc_id` is the source document the value was read from,
+    carried as that document's id — its parsed-JSON/PDF filename stem (e.g.
+    "combined_statement__historical__cs-1872"). It identifies the source
+    document, not a date; the data window the value covers lives in
+    `requested_period` (and the page's own data span), so any chronological
+    ordering keys off period, not `doc_id`.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -490,12 +462,11 @@ class AnnotatedValue(BaseModel):
 
     # Provenance — copied from the source page/branch at extract time, never
     # LLM-written. Defaults keep external lookups and old payloads valid.
-    bulletin: str | None = None  # source issue "YYYY-MM" (publication date)
+    doc_id: str | None = None  # source document id (filename stem); None for external lookups
     pages: tuple[int, ...] = ()  # source PDF page(s); () when unattributable
     requested_period: str | None = None  # branch.period — data window requested
     retrieve_key: str | None = None  # branch.key — concept this datum serves
-    source_block_page: int | None = None
-    source_block_index: int | None = None
+    obtained_visually: bool = False  # True when read via the vision tier (figure/chart fallback)
 
     @model_validator(mode="after")
     def _check_shape(self) -> AnnotatedValue:
@@ -581,10 +552,10 @@ _PAD = "         "  # 9-space continuation indent for an entry's detail lines
 
 def _provenance_str(e: AnnotatedValue) -> str:
     """One-line provenance for the schema view — only the fields that are set, so
-    external lookups (no bulletin) stay uncluttered. Empty string when nothing is set."""
+    external lookups (no doc_id) stay uncluttered. Empty string when nothing is set."""
     parts: list[str] = []
-    if e.bulletin:
-        parts.append(f"bulletin={e.bulletin!r}")
+    if e.doc_id:
+        parts.append(f"doc_id={e.doc_id!r}")
     if e.pages:
         parts.append(f"pages={list(e.pages)!r}")
     if e.source:
@@ -659,9 +630,14 @@ def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
 
     # The whole frame, values included — the agent reads the actual cells (NaN/'n/a',
     # magnitudes, exact labels), not just the schema. The full frame also lives in the
-    # exec env for the generated code to operate on.
+    # exec env for the generated code to operate on. `float_format` forces FIXED-POINT,
+    # full-precision rendering: pandas' default switches a column to scientific notation
+    # (e.g. 452197.98 -> 4.521980e+05) once it holds a large value, hiding the cents and
+    # leading the agent to transcribe rounded numbers. `format_float_positional` prints the
+    # exact value without scientific notation (trim='-' drops only trailing zeros/point).
     lines.append(f"{_PAD}frame:")
-    lines.extend(f"{_PAD}  {ln}" for ln in df.to_string().splitlines())
+    rendered = df.to_string(float_format=lambda v: np.format_float_positional(v, trim="-"))
+    lines.extend(f"{_PAD}  {ln}" for ln in rendered.splitlines())
     return lines
 
 

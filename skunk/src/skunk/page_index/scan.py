@@ -6,7 +6,6 @@ unparsed-graphics / printed page). Driven per page by the pipeline's `scan` stag
 
 from __future__ import annotations
 
-import re
 from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
@@ -17,8 +16,6 @@ from skunk.prompted_call import PromptedCall
 
 from .data_model import CONTENT_BLOCK_FIELDS, ContentBlock
 
-_MONTH_RE = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
-
 
 class PageScan(BaseModel):
     """One page's scan: the catalog payload plus build-only routing signals."""
@@ -26,23 +23,31 @@ class PageScan(BaseModel):
     page_role: Literal["content", "toc", "non_content"]
     printed_page: str | None = None
     is_continuation: bool = False
+    references_external_notes: bool = False
+    is_notes_page: bool = False
     has_unparsed_graphics: bool = False
     parse_broken: bool = (
         False  # parsed elements too mangled to trust → re-read from the PDF
     )
-    date_interval: tuple[str, str] | None = None
+    date_interval: tuple[int, int] | None = None
     blocks: list[ContentBlock] = Field(default_factory=list)
     continuation_pages: list[int] = Field(default_factory=list)
+    # Set by the build's `notes_link` pass (never the scan LLM): the pages whose footnote
+    # definitions qualify this page's data. Projected onto the catalog row's `notes_pages`.
+    notes_pages: list[int] = Field(default_factory=list)
     vision_rescanned: bool = False
 
     @field_validator("date_interval")
     @classmethod
-    def _months(cls, v: tuple[str, str] | None) -> tuple[str, str] | None:
+    def _years(cls, v: tuple[int, int] | None) -> tuple[int, int] | None:
         if v is None:
             return None
-        lo, hi = str(v[0])[:7], str(v[1])[:7]  # tolerate a stray day component
-        if not (_MONTH_RE.fullmatch(lo) and _MONTH_RE.fullmatch(hi)):
-            raise ValueError(f"date_interval must be two YYYY-MM months, got {v!r}")
+        try:
+            lo, hi = int(str(v[0])[:4]), int(str(v[1])[:4])  # tolerate a "YYYY-MM" string
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"date_interval must be two years, got {v!r}") from e
+        if not (1700 <= lo <= 2100 and 1700 <= hi <= 2100):
+            raise ValueError(f"date_interval years out of range: {v!r}")
         if lo > hi:
             raise ValueError(f"date_interval start after end: {v!r}")
         return (lo, hi)
@@ -66,15 +71,25 @@ PAGE_SCAN_FIELDS = """\
   that chapter title as a single prose block (the name as the block title) so a missing outline can
   be reconstructed from it.
 - printed_page: the page's own printed footer label (e.g. "A-1", "27"); null if unlabeled.
-- is_continuation: true ONLY when this page contains a table or figure fragment that cannot be read on its own —
-  key headers or information lives on the previous page. For example, a table whose data rows carry over from the
-  previous page WITHOUT restating their column headers. A self-contained table that is logically a continuation but
-  is legible by itself is NOT a continuation, regardless of what the caption says.
+- is_continuation: true ONLY when this page's table cannot be read on its own because the COLUMN HEADERS (and any
+  units) that make its numbers interpretable are on a PREVIOUS page and are NOT restated here — e.g. a page that
+  opens straight into unlabeled data columns. Judge by whether those headers are physically present on THIS page,
+  never by the caption: a "Continued" title means nothing. If the page restates its column headers it is legible
+  standalone, so is_continuation is FALSE — even if it is captioned "Continued" and its first rows carry on an
+  account or category begun on the previous page. A few carried-over rows do NOT make a header-bearing page a continuation.
+- references_external_notes: true when this page's tables/data carry footnote markers — superscripts, trailing
+  reference digits, or symbols (*, †, ‡) — whose definitions are NOT on this page (they sit on an end-of-chapter
+  "Footnotes" page or elsewhere). False when the page restates the definitions of every marker it uses.
+- is_notes_page: true when the page is wholly or mostly footnotes, notes, or explanatory text that qualify DATA
+  on OTHER pages — an end-of-chapter "Footnotes" section, a "Note.—" block. A data page that carries only its own
+  self-contained footnotes is NOT a notes page.
 - has_unparsed_graphics: a content page with a chart/figure whose data is not in its own text/tables.
 - parse_broken: the parsed elements are too mangled to trust — scrambled or merged cells, numbers
   with no row/column labels. When in doubt set this true rather than guessing, and leave blocks empty.
-- date_interval: the [start, end] months the page's DATA covers — each "YYYY-MM", or null when
-  undatable. Resolve fiscal/calendar years against the publication month.
+- date_interval: the [lowest, highest] YEARS the page covers — each an integer year (e.g.
+  [2024, 2024] for a single fiscal year; [1995, 2004] for a 10-year comparative table), or null
+  when undatable. The publication year is given to you. Any mention of a year, implicit or explicit,
+  in data or in prose, counts toward the span. A fiscal year is named by its end year (FY2024 -> 2024).
 - blocks: the page's content blocks (content pages, plus a divider's one naming block; see below)."""
 
 
@@ -83,8 +98,8 @@ _TEXT_LEAD = """\
 You parse ONE page of a statistical publication into retrieval metadata.
 
 The page is tagged elements ("[type] content" in reading order; tables are verbatim HTML, a bare
-"[figure]" is a graphic the parser could not extract). You also get the publication month and the
-corpus notes below.
+"[figure]" is a graphic the parser could not extract). You also get the document id and its
+publication year, plus the corpus notes below.
 """
 
 # Lead-in paragraph for the vision re-pass: same task, but the input is a rendered page image of a
@@ -94,7 +109,8 @@ _VISION_LEAD = """\
 You parse ONE page of a statistical publication into retrieval metadata.
 
 The page is a rendered IMAGE of a single page whose text the parser handled badly — it dropped a
-chart/figure or scrambled the cells. You also get the publication month and the corpus notes below.
+chart/figure or scrambled the cells. You also get the document id and its publication year, plus
+the corpus notes below.
 Because you can now SEE the page, read its charts, figures, and any garbled table directly into
 `blocks`, and set `has_unparsed_graphics`/`parse_broken` false unless the image itself is genuinely
 illegible.
@@ -110,9 +126,11 @@ _SCAN_BODY = (
   "page_role": "content" | "toc" | "non_content",
   "printed_page": "<this page's printed footer label, e.g. 'A-1'> | null",
   "is_continuation": <bool>,
+  "references_external_notes": <bool>,
+  "is_notes_page": <bool>,
   "has_unparsed_graphics": <bool>,
   "parse_broken": <bool>,
-  "date_interval": ["YYYY-MM", "YYYY-MM"] | null,
+  "date_interval": [<start_year>, <end_year>] | null,
   "blocks": [
     {"kind": "table" | "chart" | "prose", "title": "<caption | null>",
      "column_headers": ["<col>", ...], "row_headers": ["<row>", ...],
@@ -178,12 +196,13 @@ async def scan_page(
     ctx: ExecutionContext,
     page_string: str,
     *,
-    bulletin: str,
+    doc: str,
+    pub_year: int | None,
 ) -> PageScan:
     """One LLM call → a validated `PageScan` (auto-reprompts on invalid output).
     The Treasury corpus blurb + lessons come from `ctx.prompt_overrides` (the
     `page_scan` target), appended to the system prompt by `PromptedCall`."""
-    user = f"publication month: {bulletin}\n\nPAGE:\n{page_string}"
+    user = f"document: {doc}\npublication year: {pub_year}\n\nPAGE:\n{page_string}"
     return await _scan.call(ctx, user)
 
 
@@ -191,11 +210,12 @@ async def vision_scan_page(
     ctx: ExecutionContext,
     image: B64Image,
     *,
-    bulletin: str,
+    doc: str,
+    pub_year: int | None,
 ) -> PageScan:
     """Re-scan one page from its rendered IMAGE → a validated `PageScan`. Used by the
     pipeline's `vision_rescan` stage to redo pages the text scan flagged
     (`has_unparsed_graphics` / `parse_broken`). Same output object as `scan_page`."""
     return await _vision_scan.call(
-        ctx, f"publication month: {bulletin}", images=[image]
+        ctx, f"document: {doc}\npublication year: {pub_year}", images=[image]
     )

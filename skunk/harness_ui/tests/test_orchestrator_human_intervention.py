@@ -8,8 +8,7 @@ from skunk.common import AnnotatedValue, BlockRef, ExecutionContext, PageRef
 from skunk.config import SkunkConfig
 from skunk.errors import MissingData, StepFailed
 from skunk.orchestrator import BranchOutcome, Orchestrator
-from skunk.page_index.data_model import ContentBlock, PageCatalogRow
-from skunk.page_index.query import PageIndexRetriever
+from skunk.page_index.data_model import ContentBlock
 from skunk.plan import Plan, PlanDiff, Planner, RetrieveBranch
 from skunk.retrieve import RetrieveOp
 from skunk_reasoner import _structured_reasoning_payload
@@ -70,7 +69,7 @@ class _Compute:
 
 
 async def _empty_branches(_branches, _branch_ids):
-    page = PageRef(month="1954-02", page=17)
+    page = PageRef(stem="1954-02", page=17)
     block = BlockRef(
         page=page,
         block_index=2,
@@ -125,7 +124,7 @@ def test_missing_data_requires_human_before_replan() -> None:
     compute = _Compute()
     orchestrator._compute = compute
     orchestrator._run_branches = _empty_branches  # type: ignore[method-assign]
-    page = PageRef(month="1954-02", page=17)
+    page = PageRef(stem="1954-02", page=17)
     orchestrator._retrieved_blocks = [
         BlockRef(page=page, block_index=None, member_refs=(page,), block=None)
     ]
@@ -565,66 +564,6 @@ def test_document_annotation_consumes_round_before_structural_replan() -> None:
     assert replan_pending[-1]["data"]["recovery_round"] == 2
 
 
-def test_page_index_human_scope_uses_only_selected_bulletins(tmp_path) -> None:
-    retriever = object.__new__(PageIndexRetriever)
-    rows = [
-        PageCatalogRow(
-            bulletin="1985-12",
-            page=4,
-            content_blocks=[ContentBlock(kind="table", title="Old")],
-        ),
-        PageCatalogRow(
-            bulletin="1986-06",
-            page=7,
-            content_blocks=[ContentBlock(kind="table", title="Target")],
-        ),
-        PageCatalogRow(
-            bulletin="1987-06",
-            page=9,
-            content_blocks=[ContentBlock(kind="table", title="New")],
-        ),
-    ]
-    retriever._catalog = {row.ref: row for row in rows}
-    retriever._catalog_size = len(rows)
-    seen_pages: list[PageRef] = []
-
-    async def semantic_filter(pages, _branches, _ctx):
-        seen_pages.extend(pages)
-        return {page: [True] for page in pages}
-
-    async def select_blocks(refs, _pdf_dir, _ctx, _question, _branch):
-        row = retriever._catalog[refs[0]]
-        return [
-            BlockRef(
-                page=row.ref,
-                block_index=0,
-                member_refs=(row.ref,),
-                block=row.content_blocks[0],
-            )
-        ]
-
-    retriever._semantic_filter = semantic_filter
-    retriever.select_blocks = select_blocks
-    ctx = ExecutionContext(
-        question="Judiciary outlays",
-        config=SkunkConfig(pdf_dir=tmp_path),
-        llm_client=object(),  # type: ignore[arg-type]
-    )
-    try:
-        result = asyncio.run(
-            retriever.retrieve_all(
-                ctx,
-                [RetrieveBranch(key="judiciary outlays")],
-                document_scopes=[["1986-06"]],
-            )
-        )
-    finally:
-        ctx.close()
-
-    assert seen_pages == [PageRef(month="1986-06", page=7)]
-    assert result[0][0].page == PageRef(month="1986-06", page=7)
-
-
 def test_search_agent_discards_pages_outside_human_scope(monkeypatch) -> None:
     class SearchAgent:
         def __init__(self, **_kwargs):
@@ -654,7 +593,7 @@ def test_search_agent_discards_pages_outside_human_scope(monkeypatch) -> None:
     finally:
         ctx.close()
 
-    assert refs == [PageRef(month="1986-06", page=7)]
+    assert refs == [PageRef(stem="1986-06", page=7)]
 
 
 def test_replanner_prompt_maps_human_resolution_to_input() -> None:

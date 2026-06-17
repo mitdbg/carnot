@@ -163,7 +163,7 @@ class TaskRegistry:
     ) -> tuple[QuestionTask, AnswerCandidate, SubmissionRecord]:
         with self._lock:
             task = self._require_task(task_id)
-            if task.status != TaskStatus.READY:
+            if task.status != TaskStatus.READY and not self._can_resubmit_failed_answer(task):
                 raise TaskConflict(
                     f"task is not ready for submission; status={task.status}"
                 )
@@ -178,6 +178,19 @@ class TaskRegistry:
             task.submissions.append(submission)
             self._set_status(task, TaskStatus.SUBMITTING)
             return task, candidate, submission
+
+    def restart_failed_no_answer(self, task_id: str, feedback: str = "") -> QuestionTask:
+        with self._lock:
+            task = self._require_task(task_id)
+            if task.status != TaskStatus.FAILED:
+                raise TaskConflict(f"task is not failed; status={task.status}")
+            if task.latest_candidate is not None or task.submissions:
+                raise TaskConflict("task already has an answer or submission")
+            note = feedback.strip()
+            if note:
+                task.cup_feedback.append(f"Operator restart feedback: {note}")
+            self._set_status(task, TaskStatus.QUEUED)
+            return task
 
     def record_submission_accepted(
         self,
@@ -310,11 +323,13 @@ class TaskRegistry:
         review_id: str,
         response: str,
         source_docs: list[str],
+        client_id: str,
     ) -> tuple[QuestionTask, HumanReview]:
         """Record a human's correction (or accept-as-is when `response` is empty). Idempotent
         guard: re-resolving a non-open review raises `TaskConflict`."""
         with self._lock:
             task, review = self._find_review(review_id)
+            self._require_review_lock(task, client_id)
             if review.status != HumanReviewStatus.OPEN:
                 raise TaskConflict(f"review is not open; status={review.status}")
             review.status = HumanReviewStatus.RESOLVED
@@ -322,6 +337,22 @@ class TaskRegistry:
             review.response_source_docs = list(source_docs)
             review.resolved_at = utc_now()
             task.updated_at = utc_now()
+            return task, review
+
+    def begin_review_refine(
+        self, review_id: str, candidates: list[dict[str, Any]], client_id: str
+    ) -> tuple[QuestionTask, HumanReview]:
+        """Validate lock ownership and mark an OPEN review as refining atomically."""
+        with self._lock:
+            task, review = self._find_review(review_id)
+            self._require_review_lock(task, client_id)
+            if review.status != HumanReviewStatus.OPEN:
+                raise TaskConflict(f"review is not open; status={review.status}")
+            if review.refining:
+                raise TaskConflict("a refine is already running for this review")
+            review.guidance["candidates"] = candidates
+            review.refining = True
+            self._set_status(task, task.status)
             return task, review
 
     def set_review_refining(self, review_id: str, refining: bool) -> None:
@@ -437,6 +468,16 @@ class TaskRegistry:
                 task.updated_at = now  # refresh lease bookkeeping without a version bump
             return True, client_id, changed
 
+    def get_lock_holder(self, task_id: str) -> str | None:
+        with self._lock:
+            task = self._require_task(task_id)
+            return task.active_lock_holder()
+
+    def count_open_reviews(self, task_id: str) -> int:
+        with self._lock:
+            task = self._require_task(task_id)
+            return len(task.open_reviews)
+
     def release_review_lock(self, task_id: str, client_id: str) -> bool:
         """Release the lock if `client_id` holds it (idempotent no-op otherwise). Returns whether
         a lock was actually cleared, so the caller can decide to republish."""
@@ -517,6 +558,14 @@ class TaskRegistry:
         return task
 
     @staticmethod
+    def _require_review_lock(task: QuestionTask, client_id: str) -> None:
+        holder = task.active_lock_holder()
+        if holder is None:
+            raise TaskConflict("task is not locked")
+        if holder != client_id:
+            raise TaskConflict("lock held by another client")
+
+    @staticmethod
     def _find_submission(
         task: QuestionTask, local_submission_id: str
     ) -> SubmissionRecord:
@@ -524,3 +573,11 @@ class TaskRegistry:
             if submission.local_submission_id == local_submission_id:
                 return submission
         raise KeyError(local_submission_id)
+
+    def _can_resubmit_failed_answer(self, task: QuestionTask) -> bool:
+        if task.status not in {TaskStatus.SUBMITTED, TaskStatus.SCORED}:
+            return False
+        if self._round.resubmits_left == 0:
+            return False
+        submission = task.submissions[-1] if task.submissions else None
+        return submission is not None and submission.correct is False

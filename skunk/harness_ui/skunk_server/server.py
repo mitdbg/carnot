@@ -7,6 +7,7 @@ import asyncio
 import importlib
 import logging
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -27,6 +28,265 @@ from skunk_server.task_queues import TaskQueues
 from skunk_server.task_registry import TaskRegistry
 
 logger = logging.getLogger(__name__)
+
+
+_YEAR_RE = re.compile(r"(17\d{2}|18\d{2}|19\d{2}|20\d{2})")
+
+
+def _normal_confidence(value: Any) -> float | None:
+    if not isinstance(value, int | float):
+        return None
+    if value < 0:
+        return None
+    return float(value) / 100.0 if value > 1 else float(value)
+
+
+def _confidence_stats(values: list[float]) -> dict[str, float] | None:
+    clean = sorted(v for v in values if 0 <= v <= 1)
+    if not clean:
+        return None
+    p10_index = min(len(clean) - 1, max(0, int(len(clean) * 0.1)))
+    return {
+        "min": round(clean[0], 4),
+        "median": round(clean[len(clean) // 2], 4),
+        "p10": round(clean[p10_index], 4),
+    }
+
+
+def _collect_confidences(value: Any, out: list[float]) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in {"confidence", "ocr_confidence", "parser_confidence"}:
+                confidence = _normal_confidence(item)
+                if confidence is not None:
+                    out.append(confidence)
+            elif isinstance(item, dict | list):
+                _collect_confidences(item, out)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_confidences(item, out)
+
+
+def _doc_meta_from_ref(ref: Any) -> dict[str, Any] | None:
+    if isinstance(ref, dict):
+        text = " ".join(
+            str(ref.get(k, ""))
+            for k in (
+                "id",
+                "source",
+                "source_doc",
+                "path",
+                "label",
+                "family",
+                "era",
+                "fiscal_year",
+                "year",
+            )
+        )
+    else:
+        text = str(ref or "")
+    if not text:
+        return None
+
+    low = text.lower()
+    year_match = _YEAR_RE.search(low)
+    year = None
+    if isinstance(ref, dict):
+        raw_year = ref.get("fiscal_year", ref.get("year"))
+        if isinstance(raw_year, int):
+            year = raw_year
+        elif isinstance(raw_year, str) and raw_year.isdigit():
+            year = int(raw_year)
+    if year is None:
+        year = int(year_match.group(1)) if year_match else None
+
+    family = None
+    label = ref.get("label") if isinstance(ref, dict) else None
+    explicit_family = str(ref.get("family", "")).lower() if isinstance(ref, dict) else ""
+    if (
+        "govinfo_receipts" in low
+        or "gov_into_receipts" in low
+        or "govinfo receipts" in low
+        or explicit_family in {"govinfo_receipts", "gov_into_receipts"}
+    ):
+        family = "govinfo_receipts"
+        label = label or "GovInfo Receipts"
+    elif (
+        "combined_statement" in low
+        or "combined statement" in low
+        or explicit_family == "combined_statement"
+    ):
+        family = "combined_statement"
+        label = label or "Combined Statement"
+
+    era = None
+    explicit_era = str(ref.get("era", "")).lower() if isinstance(ref, dict) else ""
+    if explicit_era in {"modern", "transition", "historical"}:
+        era = explicit_era
+    elif "__modern__" in low or " modern " in f" {low} ":
+        era = "modern"
+    elif "__transition__" in low or " transition " in f" {low} ":
+        era = "transition"
+    elif "__historical__" in low or " historical " in f" {low} ":
+        era = "historical"
+    elif family == "combined_statement" and year is not None:
+        if year >= 2001:
+            era = "modern"
+        elif 1995 <= year <= 2000:
+            era = "transition"
+        elif 1872 <= year <= 1994:
+            era = "historical"
+
+    if family is None and era is None:
+        return None
+
+    if family == "combined_statement" and era in {"modern", "transition"}:
+        return {
+            "family": family,
+            "label": label,
+            "era": era,
+            "year": year,
+            "structure": "chapter_split",
+            "ocr_risk": "none",
+            "ocr_review_allowed": False,
+            "source": text,
+        }
+    if family == "combined_statement":
+        return {
+            "family": family,
+            "label": label,
+            "era": era or "historical",
+            "year": year,
+            "structure": "scanned_ocr",
+            "ocr_risk": "medium",
+            "ocr_review_allowed": True,
+            "source": text,
+        }
+    return {
+        "family": family,
+        "label": label,
+        "era": "messy",
+        "year": year,
+        "structure": "ad_hoc",
+        "ocr_risk": "high",
+        "ocr_review_allowed": True,
+        "source": text,
+    }
+
+
+def _review_corpus_summary(review) -> dict[str, Any] | None:
+    guidance = review.guidance or {}
+    refs: list[Any] = list(review.source_docs)
+    refs.extend(guidance.get("documents") or [])
+    for candidate in guidance.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        for key in ("document_id", "source_doc", "source", "path", "bulletin"):
+            if candidate.get(key):
+                refs.append(candidate[key])
+
+    docs: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for ref in refs:
+        meta = _doc_meta_from_ref(ref)
+        if meta is None:
+            continue
+        key = f"{meta.get('family')}:{meta.get('era')}:{meta.get('year')}:{meta.get('source')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        docs.append(meta)
+
+    confidences: list[float] = []
+    _collect_confidences(guidance.get("documents") or [], confidences)
+    _collect_confidences(guidance.get("candidates") or [], confidences)
+    confidence = _confidence_stats(confidences)
+
+    if not docs and confidence is None:
+        return None
+
+    risk_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
+    highest_risk = max((d.get("ocr_risk", "none") for d in docs), key=lambda r: risk_rank.get(r, 0), default=None)
+    return {
+        "documents": docs[:8],
+        "families": sorted({d["family"] for d in docs if d.get("family")}),
+        "eras": sorted({d["era"] for d in docs if d.get("era")}),
+        "confidence": confidence,
+        "ocr_review_allowed": any(d.get("ocr_review_allowed") for d in docs) if docs else None,
+        "ocr_review_blocked": any(d.get("ocr_review_allowed") is False for d in docs),
+        "ocr_risk": highest_risk,
+    }
+
+
+def _review_reason(
+    kind: str, corpus: dict[str, Any] | None, guidance: dict[str, Any] | None = None
+) -> dict[str, str] | None:
+    # A pool review whose values were read by the vision tier (`guidance.visual`) is a visual
+    # validation, not an OCR/value check — show that reason regardless of corpus OCR signals.
+    if kind == "verify_extract" and guidance and guidance.get("visual"):
+        return {"kind": "visual_validation", "policy": "confirm the figure read against source"}
+    if corpus is None:
+        return None
+    if kind == "verify_extract":
+        if corpus.get("ocr_review_blocked") and not corpus.get("ocr_review_allowed"):
+            return {
+                "kind": "value_validation",
+                "policy": "structured source; OCR review disabled",
+            }
+        # ocr_quality is intentionally never surfaced: a vision read shows the visual_validation
+        # reason above; otherwise the extract review carries no OCR-quality reason chip.
+    if kind == "figure":
+        return {"kind": "visual_validation", "policy": "confirm the figure read against source"}
+    if kind == "lookup":
+        return {"kind": "external_lookup", "policy": "verify value against cited external source"}
+    if kind == "replan_approval":
+        return {"kind": "replan_approval", "policy": "approve or steer the proposed next plan"}
+    return None
+
+
+def _task_corpus_summary(task) -> dict[str, Any] | None:
+    documents: list[dict[str, Any]] = []
+    confidences: list[float] = []
+    blocked = False
+    allowed = False
+    for review in task.open_reviews:
+        corpus = _review_corpus_summary(review)
+        if corpus is None:
+            continue
+        documents.extend(corpus.get("documents") or [])
+        if corpus.get("confidence"):
+            confidences.extend(v for v in corpus["confidence"].values() if isinstance(v, float | int))
+        blocked = blocked or bool(corpus.get("ocr_review_blocked"))
+        allowed = allowed or bool(corpus.get("ocr_review_allowed"))
+    candidate = task.latest_candidate
+    if candidate is not None:
+        for ref in candidate.source_docs:
+            meta = _doc_meta_from_ref(ref)
+            if meta is not None:
+                documents.append(meta)
+
+    if not documents and not confidences:
+        return None
+
+    seen: set[str] = set()
+    unique_docs: list[dict[str, Any]] = []
+    for doc in documents:
+        key = f"{doc.get('family')}:{doc.get('era')}:{doc.get('year')}:{doc.get('source')}"
+        if key not in seen:
+            seen.add(key)
+            unique_docs.append(doc)
+
+    risk_rank = {"none": 0, "low": 1, "medium": 2, "high": 3}
+    highest_risk = max((d.get("ocr_risk", "none") for d in unique_docs), key=lambda r: risk_rank.get(r, 0), default=None)
+    return {
+        "documents": unique_docs[:8],
+        "families": sorted({d["family"] for d in unique_docs if d.get("family")}),
+        "eras": sorted({d["era"] for d in unique_docs if d.get("era")}),
+        "confidence": _confidence_stats(confidences),
+        "ocr_review_allowed": allowed if unique_docs else None,
+        "ocr_review_blocked": blocked or any(d.get("ocr_review_allowed") is False for d in unique_docs),
+        "ocr_risk": highest_risk,
+    }
 
 
 @dataclass
@@ -55,6 +315,22 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
         def summary(task) -> dict[str, Any]:
             candidate = task.latest_candidate
             submission = task.submissions[-1] if task.submissions else None
+            open_reviews = task.open_reviews
+            review_payloads = []
+            for review in open_reviews:
+                corpus = _review_corpus_summary(review)
+                review_payloads.append(
+                    {
+                        "review_id": review.review_id,
+                        "kind": review.kind,
+                        "instructions": review.instructions,
+                        "source_docs": review.source_docs,
+                        "guidance": review.guidance,
+                        "refining": review.refining,
+                        "corpus_summary": corpus,
+                        "review_reason": _review_reason(review.kind, corpus, review.guidance),
+                    }
+                )
             return {
                 "task_id": task.task_id,
                 "round_num": task.round_num,
@@ -68,18 +344,10 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
                 # client_id annotating this task (None = free); drives the greyed-out buttons +
                 # lock indicator for every other client. Expired leases read as free.
                 "locked_by": task.active_lock_holder(now),
+                "corpus_summary": _task_corpus_summary(task),
                 # Open human reviews drive the sidebar bump + the review overlay. Small lists,
                 # so the whole payload (instruction + candidates + page refs) rides the snapshot.
-                "reviews": [
-                    {
-                        "review_id": review.review_id,
-                        "kind": review.kind,
-                        "instructions": review.instructions,
-                        "source_docs": review.source_docs,
-                        "guidance": review.guidance,
-                    }
-                    for review in task.open_reviews
-                ],
+                "reviews": review_payloads,
             }
 
         return {
@@ -154,6 +422,7 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
     app.state.queues = queues
     app.state.coordinator = coordinator
     app.state.broker = broker
+    app.state.publish_status = sink.publish_status
     return app
 
 

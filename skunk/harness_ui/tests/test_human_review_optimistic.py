@@ -48,16 +48,14 @@ def test_verify_extract_flag_off_means_no_review_even_for_tables() -> None:
     assert pol.verify_extract(RetrieveBranch(key="x"), [_table()], cfg) is False
 
 
-def test_visual_only_uses_figure_flag_regardless_of_kind() -> None:
+def test_obtained_visually_uses_figure_flag_regardless_of_kind() -> None:
+    # A vision-read value gates on human_figure regardless of value kind; the trigger is
+    # the machine-stamped `obtained_visually`, not the branch's `visual_only` prediction.
     pol = HumanAssistPolicy()
-    branch = RetrieveBranch(key="x", visual_only=True)
-    assert (
-        pol.verify_extract(branch, [_scalar()], SkunkConfig(human_figure=True)) is True
-    )
-    assert (
-        pol.verify_extract(branch, [_scalar()], SkunkConfig(human_figure=False))
-        is False
-    )
+    branch = RetrieveBranch(key="x")
+    vis = AnnotatedValue(description="d", value=5, kind="scalar", obtained_visually=True)
+    assert pol.verify_extract(branch, [vis], SkunkConfig(human_figure=True)) is True
+    assert pol.verify_extract(branch, [vis], SkunkConfig(human_figure=False)) is False
 
 
 # ── register hooks ─────────────────────────────────────────────────────────────

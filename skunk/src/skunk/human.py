@@ -40,7 +40,7 @@ from skunk.common import (
     PageRef,
 )
 from skunk.errors import ParseError
-from skunk.extract import _blocks_to_pagerefs, _render_pages_b64, _stamp_provenance
+from skunk.extract import _render_pages_b64, _stamp_provenance
 from skunk.plan import Branch, LookupBranch, RetrieveBranch
 
 # The JSON shape a human types to override the model — the same `AnnotatedValue` field set
@@ -62,14 +62,14 @@ _EDITABLE_FIELDS = ("description", "unit", "value")
 def _candidate_dicts(entries: list[AnnotatedValue]) -> list[dict]:
     """The model's values for the review UI: the editable field set PLUS read-only `notes` (the
     LLM's extract-time page context), `source`/`retrieve_key` (an external lookup's publisher +
-    target), and an `external` flag. A value with no corpus provenance (no `bulletin`/`pages`) is
+    target), and an `external` flag. A value with no corpus provenance (no `doc_id`/`pages`) is
     an external lookup, not a corpus extract — flagged so the UI can label it (priority) and show
     its target/src instead of a (nonexistent) source page. Display-only: the human edits only
     `_EDITABLE_FIELDS`; everything else rides back untouched via `_src`."""
     out: list[dict] = []
     for c in entries:
         d = c.model_dump(include=set(_FIELDS) | {"notes", "source", "retrieve_key"})
-        d["external"] = not (c.bulletin or c.pages)
+        d["external"] = not (c.doc_id or c.pages)
         out.append(d)
     return out
 
@@ -101,9 +101,9 @@ def _pagerefs_to_docstrings(refs: list[PageRef]) -> list[str]:
     (`/api/source/{month}/page/{page}.png`) renders them. Shared by the blocking broker and the
     optimistic registration path so both speak one format."""
     return [
-        f"Treasury Bulletin {p.month} PDF page {p.page}"
+        f"{p.stem} PDF page {p.page}"
         for p in refs
-        if p.month is not None and p.page is not None
+        if p.stem is not None and p.page is not None
     ]
 
 
@@ -111,25 +111,25 @@ def _value_page_attribution(
     entries: list[AnnotatedValue],
 ) -> tuple[list[PageRef], list[dict]]:
     """Map each extracted VALUE back to the actual page(s) it was read from — every
-    `AnnotatedValue` carries its own machine-stamped `bulletin`+`pages` — so a review shows ONLY
+    `AnnotatedValue` carries its own machine-stamped `doc_id`+`pages` — so a review shows ONLY
     those pages, not the whole sem-filter survivor pool, and can label each page with the value(s)
     that came from it. Returns `(refs, page_values)` where `page_values` is
     `[{"month","page","values":[description,...]}]` in page order. `([], [])` when no entry is
-    attributable (e.g. a multi-bulletin extract left provenance empty) — the caller then falls
+    attributable (e.g. a multi-document extract left provenance empty) — the caller then falls
     back to the block pool so the viewer is never empty."""
     refs: list[PageRef] = []
     page_values: list[dict] = []
     by_key: dict[tuple[str, int], list[str]] = {}
     for entry in entries:
-        if not entry.bulletin or not entry.pages:
+        if not entry.doc_id or not entry.pages:
             continue
         for page in entry.pages:
-            key = (entry.bulletin, page)
+            key = (entry.doc_id, page)
             descs = by_key.get(key)
             if descs is None:
                 by_key[key] = descs = []  # same list object lands in page_values below
-                refs.append(PageRef(month=entry.bulletin, page=page))
-                page_values.append({"month": entry.bulletin, "page": page, "values": descs})
+                refs.append(PageRef(stem=entry.doc_id, page=page))
+                page_values.append({"month": entry.doc_id, "page": page, "values": descs})
             if entry.description and entry.description not in descs:
                 descs.append(entry.description)
     return refs, page_values
@@ -186,7 +186,7 @@ class HumanRequest:
     candidates: list[AnnotatedValue]
     pages: list[PageRef] = field(default_factory=list)
     # Per-page value attribution [{month,page,values:[desc,...]}] — which extracted value(s) came
-    # from each page, so the viewer can caption a page with its bulletin + value(s).
+    # from each page, so the viewer can caption a page with its doc_id + value(s).
     page_values: list[dict] = field(default_factory=list)
     # Figure task only: a pre-filled AnnotatedValue JSON template (description = retrieval target)
     # the human edits while reading the chart, in place of confirm/correct candidate cards.
@@ -330,9 +330,9 @@ class BrokerChannel:
         # Page refs as the UI's canonical doc strings so its existing source-page viewer
         # (`/api/source/{month}/page/{page}.png`) renders them — no pixels shipped over the wire.
         source_docs = [
-            f"Treasury Bulletin {p.month} PDF page {p.page}"
+            f"{p.stem} PDF page {p.page}"
             for p in req.pages
-            if p.month is not None and p.page is not None
+            if p.stem is not None and p.page is not None
         ]
         guidance = {
             "task": req.task,
@@ -384,11 +384,13 @@ class HumanAssistPolicy:
         entries: list[AnnotatedValue],
         cfg,
     ) -> bool:
-        # Figure questions (visual_only) gate on human_figure — the model reads charts
-        # unreliably so the human produces the answer. Every other extraction gates on
-        # human_verify_extract — the human confirms/corrects the OCR/table read, regardless
-        # of value shape (scalar/vector/table all get the same review).
-        if branch.visual_only:
+        # Figure reads gate on human_figure — the model reads charts unreliably so the human
+        # produces the answer. The criterion is the machine fact that the value was actually
+        # read by the vision tier (`obtained_visually`), not the planner's up-front prediction
+        # (`branch.visual_only`): any vision fallback counts, whatever triggered it. Every other
+        # extraction gates on human_verify_extract — the human confirms/corrects the OCR/table
+        # read, regardless of value shape (scalar/vector/table all get the same review).
+        if any(e.obtained_visually for e in entries):
             return cfg.human_figure
         return cfg.human_verify_extract
 
@@ -435,7 +437,7 @@ class HumanAssist:
     async def verify_extract(
         self,
         entries: list[AnnotatedValue],
-        blocks: list,
+        pages: list[PageRef],
         branch: RetrieveBranch,
         ctx: ExecutionContext,
     ) -> list[AnnotatedValue]:
@@ -443,31 +445,34 @@ class HumanAssist:
         answer, re-stamped with the branch/page provenance the operators stamp. Assumes the
         caller already gated on `wants_verify`."""
         # Show ONLY the pages the values were actually read from (per-value provenance), not the
-        # whole survivor pool; fall back to the pool when nothing is attributable.
+        # whole retrieved set; fall back to the retrieved pages when nothing is attributable.
         refs, page_values = _value_page_attribution(entries)
         if not refs:
-            refs, page_values = _blocks_to_pagerefs(blocks), []
+            refs, page_values = list(pages), []
+        # A vision-read value (any of the entries was `obtained_visually`) is a figure review —
+        # the machine fact that vision produced it, not the planner's `visual_only` prediction.
+        visual = any(e.obtained_visually for e in entries)
         instruction = (
             "This answer must be read off the figure/chart on the page(s) below — the "
             "model is unreliable here. Give the correct value(s)."
-            if branch.visual_only
+            if visual
             else "Confirm or correct the value(s) the model extracted, checking them "
             "against the source page(s) below."
         )
         ctx.emit(
-            f"human_request task={'figure' if branch.visual_only else 'verify_extract'} "
+            f"human_request task={'figure' if visual else 'verify_extract'} "
             f"candidates={[e.description for e in entries]!r} n_pages={len(refs)}",
             kind="user",
         )
         reply = await self._channel.ask(
             HumanRequest(
-                task="figure" if branch.visual_only else "verify_extract",
+                task="figure" if visual else "verify_extract",
                 instruction=instruction,
                 candidates=entries,
                 pages=refs,
                 page_values=page_values,
                 value_template=(
-                    _figure_value_template(branch, entries) if branch.visual_only else None
+                    _figure_value_template(branch, entries) if visual else None
                 ),
                 branch=branch,
             ),
@@ -518,19 +523,24 @@ class HumanAssist:
         on `wants_pool_review`; no-op when no register hook is wired (local CLI).
 
         `source_values` (the PRE-clean pool) is the page-attribution source: data-prep coalesces
-        values across bulletins and collapses `bulletin` to a RANGE ("1985-03..1987-06"), which
-        can't map a page to a single renderable PDF. The pre-clean values still carry one bulletin
-        each, so the viewer resolves their pages. Falls back to `pool` when not given."""
+        values across documents and collapses `doc_id` to a JOINED list, which can't map a page to
+        a single renderable PDF. The pre-clean values still carry one doc_id each, so the viewer
+        resolves their pages. Falls back to `pool` when not given."""
         register = ctx.human_review_register
         if register is None:
             return None
         # Show the pages the values were pulled from (per-value provenance). Attribute from the
-        # pre-clean values (single bulletin each) so coalesced range-bulletins don't break the
+        # pre-clean values (single doc_id each) so coalesced multi-doc values don't break the
         # viewer. Lookup-derived values carry no page provenance and simply appear as cards with
         # no page; that's expected.
-        refs, page_values = _value_page_attribution(
-            source_values if source_values is not None else pool
-        )
+        attribution_src = source_values if source_values is not None else pool
+        refs, page_values = _value_page_attribution(attribution_src)
+        # Read the vision-tier provenance off the PRE-clean values: `obtained_visually` is internal
+        # provenance the data-prep agent never sees (it's kept out of every prompt), so the cleaned
+        # pool can't be trusted to carry it; the pre-clean values do. Surfaced as a UI-only boolean
+        # in guidance (never the raw field) so the optimistic UI can label the pool review "Visual
+        # QA" instead of the extract/OCR review when any value was read off a figure/chart.
+        visual = any(e.obtained_visually for e in attribution_src)
         instruction = (
             "Review the data the agent cleaned and is about to compute over. Confirm or correct "
             "the value(s), checking them against the source page(s) below."
@@ -542,6 +552,7 @@ class HumanAssist:
             "candidates": _candidate_dicts(pool),
             "fields": list(_FIELDS),
             "page_values": page_values,
+            "visual": visual,
         }
         review_id = register(
             "verify_extract", instruction, ctx.question, _pagerefs_to_docstrings(refs), guidance

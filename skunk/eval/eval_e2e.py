@@ -100,17 +100,32 @@ _URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# DAIS doc-id token: "<doc_id_stem>:<page>[,<page>...]" — e.g.
+# `combined_statement__historical__cs-1890:5,6,7`. The stem carries no colon (it uses
+# `__`/`-`), so the last `:` cleanly splits doc from its comma-separated pages. URLs (which
+# contain `/` and `?page=`) never match this, so the two source_docs forms can't collide.
+_DOC_TOKEN_RE = re.compile(r"^(?P<doc>[\w][\w\-]*):(?P<pages>\d+(?:,\d+)*)$")
+
 
 def _parse_source_docs(source_docs: str) -> list[PageRef]:
-    """Extract every (year, month, page) tuple from a source_docs cell."""
+    """Parse a `source_docs` cell into golden `PageRef`s. Two accepted forms (mixable):
+      * Treasury month-year URLs `.../january-2002...?page=5` -> `PageRef(stem="2002-01", page=5)`
+      * DAIS doc-id tokens `combined_statement__historical__cs-1890:5,6,7`
+        -> one `PageRef(stem=<doc_id>, page=N)` per page (the `stem` slot holds the doc id
+        in the rekeyed corpus)."""
     out: list[PageRef] = []
     if not isinstance(source_docs, str):
         return out
     for m in _URL_RE.finditer(source_docs):
         month_mm = _MONTH_MAP[m.group("month").lower()]
         out.append(
-            PageRef(month=f"{m.group('year')}-{month_mm}", page=int(m.group("page")))
+            PageRef(stem=f"{m.group('year')}-{month_mm}", page=int(m.group("page")))
         )
+    for tok in source_docs.split():
+        m = _DOC_TOKEN_RE.match(tok)
+        if m:
+            for pg in m.group("pages").split(","):
+                out.append(PageRef(stem=m.group("doc"), page=int(pg)))
     return out
 
 
@@ -139,7 +154,7 @@ async def _run_one_question(
     """Run one question through the Orchestrator and collect a result dict."""
     if golden_pages:
         # Normalize to fresh PageRef instances regardless of input shape.
-        golden_pages = [PageRef(month=g.month, page=g.page) for g in golden_pages]
+        golden_pages = [PageRef(stem=g.stem, page=g.page) for g in golden_pages]
         if verbose:
             print(
                 f"[e2e] Golden pages: {len(golden_pages)} → {[str(r) for r in golden_pages]}"
@@ -212,9 +227,9 @@ async def _run_one_question(
                 model=config.llm_model,
             )
 
-        # The retrieve sweep's deduped blocks — empty under golden bypass (retrieve never
+        # The retrieve sweep's deduped pages — empty under golden bypass (retrieve never
         # ran). Surfaced for the report's retrieval-recall column.
-        retrieved_blocks = list(orch.retrieved_blocks)
+        retrieved_pages = list(orch.retrieved_pages)
 
         if failure is not None:
             return {
@@ -224,7 +239,7 @@ async def _run_one_question(
                 "reason": result.failure_reason,
                 "latency_s": round(latency_s, 3),
                 "cost_usd": cost_usd,
-                "retrieved_blocks": retrieved_blocks,
+                "retrieved_pages": retrieved_pages,
             }
         return {
             "question": question,
@@ -233,7 +248,7 @@ async def _run_one_question(
             "reason": result.failure_reason,
             "latency_s": round(latency_s, 3),
             "cost_usd": cost_usd,
-            "retrieved_blocks": retrieved_blocks,
+            "retrieved_pages": retrieved_pages,
         }
     finally:
         ctx.close()
@@ -300,17 +315,13 @@ def _events_cost(events: list[dict]) -> str:
     return f"{cost:.4f}" if saw_call else ""
 
 
-def _retrieval_recall(retrieved_blocks: list, gold_pages: list[PageRef] | None) -> str:
+def _retrieval_recall(retrieved_pages: list, gold_pages: list[PageRef] | None) -> str:
     """n_hit/n_gold — how many gold pages the retrieve phase actually surfaced (matched on
-    month:page across the blocks' member pages). '' when no gold pages are recorded."""
+    month:page). '' when no gold pages are recorded."""
     if not gold_pages:
         return ""
-    gold = {(p.month, p.page) for p in gold_pages}
-    got = {
-        (r.month, r.page)
-        for b in retrieved_blocks
-        for r in getattr(b, "member_refs", ())
-    }
+    gold = {(p.stem, p.page) for p in gold_pages}
+    got = {(p.stem, p.page) for p in retrieved_pages}
     return f"{len(gold & got)}/{len(gold)}"
 
 
@@ -427,7 +438,7 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
             # The exception escaped before _run_one_question measured the run.
             "latency_s": None,
             "cost_usd": "",
-            "retrieved_blocks": [],
+            "retrieved_pages": [],
         }
 
     predicted = result["answer"] if not result["failed"] else ""
@@ -443,7 +454,7 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
             f"[e2e] {uid} Answer: {result['answer']}  [{mark} vs gold: {gold_answer!r}]"
         )
 
-    retrieved_blocks = result.get("retrieved_blocks", [])
+    retrieved_pages = result.get("retrieved_pages", [])
     category = "correct" if correct else ("fail" if result["failed"] else "wrong")
     gold_report_pages = cfg.golden_report.get(uid) or []
     return {
@@ -454,10 +465,10 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
         "question": question,
         "predicted": predicted,
         "gold_answer": gold_answer,
-        "golden_pages": " ".join(f"{p.month}:{p.page}" for p in gold_report_pages),
+        "golden_pages": " ".join(f"{p.stem}:{p.page}" for p in gold_report_pages),
         "reason": result.get("reason") or "",
         "retrieval_recall": _retrieval_recall(
-            retrieved_blocks, cfg.golden_report.get(uid)
+            retrieved_pages, cfg.golden_report.get(uid)
         ),
         # Wall-clock seconds to plan + execute the query, and USD billed for its generation
         # calls — both measured in-process by _run_one_question (no trace log needed, so they
@@ -469,7 +480,7 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
         # main() for the accuracy tally and retrieval cache.
         "correct": correct,
         "failed": result["failed"],
-        "retrieved_blocks": retrieved_blocks,
+        "retrieved_pages": retrieved_pages,
     }
 
 
@@ -684,7 +695,7 @@ def main() -> None:
 
     out = report_path
     with out.open("w", newline="", encoding="utf-8") as f:
-        # extrasaction="ignore" drops the non-column `retrieved_blocks` key (kept on
+        # extrasaction="ignore" drops the non-column `retrieved_pages` key (kept on
         # each row only for the retrieval-recall computation above).
         writer = csv.DictWriter(f, fieldnames=REPORT_FIELDS, extrasaction="ignore")
         writer.writeheader()
