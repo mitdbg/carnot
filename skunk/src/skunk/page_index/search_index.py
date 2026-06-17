@@ -210,7 +210,7 @@ def _render_rows(
 
 class SearchCorpusTool(Tool):
     name = "search_corpus"
-    _COLUMNS = "source, page, title"  # the ONLY columns this tool ever returns
+    _COLUMNS = "source || '#' || page AS doc_id, page, title"  # the ONLY columns this tool ever returns
     _MAX_ROWS = 50  # hard cap on rows returned, regardless of the query's LIMIT
     _MAX_CHARS = 30_000  # char cap on the rendered result text (a backstop)
     _TIMEOUT_S = 5.0  # wall-clock budget per query (a pathological scan is interrupted)
@@ -271,7 +271,7 @@ class SearchCorpusTool(Tool):
 
     doc = """\
 ### search_corpus(where: str, order_by: str | None = None, limit: int | None = None)
-Find candidate pages beyond your seeded shortlist. You write only the SQL `WHERE` clause (required) and optional `ORDER BY` / `LIMIT`; the tool always returns the columns `source, page, title` — triage on the title, then use read_document / grep_corpus to confirm a page actually carries the target series. The index is one SQLite FTS5 table `pages`, one row per content page of every document. At most 50 rows are returned.
+Find candidate pages beyond your seeded shortlist. You write only the SQL `WHERE` clause (required) and optional `ORDER BY` / `LIMIT`; the tool always returns the columns `doc_id, page, title` (where `doc_id` is `<source>#<page>`) — triage on the title, then copy `doc_id` VERBATIM into read_document / grep_corpus / view_figure to confirm a page actually carries the target series. The index is one SQLite FTS5 table `pages`, one row per content page of every document. At most 50 rows are returned.
 
 Columns you can filter / order on:
 - `pages MATCH '<q>'` — full-text over each page's block titles, summaries, and table row/column headers. Supports `AND` / `OR` / `NOT`, `"exact phrase"`, `prefix*`, `NEAR(a b, 5)`. For best-first ranking pass `order_by="bm25(pages)"` (more-negative = better).
