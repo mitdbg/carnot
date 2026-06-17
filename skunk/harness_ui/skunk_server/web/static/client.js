@@ -112,6 +112,16 @@ function feedbackFor(task) {
   if (task.correct == null) return null;
   return { correct: !!task.correct, points: task.points };
 }
+function canResubmit(task) {
+  return !!task
+    && ["SUBMITTED", "SCORED"].includes(task.status)
+    && task.correct === false
+    && task.answer
+    && Number(round.resubmits_left) > 0;
+}
+function canRestart(task) {
+  return !!task && task.status === "FAILED" && !task.answer;
+}
 
 // ── round timer ──────────────────────────────────────────────────────────────────
 function updateRoundTimer() {
@@ -295,8 +305,17 @@ function renderDetailActions(task) {
     html += locked
       ? `<button class="primary" disabled title="Locked by another reviewer">Submit Answer</button>`
       : `<button class="primary" onclick="submitTask('${js(task.task_id)}', event)">Submit Answer</button>`;
+  } else if (canResubmit(task)) {
+    html += locked
+      ? `<button class="primary" disabled title="Locked by another reviewer">Re-submit Answer</button>`
+      : `<button class="primary" onclick="confirmResubmit('${js(task.task_id)}', event)">Re-submit Answer</button>`;
   } else if (task.status === "SUBMITTING") {
     html += `<span class="detail-feedback pending">Submitting…</span>`;
+  }
+  if (canRestart(task)) {
+    html += locked
+      ? `<button disabled title="Locked by another reviewer">re-start</button>`
+      : `<button onclick="restartTask('${js(task.task_id)}', event)">re-start</button>`;
   }
   if (locked) {
     html += `<span class="detail-feedback">🔒 Locked by another reviewer</span>`;
@@ -322,6 +341,30 @@ async function submitTask(taskId, event) {
   // On success the status SSE stream pushes SUBMITTING -> SUBMITTED/SCORED and the UI refreshes.
 }
 window.submitTask = submitTask;
+
+async function confirmResubmit(taskId, event) {
+  if (event) { event.stopPropagation(); event.preventDefault(); }
+  const ok = confirm(
+    "Really re-submit this answer?\n\nThis may use one of the remaining Cup resubmits. Press OK only if you did not hit this by mistake."
+  );
+  if (!ok) return;
+  await submitTask(taskId);
+}
+window.confirmResubmit = confirmResubmit;
+
+async function restartTask(taskId, event) {
+  if (event) { event.stopPropagation(); event.preventDefault(); }
+  const feedback = prompt("Optional feedback for the fresh attempt:", "") || "";
+  try {
+    await apiJson(`/api/restart/${encodeURIComponent(taskId)}`, {
+      client_id: window.CLIENT_ID,
+      feedback,
+    });
+  } catch (err) {
+    flashSubmitError(taskId, err.message || String(err));
+  }
+}
+window.restartTask = restartTask;
 
 function flashSubmitError(taskId, message) {
   const host = taskId === detailTaskId ? document.getElementById("dActions") : null;

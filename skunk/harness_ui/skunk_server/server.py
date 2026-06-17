@@ -419,6 +419,7 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
     app.state.queues = queues
     app.state.coordinator = coordinator
     app.state.broker = broker
+    app.state.publish_status = sink.publish_status
     return app
 
 

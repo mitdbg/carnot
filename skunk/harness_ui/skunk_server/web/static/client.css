@@ -949,6 +949,7 @@ textarea { width: 100%; min-height: 55px; }
 .review-close {
   background: transparent; border: 1px solid var(--border2); color: var(--muted);
   width: 30px; height: 30px; border-radius: 6px; cursor: pointer; font-size: 15px;
+  display: grid; place-items: center; padding: 0; line-height: 1;
 }
 .review-close:hover { color: var(--ink); border-color: var(--ink); }
 .review-body { flex: 1; display: flex; min-height: 0; }

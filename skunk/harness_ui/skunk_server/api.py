@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import re
 from collections.abc import Callable
 from pathlib import Path
@@ -36,6 +37,7 @@ SSE_HEADERS = {
     "Connection": "keep-alive",
 }
 _MONTH_RE = re.compile(r"^\d{4}-(?:0[1-9]|1[0-2])$")
+_DOC_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
 class ReviewResolveBody(BaseModel):
@@ -62,6 +64,11 @@ class ReviewLockBody(BaseModel):
 
 class SubmitTaskBody(BaseModel):
     client_id: str = Field(..., min_length=1)
+
+
+class RestartTaskBody(BaseModel):
+    client_id: str = Field(..., min_length=1)
+    feedback: str = ""
 
 
 async def status_frames(hub: StreamHub, heartbeat: float = HEARTBEAT_INTERVAL_S):
@@ -178,6 +185,39 @@ def install_command_routes(app: FastAPI) -> None:
             headers={"Cache-Control": "public, max-age=86400"},
         )
 
+    @app.get("/api/source-doc/{doc_id}/page/{page}.png")
+    async def source_doc_page(doc_id: str, page: int) -> Response:
+        if not _DOC_ID_RE.match(doc_id) or page < 0:
+            return Response(status_code=404)
+        try:
+            import fitz
+
+            pdf_dir = Path(os.environ.get("OFFICEQA_PDF_DIR", ""))
+            pdf_path = pdf_dir / f"{doc_id}.pdf"
+            if not pdf_path.exists():
+                pdf_path = (
+                    Path(__file__).resolve().parents[2]
+                    / "data"
+                    / "dais"
+                    / "pdfs"
+                    / f"{doc_id}.pdf"
+                )
+            if not pdf_path.exists():
+                return Response(status_code=404)
+            with fitz.open(pdf_path) as pdf:
+                if page >= len(pdf):
+                    return Response(status_code=404)
+                pix = pdf[page].get_pixmap(matrix=fitz.Matrix(200 / 72, 200 / 72))
+                data = pix.tobytes("png")
+        except Exception:
+            logger.exception("source doc page render failed for %s p%s", doc_id, page)
+            return Response(status_code=500)
+        return Response(
+            content=data,
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
     @app.post("/api/reviews/{review_id}/resolve")
     async def resolve_review(review_id: str, body: ReviewResolveBody) -> JSONResponse:
         # Record a human's correction (or accept-as-is) and trigger a background recompute.
@@ -282,3 +322,28 @@ def install_command_routes(app: FastAPI) -> None:
             logger.exception("manual submit failed for %s", task_id)
             return JSONResponse({"ok": False, "error": str(error)}, status_code=502)
         return JSONResponse({"ok": True, "task_id": task_id})
+
+    @app.post("/api/restart/{task_id:path}")
+    async def restart_task(task_id: str, body: RestartTaskBody) -> JSONResponse:
+        registry = app.state.registry
+        queues = app.state.queues
+        publish_status = app.state.publish_status
+        broker = app.state.broker
+        try:
+            if broker is not None:
+                holder = broker.get_lock_holder(task_id)
+                if holder is not None and holder != body.client_id:
+                    return JSONResponse(
+                        {"ok": False, "error": "Task is locked by another user"},
+                        status_code=409,
+                    )
+            task = registry.restart_failed_no_answer(task_id, body.feedback)
+            queues.enqueue_agent(task_id)
+            publish_status()
+        except KeyError:
+            return JSONResponse(
+                {"ok": False, "error": "task not found"}, status_code=404
+            )
+        except TaskConflict as error:
+            return JSONResponse({"ok": False, "error": str(error)}, status_code=409)
+        return JSONResponse({"ok": True, "task_id": task.task_id})

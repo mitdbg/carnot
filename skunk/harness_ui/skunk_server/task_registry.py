@@ -163,7 +163,7 @@ class TaskRegistry:
     ) -> tuple[QuestionTask, AnswerCandidate, SubmissionRecord]:
         with self._lock:
             task = self._require_task(task_id)
-            if task.status != TaskStatus.READY:
+            if task.status != TaskStatus.READY and not self._can_resubmit_failed_answer(task):
                 raise TaskConflict(
                     f"task is not ready for submission; status={task.status}"
                 )
@@ -178,6 +178,19 @@ class TaskRegistry:
             task.submissions.append(submission)
             self._set_status(task, TaskStatus.SUBMITTING)
             return task, candidate, submission
+
+    def restart_failed_no_answer(self, task_id: str, feedback: str = "") -> QuestionTask:
+        with self._lock:
+            task = self._require_task(task_id)
+            if task.status != TaskStatus.FAILED:
+                raise TaskConflict(f"task is not failed; status={task.status}")
+            if task.latest_candidate is not None or task.submissions:
+                raise TaskConflict("task already has an answer or submission")
+            note = feedback.strip()
+            if note:
+                task.cup_feedback.append(f"Operator restart feedback: {note}")
+            self._set_status(task, TaskStatus.QUEUED)
+            return task
 
     def record_submission_accepted(
         self,
@@ -560,3 +573,11 @@ class TaskRegistry:
             if submission.local_submission_id == local_submission_id:
                 return submission
         raise KeyError(local_submission_id)
+
+    def _can_resubmit_failed_answer(self, task: QuestionTask) -> bool:
+        if task.status not in {TaskStatus.SUBMITTED, TaskStatus.SCORED}:
+            return False
+        if self._round.resubmits_left == 0:
+            return False
+        submission = task.submissions[-1] if task.submissions else None
+        return submission is not None and submission.correct is False
