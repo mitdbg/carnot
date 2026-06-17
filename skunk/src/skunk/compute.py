@@ -184,11 +184,11 @@ aggregating. Apply unit conversions once over the whole frame, never cell-by-cel
 Emit exactly one of the two forms below as a single fenced ```python``` block
 and nothing else — no prose, no commentary, no second block:
 
-  (a) Success — assign the final answer string to `result`. The string contains
-      only the requested answer — no prose, no "Answer:", no question
-      restatement; for a multi-part question, only the ultimate quantity asked
-      for. Carry full precision through every intermediate; round or format only
-      in the final `result` string, to the decimal places the question states.
+  (a) Success — assign the final answer string to `result`: exactly what the
+      question asks for, formatted as it requests (units, decimal places,
+      list/bracket shape, every part in order) — no prose, no "Answer:", no
+      question restatement. Carry full precision through every intermediate;
+      round or format only in the final `result` string.
       Never emit a non-finite answer: if a computation yields NaN or infinity — NaN
       cells in the inputs ("n/a"), or division by an empty/zero quantity — do not
       format it into `result`. Drop or skip those cells before aggregating; if the
