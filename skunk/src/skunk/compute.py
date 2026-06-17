@@ -227,8 +227,8 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
         system_prompt=_SYSTEM_PROMPT,
         default_effort="high",
         output_instruction=(
-            "Produce a fenced ```python``` block (assigning `result`, or `missing` for "
-            "partial progress) OR a bare missing-data JSON object."
+            "Produce a fenced ```python``` block — assign `result` for the answer, "
+            "or `keep` + `missing` for partial progress."
         ),
     )
 

@@ -61,14 +61,6 @@ overrides:
       (fiscal-year totals and year-end balances), so most periods are whole
       fiscal years.
 
-  - section: corpus
-    targets: [select_agent]
-    content: |
-      The blocks are from the U.S. Combined Statement (and early govinfo
-      receipts volumes). The same figure can appear more than once: in the
-      year-end statement for its own fiscal year, again as a prior-year
-      "comparative" column in the next year's volume, and in both the slim
-      Annual Report (summary) and the detailed Appendix (line item).
 
   # Renders under the search-agent SYSTEM prompt's `## Dataset` header.
   # Like treasury_bulletin.yaml's search_agent blurb, this carries the index
@@ -191,16 +183,16 @@ overrides:
   # Corpus blurbs for the remaining executors.
   # (compute.codegen's input-provenance blurb lives in the COMPUTE section below.)
   # ---------------------------------------------------------------------
-  # Unit vocabulary — lookup_external emits these tokens; compute sees them on
-  # lookup entries alongside natural-language units on corpus-extracted entries.
+  # Unit vocabulary — every entry carries a natural-language unit, whether it was
+  # looked up externally or extracted from the corpus; compute reconciles them.
   - section: corpus
     targets: [compute.codegen, lookup_external]
     content: |
-      Unit tokens for externally looked-up values: `usd`, `usd_thousands`,
-      `usd_millions`, `usd_billions`, `pct`, `count`, `year`, `rate`,
-      `fx_rate`, `cpi`, `text`. Corpus-extracted entries instead carry
-      natural-language units printed on the page (e.g. "dollars", "thousands of
-      dollars"); early volumes often print exact dollars-and-cents.
+      Units are natural language on every entry. Externally looked-up values
+      carry a free-form unit (e.g. "percent", "millions of dollars", "British
+      pounds per U.S. dollar"); corpus-extracted entries carry the unit printed
+      on the page (e.g. "dollars", "thousands of dollars"); early volumes often
+      print exact dollars-and-cents.
 
   - section: corpus
     targets: [lookup_external]
@@ -208,18 +200,6 @@ overrides:
       Lookups complement, rather than duplicate, the Combined Statement corpus,
       which does not carry macro / price series (CPI, GDP, population), FX spot
       rates, or external entity facts.
-
-  # ---------------------------------------------------------------------
-  # Selection lessons.
-  # ---------------------------------------------------------------------
-  - section: lessons
-    targets: [select_agent]
-    content: |
-      Commit the volume whose REPORTING fiscal year equals the requested data year; govinfo volumes are bucketed by the calendar DATA year they report (the volume itself was printed about a year later), so to find data for year D look in the volume bucketed D.
-      Prefer the DETAILED Combined Statement / Appendix for any specific line item; the slim Annual Report carries only summary highlights — do not commit it for a figure that needs the detail series.
-      A figure restated as a prior-year comparative column in a later volume is a fallback, not the first choice; if the question asks for the value "as later reported / revised", commit the later restated volume instead — never both.
-      Fiscal years 1872–1893 exist in both govinfo_receipts and combined_statement(historical); commit one (prefer combined_statement) and discard the duplicate.
-      A label wrapping the concept in extra words ("... and related activities", "..., including ...") is a broader aggregate; prefer the exact asked scope, and confirm the row labels carry the needed dates at the needed basis before committing.
 
   # ---------------------------------------------------------------------
   # Page-index build family lessons.
@@ -254,9 +234,8 @@ overrides:
   - section: lessons
     targets: [planner, replanner]
     content: |
-      One concept per `retrieve.key`. If a question names multiple values (two funds, two agencies, two revenue sources, receipts vs expenditures, ...), emit ONE branch per value rather than bundling — branches run in parallel and splitting is cheap.
+      One concept per `retrieve.key`. If a question names multiple values (two funds, two agencies, two revenue sources, receipts vs expenditures, ...), emit ONE branch per value rather than bundling.
       The converse also holds: do not split the same statistic across periods into same-key branches — use one branch with a comma-separated period ("1884-07..1885-06, 1889-07..1890-06").
-      The period is the DATA window, never a publication/"vintage" label. A named volume ("the Combined Statement for FY2013", "the 1827 receipts volume") tells SELECTION which document to read; it does not change the period.
 
   # Lesson: when a branch fails, exhaust corpus rewordings before falling back
   # to an external lookup.
@@ -287,7 +266,7 @@ overrides:
         ```
 
       - |
-        ### Example (publication year is NOT the period — the volume printed in 1826 reports the YEAR 1825; period is the data year, selection picks the 1825 volume)
+        ### Example (publication year is NOT the period — the volume printed in 1826 reports the YEAR 1825)
         Q: According to the receipts-and-expenditures volume published in 1826, what were the total expenditures of the United States for the year 1825?
         Plan:
         ```json
@@ -398,44 +377,6 @@ overrides:
       column in the next volume, and in both the summary Annual Report and the
       detailed Appendix — later reprints are sometimes revised.
 
-  # How a page is addressed/filtered (the dimensions below render under the
-  # search-agent SYSTEM prompt's `## Dataset` header).
-  # TODO(maintainer): the exact doc_id/chunk_id format and metadata_filter key
-  # names are authoritative from the index build and not yet verified against the
-  # indexer — the dimensions below are grounded in the corpus, the precise
-  # keys/format are not.
-  - section: corpus
-    targets: [search_agent]
-    content: |
-      Each source document is split into pages, and each page is treated as one
-      "document" with its own `doc_id`. The PDFs are image-only scans, so all
-      text and tables are OCR/VLM-extracted. In your final answer, `page_keys`
-      holds page-level document ids.
-
-      ### Identifiers and metadata
-      The exact `doc_id` / `chunk_id` string format and the `metadata_filter`
-      key names come from the index build — use them as configured there. The
-      addressing dimensions below are grounded in the corpus (filename slug +
-      parsed page structure) and named naturally; confirm a name against the
-      index before relying on it. A page is identified by:
-      - collection: `"combined_statement"` or `"govinfo_receipts"`.
-      - era: `"historical"` | `"transition"` | `"modern"` (combined_statement
-        only; govinfo volumes have no era).
-      - year: 4-digit string — for combined_statement the reported FISCAL year;
-        for govinfo the calendar DATA year it reports (printed about a year later).
-      - section: the section/chapter code parsed from the combined_statement
-        filename (govinfo and monolithic historical volumes carry none) — `cNN`
-        chapter, `scN` schedule, plus `rta`/`rtb`/`rtc`, `tbb`/`tbj`, `bof`,
-        `coa`, `pre`, `outlay`, `finhigh`, `sur`, `receipt`, `*ltr` (transmittal
-        letters). Modern chapter codes are stable across years; address a
-        no-section volume by year.
-      - page index: 0-based position of the page within its document — NOT the
-        printed page number (printed numbers are OCR'd, mix Roman and Arabic
-        numerals, and skip values). Filter and cite by the page index.
-      - element type: one of `text`, `title`, `table`, `section_header`,
-        `page_header`, `page_footer`, `page_number`, `footnote`, `figure`,
-        `caption`.
-
   # -------------------------------------------------------------------
   # EXTRACT (text + vision) — pull the requested figures off a page.
   # -------------------------------------------------------------------
@@ -499,8 +440,10 @@ overrides:
       near-match is present, still emit it but make the difference explicit.
       Note a terminology drift: historical volumes are titled "Receipts and
       Disbursements" / "Account of the Receipts and Expenditures" and label
-      outflows "disbursements"; modern and govinfo volumes say "expenditures" —
-      treat them as the same series but record the page's verbatim term.
+      outflows "disbursements"; govinfo volumes say "expenditures"; the modern
+      (FY2001+) volumes are titled "Receipts, Outlays, and Balances" and say
+      "outlays" — treat disbursements / expenditures / outlays as the same series
+      but record the page's verbatim term.
 
   # Lesson: when a whole column/list is asked for, extract every row on the page
   # so a later step can assemble the full series.
@@ -586,9 +529,12 @@ overrides:
         ```
 
       - |
-        ### Example (missing-data signal — bare JSON, NO fence)
+        ### Example (missing-data signal — form (b): keep what is still useful, then signal what is missing)
         Q: Real (CPI-adjusted, 2020 dollars) total expenditures for FY1953.
         input_values: only the nominal FY1953 scalar; no CPI series.
-        Why this shape: required deflator is not in input_values. Emit the bare missing-data JSON object (NO fence). Never fabricate.
-        Output (literal, no fence in your reply):
-        {"missing": ["cpi:1953", "cpi:2020"], "description": "no CPI series in input_values to convert nominal FY1953 to 2020 dollars"}
+        Why this shape: required deflator is not in input_values. KEEP the nominal value so the next round can reuse it (drop-by-default — anything not kept is lost), then signal the missing CPI. Never fabricate.
+        Output:
+        ```python
+        keep = {"nominal total expenditures FY1953 (dollars)": input_values[0]}
+        missing = {"missing": ["cpi:1953", "cpi:2020"], "description": "no CPI series in input_values to convert nominal FY1953 to 2020 dollars"}
+        ```
