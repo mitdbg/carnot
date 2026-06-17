@@ -81,8 +81,8 @@ _PROMPTS_FILE = pathlib.Path(__file__).parent.parent / "datagen" / "prompts.yaml
 with _PROMPTS_FILE.open() as _f:
     _DATAGEN_PROMPTS = yaml.safe_load(_f)
 DATAGEN_SYSTEM_PROMPT = _DATAGEN_PROMPTS["datagen_system_prompt"]
-OFFICEQA_DATAGEN_GUIDANCE = _DATAGEN_PROMPTS["officeqa_datagen_guidance"]
-DEDUP_JUDGE_PROMPT = _DATAGEN_PROMPTS["dedup_judge_prompt_officeqa"]
+DAIS_DATAGEN_GUIDANCE = _DATAGEN_PROMPTS["dais_datagen_guidance"]
+DEDUP_JUDGE_PROMPT = _DATAGEN_PROMPTS["dedup_judge_prompt_dais"]
 
 # Corpus notes describing the DAIS schema to the SearchAgent (replaces the OfficeQA
 # treasury_bulletin notes, which describe month/quarterly cadence + a {year}_{month}_{page}
@@ -513,7 +513,7 @@ def main() -> None:
         emb_model_id=args.emb_model_id,
         document_map=document_map,
         chroma_collection=collection,
-        system_prompt_template=BENCHMARK_QUALITY_FILTER_SYSTEM_PROMPT["officeqa"],
+        system_prompt_template=BENCHMARK_QUALITY_FILTER_SYSTEM_PROMPT["dais"],
         special_notes=special_notes,
         binarization_mode="doc-recall",
     )
@@ -529,7 +529,7 @@ def main() -> None:
         pairs = generate_one(
             seed, args.gen_model_id, args.provider, examples_pool, document_map, collection,
             chunk_id_to_doc_id, args.emb_model_id, trace_dir, special_notes,
-            OFFICEQA_DATAGEN_GUIDANCE, args.n_examples, args.n_qa_pairs, args.show_output,
+            DAIS_DATAGEN_GUIDANCE, args.n_examples, args.n_qa_pairs, args.show_output,
         )
         with dedup_lock:
             kept, funnel = dedup_batch(pairs, dedup_cfg)

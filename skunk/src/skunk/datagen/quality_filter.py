@@ -53,6 +53,7 @@ QUALITY_FILTER_USER_PROMPT: str = _PROMPTS["quality_filter_user_prompt"]
 BENCHMARK_QUALITY_FILTER_SYSTEM_PROMPT: dict[str, str] = {
     "officeqa":        _PROMPTS["quality_filter_system_prompt_officeqa"],
     "browsecomp-plus": _PROMPTS["quality_filter_system_prompt_browsecomp_plus"],
+    "dais":            _PROMPTS["quality_filter_system_prompt_dais"],
 }
 
 
