@@ -13,6 +13,7 @@ let round = {};
 let tasks = [];                       // latest status snapshot's task summaries
 let selectedRoundTab = null;
 let lastRoundNum = null;
+const MAX_RESUBMITS = 3;
 
 // Detail overlay: the task whose detail/trace modal is open (null = closed). Its live trace is
 // accumulated from that task's event stream.
@@ -112,15 +113,34 @@ function feedbackFor(task) {
   if (task.correct == null) return null;
   return { correct: !!task.correct, points: task.points };
 }
-function canResubmit(task) {
+function resubmitCount() {
+  return Number(round.resubmit_count ?? 0);
+}
+function hasPreviousCupSubmit(task) {
+  return Number(task?.cup_submit_count ?? 0) > 0;
+}
+function hasResubmitsAvailable() {
+  return resubmitCount() < MAX_RESUBMITS && Number(round.resubmits_left) > 0;
+}
+function isIncorrectSubmittedAnswer(task) {
   return !!task
     && ["SUBMITTED", "SCORED"].includes(task.status)
     && task.correct === false
-    && task.answer
-    && Number(round.resubmits_left) > 0;
+    && task.answer;
 }
-function canRestart(task) {
-  return !!task && task.status === "FAILED" && !task.answer;
+function canResubmit(task) {
+  return isIncorrectSubmittedAnswer(task) && hasResubmitsAvailable();
+}
+function resubmitDisabledTitle() {
+  if (resubmitCount() >= MAX_RESUBMITS) return `Maximum of ${MAX_RESUBMITS} resubmits used`;
+  if (Number(round.resubmits_left) <= 0) return "No Cup resubmits remaining";
+  return "Re-submit unavailable";
+}
+function canRerun(task) {
+  return !!task
+    && round.status === "ACTIVE"
+    && task.round_num === round.round_num
+    && ["READY", "FAILED", "SUBMITTED", "SCORED"].includes(task.status);
 }
 
 // ── round timer ──────────────────────────────────────────────────────────────────
@@ -169,7 +189,7 @@ function renderStatus() {
   document.getElementById("connection").textContent = round.connection_status || "-";
   document.getElementById("roundNum").textContent = round.round_num ?? "-";
   document.getElementById("roundStatus").textContent = round.status || "-";
-  document.getElementById("resubmitsLeft").textContent = round.resubmits_left ?? "-";
+  document.getElementById("resubmitsLeft").textContent = `${Math.min(resubmitCount(), MAX_RESUBMITS)} / ${MAX_RESUBMITS}`;
   updateRoundTimer();
 
   const rounds = [...new Set(tasks.map((t) => t.round_num))].sort((a, b) => a - b);
@@ -262,6 +282,7 @@ window.closeDetailBackdrop = closeDetailBackdrop;
 // off its own stream). No-op if it's closed.
 function refreshDetail() {
   const task = tasks.find((t) => t.task_id === detailTaskId);
+  syncTraceAttempts(task);
   const badge = document.getElementById("detailBadge");
   if (badge) {
     badge.textContent = task ? badgeLabel(task) : "none";
@@ -274,6 +295,22 @@ function refreshDetail() {
   if (ans) ans.textContent = task?.answer || "—";
   if (corpus) corpus.innerHTML = window.CorpusUI ? window.CorpusUI.summaryTags(task?.corpus_summary) : "";
   renderDetailActions(task);
+}
+
+function syncTraceAttempts(task) {
+  if (!task || !Array.isArray(task.attempt_ids)) return;
+  const allowed = new Set(task.attempt_ids);
+  let changed = false;
+  for (const attemptId of attemptOrder) {
+    if (!allowed.has(attemptId)) {
+      attemptBuffers.delete(attemptId);
+      changed = true;
+    }
+  }
+  if (changed) {
+    attemptOrder = attemptOrder.filter((attemptId) => allowed.has(attemptId));
+    renderTrace();
+  }
 }
 
 // The Review (open overlay) + Submit buttons and the per-task feedback live in the detail overlay;
@@ -302,20 +339,30 @@ function renderDetailActions(task) {
     })
     .join("");
   if (task.status === "READY") {
-    html += locked
-      ? `<button class="primary" disabled title="Locked by another reviewer">Submit Answer</button>`
-      : `<button class="primary" onclick="submitTask('${js(task.task_id)}', event)">Submit Answer</button>`;
-  } else if (canResubmit(task)) {
-    html += locked
-      ? `<button class="primary" disabled title="Locked by another reviewer">Re-submit Answer</button>`
-      : `<button class="primary" onclick="confirmResubmit('${js(task.task_id)}', event)">Re-submit Answer</button>`;
+    const resubmittingReady = hasPreviousCupSubmit(task);
+    const label = resubmittingReady ? "Re-submit Answer" : "Submit Answer";
+    if (locked) {
+      html += `<button class="primary" disabled title="Locked by another reviewer">${label}</button>`;
+    } else if (resubmittingReady && !hasResubmitsAvailable()) {
+      html += `<button class="primary" disabled title="${esc(resubmitDisabledTitle())}">${label}</button>`;
+    } else {
+      html += `<button class="primary" onclick="submitTask('${js(task.task_id)}', event)">${label}</button>`;
+    }
+  } else if (isIncorrectSubmittedAnswer(task)) {
+    if (locked) {
+      html += `<button class="primary" disabled title="Locked by another reviewer">Re-submit Answer</button>`;
+    } else if (canResubmit(task)) {
+      html += `<button class="primary" onclick="confirmResubmit('${js(task.task_id)}', event)">Re-submit Answer</button>`;
+    } else {
+      html += `<button class="primary" disabled title="${esc(resubmitDisabledTitle())}">Re-submit Answer</button>`;
+    }
   } else if (task.status === "SUBMITTING") {
     html += `<span class="detail-feedback pending">Submitting…</span>`;
   }
-  if (canRestart(task)) {
+  if (canRerun(task)) {
     html += locked
-      ? `<button disabled title="Locked by another reviewer">re-start</button>`
-      : `<button onclick="restartTask('${js(task.task_id)}', event)">re-start</button>`;
+      ? `<button disabled title="Locked by another reviewer">Re-run</button>`
+      : `<button onclick="confirmRerun('${js(task.task_id)}', event)">Re-run</button>`;
   }
   if (locked) {
     html += `<span class="detail-feedback">🔒 Locked by another reviewer</span>`;
@@ -351,6 +398,22 @@ async function confirmResubmit(taskId, event) {
   await submitTask(taskId);
 }
 window.confirmResubmit = confirmResubmit;
+
+async function confirmRerun(taskId, event) {
+  if (event) { event.stopPropagation(); event.preventDefault(); }
+  const ok = confirm(
+    "Really re-run this question?\n\nThis starts a fresh agent computation from the original prompt."
+  );
+  if (!ok) return;
+  try {
+    await apiJson(`/api/rerun/${encodeURIComponent(taskId)}`, {
+      client_id: window.CLIENT_ID,
+    });
+  } catch (err) {
+    flashSubmitError(taskId, err.message || String(err));
+  }
+}
+window.confirmRerun = confirmRerun;
 
 async function restartTask(taskId, event) {
   if (event) { event.stopPropagation(); event.preventDefault(); }

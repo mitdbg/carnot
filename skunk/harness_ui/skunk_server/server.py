@@ -337,6 +337,8 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
                 "question_id": task.question_id,
                 "prompt": task.prompt,
                 "status": task.status.value,
+                "attempt_ids": [attempt.attempt_id for attempt in task.attempts],
+                "cup_submit_count": task.cup_submit_count,
                 "answer": candidate.answer_text if candidate else None,
                 "points": submission.points_awarded if submission else None,
                 "correct": submission.correct if submission else None,

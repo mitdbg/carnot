@@ -60,6 +60,7 @@ _ALLOWED_REQUEST_HEADERS = {
 _PROXY_ROUTES: list[tuple[str, str, Callable[[dict[str, Any]], str]]] = [
     ("POST", "/api/submit/{task_id:path}", lambda p: f"/api/submit/{p['task_id']}"),
     ("POST", "/api/restart/{task_id:path}", lambda p: f"/api/restart/{p['task_id']}"),
+    ("POST", "/api/rerun/{task_id:path}", lambda p: f"/api/rerun/{p['task_id']}"),
     (
         "POST",
         "/api/reviews/{review_id}/resolve",

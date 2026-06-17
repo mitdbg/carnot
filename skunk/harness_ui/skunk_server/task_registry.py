@@ -7,6 +7,8 @@ from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any
 
+from cup_kit.protocol import MAX_RESUBMITS
+
 from skunk_server.domain import (
     AnswerCandidate,
     Attempt,
@@ -91,6 +93,8 @@ class TaskRegistry:
         event: str = "",
     ) -> None:
         with self._lock:
+            if self._round.round_num != round_num:
+                self._round.resubmit_count = 0
             self._round.round_num = round_num
             self._round.status = status
             self._round.ends_at = ends_at
@@ -163,7 +167,10 @@ class TaskRegistry:
     ) -> tuple[QuestionTask, AnswerCandidate, SubmissionRecord]:
         with self._lock:
             task = self._require_task(task_id)
-            if task.status != TaskStatus.READY and not self._can_resubmit_failed_answer(task):
+            if task.status == TaskStatus.READY:
+                if task.cup_submit_count > 0 and not self._has_resubmits_available():
+                    raise TaskConflict("no resubmits remaining")
+            elif not self._can_resubmit_failed_answer(task):
                 raise TaskConflict(
                     f"task is not ready for submission; status={task.status}"
                 )
@@ -192,6 +199,32 @@ class TaskRegistry:
             self._set_status(task, TaskStatus.QUEUED)
             return task
 
+    def rerun_finished_task(self, task_id: str) -> QuestionTask:
+        with self._lock:
+            task = self._require_task(task_id)
+            if task.round_num != self._round.round_num or self._round.status != "ACTIVE":
+                raise TaskConflict("round is not active")
+            if task.status not in {
+                TaskStatus.READY,
+                TaskStatus.FAILED,
+                TaskStatus.SUBMITTED,
+                TaskStatus.SCORED,
+            }:
+                raise TaskConflict(f"task is not finished; status={task.status}")
+            task.current_attempt_id = None
+            task.attempts.clear()
+            task.answer_candidates.clear()
+            task.failures.clear()
+            task.submissions.clear()
+            task.cup_feedback.clear()
+            task.reviews.clear()
+            task.recompute_state = None
+            task.revising = False
+            task.review_lock_holder = None
+            task.review_lock_expires_at = None
+            self._set_status(task, TaskStatus.QUEUED)
+            return task
+
     def record_submission_accepted(
         self,
         task_id: str,
@@ -204,6 +237,10 @@ class TaskRegistry:
         with self._lock:
             task = self._require_task(task_id)
             submission = self._find_submission(task, local_submission_id)
+            if submission.status == SubmissionStatus.PENDING:
+                if task.cup_submit_count > 0:
+                    self._round.resubmit_count += 1
+                task.cup_submit_count += 1
             submission.status = SubmissionStatus.ACCEPTED
             submission.cup_submission_id = cup_submission_id
             submission.correct = correct
@@ -225,6 +262,10 @@ class TaskRegistry:
         with self._lock:
             task = self._require_task(task_id)
             submission = self._find_submission(task, local_submission_id)
+            if submission.status == SubmissionStatus.PENDING:
+                if task.cup_submit_count > 0:
+                    self._round.resubmit_count += 1
+                task.cup_submit_count += 1
             submission.status = SubmissionStatus.REJECTED
             submission.rejection_reason = reason
             task.cup_feedback.append(f"Cup submission rejected: {reason}")
@@ -412,6 +453,8 @@ class TaskRegistry:
             task = self._tasks.get(task_id)
             if task is None:
                 return None
+            if candidate.attempt_id not in {attempt.attempt_id for attempt in task.attempts}:
+                return None
             task.answer_candidates.append(candidate)
             if task.status in {
                 TaskStatus.READY,
@@ -577,7 +620,14 @@ class TaskRegistry:
     def _can_resubmit_failed_answer(self, task: QuestionTask) -> bool:
         if task.status not in {TaskStatus.SUBMITTED, TaskStatus.SCORED}:
             return False
-        if self._round.resubmits_left == 0:
+        if not self._has_resubmits_available():
             return False
         submission = task.submissions[-1] if task.submissions else None
         return submission is not None and submission.correct is False
+
+    def _has_resubmits_available(self) -> bool:
+        if self._round.resubmit_count >= MAX_RESUBMITS:
+            return False
+        if self._round.resubmits_left == 0:
+            return False
+        return True

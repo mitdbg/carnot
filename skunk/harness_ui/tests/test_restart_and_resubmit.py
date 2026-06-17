@@ -11,7 +11,9 @@ from skunk_server.task_queues import TaskQueues
 from skunk_server.task_registry import TaskConflict, TaskRegistry
 
 
-def _restart_endpoint(registry: TaskRegistry, queues: TaskQueues, published: list[bool]):
+def _command_endpoint(
+    registry: TaskRegistry, queues: TaskQueues, published: list[bool], path: str
+):
     app = FastAPI()
     install_command_routes(app)
     app.state.registry = registry
@@ -20,9 +22,9 @@ def _restart_endpoint(registry: TaskRegistry, queues: TaskQueues, published: lis
     app.state.broker = None
     app.state.publish_status = lambda: published.append(True)
     for route in app.routes:
-        if getattr(route, "path", "") == "/api/restart/{task_id:path}":
+        if getattr(route, "path", "") == path:
             return route.endpoint
-    raise AssertionError("restart route not installed")
+    raise AssertionError(f"{path} route not installed")
 
 
 def _json(response):
@@ -51,7 +53,9 @@ def test_restart_failed_no_answer_requeues_with_feedback() -> None:
     queues = TaskQueues()
     published: list[bool] = []
     task_id = _failed_no_answer_task(registry)
-    endpoint = _restart_endpoint(registry, queues, published)
+    endpoint = _command_endpoint(
+        registry, queues, published, "/api/restart/{task_id:path}"
+    )
 
     response = asyncio.run(
         endpoint(task_id, RestartTaskBody(client_id="me", feedback="try a simpler plan"))
@@ -122,6 +126,52 @@ def test_incorrect_scored_answer_can_resubmit_when_tokens_remain() -> None:
     assert registry.get(task.task_id).status == TaskStatus.SUBMITTING
 
 
+def test_resubmit_count_tracks_only_subsequent_cup_submits() -> None:
+    registry = TaskRegistry()
+    registry.update_round(round_num=1, status="ACTIVE", resubmits_left=3)
+    task, _ = registry.create_task(1, "Q1", "prompt")
+    attempt = registry.begin_attempt(task.task_id, "worker")
+    assert attempt is not None
+    assert registry.complete_attempt(
+        task.task_id,
+        attempt.attempt_id,
+        AnswerCandidate(
+            attempt_id=attempt.attempt_id,
+            answer_text="bad",
+            reasoning="reasoning",
+        ),
+    )
+    _task, _candidate, initial = registry.begin_candidate_submission(task.task_id)
+    registry.record_submission_accepted(
+        task.task_id,
+        initial.local_submission_id,
+        "cup-sub-1",
+        tokens_remaining=3,
+        correct=False,
+        points_awarded=0.0,
+    )
+    assert registry.round_state().resubmit_count == 0
+
+    _task, _candidate, retry = registry.begin_candidate_submission(task.task_id)
+    registry.record_submission_accepted(
+        task.task_id,
+        retry.local_submission_id,
+        "cup-sub-2",
+        tokens_remaining=2,
+        correct=False,
+        points_awarded=0.0,
+    )
+
+    task = registry.get(task.task_id)
+    assert task is not None
+    assert task.cup_submit_count == 2
+    assert registry.round_state().resubmit_count == 1
+
+    registry.update_round(round_num=2, status="ACTIVE", resubmits_left=3)
+
+    assert registry.round_state().resubmit_count == 0
+
+
 def test_incorrect_scored_answer_cannot_resubmit_without_tokens() -> None:
     registry = TaskRegistry()
     registry.update_round(round_num=1, status="ACTIVE", resubmits_left=0)
@@ -153,3 +203,45 @@ def test_incorrect_scored_answer_cannot_resubmit_without_tokens() -> None:
         assert "not ready" in str(error)
     else:
         raise AssertionError("resubmit should reject when no tokens remain")
+
+
+def test_rerun_finished_task_requeues_and_keeps_cup_submit_history() -> None:
+    registry = TaskRegistry()
+    registry.update_round(round_num=1, status="ACTIVE", resubmits_left=3)
+    queues = TaskQueues()
+    published: list[bool] = []
+    task, _ = registry.create_task(1, "Q1", "prompt")
+    attempt = registry.begin_attempt(task.task_id, "worker")
+    assert attempt is not None
+    assert registry.complete_attempt(
+        task.task_id,
+        attempt.attempt_id,
+        AnswerCandidate(
+            attempt_id=attempt.attempt_id,
+            answer_text="bad",
+            reasoning="reasoning",
+        ),
+    )
+    _task, _candidate, submission = registry.begin_candidate_submission(task.task_id)
+    registry.record_submission_accepted(
+        task.task_id,
+        submission.local_submission_id,
+        "cup-sub",
+        tokens_remaining=3,
+        correct=False,
+        points_awarded=0.0,
+    )
+    endpoint = _command_endpoint(registry, queues, published, "/api/rerun/{task_id:path}")
+
+    response = asyncio.run(endpoint(task.task_id, RestartTaskBody(client_id="me")))
+
+    assert _json(response) == (200, {"ok": True, "task_id": task.task_id})
+    task = registry.get(task.task_id)
+    assert task is not None
+    assert task.status == TaskStatus.QUEUED
+    assert task.attempts == []
+    assert task.answer_candidates == []
+    assert task.submissions == []
+    assert task.cup_submit_count == 1
+    assert queues.agent.get_nowait() == task.task_id
+    assert published == [True]

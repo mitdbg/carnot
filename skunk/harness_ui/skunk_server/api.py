@@ -347,3 +347,28 @@ def install_command_routes(app: FastAPI) -> None:
         except TaskConflict as error:
             return JSONResponse({"ok": False, "error": str(error)}, status_code=409)
         return JSONResponse({"ok": True, "task_id": task.task_id})
+
+    @app.post("/api/rerun/{task_id:path}")
+    async def rerun_task(task_id: str, body: RestartTaskBody) -> JSONResponse:
+        registry = app.state.registry
+        queues = app.state.queues
+        publish_status = app.state.publish_status
+        broker = app.state.broker
+        try:
+            if broker is not None:
+                holder = broker.get_lock_holder(task_id)
+                if holder is not None and holder != body.client_id:
+                    return JSONResponse(
+                        {"ok": False, "error": "Task is locked by another user"},
+                        status_code=409,
+                    )
+            task = registry.rerun_finished_task(task_id)
+            queues.enqueue_agent(task_id)
+            publish_status()
+        except KeyError:
+            return JSONResponse(
+                {"ok": False, "error": "task not found"}, status_code=404
+            )
+        except TaskConflict as error:
+            return JSONResponse({"ok": False, "error": str(error)}, status_code=409)
+        return JSONResponse({"ok": True, "task_id": task.task_id})

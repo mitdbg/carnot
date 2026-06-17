@@ -132,6 +132,7 @@ class QuestionTask:
     answer_candidates: list[AnswerCandidate] = field(default_factory=list)
     failures: list[FailureRecord] = field(default_factory=list)
     submissions: list[SubmissionRecord] = field(default_factory=list)
+    cup_submit_count: int = 0
     cup_feedback: list[str] = field(default_factory=list)
     reviews: list[HumanReview] = field(default_factory=list)
     # The snapshot (JSON form of orchestrator.RecomputeState) that produced the latest answer;
@@ -180,6 +181,7 @@ class RoundState:
     ends_at: datetime | None = None
     opens_at: datetime | None = None
     resubmits_left: int | None = None
+    resubmit_count: int = 0
     connection_status: str = "starting"
     last_event: str = ""
 

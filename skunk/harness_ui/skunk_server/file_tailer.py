@@ -75,6 +75,7 @@ class FileTailer:
         stream but still strictly increasing, which is all the seq-dedup needs."""
         out: list[tuple[int, str, dict]] = []
         max_seq = -1
+        visible_attempt_ids = self._visible_attempt_ids(task_id)
         try:
             with open(self._events_file, "rb") as handle:
                 for line in handle:
@@ -83,13 +84,29 @@ class FileTailer:
                     obj = _parse_line(line)
                     if obj is None or obj.get("task_id") != task_id:
                         continue
+                    attempt_id = obj.get("attempt_id", "")
+                    if (
+                        visible_attempt_ids is not None
+                        and attempt_id not in visible_attempt_ids
+                    ):
+                        continue
                     event = _compact_event(obj.get("event") or {})
                     seq = event.get("seq", 0)
-                    out.append((seq, obj.get("attempt_id", ""), event))
+                    out.append((seq, attempt_id, event))
                     max_seq = max(max_seq, seq)
         except FileNotFoundError:
             return [], 0
         return out, max_seq + 1
+
+    def _visible_attempt_ids(self, task_id: str) -> set[str] | None:
+        for task in self._status_cache.get("tasks") or []:
+            if task.get("task_id") != task_id:
+                continue
+            attempts = task.get("attempt_ids")
+            if isinstance(attempts, list):
+                return {str(attempt_id) for attempt_id in attempts}
+            return None
+        return None
 
     # ── poll loop (web main loop) ────────────────────────────────────────────
     async def run(self) -> None:
