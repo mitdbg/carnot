@@ -93,10 +93,9 @@ class SearchAgent(MultiTurnAgent):
     )
 
     final_answer_doc = """\
-A JSON object with the `doc_id`s you identified as relevant, under the key
-"page_keys":
+A JSON object with the `doc_id`s you identified as relevant, under the key "page_keys". Here is an example:
 ```json
-{"page_keys": ["2002_06_1", "2002_12_26"]}
+{"page_keys": ["combined_statement__historical__cs-1872_12", "govinfo_receipts__1893__SERIALSET-03108_00_00-002-0256-0000_3"]}
 ```
 Use each `doc_id` exactly as it appears in the search / grep results."""
 
