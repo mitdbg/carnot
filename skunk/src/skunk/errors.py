@@ -33,9 +33,9 @@ class ParseError(StepFailed):
     """A `PromptedCall` parser could not parse the model's raw reply. `call()`
     re-prompts once (echoing `raw` + `detail`); a survivor is terminal.
     `retryable=False` skips the re-prompt entirely — for defects re-prompting
-    cannot fix because the INPUT lacks what the reply needs (e.g. the extract
-    verbatim guard on a corrupt-OCR page), so the caller fails fast to its
-    fallback tier instead of burning escalating-temperature attempts."""
+    cannot fix because the INPUT lacks what the reply needs (not a misformatted
+    reply), so the caller fails fast to its fallback tier instead of burning
+    escalating-temperature attempts."""
     def __init__(self, raw: str, detail: str, *, retryable: bool = True):
         super().__init__("parse", detail)
         self.raw = raw

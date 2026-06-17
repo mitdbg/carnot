@@ -108,19 +108,17 @@ You clean a pool of already-extracted data values before it is handed to a downs
   .requested_period / .retrieve_key   the data window / concept this datum served
 
 ## What to do
-- REMOVE duplicates: when two entries are the same series, same period, and EXACT same value, keep one.
-- REMOVE irrelevant data: when a piece of data is clearly not what the question asks for -- remove it 
-- COALESCE overlapping ranges: sometimes the requested time period is reported across different prints in overlapping ranges.
-  Coalesce them, remove the duplicates, and present one complete, contiguous series. Be careful to only coalesce data from
-  the same series with the same accounting and reporting methods. When overlapping numbers disagree, replace any provisional/estimates
-  with the later actual values, unless the question specifically requests data of a particular version. Other disagreement may be caused by OCR errors, etc. Use your best judgement.
-- CLEAN data and remove any formatting issues, fix inconsistent labels, typos.
-- PRESERVE notes and other important description of the data.
-- PRESERVE each value's shape: keep the same `kind` and payload structure as the input (scalar primitive, vector `dict[str, scalar]`, table `dict[str, dict[str, scalar]]` — never re-nest, wrap, or restructure it).
-- NEVER fabricate, compute, convert units, or pull in outside data. Every value you emit must already be present in `input_values` (verbatim) or be a faithful coalescing of input entries.
+- Union rows split across pages: one logical table or series span consecutive pages, arriving as a vector/table per page. Merge them into one value containing every distinct member from every fragment.
+- Remove duplicates: keep one only when entries share series, period, and the same keys and values. Entries that merely cover different rows are not duplicates — union them.
+- Remove irrelevant data: drop data clearly unrelated to the question (a page's share of a needed multi-page table is not irrelevant).
+- Coalesce overlapping time ranges: when the requested period is reported across prints in overlapping ranges, merge them into one contiguous series. Only coalesce the same series with the same accounting/reporting methods. When overlapping numbers disagree, prefer later actual values over provisional/estimates unless the question asks for a specific version; other disagreements may be OCR errors — use your judgement.
+- Clean labels: fix inconsistent labels and typos. 
+- Preserve notes and other important description of the data.
+- Preserve each value's shape: keep the same `kind` and payload structure (scalar primitive, vector `dict[str, scalar]`, table `dict[str, dict[str, scalar]]`) — never re-nest, wrap, or restructure; a union just makes a larger vector/table of the same kind.
+- Never fabricate, compute, convert units, round, or pull in outside data. Every value you emit must already be present in `input_values`, or be a faithful coalescing/union of input entries.
 
 ## Output
-Emit exactly one fenced ```python``` block assigning `result` — the cleaned list — and nothing else (no prose, no second block). `result` is a list of dicts, ONE PER value you are keeping. Build each dict yourself (read the source data from `input_values[i].value`) — you are cleaning and coalescing, so emit the actual value, never an `input_values[i]` reference:
+Emit exactly one fenced ```python``` block assigning `result` — the cleaned list — and nothing else (no prose, no second block). `result` is a list of dicts, one per value you keep. The block is ordinary Python with `input_values` in scope, so build each dict's `value` whichever way fits: write a literal when you are hand-cleaning labels, deduping, or selecting values, or compute it from `input_values[i].value` when that is easier — e.g. union a table split across pages with `{**input_values[0].value, **input_values[1].value, ...}`. Copy numbers exactly, never rounded. Each dict:
   {"description": "...", "value": <scalar | vector dict | table dict>, "unit": "...",
    "notes": "...", "kind": "scalar"|"vector"|"table",
    "index_name"/"row_name"/"col_name": ... as the kind requires,

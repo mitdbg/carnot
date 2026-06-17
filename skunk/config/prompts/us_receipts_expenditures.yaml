@@ -7,10 +7,9 @@
 # Agents fish out their own entries at prompt-build time. See
 # src/skunk/prompted_call.py for the schema and how entries are consumed.
 #
-# Select this file at runtime via
-#   SKUNK_PROMPT_OVERRIDES=config/prompts/us_receipts_expenditures.yaml
-# (or `config.prompt_overrides_path`; the datagen harness maps the dataset
-# name us-receipts-expenditures -> this file).
+# This is the DEFAULT prompt-overrides file (`config.prompt_overrides_path`); override
+# at runtime with SKUNK_PROMPT_OVERRIDES=<path>. The datagen harness maps the dataset
+# name us-receipts-expenditures -> this file.
 #
 # The PDFs are IMAGE-ONLY scans (no text layer): all element text is OCR/VLM
 # output. Document identity lives in the filename slug; there is no in-document
@@ -38,7 +37,7 @@ overrides:
   - section: corpus
     targets: [planner, replanner, select_agent]
     content: |
-      Publication cadence: one volume per year (no monthly/quarterly issues).
+      Publication cadence: one volume per year.
         - govinfo_receipts: annual, publication years ~1793–1893 (with gaps;
           some years printed more than once; heterogeneous in scope — some
           whole-government, some a single department such as the Post Office).
@@ -73,12 +72,20 @@ overrides:
       unrelated to the 1995–2000 "transition" era.)
 
   - section: corpus
-    targets: [extract.text, extract.vision, extract.confirm]
+    targets: [extract.text, extract.vision]
     content: |
       The pages you receive are scanned images from the U.S. Combined Statement
       of Receipts and Expenditures (or the early govinfo receipts volumes).
-      There is no text layer — the text is OCR-derived; read values exactly as
-      printed and do not "correct" them to expectation.
+
+  - section: corpus
+    targets: [extract.text, extract.vision]
+    content: |
+      Money may print cents space-separated (chiefly 19th-century / early scanned
+      volumes): "$8,008 50" means 8,008 dollars 50 cents. When a value is digits +
+      a space + a final 1-2 digit group, read it as dollars.cents and emit the
+      canonical number 8008.50 (strip "$" and thousands separators; ignore a
+      trailing footnote ref like "2/"). Period-decimal values ("8,008.50") and
+      whole values emit as-is. Always emit the number, not the spaced string.
 
   - section: corpus
     targets: [select_agent]
@@ -140,66 +147,6 @@ overrides:
         `page_header`, `page_footer`, `page_number`, `footnote`, `figure`,
         `caption`.
 
-      The index is ChromaDB: filters support equality, `$and`, `$or`, `$in`
-      (no substring/prefix match). Illustrative shape (substitute the index's
-      configured field names):
-      ```python
-      # all pages of the FY2001 Schedule 3
-      {"$and": [{"era": "modern"}, {"year": "2001"}, {"section": "sc3"}]}
-      # the whole FY1968 Combined Statement (monolithic — no section code)
-      {"$and": [{"collection": "combined_statement"}, {"year": "1968"}]}
-      # govinfo data for the year 1825 lives in volumes PUBLISHED ~1826–1827
-      {"$and": [{"collection": "govinfo_receipts"}, {"year": {"$in": ["1826", "1827"]}}]}
-      ```
-
-  # ---------------------------------------------------------------------
-  # Page-index build family — per-page scan, ToC extraction/reconstruction,
-  # and the cross-issue chapter merge + era segmentation. All reason over the
-  # same section taxonomy, so they share this corpus blurb.
-  # ---------------------------------------------------------------------
-  - section: corpus
-    targets: [page_scan, page_scan_vision, toc_outline, toc_reconstruct, chapter_merge, era_segment, era_merge]
-    content: |
-      The pages are from the U.S. Combined Statement of Receipts and
-      Expenditures — annual federal receipts, expenditures, and balances by
-      fund, source, and organizational unit. Two document SERIES exist and are
-      segmented differently:
-        - Detailed "Combined Statement" / "Appendix": stable taxonomy of front
-          matter (transmittal letters → preface → CONTENTS) → PART ONE..FIVE →
-          TABLE A–H → Schedule 1..N → organizational-unit breakdowns. This is
-          the lineage the modern per-chapter files (cNN / scN) descend from;
-          monolithic through the 1970s, pre-split per chapter in the modern era
-          and the 1998–2000 transition "appendix".
-        - Slim "Annual Report" (Treasury's annual financial report, ~1974 on;
-          the FY1990 volume was compiled by the Financial Management Service;
-          the transition "annrpt" volumes): narrative sections only — Preface,
-          Secretary's Letter, Financial Highlights, Financial Review, Financial
-          Statements, Notes.
-      Resolve relative/partial dates against the document's fiscal year
-      (combined_statement) or publication year (govinfo). Segment at the
-      Table/Schedule level (PART/SECTION too coarse, pages too fine); anchor
-      every boundary on `page_id`, never the printed page number.
-
-  - section: lessons
-    targets: [page_scan, page_scan_vision]
-    content: >
-      A cumulative / multi-year contents grid (often at the back of a volume)
-      is NOT that volume's table of contents; label it non_content. The
-      transmittal letters and CONTENTS pages at the front are not body sections.
-      Treat repeated running banners ("SUMMARY STATEMENTS") and "— Continued"
-      headers as continuations, not new sections.
-
-  - section: lessons
-    targets: [toc_outline, toc_reconstruct]
-    content: |
-      ToC presence depends on era/series: 1872–1920 detailed volumes have NO front ToC (segment from in-body ALL-CAPS organizational headings like "INDEPENDENT TREASURY", "MINTS AND ASSAY OFFICES"); 1921–1973 detailed volumes and the slim Annual Reports have a front ToC; 1995–2000 detailed appendices have a front (sometimes also back) ToC; 2001+ documents are pre-split per chapter and need no ToC parse.
-      When a CONTENTS table is present, read it as (section title, printed page) pairs, then resolve each printed page to a `page_id` via the page_number elements (interpolate across unnumbered / Roman front-matter / plate pages). Validated example: a 1968 ToC entry "Table A ... 8" resolves to page_id 18, where the TABLE A title actually appears. Normalize OCR heading variants before matching ("Table A.", "TABLE A —", "Table A - Schedule 8" are one family).
-
-  - section: lessons
-    targets: [era_segment, era_merge, chapter_merge]
-    content: |
-      Respect the FY1976→FY1977 fiscal-basis change (July-start through FY1976, October-start from FY1977) when aligning years across eras; the 1976 transition quarter belongs to no fiscal year.
-      Modern (2001+) and 1998–2000 transition "appendix" documents are already one-chapter-per-file — take the section from the slug, do not re-segment. Align the same section across issues by its printed Table/Schedule label, not by the printed page number.
 
   # ---------------------------------------------------------------------
   # Planner lessons — gotchas observed against this corpus.
@@ -379,8 +326,12 @@ overrides:
       parenthetical legend, or footnote ("(In thousands of dollars)"). Never
       guess from magnitude. Tables are OCR-derived: a cell rendered as the
       string "nan" is an EMPTY cell, not data; values may be exact dollars with
-      cents; one cell can pack several tokens (two appropriation symbols
-      "86X4070 86X4072") — keep them verbatim, do not split or invent.
+      cents. Appropriation / Treasury account symbols (agency code + availability
+      code + account number, e.g. "20X0138", "86X4058"; the middle "X" marks a
+      no-year account, and a year or year-range may appear there instead) are
+      IDENTIFIER strings, NOT numeric values — never read them as numbers. One
+      cell can pack several, comma- or space-separated ("20X0138, 20X0139"); keep
+      the cell verbatim — do not split, reformat, or invent.
 
   - section: lessons
     targets: [extract.text, extract.vision]
@@ -397,6 +348,32 @@ overrides:
       volumes are titled "Receipts and Disbursements" and label outflows
       "disbursements", while govinfo and modern volumes say "expenditures" —
       treat them as the same series but record the page's verbatim term.
+
+  - section: lessons
+    targets: [extract.text, extract.vision]
+    content: >
+      When the question needs a whole column or list — every state, every
+      collection district, all accounts — extract the complete column on the page
+      (every row), not only the rows that name entities in the question. A table
+      continued from a previous page still lists its own rows; extract all of them
+      so a downstream step can assemble the full series across pages.
+
+  - section: lessons
+    targets: [extract.text, extract.vision, search_agent]
+    content: >
+      Implicit headers in the early ledgers. The pre-1900 govinfo / historical
+      volumes (the "Account of Receipts and Expenditures", kept warrant-by-warrant
+      by the Treasury's Division of Bookkeeping and Warrants) print NO column-header
+      row: a table opens straight into positional columns — date, warrant number,
+      payee / description, amount (dollars and cents, the cents sometimes
+      space-separated, e.g. "5,313 75"). Read these columns by position, not by a
+      header. The account each row belongs to is named ABOVE the rows — the block
+      title (e.g. "Awards under the First Article of the Treaty of Ghent") and the
+      running page banner repeated at the top of every page of that account (e.g.
+      "INTERCOURSE WITH FOREIGN NATIONS") — and a "Brought forward" line is the
+      running subtotal carried from the previous page. A page (or scan block) whose
+      column_headers are empty is this layout, not missing data or a failed parse;
+      use the title / banner as the labels.
 
   # ---------------------------------------------------------------------
   # Few-shots for compute executors.

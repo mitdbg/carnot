@@ -149,20 +149,20 @@ that the value should be looked up externally.
 retrieve branch fields:
   key           natural-language phrase describing the data to find — one singular, cohesive
                 concept per branch; favor separate branches for distinct concepts. Examples:
-                "national defense expenditures", "weekly average discount rate for new 91-day bills".
+                "national defense expenditures", "gross customs receipts by collection district".
                 Never emit two branches for the same underlying table/statistic worded
-                differently (one auction's bids, allotments, and totals = one branch).
+                differently (one schedule's gross, deductions, and net columns = one branch).
                 Same concept over several periods = one branch with a comma-separated period.
   period        the period the DATA pertains to, as canonical months: "YYYY-MM", an
                 inclusive "YYYY-MM..YYYY-MM" range, or a comma-separated list of these —
                 expand fiscal years, calendar years, and quarters to month ranges. Null
                 when the question doesn't pin a data period. A named publication/print
-                issue ("as reported in the September 2012 Bulletin") is NOT the period and
-                is NOT encoded in the plan — selection chooses which issue to read.
+                volume ("as reported in a later annual volume") is NOT the period and
+                is NOT encoded in the plan — selection chooses which volume to read.
   page_pin      set ONLY when the question addresses data by an explicit page NUMBER of a
-                specific document ("on page 5 of the September 1990 issue"). Both fields
+                specific document ("on page 5 of the 1890 Combined Statement"). Both fields
                 required: {"doc_id": the source document the page is in, as the question
-                identifies it (issue/year), "page": <int> (the number exactly as written)}.
+                identifies it (volume/year), "page": <int> (the number exactly as written)}.
                 The page number is taken as-is — retrieval resolves both the printed-label
                 and the PDF-index page and leaves the choice downstream, so do not convert
                 it. Null for normal content/period retrieval; put what to read on that page in `key`.
@@ -221,7 +221,7 @@ Rules:
     _replan_prompt = PromptedCall(
         name="replanner",
         system_prompt=f"{_INITIAL_PLAN_PROMPT}\n\n{_REPLAN_INSTRUCTIONS}",
-        default_effort="medium",
+        default_effort="high",
         parse=_parse_replan,
         output_instruction="Output the Plan as a single bare JSON object — no markdown fences, no prose.",
     )

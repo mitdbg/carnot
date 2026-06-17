@@ -100,9 +100,19 @@ _URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# DAIS doc-id token: "<doc_id_stem>:<page>[,<page>...]" — e.g.
+# `combined_statement__historical__cs-1890:5,6,7`. The stem carries no colon (it uses
+# `__`/`-`), so the last `:` cleanly splits doc from its comma-separated pages. URLs (which
+# contain `/` and `?page=`) never match this, so the two source_docs forms can't collide.
+_DOC_TOKEN_RE = re.compile(r"^(?P<doc>[\w][\w\-]*):(?P<pages>\d+(?:,\d+)*)$")
+
 
 def _parse_source_docs(source_docs: str) -> list[PageRef]:
-    """Extract every (year, month, page) tuple from a source_docs cell."""
+    """Parse a `source_docs` cell into golden `PageRef`s. Two accepted forms (mixable):
+      * Treasury month-year URLs `.../january-2002...?page=5` -> `PageRef(month="2002-01", page=5)`
+      * DAIS doc-id tokens `combined_statement__historical__cs-1890:5,6,7`
+        -> one `PageRef(month=<doc_id>, page=N)` per page (the `month` slot holds the doc id
+        in the rekeyed corpus)."""
     out: list[PageRef] = []
     if not isinstance(source_docs, str):
         return out
@@ -111,6 +121,11 @@ def _parse_source_docs(source_docs: str) -> list[PageRef]:
         out.append(
             PageRef(month=f"{m.group('year')}-{month_mm}", page=int(m.group("page")))
         )
+    for tok in source_docs.split():
+        m = _DOC_TOKEN_RE.match(tok)
+        if m:
+            for pg in m.group("pages").split(","):
+                out.append(PageRef(month=m.group("doc"), page=int(pg)))
     return out
 
 

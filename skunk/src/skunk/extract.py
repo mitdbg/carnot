@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from collections.abc import Callable, Iterator
 from typing import Any
 
 from skunk.common import (
@@ -18,7 +17,7 @@ from skunk.common import (
 from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.plan import RetrieveBranch
-from skunk.page_index.data_model import continuation_chain
+from skunk.page_index.data_model import inherited_column_headers
 from skunk.page_index.store import PageStore, get_page_store
 
 
@@ -170,39 +169,6 @@ def _parse_extract_response(raw: str, ctx: ExecutionContext) -> list[AnnotatedVa
     return entries
 
 
-def _make_text_parse(
-    content: str,
-) -> Callable[[str, ExecutionContext], list[AnnotatedValue]]:
-    """Build the text-tier parse hook: shape-validate via `_parse_extract_response`,
-    then verify every emitted cell appears verbatim in `content` (the source page text).
-    A non-verbatim cell is a transcription/hallucination error the model should fix, so
-    raise `ParseError` (→ `call()` re-prompts) listing the offenders. `content` is
-    captured per call, so this is built fresh for each extract call."""
-
-    def parse(raw: str, ctx: ExecutionContext) -> list[AnnotatedValue]:
-        entries = _parse_extract_response(raw, ctx)
-        violations: list[str] = []
-        for e in entries:
-            for path, v in _cells_with_path(e):
-                if not _cell_in_text(v, content):
-                    loc = "/".join(path) if path else e.description
-                    violations.append(f"{e.description!r} [{loc}] = {v!r}")
-        if violations:
-            # Non-retryable: a verbatim miss on parsed text almost always means the OCR
-            # lacks the digits (corrupt scan), not that the model misformatted — re-prompting
-            # at higher temperature cannot conjure them, so fail straight to the vision tier.
-            raise ParseError(
-                raw,
-                "these values do NOT appear verbatim in the page text — extract only "
-                "printed values, transcribing every digit exactly:\n"
-                + "\n".join(violations),
-                retryable=False,
-            )
-        return entries
-
-    return parse
-
-
 def _stamp_provenance(
     entries: list[AnnotatedValue],
     refs: list[PageRef],
@@ -234,36 +200,6 @@ def _stamp_provenance(
     ]
 
 
-def _cells_with_path(entry: AnnotatedValue) -> Iterator[tuple[tuple[str, ...], Any]]:
-    """Yield (key_path, primitive_cell) for every cell in `entry.value`."""
-    if entry.kind == "scalar":
-        yield (), entry.value
-    elif entry.kind == "vector":
-        for k, v in entry.value.items():
-            yield (k,), v
-    elif entry.kind == "table":
-        for rk, row in entry.value.items():
-            for ck, v in row.items():
-                yield (rk, ck), v
-
-
-def _cell_in_text(value: int | float | str, text: str) -> bool:
-    """True if primitive `value` appears verbatim in `text`. Integer-valued numerics
-    also try the comma-formatted form (2582 → "2,582"); strings are case-insensitive."""
-    if isinstance(value, str):
-        return value.strip().lower() in text.lower()
-    candidates: set[str] = {str(value)}
-    is_int_valued = isinstance(value, int) or (
-        isinstance(value, float) and value == int(value)
-    )
-    if is_int_valued:
-        iv = int(value)
-        candidates.add(str(iv))
-        if abs(iv) >= 1000:
-            candidates.add(f"{iv:,}")
-    return any(c in text for c in candidates)
-
-
 # Shared envelope spec (shape + field semantics + output rules) appended to each
 # extract tier's system prompt (after the tier's own `_PREAMBLE`).
 EXTRACT_COMMON_PROMPT = """\
@@ -289,8 +225,10 @@ Cells should be simple number or string — no nested cells. A numeric cell is
 a bare number: keep print flags (r, p) and footnote markers (2/) out of the
 value; record these instead in `notes`.
 
-Transcribe numbers exactly as printed — every digit and decimal place;
-never round, truncate, or drop trailing digits.
+Transcribe a number's digits exactly — every digit and decimal place; never
+round, truncate, or drop trailing digits. You may normalize only a value's
+FORMAT per the corpus notes (e.g. space-separated cents -> a decimal point),
+never its digits.
 
 ## Field semantics
 
@@ -327,6 +265,32 @@ _EXTRACT_OUTPUT_INSTRUCTION = (
 )
 
 
+def _continuation_context(page: PageRef, ctx: ExecutionContext) -> str:
+    """Extra read context for a header-less continuation page, in place of fetching its
+    predecessor pages: (1) the column grammar inherited from the run head (`inherited_column_headers`)
+    so unlabeled cells can be placed, and (2) the page's OWN block summaries — the account it
+    reports, which a banner-only continuation page's text may not state (its account heading is on
+    an earlier page). Empty string for a normal (non-continuation) page. Shared by both tiers."""
+    store = get_page_store(str(ctx.config.pdf_dir))
+    sc = store.summary(page)
+    if sc is None or not getattr(sc, "is_continuation", False):
+        return ""
+    lines: list[str] = []
+    inh = inherited_column_headers(page, store.summary)
+    if inh:
+        # Only the column ORDER is inherited (stable across the run); the account is NOT — it can
+        # change mid-run, so it's left to the page's own summaries/titles below, not the head's.
+        cols = inh[2]
+        lines.append(
+            "This page's table opens directly into data columns; its header row is on an earlier "
+            f"page (not reprinted here). Columns, left to right: {cols}."
+        )
+    summaries = [b.summary for b in sc.blocks if b.summary]
+    if summaries:
+        lines.append("This page reports: " + " / ".join(summaries))
+    return "\n".join(lines)
+
+
 class TextExtractor:
     _PREAMBLE = """\
 You retrieve printed values from page text to fulfill a specific lookup. The
@@ -334,10 +298,9 @@ user message gives the lookup (and period, when stated), the question it
 serves, page metadata (each block's title), and the page text. Work out from
 the table markup in the text which column/row a value sits under, the
 period, and the units. Emit all data that could satisfy the lookup, including partial
-matches. Extract only what is printed — never compute or transform; every
-numeric value must appear verbatim in the page text (metadata is context, not
-a source of values). A period `YYYY-MM..YYYY-MM` is an inclusive month
-range."""
+matches. Extract only printed values — never compute, derive, or invent one
+(metadata is context, not a source of values). A period `YYYY-MM..YYYY-MM` is
+an inclusive month range."""
 
     _SYSTEM = _PREAMBLE + "\n\n" + EXTRACT_COMMON_PROMPT
 
@@ -410,16 +373,17 @@ range."""
                 content,
             ]
         )
-        # Parse hook validates shape AND verbatim-checks every cell against `content`.
-        # A shape defect raises a retryable ParseError, so `call()` re-prompts (escalating
-        # temperature) before giving up; a verbatim miss raises non-retryable and fails
-        # immediately. Either way the group degrades to empty and the operator falls
-        # through to the vision tier.
+        # Parse hook validates SHAPE only (valid AnnotatedValue array, distinguishable
+        # entries); a shape defect raises a retryable ParseError so `call()` re-prompts
+        # (escalating temperature) before degrading the group to empty. Exact transcription
+        # is a PROMPT-level instruction (like data_prep/compute), NOT a parse-level check —
+        # the old verbatim gate was net-negative, mostly false-rejecting format variants
+        # (comma floats, parenthesized negatives, space-cents) and downgrading good pages.
         prompt: PromptedCall[list[AnnotatedValue]] = PromptedCall(
             name="extract.text",
             system_prompt=self._SYSTEM,
-            default_effort="low",  # verbatim transcription, not reasoning
-            parse=_make_text_parse(content),
+            default_effort="low",  # transcription, not reasoning
+            parse=_parse_extract_response,
             output_instruction=_EXTRACT_OUTPUT_INSTRUCTION,
         )
         try:
@@ -435,26 +399,22 @@ range."""
         pages: list[PageRef], store: "PageStore"
     ) -> list[tuple[PageRef, list[PageRef]]]:
         """Expand each unique retrieved page (first-seen order) to the physical pages an extract
-        call must read: its `is_continuation` predecessor chain (the earlier pages carrying the
-        table's column headers) PREPENDED so headers come first, then the page itself (and any
-        folded continuation pages), then its linked `notes_pages` (footnote definitions) appended.
-        So whoever reads a header-less or footnote-citing page also reads the pages it depends on.
-        Returns `(page, refs)` per page — one extract call each."""
+        call must read: the page itself (and any folded continuation pages), then its linked
+        `notes_pages` (footnote definitions) appended. A header-less continuation page does NOT
+        pull in its predecessor text — the column grammar it needs is injected as a compact
+        metadata line (`inherited_column_headers`) instead, so a deep continuation reads one page
+        rather than its whole multi-page run. Returns `(page, refs)` per page — one extract call
+        each."""
         out: list[tuple[PageRef, list[PageRef]]] = []
         seen: set[PageRef] = set()
         for p in pages:
             if p in seen:
                 continue
             seen.add(p)
-            # Header-bearing predecessor chain first, so the read sees column headers.
-            refs = list(continuation_chain(p, store.summary))
             sc = store.summary(p)
             # The page itself plus any folded continuation pages (the table's tail).
             members = [p.page, *sc.continuation_pages] if sc is not None else [p.page]
-            for pg in members:
-                r = PageRef(month=p.month, page=pg)
-                if r not in refs:
-                    refs.append(r)
+            refs = [PageRef(month=p.month, page=pg) for pg in members]
             if sc is not None:  # linked footnote/notes pages last (auxiliary context)
                 for n in sc.notes_pages:
                     r = PageRef(month=p.month, page=n)
@@ -472,9 +432,10 @@ range."""
         ctx: ExecutionContext,
         looking_for: str | None = None,
     ) -> list[AnnotatedValue]:
-        """Extraction for one retrieved page: feed its `refs` (the page plus its header-bearing
-        predecessor chain and linked notes pages) FULL text — no within-page slicing — annotated
-        with the pages' full content-block metadata to orient the read at the right table(s)."""
+        """Extraction for one retrieved page: feed its `refs` (the page plus its linked notes
+        pages) FULL text — no within-page slicing — annotated with the pages' content-block
+        metadata, plus, for a header-less continuation page, the inherited column grammar and the
+        page's own block summaries (`_continuation_context`) in place of its predecessor text."""
         texts = self._fetch_page_texts(refs, ctx)
         if not texts:
             ctx.emit(
@@ -484,6 +445,9 @@ range."""
         content = "\n\n".join(text for _, text in texts)
         prov_refs = [r for r, _ in texts]
         metadata = self._page_metadata(prov_refs, ctx)
+        cont = _continuation_context(page, ctx)
+        if cont:
+            metadata = f"{cont}\n{metadata}" if metadata else cont
         ctx.emit(
             f"page_scoped page={str(page)} n_pages={len(texts)} chars={len(content)}"
         )
@@ -525,8 +489,8 @@ lookup. The user message gives the lookup (and period, when stated), the
 question it serves, and a numbered list of the attached images. Emit every
 visible value that could plausibly satisfy the lookup, including partial matches.
 When the question asks for visual understanding of a chart (e.g. counting bars above a threshold),
-you may directly answer the question. Otherwise, extract only what is visibly printed — never compute or
-transform. A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
+you may directly answer the question. Otherwise, extract only what is visibly printed — never compute,
+derive, or invent. A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
 
     _prompt = PromptedCall(
         name="extract.vision",
@@ -544,20 +508,23 @@ transform. A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
         rendered_refs: list[PageRef],
         ctx: ExecutionContext,
         looking_for: str | None = None,
+        extra_context: str | None = None,
     ) -> list[AnnotatedValue]:
         """One vision call over the rendered page images. The numbered image list
         maps each attachment back to its source page so the LLM can't conflate them.
         `looking_for` overrides the single-key opening line — the seam for a caller
-        whose one page read serves SEVERAL retrieval goals at once."""
+        whose one page read serves SEVERAL retrieval goals at once. `extra_context`
+        carries a header-less continuation page's inherited column grammar / own summaries."""
         period = f" for the period {branch.period}" if branch.period else ""
         image_lines = [
-            f"Image {i + 1}: PDF page {ref.page} of the {ref.month} Treasury Bulletin"
+            f"Image {i + 1}: PDF page {ref.page} of document {ref.month}"
             for i, ref in enumerate(rendered_refs)
         ]
         user_msg = "\n\n".join(
             [
                 looking_for or f"You are looking for {branch.key}{period}.",
                 f'For full context, this lookup serves to help answer the question: "{question}"',
+                *([extra_context] if extra_context else []),
                 "Images attached, in order:\n" + "\n".join(image_lines),
             ]
         )
@@ -628,7 +595,8 @@ async def _extract_page(
     if not images:
         return []
     return await _VISION.run(
-        ctx.question, branch, images, rendered_refs, ctx, looking_for=looking
+        ctx.question, branch, images, rendered_refs, ctx, looking_for=looking,
+        extra_context=_continuation_context(page, ctx) or None,
     )
 
 
