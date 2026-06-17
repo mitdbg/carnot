@@ -85,7 +85,7 @@ overrides:
       - `month`: zero-padded string, e.g. `"03"` (only `"03"`, `"06"`, `"09"`, `"12"` from 1983 onward).
       - `page_id`: integer, the index of the page within its bulletin.
       - `doc_id`: string, the full page key (see above).
-      - `type`: string, the element type (`"text"`, `"title"`, `"table"`, ...).
+      - `type`: string, the element type (`"text"`, `"title"`, `"table"`, `"footnote"`, ...).
 
       ### Example `metadata_filter` clauses
       ```python

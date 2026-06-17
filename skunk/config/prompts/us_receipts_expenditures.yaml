@@ -5,10 +5,10 @@
 # Same schema and style as config/prompts/treasury_bulletin.yaml: each entry
 # adds a corpus blurb, a list of few-shot example strings, or a list of lessons
 # to one or more target agents (matched by the agent's `name`). Corpus facts,
-# behavioral lessons, and few-shot examples are all in scope. The one thing
-# intentionally left out is HARNESS plumbing — the retrieval index contract
-# (doc_id/chunk_id string format, metadata_filter key names, page base) — which
-# belongs to the index build, not this corpus profile.
+# behavioral lessons, and few-shot examples are all in scope. As in
+# treasury_bulletin.yaml, the search_agent blurb additionally carries the
+# retrieval index contract (file_id/doc_id/chunk_id string format,
+# metadata_filter key names) it needs to drive its corpus tools.
 #
 # The PDFs are image-only scans (no text layer): all element text is
 # OCR/VLM-transcribed. Document identity lives in the filename slug.
@@ -92,8 +92,9 @@ overrides:
       Annual Report (summary) and the detailed Appendix (line item).
 
   # Renders under the search-agent SYSTEM prompt's `## Dataset` header.
-  # The index contract (doc_id/chunk_id format, metadata_filter keys, page base)
-  # is intentionally NOT here — it belongs to the index build.
+  # Like treasury_bulletin.yaml's search_agent blurb, this carries the index
+  # contract (file_id/doc_id/chunk_id format, metadata_filter keys) the agent
+  # needs to drive its search_corpus / grep_corpus / read_document tools.
   - section: corpus
     targets: [search_agent]
     content: |
@@ -103,8 +104,8 @@ overrides:
       plus the early govinfo receipts-and-expenditures volumes (annual;
       publication years ~1793–1893, heterogeneous — some whole-government, some
       a single department such as the Post Office). Each source document is
-      split into pages. The PDFs are image-only scans, so all text and tables
-      are OCR/VLM-extracted.
+      split into pages, and each page into elements. The PDFs are image-only
+      scans, so all text and tables are OCR/VLM-extracted.
 
       Combined_statement filenames encode the era (historical / transition /
       modern), the fiscal year, and a section/chapter code: `cNN` chapter, `scN`
@@ -112,10 +113,65 @@ overrides:
       `outlay`, `finhigh`, `sur`, `receipt`, `*ltr` (transmittal letters).
       Modern chapter codes are stable across years; monolithic historical
       volumes carry no section code. Govinfo filenames carry the PUBLICATION
-      year, and its data is for ~1–2 years earlier. A page's printed page number
-      (OCR'd, mixing Roman and Arabic numerals, with gaps) is not its position
-      within the document. Element types are: text, title, table, section_header,
-      page_header, page_footer, page_number, footnote, figure, caption.
+      year and an opaque GovInfo document id, and the data is for ~1–2 years
+      earlier. A page's printed page number (OCR'd, mixing Roman and Arabic
+      numerals, with gaps) is not its position within the document.
+
+      ### Identifier formats
+      - `file_id`: `"<collection>__<source>__<slug>"` — one source document.
+        `<collection>` is `combined_statement` or `govinfo_receipts`. For
+        combined_statement, `<source>` is the era (`historical` / `transition` /
+        `modern`); for govinfo_receipts it is the publication year. The `<slug>`
+        carries the year and section/chapter (see filename codes above). Examples:
+        `"combined_statement__historical__cs-1872"` (monolithic, one file per
+        fiscal year), `"combined_statement__modern__2001__c01"` (year + chapter
+        code), `"combined_statement__transition__CS_1995_Appendix"` /
+        `"combined_statement__transition__annrpt95"`,
+        `"govinfo_receipts__1827__GOVPUB-T-<hash>"` (also `SERIALSET-...` ids).
+      - `doc_id`: `"<file_id>_<page_id>"` (e.g. `"combined_statement__historical__cs-1872_5"`
+        = page index 5 of that file). `page_id` is the page's index in the file,
+        NOT the printed page number on the page itself (these differ).
+      - `chunk_id`: `"<doc_id>_<element_id>"` (e.g. `"combined_statement__historical__cs-1872_5_1"`
+        = element 1 on page index 5 of that file).
+      - In your final answer, the `page_keys` list holds `doc_id`s in the format above.
+
+      ### Available metadata fields (for use with `metadata_filter`)
+      Every chunk has the following metadata you can filter on:
+      - `year`: integer, e.g. `1872` (NOT a zero-padded string). For
+        combined_statement this is the REPORTING fiscal year; for govinfo_receipts
+        it is the PUBLICATION year (data is for ~1–2 years earlier). Range 1793–2024.
+      - `source`: string, one of `"historical"`, `"transition"`, `"modern"` (the
+        three combined_statement eras) or `"govinfo_receipts"`.
+      - `file_id`: string, the source document (see above).
+      - `doc_id`: string, the full page key (see above).
+      - `page_id`: integer, the index of the page within its file.
+      - `element_id`: integer, the index of the element within its page.
+      - `type`: string, the element type. The complete set is `"table"`,
+        `"section_header"`, `"text"`, `"title"`, `"footnote"`, `"caption"`.
+
+      ### Example `metadata_filter` clauses
+      ```python
+      # all elements from documents reporting/published in 1885
+      {"year": 1885}
+
+      # modern-era combined_statement (FY2001 on), tables only
+      {"$and": [
+          {"source": "modern"},
+          {"type": "table"},
+      ]}
+
+      # govinfo receipts volumes published across the 1820s
+      {"$and": [
+          {"source": "govinfo_receipts"},
+          {"year": {"$in": list(range(1820, 1830))}},
+      ]}
+
+      # a single document, restricted to table elements
+      {"$and": [
+          {"file_id": "combined_statement__historical__cs-1872"},
+          {"type": "table"},
+      ]}
+      ```
 
   # ---------------------------------------------------------------------
   # Page-index build family — per-page scan, ToC extraction/reconstruction,
