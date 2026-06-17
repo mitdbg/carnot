@@ -254,15 +254,26 @@ def _build_user_prompt(seed_chunks, examples, n_qa_pairs, n_chunks) -> str:
     return "\n".join(lines)
 
 
-def _agent_config(model_id: str, emb_model_id: str, provider: str, max_steps: int) -> SkunkConfig:
-    """SearchAgent SkunkConfig. genai uses the bare model id; openrouter the full id."""
+def _agent_config(
+    model_id: str, emb_model_id: str, provider: str, max_steps: int,
+    pdf_dir: str | None = None, page_renders_dir: str | None = None,
+) -> SkunkConfig:
+    """SearchAgent SkunkConfig. genai uses the bare model id; openrouter the full id. `pdf_dir`
+    (+ optional pre-rendered `page_renders_dir`) point the figure-viewing tool at the DAIS PDFs /
+    page-render cache so ``view_figure`` works for this corpus."""
     agent_model = model_id if provider == "openrouter" else model_id.removeprefix("google/")
+    extra: dict = {}
+    if pdf_dir:
+        extra["pdf_dir"] = pathlib.Path(pdf_dir)
+    if page_renders_dir:
+        extra["page_renders_dir"] = pathlib.Path(page_renders_dir)
     return SkunkConfig(
         agent_model_id=agent_model,
         emb_model_id=emb_model_id,
         llm_provider=provider,  # type: ignore[arg-type]
         agent_max_steps=max_steps,
         agent_max_pages_per_tool_call=MAX_PAGES_PER_TOOL_CALL,
+        **extra,
     )
 
 
@@ -281,6 +292,8 @@ def generate_one(
     n_examples: int,
     n_qa_pairs: int,
     show_output: bool,
+    pdf_dir: str | None = None,
+    page_renders_dir: str | None = None,
 ) -> list[QAPair]:
     """One synthesis run -> list of QAPair (empty on failure)."""
     rng = random.Random(seed)
@@ -300,7 +313,7 @@ def generate_one(
 
     os.makedirs(trace_dir, exist_ok=True)
     trace_path = f"{trace_dir}/{seed}_trace.txt"
-    config = _agent_config(model_id, emb_model_id, provider, AGENT_MAX_STEPS)
+    config = _agent_config(model_id, emb_model_id, provider, AGENT_MAX_STEPS, pdf_dir, page_renders_dir)
     ctx = ExecutionContext(question=user_prompt, config=config, log_path=trace_path, verbose=show_output)
     try:
         agent = QASynthAgent(
@@ -319,12 +332,24 @@ def generate_one(
     pairs: list[QAPair] = []
     for i, p in enumerate(raw_pairs):
         chunk_ids = [str(c) for c in p.get("chunk_ids", [])]
-        doc_ids = sorted({chunk_id_to_doc_id[c] for c in chunk_ids if c in chunk_id_to_doc_id})
+        mapped = [c for c in chunk_ids if c in chunk_id_to_doc_id]
+        doc_ids = sorted({chunk_id_to_doc_id[c] for c in mapped})
+        # The generator can emit malformed chunk_ids (esp. for govinfo file_ids with many
+        # underscores/hyphens). A pair with NO mappable chunk_id has empty provenance and would
+        # enter the funnel with a null doc-recall (silently kept) — drop it. Partial misses are
+        # fine (the pair still has ≥1 valid supporting doc); just warn so they're visible.
+        if not doc_ids:
+            print(f"  [datagen] seed {seed} qa {seed}-{i}: dropping — no valid chunk_ids "
+                  f"(emitted {chunk_ids!r})")
+            continue
+        if len(mapped) < len(chunk_ids):
+            print(f"  [datagen] seed {seed} qa {seed}-{i}: dropped {len(chunk_ids) - len(mapped)} "
+                  f"unmappable chunk_id(s): {[c for c in chunk_ids if c not in chunk_id_to_doc_id]!r}")
         pairs.append(QAPair(
             qa_id=f"{seed}-{i}",
             question=str(p.get("question", "")),
             answer=[str(n) for n in p.get("answer", [])],
-            chunk_ids=chunk_ids,
+            chunk_ids=mapped,
             doc_ids=doc_ids,
         ))
     with open(f"{trace_dir}/{seed}_qa_pairs.json", "w") as f:
@@ -340,10 +365,12 @@ def make_gemini_rollout_agent_factory(
     document_map: dict[str, str],
     collection,
     special_notes: str,
+    pdf_dir: str | None = None,
+    page_renders_dir: str | None = None,
 ):
     """``RolloutConfig.agent_factory`` that runs a *plain* SearchAgent (Gemini, no Tinker,
     no logprobs) exactly as it runs at test time — mirrors quality_filter's construction."""
-    config = _agent_config(model_id, emb_model_id, provider, AGENT_MAX_STEPS)
+    config = _agent_config(model_id, emb_model_id, provider, AGENT_MAX_STEPS, pdf_dir, page_renders_dir)
     overrides = (
         (PromptOverride(section="corpus", targets=("search_agent",), content=special_notes),)
         if special_notes else ()
@@ -440,6 +467,11 @@ def main() -> None:
     parser.add_argument("--chroma-port", type=int, default=None, help="ChromaDB server port (default: config/env).")
     parser.add_argument("--few-shot-csv", default="officeqa_pro.csv", help="OfficeQA benchmark CSV (few-shot).")
     parser.add_argument("--out-dir", default="dais_synthetic_qa", help="Output dir for the test set + traces.")
+    parser.add_argument("--dais-pdf-dir", default=str(pathlib.Path.home() / "dais" / "pdfs"),
+                        help="DAIS source PDFs (<file_id>.pdf) — lets the agents' view_figure render pages.")
+    parser.add_argument("--page-renders-dir", default=str(pathlib.Path.home() / "dais" / "page_renders"),
+                        help="Pre-rendered page PNGs (from skunk.dais.render_corpus); view_figure serves "
+                             "these instead of rasterizing the PDF (fitz fallback if absent).")
 
     parser.add_argument("--gen-model-id", default=DEFAULT_GEN_MODEL)
     parser.add_argument("--rollout-model-id", default=DEFAULT_ROLLOUT_MODEL)
@@ -504,6 +536,7 @@ def main() -> None:
         agent_factory=make_gemini_rollout_agent_factory(
             args.rollout_model_id, args.provider, args.emb_model_id,
             document_map, collection, special_notes,
+            args.dais_pdf_dir, args.page_renders_dir,
         ),
         tinker_backend=None,
         task_solver_cfg=None,
@@ -516,6 +549,8 @@ def main() -> None:
         system_prompt_template=BENCHMARK_QUALITY_FILTER_SYSTEM_PROMPT["dais"],
         special_notes=special_notes,
         binarization_mode="doc-recall",
+        pdf_dir=args.dais_pdf_dir,
+        page_renders_dir=args.page_renders_dir,
     )
 
     seeds = list(range(args.start_seed, args.start_seed + args.num_new_seeds))
@@ -530,6 +565,7 @@ def main() -> None:
             seed, args.gen_model_id, args.provider, examples_pool, document_map, collection,
             chunk_id_to_doc_id, args.emb_model_id, trace_dir, special_notes,
             DAIS_DATAGEN_GUIDANCE, args.n_examples, args.n_qa_pairs, args.show_output,
+            args.dais_pdf_dir, args.page_renders_dir,
         )
         with dedup_lock:
             kept, funnel = dedup_batch(pairs, dedup_cfg)

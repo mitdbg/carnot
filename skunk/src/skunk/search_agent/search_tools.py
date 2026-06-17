@@ -399,11 +399,13 @@ class ViewFigureTool(Tool):
         document_map: dict[str, str],
         pdf_dir: str | Path,
         *,
+        renders_dir: str | Path | None = None,
         dpi: int = 300,
         fmt: str = "png",
     ):
         self._document_map = document_map
         self._pdf_dir = pdf_dir
+        self._renders_dir = renders_dir
         self._dpi = dpi
         self._fmt = fmt
 
@@ -436,7 +438,7 @@ class ViewFigureTool(Tool):
         try:
             img = render_page_b64(
                 ref.stem, ref.page,
-                pdf_dir=self._pdf_dir, dpi=self._dpi, fmt=self._fmt,
+                pdf_dir=self._pdf_dir, renders_dir=self._renders_dir, dpi=self._dpi, fmt=self._fmt,
             )
         except Exception as e:
             return {VIEW_FIGURE_RESULT_TAG: True, "error": f"view_figure render error: {e}"}

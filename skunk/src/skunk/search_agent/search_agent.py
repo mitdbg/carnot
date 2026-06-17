@@ -175,7 +175,7 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
                 config.agent_max_pages_per_tool_call,
                 config.read_document_max_output_chars,
             ),
-            ViewFigureTool(self.document_map, config.pdf_dir),
+            ViewFigureTool(self.document_map, config.pdf_dir, renders_dir=config.page_renders_dir),
             PruneTool(self._pruned_chunk_ids, self._pruned_doc_ids),
         ]
         if human_intervention_handler is not None:

@@ -82,6 +82,11 @@ class QualityFilterConfig:
     max_pages_per_tool_call: int = 20
     model_context_window: int = 1_000_000
 
+    # Corpus PDF dir + optional pre-rendered page-PNG cache, so the QF agent's `view_figure`
+    # can render pages (None → SearchAgent defaults; figure viewing unavailable for the corpus).
+    pdf_dir: str | None = None
+    page_renders_dir: str | None = None
+
     # Which per-attempt score to surface to the judge in the user prompt:
     #   "doc-recall" -> RolloutRecord.doc_output_recall
     #   "eval-score" -> RolloutRecord.eval_score
@@ -168,6 +173,8 @@ def run_quality_filter_for_pair(
         emb_model_id=cfg.emb_model_id,
         agent_max_steps=cfg.max_steps,
         agent_max_pages_per_tool_call=cfg.max_pages_per_tool_call,
+        **({"pdf_dir": pathlib.Path(cfg.pdf_dir)} if cfg.pdf_dir else {}),
+        **({"page_renders_dir": pathlib.Path(cfg.page_renders_dir)} if cfg.page_renders_dir else {}),
     )
     ctx = ExecutionContext(question=pair.question, config=config, log_path=trace_path, verbose=show_output)
     agent: QualityFilterAgent | None = None

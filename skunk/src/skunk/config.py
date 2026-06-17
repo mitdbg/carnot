@@ -102,6 +102,12 @@ class SkunkConfig:
     parsed_json_dir: Path = field(default_factory=lambda: _DEFAULT_PARSED_JSON_DIR)
     pdf_dir: Path = field(default_factory=lambda: _DEFAULT_PDF_DIR)
 
+    # Optional pre-rendered page-PNG cache (`<dir>/<stem>_<page>.png`). When set, page rendering
+    # (`render_page_b64`, hence `view_figure`) serves from here instead of rasterizing the PDF —
+    # the competition-latency win for corpora with a warmed render cache (e.g. DAIS
+    # `~/dais/page_renders`). None → always render on the fly. (env: SKUNK_PAGE_RENDERS_DIR)
+    page_renders_dir: Path | None = None
+
     # Prompt overrides YAML — corpus blurbs, few-shots, lessons. (env: SKUNK_PROMPT_OVERRIDES)
     prompt_overrides_path: str = "config/prompts/us_receipts_expenditures.yaml"
 
@@ -307,6 +313,11 @@ class SkunkConfig:
                 os.environ.get("OFFICEQA_PARSED_JSON_DIR") or _DEFAULT_PARSED_JSON_DIR
             ),
             pdf_dir=Path(os.environ.get("OFFICEQA_PDF_DIR") or _DEFAULT_PDF_DIR),
+            page_renders_dir=(
+                Path(os.environ["SKUNK_PAGE_RENDERS_DIR"])
+                if os.environ.get("SKUNK_PAGE_RENDERS_DIR")
+                else None
+            ),
             prompt_overrides_path=os.environ.get(
                 "SKUNK_PROMPT_OVERRIDES", "config/prompts/us_receipts_expenditures.yaml"
             ),

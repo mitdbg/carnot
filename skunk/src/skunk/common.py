@@ -79,16 +79,28 @@ def render_page_b64(
     page: int | None,
     *,
     pdf_dir: Path | str,
+    renders_dir: Path | str | None = None,
     dpi: int = 300,
     fmt: str = "png",
     jpg_quality: int | None = None,
 ) -> B64Image | None:
     """The single PDF-page rasterizer for the repo: render one page to in-memory image bytes via
-    PyMuPDF. Returns None when the PDF doesn't exist; PyMuPDF errors propagate. No disk cache (the
-    page store layers its own cache on top). `fitz` is imported lazily so importing `common`
-    doesn't pull in PyMuPDF."""
+    PyMuPDF. Returns None when the PDF doesn't exist; PyMuPDF errors propagate. `fitz` is imported
+    lazily so importing `common` doesn't pull in PyMuPDF.
+
+    When `renders_dir` is given, a pre-rendered PNG at `<renders_dir>/<stem>_<page>.png` (the page
+    render cache; `stem` is the `month` arg, a doc-id stem) is served directly — skipping the PDF
+    open. `dpi`/`fmt`/`jpg_quality` are ignored for a cache hit (the cached PNG's own resolution
+    applies); on a miss we fall back to rasterizing the PDF."""
     if month is None or page is None or int(page) <= 0:
         return None
+    if renders_dir is not None:
+        cached = Path(renders_dir) / f"{month}_{int(page)}.png"
+        if cached.exists():
+            return B64Image(
+                mime="image/png",
+                data=base64.standard_b64encode(cached.read_bytes()).decode(),
+            )
     pdf_path = pdf_path_for(month, pdf_dir)
     if not pdf_path.exists():
         return None

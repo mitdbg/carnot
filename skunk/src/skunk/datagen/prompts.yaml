@@ -50,6 +50,14 @@ datagen_system_prompt: |
   read_document(["doc_id_1", "doc_id_2"])
   ```
 
+  ### view_figure(doc_id: str, figure_id: int | str)
+  When `read_document` output contains a `<figure id=N>` placeholder, the underlying chart/figure is NOT in the searchable text. Call `view_figure` to render the **whole page** that contains it and append it to your messages as an image you can actually see (figure in context plus any siblings). Use it to build/verify a question whose answer lives in a chart, not the text. Pass the `doc_id` you read and the `id` from the `<figure id=N>` placeholder.
+
+  ```python
+  # you read doc_id "<file_id>_12" and saw "<figure id=3>"; now view it
+  view_figure("<file_id>_12", 3)
+  ```
+
   ### prune(chunk_ids: list[str] | None = None, doc_ids: list[str] | None = None)
   Marks chunks or documents as irrelevant. Pruned ids are excluded from all subsequent search and grep results.
 
@@ -186,7 +194,17 @@ dais_datagen_guidance: |
   print(f"CAGR over {years} years: {(values[-1] / values[0]) ** (1 / years) - 1:.2%}")
   ```
 
-  **Self-check before finalizing.** Reject a candidate question if (a) its leading clause names or paraphrases a volume / era / section / table / fund title, (b) every value needed sits in one already-identified contiguous block, (c) the operation is named so explicitly that no scanning, selection, or multi-step reasoning is required, or (d) the period is ambiguous about fiscal-vs-calendar year or about which vintage of a restated figure is wanted. If any holds, rewrite it before emitting.
+  ### Question-type mix (aim for this spread across your {{ n_qa_pairs }} pairs)
+  Most pairs should be the table-driven computational questions described above. In addition, **deliberately include**:
+
+  **~1 in 10 — a figure / chart question (use `view_figure`).** Some pages carry charts that are NOT in the searchable text — they appear as `<figure id=N>` placeholders. Find them (e.g. `search_corpus(..., metadata_filter={"type": "figure"})` or by reading pages that grep surfaces), then **call `view_figure(doc_id, figure_id)` to actually see the chart** and base a question on what it depicts — a value, peak/trough, crossover, or trend a reader can only get from the figure. These are exempt from the strict "answer must be a computed value" rule (reading a quantity or trend off the chart is the point), but the answer MUST require having viewed the figure — it must not be answerable from the page text alone. Confirm you genuinely viewed the figure before committing such a pair.
+
+  **~1 in 10 — an external / world-knowledge question.** Phrase the question so the solver must first resolve an *indirect reference* from general knowledge, then pull the corresponding figure from the corpus. The external hop is the *resolution*; the final answer is still grounded in (and computed from) the corpus. Use only widely-known, unambiguous facts — rely on the model's own knowledge, there is no lookup tool.
+  - "What were total federal expenditures in the fiscal year the Korean War began?" (solver knows 1950)
+  - "By what percentage did customs receipts change between the year the Federal Reserve System was created and five years later?" (solver knows 1913)
+  Do NOT invent external *data* the corpus lacks (CPI, GDP, populations) — the answer must come from the corpus once the reference is resolved.
+
+  **Self-check before finalizing.** Reject a candidate question if (a) its leading clause names or paraphrases a volume / era / section / table / fund title, (b) every value needed sits in one already-identified contiguous block, (c) the operation is named so explicitly that no scanning, selection, or multi-step reasoning is required, (d) the period is ambiguous about fiscal-vs-calendar year or about which vintage of a restated figure is wanted, or (e) it is a figure question whose answer is actually readable from the page text (so `view_figure` was not really needed). If any holds, rewrite it before emitting.
 
 # ---------------------------------------------------------------------------
 # De-duplication judge prompts.
