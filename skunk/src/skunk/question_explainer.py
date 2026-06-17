@@ -34,11 +34,11 @@ class ConceptExplanation(BaseModel):
 PRECOMPUTED_CONCEPTS: list[tuple[str, str]] = [
     (
         "Zipf / power-law exponent",
-        "Rank the values in descending order (ranks 1..n) and run an OLS regression of log(value) on log(rank); the exponent is the absolute value of the slope. Do NOT regress log(rank) on log(value) (that inverts the exponent), and do NOT use the MLE / Hill estimator unless the question explicitly asks for it.",
+        "Rank the values in descending order (ranks 1..n) and run an OLS regression of log(value) on log(rank); the exponent is the absolute value of the slope.",
     ),
     (
         "CAGR (compound annual growth rate)",
-        "CAGR = (end / begin) ** (1 / n) - 1, where n is the number of YEAR intervals between the endpoints (end_year - begin_year), not the count of data points.",
+        "CAGR = (end / begin) ** (1 / n) - 1, where n is the number of YEAR intervals between the endpoints (end_year - begin_year).",
     ),
     (
         "Continuously compounded (logarithmic) growth rate",
@@ -46,7 +46,7 @@ PRECOMPUTED_CONCEPTS: list[tuple[str, str]] = [
     ),
     (
         "Annual decay / growth factor",
-        "The per-year multiplicative factor is (1 + CAGR); it is below 1 for a declining series. The reciprocal 1 / (1 + CAGR) is a discount factor, not the decay factor.",
+        "The per-year multiplicative factor is (1 + CAGR); it is below 1 for a declining series.",
     ),
     (
         "Geometric mean",
@@ -54,7 +54,7 @@ PRECOMPUTED_CONCEPTS: list[tuple[str, str]] = [
     ),
     (
         "Arc elasticity (midpoint method)",
-        "[(Q2 - Q1) / ((Q1 + Q2) / 2)] / [(P2 - P1) / ((P1 + P2) / 2)] — each percent change uses the average of its two endpoints in the denominator (the factor of 2 cancels). Keep the sign unless the question asks for the absolute value.",
+        "[(Q2 - Q1) / ((Q1 + Q2) / 2)] / [(P2 - P1) / ((P1 + P2) / 2)] — each percent change uses the average of its two endpoints in the denominator. Keep the sign unless the question asks for the absolute value.",
     ),
     (
         "Population vs sample standard deviation / variance",
@@ -70,7 +70,7 @@ PRECOMPUTED_CONCEPTS: list[tuple[str, str]] = [
     ),
     (
         "Median absolute deviation",
-        "median(|xᵢ - median(x)|): the median of the absolute deviations from the median. Do NOT apply the 1.4826 scaling constant unless the question asks to normalize it to a standard-deviation estimate.",
+        "median(|xᵢ - median(x)|): the median of the absolute deviations from the median.",
     ),
     (
         "Percentiles / quartiles / H-spread (Type 7)",
@@ -86,7 +86,7 @@ PRECOMPUTED_CONCEPTS: list[tuple[str, str]] = [
     ),
     (
         "Gini coefficient",
-        "Sort values ascending (i = 1..n); the population Gini is G_pop = (2 * sum(i * xᵢ)) / (n * sum(xᵢ)) - (n + 1) / n. Then apply the small-sample (bias) correction: G = G_pop * n / (n - 1). The correction is what the gold values use and matters at small n (it doubles G at n = 2).",
+        "Sort values ascending (i = 1..n); the population Gini is G_pop = (2 * sum(i * xᵢ)) / (n * sum(xᵢ)) - (n + 1) / n. Then apply the small-sample (bias) correction G = G_pop * n / (n - 1).",
     ),
     (
         "Value at Risk (historical)",
@@ -102,7 +102,7 @@ PRECOMPUTED_CONCEPTS: list[tuple[str, str]] = [
     ),
     (
         "Box-Cox transformation",
-        "Use the scaled (NIST / original Box-Cox) form: T(y) = (y ** lambda - 1) / lambda for lambda != 0, and T(y) = ln(y) for lambda = 0. Not the bare power y ** lambda.",
+        "Use the scaled (NIST / original Box-Cox) form: T(y) = (y ** lambda - 1) / lambda for lambda != 0, and T(y) = ln(y) for lambda = 0.",
     ),
     (
         "Hodrick-Prescott filter",
@@ -138,7 +138,7 @@ PRECOMPUTED_CONCEPTS: list[tuple[str, str]] = [
     ),
     (
         "Fisher Ideal symmetric growth rate",
-        "The Fisher index is the geometric mean of the Laspeyres and Paasche indexes; the symmetric growth between two values uses the index form (growth = Fisher_index - 1), not a plain percent change.",
+        "The Fisher index is the geometric mean of the Laspeyres and Paasche indexes; the symmetric growth between two values uses the index form (growth = Fisher_index - 1).",
     ),
 ]
 

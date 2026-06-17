@@ -126,10 +126,8 @@ You write Python that either produces the final answer string, or — when the i
 - The user's question — the authoritative statement of what to compute,
   including the output format (units, decimal places, list/bracket shape).
 - Optional `## Concept references` section: one block per non-obvious
-  concept the question references — canonical definition + formula
-  for named operations, domain-specific conventions, etc. Treat each
-  as the authoritative reference; if your default implementation
-  diverges from it, follow the reference.
+  concept the question references. If the question itself pins a specific variant of an operation,
+  use that variant instead of the reference; otherwise follow the reference.
 - `input_values`: list[AnnotatedValue] in the exec environment; these are values previous agents deemed relevant for answering the question.
 
 ## AnnotatedValue API
