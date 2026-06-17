@@ -80,9 +80,9 @@ overrides:
       The corpus is the U.S. "Combined Statement of Receipts and Expenditures
       of the United States" (annual; fiscal years 1872–2024, in three eras:
       historical FY1872–FY1994, transition FY1995–2000, modern FY2001–FY2024)
-      plus the early govinfo receipts-and-expenditures volumes (annual;
-      publication years ~1793–1893, heterogeneous — some whole-government, some
-      a single department such as the Post Office). Each source document is
+      plus the early govinfo receipts-and-expenditures volumes (annual; data
+      years ~1793–1893, each printed about a year later, heterogeneous — some
+      whole-government, some a single department such as the Post Office). Each source document is
       split into pages, and each page into elements. The PDFs are image-only
       scans, so all text and tables are OCR/VLM-extracted.
 
@@ -91,16 +91,17 @@ overrides:
       schedule, plus `rta`/`rtb`/`rtc`, `tbb`/`tbj`, `bof`, `coa`, `pre`,
       `outlay`, `finhigh`, `sur`, `receipt`, `*ltr` (transmittal letters).
       Modern chapter codes are stable across years; monolithic historical
-      volumes carry no section code. Govinfo filenames carry the PUBLICATION
-      year and an opaque GovInfo document id, and the data is for ~1–2 years
-      earlier. A page's printed page number (OCR'd, mixing Roman and Arabic
+      volumes carry no section code. Govinfo filenames carry the calendar DATA
+      year the volume reports and an opaque GovInfo document id; the volume was
+      printed about a year later. A page's printed page number (OCR'd, mixing Roman and Arabic
       numerals, with gaps) is not its position within the document.
 
       ### Identifier formats
       - `file_id`: `"<collection>__<source>__<slug>"` — one source document.
         `<collection>` is `combined_statement` or `govinfo_receipts`. For
         combined_statement, `<source>` is the era (`historical` / `transition` /
-        `modern`); for govinfo_receipts it is the publication year. The `<slug>`
+        `modern`); for govinfo_receipts it is the calendar DATA year the volume
+        reports (printed about a year later). The `<slug>`
         carries the year and section/chapter (see filename codes above). Examples:
         `"combined_statement__historical__cs-1872"` (monolithic, one file per
         fiscal year), `"combined_statement__modern__2001__c01"` (year + chapter
@@ -118,7 +119,8 @@ overrides:
       Every chunk has the following metadata you can filter on:
       - `year`: integer, e.g. `1872` (NOT a zero-padded string). For
         combined_statement this is the REPORTING fiscal year; for govinfo_receipts
-        it is the PUBLICATION year (data is for ~1–2 years earlier). Range 1793–2024.
+        it is the calendar DATA year the volume reports (the volume was printed
+        about a year later). Range 1793–2024.
       - `source`: string, one of `"historical"`, `"transition"`, `"modern"` (the
         three combined_statement eras) or `"govinfo_receipts"`.
       - `file_id`: string, the source document (see above).
@@ -187,15 +189,8 @@ overrides:
 
   # ---------------------------------------------------------------------
   # Corpus blurbs for the remaining executors.
+  # (compute.codegen's input-provenance blurb lives in the COMPUTE section below.)
   # ---------------------------------------------------------------------
-  - section: corpus
-    targets: [compute.codegen]
-    content: |
-      The values in `input_values` were extracted from U.S. Combined Statement
-      pages (or early govinfo volumes). Units are natural-language as printed,
-      and scale varies by era — exact dollars in historical volumes, thousands
-      or millions in modern summaries.
-
   # Unit vocabulary — lookup_external emits these tokens; compute sees them on
   # lookup entries alongside natural-language units on corpus-extracted entries.
   - section: corpus
@@ -220,7 +215,7 @@ overrides:
   - section: lessons
     targets: [select_agent]
     content: |
-      Commit the volume whose REPORTING fiscal year equals the requested data year; for govinfo, that volume was PUBLISHED 1–2 years later, so to find data for year D look in the volume bucketed D+1 or D+2.
+      Commit the volume whose REPORTING fiscal year equals the requested data year; govinfo volumes are bucketed by the calendar DATA year they report (the volume itself was printed about a year later), so to find data for year D look in the volume bucketed D.
       Prefer the DETAILED Combined Statement / Appendix for any specific line item; the slim Annual Report carries only summary highlights — do not commit it for a figure that needs the detail series.
       A figure restated as a prior-year comparative column in a later volume is a fallback, not the first choice; if the question asks for the value "as later reported / revised", commit the later restated volume instead — never both.
       Fiscal years 1872–1893 exist in both govinfo_receipts and combined_statement(historical); commit one (prefer combined_statement) and discard the duplicate.
@@ -332,46 +327,44 @@ overrides:
         }
         ```
 
-  # Few-shots: PlanDiff shape — reword a corpus-filed key vs inject a lookup.
+  # Few-shots: fresh-Plan replan — the replanner emits a fresh Plan holding ONLY
+  # the branches to run NOW; branches already in the kept pool are not re-emitted.
   - section: few_shots
     targets: [replanner]
     content:
       - |
-        ### Example (one branch failed — the concept is filed under an organizational unit; drop by index, re-add reworded; keep the branch that succeeded)
-        prior_plan.branches:
-          [0] {"kind": "retrieve", "key": "life-saving service expenditures", "period": "1912-07..1913-06"}
-          [1] {"kind": "retrieve", "key": "total expenditures of the United States", "period": "1912-07..1913-06"}
-        Branch [0] FAILED: no table named "life-saving service expenditures" — the
-        FY1913 detailed statement files it under the Treasury organizational-unit
-        breakdown ("LIFE-SAVING SERVICE", Salaries and expenses). Branch [1]
-        succeeded (in prev).
-        PlanDiff:
+        ### Example (one branch failed — the concept is filed under an organizational unit; re-emit ONLY the reworded retrieve. The branch that already succeeded is in the kept pool — do not re-emit it)
+        Values compute KEPT: total expenditures of the United States, FY1913.
+        Previous plans:
+          round 0:
+            - {"kind": "retrieve", "key": "life-saving service expenditures", "period": "1912-07..1913-06"} → FAILED: no table named "life-saving service expenditures" — the FY1913 detailed statement files it under the Treasury organizational-unit breakdown ("LIFE-SAVING SERVICE", Salaries and expenses)
+            - {"kind": "retrieve", "key": "total expenditures of the United States", "period": "1912-07..1913-06"} → ok
+        Plan (only the branches to run NOW):
         ```json
         {
-          "add": [
+          "branches": [
             {"kind": "retrieve", "key": "Life-Saving Service, salaries and expenses",
              "period": "1912-07..1913-06"}
-          ],
-          "drop": [0]
+          ]
         }
         ```
 
       - |
-        ### Example (a value is not in the corpus → drop the doomed retrieve, inject a lookup_external)
-        prior_plan.branches:
-          [0] {"kind": "retrieve", "key": "total expenditures of the United States", "period": "1952-07..1953-06"}
-          [1] {"kind": "retrieve", "key": "CPI", "period": "1953-01..1953-12"}
-        Branch [1] FAILED: the Combined Statement carries no consumer-price index.
-        Branch [0] succeeded (in prev). What was missing: cpi:1953. The question
-        named no publisher, so leave `src` null.
-        PlanDiff:
+        ### Example (a value is not in the corpus → re-emit it as a lookup_external; the retrieve that succeeded is in the kept pool, so emit ONLY the lookup)
+        Values compute KEPT: total expenditures of the United States, FY1953.
+        Previous plans:
+          round 0:
+            - {"kind": "retrieve", "key": "total expenditures of the United States", "period": "1952-07..1953-06"} → ok
+            - {"kind": "retrieve", "key": "CPI", "period": "1953-01..1953-12"} → FAILED: the Combined Statement carries no consumer-price index
+        What compute says is missing: cpi:1953. The question named no publisher, so leave `src` null.
+        Plan (only the branches to run NOW):
         ```json
         {
-          "add": [
+          "branches": [
             {"kind": "lookup_external",
-             "target": "U.S. CPI-U annual average for 1953 (base 2020=100)"}
-          ],
-          "drop": [1]
+             "target": "U.S. CPI-U annual average for 1953 (base 2020=100)",
+             "src": null}
+          ]
         }
         ```
 
