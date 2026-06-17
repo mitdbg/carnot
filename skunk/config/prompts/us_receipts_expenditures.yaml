@@ -8,9 +8,10 @@
 #   lessons    — terse imperative rules the agent must follow
 #   few_shots  — worked examples appended verbatim under "## Few-shot examples"
 #
-# Blocks are grouped below by pipeline stage. Within a stage the order is
-# corpus context → lessons → few-shot examples; blocks rendered for the same
-# target appear to the agent in this file order.
+# Blocks are grouped below by pipeline stage for editing, but the prompt builder
+# regroups them by section per target: corpus (## Dataset) → few-shot examples
+# (## Few-shot examples) → lessons (## Lessons learned). Within a section, blocks
+# appear to the agent in this file order.
 # =====================================================================
 
 overrides:
@@ -26,10 +27,10 @@ overrides:
       Date conventions. Carefully distinguish (a) the fiscal year a statement
       REPORTS, (b) the year it was PUBLISHED, and (c) calendar vs fiscal year.
       Combined_statement documents are keyed by the fiscal year they report;
-      govinfo_receipts documents are keyed by PUBLICATION year and report data
-      for the prior 1–2 years, usually a calendar year (the 1827 volume reports
-      the year 1825); some department-specific volumes use a year ending
-      mid-year. Calendar year YYYY = YYYY-01..YYYY-12. Fiscal year FYy = the 12
+      govinfo_receipts documents are keyed by the calendar DATA year they report
+      and were printed about a year later (the 1824 volume reports the year 1824
+      and was printed in 1825); some volumes span two data years and are keyed by
+      the first. Calendar year YYYY = YYYY-01..YYYY-12. Fiscal year FYy = the 12
       months ending in year y: (y-1)-10..y-09 from FY1977 on, (y-1)-07..y-06
       through FY1976 (FY1968 = 1967-07..1968-06; FY2008 = 2007-10..2008-09). The
       months 1976-07..1976-09 are the FY1976→FY1977 "transition quarter" and
@@ -49,7 +50,7 @@ overrides:
       Questions are answered against the U.S. Receipts & Expenditures corpus:
       the annual "Combined Statement of Receipts and Expenditures of the United
       States" (fiscal years 1872–2024) plus the early govinfo receipts volumes
-      (publication years ~1793–1893). Emit period as canonical month ranges
+      (data years ~1793–1893). Emit period as canonical month ranges
       (YYYY-MM, YYYY-MM..YYYY-MM, or a comma-separated list of these), never
       natural language — expand fiscal years, calendar years, and quarters to
       months yourself per the date conventions above. The data is annual
@@ -94,8 +95,8 @@ overrides:
         ```
 
       - |
-        ### Example (publication year is NOT the period — the 1827 volume reports the YEAR 1825; period is the data year, selection picks the 1827 volume)
-        Q: According to the receipts-and-expenditures volume published in 1827, what were the total expenditures of the United States for the year 1825?
+        ### Example (publication year is NOT the period — the volume printed in 1826 reports the YEAR 1825; period is the data year, selection picks the 1825 volume)
+        Q: According to the receipts-and-expenditures volume published in 1826, what were the total expenditures of the United States for the year 1825?
         Plan:
         ```json
         {
@@ -190,10 +191,12 @@ overrides:
       expenditures, prepared by the Treasury (the Register of the Treasury in
       the early volumes, later the Division of Bookkeeping and Warrants). One
       volume per year:
-        - govinfo_receipts: publication years ~1793–1893, with gaps; some years
-          printed more than once; heterogeneous in scope — some whole-government,
+        - govinfo_receipts: data years ~1793–1893 (each volume reports a calendar
+          year, printed about a year later), with gaps; some years printed more
+          than once; heterogeneous in scope — some whole-government,
           some a single department (e.g. the Post Office). The bucket year is the
-          PUBLICATION year; its data is for the prior 1–2 years.
+          calendar DATA year it reports (some volumes span two); the volume was
+          printed about a year later.
         - combined_statement: fiscal years 1872–2024, in three eras —
           historical (FY1872–FY1994), transition (FY1995–2000),
           modern (FY2001–FY2024).
@@ -229,7 +232,7 @@ overrides:
       - era: `"historical"` | `"transition"` | `"modern"` (combined_statement
         only; govinfo volumes have no era).
       - year: 4-digit string — for combined_statement the reported FISCAL year;
-        for govinfo the PUBLICATION year (its data is for ~1–2 years earlier).
+        for govinfo the calendar DATA year it reports (printed about a year later).
       - section: the section/chapter code parsed from the combined_statement
         filename (govinfo and monolithic historical volumes carry none) — `cNN`
         chapter, `scN` schedule, plus `rta`/`rtb`/`rtc`, `tbb`/`tbj`, `bof`,

@@ -2,7 +2,7 @@
 
 `RetrieveOp` turns a `RetrieveBranch` into the pages that answer it:
 - golden bypass — returns `ctx.config.golden_pages` verbatim (eval ablation).
-- `search_agent` — iterative FTS5 + PageStore + LLM loop under `skunk.search_agent`.
+- `search_agent` — iterative ChromaDB + LLM loop under `skunk.search_agent`.
 
 The search-agent backend is built lazily.
 """
@@ -10,7 +10,9 @@ The search-agent backend is built lazily.
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
+from pathlib import Path
 
 from skunk.config import SkunkConfig
 from skunk.errors import StepFailed
@@ -18,6 +20,7 @@ from skunk.common import (
     BranchRetrieval,
     ExecutionContext,
     PageRef,
+    page_key_to_pageref,
     traced_step,
 )
 from skunk.plan import RetrieveBranch
@@ -26,7 +29,7 @@ from skunk.plan import RetrieveBranch
 class RetrieveOp:
     def __init__(self, config: SkunkConfig) -> None:
         self._config = config
-        self._resources = None  # (PageStore, search_index_path) — shared across branches
+        self._resources = None  # (Collection, dict[str, str]) — shared across branches
         self._resources_lock = threading.Lock()
 
     async def run_all(
@@ -105,13 +108,12 @@ class RetrieveOp:
         required_docs: list[str] | None = None,
     ) -> list[PageRef]:
         from skunk.search_agent import SearchAgent
-        from skunk.search_agent.local_tools import doc_key_to_ref
 
-        page_store, search_index_path = self._ensure_resources(ctx.config)
+        collection, document_map = self._ensure_resources(ctx.config)
         agent = SearchAgent(
             config=ctx.config,
-            page_store=page_store,
-            search_index_path=search_index_path,
+            document_map=document_map,
+            chroma_collection=collection,
             human_intervention_handler=(
                 ctx.human_intervention_handler
                 if ctx.human_intervention_enabled
@@ -130,7 +132,7 @@ class RetrieveOp:
         bad: list[str] = []
         for key in page_keys:
             try:
-                ref = doc_key_to_ref(key)
+                ref = page_key_to_pageref(key)
                 if required_docs and ref.month not in required_docs:
                     bad.append(key)
                     continue
@@ -148,33 +150,39 @@ class RetrieveOp:
 
     def _ensure_resources(self, config: SkunkConfig):
         # Single-flight: neither parallel branches (same op) nor parallel UID workers
-        # (eval's thread pool, each with its own RetrieveOp) need to rebuild the PageStore /
-        # re-resolve the search index. The store + index path are serialized + cached
-        # process-wide by `_get_shared_resources`. The resources are read-only + shared; only
-        # the per-branch SearchAgent built around them holds mutable state.
+        # (eval's thread pool, each with its own RetrieveOp) need to re-connect to the
+        # ChromaDB server / re-fetch the collection. Connection + collection handle are
+        # serialized + cached process-wide by `_get_shared_resources`. The resources are
+        # read-only + shared; only the per-branch SearchAgent built around them holds
+        # mutable state.
         with self._resources_lock:
             if self._resources is None:
                 self._resources = _get_shared_resources(config)
             return self._resources
 
 
-# Process-wide page-index resource cache. The chroma-free retriever reads page CONTENT
-# through one shared, thread-safe `PageStore` and reaches the corpus via the prebuilt
-# read-only SQLite FTS5 search index. The eval runs many UIDs through one ThreadPoolExecutor,
-# each with its own RetrieveOp, so we cache the (PageStore, index path) process-wide and
-# single-flight construction under one global lock: this builds the store once and keeps a
-# single in-memory copy of its (read-only) page caches shared across worker threads.
+# Process-wide ChromaDB/document-map cache. Reads go through a ChromaDB *server*
+# (HttpClient) — the embedded PersistentClient deadlocks under the eval's 15-way
+# in-process concurrency (worker threads wedge inside ChromaDB's Rust core), whereas
+# the server process owns ChromaDB's concurrency. The eval runs many UIDs through one
+# ThreadPoolExecutor, each with its own RetrieveOp, so we cache the (collection handle,
+# document map) process-wide and single-flight construction under one global lock: this
+# avoids re-connecting / re-fetching the collection per UID and keeps a single in-memory
+# copy of the (read-only) document map shared across worker threads.
 _SHARED_RESOURCES_LOCK = threading.Lock()
-_SHARED_RESOURCES: dict[tuple[str, str], tuple] = {}
+_SHARED_RESOURCES: dict[tuple[str, int, str, str], tuple] = {}
 
 
 def _get_shared_resources(config: SkunkConfig):
-    """Process-wide single-flight wrapper over `_build_resources`, keyed by the page-index
-    artifact root + the corpus pdf dir. Serializes the store/index build across all
-    RetrieveOps (i.e. across all UID worker threads)."""
-    from skunk.page_index.data_model import page_index_root
-
-    key = (str(page_index_root()), str(config.pdf_dir))
+    """Process-wide single-flight wrapper over `_build_resources`, keyed by the
+    ChromaDB server (host, port) + collection + clean-page-map path. Serializes the
+    connect/collection-fetch across all RetrieveOps (i.e. across all UID worker threads)."""
+    key = (
+        config.chroma_server_host,
+        config.chroma_server_port,
+        config.chromadb_collection,
+        str(Path(config.clean_page_map_path).resolve()),
+    )
     with _SHARED_RESOURCES_LOCK:
         if key not in _SHARED_RESOURCES:
             _SHARED_RESOURCES[key] = _build_resources(config)
@@ -182,18 +190,41 @@ def _get_shared_resources(config: SkunkConfig):
 
 
 def _build_resources(config: SkunkConfig):
-    from skunk.page_index.data_model import SEARCH_INDEX_FILE, page_index_root
-    from skunk.page_index.store import get_page_store
+    from skunk.chroma_client import make_chroma_client
 
-    search_index_path = page_index_root() / SEARCH_INDEX_FILE
-    if not search_index_path.exists():
+    clean_page_map_path = Path(config.clean_page_map_path)
+
+    if not clean_page_map_path.exists():
         raise StepFailed(
             "retrieve",
-            f"search index {search_index_path!s} does not exist; build it first with "
-            "`python3 -m skunk.page_index.search_index build <root>` (see "
-            "src/skunk/page_index/search_index.py), or point SKUNK_PAGE_INDEX_DIR at a "
-            "built page-index artifact.",
+            f"clean_page_map_path {clean_page_map_path!s} does not exist; "
+            "run the page cleaner first (see "
+            "src/skunk/search_agent/prep/page_cleaner.py) or set "
+            "SKUNK_CLEAN_PAGE_MAP / config.clean_page_map_path.",
         )
 
-    page_store = get_page_store(str(config.pdf_dir))
-    return page_store, str(search_index_path)
+    with clean_page_map_path.open() as f:
+        clean_page_map = json.load(f)
+
+    document_map: dict[str, str] = {}
+    for doc_id, entry in clean_page_map.items():
+        path = entry[0] if isinstance(entry, (list, tuple)) else entry
+        try:
+            with open(path) as pf:
+                document_map[doc_id] = pf.read()
+        except OSError:
+            continue
+
+    chroma_client = make_chroma_client(
+        config.chroma_server_host, config.chroma_server_port
+    )
+    try:
+        collection = chroma_client.get_collection(name=config.chromadb_collection)
+    except Exception as e:
+        raise StepFailed(
+            "retrieve",
+            f"chromadb collection {config.chromadb_collection!r} not found on the "
+            f"server at {config.chroma_server_host}:{config.chroma_server_port}: {e}",
+        ) from e
+
+    return collection, document_map
