@@ -16,7 +16,8 @@ from skunk.errors import StepFailed
 # Artifact filenames under the build/query root, joined at each call site.
 CATALOG_SUBDIR = "catalog"  # slim shipped rows (PageCatalogRow); query-facing
 SCANS_SUBDIR = "scans"  # raw per-doc page scans (PageScan): the page store's content source
-PAGES_SUBDIR = "pages"  # per-bulletin page store: anchor -> member texts + figures
+PAGES_SUBDIR = "pages"  # raw parsed-JSON page text (legacy; superseded by `cleaned/` as the store's source)
+CLEANED_SUBDIR = "cleaned"  # the page store's text source: flat `<stem>_<page>.txt` cleaned pages
 RENDERS_SUBDIR = (
     "renders"  # lazy 200-DPI page-image cache (written on first vision read)
 )
@@ -34,6 +35,22 @@ def page_index_root() -> Path:
             "SKUNK_PAGE_INDEX_DIR is not set; point it at a built page-index artifact.",
         )
     return Path(env)
+
+
+def figure_note(n: int, headings: list[str]) -> str:
+    """The text tier's figure heads-up, or "" when `n == 0`. Figures' plotted data is absent
+    from a page's text, so whoever serves the text appends this so extract can defer to the
+    vision tier instead of scraping a value from prose. One source of truth for the wording,
+    shared by the build (`pipeline._figure_note`, counting parsed-JSON figure elements) and
+    the page store (`store.PageStore.text`, counting a `PageScan`'s chart blocks)."""
+    if n <= 0:
+        return ""
+    headers = "; ".join(h for h in dict.fromkeys(headings) if h) or "(untitled)"
+    return (
+        f"[This page has {n} figure(s)/chart(s) (headings: {headers}) whose plotted data is NOT "
+        f"in the text above. If the value you need appears only in a chart, return [] so the "
+        f"vision tier can read it.]"
+    )
 
 
 class ContentBlock(BaseModel):
@@ -213,10 +230,11 @@ def inherited_column_headers(
     """The column grammar a header-less continuation page inherits from its run HEAD, so a
     reader can place an unlabeled cell without fetching the predecessor page's text. Returns
     `(head_page, head_block_title, column_headers)`, or None when `ref` is not a header-less
-    continuation or no labeled head block exists. Skipped when `ref` carries its OWN column
-    headers (the scan sometimes re-states them on a flagged page — prefer those). Only the
-    column grammar is inherited: it is stable across a run, whereas the ACCOUNT a page reports
-    changes mid-run, so title/summary come from the page's own scan, never the head.
+    continuation or the head's spilling table carries no captured column headers. Skipped when
+    `ref` carries its OWN column headers (the scan sometimes re-states them on a flagged page —
+    prefer those). Only the column grammar is inherited: it is stable across a run, whereas the
+    ACCOUNT a page reports changes mid-run, so title/summary come from the page's own scan,
+    never the head.
 
     `get_summary` is the page store's `summary` — its objects expose `is_continuation` and
     `blocks` (each `kind` / `title` / `column_headers`)."""
@@ -231,10 +249,17 @@ def inherited_column_headers(
     head = get_summary(chain[0])
     if head is None:
         return None
-    labeled = [b for b in head.blocks if b.kind == "table" and b.column_headers]
-    if not labeled:
+    tables = [b for b in head.blocks if b.kind == "table"]
+    if not tables:
         return None
-    block = labeled[-1]  # the head's last labeled table = the one that spilled onto the run
+    # The table that spilled onto the run is the head's LAST table (bottommost on the page), so
+    # inherit ITS column grammar — not an earlier, unrelated table's. If the scan didn't capture
+    # that table's headers, there is nothing to inherit: return None rather than borrowing a
+    # different table's columns (the old `last table WITH headers` rule silently grabbed an
+    # earlier labeled table, injecting a mismatched grammar onto the continuation page).
+    block = tables[-1]
+    if not block.column_headers:
+        return None
     return (chain[0].page, block.title, list(block.column_headers))
 
 

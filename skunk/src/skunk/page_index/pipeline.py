@@ -74,7 +74,13 @@ from skunk.prompted_call import load_prompt_overrides
 from skunk.trace import configure_obs
 
 from .continuation import apply_review, find_long_chains, review_chain
-from .data_model import PAGES_SUBDIR, RENDERS_SUBDIR, TREE_FILE, PageCatalogRow
+from .data_model import (
+    PAGES_SUBDIR,
+    RENDERS_SUBDIR,
+    TREE_FILE,
+    PageCatalogRow,
+    figure_note,
+)
 from .eras import build_concept_tree
 from .notes_link import apply_links, link_notes
 from .scan import PageScan, scan_page, vision_scan_page
@@ -961,9 +967,9 @@ class CatalogStage(BulletinStage):
 
 
 def _figure_note(elems: dict[int, list[dict]], pages: list[int]) -> str:
-    """A figure heads-up across `pages`, or "" when none carry a figure. Figures' plotted
-    data is absent from the parsed text, so the text tier appends this so it can defer to the
-    vision tier instead of scraping a value from prose."""
+    """A figure heads-up across `pages`, or "" when none carry a figure — counting parsed-JSON
+    figure elements and gathering their nearby titles. The wording lives in
+    `data_model.figure_note` (shared with the page store's scan-based note)."""
     n = 0
     headings: list[str] = []
     for p in pages:
@@ -974,14 +980,7 @@ def _figure_note(elems: dict[int, list[dict]], pages: list[int]) -> str:
             for e in els
             if e.get("type") in ("title", "section_header") and e.get("content")
         ]
-    if n == 0:
-        return ""
-    headers = "; ".join(dict.fromkeys(headings)) or "(untitled)"
-    return (
-        f"[This page has {n} figure(s)/chart(s) (headings: {headers}) whose plotted data is NOT "
-        f"in the text above. If the value you need appears only in a chart, return [] so the "
-        f"vision tier can read it.]"
-    )
+    return figure_note(n, headings)
 
 
 class PageStoreStage(BulletinStage):

@@ -70,15 +70,17 @@ def test_submit_rejects_foreign_lock() -> None:
     assert coordinator.calls == []
 
 
-def test_submit_rejects_open_reviews() -> None:
+def test_submit_allowed_with_open_reviews() -> None:
+    # Open reviews must NOT block manual submission: a reviewer can always submit the current
+    # optimistic answer early (e.g. to bank points before the deadline) without first resolving
+    # every review. The submit still goes through; any open reviews simply stay open.
     coordinator = _Coordinator()
     endpoint = _endpoint(coordinator, _Broker(holder="me", open_reviews=1))
 
-    status, body = _json(asyncio.run(endpoint("1:Q1", SubmitTaskBody(client_id="me"))))
+    response = asyncio.run(endpoint("1:Q1", SubmitTaskBody(client_id="me")))
 
-    assert status == 409
-    assert "open review" in body["error"]
-    assert coordinator.calls == []
+    assert _json(response) == (200, {"ok": True, "task_id": "1:Q1"})
+    assert coordinator.calls == ["1:Q1"]
 
 
 def test_submit_success_with_no_review_conflicts() -> None:

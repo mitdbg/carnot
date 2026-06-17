@@ -87,22 +87,13 @@ const CorpusUI = (function () {
     return true;
   }
 
-  function summaryTags(summary) {
-    if (!summary) return "";
-    const docs = summary.documents || [];
-    const primary = docs.find(showDocTag);
-    const tags = [];
-    if (primary) {
-      tags.push(`<span class="tag corpus-tag ${docClass(primary)}" title="${esc(primary.source || "")}">${esc(docLabel(primary))}</span>`);
-    }
-    if (summary.ocr_review_blocked) {
-      tags.push(`<span class="tag corpus-tag corpus-blocked" title="Structured source policy: do not ask humans to review OCR content">OCR blocked</span>`);
-    } else if (summary.ocr_review_allowed) {
-      tags.push(`<span class="tag corpus-tag ${summary.ocr_risk === "high" ? "corpus-high" : "corpus-medium"}">OCR review</span>`);
-    }
-    const conf = confidenceChip(summary.confidence);
-    if (conf) tags.push(conf);
-    return tags.join("");
+  // Corpus-provenance pills (doc label + OCR review/blocked badge + confidence chip) are
+  // intentionally suppressed: the DAIS corpus is entirely scanned/OCR'd, so the OCR badge is
+  // always present and carries no per-task signal. Cards and the review modal show just the
+  // "Extract" action; the modal's per-document rows + policy reason still carry the detail.
+  // (Kept as a no-op rather than deleting call sites so it can be re-enabled for a mixed corpus.)
+  function summaryTags(_summary) {
+    return "";
   }
 
   function sourcePanel(summary, reason) {

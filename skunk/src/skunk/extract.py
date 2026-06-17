@@ -270,7 +270,10 @@ def _continuation_context(page: PageRef, ctx: ExecutionContext) -> str:
     predecessor pages: (1) the column grammar inherited from the run head (`inherited_column_headers`)
     so unlabeled cells can be placed, and (2) the page's OWN block summaries — the account it
     reports, which a banner-only continuation page's text may not state (its account heading is on
-    an earlier page). Empty string for a normal (non-continuation) page. Shared by both tiers."""
+    an earlier page). Only UNTITLED blocks are summarized: a titled block is already named by the
+    page-metadata line (`- page N: table: <title>`), so repeating its summary here just duplicates
+    that line; an untitled block has no title to show, so its summary is the only account signal.
+    Empty string for a normal (non-continuation) page. Shared by both tiers."""
     store = get_page_store(str(ctx.config.pdf_dir))
     sc = store.summary(page)
     if sc is None or not getattr(sc, "is_continuation", False):
@@ -285,7 +288,9 @@ def _continuation_context(page: PageRef, ctx: ExecutionContext) -> str:
             "This page's table opens directly into data columns; its header row is on an earlier "
             f"page (not reprinted here). Columns, left to right: {cols}."
         )
-    summaries = [b.summary for b in sc.blocks if b.summary]
+    # Only summarize blocks the page metadata can't already name (untitled ones) — a titled
+    # block's "- page N: table: <title>" line makes its summary here redundant.
+    summaries = [b.summary for b in sc.blocks if b.summary and not b.title]
     if summaries:
         lines.append("This page reports: " + " / ".join(summaries))
     return "\n".join(lines)

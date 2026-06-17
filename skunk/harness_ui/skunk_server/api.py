@@ -187,7 +187,10 @@ def install_command_routes(app: FastAPI) -> None:
 
     @app.get("/api/source-doc/{doc_id}/page/{page}.png")
     async def source_doc_page(doc_id: str, page: int) -> Response:
-        if not _DOC_ID_RE.match(doc_id) or page < 0:
+        # `page` is 1-based (the PDF viewer's page number, as shown in the review label and as
+        # passed by review_overlay.js) — matching the sibling /api/source endpoint and the rest
+        # of the corpus code. PyMuPDF indexes pages 0-based, so subtract 1 when loading.
+        if not _DOC_ID_RE.match(doc_id) or page < 1:
             return Response(status_code=404)
         try:
             import fitz
@@ -205,9 +208,9 @@ def install_command_routes(app: FastAPI) -> None:
             if not pdf_path.exists():
                 return Response(status_code=404)
             with fitz.open(pdf_path) as pdf:
-                if page >= len(pdf):
+                if page > len(pdf):
                     return Response(status_code=404)
-                pix = pdf[page].get_pixmap(matrix=fitz.Matrix(200 / 72, 200 / 72))
+                pix = pdf[page - 1].get_pixmap(matrix=fitz.Matrix(200 / 72, 200 / 72))
                 data = pix.tobytes("png")
         except Exception:
             logger.exception("source doc page render failed for %s p%s", doc_id, page)
@@ -299,15 +302,12 @@ def install_command_routes(app: FastAPI) -> None:
                         {"ok": False, "error": "Task is locked by another user"},
                         status_code=409,
                     )
-                open_count = broker.count_open_reviews(task_id)
-                if open_count > 0:
-                    return JSONResponse(
-                        {
-                            "ok": False,
-                            "error": f"{open_count} open review(s) must be resolved first",
-                        },
-                        status_code=409,
-                    )
+                # NOTE: open reviews intentionally do NOT block manual submission. A reviewer must
+                # always be able to submit the current optimistic answer early (e.g. to bank points
+                # before the round deadline) without first clearing every review. Any reviews left
+                # open stay open; resolving one still recomputes and resubmits as usual. This also
+                # matches the deadline auto-submit sweep, which calls submit_ready() directly and
+                # never consulted this guard.
             await coordinator.submit_ready(task_id)
         except KeyError:
             return JSONResponse(
