@@ -18,7 +18,7 @@ pointed at `competition_page_index/`):
 
     scans/<doc_id>.json            {"scans": {"<page>": PageScan, ...}, ...}
     pages/<doc_id>.json            {"<page>": "<text>"}
-    renders/<doc_id>/<page>.png    200-DPI image cache (populated by `scripts/prerender_cache.py`;
+    renders/<doc_id>_<page>.png    200-DPI image cache (populated by `scripts/prerender_cache.py`;
                                    a miss is rendered on demand)
 
 `extract.py` reads scans, text, and vision-tier images only through `PageStore`, so the
@@ -71,9 +71,9 @@ class PageStore:
         merge the page store keys text per physical page — a continued table's tail lives on its
         own `extra_pages` entry, not folded into the anchor — so a multi-page block's text is the
         concatenation of its `block_refs` pages, which extract feeds whole.)"""
-        if ref.month is None or ref.page is None:
+        if ref.stem is None or ref.page is None:
             return None
-        return self._bulletin_text(ref.month).get(int(ref.page))
+        return self._bulletin_text(ref.stem).get(int(ref.page))
 
     def _bulletin_text(self, bulletin: str) -> dict[int, str]:
         """`{page: text}` for one bulletin, loaded once and memoized (thread-safe). Raises if
@@ -99,9 +99,9 @@ class PageStore:
     def summary(self, ref: PageRef) -> PageScan | None:
         """The page's raw `PageScan`, or None when absent — the blocks/continuation/notes
         metadata extract reads to orient a page and expand it to its dependent pages."""
-        if ref.month is None or ref.page is None:
+        if ref.stem is None or ref.page is None:
             return None
-        return self._doc_scans(ref.month).get(int(ref.page))
+        return self._doc_scans(ref.stem).get(int(ref.page))
 
     def _doc_scans(self, doc_id: str) -> dict[int, PageScan]:
         """`{page: PageScan}` for one document, loaded once and memoized (thread-safe). Raises if
@@ -128,23 +128,23 @@ class PageStore:
         """The page's 200-DPI PNG: served from the `renders/` cache, else rendered once and
         cached. None when the ref is incomplete or the PDF can't be rendered. Concurrent calls
         for the same page render at most once (per-page lock); different pages run in parallel."""
-        if ref.month is None or ref.page is None:
+        if ref.stem is None or ref.page is None:
             return None
-        img = read_cached_image(self._renders_dir, ref.month, ref.page)
+        img = read_cached_image(self._renders_dir, ref.stem, ref.page)
         if img is not None:
             return img
-        with self._lock_for(f"{ref.month}/{ref.page}"):
+        with self._lock_for(f"{ref.stem}/{ref.page}"):
             img = read_cached_image(
-                self._renders_dir, ref.month, ref.page
+                self._renders_dir, ref.stem, ref.page
             )  # re-check under lock
             if img is not None:
                 return img
             if (
-                render_to_cache(ref.month, ref.page, self._pdf_dir, self._renders_dir)
+                render_to_cache(ref.stem, ref.page, self._pdf_dir, self._renders_dir)
                 == "skipped"
             ):
                 return None
-            return read_cached_image(self._renders_dir, ref.month, ref.page)
+            return read_cached_image(self._renders_dir, ref.stem, ref.page)
 
     def _lock_for(self, key: str) -> threading.Lock:
         with self._lock:
@@ -152,8 +152,10 @@ class PageStore:
 
 
 def render_cache_path(renders_dir: str | Path, month: str, page: int) -> Path:
-    """The page's image-cache path: `<renders_dir>/<month>/<page>.png`."""
-    return Path(renders_dir) / month / f"{page}.png"
+    """The page's image-cache path: `<renders_dir>/<month>_<page>.png` — the flat, underscore-
+    joined DAIS layout (matches `skunk.dais.render.page_render_path` / `doc_id_of`), so this cache
+    interoperates with the shared `page_renders/` render farm rather than a `<month>/` subdir."""
+    return Path(renders_dir) / f"{month}_{page}.png"
 
 
 def read_cached_image(
@@ -166,7 +168,7 @@ def read_cached_image(
 def render_to_cache(
     month: str, page: int, pdf_dir: str | Path, renders_dir: str | Path
 ) -> str:
-    """Ensure the page's `renders/<month>/<page>.png` exists at `RENDER_DPI`, rendering it once
+    """Ensure the page's `renders/<month>_<page>.png` exists at `RENDER_DPI`, rendering it once
     if absent. Returns "cached" (already present), "rendered" (newly written), or "skipped" (no
     PDF / incomplete ref). Top-level and picklable so a pre-render stage can fan it out across a
     process pool — page rasterization is CPU-bound and GIL-serialized, so it needs processes, not

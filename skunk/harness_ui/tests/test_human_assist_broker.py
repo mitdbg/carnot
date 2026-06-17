@@ -60,7 +60,7 @@ def test_broker_channel_parses_corrected_value() -> None:
         candidates=[
             AnnotatedValue(description="Total receipts", value=42, unit="millions")
         ],
-        pages=[PageRef(month="1954-02", page=17)],
+        pages=[PageRef(stem="1954-02", page=17)],
     )
     ctx = _ctx()
     try:
@@ -119,7 +119,7 @@ def test_broker_channel_parse_failure_without_candidates_raises() -> None:
 
 
 def _source_page() -> PageRef:
-    return PageRef(month="1954-02", page=17)
+    return PageRef(stem="1954-02", page=17)
 
 
 def test_human_assist_verify_extract_restamps_provenance_via_broker() -> None:

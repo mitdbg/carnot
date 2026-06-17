@@ -173,7 +173,7 @@ def install_command_routes(app: FastAPI) -> None:
 
             skunk_reasoner.SkunkReasoner.set_default_env()
             store = get_page_store(str(SkunkConfig.from_env().pdf_dir))
-            img = await asyncio.to_thread(store.image, PageRef(month=month, page=page))
+            img = await asyncio.to_thread(store.image, PageRef(stem=month, page=page))
         except Exception:
             logger.exception("source page render failed for %s p%s", month, page)
             return Response(status_code=500)

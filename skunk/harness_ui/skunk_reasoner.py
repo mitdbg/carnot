@@ -25,7 +25,7 @@ if str(SKUNK_SRC) not in sys.path:
 def _set_default_env() -> None:
     os.environ.setdefault(
         "SKUNK_PAGE_INDEX_DIR",
-        str(SKUNK_ROOT / "cache/build_v3"),
+        "/home/ubuntu/dais/competition_page_index",
     )
     os.environ.setdefault(
         "OFFICEQA_PARSED_JSON_DIR",
@@ -163,7 +163,7 @@ def _source_page_text(source_docs: list[str]) -> str:
         if (month, page) in seen:
             continue
         seen.add((month, page))
-        text = store.text(PageRef(month=month, page=page))
+        text = store.text(PageRef(stem=month, page=page))
         if not text:
             continue
         header = f"--- Treasury Bulletin {month} page {page} ---\n"
@@ -618,13 +618,13 @@ def _source_docs_from_events(events: list[dict]) -> list[str]:
                 for page_ref in summary.get("pages", []):
                     if not isinstance(page_ref, dict):
                         continue
-                    month = page_ref.get("month")
+                    month = page_ref.get("stem")
                     page = page_ref.get("page")
                     if isinstance(month, str) and isinstance(page, int):
                         _append_doc(docs, seen, month, str(page))
         msg = str(evt.get("message", ""))
         for month, page in re.findall(
-            r"PageRef\([^)]*month=([0-9]{4}-[0-9]{2})[^)]*page=(\d+)", msg
+            r"PageRef\([^)]*stem=([0-9]{4}-[0-9]{2})[^)]*page=(\d+)", msg
         ):
             _append_doc(docs, seen, month, page)
         for month, page in re.findall(

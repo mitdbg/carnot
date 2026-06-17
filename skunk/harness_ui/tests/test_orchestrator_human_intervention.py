@@ -69,7 +69,7 @@ class _Compute:
 
 
 async def _empty_branches(_branches, _branch_ids):
-    page = PageRef(month="1954-02", page=17)
+    page = PageRef(stem="1954-02", page=17)
     block = BlockRef(
         page=page,
         block_index=2,
@@ -124,7 +124,7 @@ def test_missing_data_requires_human_before_replan() -> None:
     compute = _Compute()
     orchestrator._compute = compute
     orchestrator._run_branches = _empty_branches  # type: ignore[method-assign]
-    page = PageRef(month="1954-02", page=17)
+    page = PageRef(stem="1954-02", page=17)
     orchestrator._retrieved_blocks = [
         BlockRef(page=page, block_index=None, member_refs=(page,), block=None)
     ]
@@ -593,7 +593,7 @@ def test_search_agent_discards_pages_outside_human_scope(monkeypatch) -> None:
     finally:
         ctx.close()
 
-    assert refs == [PageRef(month="1986-06", page=7)]
+    assert refs == [PageRef(stem="1986-06", page=7)]
 
 
 def test_replanner_prompt_maps_human_resolution_to_input() -> None:

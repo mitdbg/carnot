@@ -121,7 +121,7 @@ class PageCatalogRow(BaseModel):
     def ref(self) -> PageRef:
         """This row's canonical page coordinate (the catalog dict key). The `month` slot of
         `PageRef` carries the doc `source` stem — the page index's opaque per-doc key."""
-        return PageRef(month=self.source, page=self.page)
+        return PageRef(stem=self.source, page=self.page)
 
     @property
     def member_pages(self) -> list[int]:
@@ -133,14 +133,14 @@ class PageCatalogRow(BaseModel):
         """This row's member pages as `PageRef`s (a contiguous run). The retriever expands a
         kept anchor into these so extract reads the merged text once (continuation pages carry
         no text of their own) and the vision tier renders every page of the continued table."""
-        return [PageRef(month=self.source, page=p) for p in self.member_pages]
+        return [PageRef(stem=self.source, page=p) for p in self.member_pages]
 
     def notes_refs(self) -> list[PageRef]:
         """The notes/footnotes pages whose definitions qualify this page's data (`notes_pages`),
         as `PageRef`s. A reader appends these to a selected data page so extract/compute sees the
         footnote definitions; kept distinct from `member_refs` so notes never enter the table's
         own page span or `date_interval`."""
-        return [PageRef(month=self.source, page=p) for p in self.notes_pages]
+        return [PageRef(stem=self.source, page=p) for p in self.notes_pages]
 
     def block_refs(self, block: ContentBlock) -> list[PageRef]:
         """The physical pages ONE block spans: the row's member pages plus the block's own
@@ -148,7 +148,7 @@ class PageCatalogRow(BaseModel):
         expands to — so extract's text tier reads, and its vision tier renders, every page of
         a table that continues across pages, while unmerged blocks stay a single page."""
         pages = list(dict.fromkeys(self.member_pages + list(block.extra_pages)))
-        return [PageRef(month=self.source, page=p) for p in pages]
+        return [PageRef(stem=self.source, page=p) for p in pages]
 
     @property
     def primary_title(self) -> str | None:
@@ -196,7 +196,7 @@ def continuation_chain(
     page = ref.page
     while page > 1:
         page -= 1
-        prev = PageRef(month=ref.month, page=page)
+        prev = PageRef(stem=ref.stem, page=page)
         prow = get_row(prev)
         if prow is None:
             break
@@ -268,7 +268,7 @@ class PageRange(BaseModel):
 
     def refs(self) -> list[PageRef]:
         return [
-            PageRef(month=self.bulletin, page=p)
+            PageRef(stem=self.bulletin, page=p)
             for p in range(self.start, self.end + 1)
         ]
 

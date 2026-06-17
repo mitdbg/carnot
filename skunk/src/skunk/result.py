@@ -80,7 +80,7 @@ def summarize_value(v: Any) -> dict:
     if isinstance(v, list) and v and isinstance(v[0], PageRef):
         return {
             "type": "pages",
-            "pages": [{"month": p.month, "page": p.page} for p in v],
+            "pages": [{"stem": p.stem, "page": p.page} for p in v],
         }
     if isinstance(v, list) and v and isinstance(v[0], AnnotatedValue):
         return {"type": "values", "values": [_summarize_annotated(e) for e in v]}
@@ -101,7 +101,7 @@ def summarize_value(v: Any) -> dict:
         # trace viewer renders; fall through to a plain list if any key doesn't parse.
         try:
             refs = [page_key_to_pageref(x) for x in v]
-            return {"type": "pages", "pages": [{"month": p.month, "page": p.page} for p in refs]}
+            return {"type": "pages", "pages": [{"stem": p.stem, "page": p.page} for p in refs]}
         except ValueError:
             pass
     if isinstance(v, list):

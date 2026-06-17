@@ -133,7 +133,7 @@ class RetrieveOp:
         for key in page_keys:
             try:
                 ref = page_key_to_pageref(key)
-                if required_docs and ref.month not in required_docs:
+                if required_docs and ref.stem not in required_docs:
                     bad.append(key)
                     continue
                 refs.append(ref)

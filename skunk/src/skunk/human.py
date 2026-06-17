@@ -101,9 +101,9 @@ def _pagerefs_to_docstrings(refs: list[PageRef]) -> list[str]:
     (`/api/source/{month}/page/{page}.png`) renders them. Shared by the blocking broker and the
     optimistic registration path so both speak one format."""
     return [
-        f"{p.month} PDF page {p.page}"
+        f"{p.stem} PDF page {p.page}"
         for p in refs
-        if p.month is not None and p.page is not None
+        if p.stem is not None and p.page is not None
     ]
 
 
@@ -128,7 +128,7 @@ def _value_page_attribution(
             descs = by_key.get(key)
             if descs is None:
                 by_key[key] = descs = []  # same list object lands in page_values below
-                refs.append(PageRef(month=entry.doc_id, page=page))
+                refs.append(PageRef(stem=entry.doc_id, page=page))
                 page_values.append({"month": entry.doc_id, "page": page, "values": descs})
             if entry.description and entry.description not in descs:
                 descs.append(entry.description)
@@ -330,9 +330,9 @@ class BrokerChannel:
         # Page refs as the UI's canonical doc strings so its existing source-page viewer
         # (`/api/source/{month}/page/{page}.png`) renders them — no pixels shipped over the wire.
         source_docs = [
-            f"{p.month} PDF page {p.page}"
+            f"{p.stem} PDF page {p.page}"
             for p in req.pages
-            if p.month is not None and p.page is not None
+            if p.stem is not None and p.page is not None
         ]
         guidance = {
             "task": req.task,

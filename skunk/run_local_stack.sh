@@ -12,8 +12,12 @@ BACKEND_PORT="8787"
 WEB_PORT="8788"
 CHROMA_PORT="8001"
 
-# CLEAN_PAGE_MAP=~/dais/clean_page_map.json
-CLEAN_PAGE_MAP=/home/ubuntu/dais/cleaned_pages_v1/clean_page_map.json
+# Corpus = DAIS. The exports below win over .env (run_solution.sh loads .env without clobbering
+# already-exported vars), so the run doesn't depend on a stale treasury .env.
+SKUNK_CHROMADB_DIR=/home/ubuntu/dais/.chromadb-dais-slim
+# Table-corrected map (matches the corrected tables pushed into the dais-slim collection).
+# Was: /home/ubuntu/dais/cleaned_pages_v1/clean_page_map.json  (raw parsed-JSON text)
+CLEAN_PAGE_MAP=/home/ubuntu/dais/cleaned/clean_page_map.json
 CHROMA_COLLECTION="dais-slim"
 CONCURRENCY="15"
 
@@ -40,6 +44,15 @@ export SKUNK_CONSOLE_CUP_PORT="$CUP_PORT"
 export SKUNK_CONSOLE_SERVER_PORT="$BACKEND_PORT"
 export SKUNK_CONSOLE_WEB_PORT="$WEB_PORT"
 export REASONER
+
+# --- DAIS corpus config (authoritative; overrides any stale values in .env) ---
+export OFFICEQA_PDF_DIR=/home/ubuntu/dais/pdfs
+export OFFICEQA_PARSED_JSON_DIR=/home/ubuntu/dais/parsed_json
+export SKUNK_RETRIEVER=search_agent
+export SKUNK_EMB_MODEL=qwen/qwen3-embedding-8b
+export SKUNK_PROMPT_OVERRIDES=config/prompts/us_receipts_expenditures.yaml
+export SKUNK_PAGE_INDEX_DIR=/home/ubuntu/dais/competition_page_index
+export SKUNK_HUMAN_INTERVENTION=0   # bring-up: keep treasury-shaped HITL provenance off the path
 
 pids=()
 names=()

@@ -180,7 +180,7 @@ def _stamp_provenance(
     from, so they're left empty). `doc_id` is that document's id (filename stem). Branch
     fields (`period`/`key`) are call-level and always stamped. The model is frozen, so we
     rebuild via `model_copy`."""
-    source_docs = {r.month for r in refs if r.month}
+    source_docs = {r.stem for r in refs if r.stem}
     doc_id = next(iter(source_docs)) if len(source_docs) == 1 else None
     pages = (
         tuple(sorted({r.page for r in refs if r.page is not None}))
@@ -414,10 +414,10 @@ an inclusive month range."""
             sc = store.summary(p)
             # The page itself plus any folded continuation pages (the table's tail).
             members = [p.page, *sc.continuation_pages] if sc is not None else [p.page]
-            refs = [PageRef(month=p.month, page=pg) for pg in members]
+            refs = [PageRef(stem=p.stem, page=pg) for pg in members]
             if sc is not None:  # linked footnote/notes pages last (auxiliary context)
                 for n in sc.notes_pages:
-                    r = PageRef(month=p.month, page=n)
+                    r = PageRef(stem=p.stem, page=n)
                     if r not in refs:
                         refs.append(r)
             out.append((p, refs))
@@ -517,7 +517,7 @@ derive, or invent. A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
         carries a header-less continuation page's inherited column grammar / own summaries."""
         period = f" for the period {branch.period}" if branch.period else ""
         image_lines = [
-            f"Image {i + 1}: PDF page {ref.page} of document {ref.month}"
+            f"Image {i + 1}: PDF page {ref.page} of document {ref.stem}"
             for i, ref in enumerate(rendered_refs)
         ]
         user_msg = "\n\n".join(
@@ -644,7 +644,7 @@ async def run_extract(
         for p, res in zip(want, reads):
             if isinstance(res, BaseException):
                 ctx.emit(
-                    f"select_extract_failed page={p.month}:{p.page} error={str(res)!r}"
+                    f"select_extract_failed page={p.stem}:{p.page} error={str(res)!r}"
                 )
                 extracted[p] = []
             else:
@@ -669,7 +669,7 @@ async def run_extract(
                 "extract",
                 f"retrieved pages yielded no data for {branches[pos].key!r}",
             )
-        page_keys = sorted({f"{p.month}:{p.page}" for p in pages})
+        page_keys = sorted({f"{p.stem}:{p.page}" for p in pages})
         ctx.emit(
             f"select_pipeline_branch branch_id={branch_ids[pos]} "
             f"n_pages={len(pages)} n_entries={len(owned)} covered={covered}",

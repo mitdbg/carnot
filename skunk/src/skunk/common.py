@@ -354,7 +354,7 @@ class PageRef:
     """Canonical page coordinate. Frozen so it's hashable — usable as a dict key
     and set member (e.g. the page-index catalog is keyed by `PageRef`)."""
 
-    month: str | None = None  # "YYYY-MM"; in the rekeyed page index this slot holds the doc id
+    stem: str | None = None  # doc-id stem, e.g. "combined_statement__historical__cs-1872" (search-agent / page-index key)
     page: int | None = None  # 1-based PDF page index (canonical)
 
     @property
@@ -362,36 +362,36 @@ class PageRef:
         """The calendar year for a `YYYY-MM` slot, or None. Returns None when the slot is not a
         bare month (the rekeyed page index stores a doc-id stem here — its year is parsed from
         the stem via `corpus.parse_doc_id`, not from this coordinate)."""
-        if not self.month or not self.month[:4].isdigit():
+        if not self.stem or not self.stem[:4].isdigit():
             return None
-        return int(self.month[:4])
+        return int(self.stem[:4])
 
     def __post_init__(self) -> None:
-        if self.page is not None and self.month is None:
+        if self.page is not None and self.stem is None:
             raise ValueError(
-                f"PageRef with page={self.page} requires month for parsed-JSON lookup"
+                f"PageRef with page={self.page} requires stem for parsed-JSON lookup"
             )
 
     def __repr__(self) -> str:
         parts = []
         if self.year:
             parts.append(f"year={self.year}")
-        if self.month:
-            parts.append(f"month={self.month}")
+        if self.stem:
+            parts.append(f"stem={self.stem}")
         if self.page is not None:
             parts.append(f"page={self.page}")
         return f"PageRef({', '.join(parts)})"
 
 
 def page_key_to_pageref(key: str) -> PageRef:
-    """Parse a search-agent page key (`"YYYY_MM_pageid"` or `"YYYY-MM-pageid"`)
-    into a `PageRef`. Splits on the last separator so the page id is unambiguous."""
-    sep = "_" if "_" in key and key.count("_") >= 2 else "-"
+    """Parse a search-agent page key `"<stem>_<page>"` into a `PageRef`. The doc-id stem (which
+    itself contains underscores, e.g. `"combined_statement__historical__cs-1872"`) goes in the
+    `stem` slot; the trailing integer is the 1-based page index."""
     try:
-        year_str, month_str, page_str = key.rsplit(sep, 2)
+        stem, page_str = key.rsplit("_", 1)
+        return PageRef(stem=stem, page=int(page_str))
     except ValueError as e:
-        raise ValueError(f"page key {key!r} not in YYYY{sep}MM{sep}pageid form") from e
-    return PageRef(month=f"{year_str}-{month_str}", page=int(page_str))
+        raise ValueError(f"page key {key!r} not in '<stem>_<page>' form") from e
 
 
 @dataclass(frozen=True)

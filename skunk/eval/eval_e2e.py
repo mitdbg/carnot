@@ -109,9 +109,9 @@ _DOC_TOKEN_RE = re.compile(r"^(?P<doc>[\w][\w\-]*):(?P<pages>\d+(?:,\d+)*)$")
 
 def _parse_source_docs(source_docs: str) -> list[PageRef]:
     """Parse a `source_docs` cell into golden `PageRef`s. Two accepted forms (mixable):
-      * Treasury month-year URLs `.../january-2002...?page=5` -> `PageRef(month="2002-01", page=5)`
+      * Treasury month-year URLs `.../january-2002...?page=5` -> `PageRef(stem="2002-01", page=5)`
       * DAIS doc-id tokens `combined_statement__historical__cs-1890:5,6,7`
-        -> one `PageRef(month=<doc_id>, page=N)` per page (the `month` slot holds the doc id
+        -> one `PageRef(stem=<doc_id>, page=N)` per page (the `stem` slot holds the doc id
         in the rekeyed corpus)."""
     out: list[PageRef] = []
     if not isinstance(source_docs, str):
@@ -119,13 +119,13 @@ def _parse_source_docs(source_docs: str) -> list[PageRef]:
     for m in _URL_RE.finditer(source_docs):
         month_mm = _MONTH_MAP[m.group("month").lower()]
         out.append(
-            PageRef(month=f"{m.group('year')}-{month_mm}", page=int(m.group("page")))
+            PageRef(stem=f"{m.group('year')}-{month_mm}", page=int(m.group("page")))
         )
     for tok in source_docs.split():
         m = _DOC_TOKEN_RE.match(tok)
         if m:
             for pg in m.group("pages").split(","):
-                out.append(PageRef(month=m.group("doc"), page=int(pg)))
+                out.append(PageRef(stem=m.group("doc"), page=int(pg)))
     return out
 
 
@@ -154,7 +154,7 @@ async def _run_one_question(
     """Run one question through the Orchestrator and collect a result dict."""
     if golden_pages:
         # Normalize to fresh PageRef instances regardless of input shape.
-        golden_pages = [PageRef(month=g.month, page=g.page) for g in golden_pages]
+        golden_pages = [PageRef(stem=g.stem, page=g.page) for g in golden_pages]
         if verbose:
             print(
                 f"[e2e] Golden pages: {len(golden_pages)} → {[str(r) for r in golden_pages]}"
@@ -320,8 +320,8 @@ def _retrieval_recall(retrieved_pages: list, gold_pages: list[PageRef] | None) -
     month:page). '' when no gold pages are recorded."""
     if not gold_pages:
         return ""
-    gold = {(p.month, p.page) for p in gold_pages}
-    got = {(p.month, p.page) for p in retrieved_pages}
+    gold = {(p.stem, p.page) for p in gold_pages}
+    got = {(p.stem, p.page) for p in retrieved_pages}
     return f"{len(gold & got)}/{len(gold)}"
 
 
@@ -465,7 +465,7 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
         "question": question,
         "predicted": predicted,
         "gold_answer": gold_answer,
-        "golden_pages": " ".join(f"{p.month}:{p.page}" for p in gold_report_pages),
+        "golden_pages": " ".join(f"{p.stem}:{p.page}" for p in gold_report_pages),
         "reason": result.get("reason") or "",
         "retrieval_recall": _retrieval_recall(
             retrieved_pages, cfg.golden_report.get(uid)
