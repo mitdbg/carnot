@@ -156,12 +156,14 @@ def test_human_assist_figure_branch_uses_figure_kind() -> None:
         {"response": json.dumps({"description": "Peak", "value": 7})},
     )
     assist = HumanAssist(channel=BrokerChannel(handler))
-    branch = RetrieveBranch(key="peak of the chart", visual_only=True)
+    branch = RetrieveBranch(key="peak of the chart")
     ctx = _ctx()
     try:
+        # A value the vision tier produced (`obtained_visually`) drives the figure kind,
+        # regardless of the branch's `visual_only` prediction.
         out = asyncio.run(
             assist.verify_extract(
-                [AnnotatedValue(description="Peak", value=3)],
+                [AnnotatedValue(description="Peak", value=3, obtained_visually=True)],
                 [_source_page()],
                 branch,
                 ctx,

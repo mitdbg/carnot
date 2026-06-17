@@ -40,11 +40,14 @@ def _cfg(**flags: bool) -> SkunkConfig:
 
 
 def test_policy_figure_gates_on_human_figure():
+    # The figure gate triggers on a value the vision tier actually produced
+    # (`obtained_visually`), not the branch's up-front `visual_only` prediction.
     p = HumanAssistPolicy()
-    vis = RetrieveBranch(key="k", visual_only=True)
-    assert p.verify_extract(vis, [], _cfg(human_figure=True)) is True
-    assert p.verify_extract(vis, [], _cfg(human_verify_extract=True)) is False
-    assert p.verify_extract(vis, [], _cfg()) is False
+    br = RetrieveBranch(key="k")
+    vis = [AnnotatedValue(description="d", value=1, obtained_visually=True)]
+    assert p.verify_extract(br, vis, _cfg(human_figure=True)) is True
+    assert p.verify_extract(br, vis, _cfg(human_verify_extract=True)) is False
+    assert p.verify_extract(br, vis, _cfg()) is False
 
 
 def test_policy_verify_gates_on_human_verify_extract():

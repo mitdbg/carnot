@@ -173,6 +173,8 @@ def _stamp_provenance(
     entries: list[AnnotatedValue],
     refs: list[PageRef],
     branch: RetrieveBranch,
+    *,
+    obtained_visually: bool = False,
 ) -> list[AnnotatedValue]:
     """Copy machine-fact provenance from the source refs + branch onto each entry —
     never LLM-written. `doc_id`/`pages` are attributable only when every ref in the
@@ -194,6 +196,7 @@ def _stamp_provenance(
                 "pages": pages,
                 "requested_period": branch.period,
                 "retrieve_key": branch.key,
+                "obtained_visually": obtained_visually,
             }
         )
         for e in entries
@@ -548,7 +551,7 @@ derive, or invent. A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
         # several documents (no per-image attribution on the reply), so doc_id/pages
         # land only when all images share one source document — the common single-doc
         # branch; multi-doc calls keep doc_id empty.
-        return _stamp_provenance(entries, rendered_refs, branch)
+        return _stamp_provenance(entries, rendered_refs, branch, obtained_visually=True)
 
 
 

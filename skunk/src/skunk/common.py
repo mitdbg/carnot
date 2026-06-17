@@ -433,9 +433,13 @@ class AnnotatedValue(BaseModel):
     analog of the machine-stamped corpus provenance below, which it cannot fill.
     Empty for corpus extracts (whose provenance is `doc_id`/`pages`).
 
-    Provenance (`doc_id`/`pages`/`requested_period`/`retrieve_key`) is
-    machine-stamped from the extract inputs — the source page refs and the
-    retrieve branch — NOT authored by the LLM. It is absent (None/empty) for
+    Provenance (`doc_id`/`pages`/`requested_period`/`retrieve_key`/`obtained_visually`)
+    is machine-stamped from the extract inputs — the source page refs and the
+    retrieve branch — NOT authored by the LLM. `obtained_visually` records the
+    machine fact that this value was read by the vision tier (the figure/chart
+    fallback), and gates the human figure ("Visual QA") review; it is internal
+    provenance and never shown to any LLM (it is excluded from every prompt
+    rendering). It is absent (None/empty) for
     external lookups. `doc_id` is the source document the value was read from,
     carried as that document's id — its parsed-JSON/PDF filename stem (e.g.
     "combined_statement__historical__cs-1872"). It identifies the source
@@ -462,6 +466,7 @@ class AnnotatedValue(BaseModel):
     pages: tuple[int, ...] = ()  # source PDF page(s); () when unattributable
     requested_period: str | None = None  # branch.period — data window requested
     retrieve_key: str | None = None  # branch.key — concept this datum serves
+    obtained_visually: bool = False  # True when read via the vision tier (figure/chart fallback)
 
     @model_validator(mode="after")
     def _check_shape(self) -> AnnotatedValue:

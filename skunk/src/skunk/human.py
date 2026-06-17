@@ -384,11 +384,13 @@ class HumanAssistPolicy:
         entries: list[AnnotatedValue],
         cfg,
     ) -> bool:
-        # Figure questions (visual_only) gate on human_figure — the model reads charts
-        # unreliably so the human produces the answer. Every other extraction gates on
-        # human_verify_extract — the human confirms/corrects the OCR/table read, regardless
-        # of value shape (scalar/vector/table all get the same review).
-        if branch.visual_only:
+        # Figure reads gate on human_figure — the model reads charts unreliably so the human
+        # produces the answer. The criterion is the machine fact that the value was actually
+        # read by the vision tier (`obtained_visually`), not the planner's up-front prediction
+        # (`branch.visual_only`): any vision fallback counts, whatever triggered it. Every other
+        # extraction gates on human_verify_extract — the human confirms/corrects the OCR/table
+        # read, regardless of value shape (scalar/vector/table all get the same review).
+        if any(e.obtained_visually for e in entries):
             return cfg.human_figure
         return cfg.human_verify_extract
 
@@ -447,27 +449,30 @@ class HumanAssist:
         refs, page_values = _value_page_attribution(entries)
         if not refs:
             refs, page_values = list(pages), []
+        # A vision-read value (any of the entries was `obtained_visually`) is a figure review —
+        # the machine fact that vision produced it, not the planner's `visual_only` prediction.
+        visual = any(e.obtained_visually for e in entries)
         instruction = (
             "This answer must be read off the figure/chart on the page(s) below — the "
             "model is unreliable here. Give the correct value(s)."
-            if branch.visual_only
+            if visual
             else "Confirm or correct the value(s) the model extracted, checking them "
             "against the source page(s) below."
         )
         ctx.emit(
-            f"human_request task={'figure' if branch.visual_only else 'verify_extract'} "
+            f"human_request task={'figure' if visual else 'verify_extract'} "
             f"candidates={[e.description for e in entries]!r} n_pages={len(refs)}",
             kind="user",
         )
         reply = await self._channel.ask(
             HumanRequest(
-                task="figure" if branch.visual_only else "verify_extract",
+                task="figure" if visual else "verify_extract",
                 instruction=instruction,
                 candidates=entries,
                 pages=refs,
                 page_values=page_values,
                 value_template=(
-                    _figure_value_template(branch, entries) if branch.visual_only else None
+                    _figure_value_template(branch, entries) if visual else None
                 ),
                 branch=branch,
             ),
@@ -528,9 +533,14 @@ class HumanAssist:
         # pre-clean values (single doc_id each) so coalesced multi-doc values don't break the
         # viewer. Lookup-derived values carry no page provenance and simply appear as cards with
         # no page; that's expected.
-        refs, page_values = _value_page_attribution(
-            source_values if source_values is not None else pool
-        )
+        attribution_src = source_values if source_values is not None else pool
+        refs, page_values = _value_page_attribution(attribution_src)
+        # Read the vision-tier provenance off the PRE-clean values: `obtained_visually` is internal
+        # provenance the data-prep agent never sees (it's kept out of every prompt), so the cleaned
+        # pool can't be trusted to carry it; the pre-clean values do. Surfaced as a UI-only boolean
+        # in guidance (never the raw field) so the optimistic UI can label the pool review "Visual
+        # QA" instead of the extract/OCR review when any value was read off a figure/chart.
+        visual = any(e.obtained_visually for e in attribution_src)
         instruction = (
             "Review the data the agent cleaned and is about to compute over. Confirm or correct "
             "the value(s), checking them against the source page(s) below."
@@ -542,6 +552,7 @@ class HumanAssist:
             "candidates": _candidate_dicts(pool),
             "fields": list(_FIELDS),
             "page_values": page_values,
+            "visual": visual,
         }
         review_id = register(
             "verify_extract", instruction, ctx.question, _pagerefs_to_docstrings(refs), guidance

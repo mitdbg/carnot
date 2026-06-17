@@ -218,7 +218,13 @@ def _review_corpus_summary(review) -> dict[str, Any] | None:
     }
 
 
-def _review_reason(kind: str, corpus: dict[str, Any] | None) -> dict[str, str] | None:
+def _review_reason(
+    kind: str, corpus: dict[str, Any] | None, guidance: dict[str, Any] | None = None
+) -> dict[str, str] | None:
+    # A pool review whose values were read by the vision tier (`guidance.visual`) is a visual
+    # validation, not an OCR/value check — show that reason regardless of corpus OCR signals.
+    if kind == "verify_extract" and guidance and guidance.get("visual"):
+        return {"kind": "visual_validation", "policy": "confirm the figure read against source"}
     if corpus is None:
         return None
     if kind == "verify_extract":
@@ -227,11 +233,8 @@ def _review_reason(kind: str, corpus: dict[str, Any] | None) -> dict[str, str] |
                 "kind": "value_validation",
                 "policy": "structured source; OCR review disabled",
             }
-        if corpus.get("ocr_risk") in {"medium", "high"}:
-            return {
-                "kind": "ocr_quality",
-                "policy": "messy or scanned source; verify extracted content",
-            }
+        # ocr_quality is intentionally never surfaced: a vision read shows the visual_validation
+        # reason above; otherwise the extract review carries no OCR-quality reason chip.
     if kind == "figure":
         return {"kind": "visual_validation", "policy": "confirm the figure read against source"}
     if kind == "lookup":
@@ -325,7 +328,7 @@ def create_app(config: ServerConfig, reasoner: Reasoner | None = None) -> FastAP
                         "guidance": review.guidance,
                         "refining": review.refining,
                         "corpus_summary": corpus,
-                        "review_reason": _review_reason(review.kind, corpus),
+                        "review_reason": _review_reason(review.kind, corpus, review.guidance),
                     }
                 )
             return {
