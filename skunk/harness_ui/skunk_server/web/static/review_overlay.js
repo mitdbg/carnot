@@ -80,15 +80,20 @@ const CorpusUI = (function () {
     return "corpus-unknown";
   }
 
+  function showDocTag(doc) {
+    if (!doc) return false;
+    if (doc.family === "combined_statement") return false;
+    if (doc.era === "historical") return false;
+    return true;
+  }
+
   function summaryTags(summary) {
     if (!summary) return "";
     const docs = summary.documents || [];
-    const primary = docs[0];
+    const primary = docs.find(showDocTag);
     const tags = [];
     if (primary) {
       tags.push(`<span class="tag corpus-tag ${docClass(primary)}" title="${esc(primary.source || "")}">${esc(docLabel(primary))}</span>`);
-    } else if ((summary.eras || []).length) {
-      tags.push(`<span class="tag corpus-tag corpus-unknown">${esc(summary.eras.join(", "))}</span>`);
     }
     if (summary.ocr_review_blocked) {
       tags.push(`<span class="tag corpus-tag corpus-blocked" title="Structured source policy: do not ask humans to review OCR content">OCR blocked</span>`);
@@ -161,8 +166,8 @@ const ReviewOverlay = (function () {
   let baselineReviewId = null;
 
   // viewer state
-  let pages = [];              // [{month, page}] parsed from the review's source_docs
-  let pageValues = [];         // [{month,page,values:[desc,...]}] from guidance — value(s) per page
+  let pages = [];              // [{doc,page}] or legacy [{issue,page}] parsed from source refs
+  let pageValues = [];         // per-page value labels from guidance — value(s) per page
   let pageIdx = 0;
   let zoom = 1, panX = 0, panY = 0;
   let fitScale = 1;            // scale that fits the whole page in the viewport (and the min zoom)
@@ -176,15 +181,38 @@ const ReviewOverlay = (function () {
 
   function root() { return document.getElementById("reviewOverlay"); }
 
-  function parsePages(sourceDocs) {
+  function parsePages(sourceDocs, guidance) {
     const out = [];
     const seen = new Set();
+    const add = (doc, page, legacyIssue) => {
+      const pageNum = Number(page);
+      if (!Number.isInteger(pageNum) || pageNum < 0) return;
+      const docId = String(doc || "").replace(/\.pdf$/i, "").replace(/\.txt$/i, "");
+      if (!docId && !legacyIssue) return;
+      const key = `${docId || legacyIssue || "page"}/${pageNum}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(legacyIssue ? { issue: legacyIssue, page: pageNum } : { doc: docId, page: pageNum });
+    };
     for (const doc of sourceDocs || []) {
-      const m = /Treasury Bulletin (\d{4}-\d{2}) PDF page (\d+)/.exec(String(doc));
-      if (m) {
-        const key = `${m[1]}/${m[2]}`;
-        if (!seen.has(key)) { seen.add(key); out.push({ month: m[1], page: Number(m[2]) }); }
+      if (doc && typeof doc === "object") {
+        add(doc.document_id ?? doc.doc_id ?? doc.source_doc ?? doc.source ?? doc.bulletin ?? doc.file, doc.page ?? doc.pdf_page ?? doc.page_id);
+        continue;
       }
+      const text = String(doc);
+      for (const m of text.matchAll(/(?:^|[/\s])([A-Za-z0-9][A-Za-z0-9_.-]+)_(\d{1,5})(?:\.txt)?\b/g)) {
+        add(m[1], m[2]);
+      }
+      const legacy = /\b((?:18|19|20)\d{2}-(?:0[1-9]|1[0-2]))\b.*?\b(?:pdf\s*)?page\s+(\d{1,4})\b/i.exec(text);
+      if (legacy) add("", legacy[2], legacy[1]);
+      const pageOnly = /\b(?:p(?:age)?|pg|page_id|pdf_page)\s*["']?\s*[:=#.]?\s*(\d{1,5})\b/i.exec(text);
+      if (!legacy && pageOnly) {
+        const pdf = /([A-Za-z0-9][A-Za-z0-9_.-]+)\.pdf\b/i.exec(text);
+        add(pdf ? pdf[1] : "", pageOnly[1]);
+      }
+    }
+    for (const value of (guidance && guidance.page_values) || []) {
+      add(value.document_id ?? value.doc_id ?? value.source_doc ?? value.source ?? value.bulletin ?? value.month, value.page ?? value.pdf_page ?? value.page_id);
     }
     return out;
   }
@@ -454,9 +482,12 @@ const ReviewOverlay = (function () {
     const label = root().querySelector(".review-page-label");
     if (label && pages.length) {
       const pg = pages[pageIdx];
-      const pv = pageValues.find((v) => v.month === pg.month && Number(v.page) === Number(pg.page));
+      const pv = pageValues.find((v) =>
+        Number(v.page ?? v.pdf_page ?? v.page_id) === Number(pg.page)
+        && (!pg.doc || [v.document_id, v.doc_id, v.source_doc, v.source, v.bulletin, v.month].some((x) => String(x || "").replace(/\.pdf$/i, "") === pg.doc))
+      );
       const vals = pv && (pv.values || []).length ? `  —  ${pv.values.join(", ")}` : "";
-      label.textContent = `Treasury Bulletin ${pg.month}  ·  p.${pg.page}  (${pageIdx + 1}/${pages.length})${vals}`;
+      label.textContent = `${pg.doc || pg.issue || "Source"}  ·  p.${pg.page}  (${pageIdx + 1}/${pages.length})${vals}`;
     }
   }
   // Fit the loaded page to the viewport and center it; the fit scale also becomes the minimum
@@ -488,7 +519,9 @@ const ReviewOverlay = (function () {
     const img = root().querySelector(".review-page-img");
     if (img) {
       img.onload = () => scheduleFit();      // fit once the new page's natural size is known
-      img.src = `/api/source/${pages[pageIdx].month}/page/${pages[pageIdx].page}.png`;
+      img.src = pages[pageIdx].doc
+        ? `/api/source-doc/${encodeURIComponent(pages[pageIdx].doc)}/page/${pages[pageIdx].page}.png`
+        : `/api/source/${encodeURIComponent(pages[pageIdx].issue)}/page/${pages[pageIdx].page}.png`;
       scheduleFit();                          // cached image / already-laid-out: fit post-layout
     }
   }
@@ -614,7 +647,7 @@ const ReviewOverlay = (function () {
     const review = current();
     if (!review) { close(); return; }
     el.hidden = false;
-    pages = parsePages(review.source_docs);
+    pages = parsePages(review.source_docs, review.guidance);
     pageValues = (review.guidance && review.guidance.page_values) || [];
     pageIdx = 0; zoom = 1; panX = 0; panY = 0; fitScale = 1;
     const task = tasksRef.find((t) => t.task_id === activeTaskId);

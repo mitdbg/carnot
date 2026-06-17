@@ -148,6 +148,20 @@ assignments for the old task version become `SUPERSEDED`.
 
 The task detail overlay is intentionally inset lower in the viewport, with a
 14vh top offset, so the header round timer remains visible above the popup.
+The review overlay source-page viewer supports DAIS-style document/page
+references such as `cleaned_pages/<document_id>_<page>.txt` and does not
+require Treasury Bulletin month labels.
+For a `FAILED` task with no answer candidate and no submission, the detail
+overlay shows a `re-start` button. The operator may provide optional feedback;
+the server records that feedback as context for the next fresh agent attempt,
+returns the task to `QUEUED`, and enqueues it on the Agent Task Queue.
+
+For a submitted or scored answer whose latest Cup result is `correct=false`,
+the detail overlay shows `Re-submit Answer` while Cup resubmit tokens remain.
+The command reuses the existing manual submit endpoint and the `Resubmits`
+header counter is updated from Cup `tokens_remaining`.
+The `Re-submit Answer` control requires explicit user confirmation before the
+resubmission is sent.
 
 Additionally, the client displays an "Await Human" summary count and status area
 for each task that is in `AWAIT_HUMAN` processing. Request cards show the
@@ -327,12 +341,15 @@ stateDiagram-v2
     READY --> RETRY_QUEUED: first valid retry
 
     FAILED --> FAILED: assign human worker
+    FAILED --> QUEUED: re-start with no answer
     FAILED --> RETRY_QUEUED: first valid retry
     FAILED --> SUBMITTING: first valid direct answer
 
     SUBMITTING --> SUBMITTED: Cup accepts
     SUBMITTING --> READY: Cup rejects or transport failure
     SUBMITTED --> SCORED: score event
+    SUBMITTED --> SUBMITTING: re-submit if correct=false and tokens remain
+    SCORED --> SUBMITTING: re-submit if correct=false and tokens remain
 
     READY --> CANCELLED: round closes
     FAILED --> CANCELLED: round closes
@@ -354,6 +371,13 @@ submission.
 Cup rejection, scoring, and accepted-with-immediate-score feedback are stored
 on the task and automatically appended to the context of any later reasoning
 attempt. WebSocket score events also update the records.
+
+The `re-start` command is narrower than a scored-answer retry: it is available
+only after an agent failure that produced no answer candidate and no submission.
+It starts a new agent attempt from the original prompt plus optional operator
+feedback. Resubmission is available only when the latest Cup-scored submission
+has `correct=false`; token availability is taken from the round's Cup
+`resubmits_left`/`tokens_remaining` values.
 
 Human assignments do not change the task from `READY` or `FAILED`. An action
 must include its `assignment_id` and observed `task_version`. The first valid
@@ -608,6 +632,8 @@ POST /api/human-answers      # submit a direct human answer
 POST /api/interventions/{intervention_id}/claim   # claim a PENDING intervention
 POST /api/interventions/{intervention_id}/release # release a CLAIMED intervention
 POST /api/interventions/{intervention_id}/resolve # submit response and resolve
+POST /api/restart/{task_id} # re-start FAILED task with no answer candidate
+POST /api/submit/{task_id}  # submit READY or re-submit latest correct=false answer
 ```
 
 The server creates a new worker UUID when the client WebSocket connection is

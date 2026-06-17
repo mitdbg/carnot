@@ -59,6 +59,7 @@ _ALLOWED_REQUEST_HEADERS = {
 }
 _PROXY_ROUTES: list[tuple[str, str, Callable[[dict[str, Any]], str]]] = [
     ("POST", "/api/submit/{task_id:path}", lambda p: f"/api/submit/{p['task_id']}"),
+    ("POST", "/api/restart/{task_id:path}", lambda p: f"/api/restart/{p['task_id']}"),
     (
         "POST",
         "/api/reviews/{review_id}/resolve",
@@ -83,6 +84,11 @@ _PROXY_ROUTES: list[tuple[str, str, Callable[[dict[str, Any]], str]]] = [
         "GET",
         "/api/source/{month}/page/{page}.png",
         lambda p: f"/api/source/{p['month']}/page/{p['page']}.png",
+    ),
+    (
+        "GET",
+        "/api/source-doc/{doc_id}/page/{page}.png",
+        lambda p: f"/api/source-doc/{p['doc_id']}/page/{p['page']}.png",
     ),
 ]
 
