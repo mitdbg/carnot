@@ -105,11 +105,17 @@ def source_of(file_id: str) -> str:
 
 # --------------------------------------------------------------------------- LLM
 class DaisLLM:
-    """Gemini-first LLM client with automatic OpenRouter fallback on rate limits.
+    """Two-provider LLM client (genai + OpenRouter) with automatic fallback.
+
+    Provider *order* depends on the model id: a bare id (e.g. ``gemini-3.5-flash``) runs
+    **genai first** with OpenRouter fallback; a provider-qualified id (e.g.
+    ``google/gemini-2.5-flash``) runs **OpenRouter first** with genai fallback. The latter
+    is the escape hatch when genai is unhealthy (e.g. 500 storms or hung streams that the
+    per-call retry can't recover from).
 
     ``call(...)`` is drop-in compatible with ``LLMClient.call`` (returns an
-    ``LLMResponse`` with a ``.text`` field), so the table-correction and
-    page-reorder logic can use it exactly like the stock ``LLMClient``.
+    ``LLMResponse`` with a ``.text`` field), so the table-correction logic can use it
+    exactly like the stock ``LLMClient``.
     """
 
     def __init__(
@@ -132,6 +138,8 @@ class DaisLLM:
             dataclasses.replace(base, llm_provider="openrouter", llm_model=self.or_model)
         )
         self._enable_fallback = enable_fallback
+        # A provider-qualified id (has a "/") means "use OpenRouter as the primary".
+        self._prefer_openrouter = "/" in model
 
     def call(
         self,
@@ -140,15 +148,20 @@ class DaisLLM:
         images: list[B64Image] | None = None,
         **kwargs,
     ) -> LLMResponse:
+        primary, secondary, p_name, s_name = (
+            (self._openrouter, self._genai, "openrouter", "genai")
+            if self._prefer_openrouter
+            else (self._genai, self._openrouter, "genai", "openrouter")
+        )
         try:
-            return self._genai.call(system=system, user=user, images=images, **kwargs)
+            return primary.call(system=system, user=user, images=images, **kwargs)
         except Exception as e:  # noqa: BLE001 - decide fallback vs re-raise below
             # Only fall back for transient/throttling failures; a non-retryable error
-            # (bad request, context overflow, auth) would fail on OpenRouter too.
+            # (bad request, context overflow, auth) would fail on the other provider too.
             if not (self._enable_fallback and _is_retryable(e)):
                 raise
             log.warning(
-                "genai call failed (%s: %s); falling back to OpenRouter model %s",
-                type(e).__name__, e, self.or_model,
+                "%s call failed (%s: %s); falling back to %s",
+                p_name, type(e).__name__, e, s_name,
             )
-            return self._openrouter.call(system=system, user=user, images=images, **kwargs)
+            return secondary.call(system=system, user=user, images=images, **kwargs)

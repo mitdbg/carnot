@@ -137,6 +137,57 @@ officeqa_datagen_guidance: |
   print(f"CAGR over {years} years: {cagr:.2%}")
   ```
 
+dais_datagen_guidance: |
+  ### Question style (mandatory)
+  The corpus is the U.S. "Combined Statement of Receipts, Expenditures, and Balances of the United States Government" — **annual** federal fiscal reports: the combined-statement volumes (fiscal years 1872–2024, across the historical / transition / modern eras) plus the early govinfo receipts-and-expenditures volumes (publication years ~1793–1893). The following rules apply to **every** question you produce.
+
+  **Do not name the source.** Phrase the question so that knowing which specific volume, era, chapter, schedule, or table the answer comes from gives no advantage.
+  - Do NOT name a volume or its vintage ("the FY1968 Combined Statement", "the 1827 receipts volume", "the modern combined statement"), an era ("the transition-era appendix"), a section / chapter / schedule code ("Schedule 3", "Table A", "chapter c01"), a collection ("the govinfo receipts volume"), or any other document-level identifier.
+  - Do NOT write "According to ...", "Based on ...", "As reported in ...", "Using the appendix of ...", or similar phrases that point to a specific source artifact.
+  - You MAY specify the subject matter, the time period, and the type of figure — those are properties of the *question*, not its *source*.
+  - Bad: "According to Schedule 3 of the FY1953 Combined Statement, what were the total expenditures of the United States?"
+  - Good: "What were the total expenditures of the United States in fiscal year 1953?"
+
+  **Drop scaffolding clauses, even when they only name the subject.** A leading clause that quotes a table / fund / organizational-unit title verbatim ("Based on the Life-Saving Service salaries-and-expenses account, ...") pre-resolves the retrieval step. Strip it and ask directly, naming only the *quantity* and *period* a person would actually know to ask about. Refer to a figure by what it measures, not by the proper name of the table / schedule / unit that contains it, whenever a natural questioner plausibly would. The test: if removing a descriptor makes the question ambiguous about *what number* is wanted, keep it; if it only makes the answer harder to *locate*, remove it.
+
+  ### Period framing (mandatory — this corpus is annual and temporally tricky)
+  Frame every period precisely so the question targets exactly one data window, then **exploit the corpus's temporal structure to force inference hops**:
+  - State whether you mean a FISCAL or a CALENDAR year when it matters. The federal fiscal year ran **July–June through FY1976** and **October–September from FY1977 on**; the quarter **July–September 1976** (the "transition quarter") belongs to NEITHER fiscal year. A strong question can pivot on this — e.g. a change in a figure across the FY1976→FY1977 basis change, where the solver must expand each fiscal year on its own basis.
+  - The govinfo receipts volumes are dated by **publication year** but report data for the **prior 1–2 years** (a volume published in 1827 reports the year 1825). Ask about the *data* year and let the solver resolve the lag.
+  - The same figure is often **restated** — in its own year-end statement, again as a prior-year "comparative" column in the next volume, and across the duplicate FY1872–1893 coverage that appears in BOTH collections. You may ask for a value "as originally reported" vs "as later restated" to force the solver to pick the right vintage.
+  - Terminology **drifts across eras**: historical volumes title outflows "disbursements"; govinfo and modern volumes say "expenditures" — the same series under different words. A question may span eras and require the solver to unify the terminology.
+
+  ### Reasoning difficulty (mandatory)
+  Synthetic questions skew far easier than a human benchmark because they point at one contiguous block and ask for a single reduction. Push every question harder:
+  - **Make the aggregation implicit; ask for the identity, not the extremum.** Prefer "in which fiscal year between 1900 and 1930 were total customs receipts highest — and what were total internal-revenue receipts that same year?" over "what was the maximum of X".
+  - **Require assembling values that are not co-located** — across many rows, across receipts vs expenditures, or (especially) **across many annual volumes**: a statistic over a run of fiscal years lives in a different document per year, so a multi-year series forces broad retrieval.
+  - **Chain two steps** where the first result selects the input to the second ("find the fiscal year in the 1930s with the largest deficit; report total expenditures that year").
+  - **Combine two distinct quantities** into a derived figure (a ratio, share, year-over-year change, or difference between two separately retrieved series).
+  - **Reference entities / periods indirectly** when the resolution is unambiguous ("the fiscal year the Korean War began" rather than "fiscal year 1950"). Use sparingly.
+
+  ### Computation requirement (mandatory)
+  **Every answer nugget must be the result of a calculation that does not appear pre-computed in the source text.** Do not copy a printed total or average and present it as your answer. Acceptable computations include (but are not limited to):
+  - Mean, median, or standard deviation of a multi-year series of values
+  - Maximum or minimum across years or rows, or which item achieves it (argmax / argmin)
+  - Year-over-year change, percentage change, or compounded annual growth rate (CAGR) across a span of fiscal years
+  - Percentage share or ratio of two quantities
+  - Linear trend / slope across a time series (e.g. via `numpy.polyfit`)
+  - Ranking items by a numeric field and reporting the rank or the top-N items
+
+  **Watch scale and basis before computing.** Historical volumes print exact dollars (often with cents); modern volumes often print thousands or millions — never combine two figures on different scales without rescaling, and never mix a fiscal-year total with a calendar-year total. Distinguish a **flow** (a year's receipts or expenditures) from a **stock** (an outstanding balance / the public debt as of a date).
+
+  **Workflow:** retrieve the raw data values from the corpus, then compute the answer in a code block using `numpy`, `scipy`, `statistics`, or `math` and `print()` the result before deciding on the final nugget. Do not use a pre-aggregated total or average that already appears in the source text as your answer.
+
+  ```python
+  import numpy as np
+  # example: CAGR of an annual series across a span of fiscal years
+  values = np.array([2402.3, 2806.5, 3346.8, 3790.2, 4060.0])
+  years = len(values) - 1
+  print(f"CAGR over {years} years: {(values[-1] / values[0]) ** (1 / years) - 1:.2%}")
+  ```
+
+  **Self-check before finalizing.** Reject a candidate question if (a) its leading clause names or paraphrases a volume / era / section / table / fund title, (b) every value needed sits in one already-identified contiguous block, (c) the operation is named so explicitly that no scanning, selection, or multi-step reasoning is required, or (d) the period is ambiguous about fiscal-vs-calendar year or about which vintage of a restated figure is wanted. If any holds, rewrite it before emitting.
+
 # ---------------------------------------------------------------------------
 # De-duplication judge prompts.
 #
@@ -247,6 +298,60 @@ dedup_judge_prompt_officeqa: |
     -> NOT DUPLICATE (same statistic but different underlying data / time range)
   - Q1: "Who was Treasurer of the United States in 1941?" A1: "W. A. Julian"  vs  Q2: "What was
     the gold stock in December 1941?" A2: "$22.7B"
+    -> NOT DUPLICATE (different facts)
+
+  **Output Format:** Respond with a JSON object and nothing else:
+  ```json
+  {"reasoning": "Analyze whether both pairs target the same underlying fact, relationship, or data slice", "duplicate": "yes or no"}
+  ```
+
+dedup_judge_prompt_dais: |
+  You are judging whether two question-answer pairs are duplicates in a synthetic test set built on the U.S. "Combined Statement of Receipts, Expenditures, and Balances of the United States Government" — annual federal receipts, expenditures, and balances (combined-statement fiscal years 1872–2024, plus the early govinfo receipts volumes, publication years ~1793–1893).
+
+  **Question-Answer Pair 1 (Generated):**
+  Question 1: {{ generated_question }}
+  Answer 1:
+  {{ generated_answer }}
+
+  **Question-Answer Pair 2 (Validation Set):**
+  Question 2: {{ validation_question }}
+  Answer 2:
+  {{ validation_answer }}
+
+  **Your Task:** Determine if these question-answer pairs are duplicates.
+
+  Two pairs are duplicates if ANY of the following hold:
+  1. They are about the same underlying fact, statistic, or relationship.
+  2. "Inverse" framing — Q1's answer appears in Q2's question and vice versa.
+  3. They compute different statistics over the **same underlying data series / rows / fiscal-year range**
+     (e.g. "What was the mean of X over FY1920–FY1930?" vs "What was the maximum of X over FY1920–FY1930?"
+     are DUPLICATES — same underlying data, different aggregation). The goal is diversity in the underlying
+     data needed, not just in the aggregation function.
+  4. They target the same figure that merely lives in two places in THIS corpus — e.g. a fiscal year reported
+     in BOTH the govinfo and the combined-statement copies (FY1872–1893 overlap), or a value in its own
+     year-end statement vs. the same value restated as a prior-year "comparative" column in a later volume.
+     Same fact, different source / vintage = DUPLICATE.
+
+  Two pairs are NOT duplicates if:
+  - They target the same statistic over different fiscal-year ranges, different series, or different
+    organizational units (different underlying data).
+  - They happen to share an answer value but ask about distinct facts.
+
+  **Examples:**
+  - Q1: "What were the total expenditures of the United States in fiscal year 1953?" A1: "$X"  vs
+    Q2: "How much did the federal government spend in FY1953?" A2: "$X"
+    -> DUPLICATE (same fact, inverse framing)
+  - Q1: "What was the mean of annual customs receipts over FY1920–FY1930?" A1: "$X"  vs
+    Q2: "What was the largest single-year customs receipts figure over FY1920–FY1930?" A2: "$Y"
+    -> DUPLICATE (different statistic over the SAME underlying series / range)
+  - Q1: "What was the mean of annual customs receipts over FY1920–FY1930?"  vs
+    Q2: "What was the mean of annual customs receipts over FY1940–FY1950?"
+    -> NOT DUPLICATE (same statistic, different underlying data / range)
+  - Q1: "What were total ordinary receipts for the year reported in the volume published in 1881?" A1: "$Z"  vs
+    Q2: "What were total ordinary receipts of the United States in fiscal year 1880?" A2: "$Z"
+    -> DUPLICATE (the same FY1880-era figure, reached via the duplicate cross-collection / publication-lag copy)
+  - Q1: "Who was Treasurer of the United States in fiscal year 1881?"  vs
+    Q2: "What was the public debt at the end of fiscal year 1881?"
     -> NOT DUPLICATE (different facts)
 
   **Output Format:** Respond with a JSON object and nothing else:
@@ -551,6 +656,116 @@ quality_filter_system_prompt_officeqa: |
     - valid:     true if the QA pair passes all criteria above, false otherwise.
     - reasoning: a concise justification (1-3 sentences) summarizing the
                  evidence from the corpus and the rollout attempts.
+
+  ```json
+  {"valid": true, "reasoning": "Your 1-3 sentence justification here."}
+  ```
+
+quality_filter_system_prompt_dais: |
+  You are a Quality Filter for synthetic QA pairs built on the U.S. "Combined Statement of
+  Receipts, Expenditures, and Balances of the United States Government" — annual federal
+  receipts, expenditures, and balances (combined-statement fiscal years 1872–2024 across the
+  historical / transition / modern eras, plus the early govinfo receipts volumes, publication
+  years ~1793–1893).
+
+  Your job is to decide whether a (question, answer) pair is a high-quality evaluation item.
+  A pair is **valid** if and only if:
+    1. The question is unambiguous: it specifies a single underlying data slice (series,
+       organizational unit, and a clearly-bounded fiscal- or calendar-year range) clearly
+       enough that a competent human, given full access to the corpus, would converge on
+       essentially the same answer.
+    2. The provided ground-truth answer is correct given the canonical data in the corpus.
+    3. The question is non-trivially answerable from the corpus (it requires retrieval and
+       computation, not memorization).
+
+  Many answers are short, structured nugget lists (a statistic, an identity, a derived
+  figure); judge correctness nugget-by-nugget rather than expecting long-form prose.
+
+  Do NOT simply trust the TaskSolver answers provided in the user message. Use the corpus
+  tools below to verify the underlying data independently. When rollout attempts disagree,
+  use the tools to determine which (if any) is correct.
+
+  ### Corpus-specific verification rules (READ CAREFULLY — these are the common failure modes here)
+  - **Scale / units.** Historical volumes print exact dollars (often with cents); modern
+    volumes often print thousands or millions, stated in a column header, caption, or
+    footnote. Confirm the answer and every value combined into it are on the same scale —
+    a wrong or mixed scale is the single most common ground-truth error.
+  - **Fiscal vs calendar year, and the basis change.** The fiscal year ran July–June through
+    FY1976 and October–September from FY1977 on; the July–September 1976 "transition quarter"
+    belongs to neither fiscal year. Confirm the question's period maps to exactly one window
+    and the answer was computed on that basis. Reject if the period is genuinely ambiguous
+    (e.g. "in 1976" where fiscal-vs-calendar changes the answer).
+  - **Publication lag.** govinfo receipts volumes are dated by publication year but report
+    data for the prior 1–2 years; verify the figure is read for the correct DATA year.
+  - **Restatements / duplicates.** A figure can appear in its own year-end statement, as a
+    prior-year comparative column in a later volume, and in the duplicated FY1872–1893
+    coverage across both collections. If the question pins a vintage ("as originally reported"
+    / "as later restated"), confirm the answer matches that vintage and is not a silent mix.
+  - **Series qualifiers and terminology drift.** Rows differ by subtle modifiers ("ordinary"
+    vs "total" receipts, gross vs net, a flow vs an outstanding stock / balance). Historical
+    volumes label outflows "disbursements" while modern / govinfo say "expenditures" — the
+    same series under different words. Verify the answer matches the exact qualified series
+    the question asks for.
+  - **OCR.** Text is OCR / VLM-derived from image-only scans; read values exactly as printed
+    and treat a cell rendered "nan" as an empty cell, not zero.
+
+  Benchmark identifier / metadata schema:
+  {{ special_notes }}
+
+  ## Response format
+  On every step, output EITHER one fenced python code block containing a single tool call
+  (optionally preceded by pure-python computation, e.g. `math`, `statistics`, `numpy`):
+
+  ```python
+  # a single tool call
+  ```
+
+  OR a single ```json``` block with your final verdict (emit this once, when ready):
+
+  ```json
+  {"valid": true, "reasoning": "<1-3 sentence justification>"}
+  ```
+
+  You may write a brief "Thoughts:" line before the block. The ```json``` final answer is parsed as data (not executed) — write a plain JSON literal (`true`/`false`, no Python).
+
+  ## Tools
+
+  ### search_corpus(query: str, top_k: int, metadata_filter: dict | None = None)
+  Vector search over all chunks. Returns the `top_k` most relevant chunks labelled with
+  `chunk_id` and `doc_id`. Supports the same `metadata_filter` syntax as described in the
+  corpus notes.
+
+  ```python
+  search_corpus("topic X", top_k=50)
+  ```
+
+  ### grep_corpus(pattern: str, metadata_filter: dict | None = None, limit: int | None = None)
+  Regex search over chunk text. Returns matching chunks grouped by `doc_id`.
+
+  ```python
+  grep_corpus("(?i)topic Y", limit=30)
+  ```
+
+  ### read_document(doc_id: str | list[str])
+  Returns the full text of one or more documents by `doc_id`.
+
+  ```python
+  read_document(["doc_id_1", "doc_id_2"])
+  ```
+
+  ### prune(chunk_ids: list[str] | None = None, doc_ids: list[str] | None = None)
+  Marks chunks or documents as irrelevant; they are excluded from all subsequent search and
+  grep results.
+
+  ```python
+  prune(chunk_ids=["chunk_id_1"], doc_ids=["doc_id_2"])
+  ```
+
+  ## Final verdict
+  When you have reached a verdict, emit it as the single ```json``` final answer:
+    - valid:     true if the QA pair passes all criteria above, false otherwise.
+    - reasoning: a concise justification (1-3 sentences) summarizing the evidence from the
+                 corpus and the rollout attempts.
 
   ```json
   {"valid": true, "reasoning": "Your 1-3 sentence justification here."}
