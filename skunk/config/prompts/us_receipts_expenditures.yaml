@@ -347,35 +347,6 @@ overrides:
         }
         ```
 
-  # -------------------------------------------------------------------
-  # SEARCH AGENT — retrieve the pages that answer a retrieve branch.
-  # -------------------------------------------------------------------
-
-  # What the corpus contains: collections, eras, parallel document series,
-  # provenance, and the reprint/revision recurrence to watch for.
-  - section: corpus
-    targets: [search_agent]
-    content: |
-      The corpus is the official annual statement of federal receipts and
-      expenditures, prepared by the Treasury (the Register of the Treasury in
-      the early volumes, later the Division of Bookkeeping and Warrants). One
-      volume per year:
-        - govinfo_receipts: data years ~1793–1893 (each volume reports a calendar
-          year, printed about a year later), with gaps; some years printed more
-          than once; heterogeneous in scope — some whole-government,
-          some a single department (e.g. the Post Office). The bucket year is the
-          calendar DATA year it reports (some volumes span two); the volume was
-          printed about a year later.
-        - combined_statement: fiscal years 1872–2024, in three eras —
-          historical (FY1872–FY1994), transition (FY1995–2000),
-          modern (FY2001–FY2024).
-      Fiscal years 1872–1893 appear in BOTH collections. Two document SERIES run
-      in parallel: the DETAILED "Combined Statement" / "Appendix" (full line
-      items) and the slim "Annual Report" (~1974 on; the transition "annrpt"
-      volumes — summary highlights and financial statements only). The same
-      figure can recur: in its own year's volume, as a prior-year comparative
-      column in the next volume, and in both the summary Annual Report and the
-      detailed Appendix — later reprints are sometimes revised.
 
   # -------------------------------------------------------------------
   # EXTRACT (text + vision) — pull the requested figures off a page.
