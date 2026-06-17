@@ -101,7 +101,7 @@ def _pagerefs_to_docstrings(refs: list[PageRef]) -> list[str]:
     (`/api/source/{month}/page/{page}.png`) renders them. Shared by the blocking broker and the
     optimistic registration path so both speak one format."""
     return [
-        f"Treasury Bulletin {p.month} PDF page {p.page}"
+        f"{p.month} PDF page {p.page}"
         for p in refs
         if p.month is not None and p.page is not None
     ]
@@ -330,7 +330,7 @@ class BrokerChannel:
         # Page refs as the UI's canonical doc strings so its existing source-page viewer
         # (`/api/source/{month}/page/{page}.png`) renders them — no pixels shipped over the wire.
         source_docs = [
-            f"Treasury Bulletin {p.month} PDF page {p.page}"
+            f"{p.month} PDF page {p.page}"
             for p in req.pages
             if p.month is not None and p.page is not None
         ]

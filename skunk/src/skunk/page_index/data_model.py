@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Callable, Literal, Protocol
+from typing import Any, Callable, Literal, Protocol
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -205,6 +205,37 @@ def continuation_chain(
             break  # reached the header-bearing head page
     chain.reverse()
     return chain
+
+
+def inherited_column_headers(
+    ref: PageRef, get_summary: Callable[[PageRef], "Any | None"]
+) -> tuple[int, str | None, list[str]] | None:
+    """The column grammar a header-less continuation page inherits from its run HEAD, so a
+    reader can place an unlabeled cell without fetching the predecessor page's text. Returns
+    `(head_page, head_block_title, column_headers)`, or None when `ref` is not a header-less
+    continuation or no labeled head block exists. Skipped when `ref` carries its OWN column
+    headers (the scan sometimes re-states them on a flagged page — prefer those). Only the
+    column grammar is inherited: it is stable across a run, whereas the ACCOUNT a page reports
+    changes mid-run, so title/summary come from the page's own scan, never the head.
+
+    `get_summary` is the page store's `summary` — its objects expose `is_continuation` and
+    `blocks` (each `kind` / `title` / `column_headers`)."""
+    own = get_summary(ref)
+    if own is None or not getattr(own, "is_continuation", False):
+        return None
+    if any(b.column_headers for b in own.blocks):
+        return None  # the page re-states its own headers; nothing to inherit
+    chain = continuation_chain(ref, get_summary)
+    if not chain or chain[0].page is None:
+        return None
+    head = get_summary(chain[0])
+    if head is None:
+        return None
+    labeled = [b for b in head.blocks if b.kind == "table" and b.column_headers]
+    if not labeled:
+        return None
+    block = labeled[-1]  # the head's last labeled table = the one that spilled onto the run
+    return (chain[0].page, block.title, list(block.column_headers))
 
 
 # Prompt blurb for the catalog row the semantic filter sees, one per candidate page (its

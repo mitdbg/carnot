@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+import numpy as np
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, model_validator
 from google import genai
@@ -624,9 +625,14 @@ def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
 
     # The whole frame, values included — the agent reads the actual cells (NaN/'n/a',
     # magnitudes, exact labels), not just the schema. The full frame also lives in the
-    # exec env for the generated code to operate on.
+    # exec env for the generated code to operate on. `float_format` forces FIXED-POINT,
+    # full-precision rendering: pandas' default switches a column to scientific notation
+    # (e.g. 452197.98 -> 4.521980e+05) once it holds a large value, hiding the cents and
+    # leading the agent to transcribe rounded numbers. `format_float_positional` prints the
+    # exact value without scientific notation (trim='-' drops only trailing zeros/point).
     lines.append(f"{_PAD}frame:")
-    lines.extend(f"{_PAD}  {ln}" for ln in df.to_string().splitlines())
+    rendered = df.to_string(float_format=lambda v: np.format_float_positional(v, trim="-"))
+    lines.extend(f"{_PAD}  {ln}" for ln in rendered.splitlines())
     return lines
 
 

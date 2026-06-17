@@ -103,7 +103,7 @@ class SkunkConfig:
     pdf_dir: Path = field(default_factory=lambda: _DEFAULT_PDF_DIR)
 
     # Prompt overrides YAML — corpus blurbs, few-shots, lessons. (env: SKUNK_PROMPT_OVERRIDES)
-    prompt_overrides_path: str = "config/prompts/treasury_bulletin.yaml"
+    prompt_overrides_path: str = "config/prompts/us_receipts_expenditures.yaml"
 
     # Ablation: golden page refs bypass the retrieve operator (eval runs only).
     golden_pages: list[PageRef] | None = field(default=None, repr=False)
@@ -242,7 +242,7 @@ class SkunkConfig:
         # Route per-stage models through the override registry so `PromptedCall` resolves them
         # like every other call-site. Defaulted here unless a run pins them explicitly
         # (SKUNK_MODEL_OVERRIDES=stage=… or, for the filter, SKUNK_SEMFILTER_MODEL). Efforts
-        # come from each call-site's `default_effort` (compute=high, planner=high; replanner/extract=medium),
+        # come from each call-site's `default_effort` (compute=high, planner=high, replanner=high; extract=medium),
         # overridable via SKUNK_EFFORT_OVERRIDES.
         # - semfilter: the cheap coarse filter runs on flash-lite.
         # - extract.{text,vision}: flash, medium thinking. Pro is the stronger read
@@ -250,7 +250,11 @@ class SkunkConfig:
         #   parallel select-agent fan-out; pin Pro back per-run via SKUNK_MODEL_OVERRIDES. The
         #   default path is the `text` tier; `vision` is the fallback.
         # - compute.codegen: flash — codegen/reasoning over the extracted values (high thinking).
-        # - replanner: flash — recovering a failed plan runs flash at medium thinking.
+        # - data_prep.codegen: 3.1 Pro at medium thinking — cleaning/coalescing/unioning the value
+        #   pool; unioning a multi-page table needs Pro to merge every row (Flash truncated the
+        #   hand-written value dict ~halfway).
+        # - replanner: 3.1 Pro at high thinking — same as the planner; revising a failed plan
+        #   needs the same decomposition quality as the initial plan.
         # - planner: 3.1 Pro at high thinking. The initial plan's decomposition quality
         #   (branch coverage, operator routing, period fidelity) is worth the per-question
         #   cost — the flash planner systematically dropped/misrouted branches that Pro/high
@@ -261,7 +265,8 @@ class SkunkConfig:
         self.model_overrides.setdefault("extract.vision", "gemini-3.5-flash")
         self.model_overrides.setdefault("compute.codegen", "gemini-3.1-pro-preview")
         self.model_overrides.setdefault("planner", "gemini-3.1-pro-preview")
-        self.model_overrides.setdefault("replanner", "gemini-3.5-flash")
+        self.model_overrides.setdefault("replanner", "gemini-3.1-pro-preview")
+        self.model_overrides.setdefault("data_prep.codegen", "gemini-3.1-pro-preview")
 
     @classmethod
     def from_env(cls) -> SkunkConfig:
@@ -303,7 +308,7 @@ class SkunkConfig:
             ),
             pdf_dir=Path(os.environ.get("OFFICEQA_PDF_DIR") or _DEFAULT_PDF_DIR),
             prompt_overrides_path=os.environ.get(
-                "SKUNK_PROMPT_OVERRIDES", "config/prompts/treasury_bulletin.yaml"
+                "SKUNK_PROMPT_OVERRIDES", "config/prompts/us_receipts_expenditures.yaml"
             ),
             semfilter_batch_size=int(os.environ.get("SKUNK_SEMFILTER_BATCH", "32")),
             select_agent_max_output_tokens=int(
