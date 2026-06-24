@@ -54,8 +54,8 @@ query embedder, so no `emb_model_id` override is needed). Retrieval stays page-l
 
 ```bash
 # 1. PREPROCESS (CPU + OpenRouter, no GPU): PDFs -> per-doc element JSONs, in 3 resumable phases:
-#    RENDER (ProcessPool: page PNG + text-layer cache), LLM (ThreadPool: a cheap model gates each
-#    page, google/gemini-3.1-flash-lite extracts table markdown + figure summaries on hits), ASSEMBLE.
+#    RENDER (ProcessPool: page PNG + text-layer cache), LLM (ThreadPool: google/gemini-3.1-flash-lite
+#    extracts table markdown + figure summaries from each non-blank page), ASSEMBLE.
 #    Needs pymupdf + OPENROUTER_API_KEY. Validate on a few docs first with --sample. PAGE-LEVEL
 #    resumable: each phase skips work already persisted, so a rerun only renders/LLMs the missing
 #    pages then reassembles (a single failed page never reprocesses its whole doc). All dir args

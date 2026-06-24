@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ── SLURM Job Flags ──
-# CPU-ONLY + network job: no GPU, no model download (the gate/extract models run on OpenRouter).
+# CPU-ONLY + network job: no GPU, no model download (the extract model runs on OpenRouter).
 # Three phases run in-process: RENDER (ProcessPool, CPU-bound — uses the allocated cores), LLM
 # (ThreadPool, network-bound), ASSEMBLE. Everything streams in/out of S3, so it needs ~zero local
 # disk. PAGE-LEVEL RESUMABLE (each phase skips work already persisted: rendered pages, done pages,
@@ -26,6 +26,8 @@ module purge
 module load miniforge
 mamba activate officeqa
 export PYTHONNOUSERSITE=True
+# Use the conda env's libstdc++ (NumPy needs GLIBCXX_3.4.29, newer than the system /lib64 one).
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 # boto3 for S3 streaming (one-time; harmless if already installed). No `aws` CLI needed.
 pip install --quiet boto3
@@ -34,7 +36,7 @@ pip install --quiet boto3
 export AWS_PROFILE=mit
 # export AWS_DEFAULT_REGION=us-east-1   # only if the profile doesn't already set a region
 
-# ── OpenRouter key for the gate/extract calls ──
+# ── OpenRouter key for the extract calls ──
 # sbatch exports your submit-time env by default (--export=ALL), so OPENROUTER_API_KEY set in your
 # shell / ~/.bashrc propagates here. Fail fast if it didn't.
 : "${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY in your environment before sbatch}"

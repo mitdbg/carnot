@@ -29,6 +29,8 @@ module purge
 module load miniforge
 mamba activate officeqa
 export PYTHONNOUSERSITE=True
+# Use the conda env's libstdc++ (NumPy needs GLIBCXX_3.4.29, newer than the system /lib64 one).
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 # Qwen3-Embedding-8B HF cache (~16 GB) -> node-local /tmp scratch, NOT the 200 GB home quota.
 export HF_HOME=/tmp/$USER/hf_cache
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True

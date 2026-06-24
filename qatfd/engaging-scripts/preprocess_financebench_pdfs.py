@@ -7,11 +7,10 @@ Three resumable phases, each skipping work already persisted (so a rerun only do
      `{renders_dir}/{doc}/{p}.png` (binary; omitted for blank pages) and a `{p}.json` sidecar
      ({n_pages, blank, text_items}). The sidecar is written LAST as the commit marker, so an
      interrupted page re-renders next run.
-  2. LLM (ThreadPool — I/O-bound): one task per rendered page runs the two-stage vision cascade on
-     the PNG — a cheap GATE model ("table or figure on this page? YES/NO"), then (only on YES) an
-     EXTRACT model that returns `## Table N` / `## Figure N` markdown — and writes the page's
-     element list to `{pages_dir}/{doc}/{p}.json` ({n_pages, items}). A failed page persists
-     nothing, so it is retried on the next run.
+  2. LLM (ThreadPool — I/O-bound): one task per rendered (non-blank) page sends the PNG to the
+     EXTRACT model, which returns `## Table N` / `## Figure N` markdown, parsed into elements and
+     written (with the page's text elements) to `{pages_dir}/{doc}/{p}.json` ({n_pages, items}). A
+     failed page persists nothing, so it is retried on the next run.
   3. ASSEMBLE: for each doc whose every page has an element artifact, concatenate them (in page +
      element order, assigning running ids) into the final `{output_dir}/{doc}.json`.
 
@@ -64,15 +63,6 @@ _MULTI_NL_RE = re.compile(r"\n{3,}")
 _LONG_DOTS_RE = re.compile(r"\.{4,}")
 # Section headers emitted by the extract model, e.g. "## Table 1" / "## Figure 2".
 _SECTION_RE = re.compile(r"^[ \t]*#{1,6}[ \t]*(table|figure)[ \t]+\d+[ \t]*:?[ \t]*$", re.IGNORECASE | re.MULTILINE)
-
-_GATE_SYSTEM = (
-    "You are a fast document-layout classifier. You are shown a screenshot of a single page from "
-    "a company financial filing (10-K / 10-Q / 8-K / earnings release). Decide whether the page "
-    "contains at least one TABLE (a grid of rows and columns of data) or FIGURE (a chart, graph, "
-    "plot, or diagram). Plain paragraphs of text, page headers/footers, and page numbers do NOT "
-    "count. Answer with a single word: YES if the page contains a table or a figure, otherwise NO."
-)
-_GATE_USER = "Does this page contain a table or a figure? Answer with exactly one word: YES or NO."
 
 _EXTRACT_SYSTEM = (
     "You extract the tables and figures from a single page of a company financial filing, shown "
@@ -289,12 +279,6 @@ def parse_extract_markdown(md: str) -> list[tuple[str, str]]:
     return out
 
 
-def _is_yes(text: str) -> bool:
-    """True iff the gate model's reply contains YES before any NO."""
-    m = re.search(r"\b(yes|no)\b", text or "", re.IGNORECASE)
-    return bool(m) and m.group(1).lower() == "yes"
-
-
 def build_config(args) -> SystemConfig:
     """Minimal SystemConfig for OpenRouter generation (no embedding/agent fields are exercised).
     The key comes from OPENROUTER_API_KEY in the env (read by LLMClient)."""
@@ -311,10 +295,7 @@ def build_config(args) -> SystemConfig:
         llm_default_rpm=args.rpm,
         llm_model_tpm={},
         llm_default_tpm=None,
-        llm_prices={
-            "qwen3-embedding-8b": {"in": 0.01, "out": 0.00, "cached": 0.00},
-            "google/gemma-3-12b-it": {"in": 0.05, "out": 0.15, "cached": 0.00},
-        },
+        llm_prices={},
     )
 
 
@@ -363,7 +344,7 @@ def render_doc(pdf_path: str, renders_dir: str, dpi: int, target_tokens: int) ->
 # ---------------------------------------------------------------------------
 
 def llm_page(client: LLMClient, key: str, args) -> dict:
-    """Run the gate->extract cascade for one rendered page and persist its element artifact
+    """Extract tables/figures from one rendered page and persist its element artifact
     `{pages_dir}/{doc}/{p}.json`. On any error nothing is persisted -> the page retries next run."""
     doc, page_s = key.split("/")
     page_id = int(page_s)
@@ -371,25 +352,20 @@ def llm_page(client: LLMClient, key: str, args) -> dict:
     side = json.loads(read_bytes(_join(doc_renders, f"{page_id}.json")))
     n_pages, texts, is_blank = side["n_pages"], side["text_items"], side["blank"]
     items: list[list[str]] = [["text", t] for t in texts]
-    summary = {"doc": doc, "errored": False, "gate_yes": False, "n_table": 0, "n_figure": 0,
-               "n_text": len(texts), "gate_in": 0, "gate_out": 0, "extract_in": 0, "extract_out": 0}
+    summary = {"doc": doc, "errored": False, "n_table": 0, "n_figure": 0,
+               "n_text": len(texts), "extract_in": 0, "extract_out": 0}
 
     if not is_blank:
         try:
             png = read_bytes(_join(doc_renders, f"{page_id}.png"))
             img = B64Image(mime="image/png", data=base64.standard_b64encode(png).decode())
-            gate = client.call(system=_GATE_SYSTEM, user=_GATE_USER, images=[img], temperature=0.0,
-                               model=args.gate_model, ctx=None, call_site="fb_gate")
-            summary["gate_in"], summary["gate_out"] = gate.input_tokens or 0, gate.output_tokens or 0
-            if _is_yes(gate.text):
-                summary["gate_yes"] = True
-                ext = client.call(system=_EXTRACT_SYSTEM, user=_EXTRACT_USER, images=[img], temperature=0.0,
-                                  model=args.extract_model, ctx=None, call_site="fb_extract")
-                summary["extract_in"], summary["extract_out"] = ext.input_tokens or 0, ext.output_tokens or 0
-                items += [[k, c] for k, c in parse_extract_markdown(ext.text)]
+            ext = client.call(system=_EXTRACT_SYSTEM, user=_EXTRACT_USER, images=[img], temperature=0.0,
+                              model=args.extract_model, ctx=None, call_site="fb_extract")
+            summary["extract_in"], summary["extract_out"] = ext.input_tokens or 0, ext.output_tokens or 0
+            items += [[k, c] for k, c in parse_extract_markdown(ext.text)]
         except Exception as e:  # noqa: BLE001 — one bad page shouldn't kill the run
             summary["errored"] = True
-            print(f"  WARN {key}: vision call failed: {e}", flush=True)
+            print(f"  WARN {key}: extract call failed: {e}", flush=True)
             return summary
 
     try:
@@ -443,15 +419,12 @@ class Stats:
     render_blank: int = 0
     render_skipped: int = 0
     llm_pages: int = 0
-    gate_yes: int = 0
     tables: int = 0
     figures: int = 0
     text_elems: int = 0
     errors: int = 0
     docs_written: int = 0
     docs_incomplete: int = 0
-    gate_in: int = 0
-    gate_out: int = 0
     extract_in: int = 0
     extract_out: int = 0
 
@@ -487,14 +460,11 @@ def phase_llm(done_docs: set[str], args, stats: Stats) -> None:
         for i, fut in enumerate(as_completed(futs), 1):
             s = fut.result()
             stats.llm_pages += 1
-            stats.gate_in += s["gate_in"]
-            stats.gate_out += s["gate_out"]
             stats.extract_in += s["extract_in"]
             stats.extract_out += s["extract_out"]
             if s["errored"]:
                 stats.errors += 1
                 continue
-            stats.gate_yes += int(s["gate_yes"])
             stats.tables += s["n_table"]
             stats.figures += s["n_figure"]
             stats.text_elems += s["n_text"]
@@ -535,7 +505,6 @@ def main() -> None:
     parser.add_argument("--renders_dir", default=None, help="Phase-1 render cache (PNG + text sidecar). Default: {output_dir}-renders")
     parser.add_argument("--pages_dir", default=None, help="Phase-2 per-page element artifacts. Default: {output_dir}-pages")
     parser.add_argument("--phases", default="render,llm,assemble", help="Comma list of phases to run (render,llm,assemble)")
-    parser.add_argument("--gate-model", default="google/gemma-3-12b-it", help="Cheap multimodal model for the table/figure gate")
     parser.add_argument("--extract-model", default="google/gemini-3.1-flash-lite", help="Model for table-markdown / figure-summary extraction")
     parser.add_argument("--dpi", type=int, default=200, help="Page render DPI for the vision calls")
     parser.add_argument("--render-procs", type=int, default=os.cpu_count() or 4, help="Phase-1 render processes (CPU-bound)")
@@ -556,7 +525,7 @@ def main() -> None:
     pdfs = select_pdfs(args)
     done_docs = list_done_docs(args.output_dir)  # fully-assembled docs: skipped by every phase
     print(f"Selected {len(pdfs)} PDFs ({len(done_docs)} already assembled). phases={sorted(phases)} "
-          f"gate={args.gate_model} extract={args.extract_model} dpi={args.dpi}.", flush=True)
+          f"extract={args.extract_model} dpi={args.dpi}.", flush=True)
 
     stats = Stats()
     if "render" in phases:
@@ -568,13 +537,12 @@ def main() -> None:
     if "assemble" in phases:
         phase_assemble(pdfs, args, stats)
 
-    yes_rate = (stats.gate_yes / stats.llm_pages) if stats.llm_pages else 0.0
     print("\n=== summary ===", flush=True)
     print(f"render: +{stats.render_pages} pages, {stats.render_blank} blank, {stats.render_skipped} already-done", flush=True)
-    print(f"llm: {stats.llm_pages} pages, gate_yes={stats.gate_yes} ({yes_rate:.0%}), tables={stats.tables} "
-          f"figures={stats.figures} text_elems={stats.text_elems} errors={stats.errors}", flush=True)
+    print(f"llm: {stats.llm_pages} pages, tables={stats.tables} figures={stats.figures} "
+          f"text_elems={stats.text_elems} errors={stats.errors}", flush=True)
     print(f"assemble: {stats.docs_written} written, {stats.docs_incomplete} incomplete", flush=True)
-    print(f"tokens: gate in/out={stats.gate_in}/{stats.gate_out}  extract in/out={stats.extract_in}/{stats.extract_out}", flush=True)
+    print(f"tokens: extract in/out={stats.extract_in}/{stats.extract_out}", flush=True)
 
     manifest = _join(args.output_dir, f"_manifest_rank{args.rank}.json")
     write_output(manifest, json.dumps({"args": vars(args), "stats": stats.as_dict()}, indent=2).encode())
