@@ -1,9 +1,12 @@
 #!/bin/bash
 
 # ── SLURM Job Flags ──
+# Embeds the FinanceBench element JSONs with Qwen3-Embedding-8B. RESUMABLE (finished partition
+# .npz are skipped) and STREAMS element JSONs in / embeddings+metadata out of S3, so it keeps
+# ~zero local disk beyond the model cache -> on a preemptable partition just resubmit until done.
+# Keep --ntasks fixed across resubmits (the file-shard/resume keys on $SLURM_PROCID/$SLURM_NTASKS).
 #SBATCH --job-name=qwen3-financebench-embed
-#SBATCH -p pi_srmadden
-#SBATCH --nodes=1
+#SBATCH -p mit_preemptable
 #SBATCH --ntasks=2
 #SBATCH --gpus-per-task=1
 #SBATCH -c 8
@@ -25,16 +28,33 @@ nvidia-smi
 module purge
 module load miniforge
 mamba activate officeqa
-
 export PYTHONNOUSERSITE=True
-export HF_HOME=/home/mdrusso/orcd/scratch/.cache/huggingface
+# Qwen3-Embedding-8B HF cache (~16 GB) -> node-local /tmp scratch, NOT the 200 GB home quota.
+export HF_HOME=/tmp/$USER/hf_cache
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-# ── Run embedding computation ──
-# One worker per GPU; each task reads its own $SLURM_PROCID / $SLURM_NTASKS inside Python.
-# Input is the element JSONs from preprocess_financebench_pdfs.py (run that on a CPU+network box
-# first; it needs OPENROUTER_API_KEY, not a GPU).
+# boto3 for S3 streaming (one-time; harmless if already installed). No `aws` CLI needed.
+pip install --quiet boto3
+
+# ── AWS credentials for s3://carnot-research (the `mit` profile from ~/.aws/credentials) ──
+export AWS_PROFILE=mit
+# export AWS_DEFAULT_REGION=us-east-1   # only if the profile doesn't already set a region
+
+# ── Paths: stream element JSONs in / embeddings out via S3 (zero local disk beyond the model) ──
+INPUT_DIR=s3://carnot-research/financebench/financebench-elements
+OUTPUT_DIR=s3://carnot-research/financebench/financebench-element-embeddings
+
+# ── Run embedding computation (one worker per GPU; each reads its $SLURM_PROCID/$SLURM_NTASKS) ──
 srun python compute_financebench_element_embeddings.py \
-    --input_dir /home/mdrusso/carnot/skunk/financebench/financebench-elements \
-    --output_dir /home/mdrusso/carnot/skunk/financebench/financebench-element-embeddings
+    --input_dir  "$INPUT_DIR" \
+    --output_dir "$OUTPUT_DIR"
 
 echo "End: $(date)"
+
+# ── Then, on a machine WITH disk, build the Chroma index from the S3 output ──
+# 1. pull the embeddings + metadata:
+#      aws s3 sync s3://carnot-research/financebench/financebench-element-embeddings ./fb-embeddings
+# 2. build the collection:
+#      python -m skunk.search_agent.prep.create_vector_db \
+#          --embeddings-dir ./fb-embeddings --collection-name qwen-financebench \
+#          --chroma-path ./.chromadb --benchmark finance_bench

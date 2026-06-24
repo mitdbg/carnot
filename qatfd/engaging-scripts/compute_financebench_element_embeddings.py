@@ -15,17 +15,27 @@ metadata_rank{r}.json feeds `create_vector_db.py --benchmark finance_bench`, and
 `cleaned` text is what the FinanceBench benchmark's document_map is rebuilt from (concatenated per
 page in element order).
 
+`--input_dir` and `--output_dir` each accept a local path OR an `s3://bucket/prefix` URI: with S3
+the element JSONs are streamed in and the embeddings/metadata streamed out, so the Engaging GPU
+job keeps ~zero local disk (only the model cache lives on disk). S3 needs `boto3` (pip install) +
+AWS creds in the env; boto3 is imported lazily so local runs don't require it.
+
 Usage:
     python compute_financebench_element_embeddings.py \\
         --input_dir /home/mdrusso/carnot/skunk/financebench/financebench-elements \\
         --output_dir /home/mdrusso/carnot/skunk/financebench/financebench-element-embeddings
+    # or stream to/from S3 (see run_financebench_element_embeddings.slurm):
+    #   --input_dir s3://carnot-research/financebench/financebench-elements \\
+    #   --output_dir s3://carnot-research/financebench/financebench-element-embeddings
 """
 
 import argparse
 import dataclasses
 import glob
+import io
 import json
 import os
+from urllib.parse import urlparse
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
@@ -39,6 +49,90 @@ BATCH_TOKEN_BUDGET = 16384
 # Page key separator — MUST match qatfd.benchmarks.financebench._PAGE_SEP and the chroma adapter.
 # It cannot occur in a PDF filename stem, so a key is unambiguously splittable into (doc, page).
 _PAGE_SEP = "::p"
+
+
+# ---------------------------------------------------------------------------
+# I/O layer: --input_dir / --output_dir may be a local dir OR an `s3://bucket/prefix`
+# URI, so the Engaging job can stream the element JSONs in and the embeddings/metadata
+# out of S3 and keep ~zero local disk. boto3 reads credentials from the standard AWS_*
+# env vars; it's imported lazily so local runs don't need it. (Mirrors compute_biogen_embeddings.py
+# and preprocess_financebench_pdfs.py.)
+# ---------------------------------------------------------------------------
+
+_S3_CLIENT = None
+
+
+def _is_s3(path: str) -> bool:
+    return path.startswith("s3://")
+
+
+def _s3_split(uri: str) -> tuple[str, str]:
+    p = urlparse(uri)
+    return p.netloc, p.path.lstrip("/")
+
+
+def _s3():
+    global _S3_CLIENT
+    if _S3_CLIENT is None:
+        import boto3
+
+        _S3_CLIENT = boto3.client("s3")
+    return _S3_CLIENT
+
+
+def _join(base: str, name: str) -> str:
+    """Join a path/URI with a filename (works for both local paths and s3:// URIs)."""
+    return base.rstrip("/") + "/" + name
+
+
+def _exists(path: str) -> bool:
+    if _is_s3(path):
+        bucket, key = _s3_split(path)
+        try:
+            _s3().head_object(Bucket=bucket, Key=key)
+            return True
+        except Exception:
+            return False
+    return os.path.exists(path)
+
+
+def list_json(input_dir: str) -> list[str]:
+    """Sorted list of every *.json under a local dir or an s3:// prefix."""
+    if _is_s3(input_dir):
+        bucket, prefix = _s3_split(input_dir)
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+        keys: list[str] = []
+        for page in _s3().get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+            keys += [f"s3://{bucket}/{o['Key']}" for o in page.get("Contents", []) if o["Key"].endswith(".json")]
+        return sorted(keys)
+    return sorted(glob.glob(os.path.join(input_dir, "*.json")))
+
+
+def read_bytes(path: str) -> bytes:
+    """Read a file's bytes from a local path or an s3:// object (one GET, held in memory)."""
+    if _is_s3(path):
+        bucket, key = _s3_split(path)
+        return _s3().get_object(Bucket=bucket, Key=key)["Body"].read()
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def write_bytes(dest: str, data: bytes) -> None:
+    if _is_s3(dest):
+        bucket, key = _s3_split(dest)
+        # upload_fileobj does multipart automatically, so it handles the (potentially large)
+        # per-rank metadata json without hitting S3's 5 GB single-PutObject limit.
+        _s3().upload_fileobj(io.BytesIO(data), bucket, key)
+    else:
+        with open(dest, "wb") as f:
+            f.write(data)
+
+
+def write_npz(dest: str, embeddings: np.ndarray, ids: np.ndarray) -> None:
+    buf = io.BytesIO()
+    np.savez_compressed(buf, embeddings=embeddings, unique_element_ids=ids)
+    write_bytes(dest, buf.getvalue())
 
 
 def _chunk_by_tokens(text: str, tokenizer, chunk_tokens: int) -> list[str]:
@@ -70,7 +164,7 @@ def embed_oversized_text(text: str, model: SentenceTransformer) -> np.ndarray:
 
 
 def _partition_path(output_dir: str, rank: int, p: int) -> str:
-    return os.path.join(output_dir, f"embeddings_{rank}_{p}.npz")
+    return _join(output_dir, f"embeddings_{rank}_{p}.npz")
 
 
 def _partition_bounds(p: int, partition_size: int, n_total: int) -> tuple[int, int]:
@@ -94,7 +188,7 @@ def _save_partition(
     embs = np.stack([buf[k] for k in range(end - start)], axis=0)
     ids = np.array(unique_element_ids[start:end])
     path = _partition_path(output_dir, rank, p)
-    np.savez_compressed(path, embeddings=embs, unique_element_ids=ids)
+    write_npz(path, embs, ids)
     print(f"{log_prefix}  saved partition {p} -> {path} (shape: {embs.shape})", flush=True)
     del buffers[p]
 
@@ -170,7 +264,7 @@ def embed_all(
     n_partitions = (n_total + partition_size - 1) // partition_size
 
     skip_partitions: set[int] = {
-        p for p in range(n_partitions) if os.path.exists(_partition_path(output_dir, rank, p))
+        p for p in range(n_partitions) if _exists(_partition_path(output_dir, rank, p))
     }
     if skip_partitions:
         print(f"{log_prefix}Resume: skipping {len(skip_partitions)}/{n_partitions} completed partitions.", flush=True)
@@ -211,8 +305,8 @@ def embed_all(
 
 def main():
     parser = argparse.ArgumentParser(description="Compute element-level Qwen3 embeddings for FinanceBench.")
-    parser.add_argument("--input_dir", type=str, required=True, help="Directory of {doc_name}.json element files from preprocess_financebench_pdfs.py")
-    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save embedding outputs")
+    parser.add_argument("--input_dir", type=str, required=True, help="Local dir OR s3:// prefix of {doc_name}.json element files from preprocess_financebench_pdfs.py")
+    parser.add_argument("--output_dir", type=str, required=True, help="Local dir OR s3:// prefix for embeddings_{rank}_{p}.npz + metadata_rank{rank}.json")
     parser.add_argument("--rank", type=int, default=int(os.environ.get("SLURM_PROCID", 0)),
                         help="Index of this worker (0-based). Defaults to $SLURM_PROCID.")
     parser.add_argument("--world_size", type=int, default=int(os.environ.get("SLURM_NTASKS", 1)),
@@ -221,7 +315,8 @@ def main():
                         help="Total number of embedding partition files to produce across all ranks.")
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    if not _is_s3(args.output_dir):
+        os.makedirs(args.output_dir, exist_ok=True)
     log_prefix = f"[rank {args.rank}/{args.world_size}] "
 
     if args.world_size > 1 and "CUDA_VISIBLE_DEVICES" not in os.environ:
@@ -245,7 +340,7 @@ def main():
     model.max_seq_length = MAX_TOKENS
     print(f"{log_prefix}Model loaded successfully.", flush=True)
 
-    json_files = sorted(glob.glob(os.path.join(args.input_dir, "*.json")))
+    json_files = list_json(args.input_dir)
     # Skip the preprocessing manifest(s); only per-doc element files have a doc payload.
     json_files = [p for p in json_files if not os.path.basename(p).startswith("_manifest")]
     # Each worker handles its own slice of the file list.
@@ -259,8 +354,7 @@ def main():
 
     for json_path in json_files:
         try:
-            with open(json_path) as f:
-                doc = json.load(f)
+            doc = json.loads(read_bytes(json_path))
         except Exception as e:  # noqa: BLE001 — one bad file shouldn't kill the whole job
             print(f"{log_prefix}  WARN failed to read {json_path}: {e}", flush=True)
             continue
@@ -287,9 +381,8 @@ def main():
             }
 
     assert len(cleaned_elements) == len(metadata), "Duplicate element ids found; check input JSONs for consistency."
-    metadata_path = os.path.join(args.output_dir, f"metadata_rank{args.rank}.json")
-    with open(metadata_path, "w") as f:
-        json.dump(metadata, f)
+    metadata_path = _join(args.output_dir, f"metadata_rank{args.rank}.json")
+    write_bytes(metadata_path, json.dumps(metadata).encode())
     print(f"{log_prefix}Saved metadata for {len(metadata)} elements ({n_empty} empty skipped) to {metadata_path}", flush=True)
     del metadata
 

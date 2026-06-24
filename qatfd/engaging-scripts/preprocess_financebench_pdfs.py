@@ -23,11 +23,20 @@ LLM access uses the skunk `LLMClient` over OpenRouter, built from a minimal `Sys
 constructed from CLI args (no SkunkConfig / env config). `OPENROUTER_API_KEY` is read from the
 environment by the client. Models and request pacing are CLI args.
 
+`--input_dir` and `--output_dir` each accept a local path OR an `s3://bucket/prefix` URI: with S3
+the PDFs are streamed in and the element JSONs streamed out, so the Engaging job keeps ~zero local
+disk (it only needs CPU + network — no GPU, no model download). S3 needs `boto3` (pip install) +
+AWS creds in the env (AWS_PROFILE or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY); boto3 is imported
+lazily so local runs don't require it.
+
 Usage:
     OPENROUTER_API_KEY=sk-or-... python preprocess_financebench_pdfs.py \\
         --input_dir  ../skunk/financebench/pdfs \\
         --output_dir ../skunk/financebench/financebench-elements \\
         --sample 5            # validate on the first few docs before the full run
+    # or stream to/from S3 (see run_financebench_preprocess.slurm):
+    #   --input_dir s3://carnot-research/financebench/pdfs \\
+    #   --output_dir s3://carnot-research/financebench/financebench-elements
 """
 
 from __future__ import annotations
@@ -36,11 +45,12 @@ import argparse
 import asyncio
 import base64
 import glob
+import io
 import json
 import os
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
+from urllib.parse import urlparse
 
 import fitz  # PyMuPDF
 
@@ -84,6 +94,89 @@ _EXTRACT_SYSTEM = (
     "- Output ONLY the '## Table N' / '## Figure N' sections."
 )
 _EXTRACT_USER = "Extract every table (as markdown) and every figure (as a summary) from this page."
+
+
+# ---------------------------------------------------------------------------
+# I/O layer: --input_dir / --output_dir may be a local dir OR an `s3://bucket/prefix`
+# URI, so the Engaging job can stream PDFs in and element JSONs out of S3 and keep
+# ~zero local disk. boto3 reads credentials from the standard AWS_* env vars; it's
+# imported lazily so local runs don't need it. (Mirrors compute_biogen_embeddings.py.)
+# ---------------------------------------------------------------------------
+
+_S3_CLIENT = None
+
+
+def _is_s3(path: str) -> bool:
+    return path.startswith("s3://")
+
+
+def _s3_split(uri: str) -> tuple[str, str]:
+    p = urlparse(uri)
+    return p.netloc, p.path.lstrip("/")
+
+
+def _s3():
+    global _S3_CLIENT
+    if _S3_CLIENT is None:
+        import boto3
+
+        _S3_CLIENT = boto3.client("s3")
+    return _S3_CLIENT
+
+
+def _join(base: str, name: str) -> str:
+    """Join a path/URI with a filename (works for both local paths and s3:// URIs)."""
+    return base.rstrip("/") + "/" + name
+
+
+def _stem(path: str) -> str:
+    """File stem of a local path or s3:// key (e.g. ".../3M_2018_10K.pdf" -> "3M_2018_10K")."""
+    return os.path.splitext(os.path.basename(path))[0]
+
+
+def _exists(path: str) -> bool:
+    if _is_s3(path):
+        bucket, key = _s3_split(path)
+        try:
+            _s3().head_object(Bucket=bucket, Key=key)
+            return True
+        except Exception:
+            return False
+    return os.path.exists(path)
+
+
+def list_pdfs(input_dir: str) -> list[str]:
+    """Sorted list of every *.pdf under a local dir or an s3:// prefix."""
+    if _is_s3(input_dir):
+        bucket, prefix = _s3_split(input_dir)
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+        keys: list[str] = []
+        for page in _s3().get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+            keys += [f"s3://{bucket}/{o['Key']}" for o in page.get("Contents", []) if o["Key"].endswith(".pdf")]
+        return sorted(keys)
+    return sorted(glob.glob(os.path.join(input_dir, "*.pdf")))
+
+
+def read_bytes(path: str) -> bytes:
+    """Read a file's bytes from a local path or an s3:// object (one GET, held in memory)."""
+    if _is_s3(path):
+        bucket, key = _s3_split(path)
+        return _s3().get_object(Bucket=bucket, Key=key)["Body"].read()
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def write_output(dest: str, data: bytes) -> None:
+    """Write bytes to a local path (atomically via tmp+rename) or an s3:// object."""
+    if _is_s3(dest):
+        bucket, key = _s3_split(dest)
+        _s3().upload_fileobj(io.BytesIO(data), bucket, key)
+    else:
+        tmp = dest + ".tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, dest)
 
 
 # ---------------------------------------------------------------------------
@@ -283,9 +376,9 @@ async def process_pdf(
     args,
     stats: Stats,
 ) -> None:
-    """Decompose one PDF into elements and write its JSON atomically."""
-    doc_name = Path(pdf_path).stem
-    doc = fitz.open(pdf_path)
+    """Decompose one PDF into elements and write its JSON (local path or s3:// URI)."""
+    doc_name = _stem(pdf_path)
+    doc = fitz.open(stream=read_bytes(pdf_path), filetype="pdf")
     try:
         n_pages = doc.page_count
         stats.pages += n_pages
@@ -309,10 +402,7 @@ async def process_pdf(
             eid += 1
 
     payload = {"doc_name": doc_name, "n_pages": n_pages, "elements": elements}
-    tmp = out_path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(payload, f)
-    os.replace(tmp, out_path)
+    write_output(out_path, json.dumps(payload).encode())
     n_tab = sum(1 for e in elements if e["type"] == "table")
     n_fig = sum(1 for e in elements if e["type"] == "figure")
     n_txt = sum(1 for e in elements if e["type"] == "text")
@@ -328,18 +418,18 @@ async def run(pdfs: list[str], args, stats: Stats) -> None:
     # Docs run sequentially (write-as-you-go, resumable); pages within a doc fan out under `sem`,
     # which bounds in-flight renders + LLM calls across the whole job.
     for pdf in pdfs:
-        out_path = os.path.join(args.output_dir, f"{Path(pdf).stem}.json")
-        if os.path.exists(out_path):
-            print(f"[{Path(pdf).stem}] exists, skipping", flush=True)
+        out_path = _join(args.output_dir, f"{_stem(pdf)}.json")
+        if _exists(out_path):
+            print(f"[{_stem(pdf)}] exists, skipping", flush=True)
             continue
         await process_pdf(pdf, out_path, client=client, sem=sem, args=args, stats=stats)
 
 
 def select_pdfs(args) -> list[str]:
-    pdfs = sorted(glob.glob(os.path.join(args.input_dir, "*.pdf")))
+    pdfs = list_pdfs(args.input_dir)
     if args.docs:
         wanted = {d.strip() for d in args.docs.split(",") if d.strip()}
-        pdfs = [p for p in pdfs if Path(p).stem in wanted]
+        pdfs = [p for p in pdfs if _stem(p) in wanted]
     if args.world_size > 1:
         pdfs = pdfs[args.rank :: args.world_size]
     if args.sample is not None:
@@ -349,8 +439,8 @@ def select_pdfs(args) -> list[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Decompose FinanceBench PDFs into text/table/figure element JSONs.")
-    parser.add_argument("--input_dir", required=True, help="Directory of FinanceBench *.pdf files")
-    parser.add_argument("--output_dir", required=True, help="Directory to write {doc_name}.json element files")
+    parser.add_argument("--input_dir", required=True, help="Local dir OR s3:// prefix holding the FinanceBench *.pdf files")
+    parser.add_argument("--output_dir", required=True, help="Local dir OR s3:// prefix for the {doc_name}.json element files")
     parser.add_argument("--gate-model", default="google/gemma-3-12b-it", help="Cheap multimodal model for the table/figure gate")
     parser.add_argument("--extract-model", default="google/gemini-3.1-flash-lite", help="Model for table-markdown / figure-summary extraction")
     parser.add_argument("--dpi", type=int, default=200, help="Page render DPI for the vision calls")
@@ -365,7 +455,8 @@ def main() -> None:
     parser.add_argument("--world_size", type=int, default=int(os.environ.get("SLURM_NTASKS", 1)), help="Number of parallel workers")
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
+    if not _is_s3(args.output_dir):
+        os.makedirs(args.output_dir, exist_ok=True)
     pdfs = select_pdfs(args)
     print(f"Processing {len(pdfs)} PDFs (gate={args.gate_model}, extract={args.extract_model}, dpi={args.dpi}, concurrency={args.concurrency}).", flush=True)
 
@@ -378,9 +469,8 @@ def main() -> None:
           f"tables={stats.tables} figures={stats.figures} text_elems={stats.text_elems} errors={stats.errors}", flush=True)
     print(f"tokens: gate in/out={stats.gate_in}/{stats.gate_out}  extract in/out={stats.extract_in}/{stats.extract_out}", flush=True)
 
-    manifest = os.path.join(args.output_dir, f"_manifest_rank{args.rank}.json")
-    with open(manifest, "w") as f:
-        json.dump({"args": vars(args), "stats": stats.as_dict()}, f, indent=2)
+    manifest = _join(args.output_dir, f"_manifest_rank{args.rank}.json")
+    write_output(manifest, json.dumps({"args": vars(args), "stats": stats.as_dict()}, indent=2).encode())
     print(f"wrote {manifest}", flush=True)
 
 

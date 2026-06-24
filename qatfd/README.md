@@ -55,15 +55,20 @@ query embedder, so no `emb_model_id` override is needed). Retrieval stays page-l
 ```bash
 # 1. PREPROCESS (CPU + OpenRouter, no GPU): PDFs -> per-doc element JSONs. A cheap multimodal model
 #    gates each page; google/gemini-3.1-flash-lite extracts table markdown + figure summaries on hits.
-#    Needs pymupdf + OPENROUTER_API_KEY. Validate on a few docs first with --sample.
+#    Needs pymupdf + OPENROUTER_API_KEY. Validate on a few docs first with --sample. Resumable
+#    (skips docs whose {doc_name}.json already exists). --input_dir/--output_dir accept a local path
+#    OR an s3:// prefix — on a low-disk cluster, stream to/from S3 (see run_financebench_preprocess.slurm:
+#    upload PDFs once with `aws s3 sync skunk/financebench/pdfs s3://carnot-research/financebench/pdfs`).
 OPENROUTER_API_KEY=sk-or-... python engaging-scripts/preprocess_financebench_pdfs.py \
     --input_dir  ../skunk/financebench/pdfs \
     --output_dir ../skunk/financebench/financebench-elements
-# 2. EMBED (GPU): element JSONs -> Qwen3-8B embeddings — see run_financebench_element_embeddings.slurm
+# 2. EMBED (GPU): element JSONs -> Qwen3-8B embeddings — see run_financebench_element_embeddings.slurm.
+#    --input_dir/--output_dir also accept s3:// prefixes (stream JSONs in, embeddings/metadata out).
 python engaging-scripts/compute_financebench_element_embeddings.py \
     --input_dir  ../skunk/financebench/financebench-elements \
     --output_dir ../skunk/financebench/financebench-element-embeddings
-# 3. load them into the chroma collection
+# 3. load them into the chroma collection (on a box with disk; if step 2 wrote to S3, first
+#    `aws s3 sync s3://carnot-research/financebench/financebench-element-embeddings ./fb-embeddings`)
 python -m skunk.search_agent.prep.create_vector_db \
     --embeddings-dir ../skunk/financebench/financebench-element-embeddings \
     --collection-name qwen-financebench --chroma-path ../skunk/.chromadb --benchmark finance_bench
