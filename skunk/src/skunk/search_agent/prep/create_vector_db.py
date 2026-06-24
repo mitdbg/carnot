@@ -69,9 +69,39 @@ def _browsecomp_plus_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
     )
 
 
+def _biogen_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
+    """Adapter for `compute_biogen_embeddings.py` outputs (one element per PubMed abstract)."""
+    return (
+        elt_metadata["docid"],  # PMID
+        elt_metadata["cleaned"],
+        {"element_id": elt_metadata["element_id"]},
+    )
+
+
+def _financebench_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
+    """Adapter for `compute_financebench_element_embeddings.py` outputs (text/table/figure elements).
+
+    The `page_key` ("{doc_name}::p{page_num}") is the doc_id, so retrieved doc_ids line up with the
+    page-level gold the FinanceBench benchmark derives from the evidence page numbers; `type`
+    (text/table/figure) is surfaced to the SearchAgent like OfficeQA's element type.
+    """
+    return (
+        elt_metadata["page_key"],
+        elt_metadata["cleaned"],
+        {
+            "doc_name": elt_metadata["doc_name"],
+            "page_num": elt_metadata["page_num"],
+            "element_id": elt_metadata["element_id"],
+            "type": elt_metadata.get("type", "text"),
+        },
+    )
+
+
 _BENCHMARK_ADAPTERS: dict[str, ElementAdapter] = {
     "officeqa": _officeqa_adapter,
     "browsecomp_plus": _browsecomp_plus_adapter,
+    "trec_biogen": _biogen_adapter,
+    "finance_bench": _financebench_adapter,
 }
 
 

@@ -21,6 +21,7 @@ dependencies = [
     "pymupdf",
     "pyyaml",
     "numpy",
+    "sentence-transformers",
     "statsmodels",
     "tavily-python",
     "uvicorn",

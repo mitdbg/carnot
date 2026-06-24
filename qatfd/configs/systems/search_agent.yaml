@@ -1,0 +1,14 @@
+# base config for search agent system
+defaults:
+  - base
+  - _self_
+
+name: search_agent
+agent_mode: retrieve
+search_agent_max_output_tokens: 4096
+search_agent_request_timeout_s: 120.0
+grep_max_output_tokens: 200000
+agent_max_pages_per_tool_call: 20
+read_document_max_output_chars: 400000
+agent_max_steps: 20
+agent_max_misfires: 5

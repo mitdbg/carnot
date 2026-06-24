@@ -1,0 +1,29 @@
+# FinanceBench benchmark (Patronus AI open-source subset).
+#
+# Corpus: the 368 source PDFs (SEC filings), indexed at the PAGE level (one element per page) with
+# Qwen3-Embedding-8B (4096-dim) into the `qwen-financebench` Chroma collection. Build it offline:
+#   1. python engaging-scripts/compute_financebench_element_embeddings.py \
+#        --input_dir <skunk>/financebench/pdfs --output_dir <skunk>/financebench/financebench-element-embeddings
+#   2. python -m skunk.search_agent.prep.create_vector_db \
+#        --embeddings-dir <skunk>/financebench/financebench-element-embeddings \
+#        --collection-name qwen-financebench --chroma-path <skunk>/.chromadb --benchmark finance_bench
+# Runs embed the query with the SAME 8B model (the default emb config), e.g.:
+#   python3 -m qatfd.runner benchmarks=financebench systems=rag_llm experiments.split=test \
+#       benchmarks.judge_model=<judge-model>
+defaults:
+  - base
+  - _self_
+
+name: finance-bench
+chromadb_collection: qwen-financebench
+# 150 open-source questions + free-form gold answers + page-level evidence
+questions_path: financebench/financebench_open_source.jsonl
+# page_key -> page-text metadata produced by the embedding job
+fb_metadata_glob: financebench/financebench-element-embeddings/metadata_rank*.json
+# null => all 150 questions are the held-out test split (run with experiments.split=test)
+test_ids_path: null
+# llm used by the single-nugget correctness judge (set on the CLI, e.g. google/gemini-2.5-flash)
+judge_model: null
+prompts_path: null
+# pdf_dir is the SearchAgent view_figure source; page keys don't map 1:1 to a figure tool yet, so null.
+pdf_dir: null

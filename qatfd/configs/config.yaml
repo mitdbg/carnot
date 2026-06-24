@@ -1,0 +1,37 @@
+# Root Hydra config for the qatfd runner.
+#
+# Three config groups compose one run (override any leaf on the CLI):
+#   experiments/  — run-level knobs (split, sample, workers, ...)
+#   benchmarks/   — which benchmark + benchmark-specific knobs
+#   systems/      — which system + system-specific knobs
+#
+# Examples:
+#   python3 -m qatfd.runner
+#   python3 -m qatfd.runner benchmarks=browsecomp_plus systems=rag_llm
+#   python3 -m qatfd.runner experiments.sample=20 experiments.workers=8
+#   python3 -m qatfd.runner --multirun benchmarks=officeqa,browsecomp_plus systems=rag_llm,search_agent
+defaults:
+  - experiments: base
+  - benchmarks: officeqa
+  - systems: search_agent
+  - _self_
+
+# load configs + build the benchmark/system, but do not execute the run.
+dry_run: false
+
+# where run artifacts (report.csv + per-question traces) are written. A relative path
+# resolves against the current working directory; an absolute path is used as-is.
+results_root: results
+
+hydra:
+  # keep the process CWD unchanged: the runner resolves all data/result paths absolutely
+  job:
+    chdir: false
+  # Hydra's own bookkeeping (the resolved config snapshot + launcher logs). Kept out
+  # of the results tree under a dotfile dir. Relative to the launch CWD (run_all.sh
+  # cds to the qatfd repo root first).
+  run:
+    dir: qatfd/results/.hydra/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: qatfd/results/.hydra/multirun/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}_${benchmarks.name}_${systems.name}

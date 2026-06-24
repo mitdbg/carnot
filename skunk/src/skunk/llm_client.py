@@ -12,6 +12,7 @@ multi-process fan-out)."""
 
 from __future__ import annotations
 
+import aiohttp
 import asyncio
 import base64
 import logging
@@ -20,7 +21,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import httpx
 import requests
@@ -32,25 +33,51 @@ from skunk.common import (
     make_genai_client,
     get_rate_limiter,
 )
+from skunk.usage import UsageTracker
 
 if TYPE_CHECKING:
     from google import genai
     from openrouter import OpenRouter
 
     from skunk.common import B64Image, ExecutionContext
-    from skunk.config import SkunkConfig
+    from skunk.config import SystemConfig
 
 # Process-scoped logger: retries happen with no per-question ctx in scope (see
 # `_retry_call`), so they go through stdlib logging rather than `ctx.emit`.
 log = logging.getLogger(__name__)
 
+# Return type of an `attempt` driven by `_retry_call` — an `LLMResponse` for the
+# generation paths, a `list[float]` for the embedding path. The retry loop never
+# inspects the value, so it is generic over it.
+R = TypeVar("R")
+
+
+class EmptyCompletionError(RuntimeError):
+    """A generation call returned HTTP 200 but with no message content. OpenRouter
+    relays some upstream-provider failures this way — empty `choices` (or empty
+    `content`) and zeroed usage, with no exception raised. For a text-generation call
+    (final answer, judge, planner) an empty completion is never a usable result, so we
+    treat it as a transient fault: the retry loop re-issues the call, and only if it
+    stays empty past the retry budget does it surface as a failed row — far better than
+    silently recording an empty answer that then scores 0."""
+
+
+class EmptyEmbeddingError(EmptyCompletionError):
+    """An embedding call returned no vector (empty `data`, or a zero-length embedding).
+    Subclasses `EmptyCompletionError` so `_is_retryable` already treats it as transient:
+    the same OpenRouter-relays-an-upstream-failure-as-200 mode applies to the embeddings
+    endpoint, so re-issue rather than crash a question on a blip."""
+
 
 def _is_retryable(e: BaseException) -> bool:
     """True for transient failures worth retrying: HTTP 429 (throttling) and 5xx
     (server-side), plus network-layer timeouts / connection resets from the
-    underlying transport (`httpx` async, `requests` sync). Non-429 4xx — bad
-    request, auth, context-length overflow — is a permanent error that will never
-    succeed, so it raises immediately instead of burning the retry budget."""
+    underlying transport (`httpx` async, `requests` sync), and an empty-content 200
+    (`EmptyCompletionError`). Non-429 4xx — bad request, auth, context-length overflow —
+    is a permanent error that will never succeed, so it raises immediately instead of
+    burning the retry budget."""
+    if isinstance(e, EmptyCompletionError):
+        return True
     if isinstance(e, genai_errors.APIError):
         code = getattr(e, "code", None)
         return code == 429 or (code is not None and 500 <= code < 600)
@@ -71,79 +98,58 @@ def _is_retryable(e: BaseException) -> bool:
     # faults (`ClientOSError`: broken pipe / reset) derive from `ClientConnectionError` — none
     # of which the httpx/requests types below catch.
     retryable: tuple[type[BaseException], ...] = (
+        aiohttp.ClientConnectionError,
         TimeoutError,
         httpx.TimeoutException,
         httpx.TransportError,
         requests.exceptions.Timeout,
         requests.exceptions.ConnectionError,
     )
-    try:
-        import aiohttp
 
-        retryable += (aiohttp.ClientConnectionError,)
-    except ImportError:
-        pass
     return isinstance(e, retryable)
 
 
-def _is_429(e: BaseException) -> bool:
-    """True iff `e` is an HTTP 429 (rate-limit / quota) from either provider SDK — the
-    one signal the failover monitor counts (`_ProviderFailover.record_429`). Mirrors
-    the 429 arm of `_is_retryable`; lazy-imports the OpenRouter error type."""
-    if isinstance(e, genai_errors.APIError):
-        return getattr(e, "code", None) == 429
+def _error_detail(e: BaseException) -> str:
+    """Diagnostic suffix for an LLM error. OpenRouter collapses upstream-provider
+    failures into a terse `...ResponseError: Provider returned error`; the actionable
+    cause — the HTTP status, the provider's raw error body, and OpenRouter's
+    `metadata` (which carries the provider name + the raw upstream message) — lives on
+    the exception, not in `str(e)`. Surface it so an intermittent 400 is debuggable
+    straight from the logs. Best-effort: never raises, returns "" when nothing to add."""
     try:
         from openrouter.errors import OpenRouterError
     except ImportError:
-        OpenRouterError = ()  # type: ignore[assignment]
-    if isinstance(e, OpenRouterError):
-        return getattr(e, "status_code", None) == 429
-    return False
-
-
-_MODEL_RPM: dict[str, float] | None = None
-
-# Built-in per-model request caps (provider account limits). Overridable per model via
-# SKUNK_MODEL_RPM ("model=rpm,..."); a model in neither falls back to SKUNK_LLM_RPM.
-_DEFAULT_RPM: dict[str, float] = {
-    "gemini-3.5-flash": 4000.0,
-    "gemini-3-flash-preview": 4000.0,  # fine-grained filter scan model — separate quota bucket, same RPM as 3.5-flash
-    "gemini-3.1-flash-lite": 4000.0,
-    "gemini-3.1-pro-preview": 2000.0,
-}
-
-
-def _llm_model_rpm(model: str) -> float:
-    """Per-minute request cap for an LLM `model`. Parsed once from `SKUNK_MODEL_RPM`
-    ("model=rpm,..."); a model not listed falls back to its `_DEFAULT_RPM`, then to
-    `SKUNK_LLM_RPM` (default 1000). Each model gets its own limiter bucket
-    (`llm:<model>`), so mixed-model runs pace independently."""
-    global _MODEL_RPM
-    if _MODEL_RPM is None:
-        out: dict[str, float] = {}
-        for entry in os.environ.get("SKUNK_MODEL_RPM", "").split(","):
-            entry = entry.strip()
-            if not entry:
-                continue
-            name, _, rpm = entry.partition("=")
-            out[name.strip()] = float(rpm.strip())
-        _MODEL_RPM = out
-    if model in _MODEL_RPM:
-        return _MODEL_RPM[model]
-    if model in _DEFAULT_RPM:
-        return _DEFAULT_RPM[model]
-    return float(os.environ.get("SKUNK_LLM_RPM", "1000"))
+        return ""
+    if not isinstance(e, OpenRouterError):
+        return ""
+    parts: list[str] = []
+    try:
+        code = getattr(e, "status_code", None)
+        if code is not None:
+            parts.append(f"status={code}")
+        err = getattr(getattr(e, "data", None), "error", None)
+        meta = getattr(err, "metadata", None)
+        if meta:
+            parts.append(f"metadata={str(meta)[:1000]}")
+        rr = getattr(e, "raw_response", None)
+        body = getattr(rr, "text", None) if rr is not None else getattr(e, "body", None)
+        if body:
+            parts.append(f"body={str(body)[:1000]}")
+    except Exception:  # noqa: BLE001 — diagnostics must never mask the original error
+        return ""
+    return (" | " + " ".join(parts)) if parts else ""
 
 
 # ---------------------------------------------------------------------------
-# Tokens-per-minute (TPM) throttle — async, opt-in via SKUNK_MODEL_TPM.
+# Tokens-per-minute (TPM) throttle — async; per-model caps come from the
+# SystemConfig (`llm_model_tpm`, falling back to `llm_default_tpm`).
 #
 # The RPM limiter alone can't bound token throughput: one request can carry tens
 # of thousands of tokens, so a request-paced run still blows a TPM quota (the
 # full-text page-index filter pushed ~36M tok/min and 429-stormed). This bucket
 # meters estimated *input* tokens per call. Mirrors `_RateLimiter.acquire_async`'s
 # cross-loop safety (threading.Lock around refill+deduct, sleep outside the lock).
-# Off unless `SKUNK_MODEL_TPM` names the model, so it's scoped to experiments.
+# Inert for any model whose effective TPM is falsy (None/0) — paced by RPM alone.
 # ---------------------------------------------------------------------------
 
 class _AsyncTokenBudget:
@@ -206,38 +212,6 @@ def get_async_tpm_limiter(model: str, tpm: float) -> _AsyncTokenBudget:
         return lim
 
 
-_MODEL_TPM: dict[str, float] | None = None
-
-# Built-in per-model token-per-minute caps (provider account limits). Overridable per model
-# via SKUNK_MODEL_TPM ("model=tpm,..."); a model in neither is unthrottled (None) and paced
-# by RPM alone.
-_DEFAULT_TPM: dict[str, float] = {
-    "gemini-3.5-flash": 10_000_000.0,
-    "gemini-3-flash-preview": 10_000_000.0,  # fine-grained filter scan model — separate quota bucket, same TPM as 3.5-flash
-    "gemini-3.1-flash-lite": 25_000_000.0,
-    "gemini-3.1-pro-preview": 8_000_000.0,
-}
-
-
-def _llm_model_tpm(model: str) -> float | None:
-    """Per-minute *token* cap for `model`, parsed once from `SKUNK_MODEL_TPM`
-    ("model=tpm,..."), else its `_DEFAULT_TPM`. Returns None (no throttle) when neither
-    sets it — so the TPM bucket is inert for unlisted models (paced by RPM alone)."""
-    global _MODEL_TPM
-    if _MODEL_TPM is None:
-        out: dict[str, float] = {}
-        for entry in os.environ.get("SKUNK_MODEL_TPM", "").split(","):
-            entry = entry.strip()
-            if not entry:
-                continue
-            name, _, tpm = entry.partition("=")
-            out[name.strip()] = float(tpm.strip())
-        _MODEL_TPM = out
-    if model in _MODEL_TPM:
-        return _MODEL_TPM[model]
-    return _DEFAULT_TPM.get(model)
-
-
 def _estimate_prompt_tokens(system: str, user: str) -> float:
     """Cheap pre-call input-token estimate (~4 chars/token) for the TPM bucket.
     Approximate by design — it only paces throughput, it doesn't bill."""
@@ -264,7 +238,7 @@ class LLMResponse:
     thinking_tokens: int | None = None
 
 
-def _make_openrouter_client() -> "OpenRouter":
+def _make_openrouter_client() -> OpenRouter:
     """Build an OpenRouter client from `OPENROUTER_API_KEY` (for `provider=openrouter`).
     Lazy import: the SDK is only needed when this provider is selected."""
     from openrouter import OpenRouter
@@ -275,211 +249,28 @@ def _make_openrouter_client() -> "OpenRouter":
     return OpenRouter(api_key=api_key)
 
 
-# ---------------------------------------------------------------------------
-# Automatic Gemini→OpenRouter failover (self-healing).
-#
-# Gemini is the front path. A process-global monitor counts HTTP 429s in a rolling
-# per-second window (`_Rolling429Window`); once `threshold` of them land inside the window
-# it routes ALL generation to OpenRouter. Every call reads the window when picking a
-# provider, so failover is instant for new traffic and needs no broadcast / registry /
-# cancellation of in-flight calls. The provider is re-checked per RETRY ATTEMPT (see
-# `_retry_call`), so a call already on Gemini that 429s after the trip finishes on
-# OpenRouter at its next attempt — no call is ever cancelled.
-#
-# Recovery is built into the window: it DRAINS by the second. Once on OpenRouter no traffic
-# hits Gemini, so no fresh 429s arrive and the per-second buckets age out; when the windowed
-# total falls back under `threshold` the next call flips back to Gemini. No canary probes —
-# if Gemini is still storming, the resumed load simply re-trips. See `SkunkConfig.llm_failover_*`.
-# ---------------------------------------------------------------------------
-
-
-class _Rolling429Window:
-    """A self-draining rolling window of HTTP-429 counts over the last `window_s` seconds,
-    bucketed one count per second. The data structure is maintained COLLABORATIVELY — there
-    is no background thread; each caller advances the ring by the wall-clock seconds elapsed
-    since the last touch, so old seconds age out on their own. All state is private.
-
-    Simple API: `log_429()` records one failure; `check_status()` returns True when the
-    windowed total has reached `threshold` (i.e. the backup provider should be used).
-
-    Thread-safe: mutation/advance happens under a lock; `check_status` short-circuits the
-    lock when it can tell no second has rolled over yet (an atomic int read of the cached
-    epoch), so the per-call hot path is uncontended within a given second."""
-
-    def __init__(self, *, window_s: int, threshold: int) -> None:
-        self._n = max(1, int(window_s))
-        self._threshold = threshold
-        self._buckets = [0] * self._n        # ring of per-second 429 counts
-        self._head = 0                        # index of the current second's bucket
-        self._epoch = int(time.monotonic())   # wall-clock second that `_head` represents
-        self._total = 0                       # cached sum(_buckets) — the windowed count
-        self._lock = threading.Lock()
-
-    def _advance_locked(self, now_s: int) -> None:
-        """Drain the buckets for each whole second elapsed since `_epoch` (caller holds the
-        lock). This is the collaborative maintenance step — whoever touches the window next
-        pays for the seconds that have passed."""
-        steps = now_s - self._epoch
-        if steps <= 0:
-            return
-        if steps >= self._n:  # the whole window has aged out — nothing survives
-            self._buckets = [0] * self._n
-            self._head = 0
-            self._total = 0
-        else:
-            for _ in range(steps):
-                self._head = (self._head + 1) % self._n
-                self._total -= self._buckets[self._head]
-                self._buckets[self._head] = 0
-        self._epoch = now_s
-
-    def log_429(self) -> None:
-        now_s = int(time.monotonic())
-        with self._lock:
-            self._advance_locked(now_s)
-            self._buckets[self._head] += 1
-            self._total += 1
-
-    def check_status(self) -> bool:
-        """True ⇒ the windowed 429 count has reached `threshold` (use the backup)."""
-        now_s = int(time.monotonic())
-        if now_s == self._epoch:  # same second — no drain owed; atomic reads, lock-free
-            return self._total >= self._threshold
-        with self._lock:
-            self._advance_locked(now_s)
-            return self._total >= self._threshold
-
-
-class _ProviderFailover:
-    """Process-global failover policy: owns provider routing + the model map + once-per-
-    transition logging, and delegates all 429 windowing/draining to `_Rolling429Window`.
-    Inert (always routes to the configured provider) when `enabled` is False."""
-
-    def __init__(
-        self,
-        *,
-        enabled: bool,
-        threshold: int,
-        window_s: float,
-        fallback_model: str | None,
-        model_map: dict[str, str],
-    ) -> None:
-        self._enabled = enabled
-        self._fallback_model = fallback_model
-        self._model_map = dict(model_map)
-        self._window = _Rolling429Window(window_s=int(window_s), threshold=threshold)
-        self._on_backup = False  # last-logged status, so TRIP/RECOVER log once per flip
-        self._log_lock = threading.Lock()
-
-    def record_429(self) -> None:
-        """Record a 429 into the rolling window. No-op when disabled."""
-        if self._enabled:
-            self._window.log_429()
-
-    def route(self, provider: str, model: str) -> tuple[str, str]:
-        """(provider, model) for the next attempt. Disabled — or already targeting
-        openrouter — passes through unchanged. Otherwise, while the window is over threshold
-        Gemini calls become OpenRouter (mapped/fallback model); when it drains back under
-        threshold, traffic returns to Gemini."""
-        if not self._enabled or provider == "openrouter":
-            return provider, model
-        on_backup = self._window.check_status()
-        self._note_transition(on_backup)
-        if on_backup:
-            return "openrouter", self._model_map.get(model, self._fallback_model or model)
-        return provider, model
-
-    def _note_transition(self, on_backup: bool) -> None:
-        """Log TRIPPED / RECOVERED once per actual flip (double-checked under the lock)."""
-        if on_backup == self._on_backup:
-            return
-        with self._log_lock:
-            if on_backup == self._on_backup:
-                return
-            self._on_backup = on_backup
-            if on_backup:
-                log.warning(
-                    "LLM failover TRIPPED: ≥ threshold HTTP 429s in the rolling window — "
-                    "routing ALL generation to OpenRouter (default model=%s); will retry "
-                    "Gemini once the window drains", self._fallback_model,
-                )
-            else:
-                log.warning(
-                    "LLM failover RECOVERED: 429 window drained — routing generation back "
-                    "to Gemini",
-                )
-
-    @property
-    def tripped(self) -> bool:
-        return self._enabled and self._window.check_status()
-
-
-_FAILOVER: _ProviderFailover | None = None
-_FAILOVER_LOCK = threading.Lock()
-
-
-def _warn_free_failover_models(fallback: str | None, model_map: dict[str, str]) -> None:
-    """One-time warning if any failover target is a `:free` OpenRouter id — those cap at
-    ~20 RPM, BELOW the Gemini quota, so a 429 storm would only worsen on them."""
-    free = sorted({m for m in [fallback, *model_map.values()] if m and m.endswith(":free")})
-    if free:
-        log.warning(
-            "LLM failover target(s) %s are `:free` tier (~20 RPM) — too small to absorb "
-            "a 429 storm; configure paid OpenRouter model ids instead.", free,
-        )
-
-
-def get_provider_failover(config: SkunkConfig) -> _ProviderFailover:
-    """Process-wide failover monitor, built from the FIRST config seen and frozen for the
-    run (same first-use-wins contract as `get_rate_limiter`). Armed only when failover is
-    enabled AND `OPENROUTER_API_KEY` AND a failover model are all present; otherwise it's
-    INERT (logs once, never trips) so a 429 storm degrades to retries, never to the hard
-    failure an unconfigured OpenRouter client would raise."""
-    global _FAILOVER
-    with _FAILOVER_LOCK:
-        if _FAILOVER is None:
-            has_key = bool(os.environ.get("OPENROUTER_API_KEY"))
-            armed = bool(config.llm_failover_enabled and has_key and config.llm_failover_model)
-            if config.llm_failover_enabled and not armed:
-                log.warning(
-                    "LLM failover enabled but INERT (%s) — staying on the configured "
-                    "provider with no automatic OpenRouter failover.",
-                    "OPENROUTER_API_KEY not set" if not has_key
-                    else "SKUNK_LLM_FAILOVER_MODEL not set",
-                )
-            if armed:
-                _warn_free_failover_models(config.llm_failover_model, config.llm_failover_model_map)
-            _FAILOVER = _ProviderFailover(
-                enabled=armed,
-                threshold=config.llm_failover_429_threshold,
-                window_s=config.llm_failover_window_s,
-                fallback_model=config.llm_failover_model,
-                model_map=config.llm_failover_model_map,
-            )
-        return _FAILOVER
-
-
 class LLMClient:
     """LLM client. Generation calls route to either the AI Studio Gemini API
-    (`provider=genai`, default) or OpenRouter (`provider=openrouter`); both share the
-    same rate-limit / retry / logging scaffolding. Under sustained Gemini 429s an
-    automatic latch fails the whole process over to OpenRouter (`_ProviderFailover`),
-    re-decided per retry attempt. Embeddings stay on Gemini."""
+    (`provider=genai`, default) or OpenRouter (`provider=openrouter`) per
+    `config.llm_provider`; both share the same rate-limit / retry / logging
+    scaffolding. Embeddings stay on Gemini."""
 
-    def __init__(self, config: SkunkConfig) -> None:
+    def __init__(self, config: SystemConfig) -> None:
         self._config = config
         self._gemini_client: genai.Client | None = None
         self._openrouter_client: OpenRouter | None = None
-        # Process-global, shared across every LLMClient (one per question) so a 429
-        # storm spanning all in-flight questions is seen as one signal.
-        self._failover = get_provider_failover(config)
+        self._local_embedders: dict[str, Any] = {}
+        self.usage = UsageTracker(
+            default_model=config.llm_model,
+            prices=getattr(config, "llm_prices", None),
+        )
 
     def _get_gemini_client(self) -> genai.Client:
         if self._gemini_client is None:
             self._gemini_client = make_genai_client()
         return self._gemini_client
 
-    def _get_openrouter_client(self) -> "OpenRouter":
+    def _get_openrouter_client(self) -> OpenRouter:
         if self._openrouter_client is None:
             self._openrouter_client = _make_openrouter_client()
         return self._openrouter_client
@@ -531,85 +322,139 @@ class LLMClient:
 
     def _retry_call(
         self,
-        attempt: Callable[[str, str], LLMResponse],
-        configured_provider: str,
+        attempt: Callable[[str, str], R],
+        provider: str,
         model: str,
-    ) -> LLMResponse:
-        """Drive `attempt(provider, model)` with exponential-backoff retry. The
-        provider+model are re-routed through the failover latch ON EACH ATTEMPT (not
-        once up front), so a call that 429s after the latch trips runs its next attempt
-        on OpenRouter — no in-flight call is cancelled. 429s feed `record_429`; the
-        rate-limiter bucket follows the *effective* model. `attempt` owns the API call,
-        timing, parsing, and success emit."""
+        bucket: str | None = None,
+    ) -> R:
+        """Drive `attempt(provider, model)` with exponential-backoff retry, paced by a
+        rate-limiter bucket. Retries only transient faults (`_is_retryable`: 429 / 5xx /
+        transport blips); a non-429 4xx (bad request, auth, context overflow) raises
+        immediately. `attempt` owns the API call, timing, parsing, and the success emit.
+        `bucket` overrides the limiter (a shared process-wide bucket like `"embed"`);
+        when None, the per-model `llm:<model>` bucket is used at the configured RPM."""
         max_retries = self._config.llm_max_retries
         delay = self._config.llm_retry_initial_delay_s
+        limiter = (
+            get_rate_limiter(bucket)
+            if bucket is not None
+            else get_rate_limiter(
+                f"llm:{model}",
+                rate_per_min=self._config.llm_model_rpm.get(model, self._config.llm_default_rpm),
+            )
+        )
 
         for i in range(max_retries + 1):
-            provider, eff_model = self._failover.route(configured_provider, model)
-            limiter = get_rate_limiter(f"llm:{eff_model}", rate_per_min=_llm_model_rpm(eff_model))
             limiter.acquire()
             try:
-                return attempt(provider, eff_model)
+                return attempt(provider, model)
             except Exception as e:
-                if _is_429(e):
-                    self._failover.record_429()
                 # Log EVERY failure with its message — including the final one
                 # before we re-raise — so a fatal error is never silent.
                 stop = i == max_retries or not _is_retryable(e)
-                # Skip the backoff when the next attempt re-routes to a different
-                # (healthy) provider — no reason to wait out a quota we're abandoning.
-                rerouting = not stop and self._failover.route(configured_provider, model)[0] != provider
                 log.warning(
-                    "llm call failed (attempt %d/%d, provider=%s model=%s): %s: %s%s",
-                    i + 1, max_retries + 1, provider, eff_model, type(e).__name__, e,
-                    "" if stop else (
-                        "; re-routing to backup provider" if rerouting else f"; retrying in {delay:.1f}s"
-                    ),
+                    "llm call failed (attempt %d/%d, provider=%s model=%s): %s: %s%s%s",
+                    i + 1, max_retries + 1, provider, model, type(e).__name__, e,
+                    _error_detail(e),
+                    "" if stop else f"; retrying in {delay:.1f}s",
                 )
                 if stop:
                     raise
-                if not rerouting:
-                    time.sleep(delay)
-                    delay *= 2
+                time.sleep(delay)
+                delay *= 2
         raise RuntimeError("unreachable: retry loop fell through")
 
     async def _aretry_call(
         self,
         attempt: Callable[[str, str], Awaitable[LLMResponse]],
-        configured_provider: str,
+        provider: str,
         model: str,
     ) -> LLMResponse:
-        """Async twin of `_retry_call`: awaits the effective model's async rate limiter
-        and the coroutine `attempt(provider, model)`, backing off via `asyncio.sleep`
-        (never blocking the event loop). Re-routes per attempt and records 429s exactly
-        like the sync path."""
+        """Async twin of `_retry_call`: awaits the model's async rate limiter and the
+        coroutine `attempt(provider, model)`, backing off via `asyncio.sleep` (never
+        blocking the event loop)."""
         max_retries = self._config.llm_max_retries
         delay = self._config.llm_retry_initial_delay_s
+        limiter = get_rate_limiter(
+            f"llm:{model}",
+            rate_per_min=self._config.llm_model_rpm.get(model, self._config.llm_default_rpm),
+        )
 
         for i in range(max_retries + 1):
-            provider, eff_model = self._failover.route(configured_provider, model)
-            limiter = get_rate_limiter(f"llm:{eff_model}", rate_per_min=_llm_model_rpm(eff_model))
             await limiter.acquire_async()
             try:
-                return await attempt(provider, eff_model)
+                return await attempt(provider, model)
             except Exception as e:
-                if _is_429(e):
-                    self._failover.record_429()
                 stop = i == max_retries or not _is_retryable(e)
-                rerouting = not stop and self._failover.route(configured_provider, model)[0] != provider
                 log.warning(
-                    "llm call failed (attempt %d/%d, provider=%s model=%s): %s: %s%s",
-                    i + 1, max_retries + 1, provider, eff_model, type(e).__name__, e,
-                    "" if stop else (
-                        "; re-routing to backup provider" if rerouting else f"; retrying in {delay:.1f}s"
-                    ),
+                    "llm call failed (attempt %d/%d, provider=%s model=%s): %s: %s%s%s",
+                    i + 1, max_retries + 1, provider, model, type(e).__name__, e,
+                    _error_detail(e),
+                    "" if stop else f"; retrying in {delay:.1f}s",
                 )
                 if stop:
                     raise
-                if not rerouting:
-                    await asyncio.sleep(delay)
-                    delay *= 2
+                await asyncio.sleep(delay)
+                delay *= 2
         raise RuntimeError("unreachable: retry loop fell through")
+
+    def _build_response(
+        self,
+        text: str,
+        toks: dict,
+        latency_s: float,
+        *,
+        model: str,
+        temperature: float,
+        effort: Effort,
+        ctx: ExecutionContext | None,
+        call_site: str,
+    ) -> LLMResponse:
+        """Shared tail for every generation path: emit the uniform `call ...` envelope
+        (when `ctx` is set), accumulate the call into this client's `usage` tracker, and
+        pack the provider-agnostic token dict (`_usage_tokens` / `_usage_tokens_openrouter`)
+        into an `LLMResponse`. `toks` may omit any key — OpenRouter's dict has no
+        `thinking_tokens`, hence the `.get`s. The single chokepoint every call path funnels
+        through, so usage accounting lives here once rather than at each public method."""
+        if ctx is not None:
+            ctx.emit(
+                f"call call_site={call_site} model={model} temp={temperature} "
+                f"effort={effort} latency_s={round(latency_s, 3)} "
+                f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
+                f"think_tok={toks.get('thinking_tokens')}"
+            )
+        resp = LLMResponse(
+            text=text,
+            latency_s=latency_s,
+            input_tokens=toks["input_tokens"],
+            output_tokens=toks["output_tokens"],
+            cache_input_tokens=toks.get("cache_input_tokens"),
+            thinking_tokens=toks.get("thinking_tokens"),
+        )
+        self.usage.add(resp, model)
+        return resp
+
+    async def _tpm_acquire(
+        self, model: str, system: str, user: str
+    ) -> tuple[_AsyncTokenBudget | None, float]:
+        """Acquire the per-model token budget (`config.llm_model_tpm`, falling back to
+        `llm_default_tpm`) before a call, charging an up-front input-token estimate.
+        Returns (limiter, estimate) so the caller can `_tpm_settle` the actual-vs-estimate
+        delta afterward; (None, 0.0) when the model is unthrottled (paced by RPM alone)."""
+        tpm = self._config.llm_model_tpm.get(model, self._config.llm_default_tpm)
+        if not tpm:
+            return None, 0.0
+        est = _estimate_prompt_tokens(system, user)
+        lim = get_async_tpm_limiter(model, tpm)
+        await lim.acquire(est)
+        return lim, est
+
+    @staticmethod
+    def _tpm_settle(lim: _AsyncTokenBudget | None, est: float, input_tokens: int | None) -> None:
+        """Post-call correction: charge the actual-minus-estimated input tokens so the
+        bucket tracks REAL usage (the char/4 estimate runs ~2x low on dense tabular text)."""
+        if lim is not None:
+            lim.settle((input_tokens or 0) - est)
 
     def embed(
         self,
@@ -646,6 +491,76 @@ class LLMClient:
                 )
             out.extend(vecs)
         return out
+
+    # --- Query-time embedding (provider="openrouter" | "local"), usage-tracked --------
+
+    def _get_local_embedder(self, model: str) -> Any:
+        """Lazily build (and cache) a local SentenceTransformers model. `sentence-
+        transformers` is a skunk dependency; the import is deferred so a run that only
+        uses the OpenRouter backend never pays the heavy import."""
+        st = self._local_embedders.get(model)
+        if st is None:
+            from sentence_transformers import SentenceTransformer
+
+            st = SentenceTransformer(model)
+            self._local_embedders[model] = st
+        return st
+
+    def embed_query(
+        self,
+        text: str,
+        *,
+        model: str | None = None,
+        provider: str | None = None,
+        ctx: ExecutionContext | None = None,
+    ) -> list[float]:
+        """Embed a single query string for vector search, routing through the same
+        rate-limit / retry / usage-accounting scaffolding as generation so embedding
+        spend lands on this client's `usage` tracker (tokens, cost, calls).
+
+        Backends (per `config.emb_provider`, overridable via `provider`):
+          - "openrouter": the OpenRouter embeddings endpoint (e.g. Qwen3-Embedding-8B).
+            Token count is the provider-reported `usage.prompt_tokens`.
+          - "local": a local SentenceTransformers model (e.g. Qwen3-Embedding-0.6B),
+            L2-normalized to match how the corpus vectors were built. No token count is
+            reported, so it is estimated at ~4 chars/token (bills only; paces nothing).
+
+        When `ctx` is given, emits the uniform `call ...` envelope (so the embed call's
+        latency shows in the per-question trace like every LLM call); usage is recorded
+        regardless of `ctx`."""
+        model = model or self._config.emb_model_id
+        provider = provider or self._config.emb_provider
+
+        def attempt(_prov: str, m: str) -> list[float]:
+            t0 = time.monotonic()
+            if provider == "local":
+                st = self._get_local_embedder(m)
+                vec = st.encode([text], normalize_embeddings=True)[0]
+                vector = [float(x) for x in vec]
+                in_tok = max(1, len(text) // 4)  # no provider token count; estimate.
+            else:
+                resp = self._get_openrouter_client().embeddings.generate(input=text, model=m)
+                data = getattr(resp, "data", None) or []
+                vector = list(data[0].embedding) if data and data[0].embedding else []
+                if not vector:
+                    raise EmptyEmbeddingError(
+                        f"openrouter empty embedding (model={m} provider={provider})"
+                    )
+                usage = getattr(resp, "usage", None)
+                in_tok = (getattr(usage, "prompt_tokens", None) or 0) if usage else 0
+            latency_s = time.monotonic() - t0
+            self.usage.add_embed(m, in_tok)
+            if ctx is not None:
+                ctx.emit(
+                    f"call call_site=embed model={m} provider={provider} "
+                    f"latency_s={round(latency_s, 3)} in_tok={in_tok} dim={len(vector)}",
+                    kind="call",
+                )
+            return vector
+
+        # Embeddings share one process-wide "embed" rate bucket across all workers
+        # (separate from the per-model generation buckets).
+        return self._retry_call(attempt, provider, model, bucket="embed")
 
     @staticmethod
     def _gemini_parts(user: str, images: list[B64Image] | None) -> list[Any]:
@@ -745,23 +660,12 @@ class LLMClient:
                 model=model, contents=parts, config=gen_config,
             )
             latency_s = time.monotonic() - t0
-            usage = api_resp.usage_metadata
             output_text = (api_resp.text or "").strip()
-            toks = self._usage_tokens(usage)
-            if ctx is not None:
-                ctx.emit(
-                    f"call call_site={call_site} model={model} temp={temperature} "
-                    f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
-                    f"think_tok={toks['thinking_tokens']}"
-                )
-            return LLMResponse(
-                text=output_text,
-                latency_s=latency_s,
-                input_tokens=toks["input_tokens"],
-                output_tokens=toks["output_tokens"],
-                cache_input_tokens=toks.get("cache_input_tokens"),
-                thinking_tokens=toks.get("thinking_tokens"),
+            toks = self._usage_tokens(api_resp.usage_metadata)
+            return self._build_response(
+                output_text, toks, latency_s,
+                model=model, temperature=temperature, effort=effort,
+                ctx=ctx, call_site=call_site,
             )
 
         return do()
@@ -791,17 +695,9 @@ class LLMClient:
 
         async def do() -> LLMResponse:
             # TPM throttle (opt-in via SKUNK_MODEL_TPM): meter input tokens so
-            # throughput stays under quota. Charge an estimate up front for pacing,
-            # then `settle` the actual-vs-estimate delta after the call so the
-            # bucket tracks REAL token usage (the char/4 estimate runs ~2x low on
-            # dense tabular text). Inside `do` so each retry re-charges. Separate
-            # from the RPM limiter.
-            tpm = _llm_model_tpm(model)
-            tpm_lim, est = None, 0.0
-            if tpm:
-                est = _estimate_prompt_tokens(system, user)
-                tpm_lim = get_async_tpm_limiter(model, tpm)
-                await tpm_lim.acquire(est)
+            # throughput stays under quota, separate from the RPM limiter. Inside `do`
+            # so each retry re-charges. `_tpm_settle` corrects the estimate post-call.
+            tpm_lim, est = await self._tpm_acquire(model, system, user)
             t0 = time.monotonic()
             # Hard wall-clock cap mirroring the streaming path: the http_options
             # timeout in `gen_config` bounds reads, wait_for bounds the whole call.
@@ -813,25 +709,13 @@ class LLMClient:
             else:
                 api_resp = await coro
             latency_s = time.monotonic() - t0
-            usage = api_resp.usage_metadata
             output_text = (api_resp.text or "").strip()
-            toks = self._usage_tokens(usage)
-            if tpm_lim is not None:
-                tpm_lim.settle((toks["input_tokens"] or 0) - est)
-            if ctx is not None:
-                ctx.emit(
-                    f"call call_site={call_site} model={model} temp={temperature} "
-                    f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
-                    f"think_tok={toks['thinking_tokens']}"
-                )
-            return LLMResponse(
-                text=output_text,
-                latency_s=latency_s,
-                input_tokens=toks["input_tokens"],
-                output_tokens=toks["output_tokens"],
-                cache_input_tokens=toks.get("cache_input_tokens"),
-                thinking_tokens=toks.get("thinking_tokens"),
+            toks = self._usage_tokens(api_resp.usage_metadata)
+            self._tpm_settle(tpm_lim, est, toks["input_tokens"])
+            return self._build_response(
+                output_text, toks, latency_s,
+                model=model, temperature=temperature, effort=effort,
+                ctx=ctx, call_site=call_site,
             )
 
         return await do()
@@ -893,12 +777,15 @@ class LLMClient:
                 model=model_id, contents=contents, config=gen_config,  # type: ignore[arg-type]
             )
             accumulated = ""
+            stopped_text: str | None = None
             usage = None
             for chunk in resp_stream:
                 accumulated += chunk.text or ""
                 usage = getattr(chunk, "usage_metadata", None) or usage
-                if should_stop is not None and should_stop(accumulated):
-                    break
+                # Drain past `should_stop` to capture the final usage_metadata (parity
+                # with the openrouter path); record the cut point for the returned text.
+                if stopped_text is None and should_stop is not None and should_stop(accumulated):
+                    stopped_text = accumulated
             close = getattr(resp_stream, "close", None)
             if close is not None:
                 try:  # noqa: SIM105
@@ -906,21 +793,17 @@ class LLMClient:
                 except Exception:
                     pass
             latency_s = time.monotonic() - t0
-            toks = self._usage_tokens(usage)
-            if ctx is not None:
-                ctx.emit(
-                    f"call call_site={call_site} model={model_id} temp={temperature} "
-                    f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
-                    f"think_tok={toks['thinking_tokens']}"
+            if usage is None:
+                log.warning(
+                    "gemini stream returned no usage — cost undercounted (call_site=%s model=%s)",
+                    call_site, model_id,
                 )
-            return LLMResponse(
-                text=accumulated,
-                latency_s=latency_s,
-                input_tokens=toks["input_tokens"],
-                output_tokens=toks["output_tokens"],
-                cache_input_tokens=toks.get("cache_input_tokens"),
-                thinking_tokens=toks.get("thinking_tokens"),
+            accumulated = accumulated if stopped_text is None else stopped_text
+            toks = self._usage_tokens(usage)
+            return self._build_response(
+                accumulated, toks, latency_s,
+                model=model_id, temperature=temperature, effort=effort,
+                ctx=ctx, call_site=call_site,
             )
 
         return do()
@@ -991,13 +874,17 @@ class LLMClient:
                 model=model_id, contents=contents, config=gen_config,  # type: ignore[arg-type]
             )
             accumulated = ""
+            stopped_text: str | None = None
             usage = None
             try:
                 async for chunk in resp_stream:
                     accumulated += chunk.text or ""
                     usage = getattr(chunk, "usage_metadata", None) or usage
-                    if should_stop is not None and should_stop(accumulated):
-                        break
+                    # Keep draining past `should_stop` so the final usage_metadata is
+                    # captured (parity with the openrouter path); record the cut point
+                    # for the returned text. Bounded by max_output_tokens + timeout.
+                    if stopped_text is None and should_stop is not None and should_stop(accumulated):
+                        stopped_text = accumulated
             finally:
                 # Runs on normal completion AND on wait_for cancellation, so a
                 # timed-out stream still releases its connection.
@@ -1007,7 +894,7 @@ class LLMClient:
                         await aclose()
                     except Exception:
                         pass
-            return accumulated, usage
+            return (accumulated if stopped_text is None else stopped_text), usage
 
         async def do() -> LLMResponse:
             t0 = time.monotonic()
@@ -1019,28 +906,23 @@ class LLMClient:
             else:
                 accumulated, usage = await _consume()
             latency_s = time.monotonic() - t0
-            toks = self._usage_tokens(usage)
-            if ctx is not None:
-                ctx.emit(
-                    f"call call_site={call_site} model={model_id} temp={temperature} "
-                    f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
-                    f"think_tok={toks['thinking_tokens']}"
+            if usage is None:
+                log.warning(
+                    "gemini stream returned no usage — cost undercounted (call_site=%s model=%s)",
+                    call_site, model_id,
                 )
-            return LLMResponse(
-                text=accumulated,
-                latency_s=latency_s,
-                input_tokens=toks["input_tokens"],
-                output_tokens=toks["output_tokens"],
-                cache_input_tokens=toks.get("cache_input_tokens"),
-                thinking_tokens=toks.get("thinking_tokens"),
+            toks = self._usage_tokens(usage)
+            return self._build_response(
+                accumulated, toks, latency_s,
+                model=model_id, temperature=temperature, effort=effort,
+                ctx=ctx, call_site=call_site,
             )
 
         return await do()
 
     # --- OpenRouter generation path (provider="openrouter") ---
-    # Mirrors the Gemini helpers above: same do()/_retry_call shape, same ctx.emit
-    # envelope and LLMResponse, so the rate-limit/retry/logging scaffolding is shared.
+    # Mirrors the Gemini helpers above: same _retry_call shape and shared `_build_response`
+    # tail (ctx.emit envelope + LLMResponse), so the rate-limit/retry/logging is shared.
 
     @staticmethod
     def _effort_to_reasoning(effort: Effort) -> dict:
@@ -1071,6 +953,14 @@ class LLMClient:
             return ""
         msg = getattr(choices[0], "message", None)
         return getattr(msg, "content", None) or ""
+
+    @staticmethod
+    def _openrouter_finish_reason(resp: Any) -> str | None:
+        """First choice's `finish_reason` (e.g. 'stop' / 'length' / 'content_filter' /
+        'error'), or None when there are no choices — surfaced in EmptyCompletionError so
+        an empty completion's cause is visible in the retry-warning log."""
+        choices = getattr(resp, "choices", None) or []
+        return getattr(choices[0], "finish_reason", None) if choices else None
 
     @staticmethod
     def _usage_tokens_openrouter(usage: Any) -> dict:
@@ -1112,21 +1002,16 @@ class LLMClient:
             )
             latency_s = time.monotonic() - t0
             output_text = self._openrouter_text(resp).strip()
-            toks = self._usage_tokens_openrouter(getattr(resp, "usage", None))
-            if ctx is not None:
-                ctx.emit(
-                    f"call call_site={call_site} model={model} temp={temperature} "
-                    f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
-                    f"think_tok={toks['thinking_tokens']}"
+            if not output_text:
+                raise EmptyCompletionError(
+                    f"openrouter empty content (model={model} call_site={call_site} "
+                    f"finish_reason={self._openrouter_finish_reason(resp)})"
                 )
-            return LLMResponse(
-                text=output_text,
-                latency_s=latency_s,
-                input_tokens=toks["input_tokens"],
-                output_tokens=toks["output_tokens"],
-                cache_input_tokens=toks.get("cache_input_tokens"),
-                thinking_tokens=toks.get("thinking_tokens"),
+            toks = self._usage_tokens_openrouter(getattr(resp, "usage", None))
+            return self._build_response(
+                output_text, toks, latency_s,
+                model=model, temperature=temperature, effort=effort,
+                ctx=ctx, call_site=call_site,
             )
 
         return do()
@@ -1155,12 +1040,7 @@ class LLMClient:
 
         async def do() -> LLMResponse:
             # TPM throttle (opt-in via SKUNK_MODEL_TPM) — identical to the Gemini path.
-            tpm = _llm_model_tpm(model)
-            tpm_lim, est = None, 0.0
-            if tpm:
-                est = _estimate_prompt_tokens(system, user)
-                tpm_lim = get_async_tpm_limiter(model, tpm)
-                await tpm_lim.acquire(est)
+            tpm_lim, est = await self._tpm_acquire(model, system, user)
             extra = {"max_tokens": max_output_tokens} if max_output_tokens is not None else {}
             t0 = time.monotonic()
             coro = client.chat.send_async(
@@ -1170,23 +1050,17 @@ class LLMClient:
             resp = await (asyncio.wait_for(coro, timeout_s) if timeout_s is not None else coro)
             latency_s = time.monotonic() - t0
             output_text = self._openrouter_text(resp).strip()
-            toks = self._usage_tokens_openrouter(getattr(resp, "usage", None))
-            if tpm_lim is not None:
-                tpm_lim.settle((toks["input_tokens"] or 0) - est)
-            if ctx is not None:
-                ctx.emit(
-                    f"call call_site={call_site} model={model} temp={temperature} "
-                    f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
-                    f"think_tok={toks['thinking_tokens']}"
+            if not output_text:
+                raise EmptyCompletionError(
+                    f"openrouter empty content (model={model} call_site={call_site} "
+                    f"finish_reason={self._openrouter_finish_reason(resp)})"
                 )
-            return LLMResponse(
-                text=output_text,
-                latency_s=latency_s,
-                input_tokens=toks["input_tokens"],
-                output_tokens=toks["output_tokens"],
-                cache_input_tokens=toks.get("cache_input_tokens"),
-                thinking_tokens=toks.get("thinking_tokens"),
+            toks = self._usage_tokens_openrouter(getattr(resp, "usage", None))
+            self._tpm_settle(tpm_lim, est, toks["input_tokens"])
+            return self._build_response(
+                output_text, toks, latency_s,
+                model=model, temperature=temperature, effort=effort,
+                ctx=ctx, call_site=call_site,
             )
 
         return await do()
@@ -1235,6 +1109,7 @@ class LLMClient:
         def do() -> LLMResponse:
             t0 = time.monotonic()
             accumulated = ""
+            stopped_text: str | None = None
             usage = None
             with client.chat.send(
                 model=model_id, messages=or_messages, stream=True, # type: ignore
@@ -1243,24 +1118,22 @@ class LLMClient:
                 for chunk in resp_stream:
                     accumulated += self._openrouter_chunk_text(chunk)
                     usage = getattr(chunk, "usage", None) or usage
-                    if should_stop is not None and should_stop(accumulated):
-                        break
+                    # Drain to the end to capture the trailing usage chunk (see the async
+                    # twin): breaking at `should_stop` would drop cost stats entirely.
+                    if stopped_text is None and should_stop is not None and should_stop(accumulated):
+                        stopped_text = accumulated
             latency_s = time.monotonic() - t0
-            toks = self._usage_tokens_openrouter(usage)
-            if ctx is not None:
-                ctx.emit(
-                    f"call call_site={call_site} model={model_id} temp={temperature} "
-                    f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
-                    f"think_tok={toks['thinking_tokens']}"
+            if usage is None:
+                log.warning(
+                    "openrouter stream returned no usage — cost undercounted (call_site=%s model=%s)",
+                    call_site, model_id,
                 )
-            return LLMResponse(
-                text=accumulated,
-                latency_s=latency_s,
-                input_tokens=toks["input_tokens"],
-                output_tokens=toks["output_tokens"],
-                cache_input_tokens=toks.get("cache_input_tokens"),
-                thinking_tokens=toks.get("thinking_tokens"),
+            accumulated = accumulated if stopped_text is None else stopped_text
+            toks = self._usage_tokens_openrouter(usage)
+            return self._build_response(
+                accumulated, toks, latency_s,
+                model=model_id, temperature=temperature, effort=effort,
+                ctx=ctx, call_site=call_site,
             )
 
         return do()
@@ -1288,6 +1161,7 @@ class LLMClient:
 
         async def _consume() -> tuple[str, Any]:
             accumulated = ""
+            stopped_text: str | None = None
             usage = None
             async with await client.chat.send_async(
                 model=model_id, messages=or_messages, stream=True, # type: ignore
@@ -1296,9 +1170,15 @@ class LLMClient:
                 async for chunk in resp_stream:
                     accumulated += self._openrouter_chunk_text(chunk)
                     usage = getattr(chunk, "usage", None) or usage
-                    if should_stop is not None and should_stop(accumulated):
-                        break
-            return accumulated, usage
+                    # OpenRouter sends the usage chunk LAST, so we must drain the stream
+                    # to capture cost stats — breaking at `should_stop` drops them
+                    # entirely. Record the cut point for the returned text but keep
+                    # reading; the agent is prompted to emit one block then stop, so the
+                    # stream usually ends right after (max_output_tokens + the request
+                    # timeout bound the worst case).
+                    if stopped_text is None and should_stop is not None and should_stop(accumulated):
+                        stopped_text = accumulated
+            return (accumulated if stopped_text is None else stopped_text), usage
 
         async def do() -> LLMResponse:
             t0 = time.monotonic()
@@ -1307,21 +1187,16 @@ class LLMClient:
             else:
                 accumulated, usage = await _consume()
             latency_s = time.monotonic() - t0
-            toks = self._usage_tokens_openrouter(usage)
-            if ctx is not None:
-                ctx.emit(
-                    f"call call_site={call_site} model={model_id} temp={temperature} "
-                    f"effort={effort} latency_s={round(latency_s, 3)} "
-                    f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
-                    f"think_tok={toks['thinking_tokens']}"
+            if usage is None:
+                log.warning(
+                    "openrouter stream returned no usage — cost undercounted (call_site=%s model=%s)",
+                    call_site, model_id,
                 )
-            return LLMResponse(
-                text=accumulated,
-                latency_s=latency_s,
-                input_tokens=toks["input_tokens"],
-                output_tokens=toks["output_tokens"],
-                cache_input_tokens=toks.get("cache_input_tokens"),
-                thinking_tokens=toks.get("thinking_tokens"),
+            toks = self._usage_tokens_openrouter(usage)
+            return self._build_response(
+                accumulated, toks, latency_s,
+                model=model_id, temperature=temperature, effort=effort,
+                ctx=ctx, call_site=call_site,
             )
 
         return await do()

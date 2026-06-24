@@ -1,0 +1,27 @@
+# TREC-BioGen benchmark (2025 edition, Task A).
+#
+# Corpus: the 2025 BioGen document collection (26,805,982 PubMed abstracts), embedded with
+# Qwen3-Embedding-0.6B (1024-dim) into the `qwen-biogen-0.6b` Chroma collection. Runs MUST embed
+# queries with the SAME 0.6B model, e.g.:
+#   python3 -m qatfd.runner benchmarks=trec_biogen systems=search_agent \
+#       experiments.split=test systems.emb_model_id=qwen/qwen3-embedding-0.6b
+#   # (local backend: systems.emb_provider=local systems.emb_model_id=Qwen/Qwen3-Embedding-0.6B)
+defaults:
+  - base
+  - _self_
+
+name: trec-biogen
+chromadb_collection: qwen-biogen-0.6b
+# 40 questions + expert reference answers (the 2024 answers, re-released for the 2025 corpus)
+task_a_path: biogen/2025_task_a.json
+# PMID -> abstract metadata produced by the embedding job (compute_biogen_embeddings.py)
+biogen_metadata_glob: biogen/biogen-element-embeddings/metadata_rank*.json
+# official decomposed gold nuggets (organizer/BioACE baseline_labels.json); null => sentence-as-nugget
+nuggets_path: biogen/baseline_labels.json
+# null => all 40 questions are the held-out test split (run with experiments.split=test)
+test_ids_path: null
+# weight for a partially-supported nugget in the recall score
+partial_credit: 0.0
+# llm used by the nugget-completion judge
+judge_model: null
+prompts_path: null

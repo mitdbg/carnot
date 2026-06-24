@@ -1,0 +1,5 @@
+# Run output (reports + traces) is large and per-run; never tracked.
+results/
+__pycache__/
+*.pyc
+.ruff_cache/

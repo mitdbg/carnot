@@ -4,6 +4,7 @@ environment (env var noted next to each field). Construct via `SkunkConfig.from_
 from __future__ import annotations
 
 import os
+import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -11,6 +12,103 @@ from typing import TYPE_CHECKING, Literal
 if TYPE_CHECKING:
     from skunk.common import Effort, PageRef
 
+# --------------------------------------------------------------------------------
+# System-specific configuration
+# --------------------------------------------------------------------------------
+
+@dataclass
+class SystemConfig:
+    # the name of the system
+    name: str
+    # the client to use for computing embeddings
+    emb_provider: Literal["openrouter", "local"]
+    # the model to use for computing embeddings
+    emb_model_id: str
+    # generation provider for all LLM calls
+    llm_provider: Literal["genai", "openrouter"]
+    # the model to use for the system
+    agent_model_id: str
+    # default model for calls that don't pass an explicit `model=` (agent loops pass `agent_model_id`).
+    llm_model: str
+    # per-call retry on transient faults only (429 / 5xx / transport blips); the delay doubles each attempt.
+    llm_max_retries: int
+    llm_retry_initial_delay_s: float
+    # per-model request pacing (requests/min); each model gets its own `llm:<model>` token bucket; a model absent from the map uses `llm_default_rpm`.
+    llm_model_rpm: dict[str, float]
+    llm_default_rpm: float
+    # per-model token pacing (tokens/min); a model absent from the map uses `llm_default_tpm`; a falsy effective value (null / 0) means unthrottled TPM.
+    llm_model_tpm: dict[str, float]
+    llm_default_tpm: float | None
+    # USD price table for cost accounting; maps a model-substring -> {"in"/"out"/"cached": $/Mtok}.
+    # Lookup is exact-first then substring, a model with no match costs 0.
+    llm_prices: dict[str, dict[str, float]]
+    # Per-call-site overrides keyed by `PromptedCall.name`, read by skunk's agent loop
+    # (prompted_call._resolve_effort / _resolve_model). Empty = every call site uses its
+    # own default effort and `llm_model`. The qatfd harness doesn't tune per-call-site,
+    # so these default empty — but the agent code path requires the attributes to exist.
+    effort_overrides: dict[str, "Effort"] = field(default_factory=dict)
+    model_overrides: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_yaml(cls, path: str) -> SystemConfig:
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        return cls(**data)
+
+
+@dataclass
+class RAGLLMConfig(SystemConfig):
+    # number of chunks for the vector search to return
+    top_k: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.top_k is None:
+            raise ValueError(
+                "RAGLLMConfig.top_k is unset (null); set it explicitly, e.g. "
+                "`systems.top_k=20` on the command line."
+            )
+
+
+@dataclass
+class SearchAgentConfig(SystemConfig):
+    # the agent will answer the question directly if agent_mode == "answer", otherwise a separate
+    # LLM computes an answer given the SearchAgent's retrieved documents
+    agent_mode: str = "retrieve"
+
+    # maximum number of tokens and seconds the agent can take togenerate a repsonse
+    search_agent_max_output_tokens: int = 4096
+    search_agent_request_timeout_s: float = 120.0
+
+    # maximum number of tokens a single grep command can return; over-budget tool calls are dropped
+    # with a note telling the agent to narrow its pattern / pass `limit`.
+    grep_max_output_tokens: int = 200_000
+
+    # maximum number of pages the agent can process in a single read_document tool call
+    agent_max_pages_per_tool_call: int = 20
+
+    # maximum number of characters the agent can output from a single read_document tool call
+    read_document_max_output_chars: int = 400_000
+
+    # maximum number of steps the agent can take in a single conversation
+    agent_max_steps: int = 20
+
+    # maximum number of failed agent steps before aborting
+    agent_max_misfires: int = 5
+
+
+@dataclass
+class QATFDSearchAgentConfig(SystemConfig):
+    # the agent will answer the question directly if agent_mode == "answer", otherwise a separate
+    # LLM computes an answer given the QATFDSearchAgent's retrieved documents
+    agent_mode: str = "retrieve"
+
+
+#########################################################################################
+#########################################################################################
+#########################################################################################
+#########################################################################################
+#########################################################################################
+#########################################################################################
 
 # Default corpus locations (overridable via env / explicit construction — see the
 # `parsed_json_dir` / `pdf_dir` fields below). Homed here so `SkunkConfig` is the single
@@ -44,26 +142,6 @@ class SkunkConfig:
     # over 5 retries), so no separate delay cap is needed.
     llm_max_retries: int = 5
     llm_retry_initial_delay_s: float = 1.0
-
-    # Automatic provider failover. Gemini (`llm_provider`) is the front path; a
-    # process-global monitor counts HTTP 429s in a rolling per-second window of
-    # `llm_failover_window_s` seconds, and once `llm_failover_429_threshold` land inside it
-    # ALL generation routes to OpenRouter (`llm_client._ProviderFailover` /
-    # `_Rolling429Window`). It self-heals: the window drains by the second, so once 429s
-    # stop the count falls back under threshold and traffic returns to Gemini. Armed only
-    # when `llm_failover_enabled` AND `OPENROUTER_API_KEY` AND a failover model are set —
-    # otherwise inert (logs a warning, stays on Gemini), so a 429 storm never turns into
-    # hard failures. `llm_failover_model` is the default OpenRouter id used after the trip;
-    # `llm_failover_model_map` ({bare-gemini-id: openrouter-id}) overrides it per model to
-    # preserve the flash/pro split. Use PAID (non-`:free`) ids — a `:free` model caps at
-    # 20 RPM and would worsen a storm.
-    # (env: SKUNK_LLM_FAILOVER, SKUNK_LLM_FAILOVER_THRESHOLD, SKUNK_LLM_FAILOVER_WINDOW_S,
-    #  SKUNK_LLM_FAILOVER_MODEL, SKUNK_LLM_FAILOVER_MODEL_MAP)
-    llm_failover_enabled: bool = True
-    llm_failover_429_threshold: int = 8
-    llm_failover_window_s: float = 10.0
-    llm_failover_model: str | None = None
-    llm_failover_model_map: dict[str, str] = field(default_factory=dict)
 
     # Per call-site effort override: `PromptedCall.name` → Effort tier. Missing key →
     # the call-site's `default_effort`; an explicit `effort=` arg still wins over both.
@@ -275,6 +353,12 @@ class SkunkConfig:
         self.model_overrides.setdefault("data_prep.codegen", "gemini-3.1-pro-preview")
 
     @classmethod
+    def from_yaml(cls, path: str) -> SkunkConfig:
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        return cls(**data)
+
+    @classmethod
     def from_env(cls) -> SkunkConfig:
         model_overrides = _parse_model_overrides(
             os.environ.get("SKUNK_MODEL_OVERRIDES", "")
@@ -295,18 +379,6 @@ class SkunkConfig:
             llm_max_retries=int(os.environ.get("SKUNK_LLM_MAX_RETRIES", "5")),
             llm_retry_initial_delay_s=float(
                 os.environ.get("SKUNK_LLM_RETRY_INITIAL_DELAY", "1.0")
-            ),
-            llm_failover_enabled=os.environ.get("SKUNK_LLM_FAILOVER", "1")
-            not in ("", "0"),
-            llm_failover_429_threshold=int(
-                os.environ.get("SKUNK_LLM_FAILOVER_THRESHOLD", "8")
-            ),
-            llm_failover_window_s=float(
-                os.environ.get("SKUNK_LLM_FAILOVER_WINDOW_S", "10.0")
-            ),
-            llm_failover_model=os.environ.get("SKUNK_LLM_FAILOVER_MODEL") or None,
-            llm_failover_model_map=_parse_model_overrides(
-                os.environ.get("SKUNK_LLM_FAILOVER_MODEL_MAP", "")
             ),
             compute_best_of_n=int(os.environ.get("SKUNK_COMPUTE_BEST_OF_N", "5")),
             parsed_json_dir=Path(

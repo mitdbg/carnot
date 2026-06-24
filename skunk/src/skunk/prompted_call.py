@@ -83,6 +83,14 @@ def _build_tail(parts: _PromptParts) -> str:
     )
 
 
+def overrides_tail(overrides: tuple[PromptOverride, ...], name: str) -> str:
+    """The corpus/few-shot/lessons tail for call-site `name`, ready to append to a
+    system prompt. Same content `PromptedCall._assemble_system_prompt` appends, exposed
+    for call-sites that build their prompt outside a `PromptedCall` (e.g. the qatfd
+    final-answer step). Empty string when no override targets `name`."""
+    return _build_tail(_gather_overrides(overrides, name))
+
+
 def _gather_overrides(overrides: tuple[PromptOverride, ...], name: str) -> _PromptParts:
     corpus_parts: list[str] = []
     few_shots: list[str] = []

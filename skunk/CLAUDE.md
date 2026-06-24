@@ -58,31 +58,24 @@ UID0227, UID0230, UID0238, UID0240.
 
 ## Setup (.env at repo root)
 
-All LLM calls go through the **AI Studio Gemini API** (`generativelanguage.googleapis.com`)
-via the `google-genai` SDK, authenticated with an **AI Studio API key** — not Vertex/ADC:
-1. Create a key at https://aistudio.google.com/apikey
-2. `GEMINI_API_KEY=<key>` in `.env`
+LLM generation now defaults to **OpenRouter** (`SKUNK_LLM_PROVIDER=openrouter`,
+authenticated by `OPENROUTER_API_KEY`) — we no longer have an AI Studio Gemini key, so
+the legacy `genai` path is unavailable. In OpenRouter mode `SKUNK_LLM_MODEL` and every
+model override (`SKUNK_MODEL_OVERRIDES`, the qatfd `agent_model_id`) must be **full
+OpenRouter ids**, e.g. `google/gemini-2.5-flash` or `qwen/qwen-2.5-72b-instruct`.
+Strongly recommended for `lookup_external`: `FRED_API_KEY`, `TAVILY_API_KEY`. Copy
+`.env.example` → `.env`.
 
-Default model `gemini-3.5-flash` (override via `SKUNK_LLM_MODEL`; use bare model names, no
+Embeddings are unaffected by the provider (they dispatch on the embedding model id). A run
+uses a single provider for all generation; transient errors (429 / 5xx / transport blips)
+are retried with exponential backoff (`llm_client._retry_call`). NOTE: OpenRouter wraps an
+upstream provider failure as a 4xx `...ResponseError: Provider returned error`, which is
+*not* retried — `llm_client._error_detail` logs the status + provider metadata + raw body
+alongside the warning so these are diagnosable.
 
-`google/` prefix). Strongly recommended for `lookup_external`: `FRED_API_KEY`,
-`TAVILY_API_KEY`. Copy `.env.example` → `.env`.
-
-To route generation through **OpenRouter** instead, set `SKUNK_LLM_PROVIDER=openrouter`
-with `OPENROUTER_API_KEY`; in that mode `SKUNK_LLM_MODEL` (and any model overrides) must be
-full OpenRouter ids, e.g. `google/gemini-2.5-flash` or `qwen/qwen-2.5-72b-instruct`.
-Embeddings are unaffected (they dispatch on the embedding model id).
-
-**Automatic Gemini→OpenRouter failover** (on by default, auto-inert unless configured):
-a rolling per-second window counts HTTP 429s; when ≥`SKUNK_LLM_FAILOVER_THRESHOLD`
-(default 8) land within `SKUNK_LLM_FAILOVER_WINDOW_S` (default 10s), ALL generation routes
-to OpenRouter. Arm it by setting `OPENROUTER_API_KEY` + `SKUNK_LLM_FAILOVER_MODEL` (a PAID,
-non-`:free` id, e.g. `google/gemini-2.5-flash`); `SKUNK_LLM_FAILOVER_MODEL_MAP`
-(`gemini-3.1-pro-preview=google/gemini-2.5-pro,...`) overrides the target per source model.
-`SKUNK_LLM_FAILOVER=0` disables it. Unconfigured → inert (stays on Gemini, logs a warning).
-It **self-heals**: the window drains by the second, so once 429s stop the count falls back
-under threshold and traffic returns to Gemini (a renewed storm just re-trips it). See
-`llm_client._Rolling429Window` / `_ProviderFailover`.
+The legacy **AI Studio Gemini** path (`SKUNK_LLM_PROVIDER=genai`, `GEMINI_API_KEY`, bare
+model ids like `gemini-3.5-flash`) still exists in code but is dormant until a key is
+restored.
 
 ## Data corpus (not in this repo)
 

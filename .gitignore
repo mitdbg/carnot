@@ -268,6 +268,10 @@ evals/quest/data/
 .github/copilot-instructions.md
 examples/
 
+# vector databases
+.chromadb
+skunk/.chromadb
+
 # Miscellaneous
 .github/workflows/github-trust-policy.json
 venv_web/
@@ -298,3 +302,7 @@ raptor/
 skunk/treasury_bulletins_parsed/*
 skunk/treasury_bulletin_pdfs/*
 skunk/venv/
+
+# financebench corpus (PDFs + question jsonl + generated embeddings; fetch from
+# https://github.com/patronus-ai/financebench)
+skunk/financebench/

@@ -4,7 +4,7 @@ Subclasses `MultiTurnAgent`: it supplies the search-specific system prompt
 (`briefing` + `final_answer_doc`) and the chroma/page-map-backed tool set
 (`search_corpus` / `grep_corpus` / `read_document` / `prune`), and lets the base
 own the multi-turn loop, the block trajectory, and the JSON final-answer
-mechanism. The final answer is a ```json``` block ({"page_keys": [...]}), not a
+mechanism. The final answer is a ```json``` block ({"doc_ids": [...]}), not a
 tool.
 
 Two overrides specialise the base for retrieval:
@@ -21,7 +21,6 @@ The three tools that read/write prune state share the agent's per-question
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from chromadb.api.models.Collection import Collection
@@ -30,12 +29,12 @@ from skunk.common import (
     B64Image,
     ExecutionContext,
     HumanInterventionHandler,
-    make_genai_client,
 )
-from skunk.config import SkunkConfig
+from skunk.config import SearchAgentConfig
 from skunk.human_intervention import RequestHumanTool
+from skunk.llm_client import LLMClient
 from skunk.local_python_executor import CodeOutput
-from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent, TextBlock
+from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent, TextBlock, Tool
 from skunk.search_agent.search_tools import (
     EMPTY_RESULT_MESSAGE,
     GREP_RESULT_TAG,
@@ -43,28 +42,12 @@ from skunk.search_agent.search_tools import (
     READ_DOCUMENT_RESULT_TAG,
     SEARCH_RESULT_TAG,
     VIEW_FIGURE_RESULT_TAG,
-    EmbeddingClient,
     GrepCorpusTool,
     PruneTool,
     ReadDocumentTool,
     SearchCorpusTool,
     ViewFigureTool,
 )
-
-
-def _make_embedding_client(emb_model_id: str) -> tuple[EmbeddingClient, str]:
-    """Pick the embedding backend from the model id and return (client, model_id).
-
-    Gemini embeddings go through genai (AI Studio); everything else (e.g. Qwen)
-    goes through OpenRouter. The returned model id has any `google/` prefix
-    stripped for the genai path and is passed through unchanged otherwise.
-    """
-    cleaned = emb_model_id.removeprefix("google/")
-    if "gemini" in cleaned.lower():
-        return make_genai_client(), cleaned
-    from openrouter import OpenRouter
-
-    return OpenRouter(api_key=os.environ["OPENROUTER_API_KEY"]), emb_model_id
 
 
 class SearchAgent(MultiTurnAgent):
@@ -93,18 +76,25 @@ class SearchAgent(MultiTurnAgent):
     )
 
     final_answer_doc = """\
-A JSON object with the `doc_id`s you identified as relevant, under the key "page_keys". Here is an example:
+A JSON object with the `doc_id`s you identified as relevant, under the key "doc_ids". Here is an example:
 ```json
-{"page_keys": ["combined_statement__historical__cs-1872_12", "govinfo_receipts__1893__SERIALSET-03108_00_00-002-0256-0000_3"]}
+{"doc_ids": ["combined_statement__historical__cs-1872_12", "govinfo_receipts__1893__SERIALSET-03108_00_00-002-0256-0000_3"]}
 ```
 Use each `doc_id` exactly as it appears in the search / grep results."""
 
     def __init__(
         self,
-        config: SkunkConfig,
+        config: SearchAgentConfig,
         document_map: dict[str, str],
         chroma_collection: Collection,
         *,
+        pdf_dir: str | None = None,
+        page_renders_dir: str | None = None,
+        llm_client: LLMClient | None = None,
+        emb_model_id: str | None = None,
+        extra_tools: tuple[Tool, ...] = (),
+        briefing: str | None = None,
+        final_answer_doc: str | None = None,
         system_prompt_override: str | None = None,
         generation_backend=None,
         sampling_params: dict | None = None,
@@ -112,6 +102,13 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         human_intervention_handler: HumanInterventionHandler | None = None,
         required_docs: list[str] | None = None,
     ):
+        # `briefing` / `final_answer_doc` override the class-level defaults on this
+        # instance so MultiTurnAgent's template path picks them up (only consulted when
+        # there is no `system_prompt_override`). Set before super().__init__.
+        if briefing is not None:
+            self.briefing = briefing
+        if final_answer_doc is not None:
+            self.final_answer_doc = final_answer_doc
         self.config = config
         self.chroma_collection = chroma_collection
         required_doc_prefixes = {
@@ -127,7 +124,12 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             if required_doc_prefixes
             else document_map
         )
-        self.emb_client, self.emb_model_id = _make_embedding_client(config.emb_model_id)
+        # Query embedding goes through an LLMClient (it owns backend dispatch + usage
+        # accounting). Callers on the per-question request path pass `ctx.llm_client` so
+        # embedding spend is billed onto that question's tracker; offline / build paths
+        # pass nothing and get a standalone client (embeddings work, untracked).
+        self._emb_llm_client = llm_client or LLMClient(config)
+        self.emb_model_id = emb_model_id or config.emb_model_id
         required_filter = None
         if required_docs:
             clauses = [
@@ -153,14 +155,23 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         # question / branch ⇒ these sets never cross-talk between questions.
         self._pruned_chunk_ids: set[str] = set()
         self._pruned_doc_ids: set[str] = set()
+        # Already-fetched chunks/docs, auto-excluded from subsequent search/grep so each
+        # call surfaces new material (no re-duplication in context). Distinct from the
+        # pruned sets: fetched chunks STAY visible — `prune(...)` is only for ruling out
+        # irrelevant material. Shared by reference with the search/grep/read tools.
+        self._seen_chunk_ids: set[str] = set()
+        self._seen_doc_ids: set[str] = set()
 
         # Tool instances capture their deps; the prompt's tool docs are generated
         # from their `doc`s by the base, so tools and docs can't drift.
+        if pdf_dir is not None:
+            extra_tools += (ViewFigureTool(self.document_map, pdf_dir, renders_dir=page_renders_dir),)
         tools = [
             SearchCorpusTool(
-                self.chroma_collection, self.emb_model_id, self.emb_client,
+                self.chroma_collection, self.emb_model_id, self._emb_llm_client,
                 self._pruned_chunk_ids, self._pruned_doc_ids,
                 required_filter,
+                seen_chunk_ids=self._seen_chunk_ids, seen_doc_ids=self._seen_doc_ids,
             ),
             GrepCorpusTool(
                 self.chroma_collection,
@@ -168,14 +179,16 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
                 self._pruned_doc_ids,
                 config.grep_max_output_tokens,
                 required_filter,
+                seen_chunk_ids=self._seen_chunk_ids, seen_doc_ids=self._seen_doc_ids,
             ),
             ReadDocumentTool(
                 self.document_map,
                 config.agent_max_pages_per_tool_call,
                 config.read_document_max_output_chars,
+                seen_doc_ids=self._seen_doc_ids,
             ),
-            ViewFigureTool(self.document_map, config.pdf_dir, renders_dir=config.page_renders_dir),
             PruneTool(self._pruned_chunk_ids, self._pruned_doc_ids),
+            *extra_tools,
         ]
         if human_intervention_handler is not None:
             tools.append(RequestHumanTool(human_intervention_handler))
@@ -302,11 +315,11 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
                 + ", ".join(required_docs)
             )
         payload = await self.call(ctx, "\n".join(parts))
-        return self._page_keys_from_payload(payload)
+        return self._doc_ids_from_payload(payload)
 
     @staticmethod
-    def _page_keys_from_payload(payload: Any) -> list[str]:
-        keys = payload.get("page_keys") or []
+    def _doc_ids_from_payload(payload: Any) -> list[str]:
+        keys = payload.get("doc_ids") or []
         if isinstance(keys, str):
             return [keys]
         return [str(k) for k in keys]

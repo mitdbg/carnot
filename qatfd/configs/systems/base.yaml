@@ -1,0 +1,38 @@
+# base config for all systems
+name: null
+emb_provider: openrouter
+emb_model_id: Qwen/Qwen3-Embedding-8B
+agent_model_id: google/gemini-3.5-flash
+
+# --- LLM client (skunk.llm_client.LLMClient) ---
+# generation provider for all LLM calls: genai (AI Studio Gemini, bare model ids) or
+# openrouter (full vendor/model ids). Embeddings dispatch on emb_provider, not this.
+llm_provider: openrouter
+# default model for calls that don't pass an explicit model (agent loops pass agent_model_id)
+llm_model: gemini-3.5-flash
+# per-call retry on transient faults only; the delay doubles each attempt
+llm_max_retries: 5
+llm_retry_initial_delay_s: 1.0
+# per-model request pacing (requests/min); a model not listed uses llm_default_rpm
+llm_model_rpm:
+  gemini-3.5-flash: 4000
+  gemini-3-flash-preview: 4000      # fine-grained filter scan model; same RPM as 3.5-flash
+  gemini-3.1-flash-lite: 4000
+  gemini-3.1-pro-preview: 2000
+llm_default_rpm: 1000
+# per-model token pacing (tokens/min); a model not listed uses llm_default_tpm.
+# null/0 disables the TPM throttle for that model (paced by RPM alone).
+llm_model_tpm:
+  gemini-3.5-flash: 10000000
+  gemini-3-flash-preview: 10000000  # same TPM as 3.5-flash
+  gemini-3.1-flash-lite: 25000000
+  gemini-3.1-pro-preview: 8000000
+llm_default_tpm: null
+# USD price table for cost accounting; maps a model-substring -> {in/out/cached: $ per 1M tokens}
+# lookup is exact-first then substring, and an unmatched model costs 0.
+llm_prices:
+  gemini-3.5-flash: {in: 1.5, out: 9.0, cached: 0.15}
+  gemini-3.1-flash-lite: {in: 0.25, out: 1.5, cached: 0.025}
+  gemini-3.1-pro: {in: 2.0, out: 12.0, cached: 0.20}
+  qwen3-embedding-8b: {in: 0.01, out: 0.00, cached: 0.00}
+  google/gemma-3-12b-it: {in: 0.05, out: 0.15, cached: 0.00}

@@ -1,0 +1,12 @@
+# base configuration for officeqa benchmark
+defaults:
+  - base
+  - _self_
+
+name: officeqa
+chromadb_collection: qwen-v2
+csv_path: officeqa_pro.csv
+clean_page_map_path: treasury_bulletins_cleaned/clean_page_map.json
+test_set_uids_path: eval/test_set_uids.json
+prompts_path: config/prompts/treasury_bulletin.yaml
+pdf_dir: treasury_bulletin_pdfs

@@ -1,0 +1,8 @@
+# qatfd system — inherits from the vanilla search_agent config
+# (search_agent itself inherits from base, giving: base -> search_agent -> qatfd_search_agent)
+defaults:
+  - search_agent
+  - _self_
+
+# only override what differs from search_agent; everything else is inherited
+name: qatfd_search_agent

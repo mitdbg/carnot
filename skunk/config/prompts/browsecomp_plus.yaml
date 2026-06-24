@@ -25,7 +25,7 @@ overrides:
       ### Identifier formats
       - `doc_id`: a numeric string identifying each scraped web page (e.g. `"4217"`). This is the `docid` field from the `Tevatron/browsecomp-plus-corpus` HuggingFace dataset.
       - `chunk_id`: `"{doc_id}_{element_id}"` (e.g. `"4217_3"` = the 4th element, 0-indexed, of document 4217). Elements are produced by splitting the document text on `\n\n` and merging consecutive paragraphs until each chunk reaches ~1024 tokens.
-      - In your final answer, the `page_keys` list holds `doc_id`s in the format above.
+      - In your final answer, the `doc_ids` list holds `doc_id`s in the format above.
 
       ### Available metadata fields (for use with `metadata_filter`)
       Every chunk has the following metadata you can filter on:

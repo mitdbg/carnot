@@ -1,0 +1,7 @@
+# base config for all benchmarks
+chromadb_dir: .chromadb
+chromadb_collection: null
+# per-benchmark prompt-overrides YAML (under skunk/); null = none
+prompts_path: null
+# corpus PDFs dir (under skunk/) for the view_figure tool; null = no figure tool
+pdf_dir: null

@@ -1,0 +1,7 @@
+# base config for rag_llm system
+defaults:
+  - base
+  - _self_
+
+name: rag_llm
+top_k: null

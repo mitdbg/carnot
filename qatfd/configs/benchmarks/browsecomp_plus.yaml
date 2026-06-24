@@ -1,0 +1,12 @@
+# base configuration for browsecomp_plus benchmark
+defaults:
+  - base
+  - _self_
+
+name: browsecomp_plus
+chromadb_collection: qwen-browsecomp-plus
+bcp_questions: browsecomp-plus/browsecomp_plus_decrypted.jsonl
+bcp_metadata_glob: browsecomp-plus/browsecomp-plus-element-embeddings/metadata_rank*.json
+bcp_test_ids_path: browsecomp-plus/karl_bcp_test_ids.json
+judge_model: null
+prompts_path: config/prompts/browsecomp_plus.yaml

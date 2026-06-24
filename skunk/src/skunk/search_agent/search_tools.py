@@ -34,9 +34,19 @@ mutable sets (`pruned_chunk_ids` / `pruned_doc_ids`). `PruneTool` is the single
 writer — it mutates them directly — and the search/grep tools read them on every
 call (server-side `$nin`), so a prune takes effect immediately for subsequent
 searches. `SearchAgent` also reads the same sets to redact already-emitted
-chunks at render time. These sets are per-question state: the owning
-`SearchAgent` creates them (and the tool instances closing over them) in its
-`__init__`, and the orchestrator builds one `SearchAgent` per question / branch.
+chunks at render time.
+
+Fetched state: a second pair of shared sets (`seen_chunk_ids` / `seen_doc_ids`)
+auto-excludes material the agent has ALREADY fetched — chunks returned by
+search/grep, and docs opened by `read_document` — from subsequent search/grep
+results, so each call surfaces new material instead of re-duplicating context.
+Unlike pruned chunks, fetched chunks stay VISIBLE (prune is reserved for ruling
+out irrelevant material). The search/grep tools both write (on return) and read
+(union with the pruned sets) these; `read_document` writes `seen_doc_ids`.
+
+All four sets are per-question state: the owning `SearchAgent` creates them (and
+the tool instances closing over them) in its `__init__`, and the orchestrator
+builds one `SearchAgent` per question / branch.
 """
 
 from __future__ import annotations
@@ -44,15 +54,17 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from chromadb.api.models.Collection import Collection
-from google import genai
-from openrouter import OpenRouter
 
-from skunk.common import get_rate_limiter
 from skunk.common import page_key_to_pageref
 from skunk.corpus import render_page_b64
 from skunk.multi_turn_agent import Tool
+
+if TYPE_CHECKING:
+    from skunk.common import ExecutionContext
+    from skunk.llm_client import LLMClient
 
 # Tags identifying each tool's structured return payload to the SearchAgent.
 PRUNE_RESULT_TAG = "__prune__"
@@ -60,11 +72,6 @@ SEARCH_RESULT_TAG = "__search_result__"
 GREP_RESULT_TAG = "__grep_result__"
 READ_DOCUMENT_RESULT_TAG = "__read_document_result__"
 VIEW_FIGURE_RESULT_TAG = "__view_figure_result__"
-
-# Embedding clients we know how to query. Gemini embeddings go through
-# `genai.Client`; Qwen (and other OpenRouter-hosted) embeddings are only
-# available through `OpenRouter`. `SearchCorpusTool` dispatches on the type.
-EmbeddingClient = genai.Client | OpenRouter
 
 # Generic message surfaced when search_corpus / grep_corpus return zero hits.
 # ChromaDB does not tell us whether a server-side `$nin` prune filter was what
@@ -111,34 +118,29 @@ class SearchCorpusTool(Tool):
         self,
         chroma_collection: Collection,
         emb_model_id: str,
-        emb_client: EmbeddingClient,
+        llm_client: LLMClient,
         pruned_chunk_ids: set[str],
         pruned_doc_ids: set[str],
         required_metadata_filter: dict | None = None,
+        seen_chunk_ids: set[str] | None = None,
+        seen_doc_ids: set[str] | None = None,
+        ctx: ExecutionContext | None = None,
     ):
         self._chroma_collection = chroma_collection
         self._emb_model_id = emb_model_id
-        self._emb_client = emb_client
+        self._llm_client = llm_client
+        self._ctx = ctx
         self._pruned_chunk_ids = pruned_chunk_ids
         self._pruned_doc_ids = pruned_doc_ids
         self._required_metadata_filter = required_metadata_filter
+        self._seen_chunk_ids = seen_chunk_ids if seen_chunk_ids is not None else set()
+        self._seen_doc_ids = seen_doc_ids if seen_doc_ids is not None else set()
 
     def _embed_query(self, query: str) -> list[float]:
-        """Embed `query` with the same model that produced the stored embeddings.
-
-        Dispatches on the client type: `genai.Client` for Gemini embeddings,
-        `OpenRouter` for Qwen (and other OpenRouter-hosted) embeddings. The
-        process-wide "embed" bucket keeps all workers under the endpoint quota.
-        """
-        get_rate_limiter("embed").acquire()
-        if isinstance(self._emb_client, genai.Client):
-            emb_result = self._emb_client.models.embed_content(
-                model=self._emb_model_id, contents=query
-            )
-            return list(emb_result.embeddings[0].values)  # type: ignore
-        # OpenRouter (e.g. Qwen embeddings, only available via OpenRouter).
-        resp = self._emb_client.embeddings.generate(input=query, model=self._emb_model_id)
-        return list(resp.data[0].embedding)  # type: ignore
+        """Embed `query` with the same model that produced the stored embeddings, via the
+        LLMClient — which owns backend dispatch (OpenRouter / local SentenceTransformers),
+        the process-wide "embed" rate bucket, retry, and usage accounting."""
+        return self._llm_client.embed_query(query, model=self._emb_model_id, ctx=self._ctx)
 
     def __call__(
         self,
@@ -157,8 +159,8 @@ class SearchCorpusTool(Tool):
             combined_filter = self._required_metadata_filter
         where = _build_metadata_where(
             metadata_filter=combined_filter,
-            ignore_chunk_ids=self._pruned_chunk_ids,
-            ignore_doc_ids=self._pruned_doc_ids,
+            ignore_chunk_ids=self._pruned_chunk_ids | self._seen_chunk_ids,
+            ignore_doc_ids=self._pruned_doc_ids | self._seen_doc_ids,
         )
         query_kwargs: dict = {
             "query_embeddings": [query_embedding],
@@ -192,11 +194,13 @@ class SearchCorpusTool(Tool):
                     f"type={elt_type} | distance={dist:.4f}\n{doc or ''}"
                 ),
             })
+
+        self._seen_chunk_ids.update(c["chunk_id"] for c in chunks)
         return {SEARCH_RESULT_TAG: True, "chunks": chunks}
 
     doc = """\
 ### search_corpus(query: str, top_k: int, metadata_filter: dict | None = None)
-This tool performs a vector search over all chunks in the corpus. The input `query` is embedded and the `top_k` most relevant chunks are returned, each labelled with its `chunk_id` and `doc_id`. You can optionally restrict the search to a subset of the corpus by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata. Any chunks or docs you have previously pruned via `prune(...)` are automatically excluded from the results.
+This tool performs a vector search over all chunks in the corpus. The input `query` is embedded and the `top_k` most relevant chunks are returned, each labelled with its `chunk_id` and `doc_id`. You can optionally restrict the search to a subset of the corpus by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata. Chunks already returned to you (by `search_corpus` / `grep_corpus`) and documents you have already `read_document`-ed are automatically excluded from the results — as is anything you have `prune(...)`-ed — so each call surfaces new material. (To revisit material you've already fetched, look back in your context or `read_document` it again.)
 
 Supported `metadata_filter` syntax:
 - Equality: `{"field": value}`
@@ -230,10 +234,14 @@ class GrepCorpusTool(Tool):
         pruned_doc_ids: set[str],
         max_output_tokens: int,
         required_metadata_filter: dict | None = None,
+        seen_chunk_ids: set[str] | None = None,
+        seen_doc_ids: set[str] | None = None,
     ):
         self._chroma_collection = chroma_collection
         self._pruned_chunk_ids = pruned_chunk_ids
         self._pruned_doc_ids = pruned_doc_ids
+        self._seen_chunk_ids = seen_chunk_ids if seen_chunk_ids is not None else set()
+        self._seen_doc_ids = seen_doc_ids if seen_doc_ids is not None else set()
         # Hard cap on the rendered observation size (chars). `limit=None` returns every
         # matching chunk, so a broad pattern can otherwise dump 100s of K of tokens into
         # the context in one shot and 400 the next request (see SkunkConfig.grep_max_output_tokens).
@@ -255,8 +263,8 @@ class GrepCorpusTool(Tool):
             combined_filter = self._required_metadata_filter
         where = _build_metadata_where(
             metadata_filter=combined_filter,
-            ignore_chunk_ids=self._pruned_chunk_ids,
-            ignore_doc_ids=self._pruned_doc_ids,
+            ignore_chunk_ids=self._pruned_chunk_ids | self._seen_chunk_ids,
+            ignore_doc_ids=self._pruned_doc_ids | self._seen_doc_ids,
         )
         get_kwargs: dict = {
             "where_document": {"$regex": pattern},
@@ -311,6 +319,8 @@ class GrepCorpusTool(Tool):
             if doc_chunks:
                 groups.append({"doc_id": doc_id, "header": header, "chunks": doc_chunks})
 
+        for g in groups:
+            self._seen_chunk_ids.update(ch["chunk_id"] for ch in g["chunks"])
         result: dict = {GREP_RESULT_TAG: True, "groups": groups}
         if truncated:
             dropped = total_chunks - kept_chunks
@@ -324,7 +334,7 @@ class GrepCorpusTool(Tool):
 
     doc = """\
 ### grep_corpus(pattern: str, metadata_filter: dict | None = None, limit: int | None = None)
-This tool performs a regex search over the cleaned text of every chunk in the corpus and returns the matching chunks grouped by their `doc_id`. Each hit includes its `chunk_id` so you can later refer to it or prune it. By default (`limit=None`), every matching chunk is returned -- which is useful for "find every doc that mentions X" queries -- but you should pass `limit=N` for narrower exploratory searches. The same `metadata_filter` syntax as `search_corpus` is supported. Any chunks or docs you have previously pruned via `prune(...)` are automatically excluded from the results. The total output is capped: if a broad pattern matches more than the cap, the result is truncated with a note telling you how many hits were omitted -- narrow the pattern, add a `metadata_filter`, or pass `limit=N` to see the rest.
+This tool performs a regex search over the cleaned text of every chunk in the corpus and returns the matching chunks grouped by their `doc_id`. Each hit includes its `chunk_id` so you can later refer to it or prune it. By default (`limit=None`), every matching chunk is returned -- which is useful for "find every doc that mentions X" queries -- but you should pass `limit=N` for narrower exploratory searches. The same `metadata_filter` syntax as `search_corpus` is supported. Chunks already returned to you and documents you have already `read_document`-ed are automatically excluded from the results (as is anything you have `prune(...)`-ed), so each call surfaces new material. The total output is capped: if a broad pattern matches more than the cap, the result is truncated with a note telling you how many hits were omitted -- narrow the pattern, add a `metadata_filter`, or pass `limit=N` to see the rest.
 
 ```python
 # find every chunk that mentions "topic X" (case insensitive)
@@ -346,11 +356,10 @@ This tool returns the full cleaned text of one or more documents, given their `d
 read_document(["doc_id_1", "doc_id_2"])
 ```"""
 
-    def __init__(self, document_map: dict[str, str], max_pages: int, max_output_chars: int):
+    def __init__(self, document_map: dict[str, str], max_pages: int, max_output_chars: int,
+                 seen_doc_ids: set[str] | None = None):
         self._document_map = document_map
-        # Hard cap on the rendered observation size (chars). A `read_document` over many
-        # dense-table pages can otherwise dump 100s of K of tokens in one shot and 400 the
-        # next request (see SkunkConfig.read_document_max_output_chars).
+        self._seen_doc_ids = seen_doc_ids if seen_doc_ids is not None else set()
         self._max_output_chars = max_output_chars
         # Pre-substitute the jinja var: tool `doc`s may flow through a
         # StrictUndefined render, so no `{{ ... }}` may survive here.
@@ -366,6 +375,7 @@ read_document(["doc_id_1", "doc_id_2"])
                 body = "[no such document (or no content in document)]"
             else:
                 body = text
+                self._seen_doc_ids.add(did)
             rendered = f"=== doc_id={did} ===\n{body}"
             remaining = self._max_output_chars - used
             if len(rendered) > remaining:

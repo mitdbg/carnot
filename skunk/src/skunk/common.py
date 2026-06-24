@@ -29,7 +29,7 @@ from pydantic import BaseModel, ConfigDict, model_validator
 from google import genai
 
 from skunk import trace
-from skunk.config import SkunkConfig
+from skunk.config import SystemConfig
 
 if TYPE_CHECKING:
     from skunk.llm_client import LLMClient
@@ -671,6 +671,7 @@ class ExecutionContext:
     """
 
     question: str
+    config: SystemConfig
     uid: str | None = (
         None  # benchmark UID, when run from the eval harness; tags every event
     )
@@ -679,7 +680,7 @@ class ExecutionContext:
         None  # when set, stream this question's events to that file (live, flushed)
     )
     events: list[dict] = field(default_factory=list)  # per-question diagnostic events
-    config: SkunkConfig = field(default_factory=SkunkConfig.from_env)
+    config: SystemConfig
     llm_client: LLMClient | None = (
         None  # auto-created in __post_init__; pass a mock to override
     )

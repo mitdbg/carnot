@@ -1,0 +1,27 @@
+[project]
+name = "qatfd"
+version = "0.1.0"
+description = "Evaluation harness for the qatfd paper: systems x QA benchmarks over large corpora."
+requires-python = ">=3.12"
+# qatfd imports `skunk` as a library. skunk lives in the sibling ../skunk package
+# (its own pyproject + venv). Install it editable first, then this package:
+#   pip install -e ../skunk && pip install -e .
+# We do not declare skunk as a hard dependency here because it is a local path
+# package and is expected to already be importable in the active environment.
+dependencies = [
+    "hydra-core>=1.3",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["qatfd*"]
+
+[tool.setuptools.package-data]
+qatfd = ["benchmarks/data/*.json"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"

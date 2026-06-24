@@ -199,8 +199,11 @@ async function loadRun(run){
   for(const q of S.questions) S.qByUid[q.uid] = q;
   const qSel = document.getElementById("q-sel");
   qSel.innerHTML = S.questions.map(q => {
-    const failed = String(q.failed).toLowerCase()==="true";
-    const mark = failed ? "✗" : (q.predicted ? "✓" : "·");
+    // Mark correct vs incorrect; incorrect subsumes failed (no answer produced).
+    // `score` is a float in [0,1] (1 == fully correct); legacy runs used `correct`.
+    const raw = q.score != null ? q.score : q.correct;
+    const correct = parseFloat(raw) >= 1 || String(raw).toLowerCase()==="true";
+    const mark = correct ? "✓" : "✗";
     return `<option value="${esc(q.uid)}">${mark} ${esc(q.uid)} — ${esc((q.question||"").slice(0,90))}</option>`;
   }).join("");
   if(S.questions.length){ qSel.value = S.questions[0].uid; await loadQuestion(S.questions[0].uid); }
@@ -223,9 +226,11 @@ async function loadQuestion(uid){
 function buildModel(){
   const events = S.events;
   const plans = events.filter(e => e.kind === "plan");
-  const byStep = new Map(); const order = []; const orphans = [];
+  const byStep = new Map(); const order = []; const orphans = []; const answerEvents = [];
   for(const e of events){
     if(e.kind === "plan") continue;
+    // qatfd's compute/answer LLM call emits under op="answer" — surface it as its own card.
+    if(e.op === "answer"){ answerEvents.push(e); continue; }
     if(e.step_idx == null){ orphans.push(e); continue; }
     let g = byStep.get(e.step_idx);
     if(!g){ g = { step_idx:e.step_idx, op:e.op, boundary:null, events:[], startT:e.t, endT:e.t }; byStep.set(e.step_idx, g); order.push(e.step_idx); }
@@ -244,7 +249,7 @@ function buildModel(){
   // branch_id → its plan-entry fields (kind/key/period/target/...), unioned over all revisions
   const branchInfo = new Map();
   for(const p of plans){ for(const b of (p.data?.branches||[])){ if(b.branch_id!=null) branchInfo.set(b.branch_id, b); } }
-  return { plans, nodes, nodesByBranch, orchestration, retrieved, orphans, branchInfo };
+  return { plans, nodes, nodesByBranch, orchestration, retrieved, orphans, answerEvents, branchInfo };
 }
 function finalizeNode(g){
   const d = g.boundary?.data || {};
@@ -261,6 +266,7 @@ function draw(){
   const m = buildModel();
   const parts = [headerHtml(m), flowSection(m)];
   if(m.orphans?.length) parts.push(`<div class="card"><div class="card-title">Other events</div>${m.orphans.map(e=>eventHtml(e)).join("")}</div>`);
+  if(m.answerEvents?.length) parts.push(`<div class="card"><div class="card-title">Compute / answer LLM</div>${m.answerEvents.map(e=>eventHtml(e)).join("")}</div>`);
   document.getElementById("content").innerHTML = parts.join("");
 }
 
@@ -269,14 +275,22 @@ function headerHtml(m){
   const row = S.row;
   const failed = String(row.failed).toLowerCase()==="true";
   const badge = failed ? `<span class="badge fail">failed</span>` : `<span class="badge pass">ok</span>`;
+  // qatfd report.csv carries gold_docs / retrieved_docs (JSON doc-id lists); fall back
+  // to eval_e2e's golden_pages + operator-node page summaries when those are absent.
+  const goldIds = parseIdList(row.gold_docs);
+  const retrIds = parseIdList(row.retrieved_docs);
   const goldPages = parseGoldenPages(row.golden_pages);
-  const goldChips = goldPages.length ? goldPages.map(p=>`<span class="chip chip-gold">${esc(p.month)} p${esc(p.page)}</span>`).join("")
-                                     : `<span class="chip chip-none">none in report.csv</span>`;
-  const retrChips = m.retrieved.length ? m.retrieved.map(p=>`<span class="chip chip-retr">${esc(p.month)} p${esc(p.page)}</span>`).join("")
-                                       : `<span class="chip chip-none">none</span>`;
-  const wall = m.nodes.reduce((mx,n)=>Math.max(mx, n.end??0), 0);
+  const goldChips = goldIds.length ? idChips(goldIds, "chip-gold")
+    : (goldPages.length ? goldPages.map(p=>`<span class="chip chip-gold">${esc(p.month)} p${esc(p.page)}</span>`).join("")
+                        : `<span class="chip chip-none">none in report.csv</span>`);
+  const retrChips = retrIds.length ? idChips(retrIds, "chip-retr")
+    : (m.retrieved.length ? m.retrieved.map(p=>`<span class="chip chip-retr">${esc(p.month)} p${esc(p.page)}</span>`).join("")
+                          : `<span class="chip chip-none">none</span>`);
+  // prefer the per-question wall_s from report.csv; fall back to node-derived timing.
+  const wall = (row.wall_s != null && row.wall_s !== "") ? Number(row.wall_s)
+                                                         : m.nodes.reduce((mx,n)=>Math.max(mx, n.end??0), 0);
   const kv = [];
-  if(row.predicted) kv.push(rowKV("predicted", row.predicted));
+  if(row.predicted) kv.push(rowKV("predicted", stripFinalAnswer(row.predicted)));
   if(row.gold_answer) kv.push(rowKV("gold answer", row.gold_answer));
   if(failed && row.reason) kv.push(rowKV("reason", row.reason));
   kv.push(`<div class="kv"><span class="k">groundtruth src</span><span class="v">${goldChips}</span></div>`);
@@ -288,6 +302,23 @@ function headerHtml(m){
   </div>`;
 }
 function rowKV(k,v){ return `<div class="kv"><span class="k">${esc(k)}</span><span class="v mono">${esc(v)}</span></div>`; }
+// qatfd report.csv stores gold_docs / retrieved_docs as JSON string arrays of doc ids.
+function parseIdList(s){
+  if(!s) return [];
+  try { const a = JSON.parse(s); return Array.isArray(a) ? a.map(String) : []; }
+  catch { return []; }
+}
+// render doc-id chips, capping a long list (e.g. a big top_k retrieval) with a "+N more".
+function idChips(ids, cls, max=60){
+  const shown = ids.slice(0, max).map(id=>`<span class="chip ${cls}">${esc(id)}</span>`).join("");
+  return shown + (ids.length>max ? `<span class="chip chip-none">+${ids.length-max} more</span>` : "");
+}
+// strip the <FINAL_ANSWER>...</FINAL_ANSWER> wrapper for display (show just the value).
+function stripFinalAnswer(s){
+  if(!s) return s;
+  const m = /<FINAL_ANSWER>\s*([\s\S]*?)\s*<\/FINAL_ANSWER>/i.exec(s);
+  return m ? m[1] : s;
+}
 function parseGoldenPages(s){
   if(!s) return [];
   return String(s).split(/\s+/).filter(Boolean).map(tok => {

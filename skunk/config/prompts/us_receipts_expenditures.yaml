@@ -105,7 +105,7 @@ overrides:
         NOT the printed page number on the page itself (these differ).
       - `chunk_id`: `"<doc_id>_<element_id>"` (e.g. `"combined_statement__historical__cs-1872_5_1"`
         = element 1 on page index 5 of that file).
-      - In your final answer, the `page_keys` list holds `doc_id`s in the format above.
+      - In your final answer, the `doc_ids` list holds `doc_id`s in the format above.
 
       ### Available metadata fields (for use with `metadata_filter`)
       Every chunk has the following metadata you can filter on:

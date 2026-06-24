@@ -53,12 +53,25 @@ def _find_runs(root: pathlib.Path) -> list[str]:
 
 def _read_report(run_dir: pathlib.Path) -> list[dict]:
     """Question rows from `report.csv` (uid, question, predicted, gold_answer,
-    failed, reason). Empty list when the file is absent."""
+    failed, reason). Empty list when the file is absent.
+
+    Normalizes the qatfd runner's column names onto the viewer's canonical ones:
+    `qid`->`uid`, `gold`->`gold_answer`, and the legacy `correct` column ->`score`
+    (skunk's eval_e2e.py still writes `correct`; the qatfd runner writes `score`).
+    eval_e2e.py rows otherwise pass through unchanged."""
     path = run_dir / "report.csv"
     if not path.exists():
         return []
     with path.open(newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        if not r.get("uid") and r.get("qid"):
+            r["uid"] = r["qid"]
+        if not r.get("gold_answer") and r.get("gold"):
+            r["gold_answer"] = r["gold"]
+        if r.get("score") in (None, "") and r.get("correct") not in (None, ""):
+            r["score"] = r["correct"]
+    return rows
 
 
 def _iter_events(run_dir: pathlib.Path):
