@@ -20,6 +20,7 @@ import os
 import threading
 import time
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar
 
@@ -238,15 +239,64 @@ class LLMResponse:
     thinking_tokens: int | None = None
 
 
+# Raw HTTP body of the most recent OpenRouter response, captured by an httpx response
+# hook (below) and read only when a completion comes back empty — so we can log the
+# UNFILTERED upstream body (not the SDK's typed object, which could in principle drop a
+# field) and settle whether an empty completion is genuinely empty or a parse artifact.
+# A ContextVar isolates the value per async task / thread: the hook fires synchronously
+# within the same send() call we're about to inspect, so no cross-call bleed.
+_RAW_BODY_MAX = 2000
+_last_openrouter_raw_body: ContextVar[str | None] = ContextVar(
+    "_last_openrouter_raw_body", default=None
+)
+
+
+def _capture_response_body_sync(response: "httpx.Response") -> None:
+    """httpx sync `response` event hook: buffer the body and stash it. `read()` caches
+    `.content`, so the SDK's later `.json()` still works. Best-effort — never raise into
+    the request path."""
+    try:
+        response.read()
+        _last_openrouter_raw_body.set(response.text[:_RAW_BODY_MAX])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _capture_response_body_async(response: "httpx.Response") -> None:
+    """Async twin of `_capture_response_body_sync` (async clients require async hooks)."""
+    try:
+        await response.aread()
+        _last_openrouter_raw_body.set(response.text[:_RAW_BODY_MAX])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _raw_body_suffix() -> str:
+    """Diagnostic suffix carrying the last captured raw OpenRouter body, for empty-completion
+    errors. The body is the ground truth the SDK's typed `ChatResult` is parsed from, so it
+    reveals whether `content` was truly null on the wire vs. dropped in parsing."""
+    body = _last_openrouter_raw_body.get()
+    return f" raw_body={body}" if body else ""
+
+
 def _make_openrouter_client() -> OpenRouter:
     """Build an OpenRouter client from `OPENROUTER_API_KEY` (for `provider=openrouter`).
-    Lazy import: the SDK is only needed when this provider is selected."""
+    Lazy import: the SDK is only needed when this provider is selected. Inject httpx
+    clients carrying a response hook that captures each raw body (read on empty completions
+    only) — with a generous timeout, since a bare httpx client defaults to 5s and would
+    abort long generations (the app enforces its own per-request wall-clock cap)."""
+    import httpx
     from openrouter import OpenRouter
 
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         raise RuntimeError("OPENROUTER_API_KEY not set (required for provider=openrouter)")
-    return OpenRouter(api_key=api_key)
+    timeout = httpx.Timeout(600.0)
+    sync_client = httpx.Client(timeout=timeout, event_hooks={"response": [_capture_response_body_sync]})
+    async_client = httpx.AsyncClient(
+        timeout=timeout, event_hooks={"response": [_capture_response_body_async]}
+    )
+    return OpenRouter(api_key=api_key, client=sync_client, async_client=async_client)
 
 
 class LLMClient:
@@ -963,6 +1013,46 @@ class LLMClient:
         return getattr(choices[0], "finish_reason", None) if choices else None
 
     @staticmethod
+    def _openrouter_error_detail(resp: Any) -> str:
+        """Diagnostic suffix for an empty OpenRouter completion. Two cases:
+
+        - If OpenRouter populated the response-level `error` (code + a message that usually
+          carries the provider's raw text — rate-limit, capacity, content-filter, 5xx),
+          surface it: that's the actionable cause.
+        - On a `finish_reason=error` from an upstream Gemini fault, OpenRouter instead
+          returns a NULL message (content/reasoning/refusal all null) and NO error body —
+          there is no "why" in the response. The only handle is the generation `id` (look it
+          up at openrouter.ai/activity or `GET /api/v1/generation?id=<id>`), so surface that
+          plus the resolved model. The null message also rules out a refusal or a
+          length/thinking truncation — this is purely provider-side.
+
+        Best-effort; returns "" when nothing useful is present."""
+        err = getattr(resp, "error", None)
+        if err:
+            code = getattr(err, "code", None)
+            msg = getattr(err, "message", None)
+            parts = ([f"code={code}"] if code is not None else []) + (
+                [f"message={str(msg)[:800]}"] if msg else []
+            )
+            return (" upstream_error: " + " ".join(parts)) if parts else ""
+        gen_id = getattr(resp, "id", None)
+        resolved = getattr(resp, "model", None)
+        parts: list[str] = []
+        if gen_id:
+            # Emit the generation-lookup URL inline so a failure is one click from its
+            # native provider error. NOTE: this `GET /generation` endpoint 404s for most
+            # `finish_reason=error` generations (OpenRouter doesn't persist a generation
+            # that failed upstream) and has a ~20s propagation delay even for successes —
+            # the web dashboard (openrouter.ai/activity) is the more reliable place to see
+            # the native error. The URL is still worth surfacing: it resolves for some
+            # failure modes and is the handle for the activity page.
+            parts.append(f"gen_id={gen_id}")
+            parts.append(f"lookup=https://openrouter.ai/api/v1/generation?id={gen_id}")
+        if resolved:
+            parts.append(f"resolved_model={resolved}")
+        return (" no_error_body (" + " ".join(parts) + ")") if parts else ""
+
+    @staticmethod
     def _usage_tokens_openrouter(usage: Any) -> dict:
         """Token counts from an OpenRouter `ChatUsage` (best-effort — any may be None)."""
         details = getattr(usage, "prompt_tokens_details", None)
@@ -1005,7 +1095,8 @@ class LLMClient:
             if not output_text:
                 raise EmptyCompletionError(
                     f"openrouter empty content (model={model} call_site={call_site} "
-                    f"finish_reason={self._openrouter_finish_reason(resp)})"
+                    f"finish_reason={self._openrouter_finish_reason(resp)}"
+                    f"{self._openrouter_error_detail(resp)}){_raw_body_suffix()}"
                 )
             toks = self._usage_tokens_openrouter(getattr(resp, "usage", None))
             return self._build_response(
@@ -1053,7 +1144,8 @@ class LLMClient:
             if not output_text:
                 raise EmptyCompletionError(
                     f"openrouter empty content (model={model} call_site={call_site} "
-                    f"finish_reason={self._openrouter_finish_reason(resp)})"
+                    f"finish_reason={self._openrouter_finish_reason(resp)}"
+                    f"{self._openrouter_error_detail(resp)}){_raw_body_suffix()}"
                 )
             toks = self._usage_tokens_openrouter(getattr(resp, "usage", None))
             self._tpm_settle(tpm_lim, est, toks["input_tokens"])
