@@ -9,10 +9,11 @@ agents (a downstream LLM answers from the retrieved docs) and direct-answer agen
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from string import Template
 
 from skunk.common import ExecutionContext
 from skunk.config import SystemConfig
-from skunk.prompted_call import overrides_tail
+from skunk.multi_turn_agent import MultiTurnAgent
 
 from qatfd.benchmarks.base import BenchmarkResources
 from qatfd.types import AnswerOutput, Question, Retrieved
@@ -22,33 +23,84 @@ def _docs_to_context(doc_ids: list[str], document_map: dict[str, str]) -> str:
     return "\n\n".join(f"=== doc_id={d} ===\n{document_map.get(d, '') or ''}" for d in doc_ids)
 
 
-async def generate_answer_from_context(
-    ctx: ExecutionContext, question: str, context: str, *, answer_format_hint: str, model: str | None = None
-) -> str:
-    """Single LLM call: answer `question` using only `context`."""
-    system = (
-        "You are answering a question using ONLY the provided documents. If the answer "
-        "is not in them, answer with your best inference from what is given. " + answer_format_hint
-    )
-    system += overrides_tail(ctx.prompt_overrides, "final_answer")
-    user = f"Question: {question}\n\nDocuments:\n{context}"
+# A string.Template (not str.format / f-string) so the literal `{...}` JSON examples below
+# pass through untouched; only the `$max_steps` / `$answer_format_hint` placeholders fill in.
+_CODE_ANSWER_SYSTEM = Template("""\
+You are a question-answering assistant with access to a Python interpreter. You will be
+given a question and a set of reference documents. Answer the question using ONLY the
+information in those documents.
 
-    # emit the answer call's turns under an "answer" step so the trace viewer can show
-    # the compute/answer LLM trace as its own card (the agent steps emit op=None).
-    with ctx.step("answer"):
-        ctx.emit(f"answer_system chars={len(system)}", kind="system", data={"text": system})
-        ctx.emit(f"answer_user chars={len(user)}", kind="user", data={"text": user})
-        resp = await ctx.llm_client.acall( # type: ignore
-            system=system,
-            user=user,
-            temperature=0.0,
-            model=model or ctx.config.llm_model,
-            ctx=ctx,
-            call_site="final_answer",
+The documents are included as plain text in the message below — READ THEM DIRECTLY. The
+Python interpreter is a separate, empty scratchpad: it does NOT have access to the
+documents, the filesystem, or the environment. Do not try to open files, list directories,
+import os/sys, or inspect globals()/locals() — those are blocked and only waste steps. To
+compute over the documents, copy the relevant numbers out of the document text into your
+code as literals, then compute. Do not do arithmetic in your head — use code.
+
+## Step budget
+You have at most $max_steps steps. Each block you emit — a ```python``` block OR the
+final ```json``` block — consumes one step. Read the documents, do any computation in as
+few steps as possible, and emit your final ```json``` answer as soon as you have it; do not
+spend steps exploring the environment.
+
+## Response format
+On every step, output EITHER:
+  - exactly ONE fenced ```python``` block to compute intermediate results, e.g.:
+
+```python
+# values copied from the document text:
+defense = [998, 1436, 1002, 808, 935]
+print(sum(defense))
+```
+
+  - OR a single ```json``` block with your final answer (emit this once, when ready):
+
+```json
+{"answer": "<value>"}
+```
+
+You may write a brief "Thoughts:" line before the block, but no other text, and exactly
+one block per step. The ```json``` final answer is parsed as data (not executed) — write a
+plain JSON literal.
+
+## Final answer
+<value> must be formatted exactly per these rules: $answer_format_hint
+If the documents do not contain what is needed, give your best inference from what is
+provided.""")
+
+
+class CodeAnswerAgent(MultiTurnAgent):
+    """Tools-free `MultiTurnAgent` that answers from the provided context, with Python
+    code execution as its only action. The retrieved chunks are packed into the first
+    user message (no corpus tools); the agent reads them directly, transcribes the
+    relevant values into Python steps to compute, then emits a ```json``` final answer
+    ``{"answer": "..."}``.
+
+    Shared across systems as the single, fixed compute step so a run's score reflects only
+    the retrieval method that produced the context (see `RetrieveComputeSystem.compute`)."""
+
+    name = "rag_answer"
+    # Widen the per-step sandbox so the agent can do real numeric work over the tables.
+    authorized_imports = [
+        "math", "statistics", "numpy", "scipy", "statsmodels",
+        "decimal", "fractions", "itertools", "collections", "json", "re",
+    ]
+    # The retrieved context is packed into the first message; keep it (and accumulated
+    # step outputs) from being trimmed away.
+    context_budget_chars = 600_000
+    # Warn with two steps left (not one), so the model has a turn to react and commit.
+    warn_steps_remaining = 2
+
+    def __init__(self, answer_format_hint: str, max_steps: int) -> None:
+        system_prompt = _CODE_ANSWER_SYSTEM.substitute(
+            max_steps=max_steps, answer_format_hint=answer_format_hint
         )
-        answer = (resp.text or "").strip()
-        ctx.emit(f"answer_assistant chars={len(answer)}", kind="assistant", data={"text": answer})
-    return answer
+        super().__init__([], max_steps=max_steps, system_prompt_override=system_prompt)
+
+    def validate_final_answer(self, payload: object, observations: list[str]) -> str | None:
+        if not isinstance(payload, dict) or "answer" not in payload:
+            return 'Emit a JSON object with a single "answer" key, e.g. {"answer": "..."}.'
+        return None
 
 
 class System(ABC):
@@ -63,9 +115,14 @@ class System(ABC):
 
 
 class RetrieveComputeSystem(System):
-    """retrieve() -> compute() pipeline behind answer(). Subclasses implement
-    retrieve(); compute() defaults to a downstream LLM answer over the retrieved
-    context/docs, or pass-through when the agent already produced an answer."""
+    """retrieve() -> compute() pipeline behind answer(). Subclasses implement retrieve();
+    compute() runs the shared `CodeAnswerAgent` over the retrieved context/docs, or passes
+    through when the agent already produced an answer (direct-answer mode). Holding the
+    compute step fixed across systems isolates the contribution of each retrieval method."""
+
+    # Step budget for the shared code-execution answer agent. One value across all systems
+    # so compute is identical and only retrieval varies; subclasses may override.
+    answer_max_steps: int = 5
 
     @abstractmethod
     async def retrieve(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext) -> Retrieved:
@@ -75,9 +132,13 @@ class RetrieveComputeSystem(System):
         if r.direct_answer is not None:
             return r.direct_answer
         context = r.context if r.context is not None else _docs_to_context(r.doc_ids, resources.document_map)
-        return await generate_answer_from_context(
-            ctx, q.text, context, answer_format_hint=resources.answer_format_hint
+        agent = CodeAnswerAgent(
+            answer_format_hint=resources.answer_format_hint, max_steps=self.answer_max_steps
         )
+        payload = await agent.call(ctx, f"Question: {q.text}\n\nDocuments:\n{context}")
+        if isinstance(payload, dict) and payload.get("answer") is not None:
+            return str(payload["answer"])
+        return ""
 
     async def answer(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext) -> AnswerOutput:
         r = await self.retrieve(q, resources, ctx)
