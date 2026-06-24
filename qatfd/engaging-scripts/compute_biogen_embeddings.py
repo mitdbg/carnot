@@ -48,8 +48,12 @@ MAX_TOKENS = 32000
 # O(seq²) memory, so this keeps peak attention memory ~constant (≈ BUDGET × n_heads × 2 B)
 # regardless of sequence length: short docs batch large (fast), the rare long doc batches small
 # (can't OOM). With flash-attention-2 active you can safely raise both knobs further.
-MAX_BATCH = 512
-BATCH_COMPUTE_BUDGET = 512 * 512 * 512  # count × max_len² ceiling (~512 docs of 512 tokens)
+# Sized for ~22 GB peak on a 46 GB L40S. MAX_BATCH=512 ran at ~44 GB and OOM-killed any rank whose
+# shard hit a batch of longer abstracts (genuine allocation, not fragmentation — expandable_segments
+# is already on). Halving leaves real headroom; raise again only on a bigger card or after confirming
+# peak memory has margin (watch `nvidia-smi` memory.used on the running job).
+MAX_BATCH = 256
+BATCH_COMPUTE_BUDGET = 256 * 512 * 512  # count × max_len² ceiling (~256 docs of 512 tokens)
 TARGET_ELEMENT_TOKENS = 1024
 
 
