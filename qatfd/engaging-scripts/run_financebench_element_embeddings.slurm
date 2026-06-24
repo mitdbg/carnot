@@ -7,14 +7,14 @@
 # Keep --ntasks fixed across resubmits (the file-shard/resume keys on $SLURM_PROCID/$SLURM_NTASKS).
 #SBATCH --job-name=qwen3-financebench-embed
 #SBATCH -p mit_preemptable
-# The officeqa env's torch only has kernels up to sm_90 (A100/H100); it CANNOT run on the
-# Blackwell RTX PRO 6000 (sm_120) nodes on this partition -> "no kernel image is available for
-# execution on the device". Pin to a supported GPU. CONFIRM the exact feature tag for your cluster:
-#   sinfo -p mit_preemptable -o "%n %G %f" | sort -u
-# then set it below (e.g. h100|a100|"h100|a100"). Adjust if your cluster spells it differently.
-#SBATCH --constraint=h100
+# GPU TYPE IS SELECTED VIA GRES, NOT --constraint (the partition's only node features are
+# "<nodename>,rocky8"). The officeqa env's torch has kernels up to sm_90 only, so it CANNOT run on
+# the Blackwell `rtx_pro_6000` (sm_120) nodes -> "no kernel image is available for execution on the
+# device". Pin the type on the request: a100 (sm_80) is supported AND the most abundant GPU here, so
+# the queue stays short. h100/h200 (sm_90) also work; AVOID l40s (sm_89) and rtx_pro_6000 (sm_120).
+# To see types/counts: sinfo -p mit_preemptable -N -o "%N %G" | sort -u
 #SBATCH --ntasks=2
-#SBATCH --gpus-per-task=1
+#SBATCH --gpus-per-task=a100:1
 #SBATCH -c 8
 #SBATCH --mem=128G
 #SBATCH -t 04:00:00
