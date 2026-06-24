@@ -2,14 +2,15 @@
 
 # ── SLURM Job Flags ──
 # CPU-ONLY + network job: no GPU, no model download (the gate/extract models run on OpenRouter).
-# It streams PDFs in and element JSONs out of S3, so it needs ~zero local disk. RESUMABLE
-# (a doc whose {doc_name}.json already exists in the output prefix is skipped) -> on a
-# preemptable partition just resubmit until done.
+# Three phases run in-process: RENDER (ProcessPool, CPU-bound — uses the allocated cores), LLM
+# (ThreadPool, network-bound), ASSEMBLE. Everything streams in/out of S3, so it needs ~zero local
+# disk. PAGE-LEVEL RESUMABLE (each phase skips work already persisted: rendered pages, done pages,
+# assembled docs) -> on a preemptable partition just resubmit until done.
 #SBATCH --job-name=fb-preprocess
 #SBATCH -p mit_preemptable
 #SBATCH --ntasks=1
-#SBATCH -c 8
-#SBATCH --mem=16G
+#SBATCH -c 16
+#SBATCH --mem=32G
 #SBATCH -t 12:00:00
 #SBATCH -o logs/fb_preprocess_%j.out
 #SBATCH -e logs/fb_preprocess_%j.err
@@ -41,19 +42,22 @@ export AWS_PROFILE=mit
 # ── Paths: stream PDFs in / element JSONs out via S3, so the cluster needs ~zero local disk ──
 # (Upload the corpus once from a machine with disk: `aws s3 sync skunk/financebench/pdfs \
 #   s3://carnot-research/financebench/pdfs`.)
+# The script also writes two intermediate S3 prefixes derived from --output_dir (override with
+# --renders_dir / --pages_dir): *-renders (phase-1 PNG + text cache, ~25-35 GB; delete after) and
+# *-pages (phase-2 per-page element artifacts). Only OUTPUT_DIR holds the final {doc}.json.
 INPUT_DIR=s3://carnot-research/financebench/pdfs
 OUTPUT_DIR=s3://carnot-research/financebench/financebench-elements
 
-# Single asyncio process; the OpenRouter API (not local CPU) is the bottleneck, so high
-# --concurrency is fine. To split across array tasks instead, add `#SBATCH --array=0-3`, set
-# --ntasks per task to 1, and pass --rank $SLURM_ARRAY_TASK_ID --world_size 4.
+# --render-procs uses the allocated cores for phase 1; --concurrency bounds phase-2/3 network
+# threads (the OpenRouter API, not local CPU, is the bottleneck there). To split across array tasks,
+# add `#SBATCH --array=0-3` and pass --rank $SLURM_ARRAY_TASK_ID --world_size 4.
 srun python preprocess_financebench_pdfs.py \
     --input_dir  "$INPUT_DIR" \
     --output_dir "$OUTPUT_DIR" \
+    --render-procs "${SLURM_CPUS_PER_TASK:-16}" \
     --concurrency 32
 
 echo "End: $(date)"
 
-# ── Next: EMBED (GPU) reads the element JSONs (pull from S3 or point --input_dir at the S3 prefix
-#    once compute_financebench_element_embeddings.py is S3-aware), then create_vector_db on a box
-#    with disk. See run_financebench_element_embeddings.slurm and qatfd/README.md. ──
+# ── Next: EMBED (GPU) reads the element JSONs (--input_dir s3://.../financebench-elements), then
+#    create_vector_db on a box with disk. See run_financebench_element_embeddings.slurm + README. ──

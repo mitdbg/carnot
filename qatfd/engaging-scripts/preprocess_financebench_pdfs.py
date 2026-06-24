@@ -1,33 +1,30 @@
 """Preprocess FinanceBench PDFs into OfficeQA-like element JSONs (text / table / figure).
 
-Each page is decomposed into elements via a hybrid pipeline:
-  * TEXT  — taken straight from PyMuPDF's text layer (born-digital filings; no OCR), split on
-            blank lines and merged into ~512-token elements (BrowseComp-Plus style).
-  * TABLE / FIGURE — a two-stage vision cascade per page:
-      1. GATE  (cheap multimodal model, default google/gemma-3-12b-it): the 200dpi page
-         screenshot -> YES/NO "does this page contain a table or a figure?".
-      2. EXTRACT (default google/gemini-3.1-flash-lite, only when gate=YES): the same screenshot ->
-         markdown with one section per table/figure, in this exact shape:
-             ## Table 1
-             <markdown for table 1>
-             ## Figure 1
-             <summary of figure 1>
-         which is parsed back into one element per section.
+Three resumable phases, each skipping work already persisted (so a rerun only does what's missing):
+
+  1. RENDER (ProcessPool — PyMuPDF is process-safe, not thread-safe): one worker per PDF renders
+     each page to a PNG and extracts its text-layer elements. Per page it writes
+     `{renders_dir}/{doc}/{p}.png` (binary; omitted for blank pages) and a `{p}.json` sidecar
+     ({n_pages, blank, text_items}). The sidecar is written LAST as the commit marker, so an
+     interrupted page re-renders next run.
+  2. LLM (ThreadPool — I/O-bound): one task per rendered page runs the two-stage vision cascade on
+     the PNG — a cheap GATE model ("table or figure on this page? YES/NO"), then (only on YES) an
+     EXTRACT model that returns `## Table N` / `## Figure N` markdown — and writes the page's
+     element list to `{pages_dir}/{doc}/{p}.json` ({n_pages, items}). A failed page persists
+     nothing, so it is retried on the next run.
+  3. ASSEMBLE: for each doc whose every page has an element artifact, concatenate them (in page +
+     element order, assigning running ids) into the final `{output_dir}/{doc}.json`.
 
 Output: one `{output_dir}/{doc_name}.json` per PDF:
     {"doc_name": "3M_2018_10K", "n_pages": 142,
      "elements": [{"id": 0, "page_id": 0, "type": "text", "content": "..."}, ...]}
 consumed downstream by compute_financebench_element_embeddings.py.
 
-LLM access uses the skunk `LLMClient` over OpenRouter, built from a minimal `SystemConfig`
-constructed from CLI args (no SkunkConfig / env config). `OPENROUTER_API_KEY` is read from the
-environment by the client. Models and request pacing are CLI args.
-
-`--input_dir` and `--output_dir` each accept a local path OR an `s3://bucket/prefix` URI: with S3
-the PDFs are streamed in and the element JSONs streamed out, so the Engaging job keeps ~zero local
-disk (it only needs CPU + network — no GPU, no model download). S3 needs `boto3` (pip install) +
-AWS creds in the env (AWS_PROFILE or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY); boto3 is imported
-lazily so local runs don't require it.
+LLM access uses the skunk `LLMClient` over OpenRouter, built from a minimal `SystemConfig` from CLI
+args (no SkunkConfig). `OPENROUTER_API_KEY` is read from the env by the client. `--input_dir`,
+`--output_dir`, `--renders_dir`, `--pages_dir` each accept a local path OR an `s3://bucket/prefix`
+URI; with S3 everything streams in/out so the cluster keeps ~zero local disk (S3 needs `boto3` +
+AWS creds in the env; boto3 is imported lazily so local runs don't require it).
 
 Usage:
     OPENROUTER_API_KEY=sk-or-... python preprocess_financebench_pdfs.py \\
@@ -42,14 +39,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import asyncio
 import base64
 import glob
 import io
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from urllib.parse import urlparse
 
 import fitz  # PyMuPDF
@@ -97,10 +94,9 @@ _EXTRACT_USER = "Extract every table (as markdown) and every figure (as a summar
 
 
 # ---------------------------------------------------------------------------
-# I/O layer: --input_dir / --output_dir may be a local dir OR an `s3://bucket/prefix`
-# URI, so the Engaging job can stream PDFs in and element JSONs out of S3 and keep
-# ~zero local disk. boto3 reads credentials from the standard AWS_* env vars; it's
-# imported lazily so local runs don't need it. (Mirrors compute_biogen_embeddings.py.)
+# I/O layer: every dir arg may be a local path OR an `s3://bucket/prefix` URI, so the Engaging job
+# streams everything in/out of S3 and keeps ~zero local disk. boto3 reads creds from the standard
+# AWS_* env vars; it's imported lazily so local runs don't need it. (Mirrors compute_biogen_embeddings.py.)
 # ---------------------------------------------------------------------------
 
 _S3_CLIENT = None
@@ -125,7 +121,7 @@ def _s3():
 
 
 def _join(base: str, name: str) -> str:
-    """Join a path/URI with a filename (works for both local paths and s3:// URIs)."""
+    """Join a path/URI with a sub-path (works for both local paths and s3:// URIs)."""
     return base.rstrip("/") + "/" + name
 
 
@@ -168,19 +164,76 @@ def read_bytes(path: str) -> bytes:
 
 
 def write_output(dest: str, data: bytes) -> None:
-    """Write bytes to a local path (atomically via tmp+rename) or an s3:// object."""
+    """Write bytes to a local path (atomically via tmp+rename, creating parents) or an s3:// object."""
     if _is_s3(dest):
         bucket, key = _s3_split(dest)
         _s3().upload_fileobj(io.BytesIO(data), bucket, key)
     else:
+        os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
         tmp = dest + ".tmp"
         with open(tmp, "wb") as f:
             f.write(data)
         os.replace(tmp, dest)
 
 
+def page_ids_under(dir_prefix: str) -> set[int]:
+    """Integer page ids of the `{n}.json` files directly under one `{prefix}/{doc}` directory."""
+    ids: set[int] = set()
+    if _is_s3(dir_prefix):
+        bucket, prefix = _s3_split(dir_prefix)
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+        for page in _s3().get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+            for o in page.get("Contents", []):
+                k = o["Key"][len(prefix):]
+                if k.endswith(".json") and "/" not in k:
+                    ids.add(int(k[:-5]))
+        return ids
+    for p in glob.glob(os.path.join(dir_prefix, "*.json")):
+        ids.add(int(_stem(p)))
+    return ids
+
+
+def all_page_keys(prefix: str) -> set[str]:
+    """Set of "{doc}/{page}" for every `{prefix}/{doc}/{page}.json` (one LIST over the whole prefix)."""
+    keys: set[str] = set()
+    if _is_s3(prefix):
+        bucket, pfx = _s3_split(prefix)
+        if pfx and not pfx.endswith("/"):
+            pfx += "/"
+        for page in _s3().get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=pfx):
+            for o in page.get("Contents", []):
+                rel = o["Key"][len(pfx):]
+                if rel.endswith(".json") and rel.count("/") == 1:
+                    keys.add(rel[:-5])
+        return keys
+    for p in glob.glob(os.path.join(prefix, "*", "*.json")):
+        keys.add(f"{os.path.basename(os.path.dirname(p))}/{_stem(p)}")
+    return keys
+
+
+def list_done_docs(output_dir: str) -> set[str]:
+    """Doc names whose final {doc}.json already exists directly under output_dir."""
+    docs: set[str] = set()
+    if _is_s3(output_dir):
+        bucket, prefix = _s3_split(output_dir)
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+        for page in _s3().get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+            for o in page.get("Contents", []):
+                base = o["Key"][len(prefix):]
+                if base.endswith(".json") and "/" not in base and not base.startswith("_manifest"):
+                    docs.add(base[:-5])
+        return docs
+    for p in glob.glob(os.path.join(output_dir, "*.json")):
+        b = os.path.basename(p)
+        if not b.startswith("_manifest"):
+            docs.add(b[:-5])
+    return docs
+
+
 # ---------------------------------------------------------------------------
-# text elements
+# text elements + extraction parsing
 # ---------------------------------------------------------------------------
 
 def _clean_page_text(text: str) -> str:
@@ -221,14 +274,9 @@ def text_elements(page_text: str, target_tokens: int) -> list[str]:
     return out
 
 
-# ---------------------------------------------------------------------------
-# vision-extraction parsing
-# ---------------------------------------------------------------------------
-
 def parse_extract_markdown(md: str) -> list[tuple[str, str]]:
     """Parse the model's '## Table N' / '## Figure N' markdown into [(type, content), ...] where
-    type is 'table' or 'figure'. Tolerant of extra prose: any text before the first section header
-    is ignored, and empty sections are dropped."""
+    type is 'table' or 'figure'. Tolerant of extra prose; empty sections are dropped."""
     out: list[tuple[str, str]] = []
     matches = list(_SECTION_RE.finditer(md or ""))
     for i, m in enumerate(matches):
@@ -239,17 +287,6 @@ def parse_extract_markdown(md: str) -> list[tuple[str, str]]:
         if content:
             out.append((kind, content))
     return out
-
-
-# ---------------------------------------------------------------------------
-# rendering + LLM calls
-# ---------------------------------------------------------------------------
-
-def render_page_png_b64(page: fitz.Page, dpi: int) -> B64Image:
-    """Render a PDF page to an in-memory PNG and wrap it as a base64 B64Image."""
-    pix = page.get_pixmap(dpi=dpi)
-    png = pix.tobytes("png")
-    return B64Image(mime="image/png", data=base64.standard_b64encode(png).decode())
 
 
 def _is_yes(text: str) -> bool:
@@ -280,149 +317,203 @@ def build_config(args) -> SystemConfig:
         },
     )
 
+
+# ---------------------------------------------------------------------------
+# phase 1 — render (ProcessPool worker; PyMuPDF kept to its own process)
+# ---------------------------------------------------------------------------
+
+def _render_png(page: fitz.Page, dpi: int) -> bytes:
+    return page.get_pixmap(dpi=dpi).tobytes("png")
+
+
+def render_doc(pdf_path: str, renders_dir: str, dpi: int, target_tokens: int) -> tuple[str, int, int, int]:
+    """Render every not-yet-rendered page of one PDF: write `{doc}/{p}.png` (non-blank pages) then
+    the `{doc}/{p}.json` sidecar ({n_pages, blank, text_items}) as the commit marker. Runs in a
+    subprocess, so fitz never crosses threads. Returns (doc, rendered, blank, skipped)."""
+    doc = _stem(pdf_path)
+    doc_dir = _join(renders_dir, doc)
+    already = page_ids_under(doc_dir)
+    fdoc = fitz.open(stream=read_bytes(pdf_path), filetype="pdf")
+    rendered = blank = skipped = 0
+    try:
+        n_pages = fdoc.page_count
+        for p in range(n_pages):
+            if p in already:
+                skipped += 1
+                continue
+            page = fdoc[p]
+            texts = text_elements(page.get_text("text"), target_tokens)
+            has_visual = bool(page.get_images(full=True)) or len(page.get_drawings()) > 4
+            is_blank = not texts and not has_visual
+            if not is_blank:
+                write_output(_join(doc_dir, f"{p}.png"), _render_png(page, dpi))
+                rendered += 1
+            else:
+                blank += 1
+            # sidecar last == commit marker (so a half-written page re-renders next run)
+            write_output(_join(doc_dir, f"{p}.json"),
+                         json.dumps({"n_pages": n_pages, "blank": is_blank, "text_items": texts}).encode())
+    finally:
+        fdoc.close()
+    return doc, rendered, blank, skipped
+
+
+# ---------------------------------------------------------------------------
+# phase 2 — LLM (ThreadPool worker; sync `client.call`, which is thread-safe)
+# ---------------------------------------------------------------------------
+
+def llm_page(client: LLMClient, key: str, args) -> dict:
+    """Run the gate->extract cascade for one rendered page and persist its element artifact
+    `{pages_dir}/{doc}/{p}.json`. On any error nothing is persisted -> the page retries next run."""
+    doc, page_s = key.split("/")
+    page_id = int(page_s)
+    doc_renders = _join(args.renders_dir, doc)
+    side = json.loads(read_bytes(_join(doc_renders, f"{page_id}.json")))
+    n_pages, texts, is_blank = side["n_pages"], side["text_items"], side["blank"]
+    items: list[list[str]] = [["text", t] for t in texts]
+    summary = {"doc": doc, "errored": False, "gate_yes": False, "n_table": 0, "n_figure": 0,
+               "n_text": len(texts), "gate_in": 0, "gate_out": 0, "extract_in": 0, "extract_out": 0}
+
+    if not is_blank:
+        try:
+            png = read_bytes(_join(doc_renders, f"{page_id}.png"))
+            img = B64Image(mime="image/png", data=base64.standard_b64encode(png).decode())
+            gate = client.call(system=_GATE_SYSTEM, user=_GATE_USER, images=[img], temperature=0.0,
+                               model=args.gate_model, ctx=None, call_site="fb_gate")
+            summary["gate_in"], summary["gate_out"] = gate.input_tokens or 0, gate.output_tokens or 0
+            if _is_yes(gate.text):
+                summary["gate_yes"] = True
+                ext = client.call(system=_EXTRACT_SYSTEM, user=_EXTRACT_USER, images=[img], temperature=0.0,
+                                  model=args.extract_model, ctx=None, call_site="fb_extract")
+                summary["extract_in"], summary["extract_out"] = ext.input_tokens or 0, ext.output_tokens or 0
+                items += [[k, c] for k, c in parse_extract_markdown(ext.text)]
+        except Exception as e:  # noqa: BLE001 — one bad page shouldn't kill the run
+            summary["errored"] = True
+            print(f"  WARN {key}: vision call failed: {e}", flush=True)
+            return summary
+
+    try:
+        write_output(_join(_join(args.pages_dir, doc), f"{page_id}.json"),
+                     json.dumps({"n_pages": n_pages, "items": items}).encode())
+    except Exception as e:  # noqa: BLE001 — persist failure -> not done, retry next run
+        summary["errored"] = True
+        print(f"  WARN {key}: persist failed: {e}", flush=True)
+        return summary
+    summary["n_table"] = sum(1 for k, _ in items if k == "table")
+    summary["n_figure"] = sum(1 for k, _ in items if k == "figure")
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# phase 3 — assemble (ThreadPool: one task per doc reads its page artifacts)
+# ---------------------------------------------------------------------------
+
+def assemble_doc(doc: str, args) -> tuple[str, int, str]:
+    """Assemble one doc's final JSON from its element artifacts. Returns (doc, n_elements, status)
+    where status is 'written' | 'incomplete' | 'skip'."""
+    out_path = _join(args.output_dir, f"{doc}.json")
+    if _exists(out_path):
+        return doc, 0, "skip"
+    pages_doc = _join(args.pages_dir, doc)
+    page_ids = page_ids_under(pages_doc)
+    if not page_ids:
+        return doc, 0, "skip"
+    n_pages = json.loads(read_bytes(_join(pages_doc, f"{min(page_ids)}.json")))["n_pages"]
+    if page_ids != set(range(n_pages)):
+        return doc, len(set(range(n_pages)) - page_ids), "incomplete"
+
+    elements: list[dict] = []
+    eid = 0
+    for p in range(n_pages):
+        items = json.loads(read_bytes(_join(pages_doc, f"{p}.json")))["items"]
+        for etype, content in items:
+            elements.append({"id": eid, "page_id": p, "type": etype, "content": content})
+            eid += 1
+    write_output(out_path, json.dumps({"doc_name": doc, "n_pages": n_pages, "elements": elements}).encode())
+    return doc, len(elements), "written"
+
+
+# ---------------------------------------------------------------------------
+# orchestration
+# ---------------------------------------------------------------------------
+
 @dataclass
 class Stats:
-    pages: int = 0
-    gated_pages: int = 0
+    render_pages: int = 0
+    render_blank: int = 0
+    render_skipped: int = 0
+    llm_pages: int = 0
     gate_yes: int = 0
     tables: int = 0
     figures: int = 0
     text_elems: int = 0
+    errors: int = 0
+    docs_written: int = 0
+    docs_incomplete: int = 0
     gate_in: int = 0
     gate_out: int = 0
     extract_in: int = 0
     extract_out: int = 0
-    errors: int = 0
 
     def as_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__dataclass_fields__}
 
 
-@dataclass
-class _PageElements:
-    page_id: int
-    items: list[tuple[str, str]] = field(default_factory=list)  # (type, content) in doc order
+def phase_render(pdfs: list[str], done_docs: set[str], args, stats: Stats) -> None:
+    todo = [p for p in pdfs if _stem(p) not in done_docs]
+    print(f"[render] {len(todo)} PDFs over {args.render_procs} processes...", flush=True)
+    if not todo:
+        return
+    with ProcessPoolExecutor(max_workers=args.render_procs) as pex:
+        futs = [pex.submit(render_doc, p, args.renders_dir, args.dpi, args.target_element_tokens) for p in todo]
+        for fut in as_completed(futs):
+            doc, rendered, blank, skipped = fut.result()
+            stats.render_pages += rendered
+            stats.render_blank += blank
+            stats.render_skipped += skipped
+            print(f"  [render] {doc}: +{rendered} rendered, {blank} blank, {skipped} already-done", flush=True)
 
 
-async def process_page(
-    page: fitz.Page,
-    page_id: int,
-    *,
-    client: LLMClient,
-    sem: asyncio.Semaphore,
-    gate_model: str,
-    extract_model: str,
-    dpi: int,
-    target_tokens: int,
-    timeout_s: float,
-    stats: Stats,
-) -> _PageElements:
-    """Build the element list for one page: text (always) + table/figure (gate then extract)."""
-    result = _PageElements(page_id=page_id)
-    raw_text = page.get_text("text")
-    texts = text_elements(raw_text, target_tokens)
-
-    # A page with no text AND no visual content is blank -> no elements, no LLM calls.
-    has_visual = bool(page.get_images(full=True)) or len(page.get_drawings()) > 4
-    if not texts and not has_visual:
-        return result
-
-    for t in texts:
-        result.items.append(("text", t))
-    stats.text_elems += len(texts)
-
-    ext_text = ""
-    async with sem:
-        try:
-            img = await asyncio.to_thread(render_page_png_b64, page, dpi)
-            gate = await client.acall(
-                system=_GATE_SYSTEM, user=_GATE_USER, images=[img], temperature=0.0,
-                model=gate_model, max_output_tokens=4, timeout_s=timeout_s, ctx=None, call_site="fb_gate",
-            )
-            stats.gated_pages += 1
-            stats.gate_in += gate.input_tokens or 0
-            stats.gate_out += gate.output_tokens or 0
-            if not _is_yes(gate.text):
-                return result
-            stats.gate_yes += 1
-
-            ext = await client.acall(
-                system=_EXTRACT_SYSTEM, user=_EXTRACT_USER, images=[img], temperature=0.0,
-                model=extract_model, timeout_s=timeout_s, ctx=None, call_site="fb_extract",
-            )
-            ext_text = ext.text
-            stats.extract_in += ext.input_tokens or 0
-            stats.extract_out += ext.output_tokens or 0
-        except Exception as e:  # noqa: BLE001 — one bad page shouldn't kill the doc
-            stats.errors += 1
-            print(f"  WARN page {page_id}: vision call failed: {e}", flush=True)
-            return result
-
-    for kind, content in parse_extract_markdown(ext_text):
-        result.items.append((kind, content))
-        if kind == "table":
-            stats.tables += 1
-        else:
-            stats.figures += 1
-    return result
-
-
-async def process_pdf(
-    pdf_path: str,
-    out_path: str,
-    *,
-    client: LLMClient,
-    sem: asyncio.Semaphore,
-    args,
-    stats: Stats,
-) -> None:
-    """Decompose one PDF into elements and write its JSON (local path or s3:// URI)."""
-    doc_name = _stem(pdf_path)
-    doc = fitz.open(stream=read_bytes(pdf_path), filetype="pdf")
-    try:
-        n_pages = doc.page_count
-        stats.pages += n_pages
-        tasks = [
-            process_page(
-                doc[i], i, client=client, sem=sem, gate_model=args.gate_model,
-                extract_model=args.extract_model, dpi=args.dpi,
-                target_tokens=args.target_element_tokens, timeout_s=args.timeout, stats=stats,
-            )
-            for i in range(n_pages)
-        ]
-        page_results = await asyncio.gather(*tasks)
-    finally:
-        doc.close()
-
-    elements: list[dict] = []
-    eid = 0
-    for pr in page_results:
-        for etype, content in pr.items:
-            elements.append({"id": eid, "page_id": pr.page_id, "type": etype, "content": content})
-            eid += 1
-
-    payload = {"doc_name": doc_name, "n_pages": n_pages, "elements": elements}
-    write_output(out_path, json.dumps(payload).encode())
-    n_tab = sum(1 for e in elements if e["type"] == "table")
-    n_fig = sum(1 for e in elements if e["type"] == "figure")
-    n_txt = sum(1 for e in elements if e["type"] == "text")
-    print(f"[{doc_name}] {n_pages}p -> {len(elements)} elems (text={n_txt} table={n_tab} figure={n_fig})", flush=True)
-
-
-async def run(pdfs: list[str], args, stats: Stats) -> None:
-    if not os.environ.get("OPENROUTER_API_KEY"):
-        raise SystemExit("OPENROUTER_API_KEY is not set in the environment.")
+def phase_llm(done_docs: set[str], args, stats: Stats) -> None:
+    rendered = {k for k in all_page_keys(args.renders_dir) if k.split("/")[0] not in done_docs}
+    done = all_page_keys(args.pages_dir)
+    todo = sorted(rendered - done)
+    print(f"[llm] {len(todo)} pages to process ({len(done)} already done) over {args.concurrency} threads...", flush=True)
+    if not todo:
+        return
     client = LLMClient(build_config(args))
-    sem = asyncio.Semaphore(args.concurrency)
+    with ThreadPoolExecutor(max_workers=args.concurrency) as tex:
+        futs = [tex.submit(llm_page, client, key, args) for key in todo]
+        for i, fut in enumerate(as_completed(futs), 1):
+            s = fut.result()
+            stats.llm_pages += 1
+            stats.gate_in += s["gate_in"]
+            stats.gate_out += s["gate_out"]
+            stats.extract_in += s["extract_in"]
+            stats.extract_out += s["extract_out"]
+            if s["errored"]:
+                stats.errors += 1
+                continue
+            stats.gate_yes += int(s["gate_yes"])
+            stats.tables += s["n_table"]
+            stats.figures += s["n_figure"]
+            stats.text_elems += s["n_text"]
+            if i % 500 == 0:
+                print(f"  [llm] {i}/{len(todo)} pages...", flush=True)
 
-    # Docs run sequentially (write-as-you-go, resumable); pages within a doc fan out under `sem`,
-    # which bounds in-flight renders + LLM calls across the whole job.
-    for pdf in pdfs:
-        out_path = _join(args.output_dir, f"{_stem(pdf)}.json")
-        if _exists(out_path):
-            print(f"[{_stem(pdf)}] exists, skipping", flush=True)
-            continue
-        await process_pdf(pdf, out_path, client=client, sem=sem, args=args, stats=stats)
+
+def phase_assemble(pdfs: list[str], args, stats: Stats) -> None:
+    print(f"[assemble] {len(pdfs)} docs...", flush=True)
+    with ThreadPoolExecutor(max_workers=args.concurrency) as tex:
+        futs = [tex.submit(assemble_doc, _stem(p), args) for p in pdfs]
+        for fut in as_completed(futs):
+            doc, n_elem, status = fut.result()
+            if status == "written":
+                stats.docs_written += 1
+                print(f"  [assemble] {doc}: {n_elem} elements", flush=True)
+            elif status == "incomplete":
+                stats.docs_incomplete += 1
+                print(f"  [assemble] {doc}: INCOMPLETE ({n_elem} page(s) missing) -> rerun to finish", flush=True)
 
 
 def select_pdfs(args) -> list[str]:
@@ -439,34 +530,50 @@ def select_pdfs(args) -> list[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Decompose FinanceBench PDFs into text/table/figure element JSONs.")
-    parser.add_argument("--input_dir", required=True, help="Local dir OR s3:// prefix holding the FinanceBench *.pdf files")
-    parser.add_argument("--output_dir", required=True, help="Local dir OR s3:// prefix for the {doc_name}.json element files")
+    parser.add_argument("--input_dir", required=True, help="Local dir OR s3:// prefix of the FinanceBench *.pdf files")
+    parser.add_argument("--output_dir", required=True, help="Local dir OR s3:// prefix for the final {doc}.json element files")
+    parser.add_argument("--renders_dir", default=None, help="Phase-1 render cache (PNG + text sidecar). Default: {output_dir}-renders")
+    parser.add_argument("--pages_dir", default=None, help="Phase-2 per-page element artifacts. Default: {output_dir}-pages")
+    parser.add_argument("--phases", default="render,llm,assemble", help="Comma list of phases to run (render,llm,assemble)")
     parser.add_argument("--gate-model", default="google/gemma-3-12b-it", help="Cheap multimodal model for the table/figure gate")
     parser.add_argument("--extract-model", default="google/gemini-3.1-flash-lite", help="Model for table-markdown / figure-summary extraction")
     parser.add_argument("--dpi", type=int, default=200, help="Page render DPI for the vision calls")
-    parser.add_argument("--concurrency", type=int, default=32, help="Max concurrent pages (bounds in-flight LLM calls + renders)")
+    parser.add_argument("--render-procs", type=int, default=os.cpu_count() or 4, help="Phase-1 render processes (CPU-bound)")
+    parser.add_argument("--concurrency", type=int, default=32, help="Phase-2/3 threads (I/O-bound LLM + S3)")
     parser.add_argument("--rpm", type=float, default=600.0, help="Per-model requests/min pacing (LLMClient token bucket)")
     parser.add_argument("--max-retries", type=int, default=4, help="Per-call transient-fault retries (429/5xx/transport)")
-    parser.add_argument("--timeout", type=float, default=120.0, help="Per-request timeout (seconds)")
     parser.add_argument("--target-element-tokens", type=int, default=DEFAULT_TARGET_ELEMENT_TOKENS, help="Target token size for merged text elements")
     parser.add_argument("--sample", type=int, default=None, help="Process only the first N (post-filter) docs")
     parser.add_argument("--docs", type=str, default=None, help="Comma-separated doc_name stems to restrict to")
-    parser.add_argument("--rank", type=int, default=int(os.environ.get("SLURM_PROCID", 0)), help="Worker index for multi-process splitting")
-    parser.add_argument("--world_size", type=int, default=int(os.environ.get("SLURM_NTASKS", 1)), help="Number of parallel workers")
+    parser.add_argument("--rank", type=int, default=int(os.environ.get("SLURM_PROCID", 0)), help="Worker index for multi-task splitting")
+    parser.add_argument("--world_size", type=int, default=int(os.environ.get("SLURM_NTASKS", 1)), help="Number of parallel tasks")
     args = parser.parse_args()
 
-    if not _is_s3(args.output_dir):
-        os.makedirs(args.output_dir, exist_ok=True)
+    args.renders_dir = args.renders_dir or (args.output_dir.rstrip("/") + "-renders")
+    args.pages_dir = args.pages_dir or (args.output_dir.rstrip("/") + "-pages")
+    phases = {p.strip() for p in args.phases.split(",") if p.strip()}
+
     pdfs = select_pdfs(args)
-    print(f"Processing {len(pdfs)} PDFs (gate={args.gate_model}, extract={args.extract_model}, dpi={args.dpi}, concurrency={args.concurrency}).", flush=True)
+    done_docs = list_done_docs(args.output_dir)  # fully-assembled docs: skipped by every phase
+    print(f"Selected {len(pdfs)} PDFs ({len(done_docs)} already assembled). phases={sorted(phases)} "
+          f"gate={args.gate_model} extract={args.extract_model} dpi={args.dpi}.", flush=True)
 
     stats = Stats()
-    asyncio.run(run(pdfs, args, stats))
+    if "render" in phases:
+        phase_render(pdfs, done_docs, args, stats)
+    if "llm" in phases:
+        if not os.environ.get("OPENROUTER_API_KEY"):
+            raise SystemExit("OPENROUTER_API_KEY is not set in the environment.")
+        phase_llm(done_docs, args, stats)
+    if "assemble" in phases:
+        phase_assemble(pdfs, args, stats)
 
-    yes_rate = (stats.gate_yes / stats.gated_pages) if stats.gated_pages else 0.0
+    yes_rate = (stats.gate_yes / stats.llm_pages) if stats.llm_pages else 0.0
     print("\n=== summary ===", flush=True)
-    print(f"pages={stats.pages} gated={stats.gated_pages} gate_yes={stats.gate_yes} ({yes_rate:.0%}) "
-          f"tables={stats.tables} figures={stats.figures} text_elems={stats.text_elems} errors={stats.errors}", flush=True)
+    print(f"render: +{stats.render_pages} pages, {stats.render_blank} blank, {stats.render_skipped} already-done", flush=True)
+    print(f"llm: {stats.llm_pages} pages, gate_yes={stats.gate_yes} ({yes_rate:.0%}), tables={stats.tables} "
+          f"figures={stats.figures} text_elems={stats.text_elems} errors={stats.errors}", flush=True)
+    print(f"assemble: {stats.docs_written} written, {stats.docs_incomplete} incomplete", flush=True)
     print(f"tokens: gate in/out={stats.gate_in}/{stats.gate_out}  extract in/out={stats.extract_in}/{stats.extract_out}", flush=True)
 
     manifest = _join(args.output_dir, f"_manifest_rank{args.rank}.json")

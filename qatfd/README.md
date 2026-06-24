@@ -53,12 +53,16 @@ query embedder, so no `emb_model_id` override is needed). Retrieval stays page-l
 `doc_id` is the page key `{doc_name}::p{page_num}`. Three steps:
 
 ```bash
-# 1. PREPROCESS (CPU + OpenRouter, no GPU): PDFs -> per-doc element JSONs. A cheap multimodal model
-#    gates each page; google/gemini-3.1-flash-lite extracts table markdown + figure summaries on hits.
-#    Needs pymupdf + OPENROUTER_API_KEY. Validate on a few docs first with --sample. Resumable
-#    (skips docs whose {doc_name}.json already exists). --input_dir/--output_dir accept a local path
-#    OR an s3:// prefix — on a low-disk cluster, stream to/from S3 (see run_financebench_preprocess.slurm:
-#    upload PDFs once with `aws s3 sync skunk/financebench/pdfs s3://carnot-research/financebench/pdfs`).
+# 1. PREPROCESS (CPU + OpenRouter, no GPU): PDFs -> per-doc element JSONs, in 3 resumable phases:
+#    RENDER (ProcessPool: page PNG + text-layer cache), LLM (ThreadPool: a cheap model gates each
+#    page, google/gemini-3.1-flash-lite extracts table markdown + figure summaries on hits), ASSEMBLE.
+#    Needs pymupdf + OPENROUTER_API_KEY. Validate on a few docs first with --sample. PAGE-LEVEL
+#    resumable: each phase skips work already persisted, so a rerun only renders/LLMs the missing
+#    pages then reassembles (a single failed page never reprocesses its whole doc). All dir args
+#    accept a local path OR an s3:// prefix — on a low-disk cluster stream to/from S3 (see
+#    run_financebench_preprocess.slurm; upload PDFs once with `aws s3 sync skunk/financebench/pdfs
+#    s3://carnot-research/financebench/pdfs`). Two intermediate prefixes ({output_dir}-renders,
+#    {output_dir}-pages) hold the caches; only --output_dir holds the final {doc}.json.
 OPENROUTER_API_KEY=sk-or-... python engaging-scripts/preprocess_financebench_pdfs.py \
     --input_dir  ../skunk/financebench/pdfs \
     --output_dir ../skunk/financebench/financebench-elements
