@@ -52,7 +52,7 @@ import fitz  # PyMuPDF
 
 from skunk.common import B64Image
 from skunk.config import SystemConfig
-from skunk.llm_client import LLMClient
+from skunk.llm_client import EmptyCompletionError, LLMClient
 
 # Text-element sizing (BrowseComp-Plus style): merge paragraphs up to a token target, hard-split
 # anything beyond MAX. Estimated as chars/4 to avoid tokenizing on the CPU preprocessing box.
@@ -77,8 +77,8 @@ _EXTRACT_SYSTEM = (
     "- For a FIGURE (chart/graph/plot/diagram), write a concise summary covering: its title, what "
     "it plots, the axes and their units, the series/legend, and any date range(s) or key values.\n"
     "- If the page has no tables, omit all Table sections; if it has no figures, omit all Figure "
-    "sections. If it has neither, output nothing.\n"
-    "- Output ONLY the '## Table N' / '## Figure N' sections."
+    "sections. If it has NEITHER a table nor a figure, respond with exactly: NONE\n"
+    "- Output ONLY the '## Table N' / '## Figure N' sections (or NONE). Never reply empty."
 )
 _EXTRACT_USER = "Extract every table (as markdown) and every figure (as a summary) from this page."
 
@@ -359,10 +359,16 @@ def llm_page(client: LLMClient, key: str, args) -> dict:
         try:
             png = read_bytes(_join(doc_renders, f"{page_id}.png"))
             img = B64Image(mime="image/png", data=base64.standard_b64encode(png).decode())
-            ext = client.call(system=_EXTRACT_SYSTEM, user=_EXTRACT_USER, images=[img], temperature=0.0,
-                              model=args.extract_model, ctx=None, call_site="fb_extract")
-            summary["extract_in"], summary["extract_out"] = ext.input_tokens or 0, ext.output_tokens or 0
-            items += [[k, c] for k, c in parse_extract_markdown(ext.text)]
+            try:
+                ext = client.call(system=_EXTRACT_SYSTEM, user=_EXTRACT_USER, images=[img], temperature=0.0,
+                                  model=args.extract_model, ctx=None, call_site="fb_extract")
+                summary["extract_in"], summary["extract_out"] = ext.input_tokens or 0, ext.output_tokens or 0
+                items += [[k, c] for k, c in parse_extract_markdown(ext.text)]
+            except EmptyCompletionError:
+                # The prompt asks for a `NONE` sentinel on no-table/figure pages, but if the model
+                # returns truly empty content anyway, that just means "no tables/figures" — keep the
+                # text-only items and persist normally (NOT an error, so the page/doc isn't stuck).
+                print(f"  note {key}: empty extract -> no tables/figures", flush=True)
         except Exception as e:  # noqa: BLE001 — one bad page shouldn't kill the run
             summary["errored"] = True
             print(f"  WARN {key}: extract call failed: {e}", flush=True)
