@@ -26,6 +26,7 @@ metadata dict and register it.
 import argparse
 import json
 import os
+import re
 from collections.abc import Callable
 
 import chromadb
@@ -97,11 +98,31 @@ def _financebench_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
     )
 
 
+def _qampari_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
+    """Adapter for `compute_qampari_embeddings.py` outputs (one element per ~100-token Wikipedia chunk).
+
+    The chunk_id ("{page_id}__{n}") is the doc_id, so the QAMPARI benchmark's chunk-text document_map
+    (keyed by chunk_id) lines up with retrieved doc_ids; `title` is surfaced so retrieved chunks can
+    be collapsed to their Wikipedia article (the unit of QAMPARI's gold) for doc-recall.
+    """
+    return (
+        elt_metadata["chunk_id"],
+        elt_metadata["cleaned"],
+        {
+            "title": elt_metadata.get("title", ""),
+            "page_id": elt_metadata.get("page_id", ""),
+            "url": elt_metadata.get("url", ""),
+            "element_id": elt_metadata.get("element_id", 0),
+        },
+    )
+
+
 _BENCHMARK_ADAPTERS: dict[str, ElementAdapter] = {
     "officeqa": _officeqa_adapter,
     "browsecomp_plus": _browsecomp_plus_adapter,
     "trec_biogen": _biogen_adapter,
     "finance_bench": _financebench_adapter,
+    "qampari": _qampari_adapter,
 }
 
 
@@ -113,6 +134,25 @@ def _load_metadata(embeddings_dir: str) -> dict[str, dict]:
             with open(os.path.join(embeddings_dir, file)) as f:
                 metadata.update(json.load(f))
     return metadata
+
+
+_RANK_META_RE = re.compile(r"^metadata_rank(\d+)\.json$")
+_RANK_NPZ_RE = re.compile(r"^embeddings_(\d+)_")
+
+
+def _rank_metadata_shards(embeddings_dir: str) -> dict[int, str] | None:
+    """If metadata is sharded per embedding-rank (`metadata_rank{r}.json`), return {rank: filename};
+    else None (a single `metadata.json`).
+
+    Rank-sharding lets us build one rank at a time — load only that rank's metadata, add its
+    `embeddings_{r}_*.npz`, then free it — so peak RAM is a single shard rather than the whole
+    corpus held at once."""
+    shards: dict[int, str] = {}
+    for file in os.listdir(embeddings_dir):
+        m = _RANK_META_RE.match(file)
+        if m:
+            shards[int(m.group(1))] = file
+    return shards or None
 
 
 def _add_partition(
@@ -179,17 +219,29 @@ if __name__ == "__main__":
     collection = client.get_or_create_collection(name=args.collection_name)
     print(f"Writing to collection {args.collection_name!r} at {args.chroma_path} (benchmark={args.benchmark}).")
 
-    # load the metadata files (mapping from unique_element_id to per-element metadata dict)
-    metadata = _load_metadata(args.embeddings_dir)
+    npz_files = sorted(f for f in os.listdir(args.embeddings_dir) if f.startswith("embeddings") and f.endswith(".npz"))
+    shards = _rank_metadata_shards(args.embeddings_dir)
 
-    # for each embeddings_{...}.npz file, add its contents to the chroma collection
-    for file in os.listdir(args.embeddings_dir):
-        if not (file.startswith("embeddings") and file.endswith(".npz")):
-            continue
-        print(f"Processing file {file}...")
-        _add_partition(
-            collection,
-            os.path.join(args.embeddings_dir, file),
-            metadata,
-            adapter,
-        )
+    if shards is not None:
+        # Rank-sharded metadata (e.g. biogen): process one rank at a time so only a single shard's
+        # metadata is resident. Each `embeddings_{r}_*.npz` references only rank r's ids.
+        npz_by_rank: dict[int, list[str]] = {}
+        for file in npz_files:
+            m = _RANK_NPZ_RE.match(file)
+            if m is None:
+                raise ValueError(f"rank-sharded metadata present but {file!r} lacks an embeddings_{{rank}}_ prefix")
+            npz_by_rank.setdefault(int(m.group(1)), []).append(file)
+        for rank in sorted(shards):
+            print(f"Loading metadata shard for rank {rank} ({shards[rank]})...")
+            with open(os.path.join(args.embeddings_dir, shards[rank])) as f:
+                metadata = json.load(f)
+            for file in sorted(npz_by_rank.get(rank, [])):
+                print(f"Processing file {file}...")
+                _add_partition(collection, os.path.join(args.embeddings_dir, file), metadata, adapter)
+            del metadata
+    else:
+        # Single metadata.json (smaller corpora): load once, add every partition.
+        metadata = _load_metadata(args.embeddings_dir)
+        for file in npz_files:
+            print(f"Processing file {file}...")
+            _add_partition(collection, os.path.join(args.embeddings_dir, file), metadata, adapter)

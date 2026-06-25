@@ -1,4 +1,4 @@
-# FinanceBench benchmark (Patronus AI open-source subset).
+# FinanceBench benchmark
 #
 # Corpus: the 368 source PDFs (SEC filings), indexed at the PAGE level (one element per page) with
 # Qwen3-Embedding-8B (4096-dim) into the `qwen-financebench` Chroma collection. Build it offline:

@@ -100,15 +100,26 @@ def _parse_labels(text: str, n: int) -> list[str]:
 
 
 async def judge_nugget_recall(
-    ctx, *, question: str, nuggets: list[str], predicted: str, model: str, partial_credit: float = 0.0
+    ctx,
+    *,
+    question: str,
+    nuggets: list[str],
+    predicted: str,
+    model: str,
+    judge_system: str,
+    partial_credit: float = 0.0,
 ) -> dict:
     """Nugget recall (KARL TREC-BioGen): one judge call labels every gold nugget against the
-    predicted answer; score = (n_support + partial_credit * n_partial) / n_nuggets."""
+    predicted answer; score = (n_support + partial_credit * n_partial) / n_nuggets.
+
+    `judge_system` is the grader-persona system prompt, supplied per benchmark (TREC-BioGen uses a
+    biomedical persona; QAMPARI a neutral encyclopedic one) so the same machinery grades each
+    domain's nuggets appropriately."""
     if not nuggets:
         return {"score": 0.0, "scorer": "karl.nugget_completion.v1", "judge_rationale": "(no gold nuggets)"}
 
     resp = await ctx.llm_client.acall(
-        system="You are a careful biomedical answer-evaluation judge.",
+        system=judge_system,
         user=_NUGGET_COMPLETENESS_PROMPT.format(
             length=len(nuggets),
             question=question,

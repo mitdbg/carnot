@@ -87,7 +87,11 @@ def _select_questions(benchmark: Benchmark, config: ExperimentConfig) -> list[Qu
         [q for q in all_q if q.qid not in test_qids]
     )
     if config.sample:
-        pool = random.sample(pool, min(config.sample, len(pool)))
+        # sort first so the draw depends only on the seed, not load order; a local RNG
+        # (seeded when config.seed is set) keeps the subset reproducible across systems.
+        pool = sorted(pool, key=lambda q: q.qid)
+        rng = random.Random(config.seed) if config.seed is not None else random
+        pool = rng.sample(pool, min(config.sample, len(pool)))
     print(f"[qatfd] split '{config.split}': running {len(pool)} question(s).")
 
     return pool

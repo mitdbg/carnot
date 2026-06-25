@@ -6,7 +6,7 @@ import yaml
 from dataclasses import dataclass
 from typing import cast, Literal
 from omegaconf import DictConfig, OmegaConf
-from qatfd.constants import BROWSECOMP_PLUS, FINANCE_BENCH, OFFICE_QA, TREC_BIOGEN
+from qatfd.constants import BROWSECOMP_PLUS, FINANCE_BENCH, OFFICE_QA, QAMPARI, TREC_BIOGEN
 from skunk.config import QATFDSearchAgentConfig, RAGLLMConfig, SearchAgentConfig, SystemConfig
 
 # ---------------------------------------------------------------------------
@@ -19,6 +19,8 @@ class ExperimentConfig:
     split: Literal["dev", "test"] = "dev"
     # number of questions to run
     sample: int | None = None
+    # RNG seed for `sample` selection; set it to draw the same subset across systems (null = nondeterministic)
+    seed: int | None = None
     # specific qids to run (overrides split/sample)
     qids: list[str] | None = None
     # question-level concurrency
@@ -98,6 +100,25 @@ class TrecBiogenConfig(BenchmarkConfig):
     partial_credit: float = 0.0
 
 @dataclass
+class QampariConfig(BenchmarkConfig):
+    # QAMPARI test JSONL (`test_data.jsonl`): 1000 multi-answer questions over Wikipedia. Each record
+    # is (qid, question_text, answer_list[]) where every answer carries `answer_text`, `aliases`, and
+    # `proof[]` (each proof has `found_in_url` = the supporting Wikipedia article).
+    questions_path: str
+    # glob for the embedding-job metadata files (metadata_rank*.json: chunk_id -> {cleaned, title,
+    # page_id, url, element_id}), used to rebuild the passage-text doc map + the chunk->article map
+    # that collapses retrieved chunk_ids to Wikipedia articles for doc-recall.
+    qampari_metadata_glob: str
+    # the llm used by the nugget-completion judge (each gold answer entity is one nugget; the answer
+    # is graded by entity recall, mirroring KARL's nugget-based completion for QAMPARI).
+    judge_model: str
+    # optional JSON of held-out test qids ({"query_ids": [...]}); null => ALL 1000 questions are the
+    # (held-out) test set, so the benchmark is run with experiments.split=test (the whole set = the comparison).
+    test_ids_path: str | None = None
+    # weight given to a `partial_support` nugget in the recall score (full support = 1.0).
+    partial_credit: float = 0.0
+
+@dataclass
 class FinanceBenchConfig(BenchmarkConfig):
     # FinanceBench open-source JSONL: 150 questions over SEC filings (financebench_id / question /
     # answer / evidence[{doc_name, evidence_page_num, ...}]).
@@ -125,6 +146,8 @@ def benchmark_config_factory(cfg: DictConfig) -> BenchmarkConfig:
         return TrecBiogenConfig(**bench_cfg)
     elif bench_cfg["name"] == FINANCE_BENCH:
         return FinanceBenchConfig(**bench_cfg)
+    elif bench_cfg["name"] == QAMPARI:
+        return QampariConfig(**bench_cfg)
     else:
         raise ValueError(f"unknown benchmark {bench_cfg['name']!r}")
 

@@ -1,6 +1,7 @@
 # run-level knobs (maps onto qatfd.config.ExperimentConfig).
 split: dev          # dev | test  (test = held-out set; deliberate final runs only)
 sample: null        # cap to N randomly-sampled questions from the split (null = all)
+seed: null          # RNG seed for `sample`; set it to draw the same subset across systems (null = nondeterministic)
 qids: null          # explicit qids to run, list[str] (overrides split/sample)
 workers: 32         # question-level concurrency (ThreadPoolExecutor)
 run_name: ""        # label prefix for the run directory (timestamp is always appended)

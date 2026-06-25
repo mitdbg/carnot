@@ -9,6 +9,7 @@ from qatfd.benchmarks.base import Benchmark
 from qatfd.benchmarks.browsecomp_plus import BrowseCompPlusBenchmark
 from qatfd.benchmarks.financebench import FinanceBenchBenchmark
 from qatfd.benchmarks.officeqa import OfficeQABenchmark
+from qatfd.benchmarks.qampari import QampariBenchmark
 from qatfd.benchmarks.trec_biogen import TrecBiogenBenchmark
 from qatfd.config import BenchmarkConfig
 from qatfd.systems.base import System
@@ -23,6 +24,7 @@ BENCHMARKS: dict[str, type[Benchmark]] = {
     BrowseCompPlusBenchmark.name: BrowseCompPlusBenchmark,
     TrecBiogenBenchmark.name: TrecBiogenBenchmark,
     FinanceBenchBenchmark.name: FinanceBenchBenchmark,
+    QampariBenchmark.name: QampariBenchmark,
 }
 
 SYSTEMS: dict[str, type[System]] = {
