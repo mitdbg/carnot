@@ -8,25 +8,29 @@ Questions: the QAMPARI test JSONL (`test_data.jsonl`) — 1000 open-domain quest
 Gold nuggets: the gold answer entities themselves — one nugget per `answer_text`. The score is
   nugget-completion recall (KARL "treats each entity as a separate nugget"), graded by the LLM judge
   in judge.py so an alias / paraphrase of the entity still counts.
-Corpus + index: KARL's QAMPARI corpus is the subset of QAMPARI's chunked Wikipedia (~100-token
-  passages) containing at least one gold answer entity — ~256,680 chunks — embedded with
-  Qwen3-Embedding-0.6B into a Chroma collection. The chunk-text doc map is rebuilt from the
-  embedding metadata (so it matches exactly what the vectors were built from); see
-  engaging-scripts/{preprocess_qampari_corpus.py, compute_qampari_embeddings.py}.
+Corpus + index: the FULL QAMPARI chunked Wikipedia (~25.9M ~100-word passages), embedded with
+  Qwen3-Embedding-0.6B into a Chroma collection (see compute_qampari_embeddings.py). We index the
+  whole corpus — KARL's "chunks containing a gold answer entity" subset can't be reliably
+  reproduced (the answer entities are common strings that match most of Wikipedia, and the
+  entity-LINK annotations that would scope it aren't in the chunk metadata), so — like TREC-BioGen
+  — we embed everything and let retrieval do the work. The same index serves both the dev and test
+  question splits. The chunk-text doc map is served lazily from the Chroma `documents` column
+  (a 25.9M-entry dict would be far too large for RAM), keyed by chunk_id.
 Gold docs / recall: a proof identifies the supporting Wikipedia ARTICLE, not a corpus chunk (the
   proof `pid` is a per-question id, never a corpus chunk_id), and the released chunk `url` is a
   curid URL while proofs use title-slug URLs — so article identity is the normalized Wikipedia
   TITLE. gold_docs are normalized article titles; recall = fraction of gold articles whose chunks
-  were retrieved (`doc_recall`), collapsing retrieved chunk_ids -> article title via the metadata.
+  were retrieved (`doc_recall`), collapsing retrieved chunk_ids -> article title via the title in
+  the Chroma metadata (a small per-question `.get` on just the retrieved ids).
 Held-out test set: `test_ids_path` if given, else ALL 1000 questions (run with --split test).
 """
 
 from __future__ import annotations
 
 import chromadb
-import glob
 import json
 import os
+from collections import OrderedDict
 from urllib.parse import unquote, urlparse
 
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
@@ -62,6 +66,43 @@ def _article_from_url(url: str) -> str:
     return _norm_title(unquote(url))
 
 
+class _ChromaDocMap:
+    """Lazy `chunk_id -> passage text`, served from the Chroma `documents` column so eval never
+    materializes all ~25.9M chunk texts in RAM (a plain dict would be tens of GB). The row id IS the
+    chunk_id (set at index-build time), and the systems only do keyed lookups (`.get` / `[]` / `in`),
+    never iterate — so this stands in for the dict. A small LRU keeps recently-read chunks hot.
+    Mirrors TREC-BioGen's lazy doc map."""
+
+    def __init__(self, collection, cache_size: int = 4096) -> None:
+        self._collection = collection
+        self._cache: OrderedDict[str, str] = OrderedDict()
+        self._cap = cache_size
+
+    def get(self, chunk_id, default=None):
+        key = str(chunk_id)
+        if key in self._cache:
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        got = self._collection.get(ids=[key], include=["documents"])
+        docs = got.get("documents") or []
+        text = docs[0] if docs and docs[0] else None
+        if text is None:
+            return default
+        self._cache[key] = text
+        if len(self._cache) > self._cap:
+            self._cache.popitem(last=False)
+        return text
+
+    def __getitem__(self, chunk_id):
+        text = self.get(chunk_id)
+        if text is None:
+            raise KeyError(chunk_id)
+        return text
+
+    def __contains__(self, chunk_id) -> bool:
+        return self.get(chunk_id) is not None
+
+
 class QampariBenchmark(Benchmark):
     name = QAMPARI
     config: QampariConfig
@@ -78,14 +119,13 @@ class QampariBenchmark(Benchmark):
     def __init__(self, config: QampariConfig) -> None:
         config.chromadb_dir = str(resolve_under_skunk(config.chromadb_dir))
         config.questions_path = str(resolve_under_skunk(config.questions_path))
-        config.qampari_metadata_glob = str(resolve_under_skunk(config.qampari_metadata_glob))
         if config.test_ids_path:
             config.test_ids_path = str(resolve_under_skunk(config.test_ids_path))
         if config.prompts_path:
             config.prompts_path = str(resolve_under_skunk(config.prompts_path))
-        # chunk_id -> normalized article title, built from the embedding metadata in _build_resources;
-        # used by recall_metrics to collapse retrieved chunk_ids to Wikipedia articles.
-        self._chunk_to_article: dict[str, str] = {}
+        # the chroma collection, set in _build_resources; recall_metrics reads the `title` metadata of
+        # the retrieved chunk_ids from it to collapse them to Wikipedia articles.
+        self._collection = None
         super().__init__(config)
 
     # ---- questions ------------------------------------------------------------
@@ -137,27 +177,6 @@ class QampariBenchmark(Benchmark):
 
     # ---- retrieval substrate --------------------------------------------------
 
-    def _build_document_map(self) -> dict[str, str]:
-        """chunk_id -> passage text, reconstructed from the embedding-job metadata
-        (metadata_rank*.json: chunk_id -> {cleaned, title, page_id, url, element_id}). Side effect:
-        populates `self._chunk_to_article` (chunk_id -> normalized article title) for doc-recall."""
-        paths = sorted(glob.glob(self.config.qampari_metadata_glob))
-        if not paths:
-            raise FileNotFoundError(
-                f"no QAMPARI element metadata found at {self.config.qampari_metadata_glob}; "
-                f"expected metadata_rank*.json produced by compute_qampari_embeddings.py."
-            )
-        document_map: dict[str, str] = {}
-        chunk_to_article: dict[str, str] = {}
-        for p in paths:
-            with open(p) as f:
-                meta = json.load(f)
-            for chunk_id, entry in meta.items():
-                document_map[str(chunk_id)] = entry.get("cleaned", "")
-                chunk_to_article[str(chunk_id)] = _norm_title(entry.get("title", ""))
-        self._chunk_to_article = chunk_to_article
-        return document_map
-
     def _build_resources(self) -> BenchmarkResources:
         if not os.path.exists(self.config.chromadb_dir):
             raise FileNotFoundError(f"chromadb_dir {self.config.chromadb_dir} does not exist")
@@ -170,9 +189,13 @@ class QampariBenchmark(Benchmark):
                 f"chroma collection {self.config.chromadb_collection!r} not found under {self.config.chromadb_dir}."
             ) from e
 
+        self._collection = collection
+        # ~25.9M chunks is far too much for an in-RAM {chunk_id: text} dict, so serve the passage text
+        # lazily + cached from the chroma `documents` column (only the chunks a question actually reads
+        # get materialized). The systems only do keyed lookups, so the lazy mapping is a drop-in.
         return BenchmarkResources(
             chroma_collection=collection,
-            document_map=self._build_document_map(),
+            document_map=_ChromaDocMap(collection),
             config=self.config,
         )
 
@@ -190,9 +213,20 @@ class QampariBenchmark(Benchmark):
         )
 
     def recall_metrics(self, retrieved: list[str] | None, question: Question) -> dict[str, float]:
-        # Relevance is labeled at the Wikipedia-article level (a proof cites a supporting article),
-        # so collapse retrieved chunk_ids to their article title and report article-level doc_recall.
-        ret_articles = None if retrieved is None else [self._chunk_to_article.get(c, c) for c in retrieved]
+        # Relevance is labeled at the Wikipedia-article level (a proof cites a supporting article), so
+        # collapse retrieved chunk_ids to their article title and report article-level doc_recall. The
+        # title lives in each chunk's chroma metadata, so look up just the retrieved ids (one .get).
+        if retrieved is None:
+            ret_articles: list[str] | None = None
+        elif not retrieved:
+            ret_articles = []
+        else:
+            got = self._collection.get(ids=list(retrieved), include=["metadatas"])
+            id_to_title = {
+                str(cid): _norm_title((meta or {}).get("title", ""))
+                for cid, meta in zip(got.get("ids") or [], got.get("metadatas") or [])
+            }
+            ret_articles = [id_to_title.get(str(c), "") for c in retrieved]
         return {"doc_recall": doc_recall(ret_articles, question.gold_docs)}
 
     def test_qids(self) -> set[str]:

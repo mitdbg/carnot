@@ -105,12 +105,10 @@ class QampariConfig(BenchmarkConfig):
     # is (qid, question_text, answer_list[]) where every answer carries `answer_text`, `aliases`, and
     # `proof[]` (each proof has `found_in_url` = the supporting Wikipedia article).
     questions_path: str
-    # glob for the embedding-job metadata files (metadata_rank*.json: chunk_id -> {cleaned, title,
-    # page_id, url, element_id}), used to rebuild the passage-text doc map + the chunk->article map
-    # that collapses retrieved chunk_ids to Wikipedia articles for doc-recall.
-    qampari_metadata_glob: str
     # the llm used by the nugget-completion judge (each gold answer entity is one nugget; the answer
-    # is graded by entity recall, mirroring KARL's nugget-based completion for QAMPARI).
+    # is graded by entity recall, mirroring KARL's nugget-based completion for QAMPARI). The passage
+    # text + article title are served from the Chroma collection at eval time (the full ~25.9M-chunk
+    # corpus is too large for an in-RAM doc map), so no metadata-glob config is needed.
     judge_model: str
     # optional JSON of held-out test qids ({"query_ids": [...]}); null => ALL 1000 questions are the
     # (held-out) test set, so the benchmark is run with experiments.split=test (the whole set = the comparison).

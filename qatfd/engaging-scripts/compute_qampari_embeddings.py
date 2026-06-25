@@ -1,13 +1,16 @@
-"""Compute embeddings for the (filtered) QAMPARI Wikipedia corpus with Qwen3-Embedding-0.6B.
+"""Compute embeddings for the FULL QAMPARI Wikipedia corpus with Qwen3-Embedding-0.6B.
 
-Input is the corpus produced by `preprocess_qampari_corpus.py` — `qampari_chunks_*.jsonl`, one JSON
-chunk per line in QAMPARI's released schema:
+Input is QAMPARI's released chunked Wikipedia DIRECTLY — `wikipedia_chunks/chunks_v5/
+wikipedia_chunks_*.jsonl`, ~25.9M ~100-word passages, one JSON chunk per line:
     {"id": "<page_id>__<n>", "contents": "<title> <body>",
      "meta": {"revid","url","title","file_path","page_id","content","chunk_id"}}
-KARL's QAMPARI corpus is ~256,680 such chunks. Each chunk is already ~100 tokens, so — like the
-TREC-BioGen abstracts — it is embedded as a SINGLE element (no segmentation); the rare over-context
-chunk is split and its chunk embeddings averaged + renormalized. We embed `contents` (title + body),
-matching QAMPARI's BM25/DPR index field.
+We embed EVERY chunk (no filtering): KARL's "chunks containing a gold answer entity" subset can't be
+reliably reproduced (the answer entities are common strings that match most of Wikipedia, and the
+entity-LINK annotations that would scope it aren't in the chunk metadata), so — like TREC-BioGen's
+26.8M abstracts — we index the whole corpus and let retrieval do the work. Each chunk is already
+~100 words, so it is embedded as a SINGLE element (no segmentation); the rare over-context chunk is
+split and its chunk embeddings averaged + renormalized. We embed `contents` (title + body), matching
+QAMPARI's BM25/DPR index field.
 
 The chunk's own id ("<page_id>__<n>") is the unique_element_id (= the ChromaDB row id / chunk_id).
 Per-element metadata carries `cleaned` (the embedded text), `title`, `page_id`, and `url`, so
@@ -22,9 +25,9 @@ GPU box needs ~zero local disk; pull the output to a machine with disk to build 
 
 Usage (see run_qampari_embeddings.slurm):
     python compute_qampari_embeddings.py \
-        --collection_dir <skunk>/qampari/qampari-corpus \
+        --collection_dir <skunk>/qampari/wikipedia_chunks/chunks_v5 \
         --output_dir     <skunk>/qampari/qampari-element-embeddings \
-        --n_partitions   200
+        --n_partitions   2000
 """
 
 import argparse
@@ -304,12 +307,12 @@ def load_shard(collection: str, rank: int, world_size: int, log_prefix: str) -> 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Compute Qwen3-0.6B embeddings for the QAMPARI corpus.")
     parser.add_argument("--collection_dir", required=True,
-                        help="local dir OR s3:// prefix of qampari_chunks_*.jsonl (from preprocess_qampari_corpus.py)")
+                        help="local dir OR s3:// prefix of QAMPARI's wikipedia_chunks_*.jsonl (chunks_v5)")
     parser.add_argument("--output_dir", required=True,
                         help="local dir OR s3:// prefix for embeddings_{rank}_{p}.npz + metadata_rank{rank}.json")
     parser.add_argument("--rank", type=int, default=int(os.environ.get("SLURM_PROCID", 0)))
     parser.add_argument("--world_size", type=int, default=int(os.environ.get("SLURM_NTASKS", 1)))
-    parser.add_argument("--n_partitions", type=int, default=200,
+    parser.add_argument("--n_partitions", type=int, default=2000,
                         help="total partition files across all ranks (each rank writes ~n/world_size).")
     args = parser.parse_args()
 
