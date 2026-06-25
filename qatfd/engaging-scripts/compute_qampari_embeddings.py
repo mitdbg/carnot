@@ -269,6 +269,13 @@ def _chunk_text(rec: dict) -> str:
     return f"{meta.get('title', '')} {meta.get('content', '')}".strip()
 
 
+def _element_id(chunk_id: str) -> int:
+    """Element (chunk) index within its page — the trailing field of the chunk id
+    "{page_id}__{elt_id}" (page_id is a numeric Wikipedia id, so it never contains "__")."""
+    tail = chunk_id.rsplit("__", 1)[-1]
+    return int(tail) if tail.isdigit() else 0
+
+
 def load_shard(collection: str, rank: int, world_size: int, log_prefix: str) -> tuple[list[str], list[str], dict[str, dict]]:
     """Read this rank's round-robin slice of `*.jsonl` files. Returns (chunk_ids, texts, meta_by_id),
     where meta_by_id maps chunk_id -> per-element metadata for create_vector_db's qampari adapter."""
@@ -297,7 +304,7 @@ def load_shard(collection: str, rank: int, world_size: int, log_prefix: str) -> 
                 "title": str(meta.get("title", "")),
                 "page_id": str(meta.get("page_id", "")),
                 "url": str(meta.get("url", "")),
-                "element_id": 0,
+                "element_id": _element_id(cid),
             }
         if fi % 20 == 0:
             print(f"{log_prefix}  read {fi + 1}/{len(my_files)} files, {len(chunk_ids)} chunks...", flush=True)

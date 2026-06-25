@@ -31,6 +31,7 @@ from collections.abc import Callable
 
 import chromadb
 import numpy as np
+from tqdm import tqdm
 
 CHROMA_MAX_BATCH_SIZE = 5461
 
@@ -155,6 +156,19 @@ def _rank_metadata_shards(embeddings_dir: str) -> dict[int, str] | None:
     return shards or None
 
 
+def _manifest_path(chroma_path: str, collection_name: str) -> str:
+    """Sidecar listing the .npz partitions already added to this collection, so a killed build can
+    resume and skip them. Lives under the chroma dir, so deleting the DB also resets the manifest."""
+    return os.path.join(chroma_path, f".{collection_name}.built_npz.txt")
+
+
+def _load_manifest(manifest_path: str) -> set[str]:
+    if not os.path.exists(manifest_path):
+        return set()
+    with open(manifest_path) as f:
+        return {line.strip() for line in f if line.strip()}
+
+
 def _add_partition(
     collection: chromadb.Collection,
     npz_path: str,
@@ -192,7 +206,10 @@ def _add_partition(
             for j in range(len(batch_embeddings))
         ]
 
-        collection.add(
+        # upsert (not add) so resuming a partition that was interrupted mid-way — some of its
+        # sub-batches already in the collection — overwrites idempotently instead of raising on
+        # duplicate ids. Fully-added partitions are skipped earlier via the build manifest.
+        collection.upsert(
             ids=batch_chunk_ids,
             embeddings=batch_embeddings.tolist(),
             documents=batch_documents,
@@ -222,6 +239,23 @@ if __name__ == "__main__":
     npz_files = sorted(f for f in os.listdir(args.embeddings_dir) if f.startswith("embeddings") and f.endswith(".npz"))
     shards = _rank_metadata_shards(args.embeddings_dir)
 
+    # Resume support: skip .npz partitions already recorded in the manifest, and append each one as
+    # it finishes (flushed immediately) so a killed run picks up exactly where it left off.
+    manifest_path = _manifest_path(args.chroma_path, args.collection_name)
+    built = _load_manifest(manifest_path)
+    todo = [f for f in npz_files if f not in built]
+    if built:
+        print(f"Resuming: {len(built)}/{len(npz_files)} partitions already added; {len(todo)} remaining.")
+
+    manifest = open(manifest_path, "a")
+    pbar = tqdm(total=len(todo), unit="part", desc="Adding partitions", smoothing=0.05)
+
+    def _add_and_record(file: str, metadata: dict[str, dict]) -> None:
+        _add_partition(collection, os.path.join(args.embeddings_dir, file), metadata, adapter)
+        manifest.write(file + "\n")
+        manifest.flush()
+        pbar.update(1)
+
     if shards is not None:
         # Rank-sharded metadata (e.g. biogen): process one rank at a time so only a single shard's
         # metadata is resident. Each `embeddings_{r}_*.npz` references only rank r's ids.
@@ -232,16 +266,21 @@ if __name__ == "__main__":
                 raise ValueError(f"rank-sharded metadata present but {file!r} lacks an embeddings_{{rank}}_ prefix")
             npz_by_rank.setdefault(int(m.group(1)), []).append(file)
         for rank in sorted(shards):
-            print(f"Loading metadata shard for rank {rank} ({shards[rank]})...")
+            rank_todo = [f for f in sorted(npz_by_rank.get(rank, [])) if f not in built]
+            if not rank_todo:
+                continue  # whole rank already added; skip loading its (multi-GB) metadata shard
+            pbar.set_description(f"rank {rank} (loading metadata)")
             with open(os.path.join(args.embeddings_dir, shards[rank])) as f:
                 metadata = json.load(f)
-            for file in sorted(npz_by_rank.get(rank, [])):
-                print(f"Processing file {file}...")
-                _add_partition(collection, os.path.join(args.embeddings_dir, file), metadata, adapter)
+            pbar.set_description(f"rank {rank}")
+            for file in rank_todo:
+                _add_and_record(file, metadata)
             del metadata
     else:
-        # Single metadata.json (smaller corpora): load once, add every partition.
+        # Single metadata.json (smaller corpora): load once, add every remaining partition.
         metadata = _load_metadata(args.embeddings_dir)
-        for file in npz_files:
-            print(f"Processing file {file}...")
-            _add_partition(collection, os.path.join(args.embeddings_dir, file), metadata, adapter)
+        for file in todo:
+            _add_and_record(file, metadata)
+
+    pbar.close()
+    manifest.close()
