@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # ── SLURM Job Flags ──
-#SBATCH --job-name=qwen3-qampari-embed
+# QAMPARI **TEST** corpus embeddings (the 1000-question KARL comparison set).
+#SBATCH --job-name=qwen3-qampari-embed-test
 #SBATCH -p mit_preemptable
 #SBATCH --ntasks=4
 #SBATCH --gpus-per-task=1
@@ -9,8 +10,8 @@
 #SBATCH --mem-per-cpu=6G
 #SBATCH -t 6:00:00
 #SBATCH --exclude=node2901
-#SBATCH -o logs/qampari_embed_%j.out
-#SBATCH -e logs/qampari_embed_%j.err
+#SBATCH -o logs/qampari_embed_test_%j.out
+#SBATCH -e logs/qampari_embed_test_%j.err
 
 # ~256,680 chunks with Qwen3-0.6B (fits on ANY GPU >=4GB). The 4 ranks are independent — each
 # streams its file-shard to/from S3 — so they SPREAD across free GPUs cluster-wide. RESUMABLE
@@ -42,7 +43,7 @@ pip install --quiet boto3
 export AWS_PROFILE=mit
 # export AWS_DEFAULT_REGION=us-east-1   # only if the `mit` profile doesn't already set a region
 
-# ── Paths: stream the filtered corpus in / embeddings out via S3, so the cluster needs ~zero disk ──
+# ── Paths (TEST): stream the filtered corpus in / embeddings out via S3, so the cluster needs ~zero disk ──
 COLLECTION_DIR=s3://carnot-research/qampari/qampari-corpus
 OUTPUT_DIR=s3://carnot-research/qampari/qampari-element-embeddings
 
@@ -54,7 +55,7 @@ srun python compute_qampari_embeddings.py \
 
 echo "End: $(date)"
 
-# ── Then, on a machine WITH disk, build the Chroma index from the S3 output ──
+# ── Then, on a machine WITH disk, build the TEST Chroma collection from the S3 output ──
 # 1. pull the embeddings + metadata:
 #      aws s3 sync s3://carnot-research/qampari/qampari-element-embeddings ./qampari-element-embeddings
 # 2. build the collection:

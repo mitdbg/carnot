@@ -1,18 +1,19 @@
 #!/bin/bash
 
 # ── SLURM Job Flags ──
+# QAMPARI **TEST** corpus filter (the 1000-question KARL comparison set; test_data.jsonl).
 # CPU-ONLY job: filter QAMPARI's chunked Wikipedia (~21M chunks) down to the ~256,680 chunks that
 # mention a gold answer entity. Fans the chunk files across a process pool (one per allocated core).
 # Streams in/out of S3, so it needs ~zero local disk. RESUMABLE (an input file whose output already
 # exists is skipped) -> on a preemptable partition just resubmit until done.
-#SBATCH --job-name=qampari-filter
+#SBATCH --job-name=qampari-filter-test
 #SBATCH -p mit_preemptable
 #SBATCH --ntasks=1
 #SBATCH -c 32
 #SBATCH --mem=48G
 #SBATCH -t 8:00:00
-#SBATCH -o logs/qampari_filter_%j.out
-#SBATCH -e logs/qampari_filter_%j.err
+#SBATCH -o logs/qampari_filter_test_%j.out
+#SBATCH -e logs/qampari_filter_test_%j.err
 
 mkdir -p logs
 
@@ -36,11 +37,11 @@ pip install --quiet flashtext boto3
 export AWS_PROFILE=mit
 # export AWS_DEFAULT_REGION=us-east-1   # only if the profile doesn't already set a region
 
-# ── Paths ──
+# ── Paths (TEST) ──
 # CHUNKS_DIR: QAMPARI's released chunked Wikipedia, the `wikipedia_chunks/chunks_v5` dir of
 #   wikipedia_chunks_*.jsonl (download chunked_wikipedia.tar.gz, untar, upload once to S3).
 # QUESTIONS:  the QAMPARI test_data.jsonl (gold entities source).
-# OUTPUT_DIR: the filtered corpus (qampari_chunks_*.jsonl), consumed by the embedding job.
+# OUTPUT_DIR: the filtered TEST corpus (qampari_chunks_*.jsonl), consumed by the embedding job.
 CHUNKS_DIR=s3://carnot-research/qampari/wikipedia_chunks/chunks_v5
 QUESTIONS=s3://carnot-research/qampari/test_data.jsonl
 OUTPUT_DIR=s3://carnot-research/qampari/qampari-corpus
@@ -55,5 +56,5 @@ srun python preprocess_qampari_corpus.py \
 
 echo "End: $(date)"
 
-# ── Next: EMBED (GPU) reads the filtered corpus (run_qampari_embeddings.slurm), then create_vector_db
-#    on a box with disk (--benchmark qampari). See configs/benchmarks/qampari.yaml for the full recipe. ──
+# ── Next: EMBED (GPU) reads the filtered TEST corpus (run_qampari_embeddings_test.slurm), then
+#    create_vector_db on a box with disk (--benchmark qampari). See configs/benchmarks/qampari.yaml. ──
