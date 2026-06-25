@@ -6,20 +6,24 @@
 # like TREC-BioGen), so there is a single embedding job + a single Chroma collection.
 #SBATCH --job-name=qwen3-qampari-embed
 #SBATCH -p mit_preemptable
-#SBATCH --ntasks=4
-#SBATCH --gpus-per-task=1
+#SBATCH --ntasks=8
+#SBATCH --gpus-per-task=a100:1
 #SBATCH -c 8
 #SBATCH --mem-per-cpu=6G
-#SBATCH -t 12:00:00
-#SBATCH --exclude=node2901
+#SBATCH -t 6:00:00
 #SBATCH -o logs/qampari_embed_%j.out
 #SBATCH -e logs/qampari_embed_%j.err
 
-# ~25.9M chunks with Qwen3-0.6B (fits on ANY GPU >=4GB, so --gpus-per-task=1 takes whatever's free).
-# Same scale as TREC-BioGen's 26.8M abstracts. The 4 ranks are independent — each streams its
-# file-shard to/from S3 — so they SPREAD across free GPUs cluster-wide. RESUMABLE (finished partition
-# .npz are skipped) -> on mit_preemptable just resubmit until done. Keep --ntasks=4 fixed across
-# resubmits (the file-shard/resume keys on it); to pin a GPU type, use e.g. --gpus-per-task=l40s:1.
+# ~25.9M chunks with Qwen3-0.6B (fits on any GPU >=4GB; the model is tiny, so embedding is the work).
+# Same scale as TREC-BioGen's 26.8M abstracts. The 8 ranks are independent — each streams its
+# file-shard to/from S3 — so SLURM spreads them across free a100s cluster-wide. We PIN a100 via gres
+# (mit_preemptable has plenty of free a100, and it avoids the Blackwell sm_120 nodes — e.g.
+# rtx_pro_6000 — whose kernels the officeqa env's torch can't run; cf. financebench commit e56f451).
+# RESUMABLE (finished partition .npz are skipped) -> on mit_preemptable just resubmit until done.
+# Keep --ntasks=8 fixed across resubmits (the file-shard + the embeddings_{rank}_{p}.npz resume key on
+# it); changing it re-shards and orphans partial output. To go faster, raise --ntasks (one gang
+# allocation, so all N a100s must free together — 16 schedules but may queue a little longer); to use
+# a different card with more idle capacity, switch the gres type, e.g. --gpus-per-task=l40s:1.
 
 mkdir -p logs
 
