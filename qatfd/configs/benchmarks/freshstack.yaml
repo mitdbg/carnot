@@ -1,0 +1,50 @@
+# FreshStack benchmark (the KARLBench sub-benchmark; procedural reasoning over recent technical docs).
+#
+# Each FreshStack TOPIC is a separate corpus, so each topic has its own Chroma collection. `topic` is
+# the single knob — it derives the data paths + collection name (override nothing else to switch sets):
+#   - test = `langchain` (KARL's FreshStack): 203 questions / 49,514 docs  -> qwen-freshstack-langchain-0.6b
+#   - dev  = `laravel`   (closest-sized set): 184 questions / 52,351 docs  -> qwen-freshstack-laravel-0.6b
+# Both are embedded with Qwen3-Embedding-0.6B (1024-dim); KARL retrieves FreshStack with Qwen3-0.6B at
+# k=10 (for the rag_llm system set `systems.top_k=10`; the search_agent controls its own retrieval
+# breadth per tool call). Scoring = nugget-completion recall.
+#
+# Build a topic's index offline (run once per topic):
+#   1. download the topic's corpus + queries from HuggingFace to skunk/freshstack/{topic}/ :
+#        python engaging-scripts/download_freshstack.py --topics langchain laravel --out_dir <skunk>/freshstack
+#      (corpus.jsonl = {_id, text, metadata}; queries.jsonl = {query_id, query_title, query_text, nuggets[]})
+#   2. embed the topic's corpus (GPU):  sbatch engaging-scripts/run_freshstack_embeddings.slurm langchain
+#   3. build the Chroma collection:
+#        python -m skunk.search_agent.prep.create_vector_db \
+#          --embeddings-dir <skunk>/freshstack/langchain/embeddings \
+#          --collection-name qwen-freshstack-langchain-0.6b --chroma-path <skunk>/.chromadb --benchmark freshstack
+#
+# Runs MUST embed the query with the SAME 0.6B model, e.g.:
+#   # TEST (the 203-question KARL set):
+#   python3 -m qatfd.runner benchmarks=freshstack systems=search_agent experiments.split=test \
+#       systems.emb_model_id=qwen/qwen3-embedding-0.6b benchmarks.judge_model=<judge-model>
+#   # DEV (iterate here; switch the whole topic with one override):
+#   python3 -m qatfd.runner benchmarks=freshstack benchmarks.topic=laravel systems=search_agent \
+#       experiments.split=test systems.emb_model_id=qwen/qwen3-embedding-0.6b benchmarks.judge_model=<judge-model>
+#   # (rag_llm baseline: add systems=rag_llm systems.top_k=10 to match KARL's k=10)
+#   # (local backend: systems.emb_provider=local systems.emb_model_id=Qwen/Qwen3-Embedding-0.6B)
+defaults:
+  - base
+  - _self_
+
+name: freshstack
+# the FreshStack topic to run; derives questions_path / corpus_path / chromadb_collection below.
+# test = langchain; override `benchmarks.topic=laravel` for the dev set.
+topic: langchain
+# base dir under skunk/ holding each topic's data at {data_dir}/{topic}/{corpus,queries}.jsonl
+data_dir: freshstack
+# null => derived from topic: {data_dir}/{topic}/{queries,corpus}.jsonl and qwen-freshstack-{topic}-0.6b
+questions_path: null
+corpus_path: null
+chromadb_collection: null
+# null => all of the topic's questions are the held-out test split (run with experiments.split=test)
+test_ids_path: null
+# weight for a partially-supported nugget in the recall score
+partial_credit: 0.0
+# llm used by the nugget-completion judge (set on the CLI, e.g. google/gemini-2.5-flash)
+judge_model: null
+prompts_path: null

@@ -11,6 +11,7 @@
 #SBATCH -c 8
 #SBATCH --mem-per-cpu=6G
 #SBATCH -t 8:00:00
+#SBATCH --requeue
 #SBATCH -o logs/qampari_embed_%j.out
 #SBATCH -e logs/qampari_embed_%j.err
 
@@ -25,6 +26,17 @@
 # done. Keep --ntasks=4 fixed across resubmits (the file-shard + the embeddings_{rank}_{p}.npz resume
 # key on it); changing it re-shards and orphans partial output. If your QOS gpu cap is >4, you may
 # raise --ntasks to it; to use a card with more idle capacity instead, switch gres, e.g. l40s:1.
+#
+# SURVIVING PREEMPTION: `--requeue` (above) puts the job back in the queue if preempted (when the
+# partition's PreemptMode=REQUEUE; check `scontrol show partition mit_preemptable | grep -i preempt`).
+# Since the job is resumable, a requeue/restart just skips finished partitions. For preempt modes that
+# CANCEL (or to also survive hitting the 8h wall), submit a DEPENDENCY CHAIN — each link resumes, and
+# once everything's embedded the remaining links no-op in seconds:
+#   # simplest (serialize all same-name jobs for this user):
+#   for i in $(seq 1 6); do sbatch --dependency=singleton run_qampari_embeddings.slurm; done
+#   # or an explicit afterany chain (next starts after prev ends in ANY state):
+#   JOB=$(sbatch --parsable run_qampari_embeddings.slurm)
+#   for i in $(seq 1 5); do JOB=$(sbatch --parsable --dependency=afterany:$JOB run_qampari_embeddings.slurm); done
 
 mkdir -p logs
 

@@ -6,7 +6,7 @@ import yaml
 from dataclasses import dataclass
 from typing import cast, Literal
 from omegaconf import DictConfig, OmegaConf
-from qatfd.constants import BROWSECOMP_PLUS, FINANCE_BENCH, OFFICE_QA, QAMPARI, TREC_BIOGEN
+from qatfd.constants import BROWSECOMP_PLUS, FINANCE_BENCH, FRESHSTACK, OFFICE_QA, QAMPARI, TREC_BIOGEN
 from skunk.config import QATFDSearchAgentConfig, RAGLLMConfig, SearchAgentConfig, SystemConfig
 
 # ---------------------------------------------------------------------------
@@ -130,6 +130,33 @@ class FinanceBenchConfig(BenchmarkConfig):
     # (held-out) test set, so the benchmark is run with experiments.split=test (the whole set = the comparison).
     test_ids_path: str | None = None
 
+@dataclass
+class FreshstackConfig(BenchmarkConfig):
+    # the llm used by the nugget-completion judge (each gold nugget is one GPT-4o decompositional
+    # fact; the answer is graded by nugget recall, mirroring KARL's nugget-based completion).
+    judge_model: str
+    # FreshStack topic = which (corpus, queries) pair to run. Each topic has its OWN corpus and so
+    # its OWN Chroma collection (unlike QAMPARI's shared index): `langchain` is KARL's FreshStack and
+    # the held-out TEST set (203 q / 49,514 docs); `laravel` is the closest-sized DEV set (184 q /
+    # 52,351 docs). To run dev, override `benchmarks.topic=laravel` — it re-derives the data paths and
+    # collection below. (Others: angular, godot, yolo.)
+    topic: str = "langchain"
+    # base dir under skunk/ holding each topic's data at `{data_dir}/{topic}/{corpus,queries}.jsonl`.
+    data_dir: str = "freshstack"
+    # FreshStack queries JSONL; null => derived from topic as `{data_dir}/{topic}/queries.jsonl`. Each
+    # record is (query_id, query_title, query_text, nuggets[]) where every nugget carries `text`
+    # (a decompositional fact) and `relevant_corpus_ids` (the supporting corpus doc ids).
+    questions_path: str | None = None
+    # FreshStack corpus JSONL; null => derived from topic as `{data_dir}/{topic}/corpus.jsonl`. Each
+    # record is (_id, text, metadata); read directly into the doc map (_id -> text) — the corpus is
+    # small enough to hold in RAM and the file is the source of truth for the embedded text.
+    corpus_path: str | None = None
+    # optional JSON of held-out test qids ({"query_ids": [...]}); null => ALL of the topic's questions
+    # are the (held-out) test set, so the benchmark is run with experiments.split=test.
+    test_ids_path: str | None = None
+    # weight given to a `partial_support` nugget in the recall score (full support = 1.0).
+    partial_credit: float = 0.0
+
 # ---------------------------------------------------------------------------
 # configuration factories
 # ---------------------------------------------------------------------------
@@ -146,6 +173,8 @@ def benchmark_config_factory(cfg: DictConfig) -> BenchmarkConfig:
         return FinanceBenchConfig(**bench_cfg)
     elif bench_cfg["name"] == QAMPARI:
         return QampariConfig(**bench_cfg)
+    elif bench_cfg["name"] == FRESHSTACK:
+        return FreshstackConfig(**bench_cfg)
     else:
         raise ValueError(f"unknown benchmark {bench_cfg['name']!r}")
 

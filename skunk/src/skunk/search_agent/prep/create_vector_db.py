@@ -118,12 +118,32 @@ def _qampari_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
     )
 
 
+def _freshstack_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
+    """Adapter for `compute_freshstack_embeddings.py` outputs (one element per corpus document).
+
+    The corpus `_id` (e.g. "azure-openai/LICENSE.md_0_1140") is the doc_id, so retrieved doc_ids line
+    up directly with the FreshStack benchmark's gold (a nugget's relevant_corpus_ids are corpus `_id`s);
+    `file_id` is the source file the chunk belongs to (the `_id` minus its byte-range suffix), surfaced
+    for file-level grouping/recall; `url` is the GitHub source carried through for reference.
+    """
+    return (
+        elt_metadata["doc_id"],
+        elt_metadata["cleaned"],
+        {
+            "file_id": elt_metadata.get("file_id", ""),
+            "url": elt_metadata.get("url", ""),
+            "element_id": elt_metadata.get("element_id", 0),
+        },
+    )
+
+
 _BENCHMARK_ADAPTERS: dict[str, ElementAdapter] = {
     "officeqa": _officeqa_adapter,
     "browsecomp_plus": _browsecomp_plus_adapter,
     "trec_biogen": _biogen_adapter,
     "finance_bench": _financebench_adapter,
     "qampari": _qampari_adapter,
+    "freshstack": _freshstack_adapter,
 }
 
 
@@ -211,7 +231,7 @@ def _add_partition(
         # duplicate ids. Fully-added partitions are skipped earlier via the build manifest.
         collection.upsert(
             ids=batch_chunk_ids,
-            embeddings=batch_embeddings.tolist(),
+            embeddings=batch_embeddings,  # ndarray directly; avoids a 5461×1024 list conversion
             documents=batch_documents,
             metadatas=metadata_list,  # type: ignore
         )
@@ -233,7 +253,14 @@ if __name__ == "__main__":
 
     # create the chroma client and collection
     client = chromadb.PersistentClient(path=args.chroma_path)
-    collection = client.get_or_create_collection(name=args.collection_name)
+    # hnsw:num_threads parallelizes index insertion (the dominant build cost) across all cores.
+    # NOTE: HNSW params are baked at collection-creation, so this only takes effect on a *fresh*
+    # collection — delete the chroma dir to re-create with it. (If your chromadb version rejects
+    # the `hnsw:` metadata key, the configuration= form is the alternative.)
+    collection = client.get_or_create_collection(
+        name=args.collection_name,
+        metadata={"hnsw:num_threads": os.cpu_count() or 8},
+    )
     print(f"Writing to collection {args.collection_name!r} at {args.chroma_path} (benchmark={args.benchmark}).")
 
     npz_files = sorted(f for f in os.listdir(args.embeddings_dir) if f.startswith("embeddings") and f.endswith(".npz"))
