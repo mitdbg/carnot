@@ -222,6 +222,5 @@ class QuestionExplainer:
     )
 
     async def run(self, ctx: ExecutionContext, *, question: str) -> list[ConceptExplanation]:
-        if ctx.config.compute_precomputed_concept_refs:
-            return list(_ALL_CONCEPTS)
-        return await self._prompt.call(ctx, f"Question:\n{question}", temperature=0.0)
+        # Disabled: always a no-op. No LLM call, no concept references injected.
+        return []

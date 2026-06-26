@@ -292,6 +292,20 @@ overrides:
         ```
 
       - |
+        ### Example (several fiscal years — expand each on its basis, then COALESCE consecutive ranges into one rather than emitting one per FY; non-adjacent groups stay separate)
+        Q: Total budget outlays of the United States in fiscal years 1970, 1971, 1978, and 1979.
+        Plan:
+        ```json
+        {
+          "branches": [
+            {"kind": "retrieve", "key": "total budget outlays",
+             "period": "1969-07..1971-06, 1977-10..1979-09"}
+          ]
+        }
+        ```
+        (FY1970+FY1971 are contiguous on the July basis → 1969-07..1971-06; FY1978+FY1979 contiguous on the October basis → 1977-10..1979-09; the two groups are not adjacent, so they stay as two comma-separated ranges — not four.)
+
+      - |
         ### Example (a needed value looks external (CPI) — still emit a retrieve keyed by the question's wording; if the corpus lacks it, the lookup is injected at replan, never emitted here)
         Q: Real (CPI-adjusted, 2020 dollars) total expenditures of the United States in fiscal year 1953.
         Plan:

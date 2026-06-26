@@ -153,7 +153,7 @@ class SkunkConfig:
     # the model's input ceiling and 400'd it repeatedly). Over-budget hits are dropped with a
     # note telling the agent to narrow its pattern / pass `limit`. Token→char conversion uses
     # ~4 chars/token (see GrepCorpusTool). (env: SKUNK_GREP_MAX_OUTPUT_TOKENS)
-    grep_max_output_tokens: int = 200_000
+    grep_max_output_tokens: int = 20_000
 
     # Hard cap on the rendered size of a single `read_document` observation, in *chars*
     # (`read_document` dumps the full cleaned text of up to `agent_max_pages_per_tool_call`
@@ -363,7 +363,7 @@ class SkunkConfig:
                 os.environ.get("SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL", "20")
             ),
             grep_max_output_tokens=int(
-                os.environ.get("SKUNK_GREP_MAX_OUTPUT_TOKENS", "200000")
+                os.environ.get("SKUNK_GREP_MAX_OUTPUT_TOKENS", "20000")
             ),
             read_document_max_output_chars=int(
                 os.environ.get("SKUNK_READ_DOCUMENT_MAX_OUTPUT_CHARS", "400000")

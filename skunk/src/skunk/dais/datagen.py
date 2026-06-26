@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import glob
 import json
 import math
 import os
@@ -38,6 +39,7 @@ import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
+from itertools import zip_longest
 
 import yaml
 from jinja2 import Template
@@ -59,6 +61,7 @@ from skunk.datagen.rollout import (
     RolloutConfig,
     apply_threshold_and_filter,
     extract_trajectory_chunk_ids,
+    persist_seed_rollouts,
     run_single_rollout,
 )
 
@@ -456,6 +459,161 @@ def _write_outputs(valid_pairs: list[tuple[QAPair, str]], out_dir: str) -> None:
     print(f"Wrote {len(rows)} validated QA pairs to:\n  {csv_path}\n  {json_path}")
 
 
+# --------------------------------------------------------------------------- resume
+def load_deduped_pairs(trace_dir: str, seeds: list[int] | None = None) -> dict[int, dict[str, QAPair]]:
+    """Reconstruct the post-dedup kept pairs from a prior run's trace dir.
+
+    For each seed with BOTH ``{seed}_qa_pairs.json`` (full generated pairs) and
+    ``{seed}_qa_pairs_dedup.json`` (the dedup decision), rebuild the kept ``QAPair``
+    objects by filtering the full pairs to the dedup ``kept_qa_ids``. Lets a killed run
+    resume straight into rollouts without regenerating or re-deduping. Seeds that were
+    generated but never deduped are skipped (no dedup decision to honour).
+    """
+    if seeds is None:
+        seeds = sorted(
+            int(os.path.basename(p).split("_")[0])
+            for p in glob.glob(os.path.join(trace_dir, "*_qa_pairs_dedup.json"))
+        )
+    kept_by_seed: dict[int, dict[str, QAPair]] = {}
+    for seed in seeds:
+        dedup_path = os.path.join(trace_dir, f"{seed}_qa_pairs_dedup.json")
+        pairs_path = os.path.join(trace_dir, f"{seed}_qa_pairs.json")
+        if not (os.path.exists(dedup_path) and os.path.exists(pairs_path)):
+            continue
+        with open(dedup_path) as f:
+            kept_ids = set(json.load(f).get("kept_qa_ids", []))
+        with open(pairs_path) as f:
+            all_pairs = json.load(f)
+        kept = {d["qa_id"]: QAPair(**d) for d in all_pairs if d["qa_id"] in kept_ids}
+        if kept:
+            kept_by_seed[seed] = kept
+    return kept_by_seed
+
+
+# --------------------------------------------------------------------------- ASAP mode
+def run_asap_pipeline(
+    kept_pairs_by_seed: dict[int, dict[str, QAPair]],
+    rollout_cfg,
+    qf_cfg,
+    trace_dir: str,
+    out_dir: str,
+    *,
+    n_rollouts: int,
+    threshold: float,
+    rollout_concurrency: int,
+    qf_parallelism: int,
+    target_passing: int,
+    skip_quality_filter: bool,
+    show_output: bool,
+) -> None:
+    """Emergency ASAP funnel: per-pair, fully pipelined, incremental writes.
+
+    Replaces the barriered phases 2-5. Each pair is independent (no global-mean
+    threshold): a rollout binarizes to 1 iff ``doc_output_recall > threshold``, and a
+    pair is "challenging" iff its scored rollouts DISAGREE (not all 1, not all 0). The
+    moment a pair's rollouts finish it is binarized and (unless ``skip_quality_filter``)
+    handed to the quality filter; every accepted pair is written to the output CSV/JSON
+    immediately, so passing pairs accumulate live and the run can be Ctrl-C'd anytime
+    with a valid partial test set. With ``target_passing > 0`` the run stops early once
+    that many pairs pass.
+    """
+    # Flatten pairs, interleaving across seeds so early results are diverse.
+    per_seed = {s: list(d.values()) for s, d in kept_pairs_by_seed.items()}
+    cols = [[(s, i, p) for i, p in enumerate(ps)] for s, ps in per_seed.items()]
+    flat: list[tuple[int, int, QAPair]] = [
+        item for group in zip_longest(*cols) for item in group if item is not None
+    ]
+    print(f"[asap] {len(flat)} pairs -> rollouts({n_rollouts}/pair, fixed threshold "
+          f"{threshold}) -> {'(QF skipped) ' if skip_quality_filter else 'quality filter -> '}"
+          f"incremental write to {out_dir}"
+          f"{f'; stop after {target_passing} passing' if target_passing else ''}.", flush=True)
+
+    lock = threading.Lock()
+    valid_pairs: list[tuple[QAPair, str]] = []
+    state = {"pairs_done": 0, "challenging": 0, "all_pass": 0, "all_fail": 0,
+             "unscored": 0, "passed": 0, "qf_fail": 0}
+    stop = threading.Event()
+    pair_records: dict[tuple[int, int], list] = {}
+    pair_completions: dict[tuple[int, int], int] = {}
+    qf_pool = ThreadPoolExecutor(max_workers=max(1, qf_parallelism))
+    qf_futs = []
+
+    def _accept(pair: QAPair, reasoning: str) -> None:
+        valid_pairs.append((pair, reasoning))
+        state["passed"] += 1
+        _write_outputs(sorted(valid_pairs, key=lambda pr: pr[0].qa_id), out_dir)
+        print(f"  [asap] ✅ accepted {pair.qa_id} (passed={state['passed']}, "
+              f"pairs_done={state['pairs_done']}/{len(flat)}, challenging={state['challenging']})",
+              flush=True)
+        if target_passing and state["passed"] >= target_passing:
+            stop.set()
+
+    def _judge(seed: int, pair_idx: int, pair: QAPair, recs: list) -> None:
+        if stop.is_set():
+            return
+        persist_seed_rollouts(seed, recs,
+                              os.path.join(trace_dir, f"{seed}_qa{pair_idx}_rollouts.json"))
+        bins = [int(r.doc_output_recall > threshold)
+                for r in recs if r.doc_output_recall is not None]
+        if len(bins) < 2 or all(b == 1 for b in bins) or all(b == 0 for b in bins):
+            with lock:
+                if not bins:
+                    state["unscored"] += 1
+                elif bins and all(b == 1 for b in bins):
+                    state["all_pass"] += 1
+                else:
+                    state["all_fail"] += 1
+            return
+        with lock:
+            state["challenging"] += 1
+        if skip_quality_filter:
+            with lock:
+                _accept(pair, "asap: accepted on rollout disagreement (QF skipped)")
+            return
+        res = run_quality_filter_for_pair(pair, recs, qf_cfg, trace_dir, show_output)
+        with lock:
+            if res.valid:
+                _accept(pair, res.reasoning)
+            else:
+                state["qf_fail"] += 1
+
+    with ThreadPoolExecutor(max_workers=max(1, rollout_concurrency)) as rpool:
+        roll_futs = {}
+        for seed, pair_idx, pair in flat:
+            pair_records[(seed, pair_idx)] = []
+            pair_completions[(seed, pair_idx)] = 0
+            for r in range(n_rollouts):
+                roll_futs[rpool.submit(run_single_rollout, seed, pair_idx, r, pair,
+                                       rollout_cfg, trace_dir, show_output)] = (seed, pair_idx, pair)
+        for fut in as_completed(roll_futs):
+            seed, pair_idx, pair = roll_futs[fut]
+            key = (seed, pair_idx)
+            try:
+                rec = fut.result()
+                pair_records[key].append(rec)
+            except Exception as e:  # noqa: BLE001
+                print(f"  [asap] rollout error ({pair.qa_id}): {e}")
+            with lock:
+                pair_completions[key] += 1
+                complete = pair_completions[key] == n_rollouts
+                if complete:
+                    state["pairs_done"] += 1
+            if complete and not stop.is_set():
+                qf_futs.append(qf_pool.submit(_judge, seed, pair_idx, pair,
+                                              list(pair_records[key])))
+
+    for qf in as_completed(qf_futs):
+        try:
+            qf.result()
+        except Exception as e:  # noqa: BLE001
+            print(f"  [asap] judge error: {e}")
+    qf_pool.shutdown(wait=True)
+    print(f"[asap] DONE. accepted={state['passed']} written to {out_dir} | "
+          f"challenging={state['challenging']} qf_fail={state['qf_fail']} "
+          f"all_pass={state['all_pass']} all_fail={state['all_fail']} "
+          f"unscored={state['unscored']} pairs_done={state['pairs_done']}/{len(flat)}")
+
+
 # --------------------------------------------------------------------------- main
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate a synthetic QA test set for the DAIS corpus.")
@@ -491,6 +649,23 @@ def main() -> None:
     parser.add_argument("--gen-parallelism", type=int, default=8)
     parser.add_argument("--rollout-concurrency", type=int, default=16)
     parser.add_argument("--qf-parallelism", type=int, default=8)
+    parser.add_argument("--resume-from-dedup", action="store_true",
+                        help="Skip phase 1 (generate + dedup); reload the deduped pairs already "
+                             "written under <out-dir>/traces and resume straight into rollouts. "
+                             "Seeds generated but not yet deduped are skipped.")
+    parser.add_argument("--asap", action="store_true",
+                        help="EMERGENCY mode: per-pair pipelined funnel with a FIXED rollout "
+                             "threshold (no global-mean barrier) and incremental writes. Accepted "
+                             "pairs are written the moment they pass, so output accumulates live. "
+                             "Replaces the barriered phases 2-5.")
+    parser.add_argument("--asap-threshold", type=float, default=0.5,
+                        help="ASAP fixed binarization threshold on doc_output_recall (a rollout "
+                             "'passes' iff recall > this). A pair is kept iff its rollouts disagree.")
+    parser.add_argument("--target-passing", type=int, default=0,
+                        help="ASAP: stop once this many pairs have passed (0 = process all).")
+    parser.add_argument("--skip-quality-filter", action="store_true",
+                        help="ASAP: accept any challenging (disagreeing) pair WITHOUT the quality "
+                             "filter — fastest, lower precision.")
     parser.add_argument("--show-output", action="store_true")
     args = parser.parse_args()
 
@@ -503,8 +678,9 @@ def main() -> None:
     # --- shared resources ---
     client = make_chroma_client(host, port)
     collection = client.get_collection(name=args.chroma_collection_name)
-    qa_collection = client.get_or_create_collection(name=args.qa_collection_name)
-    or_client = OpenRouter(api_key=os.environ["OPENROUTER_API_KEY"])
+    if not args.resume_from_dedup:  # dedup-only resources; rollouts/QF don't need them
+        qa_collection = client.get_or_create_collection(name=args.qa_collection_name)
+        or_client = OpenRouter(api_key=os.environ["OPENROUTER_API_KEY"])
 
     print("Loading corpus maps...")
     document_map = load_document_map(args.clean_page_map)
@@ -514,13 +690,14 @@ def main() -> None:
     special_notes = DAIS_CORPUS_NOTES
     print(f"  {len(document_map)} docs, {len(chunk_id_to_doc_id)} chunks, {len(examples_pool)} few-shot examples.")
 
-    dedup_cfg = DedupConfig(
-        qa_collection=qa_collection,
-        emb_model_id=args.emb_model_id,
-        or_client=or_client,
-        judge_model_id=args.dedup_judge_model_id,
-        judge_prompt_template=DEDUP_JUDGE_PROMPT,
-    )
+    if not args.resume_from_dedup:
+        dedup_cfg = DedupConfig(
+            qa_collection=qa_collection,
+            emb_model_id=args.emb_model_id,
+            or_client=or_client,
+            judge_model_id=args.dedup_judge_model_id,
+            judge_prompt_template=DEDUP_JUDGE_PROMPT,
+        )
     rollout_cfg = RolloutConfig(
         model_id=args.rollout_model_id,
         emb_model_id=args.emb_model_id,
@@ -553,33 +730,54 @@ def main() -> None:
         page_renders_dir=args.page_renders_dir,
     )
 
-    seeds = list(range(args.start_seed, args.start_seed + args.num_new_seeds))
+    if args.resume_from_dedup:
+        # --- resume: reload deduped pairs from a prior run, skip phase 1 entirely ---
+        kept_pairs_by_seed = load_deduped_pairs(trace_dir)
+        seeds = sorted(kept_pairs_by_seed)
+        if not kept_pairs_by_seed:
+            raise SystemExit(f"--resume-from-dedup: no deduped pairs found under {trace_dir}.")
+        n_kept = sum(len(d) for d in kept_pairs_by_seed.values())
+        print(f"Resuming from dedup: {n_kept} kept pairs across {len(seeds)} seeds "
+              f"(skipped phase 1: generate + dedup).")
+    else:
+        seeds = list(range(args.start_seed, args.start_seed + args.num_new_seeds))
 
-    # --- phase 1: generate + dedup (parallel across seeds; dedup serialized) ---
-    print(f"Phase 1: generate + dedup over {len(seeds)} seeds...")
-    dedup_lock = threading.Lock()
-    kept_pairs_by_seed: dict[int, dict[str, QAPair]] = {}
+        # --- phase 1: generate + dedup (parallel across seeds; dedup serialized) ---
+        print(f"Phase 1: generate + dedup over {len(seeds)} seeds...")
+        dedup_lock = threading.Lock()
+        kept_pairs_by_seed: dict[int, dict[str, QAPair]] = {}
 
-    def _gen_and_dedup(seed: int):
-        pairs = generate_one(
-            seed, args.gen_model_id, args.provider, examples_pool, document_map, collection,
-            chunk_id_to_doc_id, args.emb_model_id, trace_dir, special_notes,
-            DAIS_DATAGEN_GUIDANCE, args.n_examples, args.n_qa_pairs, args.show_output,
-            args.dais_pdf_dir, args.page_renders_dir,
+        def _gen_and_dedup(seed: int):
+            pairs = generate_one(
+                seed, args.gen_model_id, args.provider, examples_pool, document_map, collection,
+                chunk_id_to_doc_id, args.emb_model_id, trace_dir, special_notes,
+                DAIS_DATAGEN_GUIDANCE, args.n_examples, args.n_qa_pairs, args.show_output,
+                args.dais_pdf_dir, args.page_renders_dir,
+            )
+            with dedup_lock:
+                kept, funnel = dedup_batch(pairs, dedup_cfg)
+            with open(os.path.join(trace_dir, f"{seed}_qa_pairs_dedup.json"), "w") as f:
+                json.dump({"seed": seed, "n_input": len(pairs), "n_kept": len(kept),
+                           "kept_qa_ids": [p.qa_id for p in kept], "funnel": funnel}, f, indent=2)
+            return seed, kept
+
+        with ThreadPoolExecutor(max_workers=max(1, args.gen_parallelism)) as pool:
+            for fut in as_completed([pool.submit(_gen_and_dedup, s) for s in seeds]):
+                seed, kept = fut.result()
+                kept_pairs_by_seed[seed] = {p.qa_id: p for p in kept}
+        n_kept = sum(len(d) for d in kept_pairs_by_seed.values())
+        print(f"  dedup kept {n_kept} pairs.")
+
+    if args.asap:
+        # EMERGENCY: per-pair pipelined funnel + incremental writes (replaces phases 2-5).
+        run_asap_pipeline(
+            kept_pairs_by_seed, rollout_cfg, qf_cfg, trace_dir, args.out_dir,
+            n_rollouts=args.n_rollouts, threshold=args.asap_threshold,
+            rollout_concurrency=args.rollout_concurrency, qf_parallelism=args.qf_parallelism,
+            target_passing=args.target_passing, skip_quality_filter=args.skip_quality_filter,
+            show_output=args.show_output,
         )
-        with dedup_lock:
-            kept, funnel = dedup_batch(pairs, dedup_cfg)
-        with open(os.path.join(trace_dir, f"{seed}_qa_pairs_dedup.json"), "w") as f:
-            json.dump({"seed": seed, "n_input": len(pairs), "n_kept": len(kept),
-                       "kept_qa_ids": [p.qa_id for p in kept], "funnel": funnel}, f, indent=2)
-        return seed, kept
-
-    with ThreadPoolExecutor(max_workers=max(1, args.gen_parallelism)) as pool:
-        for fut in as_completed([pool.submit(_gen_and_dedup, s) for s in seeds]):
-            seed, kept = fut.result()
-            kept_pairs_by_seed[seed] = {p.qa_id: p for p in kept}
-    n_kept = sum(len(d) for d in kept_pairs_by_seed.values())
-    print(f"  dedup kept {n_kept} pairs.")
+        return
 
     # --- phase 2: rollouts (shared executor, no per-pair barrier) ---
     print(f"Phase 2: {args.n_rollouts} Gemini rollouts/pair...")

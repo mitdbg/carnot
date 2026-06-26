@@ -128,7 +128,7 @@ class FileSink:
         reader always sees a complete document. Always writes (the file IS the channel —
         no 'no subscribers' short-circuit like the in-process hub had)."""
         try:
-            payload = json.dumps(self._status_provider(), separators=_COMPACT)
+            payload = json.dumps(self._status_provider(), separators=_COMPACT, default=_json_default)
         except Exception:  # noqa: BLE001 - never let a bad snapshot kill the backend loop
             logger.exception("status snapshot serialization failed")
             return

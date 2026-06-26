@@ -464,7 +464,8 @@ class LLMClient:
     (`provider=genai`, default) or OpenRouter (`provider=openrouter`); both share the
     same rate-limit / retry / logging scaffolding. Under sustained Gemini 429s an
     automatic latch fails the whole process over to OpenRouter (`_ProviderFailover`),
-    re-decided per retry attempt. Embeddings stay on Gemini."""
+    re-decided per retry attempt. `embed` dispatches on the model id (Gemini → AI
+    Studio, everything else → OpenRouter); it is not subject to the 429 latch."""
 
     def __init__(self, config: SkunkConfig) -> None:
         self._config = config
@@ -623,9 +624,15 @@ class LLMClient:
         """Batched embedding — build-time / offline corpus-prep only (the query
         path is embedding-free). Output is L2-unnormalized; callers normalize
         before cosine. Chunked at `batch_size` (endpoint caps at 100/request).
-        No retries / no rate limiter — one-shot build call."""
+        No retries / no rate limiter — one-shot build call.
+
+        Dispatches on the model id, matching the runtime path
+        (`search_agent._make_embedding_client`): Gemini ids go to AI Studio via
+        genai; everything else (e.g. `qwen/qwen3-embedding-8b`) goes to OpenRouter."""
         if not texts:
             return []
+        if "gemini" not in model.removeprefix("google/").lower():
+            return self._embed_openrouter(texts, model=model, batch_size=batch_size)
         client = self._get_gemini_client()
         cfg = types.EmbedContentConfig(
             task_type=task_type, output_dimensionality=dim,
@@ -645,6 +652,28 @@ class LLMClient:
                     f"for {len(chunk)} inputs; model likely requires batch_size=1"
                 )
             out.extend(vecs)
+        return out
+
+    def _embed_openrouter(
+        self, texts: list[str], *, model: str, batch_size: int,
+    ) -> list[list[float]]:
+        """OpenRouter embedding backend for non-Gemini models (e.g. Qwen). Mirrors
+        `embed`'s chunking and length checks; dims come from the model, so no
+        `output_dimensionality` knob. No retries — one-shot build call."""
+        client = self._get_openrouter_client()
+        out: list[list[float]] = []
+        for start in range(0, len(texts), batch_size):
+            chunk = texts[start:start + batch_size]
+            resp = client.embeddings.generate(input=chunk, model=model)
+            data = list(resp.data or ())
+            if not data:
+                raise RuntimeError(f"embed model {model!r} returned no embeddings for {len(chunk)} inputs")
+            if len(data) != len(chunk):
+                raise RuntimeError(
+                    f"embed model {model!r} returned {len(data)} vectors "
+                    f"for {len(chunk)} inputs"
+                )
+            out.extend(list(d.embedding) for d in data)
         return out
 
     @staticmethod
@@ -1076,10 +1105,14 @@ class LLMClient:
     def _usage_tokens_openrouter(usage: Any) -> dict:
         """Token counts from an OpenRouter `ChatUsage` (best-effort — any may be None)."""
         details = getattr(usage, "prompt_tokens_details", None)
+        completion_details = getattr(usage, "completion_tokens_details", None)
         return {
             "input_tokens": getattr(usage, "prompt_tokens", None),
             "output_tokens": getattr(usage, "completion_tokens", None),
             "total_tokens": getattr(usage, "total_tokens", None),
+            "thinking_tokens": getattr(completion_details, "reasoning_tokens", None)
+            if completion_details
+            else None,
             "cache_input_tokens": getattr(details, "cached_tokens", None) if details else None,
         }
 

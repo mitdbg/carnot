@@ -27,7 +27,6 @@ from typing import Any
 from chromadb.api.models.Collection import Collection
 
 from skunk.common import (
-    B64Image,
     ExecutionContext,
     HumanInterventionHandler,
     make_genai_client,
@@ -35,20 +34,18 @@ from skunk.common import (
 from skunk.config import SkunkConfig
 from skunk.human_intervention import RequestHumanTool
 from skunk.local_python_executor import CodeOutput
-from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent, TextBlock
+from skunk.multi_turn_agent import Block, ChunkBlock, MultiTurnAgent, TextBlock
 from skunk.search_agent.search_tools import (
     EMPTY_RESULT_MESSAGE,
     GREP_RESULT_TAG,
     PRUNE_RESULT_TAG,
     READ_DOCUMENT_RESULT_TAG,
     SEARCH_RESULT_TAG,
-    VIEW_FIGURE_RESULT_TAG,
     EmbeddingClient,
     GrepCorpusTool,
     PruneTool,
     ReadDocumentTool,
     SearchCorpusTool,
-    ViewFigureTool,
 )
 
 
@@ -90,6 +87,7 @@ class SearchAgent(MultiTurnAgent):
         "explore documents of potential relevance, then refine your searches in later steps "
         "based on what you find. Use `prune(...)` aggressively on chunks and docs you have "
         "ruled out, to keep later searches focused and your context window manageable."
+        "\n\nCRITICAL: DO NOT WRITE EXCESSIVE PYTHON CODE TO TRY AND ANSWER THE QUESTION. THERE IS A DOWNSTREAM AGENT THAT WILL DO THAT. PLEASE FOCUS ON FINDING THE SUPPORTING DOCUMENTS AND MAKE A BEST EFFORT TO RETURN THEM. FOCUS ON USING YOUR TOOLS FOR RETRIEVAL TO FIND THE SUPPORTING DOCUMENTS."
     )
 
     final_answer_doc = """\
@@ -174,7 +172,6 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
                 config.agent_max_pages_per_tool_call,
                 config.read_document_max_output_chars,
             ),
-            ViewFigureTool(self.document_map, config.pdf_dir, renders_dir=config.page_renders_dir),
             PruneTool(self._pruned_chunk_ids, self._pruned_doc_ids),
         ]
         if human_intervention_handler is not None:
@@ -244,22 +241,6 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
                 ChunkBlock(chunk_id=None, doc_id=d["doc_id"], text=d["text"])
                 for d in output["docs"]
             )
-            return blocks
-
-        if isinstance(output, dict) and output.get(VIEW_FIGURE_RESULT_TAG):
-            if output.get("error"):
-                blocks.append(TextBlock(f"[error]\n{output['error']}"))
-            else:
-                caption = (
-                    f"[full-page image of doc_id={output['doc_id']} "
-                    f"(contains <figure id={output['figure_id']}>)]"
-                )
-                blocks.append(ImageBlock(
-                    doc_id=output["doc_id"],
-                    figure_id=output["figure_id"],
-                    image=B64Image(mime=output["mime"], data=output["data"]),
-                    text=caption,
-                ))
             return blocks
 
         if isinstance(output, dict) and output.get(PRUNE_RESULT_TAG):

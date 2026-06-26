@@ -68,8 +68,12 @@ REASONER="${REASONER:-skunk_reasoner:solve}"
 
 # Cup the backend submits to. Default: the local practice server (run_practice_server.sh) so you can
 # rehearse end to end. In the real Cup, pass --cup-base-url + --team-token to point at the host.
-export CUP_BASE_URL="${CUP_BASE_URL:-http://${HOST}:${CUP_PORT}}"
+CUP_LOCAL_DEFAULT="http://${HOST}:${CUP_PORT}"
+export CUP_BASE_URL="${CUP_BASE_URL:-$CUP_LOCAL_DEFAULT}"
 export CUP_TEAM_TOKEN="${CUP_TEAM_TOKEN:-anything}"
+# Treat anything that isn't the local practice URL as a real (external) Cup, whether it came
+# from the --cup-base-url flag or from skunk/.env, so the startup banner reports it honestly.
+[[ "$CUP_BASE_URL" != "$CUP_LOCAL_DEFAULT" ]] && EXTERNAL_CUP=1
 # Backend (agent) URL — the web process proxies command routes here; never browser-facing.
 export SKUNK_SERVER_URL="http://${HOST}:${SKUNK_SERVER_PORT}"
 
