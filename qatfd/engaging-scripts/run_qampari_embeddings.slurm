@@ -54,6 +54,11 @@ export PYTHONNOUSERSITE=True
 # Qwen3-Embedding-0.6B HF cache (small model, ~1.2GB) — keep it off the home quota (use node-local /tmp).
 export HF_HOME=/tmp/$USER/hf_cache
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Cap per-sequence length. QAMPARI's wiki chunks are ~100 words, but a few malformed/oversized records
+# reach thousands of tokens; with SDPA attention (flash-attn not installed) a lone long sequence
+# materializes heads×seq² scores and OOMs the 80GB A100 (job 16684620 died here, 75GB on a 32k-token
+# chunk). 2048 covers real chunks; longer ones are split + averaged. Lower to 1024 if OOM persists.
+export EMBED_MAX_TOKENS=2048
 
 # boto3 for S3 streaming (one-time; harmless if already installed). No `aws` CLI needed.
 pip install --quiet boto3

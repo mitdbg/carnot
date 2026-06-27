@@ -42,9 +42,16 @@ import torch
 from sentence_transformers import SentenceTransformer
 
 EMBED_MODEL = "Qwen/Qwen3-Embedding-0.6B"
-MAX_TOKENS = 32000
-MAX_BATCH = 256
-BATCH_COMPUTE_BUDGET = 256 * 512 * 512  # count × max_len² ceiling (~256 chunks of 512 tokens)
+# Hard cap on the sequence length fed to the model AND the threshold above which a chunk is split +
+# averaged (embed_oversized_text). MUST stay modest: with PyTorch SDPA (no flash-attn) the attention
+# scores are materialized as heads×seq², so a lone multi-thousand-token sequence can OOM an 80GB A100
+# (job 16684620 died here at 75GB on a 32k-token chunk). QAMPARI chunks are ~100 words (~150 tokens);
+# 2048 covers virtually all of them while a lone sequence at the cap needs only ~130MB of scores, and
+# the rare longer chunk is split + averaged. Override with EMBED_MAX_TOKENS if needed.
+MAX_TOKENS = int(os.environ.get("EMBED_MAX_TOKENS", "2048"))
+MAX_BATCH = int(os.environ.get("EMBED_MAX_BATCH", "256"))
+# count × max_len² ceiling for a batch (~256 chunks of 512 tokens); bounds per-batch attention memory.
+BATCH_COMPUTE_BUDGET = int(os.environ.get("EMBED_BATCH_BUDGET", str(256 * 512 * 512)))
 TARGET_ELEMENT_TOKENS = 1024
 
 
