@@ -12,10 +12,15 @@
 #        # corpus:    https://aggreg-qa.s3.amazonaws.com/chunked_wikipedia.tar.gz
 #        #            -> wikipedia_chunks/chunks_v5/wikipedia_chunks_*.jsonl
 #   2. embed the full corpus (GPU):  sbatch engaging-scripts/run_qampari_embeddings.slurm
-#   3. build the Chroma collection:
+#   3. build the Chroma collection (its OWN store dir; the 25.9M index is too big to co-locate):
 #        python -m skunk.search_agent.prep.create_vector_db \
 #          --embeddings-dir <skunk>/qampari/qampari-element-embeddings \
-#          --collection-name qwen-qampari-0.6b --chroma-path <skunk>/.chromadb --benchmark qampari
+#          --collection-name qwen-qampari-0.6b --chroma-path <skunk>/.chromadb-qampari --benchmark qampari
+#   4. serve it (embedded reads deadlock under the eval's concurrency, so qampari reads via a server):
+#        # on the box holding .chromadb-qampari (e.g. the EC2), in a tmux — binds 127.0.0.1:8001:
+#        SKUNK_CHROMADB_DIR=.chromadb-qampari ./scripts/run_chroma_server.sh qwen-qampari-0.6b
+#        # from your laptop, forward the port (keeps the local endpoint stable across EC2 restarts):
+#        ssh -N -L 8001:localhost:8001 <ec2-host>
 #
 # Runs MUST embed the query with the SAME 0.6B model, e.g.:
 #   # TEST (the 1000-question KARL set):
@@ -32,6 +37,16 @@ defaults:
 
 name: qampari
 chromadb_collection: qwen-qampari-0.6b
+# --- retrieval backend -----------------------------------------------------------------------------
+# The 25.9M-vector index is read from a long-lived Chroma SERVER (the embedded PersistentClient
+# deadlocks under the eval's concurrency), so qampari defaults to connecting over HTTP — no per-run
+# override needed once the server + SSH tunnel (see step 4 above) are up. Default host is the tunnel
+# endpoint 127.0.0.1; set QAMPARI_CHROMA_HOST to hit a different address (e.g. the EC2 DNS directly),
+# or override `benchmarks.chromadb_host=null` to force embedded local reads from chromadb_dir.
+chromadb_host: "${oc.env:QAMPARI_CHROMA_HOST,127.0.0.1}"
+# port inherits base.yaml (8001); change the tunnel + `benchmarks.chromadb_port` together if needed.
+# embedded-fallback store location: the giant index lives in its OWN dir, not the shared .chromadb.
+chromadb_dir: .chromadb-qampari
 # 1000 multi-answer questions (qid / question_text / answer_list[].{answer_text, aliases, proof[]});
 # override with qampari/dev_data.jsonl to evaluate on the dev split against the same index.
 questions_path: qampari/test_data.jsonl
