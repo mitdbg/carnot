@@ -12,6 +12,10 @@ defaults:
 
 name: trec-biogen
 chromadb_collection: qwen-biogen-0.6b
+# The 26.8M-abstract corpus is built as 4 per-rank Chroma collections (qwen-biogen-0.6b_r0..r3),
+# because chromadb 1.5.x's metadata-segment compaction fails on a single collection that large.
+# The benchmark opens all 4 and merges query/get across them. Set to 1 for a single collection.
+chromadb_num_shards: 4
 # 40 questions + expert reference answers (the 2024 answers, re-released for the 2025 corpus)
 task_a_path: biogen/2025_task_a.json
 # PMID -> abstract metadata produced by the embedding job (compute_biogen_embeddings.py)

@@ -1,6 +1,10 @@
 # base config for all benchmarks
 chromadb_dir: .chromadb
 chromadb_collection: null
+# ChromaDB server endpoint for reads. null host => embedded PersistentClient over chromadb_dir;
+# set host (e.g. 127.0.0.1) to connect to a warm long-lived server (skunk/scripts/run_chroma_server.sh).
+chromadb_host: null
+chromadb_port: 8001
 # per-benchmark prompt-overrides YAML (under skunk/); null = none
 prompts_path: null
 # corpus PDFs dir (under skunk/) for the view_figure tool; null = no figure tool

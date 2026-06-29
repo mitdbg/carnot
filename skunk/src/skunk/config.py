@@ -97,10 +97,11 @@ class SearchAgentConfig(SystemConfig):
 
 
 @dataclass
-class QATFDSearchAgentConfig(SystemConfig):
-    # the agent will answer the question directly if agent_mode == "answer", otherwise a separate
-    # LLM computes an answer given the QATFDSearchAgent's retrieved documents
-    agent_mode: str = "retrieve"
+class QATFDSearchAgentConfig(SearchAgentConfig):
+    # Mirrors the system hierarchy (QATFDSearchAgentSystem subclasses SearchAgentSystem): the
+    # qatfd variant reuses the full search-agent config (agent_mode, step/token budgets, ...) and
+    # only adds a semantic-filter tool, which needs no extra config beyond agent_model_id (base).
+    pass
 
 
 #########################################################################################

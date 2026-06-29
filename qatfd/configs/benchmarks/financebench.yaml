@@ -14,7 +14,7 @@ defaults:
   - base
   - _self_
 
-name: finance-bench
+name: financebench
 chromadb_collection: qwen-financebench
 # 150 open-source questions + free-form gold answers + page-level evidence
 questions_path: financebench/financebench_open_source.jsonl

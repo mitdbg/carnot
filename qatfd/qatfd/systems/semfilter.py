@@ -75,10 +75,12 @@ class SemanticFilterTool(Tool):
 Keep only the documents whose full text satisfies a natural-language `predicate`.
 Each document in `doc_ids` is judged independently by an LLM (TRUE/FALSE) against
 the predicate; the tool returns the `doc_id`s that passed. Use this to narrow a set
-of candidate documents down to those actually relevant before reading them.
+of candidate documents down to those actually relevant before reading them. This tool
+is more powerful than vector search for identifying semantically relevant documents,
+but it is also more expensive. Only execute it on document sets of <=1,000 documents.
 
 ```python
-semantic_filter(doc_ids=["1946_11_41", "1950_03_12"], predicate="discusses U.S. national defense expenditures")
+semantic_filter(doc_ids=["doc_id_1", "doc_id_2"], predicate="discusses topic X in relation to Y")
 ```"""
 
     def __init__(self, llm_client, document_map: dict[str, str], model: str, ctx=None) -> None:

@@ -13,6 +13,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+import chromadb
+
 from skunk.prompted_call import PromptOverride, load_prompt_overrides
 
 from qatfd.config import BenchmarkConfig
@@ -71,6 +73,34 @@ class Benchmark(ABC):
     @abstractmethod
     def load_questions(self) -> list[Question]:
         """All questions in the benchmark (the runner applies the dev/test split)."""
+
+    def _chroma_client(self):
+        """The Chroma client — the long-lived server (HttpClient) when `chromadb_host` is set, else
+        the embedded PersistentClient over `chromadb_dir`. Centralized so every benchmark connects
+        identically and warm-server vs embedded is a single config flip (`benchmarks.chromadb_host=...`);
+        see skunk/scripts/run_chroma_server.sh to warm one."""
+        cfg = self.config
+        if cfg.chromadb_host:
+            from skunk.chroma_client import make_chroma_client
+
+            return make_chroma_client(cfg.chromadb_host, cfg.chromadb_port)
+        if not os.path.exists(cfg.chromadb_dir):
+            raise FileNotFoundError(f"chromadb_dir {cfg.chromadb_dir} does not exist.")
+        return chromadb.PersistentClient(path=cfg.chromadb_dir)
+
+    def _chroma_where(self) -> str:
+        cfg = self.config
+        return f"server {cfg.chromadb_host}:{cfg.chromadb_port}" if cfg.chromadb_host else cfg.chromadb_dir
+
+    def _open_chroma_collection(self):
+        """Open the single configured Chroma collection (`chromadb_collection`)."""
+        client = self._chroma_client()
+        try:
+            return client.get_collection(name=self.config.chromadb_collection)
+        except Exception as e:
+            raise RuntimeError(
+                f"chroma collection {self.config.chromadb_collection!r} not found ({self._chroma_where()})."
+            ) from e
 
     @abstractmethod
     def _build_resources(self) -> BenchmarkResources:

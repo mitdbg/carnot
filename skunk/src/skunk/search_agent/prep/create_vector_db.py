@@ -246,6 +246,11 @@ if __name__ == "__main__":
     parser.add_argument("--benchmark", type=str, required=True,
                         choices=sorted(_BENCHMARK_ADAPTERS.keys()),
                         help="Which embedding-script output format to expect.")
+    parser.add_argument("--only-rank", type=int, default=None,
+                        help="If set, build ONLY this embedding rank's shard (embeddings_{rank}_*.npz + "
+                             "metadata_rank{rank}.json) into --collection-name. Run once per rank with "
+                             "distinct --collection-name (e.g. NAME_r0..NAME_r3) to get one Chroma "
+                             "collection per rank, keeping each metadata segment small enough to compact.")
     args = parser.parse_args()
 
     # get the adapter for this benchmark
@@ -265,6 +270,16 @@ if __name__ == "__main__":
 
     npz_files = sorted(f for f in os.listdir(args.embeddings_dir) if f.startswith("embeddings") and f.endswith(".npz"))
     shards = _rank_metadata_shards(args.embeddings_dir)
+
+    if args.only_rank is not None:
+        # Restrict the build to a single embedding rank -> one collection per rank.
+        if not shards or args.only_rank not in shards:
+            raise ValueError(f"--only-rank {args.only_rank}: no metadata_rank{args.only_rank}.json in {args.embeddings_dir}")
+        shards = {args.only_rank: shards[args.only_rank]}
+        npz_files = [f for f in npz_files
+                     if (_RANK_NPZ_RE.match(f) and int(_RANK_NPZ_RE.match(f).group(1)) == args.only_rank)]
+        if not npz_files:
+            raise ValueError(f"--only-rank {args.only_rank}: no embeddings_{args.only_rank}_*.npz in {args.embeddings_dir}")
 
     # Resume support: skip .npz partitions already recorded in the manifest, and append each one as
     # it finishes (flushed immediately) so a killed run picks up exactly where it left off.

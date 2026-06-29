@@ -17,7 +17,6 @@ Held-out test set: `test_ids_path` if given, else ALL 40 questions (run with --s
 
 from __future__ import annotations
 
-import chromadb
 import json
 import os
 from collections import OrderedDict
@@ -79,6 +78,86 @@ class _ChromaDocMap:
 
     def __contains__(self, doc_id) -> bool:
         return self.get(doc_id) is not None
+
+
+class MergedCollection:
+    """Duck-typed stand-in for a chromadb ``Collection`` that fans a query/get out across N shard
+    collections and merges the results, so the SearchAgent and the doc map can treat a sharded
+    corpus as one collection. BioGen's 26.8M abstracts are split into one collection per embedding
+    rank (``f"{base}_r{i}"``) because chromadb 1.5.x's metadata-segment compaction fails on a single
+    collection that large; each ~6.7M-row shard compacts fine.
+
+    Only the methods skunk's retrieval actually calls are implemented — ``query`` (search_corpus),
+    ``get`` (grep_corpus + the doc map), and ``count`` (verification). A PMID lives in exactly one
+    shard (a doc's chunks all come from one source file -> one rank), so ``get`` by id/where simply
+    concatenates and the lone owning shard supplies the hit."""
+
+    def __init__(self, collections: list) -> None:
+        assert collections, "MergedCollection needs at least one shard collection"
+        self._collections = collections
+
+    @property
+    def name(self) -> str:
+        return self._collections[0].name
+
+    def count(self) -> int:
+        return sum(c.count() for c in self._collections)
+
+    def query(self, **kwargs) -> dict:
+        """Run the same query on every shard, then keep the globally closest ``n_results`` by
+        distance (chroma's default L2 space: smaller = closer)."""
+        n_results = kwargs.get("n_results", 10)
+        include = kwargs.get("include") or ["metadatas", "documents", "distances"]
+        rows: list[tuple] = []
+        for c in self._collections:
+            r = c.query(**kwargs)
+            ids = (r.get("ids") or [[]])[0]
+            n = len(ids)
+            dists = (r.get("distances") or [[None] * n])[0]
+            docs = (r.get("documents") or [[None] * n])[0]
+            metas = (r.get("metadatas") or [[None] * n])[0]
+            for i in range(n):
+                rows.append((dists[i], ids[i], docs[i], metas[i]))
+        # None distances (shouldn't happen when "distances" is included) sort last, deterministically.
+        rows.sort(key=lambda t: (t[0] is None, t[0] if t[0] is not None else 0.0))
+        rows = rows[:n_results]
+        out: dict = {"ids": [[t[1] for t in rows]]}
+        if "distances" in include:
+            out["distances"] = [[t[0] for t in rows]]
+        if "documents" in include:
+            out["documents"] = [[t[2] for t in rows]]
+        if "metadatas" in include:
+            out["metadatas"] = [[t[3] for t in rows]]
+        return out
+
+    def get(self, **kwargs) -> dict:
+        """Concatenate ``get`` across shards (each PMID is in one shard). Honors ``limit`` as a
+        global cap, short-circuiting once enough rows are collected."""
+        limit = kwargs.get("limit")
+        include = kwargs.get("include") or []
+        ids_acc: list = []
+        docs_acc: list = []
+        metas_acc: list = []
+        want_docs = want_metas = False
+        for c in self._collections:
+            r = c.get(**kwargs)
+            ids_acc.extend(r.get("ids") or [])
+            if r.get("documents") is not None:
+                want_docs = True
+                docs_acc.extend(r["documents"])
+            if r.get("metadatas") is not None:
+                want_metas = True
+                metas_acc.extend(r["metadatas"])
+            if limit is not None and len(ids_acc) >= limit:
+                break
+        if limit is not None:
+            ids_acc, docs_acc, metas_acc = ids_acc[:limit], docs_acc[:limit], metas_acc[:limit]
+        out: dict = {"ids": ids_acc}
+        if want_docs or "documents" in include:
+            out["documents"] = docs_acc
+        if want_metas or "metadatas" in include:
+            out["metadatas"] = metas_acc
+        return out
 
 
 class TrecBiogenBenchmark(Benchmark):
@@ -151,18 +230,28 @@ class TrecBiogenBenchmark(Benchmark):
 
     # ---- retrieval substrate --------------------------------------------------
 
+    def _open_collection(self):
+        """Single collection, or a MergedCollection over `chromadb_num_shards` per-rank shards
+        (`f"{chromadb_collection}_r{i}"`) when the corpus was built sharded."""
+        n = getattr(self.config, "chromadb_num_shards", 1) or 1
+        if n <= 1:
+            return self._open_chroma_collection()
+        client = self._chroma_client()
+        base = self.config.chromadb_collection
+        shards = []
+        for i in range(n):
+            shard_name = f"{base}_r{i}"
+            try:
+                shards.append(client.get_collection(name=shard_name))
+            except Exception as e:
+                raise RuntimeError(
+                    f"biogen shard collection {shard_name!r} not found ({self._chroma_where()}); "
+                    f"expected {n} shards {base}_r0..{base}_r{n - 1} (set benchmarks.chromadb_num_shards)."
+                ) from e
+        return MergedCollection(shards)
+
     def _build_resources(self) -> BenchmarkResources:
-        if not os.path.exists(self.config.chromadb_dir):
-            raise FileNotFoundError(f"chromadb_dir {self.config.chromadb_dir} does not exist")
-
-        client = chromadb.PersistentClient(path=self.config.chromadb_dir)
-        try:
-            collection = client.get_collection(name=self.config.chromadb_collection)
-        except Exception as e:
-            raise RuntimeError(
-                f"chroma collection {self.config.chromadb_collection!r} not found under {self.config.chromadb_dir}."
-            ) from e
-
+        collection = self._open_collection()
         # 26.8M abstracts is far too much to hold in a {pmid: text} dict (~60 GB RAM). The text is
         # already in the chroma `documents` column, so serve it lazily + cached — only the docs a
         # question actually reads get materialized. (The systems only do keyed lookups on the doc

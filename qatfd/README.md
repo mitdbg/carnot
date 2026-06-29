@@ -24,7 +24,7 @@ results/        run output (gitignored)
 | `officeqa` | `skunk/officeqa_pro.csv` | `skunk/.chromadb` (collection from `SKUNK_CHROMADB_COLLECTION`) + `treasury_bulletins_cleaned/clean_page_map.json` | cup-kit numeric (`score_correct`) |
 | `browsecomp_plus` | `skunk/browsecomp-plus/browsecomp_plus_decrypted.jsonl` | `skunk/.chromadb` collection `qwen-browsecomp-plus` + doc map from element metadata | LLM-as-judge (single nugget) |
 | `trec-biogen` | `skunk/biogen/2025_task_a.json` (40 Task A questions) | `skunk/.chromadb` collection `qwen-biogen-0.6b` (26.8M PubMed abstracts, Qwen3-0.6B) + doc map from element metadata | LLM-as-judge nugget-completion recall (KARL D.1) |
-| `finance-bench` | `skunk/financebench/financebench_open_source.jsonl` (150 open-source questions) | `skunk/.chromadb` collection `qwen-financebench` (368 SEC-filing PDFs indexed at page level, Qwen3-8B) + page-text doc map from element metadata | LLM-as-judge (single nugget) |
+| `financebench` | `skunk/financebench/financebench_open_source.jsonl` (150 open-source questions) | `skunk/.chromadb` collection `qwen-financebench` (368 SEC-filing PDFs indexed at page level, Qwen3-8B) + page-text doc map from element metadata | LLM-as-judge (single nugget) |
 
 Dev/test split: the runner defaults to `--split dev` (excludes the held-out test
 set). OfficeQA test = the 32 UIDs in `skunk/eval/test_set_uids.json`; BrowseComp-Plus

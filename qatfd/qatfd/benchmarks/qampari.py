@@ -27,7 +27,6 @@ Held-out test set: `test_ids_path` if given, else ALL 1000 questions (run with -
 
 from __future__ import annotations
 
-import chromadb
 import json
 import os
 from collections import OrderedDict
@@ -178,17 +177,7 @@ class QampariBenchmark(Benchmark):
     # ---- retrieval substrate --------------------------------------------------
 
     def _build_resources(self) -> BenchmarkResources:
-        if not os.path.exists(self.config.chromadb_dir):
-            raise FileNotFoundError(f"chromadb_dir {self.config.chromadb_dir} does not exist")
-
-        client = chromadb.PersistentClient(path=self.config.chromadb_dir)
-        try:
-            collection = client.get_collection(name=self.config.chromadb_collection)
-        except Exception as e:
-            raise RuntimeError(
-                f"chroma collection {self.config.chromadb_collection!r} not found under {self.config.chromadb_dir}."
-            ) from e
-
+        collection = self._open_chroma_collection()
         self._collection = collection
         # ~25.9M chunks is far too much for an in-RAM {chunk_id: text} dict, so serve the passage text
         # lazily + cached from the chroma `documents` column (only the chunks a question actually reads

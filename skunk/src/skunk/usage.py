@@ -18,6 +18,7 @@ model's `cached` rate when given, else at its `in` rate.
 
 from __future__ import annotations
 
+import threading
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
@@ -32,6 +33,12 @@ class UsageTracker:
     table means every call costs 0."""
 
     def __init__(self, default_model: str, prices: dict | None = None) -> None:
+        # Guards the mutating accumulators below: a single client is hit concurrently when
+        # tools fan LLM calls across a thread pool (e.g. semfilter's per-doc judges), and the
+        # `+=` increments are read-modify-write across bytecodes, so concurrent adds can drop
+        # updates (under-count) without it. Reads (`cost()`, snapshots) run after the writers
+        # have joined, so only the writers need the lock.
+        self._lock = threading.Lock()
         self.default_model = default_model
         self.prices = prices or {}
         self.input_tokens = 0
@@ -58,36 +65,39 @@ class UsageTracker:
         out_tok = resp.output_tokens or 0
         cache_tok = resp.cache_input_tokens or 0
         m = model or self.default_model
-        self.input_tokens += in_tok
-        self.output_tokens += out_tok
-        self.cache_input_tokens += cache_tok
-        self.by_model_in[m] += in_tok
-        self.by_model_out[m] += out_tok
-        self.by_model_cached[m] += cache_tok
-        self.n_calls += 1
+        with self._lock:
+            self.input_tokens += in_tok
+            self.output_tokens += out_tok
+            self.cache_input_tokens += cache_tok
+            self.by_model_in[m] += in_tok
+            self.by_model_out[m] += out_tok
+            self.by_model_cached[m] += cache_tok
+            self.n_calls += 1
 
     def add_embed(self, model: str | None, input_tokens: int) -> None:
         """Fold one embedding call into the running totals. `input_tokens` is the exact
         prompt-token count when the provider reports it (OpenRouter) or a char/4 estimate
         for backends that don't (local SentenceTransformers)."""
         m = model or self.default_model
-        self.embed_tokens += input_tokens
-        self.by_emb_model_in[m] += input_tokens
-        self.n_embed_calls += 1
+        with self._lock:
+            self.embed_tokens += input_tokens
+            self.by_emb_model_in[m] += input_tokens
+            self.n_embed_calls += 1
 
     def reset(self) -> None:
         """Zero all counters. Use to start a fresh accounting window on a reused
         client (e.g. separating a build/prep phase from the query phase)."""
-        self.input_tokens = 0
-        self.output_tokens = 0
-        self.cache_input_tokens = 0
-        self.n_calls = 0
-        self.by_model_in.clear()
-        self.by_model_out.clear()
-        self.by_model_cached.clear()
-        self.embed_tokens = 0
-        self.n_embed_calls = 0
-        self.by_emb_model_in.clear()
+        with self._lock:
+            self.input_tokens = 0
+            self.output_tokens = 0
+            self.cache_input_tokens = 0
+            self.n_calls = 0
+            self.by_model_in.clear()
+            self.by_model_out.clear()
+            self.by_model_cached.clear()
+            self.embed_tokens = 0
+            self.n_embed_calls = 0
+            self.by_emb_model_in.clear()
 
     def cost(self) -> float:
         """Total USD cost from the price table — generation plus embeddings. Cached input

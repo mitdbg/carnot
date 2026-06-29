@@ -44,10 +44,14 @@ class ExperimentConfig:
 class BenchmarkConfig:
     # name of the benchmark
     name: str
-    # directory for chromadb
+    # directory for chromadb (the embedded PersistentClient store, used when chromadb_host is null)
     chromadb_dir: str
     # chroma collection with benchmark embeddings
     chromadb_collection: str
+    # ChromaDB server (HttpClient) to connect reads to. null host => embedded PersistentClient over
+    # chromadb_dir; set host to use a long-lived warm server (see skunk/scripts/run_chroma_server.sh).
+    chromadb_host: str | None
+    chromadb_port: int
     # path (under skunk/) to a benchmark's prompt-overrides YAML; null = no benchmark-specific prompt notes.
     prompts_path: str | None
     # path (under skunk/) to the corpus PDFs, enabling the SearchAgent's view_figure tool; null = no figure tool.
@@ -98,6 +102,11 @@ class TrecBiogenConfig(BenchmarkConfig):
     test_ids_path: str | None = None
     # weight given to a `partial_support` nugget in the recall score (full support = 1.0).
     partial_credit: float = 0.0
+    # If >1, the 26.8M-abstract corpus is split across N per-rank Chroma collections named
+    # f"{chromadb_collection}_r{i}" (built with create_vector_db --only-rank). The benchmark opens
+    # all N and merges query/get across them (MergedCollection). This sidesteps chromadb 1.5.x's
+    # metadata-segment compaction failure on a single 26.8M-row collection. 1 => single collection.
+    chromadb_num_shards: int = 1
 
 @dataclass
 class QampariConfig(BenchmarkConfig):
