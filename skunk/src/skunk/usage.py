@@ -119,6 +119,32 @@ class UsageTracker:
             total += self.by_model_out.get(model, 0) / 1_000_000 * p.get("out", 0.0)
         return total + self.embed_cost()
 
+    def price_call(self, model: str | None, in_tok: int, cached_tok: int, out_tok: int) -> float | None:
+        """USD cost of a single generation call, priced exactly as `cost()` aggregates (so
+        per-call costs sum to the question total): uncached input at `in`, cached input at
+        `cached` (→ `in` when unset), output at `out`. Returns None when there is no price
+        table or no matching entry, so callers can distinguish "unpriced" from "$0.00"."""
+        if not self.prices:
+            return None
+        p = _match_price(model or self.default_model, self.prices)
+        if not p:
+            return None
+        in_rate = p.get("in", 0.0)
+        uncached = max(0, in_tok - cached_tok)
+        return (
+            uncached / 1_000_000 * in_rate
+            + cached_tok / 1_000_000 * p.get("cached", in_rate)
+            + out_tok / 1_000_000 * p.get("out", 0.0)
+        )
+
+    def price_embed(self, model: str | None, in_tok: int) -> float | None:
+        """USD cost of a single embedding call (input-only, billed at the model's `in` rate);
+        None when unpriced. Mirrors `embed_cost`'s per-model lookup for one call."""
+        if not self.prices:
+            return None
+        p = _match_price(model or self.default_model, self.prices)
+        return None if not p else in_tok / 1_000_000 * p.get("in", 0.0)
+
     def embed_cost(self) -> float:
         """USD cost of embedding calls alone, priced from the same table (embeddings are
         input-only, billed at the model's `in` rate). Looked up by the embedding model id,

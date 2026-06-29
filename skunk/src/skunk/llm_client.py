@@ -467,11 +467,17 @@ class LLMClient:
         `thinking_tokens`, hence the `.get`s. The single chokepoint every call path funnels
         through, so usage accounting lives here once rather than at each public method."""
         if ctx is not None:
+            # Exact per-call USD (priced as `cost()` aggregates) → the trace viewer shows
+            # per-step and cumulative spend without re-deriving it from a duplicate price table.
+            cost = self.usage.price_call(
+                model, toks["input_tokens"], toks.get("cache_input_tokens") or 0, toks["output_tokens"]
+            )
             ctx.emit(
                 f"call call_site={call_site} model={model} temp={temperature} "
                 f"effort={effort} latency_s={round(latency_s, 3)} "
                 f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
-                f"think_tok={toks.get('thinking_tokens')}"
+                f"think_tok={toks.get('thinking_tokens')}",
+                data=None if cost is None else {"cost": cost},
             )
         resp = LLMResponse(
             text=text,
@@ -601,10 +607,12 @@ class LLMClient:
             latency_s = time.monotonic() - t0
             self.usage.add_embed(m, in_tok)
             if ctx is not None:
+                cost = self.usage.price_embed(m, in_tok)
                 ctx.emit(
                     f"call call_site=embed model={m} provider={provider} "
                     f"latency_s={round(latency_s, 3)} in_tok={in_tok} dim={len(vector)}",
                     kind="call",
+                    data=None if cost is None else {"cost": cost},
                 )
             return vector
 

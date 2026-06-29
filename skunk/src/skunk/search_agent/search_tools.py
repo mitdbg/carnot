@@ -189,6 +189,8 @@ class SearchCorpusTool(Tool):
             chunks.append({
                 "chunk_id": cid,
                 "doc_id": doc_id,
+                "type": elt_type,
+                "distance": dist,
                 "text": (
                     f"[{rank}] chunk_id={cid} | doc_id={doc_id} | "
                     f"type={elt_type} | distance={dist:.4f}\n{doc or ''}"

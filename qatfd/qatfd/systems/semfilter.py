@@ -15,8 +15,14 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 
 from skunk.multi_turn_agent import Tool
+from skunk.trace import truncate
 
 SEMFILTER_RESULT_TAG = "__semfilter_result__"
+
+# Per-doc text snippet cap in the structured trace event. Each filtered doc carries a
+# preview so the trace viewer can expand it on click without a second corpus lookup; the
+# cap keeps a 1,000-doc filter from bloating events.jsonl with full document bodies.
+_SEMFILTER_DOC_PREVIEW_MAX = 2000
 
 _SEMFILTER_SYSTEM = (
     "You determine whether a document satisfies a filter condition. You are given a "
@@ -59,13 +65,33 @@ def filter_docs(
     max_workers: int = 8,
 ) -> list[str]:
     """Return the subset of `doc_ids` whose document text satisfies `predicate`,
-    preserving input order."""
+    preserving input order.
+
+    When `ctx` is provided, emits one structured `semantic_filter` observation event
+    recording the predicate and every input doc's verdict + text preview, so the trace
+    viewer can render the pass/fail breakdown (green/red) and expand each doc on click."""
     if not doc_ids:
         return []
     texts = [document_map.get(d, "") or "" for d in doc_ids]
     with ThreadPoolExecutor(max_workers=min(max_workers, len(doc_ids))) as pool:
         verdicts = list(pool.map(lambda it: _judge_one(llm_client, predicate, it, model, ctx), texts))
-    return [d for d, keep in zip(doc_ids, verdicts, strict=True) if keep]
+    kept = [d for d, keep in zip(doc_ids, verdicts, strict=True) if keep]
+
+    if ctx is not None:
+        ctx.emit(
+            f"semantic_filter n_in={len(doc_ids)} n_out={len(kept)} predicate={truncate(predicate, 80)!r}",
+            kind="observation",
+            data={
+                "predicate": predicate,
+                "n_in": len(doc_ids),
+                "n_out": len(kept),
+                "docs": [
+                    {"doc_id": d, "kept": bool(keep), "text": truncate(t, _SEMFILTER_DOC_PREVIEW_MAX, "\n…(truncated)")}
+                    for d, keep, t in zip(doc_ids, verdicts, texts, strict=True)
+                ],
+            },
+        )
+    return kept
 
 
 class SemanticFilterTool(Tool):

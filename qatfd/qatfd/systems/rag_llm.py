@@ -50,8 +50,22 @@ class RAGLLMSystem(RetrieveComputeSystem):
                 f"retrieved top_k={self.config.top_k} chunks={len(chunks)} docs={len(doc_ids)}",
                 kind="observation",
                 data={
+                    "query": q.text,
                     "doc_ids": doc_ids,
                     "chunk_ids": [c.get("chunk_id") for c in chunks],
+                    # per-chunk rows (rank order) so the viewer can show doc_id + distance + text,
+                    # mirroring the SearchAgent's search_corpus rendering.
+                    "chunks": [
+                        {
+                            "rank": i,
+                            "chunk_id": c.get("chunk_id"),
+                            "doc_id": c.get("doc_id"),
+                            "type": c.get("type"),
+                            "distance": c.get("distance"),
+                            "text": c.get("text"),
+                        }
+                        for i, c in enumerate(chunks, 1)
+                    ],
                     "context": context,
                 },
             )

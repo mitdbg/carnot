@@ -37,15 +37,32 @@ def _events_path(run_dir: pathlib.Path) -> pathlib.Path:
 
 
 def _find_runs(root: pathlib.Path) -> list[str]:
-    """Run directory names under `root` that hold an events.jsonl or report.csv,
-    newest first (dir names are timestamp-suffixed, so reverse-sorted == newest)."""
+    """Run directories under `root` that hold an events.jsonl or report.csv, returned
+    as paths relative to `root`, newest first (dir names are timestamp-suffixed, so
+    reverse-sorted == newest).
+
+    Discovers both layouts: the flat `eval/traces/<run>/` and the qatfd
+    `results/<benchmark>/<system>/<run>/` hierarchy. A directory qualifies as a run when
+    it directly contains `traces/events.jsonl` or `report.csv`; we never descend into a
+    run (so a run's own `traces/` subdir is not mistaken for another run)."""
     runs: list[str] = []
+    seen: set[pathlib.Path] = set()
+
+    def _walk(d: pathlib.Path) -> None:
+        if not d.is_dir():
+            return
+        if _events_path(d).exists() or (d / "report.csv").exists():
+            rel = d.relative_to(root)
+            if rel not in seen:
+                seen.add(rel)
+                runs.append(rel.as_posix())
+            return  # a run is a leaf — don't descend further
+        for child in sorted(d.iterdir()):
+            if child.is_dir():
+                _walk(child)
+
     try:
-        for d in root.iterdir():
-            if not d.is_dir():
-                continue
-            if _events_path(d).exists() or (d / "report.csv").exists():
-                runs.append(d.name)
+        _walk(root)
     except FileNotFoundError:
         pass
     return sorted(runs, reverse=True)
@@ -193,15 +210,22 @@ def main() -> None:
     parser.add_argument(
         "--traces-root",
         default=None,
-        help="Directory holding eval run dirs. Defaults to eval/traces relative to this script.",
+        help=(
+            "Directory holding run dirs (discovered recursively, so it may be a flat "
+            "eval/traces or the nested qatfd results/<benchmark>/<system>/<run>). "
+            "Defaults to <repo>/qatfd/results when present, else eval/traces."
+        ),
     )
     args = parser.parse_args()
 
     if args.traces_root:
         root = pathlib.Path(args.traces_root).resolve()
     else:
-        # Script lives at skunk/eval/trace_viewer/serve.py → ../.. == skunk/eval, + traces.
-        root = (pathlib.Path(__file__).resolve().parent.parent / "traces").resolve()
+        here = pathlib.Path(__file__).resolve()
+        # Script lives at <repo>/skunk/eval/trace_viewer/serve.py.
+        qatfd_results = here.parents[3] / "qatfd" / "results"
+        eval_traces = here.parent.parent / "traces"
+        root = (qatfd_results if qatfd_results.is_dir() else eval_traces).resolve()
 
     _Handler.root = root
     server = HTTPServer(("localhost", args.port), _Handler)

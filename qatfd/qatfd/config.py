@@ -103,10 +103,15 @@ class TrecBiogenConfig(BenchmarkConfig):
     # weight given to a `partial_support` nugget in the recall score (full support = 1.0).
     partial_credit: float = 0.0
     # If >1, the 26.8M-abstract corpus is split across N per-rank Chroma collections named
-    # f"{chromadb_collection}_r{i}" (built with create_vector_db --only-rank). The benchmark opens
-    # all N and merges query/get across them (MergedCollection). This sidesteps chromadb 1.5.x's
-    # metadata-segment compaction failure on a single 26.8M-row collection. 1 => single collection.
+    # f"{chromadb_collection}_r{i}", each in its OWN chroma dir (its own chroma.sqlite3). The
+    # benchmark opens all N and merges query/get across them (MergedCollection). Separate dirs are
+    # essential: collections in ONE dir share one chroma.sqlite3, so it still hits chromadb 1.5.x's
+    # ~24M-row metadata-segment scale wall. 1 => single collection.
     chromadb_num_shards: int = 1
+    # Optional explicit per-shard chroma dirs (len == chromadb_num_shards). If null, shard i is read
+    # from f"{chromadb_dir}/r{i}". Use it to point shards at independent dirs (or mix: some shards in
+    # one dir, others elsewhere — e.g. to salvage already-built shards without a full rebuild).
+    chromadb_shard_dirs: list[str] | None = None
 
 @dataclass
 class QampariConfig(BenchmarkConfig):
