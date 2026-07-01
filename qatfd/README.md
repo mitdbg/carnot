@@ -26,14 +26,31 @@ results/        run output (gitignored)
 | `trec-biogen` | `skunk/biogen/2025_task_a.json` (40 Task A questions) | `skunk/.chromadb` collection `qwen-biogen-0.6b` (26.8M PubMed abstracts, Qwen3-0.6B) + doc map from element metadata | LLM-as-judge nugget-completion recall (KARL D.1) |
 | `financebench` | `skunk/financebench/financebench_open_source.jsonl` (150 open-source questions) | `skunk/.chromadb` collection `qwen-financebench` (368 SEC-filing PDFs indexed at page level, Qwen3-8B) + page-text doc map from element metadata | LLM-as-judge (single nugget) |
 
-Dev/test split: the runner defaults to `--split dev` (excludes the held-out test
-set). OfficeQA test = the 32 UIDs in `skunk/eval/test_set_uids.json`; BrowseComp-Plus
-test = KARL's 230 calibrated-subset query_ids (`benchmarks/data/karl_bcp_test_ids.json`);
-TREC-BioGen has no sub-split — all 40 Task A questions are the held-out comparison set,
-so it is always run with `--split test`. FinanceBench likewise has no sub-split — all 150
-open-source questions are the held-out set (KARL lists 150; no 100-question subset is
-published), so it too is always run with `--split test`. Use `--split test` only for
-final-number runs.
+**Dev / test splits.** Every benchmark carries an explicit dev/test split in
+`skunk/splits/<benchmark>.json` (`{"dev": [qids], "test": [qids]}`), wired via
+`benchmarks.splits_path`. The runner defaults to `experiments.split=dev`; pass
+`experiments.split=test` only for final-number runs. The splits are generated
+deterministically by [`scripts/make_splits.py`](scripts/make_splits.py) — **that script is
+the source of truth**; regenerate with `PYTHONPATH=. python3 scripts/make_splits.py`.
+
+| benchmark | dev | test | construction |
+|-----------|----:|-----:|--------------|
+| `officeqa` | 33 | 100 | first 25% of CSV order = dev, last 75% = test (not shuffled) |
+| `browsecomp_plus` | 50 | 230 | test = KARL's 230 calibrated-subset query_ids; dev = 50 sampled (seed 0) from the disjoint remainder |
+| `trec_biogen` | 10 | 30 | shuffle the 40 Task A qids (seed 0), then slice |
+| `financebench` | 50 | 100 | shuffle the 150 qids (seed 0), then slice |
+| `qampari` | 50 | 1000 | test = all 1000 `test_data.jsonl` qids (KARL's eval set); dev = 50 sampled (seed 0) from `train_data.jsonl` (disjoint), materialized to `qampari/dev_data_sample50.jsonl` |
+| `freshstack` | 184 | 203 | split by TOPIC: dev = all `laravel` queries, test = all `langchain` queries |
+
+"shuffle (seed 0)" = sort the qids for a stable base order, then `random.Random(0).shuffle`,
+then slice — so membership depends only on the seed, not on file/load order. FreshStack's
+split is the topic itself (each topic is a separate corpus/collection): run the dev set with
+the default `benchmarks.topic=laravel`, and the test set with
+`benchmarks.topic=langchain experiments.split=test`.
+
+Caveat: OfficeQA's dev set (first 25% by CSV order, ~UID0001–UID0057) overlaps several of
+skunk's held-out 32 test UIDs, so qatfd OfficeQA **dev**-tuned numbers are not comparable to
+skunk's OfficeQA **test** numbers.
 
 The per-row `score` column is correctness in `[0,1]`: 0/1 for the binary benchmarks,
 and the graded nugget-completion recall for `trec-biogen` (the run summary averages it).

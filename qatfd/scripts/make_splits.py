@@ -9,7 +9,7 @@ Split spec:
   browsecomp_plus  test = KARL's calibrated subset,                dev = 50 sampled (seed 0) from the rest
   trec_biogen      shuffle(seed 0): dev = first 10,                test = last 30
   financebench     shuffle(seed 0): dev = first 50,                test = last 100
-  qampari          shuffle(seed 0): dev = first 50,                test = last 950
+  qampari          test = ALL 1000 test_data qids (KARL's set),    dev = 50 sampled (seed 0) from train_data
   freshstack       dev = all laravel queries,                      test = all langchain queries
 
 "shuffle(seed 0)" = sort the qids for a stable base order, then random.Random(0).shuffle, then slice —
@@ -50,6 +50,26 @@ def _shuffle_slice(qids: list[str], seed: int, n_dev: int) -> tuple[list[str], l
     return ordered[:n_dev], ordered[n_dev:]
 
 
+def _read_jsonl_by_qid(path) -> dict[str, str]:
+    """qid -> raw JSONL line (kept verbatim), for benchmarks whose split is drawn from a file the
+    benchmark loader doesn't read (e.g. QAMPARI's train_data, source of the dev extract)."""
+    by_qid: dict[str, str] = {}
+    with open(path) as f:
+        for line in f:
+            if line.strip():
+                by_qid[str(json.loads(line)["qid"])] = line if line.endswith("\n") else line + "\n"
+    return by_qid
+
+
+def _write_jsonl_extract(path, lines: list[str]) -> None:
+    """Materialize a small subset of raw JSONL records (e.g. the 50 QAMPARI dev questions) so a
+    benchmark's dev_questions_path can be loaded alongside its main question file."""
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        f.writelines(lines)
+    print(f"{'':16s} wrote {len(lines)} dev records -> {path}")
+
+
 def _write(name: str, dev: list[str], test: list[str]) -> None:
     dev_s, test_s = sorted(set(dev)), sorted(set(test))
     overlap = set(dev_s) & set(test_s)
@@ -70,10 +90,23 @@ def main() -> None:
         _write("officeqa", q[:k], q[k:])
 
         # shuffle(seed 0) then slice.
-        for name, n_dev in [("trec_biogen", 10), ("financebench", 50), ("qampari", 50)]:
+        for name, n_dev in [("trec_biogen", 10), ("financebench", 50)]:
             q = _ordered_qids(_benchmark([f"benchmarks={name}"]))
             dev, test = _shuffle_slice(q, 0, n_dev)
             _write(name, dev, test)
+
+        # qampari: test = ALL 1000 test_data qids (KARL's exact eval set — confirmed by the appendix
+        # query "What did James B. Longacre design?" living only in test_data.jsonl). dev = 50 sampled
+        # (seed 0) from train_data.jsonl, DISJOINT from test (different source file), so dev never
+        # leaks into the KARL test set. We also materialize the 50 dev records into a small extract
+        # (dev_questions_path) so the runner can load them alongside the test file.
+        bench = _benchmark(["benchmarks=qampari"])
+        train_recs = _read_jsonl_by_qid(resolve_under_skunk("qampari/train_data.jsonl"))
+        dev, _ = _shuffle_slice(list(train_recs), 0, 50)
+        _write_jsonl_extract(resolve_under_skunk(bench.config.dev_questions_path), [train_recs[q] for q in dev])
+        # test = every qid in test_data.jsonl (read directly, so the just-written dev extract can't leak in).
+        test = list(_read_jsonl_by_qid(bench.config.questions_path))
+        _write("qampari", dev, test)
 
         # browsecomp_plus: test = KARL's subset; dev = 50 sampled (seed 0) from the DISJOINT rest.
         bench = _benchmark(["benchmarks=browsecomp_plus"])

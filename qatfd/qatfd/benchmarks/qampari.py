@@ -22,12 +22,18 @@ Gold docs / recall: a proof identifies the supporting Wikipedia ARTICLE, not a c
   TITLE. gold_docs are normalized article titles; recall = fraction of gold articles whose chunks
   were retrieved (`doc_recall`), collapsing retrieved chunk_ids -> article title via the title in
   the Chroma metadata (a small per-question `.get` on just the retrieved ids).
-Held-out test set: `test_ids_path` if given, else ALL 1000 questions (run with --split test).
+Dev/test splits: TEST is all 1000 `test_data.jsonl` questions — KARL's exact eval set, confirmed by
+  its appendix query "What did James B. Longacre design?" appearing only there. DEV is 50 questions
+  sampled (seed 0) from `train_data.jsonl` (the `dev_questions_path` extract), disjoint from test so
+  it never leaks. Both are loaded together (load_questions) and served by the one shared Wikipedia
+  index; the runner selects a split via splits/qampari.json (scripts/make_splits.py). `test_ids_path`,
+  if given, further restricts the test set (else ALL 1000).
 """
 
 from __future__ import annotations
 
 import json
+import os
 from collections import OrderedDict
 from urllib.parse import unquote, urlparse
 
@@ -117,6 +123,8 @@ class QampariBenchmark(Benchmark):
     def __init__(self, config: QampariConfig) -> None:
         config.chromadb_dir = str(resolve_under_skunk(config.chromadb_dir))
         config.questions_path = str(resolve_under_skunk(config.questions_path))
+        if config.dev_questions_path:
+            config.dev_questions_path = str(resolve_under_skunk(config.dev_questions_path))
         if config.test_ids_path:
             config.test_ids_path = str(resolve_under_skunk(config.test_ids_path))
         if config.prompts_path:
@@ -145,9 +153,9 @@ class QampariBenchmark(Benchmark):
                     articles.append(art)
         return articles
 
-    def load_questions(self) -> list[Question]:
+    def _questions_from_file(self, path: str) -> list[Question]:
         questions: list[Question] = []
-        with open(self.config.questions_path) as f:
+        with open(path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -171,6 +179,16 @@ class QampariBenchmark(Benchmark):
                         },
                     )
                 )
+        return questions
+
+    def load_questions(self) -> list[Question]:
+        # test_data.jsonl (the 1000 KARL qids) PLUS the small train-sampled dev extract, so both the
+        # test and dev splits resolve from one load (the runner filters by split qid). test/dev qids
+        # are disjoint by construction (different source files -> distinct `__test`/`__train` suffixes).
+        questions = self._questions_from_file(self.config.questions_path)
+        dev_path = self.config.dev_questions_path
+        if dev_path and os.path.exists(dev_path):
+            questions.extend(self._questions_from_file(dev_path))
         return questions
 
     # ---- retrieval substrate --------------------------------------------------
