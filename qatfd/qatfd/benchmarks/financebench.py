@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import glob
 import json
-import os
 
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.judge import judge_single_nugget
@@ -166,17 +165,3 @@ class FinanceBenchBenchmark(Benchmark):
 
     def recall_metrics(self, retrieved: list[str] | None, question: Question) -> dict[str, float]:
         return financebench_recall_metrics(retrieved, question.gold_docs)
-
-    def test_qids(self) -> set[str]:
-        if self.config.test_ids_path:
-            assert os.path.exists(self.config.test_ids_path), (
-                f"test_ids_path {self.config.test_ids_path} does not exist; expected a JSON object with "
-                f"a 'query_ids' field listing the held-out FinanceBench qids."
-            )
-            with open(self.config.test_ids_path) as f:
-                data = json.load(f)
-            assert "query_ids" in data, f"test_ids_path {self.config.test_ids_path} must have a 'query_ids' field."
-            return {str(q) for q in data["query_ids"]}
-
-        # no explicit split: the whole 150-question open-source set is the held-out comparison set.
-        return {q.qid for q in self.load_questions()}

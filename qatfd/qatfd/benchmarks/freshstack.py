@@ -78,7 +78,11 @@ class FreshstackBenchmark(Benchmark):
         if not config.corpus_path:
             config.corpus_path = f"{config.data_dir}/{topic}/corpus.jsonl"
         if not config.chromadb_collection:
-            config.chromadb_collection = f"qwen-freshstack-{topic}-0.6b"
+            config.chromadb_collection = f"freshstack-{topic}-qwen-0.6b"
+        # Each topic lives in its OWN slim store; derive the per-topic dir from the default shared
+        # value (override chromadb_dir explicitly, or chromadb_host, to point elsewhere).
+        if config.chromadb_dir in (None, ".chromadb"):
+            config.chromadb_dir = f".chromadb-freshstack-{topic}-qwen-0.6b"
 
         config.chromadb_dir = str(resolve_under_skunk(config.chromadb_dir))
         config.questions_path = str(resolve_under_skunk(config.questions_path))
@@ -193,17 +197,3 @@ class FreshstackBenchmark(Benchmark):
         ret_files = None if retrieved is None else [_file_id(c) for c in retrieved]
         gold_files = [_file_id(g) for g in question.gold_docs]
         return {"doc_recall": chunk_recall, "file_recall": doc_recall(ret_files, gold_files)}
-
-    def test_qids(self) -> set[str]:
-        if self.config.test_ids_path:
-            assert os.path.exists(self.config.test_ids_path), (
-                f"test_ids_path {self.config.test_ids_path} does not exist; expected a JSON object with "
-                f"a 'query_ids' field listing the held-out FreshStack qids."
-            )
-            with open(self.config.test_ids_path) as f:
-                data = json.load(f)
-            assert "query_ids" in data, f"test_ids_path {self.config.test_ids_path} must have a 'query_ids' field."
-            return {str(q) for q in data["query_ids"]}
-
-        # no explicit split: the whole topic's question set is the held-out comparison set.
-        return {q.qid for q in self.load_questions()}

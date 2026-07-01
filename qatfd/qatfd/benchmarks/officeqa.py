@@ -163,12 +163,3 @@ class OfficeQABenchmark(Benchmark):
 
     def recall_metrics(self, retrieved: list[str] | None, question: Question) -> dict[str, float]:
         return officeqa_recall_metrics(retrieved, question.gold_docs)
-
-    def test_qids(self) -> set[str]:
-        if not os.path.exists(self.config.test_set_uids_path):
-            return set()
-        with open(self.config.test_set_uids_path) as f:
-            data = json.load(f)
-        assert "uids" in data, "test_set_uids_path must be a dict with 'uids' key."
-
-        return set(data["uids"])

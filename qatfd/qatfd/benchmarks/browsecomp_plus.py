@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import glob
 import json
-import os
 
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.judge import judge_single_nugget
@@ -109,11 +108,3 @@ class BrowseCompPlusBenchmark(Benchmark):
             "gold_doc_recall": doc_recall(retrieved, question.gold_docs),
             "evidence_doc_recall": doc_recall(retrieved, question.meta.get("evidence_docs", [])),
         }
-
-    def test_qids(self) -> set[str]:
-        assert os.path.exists(self.config.bcp_test_ids_path), f"test_qids_path {self.config.bcp_test_ids_path} does not exist; expected a JSON file containing the test query_ids (e.g. KARL's calibrated subset) for BrowseComp-Plus."
-        with open(self.config.bcp_test_ids_path) as f:
-            data = json.load(f)
-        
-        assert "query_ids" in data, f"test_qids_path {self.config.bcp_test_ids_path} should contain a JSON object with a 'query_ids' field listing the qids in the test set."
-        return {str(q) for q in data["query_ids"]}

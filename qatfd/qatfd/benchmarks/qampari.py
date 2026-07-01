@@ -28,7 +28,6 @@ Held-out test set: `test_ids_path` if given, else ALL 1000 questions (run with -
 from __future__ import annotations
 
 import json
-import os
 from collections import OrderedDict
 from urllib.parse import unquote, urlparse
 
@@ -217,17 +216,3 @@ class QampariBenchmark(Benchmark):
             }
             ret_articles = [id_to_title.get(str(c), "") for c in retrieved]
         return {"doc_recall": doc_recall(ret_articles, question.gold_docs)}
-
-    def test_qids(self) -> set[str]:
-        if self.config.test_ids_path:
-            assert os.path.exists(self.config.test_ids_path), (
-                f"test_ids_path {self.config.test_ids_path} does not exist; expected a JSON object with "
-                f"a 'query_ids' field listing the held-out QAMPARI qids."
-            )
-            with open(self.config.test_ids_path) as f:
-                data = json.load(f)
-            assert "query_ids" in data, f"test_ids_path {self.config.test_ids_path} must have a 'query_ids' field."
-            return {str(q) for q in data["query_ids"]}
-
-        # no explicit split: the whole 1000-question test set is the held-out comparison set.
-        return {q.qid for q in self.load_questions()}

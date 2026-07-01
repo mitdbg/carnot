@@ -24,7 +24,7 @@ import random
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import cast
 
@@ -62,7 +62,7 @@ def _select_questions(benchmark: Benchmark, config: ExperimentConfig) -> list[Qu
     all_q = benchmark.load_questions()
     by_qid = {q.qid: q for q in all_q}
     test_qids = benchmark.test_qids()
-    assert len(test_qids) > 0, "benchmark must define at least one test qid for a meaningful dev/test split"
+    dev_qids = benchmark.dev_qids()  # explicit dev list, or None => "everything not in test"
 
     if config.qids is not None:
         requested = [s.strip() for s in config.qids if s.strip()]
@@ -81,11 +81,14 @@ def _select_questions(benchmark: Benchmark, config: ExperimentConfig) -> list[Qu
         print(f"[qatfd] split '{config.split}': running {len(requested)} question(s).")
         return [by_qid[r] for r in requested]
 
-    pool = (
-        [q for q in all_q if q.qid in test_qids]
-        if config.split == "test" else
-        [q for q in all_q if q.qid not in test_qids]
-    )
+    if config.split == "test":
+        pool = [q for q in all_q if q.qid in test_qids]
+    elif dev_qids is not None:
+        # explicit dev split from the split file (dev is NOT necessarily test's complement — e.g.
+        # BrowseComp-Plus dev is a 50-question sample disjoint from KARL's test set).
+        pool = [q for q in all_q if q.qid in dev_qids]
+    else:
+        pool = [q for q in all_q if q.qid not in test_qids]  # legacy: no split file => dev = all - test
     if config.sample:
         # sort first so the draw depends only on the seed, not load order; a local RNG
         # (seeded when config.seed is set) keeps the subset reproducible across systems.
@@ -215,6 +218,26 @@ def _persist_run_config(
         print(f"[qatfd] WARN: failed to persist run config: {e}")
 
 
+def _load_done(results_path: Path) -> dict[str, Result]:
+    """Completed results from a prior (possibly interrupted) run, keyed by qid. Each line of
+    `results.jsonl` is one `asdict(Result)`; a truncated/corrupt trailing line (process killed
+    mid-write) is skipped rather than fatal."""
+    done: dict[str, Result] = {}
+    if not results_path.exists():
+        return done
+    with results_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = Result(**json.loads(line))
+            except Exception:  # noqa: BLE001 — skip a partial/corrupt line (e.g. killed mid-flush)
+                continue
+            done[r.qid] = r
+    return done
+
+
 def run(
     benchmark: Benchmark, system: System, exp_config: ExperimentConfig, results_root: str,
     cfg: DictConfig | None = None, overrides: list[str] | None = None,
@@ -226,43 +249,81 @@ def run(
     if not questions:
         raise Exception("[qatfd] ABORT: no questions selected for the run. Check your split, qids, and sample settings.")
 
-    # set up run directory and event logging; resolve a relative value against the current working directory
-    # (absolute values pass through).
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_label = f"{exp_config.run_name}_{ts}" if exp_config.run_name else ts
-    run_dir = Path(results_root).expanduser().resolve() / benchmark.name / system.name / run_label
+    # Run directory: resume into an existing one (skip finished questions) or create a fresh
+    # timestamped dir. A relative results_root resolves against the cwd; absolute passes through.
+    if exp_config.resume_dir:
+        run_dir = Path(exp_config.resume_dir).expanduser().resolve()
+        if not run_dir.is_dir():
+            raise Exception(f"[qatfd] ABORT: resume_dir {run_dir} does not exist.")
+        print(f"[qatfd] resuming run at {run_dir}")
+    else:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_label = f"{exp_config.run_name}_{ts}" if exp_config.run_name else ts
+        run_dir = Path(results_root).expanduser().resolve() / benchmark.name / system.name / run_label
     trace_dir = run_dir / "traces"
     trace_dir.mkdir(parents=True, exist_ok=True)
-    _persist_run_config(run_dir, cfg, overrides)
-    configure_obs(jsonl_path=str(trace_dir / "events.jsonl") if trace_dir else None)
+    # Snapshot config only for a fresh run, so resuming preserves the ORIGINAL run's config/overrides
+    # (the source of truth for how the question set was selected).
+    if not exp_config.resume_dir:
+        _persist_run_config(run_dir, cfg, overrides)
+    configure_obs(jsonl_path=str(trace_dir / "events.jsonl"))
+
+    # Already-completed results (incremental sink); resume skips these qids.
+    results_path = run_dir / "results.jsonl"
+    done = _load_done(results_path)
+    if done:
+        mismatch = next(
+            (r for r in done.values() if r.benchmark != benchmark.name or r.system != system.name), None
+        )
+        if mismatch:
+            raise Exception(
+                f"[qatfd] ABORT: {results_path} holds {mismatch.benchmark}/{mismatch.system} results, but this "
+                f"run is {benchmark.name}/{system.name}. Resume with the same benchmark + system."
+            )
+    todo = [q for q in questions if q.qid not in done]
 
     print(f"[qatfd] Trace dir: {trace_dir}")
-    print(f"[qatfd] benchmark={benchmark.name} system={system.name} questions={len(questions)} workers={exp_config.workers}")
-
-    # build the shared retrieval substrate once (chroma + document_map).
-    resources = benchmark.get_resources()
-    model = system.config.agent_model_id
-    rc = _RunCtx(
-        benchmark=benchmark, system=system, resources=resources,
-        trace_dir=trace_dir, model=model, verbose=exp_config.console,
+    print(
+        f"[qatfd] benchmark={benchmark.name} system={system.name} questions={len(questions)} "
+        f"done={len(done)} todo={len(todo)} workers={exp_config.workers}"
     )
 
-    # run the questions and collect results
-    results: list[Result | None] = [None] * len(questions)
-    if exp_config.workers <= 1:
-        for i, q in enumerate(questions):
-            results[i] = asyncio.run(_run_one(q, rc))
-    else:
-        with ThreadPoolExecutor(max_workers=exp_config.workers) as pool:
-            futures = {
-                pool.submit(lambda q: asyncio.run(_run_one(q, rc)), question): i
-                for i, question in enumerate(questions)
-            }
-            for fut in as_completed(futures):
-                results[futures[fut]] = fut.result()
+    if todo:
+        # build the shared retrieval substrate once (chroma + document_map).
+        resources = benchmark.get_resources()
+        model = system.config.agent_model_id
+        rc = _RunCtx(
+            benchmark=benchmark, system=system, resources=resources,
+            trace_dir=trace_dir, model=model, verbose=exp_config.console,
+        )
+        # Drop any half-written per-question traces from the killed attempt for the questions
+        # we're about to (re)run, so they don't linger alongside the fresh ones.
+        for q in todo:
+            for ext in (".log", ".txt"):
+                (trace_dir / f"{q.qid}{ext}").unlink(missing_ok=True)
 
-    # write results to report.csv
-    rows = [r for r in results if r is not None]
+        # Append each result to results.jsonl the moment it lands, so a kill mid-run loses nothing
+        # and the run is resumable. The as_completed loop runs in THIS thread, so the writes are
+        # serialized — no lock needed.
+        with results_path.open("a", encoding="utf-8") as rf:
+            def _persist(r: Result) -> None:
+                rf.write(json.dumps(asdict(r)) + "\n")
+                rf.flush()
+                done[r.qid] = r
+
+            if exp_config.workers <= 1:
+                for q in todo:
+                    _persist(asyncio.run(_run_one(q, rc)))
+            else:
+                with ThreadPoolExecutor(max_workers=exp_config.workers) as pool:
+                    futures = [pool.submit(lambda q: asyncio.run(_run_one(q, rc)), q) for q in todo]
+                    for fut in as_completed(futures):
+                        _persist(fut.result())
+    else:
+        print("[qatfd] all selected questions already complete; rewriting report.csv from results.jsonl")
+
+    # write report.csv from the full completed set, in the original selection order
+    rows = [done[q.qid] for q in questions if q.qid in done]
     report_path = run_dir / "report.csv"
     with report_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=report_columns(rows))

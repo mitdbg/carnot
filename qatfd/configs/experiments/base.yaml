@@ -6,3 +6,4 @@ qids: null          # explicit qids to run, list[str] (overrides split/sample)
 workers: 32         # question-level concurrency (ThreadPoolExecutor)
 run_name: ""        # label prefix for the run directory (timestamp is always appended)
 console: false      # also stream per-question logs to the console
+resume_dir: null    # resume an interrupted run: path to its run dir; finished questions (in results.jsonl) are skipped

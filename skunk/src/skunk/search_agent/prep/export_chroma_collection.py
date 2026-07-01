@@ -54,8 +54,14 @@ def main() -> None:
     parser.add_argument("--src", default=".chromadb", help="source PersistentClient path")
     parser.add_argument("--collection", required=True, help="collection name to export")
     parser.add_argument("--dest", required=True, help="destination PersistentClient path (created)")
+    parser.add_argument(
+        "--dest-collection",
+        default=None,
+        help="rename the collection in the destination (default: same as --collection)",
+    )
     parser.add_argument("--batch-size", type=int, default=CHROMA_MAX_BATCH_SIZE)
     args = parser.parse_args()
+    dest_name = args.dest_collection or args.collection
 
     src_client = chromadb.PersistentClient(path=args.src)
     src_collection = src_client.get_collection(name=args.collection)
@@ -64,17 +70,17 @@ def main() -> None:
     # Preserve the source's collection metadata (e.g. {"hnsw:space": "cosine"}) so the rebuilt
     # index uses the SAME distance function — otherwise search results would differ.
     dest_collection = dest_client.get_or_create_collection(
-        name=args.collection,
+        name=dest_name,
         metadata=src_collection.metadata or None,
     )
 
     print(
-        f"Exporting '{args.collection}': {args.src} -> {args.dest} "
+        f"Exporting '{args.collection}' -> '{dest_name}': {args.src} -> {args.dest} "
         f"({src_collection.count()} rows)",
         flush=True,
     )
     n = _copy_collection(src_collection, dest_collection, args.batch_size)
-    print(f"Done: copied {n} rows into {args.dest}", flush=True)
+    print(f"Done: copied {n} rows into {args.dest} as '{dest_name}'", flush=True)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 
 import chromadb
 
@@ -103,16 +104,25 @@ class MergedCollection:
         return self._collections[0].name
 
     def count(self) -> int:
-        return sum(c.count() for c in self._collections)
+        return sum(self._fanout(lambda c: c.count()))
+
+    def _fanout(self, fn):
+        """Run ``fn(collection)`` across all shards concurrently, results in shard order. Parallel
+        fan-out is a latency win and is safe when the shards are separate chroma SERVERS (each owns
+        its own concurrency) — which is how sharded biogen must be served, since the embedded
+        PersistentClient serializes/deadlocks under in-process concurrency."""
+        if len(self._collections) == 1:
+            return [fn(self._collections[0])]
+        with ThreadPoolExecutor(max_workers=len(self._collections)) as ex:
+            return list(ex.map(fn, self._collections))
 
     def query(self, **kwargs) -> dict:
-        """Run the same query on every shard, then keep the globally closest ``n_results`` by
-        distance (chroma's default L2 space: smaller = closer)."""
+        """Run the same query on every shard (concurrently), then keep the globally closest
+        ``n_results`` by distance (chroma's default L2 space: smaller = closer)."""
         n_results = kwargs.get("n_results", 10)
         include = kwargs.get("include") or ["metadatas", "documents", "distances"]
         rows: list[tuple] = []
-        for c in self._collections:
-            r = c.query(**kwargs)
+        for r in self._fanout(lambda c: c.query(**kwargs)):
             ids = (r.get("ids") or [[]])[0]
             n = len(ids)
             dists = (r.get("distances") or [[None] * n])[0]
@@ -141,8 +151,7 @@ class MergedCollection:
         docs_acc: list = []
         metas_acc: list = []
         want_docs = want_metas = False
-        for c in self._collections:
-            r = c.get(**kwargs)
+        for r in self._fanout(lambda c: c.get(**kwargs)):
             ids_acc.extend(r.get("ids") or [])
             if r.get("documents") is not None:
                 want_docs = True
@@ -150,8 +159,6 @@ class MergedCollection:
             if r.get("metadatas") is not None:
                 want_metas = True
                 metas_acc.extend(r["metadatas"])
-            if limit is not None and len(ids_acc) >= limit:
-                break
         if limit is not None:
             ids_acc, docs_acc, metas_acc = ids_acc[:limit], docs_acc[:limit], metas_acc[:limit]
         out: dict = {"ids": ids_acc}
@@ -246,6 +253,19 @@ class TrecBiogenBenchmark(Benchmark):
         if n <= 1:
             return self._open_chroma_collection()
         base = self.config.chromadb_collection
+        # Each shard as its own warm chroma SERVER on its own port (run_chroma_server.sh per shard):
+        # keeps HNSW resident across runs (no cold load) and dodges the embedded-client concurrency
+        # deadlock. Queried in parallel by MergedCollection. Takes precedence over shard dirs.
+        ports = getattr(self.config, "chromadb_shard_ports", None)
+        if ports:
+            if len(ports) != n:
+                raise ValueError(f"chromadb_shard_ports has {len(ports)} entries but chromadb_num_shards={n}.")
+            from skunk.chroma_client import make_chroma_client
+            host = self.config.chromadb_host or "127.0.0.1"
+            return MergedCollection(
+                [self._get_shard(make_chroma_client(host, p), f"{base}_r{i}", f"{host}:{p}")
+                 for i, p in enumerate(ports)]
+            )
         if self.config.chromadb_host:
             client = self._chroma_client()
             return MergedCollection([self._get_shard(client, f"{base}_r{i}", "server") for i in range(n)])
@@ -301,18 +321,3 @@ class TrecBiogenBenchmark(Benchmark):
         # Relevance is labeled at the PMID (document) level — the expert-cited supporting
         # PMIDs — and abstracts are one chunk per doc, so document-level recall is the metric.
         return {"doc_recall": doc_recall(retrieved, question.gold_docs)}
-
-    def test_qids(self) -> set[str]:
-        if self.config.test_ids_path:
-            assert os.path.exists(self.config.test_ids_path), (
-                f"test_ids_path {self.config.test_ids_path} does not exist; expected a JSON object "
-                f"with a 'query_ids' field listing the held-out TREC-BioGen qids."
-            )
-            with open(self.config.test_ids_path) as f:
-                data = json.load(f)
-            assert "query_ids" in data, f"test_ids_path {self.config.test_ids_path} must have a 'query_ids' field."
-            return {str(q) for q in data["query_ids"]}
-
-        # no explicit split: the whole 40-question set is the held-out comparison set.
-        with open(self.config.task_a_path) as f:
-            return {_qa_id(rec) for rec in json.load(f)}

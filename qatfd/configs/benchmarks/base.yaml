@@ -9,3 +9,5 @@ chromadb_port: 8001
 prompts_path: null
 # corpus PDFs dir (under skunk/) for the view_figure tool; null = no figure tool
 pdf_dir: null
+# dev/test split JSON (under skunk/): {"dev": [qids], "test": [qids]}. null => dev=all, test=empty.
+splits_path: null
