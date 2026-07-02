@@ -1,0 +1,53 @@
+# Prompt overrides for the BrowseComp-Plus corpus.
+#
+# Same schema as config/prompts/treasury_bulletin.yaml: each entry adds a
+# corpus blurb, a list of few-shot example strings, or a list of lessons to one
+# or more target agents (matched by the agent's `name`). Agents fish out their
+# own entries at prompt-build time. See src/skunk/prompted_call.py for the
+# schema (`load_prompt_overrides` / `PromptOverride`).
+#
+# Select this file at runtime via `SKUNK_PROMPT_OVERRIDES=config/prompts/browsecomp_plus.yaml`
+# (or `config.prompt_overrides_path`).
+#
+# Partially populated: only the search_agent corpus blurb is filled in so far.
+# Add planner / extract / compute / lookup_external blurbs, lessons, and
+# few-shots as they are developed for this corpus.
+
+overrides:
+  # ---------------------------------------------------------------------
+  # Corpus blurbs — one per agent that mentions the dataset.
+  # ---------------------------------------------------------------------
+  - section: corpus
+    targets: [search_agent]
+    content: |
+      The corpus consists of 100,195 web pages scraped from URLs relevant to 830 complex, multi-hop fact-seeking questions from BrowseComp. It was assembled in two stages: (1) human-verified positive evidence documents that support the reasoning chain needed to answer each question, and (2) hard-negative documents mined by decomposing each question into sub-queries, running them through web search, and scraping the results. On average, each query is associated with ~6 evidence documents, ~76 hard negatives, and ~3 gold documents (those that implicitly contain the final answer). Average document length is ~5,179 words.
+
+      ### Identifier formats
+      - `doc_id`: a numeric string identifying each scraped web page (e.g. `"4217"`). This is the `docid` field from the `Tevatron/browsecomp-plus-corpus` HuggingFace dataset.
+      - `chunk_id`: `"{doc_id}_{element_id}"` (e.g. `"4217_3"` = the 4th element, 0-indexed, of document 4217). Elements are produced by splitting the document text on `\n\n` and merging consecutive paragraphs until each chunk reaches ~1024 tokens.
+      - In your final answer, the `doc_ids` list holds `doc_id`s in the format above.
+
+      ### Available metadata fields (for use with `metadata_filter`)
+      Every chunk has the following metadata you can filter on:
+      - `doc_id`: string, the numeric web-page identifier (see above).
+      - `chunk_id`: string, `"{doc_id}_{element_id}"`.
+      - `url`: string, the exact source URL of the web page (equality/set-membership only — ChromaDB does not support substring or prefix matching).
+      - `element_id`: integer, 0-based index of the chunk within its document.
+
+      ### Example `metadata_filter` clauses
+      ```python
+      # all chunks from a single document
+      {"doc_id": "4217"}
+
+      # only the first two elements of a document (often page title + intro)
+      {"$and": [{"doc_id": "4217"}, {"element_id": {"$in": [0, 1]}}]}
+
+      # all chunks from a known set of relevant documents
+      {"doc_id": {"$in": ["4217", "8031", "12500"]}}
+
+      # only the first element of every document (useful for a title-level scan)
+      {"element_id": 0}
+
+      # all chunks from an exact known URL
+      {"url": "https://example.com/some-article"}
+      ```

@@ -264,11 +264,17 @@ evals/sembench/files/animals/source_data/
 evals/sembench/results/
 evals/quest/data/
 
+# qatfd benchmark data: see the dedicated block at the END of this file.
+# (The allow-list must come after the generic *.json / *.csv rules below,
+#  because in gitignore the last matching pattern wins.)
+
+
 # Copilot things
 .github/copilot-instructions.md
 examples/
 
 # vector databases
+**/chromadb/
 .chromadb
 skunk/.chromadb
 
@@ -306,3 +312,23 @@ skunk/venv/
 # financebench corpus (PDFs + question jsonl + generated embeddings; fetch from
 # https://github.com/patronus-ai/financebench)
 skunk/financebench/
+
+# ─────────────────────────────────────────────────────────────────────────────
+# qatfd benchmarks
+#
+# Ignore all benchmark payloads (chromadb indices, element embeddings, PDFs,
+# corpora, large json/jsonl data) but keep the directory structure, the small
+# metadata files, and a per-benchmark README describing the "complete" layout.
+#
+# This block MUST stay at the bottom of the file: gitignore uses last-match-wins,
+# so these negations have to override the generic *.json / *.csv rules above.
+#
+# To re-include a file inside an ignored tree you must FIRST re-include every
+# parent directory (`!.../**/`), otherwise git never descends far enough to see
+# the file. That is why the whole-directory `!qatfd/benchmarks/**/` line exists.
+# ─────────────────────────────────────────────────────────────────────────────
+qatfd/benchmarks/**
+!qatfd/benchmarks/**/
+!qatfd/benchmarks/**/*_splits.json
+!qatfd/benchmarks/**/prompts.yaml
+!qatfd/benchmarks/**/README.md

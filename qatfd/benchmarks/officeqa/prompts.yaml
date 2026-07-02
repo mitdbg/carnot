@@ -1,0 +1,383 @@
+# Prompt overrides for the U.S. Treasury Monthly Bulletin corpus.
+#
+# Each entry adds a corpus blurb, a list of few-shot example strings, or a list
+# of lessons to one or more target agents (targets are `PromptedCall` names).
+# Agents fish out their own entries at prompt-build time. See
+# src/skunk/prompted_call.py for the schema and how entries are consumed.
+#
+# Few-shots are pre-formatted strings: whatever you write here lands verbatim
+# under the agent's "## Few-shot examples" header, separated by blank lines.
+
+overrides:
+  # ---------------------------------------------------------------------
+  # Corpus blurbs — one per agent that mentions the dataset.
+  # ---------------------------------------------------------------------
+  - section: corpus
+    targets: [planner, replanner]
+    content: |
+      Questions are answered against the U.S. Treasury Monthly Bulletins,
+      a 696-document corpus spanning 1939–2025. Emit period as
+      canonical month ranges (YYYY-MM, YYYY-MM..YYYY-MM, or a comma-separated
+      list of these), never natural language — expand fiscal years, calendar
+      years, and quarters to months yourself per the date conventions below.
+
+  # Publication cadence — issue choice (planner/replanner pins, selection-agent
+  # vintage decisions) must name months an issue actually exists for.
+  - section: corpus
+    targets: [planner, replanner, select_agent]
+    content: |
+      Publication cadence: one bulletin per month from 1939 through 1982;
+      quarterly from 1983 on — issues exist only for months 03, 06, 09, 12.
+
+  # Shared date math — the planner expands question dates; the page-index build
+  # agents resolve dates printed on a page. Same conventions, stated once.
+  - section: corpus
+    targets: [planner, replanner, page_scan, page_scan_vision, toc_outline, toc_reconstruct, chapter_merge, era_segment, era_merge]
+    content: |
+      Date conventions. Carefully distinguish fiscal year (FY) from calendar year
+      (CY). Calendar year YYYY = YYYY-01..YYYY-12. Quarter Qn YYYY =
+      that quarter's three months (Q2 2023 = 2023-04..2023-06). Fiscal year FYy =
+      the 12 months ending in year y: (y-1)-10..y-09 from FY1977 on,
+      (y-1)-07..y-06 before 1977 (FY2008 = 2007-10..2008-09;
+      FY1939 = 1938-07..1939-06). The months 1976-07..1976-09 are the
+      FY1976→FY1977 "transition quarter" and belong to neither fiscal year —
+      pin them directly.
+
+  - section: corpus
+    targets: [extract.text, extract.vision, extract.confirm]
+    content: |
+      The pages you receive are from the U.S. Treasury Monthly Bulletins.
+
+  # Selection agent — corpus blurb + selection lessons (lifted from the inline
+  # briefing in src/skunk/select_agent.py; the briefing keeps only the
+  # corpus-independent task mechanics).
+  - section: corpus
+    targets: [select_agent]
+    content: |
+      The blocks are from the U.S. Treasury Monthly Bulletins; the same table
+      is reprinted across consecutive issues, sometimes with revisions.
+
+  - section: lessons
+    targets: [select_agent]
+    content: |
+      A label wrapping the concept in extra words ("... and related activities", "..., including ...") is a broader aggregate; prefer the exact asked scope.
+      When the question describes the source of the data (published in, reported by, etc.), commit issues that fit the description and discard the rest.
+      When multiple reprints exist, prefer the first print that carries all the requested data, then check a few reprints past it: when a later issue reprints that exact table with revised values, commit the revised reprint instead — not both, and never a different table. You must inspect the row labels to confirm that the needed dates exist as rows at the needed granularity and work your way forwards if the first print does not carry the data.
+      Favor whole-table coverage: a single block whose rows span the entire requested period beats a patchwork of partial windows. Assemble from multiple blocks only when no single print carries the whole period, and then tile reprints of the same table — never a mix of different tables.
+      When the question compares or combines several periods, commit blocks that carry ALL of them on the SAME time basis — all annual rows or all monthly rows, never an annual total for one period and a monthly breakdown for another. Inspect row labels to confirm the basis before committing.
+
+  # Renders under the search-agent SYSTEM prompt's `## Dataset` header.
+  # Lifted from the abandoned `officeqa_special_notes` blob in the old
+  # `src/skunk/search_agent/prompts.yaml`.
+  - section: corpus
+    targets: [search_agent, final_answer]
+    content: |
+      The corpus consists of U.S. Treasury bulletins from 1939 to 2025 Q3. From 1939-1982, every month had a single bulletin. Starting in 1983, bulletins were released quarterly (i.e. in months 3, 6, 9, and 12). Each bulletin is split into pages, and each page is treated as one "document" (with its own `doc_id`).
+
+      ### Identifier formats
+      - `doc_id`: `"<year>_<month>_<page_id>"` (e.g. `"2002_12_26"` = page 26 of the December 2002 bulletin). Use `page_id` as the index of the page in the bulletin, NOT the printed page number on the page itself (these may differ).
+      - `chunk_id`: `"<doc_id>_<element_id>"` (e.g. `"1946_11_41_6"` = the 6th element on page 41 of the November 1946 bulletin).
+      - In your final answer, the `doc_ids` list holds `doc_id`s in the format above.
+
+      ### Time periods (calendar vs. fiscal year)
+      - A **calendar year** runs January–December. A U.S. federal **fiscal year (FY)** runs October 1 – September 30 and is named for the year in which it ENDS — e.g. FY1945 = October 1944 through September 1945. (Before FY1977 the fiscal year ran July 1 – June 30; FY1976 has a transition quarter, Jul–Sep 1976.) Quarters follow the basis of the period in question. Read each question for which basis it asks, aggregate the matching months, and never mix a fiscal-year figure with a calendar-year one.
+
+      ### Revisions (look forward in time)
+      - Treasury Bulletins publish REVISED figures: the value for a given period is frequently restated in a LATER bulletin, not only in the issue covering that period. When a figure may have been revised, prefer the most recent reprint that covers the period and look forward in time (into later issues) rather than stopping at the period's own bulletin.
+
+      ### Available metadata fields (for use with `metadata_filter`)
+      Every chunk has the following metadata you can filter on:
+      - `year`: zero-padded string, e.g. `"2010"`.
+      - `month`: zero-padded string, e.g. `"03"` (only `"03"`, `"06"`, `"09"`, `"12"` from 1983 onward).
+      - `page_id`: integer, the index of the page within its bulletin.
+      - `doc_id`: string, the full page key (see above).
+      - `type`: string, the element type (`"text"`, `"title"`, `"table"`, `"footnote"`, ...).
+
+      ### Example `metadata_filter` clauses
+      ```python
+      # all pages from any month in 2008
+      {"year": "2008"}
+
+      # any Q1 bulletin in the 2010s, restricted to page index 26
+      {"$and": [
+          {"year": {"$in": [str(y) for y in range(2010, 2020)]}},
+          {"month": "03"},
+          {"page_id": 26},
+      ]}
+
+      # only table elements
+      {"type": "table"}
+      ```
+
+  # ---------------------------------------------------------------------
+  # Page-index build family — per-page scan, ToC extraction/reconstruction,
+  # and the cross-issue chapter merge + era segmentation. All reason over the
+  # same Treasury section taxonomy, so they share this corpus blurb.
+  # ---------------------------------------------------------------------
+  - section: corpus
+    targets: [page_scan, page_scan_vision, toc_outline, toc_reconstruct, chapter_merge, era_segment, era_merge]
+    content: |
+      The pages are from the U.S. Treasury Monthly Bulletin — monthly
+      federal-finance statistics (public debt, receipts/outlays, ownership of
+      Treasury securities, exchange stabilization, foreign currency positions,
+      trust funds). Resolve relative or partial dates against the publication
+      month.
+
+  - section: lessons
+    targets: [page_scan, page_scan_vision]
+    content: >
+      A cumulative table of contents — a multi-month / multi-issue contents
+      grid, usually at the back of the issue — is NOT the issue's table of
+      contents; label it non_content.
+
+  # ---------------------------------------------------------------------
+  # Planner lessons — gotchas observed against this corpus.
+  # ---------------------------------------------------------------------
+  - section: lessons
+    targets: [planner, replanner]
+    content: |
+      One concept per `retrieve.key`. If a question names multiple values (two currencies, two indices, two agencies, two bond classes, ...), emit ONE branch per value rather than bundling — branches run in parallel and splitting is cheap, while bundling forces retrieval to find a single page covering everything. 
+      The converse also holds: one branch per concept. Do not emit several branches that re-describe the same table/statistic ("bids submitted for note X", "allotments of note X", "operations for note X" = ONE branch), and do not split the same concept across periods into same-key branches — use one branch with a comma-separated period ("1940-01..1940-12, 1953-01..1953-12").
+
+  - section: lessons
+    targets: [replanner]
+    content: |
+      When replanning, only switch to external lookup if you are convinced that the retrieval term was correct and the corpus does not contain the information requested. Prefer rewording the retrieval key or correcting the data period first.
+  # ---------------------------------------------------------------------
+  # Planner few-shots. Each entry is a pre-formatted block that lands
+  # verbatim under the planner's "## Few-shot examples" header.
+  # ---------------------------------------------------------------------
+  - section: few_shots
+    targets: [planner]
+    content:
+      - |
+        ### Example (plain date range → period is the DATA window; do NOT treat the data years as a publication "vintage". Same concept, two periods → ONE branch, comma-separated period)
+        Q: Absolute percent change in national defense expenditures between CY1940 and CY1953, rounded to hundredths.
+        Plan:
+        ```json
+        {
+          "branches": [
+            {"kind": "retrieve", "key": "national defense expenditures",
+             "period": "1940-01..1940-12, 1953-01..1953-12"}
+          ]
+        }
+        ```
+
+      - |
+        ### Example (a needed value looks external (CPI) — still emit a retrieve for it, keyed by the question's wording. If the corpus has no such value, the lookup is injected at replan; never emit lookup_external here.)
+        Q: Real (CPI-adjusted, 2020 dollars) value of total national defense expenditures in CY1953.
+        Plan:
+        ```json
+        {
+          "branches": [
+            {"kind": "retrieve", "key": "national defense expenditures",
+             "period": "1953-01..1953-12"},
+            {"kind": "retrieve", "key": "CPI",
+             "period": "1953-01..1953-12"}
+          ]
+        }
+        ```
+
+      - |
+        ### Example (a named publication issue is NOT the period — period is the DATA month, 1985-12, not the September 1990 issue the value is printed in; selection picks the issue. Chart read → visual_only)
+        Q: Read the total debt held by the public for December 1985 from the chart in the September 1990 Treasury Bulletin.
+        Plan:
+        ```json
+        {
+          "branches": [
+            {"kind": "retrieve", "key": "total debt held by the public",
+             "period": "1985-12", "visual_only": true}
+          ]
+        }
+        ```
+
+      - |
+        ### Example (the named "September 2012" issue is the PUBLICATION date, NOT the period — period is the DATA window (FY2008, FY2010); selection chooses which issue to read. Two concepts × two periods → TWO branches, comma-separated periods)
+        Q: Using the figures reported in the September 2012 Treasury Bulletin, what was the change in federal debt held by the public as a percent of GDP between the end of fiscal year 2008 and fiscal year 2010?
+        Plan:
+        ```json
+        {
+          "branches": [
+            {"kind": "retrieve", "key": "federal debt held by the public",
+             "period": "2007-10..2008-09, 2009-10..2010-09"},
+            {"kind": "retrieve", "key": "GDP",
+             "period": "2007-10..2008-09, 2009-10..2010-09"}
+          ]
+        }
+        ```
+
+      - |
+        ### Example (question pins an explicit PAGE of a specific document → page_pin {doc_id, page}; the page number is taken as written (we resolve both the printed-label and PDF-index page). No period — the pin determines location. Reading a chart → visual_only; put what to read in key.)
+        Q: On page 12 of the March 1985 Treasury Bulletin, how many bars in the chart rise above $50 billion?
+        Plan:
+        ```json
+        {
+          "branches": [
+            {"kind": "retrieve", "key": "chart of bars above $50 billion",
+             "page_pin": {"doc_id": "1985-03", "page": 12},
+             "visual_only": true}
+          ]
+        }
+        ```
+
+
+  # ---------------------------------------------------------------------
+  # Replanner few-shots. Diff-shaped examples — the replanner emits a PlanDiff
+  # (add/drop), not a whole Plan, so it does NOT share the planner few-shots
+  # above (those render full `branches` plans). lookup_external is a REPLAN-ONLY
+  # branch (the initial plan is retrieve-only), so the lookup-injection path is
+  # shown here, not in the planner few-shots. The add/drop rules themselves live
+  # in the replan system prompt and are not restated.
+  # ---------------------------------------------------------------------
+  - section: few_shots
+    targets: [replanner]
+    content:
+      - |
+        ### Example (one branch failed → drop it by index, re-add reworded; keep the branch that succeeded)
+        prior_plan.branches:
+          [0] {"kind": "retrieve", "key": "unemployment insurance tax receipts", "period": "2009-01..2009-12"}
+          [1] {"kind": "retrieve", "key": "national defense expenditures", "period": "2009-01..2009-12"}
+        Branch [0] FAILED: retrieval found no table named for "unemployment insurance
+        tax receipts" — the corpus files these receipts under the Unemployment Trust
+        Fund. Branch [1] succeeded and its value is already in prev.
+        PlanDiff:
+        ```json
+        {
+          "add": [
+            {"kind": "retrieve", "key": "Unemployment Trust Fund receipts",
+             "period": "2009-01..2009-12"}
+          ],
+          "drop": [0]
+        }
+        ```
+
+      - |
+        ### Example (a value is not in the corpus → drop the doomed retrieve, inject a lookup_external)
+        prior_plan.branches:
+          [0] {"kind": "retrieve", "key": "national defense expenditures", "period": "1953-01..1953-12"}
+          [1] {"kind": "retrieve", "key": "CPI", "period": "1953-01..1953-12"}
+        Branch [1] FAILED: no consumer-price index series anywhere in the Treasury
+        Bulletin corpus. Branch [0] succeeded (in prev). What was missing: cpi:1953.
+        The question named no publisher, so leave `src` null.
+        PlanDiff:
+        ```json
+        {
+          "add": [
+            {"kind": "lookup_external",
+             "target": "U.S. CPI-U annual average for 1953 (base 2020=100)"}
+          ],
+          "drop": [1]
+        }
+        ```
+
+
+  # ---------------------------------------------------------------------
+  # Corpus blurbs for the remaining executors.
+  # ---------------------------------------------------------------------
+  - section: corpus
+    targets: [compute.codegen]
+    content: |
+      The values in `input_values` were extracted from U.S. Treasury Monthly
+      Bulletin pages.
+
+  # Unit convention — free-form natural-language labels on both lookup and
+  # corpus-extracted entries (compute reads them as prose, not codes).
+  - section: corpus
+    targets: [compute.codegen, lookup_external]
+    content: |
+      Units are free-form natural-language labels — the same convention for
+      externally looked-up and corpus-extracted values (e.g. "millions of
+      dollars", "percent", "yen per U.S. dollar"). Do not coerce them into
+      codes. For a foreign-currency amount, keep the native unit (e.g.
+      "billions of yen") and state the exchange-rate direction in `description`.
+
+  - section: corpus
+    targets: [lookup_external]
+    content: |
+      Lookups complement, rather than duplicate, the U.S. Treasury Monthly
+      Bulletin corpus. Typical asks: macro / price series (CPI, GDP,
+      population), FX spot rates, and entity facts that the bulletins
+      do not carry directly.
+
+  # ---------------------------------------------------------------------
+  # Compute lessons
+  # ---------------------------------------------------------------------
+  - section: lessons
+    targets: [compute.codegen]
+    content: >
+      Distinguish a maturity-schedule flow from an outstanding stock. A figure
+      keyed to a maturing period (a "by maturing month/maturity" row, even under
+      an "amount outstanding" column) is the amount maturing IN that period. The
+      total outstanding as of a date is the sum of that period and every later
+      maturity (the not-yet-matured remainder), declining over time. For "total
+      outstanding as of <date>", sum forward from that date; do not use the
+      single maturing-period figure.
+
+  # ---------------------------------------------------------------------
+  # Extract lessons
+  # ---------------------------------------------------------------------
+  - section: lessons
+    targets: [extract.text, extract.vision]
+    content: >
+      Unit and scale come from the printed page — column header, caption,
+      parenthetical legend, footnote like "(In millions of dollars)".
+      Never guess from magnitude: if the page shows "74" under a "billions
+      of yen" header, emit value=74 and unit="billions of yen". Do not
+      silently rescale or convert foreign currency to USD — leave it native.
+
+  - section: lessons
+    targets: [extract.text, extract.vision]
+    content: >
+      Watch for qualifier-mismatched rows. Treasury tables stack rows whose
+      labels differ by a single subtle modifier — "Total Public Debt
+      Securities" vs "Total interest-bearing debt", gross vs net, total vs
+      a subtotal, "held by the public" vs "intragovernmental", outstanding
+      vs issued. The lookup is satisfied only by a row matching the requested series
+      including EVERY qualifier. Do not substitute a near-label row for the
+      exact series. When the page has several qualifier-variants, emit each
+      as its own entry with the page's verbatim row text in `description`
+      (so the modifier is visible downstream) rather than collapsing to one.
+      When the only row present is a near-match (the exact series is not on
+      the page), still emit it, but make the qualifier difference explicit
+      in `description` — never present it as the exact series.
+
+  # ---------------------------------------------------------------------
+  # Few-shots for compute executors.
+  # ---------------------------------------------------------------------
+  - section: few_shots
+    targets: [compute.codegen]
+    content:
+      - |
+        ### Example (closed-form, two scalars)
+        Q: Absolute percent change in national defense expenditures between CY1940 and CY1953.
+        input_values: two scalars — [0] national defense expenditures for CY1940, [1] same for CY1953, both unit "millions of dollars".
+        Why this shape: Identify each entry in the input_values block, reference it by index, apply (B-A)/A·100, abs(), format. No unit conversion needed (same scale).
+        Output:
+        ```python
+        a = input_values[0].frame.iat[0, 0]  # national defense expenditures, CY1940
+        b = input_values[1].frame.iat[0, 0]  # national defense expenditures, CY1953
+        result = f'{abs((b - a) / a * 100):.2f}'
+        ```
+
+      - |
+        ### Example (FX conversion)
+        Q: JPY net options position in millions of USD, mid-March 2016.
+        input_values: [0] scalar value=2300 unit "billions of yen", [1] scalar unit "yen per U.S. dollar" description="JPY per USD spot, 2016-03".
+        Why this shape: Foreign currency → find the exchange-rate entry in the block, read direction from its description ("JPY per USD" → divide), then rescale billions → millions.
+        Output:
+        ```python
+        jpy_b = input_values[0].frame.iat[0, 0]  # 2300, billions of yen
+        rate  = input_values[1].frame.iat[0, 0]  # JPY per USD spot → divide
+        usd_m = jpy_b * 1000 / rate
+        result = f'{usd_m:,.2f}'
+        ```
+
+      - |
+        ### Example (missing-data signal — bare JSON, NO fence)
+        Q: Real (CPI-adjusted, 2020 dollars) value of CY1953 national defense expenditures.
+        input_values: only the nominal CY1953 scalar; no CPI series.
+        Why this shape: Required deflator is not in input_values. Emit the bare missing-data JSON object (NO fence). Never fabricate.
+        Output (literal, no fence in your reply):
+        {"missing": ["cpi:1953", "cpi:2020"], "description": "no CPI series in input_values to convert nominal CY1953 to 2020 dollars"}
+
+
