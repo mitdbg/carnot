@@ -52,6 +52,11 @@ class SearchAgentSystem(RetrieveComputeSystem):
     def _extra_tools(self, ctx: ExecutionContext, resources: BenchmarkResources) -> tuple:
         return ()
 
+    def _include_search_corpus(self) -> bool:
+        """Whether the agent gets the `search_corpus` (vector-search) tool. Subclasses can
+        drop it to force the agent onto other retrieval tools."""
+        return True
+
     def _prompts(self) -> tuple[str | None, str | None]:
         """(briefing, final_answer_doc) overrides; None => skunk SearchAgent defaults."""
         if self.config.agent_mode == "answer":
@@ -70,6 +75,7 @@ class SearchAgentSystem(RetrieveComputeSystem):
             llm_client=ctx.llm_client,
             emb_model_id=self.config.emb_model_id,
             extra_tools=self._extra_tools(ctx, resources),
+            include_search_corpus=self._include_search_corpus(),
             briefing=briefing,
             final_answer_doc=final_answer_doc,
             pdf_dir=resources.pdf_dir,
