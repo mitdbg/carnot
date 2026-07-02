@@ -1,13 +1,14 @@
 """BrowseComp-Plus benchmark.
 
-Questions: skunk/browsecomp-plus/browsecomp_plus_decrypted.jsonl
+Questions: benchmarks/browsecomp-plus/browsecomp_plus_decrypted.jsonl
   (query_id / query / answer / gold_docs[...]).
-Corpus + index: the prebuilt ChromaDB collection `qwen-browsecomp-plus` under
-  skunk/.chromadb (element-level, Qwen3-Embedding-8B). The doc_id->text map is
-  reconstructed from the element-embedding metadata (cleaned text per element),
+Corpus + index: the prebuilt ChromaDB collection `browsecomp-plus-qwen-8b` under
+  benchmarks/browsecomp-plus/chromadb (element-level, Qwen3-Embedding-8B). The doc_id->text
+  map is reconstructed from the element-embedding metadata (cleaned text per element),
   avoiding a re-download of the HF corpus.
 Scoring: LLM-as-judge, single-nugget correctness (see judge.py).
-Held-out test set: KARL's 230 calibrated-subset query_ids (data/karl_bcp_test_ids.json).
+Dev/test split: benchmarks/browsecomp-plus/browsecomp_plus_splits.json (test = KARL's 230
+  calibrated-subset query_ids; dev = 50 sampled seed 0 from the rest); see scripts/make_splits.py.
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.judge import judge_single_nugget
 from qatfd.config import BrowseCompPlusConfig
 from qatfd.constants import BROWSECOMP_PLUS
-from qatfd.paths import resolve_under_skunk
+from qatfd.paths import resolve_under_benchmarks
 from qatfd.types import Question
 
 
@@ -28,13 +29,12 @@ class BrowseCompPlusBenchmark(Benchmark):
     config: BrowseCompPlusConfig
 
     def __init__(self, config: BrowseCompPlusConfig) -> None:
-        # resolve paths and store config
-        config.chromadb_dir = str(resolve_under_skunk(config.chromadb_dir))
-        config.bcp_questions = str(resolve_under_skunk(config.bcp_questions))
-        config.bcp_metadata_glob = str(resolve_under_skunk(config.bcp_metadata_glob))
-        config.bcp_test_ids_path = str(resolve_under_skunk(config.bcp_test_ids_path))
+        # all benchmark data (index, questions, metadata, prompts) resolves under qatfd/benchmarks/.
+        config.chromadb_dir = str(resolve_under_benchmarks(config.chromadb_dir))
+        config.bcp_questions = str(resolve_under_benchmarks(config.bcp_questions))
+        config.bcp_metadata_glob = str(resolve_under_benchmarks(config.bcp_metadata_glob))
         if config.prompts_path:
-            config.prompts_path = str(resolve_under_skunk(config.prompts_path))
+            config.prompts_path = str(resolve_under_benchmarks(config.prompts_path))
         super().__init__(config)
 
     def load_questions(self) -> list[Question]:

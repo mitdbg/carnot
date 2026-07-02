@@ -28,10 +28,11 @@ hydra:
   job:
     chdir: false
   # Hydra's own bookkeeping (the resolved config snapshot + launcher logs). Kept out
-  # of the results tree under a dotfile dir. Relative to the launch CWD (run_all.sh
-  # cds to the qatfd repo root first).
+  # of the results tree under a dotfile dir. Relative to the launch CWD, which is the
+  # qatfd/ project dir (run_all.sh cds there; `python3 -m qatfd.runner` is run from there),
+  # so this sits next to the real `results/` — same base as results_root above.
   run:
-    dir: qatfd/results/.hydra/${now:%Y-%m-%d_%H-%M-%S}
+    dir: results/.hydra/${now:%Y-%m-%d_%H-%M-%S}
   sweep:
-    dir: qatfd/results/.hydra/multirun/${now:%Y-%m-%d_%H-%M-%S}
+    dir: results/.hydra/multirun/${now:%Y-%m-%d_%H-%M-%S}
     subdir: ${hydra.job.num}_${benchmarks.name}_${systems.name}

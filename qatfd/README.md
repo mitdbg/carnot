@@ -8,27 +8,40 @@ imports the sibling `skunk` package as a library.
 
 ```
 qatfd/
-  benchmarks/   Benchmark ABC + OfficeQA, BrowseComp-Plus (+ LLM judge, KARL test ids)
-  systems/      System ABC + the four systems (+ semantic filter)
-  registry.py   name -> Benchmark/System
-  runner.py     Hydra CLI + parallel runner -> results/<benchmark>/<system>/<run>/report.csv
-configs/        Hydra config groups (experiments/, benchmarks/, systems/)
-run_all.sh      meta driver over the {benchmarks} x {systems} matrix (Hydra multirun)
-results/        run output (gitignored)
+  qatfd/
+    benchmarks/ Benchmark ABC + the six benchmarks (+ LLM judge)
+    systems/    System ABC + the four systems (+ semantic filter)
+    registry.py name -> Benchmark/System
+    runner.py   Hydra CLI + parallel runner -> results/<benchmark>/<system>/<run>/report.csv
+  configs/      Hydra config groups (experiments/, benchmarks/, systems/)
+  benchmarks/   Benchmark DATA + indices, one dir per benchmark (gitignored; see below)
+  run_all.sh    meta driver over the {benchmarks} x {systems} matrix (Hydra multirun)
+  results/      run output (gitignored)
 ```
+
+Note the two `benchmarks/`: `qatfd/qatfd/benchmarks/` is the code (loaders/scorers);
+`qatfd/benchmarks/` is the data root (corpora, Chroma indices, questions, splits).
 
 ## Benchmarks
 
+All benchmark **data** (indices, questions, corpora, split files, and the optional
+prompt-override YAML `benchmarks.prompts_path`) lives under `qatfd/benchmarks/<benchmark>/`
+(override the root with `QATFD_BENCHMARKS_DIR`). Each embedded Chroma store is
+`<benchmark>/chromadb` (TREC-BioGen shards it into `chromadb/r0..r3`; FreshStack is per-topic
+at `freshstack/<topic>/chromadb`).
+
 | name | questions | corpus / index | scorer |
 |------|-----------|----------------|--------|
-| `officeqa` | `skunk/officeqa_pro.csv` | `skunk/.chromadb` (collection from `SKUNK_CHROMADB_COLLECTION`) + `treasury_bulletins_cleaned/clean_page_map.json` | cup-kit numeric (`score_correct`) |
-| `browsecomp_plus` | `skunk/browsecomp-plus/browsecomp_plus_decrypted.jsonl` | `skunk/.chromadb` collection `qwen-browsecomp-plus` + doc map from element metadata | LLM-as-judge (single nugget) |
-| `trec-biogen` | `skunk/biogen/2025_task_a.json` (40 Task A questions) | `skunk/.chromadb` collection `qwen-biogen-0.6b` (26.8M PubMed abstracts, Qwen3-0.6B) + doc map from element metadata | LLM-as-judge nugget-completion recall (KARL D.1) |
-| `financebench` | `skunk/financebench/financebench_open_source.jsonl` (150 open-source questions) | `skunk/.chromadb` collection `qwen-financebench` (368 SEC-filing PDFs indexed at page level, Qwen3-8B) + page-text doc map from element metadata | LLM-as-judge (single nugget) |
+| `officeqa` | `officeqa/officeqa_pro.csv` | `officeqa/chromadb` (`officeqa-qwen-8b`, Qwen3-8B) + `officeqa/treasury_bulletins_cleaned/clean_page_map.json` | cup-kit numeric (`score_correct`) |
+| `browsecomp_plus` | `browsecomp-plus/browsecomp_plus_decrypted.jsonl` | `browsecomp-plus/chromadb` (`browsecomp-plus-qwen-8b`, Qwen3-8B) + doc map from element metadata | LLM-as-judge (single nugget) |
+| `trec_biogen` | `trec-biogen/2025_task_a.json` (40 Task A questions) | `trec-biogen/chromadb` (`qwen-biogen-0.6b`, 26.8M PubMed abstracts, Qwen3-0.6B, 4 shards) + lazy chroma doc map | LLM-as-judge nugget-completion recall (KARL D.1) |
+| `financebench` | `financebench/financebench_open_source.jsonl` (150 open-source questions) | `financebench/chromadb` (`financebench-qwen-8b`, 368 SEC-filing PDFs indexed at page level, Qwen3-8B) + page-text doc map from element metadata | LLM-as-judge (single nugget) |
+| `qampari` | `qampari/test_data.jsonl` (1000) + `qampari/dev_data_sample50.jsonl` | `qampari/chromadb` (`qwen-qampari-0.6b`, ~25.9M Wikipedia chunks, Qwen3-0.6B; served over HTTP) + lazy chroma doc map | LLM-as-judge nugget (entity) recall |
+| `freshstack` | `freshstack/<topic>/queries.jsonl` (langchain=test, laravel=dev) | `freshstack/<topic>/chromadb` (`freshstack-<topic>-qwen-0.6b`, Qwen3-0.6B) + doc map from `corpus.jsonl` | LLM-as-judge nugget-completion recall |
 
-**Dev / test splits.** Every benchmark carries an explicit dev/test split in
-`skunk/splits/<benchmark>.json` (`{"dev": [qids], "test": [qids]}`), wired via
-`benchmarks.splits_path`. The runner defaults to `experiments.split=dev`; pass
+**Dev / test splits.** Every benchmark carries an explicit dev/test split co-located with its
+data at `qatfd/benchmarks/<benchmark>/<benchmark>_splits.json` (`{"dev": [qids], "test": [qids]}`),
+wired via `benchmarks.splits_path`. The runner defaults to `experiments.split=dev`; pass
 `experiments.split=test` only for final-number runs. The splits are generated
 deterministically by [`scripts/make_splits.py`](scripts/make_splits.py) — **that script is
 the source of truth**; regenerate with `PYTHONPATH=. python3 scripts/make_splits.py`.
@@ -39,7 +52,7 @@ the source of truth**; regenerate with `PYTHONPATH=. python3 scripts/make_splits
 | `browsecomp_plus` | 50 | 230 | test = KARL's 230 calibrated-subset query_ids; dev = 50 sampled (seed 0) from the disjoint remainder |
 | `trec_biogen` | 10 | 30 | shuffle the 40 Task A qids (seed 0), then slice |
 | `financebench` | 50 | 100 | shuffle the 150 qids (seed 0), then slice |
-| `qampari` | 50 | 1000 | test = all 1000 `test_data.jsonl` qids (KARL's eval set); dev = 50 sampled (seed 0) from `train_data.jsonl` (disjoint), materialized to `qampari/dev_data_sample50.jsonl` |
+| `qampari` | 50 | 1000 | test = all 1000 `test_data.jsonl` qids (KARL's eval set); dev = 50 sampled (seed 0) from `train_data.jsonl` (disjoint), materialized to `benchmarks/qampari/dev_data_sample50.jsonl` |
 | `freshstack` | 184 | 203 | split by TOPIC: dev = all `laravel` queries, test = all `langchain` queries |
 
 "shuffle (seed 0)" = sort the qids for a stable base order, then `random.Random(0).shuffle`,
@@ -77,22 +90,24 @@ query embedder, so no `emb_model_id` override is needed). Retrieval stays page-l
 #    resumable: each phase skips work already persisted, so a rerun only renders/LLMs the missing
 #    pages then reassembles (a single failed page never reprocesses its whole doc). All dir args
 #    accept a local path OR an s3:// prefix — on a low-disk cluster stream to/from S3 (see
-#    run_financebench_preprocess.slurm; upload PDFs once with `aws s3 sync skunk/financebench/pdfs
+#    run_financebench_preprocess.slurm; upload PDFs once with `aws s3 sync benchmarks/financebench/pdfs
 #    s3://carnot-research/financebench/pdfs`). Two intermediate prefixes ({output_dir}-renders,
 #    {output_dir}-pages) hold the caches; only --output_dir holds the final {doc}.json.
 OPENROUTER_API_KEY=sk-or-... python engaging-scripts/preprocess_financebench_pdfs.py \
-    --input_dir  ../skunk/financebench/pdfs \
-    --output_dir ../skunk/financebench/financebench-elements
+    --input_dir  benchmarks/financebench/pdfs \
+    --output_dir benchmarks/financebench/financebench-elements
 # 2. EMBED (GPU): element JSONs -> Qwen3-8B embeddings — see run_financebench_element_embeddings.slurm.
 #    --input_dir/--output_dir also accept s3:// prefixes (stream JSONs in, embeddings/metadata out).
+#    The metadata_rank*.json this writes are ALSO the page-text doc map (benchmarks.fb_metadata_glob),
+#    so keep the financebench-element-embeddings dir alongside the built index.
 python engaging-scripts/compute_financebench_element_embeddings.py \
-    --input_dir  ../skunk/financebench/financebench-elements \
-    --output_dir ../skunk/financebench/financebench-element-embeddings
+    --input_dir  benchmarks/financebench/financebench-elements \
+    --output_dir benchmarks/financebench/financebench-element-embeddings
 # 3. load them into the chroma collection (on a box with disk; if step 2 wrote to S3, first
 #    `aws s3 sync s3://carnot-research/financebench/financebench-element-embeddings ./fb-embeddings`)
 python -m skunk.search_agent.prep.create_vector_db \
-    --embeddings-dir ../skunk/financebench/financebench-element-embeddings \
-    --collection-name qwen-financebench --chroma-path ../skunk/.chromadb --benchmark finance_bench
+    --embeddings-dir benchmarks/financebench/financebench-element-embeddings \
+    --collection-name financebench-qwen-8b --chroma-path benchmarks/financebench/chromadb --benchmark finance_bench
 ```
 
 ## Systems (registry names)
@@ -109,9 +124,10 @@ pip install -e .          # this package
 ```
 
 Configuration is read from `skunk/.env` (loaded automatically before importing skunk)
-and the `SKUNK_*` env vars (`SkunkConfig.from_env()`): model, provider, chromadb dir,
-collection, embedding model, agent step budget, etc. API keys (`OPENROUTER_API_KEY`
-or `GEMINI_API_KEY`) must be present in the environment.
+and the `SKUNK_*` env vars (`SkunkConfig.from_env()`): model, provider, embedding model,
+agent step budget, etc. API keys (`OPENROUTER_API_KEY` or `GEMINI_API_KEY`) must be present
+in the environment. The per-benchmark chromadb dir + collection come from the benchmark config
+(under `qatfd/benchmarks/`), not `SKUNK_*`.
 
 ### Query embedding backend
 

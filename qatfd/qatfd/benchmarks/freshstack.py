@@ -13,14 +13,16 @@ Questions: the FreshStack queries JSONL (`{topic}/queries.jsonl`). Per record: `
 Gold nuggets: the nugget `text`s — one nugget per decompositional fact. The score is nugget-completion
   recall (each fact graded support / partial / not_support by the LLM judge in judge.py), exactly as
   KARL grades FreshStack ("convert ground-truth answers into fixed nuggets ... prior to evaluation").
-Corpus + index: the topic's corpus JSONL (`{topic}/corpus.jsonl`), one element per document, embedded
-  with Qwen3-Embedding-0.6B into the `qwen-freshstack-{topic}-0.6b` Chroma collection (KARL retrieves
-  FreshStack with Qwen3-0.6B, k=10). The corpus is small (~50K docs), so the doc map (_id -> text) is
-  read straight from corpus.jsonl into RAM — the file is the source of truth for the embedded text.
+Corpus + index: the topic's corpus JSONL (`freshstack/{topic}/corpus.jsonl`), one element per
+  document, embedded with Qwen3-Embedding-0.6B into the `freshstack-{topic}-qwen-0.6b` Chroma
+  collection (KARL retrieves FreshStack with Qwen3-0.6B, k=10), stored under
+  benchmarks/freshstack/{topic}/chromadb. The corpus is small (~50K docs), so the doc map
+  (_id -> text) is read straight from corpus.jsonl into RAM — the file is the source of the vectors.
 Gold docs / recall: each nugget's `relevant_corpus_ids` reference corpus `_id`s DIRECTLY (the corpus
   `_id`, e.g. "azure-openai/LICENSE.md_0_1140", is the Chroma row id), so gold_docs are the union of
   those ids and recall is a plain `doc_recall` over retrieved `_id`s — no key remapping needed.
-Held-out test set: `test_ids_path` if given, else ALL of the topic's questions (run with --split test).
+Dev/test split: by TOPIC — dev = all laravel queries, test = all langchain queries
+  (benchmarks/freshstack/freshstack_splits.json, via benchmarks.splits_path; see scripts/make_splits.py).
 """
 
 from __future__ import annotations
@@ -32,7 +34,7 @@ from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.judge import judge_nugget_recall
 from qatfd.config import FreshstackConfig
 from qatfd.constants import FRESHSTACK
-from qatfd.paths import resolve_under_skunk
+from qatfd.paths import resolve_under_benchmarks
 from qatfd.types import Question
 
 # Grader persona for the nugget judge: FreshStack answers are technical software facts (code,
@@ -79,18 +81,17 @@ class FreshstackBenchmark(Benchmark):
             config.corpus_path = f"{config.data_dir}/{topic}/corpus.jsonl"
         if not config.chromadb_collection:
             config.chromadb_collection = f"freshstack-{topic}-qwen-0.6b"
-        # Each topic lives in its OWN slim store; derive the per-topic dir from the default shared
-        # value (override chromadb_dir explicitly, or chromadb_host, to point elsewhere).
-        if config.chromadb_dir in (None, ".chromadb"):
-            config.chromadb_dir = f".chromadb-freshstack-{topic}-qwen-0.6b"
+        # Each topic's index lives in its OWN store under the topic dir; derive it from the topic
+        # unless explicitly overridden (override chromadb_dir, or chromadb_host, to point elsewhere).
+        if not config.chromadb_dir:
+            config.chromadb_dir = f"{config.data_dir}/{topic}/chromadb"
 
-        config.chromadb_dir = str(resolve_under_skunk(config.chromadb_dir))
-        config.questions_path = str(resolve_under_skunk(config.questions_path))
-        config.corpus_path = str(resolve_under_skunk(config.corpus_path))
-        if config.test_ids_path:
-            config.test_ids_path = str(resolve_under_skunk(config.test_ids_path))
+        # all benchmark data (index, questions, corpus, prompts) resolves under qatfd/benchmarks/.
+        config.chromadb_dir = str(resolve_under_benchmarks(config.chromadb_dir))
+        config.questions_path = str(resolve_under_benchmarks(config.questions_path))
+        config.corpus_path = str(resolve_under_benchmarks(config.corpus_path))
         if config.prompts_path:
-            config.prompts_path = str(resolve_under_skunk(config.prompts_path))
+            config.prompts_path = str(resolve_under_benchmarks(config.prompts_path))
         super().__init__(config)
 
     # ---- questions ------------------------------------------------------------

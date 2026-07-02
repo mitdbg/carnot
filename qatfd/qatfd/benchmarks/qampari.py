@@ -26,8 +26,8 @@ Dev/test splits: TEST is all 1000 `test_data.jsonl` questions — KARL's exact e
   its appendix query "What did James B. Longacre design?" appearing only there. DEV is 50 questions
   sampled (seed 0) from `train_data.jsonl` (the `dev_questions_path` extract), disjoint from test so
   it never leaks. Both are loaded together (load_questions) and served by the one shared Wikipedia
-  index; the runner selects a split via splits/qampari.json (scripts/make_splits.py). `test_ids_path`,
-  if given, further restricts the test set (else ALL 1000).
+  index; the runner selects a split via benchmarks/qampari/qampari_splits.json (scripts/make_splits.py) — dev = the 50
+  train_data samples, test = all 1000 test_data questions.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.judge import judge_nugget_recall
 from qatfd.config import QampariConfig
 from qatfd.constants import QAMPARI
-from qatfd.paths import resolve_under_skunk
+from qatfd.paths import resolve_under_benchmarks
 from qatfd.types import Question
 
 # Grader persona for the nugget judge: QAMPARI answers are encyclopedic entities (people, films,
@@ -121,14 +121,13 @@ class QampariBenchmark(Benchmark):
     )
 
     def __init__(self, config: QampariConfig) -> None:
-        config.chromadb_dir = str(resolve_under_skunk(config.chromadb_dir))
-        config.questions_path = str(resolve_under_skunk(config.questions_path))
+        # all benchmark data (index, questions, dev extract, prompts) resolves under qatfd/benchmarks/.
+        config.chromadb_dir = str(resolve_under_benchmarks(config.chromadb_dir))
+        config.questions_path = str(resolve_under_benchmarks(config.questions_path))
         if config.dev_questions_path:
-            config.dev_questions_path = str(resolve_under_skunk(config.dev_questions_path))
-        if config.test_ids_path:
-            config.test_ids_path = str(resolve_under_skunk(config.test_ids_path))
+            config.dev_questions_path = str(resolve_under_benchmarks(config.dev_questions_path))
         if config.prompts_path:
-            config.prompts_path = str(resolve_under_skunk(config.prompts_path))
+            config.prompts_path = str(resolve_under_benchmarks(config.prompts_path))
         # the chroma collection, set in _build_resources; recall_metrics reads the `title` metadata of
         # the retrieved chunk_ids from it to collapse them to Wikipedia articles.
         self._collection = None

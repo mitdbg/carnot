@@ -70,8 +70,7 @@ echo "End: $(date)"
 #          --collection-name qwen-biogen-0.6b \
 #          --chroma-path ./.chromadb \
 #          --benchmark trec_biogen
-# 3. run the benchmark locally (metadata glob points at the pulled dir):
-#      python3 -m qatfd.runner benchmarks=trec-biogen systems=search_agent experiments.split=test \
+# 3. run the benchmark locally (abstracts are served lazily from the chroma collection):
+#      python3 -m qatfd.runner benchmarks=trec_biogen systems=search_agent experiments.split=test \
 #          benchmarks.chromadb_dir=./.chromadb \
-#          benchmarks.biogen_metadata_glob='./biogen-element-embeddings/metadata_rank*.json' \
 #          systems.emb_model_id=qwen/qwen3-embedding-0.6b
