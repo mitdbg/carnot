@@ -1,1 +1,0 @@
-Find a hundred cars with punctures and paint scratches on images.

@@ -1,7 +1,0 @@
-{
-    "nl_question": "Which movies are biographical comedies?",
-    "modalities": ["table"],
-    "ground_truth": [
-        "The Disaster Artist"
-    ]
-}

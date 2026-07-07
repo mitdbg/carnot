@@ -1,1 +1,0 @@
-SELECT reviewId, CAST(SPLIT_PART(originalScore, '/', 1) AS FLOAT) AS reviewScore FROM Reviews WHERE id = 'ant_man_and_the_wasp_quantumania';

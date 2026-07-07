@@ -1,1 +1,0 @@
-What is the city for which we have most recordings of elephants (ties are broken arbitrarily, consider only cities with at least one elephant recording)?

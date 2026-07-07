@@ -1,1 +1,0 @@
-SELECT scoreSentiment, COUNT(*) AS count FROM Reviews WHERE id = 'taken_3' GROUP BY scoreSentiment;

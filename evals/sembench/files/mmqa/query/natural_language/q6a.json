@@ -1,7 +1,0 @@
-{
-    "nl_question": "Which airlines have destinations in Frankfurt?",
-    "modalities": ["table"],
-    "ground_truth": [
-        "Discover Airlines"
-    ]
-}

@@ -1,1 +1,0 @@
-SELECT reviewId FROM Reviews WHERE id = 'taken_3' AND scoreSentiment = 'POSITIVE';
