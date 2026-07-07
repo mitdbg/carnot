@@ -93,6 +93,7 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         llm_client: LLMClient | None = None,
         emb_model_id: str | None = None,
         extra_tools: tuple[Tool, ...] = (),
+        include_search_corpus: bool = True,
         briefing: str | None = None,
         final_answer_doc: str | None = None,
         system_prompt_override: str | None = None,
@@ -166,13 +167,19 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         # from their `doc`s by the base, so tools and docs can't drift.
         if pdf_dir is not None:
             extra_tools += (ViewFigureTool(self.document_map, pdf_dir, renders_dir=page_renders_dir),)
-        tools = [
-            SearchCorpusTool(
+        tools: list[Tool] = []
+        # Vector search over the corpus. A caller can drop it (`include_search_corpus=False`)
+        # to force the agent onto other retrieval tools — e.g. qatfd system #3 removes it so
+        # the agent must use its `semantic_filter` tool for semantic narrowing (in the prior
+        # experiment the agent always chose vector search and never the sem-filter tool).
+        if include_search_corpus:
+            tools.append(SearchCorpusTool(
                 self.chroma_collection, self.emb_model_id, self._emb_llm_client,
                 self._pruned_chunk_ids, self._pruned_doc_ids,
                 required_filter,
                 seen_chunk_ids=self._seen_chunk_ids, seen_doc_ids=self._seen_doc_ids,
-            ),
+            ))
+        tools += [
             GrepCorpusTool(
                 self.chroma_collection,
                 self._pruned_chunk_ids,
