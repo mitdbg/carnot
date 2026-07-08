@@ -2,8 +2,8 @@
 
 All retrieval tools are backed by a single ChromaDB collection in which each
 row is one *element* (chunk) extracted from a *document* (e.g. a page of a
-treasury bulletin, or a scraped web page). The layout — produced by
-`prep/create_vector_db.py` — is:
+PDF report, or a scraped web page). The layout — produced by
+`prep/create_vector_db.py`'s `run_build` — is:
 
     id:        the `chunk_id` (e.g. "1946_11_41_6")
     document:  the cleaned element text (read from the `documents` field)
@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -63,7 +64,7 @@ from skunk.common import render_page_b64
 from skunk.multi_turn_agent import Tool
 
 if TYPE_CHECKING:
-    from skunk.common import ExecutionContext
+    from skunk.common import ExecutionContext, PageRef
     from skunk.llm_client import LLMClient
 
 # Tags identifying each tool's structured return payload to the SearchAgent.
@@ -85,6 +86,7 @@ EMPTY_RESULT_MESSAGE = (
 def _build_metadata_where(
     *,
     metadata_filter: dict | None,
+    required_filter: dict | None = None,
     ignore_chunk_ids: set[str] | None,
     ignore_doc_ids: set[str] | None,
 ) -> dict | None:
@@ -92,11 +94,15 @@ def _build_metadata_where(
 
     ``metadata_filter`` is passed through as a ChromaDB-compatible where clause
     (e.g. ``{"year": "2010"}``, ``{"page_id": {"$in": [19, 26]}}``, or a
-    compound ``{"$and": [...]}`` / ``{"$or": [...]}``). It is ANDed with the
-    server-side prune filters built from ``ignore_chunk_ids`` / ``ignore_doc_ids``.
+    compound ``{"$and": [...]}`` / ``{"$or": [...]}``). ``required_filter`` is a
+    tool-construction-time clause the caller can never widen past (ANDed in when
+    set). Both are ANDed with the server-side prune filters built from
+    ``ignore_chunk_ids`` / ``ignore_doc_ids``.
     """
     clauses: list[dict] = []
 
+    if required_filter:
+        clauses.append(required_filter)
     if metadata_filter:
         clauses.append(metadata_filter)
     if ignore_doc_ids:
@@ -119,19 +125,22 @@ class SearchCorpusTool(Tool):
         chroma_collection: Collection,
         emb_model_id: str,
         llm_client: LLMClient,
-        pruned_chunk_ids: set[str],
-        pruned_doc_ids: set[str],
+        pruned_chunk_ids: set[str] | None = None,
+        pruned_doc_ids: set[str] | None = None,
         required_metadata_filter: dict | None = None,
         seen_chunk_ids: set[str] | None = None,
         seen_doc_ids: set[str] | None = None,
         ctx: ExecutionContext | None = None,
     ):
+        # The prune/seen sets are shared BY REFERENCE with the owning SearchAgent's
+        # other tools; a one-shot caller (e.g. a plain top-k vector search with no
+        # agent) omits them and gets private empty sets.
         self._chroma_collection = chroma_collection
         self._emb_model_id = emb_model_id
         self._llm_client = llm_client
         self._ctx = ctx
-        self._pruned_chunk_ids = pruned_chunk_ids
-        self._pruned_doc_ids = pruned_doc_ids
+        self._pruned_chunk_ids = pruned_chunk_ids if pruned_chunk_ids is not None else set()
+        self._pruned_doc_ids = pruned_doc_ids if pruned_doc_ids is not None else set()
         self._required_metadata_filter = required_metadata_filter
         self._seen_chunk_ids = seen_chunk_ids if seen_chunk_ids is not None else set()
         self._seen_doc_ids = seen_doc_ids if seen_doc_ids is not None else set()
@@ -150,15 +159,9 @@ class SearchCorpusTool(Tool):
     ) -> dict:
         query_embedding = self._embed_query(query)
 
-        combined_filter = metadata_filter
-        if self._required_metadata_filter and metadata_filter:
-            combined_filter = {
-                "$and": [self._required_metadata_filter, metadata_filter]
-            }
-        elif self._required_metadata_filter:
-            combined_filter = self._required_metadata_filter
         where = _build_metadata_where(
-            metadata_filter=combined_filter,
+            metadata_filter=metadata_filter,
+            required_filter=self._required_metadata_filter,
             ignore_chunk_ids=self._pruned_chunk_ids | self._seen_chunk_ids,
             ignore_doc_ids=self._pruned_doc_ids | self._seen_doc_ids,
         )
@@ -232,16 +235,18 @@ class GrepCorpusTool(Tool):
     def __init__(
         self,
         chroma_collection: Collection,
-        pruned_chunk_ids: set[str],
-        pruned_doc_ids: set[str],
         max_output_tokens: int,
+        pruned_chunk_ids: set[str] | None = None,
+        pruned_doc_ids: set[str] | None = None,
         required_metadata_filter: dict | None = None,
         seen_chunk_ids: set[str] | None = None,
         seen_doc_ids: set[str] | None = None,
     ):
+        # Prune/seen sets shared by reference with the owning agent's other tools;
+        # omitted for one-shot use (private empty sets).
         self._chroma_collection = chroma_collection
-        self._pruned_chunk_ids = pruned_chunk_ids
-        self._pruned_doc_ids = pruned_doc_ids
+        self._pruned_chunk_ids = pruned_chunk_ids if pruned_chunk_ids is not None else set()
+        self._pruned_doc_ids = pruned_doc_ids if pruned_doc_ids is not None else set()
         self._seen_chunk_ids = seen_chunk_ids if seen_chunk_ids is not None else set()
         self._seen_doc_ids = seen_doc_ids if seen_doc_ids is not None else set()
         # Hard cap on the rendered observation size (chars). `limit=None` returns every
@@ -256,15 +261,9 @@ class GrepCorpusTool(Tool):
         metadata_filter: dict | None = None,
         limit: int | None = None,
     ) -> dict:
-        combined_filter = metadata_filter
-        if self._required_metadata_filter and metadata_filter:
-            combined_filter = {
-                "$and": [self._required_metadata_filter, metadata_filter]
-            }
-        elif self._required_metadata_filter:
-            combined_filter = self._required_metadata_filter
         where = _build_metadata_where(
-            metadata_filter=combined_filter,
+            metadata_filter=metadata_filter,
+            required_filter=self._required_metadata_filter,
             ignore_chunk_ids=self._pruned_chunk_ids | self._seen_chunk_ids,
             ignore_doc_ids=self._pruned_doc_ids | self._seen_doc_ids,
         )
@@ -414,12 +413,16 @@ class ViewFigureTool(Tool):
         renders_dir: str | Path | None = None,
         dpi: int = 300,
         fmt: str = "png",
+        page_ref_parser: Callable[[str], "PageRef"] | None = None,
     ):
         self._document_map = document_map
         self._pdf_dir = pdf_dir
         self._renders_dir = renders_dir
         self._dpi = dpi
         self._fmt = fmt
+        # doc_id → PageRef, so the corpus's page-key scheme is injectable (raise
+        # ValueError for an unparseable id). Default: the "<stem>_<page>" scheme.
+        self._page_ref_parser = page_ref_parser or page_key_to_pageref
 
     @staticmethod
     def _figure_ids(page_text: str) -> list[str]:
@@ -439,13 +442,13 @@ class ViewFigureTool(Tool):
                 VIEW_FIGURE_RESULT_TAG: True,
                 "error": f"no figure with id={figure_id} on doc_id={doc_id}; {hint}",
             }
-        # doc_id is the page key `<stem>_<page>`; resolve to a PageRef for rendering.
+        # doc_id is a corpus page key; resolve to a PageRef for rendering.
         try:
-            ref = page_key_to_pageref(doc_id)
+            ref = self._page_ref_parser(doc_id)
         except ValueError:
             return {
                 VIEW_FIGURE_RESULT_TAG: True,
-                "error": f"doc_id {doc_id!r} is not in the expected '<stem>_<page>' format",
+                "error": f"doc_id {doc_id!r} is not a parseable page key for this corpus",
             }
         try:
             img = render_page_b64(

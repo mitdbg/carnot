@@ -292,6 +292,20 @@ an inclusive month range."""
 
     _SYSTEM = _PREAMBLE + "\n\n" + EXTRACT_COMMON_PROMPT
 
+    # Parse hook validates SHAPE only (valid AnnotatedValue array, distinguishable
+    # entries); a shape defect raises a retryable ParseError so `call()` re-prompts
+    # (escalating temperature) before degrading the group to empty. Exact transcription
+    # is a PROMPT-level instruction (like data_prep/compute), NOT a parse-level check —
+    # the old verbatim gate was net-negative, mostly false-rejecting format variants
+    # (comma floats, parenthesized negatives, space-cents) and downgrading good pages.
+    _prompt: PromptedCall[list[AnnotatedValue]] = PromptedCall(
+        name="extract.text",
+        system_prompt=_SYSTEM,
+        default_effort="low",  # transcription, not reasoning
+        parse=_parse_extract_response,
+        output_instruction=_EXTRACT_OUTPUT_INSTRUCTION,
+    )
+
     @staticmethod
     def _fetch_page_texts(
         refs: list[PageRef], ctx: ExecutionContext
@@ -318,17 +332,16 @@ an inclusive month range."""
         branch: RetrieveBranch,
         question: str,
         ctx: ExecutionContext,
-        looking_for: str | None = None,
+        looking_for: str,
     ) -> list[AnnotatedValue]:
         """Run one extraction call over `content` (whole-page text OR a block slice), verify
         every emitted cell appears in `content`, and stamp provenance from `prov_refs`. `content`
         is kept on its own message line so the verifier checks emitted cells against the source
-        text, not the prompt scaffolding. `looking_for` overrides the single-key opening line —
-        the seam for a caller whose one page read serves SEVERAL retrieval goals at once."""
+        text, not the prompt scaffolding. `looking_for` is the opening line naming the read's
+        goal(s) — composed once by `_extract_page` (see `_looking_line`)."""
         user_msg = "\n\n".join(
             [
-                looking_for
-                or f"You are looking for {branch.key}{f' for the period {branch.period}' if branch.period else ''}.",
+                looking_for,
                 f'For full context, this lookup serves to help answer the question: "{question}"',
                 *(
                     [
@@ -340,21 +353,8 @@ an inclusive month range."""
                 content,
             ]
         )
-        # Parse hook validates SHAPE only (valid AnnotatedValue array, distinguishable
-        # entries); a shape defect raises a retryable ParseError so `call()` re-prompts
-        # (escalating temperature) before degrading the group to empty. Exact transcription
-        # is a PROMPT-level instruction (like data_prep/compute), NOT a parse-level check —
-        # the old verbatim gate was net-negative, mostly false-rejecting format variants
-        # (comma floats, parenthesized negatives, space-cents) and downgrading good pages.
-        prompt: PromptedCall[list[AnnotatedValue]] = PromptedCall(
-            name="extract.text",
-            system_prompt=self._SYSTEM,
-            default_effort="low",  # transcription, not reasoning
-            parse=_parse_extract_response,
-            output_instruction=_EXTRACT_OUTPUT_INSTRUCTION,
-        )
         try:
-            parsed = await prompt.call(ctx, user_msg, temperature=0.0)
+            parsed = await self._prompt.call(ctx, user_msg, temperature=0.0)
         except ParseError as e:
             ctx.emit(f"extract_parse_failed tier=parsed_json error={e.detail!r}")
             return []
@@ -384,7 +384,7 @@ an inclusive month range."""
         branch: RetrieveBranch,
         question: str,
         ctx: ExecutionContext,
-        looking_for: str | None = None,
+        looking_for: str,
     ) -> list[AnnotatedValue]:
         """Extraction for one retrieved page: feed its `refs` (the page plus its linked notes
         pages) FULL text — no within-page slicing — annotated with the pages' structural
@@ -416,11 +416,11 @@ an inclusive month range."""
         branch: RetrieveBranch,
         pages: list[PageRef],
         ctx: ExecutionContext,
-        looking_for: str | None = None,
+        looking_for: str,
     ) -> list[AnnotatedValue]:
         """Extract from the retrieved pages — one extract call per unique page, its dependent
-        pages (header predecessors + notes) fed whole. `looking_for` overrides the single-key
-        opening line for multi-goal page reads."""
+        pages (header predecessors + notes) fed whole. `looking_for` is the composed opening
+        line naming the read's goal(s)."""
         groups = self._page_groups(pages, _require_store(ctx))
         ctx.emit(
             f"fan_out tier=parsed_json n_groups={len(groups)} n_pages={len(pages)}"
@@ -462,22 +462,21 @@ derive, or invent. A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
         images: list[B64Image],
         rendered_refs: list[PageRef],
         ctx: ExecutionContext,
-        looking_for: str | None = None,
+        looking_for: str,
         extra_context: str | None = None,
     ) -> list[AnnotatedValue]:
         """One vision call over the rendered page images. The numbered image list
         maps each attachment back to its source page so the LLM can't conflate them.
-        `looking_for` overrides the single-key opening line — the seam for a caller
-        whose one page read serves SEVERAL retrieval goals at once. `extra_context`
-        carries a header-less continuation page's inherited column grammar / own summaries."""
-        period = f" for the period {branch.period}" if branch.period else ""
+        `looking_for` is the composed opening line naming the read's goal(s).
+        `extra_context` carries a header-less continuation page's inherited column
+        grammar / own summaries."""
         image_lines = [
             f"Image {i + 1}: PDF page {ref.page} of document {ref.stem}"
             for i, ref in enumerate(rendered_refs)
         ]
         user_msg = "\n\n".join(
             [
-                looking_for or f"You are looking for {branch.key}{period}.",
+                looking_for,
                 f'For full context, this lookup serves to help answer the question: "{question}"',
                 *([extra_context] if extra_context else []),
                 "Images attached, in order:\n" + "\n".join(image_lines),
@@ -525,34 +524,55 @@ def _synth_branch(branches: list[RetrieveBranch]) -> RetrieveBranch:
     )
 
 
+def _looking_line(branches: list[RetrieveBranch]) -> str:
+    """The read's opening line, naming every retrieval goal this page serves —
+    composed ONCE here and passed verbatim through both tiers."""
+    if len(branches) == 1:
+        b = branches[0]
+        period = f" for the period {b.period}" if b.period else ""
+        return f"You are looking for {b.key}{period}."
+    lines = []
+    for b in branches:
+        line = f"- {b.key}"
+        if b.period:
+            line += f" (for the period {b.period})"
+        lines.append(line)
+    return "You are looking for ALL of the following:\n" + "\n".join(lines)
+
+
 async def _extract_page(
     ctx: ExecutionContext, page: PageRef, branches: list[RetrieveBranch]
 ) -> list[AnnotatedValue]:
     """One page's read serving EVERY branch that retrieved it: the call's opening line lists
-    all their targets, so a single page read extracts for each. Text tier first, pure vision
-    as the fallback — for visual_only branches, the `extract_vision_only` override, or a text
-    pass that found nothing."""
+    all their targets, so a single page read extracts for each. Tier escalation is the
+    explicit list below: text first (unless a visual_only branch or the
+    `extract_vision_only` override skips it), pure vision as the fallback; the first tier
+    that yields entries wins."""
     branch = branches[0] if len(branches) == 1 else _synth_branch(branches)
-    looking = None
-    if len(branches) > 1:
-        lines = []
-        for b in branches:
-            line = f"- {b.key}"
-            if b.period:
-                line += f" (for the period {b.period})"
-            lines.append(line)
-        looking = "You are looking for ALL of the following:\n" + "\n".join(lines)
-    if not branch.visual_only and not ctx.config.extract_vision_only:
-        entries = await _TEXT.run(ctx.question, branch, [page], ctx, looking_for=looking)
+    looking = _looking_line(branches)
+
+    async def _text_tier() -> list[AnnotatedValue]:
+        return await _TEXT.run(ctx.question, branch, [page], ctx, looking_for=looking)
+
+    async def _vision_tier() -> list[AnnotatedValue]:
+        images, rendered_refs = _render_pages_b64([page], ctx)
+        if not images:
+            return []
+        return await _VISION.run(
+            ctx.question, branch, images, rendered_refs, ctx, looking_for=looking,
+            extra_context=_require_store(ctx).extra_read_context(page) or None,
+        )
+
+    tiers = (
+        [_vision_tier]
+        if branch.visual_only or ctx.config.extract_vision_only
+        else [_text_tier, _vision_tier]
+    )
+    for tier in tiers:
+        entries = await tier()
         if entries:
             return entries
-    images, rendered_refs = _render_pages_b64([page], ctx)
-    if not images:
-        return []
-    return await _VISION.run(
-        ctx.question, branch, images, rendered_refs, ctx, looking_for=looking,
-        extra_context=_require_store(ctx).extra_read_context(page) or None,
-    )
+    return []
 
 
 async def run_extract(

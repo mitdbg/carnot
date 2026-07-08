@@ -22,6 +22,6 @@ db builder, embedding computation, recall experiment). They are not
 imported by the runtime path.
 """
 
-from skunk.search_agent.search_agent import SearchAgent
+from skunk.search_agent.search_agent import SearchAgent, doc_ids_from_payload
 
-__all__ = ["SearchAgent"]
+__all__ = ["SearchAgent", "doc_ids_from_payload"]

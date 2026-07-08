@@ -131,7 +131,11 @@ class PromptedCall[T]:
         self._output_instruction = output_instruction
         self._max_parse_retries = max_parse_retries
 
-    def _assemble_system_prompt(self, ctx: ExecutionContext) -> str:
+    def assemble_system_prompt(self, ctx: ExecutionContext) -> str:
+        """The full system prompt this call-site sends: the declared `system_prompt`
+        plus the override tail (`corpus` / `few_shots` / `lessons` sections gathered
+        from `ctx.prompt_overrides` by `name`). Public — agent loops render it
+        themselves when they own the transport (e.g. a rollout backend)."""
         return self._system_prompt + _build_tail(
             _gather_overrides(ctx.prompt_overrides, self.name)
         )
@@ -157,13 +161,12 @@ class PromptedCall[T]:
             parts.append(self._output_instruction)
         return "\n\n".join(parts)
 
-    async def call(
+    async def call_multi_turn(
         self,
         ctx: ExecutionContext,
-        user: str = "",
+        messages: list[dict],
         *,
-        messages: list[dict] | None = None,
-        images: list[B64Image] | None = None,
+        model: str | None = None,
         temperature: float = 0.0,
         effort: Effort | None = None,
         should_stop: Callable[[str], bool] | None = None,
@@ -171,53 +174,67 @@ class PromptedCall[T]:
         timeout_s: float | None = None,
         on_response: Callable[[LLMResponse], None] | None = None,
     ) -> T:
-        """Assemble the prompt, resolve effort, invoke the LLM, then parse into a
-        typed result. `on_response` (when given) observes every raw `LLMResponse`
-        — one per attempt, parse-retries included — so call-sites can record
-        per-call latency/token stats without re-deriving them from the envelope log.
-
-        Single-shot (default): assembles system+user, calls `acall`, retries on
-        `ParseError` up to `max_parse_retries` times.
-
-        Multi-turn (pass `messages`): assembles system, streams via `astream` with
-        optional `should_stop`; no retry — the caller owns the loop.
-        """
+        """One agent-loop turn over an existing `messages` transcript: assemble the
+        system prompt, stream via `astream` (with optional `should_stop`), parse.
+        On a `ParseError`, the failed reply + fix-it prompt are appended to a COPY of
+        `messages` and the turn re-streams (up to `max_parse_retries`) — the caller's
+        list never sees the retry exchange. `model` overrides the per-site resolution
+        (the agent layer passes its own agent model; effort/model overrides otherwise
+        resolve exactly as `call`)."""
         eff = self._resolve_effort(ctx, effort)
-        system = self._assemble_system_prompt(ctx)
-        if messages is not None:
-            model = ctx.config.agent_model_id or self._resolve_model(ctx)
-            messages = list(
-                messages
-            )  # work on a copy so callers don't see retry exchanges
-            attempt = 0
-            while True:
-                resp = await ctx.llm_client.astream(
-                    system=system,
-                    messages=messages,
-                    model=model,
-                    temperature=temperature,
-                    should_stop=should_stop,
-                    effort=eff,
-                    ctx=ctx,
-                    call_site=self.name,
-                    max_output_tokens=max_output_tokens,
-                    timeout_s=timeout_s,
+        system = self.assemble_system_prompt(ctx)
+        resolved_model = model or self._resolve_model(ctx)
+        messages = list(messages)  # work on a copy so callers don't see retry exchanges
+        attempt = 0
+        while True:
+            resp = await ctx.llm_client.astream(
+                system=system,
+                messages=messages,
+                model=resolved_model,
+                temperature=temperature,
+                should_stop=should_stop,
+                effort=eff,
+                ctx=ctx,
+                call_site=self.name,
+                max_output_tokens=max_output_tokens,
+                timeout_s=timeout_s,
+            )
+            if on_response is not None:
+                on_response(resp)
+            try:
+                return self._parse(resp.text, ctx)
+            except ParseError as e:
+                if attempt >= self._max_parse_retries:
+                    raise
+                ctx.emit(
+                    f"parse_retry call_site={self.name} attempt={attempt + 1} error={e.detail!r}"
                 )
-                if on_response is not None:
-                    on_response(resp)
-                try:
-                    return self._parse(resp.text, ctx)
-                except ParseError as e:
-                    if attempt >= self._max_parse_retries:
-                        raise
-                    ctx.emit(
-                        f"parse_retry call_site={self.name} attempt={attempt + 1} error={e.detail!r}"
-                    )
-                    messages.append({"role": "assistant", "content": resp.text})
-                    messages.append(
-                        {"role": "user", "content": self._compose_user("", e).strip()}
-                    )
-                    attempt += 1
+                messages.append({"role": "assistant", "content": resp.text})
+                messages.append(
+                    {"role": "user", "content": self._compose_user("", e).strip()}
+                )
+                attempt += 1
+
+    async def call(
+        self,
+        ctx: ExecutionContext,
+        user: str = "",
+        *,
+        images: list[B64Image] | None = None,
+        temperature: float = 0.0,
+        effort: Effort | None = None,
+        max_output_tokens: int | None = None,
+        timeout_s: float | None = None,
+        on_response: Callable[[LLMResponse], None] | None = None,
+    ) -> T:
+        """Single-shot: assemble system+user, resolve effort/model, invoke `acall`,
+        parse into a typed result; retries on `ParseError` up to `max_parse_retries`
+        times (at temperature 1.0 — see the loop). `on_response` (when given)
+        observes every raw `LLMResponse` — one per attempt, parse-retries included —
+        so call-sites can record per-call latency/token stats without re-deriving
+        them from the envelope log. Agent loops use `call_multi_turn` instead."""
+        eff = self._resolve_effort(ctx, effort)
+        system = self.assemble_system_prompt(ctx)
         model = self._resolve_model(ctx)
         # Capture the operator's full LLM I/O for the trace viewer — the `call`
         # envelope LLMClient logs carries only latency/tokens, not the text. System
@@ -271,7 +288,7 @@ class PromptedCall[T]:
                     raise
                 ctx.emit(
                     f"parse_retry call_site={self.name} attempt={attempt + 1} "
-                    f"next_temp={min(1.0, 0.4 + 0.2 * attempt):.1f} error={e.detail!r}"
+                    f"next_temp=1.0 error={e.detail!r}"
                 )
                 retry = e
                 attempt += 1

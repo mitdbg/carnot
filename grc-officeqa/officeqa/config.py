@@ -25,10 +25,26 @@ _DEFAULT_PARSED_JSON_DIR = (
 _DEFAULT_PDF_DIR = Path.home() / "Desktop/officeqa/treasury_bulletin_pdfs"
 
 
+# USD per Mtok for the models the OfficeQA pipeline pins (see `llm_prices` below).
+# Substring-matched, so full OpenRouter ids ("google/gemini-3.5-flash") price too.
+# Thinking tokens are billed at the output rate by the UsageTracker.
+_GEMINI_PRICES: dict[str, dict[str, float]] = {
+    "gemini-3.5-flash": {"in": 1.50, "out": 9.00},  # list price
+    "gemini-3-flash-preview": {"in": 0.50, "out": 3.00},  # verified ai.google.dev + OpenRouter, 2026-06
+    "gemini-3.1-flash-lite": {"in": 0.10, "out": 0.40},
+    "gemini-3.1-pro-preview": {"in": 2.00, "out": 12.00},
+}
+
+
 @dataclass
 class SkunkConfig(PipelineConfig):
     # ---- OfficeQA defaults over the library's -------------------------------------
     name: str = "skunk"
+    # Price table for cost accounting (`UsageTracker.cost()`; the eval report's
+    # cost_usd column reads it). $/Mtok, substring-matched by model id.
+    llm_prices: dict[str, dict[str, float]] = field(
+        default_factory=lambda: dict(_GEMINI_PRICES)
+    )
     # Embedding model for vector_search (must match the stored treasury embeddings).
     # (env: SKUNK_EMB_MODEL)
     emb_model_id: str = "Qwen/Qwen3-Embedding-8B"

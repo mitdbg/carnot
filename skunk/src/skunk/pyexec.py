@@ -47,6 +47,19 @@ def strip_code_fences(code: str) -> str:
     return s.strip()
 
 
+def parse_codegen_reply(raw: str, *, expectation: str) -> str:
+    """Parse a codegen LLM reply into bare code: strip the fence, reject an
+    empty body or a bare-JSON reply with a retryable `ParseError` carrying the
+    caller's `expectation` fix-it text. The ONE codegen-reply parser (compute
+    and data_prep both route through here; only their expectation prose differs)."""
+    from skunk.errors import ParseError
+
+    s = strip_code_fences(raw).strip()
+    if not s or s.startswith("{"):
+        raise ParseError(raw=raw, detail=expectation)
+    return s
+
+
 def _new_executor(
     extra_vars: dict[str, Any],
     extra_tools: dict[str, Any] | None = None,

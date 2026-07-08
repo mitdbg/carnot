@@ -208,7 +208,7 @@ async def _run_one_question(
                 f"MissingData: {e.reason}" if isinstance(e, MissingData) else str(e)
             )
         latency_s = time.perf_counter() - t0
-        cost_usd = _events_cost(ctx.events)
+        cost_usd = _run_cost(ctx)
         result = orch.result
         plan_obj = orch.current_plan
 
@@ -282,40 +282,16 @@ REPORT_FIELDS = [
     "cost_usd",
 ]
 
-# USD per token (input, output); thinking tokens billed at the output rate. Copied from
-# scripts/analyze_trace.py — keep the two in sync if Gemini pricing changes.
-PRICES = {
-    "gemini-3.5-flash": (1.50e-6, 9.00e-6),  # list price (was 0.30/2.50 — stale gemini-2.5-flash rate)
-    "gemini-3-flash-preview": (0.50e-6, 3.00e-6),  # list price (verified ai.google.dev + OpenRouter, 2026-06)
-    "gemini-3.1-flash-lite": (0.10e-6, 0.40e-6),
-    "gemini-3.1-pro-preview": (2.00e-6, 12.00e-6),
-}
-_CALL_RE = re.compile(
-    r"call call_site=\S+ model=(\S+) .*?in_tok=(\d+) out_tok=(\d+) think_tok=(\S+)"
-)
-
-
-def _events_cost(events: list[dict]) -> str:
-    """Sum a UID's generation cost (USD) from its in-memory `call` events (per PRICES;
-    thinking billed at the output rate). Reads `ctx.events`, which is always captured
-    regardless of `--no-traces`, so cost is available even when no log is written.
-    Returns '' when no priced `call` events were seen (e.g. golden/replay bypass, or a
-    model absent from PRICES)."""
-    cost = 0.0
-    saw_call = False
-    for evt in events:
-        c = _CALL_RE.search(evt.get("message", ""))
-        if not c:
-            continue
-        model, i, o, t = c.group(1), int(c.group(2)), int(c.group(3)), c.group(4)
-        t = 0 if t == "None" else int(t)
-        price = PRICES.get(model)
-        if price is None:
-            continue
-        pin, pout = price
-        cost += i * pin + (o + t) * pout
-        saw_call = True
-    return f"{cost:.4f}" if saw_call else ""
+def _run_cost(ctx) -> str:
+    """The question's generation+embedding cost (USD) from the client's `UsageTracker`
+    (priced by `config.llm_prices`; thinking billed at the output rate — the tracker
+    owns the pricing rules, no duplicate table or event-scraping here). One client per
+    question in this harness, so the tracker is naturally per-question scoped.
+    Returns '' when nothing priceable ran (golden/replay bypass, or an empty price table)."""
+    tracker = ctx.llm_client.usage
+    if not tracker.prices or (tracker.n_calls == 0 and tracker.n_embed_calls == 0):
+        return ""
+    return f"{tracker.cost():.4f}"
 
 
 def _retrieval_recall(retrieved_pages: list, gold_pages: list[PageRef] | None) -> str:
@@ -601,11 +577,11 @@ def main() -> None:
     # exist only on the console and vanish with the terminal.
     import logging
 
-    from skunk.trace import _LineFormatter
+    from skunk.trace import LineFormatter
 
     warn_handler = logging.FileHandler(run_dir / "warnings.log")
     warn_handler.setLevel(logging.WARNING)
-    warn_handler.setFormatter(_LineFormatter())
+    warn_handler.setFormatter(LineFormatter())
     logging.getLogger().addHandler(warn_handler)
 
     print(f"[e2e] Run directory: {run_dir}")

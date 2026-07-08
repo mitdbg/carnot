@@ -29,8 +29,6 @@ from skunk.plan import RetrieveBranch
 class RetrieveOp:
     def __init__(self, config: PipelineConfig) -> None:
         self._config = config
-        self._resources = None  # (Collection, dict[str, str]) — shared across branches
-        self._resources_lock = threading.Lock()
 
     async def run_all(
         self,
@@ -95,20 +93,23 @@ class RetrieveOp:
         ctx: ExecutionContext,
         branch: RetrieveBranch,
     ) -> list[PageRef]:
-        from skunk.search_agent import SearchAgent
+        from skunk.search_agent import SearchAgent, doc_ids_from_payload
 
-        collection, document_map = self._ensure_resources(ctx.config)
+        collection, document_map = _get_shared_resources(ctx.config)
         agent = SearchAgent(
             config=ctx.config,
             document_map=document_map,
             chroma_collection=collection,
         )
-        page_keys = await agent.retrieve(
-            ctx,
-            ctx.question,
-            branch_key=branch.key,
-            branch_period=branch.period,
-        )
+        # This operator owns the retrieval user message (the agent's `call()` is the
+        # generic entry point; the branch framing below is pipeline vocabulary).
+        parts = [f"Question: {ctx.question}"]
+        if branch.key:
+            parts.append(f"Search focus: {branch.key}")
+        if branch.period:
+            parts.append(f"Time period (of the data): {branch.period}")
+        payload = await agent.call(ctx, "\n".join(parts))
+        page_keys = doc_ids_from_payload(payload)
         refs: list[PageRef] = []
         bad: list[str] = []
         for key in page_keys:
@@ -124,18 +125,6 @@ class RetrieveOp:
                 f"search_agent returned no usable page keys (raw={page_keys!r})",
             )
         return refs
-
-    def _ensure_resources(self, config: PipelineConfig):
-        # Single-flight: neither parallel branches (same op) nor parallel UID workers
-        # (eval's thread pool, each with its own RetrieveOp) need to re-connect to the
-        # ChromaDB server / re-fetch the collection. Connection + collection handle are
-        # serialized + cached process-wide by `_get_shared_resources`. The resources are
-        # read-only + shared; only the per-branch SearchAgent built around them holds
-        # mutable state.
-        with self._resources_lock:
-            if self._resources is None:
-                self._resources = _get_shared_resources(config)
-            return self._resources
 
 
 # Process-wide ChromaDB/document-map cache. Reads go through a ChromaDB *server*
@@ -175,9 +164,8 @@ def _build_resources(config: PipelineConfig):
         raise StepFailed(
             "retrieve",
             f"clean_page_map_path {clean_page_map_path!s} does not exist; "
-            "run the page cleaner first (see "
-            "src/skunk/search_agent/prep/page_cleaner.py) or set "
-            "SKUNK_CLEAN_PAGE_MAP / config.clean_page_map_path.",
+            "build the corpus page map offline first, or point "
+            "config.clean_page_map_path (env SKUNK_CLEAN_PAGE_MAP) at it.",
         )
 
     with clean_page_map_path.open() as f:

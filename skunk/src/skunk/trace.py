@@ -15,7 +15,7 @@ Skunk has three kinds of diagnostic output that used to be wired separately:
 
 Everything renders through one function, `render_line`: the per-question console
 echo and the per-question `.log` file call it directly, and process-scoped stdlib
-logs reach it via `_LineFormatter` on the root handler. So all output shares one
+logs reach it via `LineFormatter` on the root handler. So all output shares one
 format and carries a severity level — with no external dependency (capture, the
 JSONL sink, and per-question files are all per-question, which a process-global
 logging framework cannot route correctly when the eval runs questions
@@ -75,7 +75,7 @@ def render_line(evt: dict) -> str:
     are the event metadata (`step_idx`, `op`, and `uid`/`logger` when present).
     Long string metadata is capped for readability; the JSONL sink keeps it whole.
     Used for the console echo, the per-question `.log` file, and (via
-    `_LineFormatter`) stdlib records.
+    `LineFormatter`) stdlib records.
     """
     ts = datetime.now().strftime("%H:%M:%S")
     level = evt.get("level", "info")
@@ -96,7 +96,7 @@ def render_line(evt: dict) -> str:
     return "  ".join(parts)
 
 
-class _LineFormatter(logging.Formatter):
+class LineFormatter(logging.Formatter):
     """Renders a stdlib `LogRecord` through `render_line`, so process-scoped logs
     (the `logging.getLogger(__name__)` sites, the retry warning, build pipelines)
     share the exact format of the per-question event stream."""
@@ -114,7 +114,7 @@ class _LineFormatter(logging.Formatter):
 def configure_obs(*, jsonl_path: str | None = None) -> None:
     """Configure the process-wide logging pipeline. Idempotent.
 
-    Installs `_LineFormatter` on the root handler so every stdlib logger renders
+    Installs `LineFormatter` on the root handler so every stdlib logger renders
     like the event stream. The root stays quiet (third-party libs at WARNING)
     while the whole `skunk.*` tree is allowed through at INFO. `jsonl_path`, when
     given, opens the durable JSON-line sink fed by `write_jsonl`.
@@ -131,7 +131,7 @@ def configure_obs(*, jsonl_path: str | None = None) -> None:
             return
 
         handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(_LineFormatter())
+        handler.setFormatter(LineFormatter())
         root = logging.getLogger()
         root.handlers = [handler]
         # Keep the root quiet (third-party libs stay at WARNING) but let the whole

@@ -443,7 +443,7 @@ Requirements for the final answer:
         # Capture the system prompt + opening question into the event stream so the
         # trace viewer can show them (the console / `.log` keep only the one-liners —
         # the full text rides in `data`). The system prompt is static for the call.
-        system_prompt = self._prompt._assemble_system_prompt(ctx)
+        system_prompt = self._prompt.assemble_system_prompt(ctx)
         ctx.emit(
             f"system_prompt chars={len(system_prompt)}",
             kind="system",
@@ -641,8 +641,11 @@ Requirements for the final answer:
             trimmed = trimmed + extra
         if self._backend is None:
             self._last_logprobs = None
-            return await self._prompt.call(
-                ctx, messages=trimmed, should_stop=_stop_at_first_block,
+            # Agent-model resolution lives HERE (the agent layer), not in the prompt
+            # layer: `agent_model_id` overrides the per-site model map for agent loops.
+            return await self._prompt.call_multi_turn(
+                ctx, trimmed, should_stop=_stop_at_first_block,
+                model=ctx.config.agent_model_id or None,
                 temperature=self.temperature,
                 max_output_tokens=self.max_output_tokens,
                 timeout_s=self.request_timeout_s,
@@ -651,7 +654,7 @@ Requirements for the final answer:
         # prompt, sample one turn synchronously (the rollout owns its thread +
         # loop), stash logprobs for `call()`, then parse. A bad parse raises
         # `ParseError`, which `call()` turns into a recoverable observation.
-        system = self._prompt._assemble_system_prompt(ctx)
+        system = self._prompt.assemble_system_prompt(ctx)
         rendered = [{"role": "system", "content": system}, *trimmed]
         text, self._last_logprobs = self._backend.generate(
             rendered,

@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from skunk.common import Effort, strip_code_fence
+from skunk.common import Effort
 from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.common import (
@@ -19,7 +19,7 @@ from skunk.common import (
     NeedsMore,
     input_values_desc,
 )
-from skunk.pyexec import exec_python_with_env
+from skunk.pyexec import exec_python_with_env, parse_codegen_reply
 from skunk.question_explainer import ConceptExplanation
 
 
@@ -29,21 +29,14 @@ class MissingDataSignal(BaseModel):
     missing: list[str] = []
 
 
-def _parse_codegen(raw: str) -> str:
-    """Parse a codegen reply into a Python code string. Empty / un-fenced / bare-JSON →
-    `ParseError`. Not a `PromptedCall` parse hook — called after `call()` returns so the
-    prompt layer never sees it; `ComputeOp.run()` catches the `ParseError` and retries."""
-    s = strip_code_fence(raw).strip()
-    if not s or s.startswith("{"):
-        raise ParseError(
-            raw=raw,
-            detail=(
-                "expected a fenced ```python``` block — emit (a) success (assign `result`) "
-                "or (b) missing data (assign `keep` and `missing`). Do not emit a bare "
-                "JSON object."
-            ),
-        )
-    return s
+# `parse_codegen_reply`'s fix-it text for compute replies. Not a `PromptedCall` parse
+# hook — parsed after `call()` returns so the prompt layer never sees it;
+# `ComputeOp.run()` catches the `ParseError` and retries.
+_CODEGEN_EXPECTATION = (
+    "expected a fenced ```python``` block — emit (a) success (assign `result`) "
+    "or (b) missing data (assign `keep` and `missing`). Do not emit a bare "
+    "JSON object."
+)
 
 
 # A standalone NaN/inf token in the answer string means a non-finite `result`
@@ -266,7 +259,7 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
                 "Focus on fixing them without introducing new mistakes."
             )
         raw = await self._prompt.call(ctx, user_msg, effort=effort, temperature=1.0)
-        return _parse_codegen(raw)
+        return parse_codegen_reply(raw, expectation=_CODEGEN_EXPECTATION)
 
 
 class ComputeOp:

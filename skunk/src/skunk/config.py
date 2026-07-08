@@ -148,6 +148,10 @@ class PipelineConfig(SearchAgentConfig):
     # (env: SKUNK_PRECOMPUTED_CONCEPT_REFS=1)
     compute_precomputed_concept_refs: bool = False
 
+    # Data-prep gate: codegen→exec attempts before failing safe (pool passes through
+    # unchanged). Its own budget — no longer borrows `compute_max_attempts`.
+    data_prep_max_attempts: int = 3
+
     # Replan-on-MissingData loop. Total compute invocations ≤ recovery_max_rounds + 1.
     recovery_max_rounds: int = 2
 

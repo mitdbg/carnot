@@ -25,10 +25,7 @@ from typing import Any
 
 from chromadb.api.models.Collection import Collection
 
-from skunk.common import (
-    B64Image,
-    ExecutionContext,
-)
+from skunk.common import B64Image
 from skunk.config import SearchAgentConfig
 from skunk.llm_client import LLMClient
 from skunk.local_python_executor import CodeOutput
@@ -76,7 +73,7 @@ class SearchAgent(MultiTurnAgent):
     final_answer_doc = """\
 A JSON object with the `doc_id`s you identified as relevant, under the key "doc_ids". Here is an example:
 ```json
-{"doc_ids": ["combined_statement__historical__cs-1872_12", "govinfo_receipts__1893__SERIALSET-03108_00_00-002-0256-0000_3"]}
+{"doc_ids": ["annual_report_2014_p12", "quarterly_survey_1987_q3_p4"]}
 ```
 Use each `doc_id` exactly as it appears in the search / grep results."""
 
@@ -88,6 +85,7 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         *,
         pdf_dir: str | None = None,
         page_renders_dir: str | None = None,
+        page_ref_parser=None,
         llm_client: LLMClient | None = None,
         emb_model_id: str | None = None,
         extra_tools: tuple[Tool, ...] = (),
@@ -138,7 +136,10 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         # Tool instances capture their deps; the prompt's tool docs are generated
         # from their `doc`s by the base, so tools and docs can't drift.
         if pdf_dir is not None:
-            extra_tools += (ViewFigureTool(self.document_map, pdf_dir, renders_dir=page_renders_dir),)
+            extra_tools += (ViewFigureTool(
+                self.document_map, pdf_dir, renders_dir=page_renders_dir,
+                page_ref_parser=page_ref_parser,
+            ),)
         tools: list[Tool] = []
         # Vector search over the corpus. A caller can drop it (`include_search_corpus=False`)
         # to force the agent onto other retrieval tools — e.g. qatfd system #3 removes it so
@@ -153,9 +154,9 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         tools += [
             GrepCorpusTool(
                 self.chroma_collection,
-                self._pruned_chunk_ids,
-                self._pruned_doc_ids,
                 config.grep_max_output_tokens,
+                pruned_chunk_ids=self._pruned_chunk_ids,
+                pruned_doc_ids=self._pruned_doc_ids,
                 seen_chunk_ids=self._seen_chunk_ids, seen_doc_ids=self._seen_doc_ids,
             ),
             ReadDocumentTool(
@@ -266,29 +267,16 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             blocks.append(TextBlock("[no output]"))
         return blocks
 
-    # ------------------------------------------------------------------
-    # Retriever entry point
-    # ------------------------------------------------------------------
 
-    async def retrieve(
-        self,
-        ctx: ExecutionContext,
-        question: str,
-        *,
-        branch_key: str | None = None,
-        branch_period: str | None = None,
-    ) -> list[str]:
-        parts = [f"Question: {question}"]
-        if branch_key:
-            parts.append(f"Search focus: {branch_key}")
-        if branch_period:
-            parts.append(f"Time period (of the data): {branch_period}")
-        payload = await self.call(ctx, "\n".join(parts))
-        return self._doc_ids_from_payload(payload)
-
-    @staticmethod
-    def _doc_ids_from_payload(payload: Any) -> list[str]:
-        keys = payload.get("doc_ids") or []
-        if isinstance(keys, str):
-            return [keys]
-        return [str(k) for k in keys]
+def doc_ids_from_payload(payload: Any) -> list[str]:
+    """The `doc_ids` list out of a SearchAgent final-answer payload, coerced to
+    strings; [] for a malformed payload (non-dict, or a missing/empty key). A bare
+    string value is treated as a single id. The one place the final-answer shape
+    (`final_answer_doc`) is decoded — callers compose their own user message,
+    `await agent.call(ctx, msg)`, and decode with this."""
+    if not isinstance(payload, dict):
+        return []
+    keys = payload.get("doc_ids") or []
+    if isinstance(keys, str):
+        return [keys]
+    return [str(k) for k in keys]

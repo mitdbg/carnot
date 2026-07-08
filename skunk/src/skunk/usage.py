@@ -45,9 +45,12 @@ class UsageTracker:
         self.n_calls = 0
         # per-model token sums, for cost when a run mixes models. cached is a subset
         # of input (its discounted portion), tracked separately so cost can price it.
+        # thinking is tracked separately from output (providers report it separately;
+        # genai's output_tokens EXCLUDES thoughts) and billed at the output rate.
         self.by_model_in: dict[str, int] = defaultdict(int)
         self.by_model_out: dict[str, int] = defaultdict(int)
         self.by_model_cached: dict[str, int] = defaultdict(int)
+        self.by_model_think: dict[str, int] = defaultdict(int)
         # Embeddings are accounted SEPARATELY from generation: they have only input
         # tokens (no output / no cache), a distinct price, and a distinct call count.
         # Kept out of the generation counters above so a report's `total_input_tokens`
@@ -62,6 +65,7 @@ class UsageTracker:
         in_tok = resp.input_tokens or 0
         out_tok = resp.output_tokens or 0
         cache_tok = resp.cache_input_tokens or 0
+        think_tok = resp.thinking_tokens or 0
         m = model or self.default_model
         with self._lock:
             self.input_tokens += in_tok
@@ -70,6 +74,7 @@ class UsageTracker:
             self.by_model_in[m] += in_tok
             self.by_model_out[m] += out_tok
             self.by_model_cached[m] += cache_tok
+            self.by_model_think[m] += think_tok
             self.n_calls += 1
 
     def add_embed(self, model: str | None, input_tokens: int) -> None:
@@ -85,8 +90,9 @@ class UsageTracker:
     def cost(self) -> float:
         """Total USD cost from the price table — generation plus embeddings. Cached input
         tokens are billed at the model's `cached` rate (falling back to `in` when unset)
-        and the remaining (uncached) input tokens at `in`; output tokens at `out`. Every
-        call adds to `by_model_in`, so iterating it covers all models seen."""
+        and the remaining (uncached) input tokens at `in`; output AND thinking tokens at
+        `out` (providers bill thoughts at the output rate). Every call adds to
+        `by_model_in`, so iterating it covers all models seen."""
         if not self.prices:
             return 0.0
         total = 0.0
@@ -99,14 +105,17 @@ class UsageTracker:
             uncached_in = max(0, in_tok - cached)
             total += uncached_in / 1_000_000 * in_rate
             total += cached / 1_000_000 * p.get("cached", in_rate)
-            total += self.by_model_out.get(model, 0) / 1_000_000 * p.get("out", 0.0)
+            out_and_think = self.by_model_out.get(model, 0) + self.by_model_think.get(model, 0)
+            total += out_and_think / 1_000_000 * p.get("out", 0.0)
         return total + self.embed_cost()
 
-    def price_call(self, model: str | None, in_tok: int, cached_tok: int, out_tok: int) -> float | None:
+    def price_call(
+        self, model: str | None, in_tok: int, cached_tok: int, out_tok: int, think_tok: int = 0
+    ) -> float | None:
         """USD cost of a single generation call, priced exactly as `cost()` aggregates (so
         per-call costs sum to the question total): uncached input at `in`, cached input at
-        `cached` (→ `in` when unset), output at `out`. Returns None when there is no price
-        table or no matching entry, so callers can distinguish "unpriced" from "$0.00"."""
+        `cached` (→ `in` when unset), output + thinking at `out`. Returns None when there is
+        no price table or no matching entry, so callers can distinguish "unpriced" from "$0.00"."""
         if not self.prices:
             return None
         p = _match_price(model or self.default_model, self.prices)
@@ -117,7 +126,7 @@ class UsageTracker:
         return (
             uncached / 1_000_000 * in_rate
             + cached_tok / 1_000_000 * p.get("cached", in_rate)
-            + out_tok / 1_000_000 * p.get("out", 0.0)
+            + (out_tok + think_tok) / 1_000_000 * p.get("out", 0.0)
         )
 
     def price_embed(self, model: str | None, in_tok: int) -> float | None:
