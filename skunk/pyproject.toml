@@ -27,7 +27,6 @@ dependencies = [
 # Local SentenceTransformers embedding backend (LLMClient emb_provider="local");
 # heavy (pulls in torch), so opt-in. API-backed embeddings need nothing extra.
 embeddings = ["sentence-transformers"]
-rollout = ["tinker", "tinker_cookbook"]
 dev = ["pandas-stubs==3.0.3.260530"]
 
 [tool.setuptools.packages.find]

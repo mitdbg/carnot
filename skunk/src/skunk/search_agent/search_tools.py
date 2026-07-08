@@ -59,7 +59,7 @@ from typing import TYPE_CHECKING
 from chromadb.api.models.Collection import Collection
 
 from skunk.common import page_key_to_pageref
-from skunk.corpus import render_page_b64
+from skunk.common import render_page_b64
 from skunk.multi_turn_agent import Tool
 
 if TYPE_CHECKING:
@@ -226,7 +226,7 @@ class GrepCorpusTool(Tool):
     _CHARS_PER_TOKEN = 4
     # Display unit only: the truncation note renders the token cap as "Nk tokens" for
     # readability (200000 → "200k"). Not a model/context-limit knob — the cap itself is
-    # `SkunkConfig.grep_max_output_tokens`; this is just thousands-formatting.
+    # `SearchAgentConfig.grep_max_output_tokens`; this is just thousands-formatting.
     _TOKENS_PER_K = 1000
 
     def __init__(
@@ -246,7 +246,7 @@ class GrepCorpusTool(Tool):
         self._seen_doc_ids = seen_doc_ids if seen_doc_ids is not None else set()
         # Hard cap on the rendered observation size (chars). `limit=None` returns every
         # matching chunk, so a broad pattern can otherwise dump 100s of K of tokens into
-        # the context in one shot and 400 the next request (see SkunkConfig.grep_max_output_tokens).
+        # the context in one shot and 400 the next request (see SearchAgentConfig.grep_max_output_tokens).
         self._max_output_chars = max_output_tokens * self._CHARS_PER_TOKEN
         self._required_metadata_filter = required_metadata_filter
 

@@ -1,29 +1,28 @@
-"""Build a ChromaDB collection from precomputed element embeddings.
+"""Generic, resumable loader: precomputed element embeddings → a ChromaDB collection.
 
-The on-disk layout produced by every `compute_*_element_embeddings.py`
-script is the same:
+The on-disk layout produced by every `compute_*_embeddings.py` script is the same:
 
   * one or more `embeddings_{...}.npz` files, each containing arrays
     `embeddings` (float32, [n, d]) and `unique_element_ids` (str, [n])
   * one or more `metadata{_rank{r}}.json` files containing a single dict
     mapping `unique_element_id -> per-element metadata dict`
 
-What differs per benchmark is the *shape* of those per-element metadata
-dicts and how they map onto the columns we store in ChromaDB:
+What differs per corpus is the *shape* of those per-element metadata dicts and
+how they map onto the columns stored in ChromaDB:
 
   * the row id (= the SearchAgent's `chunk_id`)
   * the `documents` column (= the chunk's text)
   * the `metadatas` column, which must always carry `doc_id` + `chunk_id`
     so the SearchAgent's prune / filter logic works, plus any
-    benchmark-specific filterable fields.
+    corpus-specific filterable fields.
 
-The benchmark-specific bit is isolated in `_BENCHMARK_ADAPTERS` below: to
-add a new benchmark, write an adapter that returns
-`(doc_id, document_text, extra_metadata)` for a single per-element
-metadata dict and register it.
+That corpus-specific bit is an `ElementAdapter` the CALLER supplies — the
+benchmark adapters live with the benchmarks (qatfd's
+`engaging-scripts/create_vector_db.py` registers one per benchmark and wraps
+`run_build` in a CLI). This module owns only the generic machinery: metadata
+loading, rank-sharding, the resume manifest, and batched upserts.
 """
 
-import argparse
 import json
 import os
 import re
@@ -38,116 +37,12 @@ CHROMA_MAX_BATCH_SIZE = 5461
 
 # An adapter maps a single per-element metadata dict (as produced by an embedding script) to:
 #   (doc_id, document_text, extra_metadata)
-# where `extra_metadata` is a dict of benchmark-specific filterable fields
+# where `extra_metadata` is a dict of corpus-specific filterable fields
 # that will be stored alongside the common `doc_id` / `chunk_id` keys.
 ElementAdapter = Callable[[dict], tuple[str, str, dict]]
 
 
-def _officeqa_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
-    """Adapter for `compute_officeqa_element_embeddings.py` outputs."""
-    return (
-        elt_metadata["page_key"],
-        elt_metadata["cleaned"],
-        {
-            "file_id": elt_metadata["file_id"],
-            "year": elt_metadata["year"],
-            "month": elt_metadata["month"],
-            "page_id": elt_metadata["page_id"],
-            "element_id": elt_metadata["element_id"],
-            "type": elt_metadata["type"],
-        },
-    )
-
-
-def _browsecomp_plus_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
-    """Adapter for `compute_browsecomp_plus_element_embeddings.py` outputs."""
-    return (
-        elt_metadata["docid"],
-        elt_metadata["cleaned"],
-        {
-            "url": elt_metadata["url"],
-            "element_id": elt_metadata["element_id"],
-        },
-    )
-
-
-def _biogen_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
-    """Adapter for `compute_biogen_embeddings.py` outputs (one element per PubMed abstract)."""
-    return (
-        elt_metadata["docid"],  # PMID
-        elt_metadata["cleaned"],
-        {"element_id": elt_metadata["element_id"]},
-    )
-
-
-def _financebench_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
-    """Adapter for `compute_financebench_element_embeddings.py` outputs (text/table/figure elements).
-
-    The `page_key` ("{doc_name}::p{page_num}") is the doc_id, so retrieved doc_ids line up with the
-    page-level gold the FinanceBench benchmark derives from the evidence page numbers; `type`
-    (text/table/figure) is surfaced to the SearchAgent like OfficeQA's element type.
-    """
-    return (
-        elt_metadata["page_key"],
-        elt_metadata["cleaned"],
-        {
-            "doc_name": elt_metadata["doc_name"],
-            "page_num": elt_metadata["page_num"],
-            "element_id": elt_metadata["element_id"],
-            "type": elt_metadata.get("type", "text"),
-        },
-    )
-
-
-def _qampari_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
-    """Adapter for `compute_qampari_embeddings.py` outputs (one element per ~100-token Wikipedia chunk).
-
-    The chunk_id ("{page_id}__{n}") is the doc_id, so the QAMPARI benchmark's chunk-text document_map
-    (keyed by chunk_id) lines up with retrieved doc_ids; `title` is surfaced so retrieved chunks can
-    be collapsed to their Wikipedia article (the unit of QAMPARI's gold) for doc-recall.
-    """
-    return (
-        elt_metadata["chunk_id"],
-        elt_metadata["cleaned"],
-        {
-            "title": elt_metadata.get("title", ""),
-            "page_id": elt_metadata.get("page_id", ""),
-            "url": elt_metadata.get("url", ""),
-            "element_id": elt_metadata.get("element_id", 0),
-        },
-    )
-
-
-def _freshstack_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
-    """Adapter for `compute_freshstack_embeddings.py` outputs (one element per corpus document).
-
-    The corpus `_id` (e.g. "azure-openai/LICENSE.md_0_1140") is the doc_id, so retrieved doc_ids line
-    up directly with the FreshStack benchmark's gold (a nugget's relevant_corpus_ids are corpus `_id`s);
-    `file_id` is the source file the chunk belongs to (the `_id` minus its byte-range suffix), surfaced
-    for file-level grouping/recall; `url` is the GitHub source carried through for reference.
-    """
-    return (
-        elt_metadata["doc_id"],
-        elt_metadata["cleaned"],
-        {
-            "file_id": elt_metadata.get("file_id", ""),
-            "url": elt_metadata.get("url", ""),
-            "element_id": elt_metadata.get("element_id", 0),
-        },
-    )
-
-
-_BENCHMARK_ADAPTERS: dict[str, ElementAdapter] = {
-    "officeqa": _officeqa_adapter,
-    "browsecomp_plus": _browsecomp_plus_adapter,
-    "trec_biogen": _biogen_adapter,
-    "finance_bench": _financebench_adapter,
-    "qampari": _qampari_adapter,
-    "freshstack": _freshstack_adapter,
-}
-
-
-def _load_metadata(embeddings_dir: str) -> dict[str, dict]:
+def load_metadata(embeddings_dir: str) -> dict[str, dict]:
     """Load and merge every `metadata*.json` file in `embeddings_dir`."""
     metadata: dict[str, dict] = {}
     for file in os.listdir(embeddings_dir):
@@ -161,7 +56,7 @@ _RANK_META_RE = re.compile(r"^metadata_rank(\d+)\.json$")
 _RANK_NPZ_RE = re.compile(r"^embeddings_(\d+)_")
 
 
-def _rank_metadata_shards(embeddings_dir: str) -> dict[int, str] | None:
+def rank_metadata_shards(embeddings_dir: str) -> dict[int, str] | None:
     """If metadata is sharded per embedding-rank (`metadata_rank{r}.json`), return {rank: filename};
     else None (a single `metadata.json`).
 
@@ -189,7 +84,7 @@ def _load_manifest(manifest_path: str) -> set[str]:
         return {line.strip() for line in f if line.strip()}
 
 
-def _add_partition(
+def add_partition(
     collection: chromadb.Collection,
     npz_path: str,
     metadata: dict[str, dict],
@@ -237,53 +132,47 @@ def _add_partition(
         )
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Create a ChromaDB vector database from precomputed embeddings.")
-    parser.add_argument("--embeddings-dir", type=str, required=True)
-    parser.add_argument("--collection-name", type=str, required=True)
-    parser.add_argument("--chroma-path", type=str, default=".chromadb",
-                        help="Directory to store ChromaDB data (default: .chromadb).")
-    parser.add_argument("--benchmark", type=str, required=True,
-                        choices=sorted(_BENCHMARK_ADAPTERS.keys()),
-                        help="Which embedding-script output format to expect.")
-    parser.add_argument("--only-rank", type=int, default=None,
-                        help="If set, build ONLY this embedding rank's shard (embeddings_{rank}_*.npz + "
-                             "metadata_rank{rank}.json) into --collection-name. Run once per rank with "
-                             "distinct --collection-name (e.g. NAME_r0..NAME_r3) to get one Chroma "
-                             "collection per rank, keeping each metadata segment small enough to compact.")
-    args = parser.parse_args()
-
-    # get the adapter for this benchmark
-    adapter = _BENCHMARK_ADAPTERS[args.benchmark]
-
-    # create the chroma client and collection
-    client = chromadb.PersistentClient(path=args.chroma_path)
+def run_build(
+    *,
+    embeddings_dir: str,
+    collection_name: str,
+    chroma_path: str,
+    adapter: ElementAdapter,
+    only_rank: int | None = None,
+) -> None:
+    """Build (or resume building) `collection_name` at `chroma_path` from every
+    `embeddings*.npz` in `embeddings_dir`, mapping per-element metadata through
+    `adapter`. `only_rank` restricts the build to a single embedding rank's shard
+    (`embeddings_{rank}_*.npz` + `metadata_rank{rank}.json`) — run once per rank
+    with distinct collection names to keep each metadata segment small enough to
+    compact."""
+    client = chromadb.PersistentClient(path=chroma_path)
     # hnsw:num_threads parallelizes index insertion (the dominant build cost) across all cores.
     # NOTE: HNSW params are baked at collection-creation, so this only takes effect on a *fresh*
     # collection — delete the chroma dir to re-create with it. (If your chromadb version rejects
     # the `hnsw:` metadata key, the configuration= form is the alternative.)
     collection = client.get_or_create_collection(
-        name=args.collection_name,
+        name=collection_name,
         metadata={"hnsw:num_threads": os.cpu_count() or 8},
     )
-    print(f"Writing to collection {args.collection_name!r} at {args.chroma_path} (benchmark={args.benchmark}).")
+    print(f"Writing to collection {collection_name!r} at {chroma_path}.")
 
-    npz_files = sorted(f for f in os.listdir(args.embeddings_dir) if f.startswith("embeddings") and f.endswith(".npz"))
-    shards = _rank_metadata_shards(args.embeddings_dir)
+    npz_files = sorted(f for f in os.listdir(embeddings_dir) if f.startswith("embeddings") and f.endswith(".npz"))
+    shards = rank_metadata_shards(embeddings_dir)
 
-    if args.only_rank is not None:
+    if only_rank is not None:
         # Restrict the build to a single embedding rank -> one collection per rank.
-        if not shards or args.only_rank not in shards:
-            raise ValueError(f"--only-rank {args.only_rank}: no metadata_rank{args.only_rank}.json in {args.embeddings_dir}")
-        shards = {args.only_rank: shards[args.only_rank]}
+        if not shards or only_rank not in shards:
+            raise ValueError(f"--only-rank {only_rank}: no metadata_rank{only_rank}.json in {embeddings_dir}")
+        shards = {only_rank: shards[only_rank]}
         npz_files = [f for f in npz_files
-                     if (_RANK_NPZ_RE.match(f) and int(_RANK_NPZ_RE.match(f).group(1)) == args.only_rank)]
+                     if (_RANK_NPZ_RE.match(f) and int(_RANK_NPZ_RE.match(f).group(1)) == only_rank)]
         if not npz_files:
-            raise ValueError(f"--only-rank {args.only_rank}: no embeddings_{args.only_rank}_*.npz in {args.embeddings_dir}")
+            raise ValueError(f"--only-rank {only_rank}: no embeddings_{only_rank}_*.npz in {embeddings_dir}")
 
     # Resume support: skip .npz partitions already recorded in the manifest, and append each one as
     # it finishes (flushed immediately) so a killed run picks up exactly where it left off.
-    manifest_path = _manifest_path(args.chroma_path, args.collection_name)
+    manifest_path = _manifest_path(chroma_path, collection_name)
     built = _load_manifest(manifest_path)
     todo = [f for f in npz_files if f not in built]
     if built:
@@ -293,7 +182,7 @@ if __name__ == "__main__":
     pbar = tqdm(total=len(todo), unit="part", desc="Adding partitions", smoothing=0.05)
 
     def _add_and_record(file: str, metadata: dict[str, dict]) -> None:
-        _add_partition(collection, os.path.join(args.embeddings_dir, file), metadata, adapter)
+        add_partition(collection, os.path.join(embeddings_dir, file), metadata, adapter)
         manifest.write(file + "\n")
         manifest.flush()
         pbar.update(1)
@@ -312,7 +201,7 @@ if __name__ == "__main__":
             if not rank_todo:
                 continue  # whole rank already added; skip loading its (multi-GB) metadata shard
             pbar.set_description(f"rank {rank} (loading metadata)")
-            with open(os.path.join(args.embeddings_dir, shards[rank])) as f:
+            with open(os.path.join(embeddings_dir, shards[rank])) as f:
                 metadata = json.load(f)
             pbar.set_description(f"rank {rank}")
             for file in rank_todo:
@@ -320,7 +209,7 @@ if __name__ == "__main__":
             del metadata
     else:
         # Single metadata.json (smaller corpora): load once, add every remaining partition.
-        metadata = _load_metadata(args.embeddings_dir)
+        metadata = load_metadata(embeddings_dir)
         for file in todo:
             _add_and_record(file, metadata)
 

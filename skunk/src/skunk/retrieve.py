@@ -14,7 +14,7 @@ import json
 import threading
 from pathlib import Path
 
-from skunk.config import SkunkConfig
+from skunk.config import PipelineConfig
 from skunk.errors import StepFailed
 from skunk.common import (
     BranchRetrieval,
@@ -27,7 +27,7 @@ from skunk.plan import RetrieveBranch
 
 
 class RetrieveOp:
-    def __init__(self, config: SkunkConfig) -> None:
+    def __init__(self, config: PipelineConfig) -> None:
         self._config = config
         self._resources = None  # (Collection, dict[str, str]) — shared across branches
         self._resources_lock = threading.Lock()
@@ -125,7 +125,7 @@ class RetrieveOp:
             )
         return refs
 
-    def _ensure_resources(self, config: SkunkConfig):
+    def _ensure_resources(self, config: PipelineConfig):
         # Single-flight: neither parallel branches (same op) nor parallel UID workers
         # (eval's thread pool, each with its own RetrieveOp) need to re-connect to the
         # ChromaDB server / re-fetch the collection. Connection + collection handle are
@@ -150,7 +150,7 @@ _SHARED_RESOURCES_LOCK = threading.Lock()
 _SHARED_RESOURCES: dict[tuple[str, int, str, str], tuple] = {}
 
 
-def _get_shared_resources(config: SkunkConfig):
+def _get_shared_resources(config: PipelineConfig):
     """Process-wide single-flight wrapper over `_build_resources`, keyed by the
     ChromaDB server (host, port) + collection + clean-page-map path. Serializes the
     connect/collection-fetch across all RetrieveOps (i.e. across all UID worker threads)."""
@@ -166,7 +166,7 @@ def _get_shared_resources(config: SkunkConfig):
         return _SHARED_RESOURCES[key]
 
 
-def _build_resources(config: SkunkConfig):
+def _build_resources(config: PipelineConfig):
     from skunk.chroma_client import make_chroma_client
 
     clean_page_map_path = Path(config.clean_page_map_path)

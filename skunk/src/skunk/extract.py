@@ -15,10 +15,21 @@ from skunk.common import (
     traced_step,
 )
 from skunk.errors import ParseError, StepFailed
+from skunk.page_store import PageContentStore
 from skunk.prompted_call import PromptedCall
 from skunk.plan import RetrieveBranch
-from skunk.page_index.data_model import inherited_column_headers
-from skunk.page_index.store import PageStore, get_page_store
+
+
+def _require_store(ctx: ExecutionContext) -> PageContentStore:
+    """The injected page-content backend, or a clear StepFailed when the app forgot to
+    wire one (`Orchestrator(page_store=...)`) — extract has no other content source."""
+    if ctx.page_store is None:
+        raise StepFailed(
+            "extract",
+            "no page store configured — pass page_store= to the Orchestrator "
+            "(see skunk.page_store.PageContentStore)",
+        )
+    return ctx.page_store
 
 
 def _render_pages_b64(
@@ -27,12 +38,12 @@ def _render_pages_b64(
     *,
     strict: bool = False,
 ) -> tuple[list[B64Image], list[PageRef]]:
-    """Page images for the vision tier, from the page store (rendered on demand at 200 DPI +
+    """Page images for the vision tier, from the page store (rendered on demand +
     cached). The returned refs identify each image's source page so the prompt's numbered list
     can't conflate them. When `strict`, a page that fails to render (error or missing PNG) raises
     StepFailed instead of being silently skipped — the vision tier must not drop the answer page.
     The vision fallback leaves `strict` off (a render miss there just skips that page)."""
-    store = get_page_store(str(ctx.config.pdf_dir))
+    store = _require_store(ctx)
     images: list[B64Image] = []
     rendered_refs: list[PageRef] = []
     for ref in refs:
@@ -268,37 +279,6 @@ _EXTRACT_OUTPUT_INSTRUCTION = (
 )
 
 
-def _continuation_context(page: PageRef, ctx: ExecutionContext) -> str:
-    """Extra read context for a header-less continuation page, in place of fetching its
-    predecessor pages: (1) the column grammar inherited from the run head (`inherited_column_headers`)
-    so unlabeled cells can be placed, and (2) the page's OWN block summaries — the account it
-    reports, which a banner-only continuation page's text may not state (its account heading is on
-    an earlier page). Only UNTITLED blocks are summarized: a titled block is already named by the
-    page-metadata line (`- page N: table: <title>`), so repeating its summary here just duplicates
-    that line; an untitled block has no title to show, so its summary is the only account signal.
-    Empty string for a normal (non-continuation) page. Shared by both tiers."""
-    store = get_page_store(str(ctx.config.pdf_dir))
-    sc = store.summary(page)
-    if sc is None or not getattr(sc, "is_continuation", False):
-        return ""
-    lines: list[str] = []
-    inh = inherited_column_headers(page, store.summary)
-    if inh:
-        # Only the column ORDER is inherited (stable across the run); the account is NOT — it can
-        # change mid-run, so it's left to the page's own summaries/titles below, not the head's.
-        cols = inh[2]
-        lines.append(
-            "This page's table opens directly into data columns; its header row is on an earlier "
-            f"page (not reprinted here). Columns, left to right: {cols}."
-        )
-    # Only summarize blocks the page metadata can't already name (untitled ones) — a titled
-    # block's "- page N: table: <title>" line makes its summary here redundant.
-    summaries = [b.summary for b in sc.blocks if b.summary and not b.title]
-    if summaries:
-        lines.append("This page reports: " + " / ".join(summaries))
-    return "\n".join(lines)
-
-
 class TextExtractor:
     _PREAMBLE = """\
 You retrieve printed values from page text to fulfill a specific lookup. The
@@ -319,7 +299,7 @@ an inclusive month range."""
         """Fetch each ref's text from the page store (an anchor's text is its merged member
         pages, with any figure note already baked in); skip refs with none (the vision tier can
         still read them)."""
-        store = get_page_store(str(ctx.config.pdf_dir))
+        store = _require_store(ctx)
         pages: list[tuple[PageRef, str]] = []
         for ref in refs:
             text = store.text(ref)
@@ -329,27 +309,6 @@ an inclusive month range."""
             ctx.emit(f"got_text tier=parsed_json page={str(ref)} chars={len(text)}")
             pages.append((ref, text))
         return pages
-
-    @staticmethod
-    def _block_meta_line(page: int | None, block: Any) -> str:
-        """One metadata line for a content block — kind and title only. Headers and summary
-        are selection-stage context; at read time they restate ~half the page's tokens out of
-        layout order, so the model reads structure from the table markup in the text instead."""
-        return f"- page {page}: {block.kind}: {block.title or '(untitled)'}"
-
-    @classmethod
-    def _page_metadata(cls, refs: list[PageRef], ctx: ExecutionContext) -> str:
-        """Structured summary of every content block on the group's pages. Empty string when no
-        scan metadata is available."""
-        store = get_page_store(str(ctx.config.pdf_dir))
-        lines: list[str] = []
-        for ref in refs:
-            sc = store.summary(ref)
-            if sc is None:
-                continue
-            for block in sc.blocks:
-                lines.append(cls._block_meta_line(ref.page, block))
-        return "\n".join(lines)
 
     async def _extract_content(
         self,
@@ -404,31 +363,18 @@ an inclusive month range."""
 
     @staticmethod
     def _page_groups(
-        pages: list[PageRef], store: "PageStore"
+        pages: list[PageRef], store: PageContentStore
     ) -> list[tuple[PageRef, list[PageRef]]]:
         """Expand each unique retrieved page (first-seen order) to the physical pages an extract
-        call must read: the page itself (and any folded continuation pages), then its linked
-        `notes_pages` (footnote definitions) appended. A header-less continuation page does NOT
-        pull in its predecessor text — the column grammar it needs is injected as a compact
-        metadata line (`inherited_column_headers`) instead, so a deep continuation reads one page
-        rather than its whole multi-page run. Returns `(page, refs)` per page — one extract call
-        each."""
+        call must read (`store.read_group`: the page plus any dependent continuation/notes
+        pages). Returns `(page, refs)` per page — one extract call each."""
         out: list[tuple[PageRef, list[PageRef]]] = []
         seen: set[PageRef] = set()
         for p in pages:
             if p in seen:
                 continue
             seen.add(p)
-            sc = store.summary(p)
-            # The page itself plus any folded continuation pages (the table's tail).
-            members = [p.page, *sc.continuation_pages] if sc is not None else [p.page]
-            refs = [PageRef(stem=p.stem, page=pg) for pg in members]
-            if sc is not None:  # linked footnote/notes pages last (auxiliary context)
-                for n in sc.notes_pages:
-                    r = PageRef(stem=p.stem, page=n)
-                    if r not in refs:
-                        refs.append(r)
-            out.append((p, refs))
+            out.append((p, store.read_group(p)))
         return out
 
     async def _extract_page_group(
@@ -441,9 +387,9 @@ an inclusive month range."""
         looking_for: str | None = None,
     ) -> list[AnnotatedValue]:
         """Extraction for one retrieved page: feed its `refs` (the page plus its linked notes
-        pages) FULL text — no within-page slicing — annotated with the pages' content-block
-        metadata, plus, for a header-less continuation page, the inherited column grammar and the
-        page's own block summaries (`_continuation_context`) in place of its predecessor text."""
+        pages) FULL text — no within-page slicing — annotated with the pages' structural
+        metadata (`store.page_metadata`), plus any per-page standalone-read context
+        (`store.extra_read_context`, e.g. a continuation page's inherited column grammar)."""
         texts = self._fetch_page_texts(refs, ctx)
         if not texts:
             ctx.emit(
@@ -452,8 +398,9 @@ an inclusive month range."""
             return []
         content = "\n\n".join(text for _, text in texts)
         prov_refs = [r for r, _ in texts]
-        metadata = self._page_metadata(prov_refs, ctx)
-        cont = _continuation_context(page, ctx)
+        store = _require_store(ctx)
+        metadata = store.page_metadata(prov_refs)
+        cont = store.extra_read_context(page)
         if cont:
             metadata = f"{cont}\n{metadata}" if metadata else cont
         ctx.emit(
@@ -474,7 +421,7 @@ an inclusive month range."""
         """Extract from the retrieved pages — one extract call per unique page, its dependent
         pages (header predecessors + notes) fed whole. `looking_for` overrides the single-key
         opening line for multi-goal page reads."""
-        groups = self._page_groups(pages, get_page_store(str(ctx.config.pdf_dir)))
+        groups = self._page_groups(pages, _require_store(ctx))
         ctx.emit(
             f"fan_out tier=parsed_json n_groups={len(groups)} n_pages={len(pages)}"
         )
@@ -604,7 +551,7 @@ async def _extract_page(
         return []
     return await _VISION.run(
         ctx.question, branch, images, rendered_refs, ctx, looking_for=looking,
-        extra_context=_continuation_context(page, ctx) or None,
+        extra_context=_require_store(ctx).extra_read_context(page) or None,
     )
 
 

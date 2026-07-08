@@ -33,6 +33,7 @@ from skunk.config import SystemConfig
 
 if TYPE_CHECKING:
     from skunk.llm_client import LLMClient
+    from skunk.page_store import PageContentStore
     from skunk.prompted_call import PromptOverride
 
 # Reasoning-effort knob, mapped onto Gemini's `thinking_level` enum. "off" means
@@ -651,6 +652,10 @@ class ExecutionContext:
     prompt_overrides: tuple[
         PromptOverride, ...
     ] = ()  # corpus/few_shot/lesson overrides; operators pick out their own entries by name
+    # Corpus page-content backend for the extract operator (see `skunk.page_store`).
+    # None → extract fails with a clear StepFailed; apps inject their implementation
+    # via `Orchestrator(page_store=...)`.
+    page_store: PageContentStore | None = None
 
     def __post_init__(self) -> None:
         if self.llm_client is None:

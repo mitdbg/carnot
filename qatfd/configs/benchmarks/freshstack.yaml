@@ -16,7 +16,7 @@
 #      (corpus.jsonl = {_id, text, metadata}; queries.jsonl = {query_id, query_title, query_text, nuggets[]})
 #   2. embed the topic's corpus (GPU):  sbatch engaging-scripts/run_freshstack_embeddings.slurm langchain
 #   3. build the Chroma collection:
-#        python -m skunk.search_agent.prep.create_vector_db \
+#        python3 engaging-scripts/create_vector_db.py \
 #          --embeddings-dir <bench>/freshstack/langchain/embeddings \
 #          --collection-name freshstack-langchain-qwen-0.6b \
 #          --chroma-path <bench>/freshstack/langchain/chromadb --benchmark freshstack

@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass, field
 from typing import cast
 from skunk.compute import ComputeOp
-from skunk.config import SkunkConfig
+from skunk.config import PipelineConfig
 from skunk.data_prep import DataPrepOp
 from skunk.errors import MissingData, StepFailed
 from skunk.lookup_external import LookupExternalOp
@@ -18,6 +18,7 @@ from skunk.common import (
     traced_step,
 )
 from skunk.llm_client import LLMClient
+from skunk.page_store import PageContentStore
 from skunk.plan import (
     AttemptRecord,
     Branch,
@@ -50,18 +51,20 @@ class Orchestrator:
         uid: str | None = None,
         verbose: bool = False,
         log_path: str | None = None,
-        config: SkunkConfig | None = None,
+        config: PipelineConfig,
         prompt_overrides: tuple[PromptOverride, ...] = (),
         llm_client: LLMClient | None = None,
+        page_store: PageContentStore | None = None,
     ):
         self._ctx = ExecutionContext(
             question=question,
             uid=uid,
             verbose=verbose,
             log_path=log_path,
-            config=config or SkunkConfig.from_env(),
+            config=config,
             prompt_overrides=prompt_overrides,
             llm_client=llm_client,
+            page_store=page_store,
         )
         self._current_plan: Plan | None = None
         # Stable per-question branch identity. `_branch_ids[i]` is the id of the

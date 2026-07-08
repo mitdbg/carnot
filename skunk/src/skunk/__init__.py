@@ -6,7 +6,7 @@ and subsumes formatting. Public API is re-exported below; see ARCHITECTURE.md fo
 
 from skunk.common import AnnotatedValue, ExecutionContext, PageRef
 from skunk.llm_client import LLMClient
-from skunk.config import SkunkConfig
+from skunk.config import PipelineConfig
 from skunk.errors import MissingData, StepFailed
 from skunk.orchestrator import Orchestrator
 from skunk.plan import Plan
@@ -24,7 +24,7 @@ __all__ = [
     "PageRef",
     "Plan",
     "ConceptExplanation",
-    "SkunkConfig",
+    "PipelineConfig",
     "StepFailed",
     "load_prompt_overrides",
 ]

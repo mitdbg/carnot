@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 
 from skunk.common import ExecutionContext
-from skunk.config import SkunkConfig
+from skunk.config import PipelineConfig
 from skunk.errors import ParseError, StepFailed
 from skunk.multi_turn_agent import MultiTurnAgent, TextBlock, _parse_step, _StepOutput
 
@@ -46,7 +46,7 @@ class _ScriptedAgent(MultiTurnAgent):
 
 
 def _ctx() -> ExecutionContext:
-    return ExecutionContext(question="q", config=SkunkConfig(), llm_client=object())
+    return ExecutionContext(question="q", config=PipelineConfig(), llm_client=object())
 
 
 def test_misfires_do_not_consume_step_budget():

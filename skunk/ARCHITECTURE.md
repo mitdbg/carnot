@@ -1,5 +1,16 @@
 # Architecture
 
+> **Layout note (2026-07-07).** The OfficeQA application layer moved out of this
+> repo dir to `../grc-officeqa/` (library-hardening refactor, see
+> REFACTOR_PLAN.md): the page-index build + page store are now
+> `grc-officeqa/officeqa/page_index/`, the Treasury corpus accessors
+> `officeqa/corpus.py`, the app config `officeqa/config.py` (`SkunkConfig`), and
+> the eval harness `grc-officeqa/eval/`. Extract reads corpus content only
+> through the `skunk.page_store.PageContentStore` protocol; the Treasury
+> implementation is `officeqa/page_store.py`. This document describes the
+> pipeline as exercised by that app — path references to `page_index/`, `eval/`,
+> and `corpus.py` below refer to their new grc-officeqa homes.
+
 ## Why this design
 
 OfficeQA questions ask about specific tables and figures inside a corpus of 696 monthly U.S. Treasury Bulletin PDFs (1939–2025). A naive date-driven retrieval agent — "the question mentions 1940, look in the 1940 bulletin" — fails on **81%** of the benchmark, because the answer-bearing table for period *P* often lives in a *later* bulletin (publication lag) or in a *retrospective summary* in a single mid-year issue. The median miss is +2 months; the long tail goes out to +9 years.
@@ -121,7 +132,7 @@ Each `AnnotatedValue` also carries **machine-stamped provenance** — `bulletin`
 
 ## Per-page tier dispatch in extract
 
-Once retrieve has named specific pages, extract chooses how to read each one. Both tiers read CONTENT through the page-index `PageStore` (`page_index/store.py`, `get_page_store`) keyed by `PageRef` — extract no longer touches the corpus parsed-JSON / PDFs at query time:
+Once retrieve has named specific pages, extract chooses how to read each one. Both tiers read CONTENT through the injected `PageContentStore` (`skunk/page_store.py` protocol; `ctx.page_store`, wired by the app via `Orchestrator(page_store=...)`) keyed by `PageRef` — extract never touches a corpus directly:
 
 ```
 Tier 1  page-store text (TextExtractor)    — the page's text via store.text(ref),
@@ -210,7 +221,7 @@ event, no `_step` reservation, no separate step structure.
   transcripts, generated code) out of the **message** — log a count or short `repr`.
 - **`kind` + `data` + `t` are the trace viewer's structured channel (optional).**
   The *message* stays a scannable one-liner, but three extra fields ride alongside
-  it for the post-hoc trace viewer (`eval/trace_viewer/`). `kind` is the event's
+  it for the post-hoc trace viewer (`scripts/trace_viewer/`). `kind` is the event's
   semantic role (`system` / `user` / `assistant` / `observation` / `error` / `call`
   / `plan` / `summary` / `step` / `note`) used for color-coding, inferred from the
   message's leading event key when omitted (`common.infer_kind`). `data` is a

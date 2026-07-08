@@ -118,7 +118,7 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
 
         # Bound each search-step LLM call: cap output (was uncapped → runaway
         # generations streamed to the 65535-token ceiling at 200–800s each) and
-        # impose a hard per-request wall-clock timeout. See SkunkConfig for the
+        # impose a hard per-request wall-clock timeout. See SearchAgentConfig for the
         # thinking/max_output_tokens interaction caveat.
         self.max_output_tokens = config.search_agent_max_output_tokens
         self.request_timeout_s = config.search_agent_request_timeout_s

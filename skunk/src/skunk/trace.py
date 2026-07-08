@@ -7,9 +7,10 @@ Skunk has three kinds of diagnostic output that used to be wired separately:
    per-question list (`ctx.events`, consumed by the trace dump), streamed to a
    per-question log file when one is open, and *echoed* to the console when the
    question runs verbose.
-2. **Process-scoped logs** — build pipelines (`page_index_old/`), offline prep
-   (`search_agent/`), and library warnings (`LLMClient` retries) that have no
-   per-question `ctx`. These go through stdlib `logging.getLogger(__name__)`.
+2. **Process-scoped logs** — app build pipelines (e.g. grc-officeqa's page
+   index), offline prep (`search_agent/prep`), and library warnings (`LLMClient`
+   retries) that have no per-question `ctx`. These go through stdlib
+   `logging.getLogger(__name__)`.
 3. **A durable machine-readable record** — one JSON line per event.
 
 Everything renders through one function, `render_line`: the per-question console
