@@ -552,11 +552,17 @@ class LLMClient:
 
     def _get_local_embedder(self, model: str) -> Any:
         """Lazily build (and cache) a local SentenceTransformers model. `sentence-
-        transformers` is a skunk dependency; the import is deferred so a run that only
-        uses the OpenRouter backend never pays the heavy import."""
+        transformers` is an optional extra (`pip install skunk[embeddings]`); the import
+        is deferred so a run that only uses API-backed embeddings never pays it."""
         st = self._local_embedders.get(model)
         if st is None:
-            from sentence_transformers import SentenceTransformer
+            try:
+                from sentence_transformers import SentenceTransformer
+            except ImportError as e:
+                raise ImportError(
+                    "local embeddings need the `embeddings` extra: "
+                    "pip install 'skunk[embeddings]'"
+                ) from e
 
             st = SentenceTransformer(model)
             self._local_embedders[model] = st

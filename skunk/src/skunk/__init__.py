@@ -1,6 +1,6 @@
-"""OfficeQA — declarative QA pipeline over the U.S. Treasury Bulletin corpus.
+"""skunk — library for agentic retrieval and computation over document corpora.
 
-question → Planner → Plan (branches) → orchestrator →
+Declarative QA pipeline: question → Planner → Plan (branches) → orchestrator →
 {retrieve, extract, lookup_external, compute}, where `compute` is the chain terminator
 and subsumes formatting. Public API is re-exported below; see ARCHITECTURE.md for intent."""
 
