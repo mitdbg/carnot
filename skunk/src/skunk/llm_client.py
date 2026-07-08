@@ -312,7 +312,7 @@ class LLMClient:
         self._local_embedders: dict[str, Any] = {}
         self.usage = UsageTracker(
             default_model=config.llm_model,
-            prices=getattr(config, "llm_prices", None),
+            prices=config.llm_prices,
         )
 
     def _get_gemini_client(self) -> genai.Client:

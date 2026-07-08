@@ -54,7 +54,9 @@ _config_lock = threading.Lock()
 _jsonl_fh: TextIO | None = None
 _jsonl_lock = threading.Lock()
 _JSONL_BUFFER_BYTES = 1 << 20  # large buffer so a big event rarely auto-flushes mid-write
-_jsonl_flush_interval_s = float(os.environ.get("SKUNK_TRACE_FLUSH_S", "0.25"))
+# Flush cadence; the env override is read when the flusher STARTS (`_ensure_jsonl_flusher`),
+# not at import — importing skunk must not read configuration from the environment.
+_jsonl_flush_interval_s = 0.25
 _jsonl_stop = threading.Event()
 _jsonl_flusher: threading.Thread | None = None
 
@@ -178,8 +180,11 @@ def _jsonl_flush_loop() -> None:
 def _ensure_jsonl_flusher() -> None:
     """Start the single background flusher (once) and register a final flush at exit. Called
     under `_config_lock` from `configure_obs` right after the sink is opened."""
-    global _jsonl_flusher
+    global _jsonl_flusher, _jsonl_flush_interval_s
     if _jsonl_flusher is None:
+        _jsonl_flush_interval_s = float(
+            os.environ.get("SKUNK_TRACE_FLUSH_S", str(_jsonl_flush_interval_s))
+        )
         _jsonl_flusher = threading.Thread(
             target=_jsonl_flush_loop, name="skunk-jsonl-flush", daemon=True
         )

@@ -57,19 +57,6 @@ class SystemConfig:
 
 
 @dataclass
-class RAGLLMConfig(SystemConfig):
-    # number of chunks for the vector search to return
-    top_k: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.top_k is None:
-            raise ValueError(
-                "RAGLLMConfig.top_k is unset (null); set it explicitly, e.g. "
-                "`systems.top_k=20` on the command line."
-            )
-
-
-@dataclass
 class SearchAgentConfig(SystemConfig):
     # the agent will answer the question directly if agent_mode == "answer", otherwise a separate
     # LLM computes an answer given the SearchAgent's retrieved documents
@@ -96,20 +83,13 @@ class SearchAgentConfig(SystemConfig):
     agent_max_misfires: int = 5
 
 
-@dataclass
-class QATFDSearchAgentConfig(SearchAgentConfig):
-    # Mirrors the system hierarchy (QATFDSearchAgentSystem subclasses SearchAgentSystem): the
-    # qatfd variant reuses the full search-agent config (agent_mode, step/token budgets, ...) and
-    # only adds a semantic-filter tool, which needs no extra config beyond agent_model_id (base).
-    pass
-
-
-#########################################################################################
-#########################################################################################
-#########################################################################################
-#########################################################################################
-#########################################################################################
-#########################################################################################
+# --------------------------------------------------------------------------------
+# OfficeQA app configuration. `SkunkConfig` extends `SearchAgentConfig` so the
+# planner/orchestrator/operator pipeline and the search agent share ONE config
+# object with the library fields declared once; the overrides below only supply
+# skunk defaults for the base's required fields. Slated to move to the app layer
+# with the OfficeQA pipeline (REFACTOR_PLAN.md Phase 5).
+# --------------------------------------------------------------------------------
 
 # Default corpus locations (overridable via env / explicit construction — see the
 # `parsed_json_dir` / `pdf_dir` fields below). Homed here so `SkunkConfig` is the single
@@ -121,11 +101,13 @@ _DEFAULT_PDF_DIR = Path.home() / "Desktop/officeqa/treasury_bulletin_pdfs"
 
 
 @dataclass
-class SkunkConfig:
-    # LLM model — all calls go through the AI Studio Gemini API (bare model names,
-    # no `google/` prefix). Needs GEMINI_API_KEY. (env: SKUNK_LLM_MODEL)
-    # LLM request pacing is a per-model token bucket (`llm:<model>`), paced from
-    # `SystemConfig.llm_model_rpm` / `llm_default_rpm` — see `LLMClient._retry_call`.
+class SkunkConfig(SearchAgentConfig):
+    # ---- skunk defaults for the base's required fields --------------------------
+    name: str = "skunk"
+    # LLM model — bare Gemini names on the "genai" provider, full OpenRouter ids on
+    # "openrouter". (env: SKUNK_LLM_MODEL). Request pacing is a per-model token
+    # bucket (`llm:<model>`), paced from `llm_model_rpm` / `llm_default_rpm` — see
+    # `LLMClient._retry_call`.
     llm_model: str = "gemini-3.5-flash"
     # LLM provider backend for all generation calls. "genai" (default) → Google AI
     # Studio Gemini SDK (needs GEMINI_API_KEY; bare model names). "openrouter" →
@@ -142,20 +124,28 @@ class SkunkConfig:
     # over 5 retries), so no separate delay cap is needed.
     llm_max_retries: int = 5
     llm_retry_initial_delay_s: float = 1.0
+    # Per-model pacing: empty maps → every model at the defaults below.
+    llm_model_rpm: dict[str, float] = field(default_factory=dict)
+    llm_default_rpm: float = 1000.0
+    llm_model_tpm: dict[str, float] = field(default_factory=dict)
+    llm_default_tpm: float | None = None
+    # USD price table for cost accounting; empty → every model costs 0.
+    llm_prices: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Embedding backend for `LLMClient.embed_query` (vector_search): "openrouter" or
+    # "local" (SentenceTransformers, needs the `embeddings` extra).
+    emb_provider: Literal["openrouter", "local"] = "openrouter"
+    # Embedding model for vector_search (must match the stored embeddings).
+    # (env: SKUNK_EMB_MODEL)
+    emb_model_id: str = "Qwen/Qwen3-Embedding-8B"
+    # Agent-loop chat model. None → `llm_model`. (env: SKUNK_AGENT_MODEL)
+    agent_model_id: str | None = None
 
-    # Per call-site effort override: `PromptedCall.name` → Effort tier. Missing key →
-    # the call-site's `default_effort`; an explicit `effort=` arg still wins over both.
-    # (env: SKUNK_EFFORT_OVERRIDES — comma-separated `name=tier` pairs)
-    effort_overrides: dict[str, Effort] = field(default_factory=dict)
+    # ---- skunk overrides of base defaults ---------------------------------------
+    # Misfires: skunk runs give the model one extra non-progressing attempt (base: 5).
+    # (env: SKUNK_AGENT_MAX_MISFIRES)
+    agent_max_misfires: int = 6
 
-    # Per call-site model override: `PromptedCall.name` → model id. Missing key →
-    # `llm_model`. Lets one run mix models (e.g. a strong default with cheap Flash
-    # pinned on `question_explainer`). Agent loops use
-    # `agent_model_id` instead. Each model is paced by its own RPM bucket — see
-    # `SystemConfig.llm_model_rpm` / `llm_default_rpm`.
-    # (env: SKUNK_MODEL_OVERRIDES — comma-separated `name=model` pairs)
-    model_overrides: dict[str, str] = field(default_factory=dict)
-
+    # ---- OfficeQA pipeline fields ------------------------------------------------
     # Compute operator
     compute_max_attempts: int = 3
     # Best-of-N: run this many independent codegen→exec trials per compute call (in
@@ -209,48 +199,10 @@ class SkunkConfig:
     chroma_server_host: str = "127.0.0.1"
     chroma_server_port: int = 8001
 
-    # Embedding model for vector_search (must match the stored embeddings).
-    # (env: SKUNK_EMB_MODEL)
-    emb_model_id: str = "gemini-embedding-001"
-
-    # Per-question search-agent budget. (env: SKUNK_AGENT_MAX_STEPS, SKUNK_AGENT_MAX_PAGES_PER_TOOL_CALL)
-    agent_max_steps: int = 20
-    agent_max_pages_per_tool_call: int = 20
-
-    # Hard cap on NON-progressing attempts (parse-misfires — prose with no runnable action
-    # block — and exec-machinery failures) before the agent aborts. These attempts do NOT
-    # count against `agent_max_steps`, so genuine search progress always gets its full step
-    # budget; this knob just stops a model that never emits a valid action from looping
-    # forever. Total LLM calls per run are bounded by agent_max_steps + agent_max_misfires.
-    # (env: SKUNK_AGENT_MAX_MISFIRES)
-    agent_max_misfires: int = 6
-
-    # Hard cap on the rendered size of a single `grep_corpus` observation, in *tokens*
-    # (`grep_corpus` defaults to limit=None = "every matching chunk", so one broad pattern
-    # could dump ~200K+ tokens into the context in one shot — that ballooned a request past
-    # the model's input ceiling and 400'd it repeatedly). Over-budget hits are dropped with a
-    # note telling the agent to narrow its pattern / pass `limit`. Token→char conversion uses
-    # ~4 chars/token (see GrepCorpusTool). (env: SKUNK_GREP_MAX_OUTPUT_TOKENS)
-    grep_max_output_tokens: int = 200_000
-
-    # Hard cap on the rendered size of a single `read_document` observation, in *chars*
-    # (`read_document` dumps the full cleaned text of up to `agent_max_pages_per_tool_call`
-    # pages; on the dense Treasury tables one over-broad call could otherwise push a request
-    # past the model's ~1M-token input ceiling and 400 it). Over-budget output is truncated
-    # with a note telling the agent to read fewer doc_ids per call. Char-based (not tokens) to
-    # avoid the chars/token estimate error on numeric tables.
-    # (env: SKUNK_READ_DOCUMENT_MAX_OUTPUT_CHARS)
-    read_document_max_output_chars: int = 400_000
-
-    # Search-agent per-LLM-call caps (RetrieveOp only). On Gemini 3.x
-    # `max_output_tokens` is a COMBINED thinking+visible budget, so keep it above the
-    # effort tier's thinking spend (medium ≈ 2.5K, high ≈ 16K thinking tokens) or the
-    # visible answer is starved to empty (finish_reason=MAX_TOKENS). 4096 is safe at
-    # the default medium effort; raise it if the search agent is moved to high.
-    # `request_timeout_s` is a hard per-request wall-clock cap (retried on trip).
-    # (env: SKUNK_SEARCH_MAX_OUTPUT_TOKENS, SKUNK_SEARCH_TIMEOUT_S)
-    search_agent_max_output_tokens: int = 4096
-    search_agent_request_timeout_s: float = 120.0
+    # (The search-agent knobs — `agent_max_steps`, `agent_max_pages_per_tool_call`,
+    # `grep_max_output_tokens`, `read_document_max_output_chars`,
+    # `search_agent_max_output_tokens`, `search_agent_request_timeout_s` — are
+    # inherited from `SearchAgentConfig`; env plumbing stays in `from_env` below.)
 
     # Step cap for the lookup_external agent (terminates earlier via its final-answer JSON block).
     # (env: SKUNK_LOOKUP_MAX_STEPS)
@@ -259,17 +211,12 @@ class SkunkConfig:
     # (env: SKUNK_LOOKUP_TOOLS — comma-separated, e.g. "fetch_fred,tavily_search")
     lookup_tools: list[str] | None = None
 
-    # Agent-loop chat model. None → `llm_model`. (env: SKUNK_AGENT_MODEL)
-    agent_model_id: str | None = None
-
-    # Per-LLM-call caps for the external-lookup agent's turns (named for the retired
-    # selection agent that shared them). Mirrors the search agent: without a combined
-    # thinking+visible cap, Flash thrashed to ~63K thinking tokens / ~285s per step
-    # and emitted no parseable tool call (parse-retry death spiral). Selection
-    # itself (skunk.block_select) is bounded PromptedCalls, not an agent loop.
-    # (env: SKUNK_SELECT_AGENT_MAX_OUTPUT_TOKENS, SKUNK_SELECT_AGENT_TIMEOUT_S)
-    select_agent_max_output_tokens: int = 8192
-    select_agent_request_timeout_s: float = 150.0
+    # Per-LLM-call caps for the external-lookup agent's turns. Mirrors the search
+    # agent: without a combined thinking+visible cap, Flash thrashed to ~63K thinking
+    # tokens / ~285s per step and emitted no parseable tool call (parse-retry death
+    # spiral). (env: SKUNK_LOOKUP_AGENT_MAX_OUTPUT_TOKENS, SKUNK_LOOKUP_AGENT_TIMEOUT_S)
+    lookup_agent_max_output_tokens: int = 8192
+    lookup_agent_request_timeout_s: float = 150.0
 
     # Per-call caps for the extract tiers (text/vision). Uncapped, individual Flash/Pro
     # extract calls hung for 260-480s and returned garbage that then burned a parse retry;
@@ -370,11 +317,11 @@ class SkunkConfig:
             prompt_overrides_path=os.environ.get(
                 "SKUNK_PROMPT_OVERRIDES", "config/prompts/us_receipts_expenditures.yaml"
             ),
-            select_agent_max_output_tokens=int(
-                os.environ.get("SKUNK_SELECT_AGENT_MAX_OUTPUT_TOKENS", "8192")
+            lookup_agent_max_output_tokens=int(
+                os.environ.get("SKUNK_LOOKUP_AGENT_MAX_OUTPUT_TOKENS", "8192")
             ),
-            select_agent_request_timeout_s=float(
-                os.environ.get("SKUNK_SELECT_AGENT_TIMEOUT_S", "150")
+            lookup_agent_request_timeout_s=float(
+                os.environ.get("SKUNK_LOOKUP_AGENT_TIMEOUT_S", "150")
             ),
             extract_max_output_tokens=int(
                 os.environ.get("SKUNK_EXTRACT_MAX_OUTPUT_TOKENS", "8192")
