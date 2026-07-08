@@ -111,20 +111,6 @@ def test_register_pool_review_carries_candidates_and_pulled_pages() -> None:
     assert captured[0]["source_docs"] == ["Treasury Bulletin 1954-02 PDF page 17"]
 
 
-def test_register_lookup_carries_agent_candidates() -> None:
-    captured: list[dict] = []
-    ctx = _ctx_with_register(captured)
-    assist = HumanAssist()
-    branch = LookupBranch(target="CPI Dec 2020", src="FRED")
-    try:
-        assist.register_lookup([_scalar("260.474")], branch, 1, ctx)
-    finally:
-        ctx.close()
-    assert captured[0]["task"] == "lookup"
-    assert captured[0]["guidance"]["branch"]["target"] == "CPI Dec 2020"
-    assert captured[0]["guidance"]["candidates"][0]["value"] == "260.474"
-
-
 def test_register_is_noop_without_a_hook() -> None:
     ctx = ExecutionContext(question="q", config=SkunkConfig(), llm_client=object())  # type: ignore[arg-type]
     try:

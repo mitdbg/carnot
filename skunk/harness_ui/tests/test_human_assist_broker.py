@@ -175,19 +175,3 @@ def test_human_assist_figure_branch_uses_figure_kind() -> None:
     assert captured[0]["kind"] == "figure"
 
 
-def test_human_assist_human_lookup_via_broker() -> None:
-    captured: list[dict] = []
-    handler = _handler(
-        captured,
-        {"response": json.dumps({"description": "CPI Dec 2020", "value": "260.474"})},
-    )
-    assist = HumanAssist(channel=BrokerChannel(handler))
-    branch = LookupBranch(target="CPI for December 2020", src="FRED")
-    ctx = _ctx()
-    try:
-        out = asyncio.run(assist.human_lookup(branch, ctx))
-    finally:
-        ctx.close()
-    assert out[0].value == "260.474"
-    assert captured[0]["kind"] == "lookup"
-    assert captured[0]["guidance"]["candidates"] == []

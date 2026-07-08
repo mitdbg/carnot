@@ -251,8 +251,7 @@ event, no `_step` reservation, no separate step structure.
   question's `ctx` is in scope, use `ctx.emit`. Code with no per-question ctx
   (build pipelines under `page_index/`, offline prep under `search_agent/`,
   library warnings such as `LLMClient`'s retry path) uses
-  `logging.getLogger(__name__)` (or `trace.get_logger(__name__)`) — both render
-  through the same `configure_obs` pipeline.
+  `logging.getLogger(__name__)` — rendered through the same `configure_obs` pipeline.
 
 ## Eval decomposition
 

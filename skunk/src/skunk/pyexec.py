@@ -78,20 +78,3 @@ def exec_python_with_env(
     return ex.state, ex.state.get("result")
 
 
-def exec_python_capture_stdout(
-    code: str, local_vars: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], str]:
-    """Exec `code` with print() output captured; returns (state, stdout). For operators
-    whose contract is "print the answer" rather than "assign `result`". Callable entries
-    in `local_vars` route to `send_tools()` (immutable); data entries to `send_variables()`."""
-    code = strip_code_fences(code)
-    tools: dict[str, Any] = {}
-    vars_: dict[str, Any] = {}
-    for k, v in (local_vars or {}).items():
-        (tools if callable(v) else vars_)[k] = v
-    ex = _new_executor(vars_, extra_tools=tools)
-    try:
-        out = ex(code)
-    except InterpreterError as e:
-        raise StepFailed("pyexec", str(e)) from e
-    return ex.state, str(out.logs)

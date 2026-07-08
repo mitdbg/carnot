@@ -8,37 +8,39 @@ works — architecture, design intent, the plan-shape spec — read `ARCHITECTUR
 OfficeQA — a declarative QA pipeline over the U.S. Treasury Bulletin corpus (696 monthly
 PDFs, 1939–2025). Questions are answered by composing 4 operators
 (`retrieve` / `extract` / `lookup_external` / `compute`) into a typed DSL plan that an
-orchestrator walks. Benchmark: `data/officeqa_pro.csv` (133 questions = 101 dev + 32 test;
+orchestrator walks. Benchmark: `data/officeqa_pro.csv` (133 questions = 33 dev + 100 test;
 not tracked in git, keep locally).
 
-## 🚨 Held-out test set — READ BEFORE ANY EVAL RUN 🚨
+## 🚨 Held-out test split — READ BEFORE ANY EVAL RUN 🚨
 
-**32 of the 133 benchmark UIDs are a HELD-OUT TEST SET — do not run on these during
-development.** The canonical list (plus the sampling seed + rationale) is
-`eval/test_set_uids.json`; the other **101 are dev**. Tuning prompts/code against the 32,
-inspecting their traces, or including them in a run is contamination that biases
-everything downstream.
+**The canonical OfficeQA dev/test split is owned by qatfd** (the sibling evaluation
+harness where systems are measured against benchmarks):
+`../qatfd/benchmarks/officeqa/officeqa_splits.json` — `{"dev": [33 uids], "test":
+[100 uids]}`, dev = the first 25% of CSV order, generated deterministically by
+`qatfd/scripts/make_splits.py`. **Do not run on, tune against, or inspect traces of
+the 100 test UIDs during development** — skunk's prompts are shared with qatfd
+systems, so contamination here biases qatfd's reported numbers too.
 
-- Every eval harness MUST load `eval/test_set_uids.json` and filter the 32 out by
+- Every eval harness MUST load the splits file and filter the test UIDs out by
   default. `--include-test-set` overrides only for a deliberate final-number run.
 - Writing a new eval script: copy the filter from `eval/eval_e2e.py` and wire it in
-  BEFORE the first LLM call. Verify by grepping the script for `test_set_uids`; if it's
-  missing, fix the script before running.
-- Invoking with `--uids`: intersect with the test set and ABORT (not warn) on any match.
-- Reporting numbers: always state dev-only (101) vs full (133). Full-set numbers are
+  BEFORE the first LLM call. `eval_e2e` ABORTs (not warns) when the splits file is
+  missing or `--uids` names a test UID.
+- Reporting numbers: always state dev-only (33) vs full (133). Full-set numbers are
   contaminated for any generalization claim.
-- Expanding the test set later: re-sample; never add UIDs already tuned against.
 
-Test UIDs: UID0035, UID0036, UID0039, UID0050, UID0065, UID0068, UID0073, UID0093,
-UID0094, UID0100, UID0108, UID0118, UID0120, UID0134, UID0147, UID0161, UID0168, UID0170,
-UID0179, UID0182, UID0183, UID0187, UID0196, UID0204, UID0211, UID0212, UID0216, UID0218,
-UID0227, UID0230, UID0238, UID0240.
+History: skunk's competition-era scheme (32 held-out UIDs in
+`eval/test_set_uids.json` + 70-UID dev list) was retired 2026-07-07 in favor of the
+qatfd split; the old lists live in git history. The two schemes are incompatible
+(the old dev70 overlaps the new test-100 by 41 UIDs), so numbers from the two
+regimes must never be compared directly.
 
 ## Running experiments
 
 - **Don't autonomously launch full dev sweeps.** Implement, sanity-check on a couple of
   dev UIDs, then hand the run command to the user.
-- Harness is `eval/eval_e2e.py`. State dev-only vs full in any reported number (see above).
+- Harness is `eval/eval_e2e.py` (`--dev-set` runs the 33-UID qatfd dev split). State
+  dev-only vs full in any reported number (see above).
 - The default `search_agent` retriever needs `cache/chromadb/` + `cache/clean_page_map.json`
   built offline (`src/skunk/search_agent/prep/`); the first non-golden run errors clearly
   if either is missing.

@@ -101,7 +101,6 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         sampling_params: dict | None = None,
         capture_logprobs: bool = False,
         human_intervention_handler: HumanInterventionHandler | None = None,
-        required_docs: list[str] | None = None,
     ):
         # `briefing` / `final_answer_doc` override the class-level defaults on this
         # instance so MultiTurnAgent's template path picks them up (only consulted when
@@ -112,37 +111,13 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             self.final_answer_doc = final_answer_doc
         self.config = config
         self.chroma_collection = chroma_collection
-        required_doc_prefixes = {
-            doc.replace("-", "_") + "_"
-            for doc in required_docs or []
-        }
-        self.document_map = (
-            {
-                doc_id: text
-                for doc_id, text in document_map.items()
-                if any(doc_id.startswith(prefix) for prefix in required_doc_prefixes)
-            }
-            if required_doc_prefixes
-            else document_map
-        )
+        self.document_map = document_map
         # Query embedding goes through an LLMClient (it owns backend dispatch + usage
         # accounting). Callers on the per-question request path pass `ctx.llm_client` so
         # embedding spend is billed onto that question's tracker; offline / build paths
         # pass nothing and get a standalone client (embeddings work, untracked).
         self._emb_llm_client = llm_client or LLMClient(config)
         self.emb_model_id = emb_model_id or config.emb_model_id
-        required_filter = None
-        if required_docs:
-            clauses = [
-                {
-                    "$and": [
-                        {"year": doc[:4]},
-                        {"month": doc[5:]},
-                    ]
-                }
-                for doc in required_docs
-            ]
-            required_filter = clauses[0] if len(clauses) == 1 else {"$or": clauses}
 
         # Bound each search-step LLM call: cap output (was uncapped → runaway
         # generations streamed to the 65535-token ceiling at 200–800s each) and
@@ -176,7 +151,6 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             tools.append(SearchCorpusTool(
                 self.chroma_collection, self.emb_model_id, self._emb_llm_client,
                 self._pruned_chunk_ids, self._pruned_doc_ids,
-                required_filter,
                 seen_chunk_ids=self._seen_chunk_ids, seen_doc_ids=self._seen_doc_ids,
             ))
         tools += [
@@ -185,7 +159,6 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
                 self._pruned_chunk_ids,
                 self._pruned_doc_ids,
                 config.grep_max_output_tokens,
-                required_filter,
                 seen_chunk_ids=self._seen_chunk_ids, seen_doc_ids=self._seen_doc_ids,
             ),
             ReadDocumentTool(
@@ -309,18 +282,12 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         *,
         branch_key: str | None = None,
         branch_period: str | None = None,
-        required_docs: list[str] | None = None,
     ) -> list[str]:
         parts = [f"Question: {question}"]
         if branch_key:
             parts.append(f"Search focus: {branch_key}")
         if branch_period:
             parts.append(f"Time period (of the data): {branch_period}")
-        if required_docs:
-            parts.append(
-                "Human-required source documents (hard scope): "
-                + ", ".join(required_docs)
-            )
         payload = await self.call(ctx, "\n".join(parts))
         return self._doc_ids_from_payload(payload)
 

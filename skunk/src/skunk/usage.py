@@ -5,9 +5,7 @@ accumulates them across one `LLMClient`'s lifetime: every `LLMClient` owns a
 `.usage` tracker that `_build_response` feeds on each successful generation, so
 the agent loop and every system call are counted with no wrapper and no
 positional-arg fishing. Read the tracker after a run (the eval harness builds one
-client per question, so its tracker is naturally per-question scoped), and call
-`.reset()` to zero it for the next accounting window (e.g. to separately bill a
-build/prep phase that reuses a long-lived client).
+client per question, so its tracker is naturally per-question scoped).
 
 Cost comes from a price table on the `SystemConfig` (`llm_prices`), a map of
 `model-substring -> {"in"/"out"/"cached": $/Mtok}`; unmatched models cost 0.
@@ -83,21 +81,6 @@ class UsageTracker:
             self.embed_tokens += input_tokens
             self.by_emb_model_in[m] += input_tokens
             self.n_embed_calls += 1
-
-    def reset(self) -> None:
-        """Zero all counters. Use to start a fresh accounting window on a reused
-        client (e.g. separating a build/prep phase from the query phase)."""
-        with self._lock:
-            self.input_tokens = 0
-            self.output_tokens = 0
-            self.cache_input_tokens = 0
-            self.n_calls = 0
-            self.by_model_in.clear()
-            self.by_model_out.clear()
-            self.by_model_cached.clear()
-            self.embed_tokens = 0
-            self.n_embed_calls = 0
-            self.by_emb_model_in.clear()
 
     def cost(self) -> float:
         """Total USD cost from the price table — generation plus embeddings. Cached input

@@ -37,8 +37,6 @@ class RetrieveOp:
         ctx: ExecutionContext,
         branches: list[RetrieveBranch],
         branch_ids: list[int] | None = None,
-        *,
-        document_scopes: list[list[str] | None] | None = None,
     ) -> list[BranchRetrieval | StepFailed]:
         """The single retrieval seam: retrieve for several branches at once, one result per
         branch aligned to `branches`. Each slot is a `BranchRetrieval` (its pages) or a
@@ -51,8 +49,7 @@ class RetrieveOp:
 
         `branch_ids` aligns each branch to its stable id so its retrieve runs in a per-branch
         `traced_step`: the rollout + the returned pages then attach to that branch in the
-        trace viewer. `document_scopes` hard-scopes a branch's corpus to a set of documents
-        (HITL human-required documents)."""
+        trace viewer."""
         if ctx.config.golden_pages is not None:
             # --golden ablation: inject the benchmark pages verbatim, already final.
             pages = ctx.config.golden_pages
@@ -60,29 +57,22 @@ class RetrieveOp:
                 f"golden_bypass n_pages={len(pages)} refs={[str(r) for r in pages]!r}"
             )
             return [BranchRetrieval(pages=tuple(pages)) for _ in branches]
-        scopes = document_scopes or [None] * len(branches)
         match str(ctx.config.retriever):
             case "search_agent":
                 ids = branch_ids if branch_ids is not None else [None] * len(branches)
 
-                async def _one(
-                    b: RetrieveBranch, bid: int | None, scope: list[str] | None
-                ) -> BranchRetrieval:
+                async def _one(b: RetrieveBranch, bid: int | None) -> BranchRetrieval:
                     # Per-branch `retrieve` step (branch_id=bid) so the SearchAgent rollout
-                    # and its `pages` summary group under this branch in the viewer. `scope`
-                    # (human-required documents, if any) hard-scopes the agent's corpus.
+                    # and its `pages` summary group under this branch in the viewer.
                     refs = await traced_step(
                         ctx, "retrieve",
-                        lambda: self._run_search_agent(ctx, b, required_docs=scope),
+                        lambda: self._run_search_agent(ctx, b),
                         branch_id=bid,
                     )
                     return BranchRetrieval(pages=tuple(refs))
 
                 settled = await asyncio.gather(
-                    *(
-                        _one(b, bid, scope)
-                        for b, bid, scope in zip(branches, ids, scopes)
-                    ),
+                    *(_one(b, bid) for b, bid in zip(branches, ids)),
                     return_exceptions=True,
                 )
                 out: list[BranchRetrieval | StepFailed] = []
@@ -104,8 +94,6 @@ class RetrieveOp:
         self,
         ctx: ExecutionContext,
         branch: RetrieveBranch,
-        *,
-        required_docs: list[str] | None = None,
     ) -> list[PageRef]:
         from skunk.search_agent import SearchAgent
 
@@ -119,24 +107,18 @@ class RetrieveOp:
                 if ctx.human_intervention_enabled
                 else None
             ),
-            required_docs=required_docs,
         )
         page_keys = await agent.retrieve(
             ctx,
             ctx.question,
             branch_key=branch.key,
             branch_period=branch.period,
-            required_docs=required_docs,
         )
         refs: list[PageRef] = []
         bad: list[str] = []
         for key in page_keys:
             try:
-                ref = page_key_to_pageref(key)
-                if required_docs and ref.stem not in required_docs:
-                    bad.append(key)
-                    continue
-                refs.append(ref)
+                refs.append(page_key_to_pageref(key))
             except ValueError:
                 bad.append(key)
         if bad:

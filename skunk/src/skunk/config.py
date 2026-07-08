@@ -124,9 +124,8 @@ _DEFAULT_PDF_DIR = Path.home() / "Desktop/officeqa/treasury_bulletin_pdfs"
 class SkunkConfig:
     # LLM model — all calls go through the AI Studio Gemini API (bare model names,
     # no `google/` prefix). Needs GEMINI_API_KEY. (env: SKUNK_LLM_MODEL)
-    # LLM request pacing is a process-wide rate limit (env: SKUNK_LLM_RPM, plus
-    # per-model overrides via SKUNK_MODEL_RPM), owned by `common._RATE_LIMITS` /
-    # `llm_client._llm_model_rpm` alongside every other external service, not by config.
+    # LLM request pacing is a per-model token bucket (`llm:<model>`), paced from
+    # `SystemConfig.llm_model_rpm` / `llm_default_rpm` — see `LLMClient._retry_call`.
     llm_model: str = "gemini-3.5-flash"
     # LLM provider backend for all generation calls. "genai" (default) → Google AI
     # Studio Gemini SDK (needs GEMINI_API_KEY; bare model names). "openrouter" →
@@ -153,7 +152,7 @@ class SkunkConfig:
     # `llm_model`. Lets one run mix models (e.g. a strong default with cheap Flash
     # pinned on `question_explainer`). Agent loops use
     # `agent_model_id` instead. Each model is paced by its own RPM bucket — see
-    # `llm_client._llm_model_rpm` (env SKUNK_MODEL_RPM).
+    # `SystemConfig.llm_model_rpm` / `llm_default_rpm`.
     # (env: SKUNK_MODEL_OVERRIDES — comma-separated `name=model` pairs)
     model_overrides: dict[str, str] = field(default_factory=dict)
 
@@ -306,7 +305,7 @@ class SkunkConfig:
     vision_rescan_charts: bool = False
 
     # Human-in-the-loop: route specific sub-tasks to a person instead of (or after) the
-    # model. Three independent toggles, all default OFF (zero behavior change when unset);
+    # model. Two independent toggles, all default OFF (zero behavior change when unset);
     # the policy/channel wiring lives in `human.py` and is enforced at the orchestrator
     # dispatch seam, so no operator or planner code changes when these flip. Transport is
     # chosen by handler presence: under the competition server these route through the async
@@ -317,11 +316,8 @@ class SkunkConfig:
     #   candidate and take their answer. (env: SKUNK_HUMAN_FIGURE=1)
     # - human_verify_extract: for non-visual extractions, the human confirms/corrects the
     #   extracted value(s) against the rendered source page(s). (env: SKUNK_HUMAN_VERIFY_EXTRACT=1)
-    # - human_lookup: every lookup_external branch is performed by the human instead of the
-    #   LookupAgent. (env: SKUNK_HUMAN_LOOKUP=1)
     human_figure: bool = False
     human_verify_extract: bool = False
-    human_lookup: bool = False
 
     def __post_init__(self) -> None:
         # Route per-stage models through the override registry so `PromptedCall` resolves them
@@ -418,7 +414,6 @@ class SkunkConfig:
             human_figure=os.environ.get("SKUNK_HUMAN_FIGURE", "0") not in ("", "0"),
             human_verify_extract=os.environ.get("SKUNK_HUMAN_VERIFY_EXTRACT", "0")
             not in ("", "0"),
-            human_lookup=os.environ.get("SKUNK_HUMAN_LOOKUP", "0") not in ("", "0"),
             retriever=os.environ.get("SKUNK_RETRIEVER", "search_agent"),  # type: ignore[arg-type]
             chromadb_dir=os.environ.get("SKUNK_CHROMADB_DIR", "cache/chromadb"),
             chromadb_collection=os.environ.get(

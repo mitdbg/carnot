@@ -147,15 +147,6 @@ def configure_obs(*, jsonl_path: str | None = None) -> None:
         _configured = True
 
 
-def get_logger(name: str | None = None) -> logging.Logger:
-    """Process-scoped logger for code with no per-question `ctx` (build pipelines,
-    offline prep). Per-question events go through `ctx.emit`. Defaults to the
-    `skunk` logger so output sits under the one tree configured at INFO."""
-    if not _configured:
-        configure_obs()
-    return logging.getLogger(name or "skunk")
-
-
 def write_jsonl(event: dict) -> None:
     """Append one full (untruncated) event as a JSON line to the durable sink. No-op when no
     sink is configured. Thread-safe across concurrent questions. Buffered — NOT flushed here;

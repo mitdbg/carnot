@@ -6,9 +6,11 @@ ChromaDB index):
 
 - page_cleaner.py: render PDF page → LLM reorders elements → write
   cleaned `.txt` per page; emits `clean_page_map.json`.
-- compute_element_embeddings.py: embed page elements.
+- compute_officeqa_element_embeddings.py /
+  compute_browsecomp_plus_element_embeddings.py: embed page elements.
 - create_vector_db.py: load embeddings into ChromaDB.
-- exp_vector_db_recall.py: recall sanity experiment.
-- harness.py: teammate's standalone CLI harness (superseded by
-  skunk's `eval/eval_e2e.py` at runtime).
+- export_chroma_collection.py: dump a collection back to npz.
+- table_corrector.py: LLM cleanup of parsed table blocks (bbox/render
+  helpers also reused by dais/ and the table-corrections viewer).
+- tinker_backend.py: Tinker sampling backend for the datagen RL harness.
 """

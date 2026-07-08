@@ -254,7 +254,7 @@ class BuildContext:
 
     The model and its RPM/TPM rate limits are NOT owned here — they come from
     `SkunkConfig` and the `llm_client` rate limiter (env SKUNK_LLM_MODEL,
-    SKUNK_MODEL_RPM/TPM, SKUNK_LLM_RPM), the same as every other entry point."""
+    SKUNK_MODEL_RPM/TPM), the same as every other entry point."""
 
     config: SkunkConfig
     paths: BuildPaths
@@ -1242,7 +1242,7 @@ def main() -> int:
         stages = tuple(s for s in PIPELINE if s.name in want)
 
     # Model + per-model RPM/TPM are read from SkunkConfig and the llm_client rate
-    # limiter (env SKUNK_LLM_MODEL, SKUNK_MODEL_RPM/TPM, SKUNK_LLM_RPM) — the build
+    # limiter (env SKUNK_LLM_MODEL, SKUNK_MODEL_RPM/TPM) — the build
     # doesn't override them.
     configure_obs()
     config = SkunkConfig.from_env()

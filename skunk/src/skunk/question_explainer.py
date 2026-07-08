@@ -143,17 +143,6 @@ PRECOMPUTED_CONCEPTS: list[tuple[str, str]] = [
 ]
 
 
-def _concept_block(concept: str, explanation: str) -> str:
-    """Render one catalog entry as the `### <Concept>` markdown the compute prompt expects."""
-    return f"### {concept}\n{explanation}"
-
-
-# The full catalog as a single markdown string (every entry). Used when selection is
-# bypassed (config.compute_precomputed_concept_refs) and kept for back-compat imports.
-PRECOMPUTED_CONCEPT_REFERENCES = "\n\n".join(
-    _concept_block(name, body) for name, body in PRECOMPUTED_CONCEPTS
-)
-
 # Numbered menu (names + definitions) shown to the selector. The bodies are needed so the
 # model can tell near-duplicates apart (Type-7 vs Hazen percentile, pop vs sample std); it
 # is a fixed prefix, so it prompt-caches and its input cost is paid once, not per question.

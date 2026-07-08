@@ -22,7 +22,6 @@ RENDERS_SUBDIR = (
     "renders"  # lazy 200-DPI page-image cache (written on first vision read)
 )
 TREE_FILE = "concept_tree.json"  # era-keyed concept tree (ConceptTree)
-SEARCH_INDEX_FILE = "search_index.sqlite"  # prebuilt FTS5 page index the `search_corpus` tool runs SQL against
 
 
 def page_index_root() -> Path:
@@ -112,8 +111,8 @@ class PageCatalogRow(BaseModel):
     source: str
     page: int  # 1-based PDF page index
     # The page's own printed footer label ("5", "A-1"); None when unlabeled. Carried from the
-    # scan so a page-pin can resolve a question's stated page number against the printed label
-    # (the planner's `page_pin`), not just the PDF index. Optional → old catalogs load as None.
+    # scan so a question's stated page number can be resolved against the printed label, not
+    # just the PDF index. Optional → old catalogs load as None.
     printed_page: str | None = None
     # True when this page's table is header-less — its column headers live on the PREVIOUS page
     # and aren't restated here (set by the scan, pruned by the `continuation_check` pass). The

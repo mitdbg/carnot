@@ -30,6 +30,7 @@
     select { background: var(--bg1); color: var(--text); border:1px solid var(--border2); border-radius:4px; padding:6px 10px; font-size:12px; min-width:240px; cursor:pointer; appearance:none;
       background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23666'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:right 8px center; padding-right:24px; max-width:680px; }
     select:focus { outline:none; border-color: var(--green); }
+    .sel-group.narrow select { min-width:150px; }
     .toggle-row { display:flex; align-items:center; gap:6px; }
     .toggle-row label { font-size:11px; color: var(--text3); cursor:pointer; user-select:none; }
     input[type=checkbox] { accent-color: var(--green); cursor:pointer; }
@@ -156,6 +157,21 @@
     .rc-dist { color: var(--yellow); }
     .rc-text { font-family: ui-monospace, monospace; font-size:11px; line-height:1.5; white-space:pre-wrap; word-break:break-word; padding:6px 9px; border-top:1px solid var(--border); color: var(--text2); max-height:420px; overflow:auto; }
 
+    /* qatfd: TREC-BioGen gold-nugget recall — each nugget colored by support label */
+    .nug-summary { display:flex; gap:14px; flex-wrap:wrap; align-items:baseline; margin-bottom:10px; font-size:12px; }
+    .nug-legend { display:inline-flex; gap:10px; margin-left:auto; font-size:11px; }
+    .nug-legend span { display:inline-flex; align-items:center; gap:5px; color:var(--text3); }
+    .nug-swatch { width:9px; height:9px; border-radius:2px; display:inline-block; }
+    .nug-swatch.s-sup { background:var(--green); } .nug-swatch.s-par { background:var(--yellow); } .nug-swatch.s-not { background:var(--red); }
+    .nuggets { display:flex; flex-direction:column; gap:4px; }
+    .nug { display:flex; gap:9px; align-items:flex-start; padding:5px 9px; border-radius:4px; border:1px solid var(--border2); border-left-width:3px; background:var(--bg1); font-size:12px; line-height:1.5; }
+    .nug .nug-icon { font-family: ui-monospace, monospace; font-weight:700; flex:0 0 auto; width:12px; text-align:center; }
+    .nug .nug-text { color:var(--text2); }
+    .nug.nug-sup { border-left-color:var(--green); }  .nug.nug-sup .nug-icon { color:var(--green); }
+    .nug.nug-par { border-left-color:var(--yellow); } .nug.nug-par .nug-icon { color:var(--yellow); }
+    .nug.nug-not { border-left-color:var(--red); }    .nug.nug-not .nug-icon { color:var(--red); }
+    .nug.nug-not .nug-text { color:var(--text3); }
+
     /* qatfd: semantic filter — pass/fail doc chips, click to expand */
     .semfilter { border:1px solid #1f5f1f; border-left:3px solid var(--green); border-radius:4px; background:rgba(0,40,0,0.12); padding:8px 10px; margin:6px 0; }
     .sf-head { display:flex; gap:12px; flex-wrap:wrap; align-items:baseline; margin-bottom:8px; font-size:12px; }
@@ -179,6 +195,8 @@
   </div>
   <div class="card">
     <div class="selectors">
+      <div class="sel-group narrow"><label>Benchmark</label><select id="bench-sel"></select></div>
+      <div class="sel-group narrow"><label>System</label><select id="sys-sel"></select></div>
       <div class="sel-group"><label>Run</label><select id="run-sel"></select></div>
       <div class="sel-group"><label>Question</label><select id="q-sel"></select></div>
       <div class="toggle-row" style="margin-left:auto"><input type="checkbox" id="show-system"><label for="show-system">system prompts</label></div>
@@ -222,17 +240,47 @@ window.VW = {
 };
 
 // ── boot / load ─────────────────────────────────────────────────────────────
+// Run ids are relative paths; the qatfd layout is benchmark/system/run, so split into a
+// cascade. Anything shallower (e.g. a flat eval/traces run) collapses under "(other)".
+function parseRunPath(r){
+  const p = r.split("/");
+  if(p.length >= 3) return { benchmark:p[0], system:p[1], run:p.slice(2).join("/"), full:r };
+  if(p.length === 2) return { benchmark:"(other)", system:p[0], run:p[1], full:r };
+  return { benchmark:"(other)", system:"(other)", run:p[0], full:r };
+}
+const selVal = (id) => document.getElementById(id).value;
+function fillSelect(id, opts){  // opts: [{value,label}]
+  document.getElementById(id).innerHTML = opts.map(o => `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join("");
+}
+const uniqSorted = (arr) => [...new Set(arr)].sort();
+
 async function boot(){
   const { runs } = await getJSON("/api/runs");
-  const runSel = document.getElementById("run-sel");
-  runSel.innerHTML = runs.map(r => `<option value="${esc(r)}">${esc(r)}</option>`).join("");
+  S.runs = (runs || []).map(parseRunPath);   // server order == newest-first
   document.getElementById("runsub").textContent = runs.length+" run(s)";
-  runSel.onchange = () => loadRun(runSel.value);
+  document.getElementById("bench-sel").onchange = onBenchChange;
+  document.getElementById("sys-sel").onchange   = onSysChange;
+  document.getElementById("run-sel").onchange   = () => { const f = selVal("run-sel"); if(f) loadRun(f); };
   document.getElementById("show-system").onchange = draw;
   document.getElementById("show-calls").onchange = draw;
   document.getElementById("q-sel").onchange = () => loadQuestion(document.getElementById("q-sel").value);
-  if(runs.length){ runSel.value = runs[0]; await loadRun(runs[0]); }
-  else document.getElementById("content").innerHTML = `<div class="hint">No runs found under eval/traces/.</div>`;
+  if(!S.runs.length){ document.getElementById("content").innerHTML = `<div class="hint">No runs found.</div>`; return; }
+  fillSelect("bench-sel", uniqSorted(S.runs.map(r => r.benchmark)).map(b => ({ value:b, label:b })));
+  await onBenchChange();
+}
+// bench → repopulate systems (for that benchmark) → cascade to runs
+async function onBenchChange(){
+  const b = selVal("bench-sel");
+  fillSelect("sys-sel", uniqSorted(S.runs.filter(r => r.benchmark===b).map(r => r.system)).map(s => ({ value:s, label:s })));
+  await onSysChange();
+}
+// system → repopulate runs (for that benchmark+system, newest first) → load the first
+async function onSysChange(){
+  const b = selVal("bench-sel"), s = selVal("sys-sel");
+  const runs = S.runs.filter(r => r.benchmark===b && r.system===s);   // preserves newest-first order
+  fillSelect("run-sel", runs.map(r => ({ value:r.full, label:r.run })));
+  const f = selVal("run-sel");
+  if(f) await loadRun(f);
 }
 async function loadRun(run){
   S.run = run;
@@ -990,23 +1038,57 @@ function stripChunkHeader(text){
   return text.replace(/^\[\d+\]\s*chunk_id=\S+\s*\|\s*doc_id=\S+\s*\|\s*type=\S+\s*\|\s*distance=[\d.]+\n?/, "");
 }
 
+// TREC-BioGen nugget-recall event (emitted by the judge): every gold nugget + its support label.
+function isNuggetEvent(e){ return e && e.data && Array.isArray(e.data.nuggets) && String(e.message||"").startsWith("nugget_judge"); }
+const NUG_CLASS = { support:"nug-sup", partial_support:"nug-par", not_support:"nug-not" };
+const NUG_ICON  = { support:"✓",       partial_support:"~",       not_support:"✗" };
+// A card showing the groundtruth nuggets, each colored green/yellow/red by whether the answer
+// fully / partially / did not support it (KARL's D.1 completeness labels behind the recall score).
+function nuggetCard(evt){
+  const d = evt.data || {}, nugs = d.nuggets || [];
+  const nNot = (d.n_nuggets ?? nugs.length) - (d.n_support ?? 0) - (d.n_partial ?? 0);
+  const recall = d.recall!=null ? (d.recall*100).toFixed(1)+"%" : "?";
+  const rows = nugs.map(n => {
+    const cls = NUG_CLASS[n.label] || "nug-not", icon = NUG_ICON[n.label] || "✗";
+    return `<div class="nug ${cls}"><span class="nug-icon">${icon}</span><span class="nug-text">${esc(n.nugget)}</span></div>`;
+  }).join("") || `<span class="empty">no gold nuggets</span>`;
+  return `<div class="card">
+    <div class="card-title">Gold-nugget recall</div>
+    <div class="nug-summary">
+      <span class="mono">${d.n_support ?? 0} supported · ${d.n_partial ?? 0} partial · ${nNot} missed / ${d.n_nuggets ?? nugs.length} nuggets · recall <b>${recall}</b></span>
+      <span class="nug-legend">
+        <span><span class="nug-swatch s-sup"></span>support</span>
+        <span><span class="nug-swatch s-par"></span>partial</span>
+        <span><span class="nug-swatch s-not"></span>not supported</span>
+      </span>
+    </div>
+    <div class="nuggets">${rows}</div>
+  </div>`;
+}
+
 function drawSearchAgent(sys){
-  const events = S.events;
+  const nugEvt = S.events.find(isNuggetEvent);
+  const events = nugEvt ? S.events.filter(e => e!==nugEvt) : S.events;
   const aStart = answerStartIdx(events);
   const retrieval = aStart>=0 ? events.slice(0, aStart) : events;
   const answer    = aStart>=0 ? events.slice(aStart) : [];
   const retrTitle = sys==="qatfd_search_agent"
     ? "Retrieval — search agent + semantic filter" : "Retrieval — search agent";
-  const parts = [qaHeaderHtml(), sectionCard(retrTitle, turnsHtml(retrieval, "r"))];
+  const parts = [qaHeaderHtml()];
+  if(nugEvt) parts.push(nuggetCard(nugEvt));
+  parts.push(sectionCard(retrTitle, turnsHtml(retrieval, "r")));
   if(answer.length) parts.push(sectionCard("Answer — code agent", turnsHtml(answer, "a")));
   document.getElementById("content").innerHTML = parts.join("");
 }
 function drawRagLlm(){
-  const events = S.events;
+  const nugEvt = S.events.find(isNuggetEvent);
+  const events = nugEvt ? S.events.filter(e => e!==nugEvt) : S.events;
   const aStart = answerStartIdx(events);
   const retrieval = aStart>=0 ? events.slice(0, aStart) : events;
   const answer    = aStart>=0 ? events.slice(aStart) : [];
-  const parts = [qaHeaderHtml(), sectionCard("Retrieval — top-k vector search", ragRetrievalHtml(retrieval))];
+  const parts = [qaHeaderHtml()];
+  if(nugEvt) parts.push(nuggetCard(nugEvt));
+  parts.push(sectionCard("Retrieval — top-k vector search", ragRetrievalHtml(retrieval)));
   if(answer.length) parts.push(sectionCard("Answer — code agent", turnsHtml(answer, "a")));
   document.getElementById("content").innerHTML = parts.join("");
 }

@@ -3,7 +3,7 @@ sub-tasks to a person instead of (or after) the model.
 
 Design: the operators (`ExtractOp`, `LookupExternalOp`) are untouched. The orchestrator
 calls this layer at its dispatch seam; everything here is gated by config flags
-(`human_figure`, `human_verify_extract`, `human_lookup`) that default OFF, so with no flag
+(`human_figure`, `human_verify_extract`) that default OFF, so with no flag
 set this is inert. Three pieces, each a swappable seam:
 
   - `HumanAssistPolicy` decides *whether* a human is asked for a given operator call. Today
@@ -41,7 +41,7 @@ from skunk.common import (
 )
 from skunk.errors import ParseError
 from skunk.extract import _render_pages_b64, _stamp_provenance
-from skunk.plan import Branch, LookupBranch, RetrieveBranch
+from skunk.plan import Branch, RetrieveBranch
 
 # The JSON shape a human types to override the model — the same `AnnotatedValue` field set
 # `LookupAgent.final_answer_doc` documents, so the human and the model speak one format.
@@ -394,9 +394,6 @@ class HumanAssistPolicy:
             return cfg.human_figure
         return cfg.human_verify_extract
 
-    def human_lookup(self, branch: LookupBranch, cfg) -> bool:
-        return cfg.human_lookup
-
 
 class HumanAssist:
     """Facade the orchestrator holds. Joins policy + channel and returns the same
@@ -419,13 +416,6 @@ class HumanAssist:
         """Cheap, side-effect-free policy check — lets the orchestrator skip opening a
         traced step (and any console prompt) when no human is consulted."""
         return self._policy.verify_extract(branch, entries, ctx.config)
-
-    def wants_lookup(self, branch: LookupBranch, ctx: ExecutionContext) -> bool:
-        # Disabled: an external lookup's value(s) are rolled into the data-prep agent's output and
-        # reviewed in the single data-prep pool review (verify_extract), so the per-lookup human
-        # hook (optimistic register_lookup + blocking human_lookup) is redundant. The lookup agent
-        # still runs; only the separate review is suppressed. (`human_lookup` policy flag retained.)
-        return False
 
     def wants_pool_review(self, ctx: ExecutionContext) -> bool:
         """Whether the cleaned data-prep pool gets a human review this round. Gated by the same
@@ -481,27 +471,6 @@ class HumanAssist:
         # Re-stamp machine provenance from the source pages + branch (the human authors only
         # the semantic fields), matching how extract stamps its own output.
         return _stamp_provenance(reply, refs, branch)
-
-    async def human_lookup(
-        self, branch: LookupBranch, ctx: ExecutionContext
-    ) -> list[AnnotatedValue]:
-        """Run the external lookup as a human task. Assumes the caller already gated on
-        `wants_lookup`."""
-        instruction = (
-            f"Perform this external lookup and report the value(s):\n  target: "
-            f"{branch.target}\n  source hint: {branch.src or '(any authoritative source)'}"
-        )
-        ctx.emit(f"human_request task=lookup target={branch.target!r}", kind="user")
-        return await self._channel.ask(
-            HumanRequest(
-                task="lookup",
-                instruction=instruction,
-                candidates=[],
-                pages=[],
-                branch=branch,
-            ),
-            ctx,
-        )
 
     # ---- Optimistic (non-blocking) registration ----------------------------------------
     # These open a human review and return immediately; the branch keeps the LLM result and
@@ -560,37 +529,6 @@ class HumanAssist:
         ctx.emit(
             f"human_review_registered task=verify_extract branch_id={POOL_REVIEW_BRANCH_ID} "
             f"review_id={review_id} candidates={len(pool)} n_pages={len(refs)}",
-            kind="user",
-        )
-        return review_id
-
-    def register_lookup(
-        self,
-        entries: list[AnnotatedValue],
-        branch: LookupBranch,
-        bid: int,
-        ctx: ExecutionContext,
-    ) -> str | None:
-        """Open a review of the lookup agent's value(s) for an external lookup, so a human can
-        confirm/correct them. `entries` are the agent's result (the review's candidates)."""
-        register = ctx.human_review_register
-        if register is None:
-            return None
-        instruction = (
-            f"Confirm or correct the value(s) found for this external lookup:\n  target: "
-            f"{branch.target}\n  source hint: {branch.src or '(any authoritative source)'}"
-        )
-        guidance = {
-            "task": "lookup",
-            "branch_id": bid,
-            "branch": _branch_identity(branch),
-            "candidates": _candidate_dicts(entries),
-            "fields": list(_FIELDS),
-        }
-        review_id = register("lookup", instruction, ctx.question, [], guidance)
-        ctx.emit(
-            f"human_review_registered task=lookup branch_id={bid} "
-            f"review_id={review_id} candidates={len(entries)}",
             kind="user",
         )
         return review_id

@@ -31,7 +31,7 @@ def _ctx(cfg: SkunkConfig) -> ExecutionContext:
 
 
 def _cfg(**flags: bool) -> SkunkConfig:
-    base = dict(human_figure=False, human_verify_extract=False, human_lookup=False)
+    base = dict(human_figure=False, human_verify_extract=False)
     base.update(flags)
     return SkunkConfig(**base)
 
@@ -56,13 +56,6 @@ def test_policy_verify_gates_on_human_verify_extract():
     assert p.verify_extract(txt, [], _cfg(human_verify_extract=True)) is True
     assert p.verify_extract(txt, [], _cfg(human_figure=True)) is False
     assert p.verify_extract(txt, [], _cfg()) is False
-
-
-def test_policy_lookup_gates_on_human_lookup():
-    p = HumanAssistPolicy()
-    lb = LookupBranch(target="t")
-    assert p.human_lookup(lb, _cfg(human_lookup=True)) is True
-    assert p.human_lookup(lb, _cfg()) is False
 
 
 # ---- reply parsing ---------------------------------------------------------------
@@ -168,18 +161,6 @@ def test_verify_extract_restamps_branch_provenance():
     assert out[0].retrieve_key == "cpi level"
     assert out[0].requested_period == "2020-01"
     assert out[0].as_of == "2020-02"
-
-
-def test_human_lookup_returns_channel_reply():
-    branch = LookupBranch(target="USD/GBP on 2002-06-30", src=None)
-    reply = [AnnotatedValue(description="rate", value=0.6549, unit="fx_rate")]
-    ch = _FakeChannel(reply)
-    assist = HumanAssist(channel=ch)
-    cfg = _cfg(human_lookup=True)
-    assert assist.wants_lookup(branch, _ctx(cfg)) is True
-    out = asyncio.run(assist.human_lookup(branch, _ctx(cfg)))
-    assert out[0].value == 0.6549
-    assert ch.requests[0].task == "lookup"
 
 
 if __name__ == "__main__":

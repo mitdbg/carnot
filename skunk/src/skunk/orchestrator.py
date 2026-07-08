@@ -30,7 +30,6 @@ from skunk.llm_client import LLMClient
 from skunk.plan import (
     AttemptRecord,
     Branch,
-    LookupBranch,
     Plan,
     Planner,
     RetrieveBranch,
@@ -158,9 +157,6 @@ class Orchestrator:
         # plan-branch ↔ operator-step on this id to render revision tabs.
         self._branch_ids: list[int] = []
         self._next_branch_id = 0
-        # Branch ids actually executed in the latest sweep (vs carried forward) — drives the
-        # `execution_status` the HITL guidance shows a reviewer.
-        self._last_executed_branch_ids: set[int] = set()
         self._planner = Planner()
         self._retrieve = RetrieveOp(self._ctx.config)
         self._lookup = LookupExternalOp()
@@ -544,22 +540,18 @@ class Orchestrator:
         self,
         branches: list[RetrieveBranch],
         branch_ids: list[int],
-        document_scopes: list[list[str] | None] | None = None,
     ) -> list[BranchRetrieval | StepFailed]:
         """Retrieve for every retrieve branch at once via the search-agent backend, returning
         one normalized `BranchRetrieval` (its whole pages) per branch — or the `StepFailed` to
         attribute to it. `RetrieveOp.run_all` owns all backend dispatch. `branch_ids` lets the
-        search-agent backend emit a per-branch `retrieve` step; `document_scopes` hard-scopes a
-        branch's corpus to human-required documents (HITL)."""
+        search-agent backend emit a per-branch `retrieve` step."""
         if not branches:
             return []
         try:
             results = await traced_step(
                 self._ctx,
                 "retrieve",
-                lambda: self._retrieve.run_all(
-                    self._ctx, branches, branch_ids, document_scopes=document_scopes
-                ),
+                lambda: self._retrieve.run_all(self._ctx, branches, branch_ids),
             )
         except StepFailed as e:
             return [e] * len(branches)
@@ -581,22 +573,14 @@ class Orchestrator:
         self,
         branches: list[Branch],
         branch_ids: list[int],
-        *,
-        document_scopes: dict[int, list[str]] | None = None,
     ) -> list[BranchOutcome]:
         # Global retrieve phase: all retrieve branches share one deduped semantic-filter
         # sweep, then each branch's routed refs feed its own extract. Lookup branches are
-        # independent and run in the per-branch tail below. `document_scopes` (keyed by
-        # stable branch id) hard-scopes a retrieve branch's corpus to human-required
-        # documents — the HITL "annotate this branch's source documents" recovery action.
-        self._last_executed_branch_ids = set(branch_ids)
+        # independent and run in the per-branch tail below.
         retrieve_pos = [i for i, b in enumerate(branches) if b.kind == "retrieve"]
         retrievals = await self._run_retrieve_phase(
             [cast(RetrieveBranch, branches[i]) for i in retrieve_pos],
             [branch_ids[i] for i in retrieve_pos],
-            document_scopes=[
-                (document_scopes or {}).get(branch_ids[i]) for i in retrieve_pos
-            ],
         )
         retr_by_pos: dict[int, BranchRetrieval | StepFailed] = dict(
             zip(retrieve_pos, retrievals)
@@ -648,27 +632,9 @@ class Orchestrator:
                         branch_id=bid,
                     )
                 return res
-            # External lookup. Optimistic: run the lookup agent, then register a review of
-            # its result. Blocking (local CLI): the human performs the lookup in place when
-            # the flag is on; else the agent does.
-            lookup_branch = cast("LookupBranch", branch)
-            mode = self._review_mode()
-            if self._human.wants_lookup(lookup_branch, self._ctx) and mode == "optimistic":
-                entries = await traced_step(
-                    self._ctx,
-                    "lookup_external",
-                    lambda: self._lookup.run(self._ctx, branch),
-                    branch_id=bid,
-                )
-                self._human.register_lookup(entries, lookup_branch, bid, self._ctx)
-                return entries
-            if self._human.wants_lookup(lookup_branch, self._ctx) and mode == "blocking":
-                return await traced_step(
-                    self._ctx,
-                    "human_lookup",
-                    lambda: self._human.human_lookup(lookup_branch, self._ctx),
-                    branch_id=bid,
-                )
+            # External lookup. Its value(s) are rolled into the data-prep agent's output and
+            # reviewed (when HITL is on) in the single data-prep pool review — there is no
+            # per-lookup human hook.
             return await traced_step(
                 self._ctx,
                 "lookup_external",

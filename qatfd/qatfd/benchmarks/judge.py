@@ -136,6 +136,25 @@ async def judge_nugget_recall(
     score = sum(weights) / len(nuggets)
     n_sup = labels.count("support")
     n_par = labels.count("partial_support")
+
+    # Persist the per-nugget verdicts (discarded by the aggregate score) as a structured event, so
+    # the trace viewer can show every gold nugget colored by whether the answer supported it.
+    if ctx is not None:
+        ctx.emit(
+            f"nugget_judge n_support={n_sup} n_partial={n_par} n_nuggets={len(nuggets)} recall={score:.3f}",
+            kind="observation",
+            data={
+                "n_support": n_sup,
+                "n_partial": n_par,
+                "n_nuggets": len(nuggets),
+                "partial_credit": partial_credit,
+                "recall": score,
+                "nuggets": [
+                    {"nugget": n, "label": lab} for n, lab in zip(nuggets, labels, strict=True)
+                ],
+            },
+        )
+
     return {
         "score": score,
         "scorer": "karl.nugget_completion.v1",

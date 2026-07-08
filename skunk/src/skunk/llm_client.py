@@ -778,94 +778,6 @@ class LLMClient:
 
         return await do()
 
-    def stream(
-        self,
-        *,
-        system: str,
-        messages: list[dict],
-        model: str | None = None,
-        should_stop: Callable[[str], bool] | None = None,
-        temperature: float = 0.0,
-        effort: Effort = "off",
-        ctx: ExecutionContext | None = None,
-        call_site: str = "llm",
-    ) -> LLMResponse:
-        """Multi-turn streaming call, accumulating chunks until `should_stop(acc)`
-        or the stream ends. `messages` are the {role, content} turns after the
-        system message ('assistant' → model role, else user). Lets multi-turn
-        agents share this client's rate-limit + retry + logging. `temperature`
-        defaults to 0.0 — agent loops are deterministic like every other call site.
-        `effort` maps onto Gemini's thinking config exactly like the single-shot
-        path (`_gemini_config`), so agent loops are tunable like every other call site."""
-        def attempt(provider: str, m: str) -> LLMResponse:
-            kw = dict(system=system, messages=messages, model=m, should_stop=should_stop,
-                      temperature=temperature, effort=effort, ctx=ctx, call_site=call_site)
-            if provider == "openrouter":
-                return self._stream_openrouter_once(**kw)  # type: ignore
-            return self._stream_gemini_once(**kw)  # type: ignore
-
-        return self._retry_call(attempt, self._config.llm_provider, model or self._config.llm_model)
-
-    def _stream_gemini_once(
-        self,
-        *,
-        system: str,
-        messages: list[dict],
-        model: str | None = None,
-        should_stop: "Callable[[str], bool] | None" = None,
-        temperature: float = 0.0,
-        effort: "Effort" = "off",
-        ctx: "ExecutionContext | None" = None,
-        call_site: str = "llm",
-    ) -> LLMResponse:
-        client = self._get_gemini_client()
-        model_id = (model or self._config.llm_model).removeprefix("google/")
-        contents = [
-            types.Content(
-                role="model" if m["role"] == "assistant" else "user",
-                parts=self._gemini_parts(m["content"], m.get("images")),
-            )
-            for m in messages
-        ]
-        gen_config = self._gemini_config(system, temperature, effort, model_id)
-
-        def do() -> LLMResponse:
-            t0 = time.monotonic()
-            resp_stream = client.models.generate_content_stream(
-                model=model_id, contents=contents, config=gen_config,  # type: ignore[arg-type]
-            )
-            accumulated = ""
-            stopped_text: str | None = None
-            usage = None
-            for chunk in resp_stream:
-                accumulated += chunk.text or ""
-                usage = getattr(chunk, "usage_metadata", None) or usage
-                # Drain past `should_stop` to capture the final usage_metadata (parity
-                # with the openrouter path); record the cut point for the returned text.
-                if stopped_text is None and should_stop is not None and should_stop(accumulated):
-                    stopped_text = accumulated
-            close = getattr(resp_stream, "close", None)
-            if close is not None:
-                try:  # noqa: SIM105
-                    close()
-                except Exception:
-                    pass
-            latency_s = time.monotonic() - t0
-            if usage is None:
-                log.warning(
-                    "gemini stream returned no usage — cost undercounted (call_site=%s model=%s)",
-                    call_site, model_id,
-                )
-            accumulated = accumulated if stopped_text is None else stopped_text
-            toks = self._usage_tokens(usage)
-            return self._build_response(
-                accumulated, toks, latency_s,
-                model=model_id, temperature=temperature, effort=effort,
-                ctx=ctx, call_site=call_site,
-            )
-
-        return do()
-
     async def astream(
         self,
         *,
@@ -880,8 +792,11 @@ class LLMClient:
         max_output_tokens: int | None = None,
         timeout_s: float | None = None,
     ) -> LLMResponse:
-        """Async twin of `stream` — uses `client.aio.models.generate_content_stream`
-        and `async for`, so the event loop runs other tasks between chunks.
+        """Multi-turn streaming call, accumulating chunks until `should_stop(acc)`
+        or the stream ends. `messages` are the {role, content} turns after the
+        system message ('assistant' → model role, else user). Lets multi-turn
+        agents share this client's rate-limit + retry + logging; the event loop
+        runs other tasks between chunks.
 
         `max_output_tokens` overrides the per-call output cap (None → provider
         default); `timeout_s` enforces a hard per-request wall-clock cap. Both are
@@ -1189,55 +1104,6 @@ class LLMClient:
             text += getattr(delta, "content", None) or ""
         return text
 
-    def _stream_openrouter_once(
-        self,
-        *,
-        system: str,
-        messages: list[dict],
-        model: str | None = None,
-        should_stop: Callable[[str], bool] | None = None,
-        temperature: float = 0.0,
-        effort: Effort = "off",
-        ctx: ExecutionContext | None = None,
-        call_site: str = "llm",
-    ) -> LLMResponse:
-        client = self._get_openrouter_client()
-        model_id = model or self._config.llm_model
-        or_messages = self._openrouter_chat_messages(system, messages)
-        reasoning = self._effort_to_reasoning(effort)
-
-        def do() -> LLMResponse:
-            t0 = time.monotonic()
-            accumulated = ""
-            stopped_text: str | None = None
-            usage = None
-            with client.chat.send(
-                model=model_id, messages=or_messages, stream=True, # type: ignore
-                temperature=temperature, reasoning=reasoning, # type: ignore
-            ) as resp_stream:
-                for chunk in resp_stream:
-                    accumulated += self._openrouter_chunk_text(chunk)
-                    usage = getattr(chunk, "usage", None) or usage
-                    # Drain to the end to capture the trailing usage chunk (see the async
-                    # twin): breaking at `should_stop` would drop cost stats entirely.
-                    if stopped_text is None and should_stop is not None and should_stop(accumulated):
-                        stopped_text = accumulated
-            latency_s = time.monotonic() - t0
-            if usage is None:
-                log.warning(
-                    "openrouter stream returned no usage — cost undercounted (call_site=%s model=%s)",
-                    call_site, model_id,
-                )
-            accumulated = accumulated if stopped_text is None else stopped_text
-            toks = self._usage_tokens_openrouter(usage)
-            return self._build_response(
-                accumulated, toks, latency_s,
-                model=model_id, temperature=temperature, effort=effort,
-                ctx=ctx, call_site=call_site,
-            )
-
-        return do()
-
     async def _astream_openrouter_once(
         self,
         *,
@@ -1252,7 +1118,7 @@ class LLMClient:
         max_output_tokens: int | None = None,
         timeout_s: float | None = None,
     ) -> LLMResponse:
-        """Async twin of `_stream_openrouter_once` — uses `client.chat.send_async` + `async for`."""
+        """OpenRouter streaming body for `astream` — `client.chat.send_async` + `async for`."""
         client = self._get_openrouter_client()
         model_id = model or self._config.llm_model
         or_messages = self._openrouter_chat_messages(system, messages)

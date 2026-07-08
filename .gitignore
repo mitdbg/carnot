@@ -313,6 +313,9 @@ skunk/venv/
 # https://github.com/patronus-ai/financebench)
 skunk/financebench/
 
+# diagram creation
+qatfd/diagrams
+
 # ─────────────────────────────────────────────────────────────────────────────
 # qatfd benchmarks
 #

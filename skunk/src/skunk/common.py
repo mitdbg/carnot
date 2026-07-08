@@ -188,7 +188,6 @@ class _RateLimiter:
 # and call `get_rate_limiter("<name>")` at the call site.
 _RATE_LIMITS: dict[str, tuple[str, float]] = {
     # name          (env override,            default rpm)  # rationale
-    "llm": ("SKUNK_LLM_RPM", 1000.0),  # Gemini generation; provider-side quota
     "embed": (
         "SKUNK_EMBED_RPM",
         600.0,
@@ -313,19 +312,6 @@ def parse_json_response(text: str) -> Any | None:
         return json.loads(strip_code_fence(text))
     except json.JSONDecodeError:
         return None
-
-
-def chunk(seq: list, n: int) -> list[list]:
-    """Split `seq` into consecutive sub-lists of at most `n` items."""
-    return [seq[i : i + n] for i in range(0, len(seq), n)]
-
-
-@dataclass
-class LLMResponse:
-    text: str
-    latency_s: float
-    input_tokens: int | None
-    output_tokens: int | None
 
 
 def make_genai_client() -> genai.Client:
@@ -680,7 +666,6 @@ class ExecutionContext:
         None  # when set, stream this question's events to that file (live, flushed)
     )
     events: list[dict] = field(default_factory=list)  # per-question diagnostic events
-    config: SystemConfig
     llm_client: LLMClient | None = (
         None  # auto-created in __post_init__; pass a mock to override
     )
@@ -690,8 +675,8 @@ class ExecutionContext:
     human_intervention_handler: HumanInterventionHandler | None = None
     human_intervention_enabled: bool = False
     # Optimistic, non-blocking review registration (server only). When set, the data-prep pool
-    # and lookup gates open a review and keep the LLM result instead of awaiting the human — see
-    # `HumanReviewRegister` and `HumanAssist.register_pool_review`/`register_lookup`.
+    # gate opens a review and keeps the LLM result instead of awaiting the human — see
+    # `HumanReviewRegister` and `HumanAssist.register_pool_review`.
     human_review_register: HumanReviewRegister | None = None
 
     def __post_init__(self) -> None:
