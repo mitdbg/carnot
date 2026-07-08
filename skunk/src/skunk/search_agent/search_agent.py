@@ -14,9 +14,9 @@ Two overrides specialise the base for retrieval:
   - `_block_is_visible` redacts chunks the agent has `prune(...)`d from the
     LLM-facing render, faithful to its prune commands during rollout.
 
-The three tools that read/write prune state share the agent's per-question
-`_pruned_chunk_ids` / `_pruned_doc_ids` sets. The orchestrator builds one
-`SearchAgent` per question / branch, so these sets never leak across questions.
+The tools share the agent's per-question `RetrievalState` (pruned + seen sets,
+see its docstring for the contract). The orchestrator builds one `SearchAgent`
+per question / branch, so state never leaks across questions.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from skunk.llm_client import LLMClient
 from skunk.local_python_executor import CodeOutput
 from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent, TextBlock, Tool
 from skunk.search_agent.search_tools import (
+    RetrievalState,
     EMPTY_RESULT_MESSAGE,
     GREP_RESULT_TAG,
     PRUNE_RESULT_TAG,
@@ -121,17 +122,12 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         self.max_output_tokens = config.search_agent_max_output_tokens
         self.request_timeout_s = config.search_agent_request_timeout_s
 
-        # Per-question prune state: shared by the search / grep / prune tools and
-        # read by `_block_is_visible` for redaction. One SearchAgent per
-        # question / branch ⇒ these sets never cross-talk between questions.
-        self._pruned_chunk_ids: set[str] = set()
-        self._pruned_doc_ids: set[str] = set()
-        # Already-fetched chunks/docs, auto-excluded from subsequent search/grep so each
-        # call surfaces new material (no re-duplication in context). Distinct from the
-        # pruned sets: fetched chunks STAY visible — `prune(...)` is only for ruling out
-        # irrelevant material. Shared by reference with the search/grep/read tools.
-        self._seen_chunk_ids: set[str] = set()
-        self._seen_doc_ids: set[str] = set()
+        # Per-question retrieval state (pruned + seen sets), shared by reference
+        # with the search / grep / read / prune tools and read by
+        # `_block_is_visible` for redaction — see `RetrievalState`'s docstring for
+        # the per-set contract. One SearchAgent per question / branch ⇒ state
+        # never cross-talks between questions.
+        self._state = RetrievalState()
 
         # Tool instances capture their deps; the prompt's tool docs are generated
         # from their `doc`s by the base, so tools and docs can't drift.
@@ -148,24 +144,21 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         if include_search_corpus:
             tools.append(SearchCorpusTool(
                 self.chroma_collection, self.emb_model_id, self._emb_llm_client,
-                self._pruned_chunk_ids, self._pruned_doc_ids,
-                seen_chunk_ids=self._seen_chunk_ids, seen_doc_ids=self._seen_doc_ids,
+                self._state,
             ))
         tools += [
             GrepCorpusTool(
                 self.chroma_collection,
                 config.grep_max_output_tokens,
-                pruned_chunk_ids=self._pruned_chunk_ids,
-                pruned_doc_ids=self._pruned_doc_ids,
-                seen_chunk_ids=self._seen_chunk_ids, seen_doc_ids=self._seen_doc_ids,
+                self._state,
             ),
             ReadDocumentTool(
                 self.document_map,
                 config.agent_max_pages_per_tool_call,
                 config.read_document_max_output_chars,
-                seen_doc_ids=self._seen_doc_ids,
+                self._state,
             ),
-            PruneTool(self._pruned_chunk_ids, self._pruned_doc_ids),
+            PruneTool(self._state),
             *extra_tools,
         ]
         super().__init__(
@@ -184,9 +177,9 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
     def _block_is_visible(self, block: Block) -> bool:
         """Redact pruned chunks from the LLM-facing render (full trajectory is kept)."""
         if isinstance(block, ChunkBlock):
-            if block.chunk_id is not None and block.chunk_id in self._pruned_chunk_ids:
+            if block.chunk_id is not None and block.chunk_id in self._state.pruned_chunk_ids:
                 return False
-            if block.doc_id in self._pruned_doc_ids:
+            if block.doc_id in self._state.pruned_doc_ids:
                 return False
         return True
 

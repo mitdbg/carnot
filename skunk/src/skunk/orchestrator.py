@@ -28,7 +28,7 @@ from skunk.plan import (
 )
 from skunk.prompted_call import PromptOverride
 from skunk.question_explainer import QuestionExplainer
-from skunk.retrieve import RetrieveOp
+from skunk.retrieve import run_retrieve_all
 from skunk.result import ExecutionResult
 
 
@@ -75,7 +75,6 @@ class Orchestrator:
         self._branch_ids: list[int] = []
         self._next_branch_id = 0
         self._planner = Planner()
-        self._retrieve = RetrieveOp(self._ctx.config)
         self._lookup = LookupExternalOp()
         self._explainer = QuestionExplainer()
         self._compute = ComputeOp()
@@ -122,6 +121,10 @@ class Orchestrator:
                 "planner",
                 lambda: self._planner.plan(self._ctx.question, self._ctx),
             )
+            # `_current_plan` tracks the ACTIVE revision for the `current_plan`
+            # property — (re)assigned only where `plan` is rebound (here and after
+            # each replan), not on every loop iteration.
+            self._current_plan = plan
             self._branch_ids = self._alloc_branch_ids(len(plan.branches))
             self._emit_plan(plan, "initial")
             outcomes = await self._run_branches(plan.branches, self._branch_ids)
@@ -145,7 +148,6 @@ class Orchestrator:
         sweep_added = True  # the initial sweep always reaches compute
 
         while True:
-            self._current_plan = plan
             if sweep_added or needs is None:
                 pool = await self._prep_pool(pool)
                 outcome = await traced_step(
@@ -201,6 +203,7 @@ class Orchestrator:
                 "replanner",
                 lambda: self._planner.replan(self._ctx, pool, attempts, reason, missing),
             )
+            self._current_plan = plan
 
             ids = self._alloc_branch_ids(len(plan.branches))
             self._branch_ids = ids
@@ -277,15 +280,15 @@ class Orchestrator:
     ) -> list[BranchRetrieval | StepFailed]:
         """Retrieve for every retrieve branch at once via the search-agent backend, returning
         one normalized `BranchRetrieval` (its whole pages) per branch — or the `StepFailed` to
-        attribute to it. `RetrieveOp.run_all` owns all backend dispatch. `branch_ids` lets the
-        search-agent backend emit a per-branch `retrieve` step."""
+        attribute to it. `retrieve.run_retrieve_all` owns all backend dispatch. `branch_ids`
+        lets the search-agent backend emit a per-branch `retrieve` step."""
         if not branches:
             return []
         try:
             results = await traced_step(
                 self._ctx,
                 "retrieve",
-                lambda: self._retrieve.run_all(self._ctx, branches, branch_ids),
+                lambda: run_retrieve_all(self._ctx, branches, branch_ids),
             )
         except StepFailed as e:
             return [e] * len(branches)

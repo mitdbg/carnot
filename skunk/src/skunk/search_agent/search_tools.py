@@ -29,24 +29,13 @@ generation view (`_block_is_visible`). The tag constants below discriminate each
 payload shape. The final answer is a JSON block (handled by the agent loop), not
 a tool.
 
-Prune state: `SearchCorpusTool`, `GrepCorpusTool`, and `PruneTool` share two
-mutable sets (`pruned_chunk_ids` / `pruned_doc_ids`). `PruneTool` is the single
-writer — it mutates them directly — and the search/grep tools read them on every
-call (server-side `$nin`), so a prune takes effect immediately for subsequent
-searches. `SearchAgent` also reads the same sets to redact already-emitted
-chunks at render time.
-
-Fetched state: a second pair of shared sets (`seen_chunk_ids` / `seen_doc_ids`)
-auto-excludes material the agent has ALREADY fetched — chunks returned by
-search/grep, and docs opened by `read_document` — from subsequent search/grep
-results, so each call surfaces new material instead of re-duplicating context.
-Unlike pruned chunks, fetched chunks stay VISIBLE (prune is reserved for ruling
-out irrelevant material). The search/grep tools both write (on return) and read
-(union with the pruned sets) these; `read_document` writes `seen_doc_ids`.
-
-All four sets are per-question state: the owning `SearchAgent` creates them (and
-the tool instances closing over them) in its `__init__`, and the orchestrator
-builds one `SearchAgent` per question / branch.
+Shared state: one `RetrievalState` object (four sets) is shared BY REFERENCE
+between the owning `SearchAgent` and its tools — its dataclass docstring spells
+out the read/write contract per set. The agent creates it (with the tool
+instances closing over it) in its `__init__`, and the orchestrator builds one
+`SearchAgent` per question / branch, so state never crosses questions. A tool
+constructed WITHOUT a state (one-shot use, e.g. a plain top-k vector search)
+gets its own private fresh one.
 """
 
 from __future__ import annotations
@@ -54,6 +43,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -66,6 +56,29 @@ from skunk.multi_turn_agent import Tool
 if TYPE_CHECKING:
     from skunk.common import ExecutionContext, PageRef
     from skunk.llm_client import LLMClient
+
+
+@dataclass
+class RetrievalState:
+    """Per-question retrieval state, shared by reference between a `SearchAgent`
+    and its tools (the one mutable contract in the retrieval loop):
+
+    - `pruned_*`: material the agent ruled out. `PruneTool` is the SINGLE writer;
+      the search/grep tools read them on every call (server-side `$nin`), so a
+      prune takes effect immediately, and `SearchAgent._block_is_visible` reads
+      them to redact already-emitted chunks at render time.
+    - `seen_*`: material already fetched — chunks returned by search/grep, docs
+      opened by `read_document` — auto-excluded from subsequent search/grep so
+      each call surfaces NEW material. Unlike pruned chunks, fetched chunks stay
+      VISIBLE (prune is reserved for ruling out irrelevant material). Search/grep
+      both write (on return) and read (unioned with the pruned sets);
+      `read_document` writes `seen_doc_ids`.
+    """
+
+    pruned_chunk_ids: set[str] = field(default_factory=set)
+    pruned_doc_ids: set[str] = field(default_factory=set)
+    seen_chunk_ids: set[str] = field(default_factory=set)
+    seen_doc_ids: set[str] = field(default_factory=set)
 
 # Tags identifying each tool's structured return payload to the SearchAgent.
 PRUNE_RESULT_TAG = "__prune__"
@@ -125,25 +138,19 @@ class SearchCorpusTool(Tool):
         chroma_collection: Collection,
         emb_model_id: str,
         llm_client: LLMClient,
-        pruned_chunk_ids: set[str] | None = None,
-        pruned_doc_ids: set[str] | None = None,
+        state: RetrievalState | None = None,
         required_metadata_filter: dict | None = None,
-        seen_chunk_ids: set[str] | None = None,
-        seen_doc_ids: set[str] | None = None,
         ctx: ExecutionContext | None = None,
     ):
-        # The prune/seen sets are shared BY REFERENCE with the owning SearchAgent's
-        # other tools; a one-shot caller (e.g. a plain top-k vector search with no
-        # agent) omits them and gets private empty sets.
+        # `state` is shared BY REFERENCE with the owning SearchAgent's other tools;
+        # a one-shot caller (e.g. a plain top-k vector search with no agent) omits
+        # it and gets a private fresh one.
         self._chroma_collection = chroma_collection
         self._emb_model_id = emb_model_id
         self._llm_client = llm_client
         self._ctx = ctx
-        self._pruned_chunk_ids = pruned_chunk_ids if pruned_chunk_ids is not None else set()
-        self._pruned_doc_ids = pruned_doc_ids if pruned_doc_ids is not None else set()
+        self._state = state if state is not None else RetrievalState()
         self._required_metadata_filter = required_metadata_filter
-        self._seen_chunk_ids = seen_chunk_ids if seen_chunk_ids is not None else set()
-        self._seen_doc_ids = seen_doc_ids if seen_doc_ids is not None else set()
 
     def _embed_query(self, query: str) -> list[float]:
         """Embed `query` with the same model that produced the stored embeddings, via the
@@ -162,8 +169,8 @@ class SearchCorpusTool(Tool):
         where = _build_metadata_where(
             metadata_filter=metadata_filter,
             required_filter=self._required_metadata_filter,
-            ignore_chunk_ids=self._pruned_chunk_ids | self._seen_chunk_ids,
-            ignore_doc_ids=self._pruned_doc_ids | self._seen_doc_ids,
+            ignore_chunk_ids=self._state.pruned_chunk_ids | self._state.seen_chunk_ids,
+            ignore_doc_ids=self._state.pruned_doc_ids | self._state.seen_doc_ids,
         )
         query_kwargs: dict = {
             "query_embeddings": [query_embedding],
@@ -200,7 +207,7 @@ class SearchCorpusTool(Tool):
                 ),
             })
 
-        self._seen_chunk_ids.update(c["chunk_id"] for c in chunks)
+        self._state.seen_chunk_ids.update(c["chunk_id"] for c in chunks)
         return {SEARCH_RESULT_TAG: True, "chunks": chunks}
 
     doc = """\
@@ -236,19 +243,13 @@ class GrepCorpusTool(Tool):
         self,
         chroma_collection: Collection,
         max_output_tokens: int,
-        pruned_chunk_ids: set[str] | None = None,
-        pruned_doc_ids: set[str] | None = None,
+        state: RetrievalState | None = None,
         required_metadata_filter: dict | None = None,
-        seen_chunk_ids: set[str] | None = None,
-        seen_doc_ids: set[str] | None = None,
     ):
-        # Prune/seen sets shared by reference with the owning agent's other tools;
-        # omitted for one-shot use (private empty sets).
+        # `state` shared by reference with the owning agent's other tools; omitted
+        # for one-shot use (private fresh one).
         self._chroma_collection = chroma_collection
-        self._pruned_chunk_ids = pruned_chunk_ids if pruned_chunk_ids is not None else set()
-        self._pruned_doc_ids = pruned_doc_ids if pruned_doc_ids is not None else set()
-        self._seen_chunk_ids = seen_chunk_ids if seen_chunk_ids is not None else set()
-        self._seen_doc_ids = seen_doc_ids if seen_doc_ids is not None else set()
+        self._state = state if state is not None else RetrievalState()
         # Hard cap on the rendered observation size (chars). `limit=None` returns every
         # matching chunk, so a broad pattern can otherwise dump 100s of K of tokens into
         # the context in one shot and 400 the next request (see SearchAgentConfig.grep_max_output_tokens).
@@ -264,8 +265,8 @@ class GrepCorpusTool(Tool):
         where = _build_metadata_where(
             metadata_filter=metadata_filter,
             required_filter=self._required_metadata_filter,
-            ignore_chunk_ids=self._pruned_chunk_ids | self._seen_chunk_ids,
-            ignore_doc_ids=self._pruned_doc_ids | self._seen_doc_ids,
+            ignore_chunk_ids=self._state.pruned_chunk_ids | self._state.seen_chunk_ids,
+            ignore_doc_ids=self._state.pruned_doc_ids | self._state.seen_doc_ids,
         )
         get_kwargs: dict = {
             "where_document": {"$regex": pattern},
@@ -321,7 +322,7 @@ class GrepCorpusTool(Tool):
                 groups.append({"doc_id": doc_id, "header": header, "chunks": doc_chunks})
 
         for g in groups:
-            self._seen_chunk_ids.update(ch["chunk_id"] for ch in g["chunks"])
+            self._state.seen_chunk_ids.update(ch["chunk_id"] for ch in g["chunks"])
         result: dict = {GREP_RESULT_TAG: True, "groups": groups}
         if truncated:
             dropped = total_chunks - kept_chunks
@@ -358,9 +359,9 @@ read_document(["doc_id_1", "doc_id_2"])
 ```"""
 
     def __init__(self, document_map: dict[str, str], max_pages: int, max_output_chars: int,
-                 seen_doc_ids: set[str] | None = None):
+                 state: RetrievalState | None = None):
         self._document_map = document_map
-        self._seen_doc_ids = seen_doc_ids if seen_doc_ids is not None else set()
+        self._state = state if state is not None else RetrievalState()
         self._max_output_chars = max_output_chars
         # Pre-substitute the jinja var: tool `doc`s may flow through a
         # StrictUndefined render, so no `{{ ... }}` may survive here.
@@ -376,7 +377,7 @@ read_document(["doc_id_1", "doc_id_2"])
                 body = "[no such document (or no content in document)]"
             else:
                 body = text
-                self._seen_doc_ids.add(did)
+                self._state.seen_doc_ids.add(did)
             rendered = f"=== doc_id={did} ===\n{body}"
             remaining = self._max_output_chars - used
             if len(rendered) > remaining:
@@ -483,9 +484,8 @@ view_figure("2002_12_8", 5)
 class PruneTool(Tool):
     name = "prune"
 
-    def __init__(self, pruned_chunk_ids: set[str], pruned_doc_ids: set[str]):
-        self._pruned_chunk_ids = pruned_chunk_ids
-        self._pruned_doc_ids = pruned_doc_ids
+    def __init__(self, state: RetrievalState):
+        self._state = state
 
     def __call__(
         self,
@@ -494,16 +494,16 @@ class PruneTool(Tool):
     ) -> dict:
         # Single writer of the shared prune sets: mutate directly, then report
         # how many were newly added (the agent renders the summary, no re-apply).
-        new_chunks = set(chunk_ids or ()) - self._pruned_chunk_ids
-        new_docs = set(doc_ids or ()) - self._pruned_doc_ids
-        self._pruned_chunk_ids.update(new_chunks)
-        self._pruned_doc_ids.update(new_docs)
+        new_chunks = set(chunk_ids or ()) - self._state.pruned_chunk_ids
+        new_docs = set(doc_ids or ()) - self._state.pruned_doc_ids
+        self._state.pruned_chunk_ids.update(new_chunks)
+        self._state.pruned_doc_ids.update(new_docs)
         return {
             PRUNE_RESULT_TAG: True,
             "new_chunk_count": len(new_chunks),
             "new_doc_count": len(new_docs),
-            "total_chunks": len(self._pruned_chunk_ids),
-            "total_docs": len(self._pruned_doc_ids),
+            "total_chunks": len(self._state.pruned_chunk_ids),
+            "total_docs": len(self._state.pruned_doc_ids),
         }
 
     doc = """\

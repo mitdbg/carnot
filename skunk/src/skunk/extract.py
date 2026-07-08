@@ -95,27 +95,28 @@ def _coerce_cell(v: Any) -> Any:
 
 
 def _coerce_numeric_cells(entry: Any) -> Any:
-    """Apply `_coerce_cell` to an entry dict's payload cells (in place), so a stray
-    print flag or comma inside a value becomes a clean number BEFORE AnnotatedValue
-    validation. Keys/labels are never touched."""
+    """Apply `_coerce_cell` to an entry dict's payload cells, so a stray print flag
+    or comma inside a value becomes a clean number BEFORE AnnotatedValue validation.
+    Keys/labels are never touched. Pure — returns a new dict (shallow-copied with a
+    rebuilt `value`); the caller's parsed-JSON input is never mutated."""
     if not isinstance(entry, dict):
         return entry
     v = entry.get("value")
     kind = entry.get("kind")
     if kind == "vector" and isinstance(v, dict):
-        entry["value"] = {k: _coerce_cell(c) for k, c in v.items()}
+        value = {k: _coerce_cell(c) for k, c in v.items()}
     elif kind == "table" and isinstance(v, dict):
-        entry["value"] = {
+        value = {
             r: {c: _coerce_cell(x) for c, x in row.items()}
             if isinstance(row, dict)
             else row
             for r, row in v.items()
         }
     elif kind == "scalar":
-        entry["value"] = (
-            [_coerce_cell(c) for c in v] if isinstance(v, list) else _coerce_cell(v)
-        )
-    return entry
+        value = [_coerce_cell(c) for c in v] if isinstance(v, list) else _coerce_cell(v)
+    else:
+        return entry
+    return {**entry, "value": value}
 
 
 def _parse_extract_response(raw: str, ctx: ExecutionContext) -> list[AnnotatedValue]:
