@@ -13,7 +13,7 @@ into the orchestrator's event stream, stamped with the enclosing `retrieve`
 step's `op`.
 The one remaining vendored piece — the `OpenRouter` shim — is a deferred
 follow-up (see "TODO after merge" in ARCHITECTURE.md). The smolagents-derived
-sandbox has been hoisted to the top-level `skunk.local_python_executor`, since
+sandbox has been hoisted to the top-level `skunk.sandbox.local_python_executor`, since
 it is shared infrastructure (used by `pyexec` and `multi_turn_agent`), not
 search-agent-specific.
 

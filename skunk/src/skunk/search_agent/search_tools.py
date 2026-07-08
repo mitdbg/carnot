@@ -2,8 +2,9 @@
 
 All retrieval tools are backed by a single ChromaDB collection in which each
 row is one *element* (chunk) extracted from a *document* (e.g. a page of a
-PDF report, or a scraped web page). The layout — produced by
-`prep/create_vector_db.py`'s `run_build` — is:
+PDF report, or a scraped web page). The layout — produced by the corpus-prep
+scripts that live with the benchmarks (e.g. qatfd's
+`engaging-scripts/create_vector_db.py`) — is:
 
     id:        the `chunk_id` (e.g. "1946_11_41_6")
     document:  the cleaned element text (read from the `documents` field)

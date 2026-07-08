@@ -19,7 +19,7 @@ from skunk.common import (
     NeedsMore,
     input_values_desc,
 )
-from skunk.pyexec import exec_python_with_env, parse_codegen_reply
+from skunk.sandbox.pyexec import exec_python_with_env, parse_codegen_reply
 from skunk.question_explainer import ConceptExplanation
 
 

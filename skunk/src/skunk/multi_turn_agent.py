@@ -13,7 +13,7 @@ from jinja2 import Environment, StrictUndefined
 from skunk.common import B64Image, Effort, ExecutionContext
 from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
-from skunk.local_python_executor import CodeOutput, LocalPythonExecutor
+from skunk.sandbox.local_python_executor import CodeOutput, LocalPythonExecutor
 
 _ENV = Environment(
     autoescape=False, keep_trailing_newline=True, undefined=StrictUndefined

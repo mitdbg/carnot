@@ -28,7 +28,7 @@ from chromadb.api.models.Collection import Collection
 from skunk.common import B64Image
 from skunk.config import SearchAgentConfig
 from skunk.llm_client import LLMClient
-from skunk.local_python_executor import CodeOutput
+from skunk.sandbox.local_python_executor import CodeOutput
 from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent, TextBlock, Tool
 from skunk.search_agent.search_tools import (
     RetrievalState,

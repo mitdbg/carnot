@@ -20,7 +20,7 @@ import pandas as pd
 import statsmodels.api as sm
 
 from skunk.errors import StepFailed
-from skunk.local_python_executor import InterpreterError, LocalPythonExecutor
+from skunk.sandbox.local_python_executor import InterpreterError, LocalPythonExecutor
 
 # Modules code may `import`; also pre-injected as globals (`_PRELOADED_GLOBALS`) so
 # code that omits the import still works — matches what the system prompts advertise.

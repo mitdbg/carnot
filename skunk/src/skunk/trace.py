@@ -8,7 +8,8 @@ Skunk has three kinds of diagnostic output that used to be wired separately:
    per-question log file when one is open, and *echoed* to the console when the
    question runs verbose.
 2. **Process-scoped logs** — app build pipelines (e.g. grc-officeqa's page
-   index), offline prep (`search_agent/prep`), and library warnings (`LLMClient`
+   index), offline corpus prep (the benchmarks' embedding/vector-db scripts),
+   and library warnings (`LLMClient`
    retries) that have no per-question `ctx`. These go through stdlib
    `logging.getLogger(__name__)`.
 3. **A durable machine-readable record** — one JSON line per event.

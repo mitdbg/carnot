@@ -30,7 +30,7 @@ from skunk.common import (
 )
 from skunk.errors import ParseError
 from skunk.prompted_call import PromptedCall
-from skunk.pyexec import exec_python_with_env, parse_codegen_reply
+from skunk.sandbox.pyexec import exec_python_with_env, parse_codegen_reply
 
 # The agent emits each kept value as a full dict (it may have cleaned labels/typos or
 # coalesced prints, so it can't pass the original object through). It authors provenance
