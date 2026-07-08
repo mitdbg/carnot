@@ -1,0 +1,4 @@
+# Mirrors the skunk library's ruff settings (this code moved from skunk/ on
+# 2026-07-07) so the move itself forces no formatting churn.
+target-version = "py312"
+line-length = 120

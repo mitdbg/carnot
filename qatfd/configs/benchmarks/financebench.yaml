@@ -5,7 +5,7 @@
 # (the metadata_rank*.json this writes are ALSO the page-text doc map — see fb_metadata_glob below):
 #   1. python engaging-scripts/compute_financebench_element_embeddings.py \
 #        --input_dir <bench>/financebench/pdfs --output_dir <bench>/financebench/financebench-element-embeddings
-#   2. python -m skunk.search_agent.prep.create_vector_db \
+#   2. python3 engaging-scripts/create_vector_db.py \
 #        --embeddings-dir <bench>/financebench/financebench-element-embeddings \
 #        --collection-name financebench-qwen-8b --chroma-path <bench>/financebench/chromadb --benchmark finance_bench
 # (<bench> = qatfd/benchmarks)

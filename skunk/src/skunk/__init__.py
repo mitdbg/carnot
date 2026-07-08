@@ -1,12 +1,12 @@
-"""OfficeQA — declarative QA pipeline over the U.S. Treasury Bulletin corpus.
+"""skunk — library for agentic retrieval and computation over document corpora.
 
-question → Planner → Plan (branches) → orchestrator →
+Declarative QA pipeline: question → Planner → Plan (branches) → orchestrator →
 {retrieve, extract, lookup_external, compute}, where `compute` is the chain terminator
 and subsumes formatting. Public API is re-exported below; see ARCHITECTURE.md for intent."""
 
 from skunk.common import AnnotatedValue, ExecutionContext, PageRef
 from skunk.llm_client import LLMClient
-from skunk.config import SkunkConfig
+from skunk.config import PipelineConfig
 from skunk.errors import MissingData, StepFailed
 from skunk.orchestrator import Orchestrator
 from skunk.plan import Plan
@@ -24,7 +24,7 @@ __all__ = [
     "PageRef",
     "Plan",
     "ConceptExplanation",
-    "SkunkConfig",
+    "PipelineConfig",
     "StepFailed",
     "load_prompt_overrides",
 ]

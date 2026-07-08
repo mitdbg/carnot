@@ -1,74 +1,68 @@
 # CLAUDE.md
 
-Operational guide for Claude Code sessions on this repo. For how the system actually
-works — architecture, design intent, the plan-shape spec — read `ARCHITECTURE.md`.
+Operational guide for Claude Code sessions on this repo. For how the system works —
+architecture, design intent, the plan-shape spec — read `ARCHITECTURE.md`.
 
 ## What this is
 
-OfficeQA — a declarative QA pipeline over the U.S. Treasury Bulletin corpus (696 monthly
-PDFs, 1939–2025). Questions are answered by composing 4 operators
-(`retrieve` / `extract` / `lookup_external` / `compute`) into a typed DSL plan that an
-orchestrator walks. Benchmark: `data/officeqa_pro.csv` (133 questions = 101 dev + 32 test;
-not tracked in git, keep locally).
+**skunk** — a library for agentic retrieval and computation over document corpora.
+Two layers:
 
-## 🚨 Held-out test set — READ BEFORE ANY EVAL RUN 🚨
+1. **Agent/LLM core** (what qatfd consumes): `llm_client`, `multi_turn_agent`,
+   `search_agent`, `prompted_call`, `chroma_client`, `trace`, `usage`, `errors`,
+   `common.ExecutionContext`, the `SystemConfig` → `SearchAgentConfig` →
+   `PipelineConfig` config hierarchy.
+2. **Operator pipeline**: question → `Planner` → typed DSL `Plan` → `Orchestrator`
+   → {`retrieve`, `extract`, `lookup_external`, `compute`} with data-prep pooling
+   and replan-on-MissingData recovery. Corpus content reaches `extract` only
+   through the `skunk.page_store.PageContentStore` protocol, injected via
+   `Orchestrator(page_store=...)`.
 
-**32 of the 133 benchmark UIDs are a HELD-OUT TEST SET — do not run on these during
-development.** The canonical list (plus the sampling seed + rationale) is
-`eval/test_set_uids.json`; the other **101 are dev**. Tuning prompts/code against the 32,
-inspecting their traces, or including them in a run is contamination that biases
-everything downstream.
+Applications live OUTSIDE this repo dir (the library has no benchmark, corpus
+paths, or eval harness of its own):
 
-- Every eval harness MUST load `eval/test_set_uids.json` and filter the 32 out by
-  default. `--include-test-set` overrides only for a deliberate final-number run.
-- Writing a new eval script: copy the filter from `eval/eval_e2e.py` and wire it in
-  BEFORE the first LLM call. Verify by grepping the script for `test_set_uids`; if it's
-  missing, fix the script before running.
-- Invoking with `--uids`: intersect with the test set and ABORT (not warn) on any match.
-- Reporting numbers: always state dev-only (101) vs full (133). Full-set numbers are
-  contaminated for any generalization claim.
-- Expanding the test set later: re-sample; never add UIDs already tuned against.
+- `../grc-officeqa/` — the OfficeQA / Grounded Reasoning Cup app (Treasury corpus
+  accessors, page-index build, `SkunkConfig.from_env`, eval harness). Its
+  CLAUDE.md carries the 🚨 held-out-split rules for any OfficeQA eval run.
+- `../qatfd/` — the paper's system×benchmark evaluation harness.
+- `../datagen/` — RL training-data synthesis (tinker).
 
-Test UIDs: UID0035, UID0036, UID0039, UID0050, UID0065, UID0068, UID0073, UID0093,
-UID0094, UID0100, UID0108, UID0118, UID0120, UID0134, UID0147, UID0161, UID0168, UID0170,
-UID0179, UID0182, UID0183, UID0187, UID0196, UID0204, UID0211, UID0212, UID0216, UID0218,
-UID0227, UID0230, UID0238, UID0240.
+The refactor that produced this layout is `REFACTOR_PLAN.md` (2026-07-07);
+deleted subtrees (`harness_ui/`, HITL, `dais/`) live in git history.
 
-## Running experiments
+## Commands
 
-- **Don't autonomously launch full dev sweeps.** Implement, sanity-check on a couple of
-  dev UIDs, then hand the run command to the user.
-- Harness is `eval/eval_e2e.py`. State dev-only vs full in any reported number (see above).
-- The default `search_agent` retriever needs `cache/chromadb/` + `cache/clean_page_map.json`
-  built offline (`src/skunk/search_agent/prep/`); the first non-golden run errors clearly
-  if either is missing.
+```bash
+venv/bin/python3 -m pytest tests/   # unit tests
+venv/bin/ruff check src/ tests/     # lint (clean at HEAD)
+```
 
 ## Conventions
 
 - **Use `python3` / `pip3`, not `python` / `pip`** — no `python` on PATH (exit 127). In a
   batched/parallel tool call, one `python: command not found` aborts the whole batch.
+- The active interpreter is `venv/bin/python3` (NOT `.venv/`); skunk is installed
+  editable there.
 - **No new ops** without updating `ARCHITECTURE.md`, the planner system prompt in
-  `src/skunk/plan.py`, the validator, AND `eval/eval_e2e.py`.
+  `src/skunk/plan.py`, the validator, AND the app-layer eval harness
+  (`../grc-officeqa/eval/eval_e2e.py`).
 - **Logging**: one event stream via `ctx.emit(...)`; full rules in `ARCHITECTURE.md` →
-  "Logging & observability".
+  "Logging & observability". The post-hoc viewer is `scripts/trace_viewer/`.
 - **No formatting-only edits.** Do not reformat lines for length, change quote style
   (single → double), add blank lines between methods, or expand/collapse argument lists
   unless it is part of a substantive change to that line. Formatting-only diffs pollute
   `git diff`, make code review harder, and cause merge conflicts.
+- Don't autonomously launch full eval sweeps (they cost real LLM spend); sanity-check
+  on a couple of items and hand the run command to the user.
 
 ## Setup (.env at repo root)
 
-LLM generation now defaults to **OpenRouter** (`SKUNK_LLM_PROVIDER=openrouter`,
+LLM generation defaults to **OpenRouter** (`SKUNK_LLM_PROVIDER=openrouter`,
 authenticated by `OPENROUTER_API_KEY`) — we no longer have an AI Studio Gemini key, so
 the legacy `genai` path is unavailable. In OpenRouter mode `SKUNK_LLM_MODEL` and every
-model override (`SKUNK_MODEL_OVERRIDES`, the qatfd `agent_model_id`) must be **full
-OpenRouter ids**, e.g. `google/gemini-2.5-flash` or `qwen/qwen-2.5-72b-instruct`.
-Strongly recommended for `lookup_external`: `FRED_API_KEY`, `TAVILY_API_KEY`. Copy
-`.env.example` → `.env`.
-
-Embeddings are unaffected by the provider (they dispatch on the embedding model id). A run
-uses a single provider for all generation; transient errors (429 / 5xx / transport blips)
-are retried with exponential backoff (`llm_client._retry_call`). NOTE: OpenRouter wraps an
+model override must be **full OpenRouter ids**, e.g. `google/gemini-2.5-flash`.
+Copy `.env.example` → `.env`. Transient errors (429 / 5xx / transport blips) are
+retried with exponential backoff (`llm_client._retry_call`). NOTE: OpenRouter wraps an
 upstream provider failure as a 4xx `...ResponseError: Provider returned error`, which is
 *not* retried — `llm_client._error_detail` logs the status + provider metadata + raw body
 alongside the warning so these are diagnosable.
@@ -77,14 +71,9 @@ The legacy **AI Studio Gemini** path (`SKUNK_LLM_PROVIDER=genai`, `GEMINI_API_KE
 model ids like `gemini-3.5-flash`) still exists in code but is dormant until a key is
 restored.
 
-## Data corpus (not in this repo)
-
-Treasury Bulletin PDFs at `~/Desktop/officeqa/treasury_bulletin_pdfs/` (~20 GB, 696 files);
-override with `OFFICEQA_PDF_DIR`. Pre-extracted tables and rendered pages live under
-`cache/` (gitignored), populated on first use.
-
 ## Pointers
 
 - `ARCHITECTURE.md` — architecture, design intent, plan-shape spec
-- `src/skunk/plan.py` — canonical Plan dataclasses + the planner system prompt (plan JSON schema)
-- `data/officeqa_pro.csv` — benchmark (not in git)
+- `REFACTOR_PLAN.md` — the library-hardening refactor plan (phases, decisions)
+- `src/skunk/plan.py` — canonical Plan dataclasses + the planner system prompt
+- `src/skunk/page_store.py` — the corpus-content protocol apps implement

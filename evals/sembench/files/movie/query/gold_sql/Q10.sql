@@ -1,1 +1,0 @@
-SELECT M.id AS movieId, M.audienceScore AS movieScore FROM Movies AS M;

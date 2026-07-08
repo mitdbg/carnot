@@ -15,9 +15,9 @@ import os
 import re
 
 import pandas as pd
-from skunk.eval.scoring import SCORER_VERSION, score_correct
 
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
+from qatfd.benchmarks.officeqa_scoring import SCORER_VERSION, score_correct
 from qatfd.config import OfficeQAConfig
 from qatfd.constants import OFFICE_QA
 from qatfd.paths import resolve_under_benchmarks

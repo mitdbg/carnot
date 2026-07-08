@@ -65,6 +65,9 @@ from qatfd.systems.base import System
 from qatfd.trace_util import dump_trace
 from qatfd.types import Question, Result, report_columns, result_to_row
 
+# keys to ignore when resuming an experiment from a previous run; these fields may naturally change
+_RESUME_IGNORED_KEYS = {"experiments.resume_dir", "experiments.run_name", "results_root", "dry_run"}
+
 @dataclass
 class _RunCtx:
     benchmark: Benchmark
@@ -119,6 +122,114 @@ def _select_questions(benchmark: Benchmark, config: ExperimentConfig) -> list[Qu
     print(f"[qatfd] split '{config.split}': running {len(pool)} question(s).")
 
     return pool
+
+
+def _resolve_run_dir(results_root: str, exp_config: ExperimentConfig, benchmark_name: str, system_name: str):
+    """
+    Resolve the run directory from the given configuration.
+    """
+    # run directory: resume into an existing one (skip finished questions) or create a fresh
+    # timestamped dir. A relative results_root resolves against the cwd; absolute passes through.
+    if exp_config.resume_dir:
+        run_dir = Path(exp_config.resume_dir).expanduser().resolve()
+        if not run_dir.is_dir():
+            raise Exception(f"[qatfd] ABORT: resume_dir {run_dir} does not exist.")
+        print(f"[qatfd] resuming run at {run_dir}")
+    else:
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_label = f"{exp_config.run_name}_{ts}" if exp_config.run_name else ts
+        run_dir = Path(results_root).expanduser().resolve() / benchmark_name / system_name / run_label
+
+    return run_dir
+
+
+def _print_summary(rows: list[Result], report_path: Path) -> None:
+    assert len(rows) > 0, "no results to summarize"
+    n = len(rows)
+    n_failed = sum(1 for r in rows if r.failed)
+    mean_score = sum(r.score for r in rows) / n
+    n_perfect = sum(1 for r in rows if r.score >= 1.0)
+    cost = sum(r.cost for r in rows)
+    print(f"\n[qatfd] Wrote {report_path} ({n} rows)")
+    print(f"[qatfd] {n - n_failed}/{n} produced an answer")
+    print(f"[qatfd] Mean score: {mean_score:.3f} ({n_perfect}/{n} fully correct)")
+    metric_keys: list[str] = []
+    for r in rows:
+        for k in r.recall_metrics:
+            if k not in metric_keys:
+                metric_keys.append(k)
+    for k in metric_keys:
+        vals = [r.recall_metrics.get(k, 0.0) for r in rows]
+        print(f"[qatfd] Mean {k}: {sum(vals) / len(vals):.3f} (over {len(vals)} questions)")
+    print(f"[qatfd] Total cost: ${cost:.4f}")
+
+
+def _persist_run_config(run_dir: Path, cfg: DictConfig, overrides: list[str] | None) -> None:
+    """Snapshot the EXACT config this run used into its own results dir, so a historical
+    run is self-describing without depending on Hydra's separate `.hydra/` output tree.
+    Writes `config.yaml` (the fully-composed, interpolation-resolved config printed at
+    startup) and `overrides.txt` (the CLI overrides that produced it)."""
+    config_file = run_dir / "config.yaml"
+    config_file.write_text(OmegaConf.to_yaml(cfg, resolve=True), encoding="utf-8")
+    if overrides:
+        overrides_file = run_dir / "overrides.txt"
+        overrides_file.write_text("\n".join(overrides) + "\n", encoding="utf-8")
+
+
+def _flatten_config(node: object, prefix: str = "") -> dict[str, object]:
+    """Flatten a nested config container into {dotted.key: leaf} (lists compare as leaves)."""
+    if isinstance(node, dict):
+        flat: dict[str, object] = {}
+        for k, v in node.items():
+            flat.update(_flatten_config(v, f"{prefix}.{k}" if prefix else str(k)))
+        return flat
+    return {prefix: node}
+
+
+def _check_resume_config(run_dir: Path, cfg: DictConfig) -> None:
+    """A resume must be the SAME experiment as the run that created the dir: compare the
+    current composed config against the persisted `config.yaml` key by key, and abort on
+    any difference outside `_RESUME_IGNORED_KEYS` — otherwise the resumed questions would
+    be measured under a different configuration than the rows already in results.jsonl."""
+    config_path = run_dir / "config.yaml"
+    if not config_path.exists():
+        raise Exception(
+            f"[qatfd] ABORT: {config_path} is missing, so the resume cannot be verified against "
+            f"the original run's config. Restore it or start a fresh run."
+        )
+    persisted = _flatten_config(OmegaConf.to_container(OmegaConf.load(config_path), resolve=True))
+    current = _flatten_config(OmegaConf.to_container(cfg, resolve=True))
+    diffs = [
+        f"  {key}: persisted={persisted.get(key, '<missing>')!r} current={current.get(key, '<missing>')!r}"
+        for key in sorted(set(persisted) | set(current))
+        if key not in _RESUME_IGNORED_KEYS and persisted.get(key) != current.get(key)
+    ]
+    if diffs:
+        raise Exception(
+            f"[qatfd] ABORT: resume config does not match {config_path}:\n"
+            + "\n".join(diffs)
+            + f"\nResume with the original run's config (only {', '.join(sorted(_RESUME_IGNORED_KEYS))} may differ)."
+        )
+
+
+def _load_finished_qids(results_path: Path) -> dict[str, Result]:
+    """Completed results from a prior (possibly interrupted) run, keyed by qid. Each line of
+    `results.jsonl` is one `asdict(Result)`; a truncated/corrupt trailing line (process killed
+    mid-write) is skipped rather than fatal."""
+    qid_to_result: dict[str, Result] = {}
+    if not results_path.exists():
+        return qid_to_result
+    with results_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = Result(**json.loads(line))
+            except Exception:  # noqa: BLE001 — skip a partial/corrupt line (e.g. killed mid-flush)
+                continue
+            qid_to_result[r.qid] = r
+    return qid_to_result
 
 
 # ---------------------------------------------------------------------------
@@ -193,158 +304,72 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
     )
 
 
-def _print_summary(rows: list[Result], report_path: Path) -> None:
-    assert len(rows) > 0, "no results to summarize"
-    n = len(rows)
-    n_failed = sum(1 for r in rows if r.failed)
-    mean_score = sum(r.score for r in rows) / n
-    n_perfect = sum(1 for r in rows if r.score >= 1.0)
-    cost = sum(r.cost for r in rows)
-    print(f"\n[qatfd] Wrote {report_path} ({n} rows)")
-    print(f"[qatfd] {n - n_failed}/{n} produced an answer")
-    print(f"[qatfd] Mean score: {mean_score:.3f} ({n_perfect}/{n} fully correct)")
-    metric_keys: list[str] = []
-    for r in rows:
-        for k in r.recall_metrics:
-            if k not in metric_keys:
-                metric_keys.append(k)
-    for k in metric_keys:
-        vals = [r.recall_metrics.get(k, 0.0) for r in rows]
-        print(f"[qatfd] Mean {k}: {sum(vals) / len(vals):.3f} (over {len(vals)} questions)")
-    print(f"[qatfd] Total cost: ${cost:.4f}")
-
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _persist_run_config(
-    run_dir: Path, cfg: DictConfig | None, overrides: list[str] | None
-) -> None:
-    """Snapshot the EXACT config this run used into its own results dir, so a historical
-    run is self-describing without depending on Hydra's separate `.hydra/` output tree.
-    Writes `config.yaml` (the fully-composed, interpolation-resolved config printed at
-    startup) and `overrides.txt` (the CLI overrides that produced it). Best-effort: a
-    snapshot failure must never abort the run."""
-    try:
-        if cfg is not None:
-            try:
-                text = OmegaConf.to_yaml(cfg, resolve=True)
-            except Exception:  # noqa: BLE001 — fall back to unresolved if interpolation fails
-                text = OmegaConf.to_yaml(cfg)
-            (run_dir / "config.yaml").write_text(text, encoding="utf-8")
-        if overrides:
-            (run_dir / "overrides.txt").write_text("\n".join(overrides) + "\n", encoding="utf-8")
-    except Exception as e:  # noqa: BLE001
-        print(f"[qatfd] WARN: failed to persist run config: {e}")
-
-
-def _load_done(results_path: Path) -> dict[str, Result]:
-    """Completed results from a prior (possibly interrupted) run, keyed by qid. Each line of
-    `results.jsonl` is one `asdict(Result)`; a truncated/corrupt trailing line (process killed
-    mid-write) is skipped rather than fatal."""
-    done: dict[str, Result] = {}
-    if not results_path.exists():
-        return done
-    with results_path.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                r = Result(**json.loads(line))
-            except Exception:  # noqa: BLE001 — skip a partial/corrupt line (e.g. killed mid-flush)
-                continue
-            done[r.qid] = r
-    return done
-
 
 def run(
-    benchmark: Benchmark, system: System, exp_config: ExperimentConfig, results_root: str,
-    cfg: DictConfig | None = None, overrides: list[str] | None = None,
+    benchmark: Benchmark, system: System, exp_config: ExperimentConfig, cfg: DictConfig, overrides: list[str] | None = None,
 ) -> None:
+    # force stdout to flush after every newline
     sys.stdout.reconfigure(line_buffering=True)  # type: ignore
+
+    # resolve the directory for storing logs and results for this run
+    run_dir = _resolve_run_dir(cfg.results_root, exp_config, benchmark.name, system.name)
+    trace_dir = run_dir / "traces"
+    trace_dir.mkdir(parents=True, exist_ok=True)
+
+    # snapshot the config for a fresh run; a resume must match the original run's snapshot
+    if not exp_config.resume_dir:
+        _persist_run_config(run_dir, cfg, overrides)
+    else:
+        _check_resume_config(run_dir, cfg)
+
+    # configure observability
+    configure_obs(jsonl_path=str(trace_dir / "events.jsonl"))
 
     # retrieve questions to run based on configuration
     questions = _select_questions(benchmark, exp_config)
     if not questions:
         raise Exception("[qatfd] ABORT: no questions selected for the run. Check your split, qids, and sample settings.")
 
-    # Run directory: resume into an existing one (skip finished questions) or create a fresh
-    # timestamped dir. A relative results_root resolves against the cwd; absolute passes through.
-    if exp_config.resume_dir:
-        run_dir = Path(exp_config.resume_dir).expanduser().resolve()
-        if not run_dir.is_dir():
-            raise Exception(f"[qatfd] ABORT: resume_dir {run_dir} does not exist.")
-        print(f"[qatfd] resuming run at {run_dir}")
-    else:
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_label = f"{exp_config.run_name}_{ts}" if exp_config.run_name else ts
-        run_dir = Path(results_root).expanduser().resolve() / benchmark.name / system.name / run_label
-    trace_dir = run_dir / "traces"
-    trace_dir.mkdir(parents=True, exist_ok=True)
-    # Snapshot config only for a fresh run, so resuming preserves the ORIGINAL run's config/overrides
-    # (the source of truth for how the question set was selected).
-    if not exp_config.resume_dir:
-        _persist_run_config(run_dir, cfg, overrides)
-    configure_obs(jsonl_path=str(trace_dir / "events.jsonl"))
-
-    # Already-completed results (incremental sink); resume skips these qids.
+    # load any already-completed results so we can skip these qids; also drops any partial question traces
     results_path = run_dir / "results.jsonl"
-    done = _load_done(results_path)
-    if done:
-        mismatch = next(
-            (r for r in done.values() if r.benchmark != benchmark.name or r.system != system.name), None
-        )
-        if mismatch:
-            raise Exception(
-                f"[qatfd] ABORT: {results_path} holds {mismatch.benchmark}/{mismatch.system} results, but this "
-                f"run is {benchmark.name}/{system.name}. Resume with the same benchmark + system."
-            )
-    todo = [q for q in questions if q.qid not in done]
+    qid_to_result = _load_finished_qids(results_path)
+    todo = [q for q in questions if q.qid not in qid_to_result]
+    for q in todo:
+        for ext in (".log", ".txt"):
+            (trace_dir / f"{q.qid}{ext}").unlink(missing_ok=True)
 
     print(f"[qatfd] Trace dir: {trace_dir}")
     print(
         f"[qatfd] benchmark={benchmark.name} system={system.name} questions={len(questions)} "
-        f"done={len(done)} todo={len(todo)} workers={exp_config.workers}"
+        f"done={len(qid_to_result)} todo={len(todo)} workers={exp_config.workers}"
     )
 
-    if todo:
-        # build the shared retrieval substrate once (chroma + document_map).
-        resources = benchmark.get_resources()
-        model = system.config.agent_model_id
-        rc = _RunCtx(
-            benchmark=benchmark, system=system, resources=resources,
-            trace_dir=trace_dir, model=model, verbose=exp_config.console,
-        )
-        # Drop any half-written per-question traces from the killed attempt for the questions
-        # we're about to (re)run, so they don't linger alongside the fresh ones.
-        for q in todo:
-            for ext in (".log", ".txt"):
-                (trace_dir / f"{q.qid}{ext}").unlink(missing_ok=True)
+    # build the shared retrieval substrate once (chroma + document_map).
+    resources = benchmark.get_resources()
+    model = system.config.agent_model_id
+    rc = _RunCtx(
+        benchmark=benchmark, system=system, resources=resources,
+        trace_dir=trace_dir, model=model, verbose=exp_config.console,
+    )
 
-        # Append each result to results.jsonl the moment it lands, so a kill mid-run loses nothing
-        # and the run is resumable. The as_completed loop runs in THIS thread, so the writes are
-        # serialized — no lock needed.
-        with results_path.open("a", encoding="utf-8") as rf:
-            def _persist(r: Result) -> None:
+    # execute each question and immediately persist its result to results.jsonl
+    assert exp_config.workers >= 1, "workers must be >= 1"
+    with results_path.open("a", encoding="utf-8") as rf:
+        with ThreadPoolExecutor(max_workers=exp_config.workers) as pool:
+            futures = [pool.submit(lambda q: asyncio.run(_run_one(q, rc)), q) for q in todo]
+            for fut in as_completed(futures):
+                r = fut.result()
                 rf.write(json.dumps(asdict(r)) + "\n")
                 rf.flush()
-                done[r.qid] = r
+                qid_to_result[r.qid] = r
 
-            if exp_config.workers <= 1:
-                for q in todo:
-                    _persist(asyncio.run(_run_one(q, rc)))
-            else:
-                with ThreadPoolExecutor(max_workers=exp_config.workers) as pool:
-                    futures = [pool.submit(lambda q: asyncio.run(_run_one(q, rc)), q) for q in todo]
-                    for fut in as_completed(futures):
-                        _persist(fut.result())
-    else:
-        print("[qatfd] all selected questions already complete; rewriting report.csv from results.jsonl")
 
     # write report.csv from the full completed set, in the original selection order
-    rows = [done[q.qid] for q in questions if q.qid in done]
+    rows = [qid_to_result[q.qid] for q in questions if q.qid in qid_to_result]
     report_path = run_dir / "report.csv"
     with report_path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=report_columns(rows))
@@ -375,7 +400,7 @@ def main(cfg: DictConfig) -> None:
     system = build_system(system_cfg)
 
     if not cfg.dry_run:
-        run(benchmark, system, exp_cfg, results_root=cfg.results_root, cfg=cfg, overrides=overrides)
+        run(benchmark, system, exp_cfg, cfg, overrides=overrides)
 
 
 if __name__ == "__main__":

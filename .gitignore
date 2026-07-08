@@ -309,9 +309,12 @@ skunk/treasury_bulletins_parsed/*
 skunk/treasury_bulletin_pdfs/*
 skunk/venv/
 
-# financebench corpus (PDFs + question jsonl + generated embeddings; fetch from
-# https://github.com/patronus-ai/financebench)
-skunk/financebench/
+# local experiment scratch (deliberately untracked)
+skunk/explore.ipynb
+skunk/compute-experiment.md
+
+# diagram creation
+qatfd/diagrams
 
 # ─────────────────────────────────────────────────────────────────────────────
 # qatfd benchmarks
@@ -332,3 +335,4 @@ qatfd/benchmarks/**
 !qatfd/benchmarks/**/*_splits.json
 !qatfd/benchmarks/**/prompts.yaml
 !qatfd/benchmarks/**/README.md
+!qatfd/benchmarks/**/exclusions.txt

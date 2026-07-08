@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from skunk.common import ExecutionContext
 from skunk.config import SearchAgentConfig
-from skunk.search_agent.search_agent import SearchAgent
+from skunk.search_agent.search_agent import SearchAgent, doc_ids_from_payload
 
 from qatfd.benchmarks.base import BenchmarkResources
 from qatfd.systems.base import RetrieveComputeSystem
@@ -86,17 +86,10 @@ class SearchAgentSystem(RetrieveComputeSystem):
     async def retrieve(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext) -> Retrieved:
         agent = self._build_agent(ctx, resources)
         payload = await agent.call(ctx, q.text)
-        doc_ids = _coerce_doc_ids(payload)
+        doc_ids = doc_ids_from_payload(payload)
         if self.config.agent_mode == "answer":
             answer = payload.get("answer") if isinstance(payload, dict) else None
             return Retrieved(doc_ids=doc_ids, direct_answer=None if answer is None else str(answer))
         return Retrieved(doc_ids=doc_ids)
 
 
-def _coerce_doc_ids(payload) -> list[str]:
-    if not isinstance(payload, dict):
-        return []
-    keys = payload.get("doc_ids") or []
-    if isinstance(keys, str):
-        return [keys]
-    return [str(k) for k in keys]

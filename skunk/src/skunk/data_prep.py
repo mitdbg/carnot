@@ -30,37 +30,38 @@ from skunk.common import (
 )
 from skunk.errors import ParseError
 from skunk.prompted_call import PromptedCall
-from skunk.pyexec import exec_python_with_env, strip_code_fences
+from skunk.pyexec import exec_python_with_env, parse_codegen_reply
 
 # The agent emits each kept value as a full dict (it may have cleaned labels/typos or
 # coalesced prints, so it can't pass the original object through). It authors provenance
 # (doc_id/pages/...) too — copied from the source entry, or UNIONed across sources when it
-# coalesces — so here, unlike elsewhere, provenance is LLM-written rather than machine-stamped.
+# coalesces — so here, unlike elsewhere, provenance is LLM-written rather than
+# machine-stamped; `_result_from_env` re-checks it against the inputs on the trusted side.
 # Allowed keys are exactly `AnnotatedValue`'s fields (kept in sync with the model); any other
 # key is a typo and rejected.
 _VALUE_FIELDS = set(AnnotatedValue.model_fields)
 
-
-def _parse_codegen(raw: str) -> str:
-    """A fenced ```python``` block is required. Empty / bare-JSON → `ParseError` (the caller
-    retries with the detail echoed back)."""
-    s = strip_code_fences(raw).strip()
-    if not s or s.startswith("{"):
-        raise ParseError(
-            raw=raw,
-            detail=(
-                "expected a single fenced ```python``` block assigning `result` — a list of "
-                "dicts, one per kept value. Do not emit a bare JSON object or prose."
-            ),
-        )
-    return s
+# `parse_codegen_reply`'s fix-it text for data-prep replies.
+_CODEGEN_EXPECTATION = (
+    "expected a single fenced ```python``` block assigning `result` — a list of "
+    "dicts, one per kept value. Do not emit a bare JSON object or prose."
+)
 
 
-def _result_from_env(env: dict[str, Any]) -> list[AnnotatedValue]:
+def _result_from_env(
+    env: dict[str, Any], input_values: list[AnnotatedValue]
+) -> list[AnnotatedValue]:
     """Validate the exec environment's `result` into a `list[AnnotatedValue]`. Each entry is a
     dict of value fields (including provenance copied from its source) validated into a fresh
     `AnnotatedValue`; a bare `input_values[i]` object is also accepted and carried verbatim.
-    Raises `ValueError` with a fix-it detail on any malformed shape."""
+    Raises `ValueError` with a fix-it detail on any malformed shape.
+
+    Trusted-side provenance check: the LLM AUTHORS provenance here (copy or union — see the
+    module docstring), so every emitted `doc_id` token and page number must already exist in
+    the inputs. A doc_id/page that appears from nowhere is fabricated provenance and rejects
+    the attempt like any other malformed result."""
+    known_doc_ids = {e.doc_id for e in input_values if e.doc_id}
+    known_pages = {p for e in input_values for p in e.pages}
     result = env.get("result")
     if not isinstance(result, list):
         raise ValueError("`result` must be a list (assign `result = [...]`).")
@@ -81,9 +82,26 @@ def _result_from_env(env: dict[str, Any]) -> list[AnnotatedValue]:
                 f"{sorted(_VALUE_FIELDS)}."
             )
         try:
-            out.append(AnnotatedValue.model_validate(item))
+            validated = AnnotatedValue.model_validate(item)
         except ValidationError as e:
             raise ValueError(f"result[{i}]: invalid AnnotatedValue dict — {e}")
+        if validated.doc_id:
+            bad_docs = [
+                tok for tok in (t.strip() for t in validated.doc_id.split(","))
+                if tok and tok not in known_doc_ids
+            ]
+            if bad_docs:
+                raise ValueError(
+                    f"result[{i}]: doc_id token(s) {bad_docs} do not appear in any input "
+                    "value — copy/union provenance from the source entries, never invent it."
+                )
+        bad_pages = [p for p in validated.pages if p not in known_pages]
+        if bad_pages:
+            raise ValueError(
+                f"result[{i}]: page(s) {bad_pages} do not appear in any input value — "
+                "copy/union provenance from the source entries, never invent it."
+            )
+        out.append(validated)
     return out
 
 
@@ -170,7 +188,7 @@ Reproduce the data exactly — your only changes are removing duplicates, coales
                 "Fix them without introducing new mistakes."
             )
         raw = await self._prompt.call(ctx, user_msg, effort=effort, temperature=0.4)
-        return _parse_codegen(raw)
+        return parse_codegen_reply(raw, expectation=_CODEGEN_EXPECTATION)
 
 
 class DataPrepOp:
@@ -193,7 +211,7 @@ class DataPrepOp:
 
         prev_code: str | None = None
         prev_failure: str | None = None
-        for try_idx in range(ctx.config.compute_max_attempts):
+        for try_idx in range(ctx.config.data_prep_max_attempts):
             try:
                 code = await self._codegen.codegen(
                     ctx, input_values, prev_code, prev_failure
@@ -220,7 +238,7 @@ class DataPrepOp:
                 continue
 
             try:
-                cleaned = _result_from_env(env)
+                cleaned = _result_from_env(env, input_values)
             except ValueError as e:
                 prev_code = code
                 prev_failure = f"`result` malformed: {e}"
@@ -238,7 +256,7 @@ class DataPrepOp:
 
         # Fail safe — never let a bad data-prep run drop compute's inputs.
         ctx.emit(
-            f"data_prep_giveup attempts={ctx.config.compute_max_attempts} "
+            f"data_prep_giveup attempts={ctx.config.data_prep_max_attempts} "
             f"last_failure={prev_failure!r} — passing the original pool through unchanged"
         )
         return input_values

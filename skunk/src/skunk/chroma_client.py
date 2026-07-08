@@ -25,7 +25,8 @@ def make_chroma_client(host: str, port: int):
     except Exception as e:
         raise RuntimeError(
             f"Could not reach the ChromaDB server at {host}:{port} ({e}). "
-            "Start it in a long-lived tmux first:  ./scripts/run_chroma_server.sh "
-            "(override host/port via SKUNK_CHROMA_SERVER_HOST / SKUNK_CHROMA_SERVER_PORT)."
+            "Start a long-lived `chroma run` server over the corpus's chroma dir first "
+            "(skunk ships a wrapper at scripts/run_chroma_server.sh), or point the "
+            "config's chroma server host/port at a running one."
         ) from e
     return client

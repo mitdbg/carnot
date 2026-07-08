@@ -7,7 +7,33 @@ from dataclasses import dataclass
 from typing import cast, Literal
 from omegaconf import DictConfig, OmegaConf
 from qatfd.constants import BROWSECOMP_PLUS, FINANCE_BENCH, FRESHSTACK, OFFICE_QA, QAMPARI, TREC_BIOGEN
-from skunk.config import QATFDSearchAgentConfig, RAGLLMConfig, SearchAgentConfig, SystemConfig
+from skunk.config import SearchAgentConfig, SystemConfig
+
+# ---------------------------------------------------------------------------
+# System configs owned by qatfd (skunk provides the SystemConfig/SearchAgentConfig
+# base; per-system extensions live with the systems that consume them)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RAGLLMConfig(SystemConfig):
+    # number of chunks for the vector search to return
+    top_k: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.top_k is None:
+            raise ValueError(
+                "RAGLLMConfig.top_k is unset (null); set it explicitly, e.g. "
+                "`systems.top_k=20` on the command line."
+            )
+
+
+@dataclass
+class QATFDSearchAgentConfig(SearchAgentConfig):
+    # Mirrors the system hierarchy (QATFDSearchAgentSystem subclasses SearchAgentSystem): the
+    # qatfd variant reuses the full search-agent config (agent_mode, step/token budgets, ...) and
+    # only adds a semantic-filter tool, which needs no extra config beyond agent_model_id (base).
+    pass
 
 # ---------------------------------------------------------------------------
 # General experiment configuration

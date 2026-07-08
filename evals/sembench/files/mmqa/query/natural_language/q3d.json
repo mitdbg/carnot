@@ -1,8 +1,0 @@
-{
-    "nl_question": "Which movies are horror?",
-    "modalities": ["table"],
-    "ground_truth": [
-        "Cloverfield",
-        "Cobweb"
-    ]
-}

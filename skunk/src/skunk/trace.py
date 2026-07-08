@@ -7,14 +7,15 @@ Skunk has three kinds of diagnostic output that used to be wired separately:
    per-question list (`ctx.events`, consumed by the trace dump), streamed to a
    per-question log file when one is open, and *echoed* to the console when the
    question runs verbose.
-2. **Process-scoped logs** — build pipelines (`page_index_old/`), offline prep
-   (`search_agent/`), and library warnings (`LLMClient` retries) that have no
-   per-question `ctx`. These go through stdlib `logging.getLogger(__name__)`.
+2. **Process-scoped logs** — app build pipelines (e.g. grc-officeqa's page
+   index), offline prep (`search_agent/prep`), and library warnings (`LLMClient`
+   retries) that have no per-question `ctx`. These go through stdlib
+   `logging.getLogger(__name__)`.
 3. **A durable machine-readable record** — one JSON line per event.
 
 Everything renders through one function, `render_line`: the per-question console
 echo and the per-question `.log` file call it directly, and process-scoped stdlib
-logs reach it via `_LineFormatter` on the root handler. So all output shares one
+logs reach it via `LineFormatter` on the root handler. So all output shares one
 format and carries a severity level — with no external dependency (capture, the
 JSONL sink, and per-question files are all per-question, which a process-global
 logging framework cannot route correctly when the eval runs questions
@@ -54,7 +55,9 @@ _config_lock = threading.Lock()
 _jsonl_fh: TextIO | None = None
 _jsonl_lock = threading.Lock()
 _JSONL_BUFFER_BYTES = 1 << 20  # large buffer so a big event rarely auto-flushes mid-write
-_jsonl_flush_interval_s = float(os.environ.get("SKUNK_TRACE_FLUSH_S", "0.25"))
+# Flush cadence; the env override is read when the flusher STARTS (`_ensure_jsonl_flusher`),
+# not at import — importing skunk must not read configuration from the environment.
+_jsonl_flush_interval_s = 0.25
 _jsonl_stop = threading.Event()
 _jsonl_flusher: threading.Thread | None = None
 
@@ -72,7 +75,7 @@ def render_line(evt: dict) -> str:
     are the event metadata (`step_idx`, `op`, and `uid`/`logger` when present).
     Long string metadata is capped for readability; the JSONL sink keeps it whole.
     Used for the console echo, the per-question `.log` file, and (via
-    `_LineFormatter`) stdlib records.
+    `LineFormatter`) stdlib records.
     """
     ts = datetime.now().strftime("%H:%M:%S")
     level = evt.get("level", "info")
@@ -93,7 +96,7 @@ def render_line(evt: dict) -> str:
     return "  ".join(parts)
 
 
-class _LineFormatter(logging.Formatter):
+class LineFormatter(logging.Formatter):
     """Renders a stdlib `LogRecord` through `render_line`, so process-scoped logs
     (the `logging.getLogger(__name__)` sites, the retry warning, build pipelines)
     share the exact format of the per-question event stream."""
@@ -111,7 +114,7 @@ class _LineFormatter(logging.Formatter):
 def configure_obs(*, jsonl_path: str | None = None) -> None:
     """Configure the process-wide logging pipeline. Idempotent.
 
-    Installs `_LineFormatter` on the root handler so every stdlib logger renders
+    Installs `LineFormatter` on the root handler so every stdlib logger renders
     like the event stream. The root stays quiet (third-party libs at WARNING)
     while the whole `skunk.*` tree is allowed through at INFO. `jsonl_path`, when
     given, opens the durable JSON-line sink fed by `write_jsonl`.
@@ -128,7 +131,7 @@ def configure_obs(*, jsonl_path: str | None = None) -> None:
             return
 
         handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(_LineFormatter())
+        handler.setFormatter(LineFormatter())
         root = logging.getLogger()
         root.handlers = [handler]
         # Keep the root quiet (third-party libs stay at WARNING) but let the whole
@@ -145,15 +148,6 @@ def configure_obs(*, jsonl_path: str | None = None) -> None:
             _ensure_jsonl_flusher()
 
         _configured = True
-
-
-def get_logger(name: str | None = None) -> logging.Logger:
-    """Process-scoped logger for code with no per-question `ctx` (build pipelines,
-    offline prep). Per-question events go through `ctx.emit`. Defaults to the
-    `skunk` logger so output sits under the one tree configured at INFO."""
-    if not _configured:
-        configure_obs()
-    return logging.getLogger(name or "skunk")
 
 
 def write_jsonl(event: dict) -> None:
@@ -187,8 +181,11 @@ def _jsonl_flush_loop() -> None:
 def _ensure_jsonl_flusher() -> None:
     """Start the single background flusher (once) and register a final flush at exit. Called
     under `_config_lock` from `configure_obs` right after the sink is opened."""
-    global _jsonl_flusher
+    global _jsonl_flusher, _jsonl_flush_interval_s
     if _jsonl_flusher is None:
+        _jsonl_flush_interval_s = float(
+            os.environ.get("SKUNK_TRACE_FLUSH_S", str(_jsonl_flush_interval_s))
+        )
         _jsonl_flusher = threading.Thread(
             target=_jsonl_flush_loop, name="skunk-jsonl-flush", daemon=True
         )

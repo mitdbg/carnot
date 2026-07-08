@@ -5,9 +5,7 @@ accumulates them across one `LLMClient`'s lifetime: every `LLMClient` owns a
 `.usage` tracker that `_build_response` feeds on each successful generation, so
 the agent loop and every system call are counted with no wrapper and no
 positional-arg fishing. Read the tracker after a run (the eval harness builds one
-client per question, so its tracker is naturally per-question scoped), and call
-`.reset()` to zero it for the next accounting window (e.g. to separately bill a
-build/prep phase that reuses a long-lived client).
+client per question, so its tracker is naturally per-question scoped).
 
 Cost comes from a price table on the `SystemConfig` (`llm_prices`), a map of
 `model-substring -> {"in"/"out"/"cached": $/Mtok}`; unmatched models cost 0.
@@ -34,7 +32,7 @@ class UsageTracker:
 
     def __init__(self, default_model: str, prices: dict | None = None) -> None:
         # Guards the mutating accumulators below: a single client is hit concurrently when
-        # tools fan LLM calls across a thread pool (e.g. semfilter's per-doc judges), and the
+        # tools fan LLM calls across a thread pool, and the
         # `+=` increments are read-modify-write across bytecodes, so concurrent adds can drop
         # updates (under-count) without it. Reads (`cost()`, snapshots) run after the writers
         # have joined, so only the writers need the lock.
@@ -47,9 +45,12 @@ class UsageTracker:
         self.n_calls = 0
         # per-model token sums, for cost when a run mixes models. cached is a subset
         # of input (its discounted portion), tracked separately so cost can price it.
+        # thinking is tracked separately from output (providers report it separately;
+        # genai's output_tokens EXCLUDES thoughts) and billed at the output rate.
         self.by_model_in: dict[str, int] = defaultdict(int)
         self.by_model_out: dict[str, int] = defaultdict(int)
         self.by_model_cached: dict[str, int] = defaultdict(int)
+        self.by_model_think: dict[str, int] = defaultdict(int)
         # Embeddings are accounted SEPARATELY from generation: they have only input
         # tokens (no output / no cache), a distinct price, and a distinct call count.
         # Kept out of the generation counters above so a report's `total_input_tokens`
@@ -64,6 +65,7 @@ class UsageTracker:
         in_tok = resp.input_tokens or 0
         out_tok = resp.output_tokens or 0
         cache_tok = resp.cache_input_tokens or 0
+        think_tok = resp.thinking_tokens or 0
         m = model or self.default_model
         with self._lock:
             self.input_tokens += in_tok
@@ -72,6 +74,7 @@ class UsageTracker:
             self.by_model_in[m] += in_tok
             self.by_model_out[m] += out_tok
             self.by_model_cached[m] += cache_tok
+            self.by_model_think[m] += think_tok
             self.n_calls += 1
 
     def add_embed(self, model: str | None, input_tokens: int) -> None:
@@ -84,26 +87,12 @@ class UsageTracker:
             self.by_emb_model_in[m] += input_tokens
             self.n_embed_calls += 1
 
-    def reset(self) -> None:
-        """Zero all counters. Use to start a fresh accounting window on a reused
-        client (e.g. separating a build/prep phase from the query phase)."""
-        with self._lock:
-            self.input_tokens = 0
-            self.output_tokens = 0
-            self.cache_input_tokens = 0
-            self.n_calls = 0
-            self.by_model_in.clear()
-            self.by_model_out.clear()
-            self.by_model_cached.clear()
-            self.embed_tokens = 0
-            self.n_embed_calls = 0
-            self.by_emb_model_in.clear()
-
     def cost(self) -> float:
         """Total USD cost from the price table — generation plus embeddings. Cached input
         tokens are billed at the model's `cached` rate (falling back to `in` when unset)
-        and the remaining (uncached) input tokens at `in`; output tokens at `out`. Every
-        call adds to `by_model_in`, so iterating it covers all models seen."""
+        and the remaining (uncached) input tokens at `in`; output AND thinking tokens at
+        `out` (providers bill thoughts at the output rate). Every call adds to
+        `by_model_in`, so iterating it covers all models seen."""
         if not self.prices:
             return 0.0
         total = 0.0
@@ -116,14 +105,17 @@ class UsageTracker:
             uncached_in = max(0, in_tok - cached)
             total += uncached_in / 1_000_000 * in_rate
             total += cached / 1_000_000 * p.get("cached", in_rate)
-            total += self.by_model_out.get(model, 0) / 1_000_000 * p.get("out", 0.0)
+            out_and_think = self.by_model_out.get(model, 0) + self.by_model_think.get(model, 0)
+            total += out_and_think / 1_000_000 * p.get("out", 0.0)
         return total + self.embed_cost()
 
-    def price_call(self, model: str | None, in_tok: int, cached_tok: int, out_tok: int) -> float | None:
+    def price_call(
+        self, model: str | None, in_tok: int, cached_tok: int, out_tok: int, think_tok: int = 0
+    ) -> float | None:
         """USD cost of a single generation call, priced exactly as `cost()` aggregates (so
         per-call costs sum to the question total): uncached input at `in`, cached input at
-        `cached` (→ `in` when unset), output at `out`. Returns None when there is no price
-        table or no matching entry, so callers can distinguish "unpriced" from "$0.00"."""
+        `cached` (→ `in` when unset), output + thinking at `out`. Returns None when there is
+        no price table or no matching entry, so callers can distinguish "unpriced" from "$0.00"."""
         if not self.prices:
             return None
         p = _match_price(model or self.default_model, self.prices)
@@ -141,7 +133,7 @@ class UsageTracker:
         return (
             uncached / 1_000_000 * in_rate
             + cached_tok / 1_000_000 * p.get("cached", in_rate)
-            + out_tok / 1_000_000 * p.get("out", 0.0)
+            + (out_tok + think_tok) / 1_000_000 * p.get("out", 0.0)
         )
 
     def price_embed(self, model: str | None, in_tok: int) -> float | None:

@@ -14,9 +14,9 @@ Two overrides specialise the base for retrieval:
   - `_block_is_visible` redacts chunks the agent has `prune(...)`d from the
     LLM-facing render, faithful to its prune commands during rollout.
 
-The three tools that read/write prune state share the agent's per-question
-`_pruned_chunk_ids` / `_pruned_doc_ids` sets. The orchestrator builds one
-`SearchAgent` per question / branch, so these sets never leak across questions.
+The tools share the agent's per-question `RetrievalState` (pruned + seen sets,
+see its docstring for the contract). The orchestrator builds one `SearchAgent`
+per question / branch, so state never leaks across questions.
 """
 
 from __future__ import annotations
@@ -25,17 +25,13 @@ from typing import Any
 
 from chromadb.api.models.Collection import Collection
 
-from skunk.common import (
-    B64Image,
-    ExecutionContext,
-    HumanInterventionHandler,
-)
+from skunk.common import B64Image
 from skunk.config import SearchAgentConfig
-from skunk.human_intervention import RequestHumanTool
 from skunk.llm_client import LLMClient
 from skunk.local_python_executor import CodeOutput
 from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent, TextBlock, Tool
 from skunk.search_agent.search_tools import (
+    RetrievalState,
     EMPTY_RESULT_MESSAGE,
     GREP_RESULT_TAG,
     PRUNE_RESULT_TAG,
@@ -78,7 +74,7 @@ class SearchAgent(MultiTurnAgent):
     final_answer_doc = """\
 A JSON object with the `doc_id`s you identified as relevant, under the key "doc_ids". Here is an example:
 ```json
-{"doc_ids": ["combined_statement__historical__cs-1872_12", "govinfo_receipts__1893__SERIALSET-03108_00_00-002-0256-0000_3"]}
+{"doc_ids": ["annual_report_2014_p12", "quarterly_survey_1987_q3_p4"]}
 ```
 Use each `doc_id` exactly as it appears in the search / grep results."""
 
@@ -90,6 +86,7 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         *,
         pdf_dir: str | None = None,
         page_renders_dir: str | None = None,
+        page_ref_parser=None,
         llm_client: LLMClient | None = None,
         emb_model_id: str | None = None,
         extra_tools: tuple[Tool, ...] = (),
@@ -100,8 +97,6 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         generation_backend=None,
         sampling_params: dict | None = None,
         capture_logprobs: bool = False,
-        human_intervention_handler: HumanInterventionHandler | None = None,
-        required_docs: list[str] | None = None,
     ):
         # `briefing` / `final_answer_doc` override the class-level defaults on this
         # instance so MultiTurnAgent's template path picks them up (only consulted when
@@ -112,61 +107,35 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             self.final_answer_doc = final_answer_doc
         self.config = config
         self.chroma_collection = chroma_collection
-        required_doc_prefixes = {
-            doc.replace("-", "_") + "_"
-            for doc in required_docs or []
-        }
-        self.document_map = (
-            {
-                doc_id: text
-                for doc_id, text in document_map.items()
-                if any(doc_id.startswith(prefix) for prefix in required_doc_prefixes)
-            }
-            if required_doc_prefixes
-            else document_map
-        )
+        self.document_map = document_map
         # Query embedding goes through an LLMClient (it owns backend dispatch + usage
         # accounting). Callers on the per-question request path pass `ctx.llm_client` so
         # embedding spend is billed onto that question's tracker; offline / build paths
         # pass nothing and get a standalone client (embeddings work, untracked).
         self._emb_llm_client = llm_client or LLMClient(config)
         self.emb_model_id = emb_model_id or config.emb_model_id
-        required_filter = None
-        if required_docs:
-            clauses = [
-                {
-                    "$and": [
-                        {"year": doc[:4]},
-                        {"month": doc[5:]},
-                    ]
-                }
-                for doc in required_docs
-            ]
-            required_filter = clauses[0] if len(clauses) == 1 else {"$or": clauses}
 
         # Bound each search-step LLM call: cap output (was uncapped → runaway
         # generations streamed to the 65535-token ceiling at 200–800s each) and
-        # impose a hard per-request wall-clock timeout. See SkunkConfig for the
+        # impose a hard per-request wall-clock timeout. See SearchAgentConfig for the
         # thinking/max_output_tokens interaction caveat.
         self.max_output_tokens = config.search_agent_max_output_tokens
         self.request_timeout_s = config.search_agent_request_timeout_s
 
-        # Per-question prune state: shared by the search / grep / prune tools and
-        # read by `_block_is_visible` for redaction. One SearchAgent per
-        # question / branch ⇒ these sets never cross-talk between questions.
-        self._pruned_chunk_ids: set[str] = set()
-        self._pruned_doc_ids: set[str] = set()
-        # Already-fetched chunks/docs, auto-excluded from subsequent search/grep so each
-        # call surfaces new material (no re-duplication in context). Distinct from the
-        # pruned sets: fetched chunks STAY visible — `prune(...)` is only for ruling out
-        # irrelevant material. Shared by reference with the search/grep/read tools.
-        self._seen_chunk_ids: set[str] = set()
-        self._seen_doc_ids: set[str] = set()
+        # Per-question retrieval state (pruned + seen sets), shared by reference
+        # with the search / grep / read / prune tools and read by
+        # `_block_is_visible` for redaction — see `RetrievalState`'s docstring for
+        # the per-set contract. One SearchAgent per question / branch ⇒ state
+        # never cross-talks between questions.
+        self._state = RetrievalState()
 
         # Tool instances capture their deps; the prompt's tool docs are generated
         # from their `doc`s by the base, so tools and docs can't drift.
         if pdf_dir is not None:
-            extra_tools += (ViewFigureTool(self.document_map, pdf_dir, renders_dir=page_renders_dir),)
+            extra_tools += (ViewFigureTool(
+                self.document_map, pdf_dir, renders_dir=page_renders_dir,
+                page_ref_parser=page_ref_parser,
+            ),)
         tools: list[Tool] = []
         # Vector search over the corpus. A caller can drop it (`include_search_corpus=False`)
         # to force the agent onto other retrieval tools — e.g. qatfd system #3 removes it so
@@ -175,30 +144,23 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         if include_search_corpus:
             tools.append(SearchCorpusTool(
                 self.chroma_collection, self.emb_model_id, self._emb_llm_client,
-                self._pruned_chunk_ids, self._pruned_doc_ids,
-                required_filter,
-                seen_chunk_ids=self._seen_chunk_ids, seen_doc_ids=self._seen_doc_ids,
+                self._state,
             ))
         tools += [
             GrepCorpusTool(
                 self.chroma_collection,
-                self._pruned_chunk_ids,
-                self._pruned_doc_ids,
                 config.grep_max_output_tokens,
-                required_filter,
-                seen_chunk_ids=self._seen_chunk_ids, seen_doc_ids=self._seen_doc_ids,
+                self._state,
             ),
             ReadDocumentTool(
                 self.document_map,
                 config.agent_max_pages_per_tool_call,
                 config.read_document_max_output_chars,
-                seen_doc_ids=self._seen_doc_ids,
+                self._state,
             ),
-            PruneTool(self._pruned_chunk_ids, self._pruned_doc_ids),
+            PruneTool(self._state),
             *extra_tools,
         ]
-        if human_intervention_handler is not None:
-            tools.append(RequestHumanTool(human_intervention_handler))
         super().__init__(
             tools, max_steps=config.agent_max_steps,
             max_misfires=config.agent_max_misfires,
@@ -215,9 +177,9 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
     def _block_is_visible(self, block: Block) -> bool:
         """Redact pruned chunks from the LLM-facing render (full trajectory is kept)."""
         if isinstance(block, ChunkBlock):
-            if block.chunk_id is not None and block.chunk_id in self._pruned_chunk_ids:
+            if block.chunk_id is not None and block.chunk_id in self._state.pruned_chunk_ids:
                 return False
-            if block.doc_id in self._pruned_doc_ids:
+            if block.doc_id in self._state.pruned_doc_ids:
                 return False
         return True
 
@@ -298,35 +260,16 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             blocks.append(TextBlock("[no output]"))
         return blocks
 
-    # ------------------------------------------------------------------
-    # Retriever entry point
-    # ------------------------------------------------------------------
 
-    async def retrieve(
-        self,
-        ctx: ExecutionContext,
-        question: str,
-        *,
-        branch_key: str | None = None,
-        branch_period: str | None = None,
-        required_docs: list[str] | None = None,
-    ) -> list[str]:
-        parts = [f"Question: {question}"]
-        if branch_key:
-            parts.append(f"Search focus: {branch_key}")
-        if branch_period:
-            parts.append(f"Time period (of the data): {branch_period}")
-        if required_docs:
-            parts.append(
-                "Human-required source documents (hard scope): "
-                + ", ".join(required_docs)
-            )
-        payload = await self.call(ctx, "\n".join(parts))
-        return self._doc_ids_from_payload(payload)
-
-    @staticmethod
-    def _doc_ids_from_payload(payload: Any) -> list[str]:
-        keys = payload.get("doc_ids") or []
-        if isinstance(keys, str):
-            return [keys]
-        return [str(k) for k in keys]
+def doc_ids_from_payload(payload: Any) -> list[str]:
+    """The `doc_ids` list out of a SearchAgent final-answer payload, coerced to
+    strings; [] for a malformed payload (non-dict, or a missing/empty key). A bare
+    string value is treated as a single id. The one place the final-answer shape
+    (`final_answer_doc`) is decoded — callers compose their own user message,
+    `await agent.call(ctx, msg)`, and decode with this."""
+    if not isinstance(payload, dict):
+        return []
+    keys = payload.get("doc_ids") or []
+    if isinstance(keys, str):
+        return [keys]
+    return [str(k) for k in keys]

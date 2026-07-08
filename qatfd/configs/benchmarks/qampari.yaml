@@ -14,7 +14,7 @@
 #        #            -> wikipedia_chunks/chunks_v5/wikipedia_chunks_*.jsonl
 #   2. embed the full corpus (GPU):  sbatch engaging-scripts/run_qampari_embeddings.slurm
 #   3. build the Chroma collection (its per-benchmark store dir; the 25.9M index is large):
-#        python -m skunk.search_agent.prep.create_vector_db \
+#        python3 engaging-scripts/create_vector_db.py \
 #          --embeddings-dir <bench>/qampari/qampari-element-embeddings \
 #          --collection-name qwen-qampari-0.6b --chroma-path <bench>/qampari/chromadb --benchmark qampari
 #   4. serve it (embedded reads deadlock under the eval's concurrency, so qampari reads via a server):

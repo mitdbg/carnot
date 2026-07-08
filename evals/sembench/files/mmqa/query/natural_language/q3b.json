@@ -1,9 +1,0 @@
-{
-    "nl_question": "Which movies are sci-fi?",
-    "modalities": ["table"],
-    "ground_truth": [
-        "Hot Tub Time Machine",
-        "Item 47",
-        "Extinction"
-    ]
-}

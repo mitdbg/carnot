@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from skunk.lookup_tools import DEFAULT_PRIORITIZATION, resolve_lookup_tools
 from skunk.common import AnnotatedValue, ExecutionContext
-from skunk.human_intervention import RequestHumanTool
 from skunk.multi_turn_agent import MultiTurnAgent, Tool
 from skunk.plan import LookupBranch
 
@@ -71,16 +70,14 @@ Put the value's publisher/origin in `source`. Examples:
 class LookupExternalOp:
     async def run(self, ctx: ExecutionContext, branch: LookupBranch) -> list[AnnotatedValue]:
         tools = resolve_lookup_tools(ctx.config)
-        if ctx.human_intervention_enabled and ctx.human_intervention_handler is not None:
-            tools = [*tools, RequestHumanTool(ctx.human_intervention_handler)]
         agent = LookupAgent(
             max_steps=ctx.config.lookup_max_steps,
             tools=tools,
         )
-        # Cap each agent turn like SearchAgent/SelectAgent: an uncapped lookup turn
+        # Cap each agent turn like SearchAgent: an uncapped lookup turn
         # hung 250s+ (thinking-only generation) and stalled the whole question.
-        agent.max_output_tokens = ctx.config.select_agent_max_output_tokens
-        agent.request_timeout_s = ctx.config.select_agent_request_timeout_s
+        agent.max_output_tokens = ctx.config.lookup_agent_max_output_tokens
+        agent.request_timeout_s = ctx.config.lookup_agent_request_timeout_s
         user_msg = branch.model_dump_json(
             include={"target", "src"}, indent=2, exclude_none=True,
         )

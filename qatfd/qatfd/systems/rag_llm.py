@@ -27,8 +27,7 @@ class RAGLLMSystem(RetrieveComputeSystem):
         # Embed via this question's LLMClient (ctx.llm_client) so query-embedding tokens/cost
         # land on the same usage tracker the runner reads; backend = config.emb_provider.
         tool = SearchCorpusTool(
-            resources.chroma_collection, self.config.emb_model_id, ctx.llm_client,
-            set(), set(), ctx=ctx,
+            resources.chroma_collection, self.config.emb_model_id, ctx.llm_client, ctx=ctx,
         )
 
         # emit under a "retrieve" step so the per-question trace records what this vector search returned

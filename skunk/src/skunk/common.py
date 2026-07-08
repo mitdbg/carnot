@@ -33,32 +33,13 @@ from skunk.config import SystemConfig
 
 if TYPE_CHECKING:
     from skunk.llm_client import LLMClient
+    from skunk.page_store import PageContentStore
     from skunk.prompted_call import PromptOverride
 
 # Reasoning-effort knob, mapped onto Gemini's `thinking_level` enum. "off" means
 # no thinking; "minimal" is the cheapest thinking tier.
 Effort = Literal["off", "minimal", "low", "medium", "high"]
 EFFORT_VALUES = ("off", "minimal", "low", "medium", "high")
-
-HumanInterventionHandler = Callable[
-    [str, str, str | None, list[str], dict[str, Any] | None],
-    Awaitable[dict[str, Any]],
-]
-
-# Optimistic review registration: same (task, instruction, question, source_docs, guidance)
-# shape as the blocking handler, but synchronous and fire-and-forget — it opens a human review
-# on the server and returns a review id (or None) WITHOUT suspending the branch. The branch
-# keeps the LLM result; a human resolve later drives a server-side recompute. Wired only under
-# the competition server (the broker injects it); None for a local CLI run.
-HumanReviewRegister = Callable[
-    [str, str, str | None, list[str], dict[str, Any] | None],
-    str | None,
-]
-
-@dataclass(frozen=True)
-class PendingHumanIntervention:
-    response: Awaitable[dict[str, Any]]
-
 
 @dataclass
 class B64Image:
@@ -188,7 +169,6 @@ class _RateLimiter:
 # and call `get_rate_limiter("<name>")` at the call site.
 _RATE_LIMITS: dict[str, tuple[str, float]] = {
     # name          (env override,            default rpm)  # rationale
-    "llm": ("SKUNK_LLM_RPM", 1000.0),  # Gemini generation; provider-side quota
     "embed": (
         "SKUNK_EMBED_RPM",
         600.0,
@@ -235,6 +215,81 @@ def get_rate_limiter(name: str, rate_per_min: float | None = None) -> _RateLimit
         if lim is None:
             lim = _RateLimiter(rate_per_sec=_resolve_rate_per_sec(name, rate_per_min))
             _LIMITERS[name] = lim
+        return lim
+
+
+# ---------------------------------------------------------------------------
+# Tokens-per-minute (TPM) throttle — async; per-model caps come from the
+# SystemConfig (`llm_model_tpm`, falling back to `llm_default_tpm`).
+#
+# The RPM limiter alone can't bound token throughput: one request can carry tens
+# of thousands of tokens, so a request-paced run still blows a TPM quota (the
+# full-text page-index filter pushed ~36M tok/min and 429-stormed). This bucket
+# meters estimated *input* tokens per call. Mirrors `_RateLimiter.acquire_async`'s
+# cross-loop safety (threading.Lock around refill+deduct, sleep outside the lock).
+# Inert for any model whose effective TPM is falsy (None/0) — paced by RPM alone.
+# Housed here so BOTH process-wide pacing registries (RPM above, TPM below) live
+# in one module with one idiom.
+# ---------------------------------------------------------------------------
+
+
+class AsyncTokenBudget:
+    """Like `_RateLimiter.acquire_async` but `acquire(amount)` deducts a variable token
+    count (the call's estimated input tokens). `capacity` allows a short burst
+    and must exceed the largest single request, or `acquire` would cap-clamp it."""
+
+    def __init__(self, rate_per_sec: float, capacity: float) -> None:
+        if rate_per_sec <= 0:
+            raise ValueError(f"rate_per_sec must be > 0 (got {rate_per_sec})")
+        self._rate = rate_per_sec
+        self._capacity = max(capacity, rate_per_sec)
+        self._tokens = self._capacity
+        self._last_refill = time.monotonic()
+        self._lock = threading.Lock()
+
+    def _refill_locked(self) -> None:
+        now = time.monotonic()
+        elapsed = now - self._last_refill
+        if elapsed > 0:
+            self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+            self._last_refill = now
+
+    async def acquire(self, amount: float) -> None:
+        amount = max(0.0, min(float(amount), self._capacity))
+        while True:
+            with self._lock:
+                self._refill_locked()
+                if self._tokens >= amount:
+                    self._tokens -= amount
+                    return
+                wait_s = (amount - self._tokens) / self._rate
+            await asyncio.sleep(wait_s)
+
+    def settle(self, delta: float) -> None:
+        """Post-call correction: charge `delta` (actual minus estimated tokens)
+        without awaiting. May drive the balance negative so the next `acquire`
+        waits longer — this is what makes the throttle track ACTUAL token usage
+        even when the pre-call estimate is off. No-op for delta 0."""
+        if not delta:
+            return
+        with self._lock:
+            self._refill_locked()
+            self._tokens -= delta
+
+
+_ASYNC_TPM_LOCK = threading.Lock()
+_ASYNC_TPM_LIMITERS: dict[str, AsyncTokenBudget] = {}
+
+
+def get_async_tpm_limiter(model: str, tpm: float) -> AsyncTokenBudget:
+    """Process-wide TPM bucket for `model`, paced at `tpm` tokens/min. Capacity is
+    ~4s of budget so a few large concurrent requests can burst, then throttle."""
+    with _ASYNC_TPM_LOCK:
+        lim = _ASYNC_TPM_LIMITERS.get(model)
+        if lim is None:
+            rate_per_sec = tpm / 60.0
+            lim = AsyncTokenBudget(rate_per_sec, capacity=max(rate_per_sec * 4.0, 256_000.0))
+            _ASYNC_TPM_LIMITERS[model] = lim
         return lim
 
 
@@ -315,22 +370,9 @@ def parse_json_response(text: str) -> Any | None:
         return None
 
 
-def chunk(seq: list, n: int) -> list[list]:
-    """Split `seq` into consecutive sub-lists of at most `n` items."""
-    return [seq[i : i + n] for i in range(0, len(seq), n)]
-
-
-@dataclass
-class LLMResponse:
-    text: str
-    latency_s: float
-    input_tokens: int | None
-    output_tokens: int | None
-
-
-def make_genai_client() -> genai.Client:
-    """Build a direct-Gemini (AI Studio) genai.Client from `GEMINI_API_KEY`.
-    Auth via api-key; no GCP project required.
+def make_genai_client(api_key: str | None = None) -> genai.Client:
+    """Build a direct-Gemini (AI Studio) genai.Client. Auth via api-key (explicit
+    `api_key` param, else `GEMINI_API_KEY`); no GCP project required.
 
     No client-side request timeout is set: HttpOptions.timeout doubles as a
     SERVER deadline (the API kills the request with 504 DEADLINE_EXCEEDED at
@@ -338,7 +380,7 @@ def make_genai_client() -> genai.Client:
     reads that deliberate for minutes — into deterministic retry-storm failures.
     Slow calls are given however long the transport allows; transport-level
     connection faults still surface and are retried (`llm_client._is_retryable`)."""
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = api_key or os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not set (required for Gemini API)")
     # By default the SDK's httpx pool caps concurrent requests at 100 (max_connections),
@@ -449,9 +491,8 @@ class AnnotatedValue(BaseModel):
     is machine-stamped from the extract inputs — the source page refs and the
     retrieve branch — NOT authored by the LLM. `obtained_visually` records the
     machine fact that this value was read by the vision tier (the figure/chart
-    fallback), and gates the human figure ("Visual QA") review; it is internal
-    provenance and never shown to any LLM (it is excluded from every prompt
-    rendering). It is absent (None/empty) for
+    fallback); it is internal provenance and never shown to any LLM (it is
+    excluded from every prompt rendering). It is absent (None/empty) for
     external lookups. `doc_id` is the source document the value was read from,
     carried as that document's id — its parsed-JSON/PDF filename stem (e.g.
     "combined_statement__historical__cs-1872"). It identifies the source
@@ -680,19 +721,16 @@ class ExecutionContext:
         None  # when set, stream this question's events to that file (live, flushed)
     )
     events: list[dict] = field(default_factory=list)  # per-question diagnostic events
-    config: SystemConfig
     llm_client: LLMClient | None = (
         None  # auto-created in __post_init__; pass a mock to override
     )
     prompt_overrides: tuple[
         PromptOverride, ...
     ] = ()  # corpus/few_shot/lesson overrides; operators pick out their own entries by name
-    human_intervention_handler: HumanInterventionHandler | None = None
-    human_intervention_enabled: bool = False
-    # Optimistic, non-blocking review registration (server only). When set, the data-prep pool
-    # and lookup gates open a review and keep the LLM result instead of awaiting the human — see
-    # `HumanReviewRegister` and `HumanAssist.register_pool_review`/`register_lookup`.
-    human_review_register: HumanReviewRegister | None = None
+    # Corpus page-content backend for the extract operator (see `skunk.page_store`).
+    # None → extract fails with a clear StepFailed; apps inject their implementation
+    # via `Orchestrator(page_store=...)`.
+    page_store: PageContentStore | None = None
 
     def __post_init__(self) -> None:
         if self.llm_client is None:

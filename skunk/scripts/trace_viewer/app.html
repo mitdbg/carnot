@@ -1,0 +1,1099 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>E2E Trace Viewer</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --bg:#0d0d0d; --bg1:#141414; --bg2:#1a1a1a; --bg3:#202020;
+      --border:#252525; --border2:#2e2e2e;
+      --text:#e0e0e0; --text2:#aaaaaa; --text3:#666666;
+      --green:#33cc33; --yellow:#e6b800; --red:#ff4444; --blue:#3399ff; --purple:#cc66ff;
+      --green-bg:#001a00; --yellow-bg:#242200; --red-bg:#2a0000; --blue-bg:#001524; --purple-bg:#150022;
+    }
+    html, body { background: var(--bg); color: var(--text); font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; font-size: 13px; line-height: 1.5; min-height: 100vh; }
+    #app { max-width: 1500px; margin: 0 auto; padding: 16px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+    .header { display:flex; align-items:center; gap:12px; margin-bottom:14px; padding-bottom:12px; border-bottom:1px solid var(--border); }
+    .header-title { font-size:13px; font-weight:700; letter-spacing:2px; text-transform:uppercase; color: var(--green); }
+    .header-sub { font-size:11px; color: var(--text3); }
+
+    .card { background: var(--bg2); border:1px solid var(--border); border-radius:6px; padding:14px 16px; margin-bottom:10px; }
+    .card-title { font-size:10px; font-weight:700; letter-spacing:1.2px; text-transform:uppercase; color: var(--text3); margin-bottom:10px; }
+
+    .selectors { display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; }
+    .sel-group { display:flex; flex-direction:column; gap:4px; }
+    .sel-group label { font-size:10px; font-weight:600; letter-spacing:0.8px; text-transform:uppercase; color: var(--text3); }
+    select { background: var(--bg1); color: var(--text); border:1px solid var(--border2); border-radius:4px; padding:6px 10px; font-size:12px; min-width:240px; cursor:pointer; appearance:none;
+      background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23666'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:right 8px center; padding-right:24px; max-width:680px; }
+    select:focus { outline:none; border-color: var(--green); }
+    .sel-group.narrow select { min-width:150px; }
+    .toggle-row { display:flex; align-items:center; gap:6px; }
+    .toggle-row label { font-size:11px; color: var(--text3); cursor:pointer; user-select:none; }
+    input[type=checkbox] { accent-color: var(--green); cursor:pointer; }
+
+    .q-text { font-size:14px; line-height:1.65; margin-bottom:12px; }
+    .kv { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:6px; font-size:12px; align-items:baseline; }
+    .kv .k { color: var(--text3); text-transform:uppercase; font-size:10px; letter-spacing:0.8px; min-width:92px; padding-top:2px; }
+    .kv .v { color: var(--text); white-space:pre-wrap; }
+
+    .badge { display:inline-block; font-size:10px; font-weight:700; letter-spacing:0.6px; padding:2px 7px; border-radius:3px; text-transform:uppercase; }
+    .badge.pass { background: var(--green-bg); color: var(--green); }
+    .badge.fail { background: var(--red-bg); color: var(--red); }
+
+    /* page / source chips */
+    .chip { display:inline-block; font-family: ui-monospace, monospace; font-size:11px; padding:2px 8px; border-radius:10px; border:1px solid var(--border2); margin:2px 5px 2px 0; color: var(--text2); }
+    .chip-gold { color: var(--green); border-color:#1f5f1f; background: var(--green-bg); }
+    .chip-retr { color: var(--blue); border-color:#14406a; background: var(--blue-bg); }
+    .chip-none { color: var(--text3); border-style:dashed; }
+
+    /* plan tabs */
+    .tabs { display:flex; gap:4px; flex-wrap:wrap; margin-bottom:12px; border-bottom:1px solid var(--border); }
+    .tab { padding:6px 14px; border:1px solid var(--border2); border-bottom:none; border-radius:5px 5px 0 0; background:var(--bg1); color:var(--text2); cursor:pointer; font-size:12px; position:relative; top:1px; }
+    .tab.active { background:var(--bg3); color:var(--text); border-color:var(--purple); }
+    .reason-box { border:1px solid #3a2e00; border-left:3px solid var(--yellow); background:#171200; padding:8px 11px; margin-bottom:12px; border-radius:4px; font-size:12px; }
+    .reason-box .rl { color: var(--yellow); font-weight:700; font-size:10px; letter-spacing:0.8px; text-transform:uppercase; margin-bottom:4px; }
+
+    /* linear flow groups (planning / branch chains) */
+    .flow-group { border:1px solid var(--border2); border-radius:7px; background:rgba(255,255,255,0.014); padding:8px 10px 4px; }
+    .flow-group.muted { opacity:0.5; }
+    .flow-head { display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin-bottom:7px; }
+    .flow-label { font-size:10px; font-weight:700; letter-spacing:1px; text-transform:uppercase; color: var(--text3); }
+    .flow-key { font-size:13px; color: var(--text); font-weight:600; }
+    .flow-fields { font-size:12px; color: var(--text2); flex-basis:100%; }
+    .flow-fields b { color: var(--text); font-weight:600; }
+    .flow-pages { flex-basis:100%; margin-top:2px; }
+    .flow-arrow { text-align:center; color: var(--text3); font-size:15px; line-height:1; margin:4px 0; }
+    .status { font-size:10px; font-weight:700; letter-spacing:0.5px; padding:2px 7px; border-radius:3px; text-transform:uppercase; }
+    .status.executed { color: var(--green); background: var(--green-bg); }
+    .status.added    { color: var(--blue);  background: var(--blue-bg); }
+    .status.carried  { color: var(--text2); background: var(--bg3); }
+    .status.dropped  { color: var(--red);   background: var(--red-bg); }
+
+    .op-badge { font-size:10px; font-weight:700; letter-spacing:0.6px; padding:2px 7px; border-radius:3px; text-transform:uppercase; }
+
+    /* operator nodes */
+    .node { border:1px solid var(--border); border-radius:6px; margin-bottom:8px; background: var(--bg2); overflow:hidden; }
+    .node.failed { border-color:#5a1414; }
+    .node > summary { list-style:none; cursor:pointer; padding:9px 11px; display:flex; align-items:center; gap:9px; flex-wrap:wrap; }
+    .node > summary::-webkit-details-marker { display:none; }
+    .ti { display:inline-block; transition: transform 0.12s; color: var(--text3); font-size:11px; width:10px; }
+    details[open] > summary > .ti { transform: rotate(90deg); }
+    .node-summary { color: var(--text2); font-size:12px; flex:1 1 280px; min-width:0; }
+    .node-summary .err { color: var(--red); }
+    .node-meta { color: var(--text3); font-size:11px; }
+    .timing { color: var(--text3); font-size:11px; font-family: ui-monospace, monospace; }
+    .node-body { padding:6px 11px 11px 11px; border-top:1px solid var(--border); }
+
+    /* messages */
+    .msg { border-left:4px solid var(--text3); border-radius:0 4px 4px 0; padding:7px 10px; margin:6px 0; background: var(--bg1); }
+    .msg-bar { display:flex; align-items:center; gap:8px; margin-bottom:4px; font-size:10px; font-weight:700; letter-spacing:0.8px; }
+    .msg-bar .meta { margin-left:auto; color: var(--text3); font-weight:500; font-size:10px; }
+    .msg-text { font-family: ui-monospace, monospace; font-size:12px; line-height:1.55; white-space:pre-wrap; word-break:break-word; color: var(--text); }
+    .msg.compact { border-left-width:2px; padding:3px 10px; background:transparent; margin:2px 0; }
+    .msg.compact .msg-line { font-family: ui-monospace, monospace; font-size:11px; color: var(--text3); white-space:pre-wrap; word-break:break-word; }
+    .expand-btn { margin-top:5px; background:var(--bg3); border:1px solid var(--border2); color:var(--blue); font-size:11px; padding:2px 9px; border-radius:4px; cursor:pointer; }
+    .expand-btn:hover { border-color:var(--blue); }
+
+    .chunk { border:1px solid var(--border2); border-radius:4px; margin:5px 0; overflow:hidden; }
+    .chunk-meta { background: var(--bg3); color: var(--blue); font-size:10px; padding:3px 8px; font-family: ui-monospace, monospace; }
+    .chunk-text { font-family: ui-monospace, monospace; font-size:11px; line-height:1.5; white-space:pre-wrap; word-break:break-word; padding:6px 8px; color: var(--text2); }
+
+    .hint { color: var(--text3); font-size:12px; padding:8px 2px; }
+    .empty { color: var(--text3); font-style:italic; font-size:11px; }
+
+    /* retrieval funnel stages */
+    .stage { border:1px solid var(--border2); border-radius:6px; background:var(--bg1); margin:6px 0; }
+    .stage > summary { list-style:none; cursor:pointer; padding:7px 10px; display:flex; gap:9px; align-items:center; flex-wrap:wrap; }
+    .stage > summary::-webkit-details-marker { display:none; }
+    .stage-name { font-size:10px; font-weight:700; letter-spacing:1px; text-transform:uppercase; color:var(--blue); min-width:84px; }
+    .stage-stat { font-size:12px; color:var(--text2); }
+    .stage-body { padding:4px 10px 9px; border-top:1px solid var(--border); }
+    .chip-lost { color:var(--red); border-color:#6a1414; background:var(--red-bg); }
+
+    /* block-select tournament */
+    .round-row { margin:8px 0; }
+    .round-label { font-size:10px; font-weight:700; letter-spacing:0.8px; text-transform:uppercase; color:var(--text3); margin-bottom:5px; }
+    .tcalls { display:flex; flex-wrap:wrap; gap:6px; align-items:flex-start; }
+    .tcall { border:1px solid var(--border2); border-radius:5px; background:var(--bg2); flex:0 1 auto; min-width:150px; max-width:100%; }
+    .tcall.lost { border-color:var(--red); background:var(--red-bg); }
+    .tcall > summary { list-style:none; cursor:pointer; padding:5px 9px; font-family:ui-monospace,monospace; font-size:11px; color:var(--text); white-space:nowrap; }
+    .tcall > summary::-webkit-details-marker { display:none; }
+    .tcall-meta { color:var(--text3); font-size:10px; }
+    .tcall-body { border-top:1px solid var(--border); padding:5px 9px; max-height:320px; overflow:auto; }
+    .tblock { font-family:ui-monospace,monospace; font-size:11px; line-height:1.5; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:560px; }
+    .tblock.dropped { color:var(--text3); }
+    .tblock.gold-kept { color:var(--green); }
+    .tblock.gold-lost { color:var(--red); font-weight:700; }
+
+    /* qatfd: question-header metadata pills (label + value, visually separated) */
+    .metabar { display:flex; gap:7px; flex-wrap:wrap; margin:9px 0 12px; }
+    .metapill { display:inline-flex; align-items:baseline; gap:7px; background:var(--bg3); border:1px solid var(--border2); border-radius:4px; padding:3px 10px; }
+    .metapill .mk { color:var(--text3); text-transform:uppercase; letter-spacing:0.7px; font-size:9px; font-weight:700; }
+    .metapill .mv { color:var(--text); font-family: ui-monospace, monospace; font-size:11px; }
+
+    /* qatfd: agent-turn summary tweaks (reuse .node) */
+    .node > summary .node-summary.mono { font-family: ui-monospace, monospace; font-size:11px; color: var(--text2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; flex:1 1 auto; min-width:40px; }
+    /* always-visible step/cumulative latency + cost badges, pinned to the summary's right */
+    .tmetrics { display:inline-flex; gap:7px; flex:0 0 auto; margin-left:auto; }
+    .tmetric { font-family: ui-monospace, monospace; font-size:11px; padding:2px 8px; border-radius:4px; border:1px solid var(--border2); background: var(--bg1); white-space:nowrap; display:inline-flex; align-items:baseline; gap:4px; }
+    .tmetric.tlat  { color: var(--blue); }
+    .tmetric.tcost { color: var(--green); }
+    .tmetric .tm-k   { color: var(--text3); font-size:9px; font-weight:700; letter-spacing:0.4px; }
+    .tmetric .tm-sep { color: var(--text3); margin:0 1px; }
+
+    /* qatfd: rag-llm retrieval — top-k chunk list */
+    .rag-retr .rc-stat { font-size:11px; color: var(--text3); margin:6px 0 4px; }
+    .rc { border:1px solid var(--border2); border-radius:5px; margin:4px 0; background: var(--bg1); }
+    .rc-head { display:flex; align-items:center; gap:10px; padding:5px 9px; cursor:pointer; font-size:11px; }
+    .rc-head:hover { background: var(--bg3); }
+    .rc-head .ti { color: var(--text3); width:10px; }
+    .rc-rank { color: var(--text3); min-width:30px; }
+    .rc-doc { color: var(--blue); font-weight:600; }
+    .rc-chunk { color: var(--text3); flex:1 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .rc-dist { color: var(--yellow); }
+    .rc-text { font-family: ui-monospace, monospace; font-size:11px; line-height:1.5; white-space:pre-wrap; word-break:break-word; padding:6px 9px; border-top:1px solid var(--border); color: var(--text2); max-height:420px; overflow:auto; }
+
+    /* qatfd: TREC-BioGen gold-nugget recall — each nugget colored by support label */
+    .nug-summary { display:flex; gap:14px; flex-wrap:wrap; align-items:baseline; margin-bottom:10px; font-size:12px; }
+    .nug-legend { display:inline-flex; gap:10px; margin-left:auto; font-size:11px; }
+    .nug-legend span { display:inline-flex; align-items:center; gap:5px; color:var(--text3); }
+    .nug-swatch { width:9px; height:9px; border-radius:2px; display:inline-block; }
+    .nug-swatch.s-sup { background:var(--green); } .nug-swatch.s-par { background:var(--yellow); } .nug-swatch.s-not { background:var(--red); }
+    .nuggets { display:flex; flex-direction:column; gap:4px; }
+    .nug { display:flex; gap:9px; align-items:flex-start; padding:5px 9px; border-radius:4px; border:1px solid var(--border2); border-left-width:3px; background:var(--bg1); font-size:12px; line-height:1.5; }
+    .nug .nug-icon { font-family: ui-monospace, monospace; font-weight:700; flex:0 0 auto; width:12px; text-align:center; }
+    .nug .nug-text { color:var(--text2); }
+    .nug.nug-sup { border-left-color:var(--green); }  .nug.nug-sup .nug-icon { color:var(--green); }
+    .nug.nug-par { border-left-color:var(--yellow); } .nug.nug-par .nug-icon { color:var(--yellow); }
+    .nug.nug-not { border-left-color:var(--red); }    .nug.nug-not .nug-icon { color:var(--red); }
+    .nug.nug-not .nug-text { color:var(--text3); }
+
+    /* qatfd: semantic filter — pass/fail doc chips, click to expand */
+    .semfilter { border:1px solid #1f5f1f; border-left:3px solid var(--green); border-radius:4px; background:rgba(0,40,0,0.12); padding:8px 10px; margin:6px 0; }
+    .sf-head { display:flex; gap:12px; flex-wrap:wrap; align-items:baseline; margin-bottom:8px; font-size:12px; }
+    .sf-head .sf-pred { color: var(--text2); }
+    .sf-head .sf-pred b { color: var(--text); font-weight:600; }
+    .sf-head .sf-stat { margin-left:auto; color: var(--text3); font-size:11px; }
+    .sf-docs { display:flex; flex-direction:column; gap:3px; }
+    .sf-doc { display:flex; flex-direction:column; gap:2px; }
+    .sf-chip { display:inline-block; align-self:flex-start; font-family: ui-monospace, monospace; font-size:11px; padding:2px 9px; border-radius:10px; border:1px solid var(--border2); cursor:pointer; user-select:none; }
+    .sf-chip.sf-pass { color: var(--green); border-color:#1f5f1f; background: var(--green-bg); }
+    .sf-chip.sf-fail { color: var(--red);   border-color:#6a1414; background: var(--red-bg); }
+    .sf-chip:hover { filter:brightness(1.3); }
+    .sf-text { font-family: ui-monospace, monospace; font-size:11px; line-height:1.5; white-space:pre-wrap; word-break:break-word; padding:6px 9px; margin:2px 0 4px 14px; border-left:2px solid var(--border2); color: var(--text2); max-height:360px; overflow:auto; }
+  </style>
+</head>
+<body>
+<div id="app">
+  <div class="header">
+    <span class="header-title">E2E Trace Viewer</span>
+    <span class="header-sub" id="runsub"></span>
+  </div>
+  <div class="card">
+    <div class="selectors">
+      <div class="sel-group narrow"><label>Benchmark</label><select id="bench-sel"></select></div>
+      <div class="sel-group narrow"><label>System</label><select id="sys-sel"></select></div>
+      <div class="sel-group"><label>Run</label><select id="run-sel"></select></div>
+      <div class="sel-group"><label>Question</label><select id="q-sel"></select></div>
+      <div class="toggle-row" style="margin-left:auto"><input type="checkbox" id="show-system"><label for="show-system">system prompts</label></div>
+      <div class="toggle-row"><input type="checkbox" id="show-calls"><label for="show-calls">LLM call lines</label></div>
+    </div>
+  </div>
+  <div id="content"></div>
+</div>
+
+<script>
+"use strict";
+
+const KIND = {
+  system:      { color:"#888888", bg:"var(--bg2)",      label:"SYSTEM" },
+  user:        { color:"#e6b800", bg:"var(--yellow-bg)", label:"USER" },
+  assistant:   { color:"#33cc33", bg:"var(--green-bg)",  label:"ASSISTANT" },
+  observation: { color:"#3399ff", bg:"var(--blue-bg)",   label:"OBSERVATION" },
+  error:       { color:"#ff4444", bg:"var(--red-bg)",    label:"ERROR" },
+  call:        { color:"#666666", bg:"transparent",      label:"LLM CALL" },
+  note:        { color:"#888888", bg:"transparent",      label:"NOTE" },
+  step:        { color:"#666666", bg:"transparent",      label:"STEP" },
+};
+const OP_COLOR = { planner:"#cc66ff", question_explainer:"#66ccaa", retrieve:"#3399ff", extract:"#e6b800", lookup_external:"#ff9933", compute:"#33cc33", replanner:"#ff66aa" };
+const COMPACT_KINDS = new Set(["call", "note", "step"]);
+const TRUNC_CHARS = 40000;   // ~10k tokens — observations longer than this collapse with a click-to-expand
+
+const S = { run:null, questions:[], qByUid:{}, uid:null, events:[], row:null, activeRev:0, expanded:new Set() };
+
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;" }[c]));
+const enc = encodeURIComponent;
+async function getJSON(url){ const r = await fetch(url); if(!r.ok) throw new Error(url+" → "+r.status); return r.json(); }
+const tok = (n) => Math.round(n/4).toLocaleString();
+const opColor = (op) => OP_COLOR[op] || "#999999";
+const fsec = (s) => (s==null ? "?" : (+s).toFixed(2)+"s");
+const showSystem = () => document.getElementById("show-system").checked;
+const showCalls  = () => document.getElementById("show-calls").checked;
+
+window.VW = {
+  toggleExpand(key){ if(S.expanded.has(key)) S.expanded.delete(key); else S.expanded.add(key); draw(); },
+  setRev(i){ S.activeRev = i; draw(); },
+};
+
+// ── boot / load ─────────────────────────────────────────────────────────────
+// Run ids are relative paths; the qatfd layout is benchmark/system/run, so split into a
+// cascade. Anything shallower (e.g. a flat eval/traces run) collapses under "(other)".
+function parseRunPath(r){
+  const p = r.split("/");
+  if(p.length >= 3) return { benchmark:p[0], system:p[1], run:p.slice(2).join("/"), full:r };
+  if(p.length === 2) return { benchmark:"(other)", system:p[0], run:p[1], full:r };
+  return { benchmark:"(other)", system:"(other)", run:p[0], full:r };
+}
+const selVal = (id) => document.getElementById(id).value;
+function fillSelect(id, opts){  // opts: [{value,label}]
+  document.getElementById(id).innerHTML = opts.map(o => `<option value="${esc(o.value)}">${esc(o.label)}</option>`).join("");
+}
+const uniqSorted = (arr) => [...new Set(arr)].sort();
+
+async function boot(){
+  const { runs } = await getJSON("/api/runs");
+  S.runs = (runs || []).map(parseRunPath);   // server order == newest-first
+  document.getElementById("runsub").textContent = runs.length+" run(s)";
+  document.getElementById("bench-sel").onchange = onBenchChange;
+  document.getElementById("sys-sel").onchange   = onSysChange;
+  document.getElementById("run-sel").onchange   = () => { const f = selVal("run-sel"); if(f) loadRun(f); };
+  document.getElementById("show-system").onchange = draw;
+  document.getElementById("show-calls").onchange = draw;
+  document.getElementById("q-sel").onchange = () => loadQuestion(document.getElementById("q-sel").value);
+  if(!S.runs.length){ document.getElementById("content").innerHTML = `<div class="hint">No runs found.</div>`; return; }
+  fillSelect("bench-sel", uniqSorted(S.runs.map(r => r.benchmark)).map(b => ({ value:b, label:b })));
+  await onBenchChange();
+}
+// bench → repopulate systems (for that benchmark) → cascade to runs
+async function onBenchChange(){
+  const b = selVal("bench-sel");
+  fillSelect("sys-sel", uniqSorted(S.runs.filter(r => r.benchmark===b).map(r => r.system)).map(s => ({ value:s, label:s })));
+  await onSysChange();
+}
+// system → repopulate runs (for that benchmark+system, newest first) → load the first
+async function onSysChange(){
+  const b = selVal("bench-sel"), s = selVal("sys-sel");
+  const runs = S.runs.filter(r => r.benchmark===b && r.system===s);   // preserves newest-first order
+  fillSelect("run-sel", runs.map(r => ({ value:r.full, label:r.run })));
+  const f = selVal("run-sel");
+  if(f) await loadRun(f);
+}
+async function loadRun(run){
+  S.run = run;
+  const { questions } = await getJSON(`/api/run?run=${enc(run)}`);
+  S.questions = questions || []; S.qByUid = {};
+  for(const q of S.questions) S.qByUid[q.uid] = q;
+  const qSel = document.getElementById("q-sel");
+  qSel.innerHTML = S.questions.map(q => {
+    // Mark correct vs incorrect; incorrect subsumes failed (no answer produced).
+    // `score` is a float in [0,1] (1 == fully correct); legacy runs used `correct`.
+    const raw = q.score != null ? q.score : q.correct;
+    const correct = parseFloat(raw) >= 1 || String(raw).toLowerCase()==="true";
+    const mark = correct ? "✓" : "✗";
+    return `<option value="${esc(q.uid)}">${mark} ${esc(q.uid)} — ${esc((q.question||"").slice(0,90))}</option>`;
+  }).join("");
+  if(S.questions.length){ qSel.value = S.questions[0].uid; await loadQuestion(S.questions[0].uid); }
+  else document.getElementById("content").innerHTML = `<div class="hint">No questions in this run.</div>`;
+}
+async function loadQuestion(uid){
+  S.uid = uid;
+  document.getElementById("content").innerHTML = `<div class="hint">Loading ${esc(uid)} …</div>`;
+  const data = await getJSON(`/api/question?run=${enc(S.run)}&uid=${enc(uid)}`);
+  S.events = data.events || [];
+  S.events.forEach((e,i) => { e._idx = i; });
+  S.row = S.qByUid[uid] || { uid };
+  S.expanded = new Set();
+  const plans = S.events.filter(e => e.kind === "plan");
+  S.activeRev = Math.max(0, plans.length - 1);   // default: final revision
+  draw();
+}
+
+// ── model building ──────────────────────────────────────────────────────────
+function buildModel(){
+  const events = S.events;
+  const plans = events.filter(e => e.kind === "plan");
+  const byStep = new Map(); const order = []; const orphans = []; const answerEvents = [];
+  for(const e of events){
+    if(e.kind === "plan") continue;
+    // qatfd's compute/answer LLM call emits under op="answer" — surface it as its own card.
+    if(e.op === "answer"){ answerEvents.push(e); continue; }
+    if(e.step_idx == null){ orphans.push(e); continue; }
+    let g = byStep.get(e.step_idx);
+    if(!g){ g = { step_idx:e.step_idx, op:e.op, boundary:null, events:[], startT:e.t, endT:e.t }; byStep.set(e.step_idx, g); order.push(e.step_idx); }
+    if(!g.op && e.op) g.op = e.op;
+    if(e.t != null){ if(g.startT==null||e.t<g.startT) g.startT=e.t; if(g.endT==null||e.t>g.endT) g.endT=e.t; }
+    if(e.kind === "step") g.boundary = e; else g.events.push(e);
+  }
+  order.sort((a,b)=>a-b);
+  const nodes = order.map(i => finalizeNode(byStep.get(i)));
+  const nodesByBranch = new Map();
+  for(const n of nodes){ if(n.branchId!=null){ if(!nodesByBranch.has(n.branchId)) nodesByBranch.set(n.branchId, []); nodesByBranch.get(n.branchId).push(n); } }
+  const orchestration = nodes.filter(n => n.branchId==null);
+  // union of retrieved pages across the whole question
+  const seen = new Set(); const retrieved = [];
+  for(const n of nodes){ const s = n.boundary?.data?.summary; if(s && s.type==="pages"){ for(const p of (s.pages||[])){ const k=`${p.month}:${p.page}`; if(!seen.has(k)){ seen.add(k); retrieved.push(p); } } } }
+  // branch_id → its plan-entry fields (kind/key/period/target/...), unioned over all revisions
+  const branchInfo = new Map();
+  for(const p of plans){ for(const b of (p.data?.branches||[])){ if(b.branch_id!=null) branchInfo.set(b.branch_id, b); } }
+  return { plans, nodes, nodesByBranch, orchestration, retrieved, orphans, answerEvents, branchInfo };
+}
+function finalizeNode(g){
+  const d = g.boundary?.data || {};
+  const end = g.boundary?.t ?? g.endT;
+  const indiv = d.elapsed_s;
+  const start = (indiv!=null && end!=null) ? Math.max(0, +(end - indiv).toFixed(3)) : g.startT;
+  return { ...g, branchId: d.branch_id ?? null, failed: !!d.error || g.boundary?.level==="warning",
+           summary: d.summary, error: d.error, indiv, start, end };
+}
+
+// ── draw ────────────────────────────────────────────────────────────────────
+function draw(){
+  if(!S.uid) return;
+  // Dispatch on the run's system (from report.csv). qatfd systems (rag_llm / search_agent /
+  // qatfd_search_agent) emit a flat agent-loop event stream, not the OfficeQA plan shape, so
+  // they get dedicated renderers; anything else falls back to the plan-shaped view below.
+  const sys = String((S.row && S.row.system) || "").toLowerCase();
+  if(sys === "rag_llm")        return drawRagLlm();
+  if(sys === "search_agent" || sys === "qatfd_search_agent") return drawSearchAgent(sys);
+  const m = buildModel();
+  const parts = [headerHtml(m), flowSection(m)];
+  if(m.orphans?.length) parts.push(`<div class="card"><div class="card-title">Other events</div>${m.orphans.map(e=>eventHtml(e)).join("")}</div>`);
+  if(m.answerEvents?.length) parts.push(`<div class="card"><div class="card-title">Compute / answer LLM</div>${m.answerEvents.map(e=>eventHtml(e)).join("")}</div>`);
+  document.getElementById("content").innerHTML = parts.join("");
+}
+
+// ── header: question + answers + source chips ───────────────────────────────
+function headerHtml(m){
+  const row = S.row;
+  const failed = String(row.failed).toLowerCase()==="true";
+  const badge = failed ? `<span class="badge fail">failed</span>` : `<span class="badge pass">ok</span>`;
+  // qatfd report.csv carries gold_docs / retrieved_docs (JSON doc-id lists); fall back
+  // to eval_e2e's golden_pages + operator-node page summaries when those are absent.
+  const goldIds = parseIdList(row.gold_docs);
+  const retrIds = parseIdList(row.retrieved_docs);
+  const goldPages = parseGoldenPages(row.golden_pages);
+  const goldChips = goldIds.length ? idChips(goldIds, "chip-gold")
+    : (goldPages.length ? goldPages.map(p=>`<span class="chip chip-gold">${esc(p.month)} p${esc(p.page)}</span>`).join("")
+                        : `<span class="chip chip-none">none in report.csv</span>`);
+  const retrChips = retrIds.length ? idChips(retrIds, "chip-retr")
+    : (m.retrieved.length ? m.retrieved.map(p=>`<span class="chip chip-retr">${esc(p.month)} p${esc(p.page)}</span>`).join("")
+                          : `<span class="chip chip-none">none</span>`);
+  // prefer the per-question wall_s from report.csv; fall back to node-derived timing.
+  const wall = (row.wall_s != null && row.wall_s !== "") ? Number(row.wall_s)
+                                                         : m.nodes.reduce((mx,n)=>Math.max(mx, n.end??0), 0);
+  const kv = [];
+  if(row.predicted) kv.push(rowKV("predicted", stripFinalAnswer(row.predicted)));
+  if(row.gold_answer) kv.push(rowKV("gold answer", row.gold_answer));
+  if(failed && row.reason) kv.push(rowKV("reason", row.reason));
+  kv.push(`<div class="kv"><span class="k">groundtruth src</span><span class="v">${goldChips}</span></div>`);
+  kv.push(`<div class="kv"><span class="k">retrieved src</span><span class="v">${retrChips}</span></div>`);
+  return `<div class="card">
+    <div class="card-title">${esc(row.uid)} ${badge} <span class="node-meta" style="margin-left:6px">wall ${fsec(wall)}</span></div>
+    <div class="q-text">${esc(row.question || "(question text unavailable — no report.csv)")}</div>
+    ${kv.join("")}
+  </div>`;
+}
+function rowKV(k,v){ return `<div class="kv"><span class="k">${esc(k)}</span><span class="v mono">${esc(v)}</span></div>`; }
+// qatfd report.csv stores gold_docs / retrieved_docs as JSON string arrays of doc ids.
+function parseIdList(s){
+  if(!s) return [];
+  try { const a = JSON.parse(s); return Array.isArray(a) ? a.map(String) : []; }
+  catch { return []; }
+}
+// render doc-id chips, capping a long list (e.g. a big top_k retrieval) with a "+N more".
+function idChips(ids, cls, max=60){
+  const shown = ids.slice(0, max).map(id=>`<span class="chip ${cls}">${esc(id)}</span>`).join("");
+  return shown + (ids.length>max ? `<span class="chip chip-none">+${ids.length-max} more</span>` : "");
+}
+// strip the <FINAL_ANSWER>...</FINAL_ANSWER> wrapper for display (show just the value).
+function stripFinalAnswer(s){
+  if(!s) return s;
+  const m = /<FINAL_ANSWER>\s*([\s\S]*?)\s*<\/FINAL_ANSWER>/i.exec(s);
+  return m ? m[1] : s;
+}
+function parseGoldenPages(s){
+  if(!s) return [];
+  return String(s).split(/\s+/).filter(Boolean).map(tok => {
+    const i = tok.lastIndexOf(":");
+    return i<0 ? { month:tok, page:"?" } : { month:tok.slice(0,i), page:tok.slice(i+1) };
+  });
+}
+
+// ── cost / golden helpers ───────────────────────────────────────────────────
+// USD per token (input, output); thinking billed at the output rate.
+const PRICES = {
+  "gemini-3.5-flash":      [0.30e-6, 2.50e-6],
+  "gemini-3.1-flash-lite": [0.10e-6, 0.40e-6],
+  "gemini-3.1-pro-preview":[2.00e-6, 12.00e-6],
+};
+// Resolve a price row, tolerating full provider-prefixed ids (e.g. "google/gemini-3.5-flash"
+// matches the "gemini-3.5-flash" key) — mirrors the backend's substring price match.
+function priceFor(model){
+  if(!model) return null;
+  if(PRICES[model]) return PRICES[model];
+  const m = model.toLowerCase();
+  for(const k in PRICES){ if(m.includes(k.toLowerCase())) return PRICES[k]; }
+  return null;
+}
+function callCost(model, inTok, outTok, thinkTok){
+  const p = priceFor(model);
+  return p ? (inTok||0)*p[0] + ((outTok||0)+(thinkTok||0))*p[1] : null;
+}
+// Per-call USD: prefer the exact `cost` the runner now emits in the call event's data;
+// fall back to token×price from the message envelope for older traces.
+function callCostOf(evt){
+  if(evt.data && evt.data.cost!=null) return evt.data.cost;
+  const c = parseCallMsg(evt.message);
+  return c ? callCost(c.model, c.inTok, c.outTok, c.thinkTok) : null;
+}
+const fusd = (c) => c==null ? "$?" : "$"+(c>=0.1 ? c.toFixed(2) : c.toFixed(4));
+// "call call_site=... model=... latency_s=... in_tok=... out_tok=... think_tok=..." envelope line
+function parseCallMsg(msg){
+  const m = /call call_site=(\S+) model=(\S+).*?latency_s=([\d.]+).*?in_tok=(\d+|None) out_tok=(\d+|None) think_tok=(\d+|None)/.exec(msg||"");
+  if(!m) return null;
+  const num = (s) => s==="None" ? 0 : +s;
+  return { site:m[1], model:m[2], latency:+m[3], inTok:num(m[4]), outTok:num(m[5]), thinkTok:num(m[6]) };
+}
+function goldenSet(){ return new Set(parseGoldenPages(S.row.golden_pages).map(p=>`${p.month}:${p.page}`)); }
+// one chip per golden page: green when present in `survivors` (Set of "month:page"), red when lost
+function goldChips(survivors){
+  const gold = [...goldenSet()];
+  if(!gold.length) return `<span class="chip chip-none">no golden pages</span>`;
+  return gold.map(g => {
+    const ok = survivors.has(g);
+    return `<span class="chip ${ok?"chip-gold":"chip-lost"}">${esc(g.replace(":"," p"))}${ok?"":" ✗"}</span>`;
+  }).join("");
+}
+
+// ── retrieval funnel: ToC pick → date filter → semantic filter ──────────────
+function stageHtml(name, stat, survivorSet, body){
+  // survivorSet null = this run didn't record survivor page identities (old trace) —
+  // show no golden verdict rather than a false "lost".
+  const chips = survivorSet ? goldChips(survivorSet)
+                            : `<span class="chip chip-none">survivor pages not recorded</span>`;
+  return `<details class="stage"><summary><span class="ti">▶</span>
+    <span class="stage-name">${esc(name)}</span><span class="stage-stat">${esc(stat)}</span>
+    <span style="margin-left:auto">${chips}</span></summary>
+    <div class="stage-body">${body || `<span class="empty">no detail</span>`}</div></details>`;
+}
+function rawEventsHtml(node){
+  return `<details class="node"><summary><span class="ti">▶</span><span class="node-meta">raw events (${node.events.length})</span></summary>
+    <div class="node-body">${node.events.map(eventHtml).join("")}</div></details>`;
+}
+function retrieveFunnelHtml(node){
+  const evts = node.events;
+  const msg0 = (e) => e.message || "";
+  const toc = evts.find(e => msg0(e).startsWith("toc_pick_pages"));
+  const sem = evts.find(e => msg0(e).startsWith("semantic_filter"));
+  if(!toc && !sem) return nodeHtml(node);   // old trace / golden / search_agent path
+  const stages = [];
+
+  // 1 — ToC pick: per-era chapters picked, pages surviving, golden coverage
+  // (structured `data` on new runs; parsed from the message repr on older ones)
+  const pickInfo = (e) => {
+    if(e.data?.picked) return e.data;
+    const m = /pick_chapters era=\((.*?)\) picked=\[(.*?)\] pages=(\d+)/.exec(msg0(e));
+    if(!m) return null;
+    const strs = (s) => [...s.matchAll(/'([^']*)'|"([^"]*)"/g)].map(x => x[1] ?? x[2]);
+    return { era: strs(m[1]), picked: strs(m[2]), n_chapters: null, pages: +m[3] };
+  };
+  const eras = evts.filter(e => msg0(e).startsWith("pick_chapters ")).map(pickInfo).filter(Boolean);
+  const tocPages = toc?.data?.pages ? new Set(toc.data.pages) : null;
+  const tocN = tocPages ? tocPages.size
+    : ((/toc_pick_pages n=(\d+)/.exec(msg0(toc||{}))||[])[1]
+       ?? `~${eras.reduce((n,d)=>n+(d.pages||0), 0)}`);
+  const nCh = eras.reduce((n,d)=>n+(d.picked||[]).length, 0);
+  const eraRows = eras.map(d => {
+    const chips = (d.picked||[]).map(c=>`<span class="chip">${esc(c)}</span>`).join("") || `<span class="chip chip-none">no chapters picked</span>`;
+    return `<div style="margin:5px 0"><div class="stage-stat mono">era ${esc((d.era||[]).join(" → "))} · ${(d.picked||[]).length}${d.n_chapters?`/${d.n_chapters}`:""} chapters · ${d.pages} pages</div>${chips}</div>`;
+  }).join("");
+  stages.push(stageHtml("ToC pick", `${nCh} chapters picked → ${tocN} pages`, tocPages, eraRows));
+
+  // 2 — date filter: per-branch kept counts; golden vs the union of branch survivors
+  const yfs = evts.filter(e => msg0(e).startsWith("year_filter"));
+  if(yfs.length){
+    const hasPages = yfs.some(e => e.data?.pages);
+    const union = hasPages ? new Set() : null;
+    let keptTotal = 0;
+    const rows = yfs.map(e => { const d = e.data || {};
+      const km = /kept=(\d+)\/(\d+)/.exec(msg0(e)) || [];
+      const kept = d.pages ? d.pages.length : (km[1] ?? "?");
+      const total = d.total ?? km[2] ?? "?";
+      const period = d.period ?? (/period='([^']*)'/.exec(msg0(e))||[])[1];
+      if(union && d.pages) for(const p of d.pages) union.add(p);
+      keptTotal += +kept || 0;
+      return `<div class="stage-stat" style="margin:4px 0">${d.key?`<b>${esc(d.key)}</b> · `:""}${period?`${esc(period)} · `:""}kept ${kept}/${total}</div>`;
+    }).join("");
+    const nLeft = union ? union.size : keptTotal;
+    stages.push(stageHtml("Date filter", `${yfs.length} branch(es) → ${nLeft} pages${union?"":" (sum, may overlap)"}`, union, rows));
+  }
+
+  // 3 — semantic filter: calls / cost / wallclock, pages left, golden coverage
+  if(sem){
+    const d = sem.data || {};
+    const pages = d.pages ? new Set(d.pages) : null;
+    const sm = /kept=(\d+)\/(\d+) blocks_kept=(\d+) blocks=(\d+)/.exec(msg0(sem)) || [];
+    const calls = evts.filter(e => e.kind==="call" && msg0(e).includes("call_site=semfilter"))
+                      .map(e => ({ ...(parseCallMsg(e.message)||{}), t:e.t })).filter(c => c.model);
+    const cost = calls.reduce((s,c)=>s+(callCost(c.model,c.inTok,c.outTok,c.thinkTok)||0), 0);
+    const wall = calls.length ? Math.max(...calls.map(c=>c.t)) - Math.min(...calls.map(c=>c.t-c.latency)) : null;
+    const stat = `${calls.length || d.n_calls || "?"} calls · ${fusd(calls.length?cost:null)} · wall ${fsec(wall)} → `
+               + `${pages ? pages.size : sm[1] ?? "?"}/${d.total ?? sm[2] ?? "?"} pages (${d.blocks_kept ?? sm[3] ?? "?"}/${d.blocks ?? sm[4] ?? "?"} blocks)`;
+    const rows = calls.map((c,i)=>`<div class="stage-stat mono">call ${i+1}: ${fsec(c.latency)} · ${fusd(callCost(c.model,c.inTok,c.outTok,c.thinkTok))} · in ${c.inTok.toLocaleString()} tok · out ${(c.outTok+c.thinkTok).toLocaleString()} tok</div>`).join("");
+    stages.push(stageHtml("Sem filter", stat, pages, rows));
+  }
+
+  return `<div class="flow-group">
+    <div class="flow-head"><span class="flow-label">retrieval funnel</span>
+      ${node.indiv!=null?`<span class="timing">Δ ${fsec(node.indiv)}</span>`:""}
+      ${node.failed?`<span class="node-summary err">✗ ${esc(node.error||"failed")}</span>`:""}
+    </div>
+    ${stages.join("")}
+    ${rawEventsHtml(node)}
+  </div>`;
+}
+
+// ── block-select tournament ─────────────────────────────────────────────────
+function tcallHtml(c, gold){
+  const d = c.data, blocks = d.blocks || [];
+  const kept = blocks.filter(b=>b.kept).length;
+  const goldIn = new Set(blocks.filter(b=>gold.has(b.page)).map(b=>b.page));
+  const goldKept = new Set(blocks.filter(b=>b.kept && gold.has(b.page)).map(b=>b.page));
+  const lost = [...goldIn].some(p=>!goldKept.has(p));
+  const cost = callCost(d.model, d.in_tok, d.out_tok, d.think_tok);
+  const lines = blocks.map(b => {
+    const g = gold.has(b.page);
+    const cls = g ? (b.kept?"gold-kept":"gold-lost") : (b.kept?"":"dropped");
+    return `<div class="tblock ${cls}">${b.kept?"✓":"✗"} ${esc(b.page)}${g?" ★":""} ${esc(b.title||"")}</div>`;
+  }).join("");
+  return `<details class="tcall ${lost?"lost":""}"><summary>${blocks.length} → ${kept}
+    <span class="tcall-meta"> · ${fusd(cost)} · ${fsec(d.latency_s)}${lost?" · gold lost":""}</span></summary>
+    <div class="tcall-body">${lines}</div></details>`;
+}
+function tournamentLegacyHtml(node){
+  // Old trace without per-call `block_select_call` events: per-call cost/latency from
+  // the call envelopes (inputs/keeps/gold per call are unrecoverable — parallel calls
+  // interleave, so prompts and replies can't be paired), plus the round summaries.
+  const msg0 = (e) => e.message || "";
+  const env = node.events.filter(e => e.kind==="call").map(e => parseCallMsg(e.message)).filter(Boolean);
+  const summaries = node.events.filter(e => /^block_select(_round|_interval| )/.test(msg0(e)))
+    .map(e => `<div class="stage-stat mono">${esc(msg0(e))}</div>`).join("");
+  const boxes = env.map((c,i) => `<details class="tcall"><summary>call ${i+1}
+    <span class="tcall-meta"> · ${fusd(callCost(c.model,c.inTok,c.outTok,c.thinkTok))} · ${fsec(c.latency)} · in ${c.inTok.toLocaleString()} tok</span></summary>
+    <div class="tcall-body"><div class="stage-stat mono">${esc(c.model)} · out ${(c.outTok+c.thinkTok).toLocaleString()} tok</div></div></details>`).join("");
+  const note = `<div class="hint">old trace — per-call inputs/keeps and gold-lost marking need a run with \`block_select_call\` events</div>`;
+  return summaries + (boxes ? `<div class="tcalls" style="margin:6px 0">${boxes}</div>` : "") + note + rawEventsHtml(node);
+}
+function tournamentHtml(node){
+  const msg0 = (e) => e.message || "";
+  const calls = node.events.filter(e => msg0(e).startsWith("block_select_call") && Array.isArray(e.data?.blocks));
+  if(!calls.length) return tournamentLegacyHtml(node);
+  const gold = goldenSet();
+  const ivals = new Map();
+  for(const c of calls){ const k = c.data.interval ?? "(all)"; if(!ivals.has(k)) ivals.set(k, []); ivals.get(k).push(c); }
+  const sums = new Map();
+  for(const e of node.events){ if(msg0(e).startsWith("block_select_interval") && e.data) sums.set(e.data.interval ?? "(all)", e.data); }
+  const parts = [];
+  for(const [label, cs] of ivals){
+    const rounds = new Map();
+    for(const c of cs){ const r = String(c.data.round); if(!rounds.has(r)) rounds.set(r, []); rounds.get(r).push(c); }
+    const order = [...rounds.keys()].sort((a,b)=> a==="final" ? 1 : b==="final" ? -1 : (+a)-(+b));
+    const roundRows = order.map(r => {
+      const rcs = rounds.get(r).slice().sort((a,b)=>(a.data.batch||0)-(b.data.batch||0));
+      const tin = rcs.reduce((n,c)=>n+(c.data.blocks||[]).length, 0);
+      const tkept = rcs.reduce((n,c)=>n+(c.data.blocks||[]).filter(b=>b.kept).length, 0);
+      return `<div class="round-row"><div class="round-label">${r==="final"?"final call":"round "+esc(r)} — ${rcs.length} call(s) · in ${tin} → kept ${tkept}</div>
+        <div class="tcalls">${rcs.map(c=>tcallHtml(c, gold)).join("")}</div></div>`;
+    }).join("");
+    // interval survivors = the keeps of its last (final) round
+    const lastCs = rounds.get(order[order.length-1]) || [];
+    const surv = new Set();
+    for(const c of lastCs) for(const b of (c.data.blocks||[])) if(b.kept) surv.add(b.page);
+    const sum = sums.get(label);
+    parts.push(`<div style="margin:6px 0 14px">
+      <div class="flow-head"><span class="flow-label">interval</span><span class="flow-key mono">${esc(label)}</span>
+        <span class="stage-stat">${sum ? `${sum.candidates} candidates → ${sum.selected} selected` : ""}</span>
+        <span style="margin-left:auto">${goldChips(surv)}</span></div>
+      ${roundRows}</div>`);
+  }
+  return parts.join("") + rawEventsHtml(node);
+}
+
+// ── merged execution flow: cumulative tabs, linearized node flow ─────────────
+// One coherent view: [planner | question_explainer] → branch chains (retrieve→extract
+// / lookup) → compute. Segmented at each `compute` (= one revision / compute attempt);
+// tab i shows segments 0..i cumulatively (the final tab is the whole trace).
+function flowSection(m){
+  const nodes = m.nodes.slice().sort((a,b)=>a.step_idx-b.step_idx);
+  const segments = []; let cur = [];
+  for(const n of nodes){ cur.push(n); if(n.op==="compute"){ segments.push(cur); cur=[]; } }
+  if(cur.length) segments.push(cur);
+  if(!segments.length) return `<div class="card"><div class="card-title">Execution</div><div class="empty">no operator steps</div></div>`;
+
+  const nTabs = segments.length;
+  const sel = Math.min(S.activeRev, nTabs-1);
+  const tabs = segments.map((s,i)=>{
+    const label = m.plans[i]?.data?.label || `attempt ${i+1}`;
+    return `<div class="tab ${i===sel?"active":""}" onclick="VW.setRev(${i})">${esc(label)}${i===nTabs-1?" ★":""}</div>`;
+  }).join("");
+
+  const items = [];
+  for(let i=0;i<=sel;i++) items.push(segmentHtml(segments[i], i, m, sel));
+  const body = items.join(arrow());
+  return `<div class="card"><div class="card-title">Execution — ${nTabs} revision(s)</div>
+    <div class="tabs">${tabs}</div>${body}</div>`;
+}
+const arrow = () => `<div class="flow-arrow">↓</div>`;
+
+function segmentHtml(seg, i, m, sel){
+  const items = [];
+  // replan divider (segment i>0 follows a failed compute)
+  const rev = m.plans[i];
+  if(i>0 && rev?.data?.reason != null){
+    const dec = replannerReasonText(m, rev.t);
+    items.push(`<div class="reason-box">
+      <div class="rl">Replan trigger</div><div class="mono">${esc(rev.data.reason)}</div>
+      ${rev.data.missing?.length ? `<div class="node-meta" style="margin-top:4px">missing: ${esc(rev.data.missing.join(", "))}</div>`:""}
+      ${dec ? `<div class="rl" style="margin-top:8px">Replanner decision</div><div class="msg-text">${esc(dec)}</div>`:""}
+    </div>`);
+  }
+  const setup = seg.filter(n => n.op==="planner" || n.op==="question_explainer");
+  const replanner = seg.filter(n => n.op==="replanner");
+  const compute = seg.filter(n => n.op==="compute");
+  const branchNodes = seg.filter(n => n.branchId!=null);
+  const retrieves = seg.filter(n => n.branchId==null && n.op==="retrieve");
+  const handledOps = new Set(["planner","question_explainer","replanner","compute","retrieve"]);
+  const others = seg.filter(n => n.branchId==null && !handledOps.has(n.op));
+
+  for(const n of replanner) items.push(nodeHtml(n));
+  if(setup.length) items.push(`<div class="flow-group"><div class="flow-head"><span class="flow-label">planning${setup.length>1?" · parallel":""}</span></div>${setup.map(nodeHtml).join("")}</div>`);
+
+  for(const n of retrieves) items.push(retrieveFunnelHtml(n));
+
+  const byBranch = new Map();
+  for(const n of branchNodes){ if(!byBranch.has(n.branchId)) byBranch.set(n.branchId, []); byBranch.get(n.branchId).push(n); }
+  for(const [bid, bnodes] of byBranch) items.push(branchGroupHtml(bid, bnodes, m, sel));
+
+  for(const n of others) items.push(nodeHtml(n));
+  for(const n of compute) items.push(nodeHtml(n));
+  return items.join(arrow());
+}
+
+function branchGroupHtml(bid, bnodes, m, sel){
+  const info = m.branchInfo.get(bid) || { kind:(bnodes[0]?.op || "?") };
+  const kind = info.kind || "?"; const color = opColor(kind==="retrieve"?"retrieve":"lookup_external");
+  // status relative to the focused revision (sel): dropped if no longer in that plan; added if not in the initial plan
+  const focusIds = new Set((m.plans[sel]?.data?.branches||[]).map(b=>b.branch_id));
+  const firstIds = new Set((m.plans[0]?.data?.branches||[]).map(b=>b.branch_id));
+  const status = !focusIds.has(bid) ? "dropped" : (!firstIds.has(bid) ? "added" : "executed");
+  const muted = status==="dropped";
+  const keyText = kind==="retrieve" ? (info.key || "") : (info.target || "");
+  const fields = kind==="retrieve"
+    ? [info.period&&field("period",info.period), info.as_of&&field("as_of",info.as_of), info.visual_only&&field("visual_only","true")]
+    : [info.src&&field("src",info.src)];
+  let pageChips = "";
+  for(const n of bnodes){ const s=n.summary; if(s && s.type==="pages"){ pageChips = (s.pages||[]).map(p=>`<span class="chip chip-retr">${esc(p.month)} p${esc(p.page)}</span>`).join("") || `<span class="chip chip-none">0 pages</span>`; } }
+  const fieldsHtml = fields.filter(Boolean).join(" · ");
+  const ordered = bnodes.slice().sort((a,b)=>a.step_idx-b.step_idx);
+  return `<div class="flow-group ${muted?"muted":""}">
+    <div class="flow-head">
+      <span class="flow-label">branch</span>
+      <span class="op-badge" style="background:${color}22;color:${color}">${esc(kind)}</span>
+      <span class="status ${status}">${status}</span>
+      <span class="flow-key">${esc(keyText)}</span>
+      ${fieldsHtml?`<div class="flow-fields">${fieldsHtml}</div>`:""}
+      ${pageChips?`<div class="flow-pages">${pageChips}</div>`:""}
+    </div>
+    ${ordered.map(nodeHtml).join("")}
+  </div>`;
+}
+function field(k,v){ return `<span><b>${esc(k)}</b>: ${esc(v)}</span>`; }
+function replannerReasonText(m, revT){
+  const cands = m.orchestration.filter(n => n.op==="replanner" && (n.end??0) <= (revT??Infinity)+0.001);
+  const node = cands.sort((a,b)=>(b.end??0)-(a.end??0))[0];
+  if(!node) return "";
+  const a = node.events.find(e=>e.kind==="assistant");
+  return a ? (a.data?.text || a.message || "") : "";
+}
+
+// ── operator node ───────────────────────────────────────────────────────────
+function nodeHtml(node){
+  const op = node.op || "?"; const color = opColor(op);
+  const summary = node.failed ? `<span class="err">✗ ${esc(node.error || "failed")}</span>` : `<span>${esc(summaryText(node.summary))}</span>`;
+  const timing = (node.start!=null && node.end!=null)
+    ? `<span class="timing">${fsec(node.start)} → ${fsec(node.end)} · Δ ${fsec(node.indiv ?? (node.end-node.start))} · cum ${fsec(node.end)}</span>` : "";
+  const body = node.op==="block_select"
+    ? tournamentHtml(node)
+    : (node.events.length ? node.events.map(eventHtml).join("") : `<div class="empty">no internal events</div>`);
+  return `<details class="node ${node.failed?"failed":""}">
+    <summary>
+      <span class="ti">▶</span>
+      <span class="op-badge" style="background:${color}22;color:${color}">${esc(op)}</span>
+      ${timing}
+      <span class="node-summary">${summary}</span>
+    </summary>
+    <div class="node-body">${body}</div>
+  </details>`;
+}
+function summaryText(s){
+  if(!s) return "(no summary)";
+  switch(s.type){
+    case "pages": { const ps=(s.pages||[]).map(p=>`${p.month??"?"} p${p.page??"?"}`); return `${ps.length} page${ps.length===1?"":"s"}`+(ps.length?": "+ps.join(", "):""); }
+    case "values": { const vs=(s.values||[]).map(v=>`${v.description}${v.unit?` (${v.unit})`:""}`); return `${vs.length} value${vs.length===1?"":"s"}`+(vs.length?": "+vs.join("; "):""); }
+    case "answer": return `answer: ${s.answer}`;
+    case "plan": return `${(s.branches||[]).length} branch(es)`;
+    case "list": return `${s.n} item(s)`;
+    case "none": return "(none)";
+    case "scalar": return String(s.value);
+    default: return s.value!=null ? JSON.stringify(s.value) : String(s.type||"");
+  }
+}
+
+// ── one event (color-coded message, with timestamp + truncation) ────────────
+function eventHtml(evt){
+  const kind = evt.kind || "note";
+  if(kind === "system" && !showSystem()) return `<div class="msg compact"><div class="msg-line">[system prompt hidden — toggle "system prompts"]</div></div>`;
+  if(kind === "call" && !showCalls()) return "";
+  const style = KIND[kind] || KIND.note;
+  const ts = evt.t!=null ? `@${fsec(evt.t)}` : "";
+  if(COMPACT_KINDS.has(kind)){
+    return `<div class="msg compact" style="border-left-color:${style.color}"><div class="msg-line">${ts?`<span style="color:var(--text3)">${ts} </span>`:""}${esc(evt.message||"")}</div></div>`;
+  }
+  const key = String(evt._idx); const expanded = S.expanded.has(key);
+  const { html, total, truncated } = renderBody(evt, expanded);
+  const tk = total ? `~${tok(total)} tok` : "";
+  const btn = (truncated || (expanded && total>TRUNC_CHARS))
+    ? `<button class="expand-btn" onclick="VW.toggleExpand('${key}')">${expanded ? "▲ collapse" : `▼ show full (~${tok(total)} tokens)`}</button>` : "";
+  return `<div class="msg" style="border-left-color:${style.color};background:${style.bg}">
+    <div class="msg-bar" style="color:${style.color}"><span>${style.label}</span><span class="meta">${ts} ${tk}</span></div>
+    ${html}${btn}
+  </div>`;
+}
+function renderBody(evt, expanded){
+  const d = evt.data || {};
+  if(evt.kind === "observation" && Array.isArray(d.blocks)){
+    const total = d.blocks.reduce((n,b)=>n+(b.text||"").length, 0);
+    if(total <= TRUNC_CHARS || expanded) return { html: d.blocks.map(blockHtml).join("")||`<span class="empty">empty</span>`, total, truncated:false };
+    // collapsed: render whole blocks until the char budget is spent, slicing the crossing one
+    let used=0; const out=[];
+    for(const b of d.blocks){
+      const len=(b.text||"").length;
+      if(used+len <= TRUNC_CHARS){ out.push(blockHtml(b)); used+=len; }
+      else { out.push(blockHtml({ ...b, text:(b.text||"").slice(0, Math.max(0,TRUNC_CHARS-used))+" …" })); break; }
+    }
+    return { html: out.join(""), total, truncated:true };
+  }
+  const text = typeof d.text === "string" ? d.text : (evt.message || "");
+  if(text.length <= TRUNC_CHARS || expanded) return { html:`<div class="msg-text">${esc(text)}</div>`, total:text.length, truncated:false };
+  return { html:`<div class="msg-text">${esc(text.slice(0,TRUNC_CHARS))} …</div>`, total:text.length, truncated:true };
+}
+function blockHtml(b){
+  if(b && b.type === "chunk"){
+    return `<div class="chunk"><div class="chunk-meta">chunk_id=${esc(b.chunk_id ?? "")} · doc_id=${esc(b.doc_id ?? "")}</div><pre class="chunk-text">${esc(b.text ?? "")}</pre></div>`;
+  }
+  return `<div class="msg-text">${esc((b && b.text) ?? "")}</div>`;
+}
+
+// ── qatfd systems (rag_llm / search_agent / qatfd_search_agent) ──────────────
+// These systems run a retrieval stage followed by a shared code-execution "answer"
+// agent. Both stages are flat event streams (step_idx=null); we render a common
+// question-metadata header, then the retrieval stage (top-k list for rag_llm, an agent
+// loop for the search agents), then the answer agent loop.
+
+function sectionCard(title, bodyHtml){
+  return `<div class="card"><div class="card-title">${esc(title)}</div>${bodyHtml}</div>`;
+}
+
+// shared question-level metadata header (predicted/gold, recall, gold vs retrieved docs)
+function qaHeaderHtml(){
+  const row = S.row;
+  const failed = String(row.failed).toLowerCase()==="true";
+  const scoreRaw = row.score!=null ? row.score : row.correct;
+  const scoreNum = parseFloat(scoreRaw);
+  const ok = !failed && (scoreNum>=1 || String(scoreRaw).toLowerCase()==="true");
+  const badge = failed ? `<span class="badge fail">failed</span>`
+    : ok ? `<span class="badge pass">ok</span>`
+    : `<span class="badge fail">score ${isNaN(scoreNum)?esc(scoreRaw):scoreNum.toFixed(2)}</span>`;
+
+  const goldIds = parseIdList(row.gold_docs);
+  const retrIds = parseIdList(row.retrieved_docs);
+  const goldSet = new Set(goldIds);
+  const goldChipsH = goldIds.length ? idChips(goldIds, "chip-gold") : `<span class="chip chip-none">none in report.csv</span>`;
+  // retrieved docs that are gold render green (hit); the rest blue.
+  const retrChipsH = retrIds.length
+    ? retrIds.slice(0,80).map(id=>`<span class="chip ${goldSet.has(id)?"chip-gold":"chip-retr"}">${esc(id)}</span>`).join("")
+      + (retrIds.length>80 ? `<span class="chip chip-none">+${retrIds.length-80} more</span>` : "")
+    : `<span class="chip chip-none">none</span>`;
+
+  const wall = (row.wall_s!=null && row.wall_s!=="") ? Number(row.wall_s) : null;
+  const pill = (k,v) => `<span class="metapill"><span class="mk">${esc(k)}</span><span class="mv">${esc(v)}</span></span>`;
+  const meta = [];
+  if(row.system)    meta.push(pill("system", row.system));
+  if(row.benchmark) meta.push(pill("benchmark", row.benchmark));
+  if(wall!=null)    meta.push(pill("wall", fsec(wall)));
+  if(row.cost!=null && row.cost!=="") meta.push(pill("cost", "$"+Number(row.cost).toFixed(4)));
+
+  const kv = [];
+  if(row.predicted)   kv.push(rowKV("predicted", stripFinalAnswer(row.predicted)));
+  if(row.gold_answer) kv.push(rowKV("gold answer", row.gold_answer));
+  if(failed && row.reason) kv.push(rowKV("reason", row.reason));
+  if(row.judge_rationale)  kv.push(rowKV("judge", row.judge_rationale));
+  if(row.doc_recall!=null && row.doc_recall!=="")   kv.push(rowKV("doc recall", Number(row.doc_recall).toFixed(2)));
+  if(row.page_recall!=null && row.page_recall!=="") kv.push(rowKV("chunk/page recall", Number(row.page_recall).toFixed(2)));
+  kv.push(`<div class="kv"><span class="k">groundtruth docs</span><span class="v">${goldChipsH}</span></div>`);
+  kv.push(`<div class="kv"><span class="k">retrieved docs</span><span class="v">${retrChipsH}</span></div>`);
+
+  return `<div class="card">
+    <div class="card-title">${esc(row.uid)} ${badge}</div>
+    ${meta.length ? `<div class="metabar">${meta.join("")}</div>` : ""}
+    <div class="q-text">${esc(row.question || "(question text unavailable — no report.csv)")}</div>
+    ${kv.join("")}
+  </div>`;
+}
+
+// The answer agent emits its own system prompt; it's the first `system` event AFTER the
+// stream's start (index 0 is the retrieval stage's system / first retrieve event).
+function answerStartIdx(events){
+  for(let i=1;i<events.length;i++) if(events[i].kind==="system") return i;
+  return -1;
+}
+const parseStep = (msg) => { const m=/step=(\d+)/.exec(msg||""); return m ? +m[1] : null; };
+
+// Turn a flat agent loop into turns: each `assistant` reply starts a turn, carrying the
+// LLM calls that preceded it (lead), the tool code it emitted, and the observation(s) it
+// produced. Pre-loop system/question and trailing notes are returned separately.
+function groupAgentTurns(events){
+  const pre = [], turns = [], tail = [];
+  let pending = [], cur = null;
+  for(const e of events){
+    const k = e.kind, msg = e.message || "";
+    if(k === "assistant"){
+      cur = { lead:pending, assistant:e, toolCode:null, notes:[], results:[], step:parseStep(msg) };
+      pending = []; turns.push(cur); continue;
+    }
+    if(k === "call"){
+      // Pre-assistant calls (and embed/tool calls fired between this assistant and its
+      // observation) belong to the current step; calls after the observation start the next.
+      if(cur && cur.results.length === 0) cur.lead.push(e); else pending.push(e);
+      continue;
+    }
+    if(k === "observation" || k === "error"){ (cur ? cur.results : pre).push(e); continue; }
+    if(k === "note"){
+      if(cur && cur.results.length === 0){                     // post-assistant, pre-observation
+        if(msg.startsWith("tool_code")) cur.toolCode = e; else cur.notes.push(e);
+      } else { (turns.length ? tail : pre).push(e); }          // pre-loop / post-observation note
+      continue;
+    }
+    if(k === "system" || k === "user"){ (turns.length || cur ? pending : pre).push(e); continue; }
+    pending.push(e);
+  }
+  if(pending.length) for(const e of pending) tail.push(e);
+  return { pre, turns, tail };
+}
+
+// "tool_code '<python repr>'" → readable code (strip the key + one quote layer, unescape).
+function toolCodeStr(evt){
+  if(!evt) return "";
+  let s = (evt.message || "").replace(/^tool_code\s+/, "");
+  s = s.replace(/^'([\s\S]*)'$/, "$1").replace(/^"([\s\S]*)"$/, "$1");
+  return s.replace(/\\n/g, "\n").replace(/\\t/g, "\t").replace(/\\'/g, "'").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+}
+function actionLabel(turn){
+  const code = toolCodeStr(turn.toolCode);
+  const lines = code.split("\n");
+  const firstLine = (lines.find(l => l.trim() && !l.trim().startsWith("#")) || lines[0] || "").trim();
+  const m = /([A-Za-z_]\w*)\s*\(/.exec(firstLine);
+  return { name: m ? m[1] : "", preview: firstLine };
+}
+
+// wall-clock end of a turn = the latest event timestamp it owns (its observation, usually).
+function turnEndT(turn){
+  let mx = null;
+  for(const e of [...turn.lead, turn.assistant, turn.toolCode, ...turn.notes, ...turn.results]){
+    if(e && e.t!=null && (mx==null || e.t>mx)) mx = e.t;
+  }
+  return mx;
+}
+// sum of the per-call costs in a turn; null when none of its calls could be priced.
+function turnCost(turn){
+  let sum = 0, any = false;
+  for(const e of turn.lead){ if(e.kind!=="call") continue; const c = callCostOf(e); if(c!=null){ sum += c; any = true; } }
+  return any ? sum : null;
+}
+
+function turnsHtml(events, keyPrefix){
+  const { pre, turns, tail } = groupAgentTurns(events);
+  // Per-step / cumulative latency is measured relative to the start of THIS stage (so the
+  // answer stage's clock isn't offset by the whole retrieval stage). Cost accumulates per stage.
+  const ts = events.map(e => e.t).filter(t => t!=null);
+  const t0 = ts.length ? Math.min(...ts) : 0;
+  let prevT = t0, cumCost = 0, anyCost = false;
+  const parts = [];
+  if(pre.length)  parts.push(pre.map(eventHtml).join(""));
+  turns.forEach((t,i) => {
+    const tEnd = turnEndT(t);
+    const stepLat = tEnd!=null ? Math.max(0, tEnd - prevT) : null;
+    const cumLat  = tEnd!=null ? Math.max(0, tEnd - t0) : null;
+    const stepCost = turnCost(t);
+    if(stepCost!=null){ cumCost += stepCost; anyCost = true; }
+    parts.push(turnHtml(t, `${keyPrefix}:${i}`, { stepLat, cumLat, stepCost, cumCost: anyCost ? cumCost : null }));
+    if(tEnd!=null) prevT = tEnd;
+  });
+  if(tail.length) parts.push(tail.map(eventHtml).join(""));
+  return parts.join("") || `<div class="empty">no agent turns</div>`;
+}
+
+// step + cumulative latency/cost badges, kept always-visible in the collapsed summary.
+function metricBadges(m){
+  if(!m) return "";
+  const lat = m.cumLat!=null
+    ? `<span class="tmetric tlat"><span class="tm-k">Δt</span>${fsec(m.stepLat)}<span class="tm-sep">·</span><span class="tm-k">Σt</span>${fsec(m.cumLat)}</span>` : "";
+  const cost = (m.stepCost!=null || m.cumCost!=null)
+    ? `<span class="tmetric tcost"><span class="tm-k">Δ$</span>${m.stepCost!=null?fusd(m.stepCost):"?"}<span class="tm-sep">·</span><span class="tm-k">Σ$</span>${m.cumCost!=null?fusd(m.cumCost):"?"}</span>` : "";
+  return (lat||cost) ? `<span class="tmetrics">${lat}${cost}</span>` : "";
+}
+
+function turnHtml(turn, key, metrics){
+  const { name, preview } = actionLabel(turn);
+  const sf = turn.results.find(r => (r.message||"").startsWith("semantic_filter") && r.data && Array.isArray(r.data.docs));
+  const badge   = name ? `<span class="op-badge" style="background:#3399ff22;color:#3399ff">${esc(name)}</span>` : "";
+  const sfBadge = sf ? `<span class="op-badge" style="background:#33cc3322;color:#33cc33">semantic_filter ${sf.data.n_out}/${sf.data.n_in}</span>` : "";
+  const stepLabel = turn.step!=null ? `step ${turn.step}` : "turn";
+  const lead   = turn.lead.map(eventHtml).join("");
+  const asst   = turn.assistant ? eventHtml(turn.assistant) : "";
+  const tc = toolCodeStr(turn.toolCode);
+  const toolCode = tc ? `<div class="msg compact" style="border-left-color:#888"><div class="msg-line mono">${esc(tc)}</div></div>` : "";
+  const notes  = turn.notes.map(eventHtml).join("");
+  const results = turn.results.map(r => r===sf ? semfilterHtml(r, key) : eventHtml(r)).join("");
+  return `<details class="node"><summary>
+      <span class="ti">▶</span>
+      <span class="node-meta">${esc(stepLabel)}</span>
+      ${badge}${sfBadge}
+      <span class="node-summary mono">${esc(preview.slice(0,140))}</span>
+      ${metricBadges(metrics)}
+    </summary>
+    <div class="node-body">${lead}${asst}${toolCode}${notes}${results}</div>
+  </details>`;
+}
+
+// semantic filter: predicate + every input doc as a pass(green)/fail(red) chip; click a
+// chip to expand that document's text (carried in the event's structured `docs` payload).
+function semfilterHtml(evt, key){
+  const d = evt.data || {}, docs = d.docs || [];
+  const head = `<div class="sf-head">
+    <span class="sf-pred">predicate: <b>${esc(d.predicate || "")}</b></span>
+    <span class="sf-stat">${d.n_out}/${d.n_in} passed</span></div>`;
+  const chips = docs.map((doc,i) => {
+    const dk = `sf:${key}:${i}`, open = S.expanded.has(dk);
+    const cls = doc.kept ? "sf-pass" : "sf-fail";
+    return `<div class="sf-doc">
+      <span class="sf-chip ${cls}" onclick="VW.toggleExpand('${dk}')">${doc.kept?"✓":"✗"} ${esc(doc.doc_id)}</span>
+      ${open ? `<pre class="sf-text">${esc(doc.text || "(no text recorded)")}</pre>` : ""}
+    </div>`;
+  }).join("") || `<span class="empty">no documents filtered</span>`;
+  return `<div class="semfilter">${head}<div class="sf-docs">${chips}</div></div>`;
+}
+
+// rag_llm retrieval: the single top-k vector search. Show the query, then each retrieved
+// chunk (rank · doc_id · distance), click to expand its text. New traces carry a structured
+// `chunks` list; older ones are reconstructed from the joined `context` string.
+function ragRetrievalHtml(events){
+  const obs = events.find(e => e.kind==="observation" && e.data && (Array.isArray(e.data.chunks) || e.data.context!=null));
+  if(!obs) return events.map(eventHtml).join("") || `<div class="empty">no retrieval events</div>`;
+  const d = obs.data;
+  const query = d.query!=null ? d.query : (S.row.question || "");
+  const chunks = Array.isArray(d.chunks) ? d.chunks : parseContextChunks(d.context, d.doc_ids, d.chunk_ids);
+  const rows = chunks.map((c,i) => {
+    const dk = `rc:${i}`, open = S.expanded.has(dk);
+    return `<div class="rc">
+      <div class="rc-head" onclick="VW.toggleExpand('${dk}')">
+        <span class="ti">${open?"▼":"▶"}</span>
+        <span class="rc-rank">#${c.rank ?? i+1}</span>
+        <span class="rc-doc">${esc(c.doc_id || "?")}</span>
+        <span class="rc-chunk">${esc(c.chunk_id || "")}</span>
+        <span class="rc-dist">${c.distance!=null ? "d="+(+c.distance).toFixed(4) : ""}</span>
+      </div>
+      ${open ? `<pre class="rc-text">${esc(stripChunkHeader(c.text || ""))}</pre>` : ""}
+    </div>`;
+  }).join("");
+  return `<div class="rag-retr">
+    <div class="kv"><span class="k">query</span><span class="v mono">${esc(query)}</span></div>
+    <div class="rc-stat">${chunks.length} chunk(s) retrieved</div>${rows}</div>`;
+}
+// reconstruct per-chunk rows from a joined `context` string (legacy traces w/o `chunks`).
+function parseContextChunks(context, docIds, chunkIds){
+  if(!context) return (chunkIds||[]).map((cid,i) => ({ rank:i+1, chunk_id:cid, doc_id:(docIds||[])[i], distance:null, text:"" }));
+  const re = /\[(\d+)\]\s*chunk_id=(\S+)\s*\|\s*doc_id=(\S+)\s*\|\s*type=(\S+)\s*\|\s*distance=([\d.]+)/g;
+  const heads = []; let m;
+  while((m = re.exec(context))) heads.push({ idx:m.index, rank:+m[1], chunk_id:m[2], doc_id:m[3], type:m[4], distance:+m[5] });
+  if(!heads.length) return [{ rank:1, chunk_id:(chunkIds||[])[0], doc_id:(docIds||[])[0], distance:null, text:context }];
+  return heads.map((h,i) => ({ ...h, text:context.slice(h.idx, i+1<heads.length?heads[i+1].idx:context.length).trim() }));
+}
+// drop the "[N] chunk_id=... | distance=..." header line (already shown in the row).
+function stripChunkHeader(text){
+  return text.replace(/^\[\d+\]\s*chunk_id=\S+\s*\|\s*doc_id=\S+\s*\|\s*type=\S+\s*\|\s*distance=[\d.]+\n?/, "");
+}
+
+// TREC-BioGen nugget-recall event (emitted by the judge): every gold nugget + its support label.
+function isNuggetEvent(e){ return e && e.data && Array.isArray(e.data.nuggets) && String(e.message||"").startsWith("nugget_judge"); }
+const NUG_CLASS = { support:"nug-sup", partial_support:"nug-par", not_support:"nug-not" };
+const NUG_ICON  = { support:"✓",       partial_support:"~",       not_support:"✗" };
+// A card showing the groundtruth nuggets, each colored green/yellow/red by whether the answer
+// fully / partially / did not support it (KARL's D.1 completeness labels behind the recall score).
+function nuggetCard(evt){
+  const d = evt.data || {}, nugs = d.nuggets || [];
+  const nNot = (d.n_nuggets ?? nugs.length) - (d.n_support ?? 0) - (d.n_partial ?? 0);
+  const recall = d.recall!=null ? (d.recall*100).toFixed(1)+"%" : "?";
+  const rows = nugs.map(n => {
+    const cls = NUG_CLASS[n.label] || "nug-not", icon = NUG_ICON[n.label] || "✗";
+    return `<div class="nug ${cls}"><span class="nug-icon">${icon}</span><span class="nug-text">${esc(n.nugget)}</span></div>`;
+  }).join("") || `<span class="empty">no gold nuggets</span>`;
+  return `<div class="card">
+    <div class="card-title">Gold-nugget recall</div>
+    <div class="nug-summary">
+      <span class="mono">${d.n_support ?? 0} supported · ${d.n_partial ?? 0} partial · ${nNot} missed / ${d.n_nuggets ?? nugs.length} nuggets · recall <b>${recall}</b></span>
+      <span class="nug-legend">
+        <span><span class="nug-swatch s-sup"></span>support</span>
+        <span><span class="nug-swatch s-par"></span>partial</span>
+        <span><span class="nug-swatch s-not"></span>not supported</span>
+      </span>
+    </div>
+    <div class="nuggets">${rows}</div>
+  </div>`;
+}
+
+function drawSearchAgent(sys){
+  const nugEvt = S.events.find(isNuggetEvent);
+  const events = nugEvt ? S.events.filter(e => e!==nugEvt) : S.events;
+  const aStart = answerStartIdx(events);
+  const retrieval = aStart>=0 ? events.slice(0, aStart) : events;
+  const answer    = aStart>=0 ? events.slice(aStart) : [];
+  const retrTitle = sys==="qatfd_search_agent"
+    ? "Retrieval — search agent + semantic filter" : "Retrieval — search agent";
+  const parts = [qaHeaderHtml()];
+  if(nugEvt) parts.push(nuggetCard(nugEvt));
+  parts.push(sectionCard(retrTitle, turnsHtml(retrieval, "r")));
+  if(answer.length) parts.push(sectionCard("Answer — code agent", turnsHtml(answer, "a")));
+  document.getElementById("content").innerHTML = parts.join("");
+}
+function drawRagLlm(){
+  const nugEvt = S.events.find(isNuggetEvent);
+  const events = nugEvt ? S.events.filter(e => e!==nugEvt) : S.events;
+  const aStart = answerStartIdx(events);
+  const retrieval = aStart>=0 ? events.slice(0, aStart) : events;
+  const answer    = aStart>=0 ? events.slice(aStart) : [];
+  const parts = [qaHeaderHtml()];
+  if(nugEvt) parts.push(nuggetCard(nugEvt));
+  parts.push(sectionCard("Retrieval — top-k vector search", ragRetrievalHtml(retrieval)));
+  if(answer.length) parts.push(sectionCard("Answer — code agent", turnsHtml(answer, "a")));
+  document.getElementById("content").innerHTML = parts.join("");
+}
+
+boot().catch(e => { document.getElementById("content").innerHTML = `<div class="hint">Error: ${esc(e.message)}</div>`; });
+</script>
+</body>
+</html>

@@ -5,32 +5,29 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "skunk"
 version = "0.1.0"
-description = "Declarative QA pipeline over the U.S. Treasury Bulletin corpus"
+description = "Library for agentic retrieval and computation over document corpora"
 requires-python = ">=3.12"
 dependencies = [
     "beautifulsoup4",
     "chromadb>=1.4.0",
-    "fastapi",
     "google-genai",
     "httpx",
     "jinja2",
     "openrouter",
     "pandas",
-    "pyarrow",
     "pydantic>=2",
     "pymupdf",
     "pyyaml",
     "numpy",
-    "sentence-transformers",
     "statsmodels",
     "tavily-python",
-    "uvicorn",
-    "websockets",
-    "pandas-stubs==3.0.3.260530",
 ]
 
 [project.optional-dependencies]
-rollout = ["tinker", "tinker_cookbook"]
+# Local SentenceTransformers embedding backend (LLMClient emb_provider="local");
+# heavy (pulls in torch), so opt-in. API-backed embeddings need nothing extra.
+embeddings = ["sentence-transformers"]
+dev = ["pandas-stubs==3.0.3.260530"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

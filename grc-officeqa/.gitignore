@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# secrets
+.env
+
+# local corpus artifacts / run outputs (not tracked)
+cache/
+data/
+eval/traces/
+eval/runs_*/
+logs/

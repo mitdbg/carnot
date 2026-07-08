@@ -4,12 +4,13 @@ import asyncio
 import json
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from jinja2 import Environment, StrictUndefined
 
-from skunk.common import B64Image, Effort, ExecutionContext, PendingHumanIntervention
+from skunk.common import B64Image, Effort, ExecutionContext
 from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.local_python_executor import CodeOutput, LocalPythonExecutor
@@ -279,7 +280,9 @@ Requirements for the final answer:
     # Extra imports authorized inside the per-step code sandbox. Default: none
     # (tool calls only). Compute-oriented agents (e.g. the task solver) widen
     # this to allow numpy / scipy / statistics / ... in their python steps.
-    authorized_imports: list[str] = []
+    # A tuple (not a list): class-level mutable defaults are shared across every
+    # instance, so an in-place append would leak between agents.
+    authorized_imports: Sequence[str] = ()
 
     def __init__(
         self,
@@ -293,7 +296,10 @@ Requirements for the final answer:
         capture_logprobs: bool = False,
     ) -> None:
         self._tools = tools
-        self.max_steps = max_steps
+        # None = keep the class default (mirrors max_misfires) — assigning the bare
+        # param used to clobber the declared default to None (an UNBOUNDED loop).
+        if max_steps is not None:
+            self.max_steps = max_steps
         if max_misfires is not None:
             self.max_misfires = max_misfires
         # Full block trajectory of the most recent `call()`; rebuilt per call.
@@ -330,12 +336,16 @@ Requirements for the final answer:
             parse=_parse_step,
             max_parse_retries=self.max_recover_retries,
         )
+        # Persistent sandbox — cross-step interpreter state survives across the loop.
+        # `call()` swaps in a fresh one per NEW run (a `resume` keeps it, so resumed
+        # turns still see the variables earlier steps defined).
+        self._executor = self._build_executor()
 
     def _build_executor(self) -> LocalPythonExecutor:
         """A fresh sandbox with the agent's tools bound. The loop keeps one persistent
         executor across steps so cross-step interpreter state survives."""
         executor = LocalPythonExecutor(
-            additional_authorized_imports=self.authorized_imports
+            additional_authorized_imports=list(self.authorized_imports)
         )
         executor.send_tools({t.name: t for t in self._tools})
         return executor
@@ -353,20 +363,6 @@ Requirements for the final answer:
         the event loop so this question's sibling branches keep progressing while the
         blocking tool I/O runs."""
         return await asyncio.to_thread(self._run_block, self._executor, code)
-
-    async def _resolve_human_intervention(
-        self, ctx: ExecutionContext, res: _CallResult
-    ) -> _CallResult:
-        """Await a `PendingHumanIntervention` the `request_human` tool may have returned,
-        replacing it in-place with the human's resolved response before the observation is
-        rendered."""
-        if res.output is not None and isinstance(
-            res.output.output, PendingHumanIntervention
-        ):
-            ctx.emit("human_intervention_waiting", kind="note")
-            res.output.output = await res.output.output.response
-            ctx.emit("human_intervention_resolved", kind="note")
-        return res
 
     def validate_final_answer(
         self, payload: object, observations: list[str]
@@ -443,21 +439,22 @@ Requirements for the final answer:
         instead of starting over — the seam for a reviewer sending the agent back with
         feedback without it re-deriving everything it already saw. Extra kwargs are ignored
         (signature compat with single-shot calls)."""
-        # Persistent sandbox — cross-step interpreter state survives here. The final answer
-        # is parsed outside the sandbox, so it is NOT bound here.
-        self._executor = self._build_executor()
-
         # Full block trajectory (no system message; call() assembles it each turn).
         # `_render_for_llm()` produces the redacted, flattened view sent to the model.
         if resume and self.messages:
+            # Keep the executor too — a resumed turn can still read the variables
+            # earlier steps defined (rebuilding here used to silently drop them).
             self.messages.append({"role": "user", "blocks": [TextBlock(user)]})
         else:
             self.messages = [{"role": "user", "blocks": [TextBlock(user)]}]
+            # Fresh sandbox per new run; the final answer is parsed outside the
+            # sandbox, so it is NOT bound here.
+            self._executor = self._build_executor()
 
         # Capture the system prompt + opening question into the event stream so the
         # trace viewer can show them (the console / `.log` keep only the one-liners —
         # the full text rides in `data`). The system prompt is static for the call.
-        system_prompt = self._prompt._assemble_system_prompt(ctx)
+        system_prompt = self._prompt.assemble_system_prompt(ctx)
         ctx.emit(
             f"system_prompt chars={len(system_prompt)}",
             kind="system",
@@ -491,8 +488,9 @@ Requirements for the final answer:
                 warned = True
                 left = max_steps - step
                 warn = (
-                    f"Only {left} of {max_steps} steps remain. You should focus your remaining on"
-                    f"your most promising lead and avoid wasting time on exploration."
+                    f"Only {left} of {max_steps} steps remain. You should focus your "
+                    f"remaining steps on your most promising lead and avoid wasting "
+                    f"time on exploration."
                 )
                 self.messages.append({"role": "user", "blocks": [TextBlock(warn)]})
                 ctx.emit(f"steps_low_warning left={left}")
@@ -524,9 +522,6 @@ Requirements for the final answer:
                     assert step_out.code is not None
                     ctx.emit(f"tool_code {step_out.code!r}")
                     result = await self._execute_code(step_out.code)
-                    # A `request_human` call returns a `PendingHumanIntervention`; await the
-                    # human's response and splice it back in before the observation renders.
-                    result = await self._resolve_human_intervention(ctx, result)
                 done = step_out
             except ParseError as e:
                 obs = f"Observation (step {turn}): {e.detail}"
@@ -593,7 +588,7 @@ Requirements for the final answer:
         "block, either:\n"
         "  • COMMIT: if a value already in your observations answers the request, your "
         "best final answer in the required format; or\n"
-        '  • NO RESULT: an envelope {"error": "<note>"} with a 2-4 sentence note describing which tools/series you tried, any '
+        '  • NO RESULT: an envelope {"error": "<note>"} with a 2-4 sentence note describing which tools/sources you tried, any '
         "candidate values you found, and what blocked you."
     )
 
@@ -658,8 +653,11 @@ Requirements for the final answer:
             trimmed = trimmed + extra
         if self._backend is None:
             self._last_logprobs = None
-            return await self._prompt.call(
-                ctx, messages=trimmed, should_stop=_stop_at_first_block,
+            # Agent-model resolution lives HERE (the agent layer), not in the prompt
+            # layer: `agent_model_id` overrides the per-site model map for agent loops.
+            return await self._prompt.call_multi_turn(
+                ctx, trimmed, should_stop=_stop_at_first_block,
+                model=ctx.config.agent_model_id or None,
                 temperature=self.temperature,
                 max_output_tokens=self.max_output_tokens,
                 timeout_s=self.request_timeout_s,
@@ -668,7 +666,7 @@ Requirements for the final answer:
         # prompt, sample one turn synchronously (the rollout owns its thread +
         # loop), stash logprobs for `call()`, then parse. A bad parse raises
         # `ParseError`, which `call()` turns into a recoverable observation.
-        system = self._prompt._assemble_system_prompt(ctx)
+        system = self._prompt.assemble_system_prompt(ctx)
         rendered = [{"role": "system", "content": system}, *trimmed]
         text, self._last_logprobs = self._backend.generate(
             rendered,

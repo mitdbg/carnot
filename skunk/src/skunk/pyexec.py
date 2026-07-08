@@ -47,6 +47,19 @@ def strip_code_fences(code: str) -> str:
     return s.strip()
 
 
+def parse_codegen_reply(raw: str, *, expectation: str) -> str:
+    """Parse a codegen LLM reply into bare code: strip the fence, reject an
+    empty body or a bare-JSON reply with a retryable `ParseError` carrying the
+    caller's `expectation` fix-it text. The ONE codegen-reply parser (compute
+    and data_prep both route through here; only their expectation prose differs)."""
+    from skunk.errors import ParseError
+
+    s = strip_code_fences(raw).strip()
+    if not s or s.startswith("{"):
+        raise ParseError(raw=raw, detail=expectation)
+    return s
+
+
 def _new_executor(
     extra_vars: dict[str, Any],
     extra_tools: dict[str, Any] | None = None,
@@ -78,20 +91,3 @@ def exec_python_with_env(
     return ex.state, ex.state.get("result")
 
 
-def exec_python_capture_stdout(
-    code: str, local_vars: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], str]:
-    """Exec `code` with print() output captured; returns (state, stdout). For operators
-    whose contract is "print the answer" rather than "assign `result`". Callable entries
-    in `local_vars` route to `send_tools()` (immutable); data entries to `send_variables()`."""
-    code = strip_code_fences(code)
-    tools: dict[str, Any] = {}
-    vars_: dict[str, Any] = {}
-    for k, v in (local_vars or {}).items():
-        (tools if callable(v) else vars_)[k] = v
-    ex = _new_executor(vars_, extra_tools=tools)
-    try:
-        out = ex(code)
-    except InterpreterError as e:
-        raise StepFailed("pyexec", str(e)) from e
-    return ex.state, str(out.logs)
