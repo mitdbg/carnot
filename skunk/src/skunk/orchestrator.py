@@ -7,21 +7,12 @@ from skunk.compute import ComputeOp
 from skunk.config import SkunkConfig
 from skunk.data_prep import DataPrepOp
 from skunk.errors import MissingData, StepFailed
-from skunk.human import (
-    POOL_REVIEW_BRANCH_ID,
-    BrokerChannel,
-    ConsoleChannel,
-    HumanAssist,
-    apply_overrides,
-)
 from skunk.lookup_external import LookupExternalOp
 from skunk.common import (
     AnnotatedValue,
     BranchRetrieval,
     ExecutionContext,
     Final,
-    HumanInterventionHandler,
-    HumanReviewRegister,
     NeedsMore,
     PageRef,
     traced_step,
@@ -35,7 +26,7 @@ from skunk.plan import (
     RetrieveBranch,
 )
 from skunk.prompted_call import PromptOverride
-from skunk.question_explainer import ConceptExplanation, QuestionExplainer
+from skunk.question_explainer import QuestionExplainer
 from skunk.retrieve import RetrieveOp
 from skunk.result import ExecutionResult
 
@@ -46,79 +37,6 @@ class BranchOutcome:
     entries: list[AnnotatedValue] | None
     error: StepFailed | None
     pages: list[PageRef] = field(default_factory=list)
-
-
-@dataclass
-class RecomputeState:
-    """The minimal snapshot needed to revise an answer after a human review resolves, WITHOUT
-    re-planning or re-retrieving: the per-branch extracted entries (keyed by stable branch id),
-    any extra (human-recovery) entries, and the concept explanations compute was given. A
-    recompute swaps a branch's entries for the human's correction and re-runs ONLY compute —
-    deterministic and cheap, so the revision reflects exactly the human's edit (no planner drift).
-    """
-
-    question: str
-    order: list[int]
-    entries_by_branch: dict[int, list[AnnotatedValue]]
-    extra_entries: list[AnnotatedValue]
-    explanations: list[ConceptExplanation]
-
-    def to_jsonable(self) -> dict:
-        return {
-            "question": self.question,
-            "order": list(self.order),
-            "entries_by_branch": {
-                str(bid): [e.model_dump(mode="json") for e in entries]
-                for bid, entries in self.entries_by_branch.items()
-            },
-            "extra_entries": [e.model_dump(mode="json") for e in self.extra_entries],
-            "explanations": [c.model_dump() for c in self.explanations],
-        }
-
-    @classmethod
-    def from_jsonable(cls, data: dict) -> RecomputeState:
-        return cls(
-            question=str(data["question"]),
-            order=[int(b) for b in data.get("order", [])],
-            entries_by_branch={
-                int(bid): [AnnotatedValue.model_validate(e) for e in entries]
-                for bid, entries in data.get("entries_by_branch", {}).items()
-            },
-            extra_entries=[
-                AnnotatedValue.model_validate(e) for e in data.get("extra_entries", [])
-            ],
-            explanations=[
-                ConceptExplanation.model_validate(c)
-                for c in data.get("explanations", [])
-            ],
-        )
-
-
-async def recompute_answer(
-    state: RecomputeState,
-    overrides: dict[int, list[dict]],
-    ctx: ExecutionContext,
-) -> str:
-    """Re-run ONLY compute over the first attempt's per-branch entries with human `overrides`
-    (keyed by branch id) applied — the deterministic revision path. Each override is the human's
-    source-indexed review items for that branch; `apply_overrides` rebuilds the branch's entries
-    from them (honoring edits, deletes, and provenance). Branches with no override keep their
-    original entries. No re-plan / re-retrieve / re-extract. One compute pass: a `Final` yields
-    the revised answer, an unresolved `NeedsMore` surfaces as `MissingData`."""
-    merged: list[AnnotatedValue] = []
-    for bid in state.order:
-        cached = state.entries_by_branch.get(bid, [])
-        if bid in overrides:
-            merged.extend(apply_overrides(overrides[bid], cached))
-        else:
-            merged.extend(cached)
-    merged.extend(state.extra_entries)
-    outcome = await ComputeOp().run(
-        merged, ctx, concept_explanations=state.explanations
-    )
-    if isinstance(outcome, Final):
-        return outcome.answer
-    raise MissingData(outcome.missing_reason, outcome.missing)
 
 
 class Orchestrator:
@@ -135,8 +53,6 @@ class Orchestrator:
         config: SkunkConfig | None = None,
         prompt_overrides: tuple[PromptOverride, ...] = (),
         llm_client: LLMClient | None = None,
-        human_intervention_handler: HumanInterventionHandler | None = None,
-        human_review_register: HumanReviewRegister | None = None,
     ):
         self._ctx = ExecutionContext(
             question=question,
@@ -146,8 +62,6 @@ class Orchestrator:
             config=config or SkunkConfig.from_env(),
             prompt_overrides=prompt_overrides,
             llm_client=llm_client,
-            human_intervention_handler=human_intervention_handler,
-            human_review_register=human_review_register,
         )
         self._current_plan: Plan | None = None
         # Stable per-question branch identity. `_branch_ids[i]` is the id of the
@@ -160,17 +74,6 @@ class Orchestrator:
         self._planner = Planner()
         self._retrieve = RetrieveOp(self._ctx.config)
         self._lookup = LookupExternalOp()
-        # Human-in-the-loop middleware (inert unless a SKUNK_HUMAN_* flag is set). Gates on
-        # ctx.config per call, so constructing it unconditionally is free when disabled.
-        # Channel by transport: under the competition server a handler is present → route
-        # human requests through the async broker/web UI; for a local CLI run fall back to
-        # the blocking console.
-        human_channel = (
-            BrokerChannel(self._ctx.human_intervention_handler)
-            if self._ctx.human_intervention_handler is not None
-            else ConsoleChannel()
-        )
-        self._human = HumanAssist(channel=human_channel)
         self._explainer = QuestionExplainer()
         self._compute = ComputeOp()
         self._data_prep = DataPrepOp()
@@ -180,10 +83,6 @@ class Orchestrator:
         # `retrieved_pages` for the eval harness's `likely_pages` / retrieval-recall reporting.
         # Empty under golden bypass (retrieve never runs).
         self._retrieved_pages: list[PageRef] = []
-        # Snapshot for an optimistic-review recompute (the per-branch entries that produced the
-        # answer); set on every compute attempt, None until then. The server stores it on the
-        # task so a later human resolve can revise the answer via `recompute_answer`.
-        self._recompute_state: RecomputeState | None = None
 
     @property
     def ctx(self) -> ExecutionContext:
@@ -194,13 +93,6 @@ class Orchestrator:
         """Deduped union of pages from every retrieve sweep this question (empty under
         golden bypass)."""
         return self._retrieved_pages
-
-    @property
-    def recompute_state(self) -> RecomputeState | None:
-        """Snapshot of the per-branch entries that produced the answer (None until the first
-        compute attempt). The server stores it so a later human-review resolve can revise the
-        answer deterministically via `recompute_answer`. See `RecomputeState`."""
-        return self._recompute_state
 
     @property
     def current_plan(self) -> Plan | None:
@@ -252,7 +144,6 @@ class Orchestrator:
         while True:
             self._current_plan = plan
             if sweep_added or needs is None:
-                pre_clean_pool = pool
                 pool = await self._prep_pool(pool)
                 outcome = await traced_step(
                     self._ctx,
@@ -265,18 +156,6 @@ class Orchestrator:
                     ),
                 )
                 if isinstance(outcome, Final):
-                    # Final answer: NOW snapshot the pool for recompute and open the single human
-                    # review of it. Registering only on success (not before every compute) means a
-                    # superseded/replanning round never has an open pool review — so a human can't
-                    # be mid-edit on a review the orchestrator is about to discard, and the
-                    # recompute snapshot always matches the data behind the answer. Page attribution
-                    # uses the PRE-clean pool (single doc_id each); the cleaned pool's coalesced
-                    # multi-doc values can't resolve to a PDF.
-                    self._capture_recompute_pool(pool, explanations)
-                    if self._human.wants_pool_review(self._ctx):
-                        self._human.register_pool_review(
-                            pool, self._ctx, source_values=pre_clean_pool
-                        )
                     self._result.answer = outcome.answer
                     return outcome.answer
                 needs = outcome
@@ -314,52 +193,18 @@ class Orchestrator:
             # Bind before the lambda (opaque to ruff's use analysis).
             reason, missing = needs.missing_reason, needs.missing
 
-            # === Replan, then HITL approval of the proposed plan ===
-            # Replan FIRST (no human steer) to produce a proposed plan, then — when a handler is
-            # wired — show the human the data-prep output, the previous plan, what compute reported
-            # missing, and the proposed plan, and block for approval. On rejection, re-run the
-            # replan with their feedback injected and execute THAT directly (no second approval).
-            previous_plan = plan
-            handler = self._ctx.human_intervention_handler
-
-            async def _replan(guidance: str | None) -> Plan:
-                return await traced_step(
-                    self._ctx,
-                    "replanner",
-                    lambda: self._planner.replan(
-                        self._ctx, pool, attempts, reason, missing, human_guidance=guidance
-                    ),
-                )
-
-            plan = await _replan(None)
-            if handler is not None:
-                self._emit_plan(
-                    previous_plan,
-                    "human_pending",
-                    reason=reason,
-                    missing=missing,
-                    recovery_round=round_idx,
-                )
-                feedback = await self._request_replan_approval(
-                    handler, previous_plan, plan, pool, reason, missing, round_idx
-                )
-                if feedback:
-                    plan = await _replan(feedback)
+            plan = await traced_step(
+                self._ctx,
+                "replanner",
+                lambda: self._planner.replan(self._ctx, pool, attempts, reason, missing),
+            )
 
             ids = self._alloc_branch_ids(len(plan.branches))
             self._branch_ids = ids
             self._emit_plan(
                 plan, "replan", reason=reason, missing=missing, recovery_round=round_idx
             )
-            # The first replan may surface in-agent `request_human` help (figure / search
-            # tool), gated to round 1 like the pre-merge HITL path.
-            self._ctx.human_intervention_enabled = (
-                round_idx == 1 and handler is not None
-            )
-            try:
-                outcomes = await self._run_branches(plan.branches, ids)
-            finally:
-                self._ctx.human_intervention_enabled = False
+            outcomes = await self._run_branches(plan.branches, ids)
             attempts += [
                 AttemptRecord(round_idx, o.branch, len(o.entries or []), o.error)
                 for o in outcomes
@@ -374,11 +219,7 @@ class Orchestrator:
         """Run the data-prep gate over the pool just before a compute call: dedup corpus reprints
         and coalesce same-series values across everything gathered so far. Fails safe via
         `DataPrepOp.run` (returns its input unchanged on any error), so it never starves compute of
-        inputs.
-
-        Cleaning runs every round, but the human review of the cleaned pool is opened only once
-        compute reaches a Final answer (see the recovery loop) — so a superseded/replanning round
-        never has an open review the human could be mid-editing."""
+        inputs."""
         if not pool:
             return pool
         return await traced_step(
@@ -425,116 +266,6 @@ class Orchestrator:
             kind="plan",
             data=data,
         )
-
-    def _review_mode(self) -> str:
-        """How a wanted human review is serviced for this run:
-        - "optimistic": a register hook is wired (under the competition server) — register an
-          open review and keep the LLM result, non-blocking. Whether a review is wanted at all
-          is the per-stage policy's job (the SKUNK_HUMAN_* gates); this only picks the transport.
-        - "blocking":   no register hook (local CLI) — await the human on the console / async
-          broker as before.
-        """
-        if self._ctx.human_review_register is None:
-            return "blocking"
-        return "optimistic"
-
-    def _capture_recompute_pool(
-        self,
-        pool: list[AnnotatedValue],
-        explanations: list[ConceptExplanation],
-    ) -> None:
-        """Snapshot the cleaned pool compute reads + explanations that produced this answer, so a
-        resolve of the data-prep pool review can recompute. The pool is stored under the sentinel
-        `POOL_REVIEW_BRANCH_ID`; `recompute_answer` applies the human's edited pool onto it and
-        re-runs ONLY compute (no replan / re-retrieve / re-extract)."""
-        self._recompute_state = RecomputeState(
-            question=self._ctx.question,
-            order=[POOL_REVIEW_BRANCH_ID],
-            entries_by_branch={POOL_REVIEW_BRANCH_ID: list(pool)},
-            extra_entries=[],
-            explanations=list(explanations),
-        )
-
-    def _replan_approval_guidance(
-        self,
-        previous_plan: Plan,
-        proposed_plan: Plan,
-        pool: list[AnnotatedValue],
-        reason: str,
-        missing: list[str],
-        round_idx: int,
-    ) -> dict:
-        """The payload the replan-approval review renders: the data-prep agent's output (the
-        cleaned pool compute read), the previous plan, what compute reported missing, and the
-        proposed new plan the human is approving. Branch ids are attached to the previous plan
-        (its `self._branch_ids`); the proposed plan has none yet (allocated after approval)."""
-
-        def _branches(plan: Plan, *, with_ids: bool) -> list[dict]:
-            if with_ids:
-                return [
-                    {"branch_id": bid, **branch.model_dump(mode="json")}
-                    for bid, branch in zip(self._branch_ids, plan.branches)
-                ]
-            return [branch.model_dump(mode="json") for branch in plan.branches]
-
-        return {
-            "recovery_round": round_idx,
-            "reason": reason,
-            "missing": missing,
-            "data_prep_output": [
-                entry.model_dump(
-                    mode="json",
-                    include={"description", "value", "unit", "kind", "doc_id", "pages"},
-                )
-                for entry in pool
-            ],
-            "previous_plan": _branches(previous_plan, with_ids=True),
-            "proposed_plan": _branches(proposed_plan, with_ids=False),
-        }
-
-    async def _request_replan_approval(
-        self,
-        handler: HumanInterventionHandler,
-        previous_plan: Plan,
-        proposed_plan: Plan,
-        pool: list[AnnotatedValue],
-        reason: str,
-        missing: list[str],
-        round_idx: int,
-    ) -> str:
-        """Block on the human to approve the proposed replan. Shows the data-prep output, the
-        previous plan, the compute MissingData, and the proposed plan. Returns the steer feedback:
-        an empty string means APPROVE (execute the proposed plan as-is); a non-empty string means
-        REJECT — the caller re-runs the replan with it injected and executes that without asking
-        again."""
-        guidance = self._replan_approval_guidance(
-            previous_plan, proposed_plan, pool, reason, missing, round_idx
-        )
-        instructions = (
-            "Review the proposed plan. Approve it to execute as-is, or reject with feedback "
-            f"telling the replanner what to change. Compute reported: {reason}"
-        )
-        if missing:
-            instructions += f"\nStill missing: {', '.join(missing)}"
-        self._ctx.emit(
-            f"replan_approval_request round={round_idx} missing={missing!r} "
-            f"proposed_branches={len(proposed_plan.branches)}",
-            kind="user",
-        )
-        response = await handler(
-            "replan_approval",
-            instructions,
-            f"Question: {self._ctx.question}",
-            [],
-            guidance,
-        )
-        feedback = str(response.get("response", "")).strip()
-        self._ctx.emit(
-            f"replan_approval_resolved round={round_idx} "
-            f"decision={'rejected' if feedback else 'approved'}",
-            kind="observation",
-        )
-        return feedback
 
     async def _run_retrieve_phase(
         self,
@@ -613,28 +344,8 @@ class Orchestrator:
                 res = (await pipeline)[retrieve_pos.index(pos)]
                 if isinstance(res, StepFailed):
                     raise res
-                # Optimistic mode reviews the data-prep output once per round (see
-                # `_prep_pool`), not each extract. Blocking mode (local CLI) still verifies the
-                # value(s) per branch in place when the policy opts in.
-                if (
-                    self._review_mode() == "blocking"
-                    and self._human.wants_verify(
-                        cast(RetrieveBranch, branch), res, self._ctx
-                    )
-                ):
-                    pages = _branch_pages(pos)
-                    res = await traced_step(
-                        self._ctx,
-                        "human_verify",
-                        lambda: self._human.verify_extract(
-                            res, pages, cast(RetrieveBranch, branch), self._ctx
-                        ),
-                        branch_id=bid,
-                    )
                 return res
-            # External lookup. Its value(s) are rolled into the data-prep agent's output and
-            # reviewed (when HITL is on) in the single data-prep pool review — there is no
-            # per-lookup human hook.
+            # External lookup.
             return await traced_step(
                 self._ctx,
                 "lookup_external",

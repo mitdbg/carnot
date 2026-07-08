@@ -239,21 +239,6 @@ class SkunkConfig(SearchAgentConfig):
     # re-reading is an opt-in phase, default off. (env: SKUNK_VISION_RESCAN_CHARTS=1)
     vision_rescan_charts: bool = False
 
-    # Human-in-the-loop: route specific sub-tasks to a person instead of (or after) the
-    # model. Two independent toggles, all default OFF (zero behavior change when unset);
-    # the policy/channel wiring lives in `human.py` and is enforced at the orchestrator
-    # dispatch seam, so no operator or planner code changes when these flip. Transport is
-    # chosen by handler presence: under the competition server these route through the async
-    # broker/web UI (non-blocking — a worker resolves each request); for a local CLI run with
-    # no handler they fall back to the blocking console, so target a handful of UIDs, not a sweep.
-    # - human_figure: for `visual_only` retrieve branches (chart/figure questions the
-    #   vision model reads unreliably), show the human the rendered page(s) + the model's
-    #   candidate and take their answer. (env: SKUNK_HUMAN_FIGURE=1)
-    # - human_verify_extract: for non-visual extractions, the human confirms/corrects the
-    #   extracted value(s) against the rendered source page(s). (env: SKUNK_HUMAN_VERIFY_EXTRACT=1)
-    human_figure: bool = False
-    human_verify_extract: bool = False
-
     def __post_init__(self) -> None:
         # Route per-stage models through the override registry so `PromptedCall` resolves them
         # like every other call-site. Defaulted here unless a run pins them explicitly
@@ -336,9 +321,6 @@ class SkunkConfig(SearchAgentConfig):
             extract_vision_only=os.environ.get("SKUNK_EXTRACT_VISION_ONLY", "0")
             not in ("", "0"),
             vision_rescan_charts=os.environ.get("SKUNK_VISION_RESCAN_CHARTS", "")
-            not in ("", "0"),
-            human_figure=os.environ.get("SKUNK_HUMAN_FIGURE", "0") not in ("", "0"),
-            human_verify_extract=os.environ.get("SKUNK_HUMAN_VERIFY_EXTRACT", "0")
             not in ("", "0"),
             retriever=os.environ.get("SKUNK_RETRIEVER", "search_agent"),  # type: ignore[arg-type]
             chromadb_dir=os.environ.get("SKUNK_CHROMADB_DIR", "cache/chromadb"),

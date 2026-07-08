@@ -135,15 +135,11 @@ Tier escalation only happens when the chosen tier reports "value not present" (o
 
 ## Human-in-the-loop
 
-An optional middleware layer (`src/skunk/human.py`) routes specific sub-tasks to a person. It is **not a new operator and adds no branch kind** — the planner is untouched; the layer wraps the existing operators at the orchestrator's `_run_branches._tail` dispatch seam. Two independent env flags, both default OFF (so the default path is byte-for-byte unchanged — no extra trace steps, no prompts):
-
-- `SKUNK_HUMAN_FIGURE=1` — for `visual_only` retrieve branches (chart/figure questions the vision tier reads unreliably), the human is shown the rendered page(s) + the model's candidate and **produces** the answer.
-- `SKUNK_HUMAN_VERIFY_EXTRACT=1` — for non-visual extractions, the human **confirms/corrects** the extracted value(s) against the rendered source page(s).
-
-(A third flag, `SKUNK_HUMAN_LOOKUP`, was removed: an external lookup's values are reviewed
-in the single data-prep pool review, so the per-lookup hook was redundant.)
-
-Three pieces, each a swappable seam: `HumanAssistPolicy` decides *whether* a human is consulted for a given call (today all-or-nothing per flag; the future-nuance seam — e.g. verify only list-valued extractions — lives here with no operator/orchestrator change); `HumanChannel` is the *how* (default `ConsoleChannel` dumps each source image to a temp PNG, prints the candidate JSON, and reads a stdin reply — blank = accept, or paste an `AnnotatedValue` object/array terminated by a line `END` to override; the client/server harness UI can implement the same `async ask(req, ctx)` interface later); and `HumanAssist` is the facade the orchestrator holds, returning the same `list[AnnotatedValue]` the operators do. Human-authored values are re-stamped with branch/page provenance via the same `_stamp_provenance` extract uses. Prompts serialize across parallel branches through a module-level `asyncio.Lock` and read stdin off the event loop via `asyncio.to_thread`. **Operational note:** with any flag on a run blocks on the console one branch at a time — target a handful of UIDs, not a sweep.
+Removed (2026-07-07, library-hardening refactor). The competition-era HITL layer —
+`human.py` (policy/channel/facade), `human_intervention.py` (`request_human` tool),
+the orchestrator's replan-approval and recompute paths, and the `SKUNK_HUMAN_*`
+config flags — was deleted wholesale; it lives in git history if a future
+application wants to reintroduce it behind a proper seam.
 
 ## Model routing
 

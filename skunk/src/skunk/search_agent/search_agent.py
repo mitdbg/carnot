@@ -28,10 +28,8 @@ from chromadb.api.models.Collection import Collection
 from skunk.common import (
     B64Image,
     ExecutionContext,
-    HumanInterventionHandler,
 )
 from skunk.config import SearchAgentConfig
-from skunk.human_intervention import RequestHumanTool
 from skunk.llm_client import LLMClient
 from skunk.local_python_executor import CodeOutput
 from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent, TextBlock, Tool
@@ -100,7 +98,6 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         generation_backend=None,
         sampling_params: dict | None = None,
         capture_logprobs: bool = False,
-        human_intervention_handler: HumanInterventionHandler | None = None,
     ):
         # `briefing` / `final_answer_doc` override the class-level defaults on this
         # instance so MultiTurnAgent's template path picks them up (only consulted when
@@ -170,8 +167,6 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             PruneTool(self._pruned_chunk_ids, self._pruned_doc_ids),
             *extra_tools,
         ]
-        if human_intervention_handler is not None:
-            tools.append(RequestHumanTool(human_intervention_handler))
         super().__init__(
             tools, max_steps=config.agent_max_steps,
             max_misfires=config.agent_max_misfires,

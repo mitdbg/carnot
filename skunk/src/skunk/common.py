@@ -40,26 +40,6 @@ if TYPE_CHECKING:
 Effort = Literal["off", "minimal", "low", "medium", "high"]
 EFFORT_VALUES = ("off", "minimal", "low", "medium", "high")
 
-HumanInterventionHandler = Callable[
-    [str, str, str | None, list[str], dict[str, Any] | None],
-    Awaitable[dict[str, Any]],
-]
-
-# Optimistic review registration: same (task, instruction, question, source_docs, guidance)
-# shape as the blocking handler, but synchronous and fire-and-forget — it opens a human review
-# on the server and returns a review id (or None) WITHOUT suspending the branch. The branch
-# keeps the LLM result; a human resolve later drives a server-side recompute. Wired only under
-# the competition server (the broker injects it); None for a local CLI run.
-HumanReviewRegister = Callable[
-    [str, str, str | None, list[str], dict[str, Any] | None],
-    str | None,
-]
-
-@dataclass(frozen=True)
-class PendingHumanIntervention:
-    response: Awaitable[dict[str, Any]]
-
-
 @dataclass
 class B64Image:
     """A single rendered page image ready to pass to an LLM: MIME type + base64 data."""
@@ -435,9 +415,8 @@ class AnnotatedValue(BaseModel):
     is machine-stamped from the extract inputs — the source page refs and the
     retrieve branch — NOT authored by the LLM. `obtained_visually` records the
     machine fact that this value was read by the vision tier (the figure/chart
-    fallback), and gates the human figure ("Visual QA") review; it is internal
-    provenance and never shown to any LLM (it is excluded from every prompt
-    rendering). It is absent (None/empty) for
+    fallback); it is internal provenance and never shown to any LLM (it is
+    excluded from every prompt rendering). It is absent (None/empty) for
     external lookups. `doc_id` is the source document the value was read from,
     carried as that document's id — its parsed-JSON/PDF filename stem (e.g.
     "combined_statement__historical__cs-1872"). It identifies the source
@@ -672,12 +651,6 @@ class ExecutionContext:
     prompt_overrides: tuple[
         PromptOverride, ...
     ] = ()  # corpus/few_shot/lesson overrides; operators pick out their own entries by name
-    human_intervention_handler: HumanInterventionHandler | None = None
-    human_intervention_enabled: bool = False
-    # Optimistic, non-blocking review registration (server only). When set, the data-prep pool
-    # gate opens a review and keeps the LLM result instead of awaiting the human — see
-    # `HumanReviewRegister` and `HumanAssist.register_pool_review`.
-    human_review_register: HumanReviewRegister | None = None
 
     def __post_init__(self) -> None:
         if self.llm_client is None:

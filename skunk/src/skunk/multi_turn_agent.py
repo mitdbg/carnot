@@ -9,7 +9,7 @@ from typing import Any, Protocol
 
 from jinja2 import Environment, StrictUndefined
 
-from skunk.common import B64Image, Effort, ExecutionContext, PendingHumanIntervention
+from skunk.common import B64Image, Effort, ExecutionContext
 from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.local_python_executor import CodeOutput, LocalPythonExecutor
@@ -354,20 +354,6 @@ Requirements for the final answer:
         blocking tool I/O runs."""
         return await asyncio.to_thread(self._run_block, self._executor, code)
 
-    async def _resolve_human_intervention(
-        self, ctx: ExecutionContext, res: _CallResult
-    ) -> _CallResult:
-        """Await a `PendingHumanIntervention` the `request_human` tool may have returned,
-        replacing it in-place with the human's resolved response before the observation is
-        rendered."""
-        if res.output is not None and isinstance(
-            res.output.output, PendingHumanIntervention
-        ):
-            ctx.emit("human_intervention_waiting", kind="note")
-            res.output.output = await res.output.output.response
-            ctx.emit("human_intervention_resolved", kind="note")
-        return res
-
     def validate_final_answer(
         self, payload: object, observations: list[str]
     ) -> str | None:
@@ -524,9 +510,6 @@ Requirements for the final answer:
                     assert step_out.code is not None
                     ctx.emit(f"tool_code {step_out.code!r}")
                     result = await self._execute_code(step_out.code)
-                    # A `request_human` call returns a `PendingHumanIntervention`; await the
-                    # human's response and splice it back in before the observation renders.
-                    result = await self._resolve_human_intervention(ctx, result)
                 done = step_out
             except ParseError as e:
                 obs = f"Observation (step {turn}): {e.detail}"

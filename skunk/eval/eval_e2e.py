@@ -161,13 +161,6 @@ async def _run_one_question(
             )
 
     config = SkunkConfig.from_env()
-    # Hermetic eval: human-in-the-loop is for the competition server, never for an automated
-    # benchmark run. Force every human-review path off regardless of the environment
-    # (SKUNK_HUMAN_* env vars `from_env` may have read), so a stray flag can't silently
-    # human-gate or stall a run. The intervention/review HANDLERS are already None (never
-    # passed to the Orchestrator below); these are the config FLAGS that would request them.
-    config.human_figure = False
-    config.human_verify_extract = False
     config.golden_pages = golden_pages
 
     overrides_path = Path(config.prompt_overrides_path)

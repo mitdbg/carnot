@@ -102,11 +102,6 @@ class RetrieveOp:
             config=ctx.config,
             document_map=document_map,
             chroma_collection=collection,
-            human_intervention_handler=(
-                ctx.human_intervention_handler
-                if ctx.human_intervention_enabled
-                else None
-            ),
         )
         page_keys = await agent.retrieve(
             ctx,
