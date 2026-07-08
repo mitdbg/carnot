@@ -129,6 +129,13 @@ class UsageTracker:
         p = _match_price(model or self.default_model, self.prices)
         if not p:
             return None
+        # Streaming can omit the usage chunk → token counts arrive as None; treat as 0
+        # (mirrors add()). Without this, a completion that streamed fine but lacked usage
+        # raised `TypeError: NoneType - int` here, which the retry loop mistook for a failed
+        # call and discarded — wasting good work and adding load to a rate-limited endpoint.
+        in_tok = in_tok or 0
+        cached_tok = cached_tok or 0
+        out_tok = out_tok or 0
         in_rate = p.get("in", 0.0)
         uncached = max(0, in_tok - cached_tok)
         return (

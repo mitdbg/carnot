@@ -299,6 +299,16 @@ def _make_openrouter_client() -> OpenRouter:
     return OpenRouter(api_key=api_key, client=sync_client, async_client=async_client)
 
 
+# Local SentenceTransformers embedders are cached PROCESS-WIDE (not per LLMClient): the
+# eval builds one LLMClient per question and runs many concurrently, so a per-instance
+# cache loaded N identical copies of the model — fine on CPU RAM, but on a single GPU that
+# is N * ~1.2GB and OOMs the device (e.g. 32 copies > a 22GB L4). One shared instance is
+# also correct: the model is read-only at inference, so concurrent .encode() calls from
+# worker threads are safe. Keyed by model id; the lock only guards the one-time load.
+_LOCAL_EMBEDDERS: dict[str, Any] = {}
+_LOCAL_EMBEDDERS_LOCK = threading.Lock()
+
+
 class LLMClient:
     """LLM client. Generation calls route to either the AI Studio Gemini API
     (`provider=genai`, default) or OpenRouter (`provider=openrouter`) per
@@ -309,7 +319,6 @@ class LLMClient:
         self._config = config
         self._gemini_client: genai.Client | None = None
         self._openrouter_client: OpenRouter | None = None
-        self._local_embedders: dict[str, Any] = {}
         self.usage = UsageTracker(
             default_model=config.llm_model,
             prices=getattr(config, "llm_prices", None),
@@ -554,12 +563,24 @@ class LLMClient:
         """Lazily build (and cache) a local SentenceTransformers model. `sentence-
         transformers` is a skunk dependency; the import is deferred so a run that only
         uses the OpenRouter backend never pays the heavy import."""
-        st = self._local_embedders.get(model)
+        st = _LOCAL_EMBEDDERS.get(model)
         if st is None:
-            from sentence_transformers import SentenceTransformer
+            with _LOCAL_EMBEDDERS_LOCK:
+                st = _LOCAL_EMBEDDERS.get(model)  # re-check: another thread may have loaded it
+                if st is None:
+                    import torch
+                    from sentence_transformers import SentenceTransformer
 
-            st = SentenceTransformer(model)
-            self._local_embedders[model] = st
+                    st = SentenceTransformer(model)
+                    # The Qwen3-Embedding checkpoints declare torch_dtype=bfloat16, so weights
+                    # load as bf16. CPU matmul cannot mix bf16 weights with the fp32 activations
+                    # the forward pass produces ("RuntimeError: expected m1 and m2 to have the
+                    # same dtype, but got: c10::BFloat16 != float"), which silently zeroes out
+                    # query embeddings and tanks retrieval. Force fp32 on CPU; on CUDA bf16 is
+                    # supported and faster, so leave it.
+                    if not torch.cuda.is_available():
+                        st = st.float()
+                    _LOCAL_EMBEDDERS[model] = st
         return st
 
     def embed_query(

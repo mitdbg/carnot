@@ -28,6 +28,27 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import cast
 
+# --- Python 3.14 / Hydra 1.3.x compatibility shim ---------------------------------------
+# Py3.14's argparse eagerly validates each argument's `help` at add_argument() time (new
+# ArgumentParser._check_help -> HelpFormatter._expand_help does `'%' not in help`). Hydra
+# passes a lazy, non-str help object (LazyCompletionHelp, defines only __repr__) for its
+# `--shell-completion` arg, so that membership test raises TypeError and the parser build
+# dies before our @hydra.main entry point ever runs. hydra-core 1.3.3 is the latest release
+# and predates 3.14, so there is no fixed upstream version to upgrade to. Coerce any
+# non-str help to str before the eager check. No-op on Pythons without _check_help (<3.14),
+# and a genuine bad string help still raises normally.
+import argparse as _argparse
+
+if hasattr(_argparse.ArgumentParser, "_check_help"):
+    _qatfd_orig_check_help = _argparse.ArgumentParser._check_help
+
+    def _qatfd_check_help_str_safe(self, action):
+        if action.help is not None and not isinstance(action.help, str):
+            action.help = str(action.help)
+        return _qatfd_orig_check_help(self, action)
+
+    _argparse.ArgumentParser._check_help = _qatfd_check_help_str_safe
+
 import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
