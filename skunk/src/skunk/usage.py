@@ -32,7 +32,7 @@ class UsageTracker:
 
     def __init__(self, default_model: str, prices: dict | None = None) -> None:
         # Guards the mutating accumulators below: a single client is hit concurrently when
-        # tools fan LLM calls across a thread pool (e.g. semfilter's per-doc judges), and the
+        # tools fan LLM calls across a thread pool, and the
         # `+=` increments are read-modify-write across bytecodes, so concurrent adds can drop
         # updates (under-count) without it. Reads (`cost()`, snapshots) run after the writers
         # have joined, so only the writers need the lock.

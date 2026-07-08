@@ -567,7 +567,8 @@ def main() -> None:
         default=16,
         help="UID-level concurrency (default: %(default)s). Each worker runs one "
         "_run_one_question independently; the process-wide LLM rate limiter "
-        "throttles cross-worker traffic (per-model, env: SKUNK_MODEL_RPM).",
+        "throttles cross-worker traffic (per-model, from config `llm_model_rpm` / "
+        "`llm_default_rpm`).",
     )
     args = parser.parse_args()
 

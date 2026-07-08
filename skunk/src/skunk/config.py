@@ -159,9 +159,9 @@ class SkunkConfig:
     # Compute operator
     compute_max_attempts: int = 3
     # Best-of-N: run this many independent codegen→exec trials per compute call (in
-    # parallel) and commit the most frequent answer (ties broken arbitrarily). MissingData
-    # outcomes abstain from the vote — a NeedsMore is returned only when EVERY trial
-    # signals it. 1 = single-trial (today's behavior). (env: SKUNK_COMPUTE_BEST_OF_N)
+    # parallel) and commit the most frequent outcome. All `NeedsMore` trials pool into a
+    # single missing-data candidate; a tie NEVER breaks in favor of missing-data (see
+    # `ComputeOp._vote`). 1 = single-trial. (env: SKUNK_COMPUTE_BEST_OF_N)
     compute_best_of_n: int = 5
     # Bypass the QuestionExplainer's per-question selection and inject the ENTIRE
     # PRECOMPUTED_CONCEPTS catalog into every compute `## Concept references` block (skips
@@ -262,18 +262,6 @@ class SkunkConfig:
     # Agent-loop chat model. None → `llm_model`. (env: SKUNK_AGENT_MODEL)
     agent_model_id: str | None = None
 
-    # Page-index semantic filter: a single coarse pass over each year-filtered page's
-    # metadata summary, scored once against every active branch target at once (a B×K
-    # true/false matrix, one row per page, one column per target). The filter runs on a
-    # cheaper model, resolved through the standard per-call model-override registry under
-    # key "semfilter" (seeded in `__post_init__`) — so it's tuned like any other call-site
-    # rather than via a dedicated field. NOTE: with the flat-block filter this is the max
-    # CONTENT BLOCKS per call (pages are exploded into blocks and packed page-coherently up to
-    # this cap), not pages. 32: the flat shape is far less batch-sensitive than the old nested
-    # page objects, so a wide cap keeps call count / latency low without losing recall.
-    # (env: SKUNK_SEMFILTER_MODEL, SKUNK_SEMFILTER_BATCH)
-    semfilter_batch_size: int = 32
-
     # Per-LLM-call caps for the external-lookup agent's turns (named for the retired
     # selection agent that shared them). Mirrors the search agent: without a combined
     # thinking+visible cap, Flash thrashed to ~63K thinking tokens / ~285s per step
@@ -322,10 +310,9 @@ class SkunkConfig:
     def __post_init__(self) -> None:
         # Route per-stage models through the override registry so `PromptedCall` resolves them
         # like every other call-site. Defaulted here unless a run pins them explicitly
-        # (SKUNK_MODEL_OVERRIDES=stage=… or, for the filter, SKUNK_SEMFILTER_MODEL). Efforts
+        # (SKUNK_MODEL_OVERRIDES=stage=…). Efforts
         # come from each call-site's `default_effort` (compute=high, planner=high, replanner=high; extract=medium),
         # overridable via SKUNK_EFFORT_OVERRIDES.
-        # - semfilter: the cheap coarse filter runs on flash-lite.
         # - extract.{text,vision}: flash, medium thinking. Pro is the stronger read
         #   on dense scanned tables but its 8M input-tok/min quota + 380s latency tails choke the
         #   parallel select-agent fan-out; pin Pro back per-run via SKUNK_MODEL_OVERRIDES. The
@@ -340,8 +327,7 @@ class SkunkConfig:
         #   (branch coverage, operator routing, period fidelity) is worth the per-question
         #   cost — the flash planner systematically dropped/misrouted branches that Pro/high
         #   gets right (plan-probe 2026-06-14: 19/20 known-bad dev plans fixed).
-        # Everything else (toc_pick, …) runs on the base `llm_model` (flash).
-        self.model_overrides.setdefault("semfilter", "gemini-3.1-flash-lite")
+        # Everything else runs on the base `llm_model` (flash).
         self.model_overrides.setdefault("extract.text", "gemini-3.5-flash")
         self.model_overrides.setdefault("extract.vision", "gemini-3.5-flash")
         self.model_overrides.setdefault("compute.codegen", "gemini-3.1-pro-preview")
@@ -360,12 +346,6 @@ class SkunkConfig:
         model_overrides = _parse_model_overrides(
             os.environ.get("SKUNK_MODEL_OVERRIDES", "")
         )
-        # SKUNK_SEMFILTER_MODEL is a convenience knob for the "semfilter" override;
-        # an explicit SKUNK_MODEL_OVERRIDES=semfilter=… wins, and the hardcoded
-        # default (`__post_init__`) fills in if neither is set.
-        sem_model = os.environ.get("SKUNK_SEMFILTER_MODEL")
-        if sem_model:
-            model_overrides.setdefault("semfilter", sem_model)
         return cls(
             llm_model=os.environ.get("SKUNK_LLM_MODEL", "gemini-3.5-flash"),
             llm_provider=os.environ.get("SKUNK_LLM_PROVIDER", "genai"),  # type: ignore[arg-type]
@@ -390,7 +370,6 @@ class SkunkConfig:
             prompt_overrides_path=os.environ.get(
                 "SKUNK_PROMPT_OVERRIDES", "config/prompts/us_receipts_expenditures.yaml"
             ),
-            semfilter_batch_size=int(os.environ.get("SKUNK_SEMFILTER_BATCH", "32")),
             select_agent_max_output_tokens=int(
                 os.environ.get("SKUNK_SELECT_AGENT_MAX_OUTPUT_TOKENS", "8192")
             ),

@@ -253,8 +253,8 @@ class BuildContext:
     cost report. One instance per `run_build`, used on one event loop.
 
     The model and its RPM/TPM rate limits are NOT owned here — they come from
-    `SkunkConfig` and the `llm_client` rate limiter (env SKUNK_LLM_MODEL,
-    SKUNK_MODEL_RPM/TPM), the same as every other entry point."""
+    `SkunkConfig` (env SKUNK_LLM_MODEL) and the `llm_client` per-model rate
+    limiter (config `llm_model_rpm`/`llm_model_tpm`), the same as every other entry point."""
 
     config: SkunkConfig
     paths: BuildPaths
@@ -1241,9 +1241,9 @@ def main() -> int:
             return 1
         stages = tuple(s for s in PIPELINE if s.name in want)
 
-    # Model + per-model RPM/TPM are read from SkunkConfig and the llm_client rate
-    # limiter (env SKUNK_LLM_MODEL, SKUNK_MODEL_RPM/TPM) — the build
-    # doesn't override them.
+    # Model (env SKUNK_LLM_MODEL) + per-model RPM/TPM (config `llm_model_rpm`/
+    # `llm_model_tpm`) are read from SkunkConfig and the llm_client rate
+    # limiter — the build doesn't override them.
     configure_obs()
     config = SkunkConfig.from_env()
     only = (

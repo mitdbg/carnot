@@ -33,7 +33,7 @@ All variables are defined inside `run_solution.sh` / `run_practice_server.sh` un
 |-----------------|--------------------------------|-------------------------------|
 | `REASONER`      | Reasoner module:function       | `skunk_reasoner:solve`        |
 | `AUTO_SUBMIT`   | Enable automatic submission    | `false`                       |
-| `PYTHON_BIN`    | Python interpreter path        | `/home/gerardo/.local/share/mamba/envs/carnot/bin/python` |
+| `PYTHON_BIN`    | Python interpreter path        | `python3` (set to your env's interpreter) |
 
 `ROUND_SECONDS`, `QUESTIONS`, and port numbers are set inside the launcher script and cannot be overridden from the environment.
 
@@ -44,7 +44,7 @@ Run each command separately from the `harness_ui` directory.
 ### 1. Practice Server
 
 ```bash
-/home/gerardo/.local/share/mamba/envs/carnot/bin/python practice_server.py \
+python3 practice_server.py \
     --host 127.0.0.1 --port 8765 \
     --round-seconds 900 \
     --questions questions/officeqa_3x5_questions.json
@@ -55,7 +55,7 @@ No `--team-token` flag is used.
 ### 2. Skunk Server
 
 ```bash
-/home/gerardo/.local/share/mamba/envs/carnot/bin/python -m skunk_server.server \
+python3 -m skunk_server.server \
     --host 127.0.0.1 --port 8787 \
     --cup-base-url http://127.0.0.1:8765 \
     --team-token anything \
