@@ -7,7 +7,7 @@ from skunk.compute import ComputeOp
 from skunk.config import PipelineConfig
 from skunk.data_prep import DataPrepOp
 from skunk.errors import MissingData, StepFailed
-from skunk.lookup_external import LookupExternalOp
+from skunk.lookup_agent.lookup_external import LookupExternalOp
 from skunk.common import (
     AnnotatedValue,
     BranchRetrieval,

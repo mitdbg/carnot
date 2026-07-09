@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from skunk.lookup_tools import DEFAULT_PRIORITIZATION, resolve_lookup_tools
+from skunk.lookup_agent.lookup_tools import DEFAULT_PRIORITIZATION, resolve_lookup_tools
 from skunk.common import AnnotatedValue, ExecutionContext
 from skunk.multi_turn_agent import MultiTurnAgent, Tool
 from skunk.plan import LookupBranch
