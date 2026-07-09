@@ -169,7 +169,7 @@ def run_quality_filter_for_pair(
     )
 
     config = SkunkConfig(
-        agent_model_id=cfg.model_id.removeprefix("google/"),
+        llm_model=cfg.model_id.removeprefix("google/"),
         emb_model_id=cfg.emb_model_id,
         agent_max_steps=cfg.max_steps,
         agent_max_pages_per_tool_call=cfg.max_pages_per_tool_call,

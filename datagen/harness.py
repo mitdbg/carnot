@@ -363,7 +363,7 @@ def generate_one(
     trace_path = f"{trace_dir}/{seed}_trace.jsonl"
 
     config = SkunkConfig(
-        agent_model_id=model_id.removeprefix("google/"),
+        llm_model=model_id.removeprefix("google/"),
         emb_model_id=emb_model_id,
         agent_max_steps=AGENT_MAX_STEPS,
         agent_max_pages_per_tool_call=MAX_PAGES_PER_TOOL_CALL,
@@ -491,7 +491,7 @@ def _make_rollout_agent_factory(
     each output doc_id into its full chunk set.
     """
     config = SkunkConfig(
-        agent_model_id=model_id.removeprefix("google/"),
+        llm_model=model_id.removeprefix("google/"),
         emb_model_id=emb_model_id,
         agent_max_steps=AGENT_MAX_STEPS,
         agent_max_pages_per_tool_call=MAX_PAGES_PER_TOOL_CALL,

@@ -2,14 +2,13 @@
 name: null
 emb_provider: openrouter
 emb_model_id: Qwen/Qwen3-Embedding-8B
-agent_model_id: google/gemini-3.5-flash
 
 # --- LLM client (skunk.llm_client.LLMClient) ---
 # generation provider for all LLM calls: genai (AI Studio Gemini, bare model ids) or
 # openrouter (full vendor/model ids). Embeddings dispatch on emb_provider, not this.
 llm_provider: openrouter
-# default model for calls that don't pass an explicit model (agent loops pass agent_model_id)
-llm_model: gemini-3.5-flash
+# default model for every LLM call (one-shot calls and agent loops alike); full OpenRouter id
+llm_model: google/gemini-3.5-flash
 # per-call retry on transient faults only; the delay doubles each attempt
 llm_max_retries: 5
 llm_retry_initial_delay_s: 1.0

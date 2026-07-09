@@ -20,6 +20,7 @@ import asyncio
 import csv
 import datetime
 import json
+import logging
 import random
 import sys
 import time
@@ -346,7 +347,7 @@ def run(
 
     # build the shared retrieval substrate once (chroma + document_map).
     resources = benchmark.get_resources()
-    model = system.config.agent_model_id
+    model = system.config.llm_model
     rc = _RunCtx(
         benchmark=benchmark, system=system, resources=resources,
         trace_dir=trace_dir, model=model, verbose=exp_config.console,
@@ -379,6 +380,13 @@ def run(
 
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig) -> None:
+    # httpx logs EVERY request (successes included) at INFO — one line per LLM call and per
+    # Chroma-server read, which floods multirun stdout under Hydra's INFO job logging. Bumping
+    # it to WARNING loses no error visibility: httpx has no per-status levels (its 429 lines
+    # are INFO too), and transient LLM faults (429/5xx) are already logged at WARNING with
+    # status + provider detail by skunk's llm_client retry path.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
     print(f"[qatfd] composed config:\n{OmegaConf.to_yaml(cfg)}")
 
     # the CLI overrides that produced this composed config (snapshotted alongside it).

@@ -27,9 +27,9 @@ class SystemConfig:
     emb_model_id: str
     # generation provider for all LLM calls
     llm_provider: Literal["genai", "openrouter"]
-    # the model to use for the system
-    agent_model_id: str
-    # default model for calls that don't pass an explicit `model=` (agent loops pass `agent_model_id`).
+    # default model for every LLM call — one-shot prompted calls AND agent loops alike.
+    # A call resolves its model as `model_overrides.get(call_site_name, llm_model)`; only a
+    # per-call-site entry in `model_overrides` (below) overrides it.
     llm_model: str
     # per-call retry on transient faults only (429 / 5xx / transport blips); the delay doubles each attempt.
     llm_max_retries: int
@@ -130,8 +130,6 @@ class PipelineConfig(SearchAgentConfig):
     # Embedding model for vector_search (must match the stored embeddings).
     # (env: SKUNK_EMB_MODEL)
     emb_model_id: str = "gemini-embedding-001"
-    # Agent-loop chat model. None → `llm_model`. (env: SKUNK_AGENT_MODEL)
-    agent_model_id: str | None = None
 
     # ---- operator knobs -----------------------------------------------------------
     # Compute operator
@@ -203,7 +201,7 @@ class PipelineConfig(SearchAgentConfig):
     extract_vision_only: bool = False
 
 
-def _parse_effort_overrides(raw: str) -> dict[str, "Effort"]:
+def parse_effort_overrides(raw: str) -> dict[str, "Effort"]:
     """Parse `SKUNK_EFFORT_OVERRIDES` ("name=tier,...") into a dict. Raises ValueError
     on malformed entries / unknown tiers so config typos fail loudly at startup."""
     from skunk.common import EFFORT_VALUES  # local to avoid import cycle
@@ -229,7 +227,7 @@ def _parse_effort_overrides(raw: str) -> dict[str, "Effort"]:
     return out
 
 
-def _parse_model_overrides(raw: str) -> dict[str, str]:
+def parse_model_overrides(raw: str) -> dict[str, str]:
     """Parse `SKUNK_MODEL_OVERRIDES` ("name=model,...") into a dict keyed by
     `PromptedCall.name`. Model ids are free-form (no enum to validate against);
     an unknown id surfaces as an API error at the call site. Raises ValueError on
@@ -253,7 +251,7 @@ def _parse_model_overrides(raw: str) -> dict[str, str]:
     return out
 
 
-def _parse_csv(raw: str) -> list[str] | None:
+def parse_csv(raw: str) -> list[str] | None:
     """Parse a comma-separated env var into a list of trimmed entries, or None when
     unset/empty (so the field falls back to its default)."""
     items = [s.strip() for s in raw.split(",") if s.strip()]

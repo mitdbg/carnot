@@ -11,9 +11,9 @@ from pathlib import Path
 
 from skunk.config import (
     PipelineConfig,
-    _parse_csv,
-    _parse_effort_overrides,
-    _parse_model_overrides,
+    parse_csv,
+    parse_effort_overrides,
+    parse_model_overrides,
 )
 
 # Default corpus locations (overridable via env / explicit construction — see the
@@ -108,13 +108,13 @@ class SkunkConfig(PipelineConfig):
 
     @classmethod
     def from_env(cls) -> SkunkConfig:
-        model_overrides = _parse_model_overrides(
+        model_overrides = parse_model_overrides(
             os.environ.get("SKUNK_MODEL_OVERRIDES", "")
         )
         return cls(
             llm_model=os.environ.get("SKUNK_LLM_MODEL", "gemini-3.5-flash"),
             llm_provider=os.environ.get("SKUNK_LLM_PROVIDER", "genai"),  # type: ignore[arg-type]
-            effort_overrides=_parse_effort_overrides(
+            effort_overrides=parse_effort_overrides(
                 os.environ.get("SKUNK_EFFORT_OVERRIDES", "")
             ),
             model_overrides=model_overrides,
@@ -180,6 +180,5 @@ class SkunkConfig(PipelineConfig):
                 os.environ.get("SKUNK_SEARCH_TIMEOUT_S", "120")
             ),
             lookup_max_steps=int(os.environ.get("SKUNK_LOOKUP_MAX_STEPS", "4")),
-            lookup_tools=_parse_csv(os.environ.get("SKUNK_LOOKUP_TOOLS", "")),
-            agent_model_id=os.environ.get("SKUNK_AGENT_MODEL") or None,
+            lookup_tools=parse_csv(os.environ.get("SKUNK_LOOKUP_TOOLS", "")),
         )

@@ -32,7 +32,7 @@ class RAGLLMConfig(SystemConfig):
 class QATFDSearchAgentConfig(SearchAgentConfig):
     # Mirrors the system hierarchy (QATFDSearchAgentSystem subclasses SearchAgentSystem): the
     # qatfd variant reuses the full search-agent config (agent_mode, step/token budgets, ...) and
-    # only adds a semantic-filter tool, which needs no extra config beyond agent_model_id (base).
+    # only adds a semantic-filter tool, which needs no extra config beyond llm_model (base).
     pass
 
 # ---------------------------------------------------------------------------

@@ -189,7 +189,7 @@ def run_task_solver(
     )
 
     config = SkunkConfig(
-        agent_model_id=cfg.task_solver_model_id.removeprefix("google/"),
+        llm_model=cfg.task_solver_model_id.removeprefix("google/"),
         agent_max_steps=cfg.task_solver_max_steps,
     )
     ctx = ExecutionContext(question=question, config=config)

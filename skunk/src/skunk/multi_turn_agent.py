@@ -653,11 +653,10 @@ Requirements for the final answer:
             trimmed = trimmed + extra
         if self._backend is None:
             self._last_logprobs = None
-            # Agent-model resolution lives HERE (the agent layer), not in the prompt
-            # layer: `agent_model_id` overrides the per-site model map for agent loops.
+            # Model resolution is delegated to the prompt layer (`_resolve_model`):
+            # `model_overrides.get(call_site_name, llm_model)`, same as every other call.
             return await self._prompt.call_multi_turn(
                 ctx, trimmed, should_stop=_stop_at_first_block,
-                model=ctx.config.agent_model_id or None,
                 temperature=self.temperature,
                 max_output_tokens=self.max_output_tokens,
                 timeout_s=self.request_timeout_s,
