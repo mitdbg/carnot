@@ -37,6 +37,7 @@ from skunk.search_agent.search_tools import (
     PRUNE_RESULT_TAG,
     READ_DOCUMENT_RESULT_TAG,
     SEARCH_RESULT_TAG,
+    SEMFILTER_RESULT_TAG,
     VIEW_FIGURE_RESULT_TAG,
     GrepCorpusTool,
     PruneTool,
@@ -129,6 +130,15 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         # never cross-talks between questions.
         self._state = RetrievalState()
 
+        # Extra tools are constructed by the caller before this state exists; hand it
+        # to any that opt in via a duck-typed `bind_retrieval_state` (e.g. `SemanticFilterTool`),
+        # so they can honor prunes and record seen chunks. Duck-typed on purpose: the
+        # generic `Tool` ABC must not learn `RetrievalState`.
+        for tool in extra_tools:
+            bind = getattr(tool, "bind_retrieval_state", None)
+            if callable(bind):
+                bind(self._state)
+
         # Tool instances capture their deps; the prompt's tool docs are generated
         # from their `doc`s by the base, so tools and docs can't drift.
         if pdf_dir is not None:
@@ -217,6 +227,29 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
                         for c in group["chunks"]
                     )
             # Surfaced when the output cap dropped hits (visible TextBlock, not redactable).
+            if output.get("truncation_note"):
+                blocks.append(TextBlock(output["truncation_note"]))
+            return blocks
+
+        if isinstance(output, dict) and output.get(SEMFILTER_RESULT_TAG):
+            if output.get("error"):
+                blocks.append(TextBlock(f"[error]\n{output['error']}"))
+            elif "chunks" in output:
+                # Corpus mode: a summary line, then one redactable ChunkBlock per snippet.
+                if output.get("summary"):
+                    blocks.append(TextBlock(output["summary"]))
+                blocks.extend(
+                    ChunkBlock(chunk_id=c["chunk_id"], doc_id=c["doc_id"], text=c["text"])
+                    for c in output["chunks"]
+                )
+                if not output.get("summary") and not output["chunks"]:
+                    blocks.append(TextBlock(EMPTY_RESULT_MESSAGE))
+            else:
+                # doc_ids mode: ids-only result.
+                blocks.append(TextBlock(
+                    f"[result]\nsemantic_filter kept {output['n_out']} of {output['n_in']} document(s). "
+                    f"kept_doc_ids={output['kept_doc_ids']}"
+                ))
             if output.get("truncation_note"):
                 blocks.append(TextBlock(output["truncation_note"]))
             return blocks

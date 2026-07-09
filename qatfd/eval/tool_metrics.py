@@ -35,7 +35,7 @@ event has ``kind`` (system/user/call/assistant/note/observation/...), a float
   emitted code (mirrors ``actionLabel``); this ignores tool names that appear
   only in the model's ``# comments``. A step is additionally counted as
   ``semantic_filter`` if it produced a structured ``semantic_filter n_in=...``
-  observation (emitted by ``qatfd.systems.semfilter``).
+  observation (emitted by ``skunk.search_agent.search_tools.filter_docs``).
 * **Tool-execution latency** — ``observation.t - tool_code.t`` for that step,
   i.e. pure tool time with the LLM reasoning of the step excluded.
 * **RAG-LLM** has no agent loop: its retrieval is a single ``search_corpus`` under

@@ -71,7 +71,8 @@ the same list, so one branch failing doesn't sink its siblings. Dispatch:
 
 - **`search_agent`** (the only backend) — the iterative ChromaDB + LLM-loop retriever under
   `src/skunk/search_agent/` (`SearchAgent`, a `MultiTurnAgent` with vector-search / grep /
-  read-document / prune tools over the chunked corpus). Branches run in parallel, a fresh
+  read-document / prune tools over the chunked corpus, plus an opt-in `semantic_filter`
+  LLM-judge tool callers can wire via `extra_tools`). Branches run in parallel, a fresh
   agent each, with per-branch failure isolation; the agent's page-key output is parsed to
   `PageRef`s.
 - **golden bypass** — `config.golden_pages` (the eval harness's `--golden` ablation) injects
