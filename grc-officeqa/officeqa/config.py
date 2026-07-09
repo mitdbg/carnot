@@ -147,10 +147,6 @@ class SkunkConfig(PipelineConfig):
             extract_request_timeout_s=float(
                 os.environ.get("SKUNK_EXTRACT_TIMEOUT_S", "150")
             ),
-            compute_precomputed_concept_refs=os.environ.get(
-                "SKUNK_PRECOMPUTED_CONCEPT_REFS", "0"
-            )
-            not in ("", "0"),
             extract_vision_only=os.environ.get("SKUNK_EXTRACT_VISION_ONLY", "0")
             not in ("", "0"),
             vision_rescan_charts=os.environ.get("SKUNK_VISION_RESCAN_CHARTS", "")

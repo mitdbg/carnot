@@ -1,7 +1,7 @@
 # qatfd/eval — results post-processing
 
 Scripts that turn the results under `../results/` into paper-ready artifacts.
-These modules read `report.csv` / `config.yaml` / `traces/events.jsonl` directly
+These modules read `report.csv` / `config.yaml` / `traces/<qid>.jsonl` directly
 and do **not** import the `qatfd` runtime package, so they run without the eval
 dependencies installed (only `pyyaml` is needed).
 
@@ -69,7 +69,7 @@ Two things to know about the numbers:
   For a contention-free number you'd need to instrument the tools with `perf_counter`
   and re-run (ask if you want this).
 
-These come from the structured `traces/events.jsonl` stream (the same one the
+These come from the per-question `traces/<qid>.jsonl` streams (the same ones the
 trace viewer renders), reconstructed the way the viewer does: split the retrieval
 stage from the answer stage at the 2nd `system` event, group the retrieval stage
 into agent turns, identify each step's tool from the first non-comment line of its

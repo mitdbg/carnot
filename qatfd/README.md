@@ -171,5 +171,5 @@ python3 -m qatfd.runner systems=rag_llm benchmarks=officeqa systems.emb_provider
 SAMPLE=20 BENCHMARKS=officeqa SYSTEMS="rag_llm,search_agent" ./run_all.sh
 ```
 
-Output: `results/<benchmark>/<system>/<run-name>_<timestamp>/` containing `report.csv`,
-`traces/events.jsonl` (structured event stream), and per-question `.txt` / `.log` traces.
+Output: `results/<benchmark>/<system>/<run-name>_<timestamp>/` containing `report.csv` and
+per-question `traces/<qid>.jsonl` (structured event stream) / `<qid>.txt` (human-readable dump) traces.

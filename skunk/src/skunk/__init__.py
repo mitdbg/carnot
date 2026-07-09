@@ -11,7 +11,6 @@ from skunk.errors import MissingData, StepFailed
 from skunk.orchestrator import Orchestrator
 from skunk.plan import Plan
 from skunk.prompted_call import load_prompt_overrides
-from skunk.question_explainer import ConceptExplanation
 from skunk.result import ExecutionResult
 
 __all__ = [
@@ -23,7 +22,6 @@ __all__ = [
     "Orchestrator",
     "PageRef",
     "Plan",
-    "ConceptExplanation",
     "PipelineConfig",
     "StepFailed",
     "load_prompt_overrides",

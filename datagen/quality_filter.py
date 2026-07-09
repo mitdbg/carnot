@@ -156,7 +156,7 @@ def run_quality_filter_for_pair(
     show_output: bool = False,
 ) -> QualityFilterResult:
     """Run the QualityFilter agent on one QA pair + its rollout attempts."""
-    trace_path = os.path.join(trace_dir, f"{pair.qa_id}_qf_trace.txt")
+    trace_path = os.path.join(trace_dir, f"{pair.qa_id}_qf_trace.jsonl")
     messages_path = os.path.join(trace_dir, f"{pair.qa_id}_qf_messages.json")
 
     system_prompt = Template(cfg.system_prompt_template).render(

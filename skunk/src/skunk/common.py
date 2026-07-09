@@ -12,7 +12,6 @@ import asyncio
 import base64
 import contextvars
 import json
-import logging
 import os
 import re
 import threading
@@ -99,11 +98,6 @@ def render_page_b64(
         data = pix.tobytes("png")
         mime = "image/png"
     return B64Image(mime=mime, data=base64.standard_b64encode(data).decode())
-
-
-# Process-scoped logger for code with no per-question ctx in scope (build
-# pipelines, offline prep); request-path code uses `ctx.emit` instead.
-log = logging.getLogger(__name__)
 
 
 class _RateLimiter:
@@ -718,7 +712,7 @@ class ExecutionContext:
     )
     verbose: bool = False  # also echo orchestrator + operator events to the console
     log_path: str | None = (
-        None  # when set, stream this question's events to that file (live, flushed)
+        None  # when set, stream this question's events to that file as JSON lines (live, flushed)
     )
     events: list[dict] = field(default_factory=list)  # per-question diagnostic events
     llm_client: LLMClient | None = (
@@ -741,10 +735,10 @@ class ExecutionContext:
             self.llm_client = LLMClient(self.config)
         # The active (step_idx, op) frame lives in the module-level `_step_frame`
         # ContextVar (per asyncio task), not on the instance — see its definition.
-        # Per-question log file: opened when log_path is set, written line-per-event
-        # and flushed live so a single question's stream lands in its own file (and
-        # survives a crash). No lock: this ctx is touched by one thread only (see the
-        # class docstring), so the file write needs no synchronization.
+        # Per-question event log: opened when log_path is set, written as one JSON
+        # line per event and flushed live so a single question's stream lands in its
+        # own file (and survives a crash). No lock: this ctx is touched by one thread
+        # only (see the class docstring), so the file write needs no synchronization.
         self._logfile = None
         if self.log_path:
             Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
@@ -814,10 +808,10 @@ class ExecutionContext:
           change.
         - `data` is an optional structured payload (the full system prompt, an
           assistant turn, structured observation blocks, a plan, a node summary).
-          It is captured to `self.events` and the durable JSONL sink for the viewer,
-          but is **deliberately excluded** from the rendered console / `.log` line
-          (which stays the scannable one-liner). Pass JSON-friendly values; the JSONL
-          sink falls back to `str` for anything else.
+          It is captured to `self.events` and the per-question `.jsonl` file for
+          the viewer, but is **deliberately excluded** from the rendered console
+          line (which stays the scannable one-liner). Pass JSON-friendly values;
+          the file write falls back to `str` for anything else.
         - Emit the fact at the layer that owns it, and only there: the
           orchestrator owns operator boundaries (the `"step"` event), so operators
           do NOT emit their own "starting"/"done"; each operator emits only its own
@@ -827,11 +821,11 @@ class ExecutionContext:
         Severity defaults to "warning" when the message contains a `_failed` event
         key or an `error=` field, else "info"; pass `level=` to override. The event
         is always captured to `self.events` (per-question, consumed by the trace
-        dump) and the JSONL sink; streamed to this question's `.log` file when one
-        is open; and echoed to the console only when `verbose` (rendered via
-        `trace.render_line`). The per-question file omits `uid` (implied by the
-        filename); the shared console prepends it so interleaved lines stay
-        attributable.
+        dump); streamed as a JSON line to this question's `.jsonl` file when one
+        is open (the durable machine-readable record); and echoed to the console
+        only when `verbose` (rendered via `trace.render_line`). The per-question
+        file omits `uid` (implied by the filename); the shared console prepends it
+        so interleaved lines stay attributable.
         """
         step_idx, op, branch_id = self._current_step()
         if level is None:
@@ -856,9 +850,8 @@ class ExecutionContext:
         if data is not None:
             evt["data"] = data
         self.events.append(evt)
-        trace.write_jsonl({"uid": self.uid, **evt})
         if self._logfile is not None:
-            self._logfile.write(trace.render_line(evt) + "\n")
+            self._logfile.write(json.dumps(evt, default=str, ensure_ascii=False) + "\n")
             self._logfile.flush()
         if self.verbose:
             print(trace.render_line({"uid": self.uid, **evt}))

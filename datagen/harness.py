@@ -360,7 +360,7 @@ def generate_one(
     user_prompt = _build_user_prompt(seed_chunks, examples, n_qa_pairs, n_chunks)
 
     os.makedirs(trace_dir, exist_ok=True)
-    trace_path = f"{trace_dir}/{seed}_trace.txt"
+    trace_path = f"{trace_dir}/{seed}_trace.jsonl"
 
     config = SkunkConfig(
         agent_model_id=model_id.removeprefix("google/"),

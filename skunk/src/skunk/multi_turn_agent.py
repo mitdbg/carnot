@@ -452,7 +452,7 @@ Requirements for the final answer:
             self._executor = self._build_executor()
 
         # Capture the system prompt + opening question into the event stream so the
-        # trace viewer can show them (the console / `.log` keep only the one-liners —
+        # trace viewer can show them (the console keeps only the one-liners —
         # the full text rides in `data`). The system prompt is static for the call.
         system_prompt = self._prompt.assemble_system_prompt(ctx)
         ctx.emit(

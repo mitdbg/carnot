@@ -7,8 +7,8 @@ the Hydra entry point; it builds a SkunkConfig (env defaults + the `skunk` overr
 constructs the benchmark + system via `qatfd.registry`, then calls `run()`.
 
 Mirrors skunk eval/eval_e2e.py's patterns: ThreadPoolExecutor over questions with
-one asyncio.run per worker, a timestamped run directory, a JSONL event sink, and a
-pre-allocated results list that preserves input order.
+one asyncio.run per worker, a timestamped run directory, per-question JSONL event
+traces, and a pre-allocated results list that preserves input order.
 """
 
 # ruff: noqa: E402 — qatfd.env.load_env() MUST run before any `import skunk` (it
@@ -56,7 +56,6 @@ from omegaconf import DictConfig, OmegaConf
 from skunk.common import ExecutionContext
 from skunk.errors import MissingData, StepFailed
 from skunk.llm_client import LLMClient
-from skunk.trace import configure_obs
 
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources
 from qatfd.config import ExperimentConfig, benchmark_config_factory, system_config_factory
@@ -239,7 +238,7 @@ def _load_finished_qids(results_path: Path) -> dict[str, Result]:
 async def _run_one(q: Question, rc: _RunCtx) -> Result:
     llm_client = LLMClient(rc.system.config)
     tracker = llm_client.usage
-    log_path = str(rc.trace_dir / f"{q.qid}.log") if rc.trace_dir else None
+    log_path = str(rc.trace_dir / f"{q.qid}.jsonl") if rc.trace_dir else None
     ctx = ExecutionContext(
         question=q.text, uid=q.qid, config=rc.system.config, llm_client=llm_client,
         log_path=log_path, verbose=rc.verbose,
@@ -326,9 +325,6 @@ def run(
     else:
         _check_resume_config(run_dir, cfg)
 
-    # configure observability
-    configure_obs(jsonl_path=str(trace_dir / "events.jsonl"))
-
     # retrieve questions to run based on configuration
     questions = _select_questions(benchmark, exp_config)
     if not questions:
@@ -339,7 +335,7 @@ def run(
     qid_to_result = _load_finished_qids(results_path)
     todo = [q for q in questions if q.qid not in qid_to_result]
     for q in todo:
-        for ext in (".log", ".txt"):
+        for ext in (".jsonl", ".txt"):
             (trace_dir / f"{q.qid}{ext}").unlink(missing_ok=True)
 
     print(f"[qatfd] Trace dir: {trace_dir}")

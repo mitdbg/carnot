@@ -3,9 +3,9 @@
 E2E Trace Viewer — local HTTP server for skunk-format trace runs (qatfd
 `results/` reports and grc-officeqa `eval/traces/` runs).
 
-Each run directory contains `report.csv` (one row per question) and
-`traces/events.jsonl` (the run-wide structured event stream — one JSON object
-per line, tagged with `uid` / `step_idx` / `op` / `kind` / optional `data`).
+Each run directory contains `report.csv` (one row per question) and per-question
+event streams at `traces/<uid>.jsonl` (one JSON object per line, tagged with
+`step_idx` / `op` / `kind` / optional `data`; the uid is the filename).
 This server discovers those run dirs and serves, per question, the ordered
 event list so the frontend (`app.html`) can render the Orchestrator's plan and
 each operator node's color-coded agent trace.
@@ -33,18 +33,14 @@ _APP_HTML = pathlib.Path(__file__).parent / "app.html"
 
 # ── Discovery + parsing helpers ─────────────────────────────────────────────
 
-def _events_path(run_dir: pathlib.Path) -> pathlib.Path:
-    return run_dir / "traces" / "events.jsonl"
-
-
 def _find_runs(root: pathlib.Path) -> list[str]:
-    """Run directories under `root` that hold an events.jsonl or report.csv, returned
-    as paths relative to `root`, newest first (dir names are timestamp-suffixed, so
-    reverse-sorted == newest).
+    """Run directories under `root` that hold per-question traces or a report.csv,
+    returned as paths relative to `root`, newest first (dir names are
+    timestamp-suffixed, so reverse-sorted == newest).
 
     Discovers both layouts: the flat `eval/traces/<run>/` and the qatfd
     `results/<benchmark>/<system>/<run>/` hierarchy. A directory qualifies as a run when
-    it directly contains `traces/events.jsonl` or `report.csv`; we never descend into a
+    it directly contains `traces/*.jsonl` or `report.csv`; we never descend into a
     run (so a run's own `traces/` subdir is not mistaken for another run)."""
     runs: list[str] = []
     seen: set[pathlib.Path] = set()
@@ -52,7 +48,7 @@ def _find_runs(root: pathlib.Path) -> list[str]:
     def _walk(d: pathlib.Path) -> None:
         if not d.is_dir():
             return
-        if _events_path(d).exists() or (d / "report.csv").exists():
+        if any((d / "traces").glob("*.jsonl")) or (d / "report.csv").exists():
             rel = d.relative_to(root)
             if rel not in seen:
                 seen.add(rel)
@@ -92,52 +88,46 @@ def _read_report(run_dir: pathlib.Path) -> list[dict]:
     return rows
 
 
-def _iter_events(run_dir: pathlib.Path):
-    """Yield parsed event dicts from the run's events.jsonl (skipping bad lines)."""
-    path = _events_path(run_dir)
+def _load_events(path: pathlib.Path) -> list[dict]:
+    """Parsed event dicts from one per-question .jsonl file (skipping bad lines)."""
+    out: list[dict] = []
     if not path.exists():
-        return
+        return out
     with path.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
-                yield json.loads(line)
+                out.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
+    return out
 
 
-def _uids_in_events(run_dir: pathlib.Path) -> list[str]:
-    """Distinct uids present in the event stream, in first-seen order."""
-    seen: dict[str, None] = {}
-    for evt in _iter_events(run_dir):
-        uid = evt.get("uid")
-        if uid is not None and uid not in seen:
-            seen[uid] = None
-    return list(seen)
+def _trace_uids(run_dir: pathlib.Path) -> list[str]:
+    """Uids with a per-question trace file, sorted lexicographically."""
+    return sorted(p.stem for p in (run_dir / "traces").glob("*.jsonl"))
 
 
 def _run_questions(run_dir: pathlib.Path) -> list[dict]:
     """The question list for a run: report.csv rows when present, else synthesized
-    from the uids found in the event stream."""
+    from the per-question trace files."""
     rows = _read_report(run_dir)
     if rows:
         return rows
     return [{"uid": uid, "question": "", "predicted": "", "gold_answer": "",
-             "failed": "", "reason": ""} for uid in _uids_in_events(run_dir)]
+             "failed": "", "reason": ""} for uid in _trace_uids(run_dir)]
 
 
 def _question_events(run_dir: pathlib.Path, uid: str) -> list[dict]:
-    """All events for one uid, in file (== chronological per-question) order. The
-    `uid` key is dropped (implied) but every other field — message / step_idx / op /
-    level / kind / data — is preserved for the frontend to structure."""
-    out: list[dict] = []
-    for evt in _iter_events(run_dir):
-        if evt.get("uid") != uid:
-            continue
-        out.append({k: v for k, v in evt.items() if k != "uid"})
-    return out
+    """All events for one uid, in file (== chronological per-question) order. Every
+    field — message / step_idx / op / level / kind / data — is preserved for the
+    frontend to structure. The uid names a file under the run's traces/, so reject
+    anything that could escape it."""
+    if not uid or "/" in uid or "\\" in uid or uid in (".", ".."):
+        return []
+    return _load_events(run_dir / "traces" / f"{uid}.jsonl")
 
 
 # ── HTTP handler ────────────────────────────────────────────────────────────

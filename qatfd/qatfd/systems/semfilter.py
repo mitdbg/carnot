@@ -21,7 +21,7 @@ SEMFILTER_RESULT_TAG = "__semfilter_result__"
 
 # Per-doc text snippet cap in the structured trace event. Each filtered doc carries a
 # preview so the trace viewer can expand it on click without a second corpus lookup; the
-# cap keeps a 1,000-doc filter from bloating events.jsonl with full document bodies.
+# cap keeps a 1,000-doc filter from bloating the event stream with full document bodies.
 _SEMFILTER_DOC_PREVIEW_MAX = 2000
 
 _SEMFILTER_SYSTEM = (

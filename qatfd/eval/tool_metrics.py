@@ -1,4 +1,4 @@
-"""Per-system tool-call breakdown table from ``results/*/traces/events.jsonl``.
+"""Per-system tool-call breakdown table from ``results/*/traces/<qid>.jsonl``.
 
 This produces the second main table: **one row-group per benchmark**, with the
 three systems (RAG-LLM, SearchAgent, QATFD) repeated within each group, reporting
@@ -19,10 +19,10 @@ thread-pool contention), not isolated tool CPU time.
 
 Where the numbers come from
 ---------------------------
-The runner writes a structured, run-wide event stream at
-``<run>/traces/events.jsonl`` (the same stream the trace viewer renders). Each
-event has ``uid``, ``kind`` (system/user/call/assistant/note/observation/...),
-a float ``t`` (seconds since the question started), a ``message``, and optional
+The runner writes one structured event stream per question at
+``<run>/traces/<qid>.jsonl`` (the same streams the trace viewer renders). Each
+event has ``kind`` (system/user/call/assistant/note/observation/...), a float
+``t`` (seconds since the question started), a ``message``, and optional
 ``data``. We reconstruct, per question, exactly what the viewer shows:
 
 * **Stage split** — the answer stage begins at the *second* ``system`` event
@@ -91,26 +91,26 @@ SYSTEM_ROW_LABEL: dict[str, str] = {
 
 
 # --------------------------------------------------------------------------- #
-# events.jsonl parsing (mirrors skunk/eval/trace_viewer/app.html)
+# per-question trace parsing (mirrors skunk/eval/trace_viewer/app.html)
 # --------------------------------------------------------------------------- #
 
 
-def _iter_uid_events(events_path: Path) -> dict[str, list[dict]]:
-    """Group a run's events.jsonl into {uid: [events in file order]}."""
-    by_uid: dict[str, list[dict]] = defaultdict(list)
-    with events_path.open(encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            uid = e.get("uid")
-            if uid is not None:
-                by_uid[uid].append(e)
-    return by_uid
+def _iter_question_events(traces_dir: Path) -> dict[str, list[dict]]:
+    """Per-question event lists from traces/<qid>.jsonl, keyed by qid (sorted)."""
+    by_qid: dict[str, list[dict]] = {}
+    for path in sorted(traces_dir.glob("*.jsonl")):
+        events: list[dict] = []
+        with path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        by_qid[path.stem] = events
+    return by_qid
 
 
 def _answer_start_idx(events: list[dict]) -> int:
@@ -223,10 +223,10 @@ def _parse_rag_llm(events: list[dict]) -> QuestionToolMetrics:
     return m
 
 
-def parse_run(events_path: Path, system: str) -> list[QuestionToolMetrics]:
+def parse_run(traces_dir: Path, system: str) -> list[QuestionToolMetrics]:
     """Per-question tool metrics for one run."""
     parser = _parse_rag_llm if system == "rag_llm" else _parse_search_agent
-    return [parser(evs) for evs in _iter_uid_events(events_path).values()]
+    return [parser(evs) for evs in _iter_question_events(traces_dir).values()]
 
 
 # --------------------------------------------------------------------------- #
@@ -263,7 +263,7 @@ def aggregate_cell(run_dirs: list[Path], system: str) -> Cell | None:
     total_q = 0
 
     for run_dir in run_dirs:
-        metrics = parse_run(run_dir / "traces" / "events.jsonl", system)
+        metrics = parse_run(run_dir / "traces", system)
         if not metrics:
             continue
         total_q += len(metrics)
@@ -293,7 +293,7 @@ def _run_dirs_for(results_root: Path, benchmark: str, system: str, llm: str | No
         return []
     dirs = []
     for run_dir in sorted(base.iterdir()):
-        if not (run_dir / "traces" / "events.jsonl").exists():
+        if not any((run_dir / "traces").glob("*.jsonl")):
             continue
         if llm is not None and _run_llm(run_dir / "config.yaml") != llm:
             continue

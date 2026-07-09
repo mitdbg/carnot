@@ -92,15 +92,15 @@ def dump_trace(
 
 def _format_event(ev: dict) -> list[str]:
     """Render one captured event as an indented trace line: the event `message`
-    (prefixed with the level when not "info"), capped for scannability — the JSONL
-    sink keeps the full text.
+    (prefixed with the level when not "info"), capped for scannability — the
+    per-question `.jsonl` keeps the full text.
 
     Operator boundary (`step`) events also carry a structured `data.summary` of
     what the operator committed; we expand the `pages` / `values` shapes here so the
     retrieved documents, extracted values, and external lookup values land in the
-    human-readable trace (not only the JSONL sink). The raw `message` already
-    elides these (it holds a short `output=` description), so without this they were
-    invisible in `.txt`/`.log`."""
+    human-readable trace (not only the per-question `.jsonl`). The raw `message`
+    already elides these (it holds a short `output=` description), so without this
+    they were invisible in the `.txt`."""
     msg = ev.get("message", "")
     level = ev.get("level", "info")
     prefix = f"{level.upper()} " if level != "info" else ""

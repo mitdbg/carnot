@@ -20,7 +20,6 @@ from skunk.common import (
     input_values_desc,
 )
 from skunk.sandbox.pyexec import exec_python_with_env, parse_codegen_reply
-from skunk.question_explainer import ConceptExplanation
 
 
 class MissingDataSignal(BaseModel):
@@ -231,7 +230,6 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
         input_values: list[AnnotatedValue],
         prev_code: str | None,
         prev_failure: str | None,
-        concept_explanations: Sequence[ConceptExplanation] = (),
         *,
         effort: Effort | None = None,
     ) -> str:
@@ -240,15 +238,6 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
         `prev_code`/`prev_failure` describe only the most-recent failed attempt —
         accumulating older ones dilutes the issue to fix."""
         user_msg = f"Question:\n{ctx.question}\n\n"
-        # `concept_explanations` are the canonical references the QuestionExplainer
-        # selected from PRECOMPUTED_CONCEPTS for this question (or the full catalog when
-        # config.compute_precomputed_concept_refs bypasses selection).
-        ref_blocks = [
-            f"### {c.concept}\n{c.explanation}" for c in concept_explanations
-        ]
-        if ref_blocks:
-            block = "\n\n".join(ref_blocks)
-            user_msg += f"## Concept references\n{block}\n\n"
         user_msg += f"input_values =\n{input_values_desc(input_values)}"
         if prev_failure:
             user_msg += "\n\nYour previous attempt failed."
@@ -271,7 +260,6 @@ class ComputeOp:
         self,
         input_values: list[AnnotatedValue],
         ctx: ExecutionContext,
-        concept_explanations: Sequence[ConceptExplanation] = (),
         *,
         round_idx: int = 0,
     ) -> Final | NeedsMore:
@@ -297,14 +285,14 @@ class ComputeOp:
         n = ctx.config.compute_best_of_n
         if n <= 1:
             return await self._run_trial(
-                input_values, ctx, concept_explanations,
+                input_values, ctx,
                 round_idx=round_idx, trial_idx=0,
             )
 
         results = await asyncio.gather(
             *(
                 self._run_trial(
-                    input_values, ctx, concept_explanations,
+                    input_values, ctx,
                     round_idx=round_idx, trial_idx=i,
                 )
                 for i in range(n)
@@ -382,7 +370,6 @@ class ComputeOp:
         self,
         input_values: list[AnnotatedValue],
         ctx: ExecutionContext,
-        concept_explanations: Sequence[ConceptExplanation],
         *,
         round_idx: int,
         trial_idx: int,
@@ -400,7 +387,6 @@ class ComputeOp:
             try:
                 code = await self._codegen.codegen(
                     ctx, input_values, prev_code, prev_failure,
-                    concept_explanations,
                 )
             except ParseError as e:
                 prev_code = None

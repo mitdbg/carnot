@@ -141,12 +141,6 @@ class PipelineConfig(SearchAgentConfig):
     # single missing-data candidate; a tie NEVER breaks in favor of missing-data (see
     # `ComputeOp._vote`). 1 = single-trial. (env: SKUNK_COMPUTE_BEST_OF_N)
     compute_best_of_n: int = 5
-    # Bypass the QuestionExplainer's per-question selection and inject the ENTIRE
-    # PRECOMPUTED_CONCEPTS catalog into every compute `## Concept references` block (skips
-    # the selection LLM call). Default OFF (the explainer selects only the relevant
-    # entries); flip per-run to A/B selection vs. full-dump on compute accuracy.
-    # (env: SKUNK_PRECOMPUTED_CONCEPT_REFS=1)
-    compute_precomputed_concept_refs: bool = False
 
     # Data-prep gate: codegen→exec attempts before failing safe (pool passes through
     # unchanged). Its own budget — no longer borrows `compute_max_attempts`.

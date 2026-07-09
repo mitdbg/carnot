@@ -71,7 +71,6 @@ from officeqa.config import SkunkConfig
 from officeqa.corpus import page_elements, parse_doc_id
 from skunk.llm_client import LLMClient
 from skunk.prompted_call import load_prompt_overrides
-from skunk.trace import configure_obs
 
 from .continuation import apply_review, find_long_chains, review_chain
 from .data_model import (
@@ -1244,7 +1243,7 @@ def main() -> int:
     # Model (env SKUNK_LLM_MODEL) + per-model RPM/TPM (config `llm_model_rpm`/
     # `llm_model_tpm`) are read from SkunkConfig and the llm_client rate
     # limiter — the build doesn't override them.
-    configure_obs()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     config = SkunkConfig.from_env()
     only = (
         {b.strip() for b in args.bulletins.split(",") if b.strip()}

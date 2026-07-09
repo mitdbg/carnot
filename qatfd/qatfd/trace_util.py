@@ -14,7 +14,8 @@ from skunk.trace import truncate
 
 # Cap for the scannable one-liner message; the structured `data` payload (full prompts,
 # the assistant turn, retrieved context) gets a much larger cap so the .txt is a
-# self-contained per-question record (the .log stays one-liners by design).
+# self-contained per-question record (the `.jsonl` carries the full structured events;
+# this `.txt` is the human-readable counterpart).
 _TRACE_FIELD_MAX_REPR = 800
 _TRACE_DATA_MAX = 20000
 

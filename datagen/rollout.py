@@ -239,7 +239,7 @@ def run_single_rollout(
     gt_docs = set(pair.doc_ids)
 
     start = time.perf_counter()
-    trace_path = os.path.join(trace_dir, f"{seed}_qa{pair_idx}_r{rollout_idx}_trace.txt")
+    trace_path = os.path.join(trace_dir, f"{seed}_qa{pair_idx}_r{rollout_idx}_trace.jsonl")
     messages_path = os.path.join(trace_dir, f"{seed}_qa{pair_idx}_r{rollout_idx}_messages.json")
 
     output_docs, trajectory_chunks, completed, num_steps, error = cfg.agent_factory(

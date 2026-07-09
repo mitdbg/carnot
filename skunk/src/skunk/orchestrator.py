@@ -27,7 +27,6 @@ from skunk.plan import (
     RetrieveBranch,
 )
 from skunk.prompted_call import PromptOverride
-from skunk.question_explainer import QuestionExplainer
 from skunk.retrieve import run_retrieve_all
 from skunk.result import ExecutionResult
 
@@ -47,11 +46,11 @@ class Orchestrator:
     def __init__(
         self,
         question: str,
+        config: PipelineConfig,
         *,
         uid: str | None = None,
         verbose: bool = False,
         log_path: str | None = None,
-        config: PipelineConfig,
         prompt_overrides: tuple[PromptOverride, ...] = (),
         llm_client: LLMClient | None = None,
         page_store: PageContentStore | None = None,
@@ -67,23 +66,13 @@ class Orchestrator:
             page_store=page_store,
         )
         self._current_plan: Plan | None = None
-        # Stable per-question branch identity. `_branch_ids[i]` is the id of the
-        # current sweep's branch `i`; every sweep (initial or replan) allocates
-        # fresh ids — branch identity dies at the end of its sweep, and a plan
-        # event's branches belong to that revision only. The trace viewer keys
-        # plan-branch ↔ operator-step on this id to render revision tabs.
         self._branch_ids: list[int] = []
         self._next_branch_id = 0
         self._planner = Planner()
         self._lookup = LookupExternalOp()
-        self._explainer = QuestionExplainer()
         self._compute = ComputeOp()
         self._data_prep = DataPrepOp()
         self._result = ExecutionResult(question=question)
-        # Deduped union of every page the retrieve phase produced this question (first-seen
-        # order, accumulated across the initial sweep and any replan sweeps). Exposed via
-        # `retrieved_pages` for the eval harness's `likely_pages` / retrieval-recall reporting.
-        # Empty under golden bypass (retrieve never runs).
         self._retrieved_pages: list[PageRef] = []
 
     @property
@@ -108,29 +97,18 @@ class Orchestrator:
         return self._result
 
     async def execute(self) -> str:
-        explain_task = asyncio.create_task(
-            traced_step(
-                self._ctx,
-                "question_explainer",
-                lambda: self._explainer.run(self._ctx, question=self._ctx.question),
-            )
+        plan = await traced_step(
+            self._ctx,
+            "planner",
+            lambda: self._planner.plan(self._ctx.question, self._ctx),
         )
-        try:
-            plan = await traced_step(
-                self._ctx,
-                "planner",
-                lambda: self._planner.plan(self._ctx.question, self._ctx),
-            )
-            # `_current_plan` tracks the ACTIVE revision for the `current_plan`
-            # property — (re)assigned only where `plan` is rebound (here and after
-            # each replan), not on every loop iteration.
-            self._current_plan = plan
-            self._branch_ids = self._alloc_branch_ids(len(plan.branches))
-            self._emit_plan(plan, "initial")
-            outcomes = await self._run_branches(plan.branches, self._branch_ids)
-            explanations = await explain_task
-        finally:
-            explain_task.cancel()
+        # `_current_plan` tracks the ACTIVE revision for the `current_plan`
+        # property — (re)assigned only where `plan` is rebound (here and after
+        # each replan), not on every loop iteration.
+        self._current_plan = plan
+        self._branch_ids = self._alloc_branch_ids(len(plan.branches))
+        self._emit_plan(plan, "initial")
+        outcomes = await self._run_branches(plan.branches, self._branch_ids)
 
         # Recovery state: the value POOL is what compute sees. On a NeedsMore the next pool
         # is exactly what compute chose to keep (re-stated inputs + any partial computation,
@@ -156,7 +134,6 @@ class Orchestrator:
                     lambda: self._compute.run(
                         pool,
                         self._ctx,
-                        concept_explanations=explanations,
                         round_idx=round_idx,
                     ),
                 )

@@ -15,8 +15,8 @@ from __future__ import annotations
 import aiohttp
 import asyncio
 import base64
-import logging
 import os
+import sys
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -45,9 +45,14 @@ if TYPE_CHECKING:
     from skunk.common import B64Image, ExecutionContext
     from skunk.config import SystemConfig
 
-# Process-scoped logger: retries happen with no per-question ctx in scope (see
-# `_retry_call`), so they go through stdlib logging rather than `ctx.emit`.
-log = logging.getLogger(__name__)
+def _warn(ctx: "ExecutionContext | None", message: str) -> None:
+    """Route a client warning onto the owning question's event stream when a ctx
+    is in scope (retry/usage warnings become attributable per question); ctx-less
+    callers (offline corpus prep) fall back to plain stderr."""
+    if ctx is not None:
+        ctx.emit(message, level="warning")
+    else:
+        print(message, file=sys.stderr)
 
 # Return type of an `attempt` driven by `_retry_call` — an `LLMResponse` for the
 # generation paths, a `list[float]` for the embedding path. The retry loop never
@@ -324,7 +329,7 @@ class LLMClient:
             if self._config.llm_provider == "openrouter"
             else self._gemini_call
         )
-        return self._retry_call(lambda: impl(spec), self._config.llm_provider, spec.model)
+        return self._retry_call(lambda: impl(spec), self._config.llm_provider, spec.model, ctx=spec.ctx)
 
     async def acall(
         self,
@@ -353,7 +358,7 @@ class LLMClient:
             else self._gemini_acall
         )
         return await self._aretry_call(
-            lambda: impl(spec), self._config.llm_provider, spec.model
+            lambda: impl(spec), self._config.llm_provider, spec.model, ctx=spec.ctx
         )
 
     def _retry_call(
@@ -362,12 +367,14 @@ class LLMClient:
         provider: str,
         model: str,
         bucket: str | None = None,
+        ctx: "ExecutionContext | None" = None,
     ) -> R:
         """Drive `attempt()` with exponential-backoff retry, paced by a
         rate-limiter bucket. Retries only transient faults (`_is_retryable`: 429 / 5xx /
         transport blips); a non-429 4xx (bad request, auth, context overflow) raises
         immediately. `attempt` owns the API call, timing, parsing, and the success emit;
-        `provider`/`model` are for the failure log. `bucket` overrides the limiter (a
+        `provider`/`model` are for the failure warning (routed onto `ctx`'s event
+        stream when given — see `_warn`). `bucket` overrides the limiter (a
         shared process-wide bucket like `"embed"`); when None, the per-model
         `llm:<model>` bucket is used at the configured RPM."""
         max_retries = self._config.llm_max_retries
@@ -389,11 +396,11 @@ class LLMClient:
                 # Log EVERY failure with its message — including the final one
                 # before we re-raise — so a fatal error is never silent.
                 stop = i == max_retries or not _is_retryable(e)
-                log.warning(
-                    "llm call failed (attempt %d/%d, provider=%s model=%s): %s: %s%s%s",
-                    i + 1, max_retries + 1, provider, model, type(e).__name__, e,
-                    _error_detail(e),
-                    "" if stop else f"; retrying in {delay:.1f}s",
+                _warn(
+                    ctx,
+                    f"llm_call_failed attempt={i + 1}/{max_retries + 1} provider={provider} "
+                    f"model={model} error={type(e).__name__}: {e}{_error_detail(e)}"
+                    f"{'' if stop else f'; retrying in {delay:.1f}s'}",
                 )
                 if stop:
                     raise
@@ -406,10 +413,11 @@ class LLMClient:
         attempt: Callable[[], Awaitable[LLMResponse]],
         provider: str,
         model: str,
+        ctx: "ExecutionContext | None" = None,
     ) -> LLMResponse:
         """Async twin of `_retry_call`: awaits the model's async rate limiter and the
         coroutine `attempt()`, backing off via `asyncio.sleep` (never blocking the
-        event loop). `provider`/`model` are for the failure log."""
+        event loop). `provider`/`model` are for the failure warning."""
         max_retries = self._config.llm_max_retries
         delay = self._config.llm_retry_initial_delay_s
         limiter = get_rate_limiter(
@@ -423,11 +431,11 @@ class LLMClient:
                 return await attempt()
             except Exception as e:
                 stop = i == max_retries or not _is_retryable(e)
-                log.warning(
-                    "llm call failed (attempt %d/%d, provider=%s model=%s): %s: %s%s%s",
-                    i + 1, max_retries + 1, provider, model, type(e).__name__, e,
-                    _error_detail(e),
-                    "" if stop else f"; retrying in {delay:.1f}s",
+                _warn(
+                    ctx,
+                    f"llm_call_failed attempt={i + 1}/{max_retries + 1} provider={provider} "
+                    f"model={model} error={type(e).__name__}: {e}{_error_detail(e)}"
+                    f"{'' if stop else f'; retrying in {delay:.1f}s'}",
                 )
                 if stop:
                     raise
@@ -625,7 +633,7 @@ class LLMClient:
 
         # Embeddings share one process-wide "embed" rate bucket across all workers
         # (separate from the per-model generation buckets).
-        return self._retry_call(attempt, provider, model, bucket="embed")
+        return self._retry_call(attempt, provider, model, bucket="embed", ctx=ctx)
 
     @staticmethod
     def _gemini_parts(user: str, images: list[B64Image] | None) -> list[Any]:
@@ -803,7 +811,7 @@ class LLMClient:
             else self._gemini_astream
         )
         return await self._aretry_call(
-            lambda: impl(spec), self._config.llm_provider, spec.model
+            lambda: impl(spec), self._config.llm_provider, spec.model, ctx=spec.ctx
         )
 
     async def _gemini_astream(self, spec: CallSpec) -> LLMResponse:
@@ -860,9 +868,9 @@ class LLMClient:
             accumulated, usage = await _consume()
         latency_s = time.monotonic() - t0
         if usage is None:
-            log.warning(
-                "gemini stream returned no usage — cost undercounted (call_site=%s model=%s)",
-                spec.call_site, model_id,
+            _warn(
+                spec.ctx,
+                f"stream_no_usage cost undercounted (call_site={spec.call_site} model={model_id})",
             )
         toks = self._usage_tokens(usage)
         return self._finish(spec, accumulated, toks, latency_s, model_id)
@@ -1088,9 +1096,9 @@ class LLMClient:
             accumulated, usage = await _consume()
         latency_s = time.monotonic() - t0
         if usage is None:
-            log.warning(
-                "openrouter stream returned no usage — cost undercounted (call_site=%s model=%s)",
-                spec.call_site, spec.model,
+            _warn(
+                spec.ctx,
+                f"stream_no_usage cost undercounted (call_site={spec.call_site} model={spec.model})",
             )
         toks = self._usage_tokens_openrouter(usage)
         return self._finish(spec, accumulated, toks, latency_s, spec.model)

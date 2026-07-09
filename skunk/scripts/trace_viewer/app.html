@@ -219,7 +219,7 @@ const KIND = {
   note:        { color:"#888888", bg:"transparent",      label:"NOTE" },
   step:        { color:"#666666", bg:"transparent",      label:"STEP" },
 };
-const OP_COLOR = { planner:"#cc66ff", question_explainer:"#66ccaa", retrieve:"#3399ff", extract:"#e6b800", lookup_external:"#ff9933", compute:"#33cc33", replanner:"#ff66aa" };
+const OP_COLOR = { planner:"#cc66ff", retrieve:"#3399ff", extract:"#e6b800", lookup_external:"#ff9933", compute:"#33cc33", replanner:"#ff66aa" };
 const COMPACT_KINDS = new Set(["call", "note", "step"]);
 const TRUNC_CHARS = 40000;   // ~10k tokens — observations longer than this collapse with a click-to-expand
 
@@ -624,7 +624,7 @@ function tournamentHtml(node){
 }
 
 // ── merged execution flow: cumulative tabs, linearized node flow ─────────────
-// One coherent view: [planner | question_explainer] → branch chains (retrieve→extract
+// One coherent view: planner → branch chains (retrieve→extract
 // / lookup) → compute. Segmented at each `compute` (= one revision / compute attempt);
 // tab i shows segments 0..i cumulatively (the final tab is the whole trace).
 function flowSection(m){
@@ -661,12 +661,12 @@ function segmentHtml(seg, i, m, sel){
       ${dec ? `<div class="rl" style="margin-top:8px">Replanner decision</div><div class="msg-text">${esc(dec)}</div>`:""}
     </div>`);
   }
-  const setup = seg.filter(n => n.op==="planner" || n.op==="question_explainer");
+  const setup = seg.filter(n => n.op==="planner");
   const replanner = seg.filter(n => n.op==="replanner");
   const compute = seg.filter(n => n.op==="compute");
   const branchNodes = seg.filter(n => n.branchId!=null);
   const retrieves = seg.filter(n => n.branchId==null && n.op==="retrieve");
-  const handledOps = new Set(["planner","question_explainer","replanner","compute","retrieve"]);
+  const handledOps = new Set(["planner","replanner","compute","retrieve"]);
   const others = seg.filter(n => n.branchId==null && !handledOps.has(n.op));
 
   for(const n of replanner) items.push(nodeHtml(n));

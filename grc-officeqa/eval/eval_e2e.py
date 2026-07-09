@@ -21,7 +21,7 @@ Usage
   # Run only specific UIDs, bypassing retrieve with golden pages
   python -m eval.eval_e2e --csv data/officeqa_pro.csv --uids UID0001,UID0030 --golden
 
-All outputs (per-question traces, run.log, report.csv, events.jsonl) land in a
+All outputs (per-question `.jsonl` / `.txt` traces, warnings.log, report.csv) land in a
 single run directory: eval/traces/<run-name>_<timestamp>/  (gitignored).
 
 `--golden` parses `source_docs?page=N` URLs from --csv and injects them as
@@ -75,8 +75,6 @@ from skunk import (  # noqa: E402
     StepFailed,
     load_prompt_overrides,
 )
-
-from skunk.trace import configure_obs  # noqa: E402
 
 from officeqa.config import SkunkConfig  # noqa: E402
 from officeqa.page_store import get_officeqa_page_store  # noqa: E402
@@ -404,7 +402,7 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
     trace_path = log_path = None
     if cfg.trace_dir:
         trace_path = str(cfg.trace_dir / f"{uid}.txt")
-        log_path = str(cfg.trace_dir / f"{uid}.log")
+        log_path = str(cfg.trace_dir / f"{uid}.jsonl")
 
     try:
         result = await _run_one_question(
@@ -533,7 +531,7 @@ def main() -> None:
         "--console",
         action="store_true",
         help="Also echo the live (interleaved) event firehose to stdout. Off by "
-        "default — per-question events stream to <run-dir>/traces/<uid>.log instead.",
+        "default — per-question events stream to <run-dir>/traces/<uid>.jsonl instead.",
     )
     parser.add_argument(
         "--include-test-set",
@@ -565,23 +563,15 @@ def main() -> None:
     if trace_dir:
         trace_dir.mkdir(parents=True, exist_ok=True)
 
-    # Configure the unified logging pipeline once for the whole process. When a
-    # trace dir is set, also open a run-wide JSONL sink (one structured line per
-    # event, tagged with uid/step_idx) alongside the per-question text traces.
-    jsonl_path = str(trace_dir / "events.jsonl") if trace_dir else None
-    configure_obs(jsonl_path=jsonl_path)
-
-    # Persist stdlib-logging warnings (LLM retry/timeout warnings from
-    # `llm_client._retry_call`, third-party libs) to the run dir. These have no
-    # per-question ctx so they bypass the event stream; without this sink they
-    # exist only on the console and vanish with the terminal.
+    # Persist stdlib-logging warnings (third-party libs; LLM retry warnings now
+    # ride each question's own event stream via ctx.emit) to the run dir. These
+    # have no per-question ctx so they bypass the event stream; without this sink
+    # they exist only on the console and vanish with the terminal.
     import logging
-
-    from skunk.trace import LineFormatter
 
     warn_handler = logging.FileHandler(run_dir / "warnings.log")
     warn_handler.setLevel(logging.WARNING)
-    warn_handler.setFormatter(LineFormatter())
+    warn_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     logging.getLogger().addHandler(warn_handler)
 
     print(f"[e2e] Run directory: {run_dir}")

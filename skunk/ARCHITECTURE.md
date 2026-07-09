@@ -156,7 +156,7 @@ application wants to reintroduce it behind a proper seam.
 
 A run can mix models per call-site. Resolution mirrors the effort knob:
 
-- **`PromptedCall` sites** (planner, extract tiers, compute.codegen, question_explainer, …) resolve their model as `config.model_overrides.get(name, config.llm_model)` — see `PromptedCall._resolve_model`. So the default `llm_model` (env `SKUNK_LLM_MODEL`) applies everywhere unless a site is pinned via `SKUNK_MODEL_OVERRIDES` (`name=model,...`). Example: run on Pro but keep `question_explainer` on cheap Flash.
+- **`PromptedCall` sites** (planner, extract tiers, compute.codegen, …) resolve their model as `config.model_overrides.get(name, config.llm_model)` — see `PromptedCall._resolve_model`. So the default `llm_model` (env `SKUNK_LLM_MODEL`) applies everywhere unless a site is pinned via `SKUNK_MODEL_OVERRIDES` (`name=model,...`). Example: run on Pro but keep `extract` on cheap Flash.
 - **Agent loops** (`LookupAgent`, search agent) use `config.agent_model_id or config.llm_model` (env `SKUNK_AGENT_MODEL`); they don't read the override map.
 - **Per-model rate limiting.** Each distinct model gets its own token-bucket keyed `llm:<model>` (`_retry_call`/`_aretry_call`). A model's RPM comes from config (`llm_model_rpm`, falling back to `llm_default_rpm` for any model not listed) — so single-model runs are unchanged. Lets a 150-RPM Pro and a high-RPM Flash run concurrently without throttling each other.
 - **Provider selection.** A run uses one generation provider for the whole process — Gemini (`provider=genai`, default) or OpenRouter (`provider=openrouter`) per `config.llm_provider`. Both share the same rate-limit / retry / logging scaffolding; `_retry_call`/`_aretry_call` retry transient faults (`_is_retryable`: 429 / 5xx / transport blips) with exponential backoff within that provider. Embeddings always go to Gemini.
@@ -167,19 +167,17 @@ A run can mix models per call-site. Resolution mirrors the effort knob:
 There is **one** observability stream and **one** non-observability result
 object — kept strictly separate:
 
-- **Observability = the event stream.** All output renders through one function,
-  `render_line` (in `src/skunk/trace.py`, the logging spine) — no external dependency. Process-scoped
-  stdlib logs reach it via `_LineFormatter` on the root handler (`configure_obs`
-  installs it; the `skunk.*` tree runs at INFO, the root at WARNING to mute
-  third-party chatter). `ExecutionContext.emit(message, level=None)` is the
-  request-scoped entry point; each event is **captured** to `ctx.events`
-  (per-question, for the trace dump) and the JSONL sink always; **streamed** to
-  the question's own `.log` file when `ctx.log_path` is set (live, flushed
-  per-event — so a single question's stream lands in its own file and survives a
-  crash); and **echoed** to the shared console only when `ctx.verbose`. Capture
-  and the per-question file live in `emit` itself (keyed on `ctx`), not in a
-  process-global logging framework, because the eval runs questions concurrently
-  — only `emit` knows which question an event belongs to. (The per-question file
+- **Observability = the event stream.** `ExecutionContext.emit(message,
+  level=None)` is the single entry point; each event is **captured** to
+  `ctx.events` (per-question, for the trace dump) always; **streamed** as one
+  JSON line to the question's own `.jsonl` file when `ctx.log_path` is set (the
+  durable machine-readable record — live, flushed per-event, so a single
+  question's stream lands in its own file and survives a crash); and **echoed**
+  to the shared console only when `ctx.verbose` (rendered via `render_line` in
+  `src/skunk/trace.py` — pure functions, no state). Everything lives in `emit`
+  itself (keyed on `ctx`), not in a process-global logging framework, because the
+  eval runs questions concurrently — only `emit` knows which question an event
+  belongs to, and per-question file handles need no locks. (The per-question file
   omits `uid`, implied by its filename; the interleaved console prepends it.)
 - **Result = `ExecutionResult`** (`src/skunk/result.py`) — the orchestrator's
   typed *return contract*: `question` / `answer` / `failed` / `failure_reason`,
@@ -231,7 +229,7 @@ event, no `_step` reservation, no separate step structure.
     - **Agent turns** (multi-turn `retrieve` / `lookup_external`): the system
       prompt, each assistant turn, and structured observation blocks
       (`multi_turn_agent`).
-    - **Single-shot operator I/O** (`planner` / `question_explainer` / `extract` /
+    - **Single-shot operator I/O** (`planner` / `extract` /
       `compute` / `replanner`): system + user + each assistant reply, emitted once
       at the `PromptedCall.call` chokepoint (the multi-turn branch never reaches it,
       so there is no double-log).
@@ -244,19 +242,20 @@ event, no `_step` reservation, no separate step structure.
   counter but **not** its `step` counter, so misfires don't burn the `agent_max_steps`
   budget; a separate `agent_max_misfires` cap (total attempts ≤ steps + misfires)
   stops a never-progressing model from looping forever.
-  `kind`/`data`/`t` are captured to `ctx.events` and the JSONL sink but
-  **deliberately excluded from the rendered console / `.log` line** (`render_line`
+  `kind`/`data`/`t` are captured to `ctx.events` and the per-question `.jsonl`
+  but **deliberately excluded from the rendered console line** (`render_line`
   skips them; the line already carries a wall-clock `HH:MM:SS`) so the human
   one-liner is unchanged. Use `data` only for the genuinely large/structured
   payloads a viewer needs; everyday events stay message-only.
 - **Severity is automatic.** `emit` levels an event `warning` when its message
   contains a `_failed` event key or an `error=` field, else `info`; pass `level=`
   to override.
-- **Request-scoped → `ctx.emit`; process-scoped → stdlib `logging`.** If a
-  question's `ctx` is in scope, use `ctx.emit`. Code with no per-question ctx
-  (build pipelines under `page_index/`, offline prep under `search_agent/`,
-  library warnings such as `LLMClient`'s retry path) uses
-  `logging.getLogger(__name__)` — rendered through the same `configure_obs` pipeline.
+- **Everything routes through `ctx`.** If a question's `ctx` is in scope, use
+  `ctx.emit` — including library warnings such as `LLMClient`'s retry path, which
+  threads the caller's ctx down (`llm_client._warn`) so retries are attributable
+  to their question. Code with genuinely no per-question ctx (offline corpus
+  prep, app build pipelines) owns its own output (stdlib `logging` / `print`);
+  skunk does not configure it.
 
 ## Eval decomposition
 
