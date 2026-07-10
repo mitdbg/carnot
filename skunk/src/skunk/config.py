@@ -83,6 +83,11 @@ class SearchAgentConfig(SystemConfig):
     # maximum number of failed agent steps before aborting
     agent_max_misfires: int = 5
 
+    # extra steps the agent may take, after its main run, to correct any returned doc_ids that
+    # do not name a real document (e.g. a bare filing name missing its page suffix). Kept separate
+    # from `agent_max_steps` so a citation fix never eats into the agent's search budget.
+    doc_id_correction_steps: int = 3
+
 
 # --------------------------------------------------------------------------------
 # Pipeline (plan/orchestrate/retrieve/extract/lookup/compute) configuration.

@@ -432,13 +432,16 @@ Requirements for the final answer:
         return out
 
     async def call(
-        self, ctx: ExecutionContext, user: str, *, resume: bool = False, **_
+        self, ctx: ExecutionContext, user: str, *, resume: bool = False,
+        max_steps: int | None = None, **_
     ) -> Any:
         """Run the multi-turn loop, returning the parsed json final-answer payload.
         `resume=True` appends `user` to the existing trajectory (with a fresh step budget)
         instead of starting over — the seam for a reviewer sending the agent back with
-        feedback without it re-deriving everything it already saw. Extra kwargs are ignored
-        (signature compat with single-shot calls)."""
+        feedback without it re-deriving everything it already saw. `max_steps` overrides the
+        agent's default budget for this call only (e.g. a short, resumed correction turn that
+        should not get a full search budget); it defaults to `self.max_steps`. Extra kwargs
+        are ignored (signature compat with single-shot calls)."""
         # Full block trajectory (no system message; call() assembles it each turn).
         # `_render_for_llm()` produces the redacted, flattened view sent to the model.
         if resume and self.messages:
@@ -461,7 +464,7 @@ Requirements for the final answer:
             data={"text": system_prompt},
         )
         ctx.emit(f"question {user!r}", kind="user", data={"text": user})
-        return await self._run_loop(ctx, self.max_steps)
+        return await self._run_loop(ctx, self.max_steps if max_steps is None else max_steps)
 
     async def _run_loop(self, ctx: ExecutionContext, max_steps: int | None) -> Any:
         """The step loop, bounded by `max_steps`. Assumes `self.messages` and

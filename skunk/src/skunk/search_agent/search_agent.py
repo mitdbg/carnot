@@ -25,8 +25,9 @@ from typing import Any
 
 from chromadb.api.models.Collection import Collection
 
-from skunk.common import B64Image
+from skunk.common import B64Image, ExecutionContext
 from skunk.config import SearchAgentConfig
+from skunk.errors import StepFailed
 from skunk.llm_client import LLMClient
 from skunk.sandbox.local_python_executor import CodeOutput
 from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent, TextBlock, Tool
@@ -293,16 +294,87 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             blocks.append(TextBlock("[no output]"))
         return blocks
 
+    # ------------------------------------------------------------------
+    # Final answer: validate + correct the returned doc_ids
+    # ------------------------------------------------------------------
+
+    async def call_with_validated_doc_ids(
+        self, ctx: ExecutionContext, user: str, *, correction_steps: int | None = None,
+    ) -> tuple[Any, list[str]]:
+        """Run the agent, then make sure the `doc_ids` it returned name real documents.
+
+        A returned id is valid when it is a key of `document_map`. This catches the common
+        failure where the model writes a bare filing name (e.g. `MICROSOFT_2023_10K`) instead
+        of the page-level id it was shown (`MICROSOFT_2023_10K::p59`): the bare name is not a
+        key, so it neither scores as a retrieved page nor loads any text for the downstream
+        answerer. If any id is invalid, the agent is re-prompted (resuming the same
+        conversation, so it still sees everything it read) to fix them, for up to
+        `correction_steps` extra turns — a budget separate from the main run so a citation fix
+        never eats into search time. After that, the valid subset is kept; only if none are
+        valid is it a true failure.
+
+        Returns `(final_payload, valid_doc_ids)`. The payload is returned untouched (callers
+        in "answer" mode still read its `answer` field); only the id list is validated.
+        """
+        if correction_steps is None:
+            correction_steps = self.config.doc_id_correction_steps
+        payload = await self.call(ctx, user)
+        doc_ids = doc_ids_from_payload(payload)
+        for _ in range(correction_steps):
+            bad = [d for d in doc_ids if d not in self.document_map]
+            if not bad:
+                break
+            ctx.emit(f"doc_id_correction n_bad={len(bad)} bad={bad!r}", data={"bad": bad})
+            payload = await self.call(
+                ctx, _doc_id_correction_message(bad), resume=True, max_steps=1
+            )
+            doc_ids = doc_ids_from_payload(payload)
+        valid = [d for d in doc_ids if d in self.document_map]
+        dropped = [d for d in doc_ids if d not in self.document_map]
+        ctx.emit(
+            f"doc_ids_validated kept={len(valid)} dropped={len(dropped)}",
+            data={"kept": valid, "dropped": dropped},
+        )
+        if not valid:
+            raise StepFailed(
+                self.name,
+                "no well-formed doc_ids after correction",
+                diagnostic=f"agent returned only unrecognized doc_ids: {doc_ids!r}",
+            )
+        return payload, valid
+
+
+def _doc_id_correction_message(bad: list[str]) -> str:
+    """The follow-up shown to the agent when some returned doc_ids name no real document.
+    Written as plain sentences because the model reads it directly."""
+    return (
+        "Some of the document identifiers you listed do not match any document in the "
+        f"collection: {bad}. This usually happens when an identifier is missing part of its "
+        "form, such as the page it refers to. Please look back through the search, grep, and "
+        "read results earlier in this conversation, find each identifier exactly as it was "
+        "written there, and return your full list again under the \"doc_ids\" key. Every "
+        "identifier must be copied exactly as it appeared in those results."
+    )
+
 
 def doc_ids_from_payload(payload: Any) -> list[str]:
     """The `doc_ids` list out of a SearchAgent final-answer payload, coerced to
     strings; [] for a malformed payload (non-dict, or a missing/empty key). A bare
-    string value is treated as a single id. The one place the final-answer shape
-    (`final_answer_doc`) is decoded — callers compose their own user message,
-    `await agent.call(ctx, msg)`, and decode with this."""
+    string value is treated as a single id. Each id is whitespace-trimmed, empties
+    are dropped, and duplicates are removed preserving first-seen order, so callers
+    can validate the ids without tripping over cosmetic differences. The one place
+    the final-answer shape (`final_answer_doc`) is decoded — callers compose their
+    own user message, `await agent.call(ctx, msg)`, and decode with this."""
     if not isinstance(payload, dict):
         return []
     keys = payload.get("doc_ids") or []
     if isinstance(keys, str):
-        return [keys]
-    return [str(k) for k in keys]
+        keys = [keys]
+    seen: set[str] = set()
+    out: list[str] = []
+    for k in keys:
+        s = str(k).strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
