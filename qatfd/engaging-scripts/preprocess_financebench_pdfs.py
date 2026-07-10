@@ -287,7 +287,6 @@ def build_config(args) -> SystemConfig:
         emb_provider="openrouter",  # unused — no embedding calls here
         emb_model_id="",
         llm_provider="openrouter",
-        agent_model_id=args.extract_model,
         llm_model=args.extract_model,
         llm_max_retries=args.max_retries,
         llm_retry_initial_delay_s=1.0,

@@ -60,7 +60,7 @@ def _summarize_annotated(e: AnnotatedValue) -> dict:
         "unit": e.unit,
         "value_kind": e.kind,
         "value": e.value,
-        "doc_id": e.doc_id,
+        "source_stem": e.source_stem,
         "pages": list(e.pages),
     }
 

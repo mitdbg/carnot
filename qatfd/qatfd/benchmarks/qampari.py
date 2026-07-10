@@ -14,14 +14,17 @@ Corpus + index: the FULL QAMPARI chunked Wikipedia (~25.9M ~100-word passages), 
   reproduced (the answer entities are common strings that match most of Wikipedia, and the
   entity-LINK annotations that would scope it aren't in the chunk metadata), so — like TREC-BioGen
   — we embed everything and let retrieval do the work. The same index serves both the dev and test
-  question splits. The chunk-text doc map is served lazily from the Chroma `documents` column
-  (a 25.9M-entry dict would be far too large for RAM), keyed by chunk_id.
-Gold docs / recall: a proof identifies the supporting Wikipedia ARTICLE, not a corpus chunk (the
-  proof `pid` is a per-question id, never a corpus chunk_id), and the released chunk `url` is a
-  curid URL while proofs use title-slug URLs — so article identity is the normalized Wikipedia
-  TITLE. gold_docs are normalized article titles; recall = fraction of gold articles whose chunks
-  were retrieved (`doc_recall`), collapsing retrieved chunk_ids -> article title via the title in
-  the Chroma metadata (a small per-question `.get` on just the retrieved ids).
+  question splits. The retrieval unit (`doc_id`) is the Wikipedia ARTICLE (its numeric `page_id`;
+  see CORPUS_MODEL.md — before 2026-07-09 it was the ~100-word chunk itself; existing collections
+  are migrated in place by scripts/migrate_doc_ids.py); the Chroma row id stays the released chunk
+  id ("{page_id}__{n}"). The article-text doc map is assembled lazily from the Chroma `documents`
+  column, all of an article's chunks joined in `element_id` order (a materialized map of 25.9M
+  chunks would be far too large for RAM), keyed by page_id.
+Gold docs / recall: a proof identifies the supporting Wikipedia ARTICLE, and the released chunk
+  `url` is a curid URL while proofs use title-slug URLs — so the gold join key is the normalized
+  Wikipedia TITLE. gold_docs are normalized article titles; recall = fraction of gold articles
+  retrieved (`doc_recall`), mapping each retrieved page_id -> title via the title in any of its
+  chunks' Chroma metadata (small per-question lookups, cached).
 Dev/test splits: TEST is all 1000 `test_data.jsonl` questions — KARL's exact eval set, confirmed by
   its appendix query "What did James B. Longacre design?" appearing only there. DEV is 50 questions
   sampled (seed 0) from `train_data.jsonl` (the `dev_questions_path` extract), disjoint from test so
@@ -71,40 +74,43 @@ def _article_from_url(url: str) -> str:
 
 
 class _ChromaDocMap:
-    """Lazy `chunk_id -> passage text`, served from the Chroma `documents` column so eval never
-    materializes all ~25.9M chunk texts in RAM (a plain dict would be tens of GB). The row id IS the
-    chunk_id (set at index-build time), and the systems only do keyed lookups (`.get` / `[]` / `in`),
-    never iterate — so this stands in for the dict. A small LRU keeps recently-read chunks hot.
-    Mirrors TREC-BioGen's lazy doc map."""
+    """Lazy `page_id -> article text`, assembled on demand from the Chroma collection: every chunk
+    whose `doc_id` metadata is the article's page_id, ordered by `element_id` (the chunk's `__n`
+    ordinal within the article) and joined. Serving articles lazily keeps eval RAM flat (25.9M
+    chunks; a materialized article map would be tens of GB). The systems only do keyed lookups
+    (`.get` / `[]` / `in`), never iterate — so this stands in for the dict. A small LRU keeps
+    recently-read articles hot. Mirrors TREC-BioGen's lazy doc map."""
 
-    def __init__(self, collection, cache_size: int = 4096) -> None:
+    def __init__(self, collection, cache_size: int = 1024) -> None:
         self._collection = collection
         self._cache: OrderedDict[str, str] = OrderedDict()
         self._cap = cache_size
 
-    def get(self, chunk_id, default=None):
-        key = str(chunk_id)
+    def get(self, doc_id, default=None):
+        key = str(doc_id)
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
-        got = self._collection.get(ids=[key], include=["documents"])
+        got = self._collection.get(where={"doc_id": key}, include=["documents", "metadatas"])
         docs = got.get("documents") or []
-        text = docs[0] if docs and docs[0] else None
-        if text is None:
+        metas = got.get("metadatas") or []
+        if not docs:
             return default
+        ordered = sorted(zip((int((m or {}).get("element_id", 0)) for m in metas), docs))
+        text = "\n\n".join(d for _, d in ordered if d)
         self._cache[key] = text
         if len(self._cache) > self._cap:
             self._cache.popitem(last=False)
         return text
 
-    def __getitem__(self, chunk_id):
-        text = self.get(chunk_id)
+    def __getitem__(self, doc_id):
+        text = self.get(doc_id)
         if text is None:
-            raise KeyError(chunk_id)
+            raise KeyError(doc_id)
         return text
 
-    def __contains__(self, chunk_id) -> bool:
-        return self.get(chunk_id) is not None
+    def __contains__(self, doc_id) -> bool:
+        return self.get(doc_id) is not None
 
 
 class QampariBenchmark(Benchmark):
@@ -128,9 +134,10 @@ class QampariBenchmark(Benchmark):
             config.dev_questions_path = str(resolve_under_benchmarks(config.dev_questions_path))
         if config.prompts_path:
             config.prompts_path = str(resolve_under_benchmarks(config.prompts_path))
-        # the chroma collection, set in _build_resources; recall_metrics reads the `title` metadata of
-        # the retrieved chunk_ids from it to collapse them to Wikipedia articles.
+        # the chroma collection, set in _build_resources; recall_metrics reads the `title` metadata
+        # of the retrieved articles' chunks from it to map page_ids to gold article titles.
         self._collection = None
+        self._title_cache: dict[str, str] = {}
         super().__init__(config)
 
     # ---- questions ------------------------------------------------------------
@@ -217,19 +224,32 @@ class QampariBenchmark(Benchmark):
             partial_credit=self.config.partial_credit,
         )
 
+    def _titles_for(self, retrieved: list[str]) -> list[str]:
+        """Normalized article title for each retrieved doc_id (an article page_id). Titles live in
+        every chunk's chroma metadata, so resolve each page_id from any one of its chunks (a
+        `where={"doc_id": ...}, limit=1` get), cached across questions. Pre-migration report rows
+        carry chunk_ids instead of page_ids, so unresolved ids fall back to a row-id lookup — the
+        same metric then recomputes identically on old rows."""
+        todo = [str(r) for r in retrieved if str(r) not in self._title_cache]
+        for pid in dict.fromkeys(todo):
+            got = self._collection.get(where={"doc_id": pid}, limit=1, include=["metadatas"])
+            metas = got.get("metadatas") or []
+            if metas:
+                self._title_cache[pid] = _norm_title((metas[0] or {}).get("title", ""))
+        missing = [pid for pid in dict.fromkeys(todo) if pid not in self._title_cache]
+        if missing:
+            got = self._collection.get(ids=missing, include=["metadatas"])
+            for cid, meta in zip(got.get("ids") or [], got.get("metadatas") or []):
+                self._title_cache[str(cid)] = _norm_title((meta or {}).get("title", ""))
+        return [self._title_cache.get(str(r), "") for r in retrieved]
+
     def recall_metrics(self, retrieved: list[str] | None, question: Question) -> dict[str, float]:
-        # Relevance is labeled at the Wikipedia-article level (a proof cites a supporting article), so
-        # collapse retrieved chunk_ids to their article title and report article-level doc_recall. The
-        # title lives in each chunk's chroma metadata, so look up just the retrieved ids (one .get).
+        # Relevance is labeled at the Wikipedia-article level (a proof cites a supporting article),
+        # and the retrieval unit is the article too (doc_id = page_id; see CORPUS_MODEL.md), but the
+        # gold join key is the normalized TITLE (proofs cite title-slug URLs), so map each retrieved
+        # page_id to its title via the chunk metadata and report article-level doc_recall.
         if retrieved is None:
             ret_articles: list[str] | None = None
-        elif not retrieved:
-            ret_articles = []
         else:
-            got = self._collection.get(ids=list(retrieved), include=["metadatas"])
-            id_to_title = {
-                str(cid): _norm_title((meta or {}).get("title", ""))
-                for cid, meta in zip(got.get("ids") or [], got.get("metadatas") or [])
-            }
-            ret_articles = [id_to_title.get(str(c), "") for c in retrieved]
+            ret_articles = self._titles_for(retrieved)
         return {"doc_recall": doc_recall(ret_articles, question.gold_docs)}

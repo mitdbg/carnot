@@ -18,6 +18,7 @@ import pandas as pd
 
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.officeqa_scoring import SCORER_VERSION, score_correct
+from qatfd.keys import officeqa_doc as _page_key_to_doc_key
 from qatfd.config import OfficeQAConfig
 from qatfd.constants import OFFICE_QA
 from qatfd.paths import resolve_under_benchmarks
@@ -45,12 +46,6 @@ def _parse_gold_page_keys(source_docs: str) -> list[str]:
         mm = _MONTH_MAP[m.group("month").lower()]
         keys.append(f"{m.group('year')}_{mm}_{int(m.group('page'))}")
     return keys
-
-
-def _page_key_to_doc_key(page_key: str) -> str:
-    """Collapse a page key "YYYY_MM_page" to its document (monthly bulletin) key
-    "YYYY_MM" by dropping the trailing page component."""
-    return "_".join(page_key.split("_")[:2])
 
 
 def officeqa_recall_metrics(retrieved: list[str] | None, gold_page_keys: list[str]) -> dict[str, float]:

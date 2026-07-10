@@ -71,6 +71,7 @@ RECALL_DISPLAY: dict[str, str] = {
     "chunk_recall": "Chunk Rec.",
     "page_recall": "Page Rec.",
     "doc_recall": "Doc Rec.",
+    "file_recall": "File Rec.",
     "gold_doc_recall": "Gold Doc Rec.",
     "evidence_doc_recall": "Ev. Doc Rec.",
 }

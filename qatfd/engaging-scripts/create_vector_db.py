@@ -10,11 +10,18 @@ The on-disk layout produced by every `compute_*_embeddings.py` script is the sam
 What differs per corpus is the *shape* of those per-element metadata dicts and
 how they map onto the columns stored in ChromaDB:
 
-  * the row id (= the SearchAgent's `chunk_id`)
+  * the row id (= the SearchAgent's `chunk_id` — the embedded CHUNK)
   * the `documents` column (= the chunk's text)
   * the `metadatas` column, which must always carry `doc_id` + `chunk_id`
-    so the SearchAgent's prune / filter logic works, plus any
+    so the SearchAgent's prune / filter logic works, plus `element_id`
+    (an int ordering a chunk within its doc, used by grep grouping) and any
     corpus-specific filterable fields.
+
+`doc_id` names the RETRIEVAL UNIT — the thing the SearchAgent reads
+(read_document), prunes, and returns, and the key of the benchmark's
+document_map. Each adapter chooses it per corpus (see CORPUS_MODEL.md):
+a page (officeqa, financebench), the whole source document (browsecomp_plus,
+trec_biogen), a Wikipedia article (qampari), or a source file (freshstack).
 
 That corpus-specific bit is an `ElementAdapter`: this script registers one per
 benchmark (`BENCHMARK_ADAPTERS`) mapping that benchmark's per-element metadata
@@ -284,37 +291,55 @@ def _financebench_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
 def _qampari_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
     """Adapter for `compute_qampari_embeddings.py` outputs (one element per ~100-token Wikipedia chunk).
 
-    The chunk_id ("{page_id}__{n}") is the doc_id, so the QAMPARI benchmark's chunk-text document_map
-    (keyed by chunk_id) lines up with retrieved doc_ids; `title` is surfaced so retrieved chunks can
-    be collapsed to their Wikipedia article (the unit of QAMPARI's gold) for doc-recall.
+    The Wikipedia ARTICLE (`page_id`) is the doc_id — the retrieval unit the SearchAgent reads,
+    prunes, and returns — while the row id stays the released chunk id ("{page_id}__{n}") and
+    `element_id` (the `__n` ordinal) orders a chunk within its article. `title` is surfaced so
+    retrieved articles can be mapped to QAMPARI's gold (normalized article titles) for doc-recall.
+    (Before 2026-07-09 the chunk itself was the doc_id; migrate an existing collection in place
+    with scripts/migrate_doc_ids.py instead of rebuilding.)
     """
+    page_id = str(elt_metadata.get("page_id", ""))
+    if not page_id:
+        raise ValueError(f"qampari element {elt_metadata.get('chunk_id')!r} has no page_id — cannot set doc_id")
     return (
-        elt_metadata["chunk_id"],
+        page_id,
         elt_metadata["cleaned"],
         {
             "title": elt_metadata.get("title", ""),
-            "page_id": elt_metadata.get("page_id", ""),
             "url": elt_metadata.get("url", ""),
             "element_id": elt_metadata.get("element_id", 0),
         },
     )
 
 
-def _freshstack_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
-    """Adapter for `compute_freshstack_embeddings.py` outputs (one element per corpus document).
+def _freshstack_byte_start(chunk_id: str) -> int | None:
+    """start_byte of a corpus `_id`'s "_{start}_{end}" byte-range suffix (None when absent).
+    Local copy of qatfd.keys.freshstack_byte_range's start half — keep the parse identical."""
+    parts = chunk_id.rsplit("_", 2)
+    if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
+        return int(parts[1])
+    return None
 
-    The corpus `_id` (e.g. "azure-openai/LICENSE.md_0_1140") is the doc_id, so retrieved doc_ids line
-    up directly with the FreshStack benchmark's gold (a nugget's relevant_corpus_ids are corpus `_id`s);
-    `file_id` is the source file the chunk belongs to (the `_id` minus its byte-range suffix), surfaced
-    for file-level grouping/recall; `url` is the GitHub source carried through for reference.
+
+def _freshstack_adapter(elt_metadata: dict) -> tuple[str, str, dict]:
+    """Adapter for `compute_freshstack_embeddings.py` outputs (one element per corpus record).
+
+    The source FILE (`file_id` = the corpus `_id` minus its "_{start}_{end}" byte-range suffix) is
+    the doc_id — the retrieval unit — while the row id stays the corpus `_id` (the chunk, which is
+    also the granularity of FreshStack's gold: a nugget's relevant_corpus_ids are corpus `_id`s,
+    collapsed to file_ids for recall). `element_id` is the chunk's start_byte — monotonic within
+    its file, so grep grouping and document assembly order chunks correctly. `url` is the GitHub
+    source carried through for reference. (Before 2026-07-09 the chunk `_id` was the doc_id;
+    migrate an existing collection in place with scripts/migrate_doc_ids.py.)
     """
+    chunk_id = str(elt_metadata["doc_id"])  # the embedding metadata's `doc_id` field is the corpus `_id`
+    file_id = str(elt_metadata.get("file_id", "")) or chunk_id
     return (
-        elt_metadata["doc_id"],
+        file_id,
         elt_metadata["cleaned"],
         {
-            "file_id": elt_metadata.get("file_id", ""),
             "url": elt_metadata.get("url", ""),
-            "element_id": elt_metadata.get("element_id", 0),
+            "element_id": _freshstack_byte_start(chunk_id) or 0,
         },
     )
 
@@ -323,10 +348,13 @@ BENCHMARK_ADAPTERS: dict[str, ElementAdapter] = {
     "officeqa": _officeqa_adapter,
     "browsecomp_plus": _browsecomp_plus_adapter,
     "trec_biogen": _biogen_adapter,
-    "finance_bench": _financebench_adapter,
+    "financebench": _financebench_adapter,
     "qampari": _qampari_adapter,
     "freshstack": _freshstack_adapter,
 }
+# deprecated alias: the CLI name for financebench before 2026-07-09 (kept so documented offline
+# build commands, e.g. the financebench.yaml header, keep working).
+BENCHMARK_ADAPTERS["finance_bench"] = _financebench_adapter
 
 
 if __name__ == "__main__":

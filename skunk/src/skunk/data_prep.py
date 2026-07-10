@@ -8,7 +8,7 @@ host execs it in the same sandbox. The code never constructs `AnnotatedValue`s i
 element is a plain dict of value fields the host validates into a fresh `AnnotatedValue`.
 The agent emits dicts (not `input_values[i]` references) because it cleans labels/typos and
 coalesces overlapping prints — the kept value is rarely the original object — and it authors
-each value's provenance (doc_id/pages/...) too: copied from the source entry, or UNIONed
+each value's provenance (source_stem/pages/...) too: copied from the source entry, or UNIONed
 across sources on a coalesce, so source-tracing and vintage selection downstream survive.
 
 The op fails safe: on any parse / exec / validation error after the attempt budget, the
@@ -34,7 +34,7 @@ from skunk.sandbox.pyexec import exec_python_with_env, parse_codegen_reply
 
 # The agent emits each kept value as a full dict (it may have cleaned labels/typos or
 # coalesced prints, so it can't pass the original object through). It authors provenance
-# (doc_id/pages/...) too — copied from the source entry, or UNIONed across sources when it
+# (source_stem/pages/...) too — copied from the source entry, or UNIONed across sources when it
 # coalesces — so here, unlike elsewhere, provenance is LLM-written rather than
 # machine-stamped; `_result_from_env` re-checks it against the inputs on the trusted side.
 # Allowed keys are exactly `AnnotatedValue`'s fields (kept in sync with the model); any other
@@ -57,10 +57,10 @@ def _result_from_env(
     Raises `ValueError` with a fix-it detail on any malformed shape.
 
     Trusted-side provenance check: the LLM AUTHORS provenance here (copy or union — see the
-    module docstring), so every emitted `doc_id` token and page number must already exist in
-    the inputs. A doc_id/page that appears from nowhere is fabricated provenance and rejects
-    the attempt like any other malformed result."""
-    known_doc_ids = {e.doc_id for e in input_values if e.doc_id}
+    module docstring), so every emitted `source_stem` token and page number must already exist
+    in the inputs. A source_stem/page that appears from nowhere is fabricated provenance and
+    rejects the attempt like any other malformed result."""
+    known_source_stems = {e.source_stem for e in input_values if e.source_stem}
     known_pages = {p for e in input_values for p in e.pages}
     result = env.get("result")
     if not isinstance(result, list):
@@ -85,14 +85,14 @@ def _result_from_env(
             validated = AnnotatedValue.model_validate(item)
         except ValidationError as e:
             raise ValueError(f"result[{i}]: invalid AnnotatedValue dict — {e}")
-        if validated.doc_id:
+        if validated.source_stem:
             bad_docs = [
-                tok for tok in (t.strip() for t in validated.doc_id.split(","))
-                if tok and tok not in known_doc_ids
+                tok for tok in (t.strip() for t in validated.source_stem.split(","))
+                if tok and tok not in known_source_stems
             ]
             if bad_docs:
                 raise ValueError(
-                    f"result[{i}]: doc_id token(s) {bad_docs} do not appear in any input "
+                    f"result[{i}]: source_stem token(s) {bad_docs} do not appear in any input "
                     "value — copy/union provenance from the source entries, never invent it."
                 )
         bad_pages = [p for p in validated.pages if p not in known_pages]
@@ -120,7 +120,7 @@ You clean a pool of already-extracted data values before it is handed to a downs
   .unit          natural-language unit, e.g. "millions of dollars", "percent"
   .notes         prose page context — footnotes, caveats, print-flag (p/r) meaning
   .kind          "scalar" | "vector" | "table"
-  .doc_id        source document id (filename stem) the value was read from; empty for external lookups
+  .source_stem   source document's filename stem the value was read from; empty for external lookups
   .pages         source PDF page number(s); empty for external lookups
   .source        external-lookup publisher (e.g. "FRED", "BEA"); empty for corpus extracts
   .requested_period / .retrieve_key   the data window / concept this datum served
@@ -142,14 +142,14 @@ Emit exactly one fenced ```python``` block assigning `result` — the cleaned li
   {"description": "...", "value": <scalar | vector dict | table dict>, "unit": "...",
    "notes": "...", "kind": "scalar"|"vector"|"table",
    "index_name"/"row_name"/"col_name": ... as the kind requires,
-   "doc_id": "<source document id>", "pages": [<int>, ...], "source": "...",
+   "source_stem": "<source document stem>", "pages": [<int>, ...], "source": "...",
    "requested_period": "...", "retrieve_key": "..."}
-Always fill the provenance fields (`doc_id`, `pages`, `source`, `requested_period`, `retrieve_key`) yourself, from the input entry/entries a value came from — downstream compute reads them to trace sources. For a value kept from ONE entry, copy them across. For a value you coalesced from SEVERAL entries, UNION them:
+Always fill the provenance fields (`source_stem`, `pages`, `source`, `requested_period`, `retrieve_key`) yourself, from the input entry/entries a value came from — downstream compute reads them to trace sources. For a value kept from ONE entry, copy them across. For a value you coalesced from SEVERAL entries, UNION them:
   - `pages`: every source page combined (deduped).
-  - `doc_id`: the source document id the data was drawn from — a single id, or the ids joined with ", " when it spans several documents.
+  - `source_stem`: the source document stem the data was drawn from — a single stem, or the stems joined with ", " when it spans several documents.
   - `requested_period`: the combined period the merged value now covers.
   - `retrieve_key`: the shared concept key (identical across true coalesce candidates).
-EXTERNAL-LOOKUP values carry no `doc_id`/`pages` — they were fetched from an outside publisher, not a corpus page. For those, leave `doc_id` empty and `pages` `[]`, and PRESERVE the `source` (the publisher, e.g. "FRED") verbatim from the input entry. For corpus extracts, leave `source` empty.
+EXTERNAL-LOOKUP values carry no `source_stem`/`pages` — they were fetched from an outside publisher, not a corpus page. For those, leave `source_stem` empty and `pages` `[]`, and PRESERVE the `source` (the publisher, e.g. "FRED") verbatim from the input entry. For corpus extracts, leave `source` empty.
 Reproduce the data exactly — your only changes are removing duplicates, coalescing, and fixing labels/typos.
 """
 

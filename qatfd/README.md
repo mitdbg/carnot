@@ -22,6 +22,9 @@ qatfd/
 Note the two `benchmarks/`: `qatfd/qatfd/benchmarks/` is the code (loaders/scorers);
 `qatfd/benchmarks/` is the data root (corpora, Chroma indices, questions, splits).
 
+How corpora map onto chunks / retrieval units (`doc_id`) / source groups — and what those
+ids mean per benchmark — is specified in [CORPUS_MODEL.md](CORPUS_MODEL.md).
+
 ## Benchmarks
 
 All benchmark **data** (indices, questions, corpora, split files, and the optional
@@ -107,7 +110,7 @@ python engaging-scripts/compute_financebench_element_embeddings.py \
 #    `aws s3 sync s3://carnot-research/financebench/financebench-element-embeddings ./fb-embeddings`)
 python -m skunk.search_agent.prep.create_vector_db \
     --embeddings-dir benchmarks/financebench/financebench-element-embeddings \
-    --collection-name financebench-qwen-8b --chroma-path benchmarks/financebench/chromadb --benchmark finance_bench
+    --collection-name financebench-qwen-8b --chroma-path benchmarks/financebench/chromadb --benchmark financebench
 ```
 
 ## Systems (registry names)

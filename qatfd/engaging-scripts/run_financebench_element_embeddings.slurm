@@ -65,4 +65,4 @@ echo "End: $(date)"
 # 2. build the collection:
 #      python -m skunk.search_agent.prep.create_vector_db \
 #          --embeddings-dir ./fb-embeddings --collection-name qwen-financebench \
-#          --chroma-path ./.chromadb --benchmark finance_bench
+#          --chroma-path ./.chromadb --benchmark financebench

@@ -1,17 +1,25 @@
 """Tool implementations for the SearchAgent.
 
 All retrieval tools are backed by a single ChromaDB collection in which each
-row is one *element* (chunk) extracted from a *document* (e.g. a page of a
-PDF report, or a scraped web page). The layout — produced by the corpus-prep
-scripts that live with the benchmarks (e.g. qatfd's
-`engaging-scripts/create_vector_db.py`) — is:
+row is one *chunk* (the embedded element) of a *document*. A "document" here
+is the corpus's RETRIEVAL UNIT — the thing `read_document` fetches whole,
+prune/seen state tracks, and the final answer returns — chosen per corpus
+when the collection is built, NOT necessarily a whole source file: a single
+page of a PDF report (OfficeQA: doc_id "1946_11_41" = the 1946-11 bulletin's
+page 41; FinanceBench: "3M_2018_10K::p59"), a scraped web page
+(BrowseComp-Plus), a PubMed abstract (TREC-BioGen), a Wikipedia article
+(QAMPARI), or a source file (FreshStack). The layout — produced by the
+corpus-prep scripts that live with the benchmarks (e.g. qatfd's
+`engaging-scripts/create_vector_db.py`; taxonomy in qatfd's
+CORPUS_MODEL.md) — is:
 
     id:        the `chunk_id` (e.g. "1946_11_41_6")
-    document:  the cleaned element text (read from the `documents` field)
+    document:  the cleaned chunk text (read from the `documents` field)
     metadata:  {
-        doc_id:     str   -- the document key, e.g. "1946_11_41"
+        doc_id:     str   -- the retrieval-unit key, e.g. "1946_11_41"
         chunk_id:   str   -- duplicate of the row id, for $nin filterability
-        element_id: int   -- 0-based index of the chunk within its document
+        element_id: int   -- int ordering the chunk within its document
+                             (a 0-based index, or any monotonic stand-in)
         type:       str   -- "text" | "title" | "table" | ...
         ...               -- any corpus-specific extras (year, month, url, ...)
     }
@@ -357,6 +365,12 @@ grep_corpus("topic Y", metadata_filter={"field_a": {"$in": ["value_1", "value_2"
 
 
 class ReadDocumentTool(Tool):
+    """Fetch the full text of one or more retrieval units by `doc_id` from `document_map`.
+
+    A "document" is the corpus's retrieval unit (see the module docstring), so what this
+    returns is a PDF page for OfficeQA/FinanceBench, an abstract for TREC-BioGen, an
+    assembled Wikipedia article for QAMPARI, or a source file for FreshStack."""
+
     name = "read_document"
     _DOC_TEMPLATE = """\
 ### read_document(doc_id: str | list[str])

@@ -58,7 +58,7 @@ def _needs_more_from_env(env: dict[str, Any]) -> NeedsMore:
     """Validate a missing-data exec environment into a `NeedsMore`. `missing` must validate
     as `MissingDataSignal`. `keep` (optional, default `{}`) is the model's drop-by-default
     choice of what to carry into the next round, a `{name: value}` dict where each value is
-    EITHER an `input_values` entry — carried verbatim so its provenance (doc_id/pages)
+    EITHER an `input_values` entry — carried verbatim so its provenance (source_stem/pages)
     survives — OR a freshly computed scalar / [scalars] / flat {label: scalar} dict,
     which becomes a provenance-free `AnnotatedValue` marked "computed". Anything not in `keep`
     is dropped. Raises `ValueError` with a fix-it detail on any malformed shape."""
@@ -135,7 +135,7 @@ You write Python that either produces the final answer string, or — when the i
   .index_name    (vector)   .row_name / .col_name (table)
   .value         raw payload — only use if you specifically need the dict/list form
   .source             publisher/origin of an external-lookup value (empty for corpus extracts)
-  .doc_id             source document id (filename stem) the value was read from
+  .source_stem        source document's filename stem the value was read from
   .pages              source PDF page number(s)
   .requested_period   data window the value was retrieved for
   .retrieve_key       the concept this datum was retrieved for
@@ -275,7 +275,7 @@ class ComputeOp:
         # final-stage survivor set for per-stage recall (eval/stage_report.py). Shared
         # across trials, so emitted once here rather than per trial.
         src_pages = sorted(
-            {f"{e.doc_id}:{p}" for e in input_values if e.doc_id for p in e.pages}
+            {f"{e.source_stem}:{p}" for e in input_values if e.source_stem for p in e.pages}
         )
         ctx.emit(
             f"compute_inputs n_values={len(input_values)} n_pages={len(src_pages)}",

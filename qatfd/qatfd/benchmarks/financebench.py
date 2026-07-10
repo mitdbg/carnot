@@ -26,24 +26,10 @@ from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.judge import judge_single_nugget
 from qatfd.config import FinanceBenchConfig
 from qatfd.constants import FINANCE_BENCH
+from qatfd.keys import financebench_doc as _page_key_to_doc
+from qatfd.keys import financebench_page_key as page_key
 from qatfd.paths import resolve_under_benchmarks
 from qatfd.types import Question
-
-# Separator joining a document name and its (zero-indexed) page number into a page key. Chosen so
-# it cannot collide with FinanceBench doc_names (which use only [A-Za-z0-9_-]); the embedding job
-# (compute_financebench_element_embeddings.py) and the chroma adapter (create_vector_db.py) MUST
-# use the identical key, or retrieved doc_ids won't line up with gold for recall.
-_PAGE_SEP = "::p"
-
-
-def page_key(doc_name: str, page_num: int) -> str:
-    """Page-level key "{doc_name}::p{page_num}" (page_num zero-indexed, as in FinanceBench)."""
-    return f"{doc_name}{_PAGE_SEP}{int(page_num)}"
-
-
-def _page_key_to_doc(key: str) -> str:
-    """Collapse a page key back to its document name (drop the trailing ::pN)."""
-    return key.split(_PAGE_SEP)[0]
 
 
 def financebench_recall_metrics(retrieved: list[str] | None, gold_page_keys: list[str]) -> dict[str, float]:

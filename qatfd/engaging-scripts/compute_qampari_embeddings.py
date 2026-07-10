@@ -13,8 +13,10 @@ split and its chunk embeddings averaged + renormalized. We embed `contents` (tit
 QAMPARI's BM25/DPR index field.
 
 The chunk's own id ("<page_id>__<n>") is the unique_element_id (= the ChromaDB row id / chunk_id).
-Per-element metadata carries `cleaned` (the embedded text), `title`, `page_id`, and `url`, so
-create_vector_db's `qampari` adapter can store the article identity the benchmark uses for doc-recall.
+Per-element metadata carries `cleaned` (the embedded text), `title`, `page_id`, and `url`.
+create_vector_db's `qampari` adapter stores the Wikipedia ARTICLE (`page_id`) as the Chroma `doc_id`
+(the retrieval unit) with the chunk's `__n` ordinal as `element_id`, and surfaces `title` — the
+article identity the benchmark's gold uses for doc-recall (see CORPUS_MODEL.md).
 
 Sharding (one worker per GPU, launched by srun): whole `.jsonl` files are assigned round-robin to
 ranks; each rank writes `embeddings_{rank}_{p}.npz` + `metadata_rank{rank}.json`.

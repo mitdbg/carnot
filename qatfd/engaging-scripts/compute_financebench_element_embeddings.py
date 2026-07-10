@@ -46,7 +46,8 @@ CHUNK_TOKENS = 31500
 # Token budget per batch: batch_size × max_seq_len_in_batch must not exceed this.
 BATCH_TOKEN_BUDGET = 16384
 
-# Page key separator — MUST match qatfd.benchmarks.financebench._PAGE_SEP and the chroma adapter.
+# Page key separator — local copy of qatfd.keys.FINANCEBENCH_PAGE_SEP (this script runs standalone
+# on the cluster, so it cannot import qatfd); MUST match it and the chroma adapter.
 # It cannot occur in a PDF filename stem, so a key is unambiguously splittable into (doc, page).
 _PAGE_SEP = "::p"
 

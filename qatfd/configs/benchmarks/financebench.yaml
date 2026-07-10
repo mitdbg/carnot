@@ -7,7 +7,7 @@
 #        --input_dir <bench>/financebench/pdfs --output_dir <bench>/financebench/financebench-element-embeddings
 #   2. python3 engaging-scripts/create_vector_db.py \
 #        --embeddings-dir <bench>/financebench/financebench-element-embeddings \
-#        --collection-name financebench-qwen-8b --chroma-path <bench>/financebench/chromadb --benchmark finance_bench
+#        --collection-name financebench-qwen-8b --chroma-path <bench>/financebench/chromadb --benchmark financebench
 # (<bench> = qatfd/benchmarks)
 # Runs embed the query with the SAME 8B model (the default emb config), e.g.:
 #   python3 -m qatfd.runner benchmarks=financebench systems=rag_llm experiments.split=test \

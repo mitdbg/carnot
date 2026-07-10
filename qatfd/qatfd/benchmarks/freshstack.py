@@ -13,14 +13,18 @@ Questions: the FreshStack queries JSONL (`{topic}/queries.jsonl`). Per record: `
 Gold nuggets: the nugget `text`s — one nugget per decompositional fact. The score is nugget-completion
   recall (each fact graded support / partial / not_support by the LLM judge in judge.py), exactly as
   KARL grades FreshStack ("convert ground-truth answers into fixed nuggets ... prior to evaluation").
-Corpus + index: the topic's corpus JSONL (`freshstack/{topic}/corpus.jsonl`), one element per
-  document, embedded with Qwen3-Embedding-0.6B into the `freshstack-{topic}-qwen-0.6b` Chroma
-  collection (KARL retrieves FreshStack with Qwen3-0.6B, k=10), stored under
-  benchmarks/freshstack/{topic}/chromadb. The corpus is small (~50K docs), so the doc map
-  (_id -> text) is read straight from corpus.jsonl into RAM — the file is the source of the vectors.
-Gold docs / recall: each nugget's `relevant_corpus_ids` reference corpus `_id`s DIRECTLY (the corpus
-  `_id`, e.g. "azure-openai/LICENSE.md_0_1140", is the Chroma row id), so gold_docs are the union of
-  those ids and recall is a plain `doc_recall` over retrieved `_id`s — no key remapping needed.
+Corpus + index: the topic's corpus JSONL (`freshstack/{topic}/corpus.jsonl`), one embedded element
+  per corpus record (a byte-range slice of a source file), embedded with Qwen3-Embedding-0.6B into
+  the `freshstack-{topic}-qwen-0.6b` Chroma collection (KARL retrieves FreshStack with Qwen3-0.6B,
+  k=10), stored under benchmarks/freshstack/{topic}/chromadb. The retrieval unit (`doc_id`) is the
+  source FILE (`file_id` = the `_id` minus its byte-range suffix; see CORPUS_MODEL.md — before
+  2026-07-09 it was the chunk `_id` itself; existing collections are migrated in place by
+  scripts/migrate_doc_ids.py). The corpus is small (~50K chunks), so the doc map (file_id -> file
+  text, slices joined in byte order) is rebuilt from corpus.jsonl into RAM — the file is the source
+  of the vectors.
+Gold docs / recall: each nugget's `relevant_corpus_ids` reference corpus `_id`s (chunks), so
+  gold_docs stay chunk `_id`s and `recall_metrics` collapses both sides to file_ids — `file_recall`
+  is the primary (and only final-answer-computable) retrieval metric.
 Dev/test split: by TOPIC — dev = all laravel queries, test = all langchain queries
   (benchmarks/freshstack/freshstack_splits.json, via benchmarks.splits_path; see scripts/make_splits.py).
 """
@@ -34,6 +38,7 @@ from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.judge import judge_nugget_recall
 from qatfd.config import FreshstackConfig
 from qatfd.constants import FRESHSTACK
+from qatfd.keys import freshstack_byte_range, freshstack_file_id
 from qatfd.paths import resolve_under_benchmarks
 from qatfd.types import Question
 
@@ -46,17 +51,6 @@ _JUDGE_SYSTEM = (
     "of the correct answer; judge whether the predicted answer entails that fact, allowing for "
     "equivalent code, paraphrase, and formatting differences."
 )
-
-
-def _file_id(doc_id: str) -> str:
-    """The source FILE a chunk belongs to: the chunk `_id` minus its trailing "_{start}_{end}" byte
-    range, e.g. "azure-openai/LICENSE.md_0_1140" -> "azure-openai/LICENSE.md". (File paths can contain
-    underscores, so we only strip when the last two underscore-separated fields are both integers.)
-    Mirrors `_file_id` in compute_freshstack_embeddings.py — keep the two identical."""
-    parts = doc_id.rsplit("_", 2)
-    if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
-        return parts[0]
-    return doc_id
 
 
 class FreshstackBenchmark(Benchmark):
@@ -148,24 +142,31 @@ class FreshstackBenchmark(Benchmark):
     # ---- retrieval substrate --------------------------------------------------
 
     def _build_document_map(self) -> dict[str, str]:
-        """`_id -> document text`, read straight from the topic's corpus.jsonl (the ~50K-doc corpus
-        fits in RAM, and this file is exactly the text the vectors were built from). The corpus `_id`
-        is the Chroma row id, so retrieved doc_ids look up directly here."""
+        """`file_id -> source-file text`, reassembled from the topic's corpus.jsonl (the ~50K-chunk
+        corpus fits in RAM, and this file is exactly the text the vectors were built from). Each
+        corpus record is a byte-range slice of a source file; a file's text is its slices joined in
+        start_byte order (the slices tile each file with only whitespace-sized gaps, so ordered
+        concatenation is a faithful reconstruction). The file_id is the Chroma `doc_id`, so
+        retrieved doc_ids look up directly here."""
         path = self.config.corpus_path
         if not os.path.exists(path):
             raise FileNotFoundError(
                 f"FreshStack corpus not found at {path}; expected the topic's corpus.jsonl "
                 f"(download with engaging-scripts/download_freshstack.py)."
             )
-        doc_map: dict[str, str] = {}
+        by_file: dict[str, list[tuple[int, str]]] = {}
         with open(path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 rec = json.loads(line)
-                doc_map[str(rec["_id"])] = str(rec.get("text", ""))
-        return doc_map
+                cid = str(rec["_id"])
+                span = freshstack_byte_range(cid)
+                by_file.setdefault(freshstack_file_id(cid), []).append(
+                    (span[0] if span else 0, str(rec.get("text", "")))
+                )
+        return {fid: "\n".join(text for _, text in sorted(slices)) for fid, slices in by_file.items()}
 
     def _build_resources(self) -> BenchmarkResources:
         collection = self._open_chroma_collection()
@@ -190,11 +191,13 @@ class FreshstackBenchmark(Benchmark):
 
     def recall_metrics(self, retrieved: list[str] | None, question: Question) -> dict[str, float]:
         # Gold relevance is labeled at the CHUNK level (a nugget's relevant_corpus_ids are corpus
-        # `_id`s = the retrieved doc_ids), so `doc_recall` is exact-chunk recall. `file_recall`
-        # collapses both sides to their source file (drop the `_id`'s byte-range suffix), isolating
-        # "found the right file but not the exact chunk". Pure (file_id derives from the id string,
-        # no resources), so it recomputes offline from a stored report.csv.
-        chunk_recall = doc_recall(retrieved, question.gold_docs)
-        ret_files = None if retrieved is None else [_file_id(c) for c in retrieved]
-        gold_files = [_file_id(g) for g in question.gold_docs]
-        return {"doc_recall": chunk_recall, "file_recall": doc_recall(ret_files, gold_files)}
+        # `_id`s), but the retrieval unit systems return is the source FILE (since 2026-07-09; see
+        # CORPUS_MODEL.md), so recall is at file granularity: a gold file counts as found when it
+        # was retrieved. Retrieved ids are collapsed through file_id too — a no-op on file ids —
+        # so the metric also recomputes identically from pre-migration report.csv rows (whose
+        # retrieved ids are chunk `_id`s). Exact-chunk recall is no longer computable from the
+        # final answer; a trace-based diagnostic (did the agent ever surface the exact gold slice)
+        # would have to recompute it offline from traces/<qid>.jsonl.
+        ret_files = None if retrieved is None else [freshstack_file_id(c) for c in retrieved]
+        gold_files = [freshstack_file_id(g) for g in question.gold_docs]
+        return {"file_recall": doc_recall(ret_files, gold_files)}

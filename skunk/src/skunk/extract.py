@@ -189,22 +189,22 @@ def _stamp_provenance(
     obtained_visually: bool = False,
 ) -> list[AnnotatedValue]:
     """Copy machine-fact provenance from the source refs + branch onto each entry —
-    never LLM-written. `doc_id`/`pages` are attributable only when every ref in the
+    never LLM-written. `source_stem`/`pages` are attributable only when every ref in the
     call shares one source document (otherwise we can't tell which document a value came
-    from, so they're left empty). `doc_id` is that document's id (filename stem). Branch
+    from, so they're left empty). `source_stem` is that document's filename stem. Branch
     fields (`period`/`key`) are call-level and always stamped. The model is frozen, so we
     rebuild via `model_copy`."""
     source_docs = {r.stem for r in refs if r.stem}
-    doc_id = next(iter(source_docs)) if len(source_docs) == 1 else None
+    source_stem = next(iter(source_docs)) if len(source_docs) == 1 else None
     pages = (
         tuple(sorted({r.page for r in refs if r.page is not None}))
-        if doc_id is not None
+        if source_stem is not None
         else ()
     )
     return [
         e.model_copy(
             update={
-                "doc_id": doc_id,
+                "source_stem": source_stem,
                 "pages": pages,
                 "requested_period": branch.period,
                 "retrieve_key": branch.key,
@@ -495,9 +495,9 @@ derive, or invent. A period `YYYY-MM..YYYY-MM` is an inclusive month range."""
             entries = []
         ctx.emit(f"vision_result tier=vision n_entries={len(entries)}")
         # Stamp provenance from the rendered refs. A single vision call may span
-        # several documents (no per-image attribution on the reply), so doc_id/pages
+        # several documents (no per-image attribution on the reply), so source_stem/pages
         # land only when all images share one source document — the common single-doc
-        # branch; multi-doc calls keep doc_id empty.
+        # branch; multi-doc calls keep source_stem empty.
         return _stamp_provenance(entries, rendered_refs, branch, obtained_visually=True)
 
 

@@ -14,10 +14,11 @@ model (1024-dim). The rare chunk longer than the model context is split and its 
 averaged + renormalized (embed_oversized_text) — still ONE vector for that `_id` (a model-context
 workaround, not a change in retrieval unit).
 
-Per-element metadata carries `doc_id` (= `_id`), `file_id` (the source file the chunk belongs to, =
-the `_id` minus its "_{start}_{end}" byte-range suffix), `cleaned` (the embedded text), and `url`, so
-create_vector_db's `freshstack` adapter builds the collection with doc_ids that line up with the
-benchmark's gold (and `file_id` for file-level grouping/recall).
+Per-element metadata carries `doc_id` (= `_id`, the chunk), `file_id` (the source file the chunk
+belongs to, = the `_id` minus its "_{start}_{end}" byte-range suffix), `cleaned` (the embedded
+text), and `url`. create_vector_db's `freshstack` adapter builds the collection with the source
+FILE (`file_id`) as the Chroma `doc_id` (the retrieval unit) and the corpus `_id` as the row id /
+chunk_id; the benchmark collapses its chunk-level gold to file_ids for recall (see CORPUS_MODEL.md).
 
 Sharding (one worker per GPU, launched by srun): the single corpus.jsonl has no files to split across
 ranks, so records are sharded round-robin BY LINE INDEX (`records[rank::world_size]`); each rank writes
@@ -244,7 +245,9 @@ def embed_all(texts, unique_element_ids, model, partition_size, output_dir, rank
 def _file_id(doc_id: str) -> str:
     """The source FILE a chunk belongs to: the chunk `_id` minus its trailing "_{start}_{end}" byte
     range, e.g. "azure-openai/LICENSE.md_0_1140" -> "azure-openai/LICENSE.md". (File paths can contain
-    underscores, so we only strip when the last two underscore-separated fields are both integers.)"""
+    underscores, so we only strip when the last two underscore-separated fields are both integers.)
+    Local copy of qatfd.keys.freshstack_file_id (this script runs standalone on the cluster, so it
+    cannot import qatfd) — keep the two identical."""
     parts = doc_id.rsplit("_", 2)
     if len(parts) == 3 and parts[1].isdigit() and parts[2].isdigit():
         return parts[0]

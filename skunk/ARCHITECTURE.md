@@ -78,6 +78,21 @@ the same list, so one branch failing doesn't sink its siblings. Dispatch:
 - **golden bypass** — `config.golden_pages` (the eval harness's `--golden` ablation) injects
   the benchmark's gold pages verbatim and skips the agent entirely.
 
+**Corpus data contract — "document" = retrieval unit.** The SearchAgent's vocabulary has two
+levels, both defined by the Chroma collection it is handed (schema in
+`search_agent/search_tools.py`'s module docstring; per-benchmark taxonomy in qatfd's
+`CORPUS_MODEL.md`): a **chunk** (one Chroma row = one embedded element; row id = `chunk_id`,
+ordered within its document by the int `element_id`) and a **document** (`doc_id` — the
+RETRIEVAL UNIT: what `read_document` fetches whole via `document_map`, what prune/seen state
+tracks, and what the final `{"doc_ids": [...]}` answer returns). The unit is chosen per corpus
+at index-build time and is often NOT a whole source file: for the Treasury corpus it is a
+single PDF page (`doc_id` "1946_11_41" = bulletin 1946-11, page 41 — which is why
+`retrieve.py` parses the agent's doc_ids straight into `PageRef`s), while other corpora use a
+web page, an abstract, a Wikipedia article, or a source file. Note the operator pipeline's
+`AnnotatedValue.source_stem` (extract provenance) is the source document's filename stem — a
+different, coarser identity than the search layer's `doc_id`, which is why it is not called
+doc_id.
+
 (The earlier catalog-based `page_index` retriever — ToC chapter picks, year filter, the
 multi-branch semantic filter, and the block-selection tournament — was retired; the
 page-index artifact now serves only extract, through the page store below. The offline
