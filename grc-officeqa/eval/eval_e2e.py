@@ -77,7 +77,6 @@ from skunk import (  # noqa: E402
 )
 
 from officeqa.config import SkunkConfig  # noqa: E402
-from officeqa.page_store import get_officeqa_page_store  # noqa: E402
 from eval.util import dump_trace  # noqa: E402
 from eval.scoring import SCORER_VERSION, score_correct  # noqa: E402
 
@@ -181,9 +180,6 @@ async def _run_one_question(
         log_path=log_path,
         config=config,
         prompt_overrides=prompt_overrides,
-        # The Treasury PageContentStore implementation — extract reads all page
-        # content/structure through this seam (skunk itself is corpus-agnostic).
-        page_store=get_officeqa_page_store(str(config.pdf_dir)),
     )
     ctx = orch.ctx
 

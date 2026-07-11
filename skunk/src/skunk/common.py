@@ -32,7 +32,6 @@ from skunk.config import SystemConfig
 
 if TYPE_CHECKING:
     from skunk.llm_client import LLMClient
-    from skunk.page_store import PageContentStore
     from skunk.prompted_call import PromptOverride
 
 # Reasoning-effort knob, mapped onto Gemini's `thinking_level` enum. "off" means
@@ -443,13 +442,28 @@ def page_key_to_pageref(key: str) -> PageRef:
 
 
 @dataclass(frozen=True)
+class RetrievedDoc:
+    """One retrieved page's content: a `PageRef` plus the page's text. Produced by the
+    retrieve operator (search-agent backend or golden bypass) and read directly by
+    compute — there is no separate extract step. The text is the cleaned per-page corpus
+    text the search agent itself reads (`retrieve`'s `document_map`)."""
+
+    ref: PageRef
+    text: str
+
+
+@dataclass(frozen=True)
 class BranchRetrieval:
     """One retrieve branch's normalized result — the single retrieval contract the
-    search-agent backend (and the golden bypass) produces: the whole pages to extract,
-    as `PageRef`s. Extraction reads each page directly (predecessor/notes expansion and
-    text→vision happen at read time). Produced solely by `RetrieveOp.run_all`."""
+    search-agent backend (and the golden bypass) produce: the retrieved pages with their
+    text, read directly by compute. Produced solely by `retrieve.run_retrieve_all`."""
 
-    pages: tuple[PageRef, ...]
+    documents: tuple[RetrievedDoc, ...]
+
+    @property
+    def pages(self) -> tuple[PageRef, ...]:
+        """The retrieved pages' refs (for recall reporting / the retrieved-page union)."""
+        return tuple(d.ref for d in self.documents)
 
 
 VALUE_KIND_VOCAB: frozenset[str] = frozenset({"scalar", "vector", "table"})
@@ -585,13 +599,9 @@ class Final:
 
 @dataclass(frozen=True)
 class NeedsMore:
-    """Compute judged its inputs insufficient. `keep` is the values to carry into the next
-    recovery round — the inputs the model chose to retain RE-STATED plus any partial
-    computation it performed, all as provenance-free `AnnotatedValue`s. Drop-by-default:
-    anything the model did not put in `keep` is gone. `missing_reason`/`missing` describe
-    what to gather next."""
+    """Compute judged its inputs insufficient. `missing_reason`/`missing` describe what to
+    gather next; the orchestrator keeps everything gathered so far and replans to add more."""
 
-    keep: list[AnnotatedValue]
     missing_reason: str
     missing: list[str]
 
@@ -684,8 +694,23 @@ def _describe_entry(i: int, e: AnnotatedValue) -> list[str]:
     # (e.g. 452197.98 -> 4.521980e+05) once it holds a large value, hiding the cents and
     # leading the agent to transcribe rounded numbers. `format_float_positional` prints the
     # exact value without scientific notation (trim='-' drops only trailing zeros/point).
+    # Rows are capped like `_join_labels` caps columns: a pathological frame (a multi-decade
+    # monthly series, 1000s of rows) would otherwise render every row into one prompt and
+    # blow past the input-token ceiling. Generated code still reads the full `.frame`.
     lines.append(f"{_PAD}frame:")
-    rendered = df.to_string(float_format=lambda v: np.format_float_positional(v, trim="-"))
+    if n_rows > _MAX_RENDERED_LABELS:
+        head = df.iloc[:_LABEL_EDGE].to_string(
+            float_format=lambda v: np.format_float_positional(v, trim="-")
+        )
+        tail = df.iloc[-_LABEL_EDGE:].to_string(
+            float_format=lambda v: np.format_float_positional(v, trim="-"), header=False
+        )
+        elided = n_rows - 2 * _LABEL_EDGE
+        rendered = f"{head}\n… ({elided} of {n_rows} labels elided) …\n{tail}"
+    else:
+        rendered = df.to_string(
+            float_format=lambda v: np.format_float_positional(v, trim="-")
+        )
     lines.extend(f"{_PAD}  {ln}" for ln in rendered.splitlines())
     return lines
 
@@ -699,6 +724,40 @@ def input_values_desc(input_values: list[AnnotatedValue]) -> str:
     for i, e in enumerate(input_values):
         lines.extend(_describe_entry(i, e))
     return "\n".join(lines)
+
+
+def documents_desc(documents: list["RetrievedDoc"]) -> str:
+    """Render retrieved pages as a plain-text context block for the compute / replan
+    prompts: one delimited section per page, keyed by its page id. Read directly by the
+    LLM — the model transcribes any numbers it needs into code (the pages are NOT in the
+    exec environment)."""
+    if not documents:
+        return "(no pages retrieved)"
+    blocks = [f"retrieved pages ({len(documents)})"]
+    for d in documents:
+        page_id = f"{d.ref.stem}_{d.ref.page}" if d.ref.stem else str(d.ref)
+        blocks.append(f"=== page {page_id} ===\n{d.text}")
+    return "\n\n".join(blocks)
+
+
+def split_pool(
+    pool: list,
+) -> tuple[list["RetrievedDoc"], list[AnnotatedValue]]:
+    """Split the orchestrator's mixed gathered pool into retrieved pages (from `retrieve`
+    branches) and structured values (from `lookup_external` branches)."""
+    docs = [x for x in pool if isinstance(x, RetrievedDoc)]
+    values = [x for x in pool if isinstance(x, AnnotatedValue)]
+    return docs, values
+
+
+def pool_desc(pool: list) -> str:
+    """Render the mixed gathered pool (retrieved pages + lookup values) for the replan
+    prompt."""
+    docs, values = split_pool(pool)
+    parts = [documents_desc(docs)]
+    if values:
+        parts.append(input_values_desc(values))
+    return "\n\n".join(parts)
 
 
 @dataclass
@@ -723,10 +782,6 @@ class ExecutionContext:
     prompt_overrides: tuple[
         PromptOverride, ...
     ] = ()  # corpus/few_shot/lesson overrides; operators pick out their own entries by name
-    # Corpus page-content backend for the extract operator (see `skunk.page_store`).
-    # None → extract fails with a clear StepFailed; apps inject their implementation
-    # via `Orchestrator(page_store=...)`.
-    page_store: PageContentStore | None = None
 
     def __post_init__(self) -> None:
         if self.llm_client is None:

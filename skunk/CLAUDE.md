@@ -13,10 +13,12 @@ Two layers:
    `common.ExecutionContext`, the `SystemConfig` → `SearchAgentConfig` →
    `PipelineConfig` config hierarchy.
 2. **Operator pipeline**: question → `Planner` → typed DSL `Plan` → `Orchestrator`
-   → {`retrieve`, `extract`, `lookup_external`, `compute`} with data-prep pooling
-   and replan-on-MissingData recovery. Corpus content reaches `extract` only
-   through the `skunk.page_store.PageContentStore` protocol, injected via
-   `Orchestrator(page_store=...)`.
+   → {`retrieve`, `lookup_external`, `compute`} with replan-on-MissingData recovery.
+   `retrieve` runs the search agent and returns the relevant pages WITH their text
+   (`RetrievedDoc`); `compute` reads that text directly and produces the answer (or
+   signals `MissingData` to drive a replan). There is no separate extract step and no
+   injected page store — page text comes from the same `clean_page_map` corpus the
+   search agent reads.
 
 Applications live OUTSIDE this repo dir (the library has no benchmark, corpus
 paths, or eval harness of its own):
@@ -43,9 +45,9 @@ venv/bin/ruff check src/ tests/     # lint (clean at HEAD)
   batched/parallel tool call, one `python: command not found` aborts the whole batch.
 - The active interpreter is `venv/bin/python3` (NOT `.venv/`); skunk is installed
   editable there.
-- **No new ops** without updating `ARCHITECTURE.md`, the planner system prompt in
-  `src/skunk/plan.py`, the validator, AND the app-layer eval harness
-  (`../grc-officeqa/eval/eval_e2e.py`).
+- **No op changes** (adding OR removing an operator) without updating `ARCHITECTURE.md`,
+  the planner system prompt in `src/skunk/plan.py`, the validator, AND the app-layer eval
+  harness (`../grc-officeqa/eval/eval_e2e.py`).
 - **Logging**: one event stream via `ctx.emit(...)`; full rules in `ARCHITECTURE.md` →
   "Logging & observability". The post-hoc viewer is `scripts/trace_viewer/`.
 - **No formatting-only edits.** Do not reformat lines for length, change quote style
@@ -76,4 +78,4 @@ restored.
 - `ARCHITECTURE.md` — architecture, design intent, plan-shape spec
 - `REFACTOR_PLAN.md` — the library-hardening refactor plan (phases, decisions)
 - `src/skunk/plan.py` — canonical Plan dataclasses + the planner system prompt
-- `src/skunk/page_store.py` — the corpus-content protocol apps implement
+- `src/skunk/retrieve.py` — the search-agent retriever; returns `RetrievedDoc`s (page + text)

@@ -22,6 +22,7 @@ from skunk.common import (
     BranchRetrieval,
     ExecutionContext,
     PageRef,
+    RetrievedDoc,
     page_key_to_pageref,
     traced_step,
 )
@@ -34,62 +35,71 @@ async def run_retrieve_all(
     branch_ids: list[int] | None = None,
 ) -> list[BranchRetrieval | StepFailed]:
     """The single retrieval seam: retrieve for several branches at once, one result per
-    branch aligned to `branches`. Each slot is a `BranchRetrieval` (its pages) or a
-    `StepFailed` — a single branch failing does not sink its siblings. A whole-sweep
-    failure (unknown retriever, missing index) raises. This is the ONLY place that
-    dispatches on `config.retriever`:
+    branch aligned to `branches`. Each slot is a `BranchRetrieval` (its retrieved pages
+    with text) or a `StepFailed` — a single branch failing does not sink its siblings. A
+    whole-sweep failure (missing index) raises. The search agent is the sole retriever:
 
-    - golden bypass (`golden_pages`) → the benchmark pages verbatim.
-    - `search_agent` → agent rollout → page keys → the retrieved pages.
+    - golden bypass (`golden_pages`) → the benchmark pages verbatim (text attached).
+    - search agent → agent rollout → page keys → the retrieved pages (text attached).
+
+    Each page's text comes from the same `document_map` the search agent reads, so compute
+    can read it directly (there is no separate extract step).
 
     `branch_ids` aligns each branch to its stable id so its retrieve runs in a per-branch
     `traced_step`: the rollout + the returned pages then attach to that branch in the
     trace viewer."""
     if ctx.config.golden_pages is not None:
-        # --golden ablation: inject the benchmark pages verbatim, already final.
+        # --golden ablation: inject the benchmark pages verbatim (text attached), already final.
         pages = ctx.config.golden_pages
+        document_map = _load_document_map(ctx.config)
+        docs = tuple(_docs_for_refs(pages, document_map))
         ctx.emit(
             f"golden_bypass n_pages={len(pages)} refs={[str(r) for r in pages]!r}"
         )
-        return [BranchRetrieval(pages=tuple(pages)) for _ in branches]
-    match str(ctx.config.retriever):
-        case "search_agent":
-            ids = branch_ids if branch_ids is not None else [None] * len(branches)
+        return [BranchRetrieval(documents=docs) for _ in branches]
 
-            async def _one(b: RetrieveBranch, bid: int | None) -> BranchRetrieval:
-                # Per-branch `retrieve` step (branch_id=bid) so the SearchAgent rollout
-                # and its `pages` summary group under this branch in the viewer.
-                refs = await traced_step(
-                    ctx, "retrieve",
-                    lambda: _run_search_agent(ctx, b),
-                    branch_id=bid,
-                )
-                return BranchRetrieval(pages=tuple(refs))
+    ids = branch_ids if branch_ids is not None else [None] * len(branches)
 
-            settled = await asyncio.gather(
-                *(_one(b, bid) for b, bid in zip(branches, ids)),
-                return_exceptions=True,
-            )
-            out: list[BranchRetrieval | StepFailed] = []
-            for r in settled:
-                if isinstance(r, StepFailed):
-                    out.append(r)
-                elif isinstance(r, BaseException):
-                    raise r
-                else:
-                    out.append(r)
-            return out
-        case other:
-            raise StepFailed(
-                "retrieve",
-                f"unknown retriever {other!r}; expected 'search_agent'",
-            )
+    async def _one(b: RetrieveBranch, bid: int | None) -> BranchRetrieval:
+        # Per-branch `retrieve` step (branch_id=bid) so the SearchAgent rollout
+        # and its `pages` summary group under this branch in the viewer.
+        return await traced_step(
+            ctx, "retrieve",
+            lambda: _run_search_agent(ctx, b),
+            branch_id=bid,
+        )
+
+    settled = await asyncio.gather(
+        *(_one(b, bid) for b, bid in zip(branches, ids)),
+        return_exceptions=True,
+    )
+    out: list[BranchRetrieval | StepFailed] = []
+    for r in settled:
+        if isinstance(r, StepFailed):
+            out.append(r)
+        elif isinstance(r, BaseException):
+            raise r
+        else:
+            out.append(r)
+    return out
+
+
+def _docs_for_refs(
+    refs: list[PageRef], document_map: dict[str, str]
+) -> list[RetrievedDoc]:
+    """Attach each ref's cleaned page text (from `document_map`, keyed by page key
+    `<stem>_<page>`) — empty string when the map has no entry for it."""
+    docs: list[RetrievedDoc] = []
+    for r in refs:
+        key = f"{r.stem}_{r.page}"
+        docs.append(RetrievedDoc(ref=r, text=document_map.get(key, "")))
+    return docs
 
 
 async def _run_search_agent(
     ctx: ExecutionContext,
     branch: RetrieveBranch,
-) -> list[PageRef]:
+) -> BranchRetrieval:
     from skunk.search_agent import SearchAgent, doc_ids_from_payload
 
     collection, document_map = _get_shared_resources(ctx.config)
@@ -121,7 +131,7 @@ async def _run_search_agent(
             "retrieve",
             f"search_agent returned no usable page keys (raw={page_keys!r})",
         )
-    return refs
+    return BranchRetrieval(documents=tuple(_docs_for_refs(refs, document_map)))
 
 
 # Process-wide ChromaDB/document-map cache. Reads go through a ChromaDB *server*
@@ -152,11 +162,23 @@ def _get_shared_resources(config: PipelineConfig):
         return _SHARED_RESOURCES[key]
 
 
-def _build_resources(config: PipelineConfig):
-    from skunk.chroma_client import make_chroma_client
+# Process-wide cache of the (read-only) document map, keyed by clean-page-map path, so the
+# golden bypass (which needs the page text but not ChromaDB) doesn't re-read it per UID.
+_DOC_MAP_LOCK = threading.Lock()
+_DOC_MAP_CACHE: dict[str, dict[str, str]] = {}
+
+
+def _load_document_map(config: PipelineConfig) -> dict[str, str]:
+    """Load `doc_id (`<stem>_<page>` page key) → cleaned page text` from
+    `config.clean_page_map_path`. Cached process-wide. Shared by the search-agent path
+    (via `_build_resources`) and the golden bypass; needs no ChromaDB."""
+    path_key = str(Path(config.clean_page_map_path).resolve())
+    with _DOC_MAP_LOCK:
+        cached = _DOC_MAP_CACHE.get(path_key)
+    if cached is not None:
+        return cached
 
     clean_page_map_path = Path(config.clean_page_map_path)
-
     if not clean_page_map_path.exists():
         raise StepFailed(
             "retrieve",
@@ -176,6 +198,16 @@ def _build_resources(config: PipelineConfig):
                 document_map[doc_id] = pf.read()
         except OSError:
             continue
+
+    with _DOC_MAP_LOCK:
+        _DOC_MAP_CACHE[path_key] = document_map
+    return document_map
+
+
+def _build_resources(config: PipelineConfig):
+    from skunk.chroma_client import make_chroma_client
+
+    document_map = _load_document_map(config)
 
     chroma_client = make_chroma_client(
         config.chroma_server_host, config.chroma_server_port
