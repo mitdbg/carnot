@@ -43,6 +43,11 @@ class SystemConfig:
     # USD price table for cost accounting; maps a model-substring -> {"in"/"out"/"cached": $/Mtok}.
     # Lookup is exact-first then substring, a model with no match costs 0.
     llm_prices: dict[str, dict[str, float]]
+    # Optional OpenRouter provider pin (ignored on the genai path): an ordered list of provider
+    # slugs (e.g. ["parasail"]). When set, generation is routed only to these providers with no
+    # fallback, so a specific provider's prompt-cache / pricing is used deterministically. null =
+    # let OpenRouter pick. Resolve slugs from the model's Providers tab (e.g. io.net => "io-net").
+    llm_provider_order: list[str] | None = None
     # Per-call-site overrides keyed by `PromptedCall.name`, read by skunk's agent loop
     # (prompted_call._resolve_effort / _resolve_model). Empty = every call site uses its
     # own default effort and `llm_model`. The qatfd harness doesn't tune per-call-site,

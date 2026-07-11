@@ -991,6 +991,15 @@ class LLMClient:
             )
         return output_text
 
+    def _openrouter_provider_kwarg(self) -> dict:
+        """`{"provider": {...}}` pinning generation to `config.llm_provider_order` (no fallback),
+        or `{}` when unset. Lets a run route deterministically to one provider so its prompt-cache
+        and pricing are the ones actually used."""
+        order = getattr(self._config, "llm_provider_order", None)
+        if not order:
+            return {}
+        return {"provider": {"order": list(order), "allow_fallbacks": False}}
+
     def _openrouter_call(self, spec: CallSpec) -> LLMResponse:
         """One OpenRouter chat call (no retry — the retry loop owns that)."""
         client = self._get_openrouter_client()
@@ -1000,6 +1009,7 @@ class LLMClient:
         resp = client.chat.send(
             model=spec.model, messages=messages, stream=False, # type: ignore
             temperature=spec.temperature, reasoning=reasoning, # type: ignore
+            **self._openrouter_provider_kwarg(),
         )
         latency_s = time.monotonic() - t0
         output_text = self._openrouter_checked_text(resp, spec)
@@ -1018,6 +1028,7 @@ class LLMClient:
             if spec.max_output_tokens is not None
             else {}
         )
+        extra.update(self._openrouter_provider_kwarg())
         t0 = time.monotonic()
         coro = client.chat.send_async(
             model=spec.model, messages=messages, stream=False, # type: ignore
@@ -1066,6 +1077,7 @@ class LLMClient:
             if spec.max_output_tokens is not None
             else {}
         )
+        extra.update(self._openrouter_provider_kwarg())
         should_stop = spec.should_stop
 
         async def _consume() -> tuple[str, Any]:
