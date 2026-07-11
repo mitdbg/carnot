@@ -1,0 +1,12 @@
+# Tool-ablation SearchAgent — inherits the vanilla search_agent config and adds three flags that
+# toggle the discovery/narrowing tools (read_document + prune are always present). Defaults
+# reproduce the vanilla SearchAgent (vector + grep, no semantic filter); override per run, e.g.
+# systems.tool_vector=false systems.tool_semantic_filter=true.
+defaults:
+  - search_agent
+  - _self_
+
+name: ablation_search_agent
+tool_vector: true            # search_corpus (vector search)
+tool_grep: true              # grep_corpus (lexical search)
+tool_semantic_filter: false  # semantic_filter (QATFD's tool)

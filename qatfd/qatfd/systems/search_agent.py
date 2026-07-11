@@ -57,6 +57,11 @@ class SearchAgentSystem(RetrieveComputeSystem):
         drop it to force the agent onto other retrieval tools."""
         return True
 
+    def _include_grep_corpus(self) -> bool:
+        """Whether the agent gets the `grep_corpus` (lexical-search) tool. Subclasses can drop
+        it (e.g. a tool-ablation system) to force the agent onto vector search / semantic filter."""
+        return True
+
     def _prompts(self) -> tuple[str | None, str | None]:
         """(briefing, final_answer_doc) overrides; None => skunk SearchAgent defaults."""
         if self.config.agent_mode == "answer":
@@ -76,6 +81,7 @@ class SearchAgentSystem(RetrieveComputeSystem):
             emb_model_id=self.config.emb_model_id,
             extra_tools=self._extra_tools(ctx, resources),
             include_search_corpus=self._include_search_corpus(),
+            include_grep_corpus=self._include_grep_corpus(),
             briefing=briefing,
             final_answer_doc=final_answer_doc,
             pdf_dir=resources.pdf_dir,

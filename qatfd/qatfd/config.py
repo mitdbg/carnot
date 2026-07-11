@@ -35,6 +35,17 @@ class QATFDSearchAgentConfig(SearchAgentConfig):
     # only adds a semantic-filter tool, which needs no extra config beyond llm_model (base).
     pass
 
+
+@dataclass
+class AblationSearchAgentConfig(SearchAgentConfig):
+    # SearchAgent variant whose retrieval tool set is chosen by config, for a tool-ablation
+    # experiment. `read_document` and `prune` are always present; these three flags toggle the
+    # discovery/narrowing tools independently. Defaults reproduce the vanilla SearchAgent
+    # (vector + grep, no semantic filter).
+    tool_vector: bool = True            # search_corpus (vector search)
+    tool_grep: bool = True              # grep_corpus (lexical search)
+    tool_semantic_filter: bool = False  # semantic_filter (QATFD's tool)
+
 # ---------------------------------------------------------------------------
 # General experiment configuration
 # ---------------------------------------------------------------------------
@@ -241,5 +252,7 @@ def system_config_factory(cfg: DictConfig) -> SystemConfig:
         return SearchAgentConfig(**system_cfg)
     elif system_cfg["name"] == "qatfd_search_agent":
         return QATFDSearchAgentConfig(**system_cfg)
+    elif system_cfg["name"] == "ablation_search_agent":
+        return AblationSearchAgentConfig(**system_cfg)
     else:
         raise ValueError(f"unknown system {system_cfg['name']!r}")

@@ -13,6 +13,7 @@ from qatfd.benchmarks.officeqa import OfficeQABenchmark
 from qatfd.benchmarks.qampari import QampariBenchmark
 from qatfd.benchmarks.trec_biogen import TrecBiogenBenchmark
 from qatfd.config import BenchmarkConfig
+from qatfd.systems.ablation_search_agent import AblationSearchAgentSystem
 from qatfd.systems.base import System
 from qatfd.systems.qatfd_search_agent import QATFDSearchAgentSystem
 from qatfd.systems.rag_llm import RAGLLMSystem
@@ -33,6 +34,7 @@ SYSTEMS: dict[str, type[System]] = {
     RAGLLMSystem.name: RAGLLMSystem,
     SearchAgentSystem.name: SearchAgentSystem,
     QATFDSearchAgentSystem.name: QATFDSearchAgentSystem,
+    AblationSearchAgentSystem.name: AblationSearchAgentSystem,
 }
 
 

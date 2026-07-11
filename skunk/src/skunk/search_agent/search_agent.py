@@ -93,6 +93,7 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         emb_model_id: str | None = None,
         extra_tools: tuple[Tool, ...] = (),
         include_search_corpus: bool = True,
+        include_grep_corpus: bool = True,
         briefing: str | None = None,
         final_answer_doc: str | None = None,
         system_prompt_override: str | None = None,
@@ -157,12 +158,15 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
                 self.chroma_collection, self.emb_model_id, self._emb_llm_client,
                 self._state,
             ))
-        tools += [
-            GrepCorpusTool(
+        # Grep is optional too (symmetric with `include_search_corpus`): a caller can drop it to
+        # force the agent onto vector search / semantic filtering, e.g. a tool-ablation experiment.
+        if include_grep_corpus:
+            tools.append(GrepCorpusTool(
                 self.chroma_collection,
                 config.grep_max_output_tokens,
                 self._state,
-            ),
+            ))
+        tools += [
             ReadDocumentTool(
                 self.document_map,
                 config.agent_max_pages_per_tool_call,
