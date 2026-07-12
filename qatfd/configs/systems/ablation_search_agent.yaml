@@ -10,3 +10,6 @@ name: ablation_search_agent
 tool_vector: true            # search_corpus (vector search)
 tool_grep: true              # grep_corpus (lexical search)
 tool_semantic_filter: false  # semantic_filter (QATFD's tool)
+# Model for the semantic_filter judge calls; null => use llm_model (the agent model). Set to a
+# cheaper model to run the token-heavy candidate filtering off the expensive agent model.
+semantic_filter_model: null

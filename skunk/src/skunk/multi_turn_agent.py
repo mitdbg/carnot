@@ -496,7 +496,9 @@ Requirements for the final answer:
                     f"time on exploration."
                 )
                 self.messages.append({"role": "user", "blocks": [TextBlock(warn)]})
-                ctx.emit(f"steps_low_warning left={left}")
+                # Carry the full warning text (not just `left=N`) so the viewer can show
+                # the agent exactly what it was told, as a first-class lifecycle event.
+                ctx.emit(f"steps_low_warning left={left}", data={"text": warn})
             # Generate → parse (retried by PromptedCall on format errors) → execute.
             # `done` is set on success; errors append an observation and advance `turn` only.
             done: _StepOutput | None = None
@@ -599,9 +601,15 @@ Requirements for the final answer:
         self, ctx: ExecutionContext, observations: list[str]
     ) -> Any:
         diagnostic = ""
+        # Record the out-of-steps prompt the agent was shown, so the viewer can tell the
+        # full story of the forced terminal turn (prompt → reply → outcome).
+        ctx.emit("terminal_prompt out_of_steps", data={"text": self._TERMINAL_PROMPT})
         try:
             step_out = await self._llm_step(
                 ctx, extra=[{"role": "user", "content": self._TERMINAL_PROMPT}]
+            )
+            ctx.emit(
+                f"terminal_reply chars={len(step_out.raw)}", data={"text": step_out.raw}
             )
             diagnostic = (
                 step_out.raw.strip()
@@ -612,13 +620,18 @@ Requirements for the final answer:
                 # real answer schemas don't use); anything else is a commit candidate.
                 if isinstance(result, dict) and list(result) == ["error"]:
                     diagnostic = str(result["error"]).strip()
-                    ctx.emit(f"terminal_giveup {diagnostic!r}")
+                    ctx.emit(f"terminal_giveup {diagnostic!r}", data={"text": diagnostic})
                 elif self.validate_final_answer(result, observations) is None:
-                    ctx.emit(f"terminal_commit {str(result)!r}")
+                    ctx.emit(
+                        f"terminal_commit {str(result)!r}", data={"text": str(result)}
+                    )
                     return result
             # else: python block → fall through to StepFailed
         except Exception as e:  # never let the terminal turn mask the real failure
-            ctx.emit(f"terminal_turn_failed error={str(e)!r}")
+            ctx.emit(
+                f"terminal_turn_failed error={str(e)!r}",
+                data={"text": f"{type(e).__name__}: {e}"},
+            )
         if not diagnostic:
             tail = observations[-2:]
             diagnostic = (

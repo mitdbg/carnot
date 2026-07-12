@@ -12,10 +12,12 @@
 #   grep_sem_read       grep + sem + read     (= QATFD)      (vector off, grep on, sem on)
 #   all_tools           grep + sem + vector + read           (vector on, grep on, sem on)
 #
-# Model is pinned to Parasail (its prompt-cache pricing is what we costed). Default worker count.
-# Reads from the already-running ChromaDB server (host/port below).
+# Default worker count. Reads from the already-running ChromaDB server (host/port below).
 #
-# Env overrides:  CHROMA_HOST=127.0.0.1  CHROMA_PORT=8001  PYTHON=python3
+# Env overrides:
+#   MODEL=qwen/qwen3.6-35b-a3b     # full OpenRouter model id
+#   PROVIDER=parasail             # OpenRouter provider pin; empty string = no pin (let OR pick)
+#   CHROMA_HOST=127.0.0.1  CHROMA_PORT=8001  PYTHON=python3
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -23,8 +25,9 @@ PYTHON="${PYTHON:-python3}"
 CHROMA_HOST="${CHROMA_HOST:-127.0.0.1}"
 CHROMA_PORT="${CHROMA_PORT:-8001}"
 
-MODEL="qwen/qwen3.6-35b-a3b"
-PROVIDER="parasail"
+# Model defaults to the qwen run; override MODEL/PROVIDER for another. PROVIDER="" pins nothing.
+MODEL="${MODEL:-qwen/qwen3.6-35b-a3b}"
+PROVIDER="${PROVIDER-parasail}"
 
 # label | tool_vector | tool_grep | tool_semantic_filter
 CONFIGS=(
@@ -38,14 +41,16 @@ CONFIGS=(
 
 for entry in "${CONFIGS[@]}"; do
   IFS='|' read -r label vec grep sem <<< "$entry"
+  provider_ovr=()
+  [ -n "$PROVIDER" ] && provider_ovr+=( "systems.llm_provider_order=[${PROVIDER}]" )
   echo "==================================================================="
-  echo "=== officeqa | ablation_search_agent | ${label}  (vector=$vec grep=$grep sem=$sem)"
+  echo "=== officeqa | ablation_search_agent | ${label}  (vector=$vec grep=$grep sem=$sem) | model=$MODEL ${PROVIDER:+provider=$PROVIDER}"
   echo "==================================================================="
   "$PYTHON" -m qatfd.runner \
     benchmarks=officeqa \
     systems=ablation_search_agent \
     systems.llm_model="$MODEL" \
-    systems.llm_provider_order="[${PROVIDER}]" \
+    "${provider_ovr[@]}" \
     systems.tool_vector="$vec" \
     systems.tool_grep="$grep" \
     systems.tool_semantic_filter="$sem" \

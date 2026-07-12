@@ -310,10 +310,16 @@ _KIND_BY_PREFIX: dict[str, str] = {
     "call": "call",
     "step": "step",
     "validation_failed": "error",
-    "terminal_giveup": "error",
-    "terminal_turn_failed": "error",
-    "terminal_commit": "note",
-    "steps_low_warning": "note",
+    # Harness lifecycle events — messages the loop injected into the agent's context
+    # (low-steps warning) or actions it took after exhausting the step budget (the
+    # forced terminal turn). Grouped under one `lifecycle` kind so the viewer can
+    # color them distinctly and gate them behind a single toggle.
+    "steps_low_warning": "lifecycle",
+    "terminal_prompt": "lifecycle",
+    "terminal_reply": "lifecycle",
+    "terminal_commit": "lifecycle",
+    "terminal_giveup": "lifecycle",
+    "terminal_turn_failed": "lifecycle",
     "parallel_branch_failed": "error",
     "compute_needs_more": "note",
     "compute_partial_malformed": "note",
@@ -860,7 +866,7 @@ class ExecutionContext:
           `data` (see below).
         - `kind` is the event's semantic role for the trace viewer's color-coding
           (`system` / `user` / `assistant` / `observation` / `error` / `call` /
-          `plan` / `summary` / `step` / `note`). When omitted it is inferred from the
+          `plan` / `summary` / `step` / `note` / `lifecycle`). When omitted it is inferred from the
           message's leading event key (`infer_kind`), so legacy one-liners need no
           change.
         - `data` is an optional structured payload (the full system prompt, an

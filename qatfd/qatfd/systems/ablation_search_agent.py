@@ -33,10 +33,14 @@ class AblationSearchAgentSystem(SearchAgentSystem):
     def _extra_tools(self, ctx: ExecutionContext, resources: BenchmarkResources) -> tuple:
         if not self.config.tool_semantic_filter:
             return ()
-        # ctx.llm_client is the usage-tracking wrapper, so the tool's LLM (judge) calls and its
-        # top_k query embeddings are both counted. Mirrors QATFDSearchAgentSystem._extra_tools.
+        # The judge (per-candidate keep/drop) calls run on `semantic_filter_model` when set, else
+        # the agent's `llm_model`; the search agent itself always stays on `llm_model`. Filtered-out
+        # candidates only reach the judge, so a cheaper judge model cuts cost without touching the
+        # agent's reasoning. ctx.llm_client is the usage-tracking wrapper, so judge calls + top_k
+        # query embeddings are both counted.
+        filter_model = self.config.semantic_filter_model or self.config.llm_model
         return (SemanticFilterTool(
-            ctx.llm_client, resources.document_map, self.config.llm_model,
+            ctx.llm_client, resources.document_map, filter_model,
             chroma_collection=resources.chroma_collection,
             emb_model_id=self.config.emb_model_id,
             max_output_tokens=self.config.grep_max_output_tokens,

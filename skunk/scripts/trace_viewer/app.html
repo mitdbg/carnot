@@ -200,6 +200,7 @@
       <div class="sel-group"><label>Run</label><select id="run-sel"></select></div>
       <div class="sel-group"><label>Question</label><select id="q-sel"></select></div>
       <div class="toggle-row" style="margin-left:auto"><input type="checkbox" id="show-system"><label for="show-system">system prompts</label></div>
+      <div class="toggle-row"><input type="checkbox" id="show-lifecycle"><label for="show-lifecycle">warnings &amp; terminal</label></div>
       <div class="toggle-row"><input type="checkbox" id="show-calls"><label for="show-calls">LLM call lines</label></div>
     </div>
   </div>
@@ -218,6 +219,23 @@ const KIND = {
   call:        { color:"#666666", bg:"transparent",      label:"LLM CALL" },
   note:        { color:"#888888", bg:"transparent",      label:"NOTE" },
   step:        { color:"#666666", bg:"transparent",      label:"STEP" },
+  // harness lifecycle: low-steps warnings + the forced terminal turn after max steps.
+  // Purple so it reads as neither an agent action (green) nor an observation (blue).
+  lifecycle:   { color:"#cc66ff", bg:"var(--purple-bg)",  label:"LIFECYCLE" },
+};
+// Lifecycle events the harness injected/took. New traces tag them kind="lifecycle";
+// old traces carry note/error — match on the leading event key too so both render alike.
+const LIFECYCLE_PREFIXES = new Set(["steps_low_warning","terminal_prompt","terminal_reply","terminal_commit","terminal_giveup","terminal_turn_failed"]);
+const evtKey = (e) => String(e.message || "").split(" ", 1)[0];
+const isLifecycle = (e) => e.kind === "lifecycle" || LIFECYCLE_PREFIXES.has(evtKey(e));
+// human labels for the lifecycle card header, keyed by event key
+const LIFECYCLE_LABEL = {
+  steps_low_warning:  "⚠ low-steps warning",
+  terminal_prompt:    "terminal — out-of-steps prompt",
+  terminal_reply:     "terminal — model reply",
+  terminal_commit:    "terminal — committed answer",
+  terminal_giveup:    "terminal — gave up",
+  terminal_turn_failed:"terminal — turn errored",
 };
 const OP_COLOR = { planner:"#cc66ff", retrieve:"#3399ff", extract:"#e6b800", lookup_external:"#ff9933", compute:"#33cc33", replanner:"#ff66aa" };
 const COMPACT_KINDS = new Set(["call", "note", "step"]);
@@ -233,6 +251,7 @@ const opColor = (op) => OP_COLOR[op] || "#999999";
 const fsec = (s) => (s==null ? "?" : (+s).toFixed(2)+"s");
 const showSystem = () => document.getElementById("show-system").checked;
 const showCalls  = () => document.getElementById("show-calls").checked;
+const showLifecycle = () => document.getElementById("show-lifecycle").checked;
 
 window.VW = {
   toggleExpand(key){ if(S.expanded.has(key)) S.expanded.delete(key); else S.expanded.add(key); draw(); },
@@ -262,6 +281,7 @@ async function boot(){
   document.getElementById("sys-sel").onchange   = onSysChange;
   document.getElementById("run-sel").onchange   = () => { const f = selVal("run-sel"); if(f) loadRun(f); };
   document.getElementById("show-system").onchange = draw;
+  document.getElementById("show-lifecycle").onchange = draw;
   document.getElementById("show-calls").onchange = draw;
   document.getElementById("q-sel").onchange = () => loadQuestion(document.getElementById("q-sel").value);
   if(!S.runs.length){ document.getElementById("content").innerHTML = `<div class="hint">No runs found.</div>`; return; }
@@ -358,7 +378,9 @@ function draw(){
   // they get dedicated renderers; anything else falls back to the plan-shaped view below.
   const sys = String((S.row && S.row.system) || "").toLowerCase();
   if(sys === "rag_llm")        return drawRagLlm();
-  if(sys === "search_agent" || sys === "qatfd_search_agent") return drawSearchAgent(sys);
+  // every search-agent variant (incl. the tool-ablation system) runs the same flat
+  // agent loop, so they share the turn-based renderer.
+  if(sys === "search_agent" || sys === "qatfd_search_agent" || sys === "ablation_search_agent") return drawSearchAgent(sys);
   const m = buildModel();
   const parts = [headerHtml(m), flowSection(m)];
   if(m.orphans?.length) parts.push(`<div class="card"><div class="card-title">Other events</div>${m.orphans.map(e=>eventHtml(e)).join("")}</div>`);
@@ -756,6 +778,13 @@ function summaryText(s){
 // ── one event (color-coded message, with timestamp + truncation) ────────────
 function eventHtml(evt){
   const kind = evt.kind || "note";
+  // Lifecycle events (low-steps warning / terminal turn) get a dedicated purple card,
+  // gated behind the "warnings & terminal" toggle. Checked first so old traces that
+  // still tag these note/error render the same way as new lifecycle-kind ones.
+  if(isLifecycle(evt)){
+    if(!showLifecycle()) return "";
+    return lifecycleHtml(evt);
+  }
   if(kind === "system" && !showSystem()) return `<div class="msg compact"><div class="msg-line">[system prompt hidden — toggle "system prompts"]</div></div>`;
   if(kind === "call" && !showCalls()) return "";
   const style = KIND[kind] || KIND.note;
@@ -770,6 +799,23 @@ function eventHtml(evt){
     ? `<button class="expand-btn" onclick="VW.toggleExpand('${key}')">${expanded ? "▲ collapse" : `▼ show full (~${tok(total)} tokens)`}</button>` : "";
   return `<div class="msg" style="border-left-color:${style.color};background:${style.bg}">
     <div class="msg-bar" style="color:${style.color}"><span>${style.label}</span><span class="meta">${ts} ${tk}</span></div>
+    ${html}${btn}
+  </div>`;
+}
+// A harness lifecycle event as a first-class purple card: the actual text the agent saw
+// (`data.text`, e.g. the full low-steps warning or terminal prompt) or, for older traces
+// without a payload, the marker message itself.
+function lifecycleHtml(evt){
+  const style = KIND.lifecycle;
+  const label = LIFECYCLE_LABEL[evtKey(evt)] || evtKey(evt).replace(/_/g, " ");
+  const ts = evt.t!=null ? `@${fsec(evt.t)}` : "";
+  const key = "life:" + String(evt._idx); const expanded = S.expanded.has(key);
+  const { html, total, truncated } = renderBody(evt, expanded);
+  const tk = total ? `~${tok(total)} tok` : "";
+  const btn = (truncated || (expanded && total>TRUNC_CHARS))
+    ? `<button class="expand-btn" onclick="VW.toggleExpand('${key}')">${expanded ? "▲ collapse" : `▼ show full (~${tok(total)} tokens)`}</button>` : "";
+  return `<div class="msg lifecycle" style="border-left-color:${style.color};background:${style.bg}">
+    <div class="msg-bar" style="color:${style.color}"><span>${esc(label)}</span><span class="meta">${ts} ${tk}</span></div>
     ${html}${btn}
   </div>`;
 }
@@ -868,12 +914,16 @@ const parseStep = (msg) => { const m=/step=(\d+)/.exec(msg||""); return m ? +m[1
 // produced. Pre-loop system/question and trailing notes are returned separately.
 function groupAgentTurns(events){
   const pre = [], turns = [], tail = [];
-  let pending = [], cur = null;
+  // Lifecycle events (low-steps warning / terminal turn) surface as top-level banners,
+  // not buried in a turn body: those preceding an assistant reply attach as that turn's
+  // `before`; any after the last turn (the terminal turn) collect in `tailLife`.
+  let pending = [], pendingLife = [], cur = null;
   for(const e of events){
     const k = e.kind, msg = e.message || "";
+    if(isLifecycle(e)){ pendingLife.push(e); continue; }
     if(k === "assistant"){
-      cur = { lead:pending, assistant:e, toolCode:null, notes:[], results:[], step:parseStep(msg) };
-      pending = []; turns.push(cur); continue;
+      cur = { lead:pending, before:pendingLife, assistant:e, toolCode:null, notes:[], results:[], step:parseStep(msg) };
+      pending = []; pendingLife = []; turns.push(cur); continue;
     }
     if(k === "call"){
       // Pre-assistant calls (and embed/tool calls fired between this assistant and its
@@ -892,7 +942,7 @@ function groupAgentTurns(events){
     pending.push(e);
   }
   if(pending.length) for(const e of pending) tail.push(e);
-  return { pre, turns, tail };
+  return { pre, turns, tail, tailLife: pendingLife };
 }
 
 // "tool_code '<python repr>'" → readable code (strip the key + one quote layer, unescape).
@@ -926,7 +976,7 @@ function turnCost(turn){
 }
 
 function turnsHtml(events, keyPrefix){
-  const { pre, turns, tail } = groupAgentTurns(events);
+  const { pre, turns, tail, tailLife } = groupAgentTurns(events);
   // Per-step / cumulative latency is measured relative to the start of THIS stage (so the
   // answer stage's clock isn't offset by the whole retrieval stage). Cost accumulates per stage.
   const ts = events.map(e => e.t).filter(t => t!=null);
@@ -935,6 +985,8 @@ function turnsHtml(events, keyPrefix){
   const parts = [];
   if(pre.length)  parts.push(pre.map(eventHtml).join(""));
   turns.forEach((t,i) => {
+    // lifecycle banners injected just before this turn (e.g. the low-steps warning)
+    if(t.before && t.before.length) parts.push(t.before.map(eventHtml).join(""));
     const tEnd = turnEndT(t);
     const stepLat = tEnd!=null ? Math.max(0, tEnd - prevT) : null;
     const cumLat  = tEnd!=null ? Math.max(0, tEnd - t0) : null;
@@ -944,6 +996,8 @@ function turnsHtml(events, keyPrefix){
     if(tEnd!=null) prevT = tEnd;
   });
   if(tail.length) parts.push(tail.map(eventHtml).join(""));
+  // the forced terminal turn (prompt → reply → outcome) after max steps
+  if(tailLife && tailLife.length) parts.push(tailLife.map(eventHtml).join(""));
   return parts.join("") || `<div class="empty">no agent turns</div>`;
 }
 
@@ -1072,7 +1126,10 @@ function drawSearchAgent(sys){
   const aStart = answerStartIdx(events);
   const retrieval = aStart>=0 ? events.slice(0, aStart) : events;
   const answer    = aStart>=0 ? events.slice(aStart) : [];
-  const retrTitle = sys==="qatfd_search_agent"
+  // name the semantic-filter tool when the run actually used it (qatfd_search_agent always
+  // does; the ablation system only in configs that enable it) — detect from the events.
+  const hasSem = retrieval.some(e => String(e.message||"").startsWith("semantic_filter") && e.data && Array.isArray(e.data.docs));
+  const retrTitle = hasSem
     ? "Retrieval — search agent + semantic filter" : "Retrieval — search agent";
   const parts = [qaHeaderHtml()];
   if(nugEvt) parts.push(nuggetCard(nugEvt));
