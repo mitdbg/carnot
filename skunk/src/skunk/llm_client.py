@@ -737,11 +737,16 @@ class _OpenRouterBackend(_OpenAIChatBackend):
         client = self._get_client()
         messages = self._single_messages(spec)
         reasoning = self._effort_to_reasoning(spec.effort)
+        extra = (
+            {"max_tokens": spec.max_output_tokens}
+            if spec.max_output_tokens is not None
+            else {}
+        )
+        extra.update(self._provider_kwarg(spec))
         t0 = time.monotonic()
         resp = client.chat.send(
             model=spec.model, messages=messages, stream=False, # type: ignore
-            temperature=spec.temperature, reasoning=reasoning, # type: ignore
-            **self._provider_kwarg(spec),
+            temperature=spec.temperature, reasoning=reasoning, **extra, # type: ignore
         )
         latency_s = time.monotonic() - t0
         output_text = self._checked_text(resp, spec)
@@ -1047,12 +1052,14 @@ class LLMClient:
         call_site: str = "llm",
         model: str | None = None,
         provider_order: list[str] | None = None,
+        max_output_tokens: int | None = None,
     ) -> LLMResponse:
         spec = CallSpec(
             system=system, user=user, images=images, temperature=temperature,
             effort=effort, ctx=ctx, call_site=call_site,
             model=model or self._config.llm_model,
             provider_order=provider_order,
+            max_output_tokens=max_output_tokens,
         )
         return self._backend_for_model(spec.model).call(spec)
 

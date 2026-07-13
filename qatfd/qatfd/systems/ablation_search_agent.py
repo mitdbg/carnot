@@ -46,4 +46,5 @@ class AblationSearchAgentSystem(SearchAgentSystem):
             max_output_tokens=self.config.grep_max_output_tokens,
             ctx=ctx,
             provider_order=self.config.semantic_filter_provider_order,
+            context_limits=self.config.llm_context_limits,
         ),)

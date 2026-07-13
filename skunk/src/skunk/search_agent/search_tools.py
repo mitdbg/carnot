@@ -63,6 +63,7 @@ from skunk.common import page_key_to_pageref
 from skunk.common import render_page_b64
 from skunk.multi_turn_agent import Tool
 from skunk.trace import truncate
+from skunk.usage import match_model_entry
 
 if TYPE_CHECKING:
     from skunk.common import ExecutionContext, PageRef
@@ -555,8 +556,40 @@ _SEMFILTER_DOC_PREVIEW_MAX = 2000
 _SEMFILTER_SYSTEM = (
     "You determine whether a document satisfies a filter condition. You are given a "
     "filter condition and a document. Output TRUE if the document satisfies the "
-    "condition, and FALSE otherwise. Your reply must be exactly TRUE or FALSE."
+    "condition, and FALSE otherwise. Your reply must be exactly TRUE or FALSE — a single "
+    "word, with no explanation, reasoning, or any other text."
 )
+
+# Judge-request sizing. The judge call caps its output at `_JUDGE_OUTPUT_TOKENS` (the reply is a
+# single word), and when the judge model has a known context window (see `context_limits`) the
+# document text is head-truncated so the whole request fits. Sizing uses the house ~4 chars/token
+# estimate (there is no tokenizer) with `_JUDGE_CTX_SAFETY` headroom to absorb that estimate's error.
+_JUDGE_OUTPUT_TOKENS = 256
+_JUDGE_CTX_SAFETY = 0.9
+_JUDGE_CHARS_PER_TOKEN = 4
+# Fixed scaffolding around the document in the judge `user` message (see `_judge_one`); its length is
+# charged against the budget so the document gets what's left.
+_JUDGE_USER_WRAPPER = "Filter Condition: \n\nDocument:\n"
+_JUDGE_TRUNC_MARKER = "\n…(truncated to fit judge context)"
+
+
+def _judge_doc_char_budget(context_limit: int, predicate: str) -> int:
+    """Max chars of document text that fit in one judge request under `context_limit` (tokens),
+    using the ~4 chars/token estimate with a safety factor and headroom reserved for the judge's
+    (short) output. Returns 0 when the fixed overhead alone already exceeds the limit."""
+    overhead_tokens = _JUDGE_OUTPUT_TOKENS + (
+        len(_SEMFILTER_SYSTEM) + len(_JUDGE_USER_WRAPPER) + len(predicate)
+    ) / _JUDGE_CHARS_PER_TOKEN
+    budget_tokens = context_limit * _JUDGE_CTX_SAFETY - overhead_tokens
+    return max(0, int(budget_tokens * _JUDGE_CHARS_PER_TOKEN))
+
+
+def _truncate_doc_for_judge(text: str, budget_chars: int) -> tuple[str, bool]:
+    """Head-truncate `text` to `budget_chars` (marker included), returning (text, was_truncated)."""
+    if len(text) <= budget_chars:
+        return text, False
+    keep = max(0, budget_chars - len(_JUDGE_TRUNC_MARKER))
+    return text[:keep] + _JUDGE_TRUNC_MARKER, True
 
 
 def _parse_bool(text: str) -> bool:
@@ -576,7 +609,7 @@ def _judge_one(llm_client, predicate: str, item_text: str, model: str, ctx, prov
     try:
         resp = llm_client.call(
             system=_SEMFILTER_SYSTEM, user=user, temperature=0.0, model=model, ctx=ctx, call_site="semfilter",
-            provider_order=provider_order,
+            provider_order=provider_order, max_output_tokens=_JUDGE_OUTPUT_TOKENS,
         )
     except Exception:
         return True  # recall-safe: keep on error
@@ -594,9 +627,15 @@ def filter_docs(
     max_workers: int = 8,
     event_extra: dict | None = None,
     provider_order: list[str] | None = None,
+    context_limit: int | None = None,
 ) -> list[str]:
     """Return the subset of `doc_ids` whose document text satisfies `predicate`,
     preserving input order.
+
+    When `context_limit` (the judge model's context window, in tokens) is set, each
+    document's text is head-truncated so the judge request fits — otherwise a document
+    larger than the judge's window would 400 and, via `_judge_one`'s recall-safe fallback,
+    be kept unjudged. `context_limit=None` sends the full text (unchanged behavior).
 
     When `ctx` is provided, emits one structured `semantic_filter` observation event
     recording the predicate and every input doc's verdict + text preview, so the trace
@@ -607,6 +646,12 @@ def filter_docs(
     if not doc_ids:
         return []
     texts = [document_map.get(d, "") or "" for d in doc_ids]
+    n_truncated = 0
+    if context_limit:
+        budget = _judge_doc_char_budget(context_limit, predicate)
+        truncated = [_truncate_doc_for_judge(t, budget) for t in texts]
+        texts = [t for t, _ in truncated]
+        n_truncated = sum(1 for _, was in truncated if was)
     with ThreadPoolExecutor(max_workers=min(max_workers, len(doc_ids))) as pool:
         verdicts = list(pool.map(lambda it: _judge_one(llm_client, predicate, it, model, ctx, provider_order), texts))
     kept = [d for d, keep in zip(doc_ids, verdicts, strict=True) if keep]
@@ -616,6 +661,7 @@ def filter_docs(
             "predicate": predicate,
             "n_in": len(doc_ids),
             "n_out": len(kept),
+            "n_truncated": n_truncated,
             "docs": [
                 {"doc_id": d, "kept": bool(keep), "text": truncate(t, _SEMFILTER_DOC_PREVIEW_MAX, "\n…(truncated)")}
                 for d, keep, t in zip(doc_ids, verdicts, texts, strict=True)
@@ -653,6 +699,7 @@ class SemanticFilterTool(Tool):
         max_output_tokens: int = 50_000,
         ctx=None,
         provider_order: list[str] | None = None,
+        context_limits: dict[str, int] | None = None,
     ) -> None:
         # `chroma_collection` (and, for top_k, `emb_model_id`) enable corpus mode; a
         # tool constructed without them supports only the doc_ids mode.
@@ -662,6 +709,9 @@ class SemanticFilterTool(Tool):
         # Per-call OpenRouter provider order for the judge calls only (None => client default). Lets a
         # cheaper judge model route to specific providers while the agent model stays unpinned.
         self._provider_order = provider_order
+        # Judge model's context window (tokens), resolved once from the `model id/substring -> limit`
+        # map by the same matcher the price table uses; None (model not in the map) => no truncation.
+        self._context_limit = match_model_entry(model, context_limits or {})
         self._chroma_collection = chroma_collection
         self._emb_model_id = emb_model_id
         self._max_candidate_docs = max_candidate_docs
@@ -713,6 +763,7 @@ class SemanticFilterTool(Tool):
             kept = filter_docs(
                 self._llm_client, predicate, list(doc_ids), self._document_map, self._model,
                 ctx=self._ctx, event_extra={"mode": "doc_ids"}, provider_order=self._provider_order,
+                context_limit=self._context_limit,
             )
             return {SEMFILTER_RESULT_TAG: True, "kept_doc_ids": kept, "n_in": len(doc_ids), "n_out": len(kept)}
 
@@ -816,6 +867,7 @@ class SemanticFilterTool(Tool):
                 "n_candidate_docs": len(candidate_doc_ids),
             },
             provider_order=self._provider_order,
+            context_limit=self._context_limit,
         )
         kept_set = set(kept)
         kept_chunks = [(cid, did, text) for cid, did, text in candidates if did in kept_set]

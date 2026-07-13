@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import threading
 from collections import defaultdict
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from skunk.llm_client import LLMResponse
@@ -176,13 +176,20 @@ class UsageTracker:
         return _match_price(model, self.prices)
 
 
-def _match_price(model: str, prices: dict[str, dict]) -> dict | None:
-    # exact (case-insensitive) match first, then substring match (e.g. "qwen/qwen3-..." matches a "qwen3" key).
+def match_model_entry(model: str, mapping: dict[str, Any]) -> Any | None:
+    """Look up a per-model value in a `model id/substring -> value` map: exact
+    (case-insensitive) match first, then substring match (e.g. "qwen/qwen3-..." matches a
+    "qwen3" key). Returns None when nothing matches. Shared by the price table and any other
+    per-model config map (e.g. context-window limits) so they resolve model ids identically."""
     m = model.lower()
-    by_lower = {k.lower(): v for k, v in prices.items()}
+    by_lower = {k.lower(): v for k, v in mapping.items()}
     if m in by_lower:
         return by_lower[m]
-    for key, val in prices.items():
+    for key, val in mapping.items():
         if key.lower() in m:
             return val
     return None
+
+
+def _match_price(model: str, prices: dict[str, dict]) -> dict | None:
+    return match_model_entry(model, prices)

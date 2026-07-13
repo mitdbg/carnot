@@ -45,6 +45,11 @@ class SystemConfig:
     # USD price table for cost accounting; maps a model-substring -> {"in"/"out"/"cached": $/Mtok}.
     # Lookup is exact-first then substring, a model with no match costs 0.
     llm_prices: dict[str, dict[str, float]]
+    # Per-model context-window limits (tokens); maps a model-substring -> max context tokens, resolved
+    # by the same exact-then-substring rule as `llm_prices`. Used by the semantic filter to head-truncate
+    # a candidate document so the judge request fits the judge model's window; a model with no match is
+    # treated as having no known limit (no truncation).
+    llm_context_limits: dict[str, int]
     # Optional OpenRouter provider pin (ignored on the vllm path): an ordered list of provider
     # slugs (e.g. ["parasail"]). When set, generation is routed only to these providers with no
     # fallback, so a specific provider's prompt-cache / pricing is used deterministically. null =
@@ -145,6 +150,8 @@ class PipelineConfig(SearchAgentConfig):
     llm_default_tpm: float | None = None
     # USD price table for cost accounting; empty → every model costs 0.
     llm_prices: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Per-model context-window limits (tokens) for judge-request sizing; empty → no model is truncated.
+    llm_context_limits: dict[str, int] = field(default_factory=dict)
     # Embedding backend for `LLMClient.embed_query` (vector_search): "openrouter" or
     # "vllm" (a local embedding server, addressed via `vllm_base_urls[emb_model_id]`).
     emb_provider: Literal["openrouter", "vllm"] = "openrouter"

@@ -36,6 +36,7 @@ class QATFDSearchAgentSystem(SearchAgentSystem):
             emb_model_id=self.config.emb_model_id,
             max_output_tokens=self.config.grep_max_output_tokens,
             ctx=ctx,
+            context_limits=self.config.llm_context_limits,
         ),)
 
     def _include_search_corpus(self) -> bool:

@@ -29,6 +29,7 @@ def _config(**overrides) -> SearchAgentConfig:
         name="t", emb_provider="openrouter", emb_model_id="emb", llm_provider="openrouter",
         llm_model="loc/m", llm_max_retries=0, llm_retry_initial_delay_s=0.0,
         llm_model_rpm={}, llm_default_rpm=1e9, llm_model_tpm={}, llm_default_tpm=None, llm_prices={},
+        llm_context_limits={},
     )
     base.update(overrides)
     return SearchAgentConfig(**base)
@@ -196,6 +197,17 @@ def test_vllm_extra_body_lands_in_request(stub_server):
     _, body = stub_server.requests[0]
     # The openai SDK merges extra_body into the top-level request JSON.
     assert body["chat_template_kwargs"] == {"enable_thinking": False}
+
+
+def test_vllm_call_passes_max_output_tokens(stub_server):
+    client = _stub_client(stub_server)
+    client.call("s", "u", model="loc/m", max_output_tokens=256)
+    _, body = stub_server.requests[0]
+    assert body["max_tokens"] == 256
+    # Default (no cap) sends no max_tokens, preserving prior behavior.
+    client.call("s", "u", model="loc/m")
+    _, body2 = stub_server.requests[1]
+    assert "max_tokens" not in body2
 
 
 def test_vllm_empty_completion_retries_then_succeeds(stub_server):

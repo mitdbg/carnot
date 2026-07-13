@@ -14,8 +14,12 @@ from skunk.search_agent.search_agent import SearchAgent
 from skunk.search_agent.search_tools import (
     EMPTY_RESULT_MESSAGE,
     SEMFILTER_RESULT_TAG,
+    _JUDGE_CHARS_PER_TOKEN,
+    _JUDGE_OUTPUT_TOKENS,
+    _JUDGE_TRUNC_MARKER,
     RetrievalState,
     SemanticFilterTool,
+    _judge_doc_char_budget,
 )
 
 
@@ -33,11 +37,14 @@ class FakeLLMClient:
     def __init__(self, verdict_fn=None):
         self.verdict_fn = verdict_fn or (lambda text: True)
         self.judged_texts: list[str] = []
+        self.judge_max_output_tokens: list[int | None] = []
         self.embed_calls: list[tuple[str, str | None]] = []
 
-    def call(self, *, system, user, temperature, model, ctx, call_site, provider_order=None):
+    def call(self, *, system, user, temperature, model, ctx, call_site, provider_order=None,
+             max_output_tokens=None):
         doc_text = user.split("\n\nDocument:\n", 1)[1]
         self.judged_texts.append(doc_text)
+        self.judge_max_output_tokens.append(max_output_tokens)
         return _Resp("TRUE" if self.verdict_fn(doc_text) else "FALSE")
 
     def embed_query(self, text, *, model=None, ctx=None):
@@ -268,6 +275,7 @@ def _agent(extra_tools=()) -> SearchAgent:
         name="t", emb_provider="openrouter", emb_model_id="emb", llm_provider="openrouter",
         llm_model="m", llm_max_retries=0, llm_retry_initial_delay_s=0.0,
         llm_model_rpm={}, llm_default_rpm=1e9, llm_model_tpm={}, llm_default_tpm=None, llm_prices={},
+        llm_context_limits={},
     )
     return SearchAgent(
         config=config, document_map={}, chroma_collection=FakeChroma([]),
@@ -320,6 +328,56 @@ def test_rendered_chunks_are_redactable():
     agent._state.pruned_chunk_ids.add("c1")
     block = ChunkBlock(chunk_id="c1", doc_id="d1", text="snippet")
     assert agent._block_is_visible(block) is False
+
+
+# ---- judge output cap + context-limit truncation ---------------------------------
+
+
+def test_judge_call_caps_output_at_256():
+    tool, client, _ = _tool(lambda t: True)
+    tool("about apples", doc_ids=["d1", "d2"])
+    # Every judge call carries the 256-token output cap (the verdict is one word).
+    assert client.judge_max_output_tokens == [_JUDGE_OUTPUT_TOKENS, _JUDGE_OUTPUT_TOKENS]
+
+
+def test_context_limit_truncates_only_oversized_docs():
+    big, small = "z" * 500_000, "tiny doc"
+    ctx = FakeCtx()
+    client = FakeLLMClient(lambda t: True)
+    limit = 8000  # tokens
+    tool = SemanticFilterTool(
+        client, {"big": big, "small": small}, "judge-model",
+        ctx=ctx, context_limits={"judge-model": limit},
+    )
+    tool("some predicate", doc_ids=["big", "small"])
+    budget = _judge_doc_char_budget(limit, "some predicate")
+    # The oversized doc is head-truncated to exactly the budget and carries the marker;
+    # the small doc is sent verbatim.
+    assert len(client.judged_texts[0]) == budget
+    assert client.judged_texts[0].endswith(_JUDGE_TRUNC_MARKER)
+    assert client.judged_texts[1] == small
+    # The truncation is estimated to fit under the limit (with the safety margin).
+    assert budget / _JUDGE_CHARS_PER_TOKEN < limit
+    # The trace event reports exactly one truncation.
+    assert ctx.events[-1][1]["n_truncated"] == 1
+
+
+def test_no_context_limit_sends_full_text():
+    big = "z" * 100_000
+    client = FakeLLMClient(lambda t: True)
+    tool = SemanticFilterTool(client, {"big": big}, "judge-model")  # no context_limits
+    assert tool._context_limit is None
+    tool("p", doc_ids=["big"])
+    assert client.judged_texts[0] == big  # untouched
+
+
+def test_context_limit_resolved_by_substring_match():
+    # The tool resolves its judge model's limit via the shared exact-then-substring matcher.
+    tool = SemanticFilterTool(
+        FakeLLMClient(), dict(_DOC_MAP), "qwen/qwen3.6-35b-a3b",
+        context_limits={"qwen3.6-35b-a3b": 262144},
+    )
+    assert tool._context_limit == 262144
 
 
 if __name__ == "__main__":
