@@ -13,3 +13,7 @@ tool_semantic_filter: false  # semantic_filter (QATFD's tool)
 # Model for the semantic_filter judge calls; null => use llm_model (the agent model). Set to a
 # cheaper model to run the token-heavy candidate filtering off the expensive agent model.
 semantic_filter_model: null
+# OpenRouter provider order (no fallback) for the semantic_filter judge calls only; null => use the
+# client-wide llm_provider_order. Lets the judge route to specific providers (e.g. [akashml, parasail])
+# while a different-family agent model stays unpinned. E.g. systems.semantic_filter_provider_order=[akashml,parasail]
+semantic_filter_provider_order: null

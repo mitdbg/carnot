@@ -45,4 +45,5 @@ class AblationSearchAgentSystem(SearchAgentSystem):
             emb_model_id=self.config.emb_model_id,
             max_output_tokens=self.config.grep_max_output_tokens,
             ctx=ctx,
+            provider_order=self.config.semantic_filter_provider_order,
         ),)

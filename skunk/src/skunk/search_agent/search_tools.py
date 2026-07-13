@@ -571,11 +571,12 @@ def _parse_bool(text: str) -> bool:
     return True
 
 
-def _judge_one(llm_client, predicate: str, item_text: str, model: str, ctx) -> bool:
+def _judge_one(llm_client, predicate: str, item_text: str, model: str, ctx, provider_order=None) -> bool:
     user = f"Filter Condition: {predicate}\n\nDocument:\n{item_text}"
     try:
         resp = llm_client.call(
-            system=_SEMFILTER_SYSTEM, user=user, temperature=0.0, model=model, ctx=ctx, call_site="semfilter"
+            system=_SEMFILTER_SYSTEM, user=user, temperature=0.0, model=model, ctx=ctx, call_site="semfilter",
+            provider_order=provider_order,
         )
     except Exception:
         return True  # recall-safe: keep on error
@@ -592,6 +593,7 @@ def filter_docs(
     ctx=None,
     max_workers: int = 8,
     event_extra: dict | None = None,
+    provider_order: list[str] | None = None,
 ) -> list[str]:
     """Return the subset of `doc_ids` whose document text satisfies `predicate`,
     preserving input order.
@@ -606,7 +608,7 @@ def filter_docs(
         return []
     texts = [document_map.get(d, "") or "" for d in doc_ids]
     with ThreadPoolExecutor(max_workers=min(max_workers, len(doc_ids))) as pool:
-        verdicts = list(pool.map(lambda it: _judge_one(llm_client, predicate, it, model, ctx), texts))
+        verdicts = list(pool.map(lambda it: _judge_one(llm_client, predicate, it, model, ctx, provider_order), texts))
     kept = [d for d, keep in zip(doc_ids, verdicts, strict=True) if keep]
 
     if ctx is not None:
@@ -650,12 +652,16 @@ class SemanticFilterTool(Tool):
         max_candidate_docs: int = 1000,
         max_output_tokens: int = 50_000,
         ctx=None,
+        provider_order: list[str] | None = None,
     ) -> None:
         # `chroma_collection` (and, for top_k, `emb_model_id`) enable corpus mode; a
         # tool constructed without them supports only the doc_ids mode.
         self._llm_client = llm_client
         self._document_map = document_map
         self._model = model
+        # Per-call OpenRouter provider order for the judge calls only (None => client default). Lets a
+        # cheaper judge model route to specific providers while the agent model stays unpinned.
+        self._provider_order = provider_order
         self._chroma_collection = chroma_collection
         self._emb_model_id = emb_model_id
         self._max_candidate_docs = max_candidate_docs
@@ -706,7 +712,7 @@ class SemanticFilterTool(Tool):
                 doc_ids = [doc_ids]
             kept = filter_docs(
                 self._llm_client, predicate, list(doc_ids), self._document_map, self._model,
-                ctx=self._ctx, event_extra={"mode": "doc_ids"},
+                ctx=self._ctx, event_extra={"mode": "doc_ids"}, provider_order=self._provider_order,
             )
             return {SEMFILTER_RESULT_TAG: True, "kept_doc_ids": kept, "n_in": len(doc_ids), "n_out": len(kept)}
 
@@ -809,6 +815,7 @@ class SemanticFilterTool(Tool):
                 "n_candidate_chunks": len(candidates),
                 "n_candidate_docs": len(candidate_doc_ids),
             },
+            provider_order=self._provider_order,
         )
         kept_set = set(kept)
         kept_chunks = [(cid, did, text) for cid, did, text in candidates if did in kept_set]

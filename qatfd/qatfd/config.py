@@ -50,6 +50,11 @@ class AblationSearchAgentConfig(SearchAgentConfig):
     # model while the search agent itself stays on `llm_model` — the filtered-out candidates never
     # enter the agent model's context, so this drives cost down without touching the agent's reasoning.
     semantic_filter_model: str | None = None
+    # OpenRouter provider order (no fallback) for the semantic_filter judge calls only. null => use
+    # the client-wide `llm_provider_order`. Lets the judge model route to specific providers (e.g.
+    # [akashml, parasail]) while the agent model (which may be a different family, e.g. a Google
+    # model that those providers don't serve) stays unpinned.
+    semantic_filter_provider_order: list[str] | None = None
 
 # ---------------------------------------------------------------------------
 # General experiment configuration
