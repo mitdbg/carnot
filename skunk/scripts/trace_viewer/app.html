@@ -353,12 +353,13 @@ function finalizeNode(g){
 // ── draw ────────────────────────────────────────────────────────────────────
 function draw(){
   if(!S.uid) return;
-  // Dispatch on the run's system (from report.csv). qatfd systems (rag_llm / search_agent /
-  // qatfd_search_agent) emit a flat agent-loop event stream, not the OfficeQA plan shape, so
-  // they get dedicated renderers; anything else falls back to the plan-shaped view below.
+  // Dispatch on the run's system (from report.csv). qatfd systems emit a flat agent-loop event
+  // stream, not the OfficeQA plan shape, so they get dedicated renderers; anything else falls
+  // back to the plan-shaped view below. Match by family (substring) so ablation variants —
+  // e.g. `ablation_search_agent`, `vector_read_search_agent` — route to the right renderer too.
   const sys = String((S.row && S.row.system) || "").toLowerCase();
-  if(sys === "rag_llm")        return drawRagLlm();
-  if(sys === "search_agent" || sys === "qatfd_search_agent") return drawSearchAgent(sys);
+  if(sys.includes("rag_llm"))      return drawRagLlm();
+  if(sys.includes("search_agent")) return drawSearchAgent(sys);
   const m = buildModel();
   const parts = [headerHtml(m), flowSection(m)];
   if(m.orphans?.length) parts.push(`<div class="card"><div class="card-title">Other events</div>${m.orphans.map(e=>eventHtml(e)).join("")}</div>`);
@@ -1072,7 +1073,10 @@ function drawSearchAgent(sys){
   const aStart = answerStartIdx(events);
   const retrieval = aStart>=0 ? events.slice(0, aStart) : events;
   const answer    = aStart>=0 ? events.slice(aStart) : [];
-  const retrTitle = sys==="qatfd_search_agent"
+  // Label the retrieval stage by what the agent actually did — a semantic_filter event present
+  // means the filter tool was used — rather than by the (possibly ablated) system name.
+  const usedSemfilter = retrieval.some(e => (e.message||"").startsWith("semantic_filter") && e.data && Array.isArray(e.data.docs));
+  const retrTitle = usedSemfilter
     ? "Retrieval — search agent + semantic filter" : "Retrieval — search agent";
   const parts = [qaHeaderHtml()];
   if(nugEvt) parts.push(nuggetCard(nugEvt));
