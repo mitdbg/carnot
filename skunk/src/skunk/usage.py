@@ -8,10 +8,11 @@ positional-arg fishing. Read the tracker after a run (the eval harness builds on
 client per question, so its tracker is naturally per-question scoped).
 
 Cost comes from a price table on the `SystemConfig` (`llm_prices`), a map of
-`model-substring -> {"in"/"out"/"cached": $/Mtok}`; unmatched models cost 0.
-genai/OpenRouter chat responses don't report a dollar cost, so this table is the
-sole cost source. Cached input tokens (a subset of input tokens) are billed at the
-model's `cached` rate when given, else at its `in` rate.
+`model-substring -> {"in"/"out"/"cached": $/Mtok}`; unmatched models cost 0, and
+models served by a local vLLM server (`free_models`, from `vllm_base_urls`) cost 0
+even when the table prices them. Chat responses don't report a dollar cost, so this
+table is the sole cost source. Cached input tokens (a subset of input tokens) are
+billed at the model's `cached` rate when given, else at its `in` rate.
 """
 
 from __future__ import annotations
@@ -28,9 +29,14 @@ class UsageTracker:
     """Accumulates token usage (and derives cost) across one client's LLM calls.
 
     `prices` is the `SystemConfig.llm_prices` table (see module docstring); an empty
-    table means every call costs 0."""
+    table means every call costs 0. `free_models` are models whose calls cost $0
+    REGARDLESS of the table — the ones routed to a local vLLM server
+    (`SystemConfig.vllm_base_urls` keys, passed in by `LLMClient`) — so a model priced
+    for OpenRouter runs is still free in a run that serves it locally."""
 
-    def __init__(self, default_model: str, prices: dict | None = None) -> None:
+    def __init__(
+        self, default_model: str, prices: dict | None = None, free_models: set[str] | None = None
+    ) -> None:
         # Guards the mutating accumulators below: a single client is hit concurrently when
         # tools fan LLM calls across a thread pool, and the
         # `+=` increments are read-modify-write across bytecodes, so concurrent adds can drop
@@ -39,14 +45,15 @@ class UsageTracker:
         self._lock = threading.Lock()
         self.default_model = default_model
         self.prices = prices or {}
+        self.free_models = set(free_models or ())
         self.input_tokens = 0
         self.output_tokens = 0
         self.cache_input_tokens = 0
         self.n_calls = 0
         # per-model token sums, for cost when a run mixes models. cached is a subset
         # of input (its discounted portion), tracked separately so cost can price it.
-        # thinking is tracked separately from output (providers report it separately;
-        # genai's output_tokens EXCLUDES thoughts) and billed at the output rate.
+        # thinking is tracked separately from output (some providers report
+        # output_tokens EXCLUDING thoughts) and billed at the output rate.
         self.by_model_in: dict[str, int] = defaultdict(int)
         self.by_model_out: dict[str, int] = defaultdict(int)
         self.by_model_cached: dict[str, int] = defaultdict(int)
@@ -78,9 +85,8 @@ class UsageTracker:
             self.n_calls += 1
 
     def add_embed(self, model: str | None, input_tokens: int) -> None:
-        """Fold one embedding call into the running totals. `input_tokens` is the exact
-        prompt-token count when the provider reports it (OpenRouter) or a char/4 estimate
-        for backends that don't (local SentenceTransformers)."""
+        """Fold one embedding call into the running totals. `input_tokens` is the
+        provider-reported prompt-token count (0 when the backend doesn't report one)."""
         m = model or self.default_model
         with self._lock:
             self.embed_tokens += input_tokens
@@ -97,7 +103,7 @@ class UsageTracker:
             return 0.0
         total = 0.0
         for model, in_tok in self.by_model_in.items():
-            p = _match_price(model, self.prices)
+            p = self._price_for(model)
             if not p:
                 continue
             in_rate = p.get("in", 0.0)
@@ -115,10 +121,11 @@ class UsageTracker:
         """USD cost of a single generation call, priced exactly as `cost()` aggregates (so
         per-call costs sum to the question total): uncached input at `in`, cached input at
         `cached` (→ `in` when unset), output + thinking at `out`. Returns None when there is
-        no price table or no matching entry, so callers can distinguish "unpriced" from "$0.00"."""
+        no price table, no matching entry, or a `free_models` (locally served) model, so
+        callers can distinguish "unpriced" from "$0.00"."""
         if not self.prices:
             return None
-        p = _match_price(model or self.default_model, self.prices)
+        p = self._price_for(model or self.default_model)
         if not p:
             return None
         # Streaming can omit the usage chunk → token counts arrive as None; treat as 0
@@ -141,7 +148,7 @@ class UsageTracker:
         None when unpriced. Mirrors `embed_cost`'s per-model lookup for one call."""
         if not self.prices:
             return None
-        p = _match_price(model or self.default_model, self.prices)
+        p = self._price_for(model or self.default_model)
         return None if not p else in_tok / 1_000_000 * p.get("in", 0.0)
 
     def embed_cost(self) -> float:
@@ -154,11 +161,19 @@ class UsageTracker:
             return 0.0
         total = 0.0
         for model, in_tok in self.by_emb_model_in.items():
-            p = _match_price(model, self.prices)
+            p = self._price_for(model)
             if not p:
                 continue
             total += in_tok / 1_000_000 * p.get("in", 0.0)
         return total
+
+    def _price_for(self, model: str) -> dict | None:
+        """The model's price entry, or None when unpriced — including every `free_models`
+        entry: a locally served model costs $0 even when the table prices it (the same id
+        can be a paid OpenRouter model in one run and a vLLM-served one in another)."""
+        if model in self.free_models:
+            return None
+        return _match_price(model, self.prices)
 
 
 def _match_price(model: str, prices: dict[str, dict]) -> dict | None:

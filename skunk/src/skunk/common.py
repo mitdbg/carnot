@@ -25,7 +25,6 @@ from typing import TYPE_CHECKING, Any, Literal
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, model_validator
-from google import genai
 
 from skunk import trace
 from skunk.config import SystemConfig
@@ -367,36 +366,6 @@ def parse_json_response(text: str) -> Any | None:
         return json.loads(strip_code_fence(text))
     except json.JSONDecodeError:
         return None
-
-
-def make_genai_client(api_key: str | None = None) -> genai.Client:
-    """Build a direct-Gemini (AI Studio) genai.Client. Auth via api-key (explicit
-    `api_key` param, else `GEMINI_API_KEY`); no GCP project required.
-
-    No client-side request timeout is set: HttpOptions.timeout doubles as a
-    SERVER deadline (the API kills the request with 504 DEADLINE_EXCEEDED at
-    the cutoff), which turned long-thinking calls — e.g. Gemini 3.x Pro vision
-    reads that deliberate for minutes — into deterministic retry-storm failures.
-    Slow calls are given however long the transport allows; transport-level
-    connection faults still surface and are retried (`llm_client._is_retryable`)."""
-    api_key = api_key or os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY not set (required for Gemini API)")
-    # By default the SDK's httpx pool caps concurrent requests at 100 (max_connections),
-    # which throttles highly-parallel offline sweeps (e.g. dais table correction) long
-    # before the server's rate limit. `SKUNK_GENAI_MAX_CONNECTIONS` lifts that ceiling;
-    # unset → SDK default, so interactive/serving paths are unaffected.
-    max_conns = os.environ.get("SKUNK_GENAI_MAX_CONNECTIONS")
-    if max_conns:
-        import httpx
-        from google.genai import types
-
-        limits = httpx.Limits(max_connections=int(max_conns), max_keepalive_connections=int(max_conns))
-        http_options = types.HttpOptions(
-            client_args={"limits": limits}, async_client_args={"limits": limits}
-        )
-        return genai.Client(api_key=api_key, http_options=http_options)
-    return genai.Client(api_key=api_key)
 
 
 # --- Cross-cutting runtime types threaded between operators and the orchestrator ---

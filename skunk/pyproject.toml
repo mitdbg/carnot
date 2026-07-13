@@ -10,9 +10,9 @@ requires-python = ">=3.12"
 dependencies = [
     "beautifulsoup4",
     "chromadb>=1.4.0",
-    "google-genai",
     "httpx",
     "jinja2",
+    "openai",
     "openrouter",
     "pandas",
     "pydantic>=2",
@@ -24,9 +24,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Local SentenceTransformers embedding backend (LLMClient emb_provider="local");
-# heavy (pulls in torch), so opt-in. API-backed embeddings need nothing extra.
-embeddings = ["sentence-transformers"]
 dev = ["pandas-stubs==3.0.3.260530"]
 
 [tool.setuptools.packages.find]

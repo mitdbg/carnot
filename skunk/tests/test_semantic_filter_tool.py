@@ -35,7 +35,7 @@ class FakeLLMClient:
         self.judged_texts: list[str] = []
         self.embed_calls: list[tuple[str, str | None]] = []
 
-    def call(self, *, system, user, temperature, model, ctx, call_site):
+    def call(self, *, system, user, temperature, model, ctx, call_site, provider_order=None):
         doc_text = user.split("\n\nDocument:\n", 1)[1]
         self.judged_texts.append(doc_text)
         return _Resp("TRUE" if self.verdict_fn(doc_text) else "FALSE")
@@ -265,7 +265,7 @@ def test_trace_event_records_mode_and_inputs():
 
 def _agent(extra_tools=()) -> SearchAgent:
     config = SearchAgentConfig(
-        name="t", emb_provider="local", emb_model_id="emb", llm_provider="openrouter",
+        name="t", emb_provider="openrouter", emb_model_id="emb", llm_provider="openrouter",
         llm_model="m", llm_max_retries=0, llm_retry_initial_delay_s=0.0,
         llm_model_rpm={}, llm_default_rpm=1e9, llm_model_tpm={}, llm_default_tpm=None, llm_prices={},
     )

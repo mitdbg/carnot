@@ -8,7 +8,7 @@
 #   SYSTEMS="rag_llm,search_agent"              ./run_all.sh   # subset of systems
 #   SAMPLE=20 WORKERS=16                        ./run_all.sh   # 20-question smoke
 #   SPLIT=test                                  ./run_all.sh   # held-out test split
-#   EMB_PROVIDER=local                          ./run_all.sh   # query-embedding backend
+#   EMB_PROVIDER=vllm                           ./run_all.sh   # query-embedding backend
 #
 # Anything after `--` is forwarded verbatim as extra Hydra overrides, e.g.:
 #   ./run_all.sh -- systems.top_k=30 skunk.llm_model=gemini-3.5-pro

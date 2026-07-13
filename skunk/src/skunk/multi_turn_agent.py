@@ -307,7 +307,7 @@ Requirements for the final answer:
         # read `messages_to_jsonable()` after the run for reward / persistence.
         self.messages: list[dict] = []
         # Optional pluggable generation backend (e.g. Tinker for RL rollouts).
-        # When None, generation goes through `PromptedCall` (the genai/Vertex
+        # When None, generation goes through `PromptedCall` (the LLMClient
         # path). When set, `_llm_step` samples from it and captures per-token
         # logprobs onto each assistant turn for `messages_to_jsonable()`.
         self._backend = generation_backend

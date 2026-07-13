@@ -33,7 +33,6 @@ from threading import Lock
 import numpy as np
 from google import genai
 from google.genai import types as genai_types  # noqa: F401
-from skunk.common import make_genai_client
 from officeqa.corpus import preprocess_text
 
 # Gemini Embedding 2 Preview context limit (tokens).
@@ -45,6 +44,28 @@ CHARS_PER_TOKEN = 3
 CHUNK_CHARS = CHUNK_TOKENS * CHARS_PER_TOKEN
 MAX_ATTEMPTS = 6
 MODEL_NAME = "gemini-embedding-2"  # Vertex AI model ID
+
+def make_genai_client(api_key: str | None = None) -> genai.Client:
+    """Build a direct-Gemini (AI Studio) genai.Client — moved here from `skunk.common`
+    when skunk dropped its genai LLM provider (this offline prep script is the sole
+    remaining consumer). Auth via api-key (explicit `api_key` param, else
+    `GEMINI_API_KEY`); no GCP project required. `SKUNK_GENAI_MAX_CONNECTIONS` lifts the
+    SDK's default 100-connection httpx pool cap for highly-parallel offline sweeps;
+    unset → SDK default."""
+    api_key = api_key or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not set (required for Gemini API)")
+    max_conns = os.environ.get("SKUNK_GENAI_MAX_CONNECTIONS")
+    if max_conns:
+        import httpx
+
+        limits = httpx.Limits(max_connections=int(max_conns), max_keepalive_connections=int(max_conns))
+        http_options = genai_types.HttpOptions(
+            client_args={"limits": limits}, async_client_args={"limits": limits}
+        )
+        return genai.Client(api_key=api_key, http_options=http_options)
+    return genai.Client(api_key=api_key)
+
 
 def _chunk_by_chars(text: str, chunk_chars: int) -> list[str]:
     """Split *text* into non-overlapping chunks of <= chunk_chars characters."""
@@ -212,7 +233,6 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Auth via ADC + GOOGLE_CLOUD_PROJECT (see skunk.common.make_genai_client).
     client = make_genai_client()
 
     json_files = sorted(glob.glob(os.path.join(args.input_dir, "*.json")))

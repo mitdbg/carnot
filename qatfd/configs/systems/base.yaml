@@ -4,8 +4,10 @@ emb_provider: openrouter
 emb_model_id: Qwen/Qwen3-Embedding-8B
 
 # --- LLM client (skunk.llm_client.LLMClient) ---
-# generation provider for all LLM calls: genai (AI Studio Gemini, bare model ids) or
-# openrouter (full vendor/model ids). Embeddings dispatch on emb_provider, not this.
+# default generation provider: openrouter (full vendor/model ids) or vllm (served model
+# names; every model must then be in vllm_base_urls). Routing is per call — a model listed
+# in vllm_base_urls goes to vLLM regardless of this default. Embeddings dispatch on
+# emb_provider, not this.
 llm_provider: openrouter
 # default model for every LLM call (one-shot calls and agent loops alike); full OpenRouter id
 llm_model: google/gemini-3.5-flash
@@ -40,3 +42,15 @@ llm_prices:
 # OpenRouter provider pin (ordered slugs, no fallback); null = OpenRouter picks. Overridden
 # per-run on the CLI, e.g. systems.llm_provider_order=[parasail].
 llm_provider_order: null
+# Per-model vLLM routing: model id -> OpenAI-compatible base URL of the vLLM server serving it
+# (launch servers with scripts/run_vllm_servers.sh, which prints/writes these URLs). A model
+# listed here routes to vLLM; every other model (e.g. benchmarks.judge_model) stays on
+# llm_provider above. Keys must equal the server's --served-model-name. Models listed here
+# cost $0 regardless of llm_prices (safe to keep a price entry for OpenRouter runs of the
+# same model). CLI example (++ because Hydra's struct mode rejects new dict keys under a
+# plain override):
+#   '++systems.vllm_base_urls={Qwen/Qwen3-32B: "http://gpu-box:8100/v1"}'
+vllm_base_urls: {}
+# Extra JSON merged into every vLLM chat request body (openai SDK extra_body), e.g.
+# {chat_template_kwargs: {enable_thinking: false}} to turn off Qwen3-style thinking.
+vllm_extra_body: null

@@ -1,8 +1,11 @@
 """The LLM client and its provider-specific scaffolding.
 
-All LLM traffic goes through either the direct Gemini API (AI Studio) via
-`google-genai` (authenticated by `GEMINI_API_KEY`, the default) or OpenRouter
-(`provider=openrouter`, authenticated by `OPENROUTER_API_KEY`). LLM calls are paced
+All LLM traffic goes through OpenRouter (`provider=openrouter`, authenticated by
+`OPENROUTER_API_KEY`) or a local vLLM server speaking the OpenAI API
+(`provider=vllm`, addressed per model via `config.vllm_base_urls`). Routing is
+per call: a model listed in `vllm_base_urls` goes to the vLLM server that serves
+it, every other model uses `config.llm_provider` — so one run can keep e.g. its
+judge on OpenRouter while the agent runs on a local model. LLM calls are paced
 by the process-wide token-bucket limiters from `skunk.common` (the per-model
 `llm:<model>` bucket); only transient SDK exceptions (HTTP 429 + 5xx, network
 timeouts / connection resets — see `_is_retryable`) are retried with exponential
@@ -12,9 +15,7 @@ multi-process fan-out)."""
 
 from __future__ import annotations
 
-import aiohttp
 import asyncio
-import base64
 import os
 import sys
 import threading
@@ -26,20 +27,17 @@ from typing import TYPE_CHECKING, Any, TypeVar
 
 import httpx
 import requests
-from google.genai import errors as genai_errors
-from google.genai import types
 
 from skunk.common import (
     AsyncTokenBudget,
     Effort,
     get_async_tpm_limiter,
     get_rate_limiter,
-    make_genai_client,
 )
 from skunk.usage import UsageTracker
 
 if TYPE_CHECKING:
-    from google import genai
+    from openai import AsyncOpenAI, OpenAI
     from openrouter import OpenRouter
 
     from skunk.common import B64Image, ExecutionContext
@@ -86,9 +84,6 @@ def _is_retryable(e: BaseException) -> bool:
     burning the retry budget."""
     if isinstance(e, EmptyCompletionError):
         return True
-    if isinstance(e, genai_errors.APIError):
-        code = getattr(e, "code", None)
-        return code == 429 or (code is not None and 500 <= code < 600)
     # OpenRouter SDK errors all derive from `OpenRouterError`, which exposes the
     # HTTP `status_code` (lazy import — the SDK is only loaded on the openrouter path).
     try:
@@ -98,15 +93,24 @@ def _is_retryable(e: BaseException) -> bool:
     if isinstance(e, OpenRouterError):
         code = getattr(e, "status_code", None)
         return code == 429 or (code is not None and 500 <= code < 600)
+    # openai SDK errors (the vllm path): `APIStatusError` carries the HTTP status;
+    # `APIConnectionError` (which includes `APITimeoutError`) wraps httpx transport
+    # faults — always transient (lazy import, same pattern as OpenRouterError above).
+    try:
+        from openai import APIConnectionError, APIStatusError
+    except ImportError:
+        APIConnectionError = APIStatusError = ()  # type: ignore[assignment,misc]
+    if isinstance(e, APIStatusError):
+        code = getattr(e, "status_code", None)
+        return code == 429 or (code is not None and 500 <= code < 600)
+    if isinstance(e, APIConnectionError):
+        return True
     # Transport faults: connection resets, read timeouts, DNS failures, etc.
     # `TimeoutError` covers both asyncio timeouts on the async SDK path and our own
     # per-request wall-clock cap (asyncio.wait_for in the streaming path raises builtin
     # TimeoutError) — treat a tripped timeout as a transient fault worth retrying, same as a
-    # transport-level read timeout. The genai async transport is aiohttp, whose connection
-    # faults (`ClientOSError`: broken pipe / reset) derive from `ClientConnectionError` — none
-    # of which the httpx/requests types below catch.
+    # transport-level read timeout.
     retryable: tuple[type[BaseException], ...] = (
-        aiohttp.ClientConnectionError,
         TimeoutError,
         httpx.TimeoutException,
         httpx.TransportError,
@@ -122,30 +126,49 @@ def _error_detail(e: BaseException) -> str:
     failures into a terse `...ResponseError: Provider returned error`; the actionable
     cause — the HTTP status, the provider's raw error body, and OpenRouter's
     `metadata` (which carries the provider name + the raw upstream message) — lives on
-    the exception, not in `str(e)`. Surface it so an intermittent 400 is debuggable
-    straight from the logs. Best-effort: never raises, returns "" when nothing to add."""
+    the exception, not in `str(e)`. The openai SDK (vllm path) likewise buries the
+    server's error body on `e.response`. Surface both so an intermittent 400 is
+    debuggable straight from the logs. Best-effort: never raises, returns "" when
+    nothing to add."""
     try:
         from openrouter.errors import OpenRouterError
     except ImportError:
-        return ""
-    if not isinstance(e, OpenRouterError):
-        return ""
-    parts: list[str] = []
+        OpenRouterError = ()  # type: ignore[assignment]
+    if isinstance(e, OpenRouterError):
+        parts: list[str] = []
+        try:
+            code = getattr(e, "status_code", None)
+            if code is not None:
+                parts.append(f"status={code}")
+            err = getattr(getattr(e, "data", None), "error", None)
+            meta = getattr(err, "metadata", None)
+            if meta:
+                parts.append(f"metadata={str(meta)[:1000]}")
+            rr = getattr(e, "raw_response", None)
+            body = getattr(rr, "text", None) if rr is not None else getattr(e, "body", None)
+            if body:
+                parts.append(f"body={str(body)[:1000]}")
+        except Exception:  # noqa: BLE001 — diagnostics must never mask the original error
+            return ""
+        return (" | " + " ".join(parts)) if parts else ""
     try:
-        code = getattr(e, "status_code", None)
-        if code is not None:
-            parts.append(f"status={code}")
-        err = getattr(getattr(e, "data", None), "error", None)
-        meta = getattr(err, "metadata", None)
-        if meta:
-            parts.append(f"metadata={str(meta)[:1000]}")
-        rr = getattr(e, "raw_response", None)
-        body = getattr(rr, "text", None) if rr is not None else getattr(e, "body", None)
-        if body:
-            parts.append(f"body={str(body)[:1000]}")
-    except Exception:  # noqa: BLE001 — diagnostics must never mask the original error
+        from openai import APIStatusError
+    except ImportError:
         return ""
-    return (" | " + " ".join(parts)) if parts else ""
+    if isinstance(e, APIStatusError):
+        parts = []
+        try:
+            code = getattr(e, "status_code", None)
+            if code is not None:
+                parts.append(f"status={code}")
+            rr = getattr(e, "response", None)
+            body = getattr(rr, "text", None) if rr is not None else getattr(e, "body", None)
+            if body:
+                parts.append(f"body={str(body)[:1000]}")
+        except Exception:  # noqa: BLE001 — diagnostics must never mask the original error
+            return ""
+        return (" | " + " ".join(parts)) if parts else ""
+    return ""
 
 
 # The TPM throttle (AsyncTokenBudget + its process-wide registry) lives in
@@ -156,13 +179,6 @@ def _estimate_prompt_tokens(system: str, user: str) -> float:
     """Cheap pre-call input-token estimate (~4 chars/token) for the TPM bucket.
     Approximate by design — it only paces throughput, it doesn't bill."""
     return (len(system) + len(user)) / 4.0
-
-
-def _requires_thinking(model: str) -> bool:
-    """True for models that mandate thinking mode (reject `thinking_budget=0`).
-    Gemini 3.x Pro tiers are thinking-only; Flash/Flash-Lite accept budget=0."""
-    m = model.lower()
-    return "gemini-3" in m and "pro" in m
 
 
 @dataclass
@@ -201,7 +217,8 @@ class CallSpec:
     should_stop: Callable[[str], bool] | None = None
     # Per-call OpenRouter provider order (no fallback). None => use config.llm_provider_order.
     # Lets a single client route one model (e.g. a cheaper semantic-filter judge) to specific
-    # providers while other models on the same client stay unpinned.
+    # providers while other models on the same client stay unpinned. OpenRouter-only: ignored
+    # when the model routes to a vLLM backend.
     provider_order: list[str] | None = None
 
 
@@ -266,106 +283,116 @@ def _make_openrouter_client(api_key: str | None = None) -> OpenRouter:
     return OpenRouter(api_key=api_key, client=sync_client, async_client=async_client)
 
 
-# Local SentenceTransformers embedders are cached PROCESS-WIDE (not per LLMClient): the
-# eval builds one LLMClient per question and runs many concurrently, so a per-instance
-# cache loaded N identical copies of the model — fine on CPU RAM, but on a single GPU that
-# is N * ~1.2GB and OOMs the device (e.g. 32 copies > a 22GB L4). One shared instance is
-# also correct: the model is read-only at inference, so concurrent .encode() calls from
-# worker threads are safe. Keyed by model id; the lock only guards the one-time load.
-_LOCAL_EMBEDDERS: dict[str, Any] = {}
-_LOCAL_EMBEDDERS_LOCK = threading.Lock()
+# vLLM (openai SDK) clients are cached PROCESS-WIDE (not per LLMClient): the eval builds
+# one LLMClient per question and runs many concurrently, so per-instance clients would
+# open one connection pool per question per server. The openai clients are thread- and
+# async-safe, so one shared (sync, async) pair per server is correct. Keyed by
+# (base_url, api_key); the lock only guards the one-time construction.
+_VLLM_CLIENTS: dict[tuple[str, str], tuple["OpenAI", "AsyncOpenAI"]] = {}
+_VLLM_CLIENTS_LOCK = threading.Lock()
 
 
-class LLMClient:
-    """LLM client. Generation calls route to either the AI Studio Gemini API
-    (`provider=genai`, default) or OpenRouter (`provider=openrouter`) per
-    `config.llm_provider`; both share the same rate-limit / retry / logging
-    scaffolding. Embeddings stay on Gemini."""
+def _make_vllm_clients(base_url: str, api_key: str | None = None) -> tuple["OpenAI", "AsyncOpenAI"]:
+    """Sync + async `openai` clients for one vLLM server (`provider=vllm`). vLLM speaks
+    the OpenAI API; a server started without `--api-key` accepts any key, so the
+    conventional placeholder "EMPTY" is sent when neither the explicit `api_key` nor
+    `VLLM_API_KEY` is set. `max_retries=0` — our retry loop owns retries. The generous
+    timeout mirrors `_make_openrouter_client` (a bare client would abort long
+    generations; the app enforces its own per-request wall-clock cap)."""
+    import httpx
+    from openai import AsyncOpenAI, OpenAI
 
-    def __init__(
-        self,
-        config: SystemConfig,
-        *,
-        gemini_api_key: str | None = None,
-        openrouter_api_key: str | None = None,
-    ) -> None:
-        """`gemini_api_key` / `openrouter_api_key` override the environment
-        (`GEMINI_API_KEY` / `OPENROUTER_API_KEY`) — the constructor is the seam for
-        callers that manage credentials themselves; env remains the default."""
+    key = api_key or os.environ.get("VLLM_API_KEY") or "EMPTY"
+    cache_key = (base_url, key)
+    clients = _VLLM_CLIENTS.get(cache_key)
+    if clients is None:
+        with _VLLM_CLIENTS_LOCK:
+            clients = _VLLM_CLIENTS.get(cache_key)  # re-check: another thread may have built it
+            if clients is None:
+                timeout = httpx.Timeout(600.0)
+                clients = (
+                    OpenAI(base_url=base_url, api_key=key, timeout=timeout, max_retries=0),
+                    AsyncOpenAI(base_url=base_url, api_key=key, timeout=timeout, max_retries=0),
+                )
+                _VLLM_CLIENTS[cache_key] = clients
+    return clients
+
+
+class _LLMBackend:
+    """Per-provider backend: the shared retry/backoff drivers, RPM/TPM pacing, and the
+    `_build_response`/`_finish` trace+usage chokepoint, over abstract provider bodies
+    (`_gen_call` / `_gen_acall` / `_gen_astream` / `_embed_once`). Backends are built
+    only by the `LLMClient` facade, which injects its own `UsageTracker` — every
+    backend of a client bills into the one tracker, so a mixed OpenRouter+vLLM run
+    still reports one usage/cost total."""
+
+    provider: str = "?"
+
+    def __init__(self, config: SystemConfig, usage: UsageTracker) -> None:
         self._config = config
-        self._gemini_api_key = gemini_api_key
-        self._openrouter_api_key = openrouter_api_key
-        self._gemini_client: genai.Client | None = None
-        self._openrouter_client: OpenRouter | None = None
-        self.usage = UsageTracker(
-            default_model=config.llm_model,
-            prices=config.llm_prices,
-        )
+        self.usage = usage
 
-    def _get_gemini_client(self) -> genai.Client:
-        if self._gemini_client is None:
-            self._gemini_client = make_genai_client(self._gemini_api_key)
-        return self._gemini_client
+    # --- entry points (called by the LLMClient facade with a resolved CallSpec) -------
 
-    def _get_openrouter_client(self) -> OpenRouter:
-        if self._openrouter_client is None:
-            self._openrouter_client = _make_openrouter_client(self._openrouter_api_key)
-        return self._openrouter_client
+    def call(self, spec: CallSpec) -> LLMResponse:
+        return self._retry_call(lambda: self._gen_call(spec), self.provider, spec.model, ctx=spec.ctx)
 
-    def call(
-        self,
-        system: str,
-        user: str,
-        images: list[B64Image] | None = None,
-        temperature: float = 0.0,
-        effort: Effort = "off",
-        ctx: ExecutionContext | None = None,
-        call_site: str = "llm",
-        model: str | None = None,
-        provider_order: list[str] | None = None,
-    ) -> LLMResponse:
-        spec = CallSpec(
-            system=system, user=user, images=images, temperature=temperature,
-            effort=effort, ctx=ctx, call_site=call_site,
-            model=model or self._config.llm_model,
-            provider_order=provider_order,
-        )
-        impl = (
-            self._openrouter_call
-            if self._config.llm_provider == "openrouter"
-            else self._gemini_call
-        )
-        return self._retry_call(lambda: impl(spec), self._config.llm_provider, spec.model, ctx=spec.ctx)
-
-    async def acall(
-        self,
-        system: str,
-        user: str,
-        images: list[B64Image] | None = None,
-        temperature: float = 0.0,
-        effort: "Effort" = "off",
-        ctx: "ExecutionContext | None" = None,
-        call_site: str = "llm",
-        model: str | None = None,
-        max_output_tokens: int | None = None,
-        timeout_s: float | None = None,
-    ) -> LLMResponse:
-        """Async twin of `call` for the request path. `max_output_tokens` /
-        `timeout_s` mirror `astream`'s caps (None → provider default / no cap)."""
-        spec = CallSpec(
-            system=system, user=user, images=images, temperature=temperature,
-            effort=effort, ctx=ctx, call_site=call_site,
-            model=model or self._config.llm_model,
-            max_output_tokens=max_output_tokens, timeout_s=timeout_s,
-        )
-        impl = (
-            self._openrouter_acall
-            if self._config.llm_provider == "openrouter"
-            else self._gemini_acall
-        )
+    async def acall(self, spec: CallSpec) -> LLMResponse:
         return await self._aretry_call(
-            lambda: impl(spec), self._config.llm_provider, spec.model, ctx=spec.ctx
+            lambda: self._gen_acall(spec), self.provider, spec.model, ctx=spec.ctx
         )
+
+    async def astream(self, spec: CallSpec) -> LLMResponse:
+        return await self._aretry_call(
+            lambda: self._gen_astream(spec), self.provider, spec.model, ctx=spec.ctx
+        )
+
+    def embed_query(
+        self, text: str, *, model: str, ctx: ExecutionContext | None = None
+    ) -> list[float]:
+        """Embed a single query string for vector search, routing through the same
+        rate-limit / retry / usage-accounting scaffolding as generation so embedding
+        spend lands on this client's `usage` tracker (tokens, cost, calls). The provider
+        body is `_embed_once`; when `ctx` is given, emits the uniform `call ...` envelope
+        (so the embed call's latency shows in the per-question trace like every LLM
+        call); usage is recorded regardless of `ctx`."""
+
+        def attempt() -> list[float]:
+            t0 = time.monotonic()
+            vector, in_tok = self._embed_once(model, text)
+            latency_s = time.monotonic() - t0
+            self.usage.add_embed(model, in_tok)
+            if ctx is not None:
+                cost = self.usage.price_embed(model, in_tok)
+                ctx.emit(
+                    f"call call_site=embed model={model} provider={self.provider} "
+                    f"latency_s={round(latency_s, 3)} in_tok={in_tok} dim={len(vector)}",
+                    kind="call",
+                    data=None if cost is None else {"cost": cost},
+                )
+            return vector
+
+        # Embeddings share one process-wide "embed" rate bucket across all workers
+        # (separate from the per-model generation buckets).
+        return self._retry_call(attempt, self.provider, model, bucket="embed", ctx=ctx)
+
+    # --- provider bodies (subclass responsibility) -------------------------------------
+
+    def _gen_call(self, spec: CallSpec) -> LLMResponse:
+        raise NotImplementedError(f"provider {self.provider!r} does not implement call")
+
+    async def _gen_acall(self, spec: CallSpec) -> LLMResponse:
+        raise NotImplementedError(f"provider {self.provider!r} does not implement acall")
+
+    async def _gen_astream(self, spec: CallSpec) -> LLMResponse:
+        raise NotImplementedError(f"provider {self.provider!r} does not implement astream")
+
+    def _embed_once(self, model: str, text: str) -> tuple[list[float], int]:
+        """One embedding request (no retry — the retry loop owns that). Returns the
+        vector and the provider-reported input-token count (0 when unreported)."""
+        raise NotImplementedError(f"provider {self.provider!r} does not implement embed_query")
+
+    # --- shared machinery ---------------------------------------------------------------
 
     def _retry_call(
         self,
@@ -463,8 +490,8 @@ class LLMClient:
     ) -> LLMResponse:
         """Shared tail for every generation path: emit the uniform `call ...` envelope
         (when `ctx` is set), accumulate the call into this client's `usage` tracker, and
-        pack the provider-agnostic token dict (`_usage_tokens` / `_usage_tokens_openrouter`)
-        into an `LLMResponse`. `toks` may omit any key — OpenRouter's dict has no
+        pack the provider-agnostic token dict (`_usage_tokens_chat`) into an
+        `LLMResponse`. `toks` may omit any key — the chat dict has no
         `thinking_tokens`, hence the `.get`s. The single chokepoint every call path funnels
         through, so usage accounting lives here once rather than at each public method."""
         if ctx is not None:
@@ -514,263 +541,6 @@ class LLMClient:
         if lim is not None:
             lim.settle((input_tokens or 0) - est)
 
-    def embed(
-        self,
-        texts: list[str],
-        *,
-        task_type: str = "CLUSTERING",
-        dim: int = 768,
-        model: str = "gemini-embedding-001",
-        batch_size: int = 100,
-    ) -> list[list[float]]:
-        """Batched embedding — build-time / offline corpus-prep only (the query
-        path is embedding-free). Output is L2-unnormalized; callers normalize
-        before cosine. Chunked at `batch_size` (endpoint caps at 100/request).
-        No retries / no rate limiter — one-shot build call."""
-        if not texts:
-            return []
-        client = self._get_gemini_client()
-        cfg = types.EmbedContentConfig(
-            task_type=task_type, output_dimensionality=dim,
-        )
-        out: list[list[float]] = []
-        for start in range(0, len(texts), batch_size):
-            chunk = texts[start:start + batch_size]
-            resp = client.models.embed_content(
-                model=model, contents=chunk, config=cfg,  # type: ignore[arg-type]
-            )
-            if not resp.embeddings:
-                raise RuntimeError(f"embed model {model!r} returned no embeddings for {len(chunk)} inputs")
-            vecs = [list(e.values or ()) for e in resp.embeddings]
-            if len(vecs) != len(chunk):
-                raise RuntimeError(
-                    f"embed model {model!r} returned {len(vecs)} vectors "
-                    f"for {len(chunk)} inputs; model likely requires batch_size=1"
-                )
-            out.extend(vecs)
-        return out
-
-    # --- Query-time embedding (provider="openrouter" | "local"), usage-tracked --------
-
-    def _get_local_embedder(self, model: str) -> Any:
-        """Lazily build (and cache) a local SentenceTransformers model. `sentence-
-        transformers` is an optional extra (`pip install skunk[embeddings]`); the import
-        is deferred so a run that only uses API-backed embeddings never pays it."""
-        st = _LOCAL_EMBEDDERS.get(model)
-        if st is None:
-            with _LOCAL_EMBEDDERS_LOCK:
-                st = _LOCAL_EMBEDDERS.get(model)  # re-check: another thread may have loaded it
-                if st is None:
-                    try:
-                        import torch
-                        from sentence_transformers import SentenceTransformer
-                    except ImportError as e:
-                        raise ImportError(
-                            "local embeddings need the `embeddings` extra: "
-                            "pip install 'skunk[embeddings]'"
-                        ) from e
-
-                    st = SentenceTransformer(model)
-                    # The Qwen3-Embedding checkpoints declare torch_dtype=bfloat16, so weights
-                    # load as bf16. CPU matmul cannot mix bf16 weights with the fp32 activations
-                    # the forward pass produces ("RuntimeError: expected m1 and m2 to have the
-                    # same dtype, but got: c10::BFloat16 != float"), which silently zeroes out
-                    # query embeddings and tanks retrieval. Force fp32 on CPU; on CUDA bf16 is
-                    # supported and faster, so leave it.
-                    if not torch.cuda.is_available():
-                        st = st.float()
-                    _LOCAL_EMBEDDERS[model] = st
-        return st
-
-    def embed_query(
-        self,
-        text: str,
-        *,
-        model: str | None = None,
-        provider: str | None = None,
-        ctx: ExecutionContext | None = None,
-    ) -> list[float]:
-        """Embed a single query string for vector search, routing through the same
-        rate-limit / retry / usage-accounting scaffolding as generation so embedding
-        spend lands on this client's `usage` tracker (tokens, cost, calls).
-
-        Backends (per `config.emb_provider`, overridable via `provider`):
-          - "openrouter": the OpenRouter embeddings endpoint (e.g. Qwen3-Embedding-8B).
-            Token count is the provider-reported `usage.prompt_tokens`.
-          - "local": a local SentenceTransformers model (e.g. Qwen3-Embedding-0.6B),
-            L2-normalized to match how the corpus vectors were built. No token count is
-            reported, so it is estimated at ~4 chars/token (bills only; paces nothing).
-
-        When `ctx` is given, emits the uniform `call ...` envelope (so the embed call's
-        latency shows in the per-question trace like every LLM call); usage is recorded
-        regardless of `ctx`."""
-        model = model or self._config.emb_model_id
-        provider = provider or self._config.emb_provider
-        m = model
-
-        def attempt() -> list[float]:
-            t0 = time.monotonic()
-            if provider == "local":
-                st = self._get_local_embedder(m)
-                vec = st.encode([text], normalize_embeddings=True)[0]
-                vector = [float(x) for x in vec]
-                in_tok = max(1, len(text) // 4)  # no provider token count; estimate.
-            else:
-                resp = self._get_openrouter_client().embeddings.generate(input=text, model=m)
-                data = getattr(resp, "data", None) or []
-                vector = list(data[0].embedding) if data and data[0].embedding else []
-                if not vector:
-                    raise EmptyEmbeddingError(
-                        f"openrouter empty embedding (model={m} provider={provider})"
-                    )
-                usage = getattr(resp, "usage", None)
-                in_tok = (getattr(usage, "prompt_tokens", None) or 0) if usage else 0
-            latency_s = time.monotonic() - t0
-            self.usage.add_embed(m, in_tok)
-            if ctx is not None:
-                cost = self.usage.price_embed(m, in_tok)
-                ctx.emit(
-                    f"call call_site=embed model={m} provider={provider} "
-                    f"latency_s={round(latency_s, 3)} in_tok={in_tok} dim={len(vector)}",
-                    kind="call",
-                    data=None if cost is None else {"cost": cost},
-                )
-            return vector
-
-        # Embeddings share one process-wide "embed" rate bucket across all workers
-        # (separate from the per-model generation buckets).
-        return self._retry_call(attempt, provider, model, bucket="embed", ctx=ctx)
-
-    @staticmethod
-    def _gemini_parts(user: str, images: list[B64Image] | None) -> list[Any]:
-        parts: list[Any] = []
-        if images:
-            for img in images:
-                parts.append(
-                    types.Part.from_bytes(data=base64.b64decode(img.data), mime_type=img.mime)
-                )
-        parts.append(types.Part.from_text(text=user))
-        return parts
-
-    @staticmethod
-    def _effort_to_thinking_config(effort: Effort, model: str) -> "types.ThinkingConfig":
-        # ThinkingLevel is the only knob that hard-caps thinking spend for Gemini 3
-        # (the legacy thinking_budget int is soft-bucketed).
-        if _requires_thinking(model):
-            # Gemini 3.x Pro: thinking is mandatory AND MINIMAL is unsupported, so
-            # "off"/"minimal" floor at LOW (the cheapest tier this model accepts).
-            level_map = {
-                "off": types.ThinkingLevel.LOW,
-                "minimal": types.ThinkingLevel.LOW,
-                "low": types.ThinkingLevel.LOW,
-                "medium": types.ThinkingLevel.MEDIUM,
-                "high": types.ThinkingLevel.HIGH,
-            }
-            return types.ThinkingConfig(thinking_level=level_map[effort])
-        if effort == "off":
-            return types.ThinkingConfig(thinking_budget=0)
-        level_map = {
-            "minimal": types.ThinkingLevel.MINIMAL,
-            "low": types.ThinkingLevel.LOW,
-            "medium": types.ThinkingLevel.MEDIUM,
-            "high": types.ThinkingLevel.HIGH,
-        }
-        return types.ThinkingConfig(thinking_level=level_map[effort])
-
-    @staticmethod
-    def _gemini_config(
-        system: str,
-        temperature: float,
-        effort: Effort,
-        model: str,
-        max_output_tokens: int = 65535,
-        timeout_s: float | None = None,
-    ) -> types.GenerateContentConfig:
-        # NOTE: on Gemini 3.x `max_output_tokens` is a COMBINED budget for thinking
-        # + visible tokens, so it must stay comfortably above the effort tier's
-        # thinking spend (medium ≈ 2.5K, high ≈ 16K thinking tokens) or the visible
-        # answer is starved to empty (finish_reason=MAX_TOKENS). `timeout_s` sets the
-        # SDK's per-read HTTP timeout; the streaming path additionally enforces a
-        # hard wall-clock cap via asyncio.wait_for.
-        http_options = (
-            types.HttpOptions(timeout=int(timeout_s * 1000)) if timeout_s is not None else None
-        )
-        return types.GenerateContentConfig(
-            system_instruction=system,
-            max_output_tokens=max_output_tokens,
-            temperature=temperature,
-            thinking_config=LLMClient._effort_to_thinking_config(effort, model),
-            http_options=http_options,
-        )
-
-    @staticmethod
-    def _usage_tokens(usage: Any) -> dict:
-        """Token counts from a Gemini `usage_metadata` (best-effort — any may be
-        None, e.g. when streaming omits usage)."""
-        return {
-            "input_tokens": getattr(usage, "prompt_token_count", None),
-            "output_tokens": getattr(usage, "candidates_token_count", None),
-            "total_tokens": getattr(usage, "total_token_count", None),
-            "thinking_tokens": getattr(usage, "thoughts_token_count", None),
-            "cache_input_tokens": getattr(usage, "cached_content_token_count", None),
-        }
-
-    @staticmethod
-    def _gemini_model_id(model: str) -> str:
-        """Bare Gemini model id for the AI Studio SDK. Full OpenRouter-style ids
-        (`google/gemini-...`) drop the prefix — consistently, on EVERY genai path
-        (call/acall/astream), so a config written for one provider degrades sanely
-        on the other."""
-        return model.removeprefix("google/")
-
-    def _gemini_call(self, spec: CallSpec) -> LLMResponse:
-        """One Gemini call (no retry — the retry loop owns that)."""
-        client = self._get_gemini_client()
-        parts = self._gemini_parts(spec.user, spec.images)
-        model_id = self._gemini_model_id(spec.model)
-        gen_config = self._gemini_config(
-            spec.system, spec.temperature, spec.effort, model_id
-        )
-        t0 = time.monotonic()
-        api_resp = client.models.generate_content(
-            model=model_id, contents=parts, config=gen_config,
-        )
-        latency_s = time.monotonic() - t0
-        output_text = (api_resp.text or "").strip()
-        toks = self._usage_tokens(api_resp.usage_metadata)
-        return self._finish(spec, output_text, toks, latency_s, model_id)
-
-    async def _gemini_acall(self, spec: CallSpec) -> LLMResponse:
-        """Async twin of `_gemini_call` — uses `client.aio.models.generate_content`."""
-        client = self._get_gemini_client()
-        parts = self._gemini_parts(spec.user, spec.images)
-        model_id = self._gemini_model_id(spec.model)
-        gen_config = self._gemini_config(
-            spec.system, spec.temperature, spec.effort, model_id,
-            spec.max_output_tokens if spec.max_output_tokens is not None else 65535,
-            spec.timeout_s,
-        )
-        # TPM throttle (opt-in via SKUNK_MODEL_TPM): meter input tokens so
-        # throughput stays under quota, separate from the RPM limiter. Per attempt
-        # (the retry loop re-invokes this body), so each retry re-charges.
-        # `_tpm_settle` corrects the estimate post-call.
-        tpm_lim, est = await self._tpm_acquire(model_id, spec.system, spec.user)
-        t0 = time.monotonic()
-        # Hard wall-clock cap mirroring the streaming path: the http_options
-        # timeout in `gen_config` bounds reads, wait_for bounds the whole call.
-        coro = client.aio.models.generate_content(
-            model=model_id, contents=parts, config=gen_config,
-        )
-        if spec.timeout_s is not None:
-            api_resp = await asyncio.wait_for(coro, spec.timeout_s)
-        else:
-            api_resp = await coro
-        latency_s = time.monotonic() - t0
-        output_text = (api_resp.text or "").strip()
-        toks = self._usage_tokens(api_resp.usage_metadata)
-        self._tpm_settle(tpm_lim, est, toks["input_tokens"])
-        return self._finish(spec, output_text, toks, latency_s, model_id)
-
     def _finish(
         self, spec: CallSpec, text: str, toks: dict, latency_s: float, model_id: str
     ) -> LLMResponse:
@@ -782,122 +552,17 @@ class LLMClient:
             ctx=spec.ctx, call_site=spec.call_site,
         )
 
-    async def astream(
-        self,
-        *,
-        system: str,
-        messages: list[dict],
-        model: str | None = None,
-        should_stop: Callable[[str], bool] | None = None,
-        temperature: float = 0.0,
-        effort: Effort = "off",
-        ctx: ExecutionContext | None = None,
-        call_site: str = "llm",
-        max_output_tokens: int | None = None,
-        timeout_s: float | None = None,
-    ) -> LLMResponse:
-        """Multi-turn streaming call, accumulating chunks until `should_stop(acc)`
-        or the stream ends. `messages` are the {role, content} turns after the
-        system message ('assistant' → model role, else user). Lets multi-turn
-        agents share this client's rate-limit + retry + logging; the event loop
-        runs other tasks between chunks.
 
-        `max_output_tokens` overrides the per-call output cap (None → provider
-        default); `timeout_s` enforces a hard per-request wall-clock cap. Both are
-        opt-in and currently used only by the search agent (see `MultiTurnAgent`)."""
-        spec = CallSpec(
-            system=system, messages=tuple(messages), temperature=temperature,
-            effort=effort, ctx=ctx, call_site=call_site, should_stop=should_stop,
-            model=model or self._config.llm_model,
-            max_output_tokens=max_output_tokens, timeout_s=timeout_s,
-        )
-        impl = (
-            self._openrouter_astream
-            if self._config.llm_provider == "openrouter"
-            else self._gemini_astream
-        )
-        return await self._aretry_call(
-            lambda: impl(spec), self._config.llm_provider, spec.model, ctx=spec.ctx
-        )
-
-    async def _gemini_astream(self, spec: CallSpec) -> LLMResponse:
-        client = self._get_gemini_client()
-        model_id = self._gemini_model_id(spec.model)
-        contents = [
-            types.Content(
-                role="model" if m["role"] == "assistant" else "user",
-                parts=self._gemini_parts(m["content"], m.get("images")),
-            )
-            for m in spec.messages or ()
-        ]
-        gen_config = self._gemini_config(
-            spec.system, spec.temperature, spec.effort, model_id,
-            spec.max_output_tokens if spec.max_output_tokens is not None else 65535,
-            spec.timeout_s,
-        )
-        should_stop = spec.should_stop
-
-        async def _consume() -> tuple[str, Any]:
-            resp_stream = await client.aio.models.generate_content_stream(
-                model=model_id, contents=contents, config=gen_config,  # type: ignore[arg-type]
-            )
-            accumulated = ""
-            stopped_text: str | None = None
-            usage = None
-            try:
-                async for chunk in resp_stream:
-                    accumulated += chunk.text or ""
-                    usage = getattr(chunk, "usage_metadata", None) or usage
-                    # Keep draining past `should_stop` so the final usage_metadata is
-                    # captured (parity with the openrouter path); record the cut point
-                    # for the returned text. Bounded by max_output_tokens + timeout.
-                    if stopped_text is None and should_stop is not None and should_stop(accumulated):
-                        stopped_text = accumulated
-            finally:
-                # Runs on normal completion AND on wait_for cancellation, so a
-                # timed-out stream still releases its connection.
-                aclose = getattr(resp_stream, "aclose", None)
-                if aclose is not None:
-                    try:  # noqa: SIM105
-                        await aclose()
-                    except Exception:
-                        pass
-            return (accumulated if stopped_text is None else stopped_text), usage
-
-        t0 = time.monotonic()
-        if spec.timeout_s is not None:
-            # Hard wall-clock cap: http_options.timeout is only per-read, so a
-            # slow-but-steady runaway would never trip it. On timeout this raises
-            # TimeoutError, which `_is_retryable` treats as a transient fault.
-            accumulated, usage = await asyncio.wait_for(_consume(), spec.timeout_s)
-        else:
-            accumulated, usage = await _consume()
-        latency_s = time.monotonic() - t0
-        if usage is None:
-            _warn(
-                spec.ctx,
-                f"stream_no_usage cost undercounted (call_site={spec.call_site} model={model_id})",
-            )
-        toks = self._usage_tokens(usage)
-        return self._finish(spec, accumulated, toks, latency_s, model_id)
-
-    # --- OpenRouter generation path (provider="openrouter") ---
-    # Mirrors the Gemini helpers above: same _retry_call shape and shared `_build_response`
-    # tail (ctx.emit envelope + LLMResponse), so the rate-limit/retry/logging is shared.
+class _OpenAIChatBackend(_LLMBackend):
+    """Shared shaping for the two OpenAI-chat-flavored backends (OpenRouter and vLLM):
+    message construction, response/chunk text extraction, token-dict packing, and the
+    empty-completion check. All extraction is `getattr`-based, so it works identically
+    on the `openrouter` SDK's and the `openai` SDK's typed response objects."""
 
     @staticmethod
-    def _effort_to_reasoning(effort: Effort) -> dict:
-        """Map our Effort tier onto OpenRouter's `reasoning` arg. "off" maps to the
-        lowest tier ("minimal") rather than disabling reasoning outright, since some
-        endpoints (e.g. Gemini 3) mandate reasoning and reject `effort=none` with a
-        400. The rest pass straight through (OpenRouter's `effort` accepts
-        minimal/low/medium/high). Models without reasoning ignore it."""
-        return {"effort": "minimal" if effort == "off" else effort}
-
-    @staticmethod
-    def _openrouter_content(user: str, images: list[B64Image] | None) -> Any:
+    def _content(user: str, images: list[B64Image] | None) -> Any:
         """User-turn content: a plain string, or OpenAI-style content parts when
-        images are attached (base64 `data:` URLs), mirroring `_gemini_parts`."""
+        images are attached (base64 `data:` URLs)."""
         if not images:
             return user
         parts: list[dict] = [
@@ -908,7 +573,7 @@ class LLMClient:
         return parts
 
     @staticmethod
-    def _openrouter_text(resp: Any) -> str:
+    def _text(resp: Any) -> str:
         choices = getattr(resp, "choices", None) or []
         if not choices:
             return ""
@@ -916,12 +581,102 @@ class LLMClient:
         return getattr(msg, "content", None) or ""
 
     @staticmethod
-    def _openrouter_finish_reason(resp: Any) -> str | None:
+    def _finish_reason(resp: Any) -> str | None:
         """First choice's `finish_reason` (e.g. 'stop' / 'length' / 'content_filter' /
         'error'), or None when there are no choices — surfaced in EmptyCompletionError so
         an empty completion's cause is visible in the retry-warning log."""
         choices = getattr(resp, "choices", None) or []
         return getattr(choices[0], "finish_reason", None) if choices else None
+
+    @staticmethod
+    def _usage_tokens_chat(usage: Any) -> dict:
+        """Token counts from an OpenAI-style chat `usage` (best-effort — any may be None;
+        vLLM reports `prompt_tokens_details.cached_tokens` only with prefix caching on)."""
+        details = getattr(usage, "prompt_tokens_details", None)
+        return {
+            "input_tokens": getattr(usage, "prompt_tokens", None),
+            "output_tokens": getattr(usage, "completion_tokens", None),
+            "total_tokens": getattr(usage, "total_tokens", None),
+            "cache_input_tokens": getattr(details, "cached_tokens", None) if details else None,
+        }
+
+    def _single_messages(self, spec: CallSpec) -> list[dict]:
+        """Single-shot messages in OpenAI chat format: leading system (if any) + the
+        one user turn (with any images) — shared by the sync and async bodies."""
+        messages: list[dict] = []
+        if spec.system:
+            messages.append({"role": "system", "content": spec.system})
+        messages.append(
+            {"role": "user", "content": self._content(spec.user, spec.images)}
+        )
+        return messages
+
+    @staticmethod
+    def _chat_messages(system: str, messages: list[dict]) -> list[dict]:
+        """Multi-turn messages in OpenAI chat format: a leading system message (if any)
+        then the {role, content} turns ('assistant' → assistant, else user)."""
+        out: list[dict] = []
+        if system:
+            out.append({"role": "system", "content": system})
+        out.extend(
+            {
+                "role": "assistant" if m["role"] == "assistant" else "user",
+                "content": _OpenAIChatBackend._content(m["content"], m.get("images")),
+            }
+            for m in messages
+        )
+        return out
+
+    @staticmethod
+    def _chunk_text(chunk: Any) -> str:
+        text = ""
+        for choice in getattr(chunk, "choices", None) or []:
+            delta = getattr(choice, "delta", None)
+            text += getattr(delta, "content", None) or ""
+        return text
+
+    def _checked_text(self, resp: Any, spec: CallSpec) -> str:
+        """The completion text, or `EmptyCompletionError` (with the provider's diagnostic
+        suffix — see `_empty_detail`) when it came back empty — shared by the sync and
+        async bodies."""
+        output_text = self._text(resp).strip()
+        if not output_text:
+            raise EmptyCompletionError(
+                f"{self.provider} empty content (model={spec.model} call_site={spec.call_site} "
+                f"finish_reason={self._finish_reason(resp)}{self._empty_detail(resp)})"
+            )
+        return output_text
+
+    def _empty_detail(self, resp: Any) -> str:
+        """Provider-specific diagnostic suffix for an empty completion ("" by default)."""
+        return ""
+
+
+class _OpenRouterBackend(_OpenAIChatBackend):
+    """OpenRouter generation + embeddings (`provider=openrouter`), via the `openrouter`
+    SDK. Owns the OpenRouter-only concepts: per-call provider-order pinning, the
+    effort→reasoning mapping, and the raw-body / error-metadata diagnostics."""
+
+    provider = "openrouter"
+
+    def __init__(self, config: SystemConfig, usage: UsageTracker, api_key: str | None = None) -> None:
+        super().__init__(config, usage)
+        self._api_key = api_key
+        self._client: OpenRouter | None = None
+
+    def _get_client(self) -> OpenRouter:
+        if self._client is None:
+            self._client = _make_openrouter_client(self._api_key)
+        return self._client
+
+    @staticmethod
+    def _effort_to_reasoning(effort: Effort) -> dict:
+        """Map our Effort tier onto OpenRouter's `reasoning` arg. "off" maps to the
+        lowest tier ("minimal") rather than disabling reasoning outright, since some
+        endpoints (e.g. Gemini 3) mandate reasoning and reject `effort=none` with a
+        400. The rest pass straight through (OpenRouter's `effort` accepts
+        minimal/low/medium/high). Models without reasoning ignore it."""
+        return {"effort": "minimal" if effort == "off" else effort}
 
     @staticmethod
     def _openrouter_error_detail(resp: Any) -> str:
@@ -963,41 +718,10 @@ class LLMClient:
             parts.append(f"resolved_model={resolved}")
         return (" no_error_body (" + " ".join(parts) + ")") if parts else ""
 
-    @staticmethod
-    def _usage_tokens_openrouter(usage: Any) -> dict:
-        """Token counts from an OpenRouter `ChatUsage` (best-effort — any may be None)."""
-        details = getattr(usage, "prompt_tokens_details", None)
-        return {
-            "input_tokens": getattr(usage, "prompt_tokens", None),
-            "output_tokens": getattr(usage, "completion_tokens", None),
-            "total_tokens": getattr(usage, "total_tokens", None),
-            "cache_input_tokens": getattr(details, "cached_tokens", None) if details else None,
-        }
+    def _empty_detail(self, resp: Any) -> str:
+        return self._openrouter_error_detail(resp) + _raw_body_suffix()
 
-    def _openrouter_single_messages(self, spec: CallSpec) -> list[dict]:
-        """Single-shot messages in OpenRouter format: leading system (if any) + the
-        one user turn (with any images) — shared by the sync and async bodies."""
-        messages: list[dict] = []
-        if spec.system:
-            messages.append({"role": "system", "content": spec.system})
-        messages.append(
-            {"role": "user", "content": self._openrouter_content(spec.user, spec.images)}
-        )
-        return messages
-
-    def _openrouter_checked_text(self, resp: Any, spec: CallSpec) -> str:
-        """The completion text, or `EmptyCompletionError` (with the full diagnostic
-        suffix chain) when it came back empty — shared by the sync and async bodies."""
-        output_text = self._openrouter_text(resp).strip()
-        if not output_text:
-            raise EmptyCompletionError(
-                f"openrouter empty content (model={spec.model} call_site={spec.call_site} "
-                f"finish_reason={self._openrouter_finish_reason(resp)}"
-                f"{self._openrouter_error_detail(resp)}){_raw_body_suffix()}"
-            )
-        return output_text
-
-    def _openrouter_provider_kwarg(self, spec: "CallSpec | None" = None) -> dict:
+    def _provider_kwarg(self, spec: "CallSpec | None" = None) -> dict:
         """`{"provider": {...}}` pinning generation to a provider order (no fallback), or `{}` when
         unset. A per-call `spec.provider_order` wins over the client-wide `config.llm_provider_order`,
         so one model (e.g. a cheaper semantic-filter judge) can be routed to specific providers while
@@ -1008,35 +732,38 @@ class LLMClient:
             return {}
         return {"provider": {"order": list(order), "allow_fallbacks": False}}
 
-    def _openrouter_call(self, spec: CallSpec) -> LLMResponse:
+    def _gen_call(self, spec: CallSpec) -> LLMResponse:
         """One OpenRouter chat call (no retry — the retry loop owns that)."""
-        client = self._get_openrouter_client()
-        messages = self._openrouter_single_messages(spec)
+        client = self._get_client()
+        messages = self._single_messages(spec)
         reasoning = self._effort_to_reasoning(spec.effort)
         t0 = time.monotonic()
         resp = client.chat.send(
             model=spec.model, messages=messages, stream=False, # type: ignore
             temperature=spec.temperature, reasoning=reasoning, # type: ignore
-            **self._openrouter_provider_kwarg(spec),
+            **self._provider_kwarg(spec),
         )
         latency_s = time.monotonic() - t0
-        output_text = self._openrouter_checked_text(resp, spec)
-        toks = self._usage_tokens_openrouter(getattr(resp, "usage", None))
+        output_text = self._checked_text(resp, spec)
+        toks = self._usage_tokens_chat(getattr(resp, "usage", None))
         return self._finish(spec, output_text, toks, latency_s, spec.model)
 
-    async def _openrouter_acall(self, spec: CallSpec) -> LLMResponse:
-        """Async twin of `_openrouter_call` — uses `client.chat.send_async`."""
-        client = self._get_openrouter_client()
-        messages = self._openrouter_single_messages(spec)
+    async def _gen_acall(self, spec: CallSpec) -> LLMResponse:
+        """Async twin of `_gen_call` — uses `client.chat.send_async`."""
+        client = self._get_client()
+        messages = self._single_messages(spec)
         reasoning = self._effort_to_reasoning(spec.effort)
-        # TPM throttle (opt-in via SKUNK_MODEL_TPM) — identical to the Gemini path.
+        # TPM throttle (opt-in via SKUNK_MODEL_TPM): meter input tokens so throughput
+        # stays under quota, separate from the RPM limiter. Per attempt (the retry loop
+        # re-invokes this body), so each retry re-charges. `_tpm_settle` corrects the
+        # estimate post-call.
         tpm_lim, est = await self._tpm_acquire(spec.model, spec.system, spec.user)
         extra = (
             {"max_tokens": spec.max_output_tokens}
             if spec.max_output_tokens is not None
             else {}
         )
-        extra.update(self._openrouter_provider_kwarg(spec))
+        extra.update(self._provider_kwarg(spec))
         t0 = time.monotonic()
         coro = client.chat.send_async(
             model=spec.model, messages=messages, stream=False, # type: ignore
@@ -1046,46 +773,22 @@ class LLMClient:
             asyncio.wait_for(coro, spec.timeout_s) if spec.timeout_s is not None else coro
         )
         latency_s = time.monotonic() - t0
-        output_text = self._openrouter_checked_text(resp, spec)
-        toks = self._usage_tokens_openrouter(getattr(resp, "usage", None))
+        output_text = self._checked_text(resp, spec)
+        toks = self._usage_tokens_chat(getattr(resp, "usage", None))
         self._tpm_settle(tpm_lim, est, toks["input_tokens"])
         return self._finish(spec, output_text, toks, latency_s, spec.model)
 
-    @staticmethod
-    def _openrouter_chat_messages(system: str, messages: list[dict]) -> list[dict]:
-        """Multi-turn messages in OpenRouter format: a leading system message (if any)
-        then the {role, content} turns ('assistant' → assistant, else user)."""
-        out: list[dict] = []
-        if system:
-            out.append({"role": "system", "content": system})
-        out.extend(
-            {
-                "role": "assistant" if m["role"] == "assistant" else "user",
-                "content": LLMClient._openrouter_content(m["content"], m.get("images")),
-            }
-            for m in messages
-        )
-        return out
-
-    @staticmethod
-    def _openrouter_chunk_text(chunk: Any) -> str:
-        text = ""
-        for choice in getattr(chunk, "choices", None) or []:
-            delta = getattr(choice, "delta", None)
-            text += getattr(delta, "content", None) or ""
-        return text
-
-    async def _openrouter_astream(self, spec: CallSpec) -> LLMResponse:
+    async def _gen_astream(self, spec: CallSpec) -> LLMResponse:
         """OpenRouter streaming body for `astream` — `client.chat.send_async` + `async for`."""
-        client = self._get_openrouter_client()
-        or_messages = self._openrouter_chat_messages(spec.system, list(spec.messages or ()))
+        client = self._get_client()
+        or_messages = self._chat_messages(spec.system, list(spec.messages or ()))
         reasoning = self._effort_to_reasoning(spec.effort)
         extra = (
             {"max_tokens": spec.max_output_tokens}
             if spec.max_output_tokens is not None
             else {}
         )
-        extra.update(self._openrouter_provider_kwarg(spec))
+        extra.update(self._provider_kwarg(spec))
         should_stop = spec.should_stop
 
         async def _consume() -> tuple[str, Any]:
@@ -1097,7 +800,7 @@ class LLMClient:
                 temperature=spec.temperature, reasoning=reasoning, **extra, # type: ignore
             ) as resp_stream:
                 async for chunk in resp_stream:
-                    accumulated += self._openrouter_chunk_text(chunk)
+                    accumulated += self._chunk_text(chunk)
                     usage = getattr(chunk, "usage", None) or usage
                     # OpenRouter sends the usage chunk LAST, so we must drain the stream
                     # to capture cost stats — breaking at `should_stop` drops them
@@ -1120,5 +823,308 @@ class LLMClient:
                 spec.ctx,
                 f"stream_no_usage cost undercounted (call_site={spec.call_site} model={spec.model})",
             )
-        toks = self._usage_tokens_openrouter(usage)
+        toks = self._usage_tokens_chat(usage)
         return self._finish(spec, accumulated, toks, latency_s, spec.model)
+
+    def _embed_once(self, model: str, text: str) -> tuple[list[float], int]:
+        """One OpenRouter embeddings call (e.g. Qwen3-Embedding-8B). Token count is the
+        provider-reported `usage.prompt_tokens`."""
+        resp = self._get_client().embeddings.generate(input=text, model=model)
+        data = getattr(resp, "data", None) or []
+        vector = list(data[0].embedding) if data and data[0].embedding else []
+        if not vector:
+            raise EmptyEmbeddingError(f"openrouter empty embedding (model={model})")
+        usage = getattr(resp, "usage", None)
+        in_tok = (getattr(usage, "prompt_tokens", None) or 0) if usage else 0
+        return vector, in_tok
+
+
+class _VLLMBackend(_OpenAIChatBackend):
+    """Local vLLM servers speaking the OpenAI API (`provider=vllm`), via the `openai`
+    SDK. vLLM serves ONE model per server process, so the base URL is resolved per
+    model from `config.vllm_base_urls` (launch servers with qatfd's
+    `scripts/run_vllm_servers.sh`, whose `--served-model-name` defaults to the model id
+    so the map keys line up). `spec.effort` is deliberately ignored — reasoning control
+    on local models goes through `config.vllm_extra_body` (e.g. `chat_template_kwargs`)
+    — as is `spec.provider_order` (an OpenRouter routing concept with no vLLM
+    analogue). Models routed here cost $0 even when `llm_prices` prices them: the
+    facade registers every `vllm_base_urls` key as a `UsageTracker` free model."""
+
+    provider = "vllm"
+
+    def __init__(self, config: SystemConfig, usage: UsageTracker, api_key: str | None = None) -> None:
+        super().__init__(config, usage)
+        self._api_key = api_key
+
+    def _clients_for(self, model: str) -> tuple[OpenAI, AsyncOpenAI]:
+        base_url = self._config.vllm_base_urls.get(model)
+        if base_url is None:
+            raise RuntimeError(
+                f"model {model!r} routed to vllm but has no vllm_base_urls entry "
+                f"(configured: {sorted(self._config.vllm_base_urls)})"
+            )
+        return _make_vllm_clients(base_url, self._api_key)
+
+    def _request_kwargs(self, spec: CallSpec) -> dict:
+        """Per-call extras beyond (model, messages, temperature): the output cap when
+        set, and `config.vllm_extra_body` merged into the request body (vLLM-specific
+        knobs such as `chat_template_kwargs`)."""
+        kwargs: dict = {}
+        if spec.max_output_tokens is not None:
+            kwargs["max_tokens"] = spec.max_output_tokens
+        if self._config.vllm_extra_body:
+            kwargs["extra_body"] = self._config.vllm_extra_body
+        return kwargs
+
+    def _gen_call(self, spec: CallSpec) -> LLMResponse:
+        """One vLLM chat call (no retry — the retry loop owns that)."""
+        client, _ = self._clients_for(spec.model)
+        messages = self._single_messages(spec)
+        t0 = time.monotonic()
+        resp = client.chat.completions.create(
+            model=spec.model, messages=messages, temperature=spec.temperature, # type: ignore[arg-type]
+            **self._request_kwargs(spec),
+        )
+        latency_s = time.monotonic() - t0
+        output_text = self._checked_text(resp, spec)
+        toks = self._usage_tokens_chat(getattr(resp, "usage", None))
+        return self._finish(spec, output_text, toks, latency_s, spec.model)
+
+    async def _gen_acall(self, spec: CallSpec) -> LLMResponse:
+        """Async twin of `_gen_call`."""
+        _, aclient = self._clients_for(spec.model)
+        messages = self._single_messages(spec)
+        # TPM throttle (opt-in via SKUNK_MODEL_TPM) — identical to the OpenRouter path.
+        tpm_lim, est = await self._tpm_acquire(spec.model, spec.system, spec.user)
+        t0 = time.monotonic()
+        coro = aclient.chat.completions.create(
+            model=spec.model, messages=messages, temperature=spec.temperature, # type: ignore[arg-type]
+            **self._request_kwargs(spec),
+        )
+        resp = await (
+            asyncio.wait_for(coro, spec.timeout_s) if spec.timeout_s is not None else coro
+        )
+        latency_s = time.monotonic() - t0
+        output_text = self._checked_text(resp, spec)
+        toks = self._usage_tokens_chat(getattr(resp, "usage", None))
+        self._tpm_settle(tpm_lim, est, toks["input_tokens"])
+        return self._finish(spec, output_text, toks, latency_s, spec.model)
+
+    async def _gen_astream(self, spec: CallSpec) -> LLMResponse:
+        """vLLM streaming body for `astream`. `stream_options.include_usage` requests
+        the final usage chunk — OpenAI-spec servers omit usage by default when
+        streaming (unlike OpenRouter, which always sends it)."""
+        _, aclient = self._clients_for(spec.model)
+        messages = self._chat_messages(spec.system, list(spec.messages or ()))
+        should_stop = spec.should_stop
+
+        async def _consume() -> tuple[str, Any]:
+            accumulated = ""
+            stopped_text: str | None = None
+            usage = None
+            stream = await aclient.chat.completions.create(
+                model=spec.model, messages=messages, temperature=spec.temperature, # type: ignore[arg-type]
+                stream=True, stream_options={"include_usage": True},
+                **self._request_kwargs(spec),
+            )
+            try:
+                async for chunk in stream:
+                    accumulated += self._chunk_text(chunk)
+                    usage = getattr(chunk, "usage", None) or usage
+                    # The usage chunk arrives LAST (include_usage), so keep draining past
+                    # `should_stop` and record the cut point for the returned text — same
+                    # contract as the OpenRouter streaming body.
+                    if stopped_text is None and should_stop is not None and should_stop(accumulated):
+                        stopped_text = accumulated
+            finally:
+                # Runs on normal completion AND on wait_for cancellation, so a
+                # timed-out stream still releases its connection.
+                try:  # noqa: SIM105
+                    await stream.close()
+                except Exception:
+                    pass
+            return (accumulated if stopped_text is None else stopped_text), usage
+
+        t0 = time.monotonic()
+        if spec.timeout_s is not None:
+            accumulated, usage = await asyncio.wait_for(_consume(), spec.timeout_s)
+        else:
+            accumulated, usage = await _consume()
+        latency_s = time.monotonic() - t0
+        if usage is None:
+            _warn(
+                spec.ctx,
+                f"stream_no_usage cost undercounted (call_site={spec.call_site} model={spec.model})",
+            )
+        toks = self._usage_tokens_chat(usage)
+        return self._finish(spec, accumulated, toks, latency_s, spec.model)
+
+    def _embed_once(self, model: str, text: str) -> tuple[list[float], int]:
+        """One vLLM embeddings call (server started with `--task embed`). Token count is
+        the server-reported `usage.prompt_tokens`."""
+        client, _ = self._clients_for(model)
+        resp = client.embeddings.create(model=model, input=text)
+        data = getattr(resp, "data", None) or []
+        vector = list(data[0].embedding) if data and data[0].embedding else []
+        if not vector:
+            raise EmptyEmbeddingError(f"vllm empty embedding (model={model})")
+        usage = getattr(resp, "usage", None)
+        in_tok = (getattr(usage, "prompt_tokens", None) or 0) if usage else 0
+        return vector, in_tok
+
+
+class LLMClient:
+    """The public LLM client — a facade that routes each call to a provider backend
+    and owns the run's single `UsageTracker`. Generation routes PER CALL: a model
+    listed in `config.vllm_base_urls` goes to the vLLM server that serves it; every
+    other model uses `config.llm_provider` ("openrouter" | "vllm") — so one client can
+    run e.g. the search agent on OpenRouter while the semantic filter judges on a
+    local vLLM model. Embeddings route on `config.emb_provider` the same way. All
+    backends share this client's rate-limit / retry / logging scaffolding and bill
+    into `self.usage`."""
+
+    def __init__(
+        self,
+        config: SystemConfig,
+        *,
+        openrouter_api_key: str | None = None,
+        vllm_api_key: str | None = None,
+    ) -> None:
+        """`openrouter_api_key` / `vllm_api_key` override the environment
+        (`OPENROUTER_API_KEY` / `VLLM_API_KEY`) — the constructor is the seam for
+        callers that manage credentials themselves; env remains the default."""
+        self._config = config
+        self._openrouter_api_key = openrouter_api_key
+        self._vllm_api_key = vllm_api_key
+        self.usage = UsageTracker(
+            default_model=config.llm_model,
+            prices=config.llm_prices,
+            # vLLM-routed models cost $0 regardless of the price table: routing is static
+            # per model id (a `vllm_base_urls` key ALWAYS goes local on this client), so
+            # the map's keys are exactly the models whose tokens were served locally —
+            # and the same id can stay priced for OpenRouter runs of other configs.
+            free_models=set(config.vllm_base_urls),
+        )
+        self._backends: dict[str, _LLMBackend] = {}
+
+    def _backend(self, provider: str) -> _LLMBackend:
+        """The (lazily built, cached) backend for a provider name. All backends share
+        this client's `usage` tracker."""
+        backend = self._backends.get(provider)
+        if backend is None:
+            if provider == "openrouter":
+                backend = _OpenRouterBackend(self._config, self.usage, api_key=self._openrouter_api_key)
+            elif provider == "vllm":
+                backend = _VLLMBackend(self._config, self.usage, api_key=self._vllm_api_key)
+            else:
+                raise ValueError(f"unknown LLM provider {provider!r} (expected 'openrouter' or 'vllm')")
+            self._backends[provider] = backend
+        return backend
+
+    def _backend_for_model(self, model: str) -> _LLMBackend:
+        """Per-call generation routing: a model with a `vllm_base_urls` entry (exact
+        match — keys must equal the server's --served-model-name) goes to vLLM;
+        anything else uses the client-wide `llm_provider`. When `llm_provider` is
+        "vllm", EVERY model must be mapped — an unmapped one fails here, naming the
+        configured keys, rather than deep in an SDK with a connection error."""
+        if model in self._config.vllm_base_urls:
+            return self._backend("vllm")
+        if self._config.llm_provider == "vllm":
+            raise RuntimeError(
+                f"llm_provider=vllm but model {model!r} has no vllm_base_urls entry "
+                f"(configured: {sorted(self._config.vllm_base_urls)})"
+            )
+        return self._backend(self._config.llm_provider)
+
+    def call(
+        self,
+        system: str,
+        user: str,
+        images: list[B64Image] | None = None,
+        temperature: float = 0.0,
+        effort: Effort = "off",
+        ctx: ExecutionContext | None = None,
+        call_site: str = "llm",
+        model: str | None = None,
+        provider_order: list[str] | None = None,
+    ) -> LLMResponse:
+        spec = CallSpec(
+            system=system, user=user, images=images, temperature=temperature,
+            effort=effort, ctx=ctx, call_site=call_site,
+            model=model or self._config.llm_model,
+            provider_order=provider_order,
+        )
+        return self._backend_for_model(spec.model).call(spec)
+
+    async def acall(
+        self,
+        system: str,
+        user: str,
+        images: list[B64Image] | None = None,
+        temperature: float = 0.0,
+        effort: "Effort" = "off",
+        ctx: "ExecutionContext | None" = None,
+        call_site: str = "llm",
+        model: str | None = None,
+        max_output_tokens: int | None = None,
+        timeout_s: float | None = None,
+    ) -> LLMResponse:
+        """Async twin of `call` for the request path. `max_output_tokens` /
+        `timeout_s` mirror `astream`'s caps (None → provider default / no cap)."""
+        spec = CallSpec(
+            system=system, user=user, images=images, temperature=temperature,
+            effort=effort, ctx=ctx, call_site=call_site,
+            model=model or self._config.llm_model,
+            max_output_tokens=max_output_tokens, timeout_s=timeout_s,
+        )
+        return await self._backend_for_model(spec.model).acall(spec)
+
+    async def astream(
+        self,
+        *,
+        system: str,
+        messages: list[dict],
+        model: str | None = None,
+        should_stop: Callable[[str], bool] | None = None,
+        temperature: float = 0.0,
+        effort: Effort = "off",
+        ctx: ExecutionContext | None = None,
+        call_site: str = "llm",
+        max_output_tokens: int | None = None,
+        timeout_s: float | None = None,
+    ) -> LLMResponse:
+        """Multi-turn streaming call, accumulating chunks until `should_stop(acc)`
+        or the stream ends. `messages` are the {role, content} turns after the
+        system message ('assistant' → model role, else user). Lets multi-turn
+        agents share this client's rate-limit + retry + logging; the event loop
+        runs other tasks between chunks.
+
+        `max_output_tokens` overrides the per-call output cap (None → provider
+        default); `timeout_s` enforces a hard per-request wall-clock cap. Both are
+        opt-in and currently used only by the search agent (see `MultiTurnAgent`)."""
+        spec = CallSpec(
+            system=system, messages=tuple(messages), temperature=temperature,
+            effort=effort, ctx=ctx, call_site=call_site, should_stop=should_stop,
+            model=model or self._config.llm_model,
+            max_output_tokens=max_output_tokens, timeout_s=timeout_s,
+        )
+        return await self._backend_for_model(spec.model).astream(spec)
+
+    def embed_query(
+        self,
+        text: str,
+        *,
+        model: str | None = None,
+        provider: str | None = None,
+        ctx: ExecutionContext | None = None,
+    ) -> list[float]:
+        """Embed a single query string for vector search (see `_LLMBackend.embed_query`
+        for the retry/usage envelope).
+
+        Backends (per `config.emb_provider`, overridable via `provider`):
+          - "openrouter": the OpenRouter embeddings endpoint (e.g. Qwen3-Embedding-8B).
+          - "vllm": a local vLLM embedding server (`--task embed`); the base URL comes
+            from `config.vllm_base_urls[model]`, same map as generation."""
+        model = model or self._config.emb_model_id
+        provider = provider or self._config.emb_provider
+        return self._backend(provider).embed_query(text, model=model, ctx=ctx)

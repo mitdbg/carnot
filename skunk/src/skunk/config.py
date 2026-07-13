@@ -21,12 +21,14 @@ if TYPE_CHECKING:
 class SystemConfig:
     # the name of the system
     name: str
-    # the client to use for computing embeddings
-    emb_provider: Literal["openrouter", "local"]
+    # the client to use for computing embeddings ("vllm" resolves the server URL from
+    # `vllm_base_urls[emb_model_id]`)
+    emb_provider: Literal["openrouter", "vllm"]
     # the model to use for computing embeddings
     emb_model_id: str
-    # generation provider for all LLM calls
-    llm_provider: Literal["genai", "openrouter"]
+    # generation provider for every LLM call whose model has no `vllm_base_urls` entry
+    # (routing is per call — see `vllm_base_urls` below)
+    llm_provider: Literal["openrouter", "vllm"]
     # default model for every LLM call — one-shot prompted calls AND agent loops alike.
     # A call resolves its model as `model_overrides.get(call_site_name, llm_model)`; only a
     # per-call-site entry in `model_overrides` (below) overrides it.
@@ -43,7 +45,7 @@ class SystemConfig:
     # USD price table for cost accounting; maps a model-substring -> {"in"/"out"/"cached": $/Mtok}.
     # Lookup is exact-first then substring, a model with no match costs 0.
     llm_prices: dict[str, dict[str, float]]
-    # Optional OpenRouter provider pin (ignored on the genai path): an ordered list of provider
+    # Optional OpenRouter provider pin (ignored on the vllm path): an ordered list of provider
     # slugs (e.g. ["parasail"]). When set, generation is routed only to these providers with no
     # fallback, so a specific provider's prompt-cache / pricing is used deterministically. null =
     # let OpenRouter pick. Resolve slugs from the model's Providers tab (e.g. io.net => "io-net").
@@ -54,6 +56,16 @@ class SystemConfig:
     # so these default empty — but the agent code path requires the attributes to exist.
     effort_overrides: dict[str, "Effort"] = field(default_factory=dict)
     model_overrides: dict[str, str] = field(default_factory=dict)
+    # Per-model vLLM routing: model id -> OpenAI-compatible base URL of the vLLM server that
+    # serves it (e.g. {"Qwen/Qwen3-32B": "http://gpu-box:8100/v1"}). Any generation call whose
+    # resolved model appears here (exact match — keys must equal the server's
+    # --served-model-name) routes to that server; all other models use `llm_provider`. Also
+    # read by `embed_query` when emb_provider="vllm" (keyed by `emb_model_id`).
+    vllm_base_urls: dict[str, str] = field(default_factory=dict)
+    # Optional extra JSON merged into every vLLM chat request body (openai SDK `extra_body`),
+    # e.g. {"chat_template_kwargs": {"enable_thinking": false}} to turn off Qwen3-style
+    # thinking. None = nothing extra. vLLM-only: OpenRouter calls never send it.
+    vllm_extra_body: dict | None = None
 
     @classmethod
     def from_yaml(cls, path: str) -> SystemConfig:
@@ -107,19 +119,18 @@ class SearchAgentConfig(SystemConfig):
 class PipelineConfig(SearchAgentConfig):
     # ---- pipeline defaults for the base's required fields ------------------------
     name: str = "pipeline"
-    # LLM model — bare Gemini names on the "genai" provider, full OpenRouter ids on
-    # "openrouter". (env: SKUNK_LLM_MODEL). Request pacing is a per-model token
+    # LLM model — a full OpenRouter id on "openrouter", the server's --served-model-name
+    # on "vllm". (env: SKUNK_LLM_MODEL). Request pacing is a per-model token
     # bucket (`llm:<model>`), paced from `llm_model_rpm` / `llm_default_rpm` — see
-    # `LLMClient._retry_call`.
-    llm_model: str = "gemini-3.5-flash"
-    # LLM provider backend for all generation calls. "genai" (default) → Google AI
-    # Studio Gemini SDK (needs GEMINI_API_KEY; bare model names). "openrouter" →
-    # OpenRouter chat API (needs OPENROUTER_API_KEY); SKUNK_LLM_MODEL must then be a
-    # full OpenRouter model id (e.g. "google/gemini-2.5-flash",
-    # "qwen/qwen-2.5-72b-instruct"). Only generation is routed; embeddings
-    # (LLMClient.embed / search-agent indexing) stay on their own model-id dispatch.
+    # `_LLMBackend._retry_call`.
+    llm_model: str = "google/gemini-3.5-flash"
+    # Default LLM provider backend. "openrouter" (default) → OpenRouter chat API (needs
+    # OPENROUTER_API_KEY). "vllm" → local vLLM servers; every model must then have a
+    # `vllm_base_urls` entry. A model WITH a `vllm_base_urls` entry routes to vLLM
+    # regardless of this default, so a mixed run (agent on OpenRouter, semantic filter
+    # on a local model) just lists the local models in the map.
     # (env: SKUNK_LLM_PROVIDER)
-    llm_provider: Literal["genai", "openrouter"] = "genai"
+    llm_provider: Literal["openrouter", "vllm"] = "openrouter"
     # Per-call retry: only transient failures (HTTP 429 + 5xx, network timeouts /
     # connection resets) are retried — see `llm_client._is_retryable`; non-429 4xx
     # (bad request, auth, context overflow) raises immediately. Delay doubles each
@@ -135,11 +146,11 @@ class PipelineConfig(SearchAgentConfig):
     # USD price table for cost accounting; empty → every model costs 0.
     llm_prices: dict[str, dict[str, float]] = field(default_factory=dict)
     # Embedding backend for `LLMClient.embed_query` (vector_search): "openrouter" or
-    # "local" (SentenceTransformers, needs the `embeddings` extra).
-    emb_provider: Literal["openrouter", "local"] = "openrouter"
+    # "vllm" (a local embedding server, addressed via `vllm_base_urls[emb_model_id]`).
+    emb_provider: Literal["openrouter", "vllm"] = "openrouter"
     # Embedding model for vector_search (must match the stored embeddings).
     # (env: SKUNK_EMB_MODEL)
-    emb_model_id: str = "gemini-embedding-001"
+    emb_model_id: str = "qwen/qwen3-embedding-8b"
 
     # ---- operator knobs -----------------------------------------------------------
     # Compute operator

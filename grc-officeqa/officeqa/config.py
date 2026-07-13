@@ -102,8 +102,8 @@ class SkunkConfig(PipelineConfig):
             os.environ.get("SKUNK_MODEL_OVERRIDES", "")
         )
         return cls(
-            llm_model=os.environ.get("SKUNK_LLM_MODEL", "gemini-3.5-flash"),
-            llm_provider=os.environ.get("SKUNK_LLM_PROVIDER", "genai"),  # type: ignore[arg-type]
+            llm_model=os.environ.get("SKUNK_LLM_MODEL", "google/gemini-3.5-flash"),
+            llm_provider=os.environ.get("SKUNK_LLM_PROVIDER", "openrouter"),  # type: ignore[arg-type]
             effort_overrides=parse_effort_overrides(
                 os.environ.get("SKUNK_EFFORT_OVERRIDES", "")
             ),
@@ -142,7 +142,7 @@ class SkunkConfig(PipelineConfig):
             ),
             chroma_server_host=os.environ.get("SKUNK_CHROMA_SERVER_HOST", "127.0.0.1"),
             chroma_server_port=int(os.environ.get("SKUNK_CHROMA_SERVER_PORT", "8001")),
-            emb_model_id=os.environ.get("SKUNK_EMB_MODEL", "gemini-embedding-001"),
+            emb_model_id=os.environ.get("SKUNK_EMB_MODEL", "qwen/qwen3-embedding-8b"),
             agent_max_steps=int(os.environ.get("SKUNK_AGENT_MAX_STEPS", "20")),
             agent_max_misfires=int(os.environ.get("SKUNK_AGENT_MAX_MISFIRES", "6")),
             agent_max_pages_per_tool_call=int(

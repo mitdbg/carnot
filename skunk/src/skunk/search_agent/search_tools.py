@@ -171,7 +171,7 @@ class SearchCorpusTool(Tool):
 
     def _embed_query(self, query: str) -> list[float]:
         """Embed `query` with the same model that produced the stored embeddings, via the
-        LLMClient — which owns backend dispatch (OpenRouter / local SentenceTransformers),
+        LLMClient — which owns backend dispatch (OpenRouter / vLLM),
         the process-wide "embed" rate bucket, retry, and usage accounting."""
         return self._llm_client.embed_query(query, model=self._emb_model_id, ctx=self._ctx)
 

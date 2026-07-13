@@ -60,18 +60,27 @@ venv/bin/ruff check src/ tests/     # lint (clean at HEAD)
 ## Setup (.env at repo root)
 
 LLM generation defaults to **OpenRouter** (`SKUNK_LLM_PROVIDER=openrouter`,
-authenticated by `OPENROUTER_API_KEY`) — we no longer have an AI Studio Gemini key, so
-the legacy `genai` path is unavailable. In OpenRouter mode `SKUNK_LLM_MODEL` and every
+authenticated by `OPENROUTER_API_KEY`). In OpenRouter mode `SKUNK_LLM_MODEL` and every
 model override must be **full OpenRouter ids**, e.g. `google/gemini-2.5-flash`.
 Copy `.env.example` → `.env`. Transient errors (429 / 5xx / transport blips) are
-retried with exponential backoff (`llm_client._retry_call`). NOTE: OpenRouter wraps an
+retried with exponential backoff (`_LLMBackend._retry_call`). NOTE: OpenRouter wraps an
 upstream provider failure as a 4xx `...ResponseError: Provider returned error`, which is
 *not* retried — `llm_client._error_detail` logs the status + provider metadata + raw body
 alongside the warning so these are diagnosable.
 
-The legacy **AI Studio Gemini** path (`SKUNK_LLM_PROVIDER=genai`, `GEMINI_API_KEY`, bare
-model ids like `gemini-3.5-flash`) still exists in code but is dormant until a key is
-restored.
+The second provider is **vLLM** (`provider=vllm`, the `openai` SDK against local
+OpenAI-compatible servers). Routing is PER CALL through one `LLMClient`: any model with a
+`SystemConfig.vllm_base_urls` entry (model id → server base URL; keys must equal the
+server's `--served-model-name`) goes to its vLLM server, every other model uses
+`llm_provider` — so a run can keep its judge on OpenRouter while the agent and/or the
+semantic filter run locally. `emb_provider=vllm` serves embeddings the same way (URL from
+`vllm_base_urls[emb_model_id]`). vLLM-routed models cost $0 regardless of `llm_prices`
+(the map's keys are registered as `UsageTracker` free models, so a model priced for
+OpenRouter runs stays free when served locally); `VLLM_API_KEY` is only needed for
+servers started with `--api-key`. qatfd's
+`scripts/run_vllm_servers.sh` launches one server per model and prints the config map.
+The legacy `genai` (AI Studio Gemini) provider and the sentence-transformers `local`
+embedding backend were REMOVED with this split (2026-07); git history has them.
 
 ## Pointers
 

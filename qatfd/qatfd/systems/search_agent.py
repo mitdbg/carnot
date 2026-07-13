@@ -76,7 +76,7 @@ class SearchAgentSystem(RetrieveComputeSystem):
             chroma_collection=resources.chroma_collection,
             # Reuse this question's LLMClient so the agent's search-tool embeddings are
             # billed onto the same usage tracker as its LLM calls; backend dispatch
-            # (openrouter / local) is read from config.emb_provider by the client.
+            # (openrouter / vllm) is read from config.emb_provider by the client.
             llm_client=ctx.llm_client,
             emb_model_id=self.config.emb_model_id,
             extra_tools=self._extra_tools(ctx, resources),

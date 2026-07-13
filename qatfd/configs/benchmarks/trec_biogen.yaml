@@ -5,7 +5,8 @@
 # queries with the SAME 0.6B model, e.g.:
 #   python3 -m qatfd.runner benchmarks=trec_biogen systems=search_agent \
 #       experiments.split=test systems.emb_model_id=qwen/qwen3-embedding-0.6b
-#   # (local backend: systems.emb_provider=local systems.emb_model_id=Qwen/Qwen3-Embedding-0.6B)
+#   # (vLLM backend: systems.emb_provider=vllm systems.emb_model_id=Qwen/Qwen3-Embedding-0.6B
+#   #  plus a vllm_base_urls entry for it — see scripts/run_vllm_servers.sh)
 defaults:
   - base
   - _self_

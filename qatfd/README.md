@@ -75,8 +75,8 @@ TREC-BioGen scores against the **official** decomposed nuggets (`baseline_labels
 number is a valid nugget-recall but is **not** directly comparable to KARL's reported 85.0.
 Its corpus/index is built offline from the 2025 Pyserini collection — see
 `engaging-scripts/run_biogen_embeddings.slurm`. Runs must embed queries with the **same**
-Qwen3-0.6B model: `systems.emb_model_id=qwen/qwen3-embedding-0.6b` (or `emb_provider=local`
-with `QATFD_LOCAL_EMB_MODEL=Qwen/Qwen3-Embedding-0.6B`).
+Qwen3-0.6B model: `systems.emb_model_id=qwen/qwen3-embedding-0.6b` (or `emb_provider=vllm`
+with `emb_model_id=Qwen/Qwen3-Embedding-0.6B` served locally — see "Running on vLLM").
 
 FinanceBench reports correctness `0/1` from a single-nugget judge (set `benchmarks.judge_model`),
 and recall at two granularities (`page_recall`, `doc_recall`) since gold is labeled at the
@@ -128,8 +128,9 @@ pip install -e .          # this package
 
 Configuration is read from `skunk/.env` (loaded automatically before importing skunk)
 and the `SKUNK_*` env vars (`SkunkConfig.from_env()`): model, provider, embedding model,
-agent step budget, etc. API keys (`OPENROUTER_API_KEY` or `GEMINI_API_KEY`) must be present
-in the environment. The per-benchmark chromadb dir + collection come from the benchmark config
+agent step budget, etc. `OPENROUTER_API_KEY` must be present in the environment (and
+`VLLM_API_KEY` only when a vLLM server was started with `--api-key`). The per-benchmark
+chromadb dir + collection come from the benchmark config
 (under `qatfd/benchmarks/`), not `SKUNK_*`.
 
 ### Query embedding backend
@@ -137,7 +138,8 @@ in the environment. The per-benchmark chromadb dir + collection come from the be
 The corpora are Qwen3-Embedding-8B (4096-dim). Pick how queries are embedded with
 `systems.emb_provider` (defaults to `openrouter`):
 - `openrouter`: OpenRouter `qwen/qwen3-embedding-8b` (needs `OPENROUTER_API_KEY`).
-- `local`: local `sentence-transformers` `Qwen/Qwen3-Embedding-8B` (`QATFD_LOCAL_EMB_MODEL` to override).
+- `vllm`: a local vLLM embedding server; set `systems.emb_model_id` to the served model name
+  and give it a `vllm_base_urls` entry (see "Running on vLLM" below).
 
 ### Cost / token accounting
 
@@ -167,12 +169,55 @@ python3 -m qatfd.runner systems=rag_llm benchmarks=browsecomp_plus experiments.s
 # FinanceBench (all 150 are the held-out test set; pick a judge model)
 python3 -m qatfd.runner systems=rag_llm benchmarks=financebench experiments.split=test experiments.sample=5 systems.top_k=20 benchmarks.judge_model=gemini-3.5-flash
 
-# Embed queries locally instead of via OpenRouter
-python3 -m qatfd.runner systems=rag_llm benchmarks=officeqa systems.emb_provider=local
-
 # Whole matrix (or a subset) via Hydra multirun
 SAMPLE=20 BENCHMARKS=officeqa SYSTEMS="rag_llm,search_agent" ./run_all.sh
 ```
 
 Output: `results/<benchmark>/<system>/<run-name>_<timestamp>/` containing `report.csv` and
 per-question `traces/<qid>.jsonl` (structured event stream) / `<qid>.txt` (human-readable dump) traces.
+
+## Running on vLLM
+
+Any model in a run — the agent model, the semantic-filter model, the embedder — can be
+served by a **local vLLM server** instead of OpenRouter. Routing is per call through one
+`LLMClient`: a model listed in `systems.vllm_base_urls` (model id → server base URL) goes
+to its vLLM server; every other model (e.g. `benchmarks.judge_model`) stays on
+`systems.llm_provider`. vLLM serves ONE model per server process, so a multi-model run
+needs one server per model.
+
+On the GPU box (vLLM installed there; it is deliberately not a qatfd dependency):
+
+```bash
+tmux new -s vllm
+./scripts/run_vllm_servers.sh 'Qwen/Qwen3-32B:gpus=0:mem=0.9' \
+                              'Qwen/Qwen3-8B:gpus=1:mem=0.45' \
+                              'Qwen/Qwen3-Embedding-0.6B:gpus=1:mem=0.2:task=embed'
+```
+
+The script starts one `vllm serve` per spec (ports `BASE_PORT`+i, per-server
+`CUDA_VISIBLE_DEVICES` / tensor-parallel / memory-fraction / max-len knobs), waits until
+every `/v1/models` answers, writes `scripts/vllm_manifest.json` (model → base URL), and
+prints the paste-ready Hydra override. `--served-model-name` defaults to the model id, so
+the map keys, `systems.llm_model` / `semantic_filter_model` / `emb_model_id`, and the
+server all agree. `--dry-run` previews the commands without vllm or a GPU.
+
+Then point a run at the servers (from this box or the GPU box — `ADVERTISE_HOST` in the
+printed URLs makes them reachable remotely):
+
+```bash
+# Agent + semantic filter local, judge on OpenRouter (see configs/systems/ablation_search_agent_vllm.yaml)
+python3 -m qatfd.runner systems=ablation_search_agent_vllm benchmarks=officeqa \
+    experiments.sample=2 benchmarks.judge_model=google/gemini-3.5-flash
+
+# Ad-hoc: route just the agent model of a vanilla system to a server
+python3 -m qatfd.runner systems=search_agent benchmarks=officeqa systems.llm_model=Qwen/Qwen3-32B \
+    '++systems.vllm_base_urls={Qwen/Qwen3-32B: "http://<gpu-host>:8100/v1"}'
+```
+
+Notes: models listed in `vllm_base_urls` are costed $0 regardless of `llm_prices` — a model
+priced for OpenRouter runs stays free when served locally; give served models a high `llm_model_rpm` entry so the default
+1000 RPM client-side bucket doesn't throttle them; `systems.vllm_extra_body` merges extra
+JSON into every vLLM chat request (e.g. `{chat_template_kwargs: {enable_thinking: false}}`
+to disable Qwen3-style thinking — skunk's `effort` tiers are OpenRouter-only and ignored on
+the vLLM path); `resume_dir` refuses runs recorded before these config keys existed (the
+composed config genuinely changed).
