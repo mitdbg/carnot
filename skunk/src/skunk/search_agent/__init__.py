@@ -1,7 +1,7 @@
 """Teammate's search agent — vendored under one subtree.
 
-Wired into the framework by `skunk.retrieve.RetrieveOp` when
-`config.retriever == "search_agent"`. The agent runs an iterative
+Wired into the framework by `skunk.retrieve.run_retrieve_all` (the sole
+retriever backend). The agent runs an iterative
 tool-using LLM loop (vector_search / retrieve_page_info / run_grep, then
 a final-answer ```json``` block) over a ChromaDB index + cleaned per-page
 text, and returns a list of page keys.

@@ -43,6 +43,11 @@ class SystemConfig:
     # USD price table for cost accounting; maps a model-substring -> {"in"/"out"/"cached": $/Mtok}.
     # Lookup is exact-first then substring, a model with no match costs 0.
     llm_prices: dict[str, dict[str, float]]
+    # Optional OpenRouter provider pin (ignored on the genai path): an ordered list of provider
+    # slugs (e.g. ["parasail"]). When set, generation is routed only to these providers with no
+    # fallback, so a specific provider's prompt-cache / pricing is used deterministically. null =
+    # let OpenRouter pick. Resolve slugs from the model's Providers tab (e.g. io.net => "io-net").
+    llm_provider_order: list[str] | None = None
     # Per-call-site overrides keyed by `PromptedCall.name`, read by skunk's agent loop
     # (prompted_call._resolve_effort / _resolve_model). Empty = every call site uses its
     # own default effort and `llm_model`. The qatfd harness doesn't tune per-call-site,
@@ -82,6 +87,11 @@ class SearchAgentConfig(SystemConfig):
 
     # maximum number of failed agent steps before aborting
     agent_max_misfires: int = 5
+
+    # extra steps the agent may take, after its main run, to correct any returned doc_ids that
+    # do not name a real document (e.g. a bare filing name missing its page suffix). Kept separate
+    # from `agent_max_steps` so a citation fix never eats into the agent's search budget.
+    doc_id_correction_steps: int = 3
 
 
 # --------------------------------------------------------------------------------
@@ -140,19 +150,13 @@ class PipelineConfig(SearchAgentConfig):
     # `ComputeOp._vote`). 1 = single-trial. (env: SKUNK_COMPUTE_BEST_OF_N)
     compute_best_of_n: int = 5
 
-    # Data-prep gate: codegen→exec attempts before failing safe (pool passes through
-    # unchanged). Its own budget — no longer borrows `compute_max_attempts`.
-    data_prep_max_attempts: int = 3
-
     # Replan-on-MissingData loop. Total compute invocations ≤ recovery_max_rounds + 1.
     recovery_max_rounds: int = 2
 
-    # Ablation: golden page refs bypass the retrieve operator (eval runs only).
+    # Ablation: golden page refs bypass the search-agent retriever (eval runs only); their
+    # page text is attached from `clean_page_map_path` so compute reads it like a normal
+    # retrieval. (set by the app, e.g. eval_e2e --golden)
     golden_pages: list[PageRef] | None = field(default=None, repr=False)
-
-    # Retrieve dispatch: "search_agent" (iterative ChromaDB + LLM loop) is the sole
-    # backend; golden_pages is a separate eval bypass. (env: SKUNK_RETRIEVER)
-    retriever: Literal["search_agent"] = "search_agent"
 
     # Search-agent corpus artifacts (built offline; agent fails fast if missing).
     # (env: SKUNK_CHROMADB_DIR, SKUNK_CHROMADB_COLLECTION, SKUNK_CLEAN_PAGE_MAP)
@@ -185,20 +189,6 @@ class PipelineConfig(SearchAgentConfig):
     # spiral). (env: SKUNK_LOOKUP_AGENT_MAX_OUTPUT_TOKENS, SKUNK_LOOKUP_AGENT_TIMEOUT_S)
     lookup_agent_max_output_tokens: int = 8192
     lookup_agent_request_timeout_s: float = 150.0
-
-    # Per-call caps for the extract tiers (text/vision). Uncapped, individual Flash/Pro
-    # extract calls hung for 260-480s and returned garbage that then burned a parse retry;
-    # a hard timeout fails fast into the retry, which typically completes in seconds.
-    # (env: SKUNK_EXTRACT_MAX_OUTPUT_TOKENS, SKUNK_EXTRACT_TIMEOUT_S)
-    extract_max_output_tokens: int = 8192
-    extract_request_timeout_s: float = 150.0
-
-    # Extract: skip the parsed-text (OCR) tier entirely and read values straight off the rendered
-    # page images (vision tier). Default OFF — parsed text first, vision as the fallback tier.
-    # Vision-only is robust to OCR corruption on dense scanned tables (it recovered single-cell
-    # OCR misses on the dev set) but costs more and can run away on thinking-only pro models;
-    # enable per-run with SKUNK_EXTRACT_VISION_ONLY=1 when OCR quality is the binding issue.
-    extract_vision_only: bool = False
 
 
 def parse_effort_overrides(raw: str) -> dict[str, "Effort"]:

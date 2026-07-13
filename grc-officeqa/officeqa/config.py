@@ -82,16 +82,9 @@ class SkunkConfig(PipelineConfig):
         # Route per-stage models through the override registry so `PromptedCall` resolves them
         # like every other call-site. Defaulted here unless a run pins them explicitly
         # (SKUNK_MODEL_OVERRIDES=stage=…). Efforts
-        # come from each call-site's `default_effort` (compute=high, planner=high, replanner=high; extract=medium),
+        # come from each call-site's `default_effort` (compute=high, planner=high, replanner=high),
         # overridable via SKUNK_EFFORT_OVERRIDES.
-        # - extract.{text,vision}: flash, medium thinking. Pro is the stronger read
-        #   on dense scanned tables but its 8M input-tok/min quota + 380s latency tails choke the
-        #   parallel select-agent fan-out; pin Pro back per-run via SKUNK_MODEL_OVERRIDES. The
-        #   default path is the `text` tier; `vision` is the fallback.
-        # - compute.codegen: flash — codegen/reasoning over the extracted values (high thinking).
-        # - data_prep.codegen: 3.1 Pro at medium thinking — cleaning/coalescing/unioning the value
-        #   pool; unioning a multi-page table needs Pro to merge every row (Flash truncated the
-        #   hand-written value dict ~halfway).
+        # - compute.codegen: 3.1 Pro at high thinking — codegen/reasoning over the retrieved pages.
         # - replanner: 3.1 Pro at high thinking — same as the planner; revising a failed plan
         #   needs the same decomposition quality as the initial plan.
         # - planner: 3.1 Pro at high thinking. The initial plan's decomposition quality
@@ -99,12 +92,9 @@ class SkunkConfig(PipelineConfig):
         #   cost — the flash planner systematically dropped/misrouted branches that Pro/high
         #   gets right (plan-probe 2026-06-14: 19/20 known-bad dev plans fixed).
         # Everything else runs on the base `llm_model` (flash).
-        self.model_overrides.setdefault("extract.text", "gemini-3.5-flash")
-        self.model_overrides.setdefault("extract.vision", "gemini-3.5-flash")
         self.model_overrides.setdefault("compute.codegen", "gemini-3.1-pro-preview")
         self.model_overrides.setdefault("planner", "gemini-3.1-pro-preview")
         self.model_overrides.setdefault("replanner", "gemini-3.1-pro-preview")
-        self.model_overrides.setdefault("data_prep.codegen", "gemini-3.1-pro-preview")
 
     @classmethod
     def from_env(cls) -> SkunkConfig:
@@ -141,17 +131,8 @@ class SkunkConfig(PipelineConfig):
             lookup_agent_request_timeout_s=float(
                 os.environ.get("SKUNK_LOOKUP_AGENT_TIMEOUT_S", "150")
             ),
-            extract_max_output_tokens=int(
-                os.environ.get("SKUNK_EXTRACT_MAX_OUTPUT_TOKENS", "8192")
-            ),
-            extract_request_timeout_s=float(
-                os.environ.get("SKUNK_EXTRACT_TIMEOUT_S", "150")
-            ),
-            extract_vision_only=os.environ.get("SKUNK_EXTRACT_VISION_ONLY", "0")
-            not in ("", "0"),
             vision_rescan_charts=os.environ.get("SKUNK_VISION_RESCAN_CHARTS", "")
             not in ("", "0"),
-            retriever=os.environ.get("SKUNK_RETRIEVER", "search_agent"),  # type: ignore[arg-type]
             chromadb_dir=os.environ.get("SKUNK_CHROMADB_DIR", "cache/chromadb"),
             chromadb_collection=os.environ.get(
                 "SKUNK_CHROMADB_COLLECTION", "treasury_pages"

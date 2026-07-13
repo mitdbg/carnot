@@ -14,7 +14,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from skunk.common import AnnotatedValue, Final, NeedsMore, PageRef, page_key_to_pageref
+from skunk.common import (
+    AnnotatedValue,
+    Final,
+    NeedsMore,
+    PageRef,
+    RetrievedDoc,
+    page_key_to_pageref,
+)
 from skunk.plan import Plan
 
 
@@ -37,6 +44,8 @@ def describe_value(v: Any) -> str:
         return f"plan with {len(v.branches)} branch(es)"
     if isinstance(v, list) and v and isinstance(v[0], PageRef):
         return f"[{len(v)} page refs]"
+    if isinstance(v, list) and v and isinstance(v[0], RetrievedDoc):
+        return f"[{len(v)} retrieved pages: {[str(d.ref) for d in v]}]"
     if isinstance(v, list) and v and isinstance(v[0], AnnotatedValue):
         descriptions = [e.description for e in v]
         return f"[{len(descriptions)} entries: {descriptions}]"
@@ -45,7 +54,7 @@ def describe_value(v: Any) -> str:
     if isinstance(v, Final):
         return f"str: {v.answer!r}"
     if isinstance(v, NeedsMore):
-        return f"needs_more n_keep={len(v.keep)} missing={v.missing!r}"
+        return f"needs_more missing={v.missing!r}"
     if isinstance(v, list):
         return f"list({len(v)} branches)"
     s = repr(v)
@@ -82,6 +91,14 @@ def summarize_value(v: Any) -> dict:
             "type": "pages",
             "pages": [{"stem": p.stem, "page": p.page} for p in v],
         }
+    if isinstance(v, list) and v and isinstance(v[0], RetrievedDoc):
+        return {
+            "type": "pages",
+            "pages": [
+                {"stem": d.ref.stem, "page": d.ref.page, "chars": len(d.text)}
+                for d in v
+            ],
+        }
     if isinstance(v, list) and v and isinstance(v[0], AnnotatedValue):
         return {"type": "values", "values": [_summarize_annotated(e) for e in v]}
     if isinstance(v, str):
@@ -93,7 +110,6 @@ def summarize_value(v: Any) -> dict:
             "type": "needs_more",
             "missing": v.missing,
             "missing_reason": v.missing_reason,
-            "keep": [_summarize_annotated(e) for e in v.keep],
         }
     if isinstance(v, list) and v and all(isinstance(x, str) for x in v):
         # The search-agent retriever returns page keys ("YYYY_MM_pageid") rather than

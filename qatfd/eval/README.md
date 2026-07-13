@@ -97,3 +97,31 @@ so no `multirow`).
 - New system: add to `SYSTEM_DISPLAY` and `SYSTEM_ORDER`.
 - New LLM: nothing to do — rows are keyed on `systems.llm_model` from each run's
   `config.yaml`.
+
+## `ablation_tables.py` — tool-ablation tables
+
+Reads every `ablation_search_agent` run (the SearchAgent variant whose retrieval
+tool set is chosen by config — any subset of vector / grep / semantic-filter, with
+`read_document` + `prune` always on, plus an optional cheaper
+`semantic_filter_model` for the judge calls) and reports each configuration's
+**usefulness** metrics so the tools can be compared head-to-head.
+
+Each configuration is identified by (tool set, agent model, judge model), read from
+the run's `config.yaml` (`tool_vector` / `tool_grep` / `tool_semantic_filter`,
+`llm_model`, `semantic_filter_model`); runs sharing all three are averaged. Two
+tables are printed: a **full breakdown** (one row per config × agent × judge with
+accuracy, page/doc recall, cost, latency) and an **accuracy pivot** (tool set ×
+model column, where a split judge gets its own `agent / judge` column).
+
+The breakdown also reports **`adjPR%` (adjusted page recall)**: per-question page
+recall, but crediting 1.0 to any *fully-correct* question (`score == 1`) even when
+its measured page recall is lower. Because a correct answer implies a usable page
+was retrieved — and the labelled gold page is not the only page that can answer a
+question — plain page recall undercounts retrieval; `adjPR` is a cheap proxy for the
+hand audit of "did a usable page get retrieved" (so `adjPR ≥ max(acc, pageR)` always).
+
+```bash
+python eval/ablation_tables.py                        # text tables -> stdout
+python eval/ablation_tables.py --benchmark officeqa   # default is officeqa
+python eval/ablation_tables.py --latex --out ablation.tex
+```

@@ -199,6 +199,10 @@ class CallSpec:
     max_output_tokens: int | None = None
     timeout_s: float | None = None
     should_stop: Callable[[str], bool] | None = None
+    # Per-call OpenRouter provider order (no fallback). None => use config.llm_provider_order.
+    # Lets a single client route one model (e.g. a cheaper semantic-filter judge) to specific
+    # providers while other models on the same client stay unpinned.
+    provider_order: list[str] | None = None
 
 
 # Raw HTTP body of the most recent OpenRouter response, captured by an httpx response
@@ -318,11 +322,13 @@ class LLMClient:
         ctx: ExecutionContext | None = None,
         call_site: str = "llm",
         model: str | None = None,
+        provider_order: list[str] | None = None,
     ) -> LLMResponse:
         spec = CallSpec(
             system=system, user=user, images=images, temperature=temperature,
             effort=effort, ctx=ctx, call_site=call_site,
             model=model or self._config.llm_model,
+            provider_order=provider_order,
         )
         impl = (
             self._openrouter_call
@@ -991,6 +997,17 @@ class LLMClient:
             )
         return output_text
 
+    def _openrouter_provider_kwarg(self, spec: "CallSpec | None" = None) -> dict:
+        """`{"provider": {...}}` pinning generation to a provider order (no fallback), or `{}` when
+        unset. A per-call `spec.provider_order` wins over the client-wide `config.llm_provider_order`,
+        so one model (e.g. a cheaper semantic-filter judge) can be routed to specific providers while
+        the rest of the client stays unpinned. Lets a run route deterministically to one provider so
+        its prompt-cache and pricing are the ones actually used."""
+        order = (spec.provider_order if spec else None) or getattr(self._config, "llm_provider_order", None)
+        if not order:
+            return {}
+        return {"provider": {"order": list(order), "allow_fallbacks": False}}
+
     def _openrouter_call(self, spec: CallSpec) -> LLMResponse:
         """One OpenRouter chat call (no retry — the retry loop owns that)."""
         client = self._get_openrouter_client()
@@ -1000,6 +1017,7 @@ class LLMClient:
         resp = client.chat.send(
             model=spec.model, messages=messages, stream=False, # type: ignore
             temperature=spec.temperature, reasoning=reasoning, # type: ignore
+            **self._openrouter_provider_kwarg(spec),
         )
         latency_s = time.monotonic() - t0
         output_text = self._openrouter_checked_text(resp, spec)
@@ -1018,6 +1036,7 @@ class LLMClient:
             if spec.max_output_tokens is not None
             else {}
         )
+        extra.update(self._openrouter_provider_kwarg(spec))
         t0 = time.monotonic()
         coro = client.chat.send_async(
             model=spec.model, messages=messages, stream=False, # type: ignore
@@ -1066,6 +1085,7 @@ class LLMClient:
             if spec.max_output_tokens is not None
             else {}
         )
+        extra.update(self._openrouter_provider_kwarg(spec))
         should_stop = spec.should_stop
 
         async def _consume() -> tuple[str, Any]:

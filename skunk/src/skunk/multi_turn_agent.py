@@ -432,13 +432,16 @@ Requirements for the final answer:
         return out
 
     async def call(
-        self, ctx: ExecutionContext, user: str, *, resume: bool = False, **_
+        self, ctx: ExecutionContext, user: str, *, resume: bool = False,
+        max_steps: int | None = None, **_
     ) -> Any:
         """Run the multi-turn loop, returning the parsed json final-answer payload.
         `resume=True` appends `user` to the existing trajectory (with a fresh step budget)
         instead of starting over — the seam for a reviewer sending the agent back with
-        feedback without it re-deriving everything it already saw. Extra kwargs are ignored
-        (signature compat with single-shot calls)."""
+        feedback without it re-deriving everything it already saw. `max_steps` overrides the
+        agent's default budget for this call only (e.g. a short, resumed correction turn that
+        should not get a full search budget); it defaults to `self.max_steps`. Extra kwargs
+        are ignored (signature compat with single-shot calls)."""
         # Full block trajectory (no system message; call() assembles it each turn).
         # `_render_for_llm()` produces the redacted, flattened view sent to the model.
         if resume and self.messages:
@@ -461,7 +464,7 @@ Requirements for the final answer:
             data={"text": system_prompt},
         )
         ctx.emit(f"question {user!r}", kind="user", data={"text": user})
-        return await self._run_loop(ctx, self.max_steps)
+        return await self._run_loop(ctx, self.max_steps if max_steps is None else max_steps)
 
     async def _run_loop(self, ctx: ExecutionContext, max_steps: int | None) -> Any:
         """The step loop, bounded by `max_steps`. Assumes `self.messages` and
@@ -493,7 +496,9 @@ Requirements for the final answer:
                     f"time on exploration."
                 )
                 self.messages.append({"role": "user", "blocks": [TextBlock(warn)]})
-                ctx.emit(f"steps_low_warning left={left}")
+                # Carry the full warning text (not just `left=N`) so the viewer can show
+                # the agent exactly what it was told, as a first-class lifecycle event.
+                ctx.emit(f"steps_low_warning left={left}", data={"text": warn})
             # Generate → parse (retried by PromptedCall on format errors) → execute.
             # `done` is set on success; errors append an observation and advance `turn` only.
             done: _StepOutput | None = None
@@ -596,9 +601,15 @@ Requirements for the final answer:
         self, ctx: ExecutionContext, observations: list[str]
     ) -> Any:
         diagnostic = ""
+        # Record the out-of-steps prompt the agent was shown, so the viewer can tell the
+        # full story of the forced terminal turn (prompt → reply → outcome).
+        ctx.emit("terminal_prompt out_of_steps", data={"text": self._TERMINAL_PROMPT})
         try:
             step_out = await self._llm_step(
                 ctx, extra=[{"role": "user", "content": self._TERMINAL_PROMPT}]
+            )
+            ctx.emit(
+                f"terminal_reply chars={len(step_out.raw)}", data={"text": step_out.raw}
             )
             diagnostic = (
                 step_out.raw.strip()
@@ -609,13 +620,18 @@ Requirements for the final answer:
                 # real answer schemas don't use); anything else is a commit candidate.
                 if isinstance(result, dict) and list(result) == ["error"]:
                     diagnostic = str(result["error"]).strip()
-                    ctx.emit(f"terminal_giveup {diagnostic!r}")
+                    ctx.emit(f"terminal_giveup {diagnostic!r}", data={"text": diagnostic})
                 elif self.validate_final_answer(result, observations) is None:
-                    ctx.emit(f"terminal_commit {str(result)!r}")
+                    ctx.emit(
+                        f"terminal_commit {str(result)!r}", data={"text": str(result)}
+                    )
                     return result
             # else: python block → fall through to StepFailed
         except Exception as e:  # never let the terminal turn mask the real failure
-            ctx.emit(f"terminal_turn_failed error={str(e)!r}")
+            ctx.emit(
+                f"terminal_turn_failed error={str(e)!r}",
+                data={"text": f"{type(e).__name__}: {e}"},
+            )
         if not diagnostic:
             tail = observations[-2:]
             diagnostic = (

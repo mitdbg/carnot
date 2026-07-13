@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from skunk.common import ExecutionContext
 from skunk.config import SearchAgentConfig
-from skunk.search_agent.search_agent import SearchAgent, doc_ids_from_payload
+from skunk.search_agent.search_agent import SearchAgent
 
 from qatfd.benchmarks.base import BenchmarkResources
 from qatfd.systems.base import RetrieveComputeSystem
@@ -57,6 +57,11 @@ class SearchAgentSystem(RetrieveComputeSystem):
         drop it to force the agent onto other retrieval tools."""
         return True
 
+    def _include_grep_corpus(self) -> bool:
+        """Whether the agent gets the `grep_corpus` (lexical-search) tool. Subclasses can drop
+        it (e.g. a tool-ablation system) to force the agent onto vector search / semantic filter."""
+        return True
+
     def _prompts(self) -> tuple[str | None, str | None]:
         """(briefing, final_answer_doc) overrides; None => skunk SearchAgent defaults."""
         if self.config.agent_mode == "answer":
@@ -76,6 +81,7 @@ class SearchAgentSystem(RetrieveComputeSystem):
             emb_model_id=self.config.emb_model_id,
             extra_tools=self._extra_tools(ctx, resources),
             include_search_corpus=self._include_search_corpus(),
+            include_grep_corpus=self._include_grep_corpus(),
             briefing=briefing,
             final_answer_doc=final_answer_doc,
             pdf_dir=resources.pdf_dir,
@@ -85,8 +91,10 @@ class SearchAgentSystem(RetrieveComputeSystem):
 
     async def retrieve(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext) -> Retrieved:
         agent = self._build_agent(ctx, resources)
-        payload = await agent.call(ctx, q.text)
-        doc_ids = doc_ids_from_payload(payload)
+        # Validate the returned doc_ids against the corpus and let the agent correct any that
+        # name no real document, so recall reflects reality and (in retrieve mode) the answerer
+        # gets real page text rather than an empty stub for a mis-cited id.
+        payload, doc_ids = await agent.call_with_validated_doc_ids(ctx, q.text)
         if self.config.agent_mode == "answer":
             answer = payload.get("answer") if isinstance(payload, dict) else None
             return Retrieved(doc_ids=doc_ids, direct_answer=None if answer is None else str(answer))

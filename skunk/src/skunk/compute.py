@@ -6,7 +6,6 @@ from collections import Counter
 from collections.abc import Sequence
 from typing import Any
 
-import numpy as np
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from skunk.common import Effort
@@ -17,7 +16,10 @@ from skunk.common import (
     ExecutionContext,
     Final,
     NeedsMore,
+    RetrievedDoc,
+    documents_desc,
     input_values_desc,
+    split_pool,
 )
 from skunk.sandbox.pyexec import exec_python_with_env, parse_codegen_reply
 
@@ -33,8 +35,7 @@ class MissingDataSignal(BaseModel):
 # `ComputeOp.run()` catches the `ParseError` and retries.
 _CODEGEN_EXPECTATION = (
     "expected a fenced ```python``` block — emit (a) success (assign `result`) "
-    "or (b) missing data (assign `keep` and `missing`). Do not emit a bare "
-    "JSON object."
+    "or (b) missing data (assign `missing`). Do not emit a bare JSON object."
 )
 
 
@@ -48,128 +49,48 @@ _NONFINITE_RE = re.compile(
 )
 
 
-def _coerce_prim(v: Any) -> Any:
-    """Unwrap numpy scalars (the usual product of pandas arithmetic) so kept
-    values pass `AnnotatedValue`'s primitive-cell validation."""
-    return v.item() if isinstance(v, np.generic) else v
-
-
 def _needs_more_from_env(env: dict[str, Any]) -> NeedsMore:
     """Validate a missing-data exec environment into a `NeedsMore`. `missing` must validate
-    as `MissingDataSignal`. `keep` (optional, default `{}`) is the model's drop-by-default
-    choice of what to carry into the next round, a `{name: value}` dict where each value is
-    EITHER an `input_values` entry — carried verbatim so its provenance (source_stem/pages)
-    survives — OR a freshly computed scalar / [scalars] / flat {label: scalar} dict,
-    which becomes a provenance-free `AnnotatedValue` marked "computed". Anything not in `keep`
-    is dropped. Raises `ValueError` with a fix-it detail on any malformed shape."""
+    as `MissingDataSignal` (`{"missing": [...], "description": "..."}`). Raises `ValueError`
+    with a fix-it detail on a malformed shape. The orchestrator keeps everything gathered so
+    far, so there is no per-value carry — the model only signals what is still missing."""
     try:
         signal = MissingDataSignal.model_validate(env["missing"])
     except ValidationError as e:
         raise ValueError(
             f'`missing` must be {{"missing": [...], "description": "..."}} — {e}'
         )
-
-    keep_raw = env.get("keep", {})
-    if not isinstance(keep_raw, dict) or not all(isinstance(k, str) for k in keep_raw):
-        raise ValueError(
-            "`keep` must be a dict keyed by str names — each value is either an "
-            "`input_values` entry (carried with its source) or a computed scalar / "
-            "[scalars] / flat {label: scalar} dict. Omit or use {} to carry nothing."
-        )
-    keep: list[AnnotatedValue] = []
-    for name, v in keep_raw.items():
-        if isinstance(v, AnnotatedValue):
-            # A re-stated input entry — carry it verbatim so provenance survives.
-            keep.append(v)
-            continue
-        # Otherwise a value the model computed — provenance-free, marked "computed".
-        try:
-            if isinstance(v, dict):
-                payload = {str(k): _coerce_prim(c) for k, c in v.items()}
-                entry = AnnotatedValue(
-                    description=name, value=payload, kind="vector",
-                    index_name="label", notes="computed",
-                )
-            else:
-                payload = (
-                    [_coerce_prim(c) for c in v]
-                    if isinstance(v, list)
-                    else _coerce_prim(v)
-                )
-                entry = AnnotatedValue(
-                    description=name, value=payload, kind="scalar", notes="computed"
-                )
-        except ValidationError as e:
-            raise ValueError(
-                f"keep[{name!r}]: value must be an `input_values` entry, a scalar, a "
-                f"list of scalars, or a flat {{label: scalar}} dict — {e}"
-            )
-        keep.append(entry)
-    return NeedsMore(
-        keep=keep, missing_reason=signal.description, missing=signal.missing
-    )
+    return NeedsMore(missing_reason=signal.description, missing=signal.missing)
 
 
 class Codegen:
     _SYSTEM_PROMPT = """\
-You write Python that either produces the final answer string, or — when the inputs are not enough — keeps the values still worth using and signals what is missing.
+You answer a question from a set of retrieved corpus pages, using a Python interpreter for any arithmetic. You either produce the final answer string, or — when the pages are not enough — signal what is still missing.
 
 ## Inputs
-- The user's question — the authoritative statement of what to compute,
+- The user's question — the authoritative statement of what to answer,
   including the output format (units, decimal places, list/bracket shape).
 - Optional `## Concept references` section: one block per non-obvious
   concept the question references. If the question itself pins a specific variant of an operation,
   use that variant instead of the reference; otherwise follow the reference.
-- `input_values`: list[AnnotatedValue] in the exec environment; these are values previous agents deemed relevant for answering the question.
+- `retrieved pages`: the corpus pages a search agent judged relevant, as plain
+  text. READ THEM DIRECTLY. To compute over them, copy the relevant numbers out
+  of the page text into your code as literals, then compute — do NOT do arithmetic
+  in your head. The pages are text only; they are NOT variables in the exec environment.
+- `input_values` (only when external lookups ran): list[AnnotatedValue] present in
+  the exec environment — values a `lookup_external` agent pulled from outside the
+  corpus. Read each through `e.frame` (a pd.DataFrame); `e.description`/`e.unit`/
+  `e.source` label it. Reference by index (`input_values[i].frame`).
 
-## AnnotatedValue API
+## Selecting data
 
-  .description   natural-language label
-  .notes         prose page context bearing on the question — footnotes,
-                 headnotes, caveats, print-flag meanings (p/r); shared
-                 across a vector/table's cells, so it is context not a
-                 per-cell discriminator (that lives in .description)
-  .frame         pd.DataFrame view of the payload (uniform across kinds)
-  .unit          natural-language unit, e.g. "millions of dollars", "percent"
-  .kind          "scalar" | "vector" | "table"  (rarely needed; prefer .frame)
-  .index_name    (vector)   .row_name / .col_name (table)
-  .value         raw payload — only use if you specifically need the dict/list form
-  .source             publisher/origin of an external-lookup value (empty for corpus extracts)
-  .source_stem        source document's filename stem the value was read from
-  .pages              source PDF page number(s)
-  .requested_period   data window the value was retrieved for
-  .retrieve_key       the concept this datum was retrieved for
-
-## Payload access
-
-Always read data through `e.frame`:
-
-  scalar  →  1x1 DataFrame; `e.frame.iat[0, 0]` for the raw cell.
-             (scalar from lookup_external may be N x 1 — a column of values.)
-  vector  →  N x 1 DataFrame; index is `e.index_name`, the single column
-             is named after the description. Use `e.frame.loc[label]`
-             or `e.frame.iloc[:, 0]` for the Series form.
-  table   →  R x C DataFrame; `index.name == e.row_name`,
-             `columns.name == e.col_name`.
-
-The `input_values =` block below shows each non-scalar entry's full frame (axis
-labels, dtypes, and every cell); the same frame also exists in the exec
-environment. Read the cells to spot NaN / "n/a" values and handle them before
-aggregating. Apply unit conversions once over the whole frame, never cell-by-cell.
-
-## Selecting inputs
-
-- Reference entries by index (`input_values[7].frame`); do not re-locate them
-  at runtime by filtering on `.description`.
-- Entries may repeat. Pick the one whose description (and notes) match the
-  question's wording, including its qualifier words ("subject to limitation",
-  "accepted", "issued"). Do not combine multiple entries for max/min/avg/sum.
-- Extra scope words in a description or its notes mark a different, broader
-  series, not a looser label for the asked one: a question about "public debt"
-  is not answered by "public debt and guaranteed obligations"; "savings bonds"
-  is not "savings bonds and savings notes". Match the question's exact series
-  even when the broader entry is more convenient to read (printed total row,
-  fuller index) — convenience of access never outweighs a series mismatch.
+- Match the question's EXACT series, including its qualifier words ("subject to
+  limitation", "accepted", "issued", "net" vs "gross"). Extra scope words mark a
+  different, broader series, not a looser label: "public debt" is not answered by
+  "public debt and guaranteed obligations"; "savings bonds" is not "savings bonds
+  and savings notes". A convenient printed total never outweighs a series mismatch.
+- Watch for footnotes, headnotes, print flags (p/r = preliminary/revised), and
+  "n/a" cells in the page text — they change what a number means.
 
 ## Output format
 
@@ -181,35 +102,27 @@ and nothing else — no prose, no commentary, no second block:
       list/bracket shape, every part in order) — no prose, no "Answer:", no
       question restatement. Carry full precision through every intermediate;
       round or format only in the final `result` string.
-      Never emit a non-finite answer: if a computation yields NaN or infinity — NaN
-      cells in the inputs ("n/a"), or division by an empty/zero quantity — do not
-      format it into `result`. Drop or skip those cells before aggregating; if the
-      inputs genuinely cannot support a finite answer, use form (b) missing instead.
+      Never emit a non-finite answer: if a computation yields NaN or infinity —
+      "n/a" cells, or division by an empty/zero quantity — do not format it into
+      `result`. Drop or skip those cells before aggregating; if the pages
+      genuinely cannot support a finite answer, use form (b) missing instead.
 
-  (b) Missing data — when you cannot finish from `input_values` alone. Do NOT
-      assign `result`; instead assign both:
-        keep    = {name: value}   # each value: an input_values entry OR a computed value
+  (b) Missing data — when you cannot finish from the retrieved pages (and any
+      `input_values`) alone. Do NOT assign `result`; instead assign:
         missing = {"missing": [<short identifier strings>], "description": "<one-line reason>"}
-      First do as much as you can, then signal. `keep` is drop-by-default —
-      anything you do not put in it is dropped for good and never reaches the next
-      round (use `keep = {}` only to start over):
-        - to retain an input you will reuse, REFERENCE the whole entry so its
-          source survives:  keep["..."] = input_values[i]   (NOT input_values[i].value)
-        - for a value you derived, assign the raw number / [list] / {label: value}
-          dict:  keep["..."] = <value>   (recorded as "computed", no source pages)
-        - state what is missing: the short identifiers + a one-line reason.
-      Name computed values self-descriptively, unit included. Never fabricate: keep
-      only values present in `input_values` or COMPUTED from them, never from
-      memory. Real-world reference data (exchange rates, deflators, CPI, GDP,
-      population, market prices) is data, not knowledge — if no input carries it,
-      list it under `missing` rather than supplying it.
+      First do as much as you can, then signal what is still needed: the short
+      identifiers + a one-line reason. Never fabricate: use only values present in
+      the pages / `input_values` or COMPUTED from them, never from memory.
+      Real-world reference data (exchange rates, deflators, CPI, GDP, population,
+      market prices) is data, not knowledge — if no page carries it, list it under
+      `missing` rather than supplying it.
 
       Rules for signaling:
-      - Never signal missing data because an input's `.pages` differ from a page
-        number named in the question.
+      - Never signal missing data because a page number differs from one named in
+        the question — the retrieved pages are what you have.
       - DO signal missing data when the supplied data does NOT align with what the
-        question asks for (e.g., reported for a different date than asked, or from a
-        different source), and clearly state this in your signal.
+        question asks for (reported for a different date than asked, or a different
+        source/series), and clearly state this in your signal.
 
 Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
 """
@@ -220,13 +133,14 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
         default_effort="high",
         output_instruction=(
             "Produce a fenced ```python``` block — assign `result` for the answer, "
-            "or `keep` + `missing` for partial progress."
+            "or `missing` when the pages are insufficient."
         ),
     )
 
     async def codegen(
         self,
         ctx: ExecutionContext,
+        documents: list[RetrievedDoc],
         input_values: list[AnnotatedValue],
         prev_code: str | None,
         prev_failure: str | None,
@@ -238,7 +152,9 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
         `prev_code`/`prev_failure` describe only the most-recent failed attempt —
         accumulating older ones dilutes the issue to fix."""
         user_msg = f"Question:\n{ctx.question}\n\n"
-        user_msg += f"input_values =\n{input_values_desc(input_values)}"
+        user_msg += documents_desc(documents)
+        if input_values:
+            user_msg += f"\n\ninput_values =\n{input_values_desc(input_values)}"
         if prev_failure:
             user_msg += "\n\nYour previous attempt failed."
             if prev_code:
@@ -258,41 +174,44 @@ class ComputeOp:
 
     async def run(
         self,
-        input_values: list[AnnotatedValue],
+        pool: list,
         ctx: ExecutionContext,
         *,
         round_idx: int = 0,
     ) -> Final | NeedsMore:
         """Best-of-N codegen for this compute call: run `compute_best_of_n` independent
-        codegen→exec trials in parallel and vote on the outcome (see `_vote`). Each trial
-        is a `_run_trial` retry loop returning `Final | NeedsMore` (or raising
-        `StepFailed`). N≤1 runs a single trial — today's behavior. Raises `StepFailed`
-        only if every trial does."""
+        codegen→exec trials in parallel and vote on the outcome (see `_vote`). `pool` is
+        the orchestrator's mixed gathered set — retrieved pages (`RetrievedDoc`) plus any
+        `lookup_external` values (`AnnotatedValue`); it is split into the codegen prompt's
+        `retrieved pages` and `input_values`. Each trial is a `_run_trial` retry loop
+        returning `Final | NeedsMore` (or raising `StepFailed`). N≤1 runs a single trial.
+        Raises `StepFailed` only if every trial does."""
         # No "starting" boundary emit — the orchestrator's trace records this
         # step's boundary; the plan is the planner step's output.
+        documents, input_values = split_pool(pool)
 
-        # Source pages behind the values reaching compute (post-retry/replan) — the
+        # Source pages behind the content reaching compute (post-retry/replan) — the
         # final-stage survivor set for per-stage recall (eval/stage_report.py). Shared
         # across trials, so emitted once here rather than per trial.
         src_pages = sorted(
-            {f"{e.source_stem}:{p}" for e in input_values if e.source_stem for p in e.pages}
+            {f"{d.ref.stem}:{d.ref.page}" for d in documents if d.ref.stem}
         )
         ctx.emit(
-            f"compute_inputs n_values={len(input_values)} n_pages={len(src_pages)}",
+            f"compute_inputs n_pages={len(src_pages)} n_values={len(input_values)}",
             data={"pages": src_pages},
         )
 
         n = ctx.config.compute_best_of_n
         if n <= 1:
             return await self._run_trial(
-                input_values, ctx,
+                documents, input_values, ctx,
                 round_idx=round_idx, trial_idx=0,
             )
 
         results = await asyncio.gather(
             *(
                 self._run_trial(
-                    input_values, ctx,
+                    documents, input_values, ctx,
                     round_idx=round_idx, trial_idx=i,
                 )
                 for i in range(n)
@@ -308,10 +227,9 @@ class ComputeOp:
         pooled MISSING-DATA candidate — all `NeedsMore` trials count equally toward it. Most
         frequent wins; a tie NEVER breaks in favor of missing-data (an actual answer beats a
         give-up at equal votes). When missing-data wins, the `NeedsMore` trials are combined:
-        their `keep` values are UNIONed (nothing any trial asked to keep is dropped) and the
-        reason is rendered per trial ("agent 1: …, agent 2: …"). If every trial raised
-        `StepFailed`, re-raise the first; any other exception
-        (programming error / cancellation) is re-raised immediately."""
+        their `missing` identifiers are UNIONed and the reason is rendered per trial
+        ("agent 1: …, agent 2: …"). If every trial raised `StepFailed`, re-raise the first;
+        any other exception (programming error / cancellation) is re-raised immediately."""
         finals: list[Final] = []
         needs: list[NeedsMore] = []
         failures: list[StepFailed] = []
@@ -345,16 +263,7 @@ class ComputeOp:
             return next(f for f in finals if f.answer == best_answer)
 
         # Missing-data wins (or no trial finalized): combine every `NeedsMore` trial. UNION
-        # their kept values (dedup identical ones) so nothing any trial chose to keep is
-        # dropped, and render the reasons per agent.
-        keep: list[AnnotatedValue] = []
-        seen: set[str] = set()
-        for n in needs:
-            for e in n.keep:
-                key = e.model_dump_json()
-                if key not in seen:
-                    seen.add(key)
-                    keep.append(e)
+        # their missing identifiers and render the reasons per agent.
         missing = list(dict.fromkeys(m for n in needs for m in n.missing))
         reason = "\n".join(
             f"agent {i}: {n.missing_reason}" for i, n in enumerate(needs, 1)
@@ -362,12 +271,13 @@ class ComputeOp:
         ctx.emit(
             f"compute_vote_needs_more n_trials={len(results)} n_final={len(finals)} "
             f"n_needs_more={len(needs)} n_failed={len(failures)} "
-            f"best_final_votes={best_votes} n_keep={len(keep)} missing={missing!r}"
+            f"best_final_votes={best_votes} missing={missing!r}"
         )
-        return NeedsMore(keep=keep, missing_reason=reason, missing=missing)
+        return NeedsMore(missing_reason=reason, missing=missing)
 
     async def _run_trial(
         self,
+        documents: list[RetrievedDoc],
         input_values: list[AnnotatedValue],
         ctx: ExecutionContext,
         *,
@@ -377,16 +287,17 @@ class ComputeOp:
         """One codegen→exec retry loop over `compute_max_attempts`: each iteration does
         codegen → exec, and any failure feeds the next attempt's `prev_failure`. Returns
         `Final` on the first clean exec that set `result`, or `NeedsMore` when codegen
-        gives up outright (form (b)) or executed code commits partial progress (form
-        (c)). Raises `StepFailed` if no iteration ever resolves. `trial_idx` tags every
-        emit so interleaved best-of-N trials stay attributable in the trace."""
+        gives up outright (form (b)). Raises `StepFailed` if no iteration ever resolves.
+        `trial_idx` tags every emit so interleaved best-of-N trials stay attributable in
+        the trace. Only `input_values` (lookup values) enter the exec env; the retrieved
+        pages are text in the prompt and the model transcribes numbers into its code."""
         prev_code: str | None = None
         prev_failure: str | None = None
 
         for try_idx in range(ctx.config.compute_max_attempts):
             try:
                 code = await self._codegen.codegen(
-                    ctx, input_values, prev_code, prev_failure,
+                    ctx, documents, input_values, prev_code, prev_failure,
                 )
             except ParseError as e:
                 prev_code = None
@@ -445,7 +356,7 @@ class ComputeOp:
                     continue
                 ctx.emit(
                     f"compute_needs_more round={round_idx} trial={trial_idx} "
-                    f"attempt={try_idx + 1} n_keep={len(needs.keep)} "
+                    f"attempt={try_idx + 1} "
                     f"missing={needs.missing!r} description={needs.missing_reason!r}"
                 )
                 return needs

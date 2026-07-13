@@ -5,7 +5,6 @@ from dataclasses import dataclass, field
 from typing import cast
 from skunk.compute import ComputeOp
 from skunk.config import PipelineConfig
-from skunk.data_prep import DataPrepOp
 from skunk.errors import MissingData, StepFailed
 from skunk.lookup_agent.lookup_external import LookupExternalOp
 from skunk.common import (
@@ -15,10 +14,10 @@ from skunk.common import (
     Final,
     NeedsMore,
     PageRef,
+    RetrievedDoc,
     traced_step,
 )
 from skunk.llm_client import LLMClient
-from skunk.page_store import PageContentStore
 from skunk.plan import (
     AttemptRecord,
     Branch,
@@ -34,7 +33,9 @@ from skunk.result import ExecutionResult
 @dataclass
 class BranchOutcome:
     branch: Branch
-    entries: list[AnnotatedValue] | None
+    # A retrieve branch contributes `RetrievedDoc`s (pages + text); a lookup_external
+    # branch contributes `AnnotatedValue`s. Both accumulate into the compute pool.
+    entries: list[RetrievedDoc | AnnotatedValue] | None
     error: StepFailed | None
     pages: list[PageRef] = field(default_factory=list)
 
@@ -53,7 +54,6 @@ class Orchestrator:
         log_path: str | None = None,
         prompt_overrides: tuple[PromptOverride, ...] = (),
         llm_client: LLMClient | None = None,
-        page_store: PageContentStore | None = None,
     ):
         self._ctx = ExecutionContext(
             question=question,
@@ -63,7 +63,6 @@ class Orchestrator:
             config=config,
             prompt_overrides=prompt_overrides,
             llm_client=llm_client,
-            page_store=page_store,
         )
         self._current_plan: Plan | None = None
         self._branch_ids: list[int] = []
@@ -71,7 +70,6 @@ class Orchestrator:
         self._planner = Planner()
         self._lookup = LookupExternalOp()
         self._compute = ComputeOp()
-        self._data_prep = DataPrepOp()
         self._result = ExecutionResult(question=question)
         self._retrieved_pages: list[PageRef] = []
 
@@ -110,12 +108,12 @@ class Orchestrator:
         self._emit_plan(plan, "initial")
         outcomes = await self._run_branches(plan.branches, self._branch_ids)
 
-        # Recovery state: the value POOL is what compute sees. On a NeedsMore the next pool
-        # is exactly what compute chose to keep (re-stated inputs + any partial computation,
-        # drop-by-default); each replan sweep then appends its newly gathered values. ATTEMPTS
-        # records every branch's fate across sweeps. Branch outcomes don't outlive their
-        # sweep — the pool is the only data carried across rounds.
-        pool: list[AnnotatedValue] = [
+        # Recovery state: the POOL is what compute sees — retrieved pages (`RetrievedDoc`)
+        # plus any lookup values (`AnnotatedValue`), everything gathered so far. On a
+        # NeedsMore the pool is retained as-is and each replan sweep appends its newly
+        # gathered entries. ATTEMPTS records every branch's fate across sweeps. Branch
+        # outcomes don't outlive their sweep — the pool is the only data carried across rounds.
+        pool: list[RetrievedDoc | AnnotatedValue] = [
             e for o in outcomes if o.entries for e in o.entries
         ]
         attempts = [
@@ -127,7 +125,6 @@ class Orchestrator:
 
         while True:
             if sweep_added or needs is None:
-                pool = await self._prep_pool(pool)
                 outcome = await traced_step(
                     self._ctx,
                     "compute",
@@ -141,13 +138,9 @@ class Orchestrator:
                     self._result.answer = outcome.answer
                     return outcome.answer
                 needs = outcome
-                # Drop-by-default: the next pool IS exactly what compute chose to keep
-                # (re-stated inputs + any partial computation); everything else is dropped.
-                prev_size = len(pool)
-                pool = list(needs.keep)
+                # The whole pool is retained across rounds; a replan sweep appends to it.
                 self._ctx.emit(
-                    f"pool_update round={round_idx} prev={prev_size} kept={len(pool)}",
-                    data={"kept": [e.description for e in pool]},
+                    f"pool_carry round={round_idx} n_entries={len(pool)}"
                 )
             else:
                 # Replan sweep produced zero new values: compute on an unchanged pool is a
@@ -195,21 +188,6 @@ class Orchestrator:
             new_entries = [e for o in outcomes if o.entries for e in o.entries]
             pool += new_entries
             sweep_added = bool(new_entries)
-
-    async def _prep_pool(
-        self, pool: list[AnnotatedValue]
-    ) -> list[AnnotatedValue]:
-        """Run the data-prep gate over the pool just before a compute call: dedup corpus reprints
-        and coalesce same-series values across everything gathered so far. Fails safe via
-        `DataPrepOp.run` (returns its input unchanged on any error), so it never starves compute of
-        inputs."""
-        if not pool:
-            return pool
-        return await traced_step(
-            self._ctx,
-            "data_prep",
-            lambda: self._data_prep.run(pool, self._ctx),
-        )
 
     def _alloc_branch_ids(self, n: int) -> list[int]:
         """Allocate `n` fresh, monotonically-increasing branch ids (stable for the
@@ -288,9 +266,9 @@ class Orchestrator:
         branches: list[Branch],
         branch_ids: list[int],
     ) -> list[BranchOutcome]:
-        # Global retrieve phase: all retrieve branches share one deduped semantic-filter
-        # sweep, then each branch's routed refs feed its own extract. Lookup branches are
-        # independent and run in the per-branch tail below.
+        # Global retrieve phase: every retrieve branch runs its own search-agent rollout,
+        # returning that branch's retrieved pages WITH their text (read directly by compute —
+        # there is no extract step). Lookup branches run independently in the per-branch tail.
         retrieve_pos = [i for i, b in enumerate(branches) if b.kind == "retrieve"]
         retrievals = await self._run_retrieve_phase(
             [cast(RetrieveBranch, branches[i]) for i in retrieve_pos],
@@ -300,34 +278,18 @@ class Orchestrator:
             zip(retrieve_pos, retrievals)
         )
 
-        # Extract runs as ONE shared sweep over all retrieve branches, launched as a task so
-        # lookup branches proceed concurrently. Each retrieve tail awaits the shared task and
-        # picks out its branch's result. Retrievals are whole pages (golden / search-agent);
-        # `run_extract` reads each unique page once and does its own per-branch traced_steps,
-        # so the tail doesn't wrap them again.
-        pipeline: asyncio.Task | None = None
-        if retrieve_pos:
-            from skunk.extract import run_extract
-
-            sub_branches = [cast(RetrieveBranch, branches[i]) for i in retrieve_pos]
-            sub_ids = [branch_ids[i] for i in retrieve_pos]
-            sub_retrievals = [retr_by_pos[i] for i in retrieve_pos]
-            pipeline = asyncio.create_task(
-                run_extract(self._ctx, sub_branches, sub_retrievals, sub_ids)
-            )
-
         def _branch_pages(pos: int) -> list[PageRef]:
             r = retr_by_pos.get(pos)
             return list(r.pages) if isinstance(r, BranchRetrieval) else []
 
-        async def _tail(pos: int) -> list[AnnotatedValue]:
+        async def _tail(pos: int) -> list[RetrievedDoc | AnnotatedValue]:
             branch, bid = branches[pos], branch_ids[pos]
             if branch.kind == "retrieve":
-                assert pipeline is not None
-                res = (await pipeline)[retrieve_pos.index(pos)]
+                # Retrieval already ran in the shared phase; surface its docs (or its failure).
+                res = retr_by_pos[pos]
                 if isinstance(res, StepFailed):
                     raise res
-                return res
+                return list(res.documents)
             # External lookup.
             return await traced_step(
                 self._ctx,

@@ -35,6 +35,27 @@ class QATFDSearchAgentConfig(SearchAgentConfig):
     # only adds a semantic-filter tool, which needs no extra config beyond llm_model (base).
     pass
 
+
+@dataclass
+class AblationSearchAgentConfig(SearchAgentConfig):
+    # SearchAgent variant whose retrieval tool set is chosen by config, for a tool-ablation
+    # experiment. `read_document` and `prune` are always present; these three flags toggle the
+    # discovery/narrowing tools independently. Defaults reproduce the vanilla SearchAgent
+    # (vector + grep, no semantic filter).
+    tool_vector: bool = True            # search_corpus (vector search)
+    tool_grep: bool = True              # grep_corpus (lexical search)
+    tool_semantic_filter: bool = False  # semantic_filter (QATFD's tool)
+    # Model for the semantic_filter's per-candidate judge calls; null => use `llm_model` (the agent
+    # model). Set it to a cheaper model to run the (token-heavy) candidate filtering on the cheap
+    # model while the search agent itself stays on `llm_model` — the filtered-out candidates never
+    # enter the agent model's context, so this drives cost down without touching the agent's reasoning.
+    semantic_filter_model: str | None = None
+    # OpenRouter provider order (no fallback) for the semantic_filter judge calls only. null => use
+    # the client-wide `llm_provider_order`. Lets the judge model route to specific providers (e.g.
+    # [akashml, parasail]) while the agent model (which may be a different family, e.g. a Google
+    # model that those providers don't serve) stays unpinned.
+    semantic_filter_provider_order: list[str] | None = None
+
 # ---------------------------------------------------------------------------
 # General experiment configuration
 # ---------------------------------------------------------------------------
@@ -241,5 +262,7 @@ def system_config_factory(cfg: DictConfig) -> SystemConfig:
         return SearchAgentConfig(**system_cfg)
     elif system_cfg["name"] == "qatfd_search_agent":
         return QATFDSearchAgentConfig(**system_cfg)
+    elif system_cfg["name"] == "ablation_search_agent":
+        return AblationSearchAgentConfig(**system_cfg)
     else:
         raise ValueError(f"unknown system {system_cfg['name']!r}")

@@ -35,3 +35,8 @@ llm_prices:
   gemini-3.1-pro: {in: 2.0, out: 12.0, cached: 0.20}
   qwen3-embedding-8b: {in: 0.01, out: 0.00, cached: 0.00}
   google/gemma-3-12b-it: {in: 0.05, out: 0.15, cached: 0.00}
+  qwen/qwen3.6-35b-a3b: {in: 0.15, out: 1.0, cached: 0.05}   # pinned to Parasail
+  qwen/qwen3.6-27b: {in: 0.285, out: 2.4, cached: 0.15}      # pinned to io.net
+# OpenRouter provider pin (ordered slugs, no fallback); null = OpenRouter picks. Overridden
+# per-run on the CLI, e.g. systems.llm_provider_order=[parasail].
+llm_provider_order: null

@@ -21,9 +21,8 @@ from skunk.common import strip_code_fence
 from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.common import (
-    AnnotatedValue,
     ExecutionContext,
-    input_values_desc,
+    pool_desc,
 )
 
 
@@ -37,8 +36,8 @@ NonEmptyStr = Annotated[str, AfterValidator(_strip_non_empty)]
 
 
 class RetrieveBranch(BaseModel):
-    """A corpus-retrieval branch. `visual_only` skips the parsed-text tier
-    downstream and goes straight to vision."""
+    """A corpus-retrieval branch — one search-agent rollout that returns the relevant
+    pages (with their text) for compute to read."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -47,7 +46,6 @@ class RetrieveBranch(BaseModel):
     period: str | None = (
         None  # YYYY-MM month/range/comma-list the DATA pertains to ("2013-06", "2022-10..2023-09", "1940-01..1940-12, 1953-01..1953-12"); None if unpinned
     )
-    visual_only: bool = False
 
 
 class LookupBranch(BaseModel):
@@ -111,8 +109,7 @@ You are a query planner. Given a question, emit a JSON plan that, when executed,
   "branches": [
     {"kind": "retrieve",
      "key": "<natural-language lookup string>",
-     "period": "<str | null>",
-     "visual_only": <bool>},
+     "period": "<str | null>"},
     {"kind": "lookup_external",
      "target": "<natural-language request for a single value>",
      "src": "<natural-language description of requested source, if applicable | null>"}
@@ -140,7 +137,6 @@ retrieve branch fields:
                 when the question doesn't pin a data period. A named publication/print
                 volume ("as reported in a later annual volume") is NOT the period and
                 is NOT encoded in the plan — selection chooses which volume to read.
-  visual_only   true only if question explicitly asks for visual understanding of charts/figures.
 
 lookup_external branch fields:
   target        natural-language request for one external value, or for the same series
@@ -159,13 +155,12 @@ Emit a fresh Plan JSON (schema above) containing ONLY the branches to run
 NOW — the new gathering actions. At least one branch.
 
 Rules:
-  - DIAGNOSE FIRST: compare the previous plans, the values compute kept,
+  - DIAGNOSE FIRST: compare the previous plans, the data gathered so far,
     and what compute says is missing — work out why the gathering so far
     did not satisfy compute, then emit branches that fix exactly that.
     Never re-emit an approach that already failed the same way.
-  - Values under "Values compute KEPT" stay available to compute; never
-    emit a branch for data already there. Everything else compute saw was
-    retrieved and dropped as not useful in its current form.
+  - Everything under "Data gathered so far" stays available to compute; never
+    emit a branch for data already there. Add only what is still missing.
   - Read each failed attempt's diagnostic before retrying it: reword the
     key, check the granularity asked for, and whether the value really is
     in the corpus (retrieve) or external (lookup_external).
@@ -227,15 +222,15 @@ Rules:
     async def replan(
         self,
         ctx: ExecutionContext,
-        pool: list[AnnotatedValue],
+        pool: list,
         attempts: list[AttemptRecord],
         missing_reason: str,
         missing: list[str],
     ) -> Plan:
         parts = [
             f"Question: {ctx.question}",
-            "Values compute KEPT for the next round (available to compute; do NOT "
-            f"request again — everything else it saw was dropped):\n{input_values_desc(pool)}",
+            "Data gathered so far (available to compute; do NOT request it "
+            f"again):\n{pool_desc(pool)}",
             self._attempts_section(attempts),
             f"What compute says is missing:\n  description: {missing_reason}\n  missing:     {missing!r}",
         ]

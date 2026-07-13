@@ -8,17 +8,18 @@ library's `../skunk/ARCHITECTURE.md`.
 
 The **Grounded Reasoning Cup / OfficeQA application layer** over the skunk library:
 a declarative QA pipeline for the U.S. Treasury Bulletin corpus (696 monthly PDFs,
-1939–2025). Questions are answered by composing skunk's 4 operators
-(`retrieve` / `extract` / `lookup_external` / `compute`) into a typed DSL plan.
+1939–2025). Questions are answered by composing skunk's operators
+(`retrieve` / `lookup_external` / `compute`) into a typed DSL plan — `retrieve` returns
+the relevant pages with their text and `compute` answers from that text directly.
 Benchmark: `data/officeqa_pro.csv` (133 questions = 33 dev + 100 test; not tracked
 in git, keep locally).
 
 Layout:
 
-- `officeqa/` — the app package: Treasury corpus accessors (`corpus.py`), the
-  page-index build pipeline + page store (`page_index/`), the skunk
-  `PageContentStore` implementation (`page_store.py`), app config
-  (`config.py`: `SkunkConfig.from_env`), offline prep scripts (`prep/`).
+- `officeqa/` — the app package: Treasury corpus accessors (`corpus.py`), app config
+  (`config.py`: `SkunkConfig.from_env`), offline prep scripts (`prep/`). NOTE: the
+  `page_index/` build pipeline is now orphaned — it fed the retired extract/page-store
+  seam and is no longer used at query time (kept pending its own removal).
 - `eval/` — the e2e harness (`eval_e2e.py`), trace dump (`util.py`), scorer
   wrapper (`scoring.py`, delegates to qatfd's vendored v5 reward), and the
   table-corrections viewer.
