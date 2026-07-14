@@ -23,6 +23,13 @@ _JUDGE_SYSTEM = (
     "then optionally a one-line justification."
 )
 
+# Output-token cap for the single-nugget judge. Its reply is a YES/NO on the first line plus an
+# optional one-line justification, so real replies run ~1-22 tokens; this generous bound (observed
+# max was 22) exists only to stop a degenerate repetition loop from running away (one qid emitted
+# 65,532 tokens → a 245 KB rationale). `_parse_yes_no` reads the first yes/no token, so a truncated
+# reply never loses the verdict.
+_JUDGE_MAX_OUTPUT_TOKENS = 1024
+
 _YESNO_RE = re.compile(r"\b(yes|no)\b", re.IGNORECASE)
 
 
@@ -41,6 +48,7 @@ async def judge_single_nugget(ctx, *, question: str, gold: str, predicted: str, 
         model=model,
         ctx=ctx,
         call_site="bcp_judge",
+        max_output_tokens=_JUDGE_MAX_OUTPUT_TOKENS,
     )
     rationale = (resp.text or "").strip()
     return {
