@@ -93,6 +93,12 @@ class SearchAgentConfig(SystemConfig):
     # with a note telling the agent to narrow its pattern / pass `limit`.
     grep_max_output_tokens: int = 200_000
 
+    # maximum output tokens for each semantic_filter judge call (the reply is just TRUE/FALSE, but a
+    # reasoning judge model needs headroom to think before emitting the verdict — too small a cap makes
+    # it hit finish_reason=length with empty content, which then retries+backs-off and destroys
+    # throughput). Threaded into `SemanticFilterTool`.
+    semantic_filter_max_output_tokens: int = 2048
+
     # maximum number of pages the agent can process in a single read_document tool call
     agent_max_pages_per_tool_call: int = 20
 

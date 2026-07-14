@@ -8,6 +8,9 @@ agent_mode: retrieve
 search_agent_max_output_tokens: 4096
 search_agent_request_timeout_s: 120.0
 grep_max_output_tokens: 200000
+# output-token cap per semantic_filter judge call; enough for a reasoning judge to think and emit
+# TRUE/FALSE (too small => finish_reason=length + empty content => retry storm that tanks throughput).
+semantic_filter_max_output_tokens: 2048
 agent_max_pages_per_tool_call: 20
 read_document_max_output_chars: 400000
 agent_max_steps: 20

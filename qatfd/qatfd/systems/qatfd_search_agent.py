@@ -37,6 +37,7 @@ class QATFDSearchAgentSystem(SearchAgentSystem):
             max_output_tokens=self.config.grep_max_output_tokens,
             ctx=ctx,
             context_limits=self.config.llm_context_limits,
+            judge_max_output_tokens=self.config.semantic_filter_max_output_tokens,
         ),)
 
     def _include_search_corpus(self) -> bool:

@@ -28,6 +28,11 @@ import pathlib
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlparse
 
+# A report.csv field (e.g. a verbose judge_rationale, or a long retrieved_docs JSON) can exceed
+# Python's default 131072-char CSV field limit and abort the whole read; raise it so one big field
+# never blocks a run from loading.
+csv.field_size_limit(10**9)
+
 _APP_HTML = pathlib.Path(__file__).parent / "app.html"
 
 
