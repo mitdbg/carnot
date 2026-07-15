@@ -80,9 +80,14 @@ if [[ "$DRY_RUN" == 0 ]] && ! command -v "$VLLM_BIN" >/dev/null 2>&1; then
   exit 1
 fi
 
+# One tag per invocation so per-model logs don't overwrite across runs; under Slurm the
+# job id is the natural tag, elsewhere a timestamp. Override with RUN_TAG=... if desired.
+RUN_TAG="${RUN_TAG:-${SLURM_JOB_ID:-$(date +%Y%m%d-%H%M%S)}}"
+
 PIDS=()
 NAMES=()
 PORTS=()
+LOGS=()
 
 cleanup() {
   trap '' INT TERM EXIT
@@ -123,7 +128,8 @@ for spec in "$@"; do
   # shellcheck disable=SC2206 — word-splitting VLLM_EXTRA_ARGS is the point
   [[ -n "${VLLM_EXTRA_ARGS:-}" ]] && cmd+=(${VLLM_EXTRA_ARGS})
 
-  log="$LOG_DIR/$(echo "$name" | tr '/:' '--').log"
+  log="$LOG_DIR/$(echo "$name" | tr '/:' '--').$RUN_TAG.log"
+  LOGS+=("$log")
   if [[ "$DRY_RUN" == 1 ]]; then
     echo "[dry-run] ${gpus:+CUDA_VISIBLE_DEVICES=$gpus }${cmd[*]}  # log: $log"
   else
@@ -151,7 +157,7 @@ if [[ "$DRY_RUN" == 0 ]]; then
     until curl -sf "${auth[@]}" -o /dev/null "http://$POLL_HOST:$port/v1/models"; do
       if ! kill -0 "$pid" 2>/dev/null; then
         echo "ERROR: vLLM server for '$name' exited during startup; last log lines:" >&2
-        tail -n 30 "$LOG_DIR/$(echo "$name" | tr '/:' '--').log" >&2 || true
+        tail -n 30 "${LOGS[$idx]}" >&2 || true
         exit 1
       fi
       if (( SECONDS >= deadline )); then
