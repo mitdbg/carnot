@@ -17,6 +17,7 @@
 #   tp=2        --tensor-parallel-size
 #   mem=0.45    --gpu-memory-utilization (fraction; lets several servers share one GPU)
 #   len=32768   --max-model-len
+#   seqs=128    --max-num-seqs (hybrid/mamba models cap this by cache blocks, see error msg)
 #   task=embed  embedding server (--task embed; newer vLLM: swap for --runner pooling)
 #   name=<id>   --served-model-name (DEFAULT: the model id itself, so the manifest keys,
 #               systems.llm_model / semantic_filter_model / emb_model_id, and the server
@@ -58,7 +59,7 @@ if [[ "${1:-}" == "--dry-run" ]]; then DRY_RUN=1; shift; fi
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 [--dry-run] <model-spec> [<model-spec> ...]" >&2
-  echo "  model-spec: <model-id>[:key=val ...]  keys: gpus= tp= mem= len= task=embed name= port=" >&2
+  echo "  model-spec: <model-id>[:key=val ...]  keys: gpus= tp= mem= len= seqs= task=embed name= port=" >&2
   echo "  Example: $0 'Qwen/Qwen3-32B:gpus=0:mem=0.9' 'Qwen/Qwen3-Embedding-0.6B:gpus=1:task=embed'" >&2
   exit 2
 fi
@@ -104,13 +105,14 @@ i=0
 for spec in "$@"; do
   IFS=':' read -r -a fields <<< "$spec"
   model="${fields[0]}"
-  gpus="" tp="" mem="" len="" task="" name="$model" port=""
+  gpus="" tp="" mem="" len="" seqs="" task="" name="$model" port=""
   for kv in "${fields[@]:1}"; do
     case "$kv" in
       gpus=*) gpus="${kv#gpus=}" ;;
       tp=*)   tp="${kv#tp=}" ;;
       mem=*)  mem="${kv#mem=}" ;;
       len=*)  len="${kv#len=}" ;;
+      seqs=*) seqs="${kv#seqs=}" ;;
       task=*) task="${kv#task=}" ;;
       name=*) name="${kv#name=}" ;;
       port=*) port="${kv#port=}" ;;
@@ -123,6 +125,7 @@ for spec in "$@"; do
   [[ -n "$tp" ]] && cmd+=(--tensor-parallel-size "$tp")
   [[ -n "$mem" ]] && cmd+=(--gpu-memory-utilization "$mem")
   [[ -n "$len" ]] && cmd+=(--max-model-len "$len")
+  [[ -n "$seqs" ]] && cmd+=(--max-num-seqs "$seqs")
   [[ -n "$task" ]] && cmd+=(--task "$task")
   [[ -n "${VLLM_API_KEY:-}" ]] && cmd+=(--api-key "$VLLM_API_KEY")
   # shellcheck disable=SC2206 — word-splitting VLLM_EXTRA_ARGS is the point

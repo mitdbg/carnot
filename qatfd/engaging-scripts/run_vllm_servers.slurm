@@ -92,7 +92,12 @@ export HF_HOME=/tmp/$USER/hf_cache
 # len= caps the context window so KV cache + CUDA graphs fit next to bf16 weights on 80 GB
 # (vLLM otherwise reserves KV for the model's full advertised context, e.g. 262K). 64K/32K
 # comfortably cover the search-agent and semantic-filter prompt sizes.
+# seqs= on BOTH: the Qwen3.6 models are hybrids whose GDN/mamba layers need one
+# fixed-size cache block per in-flight sequence, and the memory left after weights holds
+# only ~345 (27B) / ~229 (35B) blocks — vLLM's default --max-num-seqs=1024 therefore fails
+# CUDA-graph capture ("exceeds available Mamba cache blocks"). 128 concurrent decodes is
+# far above what one qatfd sweep drives at once.
 HOST=0.0.0.0 ADVERTISE_HOST=$(hostname) VLLM_BIN=$(command -v vllm) \
   ./scripts/run_vllm_servers.sh \
-    'Qwen/Qwen3.6-27B:gpus=0:mem=0.92:len=65536:name=qwen/qwen3.6-27b' \
-    'Qwen/Qwen3.6-35B-A3B:gpus=1:mem=0.95:len=32768:name=qwen/qwen3.6-35b-a3b'
+    'Qwen/Qwen3.6-27B:gpus=0:mem=0.92:len=65536:seqs=128:name=qwen/qwen3.6-27b' \
+    'Qwen/Qwen3.6-35B-A3B:gpus=1:mem=0.95:len=32768:seqs=128:name=qwen/qwen3.6-35b-a3b'
