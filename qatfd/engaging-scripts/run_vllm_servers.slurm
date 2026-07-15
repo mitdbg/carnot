@@ -74,6 +74,10 @@ export CUDA_HOME="${CUDA_HOME:-$(dirname "$(dirname "$(command -v nvcc)")")}"
 # configured host compiler"). gcc 12 fully supports C++20 and is inside nvcc 13.1's
 # supported host-compiler range; nvcc picks it up from PATH.
 module load gcc/12.2.0
+# The JIT-built kernels link against gcc 12's libstdc++, but dlopen resolves
+# libstdc++.so.6 from the node's OLD /lib64 copy ("GLIBCXX_3.4.26 not found"). The gcc
+# module sets PATH but not the runtime library path, so put its libstdc++ first.
+export LD_LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so.6)")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 mamba activate vllm
 export PYTHONNOUSERSITE=True
 # Weights cache on node-local scratch (~/orcd counts against the 200 GB home quota; /tmp is
