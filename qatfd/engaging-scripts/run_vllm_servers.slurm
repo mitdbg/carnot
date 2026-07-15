@@ -63,18 +63,18 @@ nvidia-smi
 # ── Environment setup ──
 module purge
 module load miniforge
+# CUDA toolkit for FlashInfer's JIT-compiled kernels (GDN prefill, sampling, ...): puts
+# nvcc on PATH + headers under CUDA_HOME. Pinned to the version matching the node driver
+# and the env's cu13 torch/vLLM wheels; compiled kernels are cached in ~/.cache/flashinfer,
+# so only the first run per kernel pays the compile.
+module load cuda/13.1.0
+export CUDA_HOME="${CUDA_HOME:-$(dirname "$(dirname "$(command -v nvcc)")")}"
 mamba activate vllm
 export PYTHONNOUSERSITE=True
 # Weights cache on node-local scratch (~/orcd counts against the 200 GB home quota; /tmp is
 # node-local NVMe). ~125 GB for the two models — re-downloaded per job/node, so budget the
 # first ~15 min of the walltime for the pull. export HF_TOKEN before sbatch if repos are gated.
 export HF_HOME=/tmp/$USER/hf_cache
-
-# Qwen3.6's GDN linear-attention prefill kernel is JIT-compiled by FlashInfer, which needs
-# nvcc — and compute nodes have no /usr/local/cuda (pip vLLM ships only the CUDA runtime).
-# The Triton backend bundles its own compiler, so it needs nothing from the node. Extra
-# args passed by the caller are appended after and still apply.
-export VLLM_EXTRA_ARGS="--gdn-prefill-backend triton ${VLLM_EXTRA_ARGS:-}"
 
 # ── Launch both servers (blocks until the job ends; servers die with the job) ──
 # Inside the allocation Slurm renumbers the granted GPUs 0..N-1, so gpus=0/gpus=1 pin one
