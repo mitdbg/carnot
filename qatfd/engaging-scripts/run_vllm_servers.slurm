@@ -40,6 +40,18 @@
 #   mamba activate vllm && pip install vllm
 # (~20 GB in ~/.conda — watch the 200 GB home quota; `pip cache purge` after.)
 
+# (-e/-o pipefail but NOT -u: conda's activate scripts reference unbound variables.)
+set -eo pipefail
+
+# sbatch runs a COPY of this script from a spool dir, so $0 can't locate the repo. Submit
+# from the qatfd repo root (`sbatch engaging-scripts/run_vllm_servers.slurm`) and anchor on
+# the submit dir instead.
+cd "${SLURM_SUBMIT_DIR:?}"
+if [[ ! -x scripts/run_vllm_servers.sh ]]; then
+  echo "ERROR: scripts/run_vllm_servers.sh not found in $PWD — submit from the qatfd repo root" >&2
+  exit 1
+fi
+
 mkdir -p logs
 
 echo "Job ID: $SLURM_JOB_ID"
@@ -60,9 +72,8 @@ export HF_HOME=/tmp/$USER/hf_cache
 
 # ── Launch both servers (blocks until the job ends; servers die with the job) ──
 # Inside the allocation Slurm renumbers the granted GPUs 0..N-1, so gpus=0/gpus=1 pin one
-# server per H200. ADVERTISE_HOST is the node's cluster-internal name — reachable from other
+# server per GPU. ADVERTISE_HOST is the node's cluster-internal name — reachable from other
 # cluster nodes directly, from outside via the SSH tunnel above.
-cd "$(dirname "$0")/.."   # qatfd repo root
 # len= caps the context window so KV cache + CUDA graphs fit next to bf16 weights on 80 GB
 # (vLLM otherwise reserves KV for the model's full advertised context, e.g. 262K). 64K/32K
 # comfortably cover the search-agent and semantic-filter prompt sizes.
