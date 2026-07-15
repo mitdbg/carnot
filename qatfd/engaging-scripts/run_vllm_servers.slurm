@@ -70,6 +70,12 @@ export PYTHONNOUSERSITE=True
 # first ~15 min of the walltime for the pull. export HF_TOKEN before sbatch if repos are gated.
 export HF_HOME=/tmp/$USER/hf_cache
 
+# Qwen3.6's GDN linear-attention prefill kernel is JIT-compiled by FlashInfer, which needs
+# nvcc — and compute nodes have no /usr/local/cuda (pip vLLM ships only the CUDA runtime).
+# The Triton backend bundles its own compiler, so it needs nothing from the node. Extra
+# args passed by the caller are appended after and still apply.
+export VLLM_EXTRA_ARGS="--gdn-prefill-backend triton ${VLLM_EXTRA_ARGS:-}"
+
 # ── Launch both servers (blocks until the job ends; servers die with the job) ──
 # Inside the allocation Slurm renumbers the granted GPUs 0..N-1, so gpus=0/gpus=1 pin one
 # server per GPU. ADVERTISE_HOST is the node's cluster-internal name — reachable from other
