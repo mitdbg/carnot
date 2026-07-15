@@ -478,18 +478,22 @@ Requirements for the final answer:
         # numbers every attempt, including misfired re-prompts (which don't cost a step).
         step = turn = 0
         max_turns = None if max_steps is None else max_steps + max(0, self.max_misfires)
-        warned = False
+        # Track the `left` value we last warned at so the warning counts DOWN from the
+        # threshold (2, 1, ...) rather than firing once. `left` decreases monotonically
+        # with `step`, so re-warn only when it drops to a new value (misfires that don't
+        # advance `step` keep `left` unchanged and are correctly not re-warned).
+        last_warned_left: int | None = None
         while (max_steps is None or step < max_steps) and (
             max_turns is None or turn < max_turns
         ):
             if (
                 self.warn_steps_remaining is not None
-                and not warned
                 and max_steps is not None
                 and max_steps - step <= self.warn_steps_remaining
+                and max_steps - step != last_warned_left
             ):
-                warned = True
                 left = max_steps - step
+                last_warned_left = left
                 warn = (
                     f"Only {left} of {max_steps} steps remain. You should focus your "
                     f"remaining steps on your most promising lead and avoid wasting "

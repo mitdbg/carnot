@@ -259,6 +259,12 @@ def _raw_body_suffix() -> str:
     errors. The body is the ground truth the SDK's typed `ChatResult` is parsed from, so it
     reveals whether `content` was truly null on the wire vs. dropped in parsing."""
     body = _last_openrouter_raw_body.get()
+    if not body:
+        return ""
+    # A finish_reason=length empty completion can be ~2 KB of newlines/whitespace; kept verbatim
+    # it turns this one-line diagnostic (and the trace viewer's rendering of it) into a huge blank
+    # block, so collapse whitespace runs — the JSON tokens that matter for debugging survive.
+    body = " ".join(body.split())
     return f" raw_body={body}" if body else ""
 
 

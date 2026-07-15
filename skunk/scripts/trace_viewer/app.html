@@ -178,13 +178,15 @@
     .sf-head .sf-pred { color: var(--text2); }
     .sf-head .sf-pred b { color: var(--text); font-weight:600; }
     .sf-head .sf-stat { margin-left:auto; color: var(--text3); font-size:11px; }
-    .sf-docs { display:flex; flex-direction:column; gap:3px; }
-    .sf-doc { display:flex; flex-direction:column; gap:2px; }
-    .sf-chip { display:inline-block; align-self:flex-start; font-family: ui-monospace, monospace; font-size:11px; padding:2px 9px; border-radius:10px; border:1px solid var(--border2); cursor:pointer; user-select:none; }
+    /* chips flow + wrap (a filter over N docs must not become an N-row column); an expanded
+       doc's text takes a full-width row (flex-basis:100%) so it breaks the chip flow cleanly. */
+    .sf-docs { display:flex; flex-wrap:wrap; gap:4px; align-items:flex-start; }
+    .sf-chip { display:inline-block; font-family: ui-monospace, monospace; font-size:11px; padding:2px 9px; border-radius:10px; border:1px solid var(--border2); cursor:pointer; user-select:none; }
     .sf-chip.sf-pass { color: var(--green); border-color:#1f5f1f; background: var(--green-bg); }
     .sf-chip.sf-fail { color: var(--red);   border-color:#6a1414; background: var(--red-bg); }
+    .sf-chip.open { outline:1px solid var(--text3); }
     .sf-chip:hover { filter:brightness(1.3); }
-    .sf-text { font-family: ui-monospace, monospace; font-size:11px; line-height:1.5; white-space:pre-wrap; word-break:break-word; padding:6px 9px; margin:2px 0 4px 14px; border-left:2px solid var(--border2); color: var(--text2); max-height:360px; overflow:auto; }
+    .sf-text { flex-basis:100%; font-family: ui-monospace, monospace; font-size:11px; line-height:1.5; white-space:pre-wrap; word-break:break-word; padding:6px 9px; margin:0 0 2px; border-left:2px solid var(--border2); color: var(--text2); max-height:360px; overflow:auto; }
   </style>
 </head>
 <body>
@@ -789,7 +791,11 @@ function eventHtml(evt){
   const style = KIND[kind] || KIND.note;
   const ts = evt.t!=null ? `@${fsec(evt.t)}` : "";
   if(COMPACT_KINDS.has(kind)){
-    return `<div class="msg compact" style="border-left-color:${style.color}"><div class="msg-line">${ts?`<span style="color:var(--text3)">${ts} </span>`:""}${esc(evt.message||"")}</div></div>`;
+    // Compact events are scannable one-liners by convention, but a message can embed a blob
+    // (e.g. an llm_call_failed `raw_body=` full of newlines from a finish_reason=length reply);
+    // with white-space:pre-wrap that renders as a huge blank gap, so collapse whitespace runs.
+    const line = esc((evt.message || "").replace(/\s+/g, " ").trim());
+    return `<div class="msg compact" style="border-left-color:${style.color}"><div class="msg-line">${ts?`<span style="color:var(--text3)">${ts} </span>`:""}${line}</div></div>`;
   }
   const key = String(evt._idx); const expanded = S.expanded.has(key);
   const { html, total, truncated } = renderBody(evt, expanded);
@@ -1040,13 +1046,13 @@ function semfilterHtml(evt, key){
   const head = `<div class="sf-head">
     <span class="sf-pred">predicate: <b>${esc(d.predicate || "")}</b></span>
     <span class="sf-stat">${d.n_out}/${d.n_in} passed</span></div>`;
+  // Chips are flat siblings in a wrapping row (NOT one-per-row): an expanded doc's text is a
+  // full-width sibling (.sf-text { flex-basis:100% }) that breaks the flow beneath its chip.
   const chips = docs.map((doc,i) => {
     const dk = `sf:${key}:${i}`, open = S.expanded.has(dk);
     const cls = doc.kept ? "sf-pass" : "sf-fail";
-    return `<div class="sf-doc">
-      <span class="sf-chip ${cls}" onclick="VW.toggleExpand('${dk}')">${doc.kept?"✓":"✗"} ${esc(doc.doc_id)}</span>
-      ${open ? `<pre class="sf-text">${esc(doc.text || "(no text recorded)")}</pre>` : ""}
-    </div>`;
+    return `<span class="sf-chip ${cls}${open?" open":""}" onclick="VW.toggleExpand('${dk}')">${doc.kept?"✓":"✗"} ${esc(doc.doc_id)}</span>`
+      + (open ? `<pre class="sf-text">${esc(doc.text || "(no text recorded)")}</pre>` : "");
   }).join("") || `<span class="empty">no documents filtered</span>`;
   return `<div class="semfilter">${head}<div class="sf-docs">${chips}</div></div>`;
 }
