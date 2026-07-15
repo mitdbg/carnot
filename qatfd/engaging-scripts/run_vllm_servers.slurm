@@ -69,6 +69,11 @@ module load miniforge
 # so only the first run per kernel pays the compile.
 module load cuda/13.1.0
 export CUDA_HOME="${CUDA_HOME:-$(dirname "$(dirname "$(command -v nvcc)")")}"
+# nvcc compiles kernels through a HOST g++, and the nodes' system gcc is too old for the
+# C++17/20 that FlashInfer's kernels require ("-std=c++20 ... not supported with the
+# configured host compiler"). gcc 12 fully supports C++20 and is inside nvcc 13.1's
+# supported host-compiler range; nvcc picks it up from PATH.
+module load gcc/12.2.0
 mamba activate vllm
 export PYTHONNOUSERSITE=True
 # Weights cache on node-local scratch (~/orcd counts against the 200 GB home quota; /tmp is
