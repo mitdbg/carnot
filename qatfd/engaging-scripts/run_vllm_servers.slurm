@@ -30,7 +30,9 @@
 # Connectivity: compute nodes are only reachable inside the cluster. From the machine that
 # runs qatfd (holds the chroma stores + OPENROUTER_API_KEY), tunnel through the login node
 # using the node name this job prints below:
-#   ssh -N -L 8100:<node>:8100 -L 8101:<node>:8101 <user>@orcd-login001.mit.edu
+#   ssh -N -L 8100:<node>:8100 -L 8101:<node>:8101 <user>@orcd-login.mit.edu
+# (with a ControlMaster/ControlPersist ssh-config alias, `ssh <alias>` once for
+# password+2FA, then the -N tunnel multiplexes over the socket with no re-auth)
 # then point the run at the tunnel:
 #   '++systems.vllm_base_urls={qwen/qwen3.6-27b: "http://127.0.0.1:8100/v1",
 #                              qwen/qwen3.6-35b-a3b: "http://127.0.0.1:8101/v1"}'
