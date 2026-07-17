@@ -64,7 +64,8 @@ export HF_HOME=/tmp/$USER/hf_cache
 
 # ── Launch the embedding server (blocks until the job ends; server dies with the job) ──
 # mem=0.3 leaves the rest of the GPU free (0.6B weights + pooling need little); default
-# served name = the model id, so emb_model_id and the manifest key agree.
+# served name = the model id, so emb_model_id and the manifest key agree. runner=pooling
+# (not task=embed): the cluster's vllm is new enough that --task was removed.
 HOST=0.0.0.0 ADVERTISE_HOST=$(hostname) VLLM_BIN=$(command -v vllm) \
   ./scripts/run_vllm_servers.sh \
-    'Qwen/Qwen3-Embedding-0.6B:gpus=0:mem=0.3:task=embed'
+    'Qwen/Qwen3-Embedding-0.6B:gpus=0:mem=0.3:runner=pooling'
