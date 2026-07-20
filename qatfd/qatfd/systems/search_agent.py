@@ -62,14 +62,26 @@ class SearchAgentSystem(RetrieveComputeSystem):
         it (e.g. a tool-ablation system) to force the agent onto vector search / semantic filter."""
         return True
 
-    def _prompts(self) -> tuple[str | None, str | None]:
-        """(briefing, final_answer_doc) overrides; None => skunk SearchAgent defaults."""
+    def _prompts(self, resources: BenchmarkResources) -> tuple[str | None, str | None]:
+        """(briefing, final_answer_doc) overrides; None => skunk SearchAgent defaults.
+
+        The benchmark's one-sentence `compute_objective` is appended to the briefing so the agent
+        knows what the downstream answer is graded on (exact-answer correctness vs nugget recall)
+        and can calibrate retrieval breadth. With no objective the briefing stays None (skunk's
+        default); with one in retrieve mode we materialize skunk's default briefing so the sentence
+        has something to attach to."""
         if self.config.agent_mode == "answer":
-            return _ANSWER_BRIEFING, _ANSWER_FINAL_DOC
-        return None, None
+            briefing, final_answer_doc = _ANSWER_BRIEFING, _ANSWER_FINAL_DOC
+        else:
+            briefing, final_answer_doc = None, None
+        objective = getattr(resources, "compute_objective", "") or ""
+        if objective:
+            base = briefing if briefing is not None else SearchAgent.briefing
+            briefing = f"{base} {objective}"
+        return briefing, final_answer_doc
 
     def _build_agent(self, ctx: ExecutionContext, resources: BenchmarkResources) -> SearchAgent:
-        briefing, final_answer_doc = self._prompts()
+        briefing, final_answer_doc = self._prompts(resources)
         return SearchAgent(
             config=self.config,
             document_map=resources.document_map,

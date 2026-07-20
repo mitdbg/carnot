@@ -55,6 +55,7 @@ class BenchmarkResources:
     document_map: DocumentMap  # doc_id -> full text (for read_document / answer step)
     config: BenchmarkConfig
     answer_format_hint: str = ""
+    compute_objective: str = ""  # one sentence on what the final answer is graded on (for the search agent)
     prompt_overrides: tuple[PromptOverride, ...] = field(default_factory=tuple)
     pdf_dir: str | None = None
 
@@ -66,6 +67,13 @@ class Benchmark(ABC):
     # the form the scorer expects. OfficeQA overrides to demand a terse numeric form.
     answer_format_hint: str = (
         "Answer concisely with just the factual answer (a short span or value), no explanation."
+    )
+
+    # One sentence appended to the search agent's briefing telling it what the final answer will
+    # be graded on, so it can calibrate how broadly to retrieve. This default is applied for
+    # exact-answer benchmarks
+    compute_objective: str = (
+        "The final answer to this question will be graded on exact-answer correctness."
     )
 
     def __init__(self, config: BenchmarkConfig) -> None:
@@ -114,6 +122,7 @@ class Benchmark(ABC):
         if self._resources is None:
             res = self._build_resources()
             res.answer_format_hint = self.answer_format_hint
+            res.compute_objective = self.compute_objective
             path = self.config.prompts_path
             res.prompt_overrides = load_prompt_overrides(path) if path and os.path.exists(path) else ()
             res.pdf_dir = self.config.pdf_dir

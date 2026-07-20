@@ -239,8 +239,8 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         if isinstance(output, dict) and output.get(SEMFILTER_RESULT_TAG):
             if output.get("error"):
                 blocks.append(TextBlock(f"[error]\n{output['error']}"))
-            elif "chunks" in output:
-                # Corpus mode: a summary line, then one redactable ChunkBlock per snippet.
+            else:
+                # A summary line, then one redactable ChunkBlock per kept-doc snippet.
                 if output.get("summary"):
                     blocks.append(TextBlock(output["summary"]))
                 blocks.extend(
@@ -249,12 +249,6 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
                 )
                 if not output.get("summary") and not output["chunks"]:
                     blocks.append(TextBlock(EMPTY_RESULT_MESSAGE))
-            else:
-                # doc_ids mode: ids-only result.
-                blocks.append(TextBlock(
-                    f"[result]\nsemantic_filter kept {output['n_out']} of {output['n_in']} document(s). "
-                    f"kept_doc_ids={output['kept_doc_ids']}"
-                ))
             if output.get("truncation_note"):
                 blocks.append(TextBlock(output["truncation_note"]))
             return blocks

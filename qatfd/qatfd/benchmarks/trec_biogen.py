@@ -183,6 +183,12 @@ class TrecBiogenBenchmark(Benchmark):
         "explicitly. Prefer completeness over brevity; do not omit a supported fact for concision."
     )
 
+    # TREC-Biogen is evaluated on nugget recall instead of exact-answer correctness.
+    compute_objective = (
+        "The final answer to this question will be graded on nugget recall — the fraction of the "
+        "reference answer's key facts that it covers."
+    )
+
     def __init__(self, config: TrecBiogenConfig) -> None:
         # all benchmark data (index shards, questions, nuggets, prompts) resolves under qatfd/benchmarks/.
         config.chromadb_dir = str(resolve_under_benchmarks(config.chromadb_dir))

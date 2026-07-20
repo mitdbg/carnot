@@ -1,4 +1,4 @@
-"""Unit tests for `SemanticFilterTool` (doc_ids + corpus modes), its `bind_retrieval_state`
+"""Unit tests for `SemanticFilterTool` (corpus-mode candidate selection + judging), its `bind_retrieval_state`
 wiring, and the `SEMFILTER_RESULT_TAG` rendering in `SearchAgent._blocks_from_output`.
 
 No LLM / Chroma. Runs under pytest if installed, or standalone:
@@ -119,9 +119,8 @@ def test_validation_errors():
     tool, client, collection = _tool()
     cases = [
         (dict(predicate="  "), "`predicate` is required"),
-        (dict(predicate="p", doc_ids=["d1"], metadata_filter={"year": "1946"}), "EITHER doc_ids OR corpus-mode"),
         (dict(predicate="p", search_str="q"), "search_str requires top_k"),
-        (dict(predicate="p"), "provide doc_ids, or a metadata_filter and/or top_k"),
+        (dict(predicate="p"), "provide a metadata_filter and/or top_k"),
     ]
     for kwargs, needle in cases:
         out = tool(**kwargs)
@@ -138,21 +137,6 @@ def test_corpus_mode_requires_wiring():
     tool2 = SemanticFilterTool(FakeLLMClient(), dict(_DOC_MAP), "m", chroma_collection=FakeChroma(list(_CHUNKS)))
     out2 = tool2("p", top_k=5)
     assert "top_k is not available" in out2["error"]
-
-
-# ---- doc_ids mode (legacy path) ---------------------------------------------------
-
-
-def test_doc_ids_mode_regression():
-    tool, client, collection = _tool(lambda text: "apple" in text)
-    out = tool("about apples", doc_ids=["d1", "d2"])
-    assert out == {SEMFILTER_RESULT_TAG: True, "kept_doc_ids": ["d1"], "n_in": 2, "n_out": 1}
-    assert "chunks" not in out and "summary" not in out
-    assert not collection.query_kwargs and not collection.get_kwargs  # no corpus traffic
-
-    out2 = tool("about bananas", doc_ids="d2")  # bare-string coercion
-    assert out2["kept_doc_ids"] == []
-    assert out2["n_in"] == 1
 
 
 # ---- corpus mode: vector prefilter ------------------------------------------------
@@ -194,7 +178,9 @@ def test_vector_mode_over_doc_cap():
 # ---- corpus mode: metadata-only --------------------------------------------------
 
 
-def test_metadata_mode_where_has_pruned_but_not_seen():
+def test_metadata_mode_where_excludes_pruned_and_seen_by_default():
+    # Default exclude=True: the where clause excludes BOTH pruned and seen material, so each
+    # call surfaces only new documents (like grep/search_corpus).
     tool, _, collection = _tool()
     state = RetrievalState(
         pruned_chunk_ids={"px"}, pruned_doc_ids={"pd"},
@@ -202,6 +188,22 @@ def test_metadata_mode_where_has_pruned_but_not_seen():
     )
     tool.bind_retrieval_state(state)
     tool("p", metadata_filter={"year": "1946"})
+    where = collection.get_kwargs[0]["where"]
+    assert {"year": "1946"} in where["$and"]
+    assert {"doc_id": {"$nin": ["pd", "sd"]}} in where["$and"]
+    assert {"chunk_id": {"$nin": ["px", "sx"]}} in where["$and"]
+
+
+def test_metadata_mode_exclude_false_keeps_pruned_but_not_seen():
+    # exclude=False: comprehensive over seen-but-not-pruned material (re-judge already-fetched
+    # docs under a new predicate) — only pruned ids are filtered out.
+    tool, _, collection = _tool()
+    state = RetrievalState(
+        pruned_chunk_ids={"px"}, pruned_doc_ids={"pd"},
+        seen_chunk_ids={"sx"}, seen_doc_ids={"sd"},
+    )
+    tool.bind_retrieval_state(state)
+    tool("p", metadata_filter={"year": "1946"}, exclude=False)
     where = collection.get_kwargs[0]["where"]
     assert {"year": "1946"} in where["$and"]
     assert {"doc_id": {"$nin": ["pd"]}} in where["$and"]
@@ -263,8 +265,8 @@ def test_trace_event_records_mode_and_inputs():
     assert data["metadata_filter"] == {"year": "1946"}
     assert data["n_candidate_chunks"] == 4 and data["n_candidate_docs"] == 3
 
-    tool("about fruit", doc_ids=["d1"])
-    assert ctx.events[-1][1]["mode"] == "doc_ids"
+    tool("about fruit", metadata_filter={"year": "1946"})
+    assert ctx.events[-1][1]["mode"] == "metadata"
 
 
 # ---- SearchAgent integration: bind_retrieval_state + rendering -------------------------------
@@ -311,16 +313,13 @@ def test_render_corpus_payload():
     assert isinstance(blocks[2], TextBlock) and "truncated" in blocks[2].text
 
 
-def test_render_error_and_empty_and_doc_ids_payloads():
+def test_render_error_and_empty_payloads():
     [err] = _blocks({SEMFILTER_RESULT_TAG: True, "error": "semantic_filter error: boom"})
     assert err.text == "[error]\nsemantic_filter error: boom"
 
     [empty] = _blocks({SEMFILTER_RESULT_TAG: True, "summary": "", "chunks": [],
                        "kept_doc_ids": [], "n_in": 0, "n_out": 0})
     assert empty.text == EMPTY_RESULT_MESSAGE
-
-    [ids] = _blocks({SEMFILTER_RESULT_TAG: True, "kept_doc_ids": ["d1", "d2"], "n_in": 5, "n_out": 2})
-    assert "kept 2 of 5 document(s)" in ids.text and "['d1', 'd2']" in ids.text
 
 
 def test_rendered_chunks_are_redactable():
@@ -335,7 +334,7 @@ def test_rendered_chunks_are_redactable():
 
 def test_judge_call_caps_output_at_256():
     tool, client, _ = _tool(lambda t: True)
-    tool("about apples", doc_ids=["d1", "d2"])
+    tool("about apples", top_k=2)  # top_k vector prefilter → 2 candidate docs (d1, d2)
     # Every judge call carries the 256-token output cap (the verdict is one word).
     assert client.judge_max_output_tokens == [_JUDGE_OUTPUT_TOKENS, _JUDGE_OUTPUT_TOKENS]
 
@@ -345,11 +344,17 @@ def test_context_limit_truncates_only_oversized_docs():
     ctx = FakeCtx()
     client = FakeLLMClient(lambda t: True)
     limit = 8000  # tokens
+    # Metadata-mode candidates come from the collection (sorted → big, small); the judged text is
+    # pulled from the document_map, so that's what the context-limit truncation acts on.
+    chroma = FakeChroma([
+        {"chunk_id": "big_0", "doc_id": "big", "text": big},
+        {"chunk_id": "small_0", "doc_id": "small", "text": small},
+    ])
     tool = SemanticFilterTool(
         client, {"big": big, "small": small}, "judge-model",
-        ctx=ctx, context_limits={"judge-model": limit},
+        chroma_collection=chroma, ctx=ctx, context_limits={"judge-model": limit},
     )
-    tool("some predicate", doc_ids=["big", "small"])
+    tool("some predicate", metadata_filter={"any": "x"})
     budget = _judge_doc_char_budget(limit, "some predicate")
     # The oversized doc is head-truncated to exactly the budget and carries the marker;
     # the small doc is sent verbatim.
@@ -365,9 +370,10 @@ def test_context_limit_truncates_only_oversized_docs():
 def test_no_context_limit_sends_full_text():
     big = "z" * 100_000
     client = FakeLLMClient(lambda t: True)
-    tool = SemanticFilterTool(client, {"big": big}, "judge-model")  # no context_limits
+    chroma = FakeChroma([{"chunk_id": "big_0", "doc_id": "big", "text": big}])
+    tool = SemanticFilterTool(client, {"big": big}, "judge-model", chroma_collection=chroma)  # no context_limits
     assert tool._context_limit is None
-    tool("p", doc_ids=["big"])
+    tool("p", metadata_filter={"any": "x"})
     assert client.judged_texts[0] == big  # untouched
 
 

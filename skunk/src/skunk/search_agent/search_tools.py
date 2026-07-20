@@ -88,8 +88,9 @@ class RetrievalState:
 
     Extra tools (constructed by the caller before the agent's state exists) opt in
     via a duck-typed `bind_retrieval_state(state)` that `SearchAgent.__init__` calls — e.g.
-    `SemanticFilterTool`, which reads the pruned sets only (its corpus filter stays
-    comprehensive over seen-but-not-pruned material) and writes `seen_chunk_ids`.
+    `SemanticFilterTool`, which always reads the pruned sets and, unless called with
+    `exclude=False`, the seen sets too (staying comprehensive over seen-but-not-pruned
+    material only when asked), and writes `seen_chunk_ids`.
     """
 
     pruned_chunk_ids: set[str] = field(default_factory=set)
@@ -712,8 +713,8 @@ class SemanticFilterTool(Tool):
         context_limits: dict[str, int] | None = None,
         judge_max_output_tokens: int = _JUDGE_OUTPUT_TOKENS,
     ) -> None:
-        # `chroma_collection` (and, for top_k, `emb_model_id`) enable corpus mode; a
-        # tool constructed without them supports only the doc_ids mode.
+        # `chroma_collection` is required to select candidates from the corpus (and, for
+        # top_k vector prefiltering, `emb_model_id`); without a collection every call errors.
         self._llm_client = llm_client
         self._document_map = document_map
         self._model = model
@@ -737,9 +738,10 @@ class SemanticFilterTool(Tool):
 
     def bind_retrieval_state(self, state: RetrievalState) -> None:
         """Called by `SearchAgent.__init__` (duck-typed) to share the agent's per-question
-        `RetrievalState`: corpus-mode candidate selection excludes PRUNED chunks/docs
-        (never seen ones — the filter must stay comprehensive), and rendered chunks are
-        recorded as seen."""
+        `RetrievalState`: corpus-mode candidate selection always excludes PRUNED chunks/docs
+        and, by default (`exclude=True`), SEEN ones too so each call surfaces new material;
+        `exclude=False` keeps the filter comprehensive over seen-but-not-pruned docs. Rendered
+        chunks are recorded as seen."""
         self._state = state
 
     def _error(self, msg: str) -> dict:
@@ -748,45 +750,30 @@ class SemanticFilterTool(Tool):
     def __call__(
         self,
         predicate: str,
-        doc_ids: list[str] | None = None,
         metadata_filter: dict | None = None,
         top_k: int | None = None,
         search_str: str | None = None,
+        exclude: bool = True,
     ) -> dict:
         if not predicate or not str(predicate).strip():
             return self._error("semantic_filter error: `predicate` is required.")
-        corpus_args = metadata_filter is not None or top_k is not None or search_str is not None
-        if doc_ids is not None and corpus_args:
-            return self._error(
-                "semantic_filter error: pass EITHER doc_ids OR corpus-mode arguments "
-                "(metadata_filter / top_k / search_str), not both."
-            )
         if search_str is not None and top_k is None:
             return self._error(
                 "semantic_filter error: search_str requires top_k (it is the query for the top_k vector search)."
             )
-        if doc_ids is None and metadata_filter is None and top_k is None:
+        if metadata_filter is None and top_k is None:
             return self._error(
-                "semantic_filter error: provide doc_ids, or a metadata_filter and/or top_k "
-                "to select candidates from the corpus."
+                "semantic_filter error: provide a metadata_filter and/or top_k to select "
+                "candidates from the corpus."
             )
 
-        if doc_ids is not None:
-            if isinstance(doc_ids, str):
-                doc_ids = [doc_ids]
-            kept = filter_docs(
-                self._llm_client, predicate, list(doc_ids), self._document_map, self._model,
-                ctx=self._ctx, event_extra={"mode": "doc_ids"}, provider_order=self._provider_order,
-                context_limit=self._context_limit, judge_max_output_tokens=self._judge_max_output_tokens,
-            )
-            return {SEMFILTER_RESULT_TAG: True, "kept_doc_ids": kept, "n_in": len(doc_ids), "n_out": len(kept)}
-
-        return self._corpus_mode(predicate, metadata_filter, top_k, search_str)
+        return self._corpus_mode(predicate, metadata_filter, top_k, search_str, exclude)
 
     # ---- corpus mode -------------------------------------------------------------
 
     def _corpus_mode(
-        self, predicate: str, metadata_filter: dict | None, top_k: int | None, search_str: str | None
+        self, predicate: str, metadata_filter: dict | None, top_k: int | None, search_str: str | None,
+        exclude: bool,
     ) -> dict:
         if self._chroma_collection is None:
             return self._error(
@@ -798,12 +785,23 @@ class SemanticFilterTool(Tool):
                 "semantic_filter error: top_k is not available (tool was constructed without an embedding model)."
             )
 
-        # PRUNED exclusions only — never seen ones: the filter must stay comprehensive
-        # over material the agent has already fetched but not ruled out.
+        # Always exclude PRUNED material. When `exclude` (the default), also exclude SEEN
+        # material — chunks already returned to the agent by any tool plus docs it has read —
+        # so each call surfaces only NEW candidates, like grep/search_corpus. Pass exclude=False
+        # to keep the filter comprehensive over seen-but-not-pruned docs, e.g. to re-judge
+        # already-fetched material under a new predicate.
+        ignore_chunk_ids = (
+            self._state.pruned_chunk_ids | self._state.seen_chunk_ids if exclude
+            else self._state.pruned_chunk_ids
+        )
+        ignore_doc_ids = (
+            self._state.pruned_doc_ids | self._state.seen_doc_ids if exclude
+            else self._state.pruned_doc_ids
+        )
         where = _build_metadata_where(
             metadata_filter=metadata_filter,
-            ignore_chunk_ids=self._state.pruned_chunk_ids,
-            ignore_doc_ids=self._state.pruned_doc_ids,
+            ignore_chunk_ids=ignore_chunk_ids,
+            ignore_doc_ids=ignore_doc_ids,
         )
 
         # Candidate chunks: (chunk_id, doc_id, text | None). Vector mode carries texts
@@ -953,23 +951,18 @@ class SemanticFilterTool(Tool):
         return rendered, note
 
     doc = """\
-### semantic_filter(predicate: str, doc_ids: list[str] | None = None, metadata_filter: dict | None = None, top_k: int | None = None, search_str: str | None = None)
-Keep only the documents whose FULL text satisfies a natural-language `predicate`: each candidate document is judged independently by an LLM (TRUE/FALSE) and the survivors are returned. Candidates come from exactly one of two sources:
-- **doc_ids mode**: pass `doc_ids` you already collected. Returns just the kept `doc_id`s.
-- **corpus mode**: pass a `metadata_filter` (same ChromaDB where-clause syntax as `grep_corpus`) and/or `top_k`. With `top_k`, a vector search first selects the `top_k` most relevant chunks — embedding `search_str` if given, else the predicate; prefer a short focused `search_str` when the predicate is long or compound. With only a `metadata_filter`, every matching chunk is a candidate. Candidate chunks are deduped to their parent documents before judging. Returns the kept `doc_id`s PLUS the candidate chunks of the kept documents as text snippets. Anything you have `prune(...)`-ed is excluded from the candidates; a very large snippet output is truncated with a note.
-Do not combine `doc_ids` with the corpus-mode arguments. `search_str` requires `top_k`. At most 1,000 candidate documents per call — narrow the filter or use `top_k` if you exceed it. The returned dict carries `kept_doc_ids` for programmatic use.
+### semantic_filter(predicate: str, metadata_filter: dict | None = None, top_k: int | None = None, search_str: str | None = None, exclude: bool = True)
+Keep only the documents whose FULL text satisfies a natural-language `predicate`: candidates are selected from the corpus, each is judged independently by an LLM (TRUE/FALSE), and the survivors are returned. Select candidates with a `metadata_filter` (same ChromaDB where-clause syntax as `grep_corpus`) and/or `top_k`. With `top_k`, a vector search first selects the `top_k` most relevant chunks — embedding `search_str` if given, else the predicate; prefer a short focused `search_str` when the predicate is long or compound. With only a `metadata_filter`, every matching chunk is a candidate. Candidate chunks are deduped to their parent documents before judging. Returns the kept `doc_id`s PLUS the candidate chunks of the kept documents as text snippets. Anything you have `prune(...)`-ed is excluded from the candidates; a very large snippet output is truncated with a note. By default (`exclude=True`) documents already retrieved for judging by earlier tool calls are also excluded, so each call surfaces only new candidates; pass `exclude=False` to re-judge previously-seen documents under a new predicate.
+`search_str` requires `top_k`. At most 1,000 candidate documents per call — narrow the filter or use `top_k` if you exceed it. The returned dict carries `kept_doc_ids` for programmatic use.
 
 ```python
-# corpus mode, metadata only: judge every document from 1946
+# metadata only: judge every document from 1946
 semantic_filter(predicate="mentions coal shortages affecting steel production", metadata_filter={"year": "1946"})
 
-# corpus mode, vector prefilter: judge the documents behind the 200 chunks nearest a short query
+# vector prefilter: judge the documents behind the 200 chunks nearest a short query
 semantic_filter(
     predicate="describes a government intervention in response to a labor strike, naming the statute invoked",
     top_k=200,
     search_str="government intervention strike",
 )
-
-# doc_ids mode: narrow ids you already collected (returns kept ids only)
-semantic_filter(predicate="discusses topic X in relation to Y", doc_ids=["doc_id_1", "doc_id_2"])
 ```"""
