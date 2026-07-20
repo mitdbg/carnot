@@ -30,7 +30,9 @@
 # Connectivity: compute nodes are only reachable inside the cluster. From the machine that
 # runs qatfd (holds the chroma stores + OPENROUTER_API_KEY), tunnel through the login node
 # using the node name this job prints below:
-#   ssh -N -L 8100:<node>:8100 -L 8101:<node>:8101 <user>@orcd-login001.mit.edu
+#   ssh -N -L 8100:<node>:8100 -L 8101:<node>:8101 <user>@orcd-login.mit.edu
+# (with a ControlMaster/ControlPersist ssh-config alias, `ssh <alias>` once for
+# password+2FA, then the -N tunnel multiplexes over the socket with no re-auth)
 # then point the run at the tunnel:
 #   '++systems.vllm_base_urls={qwen/qwen3.6-27b: "http://127.0.0.1:8100/v1",
 #                              qwen/qwen3.6-35b-a3b: "http://127.0.0.1:8101/v1"}'
@@ -63,18 +65,27 @@ nvidia-smi
 # ── Environment setup ──
 module purge
 module load miniforge
+# CUDA toolkit for FlashInfer's JIT-compiled kernels (GDN prefill, sampling, ...): puts
+# nvcc on PATH + headers under CUDA_HOME. Pinned to the version matching the node driver
+# and the env's cu13 torch/vLLM wheels; compiled kernels are cached in ~/.cache/flashinfer,
+# so only the first run per kernel pays the compile.
+module load cuda/13.1.0
+export CUDA_HOME="${CUDA_HOME:-$(dirname "$(dirname "$(command -v nvcc)")")}"
+# nvcc compiles kernels through a HOST g++, and the nodes' system gcc is too old for the
+# C++17/20 that FlashInfer's kernels require ("-std=c++20 ... not supported with the
+# configured host compiler"). gcc 12 fully supports C++20 and is inside nvcc 13.1's
+# supported host-compiler range; nvcc picks it up from PATH.
+module load gcc/12.2.0
+# The JIT-built kernels link against gcc 12's libstdc++, but dlopen resolves
+# libstdc++.so.6 from the node's OLD /lib64 copy ("GLIBCXX_3.4.26 not found"). The gcc
+# module sets PATH but not the runtime library path, so put its libstdc++ first.
+export LD_LIBRARY_PATH="$(dirname "$(g++ -print-file-name=libstdc++.so.6)")${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 mamba activate vllm
 export PYTHONNOUSERSITE=True
 # Weights cache on node-local scratch (~/orcd counts against the 200 GB home quota; /tmp is
 # node-local NVMe). ~125 GB for the two models — re-downloaded per job/node, so budget the
 # first ~15 min of the walltime for the pull. export HF_TOKEN before sbatch if repos are gated.
 export HF_HOME=/tmp/$USER/hf_cache
-
-# Qwen3.6's GDN linear-attention prefill kernel is JIT-compiled by FlashInfer, which needs
-# nvcc — and compute nodes have no /usr/local/cuda (pip vLLM ships only the CUDA runtime).
-# The Triton backend bundles its own compiler, so it needs nothing from the node. Extra
-# args passed by the caller are appended after and still apply.
-export VLLM_EXTRA_ARGS="--gdn-prefill-backend triton ${VLLM_EXTRA_ARGS:-}"
 
 # ── Launch both servers (blocks until the job ends; servers die with the job) ──
 # Inside the allocation Slurm renumbers the granted GPUs 0..N-1, so gpus=0/gpus=1 pin one
@@ -83,7 +94,12 @@ export VLLM_EXTRA_ARGS="--gdn-prefill-backend triton ${VLLM_EXTRA_ARGS:-}"
 # len= caps the context window so KV cache + CUDA graphs fit next to bf16 weights on 80 GB
 # (vLLM otherwise reserves KV for the model's full advertised context, e.g. 262K). 64K/32K
 # comfortably cover the search-agent and semantic-filter prompt sizes.
+# seqs= on BOTH: the Qwen3.6 models are hybrids whose GDN/mamba layers need one
+# fixed-size cache block per in-flight sequence, and the memory left after weights holds
+# only ~345 (27B) / ~229 (35B) blocks — vLLM's default --max-num-seqs=1024 therefore fails
+# CUDA-graph capture ("exceeds available Mamba cache blocks"). 128 concurrent decodes is
+# far above what one qatfd sweep drives at once.
 HOST=0.0.0.0 ADVERTISE_HOST=$(hostname) VLLM_BIN=$(command -v vllm) \
   ./scripts/run_vllm_servers.sh \
-    'Qwen/Qwen3.6-27B:gpus=0:mem=0.92:len=65536:name=qwen/qwen3.6-27b' \
-    'Qwen/Qwen3.6-35B-A3B:gpus=1:mem=0.95:len=32768:name=qwen/qwen3.6-35b-a3b'
+    'Qwen/Qwen3.6-27B:gpus=0:mem=0.92:len=65536:seqs=128:name=qwen/qwen3.6-27b' \
+    'Qwen/Qwen3.6-35B-A3B:gpus=1:mem=0.95:len=32768:seqs=128:name=qwen/qwen3.6-35b-a3b'
