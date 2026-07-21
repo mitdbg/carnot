@@ -267,14 +267,8 @@ Requirements for the final answer:
     # Format-error retries per step, delegated to PromptedCall.call(). A step whose
     # all attempts misfire still advances max_steps; execution errors are not retried.
     max_recover_retries: int = 1
-    # TODO: Should probably eventually merge with visible_observations as they tackle the same challenge
-    # Hard char cap on the message list, applied after `visible_observations` collapse
-    # as the final safety net (see `_llm_step`). Complements, not duplicates, that knob.
+    # Hard character cap on the message list as the final safety net (see `_llm_step`).
     context_budget_chars: int = 200_000
-    # If set, only the most recent N tool-result messages are shown; older ones collapse
-    # to a placeholder (assistant turns kept). None = show all, rely on `_trim`. A small
-    # window keeps loops with large observations lean; accumulator agents leave it None.
-    visible_observations: int | None = None
     # Steps remaining at which to emit a low-budget warning. None disables the warning.
     warn_steps_remaining: int | None = 1
     # Extra imports authorized inside the per-step code sandbox. Default: none
@@ -290,6 +284,8 @@ Requirements for the final answer:
         *,
         max_steps: int | None = None,
         max_misfires: int | None = None,
+        cost_budget: float | None = None,
+        latency_budget: float | None = None,
         system_prompt_override: str | None = None,
         generation_backend: GenerationBackend | None = None,
         sampling_params: dict | None = None,
@@ -302,6 +298,8 @@ Requirements for the final answer:
             self.max_steps = max_steps
         if max_misfires is not None:
             self.max_misfires = max_misfires
+        self.cost_budget = cost_budget
+        self.latency_budget = latency_budget
         # Full block trajectory of the most recent `call()`; rebuilt per call.
         # Kept on the instance (one agent per question / branch) so callers can
         # read `messages_to_jsonable()` after the run for reward / persistence.
@@ -478,6 +476,8 @@ Requirements for the final answer:
         # numbers every attempt, including misfired re-prompts (which don't cost a step).
         step = turn = 0
         max_turns = None if max_steps is None else max_steps + max(0, self.max_misfires)
+        # TODO: add cost and latency budget checks here and add budget / usage messages to loop after each observation
+        # - will likely need to keep a "cost-so-far" and "latency-so-far" counter
         # Track the `left` value we last warned at so the warning counts DOWN from the
         # threshold (2, 1, ...) rather than firing once. `left` decreases monotonically
         # with `step`, so re-warn only when it drops to a new value (misfires that don't
@@ -650,24 +650,11 @@ Requirements for the final answer:
     async def _llm_step(
         self, ctx: ExecutionContext, extra: list[dict] | None = None
     ) -> _StepOutput:
-        """Render the visible trajectory (`_render_for_llm`), collapse stale observations,
-        trim to `context_budget_chars`, then route through `PromptedCall.call()` — stopping
-        once the step's block completes (`_stop_at_first_block`). `extra` appends transient
-        messages (e.g. the terminal-turn prompt) that are deliberately NOT stored in
-        `self.messages`."""
+        """Render the visible trajectory (`_render_for_llm`), trim to `context_budget_chars`,
+        and then route through `PromptedCall.call()` — stopping once the step's block completes
+        (`_stop_at_first_block`). `extra` appends transient messages (e.g. the terminal-turn prompt)
+        that are deliberately NOT stored in `self.messages`."""
         messages = self._render_for_llm()
-        # Collapse all but the most recent `visible_observations` tool results to a
-        # placeholder (None = keep all), keeping the question + every assistant turn.
-        if self.visible_observations is not None:
-            user_idxs = [i for i, m in enumerate(messages) if m["role"] == "user"]
-            # user_idxs[0] is the initial question — always kept; the rest are results.
-            keep = set(user_idxs[1:][-self.visible_observations :]) | {user_idxs[0]}
-            messages = [
-                m
-                if (m["role"] != "user" or i in keep)
-                else {"role": "user", "content": "[earlier tool result hidden]"}
-                for i, m in enumerate(messages)
-            ]
         trimmed = _trim(messages, self.context_budget_chars)
         if extra:
             trimmed = trimmed + extra

@@ -179,6 +179,8 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         super().__init__(
             tools, max_steps=config.agent_max_steps,
             max_misfires=config.agent_max_misfires,
+            cost_budget=config.cost_budget,
+            latency_budget=config.latency_budget,
             system_prompt_override=system_prompt_override,
             generation_backend=generation_backend,
             sampling_params=sampling_params,
@@ -296,20 +298,19 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
     # Final answer: validate + correct the returned doc_ids
     # ------------------------------------------------------------------
 
-    async def call_with_validated_doc_ids(
+    async def run_with_validated_doc_ids(
         self, ctx: ExecutionContext, user: str, *, correction_steps: int | None = None,
     ) -> tuple[Any, list[str]]:
         """Run the agent, then make sure the `doc_ids` it returned name real documents.
 
-        A returned id is valid when it is a key of `document_map`. This catches the common
-        failure where the model writes a bare filing name (e.g. `MICROSOFT_2023_10K`) instead
-        of the page-level id it was shown (`MICROSOFT_2023_10K::p59`): the bare name is not a
-        key, so it neither scores as a retrieved page nor loads any text for the downstream
-        answerer. If any id is invalid, the agent is re-prompted (resuming the same
-        conversation, so it still sees everything it read) to fix them, for up to
-        `correction_steps` extra turns — a budget separate from the main run so a citation fix
-        never eats into search time. After that, the valid subset is kept; only if none are
-        valid is it a true failure.
+        A returned id is valid when it is a key of `document_map`. This catches failures where
+        the agent returns a hallucinated id or (more plausibly) a partial identifier. For example,
+        we have observed the model use source ids (e.g. `MICROSOFT_2023_10K`) instead of the
+        page-level document id it was shown (`MICROSOFT_2023_10K::p59`). If any id is invalid,
+        the agent is re-prompted (resuming the same conversation, so it still sees everything it
+        read) to fix its mistake(s) for up to `correction_steps` extra turns. This budget is
+        separate from `max_steps`. The final (sub)set of valid `doc_ids` are returned. A failure
+        is only raised if the agent returns no valid ids after all correction steps are exhausted.
 
         Returns `(final_payload, valid_doc_ids)`. The payload is returned untouched (callers
         in "answer" mode still read its `answer` field); only the id list is validated.

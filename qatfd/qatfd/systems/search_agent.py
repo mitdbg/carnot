@@ -74,10 +74,15 @@ class SearchAgentSystem(RetrieveComputeSystem):
             briefing, final_answer_doc = _ANSWER_BRIEFING, _ANSWER_FINAL_DOC
         else:
             briefing, final_answer_doc = None, None
-        objective = getattr(resources, "compute_objective", "") or ""
-        if objective:
+        if resources.compute_objective:
             base = briefing if briefing is not None else SearchAgent.briefing
-            briefing = f"{base} {objective}"
+            briefing = f"{base} {resources.compute_objective}"
+        if self.config.cost_budget is not None:
+            base = briefing if briefing is not None else SearchAgent.briefing
+            briefing = f"{base} You have a total cost budget of {self.config.cost_budget:.2f} USD. You will be provided with an update on your remaining budget after each tool call."
+        if self.config.latency_budget is not None:
+            base = briefing if briefing is not None else SearchAgent.briefing
+            briefing = f"{base} You have a total latency budget of {self.config.latency_budget:.2f} seconds. You will be provided with an update on your remaining budget after each tool call."
         return briefing, final_answer_doc
 
     def _build_agent(self, ctx: ExecutionContext, resources: BenchmarkResources) -> SearchAgent:
@@ -106,7 +111,7 @@ class SearchAgentSystem(RetrieveComputeSystem):
         # Validate the returned doc_ids against the corpus and let the agent correct any that
         # name no real document, so recall reflects reality and (in retrieve mode) the answerer
         # gets real page text rather than an empty stub for a mis-cited id.
-        payload, doc_ids = await agent.call_with_validated_doc_ids(ctx, q.text)
+        payload, doc_ids = await agent.run_with_validated_doc_ids(ctx, q.text)
         if self.config.agent_mode == "answer":
             answer = payload.get("answer") if isinstance(payload, dict) else None
             return Retrieved(doc_ids=doc_ids, direct_answer=None if answer is None else str(answer))

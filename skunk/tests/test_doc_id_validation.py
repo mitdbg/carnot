@@ -2,7 +2,7 @@
 
 Two surfaces:
   - `doc_ids_from_payload` — the lenient decoder (trim / drop-empty / dedup).
-  - `SearchAgent.call_with_validated_doc_ids` — the bounded correction loop: it re-prompts
+  - `SearchAgent.run_with_validated_doc_ids` — the bounded correction loop: it re-prompts
     the agent (resuming the same conversation, on a separate small budget) when a returned id
     names no real document, keeps the valid subset, and fails only when none are valid.
 
@@ -70,7 +70,7 @@ DOCMAP = {"A::p1": "text-a", "B::p2": "text-b"}
 
 def test_all_valid_needs_no_correction():
     agent = _FakeSearchAgent([{"doc_ids": ["A::p1", "B::p2"]}], DOCMAP)
-    payload, valid = asyncio.run(agent.call_with_validated_doc_ids(_ctx(), "q"))
+    payload, valid = asyncio.run(agent.run_with_validated_doc_ids(_ctx(), "q"))
     assert valid == ["A::p1", "B::p2"]
     assert len(agent.calls) == 1  # main run only, no correction turn
     assert agent.calls[0]["resume"] is False
@@ -79,7 +79,7 @@ def test_all_valid_needs_no_correction():
 def test_bad_id_is_corrected_on_next_turn():
     # First the model emits a bare name; the correction turn fixes it.
     agent = _FakeSearchAgent([{"doc_ids": ["A"]}, {"doc_ids": ["A::p1"]}], DOCMAP)
-    payload, valid = asyncio.run(agent.call_with_validated_doc_ids(_ctx(), "q"))
+    payload, valid = asyncio.run(agent.run_with_validated_doc_ids(_ctx(), "q"))
     assert valid == ["A::p1"]
     assert len(agent.calls) == 2  # main + one correction
     # The correction turn resumes the conversation on the tight, separate budget.
@@ -93,7 +93,7 @@ def test_persistent_bad_id_is_filtered_after_budget():
     agent = _FakeSearchAgent(
         [{"doc_ids": ["B::p2", "junk"]}] * 6, DOCMAP, correction_steps=3
     )
-    payload, valid = asyncio.run(agent.call_with_validated_doc_ids(_ctx(), "q"))
+    payload, valid = asyncio.run(agent.run_with_validated_doc_ids(_ctx(), "q"))
     assert valid == ["B::p2"]
     assert len(agent.calls) == 4  # main + 3 correction attempts (all still had a bad id)
 
@@ -101,7 +101,7 @@ def test_persistent_bad_id_is_filtered_after_budget():
 def test_all_bad_and_unfixable_raises():
     agent = _FakeSearchAgent([{"doc_ids": ["nope"]}] * 6, DOCMAP, correction_steps=3)
     try:
-        asyncio.run(agent.call_with_validated_doc_ids(_ctx(), "q"))
+        asyncio.run(agent.run_with_validated_doc_ids(_ctx(), "q"))
     except StepFailed as e:
         assert "well-formed" in e.reason
     else:
@@ -112,7 +112,7 @@ def test_all_bad_and_unfixable_raises():
 def test_correction_budget_is_configurable():
     agent = _FakeSearchAgent([{"doc_ids": ["nope"]}] * 10, DOCMAP, correction_steps=1)
     try:
-        asyncio.run(agent.call_with_validated_doc_ids(_ctx(), "q"))
+        asyncio.run(agent.run_with_validated_doc_ids(_ctx(), "q"))
     except StepFailed:
         pass
     assert len(agent.calls) == 2  # main + 1 correction only

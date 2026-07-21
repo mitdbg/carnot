@@ -25,7 +25,7 @@ DOCMAP = {"A::p1": "text-a", "B::p2": "text-b"}
 
 
 class _FakeAgent(SearchAgent):
-    """SearchAgent with the real `call_with_validated_doc_ids` but a scripted `call()`."""
+    """SearchAgent with the real `run_with_validated_doc_ids` but a scripted `call()`."""
 
     def __init__(self, script):
         self.document_map = DOCMAP

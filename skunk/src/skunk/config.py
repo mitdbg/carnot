@@ -116,6 +116,12 @@ class SearchAgentConfig(SystemConfig):
     # from `agent_max_steps` so a citation fix never eats into the agent's search budget.
     doc_id_correction_steps: int = 3
 
+    # cost budget in dollars for the search agent; None means no budget limit (default)
+    cost_budget: float | None = None
+
+    # latency budget in seconds for the search agent; None means no latency limit (default)
+    latency_budget: float | None = None
+
 
 # --------------------------------------------------------------------------------
 # Pipeline (plan/orchestrate/retrieve/extract/lookup/compute) configuration.

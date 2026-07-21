@@ -15,3 +15,7 @@ agent_max_pages_per_tool_call: 20
 read_document_max_output_chars: 400000
 agent_max_steps: 20
 agent_max_misfires: 5
+# target dollar cost budget for the search agent; null means no budget limit (default)
+cost_budget: null
+# target latency budget for the search agent; null means no latency limit (default)
+latency_budget: null

@@ -41,14 +41,14 @@ from typing import cast
 import argparse as _argparse
 
 if hasattr(_argparse.ArgumentParser, "_check_help"):
-    _qatfd_orig_check_help = _argparse.ArgumentParser._check_help
+    _qatfd_orig_check_help = _argparse.ArgumentParser._check_help # type: ignore
 
     def _qatfd_check_help_str_safe(self, action):
         if action.help is not None and not isinstance(action.help, str):
             action.help = str(action.help)
         return _qatfd_orig_check_help(self, action)
 
-    _argparse.ArgumentParser._check_help = _qatfd_check_help_str_safe
+    _argparse.ArgumentParser._check_help = _qatfd_check_help_str_safe # type: ignore
 
 import hydra
 from hydra.core.hydra_config import HydraConfig
