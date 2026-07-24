@@ -31,7 +31,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-PYTHON="${PYTHON:-../skunk/venv/bin/python3}"
+# Absolute path with `..` resolved: a relative `../skunk/...` interpreter makes the venv's
+# site.py emit a harmless sys.prefix RuntimeWarning (unresolved `..`). Normalize the DIR via
+# cd/pwd (NOT realpath — that would follow the python3 symlink out of the venv to the system
+# interpreter and lose the venv's site-packages), keeping the venv's python3 symlink intact.
+PYTHON="${PYTHON:-$(cd ../skunk/venv/bin && pwd)/python3}"
 SEED="${SEED:-0}"
 SAMPLE=10
 VLLM_HOST="${VLLM_HOST:-127.0.0.1}"
