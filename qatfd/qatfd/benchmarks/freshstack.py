@@ -34,6 +34,8 @@ from __future__ import annotations
 import json
 import os
 
+from skunk.common import ExecutionContext
+
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.judge import judge_nugget_recall
 from qatfd.config import FreshstackConfig
@@ -73,15 +75,10 @@ class FreshstackBenchmark(Benchmark):
             config.questions_path = f"{config.data_dir}/{topic}/queries.jsonl"
         if not config.corpus_path:
             config.corpus_path = f"{config.data_dir}/{topic}/corpus.jsonl"
-        if not config.chromadb_collection:
-            config.chromadb_collection = f"freshstack-{topic}-qwen-0.6b"
-        # Each topic's index lives in its OWN store under the topic dir; derive it from the topic
-        # unless explicitly overridden (override chromadb_dir, or chromadb_host, to point elsewhere).
-        if not config.chromadb_dir:
-            config.chromadb_dir = f"{config.data_dir}/{topic}/chromadb"
+        if not config.storage.collection_name:
+            config.storage.collection_name = f"freshstack-{topic}-qwen-0.6b"
 
-        # all benchmark data (index, questions, corpus, prompts) resolves under qatfd/benchmarks/.
-        config.chromadb_dir = str(resolve_under_benchmarks(config.chromadb_dir))
+        # all benchmark data (questions, corpus, prompts) resolves under qatfd/benchmarks/.
         config.questions_path = str(resolve_under_benchmarks(config.questions_path))
         config.corpus_path = str(resolve_under_benchmarks(config.corpus_path))
         if config.prompts_path:
@@ -115,7 +112,9 @@ class FreshstackBenchmark(Benchmark):
 
     def load_questions(self) -> list[Question]:
         questions: list[Question] = []
-        with open(self.config.questions_path) as f:
+        path = self.config.questions_path
+        assert path is not None  # normalized to a concrete path in __init__
+        with open(path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -149,6 +148,7 @@ class FreshstackBenchmark(Benchmark):
         concatenation is a faithful reconstruction). The file_id is the Chroma `doc_id`, so
         retrieved doc_ids look up directly here."""
         path = self.config.corpus_path
+        assert path is not None  # normalized to a concrete path in __init__
         if not os.path.exists(path):
             raise FileNotFoundError(
                 f"FreshStack corpus not found at {path}; expected the topic's corpus.jsonl "
@@ -173,12 +173,11 @@ class FreshstackBenchmark(Benchmark):
         return BenchmarkResources(
             chroma_collection=collection,
             document_map=self._build_document_map(),
-            config=self.config,
         )
 
     # ---- scoring + metrics ----------------------------------------------------
 
-    async def score(self, question: Question, predicted: str, ctx) -> dict:
+    async def score(self, question: Question, predicted: str, ctx: ExecutionContext) -> dict:
         return await judge_nugget_recall(
             ctx,
             question=question.text,

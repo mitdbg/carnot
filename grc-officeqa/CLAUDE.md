@@ -56,7 +56,7 @@ systems, so contamination here biases qatfd's reported numbers too.
   qatfd dev split). State dev-only vs full in any reported number (see above).
 - The default `search_agent` retriever needs `cache/chromadb/` + `cache/clean_page_map.json`
   built offline (`officeqa/prep/` + qatfd's `engaging-scripts/create_vector_db.py
-  --benchmark officeqa`); the first non-golden run errors clearly if either is missing.
+  --benchmark officeqa`); the first run errors clearly if either is missing.
 
 ## Conventions
 

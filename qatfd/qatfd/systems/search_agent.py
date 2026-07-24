@@ -14,7 +14,7 @@ this question's `LLMClient` (which owns embedding backend dispatch + usage accou
 from __future__ import annotations
 
 from skunk.common import ExecutionContext
-from skunk.config import SearchAgentConfig
+from skunk.config import InferenceConfig, SearchAgentConfig
 from skunk.search_agent.search_agent import SearchAgent
 
 from qatfd.benchmarks.base import BenchmarkResources
@@ -44,8 +44,9 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
 class SearchAgentSystem(RetrieveComputeSystem):
     name = "search_agent"
 
-    def __init__(self, config: SearchAgentConfig) -> None:
+    def __init__(self, config: SearchAgentConfig, inference_cfg: InferenceConfig) -> None:
         self.config = config
+        self.inference_cfg = inference_cfg
 
     # Hooks for subclasses ------------------------------------------------------
 
@@ -79,10 +80,10 @@ class SearchAgentSystem(RetrieveComputeSystem):
             briefing = f"{base} {resources.compute_objective}"
         if self.config.cost_budget is not None:
             base = briefing if briefing is not None else SearchAgent.briefing
-            briefing = f"{base} You have a total cost budget of {self.config.cost_budget:.2f} USD. You will be provided with an update on your remaining budget after each tool call."
+            briefing = f"{base} You have a total cost budget of {self.config.cost_budget:.2f} USD."
         if self.config.latency_budget is not None:
             base = briefing if briefing is not None else SearchAgent.briefing
-            briefing = f"{base} You have a total latency budget of {self.config.latency_budget:.2f} seconds. You will be provided with an update on your remaining budget after each tool call."
+            briefing = f"{base} You have a total latency budget of {self.config.latency_budget:.2f} seconds."
         return briefing, final_answer_doc
 
     def _build_agent(self, ctx: ExecutionContext, resources: BenchmarkResources) -> SearchAgent:
@@ -95,12 +96,15 @@ class SearchAgentSystem(RetrieveComputeSystem):
             # billed onto the same usage tracker as its LLM calls; backend dispatch
             # (openrouter / vllm) is read from config.emb_provider by the client.
             llm_client=ctx.llm_client,
-            emb_model_id=self.config.emb_model_id,
+            emb_model_id=self.inference_cfg.emb_model_id,
             extra_tools=self._extra_tools(ctx, resources),
             include_search_corpus=self._include_search_corpus(),
             include_grep_corpus=self._include_grep_corpus(),
             briefing=briefing,
             final_answer_doc=final_answer_doc,
+            # Key this retrieval agent's spend under the system's "retrieve" slice (the shared
+            # compute answerer is keyed separately), overriding config.agent_id.
+            agent_id=self.retrieve_usage_key,
             pdf_dir=resources.pdf_dir,
         )
 
@@ -112,9 +116,14 @@ class SearchAgentSystem(RetrieveComputeSystem):
         # name no real document, so recall reflects reality and (in retrieve mode) the answerer
         # gets real page text rather than an empty stub for a mis-cited id.
         payload, doc_ids = await agent.run_with_validated_doc_ids(ctx, q.text)
+        # Surface why the agent's loop stopped (budget/steps) so the runner can record it; the
+        # doc-id correction loop shares the agent instance, so this reflects the final state.
+        ts = agent.terminate_state
         if self.config.agent_mode == "answer":
             answer = payload.get("answer") if isinstance(payload, dict) else None
-            return Retrieved(doc_ids=doc_ids, direct_answer=None if answer is None else str(answer))
-        return Retrieved(doc_ids=doc_ids)
+            return Retrieved(
+                doc_ids=doc_ids, direct_answer=None if answer is None else str(answer), terminate_state=ts,
+            )
+        return Retrieved(doc_ids=doc_ids, terminate_state=ts)
 
 

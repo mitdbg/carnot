@@ -144,11 +144,11 @@ class PromptedCall[T]:
         if effort is not None:
             return effort
         return cast(
-            Effort, ctx.config.effort_overrides.get(self.name, self._default_effort)
+            Effort, ctx.config.inference.effort_overrides.get(self.name, self._default_effort)
         )
 
     def _resolve_model(self, ctx: ExecutionContext) -> str:
-        return ctx.config.model_overrides.get(self.name, ctx.config.llm_model)
+        return ctx.config.inference.model_overrides.get(self.name, ctx.config.inference.llm_model)
 
     def _compose_user(self, user: str, retry: ParseError | None) -> str:
         parts = [user]
@@ -173,6 +173,7 @@ class PromptedCall[T]:
         max_output_tokens: int | None = None,
         timeout_s: float | None = None,
         on_response: Callable[[LLMResponse], None] | None = None,
+        usage_key: str = "default",
     ) -> T:
         """One agent-loop turn over an existing `messages` transcript: assemble the
         system prompt, stream via `astream` (with optional `should_stop`), parse.
@@ -198,6 +199,7 @@ class PromptedCall[T]:
                 call_site=self.name,
                 max_output_tokens=max_output_tokens,
                 timeout_s=timeout_s,
+                usage_key=usage_key,
             )
             if on_response is not None:
                 on_response(resp)
@@ -226,6 +228,7 @@ class PromptedCall[T]:
         max_output_tokens: int | None = None,
         timeout_s: float | None = None,
         on_response: Callable[[LLMResponse], None] | None = None,
+        usage_key: str = "default",
     ) -> T:
         """Single-shot: assemble system+user, resolve effort/model, invoke `acall`,
         parse into a typed result; retries on `ParseError` up to `max_parse_retries`
@@ -273,6 +276,7 @@ class PromptedCall[T]:
                 model=model,
                 max_output_tokens=max_output_tokens,
                 timeout_s=timeout_s,
+                usage_key=usage_key,
             )
             if on_response is not None:
                 on_response(resp)

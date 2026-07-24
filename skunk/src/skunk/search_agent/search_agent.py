@@ -22,7 +22,6 @@ per question / branch, so state never leaks across questions.
 from __future__ import annotations
 
 from typing import Any
-
 from chromadb.api.models.Collection import Collection
 
 from skunk.common import B64Image, ExecutionContext
@@ -31,6 +30,7 @@ from skunk.errors import StepFailed
 from skunk.llm_client import LLMClient
 from skunk.sandbox.local_python_executor import CodeOutput
 from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent, TextBlock, Tool
+from skunk.prompts import load_prompts
 from skunk.search_agent.search_tools import (
     RetrievalState,
     EMPTY_RESULT_MESSAGE,
@@ -44,8 +44,12 @@ from skunk.search_agent.search_tools import (
     PruneTool,
     ReadDocumentTool,
     SearchCorpusTool,
+    SemanticFilterTool,
     ViewFigureTool,
 )
+from skunk.storage.document_map import DocumentMap
+
+_PROMPTS = load_prompts("search_agent")
 
 
 class SearchAgent(MultiTurnAgent):
@@ -57,45 +61,25 @@ class SearchAgent(MultiTurnAgent):
     # for the system prompt + output under the input ceiling (a higher budget 400'd requests).
     context_budget_chars: int = 1_300_000
     warn_steps_remaining = 2
-
-    briefing = (
-        "You are a helpful assistant for retrieving relevant information from a large "
-        "collection of documents. You will be given a question, and your task is to "
-        "identify which documents are relevant to answering it. The corpus is organized "
-        "as documents (each identified by a `doc_id`), each split into chunks (text spans, "
-        "tables, titles, ...) identified by a `chunk_id`; every chunk carries metadata you "
-        "can filter on. Some questions require looking up information that is not contained "
-        "in the corpus; that is handled by a separate agent, so you should only focus on "
-        "retrieving relevant documents for the remainder of the question. "
-        "You do not need to retrieve everything in a single tool call: use early steps to "
-        "explore documents of potential relevance, then refine your searches in later steps "
-        "based on what you find. Use `prune(...)` aggressively on chunks and docs you have "
-        "ruled out, to keep later searches focused and your context window manageable."
-    )
-
-    final_answer_doc = """\
-A JSON object with the `doc_id`s you identified as relevant, under the key "doc_ids". Here is an example:
-```json
-{"doc_ids": ["annual_report_2014_p12", "quarterly_survey_1987_q3_p4"]}
-```
-Use each `doc_id` exactly as it appears in the search / grep results."""
+    briefing = _PROMPTS["briefing"]
+    final_answer_doc = _PROMPTS["final_answer_doc"]
 
     def __init__(
         self,
         config: SearchAgentConfig,
-        document_map: dict[str, str],
+        document_map: DocumentMap,
         chroma_collection: Collection,
+        llm_client: LLMClient,
+        emb_model_id: str,
         *,
         pdf_dir: str | None = None,
         page_renders_dir: str | None = None,
-        page_ref_parser=None,
-        llm_client: LLMClient | None = None,
-        emb_model_id: str | None = None,
         extra_tools: tuple[Tool, ...] = (),
         include_search_corpus: bool = True,
         include_grep_corpus: bool = True,
         briefing: str | None = None,
         final_answer_doc: str | None = None,
+        agent_id: str | None = None,
         system_prompt_override: str | None = None,
         generation_backend=None,
         sampling_params: dict | None = None,
@@ -111,12 +95,8 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         self.config = config
         self.chroma_collection = chroma_collection
         self.document_map = document_map
-        # Query embedding goes through an LLMClient (it owns backend dispatch + usage
-        # accounting). Callers on the per-question request path pass `ctx.llm_client` so
-        # embedding spend is billed onto that question's tracker; offline / build paths
-        # pass nothing and get a standalone client (embeddings work, untracked).
-        self._emb_llm_client = llm_client or LLMClient(config)
-        self.emb_model_id = emb_model_id or config.emb_model_id
+        self._emb_llm_client = llm_client
+        self.emb_model_id = emb_model_id
 
         # Bound each search-step LLM call: cap output (was uncapped → runaway
         # generations streamed to the 65535-token ceiling at 200–800s each) and
@@ -146,7 +126,6 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
         if pdf_dir is not None:
             extra_tools += (ViewFigureTool(
                 self.document_map, pdf_dir, renders_dir=page_renders_dir,
-                page_ref_parser=page_ref_parser,
             ),)
         tools: list[Tool] = []
         # Vector search over the corpus. A caller can drop it (`include_search_corpus=False`)
@@ -181,11 +160,18 @@ Use each `doc_id` exactly as it appears in the search / grep results."""
             max_misfires=config.agent_max_misfires,
             cost_budget=config.cost_budget,
             latency_budget=config.latency_budget,
+            agent_id=agent_id if agent_id is not None else config.agent_id,
             system_prompt_override=system_prompt_override,
             generation_backend=generation_backend,
             sampling_params=sampling_params,
             capture_logprobs=capture_logprobs,
         )
+
+        # overwrite default usage key for search and sem filter tools now that agent has one
+        for tool in self._tools:
+            if isinstance(tool, SearchCorpusTool) or isinstance(tool, SemanticFilterTool):
+                tool._usage_key = str(self.agent_id)
+
 
     # ------------------------------------------------------------------
     # Block rendering / redaction (override the base hooks)

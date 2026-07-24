@@ -16,6 +16,8 @@ from __future__ import annotations
 import glob
 import json
 
+from skunk.common import ExecutionContext
+
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.judge import judge_single_nugget
 from qatfd.config import BrowseCompPlusConfig
@@ -29,8 +31,7 @@ class BrowseCompPlusBenchmark(Benchmark):
     config: BrowseCompPlusConfig
 
     def __init__(self, config: BrowseCompPlusConfig) -> None:
-        # all benchmark data (index, questions, metadata, prompts) resolves under qatfd/benchmarks/.
-        config.chromadb_dir = str(resolve_under_benchmarks(config.chromadb_dir))
+        # all benchmark data (questions, metadata, prompts) resolves under qatfd/benchmarks/.
         config.bcp_questions = str(resolve_under_benchmarks(config.bcp_questions))
         config.bcp_metadata_glob = str(resolve_under_benchmarks(config.bcp_metadata_glob))
         if config.prompts_path:
@@ -90,10 +91,9 @@ class BrowseCompPlusBenchmark(Benchmark):
         return BenchmarkResources(
             chroma_collection=collection,
             document_map=document_map,
-            config=self.config,
         )
 
-    async def score(self, question: Question, predicted: str, ctx) -> dict:
+    async def score(self, question: Question, predicted: str, ctx: ExecutionContext) -> dict:
         return await judge_single_nugget(
             ctx, question=question.text, gold=question.gold, predicted=predicted, model=self.config.judge_model
         )

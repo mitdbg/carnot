@@ -1,13 +1,11 @@
 # base config for all benchmarks
-# ALL paths below (chromadb_dir, splits_path, pdf_dir, prompts_path, + per-benchmark question/corpus
+# ALL paths below (splits_path, pdf_dir, prompts_path, + per-benchmark question/corpus
 # paths) are relative to qatfd/benchmarks/ — i.e. qatfd/benchmarks/<benchmark>/... .
-# null chromadb_dir => the benchmark derives it (freshstack: freshstack/{topic}/chromadb); every other
-# benchmark sets its own <benchmark>/chromadb below.
-chromadb_dir: null
-chromadb_collection: null
-# ChromaDB server endpoint for reads. null host => embedded PersistentClient over chromadb_dir;
-# set host (e.g. 127.0.0.1) to connect to a warm long-lived server (skunk/scripts/run_chroma_server.sh).
-chromadb_host: null
+collection_name: null
+# ChromaDB server endpoint that reads connect to. Collections are always read via a long-lived warm
+# server (skunk/scripts/run_chroma_server.sh) — there is no embedded PersistentClient read path. Point
+# the server at the corpus's on-disk chroma dir when launching it; the eval only needs host + port.
+chromadb_host: 127.0.0.1
 chromadb_port: 8001
 # per-benchmark prompt-overrides YAML (under qatfd/benchmarks/); null = none
 prompts_path: null

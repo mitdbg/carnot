@@ -646,6 +646,7 @@ def fuzzy_match_answer(ground_truth: str, predicted: str, tolerance: float = 0.0
 
             # No match found
             if best_match is not None:
+                assert best_pred_info is not None  # set together with best_match in the loop above
                 return False, f"No match: GT={gt_base} ({gt_unit or 'no unit'}), Closest={best_pred_info[0]} ({best_pred_info[1] or 'no unit'}), Diff={best_diff*100:.2f}%"
             if unit_mismatches:
                 pred_units = [unit or "no unit" for _, unit in unit_mismatches[:5]]

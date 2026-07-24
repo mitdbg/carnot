@@ -22,6 +22,8 @@ from __future__ import annotations
 import glob
 import json
 
+from skunk.common import ExecutionContext
+
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.judge import judge_single_nugget
 from qatfd.config import FinanceBenchConfig
@@ -55,14 +57,13 @@ class FinanceBenchBenchmark(Benchmark):
     )
 
     def __init__(self, config: FinanceBenchConfig) -> None:
-        # all benchmark data (index, questions, metadata, prompts, pdfs) resolves under qatfd/benchmarks/.
-        config.chromadb_dir = str(resolve_under_benchmarks(config.chromadb_dir))
+        # all benchmark data (questions, metadata, prompts, pdfs) resolves under qatfd/benchmarks/.
         config.questions_path = str(resolve_under_benchmarks(config.questions_path))
         config.fb_metadata_glob = str(resolve_under_benchmarks(config.fb_metadata_glob))
         if config.prompts_path:
             config.prompts_path = str(resolve_under_benchmarks(config.prompts_path))
-        if config.pdf_dir:
-            config.pdf_dir = str(resolve_under_benchmarks(config.pdf_dir))
+        if config.storage.pdf_dir:
+            config.storage.pdf_dir = str(resolve_under_benchmarks(config.storage.pdf_dir))
         super().__init__(config)
 
     # ---- questions ------------------------------------------------------------
@@ -138,12 +139,11 @@ class FinanceBenchBenchmark(Benchmark):
         return BenchmarkResources(
             chroma_collection=collection,
             document_map=self._build_document_map(),
-            config=self.config,
         )
 
     # ---- scoring + metrics ----------------------------------------------------
 
-    async def score(self, question: Question, predicted: str, ctx) -> dict:
+    async def score(self, question: Question, predicted: str, ctx: ExecutionContext) -> dict:
         return await judge_single_nugget(
             ctx, question=question.text, gold=question.gold, predicted=predicted, model=self.config.judge_model
         )

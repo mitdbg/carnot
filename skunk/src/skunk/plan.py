@@ -5,6 +5,8 @@ Branches are a discriminated union keyed by `kind` (`retrieve` / `lookup_externa
 
 from __future__ import annotations
 
+import uuid
+
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Annotated, Literal, Union
@@ -191,8 +193,12 @@ Rules:
         output_instruction="Output the Plan as a single bare JSON object — no markdown fences, no prose.",
     )
 
+    def __init__(self, planner_id: str | None = None):
+        # Usage-attribution key (see MultiTurnAgent.agent_id); None => fresh uuid4 per instance.
+        self.planner_id = planner_id if planner_id is not None else str(uuid.uuid4())
+
     async def plan(self, question: str, ctx: ExecutionContext) -> Plan:
-        return await self._prompt.call(ctx, f"Question: {question}", temperature=0.4)
+        return await self._prompt.call(ctx, f"Question: {question}", usage_key=str(self.planner_id), temperature=0.4)
 
     @staticmethod
     def _attempts_section(attempts: list[AttemptRecord]) -> str:

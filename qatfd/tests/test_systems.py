@@ -15,7 +15,6 @@ import asyncio
 from types import SimpleNamespace
 
 from skunk.common import ExecutionContext
-from skunk.config import PipelineConfig
 from skunk.search_agent.search_agent import SearchAgent
 
 from qatfd.systems.search_agent import SearchAgentSystem
@@ -31,6 +30,8 @@ class _FakeAgent(SearchAgent):
         self.document_map = DOCMAP
         self.name = "search_agent"
         self.config = SimpleNamespace(doc_id_correction_steps=3)
+        # Mirror the real agent's stop-reason attribute (read by retrieve() to fill Retrieved.terminate_state).
+        self.terminate_state = "finished"
         self._script = list(script)
 
     async def call(self, ctx, user, *, resume=False, max_steps=None, **_):
@@ -47,7 +48,12 @@ class _StubSystem(SearchAgentSystem):
 
 
 def _ctx() -> ExecutionContext:
-    return ExecutionContext(question="q", config=PipelineConfig(), llm_client=object())
+    # ctx.config is never read on the retrieve path: the agent is faked, and passing an
+    # llm_client makes __post_init__ skip building one from config.inference. A bare stub
+    # avoids assembling the full OrchestratorConfig sub-config tree just to satisfy the type.
+    return ExecutionContext(
+        question="q", config=SimpleNamespace(), document_map={}, llm_client=object()
+    )
 
 
 def _q() -> Question:

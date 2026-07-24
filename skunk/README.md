@@ -8,8 +8,7 @@ A declarative QA pipeline over the U.S. Treasury Bulletin corpus. Questions are 
 pip install -e ".[dev]"
 cp .env.example .env   # then fill in GEMINI_API_KEY (+ OPENROUTER_API_KEY for non-search calls)
 python -m eval.eval_e2e \
-    --csv data/officeqa_pro.csv --report eval/e2e_report.csv \
-    --uids UID0001 --golden
+    --csv data/officeqa_pro.csv --uids UID0001
 ```
 
 ## What's where
@@ -26,7 +25,7 @@ python -m eval.eval_e2e \
 ## Status
 
 The 4-op DSL is finalized. All four operators are implemented:
-- `retrieve` is currently a placeholder pending integration of an external retriever; it honors `ctx.config.golden_pages` only (use `--golden` for eval) and raises `NotImplementedError` otherwise. The previous page-index pipeline (L1 chapter pick + year-window filter, optional BM25 rerank) is preserved at `src/skunk/page_index/retrieve_prototype.py` (`PageIndexRetrievePrototype`) for regression comparison;
+- `retrieve` runs the search agent (iterative ChromaDB + LLM loop) over the corpus. The previous page-index pipeline (L1 chapter pick + year-window filter, optional BM25 rerank) is preserved at `src/skunk/page_index/retrieve_prototype.py` (`PageIndexRetrievePrototype`) for regression comparison;
 - `extract` emits a question-driven list of `AnnotatedValue` entries (each a `scalar`, `vector`, or `table` — no nesting beyond those shapes) via parsed-JSON Tier 1 and vision Tier 2; pass `visual_only=True` to go straight to vision for charts/figures;
 - `lookup_external` does a single Gemini call (Google Search grounding, or FRED/BLS via emitted Python) for facts not in the bulletin corpus;
 - `compute` terminates the chain with a codegen → in-process exec loop (bounded retries on parse/exec failure), returning the first clean result.

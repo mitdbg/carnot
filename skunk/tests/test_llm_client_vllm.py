@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import httpx
 import pytest
 
-from skunk.config import SearchAgentConfig
+from skunk.config import InferenceConfig
 from skunk.llm_client import (
     EmptyCompletionError,
     LLMClient,
@@ -24,15 +24,15 @@ from skunk.llm_client import (
 )
 
 
-def _config(**overrides) -> SearchAgentConfig:
+def _config(**overrides) -> InferenceConfig:
     base = dict(
-        name="t", emb_provider="openrouter", emb_model_id="emb", llm_provider="openrouter",
+        emb_provider="openrouter", emb_model_id="emb", llm_provider="openrouter",
         llm_model="loc/m", llm_max_retries=0, llm_retry_initial_delay_s=0.0,
         llm_model_rpm={}, llm_default_rpm=1e9, llm_model_tpm={}, llm_default_tpm=None, llm_prices={},
         llm_context_limits={},
     )
     base.update(overrides)
-    return SearchAgentConfig(**base)
+    return InferenceConfig(**base)
 
 
 # ---- routing ----------------------------------------------------------------------
@@ -62,8 +62,10 @@ def test_backends_share_one_usage_tracker(monkeypatch):
     monkeypatch.setattr(_OpenRouterBackend, "_gen_call", fake_gen)
     client.call("sys", "user", model="loc/m")
     client.call("sys", "user", model="or/m")
-    assert client.usage.n_calls == 2
-    assert set(client.usage.by_model_in) == {"loc/m", "or/m"}
+    # Usage is now bucketed per attribution key; aggregate across keys to check both calls landed.
+    per_key = client.usage.key_to_usage.values()
+    assert sum(u.n_calls for u in per_key) == 2
+    assert {m for u in per_key for m in u.model_to_input_tokens} == {"loc/m", "or/m"}
     assert client._backend("vllm").usage is client.usage is client._backend("openrouter").usage
 
 
@@ -248,7 +250,7 @@ def test_vllm_embed_query(stub_server):
     client = _stub_client(stub_server, emb_provider="vllm")
     vec = client.embed_query("apples")
     assert vec == [0.1, 0.2, 0.3]
-    assert client.usage.embed_tokens == 4
+    assert client.usage.total_embed_tokens == 4
     path, body = stub_server.requests[0]
     assert path.endswith("/embeddings")
     assert body["model"] == "emb"

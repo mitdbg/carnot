@@ -8,18 +8,20 @@ agents (a downstream LLM answers from the retrieved docs) and direct-answer agen
 
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from string import Template
 
 from skunk.common import ExecutionContext
-from skunk.config import SystemConfig
+from skunk.config import AgentConfig, InferenceConfig
 from skunk.multi_turn_agent import MultiTurnAgent
+from skunk.storage.document_map import DocumentMap
 
 from qatfd.benchmarks.base import BenchmarkResources
 from qatfd.types import AnswerOutput, Question, Retrieved
 
 
-def _docs_to_context(doc_ids: list[str], document_map: dict[str, str]) -> str:
+def _docs_to_context(doc_ids: list[str], document_map: DocumentMap) -> str:
     return "\n\n".join(f"=== doc_id={d} ===\n{document_map.get(d, '') or ''}" for d in doc_ids)
 
 
@@ -91,11 +93,11 @@ class CodeAnswerAgent(MultiTurnAgent):
     # Warn with two steps left (not one), so the model has a turn to react and commit.
     warn_steps_remaining = 2
 
-    def __init__(self, answer_format_hint: str, max_steps: int) -> None:
+    def __init__(self, answer_format_hint: str, max_steps: int, agent_id: str | None = None) -> None:
         system_prompt = _CODE_ANSWER_SYSTEM.substitute(
             max_steps=max_steps, answer_format_hint=answer_format_hint
         )
-        super().__init__([], max_steps=max_steps, system_prompt_override=system_prompt)
+        super().__init__([], max_steps=max_steps, agent_id=agent_id, system_prompt_override=system_prompt)
 
     def validate_final_answer(self, payload: object, observations: list[str]) -> str | None:
         if not isinstance(payload, dict) or "answer" not in payload:
@@ -106,8 +108,21 @@ class CodeAnswerAgent(MultiTurnAgent):
 class System(ABC):
     name: str  # set to the registry key on the instance by build_system
 
-    def __init__(self, config: SystemConfig) -> None:
+    def __init__(self, config: AgentConfig, inference_cfg: InferenceConfig) -> None:
         self.config = config
+        self.inference_cfg = inference_cfg
+
+    # Stable per-phase usage-attribution keys, derived from the system's `agent_id` (the system
+    # name; see configs/systems/base.yaml). Suffixing splits the retrieval agent's spend from the
+    # shared compute answerer's so the runner can record retrieve_cost and compute_cost separately.
+    # None when no agent_id is configured (agents then mint their own uuid and go unattributed).
+    @property
+    def retrieve_usage_key(self) -> str | None:
+        return f"{self.config.agent_id}_retrieve" if self.config.agent_id else None
+
+    @property
+    def compute_usage_key(self) -> str | None:
+        return f"{self.config.agent_id}_compute" if self.config.agent_id else None
 
     @abstractmethod
     async def answer(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext) -> AnswerOutput:
@@ -133,7 +148,8 @@ class RetrieveComputeSystem(System):
             return r.direct_answer
         context = r.context if r.context is not None else _docs_to_context(r.doc_ids, resources.document_map)
         agent = CodeAnswerAgent(
-            answer_format_hint=resources.answer_format_hint, max_steps=self.answer_max_steps
+            answer_format_hint=resources.answer_format_hint, max_steps=self.answer_max_steps,
+            agent_id=self.compute_usage_key,
         )
         payload = await agent.call(ctx, f"Question: {q.text}\n\nDocuments:\n{context}")
         if isinstance(payload, dict) and payload.get("answer") is not None:
@@ -141,6 +157,15 @@ class RetrieveComputeSystem(System):
         return ""
 
     async def answer(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext) -> AnswerOutput:
+        t0 = time.monotonic()
         r = await self.retrieve(q, resources, ctx)
+        t1 = time.monotonic()
         ans = await self.compute(q, r, resources, ctx)
-        return AnswerOutput(answer=ans, retrieved_doc_ids=r.doc_ids)
+        t2 = time.monotonic()
+        return AnswerOutput(
+            answer=ans,
+            retrieved_doc_ids=r.doc_ids,
+            terminate_state=r.terminate_state,
+            retrieve_wall_s=t1 - t0,
+            compute_wall_s=t2 - t1,
+        )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from skunk.lookup_agent.lookup_tools import DEFAULT_PRIORITIZATION, resolve_lookup_tools
 from skunk.common import AnnotatedValue, ExecutionContext
+from skunk.config import LookupAgentConfig
 from skunk.multi_turn_agent import MultiTurnAgent, Tool
 from skunk.plan import LookupBranch
 
@@ -47,8 +48,8 @@ Put the value's publisher/origin in `source`. Examples:
 ```
 '''
 
-    def __init__(self, *, max_steps: int, tools: list[Tool]):
-        super().__init__(tools, max_steps=max_steps)
+    def __init__(self, config: LookupAgentConfig, *, max_steps: int, tools: list[Tool]):
+        super().__init__(tools, max_steps=max_steps, cost_budget=config.cost_budget, latency_budget=config.latency_budget)
 
     def validate_final_answer(self, payload: object, observations: list[str]) -> str | None:
         # Shape only — no numeric-grounding check: the agent reaches every value
@@ -69,15 +70,18 @@ Put the value's publisher/origin in `source`. Examples:
 
 class LookupExternalOp:
     async def run(self, ctx: ExecutionContext, branch: LookupBranch) -> list[AnnotatedValue]:
-        tools = resolve_lookup_tools(ctx.config)
+        cfg = ctx.config.lookup
+        tools = resolve_lookup_tools(cfg)
+        # LookupAgent derives its cost/latency budgets from the config it is handed.
         agent = LookupAgent(
-            max_steps=ctx.config.lookup_max_steps,
+            cfg,
+            max_steps=cfg.lookup_max_steps,
             tools=tools,
         )
         # Cap each agent turn like SearchAgent: an uncapped lookup turn
         # hung 250s+ (thinking-only generation) and stalled the whole question.
-        agent.max_output_tokens = ctx.config.lookup_agent_max_output_tokens
-        agent.request_timeout_s = ctx.config.lookup_agent_request_timeout_s
+        agent.max_output_tokens = cfg.lookup_agent_max_output_tokens
+        agent.request_timeout_s = cfg.lookup_agent_request_timeout_s
         user_msg = branch.model_dump_json(
             include={"target", "src"}, indent=2, exclude_none=True,
         )

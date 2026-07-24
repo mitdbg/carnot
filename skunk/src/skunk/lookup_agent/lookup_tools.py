@@ -1,7 +1,7 @@
 """Lookup-agent tools — concrete `Tool` subclasses (the shared `Tool` ABC lives
 in `multi_turn_agent`). Each co-locates its API (`__call__`, what the model
 invokes) and its prompt documentation (`doc`). `resolve_lookup_tools` selects the
-active list from an explicit override or `PipelineConfig.lookup_tools` (else all
+active list from an explicit override or `LookupAgentConfig.lookup_tools` (else all
 registered tools); the `DEFAULT_PRIORITIZATION` guidance below is folded
 statically into the lookup agent's `briefing`.
 
@@ -25,7 +25,7 @@ import urllib.request
 from typing import Any
 
 from skunk.common import _RateLimiter, get_rate_limiter
-from skunk.config import PipelineConfig
+from skunk.config import LookupAgentConfig
 from skunk.multi_turn_agent import Tool
 
 
@@ -345,7 +345,7 @@ When `src` is pinned, go straight to the tool that reaches that publisher (often
 similar series."""
 
 
-def resolve_lookup_tools(config: PipelineConfig, explicit: list[Tool] | None = None) -> list[Tool]:
+def resolve_lookup_tools(config: LookupAgentConfig, explicit: list[Tool] | None = None) -> list[Tool]:
     """Pick the active lookup tools: an `explicit` list wins; else the names in
     `config.lookup_tools`; else all registered tools."""
     if explicit is not None:

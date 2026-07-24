@@ -4,8 +4,8 @@
 # the single knob — it derives the data paths + collection name (override nothing else to switch sets):
 #   - test = `langchain` (KARL's FreshStack): 203 questions / 49,514 docs  -> freshstack-langchain-qwen-0.6b
 #   - dev  = `laravel`   (closest-sized set): 184 questions / 52,351 docs  -> freshstack-laravel-qwen-0.6b
-# Each topic's collection lives in its OWN store under the topic dir (freshstack/{topic}/chromadb),
-# derived from the topic alongside the collection name.
+# Each topic's collection is named from the topic (freshstack-{topic}-qwen-0.6b); the chroma server
+# must host the collection for whichever topic you run.
 # Both are embedded with Qwen3-Embedding-0.6B (1024-dim); KARL retrieves FreshStack with Qwen3-0.6B at
 # k=10 (for the rag_llm system set `systems.top_k=10`; the search_agent controls its own retrieval
 # breadth per tool call). Scoring = nugget-completion recall.
@@ -43,16 +43,15 @@ name: freshstack
 # and the test set with topic=langchain + split=test. The split file's dev/test qid lists are disjoint,
 # so a topic/split mismatch selects zero questions (aborts) rather than silently running the wrong set.
 splits_path: freshstack/freshstack_splits.json
-# the FreshStack topic to run; derives questions_path / corpus_path / chromadb_{collection,dir} below.
+# the FreshStack topic to run; derives questions_path / corpus_path / collection_name below.
 # dev = laravel (default); override `benchmarks.topic=langchain` (with experiments.split=test) for test.
 topic: laravel
 # base dir under qatfd/benchmarks/ holding each topic's data at {data_dir}/{topic}/{corpus,queries}.jsonl
 data_dir: freshstack
-# null => derived from topic: {data_dir}/{topic}/{queries,corpus}.jsonl, freshstack-{topic}-qwen-0.6b,
-# and the store at {data_dir}/{topic}/chromadb.
+# null => derived from topic: {data_dir}/{topic}/{queries,corpus}.jsonl and freshstack-{topic}-qwen-0.6b.
 questions_path: null
 corpus_path: null
-chromadb_collection: null
+collection_name: null
 # weight for a partially-supported nugget in the recall score
 partial_credit: 0.0
 # llm used by the nugget-completion judge (set on the CLI, e.g. google/gemini-2.5-flash)

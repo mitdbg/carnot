@@ -8,7 +8,10 @@ run's score reflects this system's retrieval (a single vector search) and nothin
 
 from __future__ import annotations
 
+import uuid
+
 from skunk.common import ExecutionContext
+from skunk.config import InferenceConfig
 from skunk.search_agent.search_tools import SearchCorpusTool
 
 from qatfd.benchmarks.base import BenchmarkResources
@@ -20,14 +23,19 @@ from qatfd.types import Question, Retrieved
 class RAGLLMSystem(RetrieveComputeSystem):
     name = "rag_llm"
 
-    def __init__(self, config: RAGLLMConfig) -> None:
+    def __init__(self, config: RAGLLMConfig, inference_cfg: InferenceConfig) -> None:
         self.config = config
+        self.inference_cfg = inference_cfg
+        # Usage-attribution key for this system's query-embedding calls (its "retrieve" phase); the
+        # shared compute answerer is keyed separately (see System.retrieve_usage_key). Falls back to
+        # a fresh uuid4 when no agent_id is configured.
+        self.system_id = self.retrieve_usage_key or str(uuid.uuid4())
 
     async def retrieve(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext) -> Retrieved:
         # Embed via this question's LLMClient (ctx.llm_client) so query-embedding tokens/cost
         # land on the same usage tracker the runner reads; backend = config.emb_provider.
         tool = SearchCorpusTool(
-            resources.chroma_collection, self.config.emb_model_id, ctx.llm_client, ctx=ctx,
+            resources.chroma_collection, self.inference_cfg.emb_model_id, ctx.llm_client, ctx=ctx, usage_key=str(self.system_id),
         )
 
         # emit under a "retrieve" step so the per-question trace records what this vector search returned

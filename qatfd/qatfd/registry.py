@@ -19,7 +19,7 @@ from qatfd.systems.qatfd_search_agent import QATFDSearchAgentSystem
 from qatfd.systems.rag_llm import RAGLLMSystem
 from qatfd.systems.search_agent import SearchAgentSystem
 
-from skunk.config import SystemConfig
+from skunk.config import AgentConfig, InferenceConfig
 
 BENCHMARKS: dict[str, type[Benchmark]] = {
     OfficeQABenchmark.name: OfficeQABenchmark,
@@ -45,8 +45,8 @@ def build_benchmark(config: BenchmarkConfig) -> Benchmark:
     return BENCHMARKS[name](config)
 
 
-def build_system(config: SystemConfig) -> System:
+def build_system(config: AgentConfig, inference: InferenceConfig) -> System:
     name = config.name
     if name not in SYSTEMS:
         raise KeyError(f"unknown system {name!r}; available: {sorted(SYSTEMS)}")
-    return SYSTEMS[name](config)
+    return SYSTEMS[name](config, inference)

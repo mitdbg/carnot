@@ -19,11 +19,11 @@ Output: one `{output_dir}/{doc_name}.json` per PDF:
      "elements": [{"id": 0, "page_id": 0, "type": "text", "content": "..."}, ...]}
 consumed downstream by compute_financebench_element_embeddings.py.
 
-LLM access uses the skunk `LLMClient` over OpenRouter, built from a minimal `SystemConfig` from CLI
-args (no SkunkConfig). `OPENROUTER_API_KEY` is read from the env by the client. `--input_dir`,
-`--output_dir`, `--renders_dir`, `--pages_dir` each accept a local path OR an `s3://bucket/prefix`
-URI; with S3 everything streams in/out so the cluster keeps ~zero local disk (S3 needs `boto3` +
-AWS creds in the env; boto3 is imported lazily so local runs don't require it).
+LLM access uses the skunk `LLMClient` over OpenRouter, built from a minimal `InferenceConfig` from CLI
+args. `OPENROUTER_API_KEY` is read from the env by the client. `--input_dir`, `--output_dir`, `--renders_dir`,
+`--pages_dir` each accept a local path OR an `s3://bucket/prefix` URI; with S3 everything streams in/out so
+the cluster keeps ~zero local disk (S3 needs `boto3` + AWS creds in the env; boto3 is imported lazily so local
+runs don't require it).
 
 Usage:
     OPENROUTER_API_KEY=sk-or-... python preprocess_financebench_pdfs.py \\
@@ -51,7 +51,7 @@ from urllib.parse import urlparse
 import fitz  # PyMuPDF
 
 from skunk.common import B64Image
-from skunk.config import SystemConfig
+from skunk.config import InferenceConfig
 from skunk.llm_client import EmptyCompletionError, LLMClient
 
 # Text-element sizing (BrowseComp-Plus style): merge paragraphs up to a token target, hard-split
@@ -279,11 +279,10 @@ def parse_extract_markdown(md: str) -> list[tuple[str, str]]:
     return out
 
 
-def build_config(args) -> SystemConfig:
-    """Minimal SystemConfig for OpenRouter generation (no embedding/agent fields are exercised).
+def build_config(args) -> InferenceConfig:
+    """Minimal InferenceConfig for OpenRouter generation (no embedding/agent fields are exercised).
     The key comes from OPENROUTER_API_KEY in the env (read by LLMClient)."""
-    return SystemConfig(
-        name="financebench_preprocess",
+    return InferenceConfig(
         emb_provider="openrouter",  # unused — no embedding calls here
         emb_model_id="",
         llm_provider="openrouter",
@@ -295,6 +294,7 @@ def build_config(args) -> SystemConfig:
         llm_model_tpm={},
         llm_default_tpm=None,
         llm_prices={},
+        llm_context_limits={},
     )
 
 

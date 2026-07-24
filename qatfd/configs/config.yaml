@@ -2,6 +2,7 @@
 #
 # Three config groups compose one run (override any leaf on the CLI):
 #   experiments/  — run-level knobs (split, sample, workers, ...)
+#   inference/    - global configuration for llm inference
 #   benchmarks/   — which benchmark + benchmark-specific knobs
 #   systems/      — which system + system-specific knobs
 #
@@ -12,6 +13,7 @@
 #   python3 -m qatfd.runner --multirun benchmarks=officeqa,browsecomp_plus systems=rag_llm,search_agent
 defaults:
   - experiments: base
+  - inference: base
   - benchmarks: officeqa
   - systems: search_agent
   - _self_

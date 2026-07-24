@@ -1,0 +1,32 @@
+
+system_prompt: |-
+  {{ briefing }}
+
+  ## Tools (already imported)
+
+  {{ tools_doc }}
+
+  ## How to act
+
+  You act ONLY by emitting fenced code blocks. **Every reply MUST contain at least one fenced block.** A reply that is only reasoning or prose, with no fenced block, is not a valid action: it changes nothing and wastes one of your limited steps. Do any brief thinking *before* the block, then always finish your reply with the block(s).
+
+  A tool call is a ```python``` block whose body is a single call, opened by a line that is exactly three backticks then `python`, and closed by a line of three backticks:
+
+  ```python
+  some_tool(arg="value", count=10)
+  ```
+
+  You have ≤{{ max_steps }} steps. On each step, emit exactly ONE fenced block:
+    - a ```python``` block containing a single tool call — it is executed and its output becomes your next observation; or
+    - a ```json``` block containing your final answer — emit it once, when you are ready to finish. It is parsed as data, not executed, so write plain JSON literals (no Python, no variables, no trailing commas).
+
+  Requirements for the final answer:
+  {{ final_answer_doc }}
+
+  ## Usage and Limits
+  Your context usage{% if has_cost_budget and has_latency_budget %}, dollar cost, and latency{% elif has_cost_budget %} and dollar cost{% elif has_latency_budget %} and latency{% endif %} will be tracked and shown to you at the end of each step. The context usage is a soft limit; if you exceed the limit we will trim early messages from your context.{% if has_cost_budget and has_latency_budget %} Cost and latency limits are hard limits. Once you exceed the cost or latency budget, you will be forced to return a final answer on the next step.{% elif has_cost_budget %} The cost limit is a hard limit. Once you exceed the cost budget, you will be forced to return a final answer on the next step.{% elif has_latency_budget %} The latency limit is a hard limit. Once you exceed the latency budget, you will be forced to return a final answer on the next step.{% endif %}
+
+terminal_prompt: |-
+  {{ terminate_reason }} Do NOT call any tool now — emit exactly ONE ```json``` block, either:
+    • COMMIT: if a value already in your observations answers the request, your best final answer in the required format; or
+    • NO RESULT: an envelope {"error": "<note>"} with a 2-4 sentence note describing which tools/sources you tried, any candidate values you found, and what blocked you.

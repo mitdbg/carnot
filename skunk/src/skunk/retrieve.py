@@ -1,22 +1,18 @@
-"""retrieve operator — plain functions over two swappable backends.
+"""retrieve operator — plain functions over a search-agent backend.
 
-`run_retrieve_all` turns `RetrieveBranch`es into the pages that answer them:
-- golden bypass — returns `ctx.config.golden_pages` verbatim (eval ablation).
-- `search_agent` — iterative ChromaDB + LLM loop under `skunk.search_agent`.
+`run_retrieve_all` turns `RetrieveBranch`es into the pages that answer them via
+`search_agent` — an iterative ChromaDB + LLM loop under `skunk.search_agent`.
 
-Stateless by design (everything flows through `ctx` and the process-wide
-resources cache below); the old `RetrieveOp` class held no state and was
-retired for these functions.
+Stateless by design: the retrieval substrate (chroma collection + document map,
+plus the optional figure-tool paths) is built ONCE by the application and injected
+onto `ctx`; these functions only read it. The old `RetrieveOp` class held no state
+and was retired for these functions.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import threading
-from pathlib import Path
 
-from skunk.config import PipelineConfig
 from skunk.errors import StepFailed
 from skunk.common import (
     BranchRetrieval,
@@ -27,7 +23,7 @@ from skunk.common import (
     traced_step,
 )
 from skunk.plan import RetrieveBranch
-
+from skunk.storage.document_map import DocumentMap
 
 async def run_retrieve_all(
     ctx: ExecutionContext,
@@ -39,7 +35,6 @@ async def run_retrieve_all(
     with text) or a `StepFailed` — a single branch failing does not sink its siblings. A
     whole-sweep failure (missing index) raises. The search agent is the sole retriever:
 
-    - golden bypass (`golden_pages`) → the benchmark pages verbatim (text attached).
     - search agent → agent rollout → page keys → the retrieved pages (text attached).
 
     Each page's text comes from the same `document_map` the search agent reads, so compute
@@ -48,16 +43,6 @@ async def run_retrieve_all(
     `branch_ids` aligns each branch to its stable id so its retrieve runs in a per-branch
     `traced_step`: the rollout + the returned pages then attach to that branch in the
     trace viewer."""
-    if ctx.config.golden_pages is not None:
-        # --golden ablation: inject the benchmark pages verbatim (text attached), already final.
-        pages = ctx.config.golden_pages
-        document_map = _load_document_map(ctx.config)
-        docs = tuple(_docs_for_refs(pages, document_map))
-        ctx.emit(
-            f"golden_bypass n_pages={len(pages)} refs={[str(r) for r in pages]!r}"
-        )
-        return [BranchRetrieval(documents=docs) for _ in branches]
-
     ids = branch_ids if branch_ids is not None else [None] * len(branches)
 
     async def _one(b: RetrieveBranch, bid: int | None) -> BranchRetrieval:
@@ -85,7 +70,7 @@ async def run_retrieve_all(
 
 
 def _docs_for_refs(
-    refs: list[PageRef], document_map: dict[str, str]
+    refs: list[PageRef], document_map: DocumentMap
 ) -> list[RetrievedDoc]:
     """Attach each ref's cleaned page text (from `document_map`, keyed by page key
     `<stem>_<page>`) — empty string when the map has no entry for it."""
@@ -102,11 +87,21 @@ async def _run_search_agent(
 ) -> BranchRetrieval:
     from skunk.search_agent import SearchAgent, doc_ids_from_payload
 
-    collection, document_map = _get_shared_resources(ctx.config)
+    if ctx.chroma_collection is None:
+        raise StepFailed(
+            "retrieve",
+            "no chroma_collection on ctx; the application must build the retrieval "
+            "substrate (chroma collection + document_map) and inject it into the "
+            "Orchestrator.",
+        )
     agent = SearchAgent(
-        config=ctx.config,
-        document_map=document_map,
-        chroma_collection=collection,
+        config=ctx.config.search,
+        document_map=ctx.document_map,
+        chroma_collection=ctx.chroma_collection,
+        pdf_dir=ctx.config.storage.pdf_dir,
+        page_renders_dir=ctx.config.storage.page_renders_dir,
+        llm_client=ctx.llm_client,
+        emb_model_id=ctx.config.inference.emb_model_id,
     )
     # This operator owns the retrieval user message (the agent's `call()` is the
     # generic entry point; the branch framing below is pipeline vocabulary).
@@ -131,94 +126,4 @@ async def _run_search_agent(
             "retrieve",
             f"search_agent returned no usable page keys (raw={page_keys!r})",
         )
-    return BranchRetrieval(documents=tuple(_docs_for_refs(refs, document_map)))
-
-
-# Process-wide ChromaDB/document-map cache. Reads go through a ChromaDB *server*
-# (HttpClient) — the embedded PersistentClient deadlocks under the eval's 15-way
-# in-process concurrency (worker threads wedge inside ChromaDB's Rust core), whereas
-# the server process owns ChromaDB's concurrency. The eval runs many UIDs through one
-# ThreadPoolExecutor, each with its own RetrieveOp, so we cache the (collection handle,
-# document map) process-wide and single-flight construction under one global lock: this
-# avoids re-connecting / re-fetching the collection per UID and keeps a single in-memory
-# copy of the (read-only) document map shared across worker threads.
-_SHARED_RESOURCES_LOCK = threading.Lock()
-_SHARED_RESOURCES: dict[tuple[str, int, str, str], tuple] = {}
-
-
-def _get_shared_resources(config: PipelineConfig):
-    """Process-wide single-flight wrapper over `_build_resources`, keyed by the
-    ChromaDB server (host, port) + collection + clean-page-map path. Serializes the
-    connect/collection-fetch across all RetrieveOps (i.e. across all UID worker threads)."""
-    key = (
-        config.chroma_server_host,
-        config.chroma_server_port,
-        config.chromadb_collection,
-        str(Path(config.clean_page_map_path).resolve()),
-    )
-    with _SHARED_RESOURCES_LOCK:
-        if key not in _SHARED_RESOURCES:
-            _SHARED_RESOURCES[key] = _build_resources(config)
-        return _SHARED_RESOURCES[key]
-
-
-# Process-wide cache of the (read-only) document map, keyed by clean-page-map path, so the
-# golden bypass (which needs the page text but not ChromaDB) doesn't re-read it per UID.
-_DOC_MAP_LOCK = threading.Lock()
-_DOC_MAP_CACHE: dict[str, dict[str, str]] = {}
-
-
-def _load_document_map(config: PipelineConfig) -> dict[str, str]:
-    """Load `doc_id (`<stem>_<page>` page key) → cleaned page text` from
-    `config.clean_page_map_path`. Cached process-wide. Shared by the search-agent path
-    (via `_build_resources`) and the golden bypass; needs no ChromaDB."""
-    path_key = str(Path(config.clean_page_map_path).resolve())
-    with _DOC_MAP_LOCK:
-        cached = _DOC_MAP_CACHE.get(path_key)
-    if cached is not None:
-        return cached
-
-    clean_page_map_path = Path(config.clean_page_map_path)
-    if not clean_page_map_path.exists():
-        raise StepFailed(
-            "retrieve",
-            f"clean_page_map_path {clean_page_map_path!s} does not exist; "
-            "build the corpus page map offline first, or point "
-            "config.clean_page_map_path (env SKUNK_CLEAN_PAGE_MAP) at it.",
-        )
-
-    with clean_page_map_path.open() as f:
-        clean_page_map = json.load(f)
-
-    document_map: dict[str, str] = {}
-    for doc_id, entry in clean_page_map.items():
-        path = entry[0] if isinstance(entry, (list, tuple)) else entry
-        try:
-            with open(path) as pf:
-                document_map[doc_id] = pf.read()
-        except OSError:
-            continue
-
-    with _DOC_MAP_LOCK:
-        _DOC_MAP_CACHE[path_key] = document_map
-    return document_map
-
-
-def _build_resources(config: PipelineConfig):
-    from skunk.chroma_client import make_chroma_client
-
-    document_map = _load_document_map(config)
-
-    chroma_client = make_chroma_client(
-        config.chroma_server_host, config.chroma_server_port
-    )
-    try:
-        collection = chroma_client.get_collection(name=config.chromadb_collection)
-    except Exception as e:
-        raise StepFailed(
-            "retrieve",
-            f"chromadb collection {config.chromadb_collection!r} not found on the "
-            f"server at {config.chroma_server_host}:{config.chroma_server_port}: {e}",
-        ) from e
-
-    return collection, document_map
+    return BranchRetrieval(documents=tuple(_docs_for_refs(refs, ctx.document_map)))

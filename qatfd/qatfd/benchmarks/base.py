@@ -12,28 +12,15 @@ import json
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from chromadb import Collection
 
-import chromadb
-
+from skunk.common import ExecutionContext
+from skunk.storage.document_map import DocumentMap
 from skunk.prompted_call import PromptOverride, load_prompt_overrides
 
 from qatfd.config import BenchmarkConfig
 from qatfd.paths import resolve_under_benchmarks
 from qatfd.types import Question
-
-
-class DocumentMap(Protocol):
-    """The `doc_id -> full text` lookup the systems need (read_document / answer context). A real
-    dict (OfficeQA / BrowseComp-Plus / FinanceBench) or a lazy chroma-backed mapping (TREC-BioGen,
-    to avoid holding 26.8M abstracts in RAM) — the systems only do keyed lookups, never iterate it.
-
-    Params are positional-only (`/`) so a plain `dict[str, str]` — whose `get`/`__getitem__` are
-    positional-only in typeshed — structurally satisfies the protocol, same as the lazy mapping."""
-
-    def get(self, doc_id: str, default: Any = None, /) -> Any: ...
-    def __getitem__(self, doc_id: str, /) -> str: ...
-    def __contains__(self, doc_id: object, /) -> bool: ...
 
 
 def doc_recall(retrieved: list[str] | None, gold: list[str]) -> float:
@@ -51,9 +38,8 @@ class BenchmarkResources:
     across all per-question workers. Mirrors skunk RetrieveOp's
     (collection, document_map) pair, named so systems read fields explicitly."""
 
-    chroma_collection: Any  # chromadb Collection (vector index over chunks)
+    chroma_collection: Collection  # chromadb Collection (vector index over chunks)
     document_map: DocumentMap  # doc_id -> full text (for read_document / answer step)
-    config: BenchmarkConfig
     answer_format_hint: str = ""
     compute_objective: str = ""  # one sentence on what the final answer is graded on (for the search agent)
     prompt_overrides: tuple[PromptOverride, ...] = field(default_factory=tuple)
@@ -85,31 +71,27 @@ class Benchmark(ABC):
         """All questions in the benchmark (the runner applies the dev/test split)."""
 
     def _chroma_client(self):
-        """The Chroma client — the long-lived server (HttpClient) when `chromadb_host` is set, else
-        the embedded PersistentClient over `chromadb_dir`. Centralized so every benchmark connects
-        identically and warm-server vs embedded is a single config flip (`benchmarks.chromadb_host=...`);
-        see skunk/scripts/run_chroma_server.sh to warm one."""
+        """The Chroma client — always the long-lived warm server (HttpClient) at
+        (`chroma_server_host`, `chroma_server_port`). Collections are only ever read through a server.
+        Centralized so every benchmark connects identically; see skunk/scripts/run_chroma_server.sh to
+        warm one over the corpus's chroma dir."""
         cfg = self.config
-        if cfg.chromadb_host:
-            from skunk.chroma_client import make_chroma_client
+        from skunk.chroma_client import make_chroma_client
 
-            return make_chroma_client(cfg.chromadb_host, cfg.chromadb_port)
-        if not os.path.exists(cfg.chromadb_dir):
-            raise FileNotFoundError(f"chromadb_dir {cfg.chromadb_dir} does not exist.")
-        return chromadb.PersistentClient(path=cfg.chromadb_dir)
+        return make_chroma_client(cfg.storage.chroma_server_host, cfg.storage.chroma_server_port)
 
     def _chroma_where(self) -> str:
         cfg = self.config
-        return f"server {cfg.chromadb_host}:{cfg.chromadb_port}" if cfg.chromadb_host else cfg.chromadb_dir
+        return f"server {cfg.storage.chroma_server_host}:{cfg.storage.chroma_server_port}"
 
-    def _open_chroma_collection(self):
-        """Open the single configured Chroma collection (`chromadb_collection`)."""
+    def _open_chroma_collection(self) -> Collection:
+        """Open the single configured Chroma collection (`collection_name`)."""
         client = self._chroma_client()
         try:
-            return client.get_collection(name=self.config.chromadb_collection)
+            return client.get_collection(name=self.config.storage.collection_name)
         except Exception as e:
             raise RuntimeError(
-                f"chroma collection {self.config.chromadb_collection!r} not found ({self._chroma_where()})."
+                f"chroma collection {self.config.storage.collection_name!r} not found ({self._chroma_where()})."
             ) from e
 
     @abstractmethod
@@ -125,12 +107,12 @@ class Benchmark(ABC):
             res.compute_objective = self.compute_objective
             path = self.config.prompts_path
             res.prompt_overrides = load_prompt_overrides(path) if path and os.path.exists(path) else ()
-            res.pdf_dir = self.config.pdf_dir
+            res.pdf_dir = self.config.storage.pdf_dir
             self._resources = res
         return self._resources
 
     @abstractmethod
-    async def score(self, question: Question, predicted: str, ctx) -> dict:
+    async def score(self, question: Question, predicted: str, ctx: ExecutionContext) -> dict:
         """Grade `predicted` against gold. Returns at least
         {"score": float in [0,1], "scorer": <name>}; may add {"judge_rationale": ...}.
         Binary benchmarks return 0.0/1.0; graded ones (nugget-completion) a fraction.

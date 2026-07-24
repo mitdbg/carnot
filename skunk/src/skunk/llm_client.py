@@ -41,9 +41,9 @@ if TYPE_CHECKING:
     from openrouter import OpenRouter
 
     from skunk.common import B64Image, ExecutionContext
-    from skunk.config import SystemConfig
+    from skunk.config import InferenceConfig
 
-def _warn(ctx: "ExecutionContext | None", message: str) -> None:
+def _warn(ctx: ExecutionContext | None, message: str) -> None:
     """Route a client warning onto the owning question's event stream when a ctx
     is in scope (retry/usage warnings become attributable per question); ctx-less
     callers (offline corpus prep) fall back to plain stderr."""
@@ -205,6 +205,7 @@ class CallSpec:
 
     system: str
     model: str
+    usage_key: str = "default"
     user: str = ""
     messages: tuple[dict, ...] | None = None
     images: list[B64Image] | None = None
@@ -334,7 +335,7 @@ class _LLMBackend:
 
     provider: str = "?"
 
-    def __init__(self, config: SystemConfig, usage: UsageTracker) -> None:
+    def __init__(self, config: InferenceConfig, usage: UsageTracker) -> None:
         self._config = config
         self.usage = usage
 
@@ -354,7 +355,7 @@ class _LLMBackend:
         )
 
     def embed_query(
-        self, text: str, *, model: str, ctx: ExecutionContext | None = None
+        self, text: str, *, model: str, usage_key: str = "default", ctx: ExecutionContext | None = None
     ) -> list[float]:
         """Embed a single query string for vector search, routing through the same
         rate-limit / retry / usage-accounting scaffolding as generation so embedding
@@ -367,7 +368,7 @@ class _LLMBackend:
             t0 = time.monotonic()
             vector, in_tok = self._embed_once(model, text)
             latency_s = time.monotonic() - t0
-            self.usage.add_embed(model, in_tok)
+            self.usage.add_embed(model, in_tok, usage_key)
             if ctx is not None:
                 cost = self.usage.price_embed(model, in_tok)
                 ctx.emit(
@@ -493,6 +494,7 @@ class _LLMBackend:
         effort: Effort,
         ctx: ExecutionContext | None,
         call_site: str,
+        usage_key: str,
     ) -> LLMResponse:
         """Shared tail for every generation path: emit the uniform `call ...` envelope
         (when `ctx` is set), accumulate the call into this client's `usage` tracker, and
@@ -522,7 +524,7 @@ class _LLMBackend:
             cache_input_tokens=toks.get("cache_input_tokens"),
             thinking_tokens=toks.get("thinking_tokens"),
         )
-        self.usage.add(resp, model)
+        self.usage.add(resp, model, usage_key)
         return resp
 
     async def _tpm_acquire(
@@ -555,7 +557,7 @@ class _LLMBackend:
         return self._build_response(
             text, toks, latency_s,
             model=model_id, temperature=spec.temperature, effort=spec.effort,
-            ctx=spec.ctx, call_site=spec.call_site,
+            ctx=spec.ctx, call_site=spec.call_site, usage_key=spec.usage_key,
         )
 
 
@@ -648,7 +650,7 @@ class _OpenAIChatBackend(_LLMBackend):
         output_text = self._text(resp).strip()
         if not output_text:
             raise EmptyCompletionError(
-                f"{self.provider} empty content (model={spec.model} call_site={spec.call_site} "
+                f"{self.provider} empty content (model={spec.model} call_site={spec.call_site} usage_key={spec.usage_key}"
                 f"finish_reason={self._finish_reason(resp)}{self._empty_detail(resp)})"
             )
         return output_text
@@ -665,7 +667,7 @@ class _OpenRouterBackend(_OpenAIChatBackend):
 
     provider = "openrouter"
 
-    def __init__(self, config: SystemConfig, usage: UsageTracker, api_key: str | None = None) -> None:
+    def __init__(self, config: InferenceConfig, usage: UsageTracker, api_key: str | None = None) -> None:
         super().__init__(config, usage)
         self._api_key = api_key
         self._client: OpenRouter | None = None
@@ -727,7 +729,7 @@ class _OpenRouterBackend(_OpenAIChatBackend):
     def _empty_detail(self, resp: Any) -> str:
         return self._openrouter_error_detail(resp) + _raw_body_suffix()
 
-    def _provider_kwarg(self, spec: "CallSpec | None" = None) -> dict:
+    def _provider_kwarg(self, spec: CallSpec | None = None) -> dict:
         """`{"provider": {...}}` pinning generation to a provider order (no fallback), or `{}` when
         unset. A per-call `spec.provider_order` wins over the client-wide `config.llm_provider_order`,
         so one model (e.g. a cheaper semantic-filter judge) can be routed to specific providers while
@@ -863,7 +865,7 @@ class _VLLMBackend(_OpenAIChatBackend):
 
     provider = "vllm"
 
-    def __init__(self, config: SystemConfig, usage: UsageTracker, api_key: str | None = None) -> None:
+    def __init__(self, config: InferenceConfig, usage: UsageTracker, api_key: str | None = None) -> None:
         super().__init__(config, usage)
         self._api_key = api_key
 
@@ -996,7 +998,7 @@ class LLMClient:
 
     def __init__(
         self,
-        config: SystemConfig,
+        config: InferenceConfig,
         *,
         openrouter_api_key: str | None = None,
         vllm_api_key: str | None = None,
@@ -1059,11 +1061,12 @@ class LLMClient:
         model: str | None = None,
         provider_order: list[str] | None = None,
         max_output_tokens: int | None = None,
+        usage_key: str = "default",
     ) -> LLMResponse:
         spec = CallSpec(
             system=system, user=user, images=images, temperature=temperature,
             effort=effort, ctx=ctx, call_site=call_site,
-            model=model or self._config.llm_model,
+            model=model or self._config.llm_model, usage_key=usage_key,
             provider_order=provider_order,
             max_output_tokens=max_output_tokens,
         )
@@ -1075,19 +1078,20 @@ class LLMClient:
         user: str,
         images: list[B64Image] | None = None,
         temperature: float = 0.0,
-        effort: "Effort" = "off",
-        ctx: "ExecutionContext | None" = None,
+        effort: Effort = "off",
+        ctx: ExecutionContext | None = None,
         call_site: str = "llm",
         model: str | None = None,
         max_output_tokens: int | None = None,
         timeout_s: float | None = None,
+        usage_key: str = "default",
     ) -> LLMResponse:
         """Async twin of `call` for the request path. `max_output_tokens` /
         `timeout_s` mirror `astream`'s caps (None → provider default / no cap)."""
         spec = CallSpec(
             system=system, user=user, images=images, temperature=temperature,
             effort=effort, ctx=ctx, call_site=call_site,
-            model=model or self._config.llm_model,
+            model=model or self._config.llm_model, usage_key=usage_key,
             max_output_tokens=max_output_tokens, timeout_s=timeout_s,
         )
         return await self._backend_for_model(spec.model).acall(spec)
@@ -1105,6 +1109,7 @@ class LLMClient:
         call_site: str = "llm",
         max_output_tokens: int | None = None,
         timeout_s: float | None = None,
+        usage_key: str = "default",
     ) -> LLMResponse:
         """Multi-turn streaming call, accumulating chunks until `should_stop(acc)`
         or the stream ends. `messages` are the {role, content} turns after the
@@ -1118,7 +1123,7 @@ class LLMClient:
         spec = CallSpec(
             system=system, messages=tuple(messages), temperature=temperature,
             effort=effort, ctx=ctx, call_site=call_site, should_stop=should_stop,
-            model=model or self._config.llm_model,
+            model=model or self._config.llm_model, usage_key=usage_key,
             max_output_tokens=max_output_tokens, timeout_s=timeout_s,
         )
         return await self._backend_for_model(spec.model).astream(spec)
@@ -1130,6 +1135,7 @@ class LLMClient:
         model: str | None = None,
         provider: str | None = None,
         ctx: ExecutionContext | None = None,
+        usage_key: str = "default",
     ) -> list[float]:
         """Embed a single query string for vector search (see `_LLMBackend.embed_query`
         for the retry/usage envelope).
@@ -1140,4 +1146,4 @@ class LLMClient:
             from `config.vllm_base_urls[model]`, same map as generation."""
         model = model or self._config.emb_model_id
         provider = provider or self._config.emb_provider
-        return self._backend(provider).embed_query(text, model=model, ctx=ctx)
+        return self._backend(provider).embed_query(text, model=model, usage_key=usage_key, ctx=ctx)

@@ -1,66 +1,7 @@
 # base config for all systems
 name: null
-emb_provider: openrouter
-emb_model_id: Qwen/Qwen3-Embedding-8B
-
-# --- LLM client (skunk.llm_client.LLMClient) ---
-# default generation provider: openrouter (full vendor/model ids) or vllm (served model
-# names; every model must then be in vllm_base_urls). Routing is per call — a model listed
-# in vllm_base_urls goes to vLLM regardless of this default. Embeddings dispatch on
-# emb_provider, not this.
-llm_provider: openrouter
-# default model for every LLM call (one-shot calls and agent loops alike); full OpenRouter id
-llm_model: google/gemini-3.5-flash
-# per-call retry on transient faults only; the delay doubles each attempt
-llm_max_retries: 5
-llm_retry_initial_delay_s: 1.0
-# per-model request pacing (requests/min); a model not listed uses llm_default_rpm
-llm_model_rpm:
-  gemini-3.5-flash: 4000
-  gemini-3-flash-preview: 4000      # fine-grained filter scan model; same RPM as 3.5-flash
-  gemini-3.1-flash-lite: 4000
-  gemini-3.1-pro-preview: 2000
-llm_default_rpm: 1000
-# per-model token pacing (tokens/min); a model not listed uses llm_default_tpm.
-# null/0 disables the TPM throttle for that model (paced by RPM alone).
-llm_model_tpm:
-  gemini-3.5-flash: 10000000
-  gemini-3-flash-preview: 10000000  # same TPM as 3.5-flash
-  gemini-3.1-flash-lite: 25000000
-  gemini-3.1-pro-preview: 8000000
-llm_default_tpm: null
-# USD price table for cost accounting; maps a model-substring -> {in/out/cached: $ per 1M tokens}
-# lookup is exact-first then substring, and an unmatched model costs 0.
-llm_prices:
-  gemini-3.5-flash: {in: 1.5, out: 9.0, cached: 0.15}
-  gemini-3.1-flash-lite: {in: 0.25, out: 1.5, cached: 0.025}
-  gemini-3.1-pro: {in: 2.0, out: 12.0, cached: 0.20}
-  qwen3-embedding-8b: {in: 0.01, out: 0.00, cached: 0.00}
-  google/gemma-3-12b-it: {in: 0.05, out: 0.15, cached: 0.00}
-  qwen/qwen3.6-35b-a3b: {in: 0.15, out: 1.0, cached: 0.05}   # pinned to Parasail
-  qwen/qwen3.6-27b: {in: 0.285, out: 2.4, cached: 0.15}      # pinned to io.net
-# Per-model context-window limits (tokens); model id/substring -> max context tokens, matched
-# exact-then-substring like llm_prices. The semantic filter head-truncates each candidate document
-# so the judge request fits the judge model's window (with ~10% safety headroom); a model absent
-# here is not truncated. Only the semantic-filter judge model actually needs an entry.
-llm_context_limits:
-  gemini-3.5-flash: 1048576
-  gemini-3.1-flash-lite: 1048576
-  gemini-3.1-pro: 1048576
-  qwen/qwen3.6-35b-a3b: 262144      # AkashML & Parasail both serve 262144
-  qwen/qwen3.6-27b: 262144          # io.net serves 262140; safety margin absorbs the rounding
-# OpenRouter provider pin (ordered slugs, no fallback); null = OpenRouter picks. Overridden
-# per-run on the CLI, e.g. systems.llm_provider_order=[parasail].
-llm_provider_order: null
-# Per-model vLLM routing: model id -> OpenAI-compatible base URL of the vLLM server serving it
-# (launch servers with scripts/run_vllm_servers.sh, which prints/writes these URLs). A model
-# listed here routes to vLLM; every other model (e.g. benchmarks.judge_model) stays on
-# llm_provider above. Keys must equal the server's --served-model-name. Models listed here
-# cost $0 regardless of llm_prices (safe to keep a price entry for OpenRouter runs of the
-# same model). CLI example (++ because Hydra's struct mode rejects new dict keys under a
-# plain override):
-#   '++systems.vllm_base_urls={Qwen/Qwen3-32B: "http://gpu-box:8100/v1"}'
-vllm_base_urls: {}
-# Extra JSON merged into every vLLM chat request body (openai SDK extra_body), e.g.
-# {chat_template_kwargs: {enable_thinking: false}} to turn off Qwen3-style thinking.
-vllm_extra_body: null
+# Stable usage-attribution key for the system's retrieval agent (skunk MultiTurnAgent.agent_id /
+# RAGLLMSystem.system_id), so the runner can isolate the system's own cost from the aggregate
+# (the shared compute answerer mints its own key). Interpolates to the concrete system name; one
+# system runs per experiment, so a name-derived key is stable and never collides within a question.
+agent_id: ${systems.name}

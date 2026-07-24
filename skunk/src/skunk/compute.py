@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import uuid
 from collections import Counter
 from collections.abc import Sequence
 from typing import Any
@@ -137,6 +138,10 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
         ),
     )
 
+    def __init__(self, compute_id: str | None = None):
+        # Usage-attribution key (see MultiTurnAgent.agent_id); None => fresh uuid4 per instance.
+        self.compute_id = compute_id if compute_id is not None else str(uuid.uuid4())
+
     async def codegen(
         self,
         ctx: ExecutionContext,
@@ -163,14 +168,15 @@ Available imports: numpy (np), pandas (pd), math, statsmodels.api (sm).
                 f"\nSpecific issue(s) to address:\n{prev_failure}\n"
                 "Focus on fixing them without introducing new mistakes."
             )
-        raw = await self._prompt.call(ctx, user_msg, effort=effort, temperature=1.0)
+        raw = await self._prompt.call(ctx, user_msg, effort=effort, usage_key=str(self.compute_id), temperature=1.0)
         return parse_codegen_reply(raw, expectation=_CODEGEN_EXPECTATION)
 
 
 class ComputeOp:
     """The compute operator — a codegen → exec loop. One public `run()`."""
-    def __init__(self) -> None:
-        self._codegen = Codegen()
+    def __init__(self, compute_id: str | None = None) -> None:
+        # Forwarded to Codegen as its usage-attribution key; None => Codegen mints a uuid4.
+        self._codegen = Codegen(compute_id)
 
     async def run(
         self,

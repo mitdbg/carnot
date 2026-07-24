@@ -69,11 +69,11 @@ The benchmark's `source_docs?page=N` parameter is the PDF page index in Fraser's
 
 ## Retrieval: the search agent
 
-`run_retrieve_all` in `src/skunk/retrieve.py` is the **single retrieval seam**: it is the
-only layer that inspects `ctx.config.golden_pages`, and it normalizes retrieval to one
-per-branch result — `BranchRetrieval(documents)` (`src/skunk/common.py`), the retrieved
-pages with their text that compute reads. A branch that fails surfaces as a per-branch
-`StepFailed` in the same list, so one branch failing doesn't sink its siblings. Dispatch:
+`run_retrieve_all` in `src/skunk/retrieve.py` is the **single retrieval seam**: it
+normalizes retrieval to one per-branch result — `BranchRetrieval(documents)`
+(`src/skunk/common.py`), the retrieved pages with their text that compute reads. A branch
+that fails surfaces as a per-branch `StepFailed` in the same list, so one branch failing
+doesn't sink its siblings. Dispatch:
 
 - **`search_agent`** (the only backend) — the iterative ChromaDB + LLM-loop retriever under
   `src/skunk/search_agent/` (`SearchAgent`, a `MultiTurnAgent` with vector-search / grep /
@@ -81,8 +81,6 @@ pages with their text that compute reads. A branch that fails surfaces as a per-
   LLM-judge tool callers can wire via `extra_tools`). Branches run in parallel, a fresh
   agent each, with per-branch failure isolation; the agent's page-key output is parsed to
   `PageRef`s.
-- **golden bypass** — `config.golden_pages` (the eval harness's `--golden` ablation) injects
-  the benchmark's gold pages verbatim and skips the agent entirely.
 
 **Corpus data contract — "document" = retrieval unit.** The SearchAgent's vocabulary has two
 levels, both defined by the Chroma collection it is handed (schema in
@@ -108,7 +106,7 @@ reads. grc-officeqa's `page_index/` build survives but is orphaned.)
 
 ## The operators
 
-- **`retrieve(key, period)`** — chain head. Runs the search agent for the branch and returns its retrieved pages WITH their text, as `RetrievedDoc`s (`ref: PageRef`, `text: str`). Dispatched by `run_retrieve_all` to the search-agent backend (or short-circuited by `ctx.config.golden_pages`, which attaches the golden pages' text from `clean_page_map`) — see "Retrieval: the search agent" above. The page text is the same cleaned per-page corpus the search agent itself reads; there is no separate extract/read step.
+- **`retrieve(key, period)`** — chain head. Runs the search agent for the branch and returns its retrieved pages WITH their text, as `RetrievedDoc`s (`ref: PageRef`, `text: str`). Dispatched by `run_retrieve_all` to the search-agent backend — see "Retrieval: the search agent" above. The page text is the same cleaned per-page corpus the search agent itself reads; there is no separate extract/read step.
 - **`lookup_external(nl)`** — chain-head capable. Runs a `LookupAgent` (a `MultiTurnAgent` tool loop: FRED / BLS / World Bank / Tavily / fetch_url, ≤`lookup_max_steps` steps) over a natural-language description of external factual data (`nl`); the agent commits a dict of `AnnotatedValue` fields, which `LookupExternalOp` parses into `list[AnnotatedValue]` (one entry) on the trusted side. Use for CPI-U, FX rates, event dates, named entities (bureau names), and any fact not in the bulletin corpus. The agent infers the appropriate `kind` and `unit` (including `text` for strings). `AnnotatedValue` now exists solely for these external values.
 - **`compute()`** — chain terminator that subsumes formatting. Reads `ctx.question`, the retrieved pages' text (as plain document context — the model transcribes numbers it needs into code literals), and any `lookup_external` values (`input_values`, present as `AnnotatedValue` frames in the exec env). Runs a single loop (`ComputeOp.run`) of codegen → in-process exec under one shared budget (`compute_max_attempts`, default 3). Each iteration's codegen call emits one of two `python` forms: **(a)** assign `result` (success); or **(b)** *missing data* — assign `missing` (the identifiers + a one-line reason). Parse, exec, and malformed-block failures feed the next iteration's `prev_code` + `prev_failure`. `run()` returns a union: `Final(answer)` on a clean exec that set `result`, or `NeedsMore(missing)` — it never raises `MissingData`. Fails with `StepFailed("compute", …)` when no iteration ever resolves. Across `compute_best_of_n` trials, `_vote` returns the most-frequent outcome with all `NeedsMore`s pooled into a single "missing-data" candidate (a tie never breaks in favor of missing-data); when missing-data wins, the trials' `missing` identifiers are unioned and their reasons rendered per agent ("agent 1: …, agent 2: …").
 
@@ -277,7 +275,7 @@ One harness drives the pipeline end-to-end:
 |---|---|---|
 | `eval/eval_e2e.py` | question | answer accuracy — full pipeline end-to-end |
 
-Each operator exposes a standalone `run(prev, ctx, **kwargs)` callable on its operator-level class so the harness can invoke it without the orchestrator (e.g. `eval_e2e --golden` injects golden pages and skips retrieve).
+Each operator exposes a standalone `run(prev, ctx, **kwargs)` callable on its operator-level class so a harness can invoke it without the orchestrator.
 
 ## Caches
 
@@ -286,7 +284,7 @@ On-disk artifacts in the runtime path:
 - The search-agent corpus — a ChromaDB collection (`chromadb_dir` / `chromadb_collection`) plus `clean_page_map.json` (`doc_id → cleaned per-page text`). `retrieve` loads the page text from `clean_page_map` and connects to the ChromaDB server; both are built offline by the app (grc-officeqa's `prep/` + qatfd's `create_vector_db.py`).
 - (*Historical:* grc-officeqa's `page_index/` artifact — `catalog/*.jsonl`, `concept_tree.json`, the page store, PNG renders — fed the retired extract/page-store layer and is no longer in the runtime path.)
 
-LLM completions are **not** cached. There is no DSL plan cache — the planner runs once per question. There is no retrieval cache; `eval/eval_e2e.py --golden` is the only retrieve bypass (it injects the benchmark's gold pages, with their text, to measure the compute ceiling given perfect retrieval).
+LLM completions are **not** cached. There is no DSL plan cache — the planner runs once per question. There is no retrieval cache and no retrieve bypass; the search agent always runs.
 
 ## Post-merge integration status
 

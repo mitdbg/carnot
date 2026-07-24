@@ -16,6 +16,8 @@ import re
 
 import pandas as pd
 
+from skunk.common import ExecutionContext
+
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.officeqa_scoring import SCORER_VERSION, score_correct
 from qatfd.keys import officeqa_doc as _page_key_to_doc_key
@@ -24,7 +26,7 @@ from qatfd.constants import OFFICE_QA
 from qatfd.paths import resolve_under_benchmarks
 from qatfd.types import Question
 
-# source_docs URL -> (month, year, page). Mirrors eval/eval_e2e.py's golden parsing.
+# source_docs URL -> (month, year, page)
 _MONTH_MAP = {
     "january": "01", "february": "02", "march": "03", "april": "04",
     "may": "05", "june": "06", "july": "07", "august": "08",
@@ -79,14 +81,13 @@ class OfficeQABenchmark(Benchmark):
     )
 
     def __init__(self, config: OfficeQAConfig) -> None:
-        # all benchmark data (index, questions, page map, prompts, pdfs) resolves under qatfd/benchmarks/.
-        config.chromadb_dir = str(resolve_under_benchmarks(config.chromadb_dir))
+        # all benchmark data (questions, page map, prompts, pdfs) resolves under qatfd/benchmarks/.
         config.csv_path = str(resolve_under_benchmarks(config.csv_path))
         config.clean_page_map_path = str(resolve_under_benchmarks(config.clean_page_map_path))
         if config.prompts_path:
             config.prompts_path = str(resolve_under_benchmarks(config.prompts_path))
-        if config.pdf_dir:
-            config.pdf_dir = str(resolve_under_benchmarks(config.pdf_dir))
+        if config.storage.pdf_dir:
+            config.storage.pdf_dir = str(resolve_under_benchmarks(config.storage.pdf_dir))
         super().__init__(config)
 
     def load_questions(self) -> list[Question]:
@@ -152,10 +153,9 @@ class OfficeQABenchmark(Benchmark):
         return BenchmarkResources(
             chroma_collection=collection,
             document_map=document_map,
-            config=self.config,
         )
 
-    async def score(self, question: Question, predicted: str, ctx) -> dict:
+    async def score(self, question: Question, predicted: str, ctx: ExecutionContext) -> dict:
         return {"score": float(score_correct(question.gold, predicted)), "scorer": SCORER_VERSION}
 
     def recall_metrics(self, retrieved: list[str] | None, question: Question) -> dict[str, float]:

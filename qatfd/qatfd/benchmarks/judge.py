@@ -9,8 +9,11 @@ KARL (arXiv:2603.05218) unifies evaluation via nugget-based completion. Two flav
 
 from __future__ import annotations
 
+from skunk.common import ExecutionContext
+
 import ast
 import re
+import uuid
 
 _JUDGE_SYSTEM = (
     "You are grading a question-answering system. You are given a question, the "
@@ -22,6 +25,7 @@ _JUDGE_SYSTEM = (
     "Respond on the FIRST line with exactly 'YES' (correct) or 'NO' (incorrect), "
     "then optionally a one-line justification."
 )
+_JUDGE_UUID = uuid.uuid4()
 
 # Output-token cap for the single-nugget judge. Its reply is a YES/NO on the first line plus an
 # optional one-line justification, so real replies run ~1-22 tokens; this generous bound (observed
@@ -39,7 +43,9 @@ def _parse_yes_no(text: str) -> bool:
     return bool(m) and m.group(1).lower() == "yes"
 
 
-async def judge_single_nugget(ctx, *, question: str, gold: str, predicted: str, model: str) -> dict:
+async def judge_single_nugget(
+    ctx: ExecutionContext, *, question: str, gold: str, predicted: str, model: str, usage_key: str | None = None
+) -> dict:
     user = f"Question:\n{question}\n\nGold answer:\n{gold}\n\nPredicted answer:\n{predicted or '(no answer)'}"
     resp = await ctx.llm_client.acall(
         system=_JUDGE_SYSTEM,
@@ -49,6 +55,7 @@ async def judge_single_nugget(ctx, *, question: str, gold: str, predicted: str, 
         ctx=ctx,
         call_site="bcp_judge",
         max_output_tokens=_JUDGE_MAX_OUTPUT_TOKENS,
+        usage_key=usage_key if usage_key is not None else str(_JUDGE_UUID),
     )
     rationale = (resp.text or "").strip()
     return {
@@ -108,7 +115,7 @@ def _parse_labels(text: str, n: int) -> list[str]:
 
 
 async def judge_nugget_recall(
-    ctx,
+    ctx: ExecutionContext,
     *,
     question: str,
     nuggets: list[str],
@@ -116,6 +123,7 @@ async def judge_nugget_recall(
     model: str,
     judge_system: str,
     partial_credit: float = 0.0,
+    usage_key: str | None = None,
 ) -> dict:
     """Nugget recall (KARL TREC-BioGen): one judge call labels every gold nugget against the
     predicted answer; score = (n_support + partial_credit * n_partial) / n_nuggets.
@@ -138,6 +146,7 @@ async def judge_nugget_recall(
         model=model,
         ctx=ctx,
         call_site="biogen_nugget_judge",
+        usage_key=usage_key if usage_key is not None else str(_JUDGE_UUID),
     )
     labels = _parse_labels(resp.text or "", len(nuggets))
     weights = [partial_credit if lab == "partial_support" else _LABEL_WEIGHTS[lab] for lab in labels]

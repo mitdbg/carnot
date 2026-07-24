@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
+import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -13,11 +15,17 @@ from jinja2 import Environment, StrictUndefined
 from skunk.common import B64Image, Effort, ExecutionContext
 from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
+from skunk.prompts import load_prompts
 from skunk.sandbox.local_python_executor import CodeOutput, LocalPythonExecutor
 
 _ENV = Environment(
     autoescape=False, keep_trailing_newline=True, undefined=StrictUndefined
 )
+
+_PROMPTS = load_prompts("multi_turn_agent")
+OUT_OF_STEPS_TERMINATE_REASON = "You are out of steps."
+OVER_COST_BUDGET_TERMINATE_REASON = "You are over your cost budget."
+OVER_LATENCY_BUDGET_TERMINATE_REASON = "You are over your latency budget."
 
 
 # ---------------------------------------------------------------------------
@@ -222,38 +230,16 @@ class MultiTurnAgent(ABC):
     max_output_tokens: int | None = None
     request_timeout_s: float | None = None
 
-    _SYSTEM_TEMPLATE = """\
-{{ briefing }}
+    # System-prompt template from prompts/multi_turn_agent.yaml; rendered in __init__();
+    # (Jinja `{{ briefing }}` / `{{ tools_doc }}` / `{{ max_steps }}` / `{{ final_answer_doc }}`)
+    _SYSTEM_PROMPT_TEMPLATE = _PROMPTS["system_prompt"]
 
-## Tools (already imported)
+    # Forced-terminal-turn template from prompts/multi_turn_agent.yaml; rendered per call
+    # so the reason (out of steps / over budget) can vary.
+    # (Jinja `{{ terminate_reason }}`)
+    _TERMINAL_PROMPT_TEMPLATE = _PROMPTS["terminal_prompt"]
 
-{{ tools_doc }}
-
-## How to act
-
-You act ONLY by emitting fenced code blocks. **Every reply MUST contain at least one
-fenced block.** A reply that is only reasoning or prose, with no fenced block, is not a
-valid action: it changes nothing and wastes one of your limited steps. Do any brief
-thinking *before* the block, then always finish your reply with the block(s).
-
-A tool call is a ```python``` block whose body is a single call, opened by a line that is
-exactly three backticks then `python`, and closed by a line of three backticks:
-
-```python
-some_tool(arg="value", count=10)
-```
-
-You have ≤{{ max_steps }} steps. On each step, emit exactly ONE fenced block:
-  - a ```python``` block containing a single tool call — it is executed and its output
-    becomes your next observation; or
-  - a ```json``` block containing your final answer — emit it once, when you are ready to
-    finish. It is parsed as data, not executed, so write plain JSON literals (no Python, no
-    variables, no trailing commas).
-
-Requirements for the final answer:
-{{ final_answer_doc }}"""
-
-    max_steps: int | None = 8
+    max_steps: int = 8
     # Per-step sampling temperature, threaded to `PromptedCall.call` → `astream`.
     # 1.0 per Gemini 3.x guidance: thinking-enabled calls below 1.0 can trap the
     # model in a degenerate reasoning loop that burns the whole output budget
@@ -269,8 +255,8 @@ Requirements for the final answer:
     max_recover_retries: int = 1
     # Hard character cap on the message list as the final safety net (see `_llm_step`).
     context_budget_chars: int = 200_000
-    # Steps remaining at which to emit a low-budget warning. None disables the warning.
-    warn_steps_remaining: int | None = 1
+    # steps remaining at which to emit a low-budget warning
+    warn_steps_remaining: int = 3
     # Extra imports authorized inside the per-step code sandbox. Default: none
     # (tool calls only). Compute-oriented agents (e.g. the task solver) widen
     # this to allow numpy / scipy / statistics / ... in their python steps.
@@ -286,11 +272,17 @@ Requirements for the final answer:
         max_misfires: int | None = None,
         cost_budget: float | None = None,
         latency_budget: float | None = None,
+        agent_id: str | None = None,
         system_prompt_override: str | None = None,
         generation_backend: GenerationBackend | None = None,
         sampling_params: dict | None = None,
         capture_logprobs: bool = False,
     ) -> None:
+        # Stable usage-attribution key for this instance. Caller-supplied (e.g. from config) to
+        # pin a deterministic key, else a fresh uuid4 so parallel agents sharing one LLMClient
+        # keep their per-model token/cost tracking separate.
+        self.agent_id = agent_id if agent_id is not None else str(uuid.uuid4())
+
         self._tools = tools
         # None = keep the class default (mirrors max_misfires) — assigning the bare
         # param used to clobber the declared default to None (an UNBOUNDED loop).
@@ -298,12 +290,25 @@ Requirements for the final answer:
             self.max_steps = max_steps
         if max_misfires is not None:
             self.max_misfires = max_misfires
+
+        # state for cost and latency budget awareness
+        assert cost_budget is None or cost_budget > 0.0
+        assert latency_budget is None or latency_budget > 0.0
         self.cost_budget = cost_budget
         self.latency_budget = latency_budget
+
+        # set start time to None; updated by first invocation of call()
+        self.agent_start_time = None
+
+        # state which records the reason for termination; defaults to "finished",
+        # updated in _terminal_turn() if need be.
+        self.terminate_state = "finished"
+
         # Full block trajectory of the most recent `call()`; rebuilt per call.
         # Kept on the instance (one agent per question / branch) so callers can
         # read `messages_to_jsonable()` after the run for reward / persistence.
         self.messages: list[dict] = []
+
         # Optional pluggable generation backend (e.g. Tinker for RL rollouts).
         # When None, generation goes through `PromptedCall` (the LLMClient
         # path). When set, `_llm_step` samples from it and captures per-token
@@ -312,20 +317,23 @@ Requirements for the final answer:
         self._sampling_params = sampling_params
         self._capture_logprobs = capture_logprobs
         self._last_logprobs: dict | None = None
-        tools_doc = "\n\n".join(t.doc for t in tools)
+
+        # Overrides are complete prompts, already fully rendered by their caller (datagen /
+        # qatfd), so use them verbatim: the base must NOT jinja-render them — they carry
+        # literal `{...}` JSON (StrictUndefined chokes) and their own `{{ ... }}` were already
+        # filled by the caller — nor read briefing/final_answer_doc (override agents don't set
+        # them). Only the built-in template is rendered, with tool docs spliced in as a var.
         if system_prompt_override is not None:
-            # The agent supplies its complete, already-rendered system prompt
-            # (e.g. the datagen judge / solver prompts). We only splice tool docs
-            # where it places `{{ tools_doc }}`, and deliberately do NOT jinja-
-            # render it — those prompts contain literal `{...}` (JSON / filter
-            # examples) that StrictUndefined would choke on.
-            system_prompt = system_prompt_override.replace("{{ tools_doc }}", tools_doc)
+            system_prompt = system_prompt_override
         else:
-            template = self._SYSTEM_TEMPLATE.replace("{{ tools_doc }}", tools_doc)
-            system_prompt = _ENV.from_string(template).render(
+            tools_doc = "\n\n".join(t.doc for t in tools)
+            system_prompt = _ENV.from_string(self._SYSTEM_PROMPT_TEMPLATE).render(
                 briefing=self.briefing,
+                tools_doc=tools_doc,
                 max_steps=self.max_steps,
                 final_answer_doc=self.final_answer_doc,
+                has_cost_budget=self.cost_budget is not None,
+                has_latency_budget=self.latency_budget is not None,
             )
         self._prompt: PromptedCall[_StepOutput] = PromptedCall(
             name=self.name,
@@ -440,6 +448,11 @@ Requirements for the final answer:
         agent's default budget for this call only (e.g. a short, resumed correction turn that
         should not get a full search budget); it defaults to `self.max_steps`. Extra kwargs
         are ignored (signature compat with single-shot calls)."""
+        # mark the time at which the agent started executing; do not overwrite the start time
+        # if it has already been set (this may happen if an agent uses call() for retries)
+        if self.agent_start_time is None:
+            self.agent_start_time = time.monotonic()
+
         # Full block trajectory (no system message; call() assembles it each turn).
         # `_render_for_llm()` produces the redacted, flattened view sent to the model.
         if resume and self.messages:
@@ -464,7 +477,62 @@ Requirements for the final answer:
         ctx.emit(f"question {user!r}", kind="user", data={"text": user})
         return await self._run_loop(ctx, self.max_steps if max_steps is None else max_steps)
 
-    async def _run_loop(self, ctx: ExecutionContext, max_steps: int | None) -> Any:
+    @staticmethod
+    def steps_and_turns_left(step: int, max_steps: int, turn: int, max_turns: int) -> bool:
+        """True iff the agent still has steps (number of actions without error) or turns
+        (number of actions including errors) left."""
+        return step < max_steps and turn < max_turns
+
+    def cost_budget_left(self, ctx: ExecutionContext) -> bool:
+        """True iff the agent has not exceeded its cost budget."""
+        return self.cost_budget is None or ctx.llm_client.usage.cost(key=str(self.agent_id)) < self.cost_budget
+
+    def latency_budget_left(self) -> bool:
+        """True iff the agent has not exceeded its latency budget."""
+        assert self.agent_start_time is not None
+        return self.latency_budget is None or time.monotonic() - self.agent_start_time < self.latency_budget
+
+    def warn_low_steps(self, step: int, max_steps: int) -> bool:
+        """Warn the model if it needs to produce a final answer if it has <= self.warn_steps_remaining left."""
+        return max_steps - step <= self.warn_steps_remaining
+
+    def _get_terminate_reason(self, out_of_steps: bool, over_cost_budget: bool, over_latency_budget: bool) -> tuple[str, str]:
+        """Returns a string and explaining the reason(s) for termination and an identifier for the emitted log."""
+        terminate_reason, terminate_state = "", ""
+        if out_of_steps:
+            terminate_reason = OUT_OF_STEPS_TERMINATE_REASON
+            terminate_state = "out_of_steps"
+        if over_cost_budget:
+            terminate_reason += f" {OVER_COST_BUDGET_TERMINATE_REASON}"
+            terminate_reason = terminate_reason.lstrip()
+            terminate_state += "|over_cost_budget"
+            terminate_state = terminate_state.lstrip("|")
+        if over_latency_budget:
+            terminate_reason += f" {OVER_LATENCY_BUDGET_TERMINATE_REASON}"
+            terminate_reason = terminate_reason.lstrip()
+            terminate_state += "|over_latency_budget"
+            terminate_state = terminate_state.lstrip("|")
+
+        assert len(terminate_reason) > 0 and len(terminate_state) > 0
+        return terminate_reason, terminate_state
+
+    def add_budget_observations(self, ctx: ExecutionContext, obs_blocks: list[Block]) -> None:
+        """Add TextBlocks tracking the context, cost, and latency usage of the agent.
+        Cost and latency are tracked iff self.cost_budget and self.latency_budget are not None, respectively."""
+        ctx_chars = sum(len(m["content"]) for m in self._render_for_llm())
+        obs_blocks.append(TextBlock(
+            f"[Context usage: {ctx_chars:,}/{self.context_budget_chars:,} chars "
+            f"({ctx_chars / self.context_budget_chars * 100:.1f}%)]"
+        ))
+        if self.cost_budget is not None:
+            cost_usage = ctx.llm_client.usage.cost(key=str(self.agent_id))
+            obs_blocks.append(TextBlock(f"[Cost usage: ${cost_usage:.2f}/${self.cost_budget} ({(cost_usage / self.cost_budget * 100):.1f}%)]"))
+        if self.latency_budget is not None:
+            assert self.agent_start_time is not None
+            latency_usage = time.monotonic() - self.agent_start_time
+            obs_blocks.append(TextBlock(f"[Latency usage: {latency_usage:.1f}/{self.latency_budget}s ({(latency_usage / self.latency_budget * 100):.1f}%)]"))
+
+    async def _run_loop(self, ctx: ExecutionContext, max_steps: int) -> Any:
         """The step loop, bounded by `max_steps`. Assumes `self.messages` and
         `self._executor` are already established. `step` counts only turns that PROGRESSED
         (ran a tool call or parsed a final-answer block); parse-misfires / exec-machinery
@@ -472,37 +540,22 @@ Requirements for the final answer:
         is hard-capped at `max_steps + max_misfires` so a never-progressing model still
         terminates. Returns the validated payload, or hands off to `_terminal_turn()`."""
         observations: list[str] = []
+
         # `step` counts only turns that progressed (observation or final answer); `turn`
         # numbers every attempt, including misfired re-prompts (which don't cost a step).
         step = turn = 0
-        max_turns = None if max_steps is None else max_steps + max(0, self.max_misfires)
-        # TODO: add cost and latency budget checks here and add budget / usage messages to loop after each observation
-        # - will likely need to keep a "cost-so-far" and "latency-so-far" counter
-        # Track the `left` value we last warned at so the warning counts DOWN from the
-        # threshold (2, 1, ...) rather than firing once. `left` decreases monotonically
-        # with `step`, so re-warn only when it drops to a new value (misfires that don't
-        # advance `step` keep `left` unchanged and are correctly not re-warned).
-        last_warned_left: int | None = None
-        while (max_steps is None or step < max_steps) and (
-            max_turns is None or turn < max_turns
-        ):
-            if (
-                self.warn_steps_remaining is not None
-                and max_steps is not None
-                and max_steps - step <= self.warn_steps_remaining
-                and max_steps - step != last_warned_left
-            ):
+        max_turns = max_steps + max(0, self.max_misfires)
+        while self.steps_and_turns_left(step, max_steps, turn, max_turns) and self.cost_budget_left(ctx) and self.latency_budget_left():
+            if self.warn_low_steps(step, max_steps):
+                # add message to agent and emit so it can also be shown in trace viewer
                 left = max_steps - step
-                last_warned_left = left
                 warn = (
-                    f"Only {left} of {max_steps} steps remain. You should focus your "
-                    f"remaining steps on your most promising lead and avoid wasting "
-                    f"time on exploration."
+                    f"Only {left} of {max_steps} non-error steps remain. You should focus your "
+                    f"remaining steps on your most promising lead and avoid wasting time on exploration."
                 )
                 self.messages.append({"role": "user", "blocks": [TextBlock(warn)]})
-                # Carry the full warning text (not just `left=N`) so the viewer can show
-                # the agent exactly what it was told, as a first-class lifecycle event.
                 ctx.emit(f"steps_low_warning left={left}", data={"text": warn})
+
             # Generate → parse (retried by PromptedCall on format errors) → execute.
             # `done` is set on success; errors append an observation and advance `turn` only.
             done: _StepOutput | None = None
@@ -534,13 +587,15 @@ Requirements for the final answer:
                 done = step_out
             except ParseError as e:
                 obs = f"Observation (step {turn}): {e.detail}"
-                self.messages.append({"role": "user", "blocks": [TextBlock(obs)]})
+                obs_blocks = [TextBlock(obs)]
+                self.add_budget_observations(ctx, obs_blocks)
+                self.messages.append({"role": "user", "blocks": obs_blocks})
                 ctx.emit(f"error {obs!r}")
             except Exception as e:  # LLM step / batch machinery failed
-                obs = (
-                    f"Observation (step {turn}): exec failed — {type(e).__name__}: {e}"
-                )
-                self.messages.append({"role": "user", "blocks": [TextBlock(obs)]})
+                obs = f"Observation (step {turn}): exec failed — {type(e).__name__}: {e}"
+                obs_blocks = [TextBlock(obs)]
+                self.add_budget_observations(ctx, obs_blocks)
+                self.messages.append({"role": "user", "blocks": obs_blocks})
                 ctx.emit(f"error {obs!r}")
 
             if done is None:
@@ -556,9 +611,11 @@ Requirements for the final answer:
                 feedback = self.validate_final_answer(payload, observations)
                 if feedback is None:
                     return payload
-                fb = f"Observation (step {turn}, validation): {feedback}"
-                self.messages.append({"role": "user", "blocks": [TextBlock(fb)]})
-                observations.append(fb)
+                obs = f"Observation (step {turn}, validation): {feedback}"
+                obs_blocks = [TextBlock(obs)]
+                self.add_budget_observations(ctx, obs_blocks)
+                self.messages.append({"role": "user", "blocks": obs_blocks})
+                observations.append(obs)
                 ctx.emit(f"validation_failed {feedback!r}")
                 continue
 
@@ -572,8 +629,12 @@ Requirements for the final answer:
             else:
                 assert result.output is not None
                 obs_blocks.extend(self._blocks_from_output(result.output))
-            if step_out.notice:
-                obs_blocks.append(TextBlock(f"[notice] {step_out.notice}"))
+            if done.notice:
+                obs_blocks.append(TextBlock(f"[notice] {done.notice}"))
+
+            # add messages to inform the agent of its budget usage
+            self.add_budget_observations(ctx, obs_blocks)
+            
             self.messages.append({"role": "user", "blocks": obs_blocks})
             visible_blocks = [
                 b for b in obs_blocks if b.text and self._block_is_visible(b)
@@ -588,29 +649,36 @@ Requirements for the final answer:
                 data={"blocks": [_block_to_jsonable(b) for b in visible_blocks]},
             )
 
-        # Out of steps: one forced terminal turn that either commits an answer from the
+        # Out of steps or budget: one forced terminal turn that either commits an answer from the
         # existing observations or hands off to the planner with a diagnostic.
-        return await self._terminal_turn(ctx, observations)
-
-    _TERMINAL_PROMPT = (
-        "You are out of steps. Do NOT call any tool now — emit exactly ONE ```json``` "
-        "block, either:\n"
-        "  • COMMIT: if a value already in your observations answers the request, your "
-        "best final answer in the required format; or\n"
-        '  • NO RESULT: an envelope {"error": "<note>"} with a 2-4 sentence note describing which tools/sources you tried, any '
-        "candidate values you found, and what blocked you."
-    )
+        out_of_steps = not self.steps_and_turns_left(step, max_steps, turn, max_turns)
+        over_cost_budget = not self.cost_budget_left(ctx)
+        over_latency_budget = not self.latency_budget_left()
+        return await self._terminal_turn(ctx, observations, out_of_steps, over_cost_budget, over_latency_budget)
 
     async def _terminal_turn(
-        self, ctx: ExecutionContext, observations: list[str]
+        self,
+        ctx: ExecutionContext,
+        observations: list[str],
+        out_of_steps: bool,
+        over_cost_budget: bool,
+        over_latency_budget: bool,
     ) -> Any:
+        # hand-off note; set from the reply below, but the try may raise first
         diagnostic = ""
-        # Record the out-of-steps prompt the agent was shown, so the viewer can tell the
+
+        # get the reason for termination
+        terminate_reason, self.terminate_state = self._get_terminate_reason(out_of_steps, over_cost_budget, over_latency_budget)
+        terminal_prompt = _ENV.from_string(self._TERMINAL_PROMPT_TEMPLATE).render(
+            terminate_reason=terminate_reason
+        )
+
+        # Record the terminal prompt the agent was shown, so the viewer can tell the
         # full story of the forced terminal turn (prompt → reply → outcome).
-        ctx.emit("terminal_prompt out_of_steps", data={"text": self._TERMINAL_PROMPT})
+        ctx.emit(f"terminal_prompt {self.terminate_state}", data={"text": terminal_prompt})
         try:
             step_out = await self._llm_step(
-                ctx, extra=[{"role": "user", "content": self._TERMINAL_PROMPT}]
+                ctx, extra=[{"role": "user", "content": terminal_prompt}]
             )
             ctx.emit(
                 f"terminal_reply chars={len(step_out.raw)}", data={"text": step_out.raw}
@@ -663,7 +731,7 @@ Requirements for the final answer:
             # Model resolution is delegated to the prompt layer (`_resolve_model`):
             # `model_overrides.get(call_site_name, llm_model)`, same as every other call.
             return await self._prompt.call_multi_turn(
-                ctx, trimmed, should_stop=_stop_at_first_block,
+                ctx, trimmed, usage_key=str(self.agent_id), should_stop=_stop_at_first_block,
                 temperature=self.temperature,
                 max_output_tokens=self.max_output_tokens,
                 timeout_s=self.request_timeout_s,

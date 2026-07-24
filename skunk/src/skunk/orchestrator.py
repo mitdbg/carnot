@@ -3,10 +3,9 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 from typing import cast
+from skunk.chroma_client import make_chroma_client
 from skunk.compute import ComputeOp
-from skunk.config import PipelineConfig
-from skunk.errors import MissingData, StepFailed
-from skunk.lookup_agent.lookup_external import LookupExternalOp
+from skunk.config import OrchestratorConfig
 from skunk.common import (
     AnnotatedValue,
     BranchRetrieval,
@@ -17,7 +16,8 @@ from skunk.common import (
     RetrievedDoc,
     traced_step,
 )
-from skunk.llm_client import LLMClient
+from skunk.errors import MissingData, StepFailed
+from skunk.lookup_agent.lookup_external import LookupExternalOp
 from skunk.plan import (
     AttemptRecord,
     Branch,
@@ -28,6 +28,7 @@ from skunk.plan import (
 from skunk.prompted_call import PromptOverride
 from skunk.retrieve import run_retrieve_all
 from skunk.result import ExecutionResult
+from skunk.storage.document_map import DocumentMap
 
 
 @dataclass
@@ -47,22 +48,26 @@ class Orchestrator:
     def __init__(
         self,
         question: str,
-        config: PipelineConfig,
+        config: OrchestratorConfig,
+        document_map: DocumentMap,  # NOTE: this must be built outside of skunk for now because we don't have a uniform way of creating these
         *,
         uid: str | None = None,
         verbose: bool = False,
         log_path: str | None = None,
         prompt_overrides: tuple[PromptOverride, ...] = (),
-        llm_client: LLMClient | None = None,
     ):
+        # get chroma collection from config and pass into ExecutionContext
+        client = make_chroma_client(config.storage.chroma_server_host, config.storage.chroma_server_port)
+        chroma_collection = client.get_collection(config.storage.collection_name)
         self._ctx = ExecutionContext(
             question=question,
+            config=config,
+            document_map=document_map,
             uid=uid,
             verbose=verbose,
             log_path=log_path,
-            config=config,
             prompt_overrides=prompt_overrides,
-            llm_client=llm_client,
+            chroma_collection=chroma_collection,
         )
         self._current_plan: Plan | None = None
         self._branch_ids: list[int] = []
@@ -79,8 +84,7 @@ class Orchestrator:
 
     @property
     def retrieved_pages(self) -> list[PageRef]:
-        """Deduped union of pages from every retrieve sweep this question (empty under
-        golden bypass)."""
+        """Deduped union of pages from every retrieve sweep this question."""
         return self._retrieved_pages
 
     @property
@@ -291,12 +295,12 @@ class Orchestrator:
                     raise res
                 return list(res.documents)
             # External lookup.
-            return await traced_step(
+            return list(await traced_step(
                 self._ctx,
                 "lookup_external",
                 lambda: self._lookup.run(self._ctx, branch),
                 branch_id=bid,
-            )
+            ))
 
         results = await asyncio.gather(
             *(_tail(i) for i in range(len(branches))),

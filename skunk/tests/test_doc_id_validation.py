@@ -17,7 +17,6 @@ import asyncio
 from types import SimpleNamespace
 
 from skunk.common import ExecutionContext
-from skunk.config import PipelineConfig
 from skunk.errors import StepFailed
 from skunk.search_agent.search_agent import SearchAgent, doc_ids_from_payload
 
@@ -62,7 +61,9 @@ class _FakeSearchAgent(SearchAgent):
 
 
 def _ctx() -> ExecutionContext:
-    return ExecutionContext(question="q", config=PipelineConfig(), llm_client=object())
+    # config is only read to build an LLMClient (skipped here — a mock client is passed), so a
+    # bare stand-in suffices; the correction loop under test uses only ctx.emit / the fake agent.
+    return ExecutionContext(question="q", config=SimpleNamespace(), document_map={}, llm_client=object())  # type: ignore[arg-type]
 
 
 DOCMAP = {"A::p1": "text-a", "B::p2": "text-b"}

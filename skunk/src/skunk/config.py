@@ -1,8 +1,4 @@
-"""Centralized library configuration: the `SystemConfig` → `SearchAgentConfig` →
-`PipelineConfig` hierarchy every operator and agent reads. Apps subclass
-`PipelineConfig` to add their corpus paths / per-stage model pinning / env
-plumbing (e.g. grc-officeqa's `SkunkConfig.from_env`, which reuses the
-`_parse_*` helpers below)."""
+"""Centralized library configuration for Skunk."""
 
 from __future__ import annotations
 
@@ -11,21 +7,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
-    from skunk.common import Effort, PageRef
+    from skunk.common import Effort
 
-# --------------------------------------------------------------------------------
-# System-specific configuration
-# --------------------------------------------------------------------------------
 
 @dataclass
-class SystemConfig:
-    # the name of the system
-    name: str
-    # the client to use for computing embeddings ("vllm" resolves the server URL from
-    # `vllm_base_urls[emb_model_id]`)
-    emb_provider: Literal["openrouter", "vllm"]
-    # the model to use for computing embeddings
-    emb_model_id: str
+class InferenceConfig:
+    """Singleton configuration object which configures global inference state."""
     # generation provider for every LLM call whose model has no `vllm_base_urls` entry
     # (routing is per call — see `vllm_base_urls` below)
     llm_provider: Literal["openrouter", "vllm"]
@@ -33,6 +20,10 @@ class SystemConfig:
     # A call resolves its model as `model_overrides.get(call_site_name, llm_model)`; only a
     # per-call-site entry in `model_overrides` (below) overrides it.
     llm_model: str
+    # the client to use for computing embeddings ("vllm" resolves the server URL from `vllm_base_urls[emb_model_id]`)
+    emb_provider: Literal["openrouter", "vllm"]
+    # the model to use for computing embeddings
+    emb_model_id: str
     # per-call retry on transient faults only (429 / 5xx / transport blips); the delay doubles each attempt.
     llm_max_retries: int
     llm_retry_initial_delay_s: float
@@ -72,15 +63,61 @@ class SystemConfig:
     # thinking. None = nothing extra. vLLM-only: OpenRouter calls never send it.
     vllm_extra_body: dict | None = None
 
+
+@dataclass
+class StorageConfig:
+    """Singleton configuration object which configures global storage."""
+    # we assume that data is embedded in a chroma vector store and served externally (for now)
+    collection_name: str
+    chroma_server_host: str
+    chroma_server_port: int
+
+    # paths for pdf (rendering) storage
+    pdf_dir: str | None = None
+    page_renders_dir: str | None = None
+
+
+@dataclass
+class AgentConfig:
+    """Configuration for an agent """
+    # the name of the agent
+    name: str
+    # cost budget in dollars for the agent; None means no budget limit (default)
+    cost_budget: float | None = None
+    # latency budget in seconds for the agent; None means no latency limit (default)
+    latency_budget: float | None = None
+    # stable id used to attribute this agent's token/cost usage on the shared UsageTracker
+    # (see UsageTracker.key_to_usage). None => the agent mints a fresh uuid4 per instance; set
+    # it to pin a deterministic key (e.g. to aggregate a system's usage across questions).
+    agent_id: str | None = None
+
     @classmethod
-    def from_yaml(cls, path: str) -> SystemConfig:
+    def from_yaml(cls, path: str) -> AgentConfig:
         with open(path) as f:
             data = yaml.safe_load(f)
         return cls(**data)
 
 
 @dataclass
-class SearchAgentConfig(SystemConfig):
+class LookupAgentConfig(AgentConfig):
+    """Additional configuration for the LookupAgent"""
+    # Step cap for the lookup_external agent (terminates earlier via its final-answer JSON block).
+    # (env: SKUNK_LOOKUP_MAX_STEPS)
+    lookup_max_steps: int = 4
+    # Active lookup tools by name (see `lookup_tools._REGISTRY`); None → all tools.
+    # (env: SKUNK_LOOKUP_TOOLS — comma-separated, e.g. "fetch_fred,tavily_search")
+    lookup_tools: list[str] | None = None
+
+    # Per-LLM-call caps for the external-lookup agent's turns. Mirrors the search
+    # agent: without a combined thinking+visible cap, Flash thrashed to ~63K thinking
+    # tokens / ~285s per step and emitted no parseable tool call (parse-retry death
+    # spiral). (env: SKUNK_LOOKUP_AGENT_MAX_OUTPUT_TOKENS, SKUNK_LOOKUP_AGENT_TIMEOUT_S)
+    lookup_agent_max_output_tokens: int = 8192
+    lookup_agent_request_timeout_s: float = 150.0
+
+
+@dataclass
+class SearchAgentConfig(AgentConfig):
     # the agent will answer the question directly if agent_mode == "answer", otherwise a separate
     # LLM computes an answer given the SearchAgent's retrieved documents
     agent_mode: str = "retrieve"
@@ -116,109 +153,33 @@ class SearchAgentConfig(SystemConfig):
     # from `agent_max_steps` so a citation fix never eats into the agent's search budget.
     doc_id_correction_steps: int = 3
 
-    # cost budget in dollars for the search agent; None means no budget limit (default)
-    cost_budget: float | None = None
-
-    # latency budget in seconds for the search agent; None means no latency limit (default)
-    latency_budget: float | None = None
-
 
 # --------------------------------------------------------------------------------
-# Pipeline (plan/orchestrate/retrieve/extract/lookup/compute) configuration.
-# `PipelineConfig` extends `SearchAgentConfig` so the operator pipeline and the
-# search agent share ONE config object with the library fields declared once.
-# It is app-agnostic: corpus paths, prompt-override files, and per-stage model
-# pinning live on the app's subclass (e.g. grc-officeqa's `SkunkConfig`).
+# Orchestrator configuration.
 # --------------------------------------------------------------------------------
 
 
 @dataclass
-class PipelineConfig(SearchAgentConfig):
-    # ---- pipeline defaults for the base's required fields ------------------------
-    name: str = "pipeline"
-    # LLM model — a full OpenRouter id on "openrouter", the server's --served-model-name
-    # on "vllm". (env: SKUNK_LLM_MODEL). Request pacing is a per-model token
-    # bucket (`llm:<model>`), paced from `llm_model_rpm` / `llm_default_rpm` — see
-    # `_LLMBackend._retry_call`.
-    llm_model: str = "google/gemini-3.5-flash"
-    # Default LLM provider backend. "openrouter" (default) → OpenRouter chat API (needs
-    # OPENROUTER_API_KEY). "vllm" → local vLLM servers; every model must then have a
-    # `vllm_base_urls` entry. A model WITH a `vllm_base_urls` entry routes to vLLM
-    # regardless of this default, so a mixed run (agent on OpenRouter, semantic filter
-    # on a local model) just lists the local models in the map.
-    # (env: SKUNK_LLM_PROVIDER)
-    llm_provider: Literal["openrouter", "vllm"] = "openrouter"
-    # Per-call retry: only transient failures (HTTP 429 + 5xx, network timeouts /
-    # connection resets) are retried — see `llm_client._is_retryable`; non-429 4xx
-    # (bad request, auth, context overflow) raises immediately. Delay doubles each
-    # attempt; the retry count bounds total wait on its own (1→2→4→8→16, ~31s
-    # over 5 retries), so no separate delay cap is needed.
-    llm_max_retries: int = 5
-    llm_retry_initial_delay_s: float = 1.0
-    # Per-model pacing: empty maps → every model at the defaults below.
-    llm_model_rpm: dict[str, float] = field(default_factory=dict)
-    llm_default_rpm: float = 1000.0
-    llm_model_tpm: dict[str, float] = field(default_factory=dict)
-    llm_default_tpm: float | None = None
-    # USD price table for cost accounting; empty → every model costs 0.
-    llm_prices: dict[str, dict[str, float]] = field(default_factory=dict)
-    # Per-model context-window limits (tokens) for judge-request sizing; empty → no model is truncated.
-    llm_context_limits: dict[str, int] = field(default_factory=dict)
-    # Embedding backend for `LLMClient.embed_query` (vector_search): "openrouter" or
-    # "vllm" (a local embedding server, addressed via `vllm_base_urls[emb_model_id]`).
-    emb_provider: Literal["openrouter", "vllm"] = "openrouter"
-    # Embedding model for vector_search (must match the stored embeddings).
-    # (env: SKUNK_EMB_MODEL)
-    emb_model_id: str = "qwen/qwen3-embedding-8b"
+class OrchestratorConfig:
+    # config for the retrieval operator (search agent)
+    search: SearchAgentConfig
+    # config for the lookup operator (lookup agent)
+    lookup: LookupAgentConfig
+    # config for global inference
+    inference: InferenceConfig
+    # config for global storage
+    storage: StorageConfig
 
-    # ---- operator knobs -----------------------------------------------------------
-    # Compute operator
+    # compute operator configuration for maximum number of attempts to answer question
     compute_max_attempts: int = 3
     # Best-of-N: run this many independent codegen→exec trials per compute call (in
     # parallel) and commit the most frequent outcome. All `NeedsMore` trials pool into a
     # single missing-data candidate; a tie NEVER breaks in favor of missing-data (see
-    # `ComputeOp._vote`). 1 = single-trial. (env: SKUNK_COMPUTE_BEST_OF_N)
+    # `ComputeOp._vote`). 1 = single-trial.
     compute_best_of_n: int = 5
 
     # Replan-on-MissingData loop. Total compute invocations ≤ recovery_max_rounds + 1.
     recovery_max_rounds: int = 2
-
-    # Ablation: golden page refs bypass the search-agent retriever (eval runs only); their
-    # page text is attached from `clean_page_map_path` so compute reads it like a normal
-    # retrieval. (set by the app, e.g. eval_e2e --golden)
-    golden_pages: list[PageRef] | None = field(default=None, repr=False)
-
-    # Search-agent corpus artifacts (built offline; agent fails fast if missing).
-    # (env: SKUNK_CHROMADB_DIR, SKUNK_CHROMADB_COLLECTION, SKUNK_CLEAN_PAGE_MAP)
-    chromadb_dir: str = "cache/chromadb"
-    chromadb_collection: str = "corpus_pages"
-    clean_page_map_path: str = "cache/clean_page_map.json"
-
-    # ChromaDB server (HttpClient) the read paths connect to. The embedded PersistentClient
-    # deadlocks under 15-way in-process concurrency; the server owns ChromaDB's concurrency.
-    # Launch it over `chromadb_dir` with `scripts/run_chroma_server.sh`.
-    # (env: SKUNK_CHROMA_SERVER_HOST, SKUNK_CHROMA_SERVER_PORT)
-    chroma_server_host: str = "127.0.0.1"
-    chroma_server_port: int = 8001
-
-    # (The search-agent knobs — `agent_max_steps`, `agent_max_pages_per_tool_call`,
-    # `grep_max_output_tokens`, `read_document_max_output_chars`,
-    # `search_agent_max_output_tokens`, `search_agent_request_timeout_s` — are
-    # inherited from `SearchAgentConfig`.)
-
-    # Step cap for the lookup_external agent (terminates earlier via its final-answer JSON block).
-    # (env: SKUNK_LOOKUP_MAX_STEPS)
-    lookup_max_steps: int = 4
-    # Active lookup tools by name (see `lookup_tools._REGISTRY`); None → all tools.
-    # (env: SKUNK_LOOKUP_TOOLS — comma-separated, e.g. "fetch_fred,tavily_search")
-    lookup_tools: list[str] | None = None
-
-    # Per-LLM-call caps for the external-lookup agent's turns. Mirrors the search
-    # agent: without a combined thinking+visible cap, Flash thrashed to ~63K thinking
-    # tokens / ~285s per step and emitted no parseable tool call (parse-retry death
-    # spiral). (env: SKUNK_LOOKUP_AGENT_MAX_OUTPUT_TOKENS, SKUNK_LOOKUP_AGENT_TIMEOUT_S)
-    lookup_agent_max_output_tokens: int = 8192
-    lookup_agent_request_timeout_s: float = 150.0
 
 
 def parse_effort_overrides(raw: str) -> dict[str, "Effort"]:

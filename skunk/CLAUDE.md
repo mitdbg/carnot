@@ -10,8 +10,9 @@ Two layers:
 
 1. **Agent/LLM core** (what qatfd consumes): `llm_client`, `multi_turn_agent`,
    `search_agent`, `prompted_call`, `chroma_client`, `trace`, `usage`, `errors`,
-   `common.ExecutionContext`, the `SystemConfig` → `SearchAgentConfig` →
-   `PipelineConfig` config hierarchy.
+   `common.ExecutionContext`, and the config classes in `config.py` — global
+   `InferenceConfig` / `StorageConfig`, the `AgentConfig` → `SearchAgentConfig` /
+   `LookupAgentConfig` agent hierarchy, and the composed `OrchestratorConfig`.
 2. **Operator pipeline**: question → `Planner` → typed DSL `Plan` → `Orchestrator`
    → {`retrieve`, `lookup_external`, `compute`} with replan-on-MissingData recovery.
    `retrieve` runs the search agent and returns the relevant pages WITH their text
@@ -70,7 +71,7 @@ alongside the warning so these are diagnosable.
 
 The second provider is **vLLM** (`provider=vllm`, the `openai` SDK against local
 OpenAI-compatible servers). Routing is PER CALL through one `LLMClient`: any model with a
-`SystemConfig.vllm_base_urls` entry (model id → server base URL; keys must equal the
+`InferenceConfig.vllm_base_urls` entry (model id → server base URL; keys must equal the
 server's `--served-model-name`) goes to its vLLM server, every other model uses
 `llm_provider` — so a run can keep its judge on OpenRouter while the agent and/or the
 semantic filter run locally. `emb_provider=vllm` serves embeddings the same way (URL from

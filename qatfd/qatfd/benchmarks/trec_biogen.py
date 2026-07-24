@@ -19,11 +19,13 @@ Dev/test split: benchmarks/trec-biogen/trec_biogen_splits.json (dev = 10, test =
 from __future__ import annotations
 
 import json
-import os
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from typing import cast
 
-import chromadb
+from chromadb import Collection
+
+from skunk.common import ExecutionContext
 
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.judge import judge_nugget_recall
@@ -190,16 +192,11 @@ class TrecBiogenBenchmark(Benchmark):
     )
 
     def __init__(self, config: TrecBiogenConfig) -> None:
-        # all benchmark data (index shards, questions, nuggets, prompts) resolves under qatfd/benchmarks/.
-        config.chromadb_dir = str(resolve_under_benchmarks(config.chromadb_dir))
+        # all benchmark data (questions, nuggets, prompts) resolves under qatfd/benchmarks/.
         config.task_a_path = str(resolve_under_benchmarks(config.task_a_path))
         config.nuggets_path = str(resolve_under_benchmarks(config.nuggets_path))
         if config.prompts_path:
             config.prompts_path = str(resolve_under_benchmarks(config.prompts_path))
-        if getattr(config, "chromadb_shard_dirs", None):
-            config.chromadb_shard_dirs = [
-                d if os.path.isabs(d) else str(resolve_under_benchmarks(d)) for d in config.chromadb_shard_dirs
-            ]
         super().__init__(config)
 
     # ---- questions + nuggets --------------------------------------------------
@@ -249,47 +246,30 @@ class TrecBiogenBenchmark(Benchmark):
     # ---- retrieval substrate --------------------------------------------------
 
     def _open_collection(self):
-        """Single collection, or a MergedCollection over `chromadb_num_shards` per-rank shards
-        (`f"{chromadb_collection}_r{i}"`). Each shard lives in its OWN chroma dir — its own
+        """Single collection, or a MergedCollection over `chroma_server_num_shards` per-rank shards
+        (`f"{collection_name}_r{i}"`). Each shard was built in its OWN chroma dir — its own
         chroma.sqlite3 — so no single metadata segment reaches the scale where chromadb 1.5.x
-        compaction fails. Embedded mode: shard i is at `chromadb_shard_dirs[i]` if given, else
-        `{chromadb_dir}/r{i}`. Server mode: all shards are opened by name from the one server."""
-        n = getattr(self.config, "chromadb_num_shards", 1) or 1
+        compaction fails. Reads are server-only: with `chroma_server_shard_ports`, shard i is served by
+        its own warm server at (chroma_server_host, ports[i]) and queried in parallel; otherwise all
+        shards are opened by name from the single (chroma_server_host, chroma_server_port) server."""
+        n = getattr(self.config, "chroma_server_num_shards", 1) or 1
         if n <= 1:
             return self._open_chroma_collection()
-        base = self.config.chromadb_collection
+        base = self.config.storage.collection_name
         # Each shard as its own warm chroma SERVER on its own port (run_chroma_server.sh per shard):
-        # keeps HNSW resident across runs (no cold load) and dodges the embedded-client concurrency
-        # deadlock. Queried in parallel by MergedCollection. Takes precedence over shard dirs.
-        ports = getattr(self.config, "chromadb_shard_ports", None)
+        # keeps HNSW resident across runs (no cold load). Queried in parallel by MergedCollection.
+        ports = getattr(self.config, "chroma_server_shard_ports", None)
         if ports:
             if len(ports) != n:
-                raise ValueError(f"chromadb_shard_ports has {len(ports)} entries but chromadb_num_shards={n}.")
+                raise ValueError(f"chroma_server_shard_ports has {len(ports)} entries but chroma_server_num_shards={n}.")
             from skunk.chroma_client import make_chroma_client
-            host = self.config.chromadb_host or "127.0.0.1"
+            host = self.config.storage.chroma_server_host
             return MergedCollection(
                 [self._get_shard(make_chroma_client(host, p), f"{base}_r{i}", f"{host}:{p}")
                  for i, p in enumerate(ports)]
             )
-        if self.config.chromadb_host:
-            client = self._chroma_client()
-            return MergedCollection([self._get_shard(client, f"{base}_r{i}", "server") for i in range(n)])
-        shard_dirs = getattr(self.config, "chromadb_shard_dirs", None)
-        if shard_dirs and len(shard_dirs) != n:
-            raise ValueError(f"chromadb_shard_dirs has {len(shard_dirs)} entries but chromadb_num_shards={n}.")
-        clients: dict[str, object] = {}
-        shards = []
-        for i in range(n):
-            d = shard_dirs[i] if shard_dirs else os.path.join(self.config.chromadb_dir, f"r{i}")
-            if d not in clients:
-                if not os.path.exists(d):
-                    raise FileNotFoundError(
-                        f"biogen shard dir {d!r} does not exist; expected {n} per-shard chroma dirs "
-                        f"(default {self.config.chromadb_dir}/r0..r{n - 1}, or set benchmarks.chromadb_shard_dirs)."
-                    )
-                clients[d] = chromadb.PersistentClient(path=d)
-            shards.append(self._get_shard(clients[d], f"{base}_r{i}", d))
-        return MergedCollection(shards)
+        client = self._chroma_client()
+        return MergedCollection([self._get_shard(client, f"{base}_r{i}", "server") for i in range(n)])
 
     def _get_shard(self, client, name: str, where: str):
         try:
@@ -304,14 +284,15 @@ class TrecBiogenBenchmark(Benchmark):
         # question actually reads get materialized. (The systems only do keyed lookups on the doc
         # map; BioGen never iterates it, so the lazy mapping is a drop-in for the dict.)
         return BenchmarkResources(
-            chroma_collection=collection,
+            # MergedCollection is a duck-typed Collection stand-in (query/get/count); cast so the
+            # fiction stays local here and consumers keep treating chroma_collection as a Collection.
+            chroma_collection=cast(Collection, collection),
             document_map=_ChromaDocMap(collection),
-            config=self.config,
         )
 
     # ---- scoring + metrics ----------------------------------------------------
 
-    async def score(self, question: Question, predicted: str, ctx) -> dict:
+    async def score(self, question: Question, predicted: str, ctx: ExecutionContext) -> dict:
         return await judge_nugget_recall(
             ctx,
             question=question.text,

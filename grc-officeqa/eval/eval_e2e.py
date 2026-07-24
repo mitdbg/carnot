@@ -10,7 +10,7 @@ Usage
   python -m eval.eval_e2e --csv data/officeqa_pro.csv
 
   # Give the run a human-readable label
-  python -m eval.eval_e2e --csv data/officeqa_pro.csv --run-name golden_sweep
+  python -m eval.eval_e2e --csv data/officeqa_pro.csv --run-name dev_sweep
 
   # Sample 10 random UIDs
   python -m eval.eval_e2e --csv data/officeqa_pro.csv --sample 10
@@ -18,15 +18,15 @@ Usage
   # Run the canonical dev split (qatfd/benchmarks/officeqa/officeqa_splits.json)
   python -m eval.eval_e2e --csv data/officeqa_pro.csv --dev-set
 
-  # Run only specific UIDs, bypassing retrieve with golden pages
-  python -m eval.eval_e2e --csv data/officeqa_pro.csv --uids UID0001,UID0030 --golden
+  # Run only specific UIDs
+  python -m eval.eval_e2e --csv data/officeqa_pro.csv --uids UID0001,UID0030
 
 All outputs (per-question `.jsonl` / `.txt` traces, warnings.log, report.csv) land in a
 single run directory: eval/traces/<run-name>_<timestamp>/  (gitignored).
 
-`--golden` parses `source_docs?page=N` URLs from --csv and injects them as
-PageRefs, so extract/compute run on exactly the pages the benchmark deems
-relevant. Use it to measure the extract+compute ceiling without retrieval cost.
+The benchmark's `source_docs?page=N` reference pages are parsed into PageRefs and used
+only to report retrieval recall and populate the trace viewer's groundtruth column —
+retrieval always runs (there is no bypass).
 """
 
 from __future__ import annotations
@@ -156,17 +156,11 @@ async def _run_one_question(
     trace_path: str | None = None,
     log_path: str | None = None,
 ) -> dict:
-    """Run one question through the Orchestrator and collect a result dict."""
-    if golden_pages:
-        # Normalize to fresh PageRef instances regardless of input shape.
-        golden_pages = [PageRef(stem=g.stem, page=g.page) for g in golden_pages]
-        if verbose:
-            print(
-                f"[e2e] Golden pages: {len(golden_pages)} → {[str(r) for r in golden_pages]}"
-            )
+    """Run one question through the Orchestrator and collect a result dict.
 
+    `golden_pages` are the benchmark's reference pages, used only to populate the trace's
+    groundtruth section — retrieval always runs."""
     config = SkunkConfig.from_env()
-    config.golden_pages = golden_pages
 
     overrides_path = Path(config.prompt_overrides_path)
     prompt_overrides = (
@@ -224,8 +218,7 @@ async def _run_one_question(
                 model=config.llm_model,
             )
 
-        # The retrieve sweep's deduped pages — empty under golden bypass (retrieve never
-        # ran). Surfaced for the report's retrieval-recall column.
+        # The retrieve sweep's deduped pages, surfaced for the report's retrieval-recall column.
         retrieved_pages = list(orch.retrieved_pages)
 
         if failure is not None:
@@ -281,7 +274,7 @@ def _run_cost(ctx) -> str:
     (priced by `config.llm_prices`; thinking billed at the output rate — the tracker
     owns the pricing rules, no duplicate table or event-scraping here). One client per
     question in this harness, so the tracker is naturally per-question scoped.
-    Returns '' when nothing priceable ran (golden/replay bypass, or an empty price table)."""
+    Returns '' when nothing priceable ran (no priced calls, or an empty price table)."""
     tracker = ctx.llm_client.usage
     if not tracker.prices or (tracker.n_calls == 0 and tracker.n_embed_calls == 0):
         return ""
@@ -367,9 +360,8 @@ class EvalConfig:
 
     csv_path: str
     df_by_uid: pd.DataFrame
-    golden_lookup: dict[str, list[PageRef]] | None
-    # Always-populated golden map for the report's `golden_pages` column (the trace
-    # viewer's groundtruth chips), independent of `--golden` injection above.
+    # Reference-page map (uid → PageRefs) for the report's `golden_pages` column (the trace
+    # viewer's groundtruth chips) and the retrieval-recall metric.
     golden_report: dict[str, list[PageRef]]
     trace_dir: Path | None
     verbose: bool
@@ -389,11 +381,9 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
     gold_answer = row.get("answer")
     print(f"\n{'=' * 60}\nUID: {uid}\nQ: {question}")
 
-    golden_pages = None
-    if cfg.golden_lookup is not None:
-        golden_pages = cfg.golden_lookup.get(uid, [])
-        if not golden_pages:
-            print(f"[e2e] WARNING: no golden pages for {uid!r}")
+    # Benchmark reference pages — displayed in the trace and graded against by the
+    # retrieval-recall metric (retrieval always runs; these are never injected).
+    gold_report_pages = cfg.golden_report.get(uid) or []
 
     trace_path = log_path = None
     if cfg.trace_dir:
@@ -404,7 +394,7 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
         result = await _run_one_question(
             question=question,
             verbose=cfg.verbose,
-            golden_pages=golden_pages,
+            golden_pages=gold_report_pages,
             uid=uid,
             trace_path=trace_path,
             log_path=log_path,
@@ -448,7 +438,6 @@ async def process_uid(uid: str, cfg: EvalConfig) -> dict | None:
 
     retrieved_pages = result.get("retrieved_pages", [])
     category = "correct" if correct else ("fail" if result["failed"] else "wrong")
-    gold_report_pages = cfg.golden_report.get(uid) or []
     return {
         "uid": uid,
         "category": category,
@@ -512,11 +501,6 @@ def main() -> None:
         help="Run on the canonical dev split from qatfd's officeqa_splits.json. "
         "Mutually exclusive with --uids; combine with --sample to run a random "
         "subset of the dev set.",
-    )
-    parser.add_argument(
-        "--golden",
-        action="store_true",
-        help="Inject golden pages from --csv instead of running retrieve",
     )
     parser.add_argument(
         "--no-traces",
@@ -650,15 +634,12 @@ def main() -> None:
         f"[e2e] Running {len(uids)} UID(s){sample_note} with --workers {args.workers}"
     )
 
-    # `golden_report` is always loaded (for the report's groundtruth column);
-    # `golden_lookup` (the injection path) stays gated on the `--golden` ablation.
+    # Reference pages for the report's groundtruth column and the retrieval-recall metric.
     golden_report = load_golden(args.csv)
-    golden_lookup = golden_report if args.golden else None
 
     cfg = EvalConfig(
         csv_path=args.csv,
         df_by_uid=df_by_uid,
-        golden_lookup=golden_lookup,
         golden_report=golden_report,
         trace_dir=trace_dir,
         verbose=args.console,

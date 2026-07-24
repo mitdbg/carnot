@@ -16,6 +16,7 @@ import os
 import re
 import threading
 import time
+from chromadb import Collection
 from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -27,11 +28,12 @@ import pandas as pd
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from skunk import trace
-from skunk.config import SystemConfig
+from skunk.config import OrchestratorConfig
 
 if TYPE_CHECKING:
     from skunk.llm_client import LLMClient
     from skunk.prompted_call import PromptOverride
+    from skunk.storage.document_map import DocumentMap
 
 # Reasoning-effort knob, mapped onto Gemini's `thinking_level` enum. "off" means
 # no thinking; "minimal" is the cheapest thinking tier.
@@ -212,7 +214,7 @@ def get_rate_limiter(name: str, rate_per_min: float | None = None) -> _RateLimit
 
 # ---------------------------------------------------------------------------
 # Tokens-per-minute (TPM) throttle — async; per-model caps come from the
-# SystemConfig (`llm_model_tpm`, falling back to `llm_default_tpm`).
+# InferenceConfig (`llm_model_tpm`, falling back to `llm_default_tpm`).
 #
 # The RPM limiter alone can't bound token throughput: one request can carry tens
 # of thousands of tokens, so a request-paced run still blows a TPM quota (the
@@ -419,9 +421,9 @@ def page_key_to_pageref(key: str) -> PageRef:
 @dataclass(frozen=True)
 class RetrievedDoc:
     """One retrieved page's content: a `PageRef` plus the page's text. Produced by the
-    retrieve operator (search-agent backend or golden bypass) and read directly by
-    compute — there is no separate extract step. The text is the cleaned per-page corpus
-    text the search agent itself reads (`retrieve`'s `document_map`)."""
+    retrieve operator (search-agent backend) and read directly by compute — there is no
+    separate extract step. The text is the cleaned per-page corpus text the search agent
+    itself reads (`retrieve`'s `document_map`)."""
 
     ref: PageRef
     text: str
@@ -430,8 +432,8 @@ class RetrievedDoc:
 @dataclass(frozen=True)
 class BranchRetrieval:
     """One retrieve branch's normalized result — the single retrieval contract the
-    search-agent backend (and the golden bypass) produce: the retrieved pages with their
-    text, read directly by compute. Produced solely by `retrieve.run_retrieve_all`."""
+    search-agent backend produces: the retrieved pages with their text, read directly by
+    compute. Produced solely by `retrieve.run_retrieve_all`."""
 
     documents: tuple[RetrievedDoc, ...]
 
@@ -742,7 +744,8 @@ class ExecutionContext:
     """
 
     question: str
-    config: SystemConfig
+    config: OrchestratorConfig
+    document_map: DocumentMap
     uid: str | None = (
         None  # benchmark UID, when run from the eval harness; tags every event
     )
@@ -751,12 +754,11 @@ class ExecutionContext:
         None  # when set, stream this question's events to that file as JSON lines (live, flushed)
     )
     events: list[dict] = field(default_factory=list)  # per-question diagnostic events
-    llm_client: LLMClient | None = (
-        None  # auto-created in __post_init__; pass a mock to override
-    )
+    llm_client: LLMClient = None  # type: ignore[assignment]  # set in __post_init__; pass a mock to override
     prompt_overrides: tuple[
         PromptOverride, ...
     ] = ()  # corpus/few_shot/lesson overrides; operators pick out their own entries by name
+    chroma_collection: Collection | None = None
 
     def __post_init__(self) -> None:
         if self.llm_client is None:
@@ -764,7 +766,7 @@ class ExecutionContext:
             # top-level import would be circular.
             from skunk.llm_client import LLMClient
 
-            self.llm_client = LLMClient(self.config)
+            self.llm_client = LLMClient(self.config.inference)
         # The active (step_idx, op) frame lives in the module-level `_step_frame`
         # ContextVar (per asyncio task), not on the instance — see its definition.
         # Per-question event log: opened when log_path is set, written as one JSON

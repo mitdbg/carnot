@@ -55,6 +55,7 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from skunk.common import ExecutionContext
+from skunk.config import InferenceConfig, LookupAgentConfig, OrchestratorConfig, SearchAgentConfig
 from skunk.errors import MissingData, StepFailed
 from skunk.llm_client import LLMClient
 
@@ -237,37 +238,68 @@ def _load_finished_qids(results_path: Path) -> dict[str, Result]:
 # ---------------------------------------------------------------------------
 
 async def _run_one(q: Question, rc: _RunCtx) -> Result:
-    llm_client = LLMClient(rc.system.config)
+    llm_client = LLMClient(rc.system.inference_cfg)
     tracker = llm_client.usage
     log_path = str(rc.trace_dir / f"{q.qid}.jsonl") if rc.trace_dir else None
     ctx = ExecutionContext(
-        question=q.text, uid=q.qid, config=rc.system.config, llm_client=llm_client,
+        question=q.text, uid=q.qid,
+        config=OrchestratorConfig(
+            inference=rc.system.inference_cfg,
+            storage=rc.benchmark.config.storage,
+            search=SearchAgentConfig(name="search"),   # unused: qatfd never runs the Orchestrator
+            lookup=LookupAgentConfig(name="lookup"),   # unused
+        ),
+        llm_client=llm_client,
+        document_map=rc.resources.document_map,
         log_path=log_path, verbose=rc.verbose,
         prompt_overrides=rc.resources.prompt_overrides,
     )
 
     predicted, failed, reason, retrieved = "", False, "", None
+    # Defaults for the failure path: if answer() raises we get no AnswerOutput, so the phase
+    # splits stay 0 and the terminate flags stay False (the StepFailed text lands in `reason`).
+    terminate_state: str | None = None
+    retrieve_wall_s = compute_wall_s = 0.0
     t0 = time.monotonic()
     try:
         out = await rc.system.answer(q, rc.resources, ctx)
         predicted = out.answer
         retrieved = out.retrieved_doc_ids
+        terminate_state = out.terminate_state
+        retrieve_wall_s, compute_wall_s = out.retrieve_wall_s, out.compute_wall_s
     except (StepFailed, MissingData) as e:
         failed, reason = True, f"{type(e).__name__}: {e}"
     except Exception as e:  # noqa: BLE001 — record any failure as a row, never crash the run
         failed, reason = True, f"{type(e).__name__}: {e}"
     wall_s = time.monotonic() - t0
 
+    # A budgeted agent stamps terminate_state as a `|`-joined subset of these tokens (else
+    # "finished"/None); split it into one boolean column per reason for easy filtering.
+    ts = terminate_state or ""
+    out_of_steps = "out_of_steps" in ts
+    over_cost_budget = "over_cost_budget" in ts
+    over_latency_budget = "over_latency_budget" in ts
+
     # Snapshot system usage BEFORE scoring so the judge's tokens are not counted.
     # `cost` is the all-in total (generation + embeddings); embed_* break out the
     # query-embedding portion (tokens are exact on OpenRouter, char/4-estimated local).
+    # `cost` is the all-in total across every caller; the system's own spend is split by phase via
+    # its stable per-phase keys ({agent_id}_retrieve / _compute), so we can attribute the retrieval
+    # method's cost apart from the shared compute answerer. `system_cost` is their sum. Without a
+    # configured agent_id the agents mint their own keys and we can't isolate them, so report 0.
+    retrieve_key, compute_key = rc.system.retrieve_usage_key, rc.system.compute_usage_key
+    retrieve_cost = tracker.cost(key=retrieve_key) if retrieve_key else 0.0
+    compute_cost = tracker.cost(key=compute_key) if compute_key else 0.0
     usage = {
-        "total_input_tokens": tracker.input_tokens,
-        "total_output_tokens": tracker.output_tokens,
-        "total_cache_input_tokens": tracker.cache_input_tokens,
+        "total_input_tokens": tracker.total_input_tokens,
+        "total_output_tokens": tracker.total_output_tokens,
+        "total_cache_input_tokens": tracker.total_cached_tokens,
         "cost": tracker.cost(),
-        "embed_tokens": tracker.embed_tokens,
-        "embed_calls": tracker.n_embed_calls,
+        "system_cost": retrieve_cost + compute_cost,
+        "retrieve_cost": retrieve_cost,
+        "compute_cost": compute_cost,
+        "embed_tokens": tracker.total_embed_tokens,
+        "embed_calls": tracker.total_embed_calls,
         "embed_cost": tracker.embed_cost(),
     }
 
@@ -300,7 +332,10 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
         predicted=predicted, gold=q.gold, score=score, scorer=scorer,
         recall_metrics=recall_metrics, retrieved_docs=json.dumps(retrieved or []),
         gold_docs=json.dumps(q.gold_docs), failed=failed, reason=reason,
-        judge_rationale=judge_rationale, wall_s=round(wall_s, 3), **usage,
+        judge_rationale=judge_rationale, wall_s=round(wall_s, 3),
+        retrieve_wall_s=round(retrieve_wall_s, 3), compute_wall_s=round(compute_wall_s, 3),
+        out_of_steps=out_of_steps, over_cost_budget=over_cost_budget,
+        over_latency_budget=over_latency_budget, **usage,
     )
 
 
@@ -310,7 +345,11 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
 
 
 def run(
-    benchmark: Benchmark, system: System, exp_config: ExperimentConfig, cfg: DictConfig, overrides: list[str] | None = None,
+    benchmark: Benchmark,
+    system: System,
+    exp_config: ExperimentConfig,
+    cfg: DictConfig,
+    overrides: list[str] | None = None,
 ) -> None:
     # force stdout to flush after every newline
     sys.stdout.reconfigure(line_buffering=True)  # type: ignore
@@ -347,7 +386,7 @@ def run(
 
     # build the shared retrieval substrate once (chroma + document_map).
     resources = benchmark.get_resources()
-    model = system.config.llm_model
+    model = system.inference_cfg.llm_model
     rc = _RunCtx(
         benchmark=benchmark, system=system, resources=resources,
         trace_dir=trace_dir, model=model, verbose=exp_config.console,
@@ -396,12 +435,13 @@ def main(cfg: DictConfig) -> None:
         overrides = []
 
     exp_cfg = ExperimentConfig(**cast(dict, OmegaConf.to_container(cfg.experiments, resolve=True)))
+    inference_cfg = InferenceConfig(**cast(dict, OmegaConf.to_container(cfg.inference, resolve=True)))
     bench_cfg = benchmark_config_factory(cfg)
     system_cfg = system_config_factory(cfg)
 
     # build benchmark and system
     benchmark = build_benchmark(bench_cfg)
-    system = build_system(system_cfg)
+    system = build_system(system_cfg, inference_cfg)
 
     if not cfg.dry_run:
         run(benchmark, system, exp_cfg, cfg, overrides=overrides)

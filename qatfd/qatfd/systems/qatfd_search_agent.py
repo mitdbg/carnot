@@ -27,16 +27,16 @@ class QATFDSearchAgentSystem(SearchAgentSystem):
     name = "qatfd_search_agent"
 
     def _extra_tools(self, ctx: ExecutionContext, resources: BenchmarkResources) -> tuple:
-        model = self.config.llm_model
+        model = self.inference_cfg.llm_model
         # ctx.llm_client is the usage-tracking wrapper, so the tool's LLM (judge) calls and
         # its top_k query embeddings are both counted.
         return (SemanticFilterTool(
             ctx.llm_client, resources.document_map, model,
             chroma_collection=resources.chroma_collection,
-            emb_model_id=self.config.emb_model_id,
+            emb_model_id=self.inference_cfg.emb_model_id,
             max_output_tokens=self.config.grep_max_output_tokens,
             ctx=ctx,
-            context_limits=self.config.llm_context_limits,
+            context_limits=self.inference_cfg.llm_context_limits,
             judge_max_output_tokens=self.config.semantic_filter_max_output_tokens,
         ),)
 

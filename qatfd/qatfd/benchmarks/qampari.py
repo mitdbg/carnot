@@ -40,6 +40,8 @@ import os
 from collections import OrderedDict
 from urllib.parse import unquote, urlparse
 
+from skunk.common import ExecutionContext
+
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
 from qatfd.benchmarks.judge import judge_nugget_recall
 from qatfd.config import QampariConfig
@@ -56,9 +58,10 @@ _JUDGE_SYSTEM = (
 )
 
 
-def _norm_title(title: str) -> str:
+def _norm_title(title: object) -> str:
     """Canonical form of a Wikipedia article title: underscores -> spaces, whitespace collapsed,
-    lowercased. The single join key between a proof's article and a corpus chunk's article."""
+    lowercased. The single join key between a proof's article and a corpus chunk's article. Accepts
+    `object` because chroma types metadata values as a broad union; the `str(title)` below coerces."""
     return " ".join(str(title).replace("_", " ").split()).lower()
 
 
@@ -127,8 +130,7 @@ class QampariBenchmark(Benchmark):
     )
 
     def __init__(self, config: QampariConfig) -> None:
-        # all benchmark data (index, questions, dev extract, prompts) resolves under qatfd/benchmarks/.
-        config.chromadb_dir = str(resolve_under_benchmarks(config.chromadb_dir))
+        # all benchmark data (questions, dev extract, prompts) resolves under qatfd/benchmarks/.
         config.questions_path = str(resolve_under_benchmarks(config.questions_path))
         if config.dev_questions_path:
             config.dev_questions_path = str(resolve_under_benchmarks(config.dev_questions_path))
@@ -208,12 +210,11 @@ class QampariBenchmark(Benchmark):
         return BenchmarkResources(
             chroma_collection=collection,
             document_map=_ChromaDocMap(collection),
-            config=self.config,
         )
 
     # ---- scoring + metrics ----------------------------------------------------
 
-    async def score(self, question: Question, predicted: str, ctx) -> dict:
+    async def score(self, question: Question, predicted: str, ctx: ExecutionContext) -> dict:
         return await judge_nugget_recall(
             ctx,
             question=question.text,
@@ -230,6 +231,7 @@ class QampariBenchmark(Benchmark):
         `where={"doc_id": ...}, limit=1` get), cached across questions. Pre-migration report rows
         carry chunk_ids instead of page_ids, so unresolved ids fall back to a row-id lookup — the
         same metric then recomputes identically on old rows."""
+        assert self._collection is not None  # resources (and _collection) are built before scoring
         todo = [str(r) for r in retrieved if str(r) not in self._title_cache]
         for pid in dict.fromkeys(todo):
             got = self._collection.get(where={"doc_id": pid}, limit=1, include=["metadatas"])

@@ -38,14 +38,14 @@ class AblationSearchAgentSystem(SearchAgentSystem):
         # candidates only reach the judge, so a cheaper judge model cuts cost without touching the
         # agent's reasoning. ctx.llm_client is the usage-tracking wrapper, so judge calls + top_k
         # query embeddings are both counted.
-        filter_model = self.config.semantic_filter_model or self.config.llm_model
+        filter_model = self.config.semantic_filter_model or self.inference_cfg.llm_model
         return (SemanticFilterTool(
             ctx.llm_client, resources.document_map, filter_model,
             chroma_collection=resources.chroma_collection,
-            emb_model_id=self.config.emb_model_id,
+            emb_model_id=self.inference_cfg.emb_model_id,
             max_output_tokens=self.config.grep_max_output_tokens,
             ctx=ctx,
             provider_order=self.config.semantic_filter_provider_order,
-            context_limits=self.config.llm_context_limits,
+            context_limits=self.inference_cfg.llm_context_limits,
             judge_max_output_tokens=self.config.semantic_filter_max_output_tokens,
         ),)

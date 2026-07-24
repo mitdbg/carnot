@@ -21,20 +21,33 @@ class Question:
 class Retrieved:
     """Output of a system's `retrieve()` step. `direct_answer` is set only by
     direct-answer agents (which produce the answer themselves); for retrieve-only
-    systems it stays None and a downstream `compute()` generates the answer."""
+    systems it stays None and a downstream `compute()` generates the answer.
+
+    `terminate_state` is the retrieval agent's `MultiTurnAgent.terminate_state` (why its
+    loop stopped: "finished" or a `|`-joined subset of out_of_steps/over_cost_budget/
+    over_latency_budget); None for systems whose retrieve runs no such agent (e.g. rag_llm)."""
 
     doc_ids: list[str]
     direct_answer: str | None = None
     context: str | None = None
+    terminate_state: str | None = None
 
 
 @dataclass
 class AnswerOutput:
     """What `System.answer()` returns. `retrieved_doc_ids` decouples systems from
-    scoring (the benchmark computes doc-recall from it)."""
+    scoring (the benchmark computes doc-recall from it).
+
+    `terminate_state` surfaces the retrieval agent's stop reason to the runner (see
+    `Retrieved.terminate_state`), which parses it into the out_of_steps/over_cost_budget/
+    over_latency_budget columns. `retrieve_wall_s`/`compute_wall_s` split the answer wall time
+    across the two phases (the runner also records the end-to-end `wall_s`)."""
 
     answer: str
     retrieved_doc_ids: list[str] | None = None
+    terminate_state: str | None = None
+    retrieve_wall_s: float = 0.0
+    compute_wall_s: float = 0.0
 
 
 @dataclass
@@ -55,14 +68,29 @@ class Result:
     failed: bool
     reason: str
     judge_rationale: str = ""
+    # end-to-end answer() wall time, then its retrieve()/compute() split (see AnswerOutput).
     wall_s: float = 0.0
+    retrieve_wall_s: float = 0.0
+    compute_wall_s: float = 0.0
+    # all-in cost across every caller this question (generation + embeddings), then the system's
+    # own spend broken out by phase: system_cost is the sum of the retrieve slice (the retrieval
+    # agent, keyed `{agent_id}_retrieve`) and the compute slice (the shared answerer, keyed
+    # `{agent_id}_compute`). Lets a run compare a retrieval method's cost against compute and total.
     cost: float = 0.0
+    system_cost: float = 0.0
+    retrieve_cost: float = 0.0
+    compute_cost: float = 0.0
     total_cache_input_tokens: int = 0
     total_input_tokens: int = 0
     total_output_tokens: int = 0
     embed_tokens: int = 0
     embed_calls: int = 0
     embed_cost: float = 0.0
+    # why the retrieval agent's loop stopped (parsed from terminate_state); all False when it
+    # finished normally or the system runs no budgeted agent.
+    out_of_steps: bool = False
+    over_cost_budget: bool = False
+    over_latency_budget: bool = False
 
 
 # Fixed CSV columns. The per-benchmark recall-metric columns are dynamic and get
@@ -82,13 +110,21 @@ REPORT_FIELDS = [
     "reason",
     "judge_rationale",
     "wall_s",
+    "retrieve_wall_s",
+    "compute_wall_s",
     "cost",
+    "system_cost",
+    "retrieve_cost",
+    "compute_cost",
     "total_cache_input_tokens",
     "total_input_tokens",
     "total_output_tokens",
     "embed_tokens",
     "embed_calls",
     "embed_cost",
+    "out_of_steps",
+    "over_cost_budget",
+    "over_latency_budget",
 ]
 
 

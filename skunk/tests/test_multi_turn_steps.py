@@ -11,9 +11,10 @@ Runs under pytest if installed, or standalone: `python3 tests/test_multi_turn_st
 from __future__ import annotations
 
 import asyncio
+import time
+from types import SimpleNamespace
 
 from skunk.common import ExecutionContext
-from skunk.config import PipelineConfig
 from skunk.errors import ParseError, StepFailed
 from skunk.multi_turn_agent import MultiTurnAgent, TextBlock, _parse_step, _StepOutput
 
@@ -40,13 +41,17 @@ class _ScriptedAgent(MultiTurnAgent):
 
     async def _drive(self, ctx):
         # Bypass call()'s system-prompt assembly / executor build — neither the misfire nor
-        # the final-answer path touches them — and exercise the shared loop directly.
+        # the final-answer path touches them — and exercise the shared loop directly. call()
+        # normally stamps agent_start_time; the loop's latency check needs it, so set it here.
+        self.agent_start_time = time.monotonic()
         self.messages = [{"role": "user", "blocks": [TextBlock("q")]}]
         return await self._run_loop(ctx, self.max_steps)
 
 
 def _ctx() -> ExecutionContext:
-    return ExecutionContext(question="q", config=PipelineConfig(), llm_client=object())
+    # config is only read to build an LLMClient (skipped — a mock client is passed), so a bare
+    # stand-in suffices; the loop under test touches only ctx.emit and the scripted _llm_step.
+    return ExecutionContext(question="q", config=SimpleNamespace(), document_map={}, llm_client=object())  # type: ignore[arg-type]
 
 
 def test_misfires_do_not_consume_step_budget():

@@ -7,7 +7,13 @@ the agent loop and every system call are counted with no wrapper and no
 positional-arg fishing. Read the tracker after a run (the eval harness builds one
 client per question, so its tracker is naturally per-question scoped).
 
-Cost comes from a price table on the `SystemConfig` (`llm_prices`), a map of
+Each call is bucketed by a caller-supplied `key` (`key_to_usage` / `key_to_embed_usage`),
+so several agents sharing one client keep separate per-model token/cost tallies — an
+agent passes its `agent_id`, unkeyed calls land in `"default"`. `cost(key)` / `embed_cost(key)`
+report one caller's spend; `cost()` (key=None) and the `total_*` properties aggregate across
+all keys.
+
+Cost comes from a price table on the `InferenceConfig` (`llm_prices`), a map of
 `model-substring -> {"in"/"out"/"cached": $/Mtok}`; unmatched models cost 0, and
 models served by a local vLLM server (`free_models`, from `vllm_base_urls`) cost 0
 even when the table prices them. Chat responses don't report a dollar cost, so this
@@ -19,54 +25,92 @@ from __future__ import annotations
 
 import threading
 from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from skunk.llm_client import LLMResponse
 
+@dataclass
+class Usage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
+    n_calls: int = 0
+    model_to_input_tokens: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    model_to_output_tokens: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    model_to_cached_tokens: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    model_to_think_tokens: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+
+@dataclass
+class EmbedUsage:
+    embed_tokens: int = 0
+    n_embed_calls: int = 0
+    model_to_embed_tokens: dict[str, int] = field(default_factory=lambda: defaultdict(int))
 
 class UsageTracker:
     """Accumulates token usage (and derives cost) across one client's LLM calls.
 
-    `prices` is the `SystemConfig.llm_prices` table (see module docstring); an empty
+    `prices` is the `InferenceConfig.llm_prices` table (see module docstring); an empty
     table means every call costs 0. `free_models` are models whose calls cost $0
     REGARDLESS of the table — the ones routed to a local vLLM server
-    (`SystemConfig.vllm_base_urls` keys, passed in by `LLMClient`) — so a model priced
+    (`InferenceConfig.vllm_base_urls` keys, passed in by `LLMClient`) — so a model priced
     for OpenRouter runs is still free in a run that serves it locally."""
 
     def __init__(
         self, default_model: str, prices: dict | None = None, free_models: set[str] | None = None
     ) -> None:
         # Guards the mutating accumulators below: a single client is hit concurrently when
-        # tools fan LLM calls across a thread pool, and the
-        # `+=` increments are read-modify-write across bytecodes, so concurrent adds can drop
-        # updates (under-count) without it. Reads (`cost()`, snapshots) run after the writers
-        # have joined, so only the writers need the lock.
+        # tools fan LLM calls across a thread pool. Reads (`cost()`, snapshots) run after
+        # the writers have joined, so only the writers need the lock.
         self._lock = threading.Lock()
         self.default_model = default_model
         self.prices = prices or {}
         self.free_models = set(free_models or ())
-        self.input_tokens = 0
-        self.output_tokens = 0
-        self.cache_input_tokens = 0
-        self.n_calls = 0
-        # per-model token sums, for cost when a run mixes models. cached is a subset
-        # of input (its discounted portion), tracked separately so cost can price it.
-        # thinking is tracked separately from output (some providers report
-        # output_tokens EXCLUDING thoughts) and billed at the output rate.
-        self.by_model_in: dict[str, int] = defaultdict(int)
-        self.by_model_out: dict[str, int] = defaultdict(int)
-        self.by_model_cached: dict[str, int] = defaultdict(int)
-        self.by_model_think: dict[str, int] = defaultdict(int)
-        # Embeddings are accounted SEPARATELY from generation: they have only input
-        # tokens (no output / no cache), a distinct price, and a distinct call count.
-        # Kept out of the generation counters above so a report's `total_input_tokens`
-        # stays "tokens the LLM read" and embedding spend is its own line item.
-        self.embed_tokens = 0
-        self.n_embed_calls = 0
-        self.by_emb_model_in: dict[str, int] = defaultdict(int)
+        self.key_to_usage: dict[str, Usage] = {"default": Usage()}
+        self.key_to_embed_usage: dict[str, EmbedUsage] = {"default": EmbedUsage()}
 
-    def add(self, resp: LLMResponse, model: str | None) -> None:
+    @property
+    def total_input_tokens(self) -> int:
+        """Total number of input tokens across all keys."""
+        total = 0
+        for _, usage in self.key_to_usage.items():
+            total += usage.input_tokens
+        return total
+
+    @property
+    def total_output_tokens(self) -> int:
+        """Total number of output tokens across all keys."""
+        total = 0
+        for _, usage in self.key_to_usage.items():
+            total += usage.output_tokens
+        return total
+
+    @property
+    def total_cached_tokens(self) -> int:
+        """Total number of cached tokens across all keys."""
+        total = 0
+        for _, usage in self.key_to_usage.items():
+            total += usage.cached_tokens
+        return total
+
+    @property
+    def total_embed_tokens(self) -> int:
+        """Total number of embed tokens across all keys."""
+        total = 0
+        for _, usage in self.key_to_embed_usage.items():
+            total += usage.embed_tokens
+        return total
+
+    @property
+    def total_embed_calls(self) -> int:
+        """Total number of embed calls across all keys."""
+        total = 0
+        for _, usage in self.key_to_embed_usage.items():
+            total += usage.n_embed_calls
+        return total
+
+    def add(self, resp: LLMResponse, model: str | None, key: str) -> None:
         """Fold one `LLMResponse` into the running totals. Any token field may be
         None (streaming can omit usage) — treat those as 0."""
         in_tok = resp.input_tokens or 0
@@ -75,45 +119,57 @@ class UsageTracker:
         think_tok = resp.thinking_tokens or 0
         m = model or self.default_model
         with self._lock:
-            self.input_tokens += in_tok
-            self.output_tokens += out_tok
-            self.cache_input_tokens += cache_tok
-            self.by_model_in[m] += in_tok
-            self.by_model_out[m] += out_tok
-            self.by_model_cached[m] += cache_tok
-            self.by_model_think[m] += think_tok
-            self.n_calls += 1
+            self.key_to_usage.setdefault(key, Usage())
+            self.key_to_usage[key].input_tokens += in_tok
+            self.key_to_usage[key].output_tokens += out_tok
+            self.key_to_usage[key].cached_tokens += cache_tok
+            self.key_to_usage[key].model_to_input_tokens[m] += in_tok
+            self.key_to_usage[key].model_to_output_tokens[m] += out_tok
+            self.key_to_usage[key].model_to_cached_tokens[m] += cache_tok
+            self.key_to_usage[key].model_to_think_tokens[m] += think_tok
+            self.key_to_usage[key].n_calls += 1
 
-    def add_embed(self, model: str | None, input_tokens: int) -> None:
+    def add_embed(self, model: str | None, input_tokens: int, key: str) -> None:
         """Fold one embedding call into the running totals. `input_tokens` is the
         provider-reported prompt-token count (0 when the backend doesn't report one)."""
         m = model or self.default_model
         with self._lock:
-            self.embed_tokens += input_tokens
-            self.by_emb_model_in[m] += input_tokens
-            self.n_embed_calls += 1
+            self.key_to_embed_usage.setdefault(key, EmbedUsage())
+            self.key_to_embed_usage[key].embed_tokens += input_tokens
+            self.key_to_embed_usage[key].model_to_embed_tokens[m] += input_tokens
+            self.key_to_embed_usage[key].n_embed_calls += 1
 
-    def cost(self) -> float:
-        """Total USD cost from the price table — generation plus embeddings. Cached input
-        tokens are billed at the model's `cached` rate (falling back to `in` when unset)
-        and the remaining (uncached) input tokens at `in`; output AND thinking tokens at
-        `out` (providers bill thoughts at the output rate). Every call adds to
-        `by_model_in`, so iterating it covers all models seen."""
+    def cost(self, key: str | None = None) -> float:
+        """Total USD cost from the price table — generation plus embeddings - for the caller / agent
+        specified by `key`. If `key` is `None`, reports the aggregate cost across all callers. Cached
+        input tokens are billed at the model's `cached` rate (falling back to `in` when unset) and
+        the remaining (uncached) input tokens at `in`; output AND thinking tokens at `out` (providers
+        bill thoughts at the output rate). Every call adds to `model_to_input_tokens`, so iterating
+        it covers all models seen."""
         if not self.prices:
             return 0.0
+
+        # if key is specified but missing from map; return None
+        if key is not None and key not in self.key_to_usage:
+            return 0.0
+
         total = 0.0
-        for model, in_tok in self.by_model_in.items():
-            p = self._price_for(model)
-            if not p:
-                continue
-            in_rate = p.get("in", 0.0)
-            cached = self.by_model_cached.get(model, 0)
-            uncached_in = max(0, in_tok - cached)
-            total += uncached_in / 1_000_000 * in_rate
-            total += cached / 1_000_000 * p.get("cached", in_rate)
-            out_and_think = self.by_model_out.get(model, 0) + self.by_model_think.get(model, 0)
-            total += out_and_think / 1_000_000 * p.get("out", 0.0)
-        return total + self.embed_cost()
+        keys = self.key_to_usage.keys() if key is None else [key]
+        for k in keys:
+            usage = self.key_to_usage[k]
+            for model, in_tok in usage.model_to_input_tokens.items():
+                p = self._price_for(model)
+                if not p:
+                    continue
+                in_rate = p.get("in", 0.0)
+                cached = usage.model_to_cached_tokens.get(model, 0)
+                uncached_in = max(0, in_tok - cached)
+                total += uncached_in / 1_000_000 * in_rate
+                total += cached / 1_000_000 * p.get("cached", in_rate)
+                out_and_think = usage.model_to_output_tokens.get(model, 0) + usage.model_to_think_tokens.get(model, 0)
+                total += out_and_think / 1_000_000 * p.get("out", 0.0)
+
+        return total + self.embed_cost(key)
 
     def price_call(
         self, model: str | None, in_tok: int, cached_tok: int, out_tok: int, think_tok: int = 0
@@ -151,20 +207,29 @@ class UsageTracker:
         p = self._price_for(model or self.default_model)
         return None if not p else in_tok / 1_000_000 * p.get("in", 0.0)
 
-    def embed_cost(self) -> float:
-        """USD cost of embedding calls alone, priced from the same table (embeddings are
-        input-only, billed at the model's `in` rate). Looked up by the embedding model id,
-        so add an entry for it to `llm_prices` (e.g. `{"qwen3-embedding": {"in": ...}}`);
-        an unpriced embedding model costs 0. Folded into `cost()`; exposed separately so a
-        report can show embedding spend as its own column."""
+    def embed_cost(self, key: str | None = None) -> float:
+        """USD cost of embedding calls alone for the caller / agent specified by `key`. If `key` is `None`,
+        reports the aggregate cost across all callers. Priced from the same table (embeddings are input-only,
+        billed at the model's `in` rate). Looked up by the embedding model id, so add an entry for it to
+        `llm_prices` (e.g. `{"qwen3-embedding": {"in": ...}}`); an unpriced embedding model costs 0. Folded
+        into `cost()`; exposed separately so a report can show embedding spend as its own column."""
         if not self.prices:
             return 0.0
+
+        # if key is specified but missing from map; return None
+        if key is not None and key not in self.key_to_embed_usage:
+            return 0.0
+
         total = 0.0
-        for model, in_tok in self.by_emb_model_in.items():
-            p = self._price_for(model)
-            if not p:
-                continue
-            total += in_tok / 1_000_000 * p.get("in", 0.0)
+        keys = self.key_to_embed_usage.keys() if key is None else [key]
+        for k in keys:
+            usage = self.key_to_embed_usage[k]
+            for model, in_tok in usage.model_to_embed_tokens.items():
+                p = self._price_for(model)
+                if not p:
+                    continue
+                total += in_tok / 1_000_000 * p.get("in", 0.0)
+
         return total
 
     def _price_for(self, model: str) -> dict | None:

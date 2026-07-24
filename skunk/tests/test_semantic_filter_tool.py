@@ -41,13 +41,13 @@ class FakeLLMClient:
         self.embed_calls: list[tuple[str, str | None]] = []
 
     def call(self, *, system, user, temperature, model, ctx, call_site, provider_order=None,
-             max_output_tokens=None):
+             max_output_tokens=None, usage_key="default"):
         doc_text = user.split("\n\nDocument:\n", 1)[1]
         self.judged_texts.append(doc_text)
         self.judge_max_output_tokens.append(max_output_tokens)
         return _Resp("TRUE" if self.verdict_fn(doc_text) else "FALSE")
 
-    def embed_query(self, text, *, model=None, ctx=None):
+    def embed_query(self, text, *, model=None, ctx=None, usage_key="default"):
         self.embed_calls.append((text, model))
         return [0.0, 0.0]
 
@@ -273,15 +273,12 @@ def test_trace_event_records_mode_and_inputs():
 
 
 def _agent(extra_tools=()) -> SearchAgent:
-    config = SearchAgentConfig(
-        name="t", emb_provider="openrouter", emb_model_id="emb", llm_provider="openrouter",
-        llm_model="m", llm_max_retries=0, llm_retry_initial_delay_s=0.0,
-        llm_model_rpm={}, llm_default_rpm=1e9, llm_model_tpm={}, llm_default_tpm=None, llm_prices={},
-        llm_context_limits={},
-    )
+    # Inference settings (provider/model/prices) moved to InferenceConfig; SearchAgentConfig now
+    # holds only agent knobs, and emb_model_id is passed to the agent directly (not via config).
+    config = SearchAgentConfig(name="t")
     return SearchAgent(
         config=config, document_map={}, chroma_collection=FakeChroma([]),
-        llm_client=FakeLLMClient(), extra_tools=extra_tools,
+        llm_client=FakeLLMClient(), emb_model_id="emb", extra_tools=extra_tools,
     )
 
 

@@ -51,7 +51,6 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,14 +58,14 @@ from typing import TYPE_CHECKING
 
 from chromadb.api.models.Collection import Collection
 
-from skunk.common import page_key_to_pageref
-from skunk.common import render_page_b64
+from skunk.common import page_key_to_pageref, render_page_b64
 from skunk.multi_turn_agent import Tool
+from skunk.storage.document_map import DocumentMap
 from skunk.trace import truncate
 from skunk.usage import match_model_entry
 
 if TYPE_CHECKING:
-    from skunk.common import ExecutionContext, PageRef
+    from skunk.common import ExecutionContext
     from skunk.llm_client import LLMClient
 
 
@@ -160,6 +159,7 @@ class SearchCorpusTool(Tool):
         state: RetrievalState | None = None,
         required_metadata_filter: dict | None = None,
         ctx: ExecutionContext | None = None,
+        usage_key: str = "default",
     ):
         # `state` is shared BY REFERENCE with the owning SearchAgent's other tools;
         # a one-shot caller (e.g. a plain top-k vector search with no agent) omits
@@ -171,11 +171,16 @@ class SearchCorpusTool(Tool):
         self._state = state if state is not None else RetrievalState()
         self._required_metadata_filter = required_metadata_filter
 
+        # Usage-attribution key for this tool's embed calls. A direct caller (e.g. RAGLLMSystem)
+        # pins it at construction; when owned by a SearchAgent it's overwritten with the agent's
+        # id in that agent's post-construction rebind loop.
+        self._usage_key = usage_key
+
     def _embed_query(self, query: str) -> list[float]:
         """Embed `query` with the same model that produced the stored embeddings, via the
         LLMClient — which owns backend dispatch (OpenRouter / vLLM),
         the process-wide "embed" rate bucket, retry, and usage accounting."""
-        return self._llm_client.embed_query(query, model=self._emb_model_id, ctx=self._ctx)
+        return self._llm_client.embed_query(query, model=self._emb_model_id, ctx=self._ctx, usage_key=self._usage_key)
 
     def __call__(
         self,
@@ -383,7 +388,7 @@ This tool returns the full cleaned text of one or more documents, given their `d
 read_document(["doc_id_1", "doc_id_2"])
 ```"""
 
-    def __init__(self, document_map: dict[str, str], max_pages: int, max_output_chars: int,
+    def __init__(self, document_map: DocumentMap, max_pages: int, max_output_chars: int,
                  state: RetrievalState | None = None):
         self._document_map = document_map
         self._state = state if state is not None else RetrievalState()
@@ -433,22 +438,18 @@ class ViewFigureTool(Tool):
 
     def __init__(
         self,
-        document_map: dict[str, str],
+        document_map: DocumentMap,
         pdf_dir: str | Path,
         *,
         renders_dir: str | Path | None = None,
         dpi: int = 300,
         fmt: str = "png",
-        page_ref_parser: Callable[[str], "PageRef"] | None = None,
     ):
         self._document_map = document_map
         self._pdf_dir = pdf_dir
         self._renders_dir = renders_dir
         self._dpi = dpi
         self._fmt = fmt
-        # doc_id → PageRef, so the corpus's page-key scheme is injectable (raise
-        # ValueError for an unparseable id). Default: the "<stem>_<page>" scheme.
-        self._page_ref_parser = page_ref_parser or page_key_to_pageref
 
     @staticmethod
     def _figure_ids(page_text: str) -> list[str]:
@@ -470,7 +471,7 @@ class ViewFigureTool(Tool):
             }
         # doc_id is a corpus page key; resolve to a PageRef for rendering.
         try:
-            ref = self._page_ref_parser(doc_id)
+            ref = page_key_to_pageref(doc_id)
         except ValueError:
             return {
                 VIEW_FIGURE_RESULT_TAG: True,
@@ -609,14 +610,14 @@ def _parse_bool(text: str) -> bool:
 
 
 def _judge_one(
-    llm_client, predicate: str, item_text: str, model: str, ctx, provider_order=None,
-    max_output_tokens: int = _JUDGE_OUTPUT_TOKENS,
+    llm_client: LLMClient, predicate: str, item_text: str, model: str, ctx: ExecutionContext | None,
+    provider_order=None, max_output_tokens: int = _JUDGE_OUTPUT_TOKENS, usage_key: str = "default",
 ) -> bool:
     user = f"Filter Condition: {predicate}\n\nDocument:\n{item_text}"
     try:
         resp = llm_client.call(
             system=_SEMFILTER_SYSTEM, user=user, temperature=0.0, model=model, ctx=ctx, call_site="semfilter",
-            provider_order=provider_order, max_output_tokens=max_output_tokens,
+            provider_order=provider_order, max_output_tokens=max_output_tokens, usage_key=usage_key,
         )
     except Exception:
         return True  # recall-safe: keep on error
@@ -627,15 +628,16 @@ def filter_docs(
     llm_client,
     predicate: str,
     doc_ids: list[str],
-    document_map: dict[str, str],
+    document_map: DocumentMap,
     model: str,
     *,
-    ctx=None,
+    ctx: ExecutionContext | None = None,
     max_workers: int = 8,
     event_extra: dict | None = None,
     provider_order: list[str] | None = None,
     context_limit: int | None = None,
     judge_max_output_tokens: int = _JUDGE_OUTPUT_TOKENS,
+    usage_key: str = "default",
 ) -> list[str]:
     """Return the subset of `doc_ids` whose document text satisfies `predicate`,
     preserving input order.
@@ -662,7 +664,7 @@ def filter_docs(
         n_truncated = sum(1 for _, was in truncated if was)
     with ThreadPoolExecutor(max_workers=min(max_workers, len(doc_ids))) as pool:
         verdicts = list(pool.map(
-            lambda it: _judge_one(llm_client, predicate, it, model, ctx, provider_order, judge_max_output_tokens),
+            lambda it: _judge_one(llm_client, predicate, it, model, ctx, provider_order, judge_max_output_tokens, usage_key=usage_key),
             texts,
         ))
     kept = [d for d, keep in zip(doc_ids, verdicts, strict=True) if keep]
@@ -700,24 +702,26 @@ class SemanticFilterTool(Tool):
 
     def __init__(
         self,
-        llm_client,
-        document_map: dict[str, str],
+        llm_client: LLMClient,
+        document_map: DocumentMap,
         model: str,
         *,
         chroma_collection: Collection | None = None,
         emb_model_id: str | None = None,
         max_candidate_docs: int = 1000,
         max_output_tokens: int = 50_000,
-        ctx=None,
+        ctx: ExecutionContext | None = None,
         provider_order: list[str] | None = None,
         context_limits: dict[str, int] | None = None,
         judge_max_output_tokens: int = _JUDGE_OUTPUT_TOKENS,
+        usage_key: str = "default",
     ) -> None:
         # `chroma_collection` is required to select candidates from the corpus (and, for
         # top_k vector prefiltering, `emb_model_id`); without a collection every call errors.
         self._llm_client = llm_client
         self._document_map = document_map
         self._model = model
+        self._usage_key = usage_key
         # Per-call OpenRouter provider order for the judge calls only (None => client default). Lets a
         # cheaper judge model route to specific providers while the agent model stays unpinned.
         self._provider_order = provider_order
@@ -808,7 +812,7 @@ class SemanticFilterTool(Tool):
         # (and relevance order); metadata mode defers texts to a post-judge fetch.
         if top_k is not None:
             try:
-                emb = self._llm_client.embed_query(search_str or predicate, model=self._emb_model_id, ctx=self._ctx)
+                emb = self._llm_client.embed_query(search_str or predicate, model=self._emb_model_id, ctx=self._ctx, usage_key=self._usage_key)
                 query_kwargs: dict = {
                     "query_embeddings": [emb],
                     "n_results": top_k,
@@ -823,7 +827,8 @@ class SemanticFilterTool(Tool):
                 (cid, meta["doc_id"], doc or "")
                 for cid, doc, meta in zip(res["ids"][0], res["documents"][0], res["metadatas"][0], strict=True)  # type: ignore
             ]
-            candidate_doc_ids = list(dict.fromkeys(did for _, did, _ in candidates))  # relevance order
+            # str(): chroma types metadata values as a broad union, but doc_id is always a string.
+            candidate_doc_ids = list(dict.fromkeys(str(did) for _, did, _ in candidates))  # relevance order
             if len(candidate_doc_ids) > self._max_candidate_docs:
                 return self._error(
                     f"semantic_filter error: the top_k={top_k} search yielded {len(candidate_doc_ids)} candidate "
@@ -879,7 +884,9 @@ class SemanticFilterTool(Tool):
                 "n_candidate_docs": len(candidate_doc_ids),
             },
             provider_order=self._provider_order,
-            context_limit=self._context_limit, judge_max_output_tokens=self._judge_max_output_tokens,
+            context_limit=self._context_limit,
+            judge_max_output_tokens=self._judge_max_output_tokens,
+            usage_key=self._usage_key,
         )
         kept_set = set(kept)
         kept_chunks = [(cid, did, text) for cid, did, text in candidates if did in kept_set]
@@ -929,6 +936,8 @@ class SemanticFilterTool(Tool):
                 break
             batch = kept_chunks[start:start + self._GET_PAGE_SIZE]
             if mode == "metadata":
+                # metadata mode is only reached from _corpus_mode, which guards the collection is present.
+                assert self._chroma_collection is not None
                 fetched = self._chroma_collection.get(ids=[cid for cid, _, _ in batch], include=["documents"])
                 texts = dict(zip(fetched["ids"], fetched["documents"] or [], strict=True))
                 batch = [(cid, did, texts.get(cid) or "") for cid, did, _ in batch]
