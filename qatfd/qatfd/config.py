@@ -224,6 +224,12 @@ class FreshstackConfig(BenchmarkConfig):
 
 def benchmark_config_factory(cfg: DictConfig) -> BenchmarkConfig:
     bench_cfg = cast(dict, OmegaConf.to_container(cfg.benchmarks, resolve=True))
+    bench_cfg["storage"] = StorageConfig(
+        collection_name=bench_cfg.pop("collection_name"),
+        chroma_server_host=bench_cfg.pop("chroma_server_host"),
+        chroma_server_port=bench_cfg.pop("chroma_server_port"),
+        pdf_dir=bench_cfg.pop("pdf_dir", None),
+    )
     if bench_cfg["name"] == OFFICE_QA:
         return OfficeQAConfig(**bench_cfg)
     elif bench_cfg["name"] == BROWSECOMP_PLUS:

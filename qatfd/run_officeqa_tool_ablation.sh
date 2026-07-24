@@ -54,8 +54,8 @@ for entry in "${CONFIGS[@]}"; do
     systems.tool_vector="$vec" \
     systems.tool_grep="$grep" \
     systems.tool_semantic_filter="$sem" \
-    benchmarks.chromadb_host="$CHROMA_HOST" \
-    benchmarks.chromadb_port="$CHROMA_PORT" \
+    benchmarks.chroma_server_host="$CHROMA_HOST" \
+    benchmarks.chroma_server_port="$CHROMA_PORT" \
     experiments.run_name="$label"
 done
 

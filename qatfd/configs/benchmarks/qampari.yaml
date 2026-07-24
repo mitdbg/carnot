@@ -43,7 +43,7 @@ collection_name: qwen-qampari-0.6b
 # set); dev = 50 sampled (seed 0) from train_data, materialized into dev_questions_path. Disjoint.
 splits_path: qampari/qampari_splits.json
 # --- retrieval backend -----------------------------------------------------------------------------
-# port inherits base.yaml (8001); change the tunnel + `benchmarks.chromadb_port` together if needed.
+# port inherits base.yaml (8001); change the tunnel + `benchmarks.chroma_server_port` together if needed.
 # the 1000-question KARL TEST set (qid / question_text / answer_list[].{answer_text, aliases, proof[]}).
 questions_path: qampari/test_data.jsonl
 # the 50-question DEV set, sampled (seed 0) from train_data by scripts/make_splits.py. Loaded

@@ -45,8 +45,8 @@ for entry in "${MODELS[@]}"; do
       benchmarks=officeqa \
       systems="$system" \
       systems.llm_model="$model" \
-      benchmarks.chromadb_host="$CHROMA_HOST" \
-      benchmarks.chromadb_port="$CHROMA_PORT" \
+      benchmarks.chroma_server_host="$CHROMA_HOST" \
+      benchmarks.chroma_server_port="$CHROMA_PORT" \
       experiments.run_name="$tag" \
       "${extra[@]}"
   done
