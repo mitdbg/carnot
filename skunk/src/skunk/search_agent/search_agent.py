@@ -181,9 +181,15 @@ class SearchAgent(MultiTurnAgent):
         if isinstance(block, ChunkBlock):
             if block.chunk_id is not None and block.chunk_id in self._state.pruned_chunk_ids:
                 return False
+        if isinstance(block, (ChunkBlock, ImageBlock)):
             if block.doc_id in self._state.pruned_doc_ids:
                 return False
         return True
+
+    def _make_block_invisible(self, doc_id: str | None = None, chunk_id: str | None = None) -> None:
+        """Redact all blocks which have the doc_id or chunk_id."""
+        assert doc_id is not None or chunk_id is not None
+        
 
     def _blocks_from_output(self, out: CodeOutput) -> list[Block]:
         """Render a tool result into blocks. Chunk-bearing payloads become one

@@ -253,7 +253,7 @@ class MultiTurnAgent(ABC):
         *,
         max_steps: int | None = None,
         max_misfires: int | None = None,
-        context_hard_safety_frac: float = 0.9,
+        context_hard_safety_frac: float = 0.8,
         context_soft_safety_frac: float = 0.6,
         cost_budget: float | None = None,
         latency_budget: float | None = None,
@@ -406,6 +406,10 @@ class MultiTurnAgent(ABC):
         Subclasses (e.g. `SearchAgent`) override to redact pruned `ChunkBlock`s."""
         return True
 
+    def _make_block_invisible(self, doc_id: str | None = None, chunk_id: str | None = None) -> None:
+        """Redact all blocks which have the doc_id or chunk_id."""
+        pass
+
     def _blocks_from_output(self, out: CodeOutput) -> list[Block]:
         """Turn one tool-execution result into observation blocks.
 
@@ -551,48 +555,55 @@ class MultiTurnAgent(ABC):
         if hard_token_max_after_step >= hard_token_limit:
             usage_msg = "context usage" if self.max_output_tokens is None else "context usage + max output tokens"
             final_msg = "You may only invoke the prune tool or return your final answer." if "prune" in [t.name for t in self._tools] else "You must return your final answer."
-            warn_msg = f"[warning] {usage_msg} {hard_token_max_after_step:,} tokens exceeds hard limit {hard_token_limit:,} tokens. {final_msg} All other tool calls will be rejected."
+            warn_msg = f"[warning] {usage_msg} {hard_token_max_after_step:,} tokens exceeds hard limit {hard_token_limit:,} tokens. {final_msg} All other tool calls will be rejected on your next step."
             ctx.emit(f"context_hard_limit_exceeded tokens={hard_token_max_after_step:,} limit={hard_token_limit:,}", data={"text": warn_msg})
         elif soft_token_max_after_step >= soft_token_limit:
             usage_msg = "context usage" if self.max_output_tokens is None else "context usage + max output tokens"
-            prune_msg = " Consider using prune tool to reduce the tokens in your context window." if "prune" in [t.name for t in self._tools] else ""
+            prune_msg = " Consider using prune tool to reduce the tokens in your context window on the next step." if "prune" in [t.name for t in self._tools] else ""
             warn_msg = f"[warning] {usage_msg} {soft_token_max_after_step:,} tokens exceeds soft limit {soft_token_limit:,} tokens.{prune_msg}"
             ctx.emit(f"context_soft_limit_exceeded tokens={soft_token_max_after_step:,} limit={soft_token_limit:,}", data={"text": warn_msg})
         self.messages.append({"role": "user", "blocks": [TextBlock(warn_msg)]})
 
-    # TODO: remove the final message(s) one at a time until the context fits within the hard token limit;
-    # for each message removed, add its doc_id/chunk_id to est. tokens to summarize to the agent what was taken away
     def _trim(self, ctx: ExecutionContext) -> None:
-        """Trim the messages to fit within the model's context limit."""
+        """Trim the messages to fit within the model's context limit. Go through the list of messages
+        in reverse and redact until our estimate is under the model's context limit."""
         context_limit = self._get_context_limit(ctx)
+        redacted_msg = f"[notice] in order to trim your context to fit within the {context_limit:,} token limit, we've redacted the following docs/chunks:\n"
+        for msg in reversed(self.messages):
+            # break once we're estimated to be below the token limit
+            redacted_msg_tokens = _count_tokens([TextBlock(redacted_msg)])
+            if self._tokens_in_context + redacted_msg_tokens + (self.max_output_tokens or 0) < context_limit:
+                break
 
-        # rendered: list[dict] = []
-        # for msg in self.messages:
-        #     visible = [b for b in msg["blocks"] if self._block_is_visible(b)]
-        #     parts = [b.text for b in visible if b.text]
-        #     if not parts:
-        #         continue
-        #     entry: dict = {"role": msg["role"], "content": "\n\n".join(parts)}
-        #     images = [b.image for b in visible if isinstance(b, ImageBlock)]
-        #     if images:
-        #         entry["images"] = images
-        #     rendered.append(entry)
+            for block in msg["blocks"]:
+                if isinstance(block, TextBlock) or not self._block_is_visible(block):
+                    continue
 
-        visible_messages = [m for m in self.messages if ]
-        while _count_tokens([TextBlock(m["content"]) for m in messages]) > hard_token_limit:
-            # Remove the oldest message that is not the system prompt or the last user message
-            for i, m in enumerate(messages):
-                if m["role"] != "system" and not (m["role"] == "user" and i == len(messages) - 1):
-                    del messages[i]
+                # redact block
+                est_tokens = _count_tokens([block])
+                if isinstance(block, ImageBlock) or (isinstance(block, ChunkBlock) and block.chunk_id is None):
+                    self._make_block_invisible(doc_id=block.doc_id)
+                    redacted_msg += f" - doc_id={block.doc_id} | est. tokens={est_tokens}"
+
+                elif isinstance(block, ChunkBlock):
+                    self._make_block_invisible(chunk_id=block.chunk_id)
+                    redacted_msg += f" - chunk_id={block.chunk_id} | est. tokens={est_tokens}"
+
+                # decrement block tokens
+                self._tokens_in_context -= est_tokens
+
+                # update redacted message, recompute tokens, and break early if under limit
+                redacted_msg_tokens = _count_tokens([TextBlock(redacted_msg)])
+                if self._tokens_in_context + redacted_msg_tokens + (self.max_output_tokens or 0) < context_limit:
                     break
 
     def add_budget_observations(self, ctx: ExecutionContext, obs_blocks: list[Block]) -> None:
         """Add TextBlocks tracking the context, cost, and latency usage of the agent.
         Cost and latency are tracked iff self.cost_budget and self.latency_budget are not None, respectively."""
-        ctx_chars = sum(len(m["content"]) for m in self._render_for_llm())
+        context_limit = self._get_context_limit(ctx)
         obs_blocks.append(TextBlock(
-            f"[Context usage: {ctx_chars:,}/{self.context_budget_chars:,} chars "
-            f"({ctx_chars / self.context_budget_chars * 100:.1f}%)]"
+            f"[Context usage: ~{self._tokens_in_context:,}/{context_limit:,} chars "
+            f"({self._tokens_in_context / context_limit * 100:.1f}%)]"
         ))
         if self.cost_budget is not None:
             cost_usage = ctx.llm_client.usage.cost(key=str(self.agent_id))
@@ -676,16 +687,16 @@ class MultiTurnAgent(ABC):
             except ParseError as e:
                 obs = f"Observation (step {turn}): {e.detail}"
                 obs_blocks = [TextBlock(obs)]
+                self._tokens_in_context += _count_tokens(obs_blocks)
                 self.add_budget_observations(ctx, obs_blocks)
                 self.messages.append({"role": "user", "blocks": obs_blocks})
-                self._tokens_in_context += _count_tokens(obs_blocks)
                 ctx.emit(f"error {obs!r}")
             except Exception as e:  # LLM step / batch machinery failed
                 obs = f"Observation (step {turn}): exec failed — {type(e).__name__}: {e}"
                 obs_blocks = [TextBlock(obs)]
+                self._tokens_in_context += _count_tokens(obs_blocks)
                 self.add_budget_observations(ctx, obs_blocks)
                 self.messages.append({"role": "user", "blocks": obs_blocks})
-                self._tokens_in_context += _count_tokens(obs_blocks)
                 ctx.emit(f"error {obs!r}")
 
             if done is None:
@@ -703,9 +714,9 @@ class MultiTurnAgent(ABC):
                     return payload
                 obs = f"Observation (step {turn}, validation): {feedback}"
                 obs_blocks = [TextBlock(obs)]
+                self._tokens_in_context += _count_tokens(obs_blocks)
                 self.add_budget_observations(ctx, obs_blocks)
                 self.messages.append({"role": "user", "blocks": obs_blocks})
-                self._tokens_in_context += _count_tokens(obs_blocks)
                 observations.append(obs)
                 ctx.emit(f"validation_failed {feedback!r}")
                 continue
@@ -724,9 +735,9 @@ class MultiTurnAgent(ABC):
                 obs_blocks.append(TextBlock(f"[notice] {done.notice}"))
 
             # add messages to inform the agent of its budget usage
+            self._tokens_in_context += _count_tokens(obs_blocks)
             self.add_budget_observations(ctx, obs_blocks)
             self.messages.append({"role": "user", "blocks": obs_blocks})
-            self._tokens_in_context += _count_tokens(obs_blocks)
             visible_blocks = [
                 b for b in obs_blocks if b.text and self._block_is_visible(b)
             ]
@@ -805,19 +816,20 @@ class MultiTurnAgent(ABC):
             self.name, "max steps without accepted final answer", diagnostic=diagnostic
         )
 
+    # TODO: we still may 400 if our estimate(s) are off and trim does not actually get under the model's context limit
+    #       leave as-is for now, but eventually we should have a backstop that will auto compact if we hit a context limit 400 error
     async def _llm_step(self, ctx: ExecutionContext) -> _StepOutput:
         """Render the visible trajectory (`_render_for_llm`) and  route through
         `PromptedCall.call_multi_turn()`. `extra` appends transient messages
         (e.g. the terminal-turn prompt) that are deliberately NOT stored in `self.messages`."""
-        # add warning messages to the agent if the context usage exceeds the soft or hard token limits
-        self._warn_context_limits(ctx)
-
         # cut the trajectory to guarantee it fits within the model's context limit
         self._trim(ctx)
 
+        # add warning messages to the agent if the context usage exceeds the soft or hard token limits
+        self._warn_context_limits(ctx)
+
         # render the remaining messages to send to the model
         messages = self._render_for_llm()
-
         if self._backend is None:
             self._last_logprobs = None
             step_output, total_tokens = await self._prompt.call_multi_turn(
