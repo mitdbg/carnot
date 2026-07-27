@@ -1,8 +1,7 @@
 """Unit tests for the vLLM backend and the per-model backend routing in `LLMClient`.
 
 No GPU and no network: the openai-SDK request path is exercised end-to-end against a
-local in-process HTTP stub speaking the OpenAI chat/embeddings API (including SSE
-streaming). Runs under pytest."""
+local in-process HTTP stub speaking the OpenAI chat/embeddings API. Runs under pytest."""
 
 from __future__ import annotations
 
@@ -22,6 +21,11 @@ from skunk.llm_client import (
     _OpenRouterBackend,
     _VLLMBackend,
 )
+
+
+def _user(text: str) -> list[dict]:
+    """One user turn in the `LLMClient` messages format."""
+    return [{"role": "user", "content": text}]
 
 
 def _config(**overrides) -> InferenceConfig:
@@ -60,8 +64,8 @@ def test_backends_share_one_usage_tracker(monkeypatch):
 
     monkeypatch.setattr(_VLLMBackend, "_gen_call", fake_gen)
     monkeypatch.setattr(_OpenRouterBackend, "_gen_call", fake_gen)
-    client.call("sys", "user", model="loc/m")
-    client.call("sys", "user", model="or/m")
+    client.call("sys", _user("user"), model="loc/m")
+    client.call("sys", _user("user"), model="or/m")
     # Usage is now bucketed per attribution key; aggregate across keys to check both calls landed.
     per_key = client.usage.key_to_usage.values()
     assert sum(u.n_calls for u in per_key) == 2
@@ -82,10 +86,10 @@ def test_vllm_models_cost_zero_even_when_priced(monkeypatch):
 
     monkeypatch.setattr(_VLLMBackend, "_gen_call", fake_gen)
     monkeypatch.setattr(_OpenRouterBackend, "_gen_call", fake_gen)
-    client.call("s", "u", model="loc/m")
+    client.call("s", _user("u"), model="loc/m")
     assert client.usage.price_call("loc/m", 1_000_000, 0, 1_000_000) is None  # free, not $200
     assert client.usage.cost() == 0.0
-    client.call("s", "u", model="or/m")
+    client.call("s", _user("u"), model="or/m")
     assert client.usage.price_call("or/m", 1_000_000, 0, 1_000_000) == 20.0  # still priced
     assert client.usage.cost() == 20.0
 
@@ -103,23 +107,6 @@ def _chat_payload(text: str | None) -> dict:
     }
 
 
-_SSE_CHUNKS = [
-    {
-        "id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "loc/m",
-        "choices": [{"index": 0, "delta": {"content": "hel"}, "finish_reason": None}],
-    },
-    {
-        "id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "loc/m",
-        "choices": [{"index": 0, "delta": {"content": "lo"}, "finish_reason": "stop"}],
-    },
-    # Final usage-only chunk, sent because the request asked include_usage.
-    {
-        "id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "loc/m",
-        "choices": [], "usage": {"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
-    },
-]
-
-
 class _StubHandler(BaseHTTPRequestHandler):
     def log_message(self, *args):  # noqa: ARG002 — silence per-request stderr noise
         pass
@@ -128,9 +115,7 @@ class _StubHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length) or b"{}")
         self.server.requests.append((self.path, body))  # type: ignore[attr-defined]
-        if self.path.endswith("/chat/completions") and body.get("stream"):
-            self._respond_sse()
-        elif self.path.endswith("/chat/completions"):
+        if self.path.endswith("/chat/completions"):
             queued = self.server.chat_responses  # type: ignore[attr-defined]
             self._respond_json(queued.pop(0) if queued else _chat_payload("hello"))
         elif self.path.endswith("/embeddings"):
@@ -149,14 +134,6 @@ class _StubHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
-
-    def _respond_sse(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.end_headers()
-        for chunk in _SSE_CHUNKS:
-            self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
-        self.wfile.write(b"data: [DONE]\n\n")
 
 
 @pytest.fixture()
@@ -182,20 +159,21 @@ def _stub_client(server, **overrides) -> LLMClient:
 
 
 def test_vllm_call_parses_text_and_usage(stub_server):
-    resp = _stub_client(stub_server).call("be brief", "hi", model="loc/m")
+    resp = _stub_client(stub_server).call("be brief", _user("hi"), model="loc/m")
     assert resp.text == "hello"
     assert (resp.input_tokens, resp.output_tokens) == (7, 2)
     path, body = stub_server.requests[0]
     assert path.endswith("/chat/completions")
     assert body["model"] == "loc/m"
     assert body["messages"][0] == {"role": "system", "content": "be brief"}
+    assert body["messages"][1] == {"role": "user", "content": "hi"}
     assert "extra_body" not in body  # not set -> nothing merged
 
 
 def test_vllm_extra_body_lands_in_request(stub_server):
     extra = {"chat_template_kwargs": {"enable_thinking": False}}
     client = _stub_client(stub_server, vllm_extra_body=extra)
-    client.call("s", "u", model="loc/m")
+    client.call("s", _user("u"), model="loc/m")
     _, body = stub_server.requests[0]
     # The openai SDK merges extra_body into the top-level request JSON.
     assert body["chat_template_kwargs"] == {"enable_thinking": False}
@@ -203,11 +181,11 @@ def test_vllm_extra_body_lands_in_request(stub_server):
 
 def test_vllm_call_passes_max_output_tokens(stub_server):
     client = _stub_client(stub_server)
-    client.call("s", "u", model="loc/m", max_output_tokens=256)
+    client.call("s", _user("u"), model="loc/m", max_output_tokens=256)
     _, body = stub_server.requests[0]
     assert body["max_tokens"] == 256
     # Default (no cap) sends no max_tokens, preserving prior behavior.
-    client.call("s", "u", model="loc/m")
+    client.call("s", _user("u"), model="loc/m")
     _, body2 = stub_server.requests[1]
     assert "max_tokens" not in body2
 
@@ -215,7 +193,7 @@ def test_vllm_call_passes_max_output_tokens(stub_server):
 def test_vllm_empty_completion_retries_then_succeeds(stub_server):
     stub_server.chat_responses.extend([_chat_payload(""), _chat_payload("second try")])
     client = _stub_client(stub_server, llm_max_retries=1)
-    resp = client.call("s", "u", model="loc/m")
+    resp = client.call("s", _user("u"), model="loc/m")
     assert resp.text == "second try"
     assert len(stub_server.requests) == 2  # empty 200 -> EmptyCompletionError -> one retry
 
@@ -224,26 +202,14 @@ def test_vllm_empty_completion_exhausts_retries(stub_server):
     stub_server.chat_responses.extend([_chat_payload(None)])
     client = _stub_client(stub_server)  # llm_max_retries=0
     with pytest.raises(EmptyCompletionError, match="vllm empty content"):
-        client.call("s", "u", model="loc/m")
+        client.call("s", _user("u"), model="loc/m")
 
 
 def test_vllm_acall(stub_server):
-    resp = asyncio.run(_stub_client(stub_server).acall("s", "u", model="loc/m", max_output_tokens=64))
+    resp = asyncio.run(_stub_client(stub_server).acall("s", _user("u"), model="loc/m", max_output_tokens=64))
     assert resp.text == "hello"
     _, body = stub_server.requests[0]
     assert body["max_tokens"] == 64
-
-
-def test_vllm_astream_drains_usage(stub_server):
-    client = _stub_client(stub_server)
-    resp = asyncio.run(
-        client.astream(system="s", messages=[{"role": "user", "content": "hi"}], model="loc/m")
-    )
-    assert resp.text == "hello"
-    assert (resp.input_tokens, resp.output_tokens) == (5, 3)
-    _, body = stub_server.requests[0]
-    assert body["stream"] is True
-    assert body["stream_options"] == {"include_usage": True}
 
 
 def test_vllm_embed_query(stub_server):

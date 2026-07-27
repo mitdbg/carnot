@@ -31,9 +31,11 @@ import requests
 from skunk.common import (
     AsyncTokenBudget,
     Effort,
+    estimate_tokens,
     get_async_tpm_limiter,
     get_rate_limiter,
 )
+from skunk.constants import IMAGE_TOKENS_EST
 from skunk.usage import UsageTracker
 
 if TYPE_CHECKING:
@@ -107,7 +109,7 @@ def _is_retryable(e: BaseException) -> bool:
         return True
     # Transport faults: connection resets, read timeouts, DNS failures, etc.
     # `TimeoutError` covers both asyncio timeouts on the async SDK path and our own
-    # per-request wall-clock cap (asyncio.wait_for in the streaming path raises builtin
+    # per-request wall-clock cap (asyncio.wait_for in `_gen_acall` raises builtin
     # TimeoutError) — treat a tripped timeout as a transient fault worth retrying, same as a
     # transport-level read timeout.
     retryable: tuple[type[BaseException], ...] = (
@@ -174,19 +176,22 @@ def _error_detail(e: BaseException) -> str:
 # The TPM throttle (AsyncTokenBudget + its process-wide registry) lives in
 # `skunk.common`, next to the RPM registry — one home for all pacing state.
 
-
-def _estimate_prompt_tokens(system: str, user: str) -> float:
-    """Cheap pre-call input-token estimate (~4 chars/token) for the TPM bucket.
-    Approximate by design — it only paces throughput, it doesn't bill."""
-    return (len(system) + len(user)) / 4.0
+def _estimate_prompt_tokens(messages: list[dict]) -> float:
+    """Pre-call input-token estimate for the TPM bucket: `common.estimate_tokens` on each
+    message's `content` text (exact BPE count, chars/4 above its size cutoff) plus a flat
+    per-image charge. Approximate by design — it only paces throughput, it doesn't bill;
+    `_tpm_settle` corrects against real usage post-call."""
+    text_tokens = sum(estimate_tokens(m.get("content") or "") for m in messages)
+    n_images = sum(len(m.get("images") or ()) for m in messages)
+    return text_tokens + n_images * IMAGE_TOKENS_EST
 
 
 @dataclass
 class LLMResponse:
     text: str
     latency_s: float
-    input_tokens: int | None
-    output_tokens: int | None
+    input_tokens: int
+    output_tokens: int
     # Cached (prompt-cache hit) input tokens, when the provider reports them.
     # Subset of input_tokens; None when unknown.
     cache_input_tokens: int | None = None
@@ -194,33 +199,28 @@ class LLMResponse:
     thinking_tokens: int | None = None
 
 
+
 @dataclass(frozen=True)
 class CallSpec:
     """One generation request, provider-agnostic — the value threaded from the
-    public `call` / `acall` / `astream` methods into the per-provider bodies
-    (which used to take it as 8–10 positional args). `model` is always resolved
-    by the public method (never empty inside a provider body). Exactly one of
-    `user` (single-shot) / `messages` (multi-turn streaming) is meaningful,
-    matching the public method it came through."""
-
+    public `call` / `acall` methods into the per-provider bodies. `model` is always
+    resolved by the public method (never empty inside a provider body). `messages`
+    is expected to be a list of dictionaries with the following format:
+    [
+        {"role": "user" | "assistant", "content": str, "images": list[B64Image] | None},
+    ]
+    """
     system: str
     model: str
-    usage_key: str = "default"
-    user: str = ""
-    messages: tuple[dict, ...] | None = None
-    images: list[B64Image] | None = None
+    messages: list[dict]
     temperature: float = 0.0
     effort: Effort = "off"
     ctx: ExecutionContext | None = None
     call_site: str = "llm"
     max_output_tokens: int | None = None
     timeout_s: float | None = None
-    should_stop: Callable[[str], bool] | None = None
-    # Per-call OpenRouter provider order (no fallback). None => use config.llm_provider_order.
-    # Lets a single client route one model (e.g. a cheaper semantic-filter judge) to specific
-    # providers while other models on the same client stay unpinned. OpenRouter-only: ignored
-    # when the model routes to a vLLM backend.
     provider_order: list[str] | None = None
+    usage_key: str = "default"
 
 
 # Raw HTTP body of the most recent OpenRouter response, captured by an httpx response
@@ -328,10 +328,9 @@ def _make_vllm_clients(base_url: str, api_key: str | None = None) -> tuple["Open
 class _LLMBackend:
     """Per-provider backend: the shared retry/backoff drivers, RPM/TPM pacing, and the
     `_build_response`/`_finish` trace+usage chokepoint, over abstract provider bodies
-    (`_gen_call` / `_gen_acall` / `_gen_astream` / `_embed_once`). Backends are built
-    only by the `LLMClient` facade, which injects its own `UsageTracker` — every
-    backend of a client bills into the one tracker, so a mixed OpenRouter+vLLM run
-    still reports one usage/cost total."""
+    (`_gen_call` / `_gen_acall` / `_embed_once`). Backends are built only by the `LLMClient`
+    facade, which injects its own `UsageTracker` — every backend of a client bills into the
+    one tracker, so a mixed OpenRouter+vLLM run still reports one usage/cost total."""
 
     provider: str = "?"
 
@@ -347,11 +346,6 @@ class _LLMBackend:
     async def acall(self, spec: CallSpec) -> LLMResponse:
         return await self._aretry_call(
             lambda: self._gen_acall(spec), self.provider, spec.model, ctx=spec.ctx
-        )
-
-    async def astream(self, spec: CallSpec) -> LLMResponse:
-        return await self._aretry_call(
-            lambda: self._gen_astream(spec), self.provider, spec.model, ctx=spec.ctx
         )
 
     def embed_query(
@@ -390,9 +384,6 @@ class _LLMBackend:
 
     async def _gen_acall(self, spec: CallSpec) -> LLMResponse:
         raise NotImplementedError(f"provider {self.provider!r} does not implement acall")
-
-    async def _gen_astream(self, spec: CallSpec) -> LLMResponse:
-        raise NotImplementedError(f"provider {self.provider!r} does not implement astream")
 
     def _embed_once(self, model: str, text: str) -> tuple[list[float], int]:
         """One embedding request (no retry — the retry loop owns that). Returns the
@@ -528,7 +519,7 @@ class _LLMBackend:
         return resp
 
     async def _tpm_acquire(
-        self, model: str, system: str, user: str
+        self, model: str, messages: list[dict],
     ) -> tuple[AsyncTokenBudget | None, float]:
         """Acquire the per-model token budget (`config.llm_model_tpm`, falling back to
         `llm_default_tpm`) before a call, charging an up-front input-token estimate.
@@ -537,7 +528,7 @@ class _LLMBackend:
         tpm = self._config.llm_model_tpm.get(model, self._config.llm_default_tpm)
         if not tpm:
             return None, 0.0
-        est = _estimate_prompt_tokens(system, user)
+        est = _estimate_prompt_tokens(messages)
         lim = get_async_tpm_limiter(model, tpm)
         await lim.acquire(est)
         return lim, est
@@ -545,7 +536,8 @@ class _LLMBackend:
     @staticmethod
     def _tpm_settle(lim: AsyncTokenBudget | None, est: float, input_tokens: int | None) -> None:
         """Post-call correction: charge the actual-minus-estimated input tokens so the
-        bucket tracks REAL usage (the char/4 estimate runs ~2x low on dense tabular text)."""
+        bucket tracks REAL usage (the pre-call estimate uses o200k_base, not the provider's
+        tokenizer, and flat-estimates images and message overhead)."""
         if lim is not None:
             lim.settle((input_tokens or 0) - est)
 
@@ -608,19 +600,7 @@ class _OpenAIChatBackend(_LLMBackend):
             "cache_input_tokens": getattr(details, "cached_tokens", None) if details else None,
         }
 
-    def _single_messages(self, spec: CallSpec) -> list[dict]:
-        """Single-shot messages in OpenAI chat format: leading system (if any) + the
-        one user turn (with any images) — shared by the sync and async bodies."""
-        messages: list[dict] = []
-        if spec.system:
-            messages.append({"role": "system", "content": spec.system})
-        messages.append(
-            {"role": "user", "content": self._content(spec.user, spec.images)}
-        )
-        return messages
-
-    @staticmethod
-    def _chat_messages(system: str, messages: list[dict]) -> list[dict]:
+    def _chat_messages(self, system: str, messages: list[dict]) -> list[dict]:
         """Multi-turn messages in OpenAI chat format: a leading system message (if any)
         then the {role, content} turns ('assistant' → assistant, else user)."""
         out: list[dict] = []
@@ -629,19 +609,11 @@ class _OpenAIChatBackend(_LLMBackend):
         out.extend(
             {
                 "role": "assistant" if m["role"] == "assistant" else "user",
-                "content": _OpenAIChatBackend._content(m["content"], m.get("images")),
+                "content": self._content(m["content"], m.get("images")),
             }
             for m in messages
         )
         return out
-
-    @staticmethod
-    def _chunk_text(chunk: Any) -> str:
-        text = ""
-        for choice in getattr(chunk, "choices", None) or []:
-            delta = getattr(choice, "delta", None)
-            text += getattr(delta, "content", None) or ""
-        return text
 
     def _checked_text(self, resp: Any, spec: CallSpec) -> str:
         """The completion text, or `EmptyCompletionError` (with the provider's diagnostic
@@ -743,7 +715,7 @@ class _OpenRouterBackend(_OpenAIChatBackend):
     def _gen_call(self, spec: CallSpec) -> LLMResponse:
         """One OpenRouter chat call (no retry — the retry loop owns that)."""
         client = self._get_client()
-        messages = self._single_messages(spec)
+        messages = self._chat_messages(spec.system, spec.messages)
         reasoning = self._effort_to_reasoning(spec.effort)
         extra = (
             {"max_tokens": spec.max_output_tokens}
@@ -751,6 +723,10 @@ class _OpenRouterBackend(_OpenAIChatBackend):
             else {}
         )
         extra.update(self._provider_kwarg(spec))
+        if spec.timeout_s is not None:
+            # Sync twin of the async path's asyncio.wait_for cap, enforced at the SDK
+            # request layer. A tripped timeout raises httpx.TimeoutException — retryable.
+            extra["timeout_ms"] = int(spec.timeout_s * 1000)
         t0 = time.monotonic()
         resp = client.chat.send(
             model=spec.model, messages=messages, stream=False, # type: ignore
@@ -764,13 +740,15 @@ class _OpenRouterBackend(_OpenAIChatBackend):
     async def _gen_acall(self, spec: CallSpec) -> LLMResponse:
         """Async twin of `_gen_call` — uses `client.chat.send_async`."""
         client = self._get_client()
-        messages = self._single_messages(spec)
+        messages = self._chat_messages(spec.system, spec.messages)
         reasoning = self._effort_to_reasoning(spec.effort)
         # TPM throttle (opt-in via SKUNK_MODEL_TPM): meter input tokens so throughput
         # stays under quota, separate from the RPM limiter. Per attempt (the retry loop
         # re-invokes this body), so each retry re-charges. `_tpm_settle` corrects the
-        # estimate post-call.
-        tpm_lim, est = await self._tpm_acquire(spec.model, spec.system, spec.user)
+        # estimate post-call. Estimated from the spec-format messages (`content` text +
+        # `images`), with the system prompt folded in as a synthetic message — the
+        # wire-format `messages` local hides images inside content-parts lists.
+        tpm_lim, est = await self._tpm_acquire(spec.model, [{"content": spec.system}, *spec.messages])
         extra = (
             {"max_tokens": spec.max_output_tokens}
             if spec.max_output_tokens is not None
@@ -790,54 +768,6 @@ class _OpenRouterBackend(_OpenAIChatBackend):
         toks = self._usage_tokens_chat(getattr(resp, "usage", None))
         self._tpm_settle(tpm_lim, est, toks["input_tokens"])
         return self._finish(spec, output_text, toks, latency_s, spec.model)
-
-    async def _gen_astream(self, spec: CallSpec) -> LLMResponse:
-        """OpenRouter streaming body for `astream` — `client.chat.send_async` + `async for`."""
-        client = self._get_client()
-        or_messages = self._chat_messages(spec.system, list(spec.messages or ()))
-        reasoning = self._effort_to_reasoning(spec.effort)
-        extra = (
-            {"max_tokens": spec.max_output_tokens}
-            if spec.max_output_tokens is not None
-            else {}
-        )
-        extra.update(self._provider_kwarg(spec))
-        should_stop = spec.should_stop
-
-        async def _consume() -> tuple[str, Any]:
-            accumulated = ""
-            stopped_text: str | None = None
-            usage = None
-            async with await client.chat.send_async(
-                model=spec.model, messages=or_messages, stream=True, # type: ignore
-                temperature=spec.temperature, reasoning=reasoning, **extra, # type: ignore
-            ) as resp_stream:
-                async for chunk in resp_stream:
-                    accumulated += self._chunk_text(chunk)
-                    usage = getattr(chunk, "usage", None) or usage
-                    # OpenRouter sends the usage chunk LAST, so we must drain the stream
-                    # to capture cost stats — breaking at `should_stop` drops them
-                    # entirely. Record the cut point for the returned text but keep
-                    # reading; the agent is prompted to emit one block then stop, so the
-                    # stream usually ends right after (max_output_tokens + the request
-                    # timeout bound the worst case).
-                    if stopped_text is None and should_stop is not None and should_stop(accumulated):
-                        stopped_text = accumulated
-            return (accumulated if stopped_text is None else stopped_text), usage
-
-        t0 = time.monotonic()
-        if spec.timeout_s is not None:
-            accumulated, usage = await asyncio.wait_for(_consume(), spec.timeout_s)
-        else:
-            accumulated, usage = await _consume()
-        latency_s = time.monotonic() - t0
-        if usage is None:
-            _warn(
-                spec.ctx,
-                f"stream_no_usage cost undercounted (call_site={spec.call_site} model={spec.model})",
-            )
-        toks = self._usage_tokens_chat(usage)
-        return self._finish(spec, accumulated, toks, latency_s, spec.model)
 
     def _embed_once(self, model: str, text: str) -> tuple[list[float], int]:
         """One OpenRouter embeddings call (e.g. Qwen3-Embedding-8B). Token count is the
@@ -892,11 +822,16 @@ class _VLLMBackend(_OpenAIChatBackend):
     def _gen_call(self, spec: CallSpec) -> LLMResponse:
         """One vLLM chat call (no retry — the retry loop owns that)."""
         client, _ = self._clients_for(spec.model)
-        messages = self._single_messages(spec)
+        messages = self._chat_messages(spec.system, spec.messages)
+        kwargs = self._request_kwargs(spec)
+        if spec.timeout_s is not None:
+            # Sync twin of the async path's asyncio.wait_for cap, enforced at the SDK
+            # request layer. A tripped timeout raises APITimeoutError — retryable.
+            kwargs["timeout"] = spec.timeout_s
         t0 = time.monotonic()
         resp = client.chat.completions.create(
             model=spec.model, messages=messages, temperature=spec.temperature, # type: ignore[arg-type]
-            **self._request_kwargs(spec),
+            **kwargs,
         )
         latency_s = time.monotonic() - t0
         output_text = self._checked_text(resp, spec)
@@ -906,9 +841,9 @@ class _VLLMBackend(_OpenAIChatBackend):
     async def _gen_acall(self, spec: CallSpec) -> LLMResponse:
         """Async twin of `_gen_call`."""
         _, aclient = self._clients_for(spec.model)
-        messages = self._single_messages(spec)
+        messages = self._chat_messages(spec.system, spec.messages)
         # TPM throttle (opt-in via SKUNK_MODEL_TPM) — identical to the OpenRouter path.
-        tpm_lim, est = await self._tpm_acquire(spec.model, spec.system, spec.user)
+        tpm_lim, est = await self._tpm_acquire(spec.model, [{"content": spec.system}, *spec.messages])
         t0 = time.monotonic()
         coro = aclient.chat.completions.create(
             model=spec.model, messages=messages, temperature=spec.temperature, # type: ignore[arg-type]
@@ -922,55 +857,6 @@ class _VLLMBackend(_OpenAIChatBackend):
         toks = self._usage_tokens_chat(getattr(resp, "usage", None))
         self._tpm_settle(tpm_lim, est, toks["input_tokens"])
         return self._finish(spec, output_text, toks, latency_s, spec.model)
-
-    async def _gen_astream(self, spec: CallSpec) -> LLMResponse:
-        """vLLM streaming body for `astream`. `stream_options.include_usage` requests
-        the final usage chunk — OpenAI-spec servers omit usage by default when
-        streaming (unlike OpenRouter, which always sends it)."""
-        _, aclient = self._clients_for(spec.model)
-        messages = self._chat_messages(spec.system, list(spec.messages or ()))
-        should_stop = spec.should_stop
-
-        async def _consume() -> tuple[str, Any]:
-            accumulated = ""
-            stopped_text: str | None = None
-            usage = None
-            stream = await aclient.chat.completions.create(
-                model=spec.model, messages=messages, temperature=spec.temperature, # type: ignore[arg-type]
-                stream=True, stream_options={"include_usage": True},
-                **self._request_kwargs(spec),
-            )
-            try:
-                async for chunk in stream:
-                    accumulated += self._chunk_text(chunk)
-                    usage = getattr(chunk, "usage", None) or usage
-                    # The usage chunk arrives LAST (include_usage), so keep draining past
-                    # `should_stop` and record the cut point for the returned text — same
-                    # contract as the OpenRouter streaming body.
-                    if stopped_text is None and should_stop is not None and should_stop(accumulated):
-                        stopped_text = accumulated
-            finally:
-                # Runs on normal completion AND on wait_for cancellation, so a
-                # timed-out stream still releases its connection.
-                try:  # noqa: SIM105
-                    await stream.close()
-                except Exception:
-                    pass
-            return (accumulated if stopped_text is None else stopped_text), usage
-
-        t0 = time.monotonic()
-        if spec.timeout_s is not None:
-            accumulated, usage = await asyncio.wait_for(_consume(), spec.timeout_s)
-        else:
-            accumulated, usage = await _consume()
-        latency_s = time.monotonic() - t0
-        if usage is None:
-            _warn(
-                spec.ctx,
-                f"stream_no_usage cost undercounted (call_site={spec.call_site} model={spec.model})",
-            )
-        toks = self._usage_tokens_chat(usage)
-        return self._finish(spec, accumulated, toks, latency_s, spec.model)
 
     def _embed_once(self, model: str, text: str) -> tuple[list[float], int]:
         """One vLLM embeddings call (server started with `--task embed`). Token count is
@@ -1052,81 +938,49 @@ class LLMClient:
     def call(
         self,
         system: str,
-        user: str,
-        images: list[B64Image] | None = None,
+        messages: list[dict],
+        model: str | None = None,
         temperature: float = 0.0,
         effort: Effort = "off",
         ctx: ExecutionContext | None = None,
         call_site: str = "llm",
-        model: str | None = None,
         provider_order: list[str] | None = None,
         max_output_tokens: int | None = None,
+        timeout_s: float | None = None,
         usage_key: str = "default",
     ) -> LLMResponse:
         spec = CallSpec(
-            system=system, user=user, images=images, temperature=temperature,
-            effort=effort, ctx=ctx, call_site=call_site,
+            system=system, messages=list(messages),
+            temperature=temperature, effort=effort, ctx=ctx, call_site=call_site,
             model=model or self._config.llm_model, usage_key=usage_key,
-            provider_order=provider_order,
-            max_output_tokens=max_output_tokens,
+            provider_order=provider_order, max_output_tokens=max_output_tokens,
+            timeout_s=timeout_s,
         )
         return self._backend_for_model(spec.model).call(spec)
 
     async def acall(
         self,
         system: str,
-        user: str,
-        images: list[B64Image] | None = None,
-        temperature: float = 0.0,
-        effort: Effort = "off",
-        ctx: ExecutionContext | None = None,
-        call_site: str = "llm",
-        model: str | None = None,
-        max_output_tokens: int | None = None,
-        timeout_s: float | None = None,
-        usage_key: str = "default",
-    ) -> LLMResponse:
-        """Async twin of `call` for the request path. `max_output_tokens` /
-        `timeout_s` mirror `astream`'s caps (None → provider default / no cap)."""
-        spec = CallSpec(
-            system=system, user=user, images=images, temperature=temperature,
-            effort=effort, ctx=ctx, call_site=call_site,
-            model=model or self._config.llm_model, usage_key=usage_key,
-            max_output_tokens=max_output_tokens, timeout_s=timeout_s,
-        )
-        return await self._backend_for_model(spec.model).acall(spec)
-
-    async def astream(
-        self,
-        *,
-        system: str,
         messages: list[dict],
         model: str | None = None,
-        should_stop: Callable[[str], bool] | None = None,
         temperature: float = 0.0,
         effort: Effort = "off",
         ctx: ExecutionContext | None = None,
         call_site: str = "llm",
+        provider_order: list[str] | None = None,
         max_output_tokens: int | None = None,
         timeout_s: float | None = None,
         usage_key: str = "default",
     ) -> LLMResponse:
-        """Multi-turn streaming call, accumulating chunks until `should_stop(acc)`
-        or the stream ends. `messages` are the {role, content} turns after the
-        system message ('assistant' → model role, else user). Lets multi-turn
-        agents share this client's rate-limit + retry + logging; the event loop
-        runs other tasks between chunks.
-
-        `max_output_tokens` overrides the per-call output cap (None → provider
-        default); `timeout_s` enforces a hard per-request wall-clock cap. Both are
-        opt-in and currently used only by the search agent (see `MultiTurnAgent`)."""
+        """Async twin of `call` for the request path."""
         spec = CallSpec(
-            system=system, messages=tuple(messages), temperature=temperature,
-            effort=effort, ctx=ctx, call_site=call_site, should_stop=should_stop,
+            system=system, messages=list(messages),
+            temperature=temperature, effort=effort, ctx=ctx, call_site=call_site,
             model=model or self._config.llm_model, usage_key=usage_key,
-            max_output_tokens=max_output_tokens, timeout_s=timeout_s,
+            provider_order=provider_order, max_output_tokens=max_output_tokens,
+            timeout_s=timeout_s,
         )
-        return await self._backend_for_model(spec.model).astream(spec)
+        return await self._backend_for_model(spec.model).acall(spec)
 
     def embed_query(
         self,

@@ -359,7 +359,8 @@ def llm_page(client: LLMClient, key: str, args) -> dict:
             png = read_bytes(_join(doc_renders, f"{page_id}.png"))
             img = B64Image(mime="image/png", data=base64.standard_b64encode(png).decode())
             try:
-                ext = client.call(system=_EXTRACT_SYSTEM, user=_EXTRACT_USER, images=[img], temperature=0.0,
+                messages = [{"role": "user", "content": _EXTRACT_USER, "images": [img]}]
+                ext = client.call(system=_EXTRACT_SYSTEM, messages=messages, temperature=0.0,
                                   model=args.extract_model, ctx=None, call_site="fb_extract")
                 summary["extract_in"], summary["extract_out"] = ext.input_tokens or 0, ext.output_tokens or 0
                 items += [[k, c] for k, c in parse_extract_markdown(ext.text)]

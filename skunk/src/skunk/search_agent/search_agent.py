@@ -31,8 +31,8 @@ from skunk.llm_client import LLMClient
 from skunk.sandbox.local_python_executor import CodeOutput
 from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent, TextBlock, Tool
 from skunk.prompts import load_prompts
+from skunk.search_agent.retrieval_state import RetrievalState
 from skunk.search_agent.search_tools import (
-    RetrievalState,
     EMPTY_RESULT_MESSAGE,
     GREP_RESULT_TAG,
     PRUNE_RESULT_TAG,
@@ -142,7 +142,6 @@ class SearchAgent(MultiTurnAgent):
         if include_grep_corpus:
             tools.append(GrepCorpusTool(
                 self.chroma_collection,
-                config.grep_max_output_tokens,
                 self._state,
             ))
         tools += [
@@ -252,13 +251,9 @@ class SearchAgent(MultiTurnAgent):
             if output.get("error"):
                 blocks.append(TextBlock(f"[error]\n{output['error']}"))
             else:
-                caption = (
-                    f"[full-page image of doc_id={output['doc_id']} "
-                    f"(contains <figure id={output['figure_id']}>)]"
-                )
+                caption = f"[full-page image of doc_id={output['doc_id']}]"
                 blocks.append(ImageBlock(
                     doc_id=output["doc_id"],
-                    figure_id=output["figure_id"],
                     image=B64Image(mime=output["mime"], data=output["data"]),
                     text=caption,
                 ))

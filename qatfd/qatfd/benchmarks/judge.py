@@ -47,9 +47,10 @@ async def judge_single_nugget(
     ctx: ExecutionContext, *, question: str, gold: str, predicted: str, model: str, usage_key: str | None = None
 ) -> dict:
     user = f"Question:\n{question}\n\nGold answer:\n{gold}\n\nPredicted answer:\n{predicted or '(no answer)'}"
+    messages = [{"role": "user", "content": user}]
     resp = await ctx.llm_client.acall(
         system=_JUDGE_SYSTEM,
-        user=user,
+        messages=messages,
         temperature=0.0,
         model=model,
         ctx=ctx,
@@ -134,14 +135,15 @@ async def judge_nugget_recall(
     if not nuggets:
         return {"score": 0.0, "scorer": "karl.nugget_completion.v1", "judge_rationale": "(no gold nuggets)"}
 
+    messages = [{"role": "user", "content": _NUGGET_COMPLETENESS_PROMPT.format(
+        length=len(nuggets),
+        question=question,
+        answer=predicted or "(no answer)",
+        nugget=nuggets,
+    )}]
     resp = await ctx.llm_client.acall(
         system=judge_system,
-        user=_NUGGET_COMPLETENESS_PROMPT.format(
-            length=len(nuggets),
-            question=question,
-            answer=predicted or "(no answer)",
-            nugget=nuggets,
-        ),
+        messages=messages,
         temperature=0.0,
         model=model,
         ctx=ctx,

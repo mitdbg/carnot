@@ -126,8 +126,9 @@ class SearchAgentConfig(AgentConfig):
     search_agent_max_output_tokens: int = 4096
     search_agent_request_timeout_s: float = 120.0
 
-    # maximum number of tokens a single grep command can return; over-budget tool calls are dropped
-    # with a note telling the agent to narrow its pattern / pass `limit`.
+    # NO LONGER read by the library's grep tool (grep output is uncapped by default; the agent
+    # caps it per call via `max_output_tokens`). Kept because app-level callers (qatfd systems)
+    # reuse this knob to size `SemanticFilterTool`'s snippet output.
     grep_max_output_tokens: int = 200_000
 
     # maximum output tokens for each semantic_filter judge call (the reply is just TRUE/FALSE, but a
@@ -135,12 +136,6 @@ class SearchAgentConfig(AgentConfig):
     # it hit finish_reason=length with empty content, which then retries+backs-off and destroys
     # throughput). Threaded into `SemanticFilterTool`.
     semantic_filter_max_output_tokens: int = 2048
-
-    # maximum number of pages the agent can process in a single read_document tool call
-    agent_max_pages_per_tool_call: int = 20
-
-    # maximum number of characters the agent can output from a single read_document tool call
-    read_document_max_output_chars: int = 400_000
 
     # maximum number of steps the agent can take in a single conversation
     agent_max_steps: int = 20

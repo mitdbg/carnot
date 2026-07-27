@@ -24,10 +24,9 @@ CORPUS_MODEL.md) — is:
         ...               -- any corpus-specific extras (year, month, url, ...)
     }
 
-These tools port the old `skunk.retrieve.search_tools` closures onto the
-`MultiTurnAgent.Tool` ABC: each is an instance whose `doc` is spliced into the
-system prompt, and whose `__call__` is registered with the sandbox under `name`
-and invoked from model-emitted python.
+Each tool is an instance of the `MultiTurnAgent.Tool` ABC: whose `doc` is spliced
+into the system prompt, and whose `__call__` is registered with the sandbox under
+`name` and invoked from model-emitted python.
 
 Structured returns: every retrieval tool returns a *tagged dict* (never a bare
 string — errors are carried in an "error" field of the tagged payload) so the
@@ -38,28 +37,32 @@ generation view (`_block_is_visible`). The tag constants below discriminate each
 payload shape. The final answer is a JSON block (handled by the agent loop), not
 a tool.
 
-Shared state: one `RetrievalState` object (four sets) is shared BY REFERENCE
-between the owning `SearchAgent` and its tools — its dataclass docstring spells
-out the read/write contract per set. The agent creates it (with the tool
-instances closing over it) in its `__init__`, and the orchestrator builds one
-`SearchAgent` per question / branch, so state never crosses questions. A tool
-constructed WITHOUT a state (one-shot use, e.g. a plain top-k vector search)
-gets its own private fresh one.
+Shared state: one `RetrievalState` object is shared BY REFERENCE between the
+`SearchAgent` and its tools. The `RetrievalState` maintains the set of retrieved,
+seen, and pruned chunk/doc ids. The `SearchAgent` can fetch data into the
+`RetrievalState` without immediately rendering it into its context window. The
+`SearchAgent` may then issue additional queries over only the `RetrievalState`
+to populate its context window. When invoking tools, the agent has the ability
+to specify whether to:
+
+  1. Execute them over the entire corpus or only the subset of data in `RetrievalState`
+  2. Pull the data into the agent's context window or only into the `RetrievalState`
+  3. Prune the data from the `RetrievalState` or only from the agent's context window
 """
 
 from __future__ import annotations
 
-import re
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from chromadb.api.models.Collection import Collection
 
-from skunk.common import page_key_to_pageref, render_page_b64
+from skunk.common import estimate_tokens, page_key_to_pageref, render_page_b64
+from skunk.constants import CHARS_PER_TOKEN_EST
 from skunk.multi_turn_agent import Tool
+from skunk.search_agent.retrieval_state import RetrievalState
 from skunk.storage.document_map import DocumentMap
 from skunk.trace import truncate
 from skunk.usage import match_model_entry
@@ -67,35 +70,6 @@ from skunk.usage import match_model_entry
 if TYPE_CHECKING:
     from skunk.common import ExecutionContext
     from skunk.llm_client import LLMClient
-
-
-@dataclass
-class RetrievalState:
-    """Per-question retrieval state, shared by reference between a `SearchAgent`
-    and its tools (the one mutable contract in the retrieval loop):
-
-    - `pruned_*`: material the agent ruled out. `PruneTool` is the SINGLE writer;
-      the search/grep tools read them on every call (server-side `$nin`), so a
-      prune takes effect immediately, and `SearchAgent._block_is_visible` reads
-      them to redact already-emitted chunks at render time.
-    - `seen_*`: material already fetched — chunks returned by search/grep, docs
-      opened by `read_document` — auto-excluded from subsequent search/grep so
-      each call surfaces NEW material. Unlike pruned chunks, fetched chunks stay
-      VISIBLE (prune is reserved for ruling out irrelevant material). Search/grep
-      both write (on return) and read (unioned with the pruned sets);
-      `read_document` writes `seen_doc_ids`.
-
-    Extra tools (constructed by the caller before the agent's state exists) opt in
-    via a duck-typed `bind_retrieval_state(state)` that `SearchAgent.__init__` calls — e.g.
-    `SemanticFilterTool`, which always reads the pruned sets and, unless called with
-    `exclude=False`, the seen sets too (staying comprehensive over seen-but-not-pruned
-    material only when asked), and writes `seen_chunk_ids`.
-    """
-
-    pruned_chunk_ids: set[str] = field(default_factory=set)
-    pruned_doc_ids: set[str] = field(default_factory=set)
-    seen_chunk_ids: set[str] = field(default_factory=set)
-    seen_doc_ids: set[str] = field(default_factory=set)
 
 # Tags identifying each tool's structured return payload to the SearchAgent.
 PRUNE_RESULT_TAG = "__prune__"
@@ -150,6 +124,23 @@ def _build_metadata_where(
 
 class SearchCorpusTool(Tool):
     name = "search_corpus"
+    doc = """\
+### search_corpus(query: str, top_k: int, metadata_filter: dict | None = None)
+This tool performs a vector search over all chunks in the corpus. The input `query` is embedded and the `top_k` most relevant chunks are returned, each labelled with its `chunk_id` and `doc_id`. You can optionally restrict the search to a subset of the corpus by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata. Chunks already returned to you by earlier searches and documents you have already `read_document`-ed are automatically excluded from the results — as is anything you have `prune(...)`-ed — so each call surfaces new material. (To revisit material you've already fetched, look back in your context or `read_document` it again.)
+
+Supported `metadata_filter` syntax:
+- Equality: `{"field": value}`
+- Set membership: `{"field": {"$in": [v1, v2, ...]}}`
+- Negation / not-in: `{"field": {"$nin": [...]}}`
+- Compound: `{"$and": [clause1, clause2, ...]}` or `{"$or": [...]}`
+
+```python
+# find the 100 chunks most relevant to "topic X" anywhere in the corpus
+search_corpus("topic X", top_k=100)
+
+# find the 50 chunks most relevant to "topic Y" within a filtered subset
+search_corpus("topic Y", top_k=50, metadata_filter={"$and": [{"field_a": "value_a"}, {"field_b": {"$in": [1, 2, 3]}}]})
+```"""
 
     def __init__(
         self,
@@ -170,10 +161,6 @@ class SearchCorpusTool(Tool):
         self._ctx = ctx
         self._state = state if state is not None else RetrievalState()
         self._required_metadata_filter = required_metadata_filter
-
-        # Usage-attribution key for this tool's embed calls. A direct caller (e.g. RAGLLMSystem)
-        # pins it at construction; when owned by a SearchAgent it's overwritten with the agent's
-        # id in that agent's post-construction rebind loop.
         self._usage_key = usage_key
 
     def _embed_query(self, query: str) -> list[float]:
@@ -220,6 +207,7 @@ class SearchCorpusTool(Tool):
         ):
             doc_id = meta.get("doc_id", "?")
             elt_type = meta.get("type", "?")
+            est_num_tokens = estimate_tokens(doc)
             chunks.append({
                 "chunk_id": cid,
                 "doc_id": doc_id,
@@ -227,16 +215,19 @@ class SearchCorpusTool(Tool):
                 "distance": dist,
                 "text": (
                     f"[{rank}] chunk_id={cid} | doc_id={doc_id} | "
-                    f"type={elt_type} | distance={dist:.4f}\n{doc or ''}"
+                    f"type={elt_type} | est_num_tokens={est_num_tokens} | distance={dist:.4f}\n{doc or ''}"
                 ),
             })
 
         self._state.seen_chunk_ids.update(c["chunk_id"] for c in chunks)
         return {SEARCH_RESULT_TAG: True, "chunks": chunks}
 
+
+class GrepCorpusTool(Tool):
+    name = "grep_corpus"
     doc = """\
-### search_corpus(query: str, top_k: int, metadata_filter: dict | None = None)
-This tool performs a vector search over all chunks in the corpus. The input `query` is embedded and the `top_k` most relevant chunks are returned, each labelled with its `chunk_id` and `doc_id`. You can optionally restrict the search to a subset of the corpus by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata. Chunks already returned to you (by `search_corpus` / `grep_corpus`) and documents you have already `read_document`-ed are automatically excluded from the results — as is anything you have `prune(...)`-ed — so each call surfaces new material. (To revisit material you've already fetched, look back in your context or `read_document` it again.)
+### grep_corpus(pattern: str, metadata_filter: dict | None = None, limit: int | None = None, max_output_tokens: int | None = None)
+This tool performs a regex search over the cleaned text of every chunk in the corpus and returns the matching chunks grouped by their `doc_id`. Each hit includes its `chunk_id` so you can later refer to it or prune it. By default (`limit=None`), every matching chunk is returned -- which is useful for "find every doc that mentions X" queries -- but you should pass `limit=N` for narrower exploratory searches. You can optionally restrict the search to a subset of the corpus by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata. Chunks already returned to you and documents you have already `read_document`-ed are automatically excluded from the results (as is anything you have `prune(...)`-ed), so each call surfaces new material. The output is unlimited by default; pass `max_output_tokens` to cap it. If the matches exceed the cap, the result is truncated with a note telling you how many hits were omitted -- narrow the pattern, add a `metadata_filter`, pass `limit=N`, or adjust `max_output_tokens` to see the rest. A small `max_output_tokens` is a cheap way to peek at what a broad pattern surfaces before committing to the full output.
 
 Supported `metadata_filter` syntax:
 - Equality: `{"field": value}`
@@ -245,28 +236,19 @@ Supported `metadata_filter` syntax:
 - Compound: `{"$and": [clause1, clause2, ...]}` or `{"$or": [...]}`
 
 ```python
-# find the 100 chunks most relevant to "topic X" anywhere in the corpus
-search_corpus("topic X", top_k=100)
+# find every chunk that mentions "topic X" (case insensitive)
+grep_corpus("(?i)topic X")
 
-# find the 50 chunks most relevant to "topic Y" within a filtered subset
-search_corpus("topic Y", top_k=50, metadata_filter={"$and": [{"field_a": "value_a"}, {"field_b": {"$in": [1, 2, 3]}}]})
+# find chunks matching the literal phrase "topic Y" within a filtered subset, capped at 50 hits
+grep_corpus("topic Y", metadata_filter={"field_a": {"$in": ["value_1", "value_2"]}}, limit=50)
+
+# broad sweep, but keep the observation small: cap the output at ~5k tokens
+grep_corpus("(?i)topic Z", max_output_tokens=5000)
 ```"""
-
-
-class GrepCorpusTool(Tool):
-    name = "grep_corpus"
-
-    # Token→char factor for the output cap (mirrors `_estimate_prompt_tokens`'s ~4 chars/token).
-    _CHARS_PER_TOKEN = 4
-    # Display unit only: the truncation note renders the token cap as "Nk tokens" for
-    # readability (200000 → "200k"). Not a model/context-limit knob — the cap itself is
-    # `SearchAgentConfig.grep_max_output_tokens`; this is just thousands-formatting.
-    _TOKENS_PER_K = 1000
 
     def __init__(
         self,
         chroma_collection: Collection,
-        max_output_tokens: int,
         state: RetrievalState | None = None,
         required_metadata_filter: dict | None = None,
     ):
@@ -274,10 +256,6 @@ class GrepCorpusTool(Tool):
         # for one-shot use (private fresh one).
         self._chroma_collection = chroma_collection
         self._state = state if state is not None else RetrievalState()
-        # Hard cap on the rendered observation size (chars). `limit=None` returns every
-        # matching chunk, so a broad pattern can otherwise dump 100s of K of tokens into
-        # the context in one shot and 400 the next request (see SearchAgentConfig.grep_max_output_tokens).
-        self._max_output_chars = max_output_tokens * self._CHARS_PER_TOKEN
         self._required_metadata_filter = required_metadata_filter
 
     def __call__(
@@ -285,6 +263,7 @@ class GrepCorpusTool(Tool):
         pattern: str,
         metadata_filter: dict | None = None,
         limit: int | None = None,
+        max_output_tokens: int | None = None,
     ) -> dict:
         where = _build_metadata_where(
             metadata_filter=metadata_filter,
@@ -317,12 +296,12 @@ class GrepCorpusTool(Tool):
         for cid, doc, meta in zip(ids, documents, metadatas, strict=True):
             grouped[meta["doc_id"]].append((meta["element_id"], cid, doc))  # type: ignore
 
-        # Build groups in deterministic (doc_id, element_id) order, stopping once the
-        # rendered size would exceed `_max_output_chars`. Dropped hits are reported via a
-        # `truncation_note` so the agent knows to narrow its pattern / pass `limit` rather
-        # than assuming it saw everything.
+        # Build groups in deterministic (doc_id, element_id) order. When the agent passed
+        # `max_output_tokens`, stop once the rendered size (counted via `estimate_tokens`)
+        # would exceed it; dropped hits are reported via a `truncation_note` so the agent
+        # knows to narrow its pattern / adjust the cap rather than assuming it saw everything.
         groups: list[dict] = []
-        used_chars = 0
+        used_tokens = 0
         total_chunks = sum(len(v) for v in grouped.values())
         kept_chunks = 0
         truncated = False
@@ -332,14 +311,16 @@ class GrepCorpusTool(Tool):
             header = f"\n# doc_id={doc_id}"
             doc_chunks: list[dict] = []
             for _, cid, text in sorted(grouped[doc_id]):
-                chunk_text = f"  [chunk_id={cid}] {text}"
-                # Count the header only once we commit the first chunk of this doc.
-                cost = len(chunk_text) + (len(header) if not doc_chunks else 0)
-                if doc_chunks or groups:  # always allow the very first chunk through
-                    if used_chars + cost > self._max_output_chars:
-                        truncated = True
-                        break
-                used_chars += cost
+                est_num_tokens = estimate_tokens(text)
+                chunk_text = f"  [chunk_id={cid} | est_num_tokens={est_num_tokens}] {text}"
+                if max_output_tokens is not None:
+                    # Count the header only once we commit the first chunk of this doc.
+                    cost = estimate_tokens(chunk_text) + (estimate_tokens(header) if not doc_chunks else 0)
+                    if doc_chunks or groups:  # always allow the very first chunk through
+                        if used_tokens + cost > max_output_tokens:
+                            truncated = True
+                            break
+                    used_tokens += cost
                 doc_chunks.append({"chunk_id": cid, "doc_id": doc_id, "text": chunk_text})
                 kept_chunks += 1
             if doc_chunks:
@@ -350,91 +331,83 @@ class GrepCorpusTool(Tool):
         result: dict = {GREP_RESULT_TAG: True, "groups": groups}
         if truncated:
             dropped = total_chunks - kept_chunks
-            cap_k = self._max_output_chars // self._CHARS_PER_TOKEN // self._TOKENS_PER_K
             result["truncation_note"] = (
                 f"[grep_corpus output truncated: showing {kept_chunks} of {total_chunks} matching "
-                f"chunk(s) (~{cap_k}k-token cap reached); {dropped} chunk(s) omitted. Narrow the "
-                f"pattern, add a metadata_filter, or pass limit=N to see specific hits.]"
+                f"chunk(s) (~{max_output_tokens:,}-token cap reached); {dropped} chunk(s) omitted. Narrow the "
+                f"pattern, add a metadata_filter, pass limit=N, or raise max_output_tokens to see the rest.]"
             )
         return result
 
-    doc = """\
-### grep_corpus(pattern: str, metadata_filter: dict | None = None, limit: int | None = None)
-This tool performs a regex search over the cleaned text of every chunk in the corpus and returns the matching chunks grouped by their `doc_id`. Each hit includes its `chunk_id` so you can later refer to it or prune it. By default (`limit=None`), every matching chunk is returned -- which is useful for "find every doc that mentions X" queries -- but you should pass `limit=N` for narrower exploratory searches. The same `metadata_filter` syntax as `search_corpus` is supported. Chunks already returned to you and documents you have already `read_document`-ed are automatically excluded from the results (as is anything you have `prune(...)`-ed), so each call surfaces new material. The total output is capped: if a broad pattern matches more than the cap, the result is truncated with a note telling you how many hits were omitted -- narrow the pattern, add a `metadata_filter`, or pass `limit=N` to see the rest.
-
-```python
-# find every chunk that mentions "topic X" (case insensitive)
-grep_corpus("(?i)topic X")
-
-# find chunks matching the literal phrase "topic Y" within a filtered subset, capped at 50 hits
-grep_corpus("topic Y", metadata_filter={"field_a": {"$in": ["value_1", "value_2"]}}, limit=50)
-```"""
-
 
 class ReadDocumentTool(Tool):
-    """Fetch the full text of one or more retrieval units by `doc_id` from `document_map`.
+    """Fetch the full (or partial) text of one or more retrieval units by `doc_id` from `document_map`.
 
     A "document" is the corpus's retrieval unit (see the module docstring), so what this
     returns is a PDF page for OfficeQA/FinanceBench, an abstract for TREC-BioGen, an
     assembled Wikipedia article for QAMPARI, or a source file for FreshStack."""
 
     name = "read_document"
-    _DOC_TEMPLATE = """\
-### read_document(doc_id: str | list[str])
-This tool returns the full cleaned text of one or more documents, given their `doc_id`(s). Don't read more than ~{{ max_pages }} documents per tool call, as they may exceed your context window.
+    doc = """\
+### read_document(doc_id: str | list[str], start_char_idx: int | None | list[int | None] = None, end_char_idx: int | None | list[int | None] = None)
+This tool returns the cleaned text of one or more documents, given their `doc_id`(s). You can optionally specify `start_char_idx` and `end_char_idx` to fetch only a substring of each document. If you pass a list for `doc_id`, `start_char_idx` and `end_char_idx` must be lists of the same length or `None`, and each index pair will be applied to the corresponding document. If `end_char_idx` exceeds the document length, the document will be truncated to its actual length. If `start_char_idx` is negative, it counts from the end of the document. If `end_char_idx` is negative, it counts from the end of the document.
 
 ```python
 # read two specific documents by id
 read_document(["doc_id_1", "doc_id_2"])
+
+# read the first 1000 characters of a document
+read_document("doc_id_3", start_char_idx=0, end_char_idx=1000)
+
+# read the last 1000 characters of a document and the full text of another document
+read_document(["doc_id_4", "doc_id_5"], start_char_idx=[-1000, None])
 ```"""
 
-    def __init__(self, document_map: DocumentMap, max_pages: int, max_output_chars: int,
-                 state: RetrievalState | None = None):
+    def __init__(self, document_map: DocumentMap, state: RetrievalState | None = None):
         self._document_map = document_map
         self._state = state if state is not None else RetrievalState()
-        self._max_output_chars = max_output_chars
-        # Pre-substitute the jinja var: tool `doc`s may flow through a
-        # StrictUndefined render, so no `{{ ... }}` may survive here.
-        self.doc = self._DOC_TEMPLATE.replace("{{ max_pages }}", str(max_pages))
 
-    def __call__(self, doc_id: str | list[str]) -> dict:
-        doc_ids = [doc_id] if isinstance(doc_id, str) else list(doc_id)
+    def __call__(self, doc_id: str | list[str], start_char_idx: int | None | list[int | None] = None, end_char_idx: int | None | list[int | None] = None) -> dict:
+        if isinstance(doc_id, list):
+            err_msg = "When doc_id is a list, start_char_idx and end_char_idx must be None or also be lists of the same length."
+            assert start_char_idx is None or (isinstance(start_char_idx, list) and len(doc_id) == len(start_char_idx)), err_msg
+            assert end_char_idx is None or (isinstance(end_char_idx, list) and len(doc_id) == len(end_char_idx)), err_msg
+        doc_ids = list(doc_id) if isinstance(doc_id, list) else [doc_id]
+        start_indices = list(start_char_idx) if isinstance(start_char_idx, list) else [start_char_idx]
+        end_indices = list(end_char_idx) if isinstance(end_char_idx, list) else [end_char_idx]
+
         docs: list[dict] = []
-        used = 0  # cumulative chars emitted across docs this call
-        for n, did in enumerate(doc_ids):
+        for did, start_idx, end_idx in zip(doc_ids, start_indices, end_indices, strict=True):
             text = self._document_map.get(did)
+            total_chars = 0 if text is None else len(text)
             if text is None:
                 body = "[no such document (or no content in document)]"
             else:
                 body = text
+                if start_idx is not None or end_idx is not None:
+                    start_idx = start_idx or 0
+                    end_idx = end_idx if end_idx is not None else len(text)
+                    body = text[start_idx:end_idx]
                 self._state.seen_doc_ids.add(did)
-            rendered = f"=== doc_id={did} ===\n{body}"
-            remaining = self._max_output_chars - used
-            if len(rendered) > remaining:
-                # Truncate this doc to what's left, then stop — dropping any further docs with
-                # a note so the agent reads fewer doc_ids (or narrows with search/grep) instead.
-                dropped = len(doc_ids) - n - 1
-                note = (
-                    f"\n[truncated: read_document output exceeded "
-                    f"{self._max_output_chars} chars"
-                    + (f"; {dropped} more requested doc(s) not shown" if dropped else "")
-                    + " — read fewer doc_ids per call, or narrow with search_corpus / "
-                    "grep_corpus]"
-                )
-                docs.append({"doc_id": did, "text": rendered[: max(0, remaining)] + note})
-                break
+            rendered = f"=== doc_id={did} | total chars: {total_chars} ===\n{body}"
             docs.append({"doc_id": did, "text": rendered})
-            used += len(rendered)
         return {READ_DOCUMENT_RESULT_TAG: True, "docs": docs}
 
 
 class ViewFigureTool(Tool):
-    """Render the full page containing a `<figure id=N>` placeholder the agent saw while
-    reading a document, and hand it back as an image observation. We render the *whole*
-    page (not a bbox crop) so the agent sees the figure in context plus any sibling
-    figures on the page, and so OCR coordinate errors can't clip the chart."""
+    """Render the full page for a doc_id the agent saw while reading — typically because
+    the page text contains a `<figure id=N>` placeholder — and hand it back as an image
+    observation. We render the *whole* page (not a bbox crop) so the agent sees any
+    figures in context, and so OCR coordinate errors can't clip a chart."""
 
     name = "view_figure"
+    doc = """\
+### view_figure(doc_id: str)
+When you read a document and see a `<figure id=N>` placeholder (a chart/figure that is NOT in the searchable text), call this tool to actually *see* it. It returns an image of the **entire page** — so you see every figure on the page in context — appended to your messages, just like reading the page's text. Use it to judge whether a page whose answer may live in a chart is relevant. Pass the `doc_id` of the page you read.
+
+```python
+# you read doc_id "2002_12_8" and saw "<figure id=5>"; now view the page
+view_figure("2002_12_8")
+```"""
 
     def __init__(
         self,
@@ -451,24 +424,9 @@ class ViewFigureTool(Tool):
         self._dpi = dpi
         self._fmt = fmt
 
-    @staticmethod
-    def _figure_ids(page_text: str) -> list[str]:
-        """The figure ids that appear as `<figure id=N>` placeholders in `page_text`."""
-        return re.findall(r"<figure id=([^>]+)>", page_text)
-
-    def __call__(self, doc_id: str, figure_id: int | str) -> dict:
-        page_text = self._document_map.get(doc_id)
-        if page_text is None:
+    def __call__(self, doc_id: str) -> dict:
+        if self._document_map.get(doc_id) is None:
             return {VIEW_FIGURE_RESULT_TAG: True, "error": f"no such document: {doc_id!r}"}
-        if f"<figure id={figure_id}>" not in page_text:
-            visible = self._figure_ids(page_text)
-            hint = (
-                f"figure ids on this page: {visible}" if visible else "this page has no figures"
-            )
-            return {
-                VIEW_FIGURE_RESULT_TAG: True,
-                "error": f"no figure with id={figure_id} on doc_id={doc_id}; {hint}",
-            }
         # doc_id is a corpus page key; resolve to a PageRef for rendering.
         try:
             ref = page_key_to_pageref(doc_id)
@@ -492,23 +450,21 @@ class ViewFigureTool(Tool):
         return {
             VIEW_FIGURE_RESULT_TAG: True,
             "doc_id": doc_id,
-            "figure_id": figure_id,
             "mime": img.mime,
             "data": img.data,
         }
 
-    doc = """\
-### view_figure(doc_id: str, figure_id: int | str)
-When you read a document and see a `<figure id=N>` placeholder (a chart/figure that is NOT in the searchable text), call this tool to actually *see* it. It returns an image of the **entire page** that contains the figure — so you see the figure in context, along with any other figures on that page — appended to your messages, just like reading the page's text. Use it to judge whether a page whose answer may live in a chart is relevant. Pass the `doc_id` of the page you read and the `id` from the `<figure id=N>` placeholder.
-
-```python
-# you read doc_id "2002_12_8" and saw "<figure id=5>"; now view it
-view_figure("2002_12_8", 5)
-```"""
-
 
 class PruneTool(Tool):
     name = "prune"
+    doc = """\
+### prune(chunk_ids: list[str] | None = None, doc_ids: list[str] | None = None)
+This tool records `chunk_id`s and/or `doc_id`s that you've already inspected and deemed irrelevant. Pruned ids are excluded from the results of all subsequent corpus search/filter calls, and are dropped from your visible context. Use this aggressively whenever a search surfaces clearly irrelevant chunks or docs, to keep later searches focused and your context window manageable.
+
+```python
+# mark some chunks and a whole doc as irrelevant
+prune(chunk_ids=["chunk_id_1", "chunk_id_2"], doc_ids=["doc_id_3"])
+```"""
 
     def __init__(self, state: RetrievalState):
         self._state = state
@@ -531,16 +487,6 @@ class PruneTool(Tool):
             "total_chunks": len(self._state.pruned_chunk_ids),
             "total_docs": len(self._state.pruned_doc_ids),
         }
-
-    doc = """\
-### prune(chunk_ids: list[str] | None = None, doc_ids: list[str] | None = None)
-This tool records `chunk_id`s and/or `doc_id`s that you've already inspected and deemed irrelevant. Pruned ids are excluded from the results of all subsequent `search_corpus` and `grep_corpus` calls, and are dropped from your visible context. Use this aggressively whenever a search surfaces clearly irrelevant chunks or docs, to keep later searches focused and your context window manageable.
-
-```python
-# mark some chunks and a whole doc as irrelevant
-prune(chunk_ids=["chunk_id_1", "chunk_id_2"], doc_ids=["doc_id_3"])
-```"""
-
 
 # ---------------------------------------------------------------------------
 # Semantic filter: an LLM TRUE/FALSE judge applied per document. The judging
@@ -567,11 +513,11 @@ _SEMFILTER_SYSTEM = (
 # single word, but a reasoning judge model needs enough budget to think before emitting the verdict —
 # too small a cap makes it hit finish_reason=length with empty content, which retries + backs off and
 # tanks throughput. When the judge model has a known context window (see `context_limits`) the
-# document text is head-truncated so the whole request fits. Sizing uses the house ~4 chars/token
-# estimate (there is no tokenizer) with `_JUDGE_CTX_SAFETY` headroom to absorb that estimate's error.
+# document text is head-truncated so the whole request fits. Overhead is counted via
+# `common.estimate_tokens`; the token budget converts back to a char cap with the house
+# ~4 chars/token estimate, with `_JUDGE_CTX_SAFETY` headroom to absorb that estimate's error.
 _JUDGE_OUTPUT_TOKENS = 2048
 _JUDGE_CTX_SAFETY = 0.9
-_JUDGE_CHARS_PER_TOKEN = 4
 # Fixed scaffolding around the document in the judge `user` message (see `_judge_one`); its length is
 # charged against the budget so the document gets what's left.
 _JUDGE_USER_WRAPPER = "Filter Condition: \n\nDocument:\n"
@@ -579,14 +525,16 @@ _JUDGE_TRUNC_MARKER = "\n…(truncated to fit judge context)"
 
 
 def _judge_doc_char_budget(context_limit: int, predicate: str, max_output_tokens: int = _JUDGE_OUTPUT_TOKENS) -> int:
-    """Max chars of document text that fit in one judge request under `context_limit` (tokens),
-    using the ~4 chars/token estimate with a safety factor and headroom reserved for the judge's
-    output (`max_output_tokens`). Returns 0 when the fixed overhead alone already exceeds the limit."""
-    overhead_tokens = max_output_tokens + (
-        len(_SEMFILTER_SYSTEM) + len(_JUDGE_USER_WRAPPER) + len(predicate)
-    ) / _JUDGE_CHARS_PER_TOKEN
+    """Max chars of document text that fit in one judge request under `context_limit` (tokens):
+    the fixed overhead (prompt scaffolding, counted via `estimate_tokens`) and the judge's output
+    headroom (`max_output_tokens`) are subtracted, then the remaining token budget converts to
+    chars at ~4 chars/token with a safety factor. Returns 0 when the fixed overhead alone already
+    exceeds the limit."""
+    overhead_tokens = max_output_tokens + estimate_tokens(
+        _SEMFILTER_SYSTEM + _JUDGE_USER_WRAPPER + predicate
+    )
     budget_tokens = context_limit * _JUDGE_CTX_SAFETY - overhead_tokens
-    return max(0, int(budget_tokens * _JUDGE_CHARS_PER_TOKEN))
+    return max(0, int(budget_tokens * CHARS_PER_TOKEN_EST))
 
 
 def _truncate_doc_for_judge(text: str, budget_chars: int) -> tuple[str, bool]:
@@ -615,8 +563,9 @@ def _judge_one(
 ) -> bool:
     user = f"Filter Condition: {predicate}\n\nDocument:\n{item_text}"
     try:
+        messages = [{"role": "user", "content": user}]
         resp = llm_client.call(
-            system=_SEMFILTER_SYSTEM, user=user, temperature=0.0, model=model, ctx=ctx, call_site="semfilter",
+            system=_SEMFILTER_SYSTEM, messages=messages, temperature=0.0, model=model, ctx=ctx, call_site="semfilter",
             provider_order=provider_order, max_output_tokens=max_output_tokens, usage_key=usage_key,
         )
     except Exception:
@@ -692,9 +641,29 @@ def filter_docs(
 
 class SemanticFilterTool(Tool):
     name = "semantic_filter"
+    doc = """\
+### semantic_filter(predicate: str, metadata_filter: dict | None = None, top_k: int | None = None, search_str: str | None = None, exclude: bool = True)
+Keep only the documents whose FULL text satisfies a natural-language `predicate`: candidates are selected from the corpus, each is judged independently by an LLM (TRUE/FALSE), and the survivors are returned. Select candidates with a `metadata_filter` (a ChromaDB-style where clause over chunk metadata) and/or `top_k`. With `top_k`, a vector search first selects the `top_k` most relevant chunks — embedding `search_str` if given, else the predicate; prefer a short focused `search_str` when the predicate is long or compound. With only a `metadata_filter`, every matching chunk is a candidate. Candidate chunks are deduped to their parent documents before judging. Returns the kept `doc_id`s PLUS the candidate chunks of the kept documents as text snippets. Anything you have `prune(...)`-ed is excluded from the candidates; a very large snippet output is truncated with a note. By default (`exclude=True`) documents already retrieved for judging by earlier tool calls are also excluded, so each call surfaces only new candidates; pass `exclude=False` to re-judge previously-seen documents under a new predicate.
+`search_str` requires `top_k`. At most 1,000 candidate documents per call — narrow the filter or use `top_k` if you exceed it. The returned dict carries `kept_doc_ids` for programmatic use.
 
-    # Token→char factor for the corpus-mode output cap (mirrors GrepCorpusTool).
-    _CHARS_PER_TOKEN = 4
+Supported `metadata_filter` syntax:
+- Equality: `{"field": value}`
+- Set membership: `{"field": {"$in": [v1, v2, ...]}}`
+- Negation / not-in: `{"field": {"$nin": [...]}}`
+- Compound: `{"$and": [clause1, clause2, ...]}` or `{"$or": [...]}`
+
+```python
+# metadata only: judge every document from 1946
+semantic_filter(predicate="mentions coal shortages affecting steel production", metadata_filter={"year": "1946"})
+
+# vector prefilter: judge the documents behind the 200 chunks nearest a short query
+semantic_filter(
+    predicate="describes a government intervention in response to a labor strike, naming the statute invoked",
+    top_k=200,
+    search_str="government intervention strike",
+)
+```"""
+
     _TOKENS_PER_K = 1000
     # Page size for the metadata-only candidate scan (ids/metadatas only, no texts) and
     # for the post-judge text fetches — bounds per-request payloads against Chroma.
@@ -734,7 +703,7 @@ class SemanticFilterTool(Tool):
         self._chroma_collection = chroma_collection
         self._emb_model_id = emb_model_id
         self._max_candidate_docs = max_candidate_docs
-        self._max_output_chars = max_output_tokens * self._CHARS_PER_TOKEN
+        self._max_output_chars = max_output_tokens * CHARS_PER_TOKEN_EST
         self._ctx = ctx
         # Private fresh state for one-shot use; the owning SearchAgent replaces it via
         # `bind_retrieval_state` so corpus mode honors prunes and records seen chunks.
@@ -772,8 +741,6 @@ class SemanticFilterTool(Tool):
             )
 
         return self._corpus_mode(predicate, metadata_filter, top_k, search_str, exclude)
-
-    # ---- corpus mode -------------------------------------------------------------
 
     def _corpus_mode(
         self, predicate: str, metadata_filter: dict | None, top_k: int | None, search_str: str | None,
@@ -951,27 +918,10 @@ class SemanticFilterTool(Tool):
         note = None
         if truncated:
             dropped = len(kept_chunks) - len(rendered)
-            cap_k = self._max_output_chars // self._CHARS_PER_TOKEN // self._TOKENS_PER_K
+            cap_k = self._max_output_chars // CHARS_PER_TOKEN_EST // self._TOKENS_PER_K
             note = (
                 f"[semantic_filter output truncated: showing {len(rendered)} of {len(kept_chunks)} chunk(s) from "
                 f"kept documents (~{cap_k}k-token cap reached); {dropped} chunk(s) omitted. All kept_doc_ids are "
-                f"listed in the summary; use read_document or grep_corpus to see the omitted material.]"
+                f"listed in the summary; use read_document to see the omitted material.]"
             )
         return rendered, note
-
-    doc = """\
-### semantic_filter(predicate: str, metadata_filter: dict | None = None, top_k: int | None = None, search_str: str | None = None, exclude: bool = True)
-Keep only the documents whose FULL text satisfies a natural-language `predicate`: candidates are selected from the corpus, each is judged independently by an LLM (TRUE/FALSE), and the survivors are returned. Select candidates with a `metadata_filter` (same ChromaDB where-clause syntax as `grep_corpus`) and/or `top_k`. With `top_k`, a vector search first selects the `top_k` most relevant chunks — embedding `search_str` if given, else the predicate; prefer a short focused `search_str` when the predicate is long or compound. With only a `metadata_filter`, every matching chunk is a candidate. Candidate chunks are deduped to their parent documents before judging. Returns the kept `doc_id`s PLUS the candidate chunks of the kept documents as text snippets. Anything you have `prune(...)`-ed is excluded from the candidates; a very large snippet output is truncated with a note. By default (`exclude=True`) documents already retrieved for judging by earlier tool calls are also excluded, so each call surfaces only new candidates; pass `exclude=False` to re-judge previously-seen documents under a new predicate.
-`search_str` requires `top_k`. At most 1,000 candidate documents per call — narrow the filter or use `top_k` if you exceed it. The returned dict carries `kept_doc_ids` for programmatic use.
-
-```python
-# metadata only: judge every document from 1946
-semantic_filter(predicate="mentions coal shortages affecting steel production", metadata_filter={"year": "1946"})
-
-# vector prefilter: judge the documents behind the 200 chunks nearest a short query
-semantic_filter(
-    predicate="describes a government intervention in response to a labor strike, naming the statute invoked",
-    top_k=200,
-    search_str="government intervention strike",
-)
-```"""

@@ -8,13 +8,13 @@ No LLM / Chroma. Runs under pytest if installed, or standalone:
 from __future__ import annotations
 
 from skunk.config import SearchAgentConfig
+from skunk.constants import CHARS_PER_TOKEN_EST
 from skunk.multi_turn_agent import ChunkBlock, TextBlock, Tool
 from skunk.sandbox.local_python_executor import CodeOutput
 from skunk.search_agent.search_agent import SearchAgent
 from skunk.search_agent.search_tools import (
     EMPTY_RESULT_MESSAGE,
     SEMFILTER_RESULT_TAG,
-    _JUDGE_CHARS_PER_TOKEN,
     _JUDGE_OUTPUT_TOKENS,
     _JUDGE_TRUNC_MARKER,
     RetrievalState,
@@ -40,9 +40,9 @@ class FakeLLMClient:
         self.judge_max_output_tokens: list[int | None] = []
         self.embed_calls: list[tuple[str, str | None]] = []
 
-    def call(self, *, system, user, temperature, model, ctx, call_site, provider_order=None,
+    def call(self, *, system, messages, temperature, model, ctx, call_site, provider_order=None,
              max_output_tokens=None, usage_key="default"):
-        doc_text = user.split("\n\nDocument:\n", 1)[1]
+        doc_text = messages[0]["content"].split("\n\nDocument:\n", 1)[1]
         self.judged_texts.append(doc_text)
         self.judge_max_output_tokens.append(max_output_tokens)
         return _Resp("TRUE" if self.verdict_fn(doc_text) else "FALSE")
@@ -359,7 +359,7 @@ def test_context_limit_truncates_only_oversized_docs():
     assert client.judged_texts[0].endswith(_JUDGE_TRUNC_MARKER)
     assert client.judged_texts[1] == small
     # The truncation is estimated to fit under the limit (with the safety margin).
-    assert budget / _JUDGE_CHARS_PER_TOKEN < limit
+    assert budget / CHARS_PER_TOKEN_EST < limit
     # The trace event reports exactly one truncation.
     assert ctx.events[-1][1]["n_truncated"] == 1
 

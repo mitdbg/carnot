@@ -169,31 +169,28 @@ class PromptedCall[T]:
         model: str | None = None,
         temperature: float = 0.0,
         effort: Effort | None = None,
-        should_stop: Callable[[str], bool] | None = None,
         max_output_tokens: int | None = None,
         timeout_s: float | None = None,
         on_response: Callable[[LLMResponse], None] | None = None,
         usage_key: str = "default",
-    ) -> T:
+    ) -> tuple[T, int]:
         """One agent-loop turn over an existing `messages` transcript: assemble the
-        system prompt, stream via `astream` (with optional `should_stop`), parse.
-        On a `ParseError`, the failed reply + fix-it prompt are appended to a COPY of
-        `messages` and the turn re-streams (up to `max_parse_retries`) — the caller's
-        list never sees the retry exchange. `model` overrides the per-site resolution
-        (the agent layer passes its own agent model; effort/model overrides otherwise
-        resolve exactly as `call`)."""
+        system prompt, send to the llm_client, and parse the response. On a `ParseError`,
+        the failed reply + fix-it prompt are appended to a COPY of `messages` and the
+        turn re-streams (up to `max_parse_retries`) — the caller's list never sees the
+        retry exchange. `model` overrides the per-site resolution (the agent layer passes
+        its own agent model; effort/model overrides otherwise resolve exactly as `call`)."""
         eff = self._resolve_effort(ctx, effort)
         system = self.assemble_system_prompt(ctx)
         resolved_model = model or self._resolve_model(ctx)
         messages = list(messages)  # work on a copy so callers don't see retry exchanges
         attempt = 0
         while True:
-            resp = await ctx.llm_client.astream(
+            resp = await ctx.llm_client.acall(
                 system=system,
                 messages=messages,
                 model=resolved_model,
                 temperature=temperature,
-                should_stop=should_stop,
                 effort=eff,
                 ctx=ctx,
                 call_site=self.name,
@@ -204,7 +201,9 @@ class PromptedCall[T]:
             if on_response is not None:
                 on_response(resp)
             try:
-                return self._parse(resp.text, ctx)
+                # Usage fields are `int | None` (a provider CAN omit usage even on a 200);
+                # coalesce to 0 so a usage-less response degrades the tracker, not the step.
+                return self._parse(resp.text, ctx), (resp.input_tokens or 0) + (resp.output_tokens or 0)
             except ParseError as e:
                 if attempt >= self._max_parse_retries:
                     raise
@@ -265,10 +264,10 @@ class PromptedCall[T]:
             # re-asking — is what actually breaks a degenerate output (e.g.
             # prose-as-JSON, an unescaped backslash).
             attempt_temp = temperature if attempt == 0 else 1.0
+            messages = [{"role": "user", "content": self._compose_user(user, retry), "images": images}]
             resp = await ctx.llm_client.acall(
                 system,
-                self._compose_user(user, retry),
-                images=images,
+                messages,
                 temperature=attempt_temp,
                 effort=eff,
                 ctx=ctx,

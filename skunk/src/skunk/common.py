@@ -25,10 +25,12 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pandas as pd
+import tiktoken
 from pydantic import BaseModel, ConfigDict, model_validator
 
 from skunk import trace
 from skunk.config import OrchestratorConfig
+from skunk.constants import CHARS_PER_TOKEN_EST
 
 if TYPE_CHECKING:
     from skunk.llm_client import LLMClient
@@ -55,7 +57,7 @@ def pdf_path_for(doc: str, pdf_dir: Path | str) -> Path:
 
 
 def render_page_b64(
-    month: str | None,
+    stem: str | None,
     page: int | None,
     *,
     pdf_dir: Path | str,
@@ -65,23 +67,24 @@ def render_page_b64(
     jpg_quality: int | None = None,
 ) -> B64Image | None:
     """The single PDF-page rasterizer for the repo: render one page to in-memory image bytes via
-    PyMuPDF. Returns None when the PDF doesn't exist; PyMuPDF errors propagate. `fitz` is imported
-    lazily so importing `common` doesn't pull in PyMuPDF.
+    PyMuPDF. `stem` is the doc-id stem naming the PDF (`<pdf_dir>/<stem>.pdf`). Returns None when
+    the PDF doesn't exist; PyMuPDF errors propagate. `fitz` is imported lazily so importing
+    `common` doesn't pull in PyMuPDF.
 
     When `renders_dir` is given, a pre-rendered PNG at `<renders_dir>/<stem>_<page>.png` (the page
-    render cache; `stem` is the `month` arg, a doc-id stem) is served directly — skipping the PDF
-    open. `dpi`/`fmt`/`jpg_quality` are ignored for a cache hit (the cached PNG's own resolution
-    applies); on a miss we fall back to rasterizing the PDF."""
-    if month is None or page is None or int(page) <= 0:
+    render cache) is served directly — skipping the PDF open. `dpi`/`fmt`/`jpg_quality` are
+    ignored for a cache hit (the cached PNG's own resolution applies); on a miss we fall back to
+    rasterizing the PDF."""
+    if stem is None or page is None or int(page) <= 0:
         return None
     if renders_dir is not None:
-        cached = Path(renders_dir) / f"{month}_{int(page)}.png"
+        cached = Path(renders_dir) / f"{stem}_{int(page)}.png"
         if cached.exists():
             return B64Image(
                 mime="image/png",
                 data=base64.standard_b64encode(cached.read_bytes()).decode(),
             )
-    pdf_path = pdf_path_for(month, pdf_dir)
+    pdf_path = pdf_path_for(stem, pdf_dir)
     if not pdf_path.exists():
         return None
     import fitz
@@ -285,6 +288,33 @@ def get_async_tpm_limiter(model: str, tpm: float) -> AsyncTokenBudget:
             lim = AsyncTokenBudget(rate_per_sec, capacity=max(rate_per_sec * 4.0, 256_000.0))
             _ASYNC_TPM_LIMITERS[model] = lim
         return lim
+
+
+# ---------------------------------------------------------------------------
+# Token estimation — the one place text is converted to a token count.
+# ---------------------------------------------------------------------------
+
+# Above this many characters (~1M tokens at ~4 chars/token), `estimate_tokens` falls back
+# to the char-count heuristic: exact BPE encoding is fast and fits in modest memory (~8GB)
+# up to roughly this size, but beyond it the encode cost outweighs the estimate's error.
+_EXACT_TOKENIZE_MAX_CHARS = 4_000_000
+
+# Lazily built on first `estimate_tokens` call so importing `common` doesn't pay the
+# BPE-table load. Benign race: concurrent first calls both build; one assignment wins.
+_token_encoder: tiktoken.Encoding | None = None
+
+
+def estimate_tokens(s: str) -> int:
+    """Input-token estimate for `s`: an exact BPE count (o200k_base) for strings up to
+    `_EXACT_TOKENIZE_MAX_CHARS` chars, falling back to the ~4 chars/token heuristic
+    (`CHARS_PER_TOKEN_EST`) beyond that. Still an estimate, not a billing figure — the
+    provider's tokenizer may differ from o200k_base — but far tighter than chars/4."""
+    if len(s) > _EXACT_TOKENIZE_MAX_CHARS:
+        return len(s) // CHARS_PER_TOKEN_EST
+    global _token_encoder
+    if _token_encoder is None:
+        _token_encoder = tiktoken.get_encoding("o200k_base")
+    return len(_token_encoder.encode(s))
 
 
 # Active (step_idx, op) frame for the current operator call. A ContextVar, not

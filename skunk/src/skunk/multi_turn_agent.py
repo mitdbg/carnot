@@ -12,7 +12,8 @@ from typing import Any, Protocol
 
 from jinja2 import Environment, StrictUndefined
 
-from skunk.common import B64Image, Effort, ExecutionContext
+from skunk.common import B64Image, Effort, ExecutionContext, estimate_tokens
+from skunk.constants import IMAGE_TOKENS_EST
 from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.prompts import load_prompts
@@ -21,7 +22,6 @@ from skunk.sandbox.local_python_executor import CodeOutput, LocalPythonExecutor
 _ENV = Environment(
     autoescape=False, keep_trailing_newline=True, undefined=StrictUndefined
 )
-
 _PROMPTS = load_prompts("multi_turn_agent")
 OUT_OF_STEPS_TERMINATE_REASON = "You are out of steps."
 OVER_COST_BUDGET_TERMINATE_REASON = "You are over your cost budget."
@@ -62,7 +62,6 @@ class ImageBlock:
     `_block_to_jsonable`)."""
 
     doc_id: str
-    figure_id: str | int | None
     image: B64Image
     text: str
 
@@ -87,7 +86,6 @@ def _block_to_jsonable(b: Block) -> dict:
         return {
             "type": "image",
             "doc_id": b.doc_id,
-            "figure_id": b.figure_id,
             "mime": b.image.mime,
             "caption": b.text,
             "bytes": len(b.image.data),
@@ -96,14 +94,6 @@ def _block_to_jsonable(b: Block) -> dict:
 
 
 _FENCE_RE = re.compile(r"```([a-zA-Z0-9_]*)\n(.*?)```", re.DOTALL)
-
-
-def _stop_at_first_block(acc: str) -> bool:
-    """Streaming stop: end generation as soon as one complete fenced block has streamed in.
-    The agent acts one tool call (or one final-answer block) per step, so there is never a
-    reason to keep generating past the first block."""
-    return bool(_FENCE_RE.findall(acc))
-
 
 @dataclass
 class _StepOutput:
@@ -168,23 +158,18 @@ def _parse_step(text: str, _: ExecutionContext) -> _StepOutput:
     return _StepOutput(code=codes[0], notice=notice, raw=text)
 
 
-def _trim(messages: list[dict], budget: int) -> list[dict]:
-    """Keep first user + the most recent messages fitting in `budget` chars;
-    drop the middle behind a placeholder so observation history can't bloat unbounded."""
-    if sum(len(m["content"]) for m in messages) <= budget:
-        return messages
-    head = [
-        messages[0],  # first user question — always kept
-        {"role": "user", "content": "...(earlier steps truncated)..."},
-    ]
-    remaining = budget - sum(len(m["content"]) for m in head)
-    tail: list[dict] = []
-    for m in reversed(messages[1:]):
-        if remaining - len(m["content"]) < 0:
-            break
-        tail.append(m)
-        remaining -= len(m["content"])
-    return head + tail[::-1]
+def _count_tokens(blocks: list[Block]) -> int:
+    """Count the tokens in each block via `common.estimate_tokens` (exact BPE count,
+    chars/4 above its size cutoff). An `ImageBlock` counts its caption text plus a flat
+    per-image estimate for the base64 payload (`IMAGE_TOKENS_EST` — the payload's real
+    token cost is provider-specific)."""
+    total_tokens = 0
+    for block in blocks:
+        total_tokens += estimate_tokens(block.text)
+        if isinstance(block, ImageBlock):
+            total_tokens += IMAGE_TOKENS_EST
+
+    return total_tokens
 
 
 class Tool(ABC):
@@ -240,7 +225,7 @@ class MultiTurnAgent(ABC):
     _TERMINAL_PROMPT_TEMPLATE = _PROMPTS["terminal_prompt"]
 
     max_steps: int = 8
-    # Per-step sampling temperature, threaded to `PromptedCall.call` → `astream`.
+    # Per-step sampling temperature, threaded to `PromptedCall.call_multi_turn` → `acall`.
     # 1.0 per Gemini 3.x guidance: thinking-enabled calls below 1.0 can trap the
     # model in a degenerate reasoning loop that burns the whole output budget
     # (https://ai.google.dev/gemini-api/docs/gemini-3). Subclasses may still override.
@@ -253,8 +238,6 @@ class MultiTurnAgent(ABC):
     # Format-error retries per step, delegated to PromptedCall.call(). A step whose
     # all attempts misfire still advances max_steps; execution errors are not retried.
     max_recover_retries: int = 1
-    # Hard character cap on the message list as the final safety net (see `_llm_step`).
-    context_budget_chars: int = 200_000
     # steps remaining at which to emit a low-budget warning
     warn_steps_remaining: int = 3
     # Extra imports authorized inside the per-step code sandbox. Default: none
@@ -270,6 +253,8 @@ class MultiTurnAgent(ABC):
         *,
         max_steps: int | None = None,
         max_misfires: int | None = None,
+        context_hard_safety_frac: float = 0.9,
+        context_soft_safety_frac: float = 0.6,
         cost_budget: float | None = None,
         latency_budget: float | None = None,
         agent_id: str | None = None,
@@ -342,10 +327,46 @@ class MultiTurnAgent(ABC):
             parse=_parse_step,
             max_parse_retries=self.max_recover_retries,
         )
+
+        # store the hard and soft safety caps for the fraction of the llm client's context limit
+        self.context_hard_safety_frac = context_hard_safety_frac
+        self.context_soft_safety_frac = context_soft_safety_frac
+
+        # Number of tokens in the agent's context window. RESET to the provider-reported
+        # total (input + output) after every LLM call in `_llm_step`; incremented with
+        # tiktoken/`IMAGE_TOKENS_EST` estimates as observations are appended between calls.
+        # Transient drift is expected and bounded by one step, since every reset re-anchors
+        # to ground truth: parse retries fold their retry exchange into the reported total
+        # though it is never persisted to `self.messages`, and the estimator's tokenizer
+        # (o200k_base) differs from the actual model's. The Tinker backend path never
+        # updates it (RL rollouts don't read it).
+        self._tokens_in_context = 0
+
         # Persistent sandbox — cross-step interpreter state survives across the loop.
         # `call()` swaps in a fresh one per NEW run (a `resume` keeps it, so resumed
         # turns still see the variables earlier steps defined).
         self._executor = self._build_executor()
+
+    def _llm_model(self, ctx: ExecutionContext) -> str:
+        """The model name the agent's LLMClient uses. Subclasses may override to
+        hard-code a model (e.g. a Gemini 3.x variant) instead of reading the client."""
+        return self._prompt._resolve_model(ctx)
+
+    def _get_context_limit(self, ctx: ExecutionContext) -> int:
+        """Returns the context limit for the agent based on the context limit of its model."""
+        model = self._llm_model(ctx)
+        assert model in ctx.config.inference.llm_context_limits, f"Model {model} not found in context limits"
+        return ctx.config.inference.llm_context_limits[model]
+
+    def _get_soft_token_limit(self, ctx: ExecutionContext) -> int:
+        """Returns the soft token limit for the agent based on the context limit of its model."""
+        context_limit = self._get_context_limit(ctx)
+        return int(context_limit * self.context_soft_safety_frac)
+
+    def _get_hard_token_limit(self, ctx: ExecutionContext) -> int:
+        """Returns the hard token limit for the agent based on the context limit of its model."""
+        context_limit = self._get_context_limit(ctx)
+        return int(context_limit * self.context_hard_safety_frac)
 
     def _build_executor(self) -> LocalPythonExecutor:
         """A fresh sandbox with the agent's tools bound. The loop keeps one persistent
@@ -459,8 +480,12 @@ class MultiTurnAgent(ABC):
             # Keep the executor too — a resumed turn can still read the variables
             # earlier steps defined (rebuilding here used to silently drop them).
             self.messages.append({"role": "user", "blocks": [TextBlock(user)]})
+            self._tokens_in_context += _count_tokens(self.messages[-1]["blocks"])
         else:
             self.messages = [{"role": "user", "blocks": [TextBlock(user)]}]
+            # Fresh run: restart the context tracker from the opening message alone
+            # (the system prompt's share only enters at the first LLM-call reset).
+            self._tokens_in_context = _count_tokens(self.messages[0]["blocks"])
             # Fresh sandbox per new run; the final answer is parsed outside the
             # sandbox, so it is NOT bound here.
             self._executor = self._build_executor()
@@ -515,6 +540,51 @@ class MultiTurnAgent(ABC):
 
         assert len(terminate_reason) > 0 and len(terminate_state) > 0
         return terminate_reason, terminate_state
+
+    def _warn_context_limits(self, ctx: ExecutionContext) -> None:
+        """Warn the model if the context usage exceeds the soft or hard token limits."""
+        soft_token_max_after_step = self._tokens_in_context + (self.max_output_tokens or 0)
+        hard_token_max_after_step = self._tokens_in_context + (self.max_output_tokens or 0)
+        soft_token_limit = self._get_soft_token_limit(ctx)
+        hard_token_limit = self._get_hard_token_limit(ctx)
+        warn_msg = ""
+        if hard_token_max_after_step >= hard_token_limit:
+            usage_msg = "context usage" if self.max_output_tokens is None else "context usage + max output tokens"
+            final_msg = "You may only invoke the prune tool or return your final answer." if "prune" in [t.name for t in self._tools] else "You must return your final answer."
+            warn_msg = f"[warning] {usage_msg} {hard_token_max_after_step:,} tokens exceeds hard limit {hard_token_limit:,} tokens. {final_msg} All other tool calls will be rejected."
+            ctx.emit(f"context_hard_limit_exceeded tokens={hard_token_max_after_step:,} limit={hard_token_limit:,}", data={"text": warn_msg})
+        elif soft_token_max_after_step >= soft_token_limit:
+            usage_msg = "context usage" if self.max_output_tokens is None else "context usage + max output tokens"
+            prune_msg = " Consider using prune tool to reduce the tokens in your context window." if "prune" in [t.name for t in self._tools] else ""
+            warn_msg = f"[warning] {usage_msg} {soft_token_max_after_step:,} tokens exceeds soft limit {soft_token_limit:,} tokens.{prune_msg}"
+            ctx.emit(f"context_soft_limit_exceeded tokens={soft_token_max_after_step:,} limit={soft_token_limit:,}", data={"text": warn_msg})
+        self.messages.append({"role": "user", "blocks": [TextBlock(warn_msg)]})
+
+    # TODO: remove the final message(s) one at a time until the context fits within the hard token limit;
+    # for each message removed, add its doc_id/chunk_id to est. tokens to summarize to the agent what was taken away
+    def _trim(self, ctx: ExecutionContext) -> None:
+        """Trim the messages to fit within the model's context limit."""
+        context_limit = self._get_context_limit(ctx)
+
+        # rendered: list[dict] = []
+        # for msg in self.messages:
+        #     visible = [b for b in msg["blocks"] if self._block_is_visible(b)]
+        #     parts = [b.text for b in visible if b.text]
+        #     if not parts:
+        #         continue
+        #     entry: dict = {"role": msg["role"], "content": "\n\n".join(parts)}
+        #     images = [b.image for b in visible if isinstance(b, ImageBlock)]
+        #     if images:
+        #         entry["images"] = images
+        #     rendered.append(entry)
+
+        visible_messages = [m for m in self.messages if ]
+        while _count_tokens([TextBlock(m["content"]) for m in messages]) > hard_token_limit:
+            # Remove the oldest message that is not the system prompt or the last user message
+            for i, m in enumerate(messages):
+                if m["role"] != "system" and not (m["role"] == "user" and i == len(messages) - 1):
+                    del messages[i]
+                    break
 
     def add_budget_observations(self, ctx: ExecutionContext, obs_blocks: list[Block]) -> None:
         """Add TextBlocks tracking the context, cost, and latency usage of the agent.
@@ -572,6 +642,9 @@ class MultiTurnAgent(ABC):
                 # carries `log pi_old` for downstream RL reward computation.
                 if self._last_logprobs is not None:
                     assistant_msg["logprobs"] = self._last_logprobs
+
+                # NOTE: self._tokens_in_context is updated in _llm_step() after the LLM call,
+                # so it already reflects the total tokens in context after this assistant turn.
                 self.messages.append(assistant_msg)
                 ctx.emit(
                     f"assistant step={turn} chars={len(step_out.raw)}",
@@ -583,19 +656,36 @@ class MultiTurnAgent(ABC):
                     # free for this question's sibling branches (see `_execute_code`).
                     assert step_out.code is not None
                     ctx.emit(f"tool_code {step_out.code!r}")
+                    # Tool execution is the ONLY point where block visibility can change
+                    # (e.g. `prune` mutating the shared retrieval state read by
+                    # `_block_is_visible`), so diff visibility around it and subtract
+                    # newly-redacted blocks from the context tracker. The was-visible →
+                    # now-hidden predicate counts each block at most once, however many
+                    # of its ids (chunk_id AND doc_id) a prune named.
+                    vis_before = [
+                        (b, self._block_is_visible(b)) for m in self.messages for b in m["blocks"]
+                    ]
                     result = await self._execute_code(step_out.code)
+                    newly_hidden = [
+                        b for b, was_visible in vis_before
+                        if was_visible and not self._block_is_visible(b)
+                    ]
+                    if newly_hidden:
+                        self._tokens_in_context -= _count_tokens(newly_hidden)
                 done = step_out
             except ParseError as e:
                 obs = f"Observation (step {turn}): {e.detail}"
                 obs_blocks = [TextBlock(obs)]
                 self.add_budget_observations(ctx, obs_blocks)
                 self.messages.append({"role": "user", "blocks": obs_blocks})
+                self._tokens_in_context += _count_tokens(obs_blocks)
                 ctx.emit(f"error {obs!r}")
             except Exception as e:  # LLM step / batch machinery failed
                 obs = f"Observation (step {turn}): exec failed — {type(e).__name__}: {e}"
                 obs_blocks = [TextBlock(obs)]
                 self.add_budget_observations(ctx, obs_blocks)
                 self.messages.append({"role": "user", "blocks": obs_blocks})
+                self._tokens_in_context += _count_tokens(obs_blocks)
                 ctx.emit(f"error {obs!r}")
 
             if done is None:
@@ -615,6 +705,7 @@ class MultiTurnAgent(ABC):
                 obs_blocks = [TextBlock(obs)]
                 self.add_budget_observations(ctx, obs_blocks)
                 self.messages.append({"role": "user", "blocks": obs_blocks})
+                self._tokens_in_context += _count_tokens(obs_blocks)
                 observations.append(obs)
                 ctx.emit(f"validation_failed {feedback!r}")
                 continue
@@ -634,8 +725,8 @@ class MultiTurnAgent(ABC):
 
             # add messages to inform the agent of its budget usage
             self.add_budget_observations(ctx, obs_blocks)
-            
             self.messages.append({"role": "user", "blocks": obs_blocks})
+            self._tokens_in_context += _count_tokens(obs_blocks)
             visible_blocks = [
                 b for b in obs_blocks if b.text and self._block_is_visible(b)
             ]
@@ -673,13 +764,12 @@ class MultiTurnAgent(ABC):
             terminate_reason=terminate_reason
         )
 
-        # Record the terminal prompt the agent was shown, so the viewer can tell the
-        # full story of the forced terminal turn (prompt → reply → outcome).
+        # add the terminal prompt to the agent's messages so it can see it in the next turn
+        self.messages.append({"role": "user", "blocks": [TextBlock(terminal_prompt)]})
+        self._tokens_in_context += estimate_tokens(terminal_prompt)
         ctx.emit(f"terminal_prompt {self.terminate_state}", data={"text": terminal_prompt})
         try:
-            step_out = await self._llm_step(
-                ctx, extra=[{"role": "user", "content": terminal_prompt}]
-            )
+            step_out = await self._llm_step(ctx)
             ctx.emit(
                 f"terminal_reply chars={len(step_out.raw)}", data={"text": step_out.raw}
             )
@@ -715,33 +805,40 @@ class MultiTurnAgent(ABC):
             self.name, "max steps without accepted final answer", diagnostic=diagnostic
         )
 
-    async def _llm_step(
-        self, ctx: ExecutionContext, extra: list[dict] | None = None
-    ) -> _StepOutput:
-        """Render the visible trajectory (`_render_for_llm`), trim to `context_budget_chars`,
-        and then route through `PromptedCall.call()` — stopping once the step's block completes
-        (`_stop_at_first_block`). `extra` appends transient messages (e.g. the terminal-turn prompt)
-        that are deliberately NOT stored in `self.messages`."""
+    async def _llm_step(self, ctx: ExecutionContext) -> _StepOutput:
+        """Render the visible trajectory (`_render_for_llm`) and  route through
+        `PromptedCall.call_multi_turn()`. `extra` appends transient messages
+        (e.g. the terminal-turn prompt) that are deliberately NOT stored in `self.messages`."""
+        # add warning messages to the agent if the context usage exceeds the soft or hard token limits
+        self._warn_context_limits(ctx)
+
+        # cut the trajectory to guarantee it fits within the model's context limit
+        self._trim(ctx)
+
+        # render the remaining messages to send to the model
         messages = self._render_for_llm()
-        trimmed = _trim(messages, self.context_budget_chars)
-        if extra:
-            trimmed = trimmed + extra
+
         if self._backend is None:
             self._last_logprobs = None
-            # Model resolution is delegated to the prompt layer (`_resolve_model`):
-            # `model_overrides.get(call_site_name, llm_model)`, same as every other call.
-            return await self._prompt.call_multi_turn(
-                ctx, trimmed, usage_key=str(self.agent_id), should_stop=_stop_at_first_block,
+            step_output, total_tokens = await self._prompt.call_multi_turn(
+                ctx, messages, usage_key=str(self.agent_id),
                 temperature=self.temperature,
                 max_output_tokens=self.max_output_tokens,
                 timeout_s=self.request_timeout_s,
             )
+            if total_tokens > 0:
+                self._tokens_in_context = total_tokens
+            else:
+                # Usage-less response (coalesced to 0 in call_multi_turn): keep the running
+                # estimate rather than collapsing the tracker; count the new assistant text.
+                self._tokens_in_context += estimate_tokens(step_output.raw)
+            return step_output
         # Backend path (e.g. Tinker rollouts): prepend the assembled system
         # prompt, sample one turn synchronously (the rollout owns its thread +
         # loop), stash logprobs for `call()`, then parse. A bad parse raises
         # `ParseError`, which `call()` turns into a recoverable observation.
         system = self._prompt.assemble_system_prompt(ctx)
-        rendered = [{"role": "system", "content": system}, *trimmed]
+        rendered = [{"role": "system", "content": system}, *messages]
         text, self._last_logprobs = self._backend.generate(
             rendered,
             sampling_params=self._sampling_params,
