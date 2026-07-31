@@ -35,13 +35,13 @@ class RAGLLMSystem(RetrieveComputeSystem):
         # Embed via this question's LLMClient (ctx.llm_client) so query-embedding tokens/cost
         # land on the same usage tracker the runner reads; backend = config.emb_provider.
         tool = SearchCorpusTool(
-            resources.chroma_collection, self.inference_cfg.emb_model_id, ctx.llm_client, ctx=ctx, usage_key=str(self.system_id),
+            resources.chroma_collection, ctx.llm_client, ctx=ctx, usage_key=str(self.system_id),
         )
 
         # emit under a "retrieve" step so the per-question trace records what this vector search returned
         with ctx.step("retrieve"):
-            out = tool(query=q.text, top_k=self.config.top_k)  # type: ignore
-            chunks = out.get("chunks", []) if isinstance(out, dict) else []
+            out = tool(query=q.text, top_k=self.config.top_k, read=True, fetch=True)  # type: ignore
+            chunks = out.get("read_chunks", []) if isinstance(out, dict) else []
             context = "\n\n".join(c["text"] for c in chunks)
 
             # unique doc_ids in retrieval order, for doc-recall scoring.

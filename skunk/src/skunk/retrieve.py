@@ -101,7 +101,7 @@ async def _run_search_agent(
         pdf_dir=ctx.config.storage.pdf_dir,
         page_renders_dir=ctx.config.storage.page_renders_dir,
         llm_client=ctx.llm_client,
-        emb_model_id=ctx.config.inference.emb_model_id,
+        ctx=ctx,
     )
     # This operator owns the retrieval user message (the agent's `call()` is the
     # generic entry point; the branch framing below is pipeline vocabulary).

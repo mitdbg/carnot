@@ -16,29 +16,17 @@ are available.
 
 from __future__ import annotations
 
-from skunk.common import ExecutionContext
-from skunk.search_agent.search_tools import SemanticFilterTool
-
-from qatfd.benchmarks.base import BenchmarkResources
 from qatfd.systems.search_agent import SearchAgentSystem
 
 
 class QATFDSearchAgentSystem(SearchAgentSystem):
     name = "qatfd_search_agent"
 
-    def _extra_tools(self, ctx: ExecutionContext, resources: BenchmarkResources) -> tuple:
-        model = self.inference_cfg.llm_model
-        # ctx.llm_client is the usage-tracking wrapper, so the tool's LLM (judge) calls and
-        # its top_k query embeddings are both counted.
-        return (SemanticFilterTool(
-            ctx.llm_client, resources.document_map, model,
-            chroma_collection=resources.chroma_collection,
-            emb_model_id=self.inference_cfg.emb_model_id,
-            max_output_tokens=self.config.grep_max_output_tokens,
-            ctx=ctx,
-            context_limits=self.inference_cfg.llm_context_limits,
-            judge_max_output_tokens=self.config.semantic_filter_max_output_tokens,
-        ),)
+    def _include_semantic_filter(self) -> bool:
+        # The agent builds the tool itself (sharing its RetrievalState, ctx, and LLMClient, so
+        # judge calls + top_k query embeddings are usage-tracked). The judge runs on
+        # `semantic_filter_model` when set, else the client's default `llm_model`.
+        return True
 
     def _include_search_corpus(self) -> bool:
         # Drop the `search_corpus` (vector-search) tool so the agent is forced to use the

@@ -1,5 +1,6 @@
-"""Unit tests for `SemanticFilterTool` (corpus-mode candidate selection + judging), its `bind_retrieval_state`
-wiring, and the `SEMFILTER_RESULT_TAG` rendering in `SearchAgent._blocks_from_output`.
+"""Unit tests for `SemanticFilterTool` (candidate selection + judging in read/fetch modes), its
+shared `RetrievalState` wiring, and the `SEMFILTER_RESULT_TAG` rendering in
+`SearchAgent._blocks_from_output`.
 
 No LLM / Chroma. Runs under pytest if installed, or standalone:
 `python3 tests/test_semantic_filter_tool.py`.
@@ -7,19 +8,17 @@ No LLM / Chroma. Runs under pytest if installed, or standalone:
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from skunk.config import SearchAgentConfig
-from skunk.constants import CHARS_PER_TOKEN_EST
-from skunk.multi_turn_agent import ChunkBlock, TextBlock, Tool
+from skunk.multi_turn_agent import ChunkBlock, TextBlock
 from skunk.sandbox.local_python_executor import CodeOutput
 from skunk.search_agent.search_agent import SearchAgent
 from skunk.search_agent.search_tools import (
     EMPTY_RESULT_MESSAGE,
     SEMFILTER_RESULT_TAG,
-    _JUDGE_OUTPUT_TOKENS,
-    _JUDGE_TRUNC_MARKER,
     RetrievalState,
     SemanticFilterTool,
-    _judge_doc_char_budget,
 )
 
 
@@ -32,29 +31,34 @@ class _Resp:
 
 
 class FakeLLMClient:
-    """Judge verdict = `verdict_fn(document_text)`; records judge + embed calls."""
+    """Judge verdict = `verdict_fn(document_text)`; records judge + embed calls. `config`
+    mirrors `LLMClient.config` — the tool resolves its default judge model and the judge
+    model's context limit from it."""
 
-    def __init__(self, verdict_fn=None):
+    def __init__(self, verdict_fn=None, *, llm_model="agent-model", context_limits=None):
         self.verdict_fn = verdict_fn or (lambda text: True)
+        self.config = SimpleNamespace(llm_model=llm_model, llm_context_limits=context_limits or {})
         self.judged_texts: list[str] = []
         self.judge_max_output_tokens: list[int | None] = []
-        self.embed_calls: list[tuple[str, str | None]] = []
+        self.judge_disable_reasoning: list[bool] = []
+        self.embed_calls: list[str] = []
 
     def call(self, *, system, messages, temperature, model, ctx, call_site, provider_order=None,
-             max_output_tokens=None, usage_key="default"):
+             max_output_tokens=None, disable_reasoning=False, usage_key="default"):
         doc_text = messages[0]["content"].split("\n\nDocument:\n", 1)[1]
         self.judged_texts.append(doc_text)
         self.judge_max_output_tokens.append(max_output_tokens)
+        self.judge_disable_reasoning.append(disable_reasoning)
         return _Resp("TRUE" if self.verdict_fn(doc_text) else "FALSE")
 
-    def embed_query(self, text, *, model=None, ctx=None, usage_key="default"):
-        self.embed_calls.append((text, model))
+    def embed_query(self, text, *, ctx=None, usage_key="default"):
+        self.embed_calls.append(text)
         return [0.0, 0.0]
 
 
 class FakeChroma:
-    """Backed by a flat chunk list; records every query()/get() kwargs. The metadata
-    `where` filter is NOT applied (tests only assert what was passed), but paging is."""
+    """Backed by a flat chunk list; records every query()/get() kwargs. The `where` /
+    `where_document` filters are NOT applied (tests only assert what was passed)."""
 
     def __init__(self, chunks: list[dict]):
         self.chunks = chunks
@@ -68,18 +72,19 @@ class FakeChroma:
             "ids": [[c["chunk_id"] for c in rows]],
             "documents": [[c["text"] for c in rows]],
             "metadatas": [[{"doc_id": c["doc_id"]} for c in rows]],
+            "distances": [[0.1 * i for i, _ in enumerate(rows)]],
         }
 
-    def get(self, ids=None, where=None, include=None, limit=None, offset=None):
-        self.get_kwargs.append({"ids": ids, "where": where, "include": include, "limit": limit, "offset": offset})
-        if ids is not None:
-            wanted = set(ids)
-            rows = [c for c in self.chunks if c["chunk_id"] in wanted]
-            return {"ids": [c["chunk_id"] for c in rows], "documents": [c["text"] for c in rows]}
-        rows = self.chunks[offset or 0:]
-        if limit is not None:
-            rows = rows[:limit]
-        return {"ids": [c["chunk_id"] for c in rows], "metadatas": [{"doc_id": c["doc_id"]} for c in rows]}
+    def get(self, where=None, where_document=None, include=None, limit=None):
+        self.get_kwargs.append(
+            {"where": where, "where_document": where_document, "include": include, "limit": limit}
+        )
+        rows = self.chunks[:limit] if limit is not None else self.chunks
+        return {
+            "ids": [c["chunk_id"] for c in rows],
+            "documents": [c["text"] for c in rows],
+            "metadatas": [{"doc_id": c["doc_id"]} for c in rows],
+        }
 
 
 class FakeCtx:
@@ -99,13 +104,11 @@ _CHUNKS = [
 _DOC_MAP = {"d1": "apple document", "d2": "banana document", "d3": "cherry document"}
 
 
-def _tool(verdict_fn=None, *, chroma=True, ctx=None, **kwargs) -> tuple[SemanticFilterTool, FakeLLMClient, FakeChroma | None]:
-    client = FakeLLMClient(verdict_fn)
-    collection = FakeChroma(list(_CHUNKS)) if chroma else None
+def _tool(verdict_fn=None, *, ctx=None, context_limits=None, **kwargs) -> tuple[SemanticFilterTool, FakeLLMClient, FakeChroma]:
+    client = FakeLLMClient(verdict_fn, context_limits=context_limits)
+    collection = FakeChroma(list(_CHUNKS))
     tool = SemanticFilterTool(
-        client, dict(_DOC_MAP), "judge-model",
-        chroma_collection=collection,
-        emb_model_id="emb-model" if chroma else None,
+        collection, client, dict(_DOC_MAP), "judge-model",
         ctx=ctx,
         **kwargs,
     )
@@ -118,9 +121,11 @@ def _tool(verdict_fn=None, *, chroma=True, ctx=None, **kwargs) -> tuple[Semantic
 def test_validation_errors():
     tool, client, collection = _tool()
     cases = [
-        (dict(predicate="  "), "`predicate` is required"),
-        (dict(predicate="p", search_str="q"), "search_str requires top_k"),
-        (dict(predicate="p"), "provide a metadata_filter and/or top_k"),
+        (dict(predicate="  ", fetch=True), "`predicate` is required"),
+        # A selector is present (pattern), so the search_str/top_k pairing check is reached.
+        (dict(predicate="p", fetch=True, pattern="x", search_str="q"), "search_str requires top_k"),
+        (dict(predicate="p", fetch=True), "must provide one of"),
+        (dict(predicate="p", fetch=True, metadata_filter={"y": "1"}, limit=5), "limit requires pattern"),
     ]
     for kwargs, needle in cases:
         out = tool(**kwargs)
@@ -129,14 +134,20 @@ def test_validation_errors():
     assert not client.judged_texts and not collection.query_kwargs and not collection.get_kwargs
 
 
-def test_corpus_mode_requires_wiring():
-    tool, _, _ = _tool(chroma=False)
-    out = tool("p", metadata_filter={"year": "1946"})
-    assert "corpus mode is not available" in out["error"]
+def test_read_only_requires_nonempty_working_set():
+    tool, _, _ = _tool()  # fresh private state → empty working set
+    try:
+        tool("p", read=True)
+    except AssertionError as e:
+        assert "empty working set" in str(e)
+    else:
+        raise AssertionError("expected AssertionError on read from an empty working set")
 
-    tool2 = SemanticFilterTool(FakeLLMClient(), dict(_DOC_MAP), "m", chroma_collection=FakeChroma(list(_CHUNKS)))
-    out2 = tool2("p", top_k=5)
-    assert "top_k is not available" in out2["error"]
+
+def test_default_judge_model_is_client_default():
+    # No explicit judge model => the client's `llm_model` (the agent model).
+    tool = SemanticFilterTool(FakeChroma(list(_CHUNKS)), FakeLLMClient(), dict(_DOC_MAP))
+    assert tool._model == "agent-model"
 
 
 # ---- corpus mode: vector prefilter ------------------------------------------------
@@ -144,178 +155,226 @@ def test_corpus_mode_requires_wiring():
 
 def test_vector_mode_embeds_search_str_or_predicate():
     tool, client, collection = _tool()
-    tool("a long verbose predicate", top_k=3, search_str="short query")
-    assert client.embed_calls[-1] == ("short query", "emb-model")
+    tool("a long verbose predicate", fetch=True, top_k=3, search_str="short query")
+    assert client.embed_calls[-1] == "short query"
     assert collection.query_kwargs[-1]["n_results"] == 3
-    assert "where" not in collection.query_kwargs[-1]  # nothing to filter or exclude
+    assert "where" not in collection.query_kwargs[-1]  # nothing fetched/pruned yet → no filter
 
-    tool("a long verbose predicate", top_k=2)
-    assert client.embed_calls[-1] == ("a long verbose predicate", "emb-model")
+    tool2, client2, collection2 = _tool()
+    tool2("a long verbose predicate", fetch=True, top_k=2)
+    assert client2.embed_calls[-1] == "a long verbose predicate"
 
 
-def test_vector_mode_result_payload():
-    tool, client, _ = _tool(lambda text: "apple" in text)
+def test_vector_mode_read_and_fetch_payload():
     state = RetrievalState()
-    tool.bind_retrieval_state(state)
-    out = tool("about apples", top_k=4)
+    tool, client, _ = _tool(lambda text: "apple" in text, state=state)
+    out = tool("about apples", read=True, fetch=True, top_k=4)
     # Judged the deduped parent docs' FULL text (from document_map), not chunk text.
     assert sorted(client.judged_texts) == ["apple document", "banana document", "cherry document"]
     assert out["kept_doc_ids"] == ["d1"] and out["n_in"] == 3 and out["n_out"] == 1
-    # Snippets: only kept docs' candidate chunks, in relevance (candidate) order, marked seen.
-    assert [c["chunk_id"] for c in out["chunks"]] == ["d1_0", "d1_1"]
-    assert "apple pie recipe" in out["chunks"][0]["text"]
-    assert state.seen_chunk_ids == {"d1_0", "d1_1"}
+    # Kept docs' candidate chunks in (doc_id, chunk_id) order, present under BOTH keys.
+    assert [c["chunk_id"] for c in out["read_chunks"]] == ["d1_0", "d1_1"]
+    assert [c["chunk_id"] for c in out["fetched_chunks"]] == ["d1_0", "d1_1"]
+    assert "apple pie recipe" in out["read_chunks"][0]["text"]
+    assert "est_num_tokens" in out["read_chunks"][0]
+    # State: kept chunks AND their docs are marked read + fetched.
+    assert state.read_chunk_ids == {"d1_0", "d1_1"} and state.fetched_chunk_ids == {"d1_0", "d1_1"}
+    assert state.read_doc_ids == {"d1"} and state.fetched_doc_ids == {"d1"}
     assert "kept 1/3" in out["summary"] and "d1" in out["summary"]
 
 
+def test_fetch_only_populates_working_set_not_read():
+    state = RetrievalState()
+    tool, _, _ = _tool(lambda text: "apple" in text, state=state)
+    out = tool("about apples", fetch=True, top_k=4)
+    assert out["read_chunks"] == [] and [c["chunk_id"] for c in out["fetched_chunks"]] == ["d1_0", "d1_1"]
+    assert state.fetched_chunk_ids == {"d1_0", "d1_1"} and state.fetched_doc_ids == {"d1"}
+    assert not state.read_chunk_ids and not state.read_doc_ids
+
+
 def test_vector_mode_over_doc_cap():
-    tool, client, _ = _tool(max_candidate_docs=2)
-    out = tool("p", top_k=4)  # 4 chunks → 3 distinct docs > cap 2
+    tool, client, _ = _tool()
+    tool._MAX_CANDIDATE_DOCS = 2  # instance attr shadows the class constant
+    out = tool("p", fetch=True, top_k=4)  # 4 chunks → 3 distinct docs > cap 2
     assert "over the 2-document cap" in out["error"]
     assert not client.judged_texts  # cap trips before any judge spend
 
 
-# ---- corpus mode: metadata-only --------------------------------------------------
+# ---- where-clause construction per mode ------------------------------------------
 
 
-def test_metadata_mode_where_excludes_pruned_and_seen_by_default():
-    # Default exclude=True: the where clause excludes BOTH pruned and seen material, so each
-    # call surfaces only new documents (like grep/search_corpus).
-    tool, _, collection = _tool()
+def test_fetch_mode_excludes_fetched_and_pruned():
     state = RetrievalState(
         pruned_chunk_ids={"px"}, pruned_doc_ids={"pd"},
-        seen_chunk_ids={"sx"}, seen_doc_ids={"sd"},
+        fetched_chunk_ids={"fx"}, fetched_doc_ids={"fd"},
     )
-    tool.bind_retrieval_state(state)
-    tool("p", metadata_filter={"year": "1946"})
+    tool, _, collection = _tool(state=state)
+    tool("p", fetch=True, metadata_filter={"year": "1946"})
     where = collection.get_kwargs[0]["where"]
     assert {"year": "1946"} in where["$and"]
-    assert {"doc_id": {"$nin": ["pd", "sd"]}} in where["$and"]
-    assert {"chunk_id": {"$nin": ["px", "sx"]}} in where["$and"]
+    assert {"doc_id": {"$nin": ["fd", "pd"]}} in where["$and"]
+    assert {"chunk_id": {"$nin": ["fx", "px"]}} in where["$and"]
 
 
-def test_metadata_mode_exclude_false_keeps_pruned_but_not_seen():
-    # exclude=False: comprehensive over seen-but-not-pruned material (re-judge already-fetched
-    # docs under a new predicate) — only pruned ids are filtered out.
-    tool, _, collection = _tool()
+def test_fetch_and_read_mode_excludes_pruned_and_fetched():
+    # Dedup is on the FETCH axis: fetch+read excludes working-set (fetched) + pruned material,
+    # but NOT read material — already-read docs outside the working set don't exist (read marks
+    # fetched too), and re-reads are always allowed.
     state = RetrievalState(
         pruned_chunk_ids={"px"}, pruned_doc_ids={"pd"},
-        seen_chunk_ids={"sx"}, seen_doc_ids={"sd"},
+        read_chunk_ids={"sx"}, read_doc_ids={"sd"},
+        fetched_chunk_ids={"fx"}, fetched_doc_ids={"fd"},
     )
-    tool.bind_retrieval_state(state)
-    tool("p", metadata_filter={"year": "1946"}, exclude=False)
+    tool, _, collection = _tool(state=state)
+    tool("p", read=True, fetch=True, metadata_filter={"year": "1946"})
     where = collection.get_kwargs[0]["where"]
     assert {"year": "1946"} in where["$and"]
-    assert {"doc_id": {"$nin": ["pd"]}} in where["$and"]
+    assert {"doc_id": {"$nin": ["fd", "pd"]}} in where["$and"]
+    assert {"chunk_id": {"$nin": ["fx", "px"]}} in where["$and"]
+
+
+def test_read_mode_includes_working_set_as_union():
+    # Read-only mode restricts candidates to the working set: chunk ∈ fetched_chunks OR
+    # doc ∈ fetched_docs (a doc opened via read_document exposes ALL its chunks), minus
+    # pruned material only — read chunks stay eligible, so the same doc/chunk can be
+    # re-judged under a different predicate.
+    state = RetrievalState(
+        fetched_chunk_ids={"fx"}, fetched_doc_ids={"fd"},
+        pruned_chunk_ids={"px"}, read_chunk_ids={"sx"},
+    )
+    tool, _, collection = _tool(state=state)
+    tool("p", read=True)  # no selector needed: the working set IS the candidate pool
+    where = collection.get_kwargs[0]["where"]
+    assert {"$or": [{"doc_id": {"$in": ["fd"]}}, {"chunk_id": {"$in": ["fx"]}}]} in where["$and"]
     assert {"chunk_id": {"$nin": ["px"]}} in where["$and"]
-    assert "sx" not in str(where) and "sd" not in str(where)
 
 
-def test_metadata_mode_two_phase_fetch():
-    tool, client, collection = _tool(lambda text: "banana" in text)
-    out = tool("about bananas", metadata_filter={"kind": "any"})
-    # Phase 1: ids/metadatas-only paged scan — no texts pulled for the full match set.
-    assert collection.get_kwargs[0]["include"] == ["metadatas"]
-    assert collection.get_kwargs[0]["limit"] == SemanticFilterTool._GET_PAGE_SIZE
-    # Every matched doc judged (thread-pool order is arbitrary); phase 2 fetches texts
-    # ONLY for the kept doc's chunks.
+def test_read_mode_allows_rereading_same_docs():
+    # Two read-only calls over the same working set: the second call's filter must not
+    # exclude what the first call read — different predicates over the same docs re-judge
+    # them and return them again.
+    state = RetrievalState(fetched_chunk_ids={"d1_0", "d1_1"}, fetched_doc_ids={"d1"})
+    tool, _, collection = _tool(lambda text: "apple" in text, state=state)
+    first = tool("about apples", read=True)
+    assert first["kept_doc_ids"] == ["d1"] and state.read_doc_ids == {"d1"}
+    second = tool("still about apples", read=True)
+    assert second["kept_doc_ids"] == ["d1"]  # re-read allowed despite read marks
+    # the second call's exclusions contain no read ids
+    where = collection.get_kwargs[1]["where"]
+    clauses = where["$and"] if "$and" in where else [where]
+    nin_values = [v for c in clauses for f, spec in c.items() if isinstance(spec, dict) and "$nin" in spec for v in spec["$nin"]]
+    assert "d1" not in nin_values and "d1_0" not in nin_values and "d1_1" not in nin_values
+
+
+# ---- corpus mode: grep prefilter --------------------------------------------------
+
+
+def test_grep_mode_passes_pattern_and_limit():
+    tool, client, collection = _tool()
+    tool("p", fetch=True, pattern="(?i)apple", limit=7)
+    got = collection.get_kwargs[0]
+    assert got["where_document"] == {"$regex": "(?i)apple"} and got["limit"] == 7
+    # The fake ignores the regex, so all 3 parent docs get judged.
     assert sorted(client.judged_texts) == ["apple document", "banana document", "cherry document"]
-    assert collection.get_kwargs[1]["ids"] == ["d2_0"]
-    assert out["kept_doc_ids"] == ["d2"]
-    assert [c["chunk_id"] for c in out["chunks"]] == ["d2_0"]
-    assert "banana bread" in out["chunks"][0]["text"]
 
 
-def test_metadata_mode_over_doc_cap_before_judging():
-    tool, client, collection = _tool(max_candidate_docs=2)
-    out = tool("p", metadata_filter={"kind": "any"})
-    assert "matched more than 2 candidate documents" in out["error"]
-    assert not client.judged_texts
-    assert len(collection.get_kwargs) == 1  # no phase-2 text fetch either
-
-
-def test_output_cap_truncates_and_marks_only_rendered_seen():
-    # Cap of 4 tokens = 16 chars: the first chunk always renders, the second is dropped.
-    tool, _, _ = _tool(lambda text: "apple" in text, max_output_tokens=4)
-    state = RetrievalState()
-    tool.bind_retrieval_state(state)
-    out = tool("about apples", top_k=4)
-    assert [c["chunk_id"] for c in out["chunks"]] == ["d1_0"]
-    assert "showing 1 of 2 chunk(s)" in out["truncation_note"]
-    assert state.seen_chunk_ids == {"d1_0"}  # the omitted chunk stays fetchable later
+# ---- zero candidates + trace event ------------------------------------------------
 
 
 def test_zero_candidates_payload():
     tool, _, collection = _tool()
     collection.chunks = []
-    out = tool("p", metadata_filter={"year": "3000"})
-    assert out["kept_doc_ids"] == [] and out["chunks"] == [] and not out["summary"]
-
-
-# ---- trace event ------------------------------------------------------------------
+    out = tool("p", fetch=True, metadata_filter={"year": "3000"})
+    assert out["kept_doc_ids"] == [] and out["read_chunks"] == [] and out["fetched_chunks"] == []
+    assert not out["summary"] and out["n_in"] == 0 and out["n_out"] == 0
 
 
 def test_trace_event_records_mode_and_inputs():
     ctx = FakeCtx()
     tool, _, _ = _tool(ctx=ctx)
-    tool("about fruit", top_k=4, search_str="fruit", metadata_filter={"year": "1946"})
+    tool("about fruit", fetch=True, top_k=4, search_str="fruit", metadata_filter={"year": "1946"})
     message, data = ctx.events[-1]
     assert message.startswith("semantic_filter n_in=")  # load-bearing: tool_metrics keys on this
     assert data["mode"] == "vector" and data["top_k"] == 4 and data["search_str"] == "fruit"
     assert data["metadata_filter"] == {"year": "1946"}
     assert data["n_candidate_chunks"] == 4 and data["n_candidate_docs"] == 3
 
-    tool("about fruit", metadata_filter={"year": "1946"})
+    tool2, _, _ = _tool(ctx=ctx)
+    tool2("about fruit", fetch=True, metadata_filter={"year": "1946"})
     assert ctx.events[-1][1]["mode"] == "metadata"
 
 
-# ---- SearchAgent integration: bind_retrieval_state + rendering -------------------------------
+# ---- SearchAgent integration: first-class tool wiring + rendering ----------------
 
 
-def _agent(extra_tools=()) -> SearchAgent:
-    # Inference settings (provider/model/prices) moved to InferenceConfig; SearchAgentConfig now
-    # holds only agent knobs, and emb_model_id is passed to the agent directly (not via config).
+def _agent(**kwargs) -> SearchAgent:
     config = SearchAgentConfig(name="t")
     return SearchAgent(
         config=config, document_map={}, chroma_collection=FakeChroma([]),
-        llm_client=FakeLLMClient(), emb_model_id="emb", extra_tools=extra_tools,
+        llm_client=FakeLLMClient(), **kwargs,
     )
 
 
-def test_bind_retrieval_state_hook():
-    bound = SemanticFilterTool(FakeLLMClient(), {}, "m")
-    class NoBind(Tool):
-        name = "nobind"
-        doc = "### nobind()\nDoes nothing."
-        def __call__(self):
-            return None
-    agent = _agent(extra_tools=(bound, NoBind()))  # tool without bind_retrieval_state must not break init
-    assert bound._state is agent._state
+def test_semantic_filter_is_first_class_and_shares_agent_state():
+    # `include_semantic_filter=True` makes the agent construct the tool itself, sharing its
+    # per-question RetrievalState by reference, like search/grep/read/prune.
+    agent = _agent(include_semantic_filter=True)
+    tool = next(t for t in agent._tools if t.name == "semantic_filter")
+    assert tool._state is agent._state
+    # Off by default: the vanilla agent has no semantic_filter tool.
+    assert all(t.name != "semantic_filter" for t in _agent()._tools)
 
 
 def _blocks(payload: dict) -> list:
     return _agent()._blocks_from_output(CodeOutput(output=payload, logs=""))
 
 
-def test_render_corpus_payload():
+def test_render_read_payload():
     blocks = _blocks({
         SEMFILTER_RESULT_TAG: True,
         "summary": "[semantic_filter] kept 1/3",
-        "chunks": [{"chunk_id": "c1", "doc_id": "d1", "text": "snippet"}],
-        "truncation_note": "[semantic_filter output truncated]",
+        "read_chunks": [{"chunk_id": "c1", "doc_id": "d1", "est_num_tokens": 2, "header": "h", "text": "snippet"}],
+        "fetched_chunks": [],
         "kept_doc_ids": ["d1"], "n_in": 3, "n_out": 1,
     })
     assert isinstance(blocks[0], TextBlock) and "kept 1/3" in blocks[0].text
     assert isinstance(blocks[1], ChunkBlock) and blocks[1].chunk_id == "c1" and blocks[1].doc_id == "d1"
-    assert isinstance(blocks[2], TextBlock) and "truncated" in blocks[2].text
+
+
+def test_render_fetched_payload_is_a_digest():
+    chunk = {"chunk_id": "c1", "doc_id": "d1", "est_num_tokens": 7, "header": "[c1 header]", "text": "snippet"}
+    blocks = _blocks({
+        SEMFILTER_RESULT_TAG: True,
+        "summary": "[semantic_filter] kept 1/3",
+        "read_chunks": [],
+        "fetched_chunks": [chunk],
+        "kept_doc_ids": ["d1"], "n_in": 3, "n_out": 1,
+    })
+    # Fetch-only renders the summary plus a digest TextBlock (no ChunkBlocks → no chunk text
+    # enters the agent's context).
+    assert isinstance(blocks[0], TextBlock) and "kept 1/3" in blocks[0].text
+    assert isinstance(blocks[1], TextBlock)
+    assert "Retrieved 1 chunks from 1 documents" in blocks[1].text and "[c1 header]" in blocks[1].text
+    assert all(not isinstance(b, ChunkBlock) for b in blocks)
+
+
+def test_render_summary_only_when_all_rejected():
+    # kept 0/N: no chunks under either key, but the summary must still reach the agent.
+    [summary] = _blocks({
+        SEMFILTER_RESULT_TAG: True,
+        "summary": "[semantic_filter] kept 0/3 candidate document(s) matching the predicate. kept_doc_ids=[].",
+        "read_chunks": [], "fetched_chunks": [],
+        "kept_doc_ids": [], "n_in": 3, "n_out": 0,
+    })
+    assert isinstance(summary, TextBlock) and "kept 0/3" in summary.text
 
 
 def test_render_error_and_empty_payloads():
     [err] = _blocks({SEMFILTER_RESULT_TAG: True, "error": "semantic_filter error: boom"})
     assert err.text == "[error]\nsemantic_filter error: boom"
 
-    [empty] = _blocks({SEMFILTER_RESULT_TAG: True, "summary": "", "chunks": [],
-                       "kept_doc_ids": [], "n_in": 0, "n_out": 0})
+    [empty] = _blocks({SEMFILTER_RESULT_TAG: True, "summary": "", "read_chunks": [],
+                       "fetched_chunks": [], "kept_doc_ids": [], "n_in": 0, "n_out": 0})
     assert empty.text == EMPTY_RESULT_MESSAGE
 
 
@@ -324,61 +383,85 @@ def test_rendered_chunks_are_redactable():
     agent._state.pruned_chunk_ids.add("c1")
     block = ChunkBlock(chunk_id="c1", doc_id="d1", text="snippet")
     assert agent._block_is_visible(block) is False
+    # Trim-time redaction (redacted_* sets) hides blocks the same way.
+    agent._make_block_invisible(chunk_id="c2")
+    assert agent._block_is_visible(ChunkBlock(chunk_id="c2", doc_id="d1", text="s")) is False
+    agent._make_block_invisible(doc_id="d9")
+    assert agent._block_is_visible(ChunkBlock(chunk_id=None, doc_id="d9", text="s")) is False
 
 
 # ---- judge output cap + context-limit truncation ---------------------------------
 
 
-def test_judge_call_caps_output_at_256():
+def test_judge_call_caps_output():
     tool, client, _ = _tool(lambda t: True)
-    tool("about apples", top_k=2)  # top_k vector prefilter → 2 candidate docs (d1, d2)
-    # Every judge call carries the 256-token output cap (the verdict is one word).
-    assert client.judge_max_output_tokens == [_JUDGE_OUTPUT_TOKENS, _JUDGE_OUTPUT_TOKENS]
+    tool("about apples", fetch=True, top_k=2)  # top_k vector prefilter → 2 candidate docs (d1, d2)
+    # Every judge call carries the tool's default output cap (the verdict is one word).
+    cap = SemanticFilterTool._JUDGE_MAX_OUTPUT_TOKENS
+    assert client.judge_max_output_tokens == [cap, cap]
+
+    tool2, client2, _ = _tool(lambda t: True, judge_max_output_tokens=2048)
+    tool2("about apples", fetch=True, top_k=2)
+    # A reasoning judge gets its configured thinking headroom instead.
+    assert client2.judge_max_output_tokens == [2048, 2048]
+
+
+def test_judge_reasoning_disabled_by_default():
+    tool, client, _ = _tool(lambda t: True)
+    tool("about apples", fetch=True, top_k=2)
+    # Judge calls disable thinking by default (the verdict is one token)...
+    assert client.judge_disable_reasoning == [True, True]
+
+    tool2, client2, _ = _tool(lambda t: True, disable_judge_reasoning=False)
+    tool2("about apples", fetch=True, top_k=2)
+    # ...but a reasoning-mandated judge model can opt back in.
+    assert client2.judge_disable_reasoning == [False, False]
 
 
 def test_context_limit_truncates_only_oversized_docs():
     big, small = "z" * 500_000, "tiny doc"
     ctx = FakeCtx()
-    client = FakeLLMClient(lambda t: True)
     limit = 8000  # tokens
-    # Metadata-mode candidates come from the collection (sorted → big, small); the judged text is
+    # The limit is resolved from the client's config (`llm_context_limits`), not a tool arg.
+    client = FakeLLMClient(lambda t: True, context_limits={"judge-model": limit})
+    # Metadata-mode candidates come from the collection (big, small); the judged text is
     # pulled from the document_map, so that's what the context-limit truncation acts on.
     chroma = FakeChroma([
         {"chunk_id": "big_0", "doc_id": "big", "text": big},
         {"chunk_id": "small_0", "doc_id": "small", "text": small},
     ])
-    tool = SemanticFilterTool(
-        client, {"big": big, "small": small}, "judge-model",
-        chroma_collection=chroma, ctx=ctx, context_limits={"judge-model": limit},
-    )
-    tool("some predicate", metadata_filter={"any": "x"})
-    budget = _judge_doc_char_budget(limit, "some predicate")
-    # The oversized doc is head-truncated to exactly the budget and carries the marker;
+    tool = SemanticFilterTool(chroma, client, {"big": big, "small": small}, "judge-model", ctx=ctx)
+    assert tool._context_limit == limit
+    tool("some predicate", fetch=True, metadata_filter={"any": "x"})
+    # The oversized doc is head-truncated (marker appended) to fit the judge's window;
     # the small doc is sent verbatim.
-    assert len(client.judged_texts[0]) == budget
-    assert client.judged_texts[0].endswith(_JUDGE_TRUNC_MARKER)
+    marker = SemanticFilterTool._JUDGE_TRUNC_MARKER
+    assert client.judged_texts[0].endswith(marker) and len(client.judged_texts[0]) < len(big)
     assert client.judged_texts[1] == small
-    # The truncation is estimated to fit under the limit (with the safety margin).
-    assert budget / CHARS_PER_TOKEN_EST < limit
+    # The truncated text honors the tool's own token budget for this predicate.
+    from skunk.common import estimate_tokens
+    budget = tool._judge_doc_token_budget("some predicate")
+    assert estimate_tokens(client.judged_texts[0][: -len(marker)]) <= budget
     # The trace event reports exactly one truncation.
     assert ctx.events[-1][1]["n_truncated"] == 1
 
 
 def test_no_context_limit_sends_full_text():
     big = "z" * 100_000
-    client = FakeLLMClient(lambda t: True)
+    client = FakeLLMClient(lambda t: True)  # no llm_context_limits entry for the judge model
     chroma = FakeChroma([{"chunk_id": "big_0", "doc_id": "big", "text": big}])
-    tool = SemanticFilterTool(client, {"big": big}, "judge-model", chroma_collection=chroma)  # no context_limits
+    tool = SemanticFilterTool(chroma, client, {"big": big}, "judge-model")
     assert tool._context_limit is None
-    tool("p", metadata_filter={"any": "x"})
+    tool("p", fetch=True, metadata_filter={"any": "x"})
     assert client.judged_texts[0] == big  # untouched
 
 
 def test_context_limit_resolved_by_substring_match():
     # The tool resolves its judge model's limit via the shared exact-then-substring matcher.
     tool = SemanticFilterTool(
-        FakeLLMClient(), dict(_DOC_MAP), "qwen/qwen3.6-35b-a3b",
-        context_limits={"qwen3.6-35b-a3b": 262144},
+        FakeChroma(list(_CHUNKS)),
+        FakeLLMClient(context_limits={"qwen3.6-35b-a3b": 262144}),
+        dict(_DOC_MAP), "qwen/qwen3.6-35b-a3b",
     )
     assert tool._context_limit == 262144
 

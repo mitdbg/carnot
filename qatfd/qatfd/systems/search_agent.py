@@ -63,6 +63,14 @@ class SearchAgentSystem(RetrieveComputeSystem):
         it (e.g. a tool-ablation system) to force the agent onto vector search / semantic filter."""
         return True
 
+    def _include_semantic_filter(self) -> bool:
+        """Whether the agent gets the `semantic_filter` (LLM-judged predicate) tool. Off in the
+        vanilla SearchAgent; subclasses (system #3, the ablation system) turn it on. The judge
+        model / provider pinning / output cap ride on `SearchAgentConfig`
+        (`semantic_filter_model`, `semantic_filter_provider_order`,
+        `semantic_filter_max_output_tokens`)."""
+        return False
+
     def _prompts(self, resources: BenchmarkResources) -> tuple[str | None, str | None]:
         """(briefing, final_answer_doc) overrides; None => skunk SearchAgent defaults.
 
@@ -94,12 +102,14 @@ class SearchAgentSystem(RetrieveComputeSystem):
             chroma_collection=resources.chroma_collection,
             # Reuse this question's LLMClient so the agent's search-tool embeddings are
             # billed onto the same usage tracker as its LLM calls; backend dispatch
-            # (openrouter / vllm) is read from config.emb_provider by the client.
+            # (openrouter / vllm) and the embedding model are read from config by the client.
             llm_client=ctx.llm_client,
-            emb_model_id=self.inference_cfg.emb_model_id,
+            # ctx is threaded into the agent's tools for trace events + usage attribution.
+            ctx=ctx,
             extra_tools=self._extra_tools(ctx, resources),
             include_search_corpus=self._include_search_corpus(),
             include_grep_corpus=self._include_grep_corpus(),
+            include_semantic_filter=self._include_semantic_filter(),
             briefing=briefing,
             final_answer_doc=final_answer_doc,
             # Key this retrieval agent's spend under the system's "retrieve" slice (the shared

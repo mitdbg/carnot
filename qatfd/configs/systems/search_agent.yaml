@@ -7,12 +7,14 @@ name: search_agent
 agent_mode: retrieve
 search_agent_max_output_tokens: 4096
 search_agent_request_timeout_s: 120.0
-grep_max_output_tokens: 200000
-# output-token cap per semantic_filter judge call; enough for a reasoning judge to think and emit
-# TRUE/FALSE (too small => finish_reason=length + empty content => retry storm that tanks throughput).
-semantic_filter_max_output_tokens: 2048
-agent_max_pages_per_tool_call: 20
-read_document_max_output_chars: 400000
+# output-token cap per semantic_filter judge call. Judge reasoning is disabled
+# (semantic_filter_disable_reasoning) and the reply is a single TRUE/FALSE token, so a tiny cap
+# suffices. If you re-enable reasoning, raise this too (a capped reasoning judge returns
+# finish_reason=length + empty content => retry storm that tanks throughput).
+semantic_filter_max_output_tokens: 4
+# Disable thinking on the judge calls (OpenRouter reasoning={"enabled": false}); set false (and
+# raise the cap above) for judge models that mandate reasoning.
+semantic_filter_disable_reasoning: true
 agent_max_steps: 20
 agent_max_misfires: 5
 # target dollar cost budget for the search agent; null means no budget limit (default)

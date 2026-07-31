@@ -1,6 +1,6 @@
-"""Unit tests for the context-size caps that keep a single LLM request under the model's
-~1.05M input-token ceiling: the `read_document` per-call output cap and the
-`input_values_desc` axis-label elision.
+"""Unit tests for `read_document` (full/partial reads + RetrievalState bookkeeping — the
+per-call output cap was deliberately removed: the agent manages its own window via the
+working set and prune) and the `input_values_desc` axis-label elision.
 
 No LLM / PDFs / Chroma. Runs under pytest if installed, or standalone:
 `python3 tests/test_context_caps.py`.
@@ -9,47 +9,54 @@ No LLM / PDFs / Chroma. Runs under pytest if installed, or standalone:
 from __future__ import annotations
 
 from skunk.common import AnnotatedValue, _MAX_RENDERED_LABELS, input_values_desc
+from skunk.search_agent.retrieval_state import RetrievalState
 from skunk.search_agent.search_tools import READ_DOCUMENT_RESULT_TAG, ReadDocumentTool
 
 
-# ---- read_document output cap ----------------------------------------------------
+# ---- read_document ---------------------------------------------------------------
 
 
-def _doc_text_len(out: dict) -> int:
-    return sum(len(d["text"]) for d in out["docs"])
-
-
-def test_read_document_truncates_and_drops_overflow():
-    docs = {"d1": "a" * 1000, "d2": "b" * 1000, "d3": "c" * 1000}
-    tool = ReadDocumentTool(docs, max_pages=20, max_output_chars=500)
-    out = tool(["d1", "d2", "d3"])
-    assert out[READ_DOCUMENT_RESULT_TAG] is True
-    # Only the first doc is (partly) returned; d2/d3 are dropped.
-    assert len(out["docs"]) == 1
-    text = out["docs"][0]["text"]
-    assert "[truncated:" in text and "2 more requested doc(s) not shown" in text
-    # The doc body honored the cap (the appended note is the only allowed overflow).
-    assert len(text.replace("[truncated:", "")) <= 500 + 400  # body ≤ cap + bounded note
-
-
-def test_read_document_small_read_is_unchanged():
+def test_read_document_returns_full_docs():
     docs = {"d1": "hello", "d2": "world"}
-    tool = ReadDocumentTool(docs, max_pages=20, max_output_chars=400_000)
-    out = tool(["d1", "d2"])
+    out = ReadDocumentTool(docs)(["d1", "d2"])
+    assert out[READ_DOCUMENT_RESULT_TAG] is True
     assert len(out["docs"]) == 2
-    assert "[truncated:" not in _join_all(out)
-    assert out["docs"][0]["text"] == "=== doc_id=d1 ===\nhello"
-    assert out["docs"][1]["text"] == "=== doc_id=d2 ===\nworld"
+    # Header carries the doc id + size hints; the full body follows uncapped.
+    assert out["docs"][0]["doc_id"] == "d1" and out["docs"][0]["text"].endswith("===\nhello")
+    assert "doc_id=d1" in out["docs"][0]["text"] and "total chars: 5" in out["docs"][0]["text"]
+    assert out["docs"][1]["doc_id"] == "d2" and out["docs"][1]["text"].endswith("===\nworld")
 
 
 def test_read_document_missing_doc_note():
-    tool = ReadDocumentTool({}, max_pages=20, max_output_chars=400_000)
-    out = tool("nope")
+    state = RetrievalState()
+    out = ReadDocumentTool({}, state)("nope")
     assert "no such document" in out["docs"][0]["text"]
+    # A missing doc is NOT recorded as read/fetched.
+    assert not state.read_doc_ids and not state.fetched_doc_ids
 
 
-def _join_all(out: dict) -> str:
-    return "\n".join(d["text"] for d in out["docs"])
+def test_read_document_char_ranges_and_scalar_broadcast():
+    docs = {"d1": "abcdefghij", "d2": "hello"}
+    tool = ReadDocumentTool(docs)
+    # A None start/end broadcasts across a list of doc_ids (non-None scalars with a list are
+    # rejected by the tool's contract — indices must then be same-length lists).
+    # Per-doc ranges; None entries mean "no bound" for that doc (the docstring's own example).
+    out = tool(["d1", "d2"], start_char_idx=[-3, None])
+    assert out["docs"][0]["text"].endswith("===\nhij")
+    assert out["docs"][1]["text"].endswith("===\nhello")
+    # end_char_idx past the doc length truncates to the actual length.
+    out = tool("d2", start_char_idx=1, end_char_idx=1000)
+    assert out["docs"][0]["text"].endswith("===\nello")
+
+
+def test_read_document_updates_state_and_unprunes():
+    state = RetrievalState(pruned_doc_ids={"d1"})
+    tool = ReadDocumentTool({"d1": "hello"}, state)
+    tool("d1")
+    # Reading marks the doc read + fetched, and re-reading a pruned doc un-prunes it so the
+    # new blocks are visible again.
+    assert state.read_doc_ids == {"d1"} and state.fetched_doc_ids == {"d1"}
+    assert "d1" not in state.pruned_doc_ids
 
 
 # ---- input_values_desc label elision ---------------------------------------------
@@ -84,9 +91,10 @@ def test_input_values_desc_small_index_is_full():
 
 
 if __name__ == "__main__":
-    test_read_document_truncates_and_drops_overflow()
-    test_read_document_small_read_is_unchanged()
+    test_read_document_returns_full_docs()
     test_read_document_missing_doc_note()
+    test_read_document_char_ranges_and_scalar_broadcast()
+    test_read_document_updates_state_and_unprunes()
     test_input_values_desc_elides_long_index()
     test_input_values_desc_small_index_is_full()
     print("ok")

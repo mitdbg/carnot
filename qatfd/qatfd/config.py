@@ -43,16 +43,8 @@ class AblationSearchAgentConfig(SearchAgentConfig):
     tool_vector: bool = True            # search_corpus (vector search)
     tool_grep: bool = True              # grep_corpus (lexical search)
     tool_semantic_filter: bool = False  # semantic_filter (QATFD's tool)
-    # Model for the semantic_filter's per-candidate judge calls; null => use `llm_model` (the agent
-    # model). Set it to a cheaper model to run the (token-heavy) candidate filtering on the cheap
-    # model while the search agent itself stays on `llm_model` — the filtered-out candidates never
-    # enter the agent model's context, so this drives cost down without touching the agent's reasoning.
-    semantic_filter_model: str | None = None
-    # OpenRouter provider order (no fallback) for the semantic_filter judge calls only. null => use
-    # the client-wide `llm_provider_order`. Lets the judge model route to specific providers (e.g.
-    # [akashml, parasail]) while the agent model (which may be a different family, e.g. a Google
-    # model that those providers don't serve) stays unpinned.
-    semantic_filter_provider_order: list[str] | None = None
+    # The judge-model knobs (`semantic_filter_model`, `semantic_filter_provider_order`) moved to
+    # the base `SearchAgentConfig` when the tool became first-class in skunk's SearchAgent.
 
 # ---------------------------------------------------------------------------
 # General experiment configuration

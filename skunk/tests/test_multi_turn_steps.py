@@ -49,9 +49,13 @@ class _ScriptedAgent(MultiTurnAgent):
 
 
 def _ctx() -> ExecutionContext:
-    # config is only read to build an LLMClient (skipped — a mock client is passed), so a bare
-    # stand-in suffices; the loop under test touches only ctx.emit and the scripted _llm_step.
-    return ExecutionContext(question="q", config=SimpleNamespace(), document_map={}, llm_client=object())  # type: ignore[arg-type]
+    # The loop under test touches ctx.emit, the scripted _llm_step, and (via
+    # add_budget_observations) the model's context limit — so the config stand-in carries just
+    # enough `inference` for `_resolve_model` / `_get_context_limit`. The limit is huge so no
+    # soft/hard-limit warnings fire in these step-budget tests.
+    inference = SimpleNamespace(model_overrides={}, llm_model="test-model", llm_context_limits={"test-model": 10_000_000})
+    config = SimpleNamespace(inference=inference)
+    return ExecutionContext(question="q", config=config, document_map={}, llm_client=object())  # type: ignore[arg-type]
 
 
 def test_misfires_do_not_consume_step_budget():

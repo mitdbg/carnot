@@ -126,16 +126,30 @@ class SearchAgentConfig(AgentConfig):
     search_agent_max_output_tokens: int = 4096
     search_agent_request_timeout_s: float = 120.0
 
-    # NO LONGER read by the library's grep tool (grep output is uncapped by default; the agent
-    # caps it per call via `max_output_tokens`). Kept because app-level callers (qatfd systems)
-    # reuse this knob to size `SemanticFilterTool`'s snippet output.
-    grep_max_output_tokens: int = 200_000
+    # maximum output tokens for each semantic_filter judge call. The reply is a single TRUE/FALSE
+    # token and judge reasoning is disabled (`semantic_filter_disable_reasoning`), so a tiny cap
+    # suffices. If reasoning is re-enabled, raise this too — a reasoning judge that hits the cap
+    # returns finish_reason=length with empty content, which retries+backs-off and destroys
+    # throughput. Threaded into `SemanticFilterTool`.
+    semantic_filter_max_output_tokens: int = 4
 
-    # maximum output tokens for each semantic_filter judge call (the reply is just TRUE/FALSE, but a
-    # reasoning judge model needs headroom to think before emitting the verdict — too small a cap makes
-    # it hit finish_reason=length with empty content, which then retries+backs-off and destroys
-    # throughput). Threaded into `SemanticFilterTool`.
-    semantic_filter_max_output_tokens: int = 2048
+    # Disable reasoning/thinking on the semantic_filter judge calls (OpenRouter
+    # `reasoning={"enabled": false}`): the verdict is one token, so thinking is pure cost.
+    # Set False for judge models that mandate reasoning (they 400 on disabled reasoning) —
+    # and then raise `semantic_filter_max_output_tokens` to give the judge headroom.
+    semantic_filter_disable_reasoning: bool = True
+
+    # Model for the semantic_filter's per-candidate judge calls; None => `llm_model` (the agent
+    # model). Set it to a cheaper model to run the (token-heavy) candidate filtering on the cheap
+    # model while the search agent itself stays on `llm_model` — the filtered-out candidates never
+    # enter the agent model's context, so this drives cost down without touching the agent's reasoning.
+    semantic_filter_model: str | None = None
+
+    # OpenRouter provider order (no fallback) for the semantic_filter judge calls only. None => use
+    # the client-wide `llm_provider_order`. Lets the judge model route to specific providers (e.g.
+    # [akashml, parasail]) while the agent model (which may be a different family, e.g. a Google
+    # model that those providers don't serve) stays unpinned.
+    semantic_filter_provider_order: list[str] | None = None
 
     # maximum number of steps the agent can take in a single conversation
     agent_max_steps: int = 20

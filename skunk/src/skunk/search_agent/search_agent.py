@@ -2,9 +2,9 @@
 
 Subclasses `MultiTurnAgent`: it supplies the search-specific system prompt
 (`briefing` + `final_answer_doc`) and the chroma/page-map-backed tool set
-(`search_corpus` / `grep_corpus` / `read_document` / `prune`), and lets the base
-own the multi-turn loop, the block trajectory, and the JSON final-answer
-mechanism. The final answer is a ```json``` block ({"doc_ids": [...]}), not a
+(`search_corpus` / `grep_corpus` / `semantic_filter` / `read_document` / `prune`),
+and lets the base own the multi-turn loop, the block trajectory, and the JSON
+final-answer mechanism. The final answer is a ```json``` block ({"doc_ids": [...]}), not a
 tool.
 
 Two overrides specialise the base for retrieval:
@@ -60,6 +60,7 @@ class SearchAgent(MultiTurnAgent):
     # ~1.5 chars/token, so keep this conservative — 1.3M chars ≈ 870K tokens, leaving headroom
     # for the system prompt + output under the input ceiling (a higher budget 400'd requests).
     context_budget_chars: int = 1_300_000
+    chunks_per_summary: int = 10
     warn_steps_remaining = 2
     briefing = _PROMPTS["briefing"]
     final_answer_doc = _PROMPTS["final_answer_doc"]
@@ -70,13 +71,14 @@ class SearchAgent(MultiTurnAgent):
         document_map: DocumentMap,
         chroma_collection: Collection,
         llm_client: LLMClient,
-        emb_model_id: str,
         *,
+        ctx: ExecutionContext | None = None,
         pdf_dir: str | None = None,
         page_renders_dir: str | None = None,
         extra_tools: tuple[Tool, ...] = (),
         include_search_corpus: bool = True,
         include_grep_corpus: bool = True,
+        include_semantic_filter: bool = False,
         briefing: str | None = None,
         final_answer_doc: str | None = None,
         agent_id: str | None = None,
@@ -95,8 +97,7 @@ class SearchAgent(MultiTurnAgent):
         self.config = config
         self.chroma_collection = chroma_collection
         self.document_map = document_map
-        self._emb_llm_client = llm_client
-        self.emb_model_id = emb_model_id
+        self._llm_client = llm_client
 
         # Bound each search-step LLM call: cap output (was uncapped → runaway
         # generations streamed to the 65535-token ceiling at 200–800s each) and
@@ -105,24 +106,16 @@ class SearchAgent(MultiTurnAgent):
         self.max_output_tokens = config.search_agent_max_output_tokens
         self.request_timeout_s = config.search_agent_request_timeout_s
 
-        # Per-question retrieval state (pruned + seen sets), shared by reference
-        # with the search / grep / read / prune tools and read by
-        # `_block_is_visible` for redaction — see `RetrievalState`'s docstring for
-        # the per-set contract. One SearchAgent per question / branch ⇒ state
-        # never cross-talks between questions.
+        # Per-question retrieval state (pruned + read + fetched sets), shared by
+        # reference with the search / grep / semantic-filter / read / prune tools
+        # and read by `_block_is_visible` for redaction — see `RetrievalState`'s
+        # docstring for the per-set contract. One SearchAgent per question / branch
+        # ⇒ state never cross-talks between questions.
         self._state = RetrievalState()
 
-        # Extra tools are constructed by the caller before this state exists; hand it
-        # to any that opt in via a duck-typed `bind_retrieval_state` (e.g. `SemanticFilterTool`),
-        # so they can honor prunes and record seen chunks. Duck-typed on purpose: the
-        # generic `Tool` ABC must not learn `RetrievalState`.
-        for tool in extra_tools:
-            bind = getattr(tool, "bind_retrieval_state", None)
-            if callable(bind):
-                bind(self._state)
-
         # Tool instances capture their deps; the prompt's tool docs are generated
-        # from their `doc`s by the base, so tools and docs can't drift.
+        # from their `doc`s by the base, so tools and docs can't drift. `ctx` is threaded
+        # into the tools that emit trace events / bill usage on it (embeds, judge calls).
         if pdf_dir is not None:
             extra_tools += (ViewFigureTool(
                 self.document_map, pdf_dir, renders_dir=page_renders_dir,
@@ -130,12 +123,11 @@ class SearchAgent(MultiTurnAgent):
         tools: list[Tool] = []
         # Vector search over the corpus. A caller can drop it (`include_search_corpus=False`)
         # to force the agent onto other retrieval tools — e.g. qatfd system #3 removes it so
-        # the agent must use its `semantic_filter` tool for semantic narrowing (in the prior
+        # the agent must use the `semantic_filter` tool for semantic narrowing (in the prior
         # experiment the agent always chose vector search and never the sem-filter tool).
         if include_search_corpus:
             tools.append(SearchCorpusTool(
-                self.chroma_collection, self.emb_model_id, self._emb_llm_client,
-                self._state,
+                self.chroma_collection, self._llm_client, self._state, ctx,
             ))
         # Grep is optional too (symmetric with `include_search_corpus`): a caller can drop it to
         # force the agent onto vector search / semantic filtering, e.g. a tool-ablation experiment.
@@ -144,11 +136,24 @@ class SearchAgent(MultiTurnAgent):
                 self.chroma_collection,
                 self._state,
             ))
+        # LLM-judged predicate filter over candidate documents. Off by default; callers opt in
+        # (e.g. qatfd systems #3 / ablation). The judge model, its provider pinning, and its
+        # output cap come from config; its context limit is resolved from the client's config.
+        if include_semantic_filter:
+            tools.append(SemanticFilterTool(
+                self.chroma_collection,
+                self._llm_client,
+                self.document_map,
+                config.semantic_filter_model,
+                state=self._state,
+                ctx=ctx,
+                provider_order=config.semantic_filter_provider_order,
+                judge_max_output_tokens=config.semantic_filter_max_output_tokens,
+                disable_judge_reasoning=config.semantic_filter_disable_reasoning,
+            ))
         tools += [
             ReadDocumentTool(
                 self.document_map,
-                config.agent_max_pages_per_tool_call,
-                config.read_document_max_output_chars,
                 self._state,
             ),
             PruneTool(self._state),
@@ -179,17 +184,20 @@ class SearchAgent(MultiTurnAgent):
     def _block_is_visible(self, block: Block) -> bool:
         """Redact pruned chunks from the LLM-facing render (full trajectory is kept)."""
         if isinstance(block, ChunkBlock):
-            if block.chunk_id is not None and block.chunk_id in self._state.pruned_chunk_ids:
+            if block.chunk_id is not None and block.chunk_id in self._state.pruned_chunk_ids | self._state.redacted_chunk_ids:
                 return False
         if isinstance(block, (ChunkBlock, ImageBlock)):
-            if block.doc_id in self._state.pruned_doc_ids:
+            if block.doc_id in self._state.pruned_doc_ids | self._state.redacted_doc_ids:
                 return False
         return True
 
     def _make_block_invisible(self, doc_id: str | None = None, chunk_id: str | None = None) -> None:
         """Redact all blocks which have the doc_id or chunk_id."""
         assert doc_id is not None or chunk_id is not None
-        
+        if chunk_id:
+            self._state.redacted_chunk_ids.add(chunk_id)
+        if doc_id:
+            self._state.redacted_doc_ids.add(doc_id)
 
     def _blocks_from_output(self, out: CodeOutput) -> list[Block]:
         """Render a tool result into blocks. Chunk-bearing payloads become one
@@ -203,27 +211,48 @@ class SearchAgent(MultiTurnAgent):
         if isinstance(output, dict) and output.get(SEARCH_RESULT_TAG):
             if output.get("error"):
                 blocks.append(TextBlock(f"[error]\n{output['error']}"))
-            elif not output["chunks"]:
+            elif not output["read_chunks"] and not output["fetched_chunks"]:
                 blocks.append(TextBlock(EMPTY_RESULT_MESSAGE))
-            else:
+            elif output["read_chunks"]:
                 blocks.extend(
                     ChunkBlock(chunk_id=c["chunk_id"], doc_id=c["doc_id"], text=c["text"])
-                    for c in output["chunks"]
+                    for c in output["read_chunks"]
                 )
+            elif output["fetched_chunks"]:
+                total_est_num_tokens = sum(chunk["est_num_tokens"] for chunk in output["fetched_chunks"])
+                fetch_summary = f"Retrieved {len(output['fetched_chunks'])} chunks with {total_est_num_tokens:,} est. tokens. Here are the top-{self.chunks_per_summary} chunks by est. token count:\n"
+                chunks_desc_token_order = sorted(output["fetched_chunks"], key=lambda c: c["est_num_tokens"], reverse=True)
+                for chunk in chunks_desc_token_order[:self.chunks_per_summary]:
+                    fetch_summary += f" - {chunk['header']}\n"
+                blocks.append(TextBlock(fetch_summary))
+
             return blocks
 
         if isinstance(output, dict) and output.get(GREP_RESULT_TAG):
             if output.get("error"):
                 blocks.append(TextBlock(f"[error]\n{output['error']}"))
-            elif not output["groups"]:
+            elif not output["read_groups"] and not output["fetched_groups"]:
                 blocks.append(TextBlock(EMPTY_RESULT_MESSAGE))
-            else:
-                for group in output["groups"]:
-                    blocks.append(TextBlock(group["header"]))
-                    blocks.extend(
-                        ChunkBlock(chunk_id=c["chunk_id"], doc_id=c["doc_id"], text=c["text"])
-                        for c in group["chunks"]
-                    )
+            elif output["read_groups"]:
+                for group in output["read_groups"]:
+                    blocks.append(TextBlock(group["header"]))  # TODO: would it be alright to change this to `ChunkBlock(chunk_id=None, doc_id=group["doc_id"], text=group["header"])`? This way it gets removed with prune calls; let's leave as-is though if that would in any way confuse the agent into thinking this is the entire document text
+                    if group["read_chunks"]:
+                        blocks.extend(
+                            ChunkBlock(chunk_id=c["chunk_id"], doc_id=c["doc_id"], text=c["text"])
+                            for c in group["read_chunks"]
+                        )
+                    else:
+                        blocks.append(TextBlock("[chunks truncated...]"))
+            elif output["fetched_groups"]:
+                total_chunks = sum(len(g["fetched_chunks"]) for g in output["fetched_groups"])
+                total_groups = len(output["fetched_groups"])
+                total_est_num_tokens = sum([c["est_num_tokens"] for g in output["fetched_groups"] for c in g["fetched_chunks"]])
+                fetch_summary = f"Retrieved {total_chunks} chunks from {total_groups} documents with {total_est_num_tokens:,} est. tokens. Here are the top-{self.chunks_per_summary} chunks by est. token count:\n"
+                chunks_desc_token_order = sorted([c for g in output["fetched_groups"] for c in g["fetched_chunks"]], key=lambda c: c["est_num_tokens"], reverse=True)
+                for chunk in chunks_desc_token_order[:self.chunks_per_summary]:
+                    fetch_summary += f"{chunk['header']}\n"
+                blocks.append(TextBlock(fetch_summary))
+
             # Surfaced when the output cap dropped hits (visible TextBlock, not redactable).
             if output.get("truncation_note"):
                 blocks.append(TextBlock(output["truncation_note"]))
@@ -232,18 +261,29 @@ class SearchAgent(MultiTurnAgent):
         if isinstance(output, dict) and output.get(SEMFILTER_RESULT_TAG):
             if output.get("error"):
                 blocks.append(TextBlock(f"[error]\n{output['error']}"))
-            else:
-                # A summary line, then one redactable ChunkBlock per kept-doc snippet.
+            elif not output.get("summary") and not output["read_chunks"] and not output["fetched_chunks"]:
+                blocks.append(TextBlock(EMPTY_RESULT_MESSAGE))
+            elif output["summary"] and not output["read_chunks"] and not output["fetched_chunks"]:
+                blocks.append(TextBlock(output["summary"]))
+            elif output["read_chunks"]:
                 if output.get("summary"):
                     blocks.append(TextBlock(output["summary"]))
                 blocks.extend(
                     ChunkBlock(chunk_id=c["chunk_id"], doc_id=c["doc_id"], text=c["text"])
-                    for c in output["chunks"]
+                    for c in output["read_chunks"]
                 )
-                if not output.get("summary") and not output["chunks"]:
-                    blocks.append(TextBlock(EMPTY_RESULT_MESSAGE))
-            if output.get("truncation_note"):
-                blocks.append(TextBlock(output["truncation_note"]))
+            elif output["fetched_chunks"]:
+                if output.get("summary"):
+                    blocks.append(TextBlock(output["summary"]))
+                total_chunks = len(output["fetched_chunks"])
+                total_docs = len(set(output["kept_doc_ids"]))
+                total_est_num_tokens = sum(c["est_num_tokens"] for c in output["fetched_chunks"])
+                fetch_summary = f"Retrieved {total_chunks} chunks from {total_docs} documents with {total_est_num_tokens:,} est. tokens. Here are the top-{self.chunks_per_summary} chunks by est. token count:\n"
+                chunks_desc_token_order = sorted(output["fetched_chunks"], key=lambda c: c["est_num_tokens"], reverse=True)
+                for chunk in chunks_desc_token_order[:self.chunks_per_summary]:
+                    fetch_summary += f"{chunk['header']}\n"
+                blocks.append(TextBlock(fetch_summary))
+
             return blocks
 
         if isinstance(output, dict) and output.get(READ_DOCUMENT_RESULT_TAG):

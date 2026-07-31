@@ -94,6 +94,7 @@ def _block_to_jsonable(b: Block) -> dict:
 
 
 _FENCE_RE = re.compile(r"```([a-zA-Z0-9_]*)\n(.*?)```", re.DOTALL)
+_PRUNE_RE = re.compile(r"prune\(.*\)", re.DOTALL)
 
 @dataclass
 class _StepOutput:
@@ -562,19 +563,22 @@ class MultiTurnAgent(ABC):
             prune_msg = " Consider using prune tool to reduce the tokens in your context window on the next step." if "prune" in [t.name for t in self._tools] else ""
             warn_msg = f"[warning] {usage_msg} {soft_token_max_after_step:,} tokens exceeds soft limit {soft_token_limit:,} tokens.{prune_msg}"
             ctx.emit(f"context_soft_limit_exceeded tokens={soft_token_max_after_step:,} limit={soft_token_limit:,}", data={"text": warn_msg})
-        self.messages.append({"role": "user", "blocks": [TextBlock(warn_msg)]})
+        if warn_msg:
+            self.messages.append({"role": "user", "blocks": [TextBlock(warn_msg)]})
 
     def _trim(self, ctx: ExecutionContext) -> None:
         """Trim the messages to fit within the model's context limit. Go through the list of messages
         in reverse and redact until our estimate is under the model's context limit."""
         context_limit = self._get_context_limit(ctx)
         redacted_msg = f"[notice] in order to trim your context to fit within the {context_limit:,} token limit, we've redacted the following docs/chunks:\n"
+        trimmed = False
         for msg in reversed(self.messages):
             # break once we're estimated to be below the token limit
-            redacted_msg_tokens = _count_tokens([TextBlock(redacted_msg)])
+            redacted_msg_tokens = _count_tokens([TextBlock(redacted_msg)]) if trimmed else 0
             if self._tokens_in_context + redacted_msg_tokens + (self.max_output_tokens or 0) < context_limit:
                 break
 
+            trimmed = True
             for block in msg["blocks"]:
                 if isinstance(block, TextBlock) or not self._block_is_visible(block):
                     continue
@@ -583,11 +587,13 @@ class MultiTurnAgent(ABC):
                 est_tokens = _count_tokens([block])
                 if isinstance(block, ImageBlock) or (isinstance(block, ChunkBlock) and block.chunk_id is None):
                     self._make_block_invisible(doc_id=block.doc_id)
-                    redacted_msg += f" - doc_id={block.doc_id} | est. tokens={est_tokens}"
+                    redacted_msg += f" - doc_id={block.doc_id} | est. tokens={est_tokens}\n"
+                    self._tokens_in_context += estimate_tokens(redacted_msg)
 
                 elif isinstance(block, ChunkBlock):
                     self._make_block_invisible(chunk_id=block.chunk_id)
-                    redacted_msg += f" - chunk_id={block.chunk_id} | est. tokens={est_tokens}"
+                    redacted_msg += f" - chunk_id={block.chunk_id} | est. tokens={est_tokens}\n"
+                    self._tokens_in_context += estimate_tokens(redacted_msg)
 
                 # decrement block tokens
                 self._tokens_in_context -= est_tokens
@@ -597,12 +603,15 @@ class MultiTurnAgent(ABC):
                 if self._tokens_in_context + redacted_msg_tokens + (self.max_output_tokens or 0) < context_limit:
                     break
 
+        if trimmed:
+            self.messages.append({"role": "user", "blocks": [TextBlock(redacted_msg)]})
+
     def add_budget_observations(self, ctx: ExecutionContext, obs_blocks: list[Block]) -> None:
         """Add TextBlocks tracking the context, cost, and latency usage of the agent.
         Cost and latency are tracked iff self.cost_budget and self.latency_budget are not None, respectively."""
         context_limit = self._get_context_limit(ctx)
         obs_blocks.append(TextBlock(
-            f"[Context usage: ~{self._tokens_in_context:,}/{context_limit:,} chars "
+            f"[Context usage: ~{self._tokens_in_context:,}/{context_limit:,} tokens "
             f"({self._tokens_in_context / context_limit * 100:.1f}%)]"
         ))
         if self.cost_budget is not None:
@@ -667,6 +676,13 @@ class MultiTurnAgent(ABC):
                     # free for this question's sibling branches (see `_execute_code`).
                     assert step_out.code is not None
                     ctx.emit(f"tool_code {step_out.code!r}")
+
+                    # if we are above the hard context limit, block any non-prune tool call
+                    hard_token_max_after_step = self._tokens_in_context + (self.max_output_tokens or 0)
+                    above_limit = hard_token_max_after_step >= self._get_hard_token_limit(ctx)
+                    if above_limit and not _PRUNE_RE.findall(step_out.code):
+                        raise Exception("You are above the hard token limit for the model but did not invoke the `prune()` tool or produce a final answer.")
+
                     # Tool execution is the ONLY point where block visibility can change
                     # (e.g. `prune` mutating the shared retrieval state read by
                     # `_block_is_visible`), so diff visibility around it and subtract

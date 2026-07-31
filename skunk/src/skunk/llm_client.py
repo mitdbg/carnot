@@ -215,6 +215,15 @@ class CallSpec:
     messages: list[dict]
     temperature: float = 0.0
     effort: Effort = "off"
+    # Disable reasoning outright (OpenRouter `reasoning={"effort": "none"}`), overriding `effort`.
+    # Unlike effort="off" — which maps to the cheapest reasoning tier because some endpoints
+    # mandate reasoning — this asks the provider to emit NO thinking tokens at all, for call
+    # sites whose reply is a single token (e.g. the semantic_filter TRUE/FALSE judge). Endpoints
+    # that mandate reasoning (e.g. Gemini 3) reject it with a 400 — keep those call sites on
+    # `effort` instead. (The SDK's chat `Reasoning` model silently DROPS an `enabled` key, so
+    # `{"enabled": false}` is not a usable encoding here; `effort` is an open enum and "none"
+    # passes through to the provider.)
+    disable_reasoning: bool = False
     ctx: ExecutionContext | None = None
     call_site: str = "llm"
     max_output_tokens: int | None = None
@@ -716,7 +725,7 @@ class _OpenRouterBackend(_OpenAIChatBackend):
         """One OpenRouter chat call (no retry — the retry loop owns that)."""
         client = self._get_client()
         messages = self._chat_messages(spec.system, spec.messages)
-        reasoning = self._effort_to_reasoning(spec.effort)
+        reasoning = {"effort": "none"} if spec.disable_reasoning else self._effort_to_reasoning(spec.effort)
         extra = (
             {"max_tokens": spec.max_output_tokens}
             if spec.max_output_tokens is not None
@@ -741,7 +750,7 @@ class _OpenRouterBackend(_OpenAIChatBackend):
         """Async twin of `_gen_call` — uses `client.chat.send_async`."""
         client = self._get_client()
         messages = self._chat_messages(spec.system, spec.messages)
-        reasoning = self._effort_to_reasoning(spec.effort)
+        reasoning = {"effort": "none"} if spec.disable_reasoning else self._effort_to_reasoning(spec.effort)
         # TPM throttle (opt-in via SKUNK_MODEL_TPM): meter input tokens so throughput
         # stays under quota, separate from the RPM limiter. Per attempt (the retry loop
         # re-invokes this body), so each retry re-charges. `_tpm_settle` corrects the
@@ -906,6 +915,13 @@ class LLMClient:
         )
         self._backends: dict[str, _LLMBackend] = {}
 
+    @property
+    def config(self) -> InferenceConfig:
+        """The client's `InferenceConfig` (read-only). The seam for callers that need the
+        client's model defaults or limits (e.g. `SemanticFilterTool` resolving its judge
+        model's context window) without threading the config alongside the client."""
+        return self._config
+
     def _backend(self, provider: str) -> _LLMBackend:
         """The (lazily built, cached) backend for a provider name. All backends share
         this client's `usage` tracker."""
@@ -942,6 +958,7 @@ class LLMClient:
         model: str | None = None,
         temperature: float = 0.0,
         effort: Effort = "off",
+        disable_reasoning: bool = False,
         ctx: ExecutionContext | None = None,
         call_site: str = "llm",
         provider_order: list[str] | None = None,
@@ -951,7 +968,8 @@ class LLMClient:
     ) -> LLMResponse:
         spec = CallSpec(
             system=system, messages=list(messages),
-            temperature=temperature, effort=effort, ctx=ctx, call_site=call_site,
+            temperature=temperature, effort=effort, disable_reasoning=disable_reasoning,
+            ctx=ctx, call_site=call_site,
             model=model or self._config.llm_model, usage_key=usage_key,
             provider_order=provider_order, max_output_tokens=max_output_tokens,
             timeout_s=timeout_s,
@@ -965,6 +983,7 @@ class LLMClient:
         model: str | None = None,
         temperature: float = 0.0,
         effort: Effort = "off",
+        disable_reasoning: bool = False,
         ctx: ExecutionContext | None = None,
         call_site: str = "llm",
         provider_order: list[str] | None = None,
@@ -975,7 +994,8 @@ class LLMClient:
         """Async twin of `call` for the request path."""
         spec = CallSpec(
             system=system, messages=list(messages),
-            temperature=temperature, effort=effort, ctx=ctx, call_site=call_site,
+            temperature=temperature, effort=effort, disable_reasoning=disable_reasoning,
+            ctx=ctx, call_site=call_site,
             model=model or self._config.llm_model, usage_key=usage_key,
             provider_order=provider_order, max_output_tokens=max_output_tokens,
             timeout_s=timeout_s,
