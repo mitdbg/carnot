@@ -5,10 +5,11 @@
 # label is the run-name, so the four runs land in distinct dirs under
 #   results/officeqa/ablation_search_agent/<label>_<timestamp>/
 #
-#   grep_read           grep + read              (vector off, grep on,  sem off)
-#   vector_read         vector-search + read     (vector on,  grep off, sem off)
-#   grep_vector_read    grep + vector + read     (vector on,  grep on,  sem off)  = SearchAgent
-#   sem_read            semantic-filter + read   (vector off, grep off, sem on)
+#   grep_read           grep + read                  (vector off, grep on,  sem off)
+#   vector_read         vector-search + read         (vector on,  grep off, sem off)
+#   grep_vector_read    grep + vector + read         (vector on,  grep on,  sem off)  = SearchAgent
+#   sem_read            semantic-filter + read       (vector off, grep off, sem on)
+#   all_tools           grep + vector + sem + read   (vector on,  grep on,  sem on)
 #
 # All model calls go through OpenRouter (needs OPENROUTER_API_KEY in the environment) and read
 # from the already-running ChromaDB server (host/port below). Run with the skunk venv active.
@@ -39,6 +40,7 @@ CONFIGS=(
   "vector_read|true|false|false"
   "grep_vector_read|true|true|false"
   "sem_read|false|false|true"
+  "all_tools|true|true|true"
 )
 
 for entry in "${CONFIGS[@]}"; do
@@ -63,5 +65,5 @@ for entry in "${CONFIGS[@]}"; do
 done
 
 echo
-echo "All 4 ablation runs complete."
+echo "All ${#CONFIGS[@]} ablation runs complete."
 echo "Reports: results/officeqa/ablation_search_agent/<label>_<timestamp>/report.csv"
