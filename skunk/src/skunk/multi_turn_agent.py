@@ -17,6 +17,7 @@ from skunk.constants import IMAGE_TOKENS_EST
 from skunk.errors import ParseError, StepFailed
 from skunk.prompted_call import PromptedCall
 from skunk.prompts import load_prompts
+from skunk.usage import match_model_entry
 from skunk.sandbox.local_python_executor import CodeOutput, LocalPythonExecutor
 
 _ENV = Environment(
@@ -354,10 +355,14 @@ class MultiTurnAgent(ABC):
         return self._prompt._resolve_model(ctx)
 
     def _get_context_limit(self, ctx: ExecutionContext) -> int:
-        """Returns the context limit for the agent based on the context limit of its model."""
+        """Returns the context limit for the agent based on the context limit of its model.
+        `llm_context_limits` is an id-or-SUBSTRING map (e.g. a bare "gemini-3.5-flash" key must
+        match the full "google/gemini-3.5-flash" id), so resolve via `match_model_entry` like
+        every other per-model map — an exact-key lookup here breaks on substring keys."""
         model = self._llm_model(ctx)
-        assert model in ctx.config.inference.llm_context_limits, f"Model {model} not found in context limits"
-        return ctx.config.inference.llm_context_limits[model]
+        limit = match_model_entry(model, ctx.config.inference.llm_context_limits)
+        assert limit is not None, f"Model {model} not found in context limits"
+        return int(limit)
 
     def _get_soft_token_limit(self, ctx: ExecutionContext) -> int:
         """Returns the soft token limit for the agent based on the context limit of its model."""

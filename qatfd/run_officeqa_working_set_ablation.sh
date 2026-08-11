@@ -15,9 +15,13 @@
 # from the already-running ChromaDB server (host/port below). Run with the skunk venv active.
 #
 # Env overrides:
-#   MODEL=qwen/qwen3.6-35b-a3b    # full OpenRouter model id
-#   PROVIDER=parasail             # OpenRouter provider pin; empty string = no pin (let OR pick)
+#   MODEL=google/gemini-3.5-flash        # agent model (full OpenRouter id)
+#   PROVIDER=                            # agent provider pin; empty string = no pin (let OR pick)
+#   JUDGE_MODEL=qwen/qwen3.6-35b-a3b     # semantic_filter judge model; "" = use the agent model
 #   JUDGE_PROVIDERS=parasail,akashml,deepinfra  # semantic_filter judge provider order; "" = client default
+#   ARMS=vector_read,grep_vector_read,sem_read,all_tools  # comma-separated labels to run; "" = all
+#   WORKING_SET_OFF=true          # disable the working-set abstraction (tools force fetch+read);
+#                                 # run labels get a _ws_off suffix so runs land in distinct dirs
 #   CHROMA_HOST=127.0.0.1  CHROMA_PORT=8001  PYTHON=python3
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -26,10 +30,15 @@ PYTHON="${PYTHON:-python3}"
 CHROMA_HOST="${CHROMA_HOST:-127.0.0.1}"
 CHROMA_PORT="${CHROMA_PORT:-8001}"
 
-# Model defaults to the qwen run; override MODEL/PROVIDER for another. PROVIDER="" pins nothing.
-MODEL="${MODEL:-qwen/qwen3.6-35b-a3b}"
-PROVIDER="${PROVIDER-parasail}"
-# Provider order for the semantic_filter judge calls only (sem_read arm); "" = client default.
+# Agent model defaults to gemini-3.5-flash, unpinned: PROVIDER defaults to "" because the qwen
+# pin (parasail) does not serve Gemini — set PROVIDER only when it actually serves MODEL.
+MODEL="${MODEL:-google/gemini-3.5-flash}"
+PROVIDER="${PROVIDER-}"
+# Judge model + provider order for the semantic_filter judge calls only (sem_read/all_tools arms).
+# JUDGE_MODEL="" = fall back to the agent model; JUDGE_PROVIDERS="" = client default routing.
+# NOTE: a new JUDGE_MODEL needs an inference.llm_context_limits entry (configs/inference/base.yaml)
+# or the semantic filter won't head-truncate oversized candidate docs for it.
+JUDGE_MODEL="${JUDGE_MODEL-qwen/qwen3.6-35b-a3b}"
 JUDGE_PROVIDERS="${JUDGE_PROVIDERS-parasail,akashml,deepinfra}"
 
 : "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set in the environment}"
@@ -43,13 +52,29 @@ CONFIGS=(
   "all_tools|true|true|true"
 )
 
+# ARMS: comma-separated subset of labels to run (e.g. resume a partial sweep); "" = all.
+ARMS="${ARMS-}"
+# WORKING_SET_OFF=true disables the working-set abstraction (systems.working_set_off).
+WORKING_SET_OFF="${WORKING_SET_OFF:-false}"
+
 for entry in "${CONFIGS[@]}"; do
   IFS='|' read -r label vec grep sem <<< "$entry"
+  if [ -n "$ARMS" ] && ! [[ ",$ARMS," == *",$label,"* ]]; then
+    echo "--- skipping $label (not in ARMS=$ARMS)"
+    continue
+  fi
   provider_ovr=()
   [ -n "$PROVIDER" ] && provider_ovr+=( "inference.llm_provider_order=[${PROVIDER}]" )
+  [ -n "$JUDGE_MODEL" ] && provider_ovr+=( "systems.semantic_filter_model=${JUDGE_MODEL}" )
   [ -n "$JUDGE_PROVIDERS" ] && provider_ovr+=( "systems.semantic_filter_provider_order=[${JUDGE_PROVIDERS}]" )
+  run_name="$label"
+  if [ "$WORKING_SET_OFF" = "true" ]; then
+    provider_ovr+=( "systems.working_set_off=true" )
+    run_name="${label}_ws_off"
+  fi
   echo "==================================================================="
-  echo "=== officeqa | ablation_search_agent | ${label}  (vector=$vec grep=$grep sem=$sem) | model=$MODEL ${PROVIDER:+provider=$PROVIDER}"
+  echo "=== officeqa | ablation_search_agent | ${run_name}  (vector=$vec grep=$grep sem=$sem working_set_off=$WORKING_SET_OFF)"
+  echo "===   agent=$MODEL${PROVIDER:+ (pin: $PROVIDER)} | judge=${JUDGE_MODEL:-$MODEL}${JUDGE_PROVIDERS:+ (pin: $JUDGE_PROVIDERS)}"
   echo "==================================================================="
   "$PYTHON" -m qatfd.runner \
     benchmarks=officeqa \
@@ -61,7 +86,7 @@ for entry in "${CONFIGS[@]}"; do
     systems.tool_semantic_filter="$sem" \
     benchmarks.chroma_server_host="$CHROMA_HOST" \
     benchmarks.chroma_server_port="$CHROMA_PORT" \
-    experiments.run_name="$label"
+    experiments.run_name="$run_name"
 done
 
 echo

@@ -21,3 +21,5 @@ agent_max_misfires: 5
 cost_budget: null
 # target latency budget for the search agent; null means no latency limit (default)
 latency_budget: null
+# whether to turn the working set abstraction off for ablation experiments
+working_set_off: false

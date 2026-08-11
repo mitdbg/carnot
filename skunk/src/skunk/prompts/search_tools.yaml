@@ -1,4 +1,4 @@
-search_corpus_no_fetch: |-
+search_corpus_no_working_set: |-
   ### search_corpus(query: str, top_k: int, metadata_filter: dict | None = None)
   This tool performs a vector search over all chunks in the corpus. The input `query` is embedded and the `top_k` most relevant chunks are returned, each labelled with its `chunk_id` and `doc_id`. You can optionally restrict the search to a subset of the corpus by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata.
 
@@ -8,7 +8,7 @@ search_corpus_no_fetch: |-
   - Negation / not-in: `{"field": {"$nin": [...]}}`
   - Compound: `{"$and": [clause1, clause2, ...]}` or `{"$or": [...]}`
 
-  Chunks already returned to you by earlier tool calls are automatically excluded from the results, so each call surfaces new material. (To revisit material you've already fetched, look back in your context or `read_document` it again.)
+  Chunks already returned to you by earlier tool calls are automatically excluded from the results, so each call surfaces new material. (To revisit material you've already read, look back in your context or `read_document` it again.)
 
   ```python
   # find the 100 chunks most relevant to "topic X" anywhere in the corpus
@@ -20,7 +20,7 @@ search_corpus_no_fetch: |-
   search_corpus("topic Y", top_k=50, metadata_filter={"$and": [{"field_a": "value_a"}, {"field_b": {"$in": [1, 2, 3]}}]})
   ```
 
-search_corpus_with_fetch: |-
+search_corpus: |-
   ### search_corpus(query: str, top_k: int, read: bool = False, fetch: bool = False, metadata_filter: dict | None = None)
   This tool performs a vector search over the corpus by embedding the input `query` and returning the `top_k` most relevant chunks, each labelled with its `chunk_id` and `doc_id`. You can optionally restrict the search to a subset of the corpus by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata.
 
@@ -53,7 +53,7 @@ search_corpus_with_fetch: |-
   search_corpus("topic Z", top_k=20, read=True)
   ```
 
-grep_corpus_no_fetch: |-
+grep_corpus_no_working_set: |-
   ### grep_corpus(pattern: str, metadata_filter: dict | None = None, limit: int | None = None, max_output_tokens: int | None = None)
   This tool performs a regex search over the cleaned text of every chunk in the corpus and returns the matching chunks grouped by their `doc_id`. Each hit includes its `chunk_id` so you can later refer to it or prune it. The output is unlimited by default (`limit=None` and `max_output_tokens=None`). This is useful for exhaustive queries -- "find every doc that mentions X" -- but you should pass `limit=N` or `max_output_tokens=M` for narrower exploratory searches. If the matches exceed either cap, the result is truncated with a note telling you how many hits were omitted. You can optionally restrict the search to a subset of the corpus by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata.
 
@@ -80,7 +80,7 @@ grep_corpus_no_fetch: |-
   grep_corpus("(?i)topic Z", max_output_tokens=5000)
   ```
 
-grep_corpus_with_fetch: |-
+grep_corpus: |-
   ### grep_corpus(pattern: str, read: bool = False, fetch: bool = False, metadata_filter: dict | None = None, limit: int | None = None, max_output_tokens: int | None = None)
   This tool performs a regex search over the corpus and returns the matching chunks grouped by their `doc_id`. Each hit includes its `chunk_id` so you can later refer to it or prune it. The output is unlimited by default (`limit=None` and `max_output_tokens=None`). This is useful for exhaustive queries -- "find every doc that mentions X" -- but you should pass `limit=N` or `max_output_tokens=M` for narrower exploratory searches. If the matches exceed the `max_output_tokens` cap, the result is truncated with a note telling you how many hits were omitted. You can optionally restrict the search to a subset of the corpus by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata.
 
@@ -154,6 +154,58 @@ prune: |-
 
 sem_filter_judge: |-
   Determine whether a document satisfies a filter condition. You are given a filter condition and a document. Output TRUE if the document satisfies the condition, and FALSE otherwise. Your reply must be exactly TRUE or FALSE — a single word, with no explanation, reasoning, or any other text.
+
+sem_filter_tool_no_working_set: |-
+  ### semantic_filter(predicate: str, metadata_filter: dict | None = None, top_k: int | None = None, search_str: str | None = None, pattern: str | None = None, limit: int | None = None)
+  Keep only the documents whose FULL text satisfies a natural-language `predicate`: candidates are selected from the corpus, each is judged independently by an LLM (TRUE/FALSE), and the survivors are returned. Ideally, your candidate selection should limit the number of LLM invocations to <= 1000. To perform candidate selection, this tool accepts a `metadata_filter` (a ChromaDB-style where clause over chunk metadata).
+
+  Supported `metadata_filter` syntax:
+  - Equality: `{"field": value}`
+  - Set membership: `{"field": {"$in": [v1, v2, ...]}}`
+  - Negation / not-in: `{"field": {"$nin": [...]}}`
+  - Compound: `{"$and": [clause1, clause2, ...]}` or `{"$or": [...]}`
+
+  With only a `metadata_filter`, every matching chunk is a candidate. You can further sharpen your candidate selection by providing arguments for a vector search or grep command.
+
+  **Vector Search:** to perform candidate selection with vector search, specify the parameters `top_k` and optionally `search_str`. Vector search will select the `top_k` most relevant chunks — embedding `search_str` if given, else the predicate; prefer a short focused `search_str` when the predicate is long or compound.
+
+  **Grep:** to perform candidate selection with grep, specify the parameters `pattern` and optionally `limit`. The tool will filter for candidate chunks whose text matches the regular expression.
+
+  Candidate chunks are deduped to their parent documents before judging. Chunks that have been pruned are automatically excluded from the results. A call may re-surface documents you have already seen — use this to apply a new predicate to known material. Results are not deduplicated against earlier calls, so repeating an identical call returns identical results rather than new material.
+
+  ```python
+  # metadata only: judge every document from 1946 in the corpus
+  semantic_filter(predicate="mentions coal shortages affecting steel production", metadata_filter={"year": "1946"})
+
+  # vector prefilter: judge the documents behind the 200 chunks nearest a short query
+  semantic_filter(
+      predicate="describes a government intervention in response to a labor strike, naming the statute invoked",
+      top_k=200,
+      search_str="government intervention strike",
+  )
+
+  # grep prefilter: judge the documents which match the regular expression
+  semantic_filter(
+      predicate="The document is a legal contract between ACME Corp. and one of their suppliers",
+      pattern=r"(?i)ACME Corp(oration|\.)",
+  )
+
+  # metadata + vector prefilter: restrict candidates to a subset of years, then judge the documents behind the 300 nearest chunks
+  semantic_filter(
+      predicate="reports a change in the interest rate set by the central bank, stating the new rate",
+      top_k=300,
+      search_str="central bank interest rate change",
+      metadata_filter={"year": {"$in": ["1951", "1952", "1953"]}},
+  )
+
+  # metadata + grep prefilter: within a filtered subset, judge the documents matching the regex (capped at 500 candidate chunks)
+  semantic_filter(
+      predicate="attributes a production slowdown to a shortage of a specific raw material",
+      pattern=r"(?i)shortage",
+      limit=500,
+      metadata_filter={"$and": [{"field_a": "value_a"}, {"year": {"$nin": ["1946"]}}]},
+  )
+  ```
 
 sem_filter_tool: |-
   ### semantic_filter(predicate: str, read: bool = False, fetch: bool = False, metadata_filter: dict | None = None, top_k: int | None = None, search_str: str | None = None, pattern: str | None = None, limit: int | None = None)

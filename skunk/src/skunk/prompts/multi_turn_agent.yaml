@@ -26,6 +26,8 @@ system_prompt: |-
   ## Usage and Limits
   Your context usage{% if has_cost_budget and has_latency_budget %}, dollar cost, and latency{% elif has_cost_budget %} and dollar cost{% elif has_latency_budget %} and latency{% endif %} will be tracked and shown to you at the end of each step. The context usage is a soft limit; if you exceed the limit we will trim early messages from your context.{% if has_cost_budget and has_latency_budget %} Cost and latency limits are hard limits. Once you exceed the cost or latency budget, you will be forced to return a final answer on the next step.{% elif has_cost_budget %} The cost limit is a hard limit. Once you exceed the cost budget, you will be forced to return a final answer on the next step.{% elif has_latency_budget %} The latency limit is a hard limit. Once you exceed the latency budget, you will be forced to return a final answer on the next step.{% endif %}
 
+# TODO: make terminal prompt which forces model to provide an answer ("error" is not an option);
+# make this prompt the default and then have the error prompt be configurable
 terminal_prompt: |-
   {{ terminate_reason }} Do NOT call any tool now — emit exactly ONE ```json``` block, either:
     • COMMIT: if a value already in your observations answers the request, your best final answer in the required format; or

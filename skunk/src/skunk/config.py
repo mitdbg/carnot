@@ -162,6 +162,9 @@ class SearchAgentConfig(AgentConfig):
     # from `agent_max_steps` so a citation fix never eats into the agent's search budget.
     doc_id_correction_steps: int = 3
 
+    # turn off the working set abstraction for ablation experiments which evaluate its effectiveness
+    working_set_off: bool = False
+
 
 # --------------------------------------------------------------------------------
 # Orchestrator configuration.

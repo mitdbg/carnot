@@ -127,7 +127,11 @@ class SearchAgent(MultiTurnAgent):
         # experiment the agent always chose vector search and never the sem-filter tool).
         if include_search_corpus:
             tools.append(SearchCorpusTool(
-                self.chroma_collection, self._llm_client, self._state, ctx,
+                self.chroma_collection,
+                self._llm_client,
+                self._state,
+                ctx,
+                working_set_off=config.working_set_off,
             ))
         # Grep is optional too (symmetric with `include_search_corpus`): a caller can drop it to
         # force the agent onto vector search / semantic filtering, e.g. a tool-ablation experiment.
@@ -135,6 +139,7 @@ class SearchAgent(MultiTurnAgent):
             tools.append(GrepCorpusTool(
                 self.chroma_collection,
                 self._state,
+                working_set_off=config.working_set_off,
             ))
         # LLM-judged predicate filter over candidate documents. Off by default; callers opt in
         # (e.g. qatfd systems #3 / ablation). The judge model, its provider pinning, and its
@@ -150,6 +155,7 @@ class SearchAgent(MultiTurnAgent):
                 provider_order=config.semantic_filter_provider_order,
                 judge_max_output_tokens=config.semantic_filter_max_output_tokens,
                 disable_judge_reasoning=config.semantic_filter_disable_reasoning,
+                working_set_off=config.working_set_off,
             ))
         tools += [
             ReadDocumentTool(

@@ -135,7 +135,7 @@ def _build_metadata_where(
 
 class SearchCorpusTool(Tool):
     name = "search_corpus"
-    doc = _PROMPTS["search_corpus_with_fetch"]
+    doc = _PROMPTS["search_corpus"]
 
     def __init__(
         self,
@@ -144,13 +144,16 @@ class SearchCorpusTool(Tool):
         state: RetrievalState | None = None,
         ctx: ExecutionContext | None = None,
         usage_key: str = "default",
+        working_set_off: bool = False,
     ):
         self._chroma_collection = chroma_collection
         self._llm_client = llm_client
         self._ctx = ctx
         self._state = state if state is not None else RetrievalState()
         self._usage_key = usage_key
-        # TODO: revert to no_fetch doc string based on ctx.config
+        self._working_set_off = working_set_off
+        if working_set_off:
+            self.doc = _PROMPTS["search_corpus_no_working_set"]
 
     def _embed_query(self, query: str) -> list[float]:
         """Embed `query` with the same model that produced the stored embeddings, via the
@@ -166,6 +169,10 @@ class SearchCorpusTool(Tool):
         fetch: bool = False,
         metadata_filter: dict | None = None,
     ) -> dict:
+        # read corpus directly every time if working set abstraction is turned off
+        if self._working_set_off:
+            fetch = read = True
+
         assert fetch or read, "At least one of fetch or read must be present."
         assert fetch or not self._state.empty(), "Cannot read from empty working set"
         query_embedding = self._embed_query(query)
@@ -237,15 +244,19 @@ class SearchCorpusTool(Tool):
 
 class GrepCorpusTool(Tool):
     name = "grep_corpus"
-    doc = _PROMPTS["grep_corpus_with_fetch"]
+    doc = _PROMPTS["grep_corpus"]
 
     def __init__(
         self,
         chroma_collection: Collection,
         state: RetrievalState | None = None,
+        working_set_off: bool = False,
     ):
         self._chroma_collection = chroma_collection
         self._state = state if state is not None else RetrievalState()
+        self._working_set_off = working_set_off
+        if working_set_off:
+            self.doc = _PROMPTS["grep_corpus_no_working_set"]
 
     def __call__(
         self,
@@ -256,6 +267,10 @@ class GrepCorpusTool(Tool):
         limit: int | None = None,
         max_output_tokens: int | None = None,
     ) -> dict:
+        # read corpus directly every time if working set abstraction is turned off
+        if self._working_set_off:
+            fetch = read = True
+
         assert fetch or read, "At least one of fetch or read must be present."
         assert fetch or not self._state.empty(), "Cannot read from empty working set"
         # set the inclusion and exclusion filters based on the scenario
@@ -511,6 +526,7 @@ class SemanticFilterTool(Tool):
         judge_max_output_tokens: int | None = None,
         disable_judge_reasoning: bool = True,
         usage_key: str = "default",
+        working_set_off: bool = False,
     ) -> None:
         self._chroma_collection = chroma_collection
         self._llm_client = llm_client
@@ -521,6 +537,9 @@ class SemanticFilterTool(Tool):
         self._judge_max_output_tokens = judge_max_output_tokens or self._JUDGE_MAX_OUTPUT_TOKENS
         self._disable_judge_reasoning = disable_judge_reasoning
         self._usage_key = usage_key
+        self._working_set_off = working_set_off
+        if working_set_off:
+            self.doc = _PROMPTS["sem_filter_tool_no_working_set"]
 
         # per-call OpenRouter provider order for the judge calls only (None => client default). Lets a
         # cheaper judge model route to specific providers while the agent model stays unpinned.
@@ -711,6 +730,10 @@ class SemanticFilterTool(Tool):
         pattern: str | None = None,
         limit: int | None = None,
     ) -> dict:
+        # read corpus directly every time if working set abstraction is turned off
+        if self._working_set_off:
+            fetch = read = True
+
         assert fetch or read, "At least one of fetch or read must be present."
         assert fetch or not self._state.empty(), "Cannot read from empty working set"
         if not predicate or not str(predicate).strip():
@@ -735,12 +758,19 @@ class SemanticFilterTool(Tool):
         # Set the inclusion and exclusion filters based on the scenario. This tool dedups on the
         # FETCH axis only: a document enters the working set once, so fetch paths exclude what's
         # already fetched. Reads never dedup — the same working-set doc/chunk can be re-judged
-        # under a different predicate any number of times — so read excludes only prunes.
+        # under a different predicate any number of times — so read excludes only prunes. With the
+        # working set off there is no fetch axis, so the whole corpus is read-path: prunes only.
         in_chunk_ids = in_doc_ids = not_in_chunk_ids = not_in_doc_ids = None
-        if fetch:
+        if self._working_set_off:
+            # treat the corpus as the working set where only pruned material is excluded
+            not_in_chunk_ids = self._state.pruned_chunk_ids
+            not_in_doc_ids = self._state.pruned_doc_ids
+        elif fetch:
+            # fetch: candidates come from the corpus, exclude already fetched or pruned
             not_in_chunk_ids = self._state.fetched_chunk_ids | self._state.pruned_chunk_ids
             not_in_doc_ids = self._state.fetched_doc_ids | self._state.pruned_doc_ids
-        else:  # read-only: candidates come from the working set
+        else:
+            # read: candidates come from the working set
             in_chunk_ids = self._state.fetched_chunk_ids
             in_doc_ids = self._state.fetched_doc_ids
             not_in_chunk_ids = self._state.pruned_chunk_ids
@@ -831,6 +861,14 @@ class SemanticFilterTool(Tool):
         if read:
             self._state.read_chunk_ids.update(c["chunk_id"] for c in kept_chunks)
             self._state.read_doc_ids.update(kept)
+            # A re-surfaced chunk must actually render: `_block_is_visible` hides ChunkBlocks by
+            # chunk_id/doc_id, so a kept chunk the context trimmer once redacted would come back
+            # invisible while the summary says its doc passed. Drop kept ids from the redaction
+            # sets (mirrors `read_document`); the trimmer can always re-redact on a later step.
+            for c in kept_chunks:
+                self._state.redacted_chunk_ids.discard(c["chunk_id"])
+            for did in kept:
+                self._state.redacted_doc_ids.discard(did)
 
         summary = (
             f"[semantic_filter] kept {len(kept)}/{len(candidate_doc_ids)} candidate document(s) matching the "
