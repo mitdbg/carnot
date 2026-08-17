@@ -251,10 +251,12 @@ async def _is_inquiry_unique(inquiry: str, question: dict, ctx: ExecutionContext
             n_results=TOP_K_NEIGHBORS,
             include=["metadatas", "documents"],
         )
+        documents, metadatas = results['documents'], results['metadatas']
+        assert documents is not None and metadatas is not None
         ids = results['ids'][0]
-        inquiries = results['documents'][0]
-        questions = [m['question'] for m in results['metadatas'][0]]
-        answers = [m['answer'] for m in results['metadatas'][0]]
+        inquiries = documents[0]
+        questions = [m['question'] for m in metadatas[0]]
+        answers = [m['answer'] for m in metadatas[0]]
         neighbor_lines_of_inquiry = [
             {"id": _id, "line_of_inquiry": inquiry, "question": question, "answer": answer}
             for _id, inquiry, question, answer in zip(ids, inquiries, questions, answers, strict=True)
@@ -311,9 +313,11 @@ async def _is_qa_pair_unique(qa_pair: dict, qid: str, idx: int, solvable: bool, 
                 where={"kind": "question"},
                 include=["metadatas", "documents"],
             )
+            documents, metadatas = results['documents'], results['metadatas']
+            assert documents is not None and metadatas is not None
             ids = results['ids'][0]
-            questions = results['documents'][0]
-            answers = [m['answer'] for m in results['metadatas'][0]]
+            questions = documents[0]
+            answers = [m['answer'] for m in metadatas[0]]
             neighbor_qa_pairs = [
                 {"qid": _id, "question": question, "answer": answer}
                 for _id, question, answer in zip(ids, questions, answers, strict=True)
@@ -590,6 +594,7 @@ async def generate_follow_up_questions(
     if inquiry_tries == MAX_INQUIRY_TRIES:
         raise Exception("Exceeded MAX_INQUIRY_TRIES")
 
+    # generate k follow up questions which are solvable and unique
     for idx in range(k):
         n_docs = max(1, round(rng.normal(loc=docs_mean, scale=docs_std)))
         qa_pair, qa_stats = await _generate_follow_up_question(idx, n_docs, question, qa_pairs, line_of_inquiry, ctx, collection, document_map)
@@ -613,6 +618,8 @@ async def generate_follow_up_questions(
 
         if qa_pair_tries == MAX_QA_PAIR_TRIES:
             raise Exception("Exceeded MAX_QA_PAIR_TRIES")
+
+        # TODO: try solving each question with multiple models to compute a solve rate for small / medium / large models
 
         qa_pairs.append({
             "qid": question["qid"],
@@ -927,4 +934,3 @@ if __name__ == "__main__":
 
 
 # TODO: add solve logic and measure fraction of solve(s) per question
-# TODO: run 1
