@@ -1,9 +1,0 @@
-# Mirrors the skunk library's ruff settings (this code moved from skunk/ on
-# 2026-07-07) so the move itself forces no formatting churn.
-target-version = "py312"
-line-length = 120
-
-[lint]
-# StepFailed is a deliberate name (read as a tagged failure mode, not a fatal
-# error); we intentionally don't follow PEP 8's "Error" suffix convention here.
-extend-ignore = ["N818"]
