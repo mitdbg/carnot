@@ -2,11 +2,11 @@
 
 Focus: `SearchAgentSystem.retrieve()` must return only the doc_ids that name real documents,
 because that list both scores recall and (in retrieve mode) selects the text handed to the
-answerer. The real per-id validation loop lives in skunk and is tested there; here we confirm
-the system runs the returned ids through it and threads answer-mode through unchanged.
+answerer. The real per-id validation loop lives in `SearchAgent.call()` in skunk and is tested
+there; here we confirm the system goes through it and threads answer-mode through unchanged.
 
-The agent is faked (its `call()` replays a script), so no LLM / chroma / tools are built.
-Runs under pytest, or standalone: `python3 tests/test_systems.py`.
+The agent's underlying multi-turn loop is faked (see `_ScriptedRun`), so no LLM / chroma /
+tools are built. Runs under pytest, or standalone: `python3 tests/test_systems.py`.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import asyncio
 from types import SimpleNamespace
 
 from skunk.common import ExecutionContext
+from skunk.multi_turn_agent import MultiTurnAgent
 from skunk.search_agent.search_agent import SearchAgent
 
 from qatfd.systems.search_agent import SearchAgentSystem
@@ -23,8 +24,21 @@ from qatfd.types import Question
 DOCMAP = {"A::p1": "text-a", "B::p2": "text-b"}
 
 
-class _FakeAgent(SearchAgent):
-    """SearchAgent with the real `run_with_validated_doc_ids` but a scripted `call()`."""
+class _ScriptedRun(MultiTurnAgent):
+    """Replays a script of final-answer payloads in place of the real multi-turn loop.
+
+    `SearchAgent.call()` (the validate-and-correct entrypoint under test) reaches the loop
+    through `super().call(...)`, which resolves to whatever follows `SearchAgent` in the MRO —
+    so the script has to be installed *below* SearchAgent, not on the subclass. `_FakeAgent`
+    lists this mixin after SearchAgent to slot it in there.
+    """
+
+    async def call(self, ctx, user, *, resume=False, max_steps=None, **_):
+        return self._script.pop(0) if self._script else {}
+
+
+class _FakeAgent(SearchAgent, _ScriptedRun):
+    """The real `SearchAgent.call()` (validation + correction) over a scripted agent loop."""
 
     def __init__(self, script):
         self.document_map = DOCMAP
@@ -33,9 +47,6 @@ class _FakeAgent(SearchAgent):
         # Mirror the real agent's stop-reason attribute (read by retrieve() to fill Retrieved.terminate_state).
         self.terminate_state = "finished"
         self._script = list(script)
-
-    async def call(self, ctx, user, *, resume=False, max_steps=None, **_):
-        return self._script.pop(0) if self._script else {}
 
 
 class _StubSystem(SearchAgentSystem):
@@ -48,7 +59,7 @@ class _StubSystem(SearchAgentSystem):
 
 
 def _ctx() -> ExecutionContext:
-    # ctx.config is never read on the retrieve path: the agent is faked, and passing an
+    # ctx.config is never read on the retrieve path: the agent loop is faked, and passing an
     # llm_client makes __post_init__ skip building one from config.inference. A bare stub
     # avoids assembling the full OrchestratorConfig sub-config tree just to satisfy the type.
     return ExecutionContext(

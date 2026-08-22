@@ -1,25 +1,3 @@
-search_corpus_no_working_set: |-
-  ### search_corpus(query: str, top_k: int, metadata_filter: dict | None = None)
-  This tool performs a vector search over all chunks in the corpus. The input `query` is embedded and the `top_k` most relevant chunks are returned, each labelled with its `chunk_id` and `doc_id`. You can optionally restrict the search to a subset of the corpus by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata.
-
-  Supported `metadata_filter` syntax:
-  - Equality: `{"field": value}`
-  - Set membership: `{"field": {"$in": [v1, v2, ...]}}`
-  - Negation / not-in: `{"field": {"$nin": [...]}}`
-  - Compound: `{"$and": [clause1, clause2, ...]}` or `{"$or": [...]}`
-
-  Chunks already returned to you by earlier tool calls are automatically excluded from the results, so each call surfaces new material. (To revisit material you've already read, look back in your context or `read_document` it again.)
-
-  ```python
-  # find the 100 chunks most relevant to "topic X" anywhere in the corpus
-  search_corpus("topic X", top_k=100)
-  ```
-
-  ```python
-  # find the 50 chunks most relevant to "topic Y" within a filtered subset
-  search_corpus("topic Y", top_k=50, metadata_filter={"$and": [{"field_a": "value_a"}, {"field_b": {"$in": [1, 2, 3]}}]})
-  ```
-
 search_corpus: |-
   ### search_corpus(query: str, top_k: int, read: bool = False, fetch: bool = False, metadata_filter: dict | None = None)
   This tool performs a vector search over the corpus by embedding the input `query` and returning the `top_k` most relevant chunks, each labelled with its `chunk_id` and `doc_id`. You can optionally restrict the search to a subset of the corpus by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata.
@@ -30,14 +8,23 @@ search_corpus: |-
   - Negation / not-in: `{"field": {"$nin": [...]}}`
   - Compound: `{"$and": [clause1, clause2, ...]}` or `{"$or": [...]}`
 
-  The `fetch` and `read` arguments are booleans which help you control a "working set" of chunks and documents. The working set is initially empty, but can serve queries more quickly once filled with a relevant subset of the entire corpus. The working set also acts as a buffer between the raw corpus and your context window, allowing you to be selective about which tokens enter your window. There are three ways you can use `fetch` and `read` (at least one must be `True`):
+  {% if working_set_collection_on or id_tracking_on %}
+  The `fetch` and `read` arguments are booleans which help you control a "working set" of chunks and documents (shown below). Your working set contains a (possibly empty) subset of the entire corpus. {% if working_set_collection_on %} The working set can serve queries more quickly since it caches the subset in a smaller, more efficient collection. {% endif %} The working set also acts as a buffer between the raw corpus and your context window, allowing you to be selective about which tokens enter your window. There are three ways you can use `fetch` and `read` (at least one must be `True`):
 
-  - `fetch=True` and `read=True`: the entire corpus is queried and the `top_k` chunks are pulled into the working set. These `top_k` chunks are also placed immediately into your context window before the next step.
-  - `fetch=True` and `read=False`: the entire corpus is queried and the `top_k` chunks are pulled into the working set. A short digest of the retrieved chunks and their estimated token sizes is placed into your context window before the next step.
-  - `fetch=False` and `read=True`: the working set is queried and the `top_k` chunks are placed into your context window before the next step.
+  - `fetch=True` and `read=True`: the entire corpus is queried and the `top_k` chunks are copied into the working set. These `top_k` chunks are also placed immediately into your context window before the next step.
+  - `fetch=True` and `read=False`: the entire corpus is queried and the `top_k` chunks are copied into the working set. A short digest of the retrieved chunks and their estimated token sizes is placed into your context window before the next step.
+  - `fetch=False` and `read=True`: only the working set is queried and the `top_k` chunks are placed into your context window before the next step.
+  {% endif %}
 
-  Chunks already returned to you by earlier tool calls are automatically excluded from the results, so each call surfaces new material. (To revisit material you've already read, look back in your context or call the `read_document` tool on it again.)
+  {% if id_tracking_on %}
+  Results are automatically de-duplicated against what you have already retrieved, and the rule depends on `read`:
+  - Calls with `read=True` exclude chunks you have already read into your context window, so re-running a query surfaces material you have not seen yet — including chunks that were fetched earlier but never read.
+  - Fetch-only calls (`read=False`) exclude chunks that are already in your working set, so repeated fetches only add new material.
+  - Pruned chunks and documents are always excluded.
+  (These rules apply at both the chunk and whole-document level: a document you read with `read_document` counts as fetched and read.) To revisit material you have already read, look back in your context window or call `read_document` with its `doc_id` — `read_document` results are never filtered.
+  {% endif %}
 
+  {% if working_set_collection_on or id_tracking_on %}
   ```python
   # fetch the 1000 chunks most relevant to "topic X" into the working set
   search_corpus("topic X", top_k=1000, fetch=True)
@@ -52,33 +39,17 @@ search_corpus: |-
   # read the 20 chunks most relevant to "topic Z" from the working set
   search_corpus("topic Z", top_k=20, read=True)
   ```
-
-grep_corpus_no_working_set: |-
-  ### grep_corpus(pattern: str, metadata_filter: dict | None = None, limit: int | None = None, max_output_tokens: int | None = None)
-  This tool performs a regex search over the cleaned text of every chunk in the corpus and returns the matching chunks grouped by their `doc_id`. Each hit includes its `chunk_id` so you can later refer to it or prune it. The output is unlimited by default (`limit=None` and `max_output_tokens=None`). This is useful for exhaustive queries -- "find every doc that mentions X" -- but you should pass `limit=N` or `max_output_tokens=M` for narrower exploratory searches. If the matches exceed either cap, the result is truncated with a note telling you how many hits were omitted. You can optionally restrict the search to a subset of the corpus by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata.
-
-  Supported `metadata_filter` syntax:
-  - Equality: `{"field": value}`
-  - Set membership: `{"field": {"$in": [v1, v2, ...]}}`
-  - Negation / not-in: `{"field": {"$nin": [...]}}`
-  - Compound: `{"$and": [clause1, clause2, ...]}` or `{"$or": [...]}`
-  
-  Chunks already returned to you by earlier tool calls are automatically excluded from the results, so each call surfaces new material. (To revisit material you've already read, look back in your context or call the `read_document` tool on it again.)
-
+  {% else %}
   ```python
-  # find every chunk that mentions "topic X" (case insensitive)
-  grep_corpus("(?i)topic X")
+  # find the 100 chunks most relevant to "topic X" anywhere in the corpus
+  search_corpus("topic X", top_k=100)
   ```
 
   ```python
-  # find chunks matching the literal phrase "topic Y" within a filtered subset, capped at 50 hits
-  grep_corpus("topic Y", metadata_filter={"field_a": {"$in": ["value_1", "value_2"]}}, limit=50)
+  # find the 50 chunks most relevant to "topic Y" within a filtered subset
+  search_corpus("topic Y", top_k=50, metadata_filter={"$and": [{"field_a": "value_a"}, {"field_b": {"$in": [1, 2, 3]}}]})
   ```
-
-  ```python
-  # broad sweep, but keep the observation small: cap the output at ~5k tokens
-  grep_corpus("(?i)topic Z", max_output_tokens=5000)
-  ```
+  {% endif %}
 
 grep_corpus: |-
   ### grep_corpus(pattern: str, read: bool = False, fetch: bool = False, metadata_filter: dict | None = None, limit: int | None = None, max_output_tokens: int | None = None)
@@ -90,16 +61,25 @@ grep_corpus: |-
   - Negation / not-in: `{"field": {"$nin": [...]}}`
   - Compound: `{"$and": [clause1, clause2, ...]}` or `{"$or": [...]}`
 
-  The `fetch` and `read` arguments are booleans which help you control a "working set" of chunks and documents. The working set is initially empty, but can serve queries more quickly once filled with a relevant subset of the entire corpus. The working set also acts as a buffer between the raw corpus and your context window, allowing you to be selective about which tokens enter your window. There are three ways you can use `fetch` and `read` (at least one must be `True`):
-
-  - `fetch=True` and `read=True`: the entire corpus is queried and the grepped chunks are pulled into the working set. These chunks are also placed immediately into your context window before the next step.
-  - `fetch=True` and `read=False`: the entire corpus is queried and the grepped chunks are pulled into the working set. A short digest of the retrieved chunks and their estimated token sizes is placed into your context window before the next step.
-  - `fetch=False` and `read=True`: the working set is queried and the grepped chunks are placed into your context window before the next step.
-
   Note that `max_output_tokens` will limit the number of tokens read, but not the number of tokens fetched. `limit` will limit the number of tokens read and fetched. 
-  
-  Chunks already returned to you by earlier tool calls are automatically excluded from the results, so each call surfaces new material. (To revisit material you've already read, look back in your context or call the `read_document` tool on it again.)
 
+  {% if working_set_collection_on or id_tracking_on %}
+  The `fetch` and `read` arguments are booleans which help you control a "working set" of chunks and documents (shown below). Your working set contains a (possibly empty) subset of the entire corpus. {% if working_set_collection_on %} The working set can serve queries more quickly since it caches the subset in a smaller, more efficient collection. {% endif %} The working set also acts as a buffer between the raw corpus and your context window, allowing you to be selective about which tokens enter your window. There are three ways you can use `fetch` and `read` (at least one must be `True`):
+
+  - `fetch=True` and `read=True`: the entire corpus is queried and the matching chunks are copied into the working set. These matching chunks are also placed immediately into your context window before the next step.
+  - `fetch=True` and `read=False`: the entire corpus is queried and the matching chunks are copied into the working set. A short digest of the retrieved chunks and their estimated token sizes is placed into your context window before the next step.
+  - `fetch=False` and `read=True`: only the working set is queried and the matching chunks are placed into your context window before the next step.
+  {% endif %}
+
+  {% if id_tracking_on %}
+  Results are automatically de-duplicated against what you have already retrieved, and the rule depends on `read`:
+  - Calls with `read=True` exclude chunks you have already read into your context window, so re-running a query surfaces material you have not seen yet — including chunks that were fetched earlier but never read.
+  - Fetch-only calls (`read=False`) exclude chunks that are already in your working set, so repeated fetches only add new material.
+  - Pruned chunks and documents are always excluded.
+  (These rules apply at both the chunk and whole-document level: a document you read with `read_document` counts as fetched and read.) To revisit material you have already read, look back in your context window or call `read_document` with its `doc_id` — `read_document` results are never filtered.
+  {% endif %}
+
+  {% if working_set_collection_on or id_tracking_on %}
   ```python
   # fetch every chunk that mentions "topic X" (case insensitive) into the working set
   grep_corpus("(?i)topic X", fetch=True)
@@ -114,6 +94,22 @@ grep_corpus: |-
   # read the first ~5k tokens about topic Z from the working set
   grep_corpus("(?i)topic Z", read=True, max_output_tokens=5000)
   ```
+  {% else %}
+  ```python
+  # find every chunk that mentions "topic X" (case insensitive)
+  grep_corpus("(?i)topic X")
+  ```
+
+  ```python
+  # find chunks matching the literal phrase "topic Y" within a filtered subset, capped at 50 hits
+  grep_corpus("topic Y", metadata_filter={"field_a": {"$in": ["value_1", "value_2"]}}, limit=50)
+  ```
+
+  ```python
+  # broad sweep, but keep the observation small: cap the output at ~5k tokens
+  grep_corpus("(?i)topic Z", max_output_tokens=5000)
+  ```
+  {% endif %}
 
 read_document: |-
   ### read_document(doc_id: str | list[str], start_char_idx: int | None | list[int | None] = None, end_char_idx: int | None | list[int | None] = None)
@@ -145,7 +141,11 @@ view_figure: |-
 
 prune: |-
   ### prune(chunk_ids: list[str] | None = None, doc_ids: list[str] | None = None)
-  This tool records `chunk_id`s and/or `doc_id`s that you've already inspected and deemed irrelevant. Pruned ids are excluded from the results of all subsequent corpus search/filter calls, are dropped from your visible context, and are removed from the working set. Use this aggressively whenever a read surfaces clearly irrelevant chunks or docs, to keep later searches focused and keep your context window and working set manageable.
+  {% if working_set_collection_on or id_tracking_on %}
+  This tool records `chunk_id`s and/or `doc_id`s that you've already inspected and deemed irrelevant. {% if id_tracking_on %} Pruned ids are excluded from the results of all subsequent corpus search/filter calls. {% endif %} Pruned ids are {% if id_tracking_on %} also {% endif %} dropped from your visible context and are excluded from working-set queries. Use this aggressively whenever a read surfaces clearly irrelevant chunks or docs, to keep later searches focused and keep your context window and working set manageable.
+  {% else %}
+  This tool removes `chunk_id`s and/or `doc_id`s that you've already inspected and deemed irrelevant from your visible context. Use this aggressively whenever a read surfaces clearly irrelevant chunks (or docs) to keep later searches focused and keep your context window manageable.
+  {% endif %}
 
   ```python
   # mark some chunks and a whole doc as irrelevant
@@ -154,58 +154,6 @@ prune: |-
 
 sem_filter_judge: |-
   Determine whether a document satisfies a filter condition. You are given a filter condition and a document. Output TRUE if the document satisfies the condition, and FALSE otherwise. Your reply must be exactly TRUE or FALSE — a single word, with no explanation, reasoning, or any other text.
-
-sem_filter_tool_no_working_set: |-
-  ### semantic_filter(predicate: str, metadata_filter: dict | None = None, top_k: int | None = None, search_str: str | None = None, pattern: str | None = None, limit: int | None = None)
-  Keep only the documents whose FULL text satisfies a natural-language `predicate`: candidates are selected from the corpus, each is judged independently by an LLM (TRUE/FALSE), and the survivors are returned. Ideally, your candidate selection should limit the number of LLM invocations to <= 1000. To perform candidate selection, this tool accepts a `metadata_filter` (a ChromaDB-style where clause over chunk metadata).
-
-  Supported `metadata_filter` syntax:
-  - Equality: `{"field": value}`
-  - Set membership: `{"field": {"$in": [v1, v2, ...]}}`
-  - Negation / not-in: `{"field": {"$nin": [...]}}`
-  - Compound: `{"$and": [clause1, clause2, ...]}` or `{"$or": [...]}`
-
-  With only a `metadata_filter`, every matching chunk is a candidate. You can further sharpen your candidate selection by providing arguments for a vector search or grep command.
-
-  **Vector Search:** to perform candidate selection with vector search, specify the parameters `top_k` and optionally `search_str`. Vector search will select the `top_k` most relevant chunks — embedding `search_str` if given, else the predicate; prefer a short focused `search_str` when the predicate is long or compound.
-
-  **Grep:** to perform candidate selection with grep, specify the parameters `pattern` and optionally `limit`. The tool will filter for candidate chunks whose text matches the regular expression.
-
-  Candidate chunks are deduped to their parent documents before judging. Chunks that have been pruned are automatically excluded from the results. A call may re-surface documents you have already seen — use this to apply a new predicate to known material. Results are not deduplicated against earlier calls, so repeating an identical call returns identical results rather than new material.
-
-  ```python
-  # metadata only: judge every document from 1946 in the corpus
-  semantic_filter(predicate="mentions coal shortages affecting steel production", metadata_filter={"year": "1946"})
-
-  # vector prefilter: judge the documents behind the 200 chunks nearest a short query
-  semantic_filter(
-      predicate="describes a government intervention in response to a labor strike, naming the statute invoked",
-      top_k=200,
-      search_str="government intervention strike",
-  )
-
-  # grep prefilter: judge the documents which match the regular expression
-  semantic_filter(
-      predicate="The document is a legal contract between ACME Corp. and one of their suppliers",
-      pattern=r"(?i)ACME Corp(oration|\.)",
-  )
-
-  # metadata + vector prefilter: restrict candidates to a subset of years, then judge the documents behind the 300 nearest chunks
-  semantic_filter(
-      predicate="reports a change in the interest rate set by the central bank, stating the new rate",
-      top_k=300,
-      search_str="central bank interest rate change",
-      metadata_filter={"year": {"$in": ["1951", "1952", "1953"]}},
-  )
-
-  # metadata + grep prefilter: within a filtered subset, judge the documents matching the regex (capped at 500 candidate chunks)
-  semantic_filter(
-      predicate="attributes a production slowdown to a shortage of a specific raw material",
-      pattern=r"(?i)shortage",
-      limit=500,
-      metadata_filter={"$and": [{"field_a": "value_a"}, {"year": {"$nin": ["1946"]}}]},
-  )
-  ```
 
 sem_filter_tool: |-
   ### semantic_filter(predicate: str, read: bool = False, fetch: bool = False, metadata_filter: dict | None = None, top_k: int | None = None, search_str: str | None = None, pattern: str | None = None, limit: int | None = None)
@@ -223,14 +171,17 @@ sem_filter_tool: |-
 
   **Grep:** to perform candidate selection with grep, specify the parameters `pattern` and optionally `limit`. The tool will filter for candidate chunks whose text matches the regular expression.
 
-  The `fetch` and `read` arguments are booleans which help you control a "working set" of chunks and documents. The working set is initially empty, but can serve queries more quickly once filled with a relevant subset of the entire corpus. The working set also acts as a buffer between the raw corpus and your context window, allowing you to be selective about which tokens enter your window. There are three ways you can use `fetch` and `read` (at least one must be `True`):
+  {% if working_set_collection_on or id_tracking_on %}
+  The `fetch` and `read` arguments are booleans which help you control a "working set" of chunks and documents (shown below). Your working set contains a (possibly empty) subset of the entire corpus which has been deemed relevant to your task. Once filled with documents and chunks, the working set can serve queries more quickly since it caches the subset in a smaller, more efficient collection. The working set also acts as a buffer between the raw corpus and your context window, allowing you to be selective about which tokens enter your window. There are three ways you can use `fetch` and `read` (at least one must be `True`):
 
   - `fetch=True` and `read=True`: the entire corpus is queried and the chunks which pass the filter (and their backing documents) are pulled into the working set. These chunks are also placed immediately into your context window before the next step.
   - `fetch=True` and `read=False`: the entire corpus is queried and the chunks which pass the filter (and their backing documents) are pulled into the working set. A short digest of the retrieved chunks and their estimated token sizes is placed into your context window before the next step.
   - `fetch=False` and `read=True`: the working set is queried and the chunks which pass the filter are placed into your context window before the next step.
-  
-  Candidate chunks are deduped to their parent documents before judging. Fetch calls automatically exclude material already in the working set (each document is fetched at most once), so repeated fetches surface new material. Read calls are never deduplicated: you can re-read the same working-set documents and chunks any number of times — e.g. to judge them against a different predicate.
+  {% endif %}
 
+  Candidate chunks are deduped to their parent documents before judging. {% if working_set_collection_on or id_tracking_on %} Chunks that have been pruned are automatically excluded from the results. Fetch-only calls automatically exclude material already in the working set (each document is fetched at most once), so repeated fetches surface new material. Read calls never exclude material: you can re-read the same working-set documents and chunks any number of times — e.g. to judge them against a different predicate. {% endif %}
+
+  {% if working_set_collection_on or id_tracking_on %}
   ```python
   # metadata only: judge every document from 1946 in the working set
   semantic_filter(predicate="mentions coal shortages affecting steel production", read=True, metadata_filter={"year": "1946"})
@@ -270,3 +221,38 @@ sem_filter_tool: |-
       metadata_filter={"$and": [{"field_a": "value_a"}, {"year": {"$nin": ["1946"]}}]},
   )
   ```
+  {% else %}
+  ```python
+  # metadata only: judge every document from 1946 in the corpus
+  semantic_filter(predicate="mentions coal shortages affecting steel production", metadata_filter={"year": "1946"})
+
+  # vector prefilter: judge the documents behind the 200 chunks nearest a short query
+  semantic_filter(
+      predicate="describes a government intervention in response to a labor strike, naming the statute invoked",
+      top_k=200,
+      search_str="government intervention strike",
+  )
+
+  # grep prefilter: judge the documents which match the regular expression
+  semantic_filter(
+      predicate="The document is a legal contract between ACME Corp. and one of their suppliers",
+      pattern=r"(?i)ACME Corp(oration|\.)",
+  )
+
+  # metadata + vector prefilter: restrict candidates to a subset of years, then judge the documents behind the 300 nearest chunks
+  semantic_filter(
+      predicate="reports a change in the interest rate set by the central bank, stating the new rate",
+      top_k=300,
+      search_str="central bank interest rate change",
+      metadata_filter={"year": {"$in": ["1951", "1952", "1953"]}},
+  )
+
+  # metadata + grep prefilter: within a filtered subset, judge the documents matching the regex (capped at 500 candidate chunks)
+  semantic_filter(
+      predicate="attributes a production slowdown to a shortage of a specific raw material",
+      pattern=r"(?i)shortage",
+      limit=500,
+      metadata_filter={"$and": [{"field_a": "value_a"}, {"year": {"$nin": ["1946"]}}]},
+  )
+  ```
+  {% endif %}

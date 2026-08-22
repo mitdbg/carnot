@@ -1,0 +1,14 @@
+working_set_summary: |-
+  Working Set (id={{ id }})
+  -----------
+
+  Summary: {{ summary }}
+  ---
+  Fetch Actions (tool calls which built this WorkingSet): {{ fetch_actions }}
+
+# TODO: finish this and the user prompt
+compute_summary_system_prompt: |-
+  You are an agent whose job is to generate a summary of the contents of a "working set". A working set is a collection of chunks and documents in a vector database, often created by an agent who searched a larger corpus for information relevant to a given topic. Your job is to produce a natural language description of the chunks and documents which are in the working set to help another agent decide whether this working set is relevant to future user queries. You will be presented with a list of the actions (i.e. tool calls) that were used to fetch data from the larger corpus into the working set. You will also be provided with previews of (some of) the 
+
+compute_summary_user_prompt: |-
+  TODO

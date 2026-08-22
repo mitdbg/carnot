@@ -116,8 +116,18 @@ python -m skunk.search_agent.prep.create_vector_db \
 ## Systems (registry names)
 
 - `rag_llm` — one vector search, stuff top-k chunks, single LLM call.
-- `search_agent` — skunk SearchAgent (grep / vector-search / read / prune).
-- `qatfd_search_agent` — `search_agent` plus a `semantic_filter` tool the agent can call mid-loop.
+- `search_agent` — skunk SearchAgent. `read_document` + `prune` are always present; the
+  discovery/narrowing tools are chosen by config, so every variant is this one system:
+
+  | Variant | Overrides |
+  |---|---|
+  | SearchAgent (grep + vector) | `systems.include_search_corpus=true systems.include_grep_corpus=true` |
+  | QATFD (grep + semantic filter) | `systems.include_grep_corpus=true systems.include_semantic_filter=true` |
+  | any other point in the lattice | set the three `systems.include_*` flags directly |
+
+  All of them write to `results/<benchmark>/search_agent/`, so pass
+  `experiments.run_name=<label>` to keep the dirs legible. The eval scripts identify a run's
+  variant from its `config.yaml` snapshot, not from the dir name — see `eval/variants.py`.
 
 ## Setup
 
@@ -198,20 +208,25 @@ The script starts one `vllm serve` per spec (ports `BASE_PORT`+i, per-server
 `CUDA_VISIBLE_DEVICES` / tensor-parallel / memory-fraction / max-len knobs), waits until
 every `/v1/models` answers, writes `scripts/vllm_manifest.json` (model → base URL), and
 prints the paste-ready Hydra override. `--served-model-name` defaults to the model id, so
-the map keys, `systems.llm_model` / `semantic_filter_model` / `emb_model_id`, and the
-server all agree. `--dry-run` previews the commands without vllm or a GPU.
+the map keys, `inference.llm_model` / `inference.emb_model_id` / `systems.semantic_filter_model`,
+and the server all agree. `--dry-run` previews the commands without vllm or a GPU.
 
 Then point a run at the servers (from this box or the GPU box — `ADVERTISE_HOST` in the
 printed URLs makes them reachable remotely):
 
 ```bash
-# Agent + semantic filter local, judge on OpenRouter (see configs/systems/ablation_search_agent_vllm.yaml)
-python3 -m qatfd.runner systems=ablation_search_agent_vllm benchmarks=officeqa \
+# Agent + semantic filter local, judge on OpenRouter. Routing is per call: a model listed in
+# vllm_base_urls goes to its server, everything else (here the judge) uses inference.llm_provider.
+python3 -m qatfd.runner systems=search_agent benchmarks=officeqa \
+    systems.include_search_corpus=false systems.include_grep_corpus=true \
+    systems.include_semantic_filter=true systems.semantic_filter_model=Qwen/Qwen3-8B \
+    inference.llm_model=Qwen/Qwen3-32B \
+    '++inference.vllm_base_urls={Qwen/Qwen3-32B: "http://<gpu-host>:8100/v1", Qwen/Qwen3-8B: "http://<gpu-host>:8101/v1"}' \
     experiments.sample=2 benchmarks.judge_model=google/gemini-3.5-flash
 
 # Ad-hoc: route just the agent model of a vanilla system to a server
-python3 -m qatfd.runner systems=search_agent benchmarks=officeqa systems.llm_model=Qwen/Qwen3-32B \
-    '++systems.vllm_base_urls={Qwen/Qwen3-32B: "http://<gpu-host>:8100/v1"}'
+python3 -m qatfd.runner systems=search_agent benchmarks=officeqa inference.llm_model=Qwen/Qwen3-32B \
+    '++inference.vllm_base_urls={Qwen/Qwen3-32B: "http://<gpu-host>:8100/v1"}'
 ```
 
 Notes: models listed in `vllm_base_urls` are costed $0 regardless of `llm_prices` — a model

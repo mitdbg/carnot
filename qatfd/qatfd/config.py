@@ -6,7 +6,7 @@ import yaml
 from dataclasses import dataclass
 from typing import cast, Literal
 from omegaconf import DictConfig, OmegaConf
-from qatfd.constants import BROWSECOMP_PLUS, FINANCE_BENCH, FRESHSTACK, OFFICE_QA, QAMPARI, TREC_BIOGEN
+from qatfd.constants import BROWSECOMP_PLUS, FINANCE_BENCH, FRESHSTACK, OFFICE_QA, OFFICE_QA_SYNTH, QAMPARI, TREC_BIOGEN
 from skunk.config import AgentConfig, SearchAgentConfig, StorageConfig
 
 # ---------------------------------------------------------------------------
@@ -25,27 +25,6 @@ class RAGLLMConfig(AgentConfig):
                 "`systems.top_k=20` on the command line."
             )
 
-
-@dataclass
-class QATFDSearchAgentConfig(SearchAgentConfig):
-    # Mirrors the system hierarchy (QATFDSearchAgentSystem subclasses SearchAgentSystem): the
-    # qatfd variant reuses the full search-agent config (agent_mode, step/token budgets, ...) and
-    # only adds a semantic-filter tool, which needs no extra config beyond llm_model (base).
-    pass
-
-
-@dataclass
-class AblationSearchAgentConfig(SearchAgentConfig):
-    # SearchAgent variant whose retrieval tool set is chosen by config, for a tool-ablation
-    # experiment. `read_document` and `prune` are always present; these three flags toggle the
-    # discovery/narrowing tools independently. Defaults reproduce the vanilla SearchAgent
-    # (vector + grep, no semantic filter).
-    tool_vector: bool = True            # search_corpus (vector search)
-    tool_grep: bool = True              # grep_corpus (lexical search)
-    tool_semantic_filter: bool = False  # semantic_filter (QATFD's tool)
-    # The judge-model knobs (`semantic_filter_model`, `semantic_filter_provider_order`) moved to
-    # the base `SearchAgentConfig` when the tool became first-class in skunk's SearchAgent.
-
 # ---------------------------------------------------------------------------
 # General experiment configuration
 # ---------------------------------------------------------------------------
@@ -53,7 +32,7 @@ class AblationSearchAgentConfig(SearchAgentConfig):
 
 @dataclass
 class ExperimentConfig:
-    # the benchmark split to run (dev/test)
+    # the benchmark split to run (dev|test)
     split: Literal["dev", "test"] = "dev"
     # number of questions to run
     sample: int | None = None
@@ -71,6 +50,8 @@ class ExperimentConfig:
     # traces). Questions already recorded in results.jsonl are skipped; the rest are (re)run into
     # the same dir. Reuse the SAME benchmark/system/split/sample/seed so the question set matches.
     resume_dir: str | None = None
+    # the mode to run the experiment questions in (parallel|sequential|all)
+    run_mode: Literal["parallel", "sequential", "all"] = "parallel"
 
     @classmethod
     def from_yaml(cls, path: str) -> ExperimentConfig:
@@ -110,6 +91,12 @@ class OfficeQAConfig(BenchmarkConfig):
     csv_path: str
     # document map containing clean page text
     clean_page_map_path: str
+
+
+@dataclass
+class OfficeQASynthConfig(OfficeQAConfig):
+    # path (under qatfd/benchmarks/, or absolute) to the synthetic qa_pairs.json
+    qa_pairs_path: str
 
 
 @dataclass
@@ -224,6 +211,8 @@ def benchmark_config_factory(cfg: DictConfig) -> BenchmarkConfig:
     )
     if bench_cfg["name"] == OFFICE_QA:
         return OfficeQAConfig(**bench_cfg)
+    elif bench_cfg["name"] == OFFICE_QA_SYNTH:
+        return OfficeQASynthConfig(**bench_cfg)
     elif bench_cfg["name"] == BROWSECOMP_PLUS:
         return BrowseCompPlusConfig(**bench_cfg)
     elif bench_cfg["name"] == TREC_BIOGEN:
@@ -244,9 +233,5 @@ def system_config_factory(cfg: DictConfig) -> AgentConfig:
         return RAGLLMConfig(**system_cfg)
     elif system_cfg["name"] == "search_agent":
         return SearchAgentConfig(**system_cfg)
-    elif system_cfg["name"] == "qatfd_search_agent":
-        return QATFDSearchAgentConfig(**system_cfg)
-    elif system_cfg["name"] == "ablation_search_agent":
-        return AblationSearchAgentConfig(**system_cfg)
     else:
         raise ValueError(f"unknown system {system_cfg['name']!r}")

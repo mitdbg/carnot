@@ -1,0 +1,14 @@
+# Synthetic OfficeQA benchmark: LLM-generated QA pairs over the Treasury Bulletin corpus,
+# grouped into ~6-question "lines of inquiry" over shared document sets (dataset_datagen).
+# Inherits the officeqa corpus, chroma collection, page map, and scorer; only the question
+# source differs. File order groups each line of inquiry consecutively, so a sequential
+# (workers=1) run exercises working-set reuse across related questions.
+defaults:
+  - officeqa
+  - _self_
+
+name: officeqa_synth
+# LOI-grouped synthetic QA pairs (copied from dataset_datagen/output/officeqa-dev/qa_pairs.json)
+qa_pairs_path: officeqa/synth_dev_qa_pairs.json
+# no dev/test split: `experiments.split=dev` (the default) runs all questions
+splits_path: null

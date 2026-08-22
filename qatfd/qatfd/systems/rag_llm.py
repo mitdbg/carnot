@@ -13,6 +13,7 @@ import uuid
 from skunk.common import ExecutionContext
 from skunk.config import InferenceConfig
 from skunk.search_agent.search_tools import SearchCorpusTool
+from skunk.search_state.working_set import WorkingSet
 
 from qatfd.benchmarks.base import BenchmarkResources
 from qatfd.config import RAGLLMConfig
@@ -32,10 +33,17 @@ class RAGLLMSystem(RetrieveComputeSystem):
         self.system_id = self.retrieve_usage_key or str(uuid.uuid4())
 
     async def retrieve(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext) -> Retrieved:
-        # Embed via this question's LLMClient (ctx.llm_client) so query-embedding tokens/cost
-        # land on the same usage tracker the runner reads; backend = config.emb_provider.
+        # NOTE: WorkingSet is required argument; but will not be used b/c working_set_collection_off=True
         tool = SearchCorpusTool(
-            resources.chroma_collection, ctx.llm_client, ctx=ctx, usage_key=str(self.system_id),
+            resources.chroma_collection,
+            ctx.llm_client,
+            WorkingSet(collection=resources.chroma_collection),
+            ctx,
+            # embed via this question's LLMClient (ctx.llm_client) so query-embedding tokens/cost
+            # land on the same usage tracker the runner reads; backend = config.emb_provider
+            usage_key=str(self.system_id),
+            working_set_collection_off=True,
+            id_tracking_off=True,
         )
 
         # emit under a "retrieve" step so the per-question trace records what this vector search returned

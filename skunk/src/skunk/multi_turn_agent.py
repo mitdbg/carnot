@@ -273,6 +273,7 @@ class MultiTurnAgent(ABC):
         self._tools = tools
         # None = keep the class default (mirrors max_misfires) — assigning the bare
         # param used to clobber the declared default to None (an UNBOUNDED loop).
+        self.step = self.turn = 0
         if max_steps is not None:
             self.max_steps = max_steps
         if max_misfires is not None:
@@ -310,25 +311,8 @@ class MultiTurnAgent(ABC):
         # literal `{...}` JSON (StrictUndefined chokes) and their own `{{ ... }}` were already
         # filled by the caller — nor read briefing/final_answer_doc (override agents don't set
         # them). Only the built-in template is rendered, with tool docs spliced in as a var.
-        if system_prompt_override is not None:
-            system_prompt = system_prompt_override
-        else:
-            tools_doc = "\n\n".join(t.doc for t in tools)
-            system_prompt = _ENV.from_string(self._SYSTEM_PROMPT_TEMPLATE).render(
-                briefing=self.briefing,
-                tools_doc=tools_doc,
-                max_steps=self.max_steps,
-                final_answer_doc=self.final_answer_doc,
-                has_cost_budget=self.cost_budget is not None,
-                has_latency_budget=self.latency_budget is not None,
-            )
-        self._prompt: PromptedCall[_StepOutput] = PromptedCall(
-            name=self.name,
-            system_prompt=system_prompt,
-            default_effort=self.default_effort,
-            parse=_parse_step,
-            max_parse_retries=self.max_recover_retries,
-        )
+        self._system_prompt_override = system_prompt_override
+        self._rebuild_prompt()
 
         # store the hard and soft safety caps for the fraction of the llm client's context limit
         self.context_hard_safety_frac = context_hard_safety_frac
@@ -373,6 +357,33 @@ class MultiTurnAgent(ABC):
         """Returns the hard token limit for the agent based on the context limit of its model."""
         context_limit = self._get_context_limit(ctx)
         return int(context_limit * self.context_hard_safety_frac)
+
+    def _render_system_prompt(self) -> str:
+        """The agent's system prompt: the override verbatim when one was given, else the
+        built-in template with the CURRENT `self._tools` docs spliced in."""
+        if self._system_prompt_override is not None:
+            return self._system_prompt_override
+        tools_doc = "\n\n".join(t.doc for t in self._tools)
+        return _ENV.from_string(self._SYSTEM_PROMPT_TEMPLATE).render(
+            briefing=self.briefing,
+            tools_doc=tools_doc,
+            max_steps=self.max_steps,
+            final_answer_doc=self.final_answer_doc,
+            has_cost_budget=self.cost_budget is not None,
+            has_latency_budget=self.latency_budget is not None,
+        )
+
+    def _rebuild_prompt(self) -> None:
+        """(Re)build `self._prompt` from the current system prompt. Subclasses that construct
+        their tools at call time (e.g. SearchAgent) MUST invoke this after replacing
+        `self._tools`, or the model is never shown the tool docs."""
+        self._prompt: PromptedCall[_StepOutput] = PromptedCall(
+            name=self.name,
+            system_prompt=self._render_system_prompt(),
+            default_effort=self.default_effort,
+            parse=_parse_step,
+            max_parse_retries=self.max_recover_retries,
+        )
 
     def _build_executor(self) -> LocalPythonExecutor:
         """A fresh sandbox with the agent's tools bound. The loop keeps one persistent
@@ -638,12 +649,12 @@ class MultiTurnAgent(ABC):
 
         # `step` counts only turns that progressed (observation or final answer); `turn`
         # numbers every attempt, including misfired re-prompts (which don't cost a step).
-        step = turn = 0
+        self.step = self.turn = 0
         max_turns = max_steps + max(0, self.max_misfires)
-        while self.steps_and_turns_left(step, max_steps, turn, max_turns) and self.cost_budget_left(ctx) and self.latency_budget_left():
-            if self.warn_low_steps(step, max_steps):
+        while self.steps_and_turns_left(self.step, max_steps, self.turn, max_turns) and self.cost_budget_left(ctx) and self.latency_budget_left():
+            if self.warn_low_steps(self.step, max_steps):
                 # add message to agent and emit so it can also be shown in trace viewer
-                left = max_steps - step
+                left = max_steps - self.step
                 warn = (
                     f"Only {left} of {max_steps} non-error steps remain. You should focus your "
                     f"remaining steps on your most promising lead and avoid wasting time on exploration."
@@ -655,7 +666,7 @@ class MultiTurnAgent(ABC):
             # `done` is set on success; errors append an observation and advance `turn` only.
             done: _StepOutput | None = None
             result: _CallResult | None = None
-            turn += 1
+            self.turn += 1
             try:
                 step_out = await self._llm_step(ctx)
                 assistant_msg: dict = {
@@ -672,7 +683,7 @@ class MultiTurnAgent(ABC):
                 # so it already reflects the total tokens in context after this assistant turn.
                 self.messages.append(assistant_msg)
                 ctx.emit(
-                    f"assistant step={turn} chars={len(step_out.raw)}",
+                    f"assistant step={self.turn} chars={len(step_out.raw)}",
                     kind="assistant",
                     data={"text": step_out.raw},
                 )
@@ -706,14 +717,14 @@ class MultiTurnAgent(ABC):
                         self._tokens_in_context -= _count_tokens(newly_hidden)
                 done = step_out
             except ParseError as e:
-                obs = f"Observation (step {turn}): {e.detail}"
+                obs = f"Observation (step {self.turn}): {e.detail}"
                 obs_blocks = [TextBlock(obs)]
                 self._tokens_in_context += _count_tokens(obs_blocks)
                 self.add_budget_observations(ctx, obs_blocks)
                 self.messages.append({"role": "user", "blocks": obs_blocks})
                 ctx.emit(f"error {obs!r}")
             except Exception as e:  # LLM step / batch machinery failed
-                obs = f"Observation (step {turn}): exec failed — {type(e).__name__}: {e}"
+                obs = f"Observation (step {self.turn}): exec failed — {type(e).__name__}: {e}"
                 obs_blocks = [TextBlock(obs)]
                 self._tokens_in_context += _count_tokens(obs_blocks)
                 self.add_budget_observations(ctx, obs_blocks)
@@ -726,14 +737,14 @@ class MultiTurnAgent(ABC):
             # The turn progressed (a tool call ran, or a final-answer block parsed) — only
             # now does it count against the step budget. A validation-failed final answer
             # still progressed, so it too costs a step.
-            step += 1
+            self.step += 1
 
             if done.is_final:  # final-answer block
                 payload = done.result
                 feedback = self.validate_final_answer(payload, observations)
                 if feedback is None:
                     return payload
-                obs = f"Observation (step {turn}, validation): {feedback}"
+                obs = f"Observation (step {self.turn}, validation): {feedback}"
                 obs_blocks = [TextBlock(obs)]
                 self._tokens_in_context += _count_tokens(obs_blocks)
                 self.add_budget_observations(ctx, obs_blocks)
@@ -746,7 +757,7 @@ class MultiTurnAgent(ABC):
             # The step's observation: the tool result rendered via `_blocks_from_output`
             # (subclasses may emit redactable ChunkBlocks), or an `[error]` block on failure,
             # plus an over-emission `[notice]` if the model sent more than one block.
-            obs_blocks: list[Block] = [TextBlock(f"Observation (step {turn}):")]
+            obs_blocks: list[Block] = [TextBlock(f"Observation (step {self.turn}):")]
             if result.error is not None:
                 obs_blocks.append(TextBlock(f"[error]\n{result.error}"))
             else:
@@ -774,7 +785,7 @@ class MultiTurnAgent(ABC):
 
         # Out of steps or budget: one forced terminal turn that either commits an answer from the
         # existing observations or hands off to the planner with a diagnostic.
-        out_of_steps = not self.steps_and_turns_left(step, max_steps, turn, max_turns)
+        out_of_steps = not self.steps_and_turns_left(self.step, max_steps, self.turn, max_turns)
         over_cost_budget = not self.cost_budget_left(ctx)
         over_latency_budget = not self.latency_budget_left()
         return await self._terminal_turn(ctx, observations, out_of_steps, over_cost_budget, over_latency_budget)

@@ -1,8 +1,11 @@
-"""Per-system tool-call breakdown table from ``results/*/traces/<qid>.jsonl``.
+"""Per-configuration tool-call breakdown table from ``results/*/traces/<qid>.jsonl``.
 
-This produces the second main table: **one row-group per benchmark**, with the
-three systems (RAG-LLM, SearchAgent, QATFD) repeated within each group, reporting
-where time goes inside each system's *retrieval* stage:
+This produces the second main table: **one row-group per benchmark**, with one row per
+retrieval configuration found in the results — RAG-LLM plus each SearchAgent tool set
+(``SearchAgent`` = grep+vector, ``QATFD`` = grep+sem, and any other point in the lattice).
+The tool sets are one system configured by flags, so rows are identified from each run's
+``config.yaml`` via ``variants.py``, not from its results/ directory name. Each row reports
+where time goes inside that configuration's *retrieval* stage:
 
 * avg. # search steps (agent steps; 1.0 for RAG-LLM),
 * avg. # vector-search / grep / read-document / semantic-filter tool calls per question,
@@ -11,7 +14,8 @@ where time goes inside each system's *retrieval* stage:
 Counts include every *attempted* tool call, including errored / hallucinated ones
 (a step where the agent invokes a tool it doesn't actually have raises "Forbidden
 function evaluation"). This is intentional: a nonzero count for such a tool is a
-useful signal of a prompting bug (e.g. QATFD attempting ``search_corpus`` on QAMPARI).
+useful signal of a prompting bug (e.g. a sem-only configuration attempting
+``search_corpus`` on QAMPARI).
 Because errored calls return in ~0s, they pull that tool's latency average toward 0.
 Latency is wall-clock (``observation.t - tool_code.t``) under the runner's concurrent
 execution, so it reflects real per-call wall time (including shared ChromaDB /
@@ -66,12 +70,14 @@ import yaml
 # Sibling module in this same folder. Relative import when imported as a package,
 # plain import when run as a script (this dir is then on sys.path).
 try:
-    from .latex_tables import BENCHMARKS, _default_results_root
+    from .latex_tables import BENCHMARKS, _default_results_root, _tex_escape
+    from .variants import Variant, judge_of, llm_of, model_label, variant_of
 except ImportError:
-    from latex_tables import BENCHMARKS, _default_results_root
+    from latex_tables import BENCHMARKS, _default_results_root, _tex_escape
+    from variants import Variant, judge_of, llm_of, model_label, variant_of
 
 # The tool types broken out (in column order). ``search_corpus`` == vector search.
-# ``semantic_filter`` is QATFD-only (0 for RAG-LLM / SearchAgent).
+# ``semantic_filter`` is only present in variants whose tool set includes it.
 TOOL_KEYS: list[str] = ["search_corpus", "grep_corpus", "read_document", "semantic_filter"]
 TOOL_HEADER: dict[str, str] = {
     "search_corpus": "Vec.",
@@ -80,14 +86,10 @@ TOOL_HEADER: dict[str, str] = {
     "semantic_filter": "Sem.Filt.",
 }
 
-# Systems shown, in row order within each benchmark group. RAG-LLM is collapsed to
-# one row (no k split) for this diagnostic table.
-TOOL_TABLE_SYSTEMS: list[str] = ["rag_llm", "search_agent", "qatfd_search_agent"]
-SYSTEM_ROW_LABEL: dict[str, str] = {
-    "rag_llm": "RAG-LLM",
-    "search_agent": "SearchAgent",
-    "qatfd_search_agent": "QATFD",
-}
+# Rows are the variants actually present in the results (see `variants.py`), ordered
+# canonically, rather than a fixed system list: the SearchAgent tool sets are one system now,
+# so which rows exist depends on what was run. RAG-LLM is still collapsed to one row (no k
+# split) for this diagnostic table.
 
 
 # --------------------------------------------------------------------------- #
@@ -192,11 +194,11 @@ def _parse_search_agent(events: list[dict]) -> QuestionToolMetrics:
         if name not in TOOL_KEYS:
             continue
         # Count every ATTEMPTED tool call, including errored / hallucinated ones. This is
-        # deliberate: a nonzero count for a tool the agent doesn't actually have (e.g. QATFD
-        # calling `search_corpus`, which raises "Forbidden function evaluation") is a useful
-        # signal of a prompting bug — the QATFD system prompt still references `search_corpus`
-        # in its grep/prune tool docs, and QAMPARI's entity questions make the agent take the
-        # bait. Errored calls return in ~0s, so they pull the latency average toward 0.
+        # deliberate: a nonzero count for a tool the configuration doesn't actually include
+        # (which raises "Forbidden function evaluation") is a useful signal of a prompting
+        # bug — the system prompt still references `search_corpus` in its grep/prune tool
+        # docs even when the tool is off, and QAMPARI's entity questions make the agent take
+        # the bait. Errored calls return in ~0s, so they pull the latency average toward 0.
         m.counts[name] += 1
         # Latency is to the tool's OWN result — the first observation/error after the
         # tool_code — NOT max(results.t): _group_turns also attaches trailing error events
@@ -224,7 +226,8 @@ def _parse_rag_llm(events: list[dict]) -> QuestionToolMetrics:
 
 
 def parse_run(traces_dir: Path, system: str) -> list[QuestionToolMetrics]:
-    """Per-question tool metrics for one run."""
+    """Per-question tool metrics for one run. `system` selects the trace shape: RAG-LLM has no
+    agent loop, every SearchAgent configuration does."""
     parser = _parse_rag_llm if system == "rag_llm" else _parse_search_agent
     return [parser(evs) for evs in _iter_question_events(traces_dir).values()]
 
@@ -236,7 +239,7 @@ def parse_run(traces_dir: Path, system: str) -> list[QuestionToolMetrics]:
 
 @dataclass
 class Cell:
-    """Aggregated metrics for one (benchmark, system) row."""
+    """Aggregated metrics for one (benchmark, variant) row."""
 
     n_runs: int = 0
     n_questions: int = 0
@@ -245,16 +248,31 @@ class Cell:
     avg_latency: dict[str, float | None] = field(default_factory=dict)  # tool -> avg per-call latency
 
 
-def _run_llm(config_path: Path) -> str | None:
+@dataclass(frozen=True)
+class RunId:
+    """What a run dir is: its variant (row), its system (parser), and its models."""
+
+    variant: Variant
+    llm: str
+    judge: str | None
+
+
+def _run_id(run_dir: Path) -> RunId | None:
+    """Read a run's identity from its persisted ``config.yaml``, or None if unreadable."""
+    config_path = run_dir / "config.yaml"
     if not config_path.exists():
         return None
     cfg = yaml.safe_load(config_path.read_text()) or {}
-    systems = cfg.get("systems", {}) or {}
-    return systems.get("llm_model") or systems.get("agent_model_id")
+    llm = llm_of(cfg)
+    return RunId(
+        variant=variant_of(cfg, fallback_system=run_dir.parent.name),
+        llm=llm,
+        judge=judge_of(cfg, llm),
+    )
 
 
 def aggregate_cell(run_dirs: list[Path], system: str) -> Cell | None:
-    """Average across runs of one (benchmark, system): per-run means of steps and
+    """Average across runs of one (benchmark, variant): per-run means of steps and
     per-tool counts are averaged equally; per-tool latency pools all calls in a run,
     then averages run-level means."""
     per_run_steps: list[float] = []
@@ -287,18 +305,33 @@ def aggregate_cell(run_dirs: list[Path], system: str) -> Cell | None:
     return cell
 
 
-def _run_dirs_for(results_root: Path, benchmark: str, system: str, llm: str | None) -> list[Path]:
-    base = results_root / benchmark / system
+def _run_dirs_by_variant(
+    results_root: Path, benchmark: str, llm: str | None
+) -> dict[tuple[Variant, str, str | None], list[Path]]:
+    """Every traced run under ``results/<benchmark>/``, grouped by (variant, agent, judge).
+
+    Walks all system dirs rather than one per row: the SearchAgent variants share the
+    ``search_agent`` dir, so the tool set has to come from each run's config. The judge model
+    is part of the key so two semantic-filter runs that differ only in `semantic_filter_model`
+    stay separate rows.
+    """
+    base = results_root / benchmark
     if not base.is_dir():
-        return []
-    dirs = []
-    for run_dir in sorted(base.iterdir()):
-        if not any((run_dir / "traces").glob("*.jsonl")):
+        return {}
+    groups: dict[tuple[Variant, str, str | None], list[Path]] = defaultdict(list)
+    for system_dir in sorted(base.iterdir()):
+        if not system_dir.is_dir():
             continue
-        if llm is not None and _run_llm(run_dir / "config.yaml") != llm:
-            continue
-        dirs.append(run_dir)
-    return dirs
+        for run_dir in sorted(system_dir.iterdir()):
+            if not run_dir.is_dir() or not any((run_dir / "traces").glob("*.jsonl")):
+                continue
+            rid = _run_id(run_dir)
+            if rid is None:
+                continue
+            if llm is not None and rid.llm != llm:
+                continue
+            groups[(rid.variant, rid.llm, rid.judge)].append(run_dir)
+    return groups
 
 
 def build_cells(
@@ -306,14 +339,24 @@ def build_cells(
     *,
     benchmarks: list[str],
     llm: str | None = None,
-) -> dict[str, dict[str, Cell | None]]:
-    """benchmark -> system -> Cell (or None if no runs)."""
-    out: dict[str, dict[str, Cell | None]] = {}
+) -> dict[str, list[tuple[str, Cell]]]:
+    """benchmark -> ordered list of (row label, Cell) for the variants that have runs."""
+    out: dict[str, list[tuple[str, Cell]]] = {}
     for bench in benchmarks:
-        out[bench] = {}
-        for system in TOOL_TABLE_SYSTEMS:
-            run_dirs = _run_dirs_for(results_root, bench, system, llm)
-            out[bench][system] = aggregate_cell(run_dirs, system) if run_dirs else None
+        rows: list[tuple[tuple, str, Cell]] = []
+        groups = _run_dirs_by_variant(results_root, bench, llm)
+        for (variant, agent, judge), run_dirs in groups.items():
+            cell = aggregate_cell(run_dirs, variant.system)
+            if cell is None:
+                continue
+            # Only disambiguate the row label by model when the table mixes models; with
+            # --llm pinned (the recommended usage) the label stays just the variant.
+            label = variant.label
+            if llm is None:
+                label = f"{label} ({model_label(agent, judge, short=True)})"
+            rows.append(((variant.order, agent, judge or ""), label, cell))
+        rows.sort(key=lambda r: r[0])
+        out[bench] = [(label, cell) for _, label, cell in rows]
     return out
 
 
@@ -327,12 +370,12 @@ def _num(v: float | None, fmt: str) -> str:
 
 
 def render_tool_table(
-    cells: dict[str, dict[str, Cell | None]],
+    cells: dict[str, list[tuple[str, Cell]]],
     *,
     benchmarks: list[str],
     label: str = "tab:tool-breakdown",
 ) -> str:
-    # Columns: Benchmark | System | steps | Vec# Grep# Sem# | VecLat GrepLat SemLat
+    # Columns: Benchmark | Config | steps | Vec# Grep# Sem# | VecLat GrepLat SemLat
     n_tools = len(TOOL_KEYS)
     colspec = "ll" + "r" + "r" * n_tools + "r" * n_tools
     count_headers = [TOOL_HEADER[t] for t in TOOL_KEYS]
@@ -347,7 +390,7 @@ def render_tool_table(
     out.append(rf"  \begin{{tabular}}{{{colspec}}}")
     out.append(r"    \toprule")
     # grouped header
-    first_count = 3  # 1-based column index of first count col (after Benchmark, System, Steps)
+    first_count = 3  # 1-based column index of first count col (after Benchmark, Config, Steps)
     out.append(
         rf"    & & & \multicolumn{{{n_tools}}}{{c}}{{Avg.\ \# tool calls}} "
         rf"& \multicolumn{{{n_tools}}}{{c}}{{Avg.\ tool latency (s)}} \\"
@@ -356,40 +399,36 @@ def render_tool_table(
         rf"    \cmidrule(lr){{{first_count + 1}-{first_count + n_tools}}}"
         rf"\cmidrule(lr){{{first_count + n_tools + 1}-{first_count + 2 * n_tools}}}"
     )
-    out.append("    Benchmark & System & Steps & " + " & ".join(count_headers + lat_headers) + r" \\")
+    out.append("    Benchmark & Config & Steps & " + " & ".join(count_headers + lat_headers) + r" \\")
     out.append(r"    \midrule")
 
     for bi, bench in enumerate(benchmarks):
-        systems = cells.get(bench, {})
+        bench_rows = cells.get(bench, [])
         bench_label = BENCHMARKS.get(bench, bench)
-        for si, system in enumerate(TOOL_TABLE_SYSTEMS):
-            cell = systems.get(system)
-            # Benchmark name on the first system row only; \midrule separates groups.
-            bench_cell = bench_label if si == 0 else ""
-            row = [bench_cell, SYSTEM_ROW_LABEL[system]]
-            if cell is None:
-                row += ["--"] * (1 + 2 * n_tools)
-            else:
-                row.append(_num(cell.avg_steps, "{:.1f}"))
-                row += [_num(cell.avg_count.get(t, 0.0), "{:.1f}") for t in TOOL_KEYS]
-                row += [_num(cell.avg_latency.get(t), "{:.2f}") for t in TOOL_KEYS]
-            comment = ""
-            if cell is not None:
-                comment = f"  % n_runs={cell.n_runs}, n_q={cell.n_questions}"
-            out.append("    " + " & ".join(row) + r" \\" + comment)
+        if not bench_rows:
+            out.append("    " + " & ".join([bench_label, r"\emph{no runs}"] + ["--"] * (1 + 2 * n_tools)) + r" \\")
+        for ri, (row_label, cell) in enumerate(bench_rows):
+            # Benchmark name on the first row of the group only; \midrule separates groups.
+            row = [bench_label if ri == 0 else "", _tex_escape(row_label)]
+            row.append(_num(cell.avg_steps, "{:.1f}"))
+            row += [_num(cell.avg_count.get(t, 0.0), "{:.1f}") for t in TOOL_KEYS]
+            row += [_num(cell.avg_latency.get(t), "{:.2f}") for t in TOOL_KEYS]
+            out.append("    " + " & ".join(row) + r" \\" + f"  % n_runs={cell.n_runs}, n_q={cell.n_questions}")
         if bi != len(benchmarks) - 1:
             out.append(r"    \midrule")
 
     out.append(r"    \bottomrule")
     out.append(r"  \end{tabular}")
     out.append(
-        r"  \caption{Retrieval-stage tool usage per system. \emph{Steps} is the average "
-        r"number of agent steps (1.0 for RAG-LLM). \emph{Vec./Grep/Read/Sem.Filt.} are the "
+        r"  \caption{Retrieval-stage tool usage per configuration. Each row is one retrieval "
+        r"tool set (\emph{SearchAgent} = grep+vector, \emph{QATFD} = grep+sem); "
+        r"\texttt{read\_document} and \texttt{prune} are always available. \emph{Steps} is the "
+        r"average number of agent steps (1.0 for RAG-LLM). \emph{Vec./Grep/Read/Sem.Filt.} are the "
         r"average number of vector-search, grep, read-document, and semantic-filter tool "
-        r"calls per question, and their average per-call latency in seconds. Semantic filter "
-        r"is a QATFD-only tool (0 for RAG-LLM and SearchAgent). Counts include every "
-        r"attempted call, so a nonzero count for a tool the agent lacks (e.g.\ QATFD's "
-        r"hallucinated \texttt{search\_corpus} on QAMPARI) signals a prompting bug; such "
+        r"calls per question, and their average per-call latency in seconds. A tool absent from a "
+        r"configuration scores 0. Counts include every "
+        r"attempted call, so a nonzero count for a tool the agent lacks (e.g.\ a sem-only "
+        r"configuration hallucinating \texttt{search\_corpus} on QAMPARI) signals a prompting bug; such "
         r"errored calls return in ${\sim}0$s and pull that tool's latency toward zero. "
         r"Latency is wall-clock time between the tool call and its result under concurrent "
         r"execution, so it includes shared-index and thread-pool contention, not just the "

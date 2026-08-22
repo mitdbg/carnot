@@ -27,11 +27,11 @@
 # Runs MUST embed the query with the SAME 0.6B model, e.g.:
 #   # TEST (the 1000-question KARL set):
 #   python3 -m qatfd.runner benchmarks=qampari systems=search_agent experiments.split=test \
-#       systems.emb_model_id=qwen/qwen3-embedding-0.6b benchmarks.judge_model=<judge-model>
+#       inference.emb_model_id=qwen/qwen3-embedding-0.6b benchmarks.judge_model=<judge-model>
 #   # DEV (iterate here; 50 questions sampled from train_data, same index — just flip the split):
 #   python3 -m qatfd.runner benchmarks=qampari systems=search_agent experiments.split=dev \
-#       systems.emb_model_id=qwen/qwen3-embedding-0.6b benchmarks.judge_model=<judge-model>
-#   # (vLLM backend: systems.emb_provider=vllm systems.emb_model_id=Qwen/Qwen3-Embedding-0.6B
+#       inference.emb_model_id=qwen/qwen3-embedding-0.6b benchmarks.judge_model=<judge-model>
+#   # (vLLM backend: inference.emb_provider=vllm inference.emb_model_id=Qwen/Qwen3-Embedding-0.6B
 #   #  plus a vllm_base_urls entry for it — see scripts/run_vllm_servers.sh)
 defaults:
   - base

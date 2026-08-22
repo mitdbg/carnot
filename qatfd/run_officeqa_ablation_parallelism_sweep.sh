@@ -49,9 +49,9 @@ CHAT_MODEL="qwen/qwen3.6-35b-a3b"
 EMB_MODEL="Qwen/Qwen3-Embedding-8B"
 VLLM_URLS="{${CHAT_MODEL}: \"http://${VLLM_HOST}:${CHAT_PORT}/v1\", ${EMB_MODEL}: \"http://${VLLM_HOST}:${EMB_PORT}/v1\"}"
 
-RESULTS_DIR="results/officeqa/ablation_search_agent"
+RESULTS_DIR="results/officeqa/search_agent"
 
-# label | tool_vector | tool_grep | tool_semantic_filter
+# label | include_search_corpus | include_grep_corpus | include_semantic_filter
 CONFIGS=(
   "grep_read|false|true|false"
   "vector_read|true|false|false"
@@ -87,7 +87,7 @@ for w in $WORKERS; do
     echo "==================================================================="
     "$PYTHON" -m qatfd.runner \
       benchmarks=officeqa \
-      systems=ablation_search_agent \
+      systems=search_agent \
       experiments.split=dev \
       experiments.sample="$SAMPLE" \
       experiments.seed="$SEED" \
@@ -98,9 +98,9 @@ for w in $WORKERS; do
       inference.emb_model_id="$EMB_MODEL" \
       inference.llm_default_rpm=100000 \
       "++inference.vllm_base_urls=${VLLM_URLS}" \
-      systems.tool_vector="$vec" \
-      systems.tool_grep="$grep" \
-      systems.tool_semantic_filter="$sem" \
+      systems.include_search_corpus="$vec" \
+      systems.include_grep_corpus="$grep" \
+      systems.include_semantic_filter="$sem" \
       benchmarks.chroma_server_host="$CHROMA_HOST" \
       benchmarks.chroma_server_port="$CHROMA_PORT" \
       experiments.run_name="$run_name"

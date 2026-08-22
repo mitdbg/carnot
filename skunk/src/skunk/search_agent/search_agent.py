@@ -21,17 +21,21 @@ per question / branch, so state never leaks across questions.
 
 from __future__ import annotations
 
+import json
+import re
+import time
 from typing import Any
 from chromadb.api.models.Collection import Collection
+from jinja2 import Environment, StrictUndefined
 
-from skunk.common import B64Image, ExecutionContext
+from skunk.common import B64Image, ExecutionContext, strip_code_fence
 from skunk.config import SearchAgentConfig
-from skunk.errors import StepFailed
+from skunk.errors import ParseError, StepFailed
 from skunk.llm_client import LLMClient
 from skunk.sandbox.local_python_executor import CodeOutput
 from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent, TextBlock, Tool
+from skunk.prompted_call import PromptedCall
 from skunk.prompts import load_prompts
-from skunk.search_agent.retrieval_state import RetrievalState
 from skunk.search_agent.search_tools import (
     EMPTY_RESULT_MESSAGE,
     GREP_RESULT_TAG,
@@ -47,9 +51,57 @@ from skunk.search_agent.search_tools import (
     SemanticFilterTool,
     ViewFigureTool,
 )
+from skunk.search_state.working_set import WorkingSet
+from skunk.search_state.working_set_registry import WorkingSetRegistry, WS_PREFIX, DEFAULT_CHROMA_PATH
 from skunk.storage.document_map import DocumentMap
 
+_ENV = Environment(
+    autoescape=False, keep_trailing_newline=True, undefined=StrictUndefined
+)
+
 _PROMPTS = load_prompts("search_agent")
+
+_JSON_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_]*)\n(.*?)```", re.DOTALL)
+
+
+def _parse_list(text: str, _: ExecutionContext) -> list[str]:
+    """Parse the model's reply as a JSON array of strings, raising `ParseError` on
+    anything else so `PromptedCall` re-prompts with the failure echoed back.
+
+    Accepts a bare array or one wrapped in a ```json``` fence (what the selector prompts
+    ask for). When the reply wraps prose around the fence, the LAST fenced block wins —
+    models that think out loud tend to rehearse candidate lists before committing to the
+    final one. Non-string entries are rejected rather than coerced: callers feed these
+    straight into `WorkingSetRegistry.get()`, where a stringified int is a silent miss.
+    """
+    fences = _JSON_FENCE_RE.findall(text)
+    body = fences[-1].strip() if fences else strip_code_fence(text)
+    if not body:
+        raise ParseError(
+            raw=text,
+            detail="Your reply was empty. Emit a single ```json``` block holding a JSON "
+            'array of the ids you selected, e.g. ["id1", "id2"], or [] if none apply.',
+        )
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError as e:
+        raise ParseError(
+            raw=text, detail=f"the JSON array was malformed — {e}"
+        ) from e
+    if not isinstance(parsed, list):
+        raise ParseError(
+            raw=text,
+            detail=f"expected a JSON array, got {type(parsed).__name__}. Emit ONE "
+            '```json``` block holding a flat array of strings, e.g. ["id1", "id2"].',
+        )
+    non_strings = [v for v in parsed if not isinstance(v, str)]
+    if non_strings:
+        raise ParseError(
+            raw=text,
+            detail=f"every array entry must be a string; got {non_strings!r}. Emit a flat "
+            'array of ids, e.g. ["id1", "id2"] — no nested objects or arrays.',
+        )
+    return parsed
 
 
 class SearchAgent(MultiTurnAgent):
@@ -72,17 +124,13 @@ class SearchAgent(MultiTurnAgent):
         chroma_collection: Collection,
         llm_client: LLMClient,
         *,
-        ctx: ExecutionContext | None = None,
-        pdf_dir: str | None = None,
-        page_renders_dir: str | None = None,
+        registry: WorkingSetRegistry | None = None,
         extra_tools: tuple[Tool, ...] = (),
-        include_search_corpus: bool = True,
-        include_grep_corpus: bool = True,
-        include_semantic_filter: bool = False,
         briefing: str | None = None,
         final_answer_doc: str | None = None,
         agent_id: str | None = None,
         system_prompt_override: str | None = None,
+        working_set_name: str | None = None,
         generation_backend=None,
         sampling_params: dict | None = None,
         capture_logprobs: bool = False,
@@ -98,6 +146,7 @@ class SearchAgent(MultiTurnAgent):
         self.chroma_collection = chroma_collection
         self.document_map = document_map
         self._llm_client = llm_client
+        self._registry = registry or WorkingSetRegistry(chroma_path=DEFAULT_CHROMA_PATH)
 
         # Bound each search-step LLM call: cap output (was uncapped → runaway
         # generations streamed to the 65535-token ceiling at 200–800s each) and
@@ -105,68 +154,10 @@ class SearchAgent(MultiTurnAgent):
         # thinking/max_output_tokens interaction caveat.
         self.max_output_tokens = config.search_agent_max_output_tokens
         self.request_timeout_s = config.search_agent_request_timeout_s
-
-        # Per-question retrieval state (pruned + read + fetched sets), shared by
-        # reference with the search / grep / semantic-filter / read / prune tools
-        # and read by `_block_is_visible` for redaction — see `RetrievalState`'s
-        # docstring for the per-set contract. One SearchAgent per question / branch
-        # ⇒ state never cross-talks between questions.
-        self._state = RetrievalState()
-
-        # Tool instances capture their deps; the prompt's tool docs are generated
-        # from their `doc`s by the base, so tools and docs can't drift. `ctx` is threaded
-        # into the tools that emit trace events / bill usage on it (embeds, judge calls).
-        if pdf_dir is not None:
-            extra_tools += (ViewFigureTool(
-                self.document_map, pdf_dir, renders_dir=page_renders_dir,
-            ),)
-        tools: list[Tool] = []
-        # Vector search over the corpus. A caller can drop it (`include_search_corpus=False`)
-        # to force the agent onto other retrieval tools — e.g. qatfd system #3 removes it so
-        # the agent must use the `semantic_filter` tool for semantic narrowing (in the prior
-        # experiment the agent always chose vector search and never the sem-filter tool).
-        if include_search_corpus:
-            tools.append(SearchCorpusTool(
-                self.chroma_collection,
-                self._llm_client,
-                self._state,
-                ctx,
-                working_set_off=config.working_set_off,
-            ))
-        # Grep is optional too (symmetric with `include_search_corpus`): a caller can drop it to
-        # force the agent onto vector search / semantic filtering, e.g. a tool-ablation experiment.
-        if include_grep_corpus:
-            tools.append(GrepCorpusTool(
-                self.chroma_collection,
-                self._state,
-                working_set_off=config.working_set_off,
-            ))
-        # LLM-judged predicate filter over candidate documents. Off by default; callers opt in
-        # (e.g. qatfd systems #3 / ablation). The judge model, its provider pinning, and its
-        # output cap come from config; its context limit is resolved from the client's config.
-        if include_semantic_filter:
-            tools.append(SemanticFilterTool(
-                self.chroma_collection,
-                self._llm_client,
-                self.document_map,
-                config.semantic_filter_model,
-                state=self._state,
-                ctx=ctx,
-                provider_order=config.semantic_filter_provider_order,
-                judge_max_output_tokens=config.semantic_filter_max_output_tokens,
-                disable_judge_reasoning=config.semantic_filter_disable_reasoning,
-                working_set_off=config.working_set_off,
-            ))
-        tools += [
-            ReadDocumentTool(
-                self.document_map,
-                self._state,
-            ),
-            PruneTool(self._state),
-            *extra_tools,
-        ]
+        self.extra_tools = extra_tools
         super().__init__(
-            tools, max_steps=config.agent_max_steps,
+            tools=[],  # NOTE: we construct tools at runtime based on ExecutionContext configuration
+            max_steps=config.agent_max_steps,
             max_misfires=config.agent_max_misfires,
             cost_budget=config.cost_budget,
             latency_budget=config.latency_budget,
@@ -177,11 +168,9 @@ class SearchAgent(MultiTurnAgent):
             capture_logprobs=capture_logprobs,
         )
 
-        # overwrite default usage key for search and sem filter tools now that agent has one
-        for tool in self._tools:
-            if isinstance(tool, SearchCorpusTool) or isinstance(tool, SemanticFilterTool):
-                tool._usage_key = str(self.agent_id)
-
+        # create (or get) working set for agent
+        working_set_name = f"{WS_PREFIX}{working_set_name if working_set_name else self.agent_id}"
+        self._working_set = self._registry.get_or_create(name=working_set_name)
 
     # ------------------------------------------------------------------
     # Block rendering / redaction (override the base hooks)
@@ -190,10 +179,10 @@ class SearchAgent(MultiTurnAgent):
     def _block_is_visible(self, block: Block) -> bool:
         """Redact pruned chunks from the LLM-facing render (full trajectory is kept)."""
         if isinstance(block, ChunkBlock):
-            if block.chunk_id is not None and block.chunk_id in self._state.pruned_chunk_ids | self._state.redacted_chunk_ids:
+            if block.chunk_id is not None and block.chunk_id in self._working_set.pruned_chunk_ids | self._working_set.redacted_chunk_ids:
                 return False
         if isinstance(block, (ChunkBlock, ImageBlock)):
-            if block.doc_id in self._state.pruned_doc_ids | self._state.redacted_doc_ids:
+            if block.doc_id in self._working_set.pruned_doc_ids | self._working_set.redacted_doc_ids:
                 return False
         return True
 
@@ -201,9 +190,9 @@ class SearchAgent(MultiTurnAgent):
         """Redact all blocks which have the doc_id or chunk_id."""
         assert doc_id is not None or chunk_id is not None
         if chunk_id:
-            self._state.redacted_chunk_ids.add(chunk_id)
+            self._working_set.redacted_chunk_ids.add(chunk_id)
         if doc_id:
-            self._state.redacted_doc_ids.add(doc_id)
+            self._working_set.redacted_doc_ids.add(doc_id)
 
     def _blocks_from_output(self, out: CodeOutput) -> list[Block]:
         """Render a tool result into blocks. Chunk-bearing payloads become one
@@ -327,12 +316,112 @@ class SearchAgent(MultiTurnAgent):
             blocks.append(TextBlock("[no output]"))
         return blocks
 
+    def _build_tools(self, ctx: ExecutionContext) -> list[Tool]:
+        """Build the set of tools used by the SearchAgent at runtime."""
+        tools: list[Tool] = [
+            ReadDocumentTool(
+                self.document_map,
+                self._working_set,
+                id_tracking_off=ctx.config.search.id_tracking_off,
+            ),
+            PruneTool(self._working_set),
+            *self.extra_tools,
+        ]
+
+        if ctx.config.search.include_search_corpus:
+            tools.append(SearchCorpusTool(
+                self.chroma_collection,
+                self._llm_client,
+                self._working_set,
+                ctx,
+                usage_key=self.agent_id,
+                working_set_collection_off=ctx.config.search.working_set_collection_off,
+                id_tracking_off=ctx.config.search.id_tracking_off,
+            ))
+
+        if ctx.config.search.include_grep_corpus:
+            tools.append(GrepCorpusTool(
+                self.chroma_collection,
+                self._working_set,
+                working_set_collection_off=ctx.config.search.working_set_collection_off,
+                id_tracking_off=ctx.config.search.id_tracking_off,
+            ))
+
+        if ctx.config.search.include_semantic_filter:
+            tools.append(SemanticFilterTool(
+                self.chroma_collection,
+                self._llm_client,
+                self.document_map,
+                self._working_set,
+                ctx.config.search.semantic_filter_model,
+                ctx=ctx,
+                provider_order=ctx.config.search.semantic_filter_provider_order,
+                judge_max_output_tokens=ctx.config.search.semantic_filter_max_output_tokens,
+                disable_judge_reasoning=ctx.config.search.semantic_filter_disable_reasoning,
+                usage_key=self.agent_id,
+                working_set_collection_off=ctx.config.search.working_set_collection_off,
+                id_tracking_off=ctx.config.search.id_tracking_off,
+            ))
+
+        if ctx.config.storage.pdf_dir is not None:
+            tools.append(ViewFigureTool(
+                self.document_map, ctx.config.storage.pdf_dir, renders_dir=ctx.config.storage.page_renders_dir,
+            ))
+
+        return tools
+
+    async def _find_related_working_sets(self, ctx: ExecutionContext, user: str) -> list[WorkingSet]:
+        """Search the registry for existing WorkingSet(s) which may be useful for answering the user query."""
+        # TODO: eventually, subsample working set summaries; but for now throw them all into a prompt
+        all_working_sets: list[WorkingSet] = [ws for ws in self._registry if ws.id != self._working_set.id]
+        if len(all_working_sets) == 0:
+            return []
+
+        # for now, working set summaries consist of the actions used to construct them; because of the
+        # incremental nature of our working sets, this requires pulling all fetch operations from ancestors
+        working_set_summaries: list[dict] = []
+        for ws in all_working_sets:
+            ancestors = self._registry.ancestors_of(ws)
+            fetch_actions = [action for action, is_fetch in ws.actions if is_fetch]
+            for ancestor in ancestors:
+                ancestor_fetch_actions = [action for action, is_fetch in ancestor.actions if is_fetch]
+                if ancestor_fetch_actions:
+                    fetch_actions = ancestor_fetch_actions + fetch_actions
+            working_set_summaries.append({"id": ws.id, "actions": fetch_actions})
+
+        # construct prompt and ask llm for list of relevant working set ids
+        relevant_working_sets_system_template = _PROMPTS["relevant_working_set_selector_system_prompt"]
+        relevant_working_sets_system_prompt = _ENV.from_string(relevant_working_sets_system_template).render(
+            working_set_summaries=working_set_summaries,
+        )
+        relevant_working_sets_user_template = _PROMPTS["relevant_working_set_selector_user_prompt"]
+        relevant_working_sets_user_prompt = _ENV.from_string(relevant_working_sets_user_template).render(
+            user=user
+        )
+        _prompt = PromptedCall(
+            name=self.name,
+            system_prompt=relevant_working_sets_system_prompt,
+            default_effort=self.default_effort,
+            parse=_parse_list,
+            max_parse_retries=self.max_recover_retries,
+        )
+        relevant_working_set_ids = await _prompt.call(ctx, user=relevant_working_sets_user_prompt, usage_key=self.agent_id)
+
+        return [self._registry.get(id) for id in relevant_working_set_ids if self._registry.contains(id)]
+
+    def _add_working_set_message(self) -> None:
+        """Add a message to the agent's context informing it of the working set(s) at its disposal."""
+        ancestors = self._registry.ancestors_of(self._working_set)
+        working_set_summary = self._working_set.to_message(ancestors)
+        message = f"{_PROMPTS['working_set']}\n\n{working_set_summary}\n\n"
+        self.messages.append({"role": "system", "blocks": [TextBlock(message)]})
+
     # ------------------------------------------------------------------
     # Final answer: validate + correct the returned doc_ids
     # ------------------------------------------------------------------
 
-    async def run_with_validated_doc_ids(
-        self, ctx: ExecutionContext, user: str, *, correction_steps: int | None = None,
+    async def call(
+        self, ctx: ExecutionContext, user: str, *, correction_steps: int | None = None, **_
     ) -> tuple[Any, list[str]]:
         """Run the agent, then make sure the `doc_ids` it returned name real documents.
 
@@ -348,16 +437,76 @@ class SearchAgent(MultiTurnAgent):
         Returns `(final_payload, valid_doc_ids)`. The payload is returned untouched (callers
         in "answer" mode still read its `answer` field); only the id list is validated.
         """
+        # rename booleans to make logic more readable
+        working_set_collection_on = not ctx.config.search.working_set_collection_off
+        id_tracking_on = not ctx.config.search.id_tracking_off
+
+        # if configured: retrieve and union any working sets that are relevant to the query
+        t0 = time.monotonic()
+        if ctx.config.search.fetch_related_working_sets:
+            working_sets = await self._find_related_working_sets(ctx, user)
+            self._working_set.add_parents(working_sets)
+            t1 = time.monotonic()
+            ctx.emit(
+                f"_find_related_working_set n_found={len(working_sets)} found_ids={[ws.id for ws in working_sets]} time={t1 - t0:.3f}",
+                kind="_find_related_working_set",
+                data={"n_found": len(working_sets), "found_ids": [ws.id for ws in working_sets], "time": t1 - t0},
+            )
+
+            # TODO: remove this and update search tools to query ancestors through working set .query() and .get()
+            for ancestor in working_sets:
+                # copy data
+                if working_set_collection_on:
+                    results = ancestor.collection.get(include=["documents", "metadatas", "embeddings"])
+                    if results["ids"]:
+                        self._working_set.collection.upsert(
+                            ids=results["ids"],
+                            embeddings=results["embeddings"],
+                            metadatas=results["metadatas"],
+                            documents=results["documents"],
+                        )
+
+                # union fetched chunk/doc ids
+                self._working_set.fetched_chunk_ids = self._working_set.fetched_chunk_ids.union(ancestor.fetched_chunk_ids)
+                self._working_set.fetched_doc_ids = self._working_set.fetched_doc_ids.union(ancestor.fetched_doc_ids)
+
+            t2 = time.monotonic()
+            ctx.emit(
+                f"_copy_ancestor_working_sets time={t2 - t1:.3f}",
+                kind="_copy_ancestor_working_sets",
+                data={"time": t2 - t1},
+            )
+
+        # add message summarizing the state of the working set
+        if working_set_collection_on or id_tracking_on:
+            self._add_working_set_message()
+
+        # construct the tools, then rebuild the system prompt (it splices in the tool docs)
+        # and the local python executor from them
+        self._tools = self._build_tools(ctx)
+        self._rebuild_prompt()
+        self._executor = self._build_executor()
+
+        # run the agent on the user query
+        payload = await super().call(ctx, user)
+
+        # TODO: compute the working set's summary
+        # NOTE: can be done off the critical path
+        if working_set_collection_on:
+            self._working_set.compute_summary()
+
+        # parse the doc_ids from the agent output
+        doc_ids = doc_ids_from_payload(payload)
+
+        # reprompt the agent to correct any mistakes if there is an issue parsing the doc_ids
         if correction_steps is None:
             correction_steps = self.config.doc_id_correction_steps
-        payload = await self.call(ctx, user)
-        doc_ids = doc_ids_from_payload(payload)
         for _ in range(correction_steps):
             bad = [d for d in doc_ids if d not in self.document_map]
             if not bad:
                 break
             ctx.emit(f"doc_id_correction n_bad={len(bad)} bad={bad!r}", data={"bad": bad})
-            payload = await self.call(
+            payload = await super().call(
                 ctx, _doc_id_correction_message(bad), resume=True, max_steps=1
             )
             doc_ids = doc_ids_from_payload(payload)
@@ -367,6 +516,11 @@ class SearchAgent(MultiTurnAgent):
             f"doc_ids_validated kept={len(valid)} dropped={len(dropped)}",
             data={"kept": valid, "dropped": dropped},
         )
+
+        # persist the computed working set back into the registry
+        self._working_set.persist()
+        self._registry.update(self._working_set.id, self._working_set)
+
         if not valid:
             raise StepFailed(
                 self.name,

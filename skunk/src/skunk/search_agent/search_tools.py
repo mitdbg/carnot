@@ -58,11 +58,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from chromadb.api.models.Collection import Collection
+from jinja2 import Environment, StrictUndefined
 
 from skunk.common import estimate_tokens, page_key_to_pageref, render_page_b64
 from skunk.multi_turn_agent import Tool
 from skunk.prompts import load_prompts
-from skunk.search_agent.retrieval_state import RetrievalState
+from skunk.search_state.working_set import WorkingSet
 from skunk.storage.document_map import DocumentMap
 from skunk.trace import truncate
 from skunk.usage import match_model_entry
@@ -70,6 +71,11 @@ from skunk.usage import match_model_entry
 if TYPE_CHECKING:
     from skunk.common import ExecutionContext
     from skunk.llm_client import LLMClient
+
+_ENV = Environment(
+    autoescape=False, keep_trailing_newline=True, undefined=StrictUndefined,
+    trim_blocks=True, lstrip_blocks=True,
+)
 
 # templates / strings for each tool's docstring
 _PROMPTS = load_prompts("search_tools")
@@ -132,28 +138,33 @@ def _build_metadata_where(
         return clauses[0]
     return {"$and": clauses}
 
-
+# TODO: have claude template the prompts on a preliminary sample so you can see what things look like in the 4 scenarios
 class SearchCorpusTool(Tool):
     name = "search_corpus"
-    doc = _PROMPTS["search_corpus"]
+    doc_template = _PROMPTS["search_corpus"]
+    doc: str
 
     def __init__(
         self,
         chroma_collection: Collection,
         llm_client: LLMClient,
-        state: RetrievalState | None = None,
-        ctx: ExecutionContext | None = None,
+        working_set: WorkingSet,
+        ctx: ExecutionContext,
         usage_key: str = "default",
-        working_set_off: bool = False,
+        working_set_collection_off: bool = False,
+        id_tracking_off: bool = False,
     ):
         self._chroma_collection = chroma_collection
         self._llm_client = llm_client
         self._ctx = ctx
-        self._state = state if state is not None else RetrievalState()
+        self._working_set = working_set
         self._usage_key = usage_key
-        self._working_set_off = working_set_off
-        if working_set_off:
-            self.doc = _PROMPTS["search_corpus_no_working_set"]
+        self._working_set_collection_off = working_set_collection_off
+        self._id_tracking_off = id_tracking_off
+        self.doc = _ENV.from_string(self.doc_template).render(
+            working_set_collection_on=not self._working_set_collection_off,
+            id_tracking_on=not self._id_tracking_off,
+        )
 
     def _embed_query(self, query: str) -> list[float]:
         """Embed `query` with the same model that produced the stored embeddings, via the
@@ -169,27 +180,33 @@ class SearchCorpusTool(Tool):
         fetch: bool = False,
         metadata_filter: dict | None = None,
     ) -> dict:
-        # read corpus directly every time if working set abstraction is turned off
-        if self._working_set_off:
+        # if the working set collection and id tracking are turned off, then every query
+        # is a fetch + read query that goes directly to self._chroma_collection
+        if self._working_set_collection_off and self._id_tracking_off:
             fetch = read = True
 
         assert fetch or read, "At least one of fetch or read must be present."
-        assert fetch or not self._state.empty(), "Cannot read from empty working set"
+        assert fetch or not self._working_set.empty(use_id_state=self._working_set_collection_off), "Cannot read from empty working set"
         query_embedding = self._embed_query(query)
 
-        # set the inclusion and exclusion filters based on the scenario
+        # rephrase booleans to improve readability below
+        working_set_collection_on = not self._working_set_collection_off
+        id_tracking_on = not self._id_tracking_off
+
+        # set the inclusion and exclusion filters based on the scenario if id tracking is on
         in_chunk_ids = in_doc_ids = not_in_chunk_ids = not_in_doc_ids = None
-        if fetch and read:
-            not_in_chunk_ids = self._state.pruned_chunk_ids | self._state.read_chunk_ids
-            not_in_doc_ids = self._state.pruned_doc_ids | self._state.read_doc_ids
-        elif fetch:
-            not_in_chunk_ids = self._state.fetched_chunk_ids | self._state.pruned_chunk_ids
-            not_in_doc_ids = self._state.fetched_doc_ids | self._state.pruned_doc_ids
-        elif read:
-            in_chunk_ids = self._state.fetched_chunk_ids
-            in_doc_ids = self._state.fetched_doc_ids
-            not_in_chunk_ids = self._state.pruned_chunk_ids | self._state.read_chunk_ids
-            not_in_doc_ids = self._state.pruned_doc_ids | self._state.read_doc_ids
+        if id_tracking_on:
+            if fetch and read:
+                not_in_chunk_ids = self._working_set.pruned_chunk_ids | self._working_set.read_chunk_ids
+                not_in_doc_ids = self._working_set.pruned_doc_ids | self._working_set.read_doc_ids
+            elif fetch:
+                not_in_chunk_ids = self._working_set.fetched_chunk_ids | self._working_set.pruned_chunk_ids
+                not_in_doc_ids = self._working_set.fetched_doc_ids | self._working_set.pruned_doc_ids
+            elif read:
+                in_chunk_ids = self._working_set.fetched_chunk_ids
+                in_doc_ids = self._working_set.fetched_doc_ids
+                not_in_chunk_ids = self._working_set.pruned_chunk_ids | self._working_set.read_chunk_ids
+                not_in_doc_ids = self._working_set.pruned_doc_ids | self._working_set.read_doc_ids
 
         where = _build_metadata_where(
             metadata_filter=metadata_filter,
@@ -201,13 +218,25 @@ class SearchCorpusTool(Tool):
         query_kwargs: dict = {
             "query_embeddings": [query_embedding],
             "n_results": top_k,
-            "include": ["metadatas", "documents", "distances"],
+            "include": (
+                ["metadatas", "documents", "distances", "embeddings"]
+                if working_set_collection_on
+                else ["metadatas", "documents", "distances"]
+            ),
         }
         if where is not None:
             query_kwargs["where"] = where
 
+        # query results from the appropriate collection
         try:
-            results = self._chroma_collection.query(**query_kwargs)
+            # route the query: fetch always reads the full corpus; read-only is served by the
+            # working-set collection when it exists, and by the corpus — restricted to fetched
+            # material through the inclusion filters — when it does not
+            if fetch or self._working_set_collection_off:
+                results = self._chroma_collection.query(**query_kwargs)
+            else:
+                results = self._working_set.collection.query(**query_kwargs)
+
         except Exception as e:
             return {SEARCH_RESULT_TAG: True, "read_chunks": [], "fetched_chunks": [], "error": f"search_corpus error: {e}"}
 
@@ -216,6 +245,32 @@ class SearchCorpusTool(Tool):
         metadatas = results["metadatas"][0]  # type: ignore
         distances = results["distances"][0]  # type: ignore
 
+        # insert results into working set collection (if turned on)
+        # TODO: figure out a way to run this in the background (off critical path)
+        if fetch and working_set_collection_on and len(ids) > 0:
+            embeddings = results["embeddings"][0]  # type: ignore
+            self._working_set.insert(
+                ids=ids,
+                documents=documents,
+                metadatas=metadatas,  # type: ignore
+                embeddings=embeddings, # type: ignore
+            )
+
+        # update id state (if id tracking on)
+        if id_tracking_on:
+            if fetch:
+                self._working_set.fetched_chunk_ids.update(ids)
+            if read:
+                self._working_set.read_chunk_ids.update(ids)
+
+        # add action to the working set
+        if working_set_collection_on or id_tracking_on:
+            self._working_set.add_action(
+                tool=self.name,
+                tool_kwargs={"query": query, "top_k": top_k, "read": read, "fetch": fetch, "metadata_filter": metadata_filter},
+            )
+
+        # return results to agent
         chunks: list[dict] = []
         for rank, (cid, doc, meta, dist) in enumerate(
             zip(ids, documents, metadatas, distances, strict=True), 1
@@ -234,29 +289,29 @@ class SearchCorpusTool(Tool):
                 "text": f"{header}\n{doc or ''}",
             })
 
-        if fetch:
-            self._state.fetched_chunk_ids.update(c["chunk_id"] for c in chunks)
-        if read:
-            self._state.read_chunk_ids.update(c["chunk_id"] for c in chunks)
-
         return {SEARCH_RESULT_TAG: True, "read_chunks": chunks if read else [], "fetched_chunks": chunks if fetch else []}
 
 
 class GrepCorpusTool(Tool):
     name = "grep_corpus"
-    doc = _PROMPTS["grep_corpus"]
+    doc_template = _PROMPTS["grep_corpus"]
+    doc: str
 
     def __init__(
         self,
         chroma_collection: Collection,
-        state: RetrievalState | None = None,
-        working_set_off: bool = False,
+        working_set: WorkingSet,
+        working_set_collection_off: bool = False,
+        id_tracking_off: bool = False,
     ):
         self._chroma_collection = chroma_collection
-        self._state = state if state is not None else RetrievalState()
-        self._working_set_off = working_set_off
-        if working_set_off:
-            self.doc = _PROMPTS["grep_corpus_no_working_set"]
+        self._working_set = working_set
+        self._working_set_collection_off = working_set_collection_off
+        self._id_tracking_off = id_tracking_off
+        self.doc = _ENV.from_string(self.doc_template).render(
+            working_set_collection_on=not self._working_set_collection_off,
+            id_tracking_on=not self._id_tracking_off,
+        )
 
     def __call__(
         self,
@@ -267,25 +322,32 @@ class GrepCorpusTool(Tool):
         limit: int | None = None,
         max_output_tokens: int | None = None,
     ) -> dict:
-        # read corpus directly every time if working set abstraction is turned off
-        if self._working_set_off:
+        # if the working set collection and id tracking are turned off, then every query
+        # is a fetch + read query that goes directly to self._chroma_collection
+        if self._working_set_collection_off and self._id_tracking_off:
             fetch = read = True
 
         assert fetch or read, "At least one of fetch or read must be present."
-        assert fetch or not self._state.empty(), "Cannot read from empty working set"
+        assert fetch or not self._working_set.empty(use_id_state=self._working_set_collection_off), "Cannot read from empty working set"
+
+        # rephrase booleans to improve readability below
+        working_set_collection_on = not self._working_set_collection_off
+        id_tracking_on = not self._id_tracking_off
+
         # set the inclusion and exclusion filters based on the scenario
         in_chunk_ids = in_doc_ids = not_in_chunk_ids = not_in_doc_ids = None
-        if fetch and read:
-            not_in_chunk_ids = self._state.pruned_chunk_ids | self._state.read_chunk_ids
-            not_in_doc_ids = self._state.pruned_doc_ids | self._state.read_doc_ids
-        elif fetch:
-            not_in_chunk_ids = self._state.fetched_chunk_ids | self._state.pruned_chunk_ids
-            not_in_doc_ids = self._state.fetched_doc_ids | self._state.pruned_doc_ids
-        elif read:
-            in_chunk_ids = self._state.fetched_chunk_ids
-            in_doc_ids = self._state.fetched_doc_ids
-            not_in_chunk_ids = self._state.pruned_chunk_ids | self._state.read_chunk_ids
-            not_in_doc_ids = self._state.pruned_doc_ids | self._state.read_doc_ids
+        if id_tracking_on:
+            if fetch and read:
+                not_in_chunk_ids = self._working_set.pruned_chunk_ids | self._working_set.read_chunk_ids
+                not_in_doc_ids = self._working_set.pruned_doc_ids | self._working_set.read_doc_ids
+            elif fetch:
+                not_in_chunk_ids = self._working_set.fetched_chunk_ids | self._working_set.pruned_chunk_ids
+                not_in_doc_ids = self._working_set.fetched_doc_ids | self._working_set.pruned_doc_ids
+            elif read:
+                in_chunk_ids = self._working_set.fetched_chunk_ids
+                in_doc_ids = self._working_set.fetched_doc_ids
+                not_in_chunk_ids = self._working_set.pruned_chunk_ids | self._working_set.read_chunk_ids
+                not_in_doc_ids = self._working_set.pruned_doc_ids | self._working_set.read_doc_ids
 
         where = _build_metadata_where(
             metadata_filter=metadata_filter,
@@ -296,23 +358,58 @@ class GrepCorpusTool(Tool):
         )
         get_kwargs: dict = {
             "where_document": {"$regex": pattern},
-            "include": ["metadatas", "documents"],
+            "include": ["metadatas", "documents", "embeddings"] if working_set_collection_on else ["metadatas", "documents"],
         }
         if where is not None:
             get_kwargs["where"] = where
         if limit is not None:
             get_kwargs["limit"] = limit
 
+        # query results from the appropriate collection
         try:
-            res = self._chroma_collection.get(**get_kwargs)
+            # route the query: fetch always reads the full corpus; read-only is served by the
+            # working-set collection when it exists, and by the corpus — restricted to fetched
+            # material through the inclusion filters — when it does not
+            if fetch or self._working_set_collection_off:
+                res = self._chroma_collection.get(**get_kwargs)
+            else:
+                res = self._working_set.collection.get(**get_kwargs)
+
         except Exception as e:
             return {GREP_RESULT_TAG: True, "read_groups": [], "fetched_groups": [], "error": f"grep_corpus error: {e}"}
 
         ids = res["ids"]
-        documents = res["documents"] or []
-        metadatas = res["metadatas"] or []
+        documents = res["documents"] or [None] * len(ids)
+        metadatas = res["metadatas"] or [None] * len(ids)
+
+        # if we got an empty result, return early
         if not ids:
             return {GREP_RESULT_TAG: True, "read_groups": [], "fetched_groups": []}
+
+        # insert results into working set collection (if turned on)
+        # TODO: figure out a way to run this in the background (off critical path)
+        if fetch and working_set_collection_on and len(ids) > 0:
+            embeddings = res["embeddings"]  # type: ignore
+            self._working_set.insert(
+                ids=ids,
+                documents=documents,  # type: ignore
+                metadatas=metadatas,  # type: ignore
+                embeddings=embeddings,  # type: ignore
+            )
+
+        # add action to the working set
+        if working_set_collection_on or id_tracking_on:
+            self._working_set.add_action(
+                tool=self.name,
+                tool_kwargs={
+                    "pattern": pattern,
+                    "read": read,
+                    "fetch": fetch,
+                    "metadata_filter": metadata_filter,
+                    "limit": limit,
+                    "max_output_tokens": max_output_tokens,
+                },
+            )
 
         # Group hits by doc_id, preserving element ordering within each doc.
         grouped: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
@@ -351,12 +448,15 @@ class GrepCorpusTool(Tool):
 
             groups.append({"doc_id": doc_id, "header": header, "read_chunks": read_doc_chunks, "fetched_chunks": fetched_doc_chunks})
 
-        for g in groups:
-            if fetch:
-                self._state.fetched_chunk_ids.update(c["chunk_id"] for c in g["fetched_chunks"])
-            if read:
-                self._state.read_chunk_ids.update(c["chunk_id"] for c in g["read_chunks"])
+        # update id state (if id tracking on)
+        if id_tracking_on:
+            for g in groups:
+                if fetch:
+                    self._working_set.fetched_chunk_ids.update(c["chunk_id"] for c in g["fetched_chunks"])
+                if read:
+                    self._working_set.read_chunk_ids.update(c["chunk_id"] for c in g["read_chunks"])
 
+        # return results to agent
         result: dict = {GREP_RESULT_TAG: True, "read_groups": groups if read else [], "fetched_groups": groups if fetch else []}
         if read and truncated:
             dropped = total_chunks - kept_chunks
@@ -365,6 +465,7 @@ class GrepCorpusTool(Tool):
                 f"chunk(s) (~{max_output_tokens:,}-token cap reached); {dropped} chunk(s) omitted. Narrow the "
                 f"pattern, add a metadata_filter, pass limit=N, or raise max_output_tokens to see the rest.]"
             )
+
         return result
 
 
@@ -378,9 +479,10 @@ class ReadDocumentTool(Tool):
     name = "read_document"
     doc = _PROMPTS["read_document"]
 
-    def __init__(self, document_map: DocumentMap, state: RetrievalState | None = None):
+    def __init__(self, document_map: DocumentMap, working_set: WorkingSet, id_tracking_off: bool):
         self._document_map = document_map
-        self._state = state if state is not None else RetrievalState()
+        self._working_set = working_set
+        self._id_tracking_off = id_tracking_off
 
     def __call__(self, doc_id: str | list[str], start_char_idx: int | None | list[int | None] = None, end_char_idx: int | None | list[int | None] = None) -> dict:
         if isinstance(doc_id, list):
@@ -404,10 +506,15 @@ class ReadDocumentTool(Tool):
                     start_idx = start_idx or 0
                     end_idx = end_idx if end_idx is not None else len(text)
                     body = text[start_idx:end_idx]
-                self._state.read_doc_ids.add(did)
-                self._state.fetched_doc_ids.add(did)
-                self._state.pruned_doc_ids.discard(did)
-                self._state.redacted_doc_ids.discard(did)
+
+                if not self._id_tracking_off:
+                    self._working_set.read_doc_ids.add(did)
+                    self._working_set.fetched_doc_ids.add(did)
+                    self._working_set.pruned_doc_ids.discard(did)
+                    self._working_set.redacted_doc_ids.discard(did)
+
+                self._working_set.add_action(self.name, {"doc_id": doc_id, "start_char_idx": start_char_idx, "end_char_idx": end_char_idx})
+
             rendered = f"=== doc_id={did} | total chars: {total_chars} | est. tokens: {est_tokens} ===\n{body}"
             docs.append({"doc_id": did, "text": rendered})
         return {READ_DOCUMENT_RESULT_TAG: True, "docs": docs}
@@ -472,36 +579,35 @@ class PruneTool(Tool):
     name = "prune"
     doc = _PROMPTS["prune"]
 
-    def __init__(self, state: RetrievalState):
-        self._state = state
+    def __init__(self, working_set: WorkingSet):
+        self._working_set = working_set
 
     def __call__(
         self,
         chunk_ids: list[str] | None = None,
         doc_ids: list[str] | None = None,
     ) -> dict:
-        # Single writer of the shared prune sets: mutate directly, then report
-        # how many were newly added (the agent renders the summary, no re-apply).
-        new_chunks = set(chunk_ids or ()) - self._state.pruned_chunk_ids
-        new_docs = set(doc_ids or ()) - self._state.pruned_doc_ids
-        self._state.pruned_chunk_ids.update(new_chunks)
-        self._state.pruned_doc_ids.update(new_docs)
+        # prune the chunks and docs from the working set and add an action to the working set
+        new_pruned_chunks, new_pruned_docs = self._working_set.prune(chunk_ids, doc_ids)
+        self._working_set.add_action(tool=self.name, tool_kwargs={"chunk_ids": chunk_ids, "doc_ids": doc_ids})
+
         return {
             PRUNE_RESULT_TAG: True,
-            "new_chunk_count": len(new_chunks),
-            "new_doc_count": len(new_docs),
-            "total_chunks": len(self._state.pruned_chunk_ids),
-            "total_docs": len(self._state.pruned_doc_ids),
+            "new_chunk_count": len(new_pruned_chunks),
+            "new_doc_count": len(new_pruned_docs),
+            "total_chunks": len(self._working_set.pruned_chunk_ids),
+            "total_docs": len(self._working_set.pruned_doc_ids),
         }
+
 
 # Per-doc text snippet cap in the structured trace event. Each filtered doc carries a
 # preview so the trace viewer can expand it on click without a second corpus lookup; the
 # cap keeps a 1,000-doc filter from bloating the event stream with full document bodies.
 
-
 class SemanticFilterTool(Tool):
     name = "semantic_filter"
-    doc = _PROMPTS["sem_filter_tool"]
+    doc_template = _PROMPTS["sem_filter_tool"]
+    doc: str
 
     _SEMFILTER_JUDGE_PROMPT = _PROMPTS["sem_filter_judge"]
     _SEMFILTER_MAX_WORKERS = 16
@@ -517,29 +623,34 @@ class SemanticFilterTool(Tool):
         chroma_collection: Collection,
         llm_client: LLMClient,
         document_map: DocumentMap,
+        working_set: WorkingSet,
         model: str | None = None,
         *,
-        state: RetrievalState | None = None,
         ctx: ExecutionContext | None = None,
         max_workers: int | None = None,
         provider_order: list[str] | None = None,
         judge_max_output_tokens: int | None = None,
         disable_judge_reasoning: bool = True,
         usage_key: str = "default",
-        working_set_off: bool = False,
+        working_set_collection_off: bool = False,
+        id_tracking_off: bool = False,
     ) -> None:
         self._chroma_collection = chroma_collection
         self._llm_client = llm_client
         self._document_map = document_map
+        self._working_set = working_set
         self._model = model or llm_client.config.llm_model
         self._ctx = ctx
         self._max_workers = max_workers or self._SEMFILTER_MAX_WORKERS
         self._judge_max_output_tokens = judge_max_output_tokens or self._JUDGE_MAX_OUTPUT_TOKENS
         self._disable_judge_reasoning = disable_judge_reasoning
         self._usage_key = usage_key
-        self._working_set_off = working_set_off
-        if working_set_off:
-            self.doc = _PROMPTS["sem_filter_tool_no_working_set"]
+        self._working_set_collection_off = working_set_collection_off
+        self._id_tracking_off = id_tracking_off
+        self.doc = _ENV.from_string(self.doc_template).render(
+            working_set_collection_on=not self._working_set_collection_off,
+            id_tracking_on=not self._id_tracking_off,
+        )
 
         # per-call OpenRouter provider order for the judge calls only (None => client default). Lets a
         # cheaper judge model route to specific providers while the agent model stays unpinned.
@@ -547,11 +658,6 @@ class SemanticFilterTool(Tool):
 
         # resolve the model's context limit
         self._context_limit = match_model_entry(self._model, llm_client.config.llm_context_limits)
-
-        # Per-question retrieval state shared by reference with the owning SearchAgent
-        # (same as the search / grep / read tools), so corpus mode honors prunes and
-        # records read chunks; a private fresh state for standalone use.
-        self._state = state if state is not None else RetrievalState()
 
     @staticmethod
     def _parse_bool(text: str) -> bool:
@@ -568,63 +674,96 @@ class SemanticFilterTool(Tool):
     def _error(self, msg: str) -> dict:
         return {SEMFILTER_RESULT_TAG: True, "error": msg}
 
-    def _metadata_only_selection(self, where: dict) -> tuple[list[tuple], list[str]]:
+    def _metadata_only_selection(self, where: dict, fetch: bool) -> tuple[list[tuple], list[str]]:
         """Use metadata filtering to return a set of candidates and candidate ids."""
-        res = self._chroma_collection.get(where=where, include=["metadatas", "documents"])
-        ids = res["ids"]
-        documents = res["documents"] or []
-        metadatas = res["metadatas"] or []
+        working_set_collection_on = not self._working_set_collection_off
+        get_kwargs: dict = {
+            "where": where,
+            "include": ["metadatas", "documents", "embeddings"] if working_set_collection_on else ["metadatas", "documents"],
+        }
 
-        # TODO: if we use strict=True here wouldn't that truncate candidates unnecessarily in the case where we only have ids?
+        # route the query: fetch always reads the full corpus; read-only is served by the
+        # working-set collection when it exists, and by the corpus — restricted to fetched
+        # material through the inclusion filters — when it does not
+        if fetch or self._working_set_collection_off:
+            res = self._chroma_collection.get(**get_kwargs)
+        else:
+            res = self._working_set.collection.get(**get_kwargs)
+
+        ids = res["ids"]
+        documents = res["documents"] or [None] * len(ids)
+        metadatas = res["metadatas"] or [None] * len(ids)
+        embeddings = res["embeddings"] if working_set_collection_on else [None] * len(ids)
+
         candidates = [
-            (cid, meta["doc_id"], doc or "")
-            for cid, doc, meta in zip(ids, documents, metadatas, strict=True) 
+            (cid, meta["doc_id"], doc or "", meta, emb if emb is not None else [])
+            for cid, doc, meta, emb in zip(ids, documents, metadatas, embeddings, strict=True)  # type: ignore
         ]
-        candidate_doc_ids = list(dict.fromkeys(str(did) for _, did, _ in candidates))
+        candidate_doc_ids = list(dict.fromkeys(str(did) for _, did, _, _, _ in candidates))
         return candidates, candidate_doc_ids
 
-    def _vector_search_selection(self, search_str: str, top_k: int, where: dict | None) -> tuple[list[tuple], list[str]]:
+    def _vector_search_selection(self, search_str: str, top_k: int, where: dict | None, fetch: bool) -> tuple[list[tuple], list[str]]:
         """Use vector search to return a set of candidates and candidate ids."""
+        working_set_collection_on = not self._working_set_collection_off
         emb = self._llm_client.embed_query(search_str, ctx=self._ctx, usage_key=self._usage_key)
         query_kwargs: dict = {
             "query_embeddings": [emb],
             "n_results": top_k,
-            "include": ["metadatas", "documents"],
+            "include": ["metadatas", "documents", "embeddings"] if working_set_collection_on else ["metadatas", "documents"],
         }
         if where is not None:
             query_kwargs["where"] = where
-        res = self._chroma_collection.query(**query_kwargs)
+
+        # route the query: fetch always reads the full corpus; read-only is served by the
+        # working-set collection when it exists, and by the corpus — restricted to fetched
+        # material through the inclusion filters — when it does not
+        if fetch or self._working_set_collection_off:
+            res = self._chroma_collection.query(**query_kwargs)
+        else:
+            res = self._working_set.collection.query(**query_kwargs)
+
+        ids = res["ids"][0]
+        documents = res["documents"][0]  # type: ignore
+        metadatas = res["metadatas"][0]  # type: ignore
+        embeddings = res["embeddings"][0] if working_set_collection_on else [None] * len(ids)  # type: ignore
 
         candidates = [
-            (cid, meta["doc_id"], doc or "")
-            for cid, doc, meta in zip(res["ids"][0], res["documents"][0], res["metadatas"][0], strict=True)  # type: ignore
+            (cid, meta["doc_id"], doc or "", meta, emb if emb is not None else [])
+            for cid, doc, meta, emb in zip(ids, documents, metadatas, embeddings, strict=True)  # type: ignore
         ]
-        candidate_doc_ids = list(dict.fromkeys(str(did) for _, did, _ in candidates))
+        candidate_doc_ids = list(dict.fromkeys(str(did) for _, did, _, _, _ in candidates))
         return candidates, candidate_doc_ids
 
-    def _grep_selection(self, pattern: str, limit: int | None, where: dict | None) -> tuple[list[tuple], list[str]]:
+    def _grep_selection(self, pattern: str, limit: int | None, where: dict | None, fetch: bool) -> tuple[list[tuple], list[str]]:
         """Use grep to return a set of candidates and candidate ids."""
+        working_set_collection_on = not self._working_set_collection_off
         get_kwargs: dict = {
             "where_document": {"$regex": pattern},
-            "include": ["metadatas", "documents"],
+            "include": ["metadatas", "documents", "embeddings"] if working_set_collection_on else ["metadatas", "documents"],
         }
         if where is not None:
             get_kwargs["where"] = where
         if limit is not None:
             get_kwargs["limit"] = limit
-        res = self._chroma_collection.get(**get_kwargs)
+
+        # route the query: fetch always reads the full corpus; read-only is served by the
+        # working-set collection when it exists, and by the corpus — restricted to fetched
+        # material through the inclusion filters — when it does not
+        if fetch or self._working_set_collection_off:
+            res = self._chroma_collection.get(**get_kwargs)
+        else:
+            res = self._working_set.collection.get(**get_kwargs)
 
         ids = res["ids"]
-        documents = res["documents"] or []
-        metadatas = res["metadatas"] or []
+        documents = res["documents"] or [None] * len(ids)
+        metadatas = res["metadatas"] or [None] * len(ids)
+        embeddings = res["embeddings"] if working_set_collection_on else [None] * len(ids)
 
-        # TODO: if we use strict=True here (and in GrepCorpusTool);
-        # wouldn't that truncate candidates unnecessarily in the case where we only have ids?
         candidates = [
-            (cid, meta["doc_id"], doc or "")
-            for cid, doc, meta in zip(ids, documents, metadatas, strict=True) 
+            (cid, meta["doc_id"], doc or "", meta, emb if emb is not None else [])
+            for cid, doc, meta, emb in zip(ids, documents, metadatas, embeddings, strict=True)  # type: ignore
         ]
-        candidate_doc_ids = list(dict.fromkeys(str(did) for _, did, _ in candidates))
+        candidate_doc_ids = list(dict.fromkeys(str(did) for _, did, _, _, _ in candidates))
         return candidates, candidate_doc_ids
 
     def _truncate_doc_for_judge(self, text: str, budget_tokens: int) -> tuple[str, bool]:
@@ -730,12 +869,14 @@ class SemanticFilterTool(Tool):
         pattern: str | None = None,
         limit: int | None = None,
     ) -> dict:
-        # read corpus directly every time if working set abstraction is turned off
-        if self._working_set_off:
+        # if the working set collection and id tracking are turned off, then every query
+        # is a fetch + read query that goes directly to self._chroma_collection
+        if self._working_set_collection_off and self._id_tracking_off:
             fetch = read = True
 
         assert fetch or read, "At least one of fetch or read must be present."
-        assert fetch or not self._state.empty(), "Cannot read from empty working set"
+        assert fetch or not self._working_set.empty(use_id_state=self._working_set_collection_off), "Cannot read from empty working set"
+
         if not predicate or not str(predicate).strip():
             return self._error("semantic_filter error: `predicate` is required.")
         if fetch and metadata_filter is None and top_k is None and pattern is None:
@@ -755,26 +896,28 @@ class SemanticFilterTool(Tool):
             # TODO: add a warning / notice that we will only execute the vector search
             pass
 
-        # Set the inclusion and exclusion filters based on the scenario. This tool dedups on the
-        # FETCH axis only: a document enters the working set once, so fetch paths exclude what's
-        # already fetched. Reads never dedup — the same working-set doc/chunk can be re-judged
-        # under a different predicate any number of times — so read excludes only prunes. With the
-        # working set off there is no fetch axis, so the whole corpus is read-path: prunes only.
+        # rephrase booleans to improve readability below
+        working_set_collection_on = not self._working_set_collection_off
+        id_tracking_on = not self._id_tracking_off
+
+        # set the inclusion and exclusion filters based on the scenario; this tool differs a bit
+        # from vector search and grep because we want to allow the tool to re-read chunks / documents
+        # while applying new predicates; we exclude pruned chunks when read is true; we additionally
+        # exclude previously fetched chunks when the filter is fetch-only (the are already in the
+        # working set)
         in_chunk_ids = in_doc_ids = not_in_chunk_ids = not_in_doc_ids = None
-        if self._working_set_off:
-            # treat the corpus as the working set where only pruned material is excluded
-            not_in_chunk_ids = self._state.pruned_chunk_ids
-            not_in_doc_ids = self._state.pruned_doc_ids
-        elif fetch:
-            # fetch: candidates come from the corpus, exclude already fetched or pruned
-            not_in_chunk_ids = self._state.fetched_chunk_ids | self._state.pruned_chunk_ids
-            not_in_doc_ids = self._state.fetched_doc_ids | self._state.pruned_doc_ids
-        else:
-            # read: candidates come from the working set
-            in_chunk_ids = self._state.fetched_chunk_ids
-            in_doc_ids = self._state.fetched_doc_ids
-            not_in_chunk_ids = self._state.pruned_chunk_ids
-            not_in_doc_ids = self._state.pruned_doc_ids
+        if id_tracking_on:
+            if fetch and read:
+                not_in_chunk_ids = self._working_set.pruned_chunk_ids
+                not_in_doc_ids = self._working_set.pruned_doc_ids
+            elif fetch:
+                not_in_chunk_ids = self._working_set.fetched_chunk_ids | self._working_set.pruned_chunk_ids
+                not_in_doc_ids = self._working_set.fetched_doc_ids | self._working_set.pruned_doc_ids
+            else:
+                in_chunk_ids = self._working_set.fetched_chunk_ids
+                in_doc_ids = self._working_set.fetched_doc_ids
+                not_in_chunk_ids = self._working_set.pruned_chunk_ids
+                not_in_doc_ids = self._working_set.pruned_doc_ids
 
         where = _build_metadata_where(
             metadata_filter=metadata_filter,
@@ -784,11 +927,11 @@ class SemanticFilterTool(Tool):
             not_in_doc_ids=not_in_doc_ids,
         )
 
-        # select candidate chunks: (chunk_id, doc_id, text | None) using vector search, grep, or metadata-only filtering
+        # select candidate chunks: (chunk_id, doc_id, text | None, meta, emb) using vector search, grep, or metadata-only filtering
         if top_k is not None:
             mode = "vector"
             try:
-                candidates, candidate_doc_ids = self._vector_search_selection(search_str or predicate, top_k, where)
+                candidates, candidate_doc_ids = self._vector_search_selection(search_str or predicate, top_k, where, fetch)
             except Exception as e:
                 return self._error(f"semantic_filter error while executing vector search: {e}")
 
@@ -800,7 +943,7 @@ class SemanticFilterTool(Tool):
         elif pattern is not None:
             mode = "grep"
             try:
-                candidates, candidate_doc_ids = self._grep_selection(pattern, limit, where)
+                candidates, candidate_doc_ids = self._grep_selection(pattern, limit, where, fetch)
             except Exception as e:
                 return self._error(f"semantic_filter error while executing grep: {e}")
 
@@ -813,7 +956,7 @@ class SemanticFilterTool(Tool):
             mode = "metadata"
             try:
                 assert isinstance(where, dict)
-                candidates, candidate_doc_ids = self._metadata_only_selection(where)
+                candidates, candidate_doc_ids = self._metadata_only_selection(where, fetch)
             except Exception as e:
                 return self._error(f"semantic_filter error while executing metadata: {e}")
                 
@@ -824,7 +967,7 @@ class SemanticFilterTool(Tool):
                 )
             
         if not candidate_doc_ids:
-            # Renders as EMPTY_RESULT_MESSAGE (a prune filter may have eliminated everything).
+            # renders as EMPTY_RESULT_MESSAGE (a prune filter or bad grep may lead to no results)
             return {SEMFILTER_RESULT_TAG: True, "summary": "", "read_chunks": [], "fetched_chunks": [], "kept_doc_ids": [], "n_in": 0, "n_out": 0}
 
         # filter documents using judge model
@@ -849,27 +992,64 @@ class SemanticFilterTool(Tool):
                 "header": f"  [chunk_id={cid} | doc_id={did} | est_num_tokens={estimate_tokens(text)}]",
                 "text": f"chunk_id={cid} | doc_id={did}\n{text}"
             }
-            for cid, did, text in candidates
+            for cid, did, text, _, _ in candidates
             if did in kept_set
         ]
 
+        # insert results into working set collection (if turned on)
+        # TODO: figure out a way to run this in the background (off critical path)
+        if fetch and working_set_collection_on and len(kept_set) > 0:
+            ids, documents, metadatas, embeddings = [], [], [], []
+            for id, doc_id, doc, meta, emb in candidates:
+                if doc_id in kept_set:
+                    ids.append(id)
+                    documents.append(doc)
+                    metadatas.append(meta)
+                    embeddings.append(emb)
+
+            self._working_set.insert(
+                ids=ids,  # type: ignore
+                documents=documents,  # type: ignore
+                metadatas=metadatas,  # type: ignore
+                embeddings=embeddings, # type: ignore
+            )
+
+        # update id state (if id tracking on)
         # (doc_id, chunk_id) order within the sorted kept docs
         kept_chunks.sort(key=lambda c: (c["doc_id"], c["chunk_id"]))
-        if fetch:
-            self._state.fetched_chunk_ids.update(c["chunk_id"] for c in kept_chunks)
-            self._state.fetched_doc_ids.update(kept)
-        if read:
-            self._state.read_chunk_ids.update(c["chunk_id"] for c in kept_chunks)
-            self._state.read_doc_ids.update(kept)
-            # A re-surfaced chunk must actually render: `_block_is_visible` hides ChunkBlocks by
-            # chunk_id/doc_id, so a kept chunk the context trimmer once redacted would come back
-            # invisible while the summary says its doc passed. Drop kept ids from the redaction
-            # sets (mirrors `read_document`); the trimmer can always re-redact on a later step.
-            for c in kept_chunks:
-                self._state.redacted_chunk_ids.discard(c["chunk_id"])
-            for did in kept:
-                self._state.redacted_doc_ids.discard(did)
+        if id_tracking_on:
+            if fetch:
+                self._working_set.fetched_chunk_ids.update(c["chunk_id"] for c in kept_chunks)
+                self._working_set.fetched_doc_ids.update(kept)
+            if read:
+                self._working_set.read_chunk_ids.update(c["chunk_id"] for c in kept_chunks)
+                self._working_set.read_doc_ids.update(kept)
+                # A re-surfaced chunk must actually render: `_block_is_visible` hides ChunkBlocks by
+                # chunk_id/doc_id, so a kept chunk the context trimmer once redacted would come back
+                # invisible while the summary says its doc passed. Drop kept ids from the redaction
+                # sets (mirrors `read_document`); the trimmer can always re-redact on a later step.
+                for c in kept_chunks:
+                    self._working_set.redacted_chunk_ids.discard(c["chunk_id"])
+                for did in kept:
+                    self._working_set.redacted_doc_ids.discard(did)
 
+        # add action to the working set
+        if working_set_collection_on or id_tracking_on:
+            self._working_set.add_action(
+                tool=self.name,
+                tool_kwargs={
+                    "predicate": predicate,
+                    "read": read,
+                    "fetch": fetch, 
+                    "metadata_filter": metadata_filter,
+                    "top_k": top_k,
+                    "search_str": search_str,
+                    "pattern": pattern,
+                    "limit": limit,
+                },
+            )
+
+        # return results to the agent
         summary = (
             f"[semantic_filter] kept {len(kept)}/{len(candidate_doc_ids)} candidate document(s) matching the "
             f"predicate. kept_doc_ids={kept}." + (" Chunks from kept documents follow." if kept_chunks else "")

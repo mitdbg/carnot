@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Tool-ablation experiment: qwen3.6-35b-a3b + the SearchAgent on OfficeQA (dev split), sweeping
-# the six retrieval tool sets below. Every run uses the `ablation_search_agent` system, which
-# always has read_document + prune and toggles vector / grep / semantic_filter by config; the
-# config label is the run-name, so the six runs land in distinct dirs under
-#   results/officeqa/ablation_search_agent/<label>_<timestamp>/
+# the six retrieval tool sets below. Every run uses the `search_agent` system, which always has
+# read_document + prune and toggles vector / grep / semantic_filter by config; the config label
+# is the run-name, so the six runs land in distinct dirs under
+#   results/officeqa/search_agent/<label>_<timestamp>/
 #
 #   grep_read           grep + read                        (vector off, grep on,  sem off)
 #   vector_read         vector-search + read               (vector on,  grep off, sem off)
@@ -29,7 +29,7 @@ CHROMA_PORT="${CHROMA_PORT:-8001}"
 MODEL="${MODEL:-qwen/qwen3.6-35b-a3b}"
 PROVIDER="${PROVIDER-parasail}"
 
-# label | tool_vector | tool_grep | tool_semantic_filter
+# label | include_search_corpus | include_grep_corpus | include_semantic_filter
 CONFIGS=(
   "grep_read|false|true|false"
   "vector_read|true|false|false"
@@ -42,18 +42,18 @@ CONFIGS=(
 for entry in "${CONFIGS[@]}"; do
   IFS='|' read -r label vec grep sem <<< "$entry"
   provider_ovr=()
-  [ -n "$PROVIDER" ] && provider_ovr+=( "systems.llm_provider_order=[${PROVIDER}]" )
+  [ -n "$PROVIDER" ] && provider_ovr+=( "inference.llm_provider_order=[${PROVIDER}]" )
   echo "==================================================================="
-  echo "=== officeqa | ablation_search_agent | ${label}  (vector=$vec grep=$grep sem=$sem) | model=$MODEL ${PROVIDER:+provider=$PROVIDER}"
+  echo "=== officeqa | search_agent | ${label}  (vector=$vec grep=$grep sem=$sem) | model=$MODEL ${PROVIDER:+provider=$PROVIDER}"
   echo "==================================================================="
   "$PYTHON" -m qatfd.runner \
     benchmarks=officeqa \
-    systems=ablation_search_agent \
-    systems.llm_model="$MODEL" \
+    systems=search_agent \
+    inference.llm_model="$MODEL" \
     "${provider_ovr[@]}" \
-    systems.tool_vector="$vec" \
-    systems.tool_grep="$grep" \
-    systems.tool_semantic_filter="$sem" \
+    systems.include_search_corpus="$vec" \
+    systems.include_grep_corpus="$grep" \
+    systems.include_semantic_filter="$sem" \
     benchmarks.chroma_server_host="$CHROMA_HOST" \
     benchmarks.chroma_server_port="$CHROMA_PORT" \
     experiments.run_name="$label"
@@ -61,5 +61,5 @@ done
 
 echo
 echo "All 6 ablation runs complete."
-echo "Reports: results/officeqa/ablation_search_agent/<label>_<timestamp>/report.csv"
-echo "Tool breakdown: python3 <scratchpad>/tool_metrics_ablation.py"
+echo "Reports: results/officeqa/search_agent/<label>_<timestamp>/report.csv"
+echo "Ablation tables: python3 eval/ablation_tables.py --benchmark officeqa"

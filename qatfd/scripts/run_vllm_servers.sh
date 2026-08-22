@@ -4,7 +4,7 @@
 # mixes models (agent + semantic filter + embedder) needs several servers on distinct
 # ports; this script starts them all, waits for health, writes a JSON manifest of
 # model -> base URL, and prints the paste-ready Hydra override for
-# `systems.vllm_base_urls`. skunk's LLMClient routes any model listed in that map to its
+# `inference.vllm_base_urls`. skunk's LLMClient routes any model listed in that map to its
 # server; unlisted models (e.g. benchmarks.judge_model) stay on OpenRouter.
 #
 #   tmux new -s vllm
@@ -21,7 +21,8 @@
 #   task=embed  embedding server, OLD vllm (--task embed; removed in newer vLLM)
 #   runner=pooling  embedding server, NEW vllm (--runner pooling replaces --task embed)
 #   name=<id>   --served-model-name (DEFAULT: the model id itself, so the manifest keys,
-#               systems.llm_model / semantic_filter_model / emb_model_id, and the server
+#               inference.llm_model / inference.emb_model_id / systems.semantic_filter_model,
+#               and the server
 #               all agree — see skunk config.py `vllm_base_urls`)
 #   port=8105   explicit port (default: BASE_PORT + arg index)
 # Model ids never contain ':', so the colon-split is unambiguous.
@@ -190,7 +191,7 @@ override+="}"
 
 if [[ "$DRY_RUN" == 1 ]]; then
   echo "[dry-run] manifest ($MANIFEST): $manifest_json"
-  echo "[dry-run] Hydra override: '++systems.vllm_base_urls=$override'"
+  echo "[dry-run] Hydra override: '++inference.vllm_base_urls=$override'"
   exit 0
 fi
 
@@ -198,9 +199,9 @@ printf '%s\n' "$manifest_json" > "$MANIFEST"
 echo "Wrote $MANIFEST"
 echo
 echo "All servers healthy. Point qatfd at them with:"
-echo "  '++systems.vllm_base_urls=$override'"
+echo "  '++inference.vllm_base_urls=$override'"
 echo "(++ because Hydra's struct mode rejects new dict keys under a plain override)"
-echo "(add systems.llm_provider=vllm to route EVERY model locally, or leave it on"
+echo "(add inference.llm_provider=vllm to route EVERY model locally, or leave it on"
 echo " openrouter so only the mapped models — not e.g. the judge — go local)"
 echo
 # Keep the servers in the foreground so this tmux pane owns their lifetime.

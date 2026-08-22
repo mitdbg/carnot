@@ -32,10 +32,11 @@ _LATENCY_RE = re.compile(r"\blatency_s=([0-9.]+)")
 class GenStats:
     """Cost + latency for one agent run (one line of inquiry, or one follow-up question)."""
 
-    usage_key: str          # == the agent's agent_id; the UsageTracker bucket
-    kind: str               # "line_of_inquiry" | "follow_up_question"
+    usage_key: str              # == the agent's agent_id; the UsageTracker bucket
+    kind: str                   # "line_of_inquiry" | "follow_up_question"
     qid: str
-    idx: int | None = None  # follow-up index within the question; None for the line of inquiry
+    idx: int | None = None      # follow-up index within the question; None for the line of inquiry
+    attempt: int | None = None  # used to track retries
 
     # wall-clock around `agent.call()` — includes rate-limit waits, retries and tool time
     wall_latency_s: float = 0.0
@@ -51,6 +52,7 @@ class GenStats:
     embed_tokens: int = 0
     n_llm_calls: int = 0
     n_embed_calls: int = 0
+    n_steps: int = 0
 
     model_to_input_tokens: dict[str, int] = field(default_factory=dict)
     model_to_output_tokens: dict[str, int] = field(default_factory=dict)
@@ -61,6 +63,10 @@ class GenStats:
     # agent outcome: "finished" | "out_of_steps" | "over_cost_budget" | ... | "error"
     terminate_state: str = "finished"
     error: str | None = None
+
+    # used to indicate whether a generated inquiry or qa pair was deemed solvable / unique or not
+    solvable: bool | None = None
+    unique: bool | None = None
 
     def to_json(self) -> dict:
         return asdict(self)
@@ -73,8 +79,10 @@ def usage_snapshot(
     kind: str,
     qid: str,
     idx: int | None = None,
+    attempt: int | None = None,
     wall_latency_s: float = 0.0,
     llm_latency_s: float = 0.0,
+    n_steps: int = 0,
 ) -> GenStats:
     """Read one agent's bucket out of the shared `UsageTracker`.
 
@@ -89,6 +97,8 @@ def usage_snapshot(
         kind=kind,
         qid=qid,
         idx=idx,
+        attempt=attempt,
+        n_steps=n_steps,
         wall_latency_s=round(wall_latency_s, 3),
         llm_latency_s=round(llm_latency_s, 3),
         cost_usd=tracker.cost(key=usage_key),

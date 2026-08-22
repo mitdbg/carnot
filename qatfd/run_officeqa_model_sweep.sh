@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
-# Sweep {rag_llm, search_agent, qatfd_search_agent} x {3 models} on OfficeQA (dev split).
+# Sweep {RAG-LLM, SearchAgent, QATFD} x {3 models} on OfficeQA (dev split).
 #
-#   - rag_llm uses top_k=10 (the agent systems take no top_k).
+#   - rag_llm uses top_k=10 (the agent arms take no top_k).
+#   - SearchAgent and QATFD are the same `search_agent` system with different retrieval tool
+#     sets (read_document + prune are always present):
+#       search_agent   grep + vector + read
+#       qatfd          grep + semantic-filter + read
 #   - Default worker count (ExperimentConfig.workers = 32); not overridden here.
 #   - Reads from the already-running ChromaDB server (host/port below); OfficeQA's scorer
 #     is the deterministic numeric cup scorer, so no judge model is needed.
 #
-# Runs are written to results/officeqa/<system>/<model-tag>_<timestamp>/ — the model id
-# (slashes replaced with dashes) is the run-name prefix so each model is distinguishable.
+# Runs are written to results/officeqa/<system>/<arm>_<model-tag>_<timestamp>/. Both agent arms
+# share the `search_agent` dir, so the arm label leads the run-name to keep them apart; the
+# model id (slashes replaced with dashes) follows so each model is distinguishable. The eval
+# scripts recover the arm from each run's config.yaml (eval/variants.py), not from this name.
 #
 # Env overrides:
+#   ARMS=rag_llm,search_agent,qatfd          # comma-separated subset of arms to run
 #   CHROMA_HOST=127.0.0.1 CHROMA_PORT=8001   # the tmux ChromaDB server endpoint
 #   PYTHON=python3                            # interpreter (must have qatfd importable)
 set -euo pipefail
@@ -28,29 +35,44 @@ MODELS=(
   "qwen/qwen3.6-35b-a3b|parasail"
   "qwen/qwen3.6-27b|io-net"
 )
-SYSTEMS=(rag_llm search_agent qatfd_search_agent)
+
+# arm | systems group | arm-specific overrides (space-separated)
+ARM_CONFIGS=(
+  "rag_llm|rag_llm|systems.top_k=10"
+  "search_agent|search_agent|systems.include_search_corpus=true systems.include_grep_corpus=true systems.include_semantic_filter=false"
+  "qatfd|search_agent|systems.include_search_corpus=false systems.include_grep_corpus=true systems.include_semantic_filter=true"
+)
+
+ARMS="${ARMS:-rag_llm,search_agent,qatfd}"
+n_runs=0
 
 for entry in "${MODELS[@]}"; do
   model="${entry%%|*}"
   provider="${entry##*|}"
   tag="${model//\//-}"   # results-dir-safe label (no slashes)
-  for system in "${SYSTEMS[@]}"; do
+  for arm_entry in "${ARM_CONFIGS[@]}"; do
+    IFS='|' read -r arm system arm_overrides <<< "$arm_entry"
+    if ! [[ ",$ARMS," == *",$arm,"* ]]; then
+      continue
+    fi
     extra=()
-    [ "$system" = "rag_llm" ] && extra+=( "systems.top_k=10" )
-    [ -n "$provider" ] && extra+=( "systems.llm_provider_order=[${provider}]" )
+    # shellcheck disable=SC2206 — deliberate word-splitting of the override list
+    extra+=( ${arm_overrides} )
+    [ -n "$provider" ] && extra+=( "inference.llm_provider_order=[${provider}]" )
     echo "==================================================================="
-    echo "=== officeqa | ${system} | ${model} ${provider:+(provider=$provider)}"
+    echo "=== officeqa | ${arm} | ${model} ${provider:+(provider=$provider)}"
     echo "==================================================================="
     "$PYTHON" -m qatfd.runner \
       benchmarks=officeqa \
       systems="$system" \
-      systems.llm_model="$model" \
+      inference.llm_model="$model" \
       benchmarks.chroma_server_host="$CHROMA_HOST" \
       benchmarks.chroma_server_port="$CHROMA_PORT" \
-      experiments.run_name="$tag" \
+      experiments.run_name="${arm}_${tag}" \
       "${extra[@]}"
+    n_runs=$((n_runs + 1))
   done
 done
 
 echo
-echo "All 9 runs complete. Reports: results/officeqa/<system>/<model-tag>_<timestamp>/report.csv"
+echo "All ${n_runs} runs complete. Reports: results/officeqa/<system>/<arm>_<model-tag>_<timestamp>/report.csv"

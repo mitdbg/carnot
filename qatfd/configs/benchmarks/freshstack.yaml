@@ -25,12 +25,12 @@
 # serve it with vLLM (scripts/run_vllm_servers.sh '...Embedding-0.6B:task=embed'; capitalized HF id). E.g.:
 #   # TEST (the 203-question KARL set):
 #   python3 -m qatfd.runner benchmarks=freshstack systems=search_agent experiments.split=test \
-#       systems.emb_provider=vllm systems.emb_model_id=Qwen/Qwen3-Embedding-0.6B \
-#       '++systems.vllm_base_urls={Qwen/Qwen3-Embedding-0.6B: "http://<host>:8100/v1"}' benchmarks.judge_model=<judge-model>
+#       inference.emb_provider=vllm inference.emb_model_id=Qwen/Qwen3-Embedding-0.6B \
+#       '++inference.vllm_base_urls={Qwen/Qwen3-Embedding-0.6B: "http://<host>:8100/v1"}' benchmarks.judge_model=<judge-model>
 #   # DEV (iterate here; switch the whole topic with one override):
 #   python3 -m qatfd.runner benchmarks=freshstack benchmarks.topic=laravel systems=search_agent \
-#       experiments.split=test systems.emb_provider=vllm systems.emb_model_id=Qwen/Qwen3-Embedding-0.6B \
-#       '++systems.vllm_base_urls={Qwen/Qwen3-Embedding-0.6B: "http://<host>:8100/v1"}' \
+#       experiments.split=test inference.emb_provider=vllm inference.emb_model_id=Qwen/Qwen3-Embedding-0.6B \
+#       '++inference.vllm_base_urls={Qwen/Qwen3-Embedding-0.6B: "http://<host>:8100/v1"}' \
 #       benchmarks.judge_model=<judge-model>
 #   # (rag_llm baseline: add systems=rag_llm systems.top_k=10 to match KARL's k=10)
 defaults:

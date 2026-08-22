@@ -126,6 +126,11 @@ class SearchAgentConfig(AgentConfig):
     search_agent_max_output_tokens: int = 4096
     search_agent_request_timeout_s: float = 120.0
 
+    # boolean switches determining which tools the SearchAgent has access to
+    include_search_corpus: bool = True
+    include_grep_corpus: bool = True
+    include_semantic_filter: bool = False
+
     # maximum output tokens for each semantic_filter judge call. The reply is a single TRUE/FALSE
     # token and judge reasoning is disabled (`semantic_filter_disable_reasoning`), so a tiny cap
     # suffices. If reasoning is re-enabled, raise this too — a reasoning judge that hits the cap
@@ -162,8 +167,14 @@ class SearchAgentConfig(AgentConfig):
     # from `agent_max_steps` so a citation fix never eats into the agent's search budget.
     doc_id_correction_steps: int = 3
 
-    # turn off the working set abstraction for ablation experiments which evaluate its effectiveness
-    working_set_off: bool = False
+    # turn off the intermediate collection used by each Working Set (ablation flag)
+    working_set_collection_off: bool = False
+
+    # turn off Working Set id tracking for inclusion / exclusion filters (ablation flag)
+    id_tracking_off: bool = False
+
+    # retrieve related working sets before running the agent
+    fetch_related_working_sets: bool = False
 
 
 # --------------------------------------------------------------------------------

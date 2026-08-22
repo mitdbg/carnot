@@ -7,6 +7,16 @@ name: search_agent
 agent_mode: retrieve
 search_agent_max_output_tokens: 4096
 search_agent_request_timeout_s: 120.0
+include_search_corpus: true
+include_grep_corpus: true
+include_semantic_filter: false
+# Model for the semantic_filter judge calls; null => use llm_model (the agent model). Set to a
+# cheaper model to run the token-heavy candidate filtering off the expensive agent model.
+semantic_filter_model: null
+# OpenRouter provider order (no fallback) for the semantic_filter judge calls only; null => use the
+# client-wide llm_provider_order. Lets the judge route to specific providers (e.g. [akashml, parasail])
+# while a different-family agent model stays unpinned. E.g. systems.semantic_filter_provider_order=[akashml,parasail]
+semantic_filter_provider_order: null
 # output-token cap per semantic_filter judge call. Judge reasoning is disabled
 # (semantic_filter_disable_reasoning) and the reply is a single TRUE/FALSE token, so a tiny cap
 # suffices. If you re-enable reasoning, raise this too (a capped reasoning judge returns
@@ -21,5 +31,9 @@ agent_max_misfires: 5
 cost_budget: null
 # target latency budget for the search agent; null means no latency limit (default)
 latency_budget: null
-# whether to turn the working set abstraction off for ablation experiments
-working_set_off: false
+# whether to turn the working set's intermediate collection off (ablation flag)
+working_set_collection_off: false
+# whether to turn off the working set's id-tracking for inclusion / exclusion filters (ablation flag)
+id_tracking_off: false
+# whether to fetch related working sets at the beginning of each agent execution
+fetch_related_working_sets: true

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Working-set tool ablation: the SearchAgent on OfficeQA (dev split), sweeping the four
-# retrieval tool sets below. Every run uses the `ablation_search_agent` system, which always
+# retrieval tool sets below. Every run uses the `search_agent` system, which always
 # has read_document + prune and toggles vector / grep / semantic_filter by config; the config
 # label is the run-name, so the four runs land in distinct dirs under
-#   results/officeqa/ablation_search_agent/<label>_<timestamp>/
+#   results/officeqa/search_agent/<label>_<timestamp>/
 #
 #   grep_read           grep + read                  (vector off, grep on,  sem off)
 #   vector_read         vector-search + read         (vector on,  grep off, sem off)
@@ -43,7 +43,7 @@ JUDGE_PROVIDERS="${JUDGE_PROVIDERS-parasail,akashml,deepinfra}"
 
 : "${OPENROUTER_API_KEY:?OPENROUTER_API_KEY must be set in the environment}"
 
-# label | tool_vector | tool_grep | tool_semantic_filter
+# label | include_search_corpus | include_grep_corpus | include_semantic_filter
 CONFIGS=(
   "grep_read|false|true|false"
   "vector_read|true|false|false"
@@ -73,17 +73,17 @@ for entry in "${CONFIGS[@]}"; do
     run_name="${label}_ws_off"
   fi
   echo "==================================================================="
-  echo "=== officeqa | ablation_search_agent | ${run_name}  (vector=$vec grep=$grep sem=$sem working_set_off=$WORKING_SET_OFF)"
+  echo "=== officeqa | search_agent | ${run_name}  (vector=$vec grep=$grep sem=$sem working_set_off=$WORKING_SET_OFF)"
   echo "===   agent=$MODEL${PROVIDER:+ (pin: $PROVIDER)} | judge=${JUDGE_MODEL:-$MODEL}${JUDGE_PROVIDERS:+ (pin: $JUDGE_PROVIDERS)}"
   echo "==================================================================="
   "$PYTHON" -m qatfd.runner \
     benchmarks=officeqa \
-    systems=ablation_search_agent \
+    systems=search_agent \
     inference.llm_model="$MODEL" \
     "${provider_ovr[@]}" \
-    systems.tool_vector="$vec" \
-    systems.tool_grep="$grep" \
-    systems.tool_semantic_filter="$sem" \
+    systems.include_search_corpus="$vec" \
+    systems.include_grep_corpus="$grep" \
+    systems.include_semantic_filter="$sem" \
     benchmarks.chroma_server_host="$CHROMA_HOST" \
     benchmarks.chroma_server_port="$CHROMA_PORT" \
     experiments.run_name="$run_name"
@@ -91,4 +91,4 @@ done
 
 echo
 echo "All ${#CONFIGS[@]} ablation runs complete."
-echo "Reports: results/officeqa/ablation_search_agent/<label>_<timestamp>/report.csv"
+echo "Reports: results/officeqa/search_agent/<label>_<timestamp>/report.csv"

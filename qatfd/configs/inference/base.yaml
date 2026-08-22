@@ -65,7 +65,7 @@ llm_context_limits:
   qwen/qwen3.6-35b-a3b: 262144      # AkashML & Parasail both serve 262144
   qwen/qwen3.6-27b: 262144          # io.net serves 262140; safety margin absorbs the rounding
 # OpenRouter provider pin (ordered slugs, no fallback); null = OpenRouter picks. Overridden
-# per-run on the CLI, e.g. systems.llm_provider_order=[parasail].
+# per-run on the CLI, e.g. inference.llm_provider_order=[parasail].
 llm_provider_order: null
 # Per-model vLLM routing: model id -> OpenAI-compatible base URL of the vLLM server serving it
 # (launch servers with scripts/run_vllm_servers.sh, which prints/writes these URLs). A model
@@ -74,7 +74,7 @@ llm_provider_order: null
 # cost $0 regardless of llm_prices (safe to keep a price entry for OpenRouter runs of the
 # same model). CLI example (++ because Hydra's struct mode rejects new dict keys under a
 # plain override):
-#   '++systems.vllm_base_urls={Qwen/Qwen3-32B: "http://gpu-box:8100/v1"}'
+#   '++inference.vllm_base_urls={Qwen/Qwen3-32B: "http://gpu-box:8100/v1"}'
 vllm_base_urls: {}
 # Extra JSON merged into every vLLM chat request body (openai SDK extra_body), e.g.
 # {chat_template_kwargs: {enable_thinking: false}} to turn off Qwen3-style thinking.

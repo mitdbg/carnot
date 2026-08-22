@@ -13,9 +13,12 @@ this question's `LLMClient` (which owns embedding backend dispatch + usage accou
 
 from __future__ import annotations
 
+import uuid
+
 from skunk.common import ExecutionContext
 from skunk.config import InferenceConfig, SearchAgentConfig
 from skunk.search_agent.search_agent import SearchAgent
+from skunk.search_state.working_set_registry import WorkingSetRegistry
 
 from qatfd.benchmarks.base import BenchmarkResources
 from qatfd.systems.base import RetrieveComputeSystem
@@ -53,24 +56,6 @@ class SearchAgentSystem(RetrieveComputeSystem):
     def _extra_tools(self, ctx: ExecutionContext, resources: BenchmarkResources) -> tuple:
         return ()
 
-    def _include_search_corpus(self) -> bool:
-        """Whether the agent gets the `search_corpus` (vector-search) tool. Subclasses can
-        drop it to force the agent onto other retrieval tools."""
-        return True
-
-    def _include_grep_corpus(self) -> bool:
-        """Whether the agent gets the `grep_corpus` (lexical-search) tool. Subclasses can drop
-        it (e.g. a tool-ablation system) to force the agent onto vector search / semantic filter."""
-        return True
-
-    def _include_semantic_filter(self) -> bool:
-        """Whether the agent gets the `semantic_filter` (LLM-judged predicate) tool. Off in the
-        vanilla SearchAgent; subclasses (system #3, the ablation system) turn it on. The judge
-        model / provider pinning / output cap ride on `SearchAgentConfig`
-        (`semantic_filter_model`, `semantic_filter_provider_order`,
-        `semantic_filter_max_output_tokens`)."""
-        return False
-
     def _prompts(self, resources: BenchmarkResources) -> tuple[str | None, str | None]:
         """(briefing, final_answer_doc) overrides; None => skunk SearchAgent defaults.
 
@@ -94,7 +79,7 @@ class SearchAgentSystem(RetrieveComputeSystem):
             briefing = f"{base} You have a total latency budget of {self.config.latency_budget:.2f} seconds."
         return briefing, final_answer_doc
 
-    def _build_agent(self, ctx: ExecutionContext, resources: BenchmarkResources) -> SearchAgent:
+    def _build_agent(self, ctx: ExecutionContext, resources: BenchmarkResources, q: Question) -> SearchAgent:
         briefing, final_answer_doc = self._prompts(resources)
         return SearchAgent(
             config=self.config,
@@ -104,28 +89,27 @@ class SearchAgentSystem(RetrieveComputeSystem):
             # billed onto the same usage tracker as its LLM calls; backend dispatch
             # (openrouter / vllm) and the embedding model are read from config by the client.
             llm_client=ctx.llm_client,
-            # ctx is threaded into the agent's tools for trace events + usage attribution.
-            ctx=ctx,
+            registry=WorkingSetRegistry(
+                chroma_host=ctx.config.storage.chroma_server_host,
+                chroma_port=ctx.config.storage.chroma_server_port,
+            ),
             extra_tools=self._extra_tools(ctx, resources),
-            include_search_corpus=self._include_search_corpus(),
-            include_grep_corpus=self._include_grep_corpus(),
-            include_semantic_filter=self._include_semantic_filter(),
             briefing=briefing,
             final_answer_doc=final_answer_doc,
             # Key this retrieval agent's spend under the system's "retrieve" slice (the shared
             # compute answerer is keyed separately), overriding config.agent_id.
             agent_id=self.retrieve_usage_key,
-            pdf_dir=resources.pdf_dir,
+            working_set_name=f"{q.qid}_{str(uuid.uuid4())}",
         )
 
     # Pipeline ------------------------------------------------------------------
 
     async def retrieve(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext) -> Retrieved:
-        agent = self._build_agent(ctx, resources)
+        agent = self._build_agent(ctx, resources, q)
         # Validate the returned doc_ids against the corpus and let the agent correct any that
         # name no real document, so recall reflects reality and (in retrieve mode) the answerer
         # gets real page text rather than an empty stub for a mis-cited id.
-        payload, doc_ids = await agent.run_with_validated_doc_ids(ctx, q.text)
+        payload, doc_ids = await agent.call(ctx, q.text)
         # Surface why the agent's loop stopped (budget/steps) so the runner can record it; the
         # doc-id correction loop shares the agent instance, so this reflects the final state.
         ts = agent.terminate_state

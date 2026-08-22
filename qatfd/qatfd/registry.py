@@ -10,12 +10,11 @@ from qatfd.benchmarks.browsecomp_plus import BrowseCompPlusBenchmark
 from qatfd.benchmarks.financebench import FinanceBenchBenchmark
 from qatfd.benchmarks.freshstack import FreshstackBenchmark
 from qatfd.benchmarks.officeqa import OfficeQABenchmark
+from qatfd.benchmarks.officeqa_synth import OfficeQASynthBenchmark
 from qatfd.benchmarks.qampari import QampariBenchmark
 from qatfd.benchmarks.trec_biogen import TrecBiogenBenchmark
 from qatfd.config import BenchmarkConfig
-from qatfd.systems.ablation_search_agent import AblationSearchAgentSystem
 from qatfd.systems.base import System
-from qatfd.systems.qatfd_search_agent import QATFDSearchAgentSystem
 from qatfd.systems.rag_llm import RAGLLMSystem
 from qatfd.systems.search_agent import SearchAgentSystem
 
@@ -23,6 +22,7 @@ from skunk.config import AgentConfig, InferenceConfig
 
 BENCHMARKS: dict[str, type[Benchmark]] = {
     OfficeQABenchmark.name: OfficeQABenchmark,
+    OfficeQASynthBenchmark.name: OfficeQASynthBenchmark,
     BrowseCompPlusBenchmark.name: BrowseCompPlusBenchmark,
     TrecBiogenBenchmark.name: TrecBiogenBenchmark,
     FinanceBenchBenchmark.name: FinanceBenchBenchmark,
@@ -33,8 +33,6 @@ BENCHMARKS: dict[str, type[Benchmark]] = {
 SYSTEMS: dict[str, type[System]] = {
     RAGLLMSystem.name: RAGLLMSystem,
     SearchAgentSystem.name: SearchAgentSystem,
-    QATFDSearchAgentSystem.name: QATFDSearchAgentSystem,
-    AblationSearchAgentSystem.name: AblationSearchAgentSystem,
 }
 
 

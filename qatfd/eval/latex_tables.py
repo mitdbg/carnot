@@ -4,8 +4,12 @@ Layout (decided with the paper's main table in mind):
 
 * **One table per benchmark** (OfficeQA, BrowseComp-Plus, TREC-BioGen,
   FinanceBench, QAMPARI, FreshStack).
-* **Rows = (system x LLM)**: RAG-LLM (k=10/100/1000), SearchAgent, QATFD, each
-  repeated per LLM it was run with (gemini-3.5-flash, opus-4.8, ...).
+* **Rows = (variant x LLM)**: RAG-LLM (k=10/100/1000) plus one row per SearchAgent
+  retrieval tool set — ``SearchAgent`` (grep+vector) and ``QATFD`` (grep+sem) are two
+  points in that lattice — each repeated per LLM it was run with (gemini-3.5-flash,
+  opus-4.8, ...). See ``variants.py``: the SearchAgent variants are a single system
+  configured by its tool flags, so the row identity is read from each run's
+  ``config.yaml``, not from its results/ directory name.
 * **Columns = metrics**: Accuracy, optional retrieval recall column(s), avg.
   per-question cost, avg. per-question latency.
 * **Best per column is bolded** (highest for accuracy/recall, lowest for
@@ -16,11 +20,12 @@ How the numbers are computed
 Each ``report.csv`` is one *run* (one full pass over the benchmark's questions).
 For a run we take the per-question mean of each metric (``score`` -> accuracy,
 ``cost``, ``wall_s`` -> latency, and each per-benchmark recall column). When the
-same (benchmark, system, LLM, top_k) config was run multiple times, we **average
-across runs** (equal weight per run) and report the run count.
+same (benchmark, variant, LLM, judge, top_k) config was run multiple times, we
+**average across runs** (equal weight per run) and report the run count.
 
-Run discovery walks ``results/<benchmark>/<system>/<run_name>_<ts>/`` and reads
-each run's ``config.yaml`` to recover the system, LLM, and ``top_k``.
+Run discovery walks ``results/<benchmark>/<system>/<run_name>_<ts>/`` and reads each
+run's ``config.yaml`` to recover the variant, the agent LLM (``inference.llm_model``),
+the semantic-filter judge model, and ``top_k``.
 
 Usage
 -----
@@ -43,6 +48,12 @@ from pathlib import Path
 
 import yaml
 
+# Sibling module: relative import as a package, plain import when run as a script.
+try:
+    from .variants import Variant, judge_of, llm_of, model_label, variant_of
+except ImportError:
+    from variants import Variant, judge_of, llm_of, model_label, variant_of
+
 # --------------------------------------------------------------------------- #
 # Display config
 # --------------------------------------------------------------------------- #
@@ -57,13 +68,9 @@ BENCHMARKS: dict[str, str] = {
     "freshstack": "FreshStack",
 }
 
-# System dir-name -> display name, plus the order systems appear in each table.
-SYSTEM_DISPLAY: dict[str, str] = {
-    "rag_llm": "RAG-LLM",
-    "search_agent": "SearchAgent",
-    "qatfd_search_agent": "QATFD",
-}
-SYSTEM_ORDER: list[str] = ["rag_llm", "search_agent", "qatfd_search_agent"]
+# Row labels and their order come from `variants.py`: the SearchAgent variants are now one
+# system distinguished by its tool flags, so a row's identity is read from each run's
+# config.yaml rather than from its results/ directory name.
 
 # Pretty headers for the dynamic per-benchmark recall columns. Order = column
 # order in the table (fine-grained -> coarse-grained).
@@ -111,7 +118,9 @@ class Run:
 
     benchmark: str
     system: str
-    llm: str
+    variant: Variant  # row identity (tool set + working-set mode), from config.yaml
+    llm: str  # agent model
+    judge: str | None  # semantic-filter judge model; None when the run has no sem filter
     top_k: int | None
     run_dir: Path
     n_questions: int
@@ -122,8 +131,9 @@ class Run:
 class Row:
     """An averaged (system, llm, top_k) cell-row in a benchmark table."""
 
-    system: str
+    variant: Variant
     llm: str
+    judge: str | None
     top_k: int | None
     n_runs: int
     n_questions: int
@@ -131,14 +141,17 @@ class Row:
 
     @property
     def system_label(self) -> str:
-        base = SYSTEM_DISPLAY.get(self.system, self.system)
-        if self.system == "rag_llm" and self.top_k is not None:
-            return f"{base} (k={self.top_k})"
-        return base
+        if self.variant.system == "rag_llm" and self.top_k is not None:
+            return f"{self.variant.label} (k={self.top_k})"
+        return self.variant.label
+
+    @property
+    def model_label(self) -> str:
+        """Agent model, or ``agent / judge`` when the semantic filter used its own model."""
+        return model_label(self.llm, self.judge)
 
     def sort_key(self) -> tuple:
-        sys_idx = SYSTEM_ORDER.index(self.system) if self.system in SYSTEM_ORDER else len(SYSTEM_ORDER)
-        return (sys_idx, self.top_k if self.top_k is not None else -1, self.llm)
+        return (self.variant.order, self.top_k if self.top_k is not None else -1, self.llm, self.judge or "")
 
 
 # --------------------------------------------------------------------------- #
@@ -172,9 +185,11 @@ def load_run(run_dir: Path, *, exclude_failed: bool = False) -> Run | None:
     cfg = yaml.safe_load(config.read_text()) or {}
     systems = cfg.get("systems", {}) or {}
     benchmarks = cfg.get("benchmarks", {}) or {}
-    system = systems.get("name", run_dir.parent.name)
     benchmark = benchmarks.get("name", run_dir.parent.parent.name)
-    llm = systems.get("llm_model") or systems.get("agent_model_id") or "unknown"
+    # The run dir is named after the system, so it is the fallback when the snapshot predates
+    # `systems.name`. Everything else that identifies the row comes from the config itself.
+    variant = variant_of(cfg, fallback_system=run_dir.parent.name)
+    llm = llm_of(cfg)
     top_k = systems.get("top_k")
 
     with report.open(newline="", encoding="utf-8") as f:
@@ -206,8 +221,10 @@ def load_run(run_dir: Path, *, exclude_failed: bool = False) -> Run | None:
 
     return Run(
         benchmark=benchmark,
-        system=system,
+        system=variant.system,
+        variant=variant,
         llm=llm,
+        judge=judge_of(cfg, llm),
         top_k=int(top_k) if top_k is not None else None,
         run_dir=run_dir,
         n_questions=len(rows),
@@ -231,21 +248,24 @@ def discover_runs(results_root: Path, *, exclude_failed: bool = False) -> list[R
 
 
 def aggregate_rows(runs: list[Run], *, warn: bool = True) -> dict[str, list[Row]]:
-    """Group runs by (benchmark, system, llm, top_k) and average across runs.
+    """Group runs by (benchmark, variant, llm, judge, top_k) and average across runs.
+
+    The judge model is part of the key so two semantic-filter runs that differ only in
+    `semantic_filter_model` stay separate rows instead of silently averaging together.
 
     Returns benchmark -> sorted list of Rows.
     """
     groups: dict[tuple, list[Run]] = defaultdict(list)
     for r in runs:
-        groups[(r.benchmark, r.system, r.llm, r.top_k)].append(r)
+        groups[(r.benchmark, r.variant, r.llm, r.judge, r.top_k)].append(r)
 
     by_bench: dict[str, list[Row]] = defaultdict(list)
-    for (benchmark, system, llm, top_k), grp in groups.items():
+    for (benchmark, variant, llm, judge, top_k), grp in groups.items():
         if warn and len({r.n_questions for r in grp}) > 1:
             counts = ", ".join(f"{r.run_dir.name}={r.n_questions}q" for r in grp)
             print(
                 f"[latex_tables] warn: averaging runs with differing question counts "
-                f"for {benchmark}/{system}/{llm}/k={top_k}: {counts}",
+                f"for {benchmark}/{variant.label}/{model_label(llm, judge)}/k={top_k}: {counts}",
                 file=sys.stderr,
             )
         all_keys = sorted({k for r in grp for k in r.means})
@@ -256,8 +276,9 @@ def aggregate_rows(runs: list[Run], *, warn: bool = True) -> dict[str, list[Row]
                 means[key] = sum(vals) / len(vals)
         by_bench[benchmark].append(
             Row(
-                system=system,
+                variant=variant,
                 llm=llm,
+                judge=judge,
                 top_k=top_k,
                 n_runs=len(grp),
                 n_questions=max(r.n_questions for r in grp),
@@ -336,7 +357,7 @@ def render_benchmark_table(
     else:
         best = _best_values(rows, metrics)
         for row in rows:
-            cells = [row.system_label, _tex_escape(row.llm)]
+            cells = [row.system_label, _tex_escape(row.model_label)]
             cells += [_fmt_cell(row, m, best[m.key]) for m in metrics]
             comment = f"  % n_runs={row.n_runs}, n_q={row.n_questions}"
             out.append("    " + " & ".join(cells) + r" \\" + comment)

@@ -8,15 +8,16 @@ fold in the answer/compute agent). Per the harness schema, cost = retrieve_cost 
 and wall_s = retrieve_wall_s + compute_wall_s. Latency caveat: `retrieve_wall_s` is measured
 under each run's configured worker concurrency, so — unlike cost — it is not concurrency-invariant.
 
-Each run dir under results/officeqa/ablation_search_agent/ is one point: the agent model is
-read from the run's config.yaml snapshot, working-set state from the `_ws_off` run-name marker.
+Each run dir under results/officeqa/search_agent/ is one point: the agent model and the
+working-set state are read from the run's config.yaml snapshot (`systems.working_set_off`),
+falling back to the `_ws_off` run-name marker for runs written before that flag existed.
 If a (tool set, model, ws) combo has several completed runs, the latest one wins; runs with
 zero cost (crashed-at-startup sweeps) or missing report.csv are skipped. All fields come from
 each run's report.csv (the harness's canonical per-question output).
 
 Usage (from qatfd/, any interpreter with matplotlib + pyyaml):
     python3 scripts/plot_working_set_ablation.py [results_dir] [out_dir]
-Defaults: results/officeqa/ablation_search_agent, writing both PDFs into that dir:
+Defaults: results/officeqa/search_agent, writing both PDFs into that dir:
     working_set_ablation_scatter_retrieve_cost.pdf
     working_set_ablation_scatter_retrieve_latency.pdf
 """
@@ -89,9 +90,13 @@ def load_runs(results_dir: Path) -> dict[tuple[str, str, str], dict]:
         m = re.match(r"(.+?)(_ws_off)?_(\d{8}_\d{6})$", run)
         if not m or m.group(1) not in ARMS:
             continue
-        arm, ws, stamp = m.group(1), ("off" if m.group(2) else "on"), m.group(3)
+        arm, stamp = m.group(1), m.group(3)
         cfg = yaml.safe_load((report.parent / "config.yaml").open())
         model = cfg["inference"]["llm_model"].split("/")[-1]
+        # Every tool set now writes under the one `search_agent` dir, so take the working-set
+        # state from the config rather than trusting the run-name marker to have been set.
+        ws_off = (cfg.get("systems") or {}).get("working_set_off")
+        ws = ("off" if ws_off else "on") if ws_off is not None else ("off" if m.group(2) else "on")
         rows = list(csv.DictReader(report.open()))
         cost = sum(float(r["cost"]) for r in rows if r["cost"])
         if not rows or cost == 0:  # crashed-at-startup sweep; not a real datapoint
@@ -168,7 +173,7 @@ def make_figure(runs: dict[tuple[str, str, str], dict], spec: dict, out_pdf: Pat
 
 
 def main() -> None:
-    results_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("results/officeqa/ablation_search_agent")
+    results_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("results/officeqa/search_agent")
     out_dir = Path(sys.argv[2]) if len(sys.argv) > 2 else results_dir
     runs = load_runs(results_dir)
     if not runs:

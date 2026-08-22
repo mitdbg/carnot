@@ -50,6 +50,7 @@ if hasattr(_argparse.ArgumentParser, "_check_help"):
 
     _argparse.ArgumentParser._check_help = _qatfd_check_help_str_safe # type: ignore
 
+from enum import Enum
 import hydra
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
@@ -68,6 +69,12 @@ from qatfd.types import Question, Result, report_columns, result_to_row
 
 # keys to ignore when resuming an experiment from a previous run; these fields may naturally change
 _RESUME_IGNORED_KEYS = {"experiments.resume_dir", "experiments.run_name", "results_root", "dry_run"}
+
+# modes for running benchmark questions
+class RunMode(Enum):
+    PARALLEL = "parallel"
+    SEQUENTIAL = "sequential"
+    ALL = "all"
 
 @dataclass
 class _RunCtx:
@@ -241,12 +248,13 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
     llm_client = LLMClient(rc.system.inference_cfg)
     tracker = llm_client.usage
     log_path = str(rc.trace_dir / f"{q.qid}.jsonl") if rc.trace_dir else None
+    search_config = rc.system.config if isinstance(rc.system.config, SearchAgentConfig) else SearchAgentConfig(name="search")
     ctx = ExecutionContext(
         question=q.text, uid=q.qid,
         config=OrchestratorConfig(
             inference=rc.system.inference_cfg,
             storage=rc.benchmark.config.storage,
-            search=SearchAgentConfig(name="search"),   # unused: qatfd never runs the Orchestrator
+            search=search_config,
             lookup=LookupAgentConfig(name="lookup"),   # unused
         ),
         llm_client=llm_client,
@@ -339,6 +347,42 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
     )
 
 
+async def _run_all(qs: list[Question], rc: _RunCtx) -> list[Result]:
+    return []
+
+# ---------------------------------------------------------------------------
+# Question Execution Strategies (parallel | sequential | all)
+# ---------------------------------------------------------------------------
+def _execute_parallel(rc: _RunCtx, qid_to_result: dict[str, Result], todo: list[Question], results_path: Path, exp_config: ExperimentConfig) -> None:
+    """Run the benchmark questions in parallel; speeds up experiments when questions are executed in isolation."""
+    assert exp_config.workers >= 1, "workers must be >= 1"
+    with results_path.open("a", encoding="utf-8") as rf:
+        with ThreadPoolExecutor(max_workers=exp_config.workers) as pool:
+            futures = [pool.submit(lambda q: asyncio.run(_run_one(q, rc)), q) for q in todo]
+            for fut in as_completed(futures):
+                r = fut.result()
+                rf.write(json.dumps(asdict(r)) + "\n")
+                rf.flush()
+                qid_to_result[r.qid] = r
+
+def _execute_sequential(rc: _RunCtx, qid_to_result: dict[str, Result], todo: list[Question], results_path: Path, exp_config: ExperimentConfig) -> None:
+    """Run the benchmark questions in sequence; good for experiments where state is shared / reused across questions."""
+    with results_path.open("a", encoding="utf-8") as rf:
+        for q in todo:
+            r = asyncio.run(_run_one(q, rc))
+            rf.write(json.dumps(asdict(r)) + "\n")
+            rf.flush()
+            qid_to_result[r.qid] = r
+
+def _execute_all(rc: _RunCtx, qid_to_result: dict[str, Result], todo: list[Question], results_path: Path, exp_config: ExperimentConfig) -> None:
+    """Run the benchmark questions in sequence; good for experiments where state is shared / reused across questions."""
+    results = asyncio.run(_run_all(todo, rc))
+    with results_path.open("a", encoding="utf-8") as rf:
+        for r in results:
+            rf.write(json.dumps(asdict(r)) + "\n")
+            rf.flush()
+            qid_to_result[r.qid] = r
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -393,16 +437,14 @@ def run(
     )
 
     # execute each question and immediately persist its result to results.jsonl
-    assert exp_config.workers >= 1, "workers must be >= 1"
-    with results_path.open("a", encoding="utf-8") as rf:
-        with ThreadPoolExecutor(max_workers=exp_config.workers) as pool:
-            futures = [pool.submit(lambda q: asyncio.run(_run_one(q, rc)), q) for q in todo]
-            for fut in as_completed(futures):
-                r = fut.result()
-                rf.write(json.dumps(asdict(r)) + "\n")
-                rf.flush()
-                qid_to_result[r.qid] = r
-
+    if RunMode(exp_config.run_mode) == RunMode.PARALLEL:
+        _execute_parallel(rc, qid_to_result, todo, results_path, exp_config)
+    elif RunMode(exp_config.run_mode) == RunMode.SEQUENTIAL:
+        _execute_sequential(rc, qid_to_result, todo, results_path, exp_config)
+    elif RunMode(exp_config.run_mode) == RunMode.ALL:
+        _execute_all(rc, qid_to_result, todo, results_path, exp_config)
+    else:
+        raise Exception(f"Unsupported run_mode: {exp_config.run_mode}")
 
     # write report.csv from the full completed set, in the original selection order
     rows = [qid_to_result[q.qid] for q in questions if q.qid in qid_to_result]

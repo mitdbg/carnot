@@ -98,10 +98,7 @@ async def _run_search_agent(
         config=ctx.config.search,
         document_map=ctx.document_map,
         chroma_collection=ctx.chroma_collection,
-        pdf_dir=ctx.config.storage.pdf_dir,
-        page_renders_dir=ctx.config.storage.page_renders_dir,
         llm_client=ctx.llm_client,
-        ctx=ctx,
     )
     # This operator owns the retrieval user message (the agent's `call()` is the
     # generic entry point; the branch framing below is pipeline vocabulary).
@@ -110,7 +107,7 @@ async def _run_search_agent(
         parts.append(f"Search focus: {branch.key}")
     if branch.period:
         parts.append(f"Time period (of the data): {branch.period}")
-    payload = await agent.call(ctx, "\n".join(parts))
+    payload, _ = await agent.call(ctx, "\n".join(parts))
     page_keys = doc_ids_from_payload(payload)
     refs: list[PageRef] = []
     bad: list[str] = []

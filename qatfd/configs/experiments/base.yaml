@@ -7,3 +7,4 @@ workers: 32         # question-level concurrency (ThreadPoolExecutor)
 run_name: ""        # label prefix for the run directory (timestamp is always appended)
 console: false      # also stream per-question logs to the console
 resume_dir: null    # resume an interrupted run: path to its run dir; finished questions (in results.jsonl) are skipped
+run_mode: parallel  # run benchmark questions in 'parallel', 'sequential', or 'all'

@@ -1,15 +1,17 @@
-"""Ablation tables from ``ablation_search_agent`` runs.
+"""Ablation tables from ``search_agent`` runs.
 
-The ``ablation_search_agent`` system (qatfd/systems/ablation_search_agent.py) runs the
-SearchAgent with a config-chosen retrieval tool set — any subset of vector-search / grep /
-semantic-filter, with read_document + prune always on — and an optional separate model for the
-semantic-filter judge (``semantic_filter_model``). This script reads every such run under
-``results/`` and reports, per configuration, the *usefulness* metrics (accuracy, recall, cost,
-latency), so the tools can be compared head-to-head.
+The ``search_agent`` system (qatfd/systems/search_agent.py) runs with a config-chosen retrieval
+tool set — any subset of vector-search / grep / semantic-filter, with read_document + prune
+always on — and an optional separate model for the semantic-filter judge
+(``semantic_filter_model``). Every ablation is therefore a `search_agent` run: this script reads
+all of them under ``results/`` and reports, per configuration, the *usefulness* metrics
+(accuracy, recall, cost, latency), so the tools can be compared head-to-head.
 
-Each configuration is identified by three things read from the run's ``config.yaml``:
-  * the tool set (from ``tool_vector`` / ``tool_grep`` / ``tool_semantic_filter``),
-  * the agent model (``llm_model``),
+Each configuration is identified by three things read from the run's ``config.yaml`` (resolved
+by ``variants.py``, which the main tables share):
+  * the tool set (from ``include_search_corpus`` / ``include_grep_corpus`` /
+    ``include_semantic_filter``), with a non-default working-set mode noted in the label,
+  * the agent model (``inference.llm_model``),
   * the semantic-filter judge model (``semantic_filter_model``, or the agent model when unset;
     ``--`` when there is no semantic filter).
 Runs that share all three are averaged (so repeats collapse into one row).
@@ -33,26 +35,19 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import yaml
-
 # Sibling module: relative import as a package, plain import when run as a script.
 try:
     from .latex_tables import _default_results_root, discover_runs
+    from .variants import AGENT_SYSTEM, model_sort_key
 except ImportError:
     from latex_tables import _default_results_root, discover_runs
+    from variants import AGENT_SYSTEM, model_sort_key
 
-ABLATION_SYSTEM = "ablation_search_agent"
-
-# Canonical config order + labels, keyed by the (vector, grep, sem) flag tuple. read_document is
-# always present; two points in the lattice coincide with named systems (annotated).
-_CONFIG_TABLE: dict[tuple[bool, bool, bool], tuple[int, str]] = {
-    (False, True, False): (0, "grep+read"),
-    (True, False, False): (1, "vector+read"),
-    (False, False, True): (2, "sem+read"),
-    (True, True, False): (3, "grep+vector+read (SearchAgent)"),
-    (False, True, True): (4, "grep+sem+read (QATFD)"),
-    (True, True, True): (5, "all tools"),
-}
+# Every ablation is now a `search_agent` run whose tool flags differ (the dedicated
+# `ablation_search_agent` system is gone), so this reads every SearchAgent run and lets the
+# config identify the point in the tool lattice. The canonical order + labels live in
+# `variants.py` and are shared with the main tables.
+ABLATION_SYSTEM = AGENT_SYSTEM
 
 # Preferred model column order (ascending capability/size, roughly); unknown models sort after.
 _MODEL_ORDER: list[str] = [
@@ -105,17 +100,8 @@ def _adj_page_recall(run_dir: Path) -> float | None:
     return sum(vals) / len(vals) if vals else None
 
 
-def _config_of(v: bool, g: bool, s: bool) -> tuple[int, str]:
-    return _CONFIG_TABLE.get((bool(v), bool(g), bool(s)), (99, _adhoc_label(v, g, s)))
-
-
-def _adhoc_label(v: bool, g: bool, s: bool) -> str:
-    parts = [n for n, on in (("grep", g), ("vector", v), ("sem", s)) if on]
-    return "+".join([*parts, "read"]) if parts else "read-only"
-
-
 def _model_key(m: str) -> tuple[int, str]:
-    return (_MODEL_ORDER.index(m) if m in _MODEL_ORDER else len(_MODEL_ORDER), m)
+    return model_sort_key(m, _MODEL_ORDER)
 
 
 def _short(model: str | None) -> str:
@@ -148,11 +134,9 @@ def load_cells(results_root: Path, benchmark: str | None) -> list[AblationCell]:
             continue
         if benchmark and run.benchmark != benchmark:
             continue
-        cfg = (yaml.safe_load((run.run_dir / "config.yaml").read_text()) or {}).get("systems", {}) or {}
-        order, label = _config_of(cfg.get("tool_vector"), cfg.get("tool_grep"), cfg.get("tool_semantic_filter"))
-        judge = None
-        if cfg.get("tool_semantic_filter"):
-            judge = cfg.get("semantic_filter_model") or run.llm
+        # `discover_runs` already resolved the run's identity from its config.yaml: the tool
+        # set (with the working-set mode folded into the label) and the sem-filter judge model.
+        order, label, judge = run.variant.order, run.variant.tools_label, run.judge
         key = (label, run.llm, judge)
         means = dict(run.means)
         adj = _adj_page_recall(run.run_dir)

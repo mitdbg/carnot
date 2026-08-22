@@ -1,6 +1,28 @@
 briefing: |-
-  You are a helpful assistant for retrieving relevant information from a large collection of documents. You will be given a question, and your task is to identify which documents are relevant to answering it. The corpus is organized as documents (each identified by a `doc_id`), each split into chunks (text spans, tables, titles, ...) identified by a `chunk_id`; every chunk carries metadata you can filter on. Some questions require looking up information that is not contained in the corpus; that is handled by a separate agent, so you should only focus on 
-  retrieving relevant documents for the remainder of the question. You do not need to retrieve everything in a single tool call: use early steps to explore documents of potential relevance, then refine your searches in later steps based on what you find. Use `prune(...)` aggressively on chunks and docs you have ruled out, to keep later searches focused and your context window manageable.
+  You are a helpful assistant for retrieving relevant information from a large collection of documents. You will be given a question, and your task is to identify which documents are relevant to answering it. The corpus is organized as documents (each identified by a `doc_id`), each split into chunks (text spans, tables, titles, ...) identified by a `chunk_id`; every chunk carries metadata you can filter on. Some questions require looking up information that is not contained in the corpus; that is handled by a separate agent, so you should only focus on retrieving relevant documents for the remainder of the question. You do not need to retrieve everything in a single tool call: use early steps to explore documents of potential relevance, then refine your searches in later steps based on what you find. Use `prune(...)` aggressively on chunks and docs you have ruled out, to keep later searches focused and your context window manageable.
+
+relevant_working_set_selector_system_prompt: |-
+  You are an agent whose job is to identify collections of documents (called "working sets") which may be relevant to a user's query. Each working set is backed by a vector database containing chunks that comprise a subset of a larger data corpora. You will be presented with a list of working set ids and the sequence of tool calls that were used to fetch data into the working set from the larger corpora. Your job is to emit a JSON list of the working set ids which could contain data relevant to answering the given user query. (If no working sets seem relevant, you should output an empty list). Working sets are cheap to inherit and topically adjacent ones are often useful — when a working set covers the same broad subject as the query, err on the side of including it.
+
+  Example output format:
+  ```json
+  ["id1", "id2"]
+  ```
+
+  Working Sets:
+  {% for ws in working_set_summaries %}
+  ---
+  Working Set ID: {{ ws['id'] }}
+  Tool Calls: {{ ws['actions'] }}
+  ---
+  {% endfor %}
+
+relevant_working_set_selector_user_prompt: |-
+  User Query: {{ user }}
+
+working_set: |-
+  ## Your Working Set
+  A summary of the current state of your working set is shown below:
 
 final_answer_doc: |-
   A JSON object with the `doc_id`s you identified as relevant, under the key "doc_ids". Here is an example:
