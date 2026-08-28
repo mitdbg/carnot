@@ -1,4 +1,4 @@
-"""Agent prompt templates, stored as YAML alongside this module.
+"""QATFD prompt templates, stored as YAML alongside this module.
 
 Each `.yaml` maps a prompt key -> a template string. Templates use Jinja `{{ var }}`
 placeholders and are rendered by the module / class that owns them (see e.g. `SearchAgent`).
@@ -16,7 +16,7 @@ import yaml
 
 
 @lru_cache(maxsize=None)
-def load_prompts(name: str) -> dict[str, str]:
+def load_qatfd_prompts(name: str) -> dict[str, str]:
     """Return the `{key: template}` map from `skunk/prompts/<name>.yaml` (cached)."""
     text = resources.files(__name__).joinpath(f"{name}.yaml").read_text(encoding="utf-8")
     data = yaml.safe_load(text)

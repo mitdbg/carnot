@@ -21,7 +21,7 @@
 #   task=embed  embedding server, OLD vllm (--task embed; removed in newer vLLM)
 #   runner=pooling  embedding server, NEW vllm (--runner pooling replaces --task embed)
 #   name=<id>   --served-model-name (DEFAULT: the model id itself, so the manifest keys,
-#               inference.llm_model / inference.emb_model_id / systems.semantic_filter_model,
+#               inference.llm_model / inference.emb_model_id / systems.semantic_filter_llm_model,
 #               and the server
 #               all agree — see skunk config.py `vllm_base_urls`)
 #   port=8105   explicit port (default: BASE_PORT + arg index)

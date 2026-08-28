@@ -16,6 +16,8 @@ import re
 
 import pandas as pd
 
+from jinja2 import Environment, StrictUndefined
+
 from skunk.common import ExecutionContext
 
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
@@ -24,7 +26,13 @@ from qatfd.keys import officeqa_doc as _page_key_to_doc_key
 from qatfd.config import OfficeQAConfig
 from qatfd.constants import OFFICE_QA
 from qatfd.paths import resolve_under_benchmarks
+from qatfd.prompts import load_qatfd_prompts
 from qatfd.types import Question
+
+_ENV = Environment(
+    autoescape=False, keep_trailing_newline=True, undefined=StrictUndefined
+)
+_PROMPTS = load_qatfd_prompts("officeqa")
 
 # source_docs URL -> (month, year, page)
 _MONTH_MAP = {
@@ -79,13 +87,12 @@ class OfficeQABenchmark(Benchmark):
         "If several values are requested, list them in brackets like [1.2, 3.4]. For a "
         "non-numeric answer, give the date or short phrase alone."
     )
+    corpus_details = _ENV.from_string(_PROMPTS["corpus_details"]).render()
 
     def __init__(self, config: OfficeQAConfig) -> None:
         # all benchmark data (questions, page map, prompts, pdfs) resolves under qatfd/benchmarks/.
         config.csv_path = str(resolve_under_benchmarks(config.csv_path))
         config.clean_page_map_path = str(resolve_under_benchmarks(config.clean_page_map_path))
-        if config.prompts_path:
-            config.prompts_path = str(resolve_under_benchmarks(config.prompts_path))
         if config.storage.pdf_dir:
             config.storage.pdf_dir = str(resolve_under_benchmarks(config.storage.pdf_dir))
         super().__init__(config)
@@ -153,6 +160,9 @@ class OfficeQABenchmark(Benchmark):
         return BenchmarkResources(
             chroma_collection=collection,
             document_map=document_map,
+            answer_format_hint=self.answer_format_hint,
+            compute_objective=self.compute_objective,
+            corpus_details=self.corpus_details,
         )
 
     async def score(self, question: Question, predicted: str, ctx: ExecutionContext) -> dict:

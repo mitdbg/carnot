@@ -27,6 +27,5 @@ questions_path: financebench/financebench_open_source.jsonl
 fb_metadata_glob: financebench/financebench-element-embeddings/metadata_rank*.json
 # llm used by the single-nugget correctness judge (set on the CLI, e.g. google/gemini-2.5-flash)
 judge_model: null
-prompts_path: null
 # pdf_dir is the SearchAgent view_figure source; page keys don't map 1:1 to a figure tool yet, so null.
 pdf_dir: null

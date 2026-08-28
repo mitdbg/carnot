@@ -60,8 +60,6 @@ class FinanceBenchBenchmark(Benchmark):
         # all benchmark data (questions, metadata, prompts, pdfs) resolves under qatfd/benchmarks/.
         config.questions_path = str(resolve_under_benchmarks(config.questions_path))
         config.fb_metadata_glob = str(resolve_under_benchmarks(config.fb_metadata_glob))
-        if config.prompts_path:
-            config.prompts_path = str(resolve_under_benchmarks(config.prompts_path))
         if config.storage.pdf_dir:
             config.storage.pdf_dir = str(resolve_under_benchmarks(config.storage.pdf_dir))
         super().__init__(config)
@@ -139,6 +137,8 @@ class FinanceBenchBenchmark(Benchmark):
         return BenchmarkResources(
             chroma_collection=collection,
             document_map=self._build_document_map(),
+            answer_format_hint=self.answer_format_hint,
+            compute_objective=self.compute_objective,
         )
 
     # ---- scoring + metrics ----------------------------------------------------

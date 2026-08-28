@@ -116,11 +116,11 @@ def llm_of(cfg: dict) -> str:
 
 def judge_of(cfg: dict, agent_llm: str) -> str | None:
     """The semantic-filter judge model, or None when the run has no semantic filter. An unset
-    ``semantic_filter_model`` means the judge shares the agent model."""
+    ``semantic_filter_llm_model`` means the judge shares the agent model."""
     systems = cfg.get("systems") or {}
     if not systems.get("include_semantic_filter"):
         return None
-    return systems.get("semantic_filter_model") or agent_llm
+    return systems.get("semantic_filter_llm_model") or agent_llm
 
 
 def model_label(llm: str, judge: str | None, *, short: bool = False) -> str:

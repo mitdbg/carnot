@@ -8,11 +8,10 @@ run's score reflects this system's retrieval (a single vector search) and nothin
 
 from __future__ import annotations
 
-import uuid
+import time
 
 from skunk.common import ExecutionContext
-from skunk.config import InferenceConfig
-from skunk.search_agent.search_tools import SearchCorpusTool
+from skunk.agents.search_agent.search_tools import SearchCorpusTool
 from skunk.search_state.working_set import WorkingSet
 
 from qatfd.benchmarks.base import BenchmarkResources
@@ -24,64 +23,56 @@ from qatfd.types import Question, Retrieved
 class RAGLLMSystem(RetrieveComputeSystem):
     name = "rag_llm"
 
-    def __init__(self, config: RAGLLMConfig, inference_cfg: InferenceConfig) -> None:
-        self.config = config
-        self.inference_cfg = inference_cfg
-        # Usage-attribution key for this system's query-embedding calls (its "retrieve" phase); the
-        # shared compute answerer is keyed separately (see System.retrieve_usage_key). Falls back to
-        # a fresh uuid4 when no agent_id is configured.
-        self.system_id = self.retrieve_usage_key or str(uuid.uuid4())
-
     async def retrieve(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext) -> Retrieved:
+        self.retrieve_config: RAGLLMConfig
+
         # NOTE: WorkingSet is required argument; but will not be used b/c working_set_collection_off=True
         tool = SearchCorpusTool(
             resources.chroma_collection,
             ctx.llm_client,
             WorkingSet(collection=resources.chroma_collection),
-            ctx,
-            # embed via this question's LLMClient (ctx.llm_client) so query-embedding tokens/cost
-            # land on the same usage tracker the runner reads; backend = config.emb_provider
-            usage_key=str(self.system_id),
+            usage_key=str(self.retrieve_usage_key),
             working_set_collection_off=True,
             id_tracking_off=True,
         )
 
-        # emit under a "retrieve" step so the per-question trace records what this vector search returned
-        with ctx.step("retrieve"):
-            out = tool(query=q.text, top_k=self.config.top_k, read=True, fetch=True)  # type: ignore
-            chunks = out.get("read_chunks", []) if isinstance(out, dict) else []
-            context = "\n\n".join(c["text"] for c in chunks)
+        # perform top-k vector search query
+        tool_start_time = time.monotonic()
+        out = tool(query=q.text, top_k=self.retrieve_config.top_k, read=True, fetch=True)  # type: ignore
+        chunks = out.get("read_chunks", []) if isinstance(out, dict) else []
+        context = "\n\n".join(c["text"] for c in chunks)
 
-            # unique doc_ids in retrieval order, for doc-recall scoring.
-            seen: set[str] = set()
-            doc_ids: list[str] = []
-            for c in chunks:
-                d = c["doc_id"]
-                if d not in seen:
-                    seen.add(d)
-                    doc_ids.append(d)
+        # unique doc_ids in retrieval order, for doc-recall scoring.
+        seen: set[str] = set()
+        doc_ids: list[str] = []
+        for c in chunks:
+            d = c["doc_id"]
+            if d not in seen:
+                seen.add(d)
+                doc_ids.append(d)
 
-            ctx.emit(
-                f"retrieved top_k={self.config.top_k} chunks={len(chunks)} docs={len(doc_ids)}",
-                kind="observation",
-                data={
-                    "query": q.text,
-                    "doc_ids": doc_ids,
-                    "chunk_ids": [c.get("chunk_id") for c in chunks],
-                    # per-chunk rows (rank order) so the viewer can show doc_id + distance + text,
-                    # mirroring the SearchAgent's search_corpus rendering.
-                    "chunks": [
-                        {
-                            "rank": i,
-                            "chunk_id": c.get("chunk_id"),
-                            "doc_id": c.get("doc_id"),
-                            "type": c.get("type"),
-                            "distance": c.get("distance"),
-                            "text": c.get("text"),
-                        }
-                        for i, c in enumerate(chunks, 1)
-                    ],
-                    "context": context,
-                },
-            )
+        ctx.tracer.emit(
+            f"retrieved",
+            kind="observation",
+            data={
+                "query": q.text,
+                "top_k": self.retrieve_config.top_k,
+                "latency_s": time.monotonic() - tool_start_time,
+                "doc_ids": doc_ids,
+                "chunk_ids": [c.get("chunk_id") for c in chunks],
+                "chunks": [
+                    {
+                        "rank": i,
+                        "chunk_id": c.get("chunk_id"),
+                        "doc_id": c.get("doc_id"),
+                        "type": c.get("type"),
+                        "distance": c.get("distance"),
+                        "text": c.get("text"),
+                    }
+                    for i, c in enumerate(chunks, 1)
+                ],
+                "context": context,
+            },
+        )
+
         return Retrieved(doc_ids=doc_ids, context=context)

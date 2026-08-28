@@ -16,6 +16,8 @@ from __future__ import annotations
 import glob
 import json
 
+from jinja2 import Environment, StrictUndefined
+
 from skunk.common import ExecutionContext
 
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources, doc_recall
@@ -23,19 +25,24 @@ from qatfd.benchmarks.judge import judge_single_nugget
 from qatfd.config import BrowseCompPlusConfig
 from qatfd.constants import BROWSECOMP_PLUS
 from qatfd.paths import resolve_under_benchmarks
+from qatfd.prompts import load_qatfd_prompts
 from qatfd.types import Question
+
+_ENV = Environment(
+    autoescape=False, keep_trailing_newline=True, undefined=StrictUndefined
+)
+_PROMPTS = load_qatfd_prompts("browsecomp_plus")
 
 
 class BrowseCompPlusBenchmark(Benchmark):
     name = BROWSECOMP_PLUS
     config: BrowseCompPlusConfig
+    corpus_details = _ENV.from_string(_PROMPTS["corpus_details"]).render()
 
     def __init__(self, config: BrowseCompPlusConfig) -> None:
         # all benchmark data (questions, metadata, prompts) resolves under qatfd/benchmarks/.
         config.bcp_questions = str(resolve_under_benchmarks(config.bcp_questions))
         config.bcp_metadata_glob = str(resolve_under_benchmarks(config.bcp_metadata_glob))
-        if config.prompts_path:
-            config.prompts_path = str(resolve_under_benchmarks(config.prompts_path))
         super().__init__(config)
 
     def load_questions(self) -> list[Question]:
@@ -91,6 +98,9 @@ class BrowseCompPlusBenchmark(Benchmark):
         return BenchmarkResources(
             chroma_collection=collection,
             document_map=document_map,
+            answer_format_hint=self.answer_format_hint,
+            compute_objective=self.compute_objective,
+            corpus_details=self.corpus_details,
         )
 
     async def score(self, question: Question, predicted: str, ctx: ExecutionContext) -> dict:

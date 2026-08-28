@@ -66,6 +66,10 @@ class FreshstackBenchmark(Benchmark):
         "include the relevant code, configuration, commands, or API usage the documents support. Cover "
         "every supported fact the question calls for — prefer completeness over a one-line answer."
     )
+    compute_objective = (
+        "the final answer to this question will be graded on nugget recall — the fraction of the "
+        "reference answer's key facts that the final answer covers."
+    )
 
     def __init__(self, config: FreshstackConfig) -> None:
         # `topic` is the single source of truth: derive the data paths + collection from it unless
@@ -81,8 +85,6 @@ class FreshstackBenchmark(Benchmark):
         # all benchmark data (questions, corpus, prompts) resolves under qatfd/benchmarks/.
         config.questions_path = str(resolve_under_benchmarks(config.questions_path))
         config.corpus_path = str(resolve_under_benchmarks(config.corpus_path))
-        if config.prompts_path:
-            config.prompts_path = str(resolve_under_benchmarks(config.prompts_path))
         super().__init__(config)
 
     # ---- questions ------------------------------------------------------------
@@ -173,6 +175,8 @@ class FreshstackBenchmark(Benchmark):
         return BenchmarkResources(
             chroma_collection=collection,
             document_map=self._build_document_map(),
+            answer_format_hint=self.answer_format_hint,
+            compute_objective=self.compute_objective,
         )
 
     # ---- scoring + metrics ----------------------------------------------------

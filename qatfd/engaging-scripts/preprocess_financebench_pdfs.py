@@ -104,7 +104,7 @@ def _s3_split(uri: str) -> tuple[str, str]:
 def _s3():
     global _S3_CLIENT
     if _S3_CLIENT is None:
-        import boto3
+        import boto3  # type: ignore
 
         _S3_CLIENT = boto3.client("s3")
     return _S3_CLIENT
@@ -322,7 +322,7 @@ def render_doc(pdf_path: str, renders_dir: str, dpi: int, target_tokens: int) ->
                 skipped += 1
                 continue
             page = fdoc[p]
-            texts = text_elements(page.get_text("text"), target_tokens)
+            texts = text_elements(page.get_text("text"), target_tokens)  # type: ignore
             has_visual = bool(page.get_images(full=True)) or len(page.get_drawings()) > 4
             is_blank = not texts and not has_visual
             if not is_blank:
@@ -359,9 +359,12 @@ def llm_page(client: LLMClient, key: str, args) -> dict:
             png = read_bytes(_join(doc_renders, f"{page_id}.png"))
             img = B64Image(mime="image/png", data=base64.standard_b64encode(png).decode())
             try:
-                messages = [{"role": "user", "content": _EXTRACT_USER, "images": [img]}]
-                ext = client.call(system=_EXTRACT_SYSTEM, messages=messages, temperature=0.0,
-                                  model=args.extract_model, ctx=None, call_site="fb_extract")
+                messages = [
+                    {"role": "system", "content": _EXTRACT_SYSTEM},
+                    {"role": "user", "content": _EXTRACT_USER, "images": [img]},
+                ]
+                ext = client.call(messages=messages, temperature=0.0,
+                                  model=args.extract_model, call_site="fb_extract")
                 summary["extract_in"], summary["extract_out"] = ext.input_tokens or 0, ext.output_tokens or 0
                 items += [[k, c] for k, c in parse_extract_markdown(ext.text)]
             except EmptyCompletionError:

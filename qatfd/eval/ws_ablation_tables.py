@@ -16,12 +16,13 @@ Produces, for each phase (p1..p4) found under ``results/*/search_agent/``:
    vector/grep calls.
 
 Notes on the tool breakdown:
-* fetch/read mode is classified from ``read=True`` / ``fetch=True`` in the emitted
-  call text (kwargs only — a positional ``True`` is not recognized); calls that name
-  neither are shown under ``none`` (the tools force fetch+read in the no-working-set
-  cell, error otherwise).
+* fetch/read mode comes from the tool_call event's structured kwargs when the call
+  executed (positional args resolved), else from ``read=True`` / ``fetch=True`` in
+  the emitted call text; calls that name neither are shown under ``none`` (the
+  tools force fetch+read in the no-working-set cell, error otherwise).
 * Counts include attempted-but-errored calls (consistent with tool_metrics.py);
-  errored calls return fast and pull latency averages down.
+  errored calls are timed too (``tool_latency_s`` wraps the sandboxed execution) and
+  return fast, pulling latency averages down.
 * Only questions present in ``results.jsonl`` are counted, so the script is safe to
   run while the sweep is still going (in-flight questions are skipped).
 * If a phase+cell has several timestamped run dirs, the LATEST is used (noted).
@@ -43,9 +44,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 try:
-    from .tool_metrics import _group_turns, _iter_question_events, _tool_code_str, _action_name
+    from .tool_metrics import _action_name, _iter_agent_steps, _iter_question_events
 except ImportError:
-    from tool_metrics import _group_turns, _iter_question_events, _tool_code_str, _action_name
+    from tool_metrics import _action_name, _iter_agent_steps, _iter_question_events
 
 CELL_ORDER = ["ws_coll_on_id_on", "ws_coll_on_id_off", "ws_coll_off_id_on", "ws_coll_off_id_off"]
 MODED_TOOLS = ["search_corpus", "grep_corpus"]        # broken out by fetch/read mode
@@ -129,23 +130,28 @@ def high_level_row(rows: list[dict]) -> dict | None:
 # --------------------------------------------------------------------------- #
 
 def _answer_start(events: list[dict]) -> int:
-    """Index where the retrieval stage ends. tool_metrics' heuristic (first ``system``
-    event at i>=1) breaks on these traces twice over: reuse phases prepend selector
-    events (their PromptedCall emits its own ``system``), and the compute answerer is
-    itself a code-running agent whose ``tool_code`` steps must not be counted. The
-    robust anchor is SearchAgent's ``doc_ids_validated`` note — emitted exactly once,
-    after the agent loop and any doc-id-correction turns, before compute begins. A
-    trace without it (question failed in retrieval) is retrieval end-to-end."""
+    """Index where the retrieval stage ends. The robust anchor (rather than
+    tool_metrics' second-``system``-event heuristic) is SearchAgent's
+    ``doc_ids_validated`` lifecycle event — emitted exactly once, after the agent
+    loop and any doc-id-correction turns, before compute begins — so the compute
+    answerer's own code-running steps are never counted. A trace without it
+    (question failed in retrieval) is retrieval end-to-end."""
     for i, e in enumerate(events):
-        if e.get("kind") == "note" and (e.get("message") or "").startswith("doc_ids_validated"):
+        if e.get("id") == "doc_ids_validated":
             return i
     return len(events)
 
 
-def _call_mode(code: str) -> str:
-    """fetch/read mode of the step's primary call, from kwargs in the call text."""
-    has_read = re.search(r"\bread\s*=\s*True\b", code) is not None
-    has_fetch = re.search(r"\bfetch\s*=\s*True\b", code) is not None
+def _call_mode(code: str, tool_kwargs: dict | None) -> str:
+    """fetch/read mode of the step's primary call. The tool_call event's structured
+    kwargs are authoritative when the call executed (they resolve positional args
+    too); for errored calls, fall back to kwargs in the emitted call text."""
+    if tool_kwargs is not None:
+        has_read = bool(tool_kwargs.get("read"))
+        has_fetch = bool(tool_kwargs.get("fetch"))
+    else:
+        has_read = re.search(r"\bread\s*=\s*True\b", code) is not None
+        has_fetch = re.search(r"\bfetch\s*=\s*True\b", code) is not None
     if has_fetch and has_read:
         return "fetch+read"
     if has_fetch:
@@ -180,22 +186,20 @@ def parse_tool_usage(run_dir: Path, finished_qids: set[str]) -> ToolUsage:
             continue
         usage.n_questions += 1
         retrieval = events[: _answer_start(events)]
-        for turn in _group_turns(retrieval):
-            if turn.tool_code is None:
+        for s in _iter_agent_steps(retrieval):
+            if s.is_final or not s.code:
                 continue
             usage.steps += 1
-            code = _tool_code_str(turn.tool_code.get("message", ""))
-            name = _action_name(code)
+            name = s.tool or _action_name(s.code)
             if name in MODED_TOOLS:
-                key = (name, _call_mode(code))
+                key = (name, _call_mode(s.code, s.tool_kwargs))
             elif name in PLAIN_TOOLS:
                 key = (name, "-")
             else:
                 continue
             usage.counts[key] += 1
-            first_t = next((r["t"] for r in turn.results if r.get("t") is not None), None)
-            if first_t is not None and turn.tool_code.get("t") is not None:
-                usage.latencies[key].append(max(0.0, first_t - turn.tool_code["t"]))
+            if s.latency is not None:
+                usage.latencies[key].append(s.latency)
     return usage
 
 

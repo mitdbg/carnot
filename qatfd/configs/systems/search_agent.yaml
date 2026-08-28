@@ -4,15 +4,18 @@ defaults:
   - _self_
 
 name: search_agent
-agent_mode: retrieve
-search_agent_max_output_tokens: 4096
-search_agent_request_timeout_s: 120.0
+max_output_tokens: 4096
+request_timeout_s: 120.0
 include_search_corpus: true
 include_grep_corpus: true
 include_semantic_filter: false
+chunks_per_summary: 10
+semantic_filter_max_workers: 16
+semantic_filter_max_candidate_docs: 1000
+semantic_filter_context_safety_frac: 0.9
 # Model for the semantic_filter judge calls; null => use llm_model (the agent model). Set to a
 # cheaper model to run the token-heavy candidate filtering off the expensive agent model.
-semantic_filter_model: null
+semantic_filter_llm_model: null
 # OpenRouter provider order (no fallback) for the semantic_filter judge calls only; null => use the
 # client-wide llm_provider_order. Lets the judge route to specific providers (e.g. [akashml, parasail])
 # while a different-family agent model stays unpinned. E.g. systems.semantic_filter_provider_order=[akashml,parasail]
@@ -25,8 +28,8 @@ semantic_filter_max_output_tokens: 4
 # Disable thinking on the judge calls (OpenRouter reasoning={"enabled": false}); set false (and
 # raise the cap above) for judge models that mandate reasoning.
 semantic_filter_disable_reasoning: true
-agent_max_steps: 20
-agent_max_misfires: 5
+max_steps: 20
+max_misfires: 5
 # target dollar cost budget for the search agent; null means no budget limit (default)
 cost_budget: null
 # target latency budget for the search agent; null means no latency limit (default)

@@ -43,8 +43,9 @@ def build_benchmark(config: BenchmarkConfig) -> Benchmark:
     return BENCHMARKS[name](config)
 
 
-def build_system(config: AgentConfig, inference: InferenceConfig) -> System:
-    name = config.name
+def build_system(retrieve_config: AgentConfig, compute_config: AgentConfig, inference: InferenceConfig) -> System:
+    name = retrieve_config.name
     if name not in SYSTEMS:
         raise KeyError(f"unknown system {name!r}; available: {sorted(SYSTEMS)}")
-    return SYSTEMS[name](config, inference)
+
+    return SYSTEMS[name](retrieve_config, compute_config, inference)

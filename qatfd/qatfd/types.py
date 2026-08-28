@@ -19,16 +19,13 @@ class Question:
 
 @dataclass
 class Retrieved:
-    """Output of a system's `retrieve()` step. `direct_answer` is set only by
-    direct-answer agents (which produce the answer themselves); for retrieve-only
-    systems it stays None and a downstream `compute()` generates the answer.
+    """Output of a system's `retrieve()` step.
 
-    `terminate_state` is the retrieval agent's `MultiTurnAgent.terminate_state` (why its
+    `terminate_state` is the retrieval agent's `MultiTurnAgent._terminate_state` (why its
     loop stopped: "finished" or a `|`-joined subset of out_of_steps/over_cost_budget/
     over_latency_budget); None for systems whose retrieve runs no such agent (e.g. rag_llm)."""
 
     doc_ids: list[str]
-    direct_answer: str | None = None
     context: str | None = None
     terminate_state: str | None = None
 

@@ -1,14 +1,12 @@
 # base config for all benchmarks
-# ALL paths below (splits_path, pdf_dir, prompts_path, + per-benchmark question/corpus
-# paths) are relative to qatfd/benchmarks/ — i.e. qatfd/benchmarks/<benchmark>/... .
+# ALL paths below (splits_path, pdf_dir, + per-benchmark question/corpus paths)
+# are relative to qatfd/benchmarks/ — i.e. qatfd/benchmarks/<benchmark>/... .
 collection_name: null
 # ChromaDB server endpoint that reads connect to. Collections are always read via a long-lived warm
 # server (skunk/scripts/run_chroma_server.sh) — there is no embedded PersistentClient read path. Point
 # the server at the corpus's on-disk chroma dir when launching it; the eval only needs host + port.
 chroma_server_host: 127.0.0.1
 chroma_server_port: 8001
-# per-benchmark prompt-overrides YAML (under qatfd/benchmarks/); null = none
-prompts_path: null
 # corpus PDFs dir (under qatfd/benchmarks/) for the view_figure tool; null = no figure tool
 pdf_dir: null
 # dev/test split JSON (under qatfd/benchmarks/): {"dev": [qids], "test": [qids]}. null => dev=all, test=empty.

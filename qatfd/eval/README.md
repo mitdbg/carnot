@@ -94,20 +94,23 @@ Two things to know about the numbers:
   the system prompt still references `search_corpus` in its grep/prune tool docs even
   when the tool is off.
   Errored calls return in ~0s, so they pull that tool's latency average toward zero.
-- **Latency is wall-clock, not isolated CPU time.** It's `observation.t − tool_code.t`
-  measured under the runner's concurrent execution (`workers=N`), and `grep`/vector
-  search run as ChromaDB calls on a shared collection. So a tool's latency includes
-  contention from sibling questions (and, for SearchAgent, from its own concurrent
-  vector queries) — useful as real serving latency, but not a clean per-call CPU cost.
-  For a contention-free number you'd need to instrument the tools with `perf_counter`
-  and re-run (ask if you want this).
+- **Latency is wall-clock, not isolated CPU time.** It's the agent's own
+  `tool_latency_s`, measured around the sandboxed tool execution under the runner's
+  concurrent execution (`workers=N`), and `grep`/vector search run as ChromaDB calls
+  on a shared collection. So a tool's latency includes contention from sibling
+  questions (and, for SearchAgent, from its own concurrent vector queries) — useful
+  as real serving latency, but not a clean per-call CPU cost. For a contention-free
+  number you'd need to instrument the tools with `perf_counter` and re-run (ask if
+  you want this).
 
-These come from the per-question `traces/<qid>.jsonl` streams (the same ones the
-trace viewer renders), reconstructed the way the viewer does: split the retrieval
-stage from the answer stage at the 2nd `system` event, group the retrieval stage
-into agent turns, identify each step's tool from the first non-comment line of its
-emitted code, and take tool latency as `observation.t - tool_code.t` (pure tool
-time, LLM reasoning excluded). A tool absent from a configuration scores 0.
+These come from the per-question `traces/<qid>.jsonl` streams of structured
+`skunk.trace.TraceEvent` lines: split the retrieval stage from the answer stage at
+the 2nd `system` event (the compute agent's system prompt), take each executed step
+from its closing `agent_step` event, identify the step's tool from its
+`kind="tool_call"` result event (`data.tool`) — falling back to the first
+non-comment line of `data.code` for errored calls — and take tool latency from the
+`agent_step` event's `tool_latency_s` (measured by the agent around the sandboxed
+execution; LLM reasoning excluded). A tool absent from a configuration scores 0.
 
 ```bash
 python eval/tool_metrics.py                       # table -> stdout

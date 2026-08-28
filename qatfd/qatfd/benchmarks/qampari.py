@@ -128,14 +128,16 @@ class QampariBenchmark(Benchmark):
         "Do not stop at one answer; prefer completeness (recall) over brevity, and include an "
         "entity whenever the documents support it."
     )
+    compute_objective = (
+        "the final answer to this question will be graded on nugget recall — the fraction of the "
+        "reference answer's key facts that the final answer covers."
+    )
 
     def __init__(self, config: QampariConfig) -> None:
         # all benchmark data (questions, dev extract, prompts) resolves under qatfd/benchmarks/.
         config.questions_path = str(resolve_under_benchmarks(config.questions_path))
         if config.dev_questions_path:
             config.dev_questions_path = str(resolve_under_benchmarks(config.dev_questions_path))
-        if config.prompts_path:
-            config.prompts_path = str(resolve_under_benchmarks(config.prompts_path))
         # the chroma collection, set in _build_resources; recall_metrics reads the `title` metadata
         # of the retrieved articles' chunks from it to map page_ids to gold article titles.
         self._collection = None
@@ -210,6 +212,8 @@ class QampariBenchmark(Benchmark):
         return BenchmarkResources(
             chroma_collection=collection,
             document_map=_ChromaDocMap(collection),
+            answer_format_hint=self.answer_format_hint,
+            compute_objective=self.compute_objective,
         )
 
     # ---- scoring + metrics ----------------------------------------------------

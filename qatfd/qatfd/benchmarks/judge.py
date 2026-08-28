@@ -47,9 +47,11 @@ async def judge_single_nugget(
     ctx: ExecutionContext, *, question: str, gold: str, predicted: str, model: str, usage_key: str | None = None
 ) -> dict:
     user = f"Question:\n{question}\n\nGold answer:\n{gold}\n\nPredicted answer:\n{predicted or '(no answer)'}"
-    messages = [{"role": "user", "content": user}]
+    messages = [
+        {"role": "system", "content": _JUDGE_SYSTEM},
+        {"role": "user", "content": user},
+    ]
     resp = await ctx.llm_client.acall(
-        system=_JUDGE_SYSTEM,
         messages=messages,
         temperature=0.0,
         model=model,
@@ -135,14 +137,19 @@ async def judge_nugget_recall(
     if not nuggets:
         return {"score": 0.0, "scorer": "karl.nugget_completion.v1", "judge_rationale": "(no gold nuggets)"}
 
-    messages = [{"role": "user", "content": _NUGGET_COMPLETENESS_PROMPT.format(
-        length=len(nuggets),
-        question=question,
-        answer=predicted or "(no answer)",
-        nugget=nuggets,
-    )}]
+    messages = [
+        {"role": "system", "content": judge_system},
+        {
+            "role": "user",
+            "content": _NUGGET_COMPLETENESS_PROMPT.format(
+                length=len(nuggets),
+                question=question,
+                answer=predicted or "(no answer)",
+                nugget=nuggets,
+            ),
+        }
+    ]
     resp = await ctx.llm_client.acall(
-        system=judge_system,
         messages=messages,
         temperature=0.0,
         model=model,
@@ -159,8 +166,8 @@ async def judge_nugget_recall(
     # Persist the per-nugget verdicts (discarded by the aggregate score) as a structured event, so
     # the trace viewer can show every gold nugget colored by whether the answer supported it.
     if ctx is not None:
-        ctx.emit(
-            f"nugget_judge n_support={n_sup} n_partial={n_par} n_nuggets={len(nuggets)} recall={score:.3f}",
+        ctx.tracer.emit(
+            id=f"nugget_judge",
             kind="observation",
             data={
                 "n_support": n_sup,

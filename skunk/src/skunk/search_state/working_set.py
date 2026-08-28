@@ -70,8 +70,6 @@ class WorkingSet:
         read_doc_ids: set[str] | None = None,
         fetched_chunk_ids: set[str] | None = None,
         fetched_doc_ids: set[str] | None = None,
-        redacted_chunk_ids: set[str] | None = None,
-        redacted_doc_ids: set[str] | None = None,
         summary: str | None = None,
         actions: list[tuple[str, bool]] | None = None,
         parent_working_set_ids: set[str] | None = None,
@@ -83,8 +81,6 @@ class WorkingSet:
         self.read_doc_ids: set[str] = read_doc_ids or set()
         self.fetched_chunk_ids: set[str] = fetched_chunk_ids or set()
         self.fetched_doc_ids: set[str] = fetched_doc_ids or set()
-        self.redacted_chunk_ids: set[str] = redacted_chunk_ids or set()
-        self.redacted_doc_ids: set[str] = redacted_doc_ids or set()
         self.summary = summary or "(Summary not yet computed.)"
         self.actions: list[tuple[str, bool]] = actions or []
         self.parent_working_set_ids: set[str] = parent_working_set_ids or set()
@@ -107,8 +103,6 @@ class WorkingSet:
         read_doc_ids = set(filter(None, metadata["read_doc_ids"].split(WorkingSet.METADATA_LIST_DELIMITER)))
         fetched_chunk_ids = set(filter(None, metadata["fetched_chunk_ids"].split(WorkingSet.METADATA_LIST_DELIMITER)))
         fetched_doc_ids = set(filter(None, metadata["fetched_doc_ids"].split(WorkingSet.METADATA_LIST_DELIMITER)))
-        redacted_chunk_ids = set(filter(None, metadata["redacted_chunk_ids"].split(WorkingSet.METADATA_LIST_DELIMITER)))
-        redacted_doc_ids = set(filter(None, metadata["redacted_doc_ids"].split(WorkingSet.METADATA_LIST_DELIMITER)))
         parent_working_set_ids = set(filter(None, metadata["parent_working_set_ids"].split(WorkingSet.METADATA_LIST_DELIMITER)))
 
         # parse list of tuples for actions
@@ -127,8 +121,6 @@ class WorkingSet:
             fetched_doc_ids=fetched_doc_ids,
             read_chunk_ids=read_chunk_ids,
             read_doc_ids=read_doc_ids,
-            redacted_chunk_ids=redacted_chunk_ids,
-            redacted_doc_ids=redacted_doc_ids,
             summary=summary,
             actions=actions,
             parent_working_set_ids=parent_working_set_ids,
@@ -142,8 +134,7 @@ class WorkingSet:
         metadata=None and fails."""
         keys = (
             "pruned_chunk_ids", "pruned_doc_ids", "read_chunk_ids", "read_doc_ids",
-            "fetched_chunk_ids", "fetched_doc_ids", "redacted_chunk_ids", "redacted_doc_ids",
-            "actions", "parent_working_set_ids",
+            "fetched_chunk_ids", "fetched_doc_ids", "actions", "parent_working_set_ids",
         )
         metadata = {key: "" for key in keys}
         metadata["summary"] = "(Summary not yet computed.)"
@@ -159,8 +150,6 @@ class WorkingSet:
             "read_doc_ids": self.METADATA_LIST_DELIMITER.join(self.read_doc_ids),
             "fetched_chunk_ids": self.METADATA_LIST_DELIMITER.join(self.fetched_chunk_ids),
             "fetched_doc_ids": self.METADATA_LIST_DELIMITER.join(self.fetched_doc_ids),
-            "redacted_chunk_ids": self.METADATA_LIST_DELIMITER.join(self.redacted_chunk_ids),
-            "redacted_doc_ids": self.METADATA_LIST_DELIMITER.join(self.redacted_doc_ids),
             "summary": self.summary,
             "actions": self.METADATA_LIST_DELIMITER.join(actions),
             "parent_working_set_ids": self.METADATA_LIST_DELIMITER.join(self.parent_working_set_ids),

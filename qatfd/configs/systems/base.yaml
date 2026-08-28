@@ -1,7 +1,7 @@
 # base config for all systems
 name: null
-# Stable usage-attribution key for the system's retrieval agent (skunk MultiTurnAgent.agent_id /
-# RAGLLMSystem.system_id), so the runner can isolate the system's own cost from the aggregate
-# (the shared compute answerer mints its own key). Interpolates to the concrete system name; one
-# system runs per experiment, so a name-derived key is stable and never collides within a question.
+# Stable usage-attribution key for the system's retrieval agent (skunk MultiTurnAgent.agent_id),
+# so the runner can isolate the system's own cost from the aggregate (the shared compute answerer
+# mints its own key). Interpolates to the concrete system name; one system runs per experiment,
+# so a name-derived key is stable and never collides within a question.
 agent_id: ${systems.name}

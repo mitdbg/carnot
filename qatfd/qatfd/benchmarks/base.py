@@ -11,12 +11,11 @@ from __future__ import annotations
 import json
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from chromadb import Collection
 
 from skunk.common import ExecutionContext
 from skunk.storage.document_map import DocumentMap
-from skunk.prompted_call import PromptOverride, load_prompt_overrides
 
 from qatfd.config import BenchmarkConfig
 from qatfd.paths import resolve_under_benchmarks
@@ -40,10 +39,9 @@ class BenchmarkResources:
 
     chroma_collection: Collection  # chromadb Collection (vector index over chunks)
     document_map: DocumentMap  # doc_id -> full text (for read_document / answer step)
-    answer_format_hint: str = ""
+    answer_format_hint: str = ""  # guidance on the format of the final answer (for the compute agent)
     compute_objective: str = ""  # one sentence on what the final answer is graded on (for the search agent)
-    prompt_overrides: tuple[PromptOverride, ...] = field(default_factory=tuple)
-    pdf_dir: str | None = None
+    corpus_details: str | None = None  # information about the nature of the corpus, including available metadata fields
 
 
 class Benchmark(ABC):
@@ -59,8 +57,11 @@ class Benchmark(ABC):
     # be graded on, so it can calibrate how broadly to retrieve. This default is applied for
     # exact-answer benchmarks
     compute_objective: str = (
-        "The final answer to this question will be graded on exact-answer correctness."
+        "the final answer to this question will be graded on exact-answer correctness."
     )
+
+    # description of the corpus and any available metadata fields
+    corpus_details: str | None = None
 
     def __init__(self, config: BenchmarkConfig) -> None:
         self.config = config
@@ -96,19 +97,12 @@ class Benchmark(ABC):
 
     @abstractmethod
     def _build_resources(self) -> BenchmarkResources:
-        """Open the chroma collection + build the document_map. Called once, cached
-        by `get_resources`."""
+        """Open the chroma collection + build the document_map. Called once, cached by `get_resources`."""
 
     def get_resources(self) -> BenchmarkResources:
         """Cached accessor for the (collection, document_map) substrate."""
         if self._resources is None:
-            res = self._build_resources()
-            res.answer_format_hint = self.answer_format_hint
-            res.compute_objective = self.compute_objective
-            path = self.config.prompts_path
-            res.prompt_overrides = load_prompt_overrides(path) if path and os.path.exists(path) else ()
-            res.pdf_dir = self.config.storage.pdf_dir
-            self._resources = res
+            self._resources = self._build_resources()
         return self._resources
 
     @abstractmethod

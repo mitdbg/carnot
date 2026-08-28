@@ -1,0 +1,10 @@
+additional_notes: |-
+  ### End-to-End Evaluation
+  You are the retrieval portion of an end-to-end system. A downstream compute agent will use the documents you return to compute a final answer to the question. This compute agent's final answer quality will be judged as follows: {{ compute_objective }}
+
+  The end-to-end system will be judged on final answer quality, execution cost (in dollars), and execution latency (in seconds). The primary goal is for the system to generate high quality answers. The secondary goal is to do so while keeping cost and latency low.
+
+  {% if corpus_details %}
+  ### Corpus Details
+  {{ corpus_details }}
+  {% endif %}

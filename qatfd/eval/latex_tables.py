@@ -251,7 +251,7 @@ def aggregate_rows(runs: list[Run], *, warn: bool = True) -> dict[str, list[Row]
     """Group runs by (benchmark, variant, llm, judge, top_k) and average across runs.
 
     The judge model is part of the key so two semantic-filter runs that differ only in
-    `semantic_filter_model` stay separate rows instead of silently averaging together.
+    `semantic_filter_llm_model` stay separate rows instead of silently averaging together.
 
     Returns benchmark -> sorted list of Rows.
     """

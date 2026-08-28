@@ -1,22 +1,12 @@
 """SearchAgent — iterative code-execution retriever.
 
 Subclasses `MultiTurnAgent`: it supplies the search-specific system prompt
-(`briefing` + `final_answer_doc`) and the chroma/page-map-backed tool set
-(`search_corpus` / `grep_corpus` / `semantic_filter` / `read_document` / `prune`),
-and lets the base own the multi-turn loop, the block trajectory, and the JSON
-final-answer mechanism. The final answer is a ```json``` block ({"doc_ids": [...]}), not a
-tool.
+and the chroma-backed tool set (`search_corpus` / `grep_corpus` / `semantic_filter`
+/ `read_document` / `prune`). The tools share the agent's `WorkingSet`.
 
-Two overrides specialise the base for retrieval:
-  - `_blocks_from_output` turns the tools' structured (tagged-dict) returns into
-    `ChunkBlock`s (one per chunk, carrying chunk_id / doc_id) so the full
-    trajectory is preserved for reward computation.
-  - `_block_is_visible` redacts chunks the agent has `prune(...)`d from the
-    LLM-facing render, faithful to its prune commands during rollout.
-
-The tools share the agent's per-question `RetrievalState` (pruned + seen sets,
-see its docstring for the contract). The orchestrator builds one `SearchAgent`
-per question / branch, so state never leaks across questions.
+`_blocks_from_output()` turns the tools' structured (tagged-dict) returns into
+`ChunkBlock`s (one per chunk, carrying chunk_id / doc_id) so the full trajectory
+is preserved (useful for metrics and future reward computation).
 """
 
 from __future__ import annotations
@@ -28,15 +18,18 @@ from typing import Any
 from chromadb.api.models.Collection import Collection
 from jinja2 import Environment, StrictUndefined
 
-from skunk.common import B64Image, ExecutionContext, strip_code_fence
-from skunk.config import SearchAgentConfig
-from skunk.errors import ParseError, StepFailed
-from skunk.llm_client import LLMClient
-from skunk.sandbox.local_python_executor import CodeOutput
-from skunk.multi_turn_agent import Block, ChunkBlock, ImageBlock, MultiTurnAgent, TextBlock, Tool
-from skunk.prompted_call import PromptedCall
-from skunk.prompts import load_prompts
-from skunk.search_agent.search_tools import (
+from skunk.agents.multi_turn_agent import (
+    Block,
+    ChunkBlock,
+    ImageBlock,
+    Message,
+    MultiTurnAgent,
+    StepOutput,
+    TextBlock,
+    Tool,
+    parse_step,
+)
+from skunk.agents.search_agent.search_tools import (
     EMPTY_RESULT_MESSAGE,
     GREP_RESULT_TAG,
     PRUNE_RESULT_TAG,
@@ -51,6 +44,12 @@ from skunk.search_agent.search_tools import (
     SemanticFilterTool,
     ViewFigureTool,
 )
+from skunk.common import B64Image, ExecutionContext, strip_code_fence
+from skunk.config import SearchAgentConfig, StorageConfig
+from skunk.errors import ParseError, StepFailed
+from skunk.llm_client import LLMClient
+from skunk.prompts import load_prompts
+from skunk.sandbox.local_python_executor import CodeOutput, BASE_BUILTIN_MODULES
 from skunk.search_state.working_set import WorkingSet
 from skunk.search_state.working_set_registry import WorkingSetRegistry, WS_PREFIX, DEFAULT_CHROMA_PATH
 from skunk.storage.document_map import DocumentMap
@@ -58,15 +57,14 @@ from skunk.storage.document_map import DocumentMap
 _ENV = Environment(
     autoescape=False, keep_trailing_newline=True, undefined=StrictUndefined
 )
-
 _PROMPTS = load_prompts("search_agent")
 
 _JSON_FENCE_RE = re.compile(r"```(?:[a-zA-Z0-9_]*)\n(.*?)```", re.DOTALL)
 
 
-def _parse_list(text: str, _: ExecutionContext) -> list[str]:
+def _parse_list(text: str) -> list[str]:
     """Parse the model's reply as a JSON array of strings, raising `ParseError` on
-    anything else so `PromptedCall` re-prompts with the failure echoed back.
+    anything else so the agent can retry.
 
     Accepts a bare array or one wrapped in a ```json``` fence (what the selector prompts
     ask for). When the reply wraps prose around the fence, the LAST fenced block wins —
@@ -78,7 +76,6 @@ def _parse_list(text: str, _: ExecutionContext) -> list[str]:
     body = fences[-1].strip() if fences else strip_code_fence(text)
     if not body:
         raise ParseError(
-            raw=text,
             detail="Your reply was empty. Emit a single ```json``` block holding a JSON "
             'array of the ids you selected, e.g. ["id1", "id2"], or [] if none apply.',
         )
@@ -86,18 +83,16 @@ def _parse_list(text: str, _: ExecutionContext) -> list[str]:
         parsed = json.loads(body)
     except json.JSONDecodeError as e:
         raise ParseError(
-            raw=text, detail=f"the JSON array was malformed — {e}"
+            detail=f"the JSON array was malformed — {e}"
         ) from e
     if not isinstance(parsed, list):
         raise ParseError(
-            raw=text,
             detail=f"expected a JSON array, got {type(parsed).__name__}. Emit ONE "
             '```json``` block holding a flat array of strings, e.g. ["id1", "id2"].',
         )
     non_strings = [v for v in parsed if not isinstance(v, str)]
     if non_strings:
         raise ParseError(
-            raw=text,
             detail=f"every array entry must be a string; got {non_strings!r}. Emit a flat "
             'array of ids, e.g. ["id1", "id2"] — no nested objects or arrays.',
         )
@@ -105,17 +100,22 @@ def _parse_list(text: str, _: ExecutionContext) -> list[str]:
 
 
 class SearchAgent(MultiTurnAgent):
-    name = "search_agent"
-    # Larger than the MultiTurnAgent default — search chains accumulate many
-    # page-content observations across a 20-step ceiling. Char budget, but the model limit is
-    # in TOKENS (~1.05M for gemini-3.5-flash): the Treasury tables are dense numerics at only
-    # ~1.5 chars/token, so keep this conservative — 1.3M chars ≈ 870K tokens, leaving headroom
-    # for the system prompt + output under the input ceiling (a higher budget 400'd requests).
-    context_budget_chars: int = 1_300_000
-    chunks_per_summary: int = 10
-    warn_steps_remaining = 2
-    briefing = _PROMPTS["briefing"]
-    final_answer_doc = _PROMPTS["final_answer_doc"]
+    """
+    Preconditions:
+    - corpus is divided into documents with unique `doc_id`; documents are further split into chunks with unique `chunk_id`
+    """
+
+    @staticmethod
+    def parse_step(text: str) -> StepOutput:
+        """Apply the basic answer parser and validate that a final answer has a `doc_ids` field."""
+        step_output = parse_step(text)
+
+        if step_output.is_final and "doc_ids" not in step_output.result:
+            raise ParseError(
+                detail='Final answer must be a JSON object with a single "doc_ids" key, e.g. {"doc_ids": ["...", ...]}.'
+            )
+
+        return step_output
 
     def __init__(
         self,
@@ -123,78 +123,68 @@ class SearchAgent(MultiTurnAgent):
         document_map: DocumentMap,
         chroma_collection: Collection,
         llm_client: LLMClient,
+        storage_config: StorageConfig,
         *,
-        registry: WorkingSetRegistry | None = None,
-        extra_tools: tuple[Tool, ...] = (),
-        briefing: str | None = None,
-        final_answer_doc: str | None = None,
         agent_id: str | None = None,
-        system_prompt_override: str | None = None,
+        registry: WorkingSetRegistry | None = None,
         working_set_name: str | None = None,
-        generation_backend=None,
-        sampling_params: dict | None = None,
-        capture_logprobs: bool = False,
+        additional_notes: str | None = None,
     ):
-        # `briefing` / `final_answer_doc` override the class-level defaults on this
-        # instance so MultiTurnAgent's template path picks them up (only consulted when
-        # there is no `system_prompt_override`). Set before super().__init__.
-        if briefing is not None:
-            self.briefing = briefing
-        if final_answer_doc is not None:
-            self.final_answer_doc = final_answer_doc
-        self.config = config
-        self.chroma_collection = chroma_collection
+        # override the default agent_id if one is provided
+        config.agent_id = config.agent_id if agent_id is None else agent_id
+
+        # NOTE: temporary enforcement; if config.agent_id is None here, then _build_tools()
+        # will assign a (None) agent_id to the tools, and super().__init__() will create a
+        # different agent_id with uuid.uuid4()
+        assert config.agent_id is not None, "Must supply agent_id for SearchAgent"
+
+        # set variables
         self.document_map = document_map
+        self.chroma_collection = chroma_collection
         self._llm_client = llm_client
         self._registry = registry or WorkingSetRegistry(chroma_path=DEFAULT_CHROMA_PATH)
 
-        # Bound each search-step LLM call: cap output (was uncapped → runaway
-        # generations streamed to the 65535-token ceiling at 200–800s each) and
-        # impose a hard per-request wall-clock timeout. See SearchAgentConfig for the
-        # thinking/max_output_tokens interaction caveat.
-        self.max_output_tokens = config.search_agent_max_output_tokens
-        self.request_timeout_s = config.search_agent_request_timeout_s
-        self.extra_tools = extra_tools
-        super().__init__(
-            tools=[],  # NOTE: we construct tools at runtime based on ExecutionContext configuration
-            max_steps=config.agent_max_steps,
-            max_misfires=config.agent_max_misfires,
-            cost_budget=config.cost_budget,
-            latency_budget=config.latency_budget,
-            agent_id=agent_id if agent_id is not None else config.agent_id,
-            system_prompt_override=system_prompt_override,
-            generation_backend=generation_backend,
-            sampling_params=sampling_params,
-            capture_logprobs=capture_logprobs,
-        )
-
         # create (or get) working set for agent
-        working_set_name = f"{WS_PREFIX}{working_set_name if working_set_name else self.agent_id}"
+        working_set_name = f"{WS_PREFIX}{working_set_name if working_set_name else config.agent_id}"
         self._working_set = self._registry.get_or_create(name=working_set_name)
 
-    # ------------------------------------------------------------------
-    # Block rendering / redaction (override the base hooks)
-    # ------------------------------------------------------------------
+        # construct the SearchAgent's tools
+        # NOTE: if we ever stray from this approach 
+        tools = self._build_tools(config, storage_config)
 
-    def _block_is_visible(self, block: Block) -> bool:
-        """Redact pruned chunks from the LLM-facing render (full trajectory is kept)."""
-        if isinstance(block, ChunkBlock):
-            if block.chunk_id is not None and block.chunk_id in self._working_set.pruned_chunk_ids | self._working_set.redacted_chunk_ids:
-                return False
-        if isinstance(block, (ChunkBlock, ImageBlock)):
-            if block.doc_id in self._working_set.pruned_doc_ids | self._working_set.redacted_doc_ids:
-                return False
-        return True
+        # construct the system prompt
+        system_prompt_template = _PROMPTS["system_prompt"]
+        system_prompt = _ENV.from_string(system_prompt_template).render(
+            max_steps=config.max_steps,
+            authorized_imports=list(set(BASE_BUILTIN_MODULES) | set(config.authorized_imports)),
+            tools="\n\n".join(t.doc for t in tools),
+            cost_budget=config.cost_budget,
+            latency_budget=config.latency_budget,
+            additional_notes=additional_notes,
+        )
 
-    def _make_block_invisible(self, doc_id: str | None = None, chunk_id: str | None = None) -> None:
-        """Redact all blocks which have the doc_id or chunk_id."""
-        assert doc_id is not None or chunk_id is not None
-        if chunk_id:
-            self._working_set.redacted_chunk_ids.add(chunk_id)
-        if doc_id:
-            self._working_set.redacted_doc_ids.add(doc_id)
+        # construct the terminal prompt
+        terminal_prompt_template = _PROMPTS["terminal_prompt"]
+        terminal_prompt = _ENV.from_string(terminal_prompt_template).render()
 
-    def _blocks_from_output(self, out: CodeOutput) -> list[Block]:
+        # initialize the agent
+        super().__init__(config, tools=tools, system_prompt=system_prompt, terminal_prompt=terminal_prompt, parse=SearchAgent.parse_step)
+        self.config: SearchAgentConfig
+
+    def _resolve_semantic_filter_llm_model(self) -> str:
+        """Model to use for semantic filter judgements; precedence is:
+        1. SearchAgentConfig.semantic_filter_llm_model
+        2. SearchAgentConfig.llm_model
+        3. LLMClient.config.llm_model
+        """
+        if self.config.semantic_filter_llm_model:
+            return self.config.semantic_filter_llm_model
+        elif self.config.llm_model:
+            return self.config.llm_model
+
+        return self._llm_client.config.llm_model
+
+    def _blocks_from_output(self, ctx: ExecutionContext, out: CodeOutput) -> list[Block]:
         """Render a tool result into blocks. Chunk-bearing payloads become one
         `ChunkBlock` per chunk (redactable); everything else is a `TextBlock`."""
         blocks: list[Block] = []
@@ -214,16 +204,29 @@ class SearchAgent(MultiTurnAgent):
                     for c in output["read_chunks"]
                 )
             elif output["fetched_chunks"]:
+                summary_num_chunks = min(self.config.chunks_per_summary, len(output["fetched_chunks"]))
                 total_est_num_tokens = sum(chunk["est_num_tokens"] for chunk in output["fetched_chunks"])
-                fetch_summary = f"Retrieved {len(output['fetched_chunks'])} chunks with {total_est_num_tokens:,} est. tokens. Here are the top-{self.chunks_per_summary} chunks by est. token count:\n"
-                chunks_desc_token_order = sorted(output["fetched_chunks"], key=lambda c: c["est_num_tokens"], reverse=True)
-                for chunk in chunks_desc_token_order[:self.chunks_per_summary]:
+                fetch_summary = f"Retrieved {len(output['fetched_chunks'])} chunks with {total_est_num_tokens:,} est. tokens. Here are the top-{summary_num_chunks} chunks by similarity (smallest distance):\n"
+                chunks_asc_distance = sorted(output["fetched_chunks"], key=lambda c: c["distance"])
+                for chunk in chunks_asc_distance[:summary_num_chunks]:
                     fetch_summary += f" - {chunk['header']}\n"
                 blocks.append(TextBlock(fetch_summary))
 
-            return blocks
+            ctx.tracer.emit(
+                id="search_corpus_tool_call",
+                kind="tool_call",
+                step=self._step,
+                turn=self._turn,
+                data={
+                    "tool": output["tool"],
+                    "tool_kwargs": output["tool_kwargs"],
+                    "read_chunks": [{k: v for k, v in chunk.items() if k not in ["header", "text"]} for chunk in output["read_chunks"]],
+                    "fetched_chunks": [{k: v for k, v in chunk.items() if k not in ["header", "text"]} for chunk in output["fetched_chunks"]],
+                    "error": output.get("error"),
+                },
+            )
 
-        if isinstance(output, dict) and output.get(GREP_RESULT_TAG):
+        elif isinstance(output, dict) and output.get(GREP_RESULT_TAG):
             if output.get("error"):
                 blocks.append(TextBlock(f"[error]\n{output['error']}"))
             elif not output["read_groups"] and not output["fetched_groups"]:
@@ -231,29 +234,52 @@ class SearchAgent(MultiTurnAgent):
             elif output["read_groups"]:
                 for group in output["read_groups"]:
                     blocks.append(TextBlock(group["header"]))  # TODO: would it be alright to change this to `ChunkBlock(chunk_id=None, doc_id=group["doc_id"], text=group["header"])`? This way it gets removed with prune calls; let's leave as-is though if that would in any way confuse the agent into thinking this is the entire document text
-                    if group["read_chunks"]:
+                    if group["chunks"]:
                         blocks.extend(
                             ChunkBlock(chunk_id=c["chunk_id"], doc_id=c["doc_id"], text=c["text"])
-                            for c in group["read_chunks"]
+                            for c in group["chunks"]
                         )
                     else:
                         blocks.append(TextBlock("[chunks truncated...]"))
             elif output["fetched_groups"]:
-                total_chunks = sum(len(g["fetched_chunks"]) for g in output["fetched_groups"])
+                total_chunks = sum(len(g["chunks"]) for g in output["fetched_groups"])
                 total_groups = len(output["fetched_groups"])
-                total_est_num_tokens = sum([c["est_num_tokens"] for g in output["fetched_groups"] for c in g["fetched_chunks"]])
-                fetch_summary = f"Retrieved {total_chunks} chunks from {total_groups} documents with {total_est_num_tokens:,} est. tokens. Here are the top-{self.chunks_per_summary} chunks by est. token count:\n"
-                chunks_desc_token_order = sorted([c for g in output["fetched_groups"] for c in g["fetched_chunks"]], key=lambda c: c["est_num_tokens"], reverse=True)
-                for chunk in chunks_desc_token_order[:self.chunks_per_summary]:
+                total_est_num_tokens = sum([c["est_num_tokens"] for g in output["fetched_groups"] for c in g["chunks"]])
+                summary_num_chunks = min(self.config.chunks_per_summary, total_chunks)
+                fetch_summary = f"Retrieved {total_chunks} chunks from {total_groups} documents with {total_est_num_tokens:,} est. tokens. Here are the top-{summary_num_chunks} chunks by similarity (smallest distance):\n"
+                chunks_asc_distance = sorted([c for g in output["fetched_groups"] for c in g["chunks"]], key=lambda c: c["distance"])
+                for chunk in chunks_asc_distance[:summary_num_chunks]:
                     fetch_summary += f"{chunk['header']}\n"
                 blocks.append(TextBlock(fetch_summary))
 
             # Surfaced when the output cap dropped hits (visible TextBlock, not redactable).
             if output.get("truncation_note"):
                 blocks.append(TextBlock(output["truncation_note"]))
-            return blocks
 
-        if isinstance(output, dict) and output.get(SEMFILTER_RESULT_TAG):
+            ctx.tracer.emit(
+                id="grep_corpus_tool_call",
+                kind="tool_call",
+                step=self._step,
+                turn=self._turn,
+                data={
+                    "tool": output["tool"],
+                    "tool_kwargs": output["tool_kwargs"],
+                    "read_groups": [
+                        {k: v for k, v in chunk.items() if k not in ["header", "text"]}
+                        for group in output["read_groups"]
+                        for chunk in group["chunks"]
+                    ],
+                    "fetched_groups": [
+                        {k: v for k, v in chunk.items() if k not in ["header", "text"]}
+                        for group in output["fetched_groups"]
+                        for chunk in group["chunks"]
+                    ],
+                    "error": output.get("error"),
+                    "truncation_note": output.get("truncation_note"),
+                },
+            )
+
+        elif isinstance(output, dict) and output.get(SEMFILTER_RESULT_TAG):
             if output.get("error"):
                 blocks.append(TextBlock(f"[error]\n{output['error']}"))
             elif not output.get("summary") and not output["read_chunks"] and not output["fetched_chunks"]:
@@ -273,22 +299,50 @@ class SearchAgent(MultiTurnAgent):
                 total_chunks = len(output["fetched_chunks"])
                 total_docs = len(set(output["kept_doc_ids"]))
                 total_est_num_tokens = sum(c["est_num_tokens"] for c in output["fetched_chunks"])
-                fetch_summary = f"Retrieved {total_chunks} chunks from {total_docs} documents with {total_est_num_tokens:,} est. tokens. Here are the top-{self.chunks_per_summary} chunks by est. token count:\n"
-                chunks_desc_token_order = sorted(output["fetched_chunks"], key=lambda c: c["est_num_tokens"], reverse=True)
-                for chunk in chunks_desc_token_order[:self.chunks_per_summary]:
+                summary_num_chunks = min(self.config.chunks_per_summary, total_chunks)
+                fetch_summary = f"Retrieved {total_chunks} chunks from {total_docs} documents with {total_est_num_tokens:,} est. tokens. Here are the top-{summary_num_chunks} chunks by similarity (smallest distance):\n"
+                chunks_asc_distance = sorted(output["fetched_chunks"], key=lambda c: c["distance"])
+                for chunk in chunks_asc_distance[:summary_num_chunks]:
                     fetch_summary += f"{chunk['header']}\n"
                 blocks.append(TextBlock(fetch_summary))
 
-            return blocks
+            ctx.tracer.emit(
+                id="sem_filter_tool_call",
+                kind="tool_call",
+                step=self._step,
+                turn=self._turn,
+                data={
+                    "tool": output["tool"],
+                    "tool_kwargs": output["tool_kwargs"],
+                    "mode": output.get("mode"),
+                    "summary": output.get("summary"),
+                    "read_chunks": [{k: v for k, v in chunk.items() if k not in ["header", "text"]} for chunk in output.get("read_chunks", [])],
+                    "fetched_chunks": [{k: v for k, v in chunk.items() if k not in ["header", "text"]} for chunk in output.get("fetched_chunks", [])],
+                    "kept_doc_ids": output.get("kept_doc_ids"),
+                    "rejected_doc_ids": output.get("rejected_doc_ids"),
+                    "error": output.get("error"),
+                },
+            )
 
-        if isinstance(output, dict) and output.get(READ_DOCUMENT_RESULT_TAG):
+        elif isinstance(output, dict) and output.get(READ_DOCUMENT_RESULT_TAG):
             blocks.extend(
                 ChunkBlock(chunk_id=None, doc_id=d["doc_id"], text=d["text"])
                 for d in output["docs"]
             )
-            return blocks
 
-        if isinstance(output, dict) and output.get(VIEW_FIGURE_RESULT_TAG):
+            ctx.tracer.emit(
+                id="read_document_tool_call",
+                kind="tool_call",
+                step=self._step,
+                turn=self._turn,
+                data={
+                    "tool": output["tool"],
+                    "tool_kwargs": output["tool_kwargs"],
+                    "doc_ids": [doc["doc_id"] for doc in output["docs"]],
+                },
+            )
+
+        elif isinstance(output, dict) and output.get(VIEW_FIGURE_RESULT_TAG):
             if output.get("error"):
                 blocks.append(TextBlock(f"[error]\n{output['error']}"))
             else:
@@ -298,74 +352,102 @@ class SearchAgent(MultiTurnAgent):
                     image=B64Image(mime=output["mime"], data=output["data"]),
                     text=caption,
                 ))
-            return blocks
 
-        if isinstance(output, dict) and output.get(PRUNE_RESULT_TAG):
+            ctx.tracer.emit(
+                id="view_figure_tool_call",
+                kind="tool_call",
+                step=self._step,
+                turn=self._turn,
+                data={
+                    "tool": output["tool"],
+                    "tool_kwargs": output["tool_kwargs"],
+                    "doc_id": output.get("doc_id"),
+                    "mime": output.get("mime"),
+                    "error": output.get("error"),
+                },
+            )
+
+        elif isinstance(output, dict) and output.get(PRUNE_RESULT_TAG):
+            # modify the block visibility for any chunks / docs that were pruned
+            # NOTE: we do not need to change visibility for any other tool calls because they
+            #       will append new blocks with the data they read / fetched; un-redacting their
+            #       previous blocks in the message history will only take up more space and mess
+            #       with the prefix cache
+            self._make_blocks_invisible(doc_ids=output["new_pruned_doc_ids"], chunk_ids=output["new_pruned_chunk_ids"])
             blocks.append(TextBlock(
                 f"[result]\nPruned {output['new_chunk_count']} chunk(s) and "
                 f"{output['new_doc_count']} doc(s). {output['total_chunks']} chunk(s) and "
                 f"{output['total_docs']} doc(s) are now excluded from future searches."
             ))
-            return blocks
 
-        # Non-structured output: default [result] rendering (mirrors the base).
-        result_s = "" if output is None else str(output).strip()
-        if result_s and result_s != stdout_s and result_s not in stdout_s:
-            blocks.append(TextBlock(f"[result]\n{result_s}"))
-        if not blocks:
-            blocks.append(TextBlock("[no output]"))
+            ctx.tracer.emit(
+                id="prune_tool_call",
+                kind="tool_call",
+                step=self._step,
+                turn=self._turn,
+                data={
+                    "tool": output["tool"],
+                    "tool_kwargs": output["tool_kwargs"],
+                    "new_pruned_doc_ids": output["new_pruned_doc_ids"],
+                    "new_pruned_chunk_ids": output["new_pruned_chunk_ids"],
+                },
+            )
+
+        else:
+            # non-structured output: default [result] rendering (mirrors the base).
+            result_s = "" if output is None else str(output).strip()
+            if result_s and result_s != stdout_s and result_s not in stdout_s:
+                blocks.append(TextBlock(f"[result]\n{result_s}"))
+            if not blocks:
+                blocks.append(TextBlock("[no output]"))
+
         return blocks
 
-    def _build_tools(self, ctx: ExecutionContext) -> list[Tool]:
-        """Build the set of tools used by the SearchAgent at runtime."""
+    def _build_tools(self, config: SearchAgentConfig, storage_config: StorageConfig) -> list[Tool]:
+        """Build the set of tools used by the SearchAgent."""
         tools: list[Tool] = [
             ReadDocumentTool(
                 self.document_map,
                 self._working_set,
-                id_tracking_off=ctx.config.search.id_tracking_off,
+                id_tracking_off=config.id_tracking_off,
             ),
             PruneTool(self._working_set),
-            *self.extra_tools,
         ]
 
-        if ctx.config.search.include_search_corpus:
+        if config.include_search_corpus:
             tools.append(SearchCorpusTool(
                 self.chroma_collection,
                 self._llm_client,
                 self._working_set,
-                ctx,
-                usage_key=self.agent_id,
-                working_set_collection_off=ctx.config.search.working_set_collection_off,
-                id_tracking_off=ctx.config.search.id_tracking_off,
+                usage_key=str(config.agent_id),
+                working_set_collection_off=config.working_set_collection_off,
+                id_tracking_off=config.id_tracking_off,
             ))
 
-        if ctx.config.search.include_grep_corpus:
+        if config.include_grep_corpus:
             tools.append(GrepCorpusTool(
                 self.chroma_collection,
                 self._working_set,
-                working_set_collection_off=ctx.config.search.working_set_collection_off,
-                id_tracking_off=ctx.config.search.id_tracking_off,
+                working_set_collection_off=config.working_set_collection_off,
+                id_tracking_off=config.id_tracking_off,
             ))
 
-        if ctx.config.search.include_semantic_filter:
+        if config.include_semantic_filter:
             tools.append(SemanticFilterTool(
                 self.chroma_collection,
                 self._llm_client,
                 self.document_map,
                 self._working_set,
-                ctx.config.search.semantic_filter_model,
-                ctx=ctx,
-                provider_order=ctx.config.search.semantic_filter_provider_order,
-                judge_max_output_tokens=ctx.config.search.semantic_filter_max_output_tokens,
-                disable_judge_reasoning=ctx.config.search.semantic_filter_disable_reasoning,
-                usage_key=self.agent_id,
-                working_set_collection_off=ctx.config.search.working_set_collection_off,
-                id_tracking_off=ctx.config.search.id_tracking_off,
+                config,
+                self._resolve_semantic_filter_llm_model(),
+                usage_key=str(config.agent_id),
+                working_set_collection_off=config.working_set_collection_off,
+                id_tracking_off=config.id_tracking_off,
             ))
 
-        if ctx.config.storage.pdf_dir is not None:
+        if storage_config.pdf_dir is not None:
             tools.append(ViewFigureTool(
-                self.document_map, ctx.config.storage.pdf_dir, renders_dir=ctx.config.storage.page_renders_dir,
+                self.document_map, storage_config.pdf_dir, renders_dir=storage_config.page_renders_dir,
             ))
 
         return tools
@@ -398,14 +480,29 @@ class SearchAgent(MultiTurnAgent):
         relevant_working_sets_user_prompt = _ENV.from_string(relevant_working_sets_user_template).render(
             user=user
         )
-        _prompt = PromptedCall(
-            name=self.name,
-            system_prompt=relevant_working_sets_system_prompt,
-            default_effort=self.default_effort,
-            parse=_parse_list,
-            max_parse_retries=self.max_recover_retries,
-        )
-        relevant_working_set_ids = await _prompt.call(ctx, user=relevant_working_sets_user_prompt, usage_key=self.agent_id)
+        messages = [
+            {"role": "system", "content": relevant_working_sets_system_prompt},
+            {"role": "user", "content": relevant_working_sets_user_prompt},
+        ]
+        relevant_working_set_ids: list[str] = []
+        try:
+            resp = await ctx.llm_client.acall(
+                messages=messages,
+                model=self._resolve_model(ctx),
+                temperature=self.config.temperature,
+                effort=self._resolve_effort(ctx),
+                call_site=self.config.name,
+                max_output_tokens=self.config.max_output_tokens,
+                timeout_s=self.config.request_timeout_s,
+                usage_key=self.agent_id,
+            )
+            relevant_working_set_ids = _parse_list(resp.text)
+        except ParseError as e:
+            ctx.tracer.emit(id="find_related_working_sets", level="error", kind="background", message="ParseError when fetching related working sets", data={"error": e.detail})
+            relevant_working_set_ids = []
+        except Exception as e:
+            ctx.tracer.emit(id="find_related_working_sets", level="error", kind="background", message="Unexpected error when fetching related working sets", data={"error": f"{type(e).__name__}: {e}"})
+            relevant_working_set_ids = []
 
         return [self._registry.get(id) for id in relevant_working_set_ids if self._registry.contains(id)]
 
@@ -414,14 +511,14 @@ class SearchAgent(MultiTurnAgent):
         ancestors = self._registry.ancestors_of(self._working_set)
         working_set_summary = self._working_set.to_message(ancestors)
         message = f"{_PROMPTS['working_set']}\n\n{working_set_summary}\n\n"
-        self.messages.append({"role": "system", "blocks": [TextBlock(message)]})
+        self._messages.append(Message(role="system", blocks=[TextBlock(message)]))
 
     # ------------------------------------------------------------------
     # Final answer: validate + correct the returned doc_ids
     # ------------------------------------------------------------------
 
     async def call(
-        self, ctx: ExecutionContext, user: str, *, correction_steps: int | None = None, **_
+        self, ctx: ExecutionContext, input: str, *, correction_steps: int | None = None, **_
     ) -> tuple[Any, list[str]]:
         """Run the agent, then make sure the `doc_ids` it returned name real documents.
 
@@ -444,13 +541,17 @@ class SearchAgent(MultiTurnAgent):
         # if configured: retrieve and union any working sets that are relevant to the query
         t0 = time.monotonic()
         if ctx.config.search.fetch_related_working_sets:
-            working_sets = await self._find_related_working_sets(ctx, user)
+            working_sets = await self._find_related_working_sets(ctx, input)
             self._working_set.add_parents(working_sets)
             t1 = time.monotonic()
-            ctx.emit(
-                f"_find_related_working_set n_found={len(working_sets)} found_ids={[ws.id for ws in working_sets]} time={t1 - t0:.3f}",
-                kind="_find_related_working_set",
-                data={"n_found": len(working_sets), "found_ids": [ws.id for ws in working_sets], "time": t1 - t0},
+            ctx.tracer.emit(
+                id="find_related_working_sets",
+                kind="background",
+                data={
+                    "n_found": len(working_sets),
+                    "found_ids": [ws.id for ws in working_sets],
+                    "time": t1 - t0,
+                }
             )
 
             # TODO: remove this and update search tools to query ancestors through working set .query() and .get()
@@ -471,9 +572,9 @@ class SearchAgent(MultiTurnAgent):
                 self._working_set.fetched_doc_ids = self._working_set.fetched_doc_ids.union(ancestor.fetched_doc_ids)
 
             t2 = time.monotonic()
-            ctx.emit(
-                f"_copy_ancestor_working_sets time={t2 - t1:.3f}",
-                kind="_copy_ancestor_working_sets",
+            ctx.tracer.emit(
+                id="copy_ancestor_working_sets",
+                kind="background",
                 data={"time": t2 - t1},
             )
 
@@ -481,14 +582,8 @@ class SearchAgent(MultiTurnAgent):
         if working_set_collection_on or id_tracking_on:
             self._add_working_set_message()
 
-        # construct the tools, then rebuild the system prompt (it splices in the tool docs)
-        # and the local python executor from them
-        self._tools = self._build_tools(ctx)
-        self._rebuild_prompt()
-        self._executor = self._build_executor()
-
         # run the agent on the user query
-        payload = await super().call(ctx, user)
+        payload = await super().call(ctx, input)
 
         # TODO: compute the working set's summary
         # NOTE: can be done off the critical path
@@ -501,19 +596,20 @@ class SearchAgent(MultiTurnAgent):
         # reprompt the agent to correct any mistakes if there is an issue parsing the doc_ids
         if correction_steps is None:
             correction_steps = self.config.doc_id_correction_steps
-        for _ in range(correction_steps):
+        for turn in range(correction_steps):
             bad = [d for d in doc_ids if d not in self.document_map]
             if not bad:
                 break
-            ctx.emit(f"doc_id_correction n_bad={len(bad)} bad={bad!r}", data={"bad": bad})
+            ctx.tracer.emit(id="doc_id_correction", kind="lifecycle", step=self._step, turn=self._turn + turn, data={"bad": bad})
             payload = await super().call(
                 ctx, _doc_id_correction_message(bad), resume=True, max_steps=1
             )
             doc_ids = doc_ids_from_payload(payload)
         valid = [d for d in doc_ids if d in self.document_map]
         dropped = [d for d in doc_ids if d not in self.document_map]
-        ctx.emit(
-            f"doc_ids_validated kept={len(valid)} dropped={len(dropped)}",
+        ctx.tracer.emit(
+            id="doc_ids_validated",
+            kind="lifecycle",
             data={"kept": valid, "dropped": dropped},
         )
 
@@ -523,10 +619,11 @@ class SearchAgent(MultiTurnAgent):
 
         if not valid:
             raise StepFailed(
-                self.name,
+                self.config.name,
                 "no well-formed doc_ids after correction",
                 diagnostic=f"agent returned only unrecognized doc_ids: {doc_ids!r}",
             )
+
         return payload, valid
 
 

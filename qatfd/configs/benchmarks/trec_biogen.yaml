@@ -29,4 +29,3 @@ nuggets_path: trec-biogen/baseline_labels.json
 partial_credit: 0.0
 # llm used by the nugget-completion judge
 judge_model: null
-prompts_path: null

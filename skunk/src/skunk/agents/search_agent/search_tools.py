@@ -24,30 +24,29 @@ CORPUS_MODEL.md) — is:
         ...               -- any corpus-specific extras (year, month, url, ...)
     }
 
-Each tool is an instance of the `MultiTurnAgent.Tool` ABC: whose `doc` is spliced
-into the system prompt, and whose `__call__` is registered with the sandbox under
-`name` and invoked from model-emitted python.
+Each tool is an instance of the `Tool` ABC: whose `doc` is spliced into the
+system prompt, and whose `__call__` is registered with the sandbox under `name`
+and invoked from model-emitted python.
 
 Structured returns: every retrieval tool returns a *tagged dict* (never a bare
 string — errors are carried in an "error" field of the tagged payload) so the
 return shape is uniform. Each chunk carries its `chunk_id` / `doc_id`, which
-`SearchAgent._blocks_from_output` turns into `ChunkBlock`s: this keeps the full
-trajectory for reward computation while redacting pruned chunks from the
-generation view (`_block_is_visible`). The tag constants below discriminate each
-payload shape. The final answer is a JSON block (handled by the agent loop), not
-a tool.
+`SearchAgent._blocks_from_output` turns into `ChunkBlock`s: this keeps the
+full trajectory for reward computation while redacting pruned chunks from the
+generation view. The tag constants below discriminate each payload shape.
+The final answer is a JSON block (handled by the agent loop), not a tool.
 
-Shared state: one `RetrievalState` object is shared BY REFERENCE between the
-`SearchAgent` and its tools. The `RetrievalState` maintains the set of retrieved,
+Shared state: one `WorkingSet` object is shared BY REFERENCE between the
+`SearchAgent` and its tools. The `WorkingSet` maintains the set of retrieved,
 seen, and pruned chunk/doc ids. The `SearchAgent` can fetch data into the
-`RetrievalState` without immediately rendering it into its context window. The
-`SearchAgent` may then issue additional queries over only the `RetrievalState`
+`WorkingSet` without immediately rendering it into its context window. The
+`SearchAgent` may then issue additional queries over only the `WorkingSet`
 to populate its context window. When invoking tools, the agent has the ability
 to specify whether to:
 
-  1. Execute them over the entire corpus or only the subset of data in `RetrievalState`
-  2. Pull the data into the agent's context window or only into the `RetrievalState`
-  3. Prune the data from the `RetrievalState` or only from the agent's context window
+  1. Execute them over the entire corpus or only the subset of data in `WorkingSet`
+  2. Pull the data into the agent's context window or only into the `WorkingSet`
+  3. Prune the data from the `WorkingSet` or only from the agent's context window
 """
 
 from __future__ import annotations
@@ -61,11 +60,12 @@ from chromadb.api.models.Collection import Collection
 from jinja2 import Environment, StrictUndefined
 
 from skunk.common import estimate_tokens, page_key_to_pageref, render_page_b64
-from skunk.multi_turn_agent import Tool
+from skunk.config import SearchAgentConfig
+from skunk.agents.multi_turn_agent import Tool
 from skunk.prompts import load_prompts
 from skunk.search_state.working_set import WorkingSet
 from skunk.storage.document_map import DocumentMap
-from skunk.trace import truncate
+from skunk.trace import Tracer
 from skunk.usage import match_model_entry
 
 if TYPE_CHECKING:
@@ -138,8 +138,9 @@ def _build_metadata_where(
         return clauses[0]
     return {"$and": clauses}
 
-# TODO: have claude template the prompts on a preliminary sample so you can see what things look like in the 4 scenarios
+
 class SearchCorpusTool(Tool):
+    """Preconditions: chromadb is configured to return distance (not similarity)."""
     name = "search_corpus"
     doc_template = _PROMPTS["search_corpus"]
     doc: str
@@ -149,14 +150,12 @@ class SearchCorpusTool(Tool):
         chroma_collection: Collection,
         llm_client: LLMClient,
         working_set: WorkingSet,
-        ctx: ExecutionContext,
         usage_key: str = "default",
         working_set_collection_off: bool = False,
         id_tracking_off: bool = False,
     ):
         self._chroma_collection = chroma_collection
         self._llm_client = llm_client
-        self._ctx = ctx
         self._working_set = working_set
         self._usage_key = usage_key
         self._working_set_collection_off = working_set_collection_off
@@ -170,7 +169,7 @@ class SearchCorpusTool(Tool):
         """Embed `query` with the same model that produced the stored embeddings, via the
         LLMClient — which owns backend dispatch (OpenRouter / vLLM), the process-wide "embed"
         rate bucket, retry, and usage accounting."""
-        return self._llm_client.embed_query(query, ctx=self._ctx, usage_key=self._usage_key)
+        return self._llm_client.embed_query(query, usage_key=self._usage_key)
 
     def __call__(
         self,
@@ -238,7 +237,8 @@ class SearchCorpusTool(Tool):
                 results = self._working_set.collection.query(**query_kwargs)
 
         except Exception as e:
-            return {SEARCH_RESULT_TAG: True, "read_chunks": [], "fetched_chunks": [], "error": f"search_corpus error: {e}"}
+            tool_kwargs = {"query": query, "top_k": top_k, "read": read, "fetch": fetch, "metadata_filter": metadata_filter}
+            return {SEARCH_RESULT_TAG: True, "tool": self.name, "tool_kwargs": tool_kwargs, "read_chunks": [], "fetched_chunks": [], "error": f"search_corpus error: {e}"}
 
         ids = results["ids"][0]
         documents = results["documents"][0]  # type: ignore
@@ -289,7 +289,8 @@ class SearchCorpusTool(Tool):
                 "text": f"{header}\n{doc or ''}",
             })
 
-        return {SEARCH_RESULT_TAG: True, "read_chunks": chunks if read else [], "fetched_chunks": chunks if fetch else []}
+        tool_kwargs = {"query": query, "top_k": top_k, "read": read, "fetch": fetch, "metadata_filter": metadata_filter}
+        return {SEARCH_RESULT_TAG: True, "tool": self.name, "tool_kwargs": tool_kwargs, "read_chunks": chunks if read else [], "fetched_chunks": chunks if fetch else []}
 
 
 class GrepCorpusTool(Tool):
@@ -376,7 +377,8 @@ class GrepCorpusTool(Tool):
                 res = self._working_set.collection.get(**get_kwargs)
 
         except Exception as e:
-            return {GREP_RESULT_TAG: True, "read_groups": [], "fetched_groups": [], "error": f"grep_corpus error: {e}"}
+            tool_kwargs = {"pattern": pattern, "limit": limit, "max_output_tokens": max_output_tokens, "read": read, "fetch": fetch, "metadata_filter": metadata_filter}
+            return {GREP_RESULT_TAG: True, "tool": self.name, "tool_kwargs": tool_kwargs, "read_groups": [], "fetched_groups": [], "error": f"grep_corpus error: {e}"}
 
         ids = res["ids"]
         documents = res["documents"] or [None] * len(ids)
@@ -384,7 +386,8 @@ class GrepCorpusTool(Tool):
 
         # if we got an empty result, return early
         if not ids:
-            return {GREP_RESULT_TAG: True, "read_groups": [], "fetched_groups": []}
+            tool_kwargs = {"pattern": pattern, "limit": limit, "max_output_tokens": max_output_tokens, "read": read, "fetch": fetch, "metadata_filter": metadata_filter}
+            return {GREP_RESULT_TAG: True, "tool": self.name, "tool_kwargs": tool_kwargs, "read_groups": [], "fetched_groups": []}
 
         # insert results into working set collection (if turned on)
         # TODO: figure out a way to run this in the background (off critical path)
@@ -420,7 +423,8 @@ class GrepCorpusTool(Tool):
         # `max_output_tokens`, stop once the rendered size (counted via `estimate_tokens`)
         # would exceed it; dropped hits are reported via a `truncation_note` so the agent
         # knows to narrow its pattern / adjust the cap rather than assuming it saw everything.
-        groups: list[dict] = []
+        read_groups: list[dict] = []
+        fetched_groups: list[dict] = []
         used_tokens = 0
         total_chunks = sum(len(v) for v in grouped.values())
         kept_chunks = 0
@@ -435,29 +439,31 @@ class GrepCorpusTool(Tool):
                 chunk_text = f"{chunk_header} {text}"
                 fetched_doc_chunks.append({"chunk_id": cid, "doc_id": doc_id, "est_num_tokens": est_num_tokens, "header": chunk_header, "text": chunk_text})
                 if max_output_tokens is not None:
-                    # Count the header only once we commit the first chunk of this doc.
+                    # count the header only once we commit the first chunk of this doc.
                     cost = estimate_tokens(chunk_text) + (estimate_tokens(header) if not read_doc_chunks else 0)
-                    if read_doc_chunks or groups:  # always allow the very first chunk through
-                        if used_tokens + cost > max_output_tokens:
-                            truncated = True
+                    if used_tokens + cost > max_output_tokens:
+                        truncated = True
                     used_tokens += cost
 
                 if not truncated:
                     read_doc_chunks.append({"chunk_id": cid, "doc_id": doc_id, "header": chunk_header, "text": chunk_text})
                     kept_chunks += 1
 
-            groups.append({"doc_id": doc_id, "header": header, "read_chunks": read_doc_chunks, "fetched_chunks": fetched_doc_chunks})
+            read_groups.append({"doc_id": doc_id, "header": header, "chunks": read_doc_chunks})
+            fetched_groups.append({"doc_id": doc_id, "header": header, "chunks": fetched_doc_chunks})
 
         # update id state (if id tracking on)
         if id_tracking_on:
-            for g in groups:
-                if fetch:
-                    self._working_set.fetched_chunk_ids.update(c["chunk_id"] for c in g["fetched_chunks"])
-                if read:
-                    self._working_set.read_chunk_ids.update(c["chunk_id"] for c in g["read_chunks"])
+            if fetch:
+                for g in fetched_groups:
+                    self._working_set.fetched_chunk_ids.update(c["chunk_id"] for c in g["chunks"])
+            if read:
+                for g in read_groups:
+                    self._working_set.read_chunk_ids.update(c["chunk_id"] for c in g["chunks"])
 
         # return results to agent
-        result: dict = {GREP_RESULT_TAG: True, "read_groups": groups if read else [], "fetched_groups": groups if fetch else []}
+        tool_kwargs = {"pattern": pattern, "limit": limit, "max_output_tokens": max_output_tokens, "read": read, "fetch": fetch, "metadata_filter": metadata_filter}
+        result: dict = {GREP_RESULT_TAG: True, "tool": self.name, "tool_kwargs": tool_kwargs, "read_groups": read_groups, "fetched_groups": fetched_groups}
         if read and truncated:
             dropped = total_chunks - kept_chunks
             result["truncation_note"] = (
@@ -511,20 +517,26 @@ class ReadDocumentTool(Tool):
                     self._working_set.read_doc_ids.add(did)
                     self._working_set.fetched_doc_ids.add(did)
                     self._working_set.pruned_doc_ids.discard(did)
-                    self._working_set.redacted_doc_ids.discard(did)
 
                 self._working_set.add_action(self.name, {"doc_id": doc_id, "start_char_idx": start_char_idx, "end_char_idx": end_char_idx})
 
             rendered = f"=== doc_id={did} | total chars: {total_chars} | est. tokens: {est_tokens} ===\n{body}"
             docs.append({"doc_id": did, "text": rendered})
-        return {READ_DOCUMENT_RESULT_TAG: True, "docs": docs}
+
+        tool_kwargs = {"doc_id": doc_id, "start_char_idx": start_char_idx, "end_char_idx": end_char_idx}
+        return {READ_DOCUMENT_RESULT_TAG: True, "tool": self.name, "tool_kwargs": tool_kwargs, "docs": docs}
 
 
 class ViewFigureTool(Tool):
     """Render the full page for a doc_id the agent saw while reading — typically because
     the page text contains a `<figure id=N>` placeholder — and hand it back as an image
     observation. We render the *whole* page (not a bbox crop) so the agent sees any
-    figures in context, and so OCR coordinate errors can't clip a chart."""
+    figures in context, and so OCR coordinate errors can't clip a chart.
+    
+    Preconditions:
+        - the `doc_id` obeys the format "{document_stem}_{page_num}"
+        - the "{document_stem}.pdf" lives at `pdf_dir` OR "{document_stem}.{fmt}" lives at `renders_dir`
+    """
 
     name = "view_figure"
     doc = _PROMPTS["view_figure"]
@@ -545,14 +557,18 @@ class ViewFigureTool(Tool):
         self._fmt = fmt
 
     def __call__(self, doc_id: str) -> dict:
-        if self._document_map.get(doc_id) is None:
-            return {VIEW_FIGURE_RESULT_TAG: True, "error": f"no such document: {doc_id!r}"}
-        # doc_id is a corpus page key; resolve to a PageRef for rendering.
+        # return an error if the agent caller hallucinated the doc_id
+        if doc_id not in self._document_map.get(doc_id):
+            return {VIEW_FIGURE_RESULT_TAG: True, "tool": self.name, "tool_kwargs": {"doc_id": doc_id}, "error": f"no such document: {doc_id!r}"}
+
+        # return an error if the doc_id is not well-formed: "{document_stem}_{page_num}"
         try:
             ref = page_key_to_pageref(doc_id)
         except ValueError:
             return {
                 VIEW_FIGURE_RESULT_TAG: True,
+                "tool": self.name,
+                "tool_kwargs": {"doc_id": doc_id},
                 "error": f"doc_id {doc_id!r} is not a parseable page key for this corpus",
             }
         try:
@@ -561,14 +577,18 @@ class ViewFigureTool(Tool):
                 pdf_dir=self._pdf_dir, renders_dir=self._renders_dir, dpi=self._dpi, fmt=self._fmt,
             )
         except Exception as e:
-            return {VIEW_FIGURE_RESULT_TAG: True, "error": f"view_figure render error: {e}"}
+            return {VIEW_FIGURE_RESULT_TAG: True, "tool": self.name, "tool_kwargs": {"doc_id": doc_id}, "error": f"view_figure render error: {e}"}
         if img is None:
             return {
                 VIEW_FIGURE_RESULT_TAG: True,
+                "tool": self.name,
+                "tool_kwargs": {"doc_id": doc_id},
                 "error": f"could not render page for doc_id={doc_id} (PDF missing)",
             }
         return {
             VIEW_FIGURE_RESULT_TAG: True,
+            "tool": self.name,
+            "tool_kwargs": {"doc_id": doc_id},
             "doc_id": doc_id,
             "mime": img.mime,
             "data": img.data,
@@ -578,6 +598,7 @@ class ViewFigureTool(Tool):
 class PruneTool(Tool):
     name = "prune"
     doc = _PROMPTS["prune"]
+    reclaimer = True
 
     def __init__(self, working_set: WorkingSet):
         self._working_set = working_set
@@ -593,30 +614,27 @@ class PruneTool(Tool):
 
         return {
             PRUNE_RESULT_TAG: True,
+            "tool": self.name,
+            "tool_kwargs": {"chunk_ids": chunk_ids, "doc_ids": doc_ids},
             "new_chunk_count": len(new_pruned_chunks),
             "new_doc_count": len(new_pruned_docs),
+            "new_pruned_chunk_ids": new_pruned_chunks,
+            "new_pruned_doc_ids": new_pruned_docs,
             "total_chunks": len(self._working_set.pruned_chunk_ids),
             "total_docs": len(self._working_set.pruned_doc_ids),
         }
 
-
-# Per-doc text snippet cap in the structured trace event. Each filtered doc carries a
-# preview so the trace viewer can expand it on click without a second corpus lookup; the
-# cap keeps a 1,000-doc filter from bloating the event stream with full document bodies.
 
 class SemanticFilterTool(Tool):
     name = "semantic_filter"
     doc_template = _PROMPTS["sem_filter_tool"]
     doc: str
 
+    # NOTE: _JUDGE_USER_WRAPPER captures user prompt from `_judge_one()`
+    #       _JUDGE_TRUNC_WRAPPER used in `_truncate_doc_for_judge()`
     _SEMFILTER_JUDGE_PROMPT = _PROMPTS["sem_filter_judge"]
-    _SEMFILTER_MAX_WORKERS = 16
-    _JUDGE_MAX_OUTPUT_TOKENS = 4
-    _MAX_CANDIDATE_DOCS = 1000
-    _JUDGE_CTX_SAFETY = 0.9
     _JUDGE_USER_WRAPPER = "Filter Condition: \n\nDocument:\n"
     _JUDGE_TRUNC_MARKER = "\n…(truncated to fit judge context)"
-    _SEMFILTER_DOC_PREVIEW_MAX = 2000
 
     def __init__(
         self,
@@ -624,13 +642,9 @@ class SemanticFilterTool(Tool):
         llm_client: LLMClient,
         document_map: DocumentMap,
         working_set: WorkingSet,
-        model: str | None = None,
+        config: SearchAgentConfig,
+        model: str,
         *,
-        ctx: ExecutionContext | None = None,
-        max_workers: int | None = None,
-        provider_order: list[str] | None = None,
-        judge_max_output_tokens: int | None = None,
-        disable_judge_reasoning: bool = True,
         usage_key: str = "default",
         working_set_collection_off: bool = False,
         id_tracking_off: bool = False,
@@ -639,11 +653,8 @@ class SemanticFilterTool(Tool):
         self._llm_client = llm_client
         self._document_map = document_map
         self._working_set = working_set
-        self._model = model or llm_client.config.llm_model
-        self._ctx = ctx
-        self._max_workers = max_workers or self._SEMFILTER_MAX_WORKERS
-        self._judge_max_output_tokens = judge_max_output_tokens or self._JUDGE_MAX_OUTPUT_TOKENS
-        self._disable_judge_reasoning = disable_judge_reasoning
+        self._config = config
+        self._model = model
         self._usage_key = usage_key
         self._working_set_collection_off = working_set_collection_off
         self._id_tracking_off = id_tracking_off
@@ -651,10 +662,6 @@ class SemanticFilterTool(Tool):
             working_set_collection_on=not self._working_set_collection_off,
             id_tracking_on=not self._id_tracking_off,
         )
-
-        # per-call OpenRouter provider order for the judge calls only (None => client default). Lets a
-        # cheaper judge model route to specific providers while the agent model stays unpinned.
-        self._provider_order = provider_order
 
         # resolve the model's context limit
         self._context_limit = match_model_entry(self._model, llm_client.config.llm_context_limits)
@@ -671,8 +678,8 @@ class SemanticFilterTool(Tool):
             return False
         return True
 
-    def _error(self, msg: str) -> dict:
-        return {SEMFILTER_RESULT_TAG: True, "error": msg}
+    def _error(self, msg: str, tool_kwargs: dict) -> dict:
+        return {SEMFILTER_RESULT_TAG: True, "tool": self.name, "tool_kwargs": tool_kwargs, "error": msg}
 
     def _metadata_only_selection(self, where: dict, fetch: bool) -> tuple[list[tuple], list[str]]:
         """Use metadata filtering to return a set of candidates and candidate ids."""
@@ -705,7 +712,7 @@ class SemanticFilterTool(Tool):
     def _vector_search_selection(self, search_str: str, top_k: int, where: dict | None, fetch: bool) -> tuple[list[tuple], list[str]]:
         """Use vector search to return a set of candidates and candidate ids."""
         working_set_collection_on = not self._working_set_collection_off
-        emb = self._llm_client.embed_query(search_str, ctx=self._ctx, usage_key=self._usage_key)
+        emb = self._llm_client.embed_query(search_str, usage_key=self._usage_key)
         query_kwargs: dict = {
             "query_embeddings": [emb],
             "n_results": top_k,
@@ -780,83 +787,55 @@ class SemanticFilterTool(Tool):
         headroom (`max_output_tokens`) are subtracted, then the remaining token budget is returned
         with a safety factor. Returns 0 when the fixed overhead alone already exceeds the limit."""
         assert isinstance(self._context_limit, int)
-        overhead_tokens = self._judge_max_output_tokens + estimate_tokens(
+        overhead_tokens = self._config.semantic_filter_max_output_tokens + estimate_tokens(
             self._SEMFILTER_JUDGE_PROMPT + self._JUDGE_USER_WRAPPER + predicate
         )
-        budget_tokens = self._context_limit * self._JUDGE_CTX_SAFETY - overhead_tokens
+        budget_tokens = self._context_limit * self._config.semantic_filter_context_safety_frac - overhead_tokens
         return max(0, int(budget_tokens))
 
     def _judge_one(self, predicate: str, item_text: str) -> bool:
         user = f"Filter Condition: {predicate}\n\nDocument:\n{item_text}"
         try:
-            messages = [{"role": "user", "content": user}]
+            messages = [
+                {"role": "system", "content": self._SEMFILTER_JUDGE_PROMPT},
+                {"role": "user", "content": user},
+            ]
             resp = self._llm_client.call(
-                system=self._SEMFILTER_JUDGE_PROMPT,
                 messages=messages,
                 temperature=0.0,
                 model=self._model,
-                ctx=self._ctx,
                 call_site="semfilter",
-                provider_order=self._provider_order,
-                max_output_tokens=self._judge_max_output_tokens,
-                disable_reasoning=self._disable_judge_reasoning,
+                provider_order=self._config.semantic_filter_provider_order,
+                max_output_tokens=self._config.semantic_filter_max_output_tokens,
+                disable_reasoning=self._config.semantic_filter_disable_reasoning,
                 usage_key=self._usage_key,
             )
         except Exception:
             return True  # recall-safe: keep on error
         return self._parse_bool(resp.text)
 
-    def _filter_docs(self, predicate: str, doc_ids: list[str], event_extra: dict | None = None) -> list[str]:
-        """Return the subset of `doc_ids` whose document text satisfies `predicate`,
+    def _filter_docs(self, predicate: str, doc_ids: list[str]) -> set[str]:
+        """Returns the subset of `doc_ids` whose document text satisfies `predicate`,
         preserving input order.
     
         When `context_limit` (the judge model's context window, in tokens) is set, each
         document's text is head-truncated so the judge request fits — otherwise a document
         larger than the judge's window would 400 and, via `_judge_one`'s recall-safe fallback,
         be kept unjudged. `context_limit=None` sends the full text (unchanged behavior).
-    
-        When `ctx` is provided, emits one structured `semantic_filter` observation event
-        recording the predicate and every input doc's verdict + text preview, so the trace
-        viewer can render the pass/fail breakdown (green/red) and expand each doc on click.
-        `event_extra` keys are merged into the event's `data` (callers record e.g. the
-        candidate-selection mode); the message format is load-bearing — downstream metrics
-        key on `semantic_filter n_in=...`."""
+        """
         texts = [self._document_map.get(d, "") or "" for d in doc_ids]
-        n_truncated = 0
         if self._context_limit:
             budget = self._judge_doc_token_budget(predicate)
             truncated = [self._truncate_doc_for_judge(t, budget) for t in texts]
             texts = [t for t, _ in truncated]
-            n_truncated = sum(1 for _, was in truncated if was)
 
-        with ThreadPoolExecutor(max_workers=min(self._max_workers, len(doc_ids))) as pool:
+        with ThreadPoolExecutor(max_workers=min(self._config.semantic_filter_max_workers, len(doc_ids))) as pool:
             verdicts = list(pool.map(
                 lambda text: self._judge_one(predicate, text),
                 texts,
             ))
 
-        kept = [d for d, keep in zip(doc_ids, verdicts, strict=True) if keep]
-    
-        if self._ctx is not None:
-            data = {
-                "predicate": predicate,
-                "n_in": len(doc_ids),
-                "n_out": len(kept),
-                "n_truncated": n_truncated,
-                "docs": [
-                    {"doc_id": d, "kept": bool(keep), "text": truncate(t, self._SEMFILTER_DOC_PREVIEW_MAX, "\n…(truncated)")}
-                    for d, keep, t in zip(doc_ids, verdicts, texts, strict=True)
-                ],
-            }
-            if event_extra:
-                data.update(event_extra)
-            self._ctx.emit(
-                f"semantic_filter n_in={len(doc_ids)} n_out={len(kept)} predicate={truncate(predicate, 80)!r}",
-                kind="observation",
-                data=data,
-            )
-
-        return kept
+        return set([did for did, keep in zip(doc_ids, verdicts, strict=True) if keep])
 
     def __call__(
         self,
@@ -874,23 +853,37 @@ class SemanticFilterTool(Tool):
         if self._working_set_collection_off and self._id_tracking_off:
             fetch = read = True
 
+        tool_kwargs = {
+            "predicate": predicate,
+            "pattern": pattern,
+            "limit": limit,
+            "top_k": top_k,
+            "search_str": search_str,
+            "read": read,
+            "fetch": fetch,
+            "metadata_filter": metadata_filter,
+        }
+
         assert fetch or read, "At least one of fetch or read must be present."
         assert fetch or not self._working_set.empty(use_id_state=self._working_set_collection_off), "Cannot read from empty working set"
 
         if not predicate or not str(predicate).strip():
-            return self._error("semantic_filter error: `predicate` is required.")
+            return self._error("semantic_filter error: `predicate` is required.", tool_kwargs)
         if fetch and metadata_filter is None and top_k is None and pattern is None:
             return self._error(
                 "semantic_filter error: if fetching from the full corpus, must provide one of " \
-                "`metadata_filter`, `top_k`, or `pattern` for candidate selection."
+                "`metadata_filter`, `top_k`, or `pattern` for candidate selection.",
+                tool_kwargs,
             )
         if search_str is not None and top_k is None:
             return self._error(
-                "semantic_filter error: search_str requires top_k (it is the query for the top_k vector search)."
+                "semantic_filter error: search_str requires top_k (it is the query for the top_k vector search).",
+                tool_kwargs,
             )
         if limit is not None and pattern is None:
             return self._error(
-                "semantic_filter error: limit requires pattern (it is the limit for the grep expression)."
+                "semantic_filter error: limit requires pattern (it is the limit for the grep expression).",
+                tool_kwargs,
             )
         if top_k is not None and pattern is not None:
             # TODO: add a warning / notice that we will only execute the vector search
@@ -933,24 +926,26 @@ class SemanticFilterTool(Tool):
             try:
                 candidates, candidate_doc_ids = self._vector_search_selection(search_str or predicate, top_k, where, fetch)
             except Exception as e:
-                return self._error(f"semantic_filter error while executing vector search: {e}")
+                return self._error(f"semantic_filter error while executing vector search: {e}", tool_kwargs)
 
-            if len(candidate_doc_ids) > self._MAX_CANDIDATE_DOCS:
+            if len(candidate_doc_ids) > self._config.semantic_filter_max_candidate_docs:
                 return self._error(
                     f"semantic_filter error: the top_k={top_k} vector search yielded {len(candidate_doc_ids)} candidate "
-                    f"documents, over the {self._MAX_CANDIDATE_DOCS}-document cap. Lower top_k or narrow the metadata_filter."
+                    f"documents, over the {self._config.semantic_filter_max_candidate_docs}-document cap. Lower top_k or narrow the metadata_filter.",
+                    tool_kwargs,
                 )
         elif pattern is not None:
             mode = "grep"
             try:
                 candidates, candidate_doc_ids = self._grep_selection(pattern, limit, where, fetch)
             except Exception as e:
-                return self._error(f"semantic_filter error while executing grep: {e}")
+                return self._error(f"semantic_filter error while executing grep: {e}", tool_kwargs)
 
-            if len(candidate_doc_ids) > self._MAX_CANDIDATE_DOCS:
+            if len(candidate_doc_ids) > self._config.semantic_filter_max_candidate_docs:
                 return self._error(
                     f"semantic_filter error: the pattern={pattern}, limit={limit} grep yielded {len(candidate_doc_ids)} candidate "
-                    f"documents, over the {self._MAX_CANDIDATE_DOCS}-document cap. Lower limit or narrow the metadata_filter."
+                    f"documents, over the {self._config.semantic_filter_max_candidate_docs}-document cap. Lower limit or narrow the metadata_filter.",
+                    tool_kwargs,
                 )
         else:
             mode = "metadata"
@@ -958,50 +953,51 @@ class SemanticFilterTool(Tool):
                 assert isinstance(where, dict)
                 candidates, candidate_doc_ids = self._metadata_only_selection(where, fetch)
             except Exception as e:
-                return self._error(f"semantic_filter error while executing metadata: {e}")
+                return self._error(f"semantic_filter error while executing metadata: {e}", tool_kwargs)
                 
-            if len(candidate_doc_ids) > self._MAX_CANDIDATE_DOCS:
+            if len(candidate_doc_ids) > self._config.semantic_filter_max_candidate_docs:
                 return self._error(
                     f"semantic_filter error: the where={where} metadata_filter yielded {len(candidate_doc_ids)} candidate "
-                    f"documents, over the {self._MAX_CANDIDATE_DOCS}-document cap. Narrow the metadata_filter or combine with vector search or grep."
+                    f"documents, over the {self._config.semantic_filter_max_candidate_docs}-document cap. Narrow the metadata_filter or combine with vector search or grep.",
+                    tool_kwargs,
                 )
-            
+
         if not candidate_doc_ids:
             # renders as EMPTY_RESULT_MESSAGE (a prune filter or bad grep may lead to no results)
-            return {SEMFILTER_RESULT_TAG: True, "summary": "", "read_chunks": [], "fetched_chunks": [], "kept_doc_ids": [], "n_in": 0, "n_out": 0}
+            return {
+                SEMFILTER_RESULT_TAG: True,
+                "tool": self.name,
+                "tool_kwargs": tool_kwargs,
+                "mode": mode,
+                "summary": "",
+                "read_chunks": [],
+                "fetched_chunks": [],
+                "kept_doc_ids": [],
+                "rejected_doc_ids": [],
+            }
 
         # filter documents using judge model
-        kept = self._filter_docs(
-            predicate,
-            candidate_doc_ids,
-            event_extra={
-                "mode": mode,
-                "metadata_filter": metadata_filter,
-                "top_k": top_k,
-                "search_str": search_str,
-                "n_candidate_chunks": len(candidates),
-                "n_candidate_docs": len(candidate_doc_ids),
-            },
-        )
-        kept_set = set(kept)
-        kept_chunks = [
-            {
-                "chunk_id": cid,
-                "doc_id": did,
-                "est_num_tokens": estimate_tokens(text),
-                "header": f"  [chunk_id={cid} | doc_id={did} | est_num_tokens={estimate_tokens(text)}]",
-                "text": f"chunk_id={cid} | doc_id={did}\n{text}"
-            }
-            for cid, did, text, _, _ in candidates
-            if did in kept_set
-        ]
+        kept_doc_ids = self._filter_docs(predicate, candidate_doc_ids)
+        kept_chunks, kept_chunk_ids, rejected_doc_ids = [], set(), set()
+        for cid, did, text, _, _ in candidates:
+            if did in kept_doc_ids:
+                kept_chunks.append({
+                    "chunk_id": cid,
+                    "doc_id": did,
+                    "est_num_tokens": estimate_tokens(text),
+                    "header": f"  [chunk_id={cid} | doc_id={did} | est_num_tokens={estimate_tokens(text)}]",
+                    "text": f"chunk_id={cid} | doc_id={did}\n{text}"
+                })
+                kept_chunk_ids.add(cid)
+            else:
+                rejected_doc_ids.add(did)
 
         # insert results into working set collection (if turned on)
         # TODO: figure out a way to run this in the background (off critical path)
-        if fetch and working_set_collection_on and len(kept_set) > 0:
+        if fetch and working_set_collection_on and len(kept_doc_ids) > 0:
             ids, documents, metadatas, embeddings = [], [], [], []
             for id, doc_id, doc, meta, emb in candidates:
-                if doc_id in kept_set:
+                if doc_id in kept_doc_ids:
                     ids.append(id)
                     documents.append(doc)
                     metadatas.append(meta)
@@ -1015,23 +1011,13 @@ class SemanticFilterTool(Tool):
             )
 
         # update id state (if id tracking on)
-        # (doc_id, chunk_id) order within the sorted kept docs
-        kept_chunks.sort(key=lambda c: (c["doc_id"], c["chunk_id"]))
         if id_tracking_on:
             if fetch:
-                self._working_set.fetched_chunk_ids.update(c["chunk_id"] for c in kept_chunks)
-                self._working_set.fetched_doc_ids.update(kept)
+                self._working_set.fetched_chunk_ids.update(kept_chunk_ids)
+                self._working_set.fetched_doc_ids.update(kept_doc_ids)
             if read:
-                self._working_set.read_chunk_ids.update(c["chunk_id"] for c in kept_chunks)
-                self._working_set.read_doc_ids.update(kept)
-                # A re-surfaced chunk must actually render: `_block_is_visible` hides ChunkBlocks by
-                # chunk_id/doc_id, so a kept chunk the context trimmer once redacted would come back
-                # invisible while the summary says its doc passed. Drop kept ids from the redaction
-                # sets (mirrors `read_document`); the trimmer can always re-redact on a later step.
-                for c in kept_chunks:
-                    self._working_set.redacted_chunk_ids.discard(c["chunk_id"])
-                for did in kept:
-                    self._working_set.redacted_doc_ids.discard(did)
+                self._working_set.read_chunk_ids.update(kept_chunk_ids)
+                self._working_set.read_doc_ids.update(kept_doc_ids)
 
         # add action to the working set
         if working_set_collection_on or id_tracking_on:
@@ -1040,7 +1026,7 @@ class SemanticFilterTool(Tool):
                 tool_kwargs={
                     "predicate": predicate,
                     "read": read,
-                    "fetch": fetch, 
+                    "fetch": fetch,
                     "metadata_filter": metadata_filter,
                     "top_k": top_k,
                     "search_str": search_str,
@@ -1051,17 +1037,19 @@ class SemanticFilterTool(Tool):
 
         # return results to the agent
         summary = (
-            f"[semantic_filter] kept {len(kept)}/{len(candidate_doc_ids)} candidate document(s) matching the "
-            f"predicate. kept_doc_ids={kept}." + (" Chunks from kept documents follow." if kept_chunks else "")
+            f"[semantic_filter] kept {len(kept_doc_ids)}/{len(candidate_doc_ids)} candidate document(s) matching the "
+            f"predicate. kept_doc_ids={kept_doc_ids}." + (" Chunks from kept documents follow." if kept_chunks else "")
         )
         result = {
             SEMFILTER_RESULT_TAG: True,
+            "tool": self.name,
+            "tool_kwargs": tool_kwargs,
+            "mode": mode,
             "summary": summary,
             "read_chunks": kept_chunks if read else [],
             "fetched_chunks": kept_chunks if fetch else [],
-            "kept_doc_ids": kept,
-            "n_in": len(candidate_doc_ids),
-            "n_out": len(kept),
+            "kept_doc_ids": kept_doc_ids,
+            "rejected_doc_ids": rejected_doc_ids,
         }
 
         return result

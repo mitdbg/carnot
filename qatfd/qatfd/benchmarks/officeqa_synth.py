@@ -21,7 +21,7 @@ from qatfd.types import Question
 
 class OfficeQASynthBenchmark(OfficeQABenchmark):
     name = OFFICE_QA_SYNTH
-    config: OfficeQASynthConfig
+    config: OfficeQASynthConfig  # type: ignore
 
     def __init__(self, config: OfficeQASynthConfig) -> None:
         config.qa_pairs_path = str(resolve_under_benchmarks(config.qa_pairs_path))

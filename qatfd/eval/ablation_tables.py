@@ -3,7 +3,7 @@
 The ``search_agent`` system (qatfd/systems/search_agent.py) runs with a config-chosen retrieval
 tool set — any subset of vector-search / grep / semantic-filter, with read_document + prune
 always on — and an optional separate model for the semantic-filter judge
-(``semantic_filter_model``). Every ablation is therefore a `search_agent` run: this script reads
+(``semantic_filter_llm_model``). Every ablation is therefore a `search_agent` run: this script reads
 all of them under ``results/`` and reports, per configuration, the *usefulness* metrics
 (accuracy, recall, cost, latency), so the tools can be compared head-to-head.
 
@@ -12,7 +12,7 @@ by ``variants.py``, which the main tables share):
   * the tool set (from ``include_search_corpus`` / ``include_grep_corpus`` /
     ``include_semantic_filter``), with a non-default working-set mode noted in the label,
   * the agent model (``inference.llm_model``),
-  * the semantic-filter judge model (``semantic_filter_model``, or the agent model when unset;
+  * the semantic-filter judge model (``semantic_filter_llm_model``, or the agent model when unset;
     ``--`` when there is no semantic filter).
 Runs that share all three are averaged (so repeats collapse into one row).
 

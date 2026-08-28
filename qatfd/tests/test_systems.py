@@ -15,8 +15,8 @@ import asyncio
 from types import SimpleNamespace
 
 from skunk.common import ExecutionContext
-from skunk.multi_turn_agent import MultiTurnAgent
-from skunk.search_agent.search_agent import SearchAgent
+from skunk.agents.multi_turn_agent import MultiTurnAgent
+from skunk.agents.search_agent.search_agent import SearchAgent
 
 from qatfd.systems.search_agent import SearchAgentSystem
 from qatfd.types import Question
@@ -33,7 +33,7 @@ class _ScriptedRun(MultiTurnAgent):
     lists this mixin after SearchAgent to slot it in there.
     """
 
-    async def call(self, ctx, user, *, resume=False, max_steps=None, **_):
+    async def call(self, ctx, input, *, resume=False, **_):
         return self._script.pop(0) if self._script else {}
 
 
@@ -50,20 +50,20 @@ class _FakeAgent(SearchAgent, _ScriptedRun):
 
 
 class _StubSystem(SearchAgentSystem):
-    def __init__(self, agent, agent_mode="retrieve"):
-        self.config = SimpleNamespace(agent_mode=agent_mode)
+    def __init__(self, agent):
+        self.config = SimpleNamespace()
         self._agent = agent
 
-    def _build_agent(self, ctx, resources):
+    def _build_retrieve_agent(self, ctx, resources, q):
         return self._agent
 
 
 def _ctx() -> ExecutionContext:
     # ctx.config is never read on the retrieve path: the agent loop is faked, and passing an
     # llm_client makes __post_init__ skip building one from config.inference. A bare stub
-    # avoids assembling the full OrchestratorConfig sub-config tree just to satisfy the type.
+    # avoids assembling the full SkunkConfig sub-config tree just to satisfy the type.
     return ExecutionContext(
-        question="q", config=SimpleNamespace(), document_map={}, llm_client=object()
+        config=SimpleNamespace(), document_map={}, llm_client=object()
     )
 
 
@@ -80,7 +80,6 @@ def test_retrieve_keeps_only_well_formed_ids():
     ]))
     r = asyncio.run(system.retrieve(_q(), resources=None, ctx=_ctx()))
     assert r.doc_ids == ["A::p1"]
-    assert r.direct_answer is None
 
 
 def test_retrieve_filters_when_correction_does_not_fix_everything():
@@ -90,21 +89,7 @@ def test_retrieve_filters_when_correction_does_not_fix_everything():
     assert r.doc_ids == ["A::p1"]
 
 
-def test_retrieve_answer_mode_threads_direct_answer():
-    system = _StubSystem(
-        _FakeAgent([
-            {"answer": "42", "doc_ids": ["B::p2", "NOT_A_DOC"]},
-            {"answer": "42", "doc_ids": ["B::p2"]},
-        ]),
-        agent_mode="answer",
-    )
-    r = asyncio.run(system.retrieve(_q(), resources=None, ctx=_ctx()))
-    assert r.doc_ids == ["B::p2"]
-    assert r.direct_answer == "42"
-
-
 if __name__ == "__main__":
     test_retrieve_keeps_only_well_formed_ids()
     test_retrieve_filters_when_correction_does_not_fix_everything()
-    test_retrieve_answer_mode_threads_direct_answer()
     print("ok")

@@ -1,0 +1,38 @@
+
+corpus_details: |-
+  The corpus consists of U.S. Treasury bulletins from 1939 to 2025 Q3. From 1939-1982, every month had a single bulletin. Starting in 1983, bulletins were released quarterly (i.e. in months 3, 6, 9, and 12). Each bulletin is split into pages, and each page is treated as one "document" (with its own `doc_id`).
+
+  #### Identifier formats
+  - `doc_id`: `"<year>_<month>_<page_id>"` (e.g. `"2002_12_26"` = page 26 of the December 2002 bulletin). Use `page_id` as the index of the page in the bulletin, NOT the printed page number on the page itself (these may differ).
+  - `chunk_id`: `"<doc_id>_<element_id>"` (e.g. `"1946_11_41_6"` = the 6th element on page 41 of the November 1946 bulletin).
+  - In your final answer, the `doc_ids` list holds `doc_id`s in the format above.
+
+  #### Time periods (calendar vs. fiscal year)
+  - A **calendar year** runs January–December. A U.S. federal **fiscal year (FY)** runs October 1 – September 30 and is named for the year in which it ENDS — e.g. FY1945 = October 1944 through September 1945. (Before FY1977 the fiscal year ran July 1 – June 30; FY1976 has a transition quarter, Jul–Sep 1976.) Quarters follow the basis of the period in question. Read each question for which basis it asks, aggregate the matching months, and never mix a fiscal-year figure with a calendar-year one.
+
+  #### Revisions (look forward in time)
+  - Treasury Bulletins publish REVISED figures: the value for a given period is frequently restated in a LATER bulletin, not only in the issue covering that period. When a figure may have been revised, prefer the most recent reprint that covers the period and look forward in time (into later issues) rather than stopping at the period's own bulletin.
+
+  #### Available metadata fields (for use with `metadata_filter`)
+  Every chunk has the following metadata you can filter on:
+  - `year`: zero-padded string, e.g. `"2010"`.
+  - `month`: zero-padded string, e.g. `"03"` (only `"03"`, `"06"`, `"09"`, `"12"` from 1983 onward).
+  - `page_id`: integer, the index of the page within its bulletin.
+  - `doc_id`: string, the full page key (see above).
+  - `type`: string, the element type (`"text"`, `"title"`, `"table"`, `"footnote"`, ...).
+
+  #### Example `metadata_filter` clauses
+  ```python
+  # all pages from any month in 2008
+  {"year": "2008"}
+
+  # any Q1 bulletin in the 2010s, restricted to page index 26
+  {"$and": [
+      {"year": {"$in": [str(y) for y in range(2010, 2020)]}},
+      {"month": "03"},
+      {"page_id": 26},
+  ]}
+
+  # only table elements
+  {"type": "table"}
+  ```

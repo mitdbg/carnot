@@ -10,5 +10,4 @@ collection_name: officeqa-qwen-8b
 splits_path: officeqa/officeqa_splits.json
 csv_path: officeqa/officeqa_pro.csv
 clean_page_map_path: officeqa/treasury_bulletins_cleaned/clean_page_map.json
-prompts_path: officeqa/prompts.yaml
 pdf_dir: officeqa/treasury_bulletin_pdfs

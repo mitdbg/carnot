@@ -1,9 +1,9 @@
 """Shared ChromaDB client construction.
 
 Read paths talk to a ChromaDB **server** (HttpClient), not the embedded `PersistentClient`.
-The embedded engine deadlocks under the eval's 15-way in-process concurrency (worker threads
-wedge inside ChromaDB's Rust core); the server process owns ChromaDB's concurrency, so many
-clients can query it in parallel safely. Start the server with `scripts/run_chroma_server.sh`.
+The embedded engine deadlocks under in-process concurrency (worker threads get stuck inside
+ChromaDB's Rust core); the server process owns ChromaDB's concurrency, so many clients can
+query it in parallel safely. Start the server with `scripts/run_chroma_server.sh`.
 
 Build/write scripts (`create_vector_db.py`, `export_chroma_collection.py`, …) still use
 `PersistentClient` directly — they run standalone, and must NOT touch the same on-disk store

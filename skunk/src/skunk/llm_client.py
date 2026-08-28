@@ -44,15 +44,16 @@ if TYPE_CHECKING:
 
     from skunk.common import B64Image, ExecutionContext
     from skunk.config import InferenceConfig
+    from skunk.trace import Tracer
 
-def _warn(ctx: ExecutionContext | None, message: str) -> None:
-    """Route a client warning onto the owning question's event stream when a ctx
-    is in scope (retry/usage warnings become attributable per question); ctx-less
+def _warn(tracer: Tracer | None, id: str, msg: str, data: dict | None) -> None:
+    """Route a client warning onto the owning question's event stream when a tracer
+    is in scope (retry/usage warnings become attributable per question); tracer-less
     callers (offline corpus prep) fall back to plain stderr."""
-    if ctx is not None:
-        ctx.emit(message, level="warning")
+    if tracer is not None:
+        tracer.emit(id, level="warning", kind="call", message=msg, data=data or {})
     else:
-        print(message, file=sys.stderr)
+        print(msg, file=sys.stderr)
 
 # Return type of an `attempt` driven by `_retry_call` — an `LLMResponse` for the
 # generation paths, a `list[float]` for the embedding path. The retry loop never
@@ -207,10 +208,9 @@ class CallSpec:
     resolved by the public method (never empty inside a provider body). `messages`
     is expected to be a list of dictionaries with the following format:
     [
-        {"role": "user" | "assistant", "content": str, "images": list[B64Image] | None},
+        {"role": "system" | "user" | "assistant", "content": str, "images": list[B64Image] | None},
     ]
     """
-    system: str
     model: str
     messages: list[dict]
     temperature: float = 0.0
@@ -224,7 +224,6 @@ class CallSpec:
     # `{"enabled": false}` is not a usable encoding here; `effort` is an open enum and "none"
     # passes through to the provider.)
     disable_reasoning: bool = False
-    ctx: ExecutionContext | None = None
     call_site: str = "llm"
     max_output_tokens: int | None = None
     timeout_s: float | None = None
@@ -343,48 +342,53 @@ class _LLMBackend:
 
     provider: str = "?"
 
-    def __init__(self, config: InferenceConfig, usage: UsageTracker) -> None:
+    def __init__(self, config: InferenceConfig, usage: UsageTracker, tracer: Tracer | None = None) -> None:
         self._config = config
         self.usage = usage
+        self._tracer = tracer
 
     # --- entry points (called by the LLMClient facade with a resolved CallSpec) -------
 
     def call(self, spec: CallSpec) -> LLMResponse:
-        return self._retry_call(lambda: self._gen_call(spec), self.provider, spec.model, ctx=spec.ctx)
+        return self._retry_call(lambda: self._gen_call(spec), self.provider, spec.model)
 
     async def acall(self, spec: CallSpec) -> LLMResponse:
-        return await self._aretry_call(
-            lambda: self._gen_acall(spec), self.provider, spec.model, ctx=spec.ctx
-        )
+        return await self._aretry_call(lambda: self._gen_acall(spec), self.provider, spec.model)
 
-    def embed_query(
-        self, text: str, *, model: str, usage_key: str = "default", ctx: ExecutionContext | None = None
-    ) -> list[float]:
+    def embed_query(self, text: str, *, model: str, usage_key: str = "default") -> list[float]:
         """Embed a single query string for vector search, routing through the same
         rate-limit / retry / usage-accounting scaffolding as generation so embedding
         spend lands on this client's `usage` tracker (tokens, cost, calls). The provider
-        body is `_embed_once`; when `ctx` is given, emits the uniform `call ...` envelope
-        (so the embed call's latency shows in the per-question trace like every LLM
-        call); usage is recorded regardless of `ctx`."""
+        body is `_embed_once`; if `self._tracer` is present, emits the uniform `call ...`
+        envelope (so the embed call's latency shows in the per-question trace like every LLM
+        call); usage is recorded regardless of the tracer."""
 
         def attempt() -> list[float]:
             t0 = time.monotonic()
             vector, in_tok = self._embed_once(model, text)
             latency_s = time.monotonic() - t0
             self.usage.add_embed(model, in_tok, usage_key)
-            if ctx is not None:
+            if self._tracer is not None:
                 cost = self.usage.price_embed(model, in_tok)
-                ctx.emit(
-                    f"call call_site=embed model={model} provider={self.provider} "
-                    f"latency_s={round(latency_s, 3)} in_tok={in_tok} dim={len(vector)}",
+                self._tracer.emit(
+                    id="call",
                     kind="call",
-                    data=None if cost is None else {"cost": cost},
+                    data={
+                        "call_site": "embed",
+                        "model": model,
+                        "provider": self.provider,
+                        "latency_s": round(latency_s, 3),
+                        "in_tok": in_tok,
+                        "dim": len(vector),
+                        "cost": cost
+                    },
                 )
+
             return vector
 
         # Embeddings share one process-wide "embed" rate bucket across all workers
         # (separate from the per-model generation buckets).
-        return self._retry_call(attempt, self.provider, model, bucket="embed", ctx=ctx)
+        return self._retry_call(attempt, self.provider, model, bucket="embed")
 
     # --- provider bodies (subclass responsibility) -------------------------------------
 
@@ -407,16 +411,15 @@ class _LLMBackend:
         provider: str,
         model: str,
         bucket: str | None = None,
-        ctx: "ExecutionContext | None" = None,
     ) -> R:
         """Drive `attempt()` with exponential-backoff retry, paced by a
         rate-limiter bucket. Retries only transient faults (`_is_retryable`: 429 / 5xx /
         transport blips); a non-429 4xx (bad request, auth, context overflow) raises
         immediately. `attempt` owns the API call, timing, parsing, and the success emit;
-        `provider`/`model` are for the failure warning (routed onto `ctx`'s event
-        stream when given — see `_warn`). `bucket` overrides the limiter (a
-        shared process-wide bucket like `"embed"`); when None, the per-model
-        `llm:<model>` bucket is used at the configured RPM."""
+        `provider`/`model` are for the failure warning (routed onto `self._tracer`'s event
+        stream when present — see `_warn`). `bucket` overrides the limiter (a shared
+        process-wide bucket like `"embed"`); when None, the per-model `llm:<model>` bucket
+        is used at the configured RPM."""
         max_retries = self._config.llm_max_retries
         delay = self._config.llm_retry_initial_delay_s
         limiter = (
@@ -437,10 +440,20 @@ class _LLMBackend:
                 # before we re-raise — so a fatal error is never silent.
                 stop = i == max_retries or not _is_retryable(e)
                 _warn(
-                    ctx,
-                    f"llm_call_failed attempt={i + 1}/{max_retries + 1} provider={provider} "
-                    f"model={model} error={type(e).__name__}: {e}{_error_detail(e)}"
-                    f"{'' if stop else f'; retrying in {delay:.1f}s'}",
+                    self._tracer,
+                    id="llm_call_failed",
+                    msg=(
+                        f"llm_call_failed attempt={i + 1}/{max_retries + 1} provider={provider} "
+                        f"model={model} error={type(e).__name__}: {e}{_error_detail(e)}"
+                        f"{'' if stop else f'; retrying in {delay:.1f}s'}"
+                    ),
+                    data={
+                        "attempt": i + 1,
+                        "max_attempts": max_retries + 1,
+                        "provider": provider,
+                        "model": model,
+                        "error": f"{type(e).__name__}: {e}{_error_detail(e)}",
+                    }
                 )
                 if stop:
                     raise
@@ -453,7 +466,6 @@ class _LLMBackend:
         attempt: Callable[[], Awaitable[LLMResponse]],
         provider: str,
         model: str,
-        ctx: "ExecutionContext | None" = None,
     ) -> LLMResponse:
         """Async twin of `_retry_call`: awaits the model's async rate limiter and the
         coroutine `attempt()`, backing off via `asyncio.sleep` (never blocking the
@@ -472,10 +484,20 @@ class _LLMBackend:
             except Exception as e:
                 stop = i == max_retries or not _is_retryable(e)
                 _warn(
-                    ctx,
-                    f"llm_call_failed attempt={i + 1}/{max_retries + 1} provider={provider} "
-                    f"model={model} error={type(e).__name__}: {e}{_error_detail(e)}"
-                    f"{'' if stop else f'; retrying in {delay:.1f}s'}",
+                    self._tracer,
+                    id="llm_call_failed",
+                    msg=(
+                        f"llm_call_failed attempt={i + 1}/{max_retries + 1} provider={provider} "
+                        f"model={model} error={type(e).__name__}: {e}{_error_detail(e)}"
+                        f"{'' if stop else f'; retrying in {delay:.1f}s'}"
+                    ),
+                    data={
+                        "attempt": i + 1,
+                        "max_attempts": max_retries + 1,
+                        "provider": provider,
+                        "model": model,
+                        "error": f"{type(e).__name__}: {e}{_error_detail(e)}",
+                    }
                 )
                 if stop:
                     raise
@@ -492,29 +514,37 @@ class _LLMBackend:
         model: str,
         temperature: float,
         effort: Effort,
-        ctx: ExecutionContext | None,
         call_site: str,
         usage_key: str,
     ) -> LLMResponse:
         """Shared tail for every generation path: emit the uniform `call ...` envelope
-        (when `ctx` is set), accumulate the call into this client's `usage` tracker, and
-        pack the provider-agnostic token dict (`_usage_tokens_chat`) into an
-        `LLMResponse`. `toks` may omit any key — the chat dict has no
-        `thinking_tokens`, hence the `.get`s. The single chokepoint every call path funnels
-        through, so usage accounting lives here once rather than at each public method."""
-        if ctx is not None:
+        (when `self._tracer` is set), accumulate the call into this client's `usage` tracker,
+        and pack the provider-agnostic token dict (`_usage_tokens_chat`) into an `LLMResponse`.
+        `toks` may omit any key — the chat dict has no `thinking_tokens`, hence the `.get`s.
+        The single chokepoint every call path funnels through, so usage accounting lives here
+        once rather than at each public method."""
+        if self._tracer is not None:
             # Exact per-call USD (priced as `cost()` aggregates) → the trace viewer shows
             # per-step and cumulative spend without re-deriving it from a duplicate price table.
             cost = self.usage.price_call(
                 model, toks["input_tokens"], toks.get("cache_input_tokens") or 0,
                 toks["output_tokens"], toks.get("thinking_tokens") or 0,
             )
-            ctx.emit(
-                f"call call_site={call_site} model={model} temp={temperature} "
-                f"effort={effort} latency_s={round(latency_s, 3)} "
-                f"in_tok={toks['input_tokens']} out_tok={toks['output_tokens']} "
-                f"think_tok={toks.get('thinking_tokens')}",
-                data=None if cost is None else {"cost": cost},
+            self._tracer.emit(
+                id="call",
+                kind="call",
+                data={
+                    "call_site": call_site,
+                    "model": model,
+                    "provider": self.provider,
+                    "temperature": temperature,
+                    "effort": effort,
+                    "latency_s": round(latency_s, 3),
+                    "in_tok": toks["input_tokens"],
+                    "out_tok": toks["output_tokens"],
+                    "think_tok": toks.get("thinking_tokens"),
+                    "cost": cost,
+                },
             )
         resp = LLMResponse(
             text=text,
@@ -558,7 +588,7 @@ class _LLMBackend:
         return self._build_response(
             text, toks, latency_s,
             model=model_id, temperature=spec.temperature, effort=spec.effort,
-            ctx=spec.ctx, call_site=spec.call_site, usage_key=spec.usage_key,
+            call_site=spec.call_site, usage_key=spec.usage_key,
         )
 
 
@@ -569,9 +599,8 @@ class _OpenAIChatBackend(_LLMBackend):
     on the `openrouter` SDK's and the `openai` SDK's typed response objects."""
 
     @staticmethod
-    def _content(user: str, images: list[B64Image] | None) -> Any:
-        """User-turn content: a plain string, or OpenAI-style content parts when
-        images are attached (base64 `data:` URLs)."""
+    def _content(user: str, images: list[B64Image] | None) -> str | list[dict]:
+        """Returns a plain string, or OpenAI-style content parts when images are attached (base64 `data:` URLs)."""
         if not images:
             return user
         parts: list[dict] = [
@@ -580,6 +609,11 @@ class _OpenAIChatBackend(_LLMBackend):
         ]
         parts.append({"type": "text", "text": user})
         return parts
+
+    @staticmethod
+    def _role(role: str) -> str:
+        """Returns the role as-is; maps unexpected roles to "user"."""
+        return role if role in ["system", "assistant", "user"] else "user"
 
     @staticmethod
     def _text(resp: Any) -> str:
@@ -609,20 +643,15 @@ class _OpenAIChatBackend(_LLMBackend):
             "cache_input_tokens": getattr(details, "cached_tokens", None) if details else None,
         }
 
-    def _chat_messages(self, system: str, messages: list[dict]) -> list[dict]:
-        """Multi-turn messages in OpenAI chat format: a leading system message (if any)
-        then the {role, content} turns ('assistant' → assistant, else user)."""
-        out: list[dict] = []
-        if system:
-            out.append({"role": "system", "content": system})
-        out.extend(
+    def _chat_messages(self, messages: list[dict]) -> list[dict]:
+        """Multi-turn messages in OpenAI chat format."""
+        return [
             {
-                "role": "assistant" if m["role"] == "assistant" else "user",
-                "content": self._content(m["content"], m.get("images")),
+                "role": self._role(msg["role"]),
+                "content": self._content(msg["content"], msg.get("images")),
             }
-            for m in messages
-        )
-        return out
+            for msg in messages
+        ]
 
     def _checked_text(self, resp: Any, spec: CallSpec) -> str:
         """The completion text, or `EmptyCompletionError` (with the provider's diagnostic
@@ -648,8 +677,8 @@ class _OpenRouterBackend(_OpenAIChatBackend):
 
     provider = "openrouter"
 
-    def __init__(self, config: InferenceConfig, usage: UsageTracker, api_key: str | None = None) -> None:
-        super().__init__(config, usage)
+    def __init__(self, config: InferenceConfig, usage: UsageTracker, tracer: Tracer | None = None, api_key: str | None = None) -> None:
+        super().__init__(config, usage, tracer)
         self._api_key = api_key
         self._client: OpenRouter | None = None
 
@@ -724,7 +753,7 @@ class _OpenRouterBackend(_OpenAIChatBackend):
     def _gen_call(self, spec: CallSpec) -> LLMResponse:
         """One OpenRouter chat call (no retry — the retry loop owns that)."""
         client = self._get_client()
-        messages = self._chat_messages(spec.system, spec.messages)
+        messages = self._chat_messages(spec.messages)
         reasoning = {"effort": "none"} if spec.disable_reasoning else self._effort_to_reasoning(spec.effort)
         extra = (
             {"max_tokens": spec.max_output_tokens}
@@ -749,15 +778,14 @@ class _OpenRouterBackend(_OpenAIChatBackend):
     async def _gen_acall(self, spec: CallSpec) -> LLMResponse:
         """Async twin of `_gen_call` — uses `client.chat.send_async`."""
         client = self._get_client()
-        messages = self._chat_messages(spec.system, spec.messages)
+        messages = self._chat_messages(spec.messages)
         reasoning = {"effort": "none"} if spec.disable_reasoning else self._effort_to_reasoning(spec.effort)
         # TPM throttle (opt-in via SKUNK_MODEL_TPM): meter input tokens so throughput
         # stays under quota, separate from the RPM limiter. Per attempt (the retry loop
         # re-invokes this body), so each retry re-charges. `_tpm_settle` corrects the
         # estimate post-call. Estimated from the spec-format messages (`content` text +
-        # `images`), with the system prompt folded in as a synthetic message — the
-        # wire-format `messages` local hides images inside content-parts lists.
-        tpm_lim, est = await self._tpm_acquire(spec.model, [{"content": spec.system}, *spec.messages])
+        # `images`), the wire-format `messages` local hides images inside content-parts lists.
+        tpm_lim, est = await self._tpm_acquire(spec.model, spec.messages)
         extra = (
             {"max_tokens": spec.max_output_tokens}
             if spec.max_output_tokens is not None
@@ -804,8 +832,8 @@ class _VLLMBackend(_OpenAIChatBackend):
 
     provider = "vllm"
 
-    def __init__(self, config: InferenceConfig, usage: UsageTracker, api_key: str | None = None) -> None:
-        super().__init__(config, usage)
+    def __init__(self, config: InferenceConfig, usage: UsageTracker, tracer: Tracer | None = None, api_key: str | None = None) -> None:
+        super().__init__(config, usage, tracer)
         self._api_key = api_key
 
     def _clients_for(self, model: str) -> tuple[OpenAI, AsyncOpenAI]:
@@ -831,7 +859,7 @@ class _VLLMBackend(_OpenAIChatBackend):
     def _gen_call(self, spec: CallSpec) -> LLMResponse:
         """One vLLM chat call (no retry — the retry loop owns that)."""
         client, _ = self._clients_for(spec.model)
-        messages = self._chat_messages(spec.system, spec.messages)
+        messages = self._chat_messages(spec.messages)
         kwargs = self._request_kwargs(spec)
         if spec.timeout_s is not None:
             # Sync twin of the async path's asyncio.wait_for cap, enforced at the SDK
@@ -850,9 +878,9 @@ class _VLLMBackend(_OpenAIChatBackend):
     async def _gen_acall(self, spec: CallSpec) -> LLMResponse:
         """Async twin of `_gen_call`."""
         _, aclient = self._clients_for(spec.model)
-        messages = self._chat_messages(spec.system, spec.messages)
+        messages = self._chat_messages(spec.messages)
         # TPM throttle (opt-in via SKUNK_MODEL_TPM) — identical to the OpenRouter path.
-        tpm_lim, est = await self._tpm_acquire(spec.model, [{"content": spec.system}, *spec.messages])
+        tpm_lim, est = await self._tpm_acquire(spec.model, spec.messages)
         t0 = time.monotonic()
         coro = aclient.chat.completions.create(
             model=spec.model, messages=messages, temperature=spec.temperature, # type: ignore[arg-type]
@@ -895,6 +923,7 @@ class LLMClient:
         self,
         config: InferenceConfig,
         *,
+        tracer: Tracer | None = None,
         openrouter_api_key: str | None = None,
         vllm_api_key: str | None = None,
     ) -> None:
@@ -902,6 +931,7 @@ class LLMClient:
         (`OPENROUTER_API_KEY` / `VLLM_API_KEY`) — the constructor is the seam for
         callers that manage credentials themselves; env remains the default."""
         self._config = config
+        self._tracer = tracer
         self._openrouter_api_key = openrouter_api_key
         self._vllm_api_key = vllm_api_key
         self.usage = UsageTracker(
@@ -928,9 +958,9 @@ class LLMClient:
         backend = self._backends.get(provider)
         if backend is None:
             if provider == "openrouter":
-                backend = _OpenRouterBackend(self._config, self.usage, api_key=self._openrouter_api_key)
+                backend = _OpenRouterBackend(self._config, self.usage, tracer=self._tracer, api_key=self._openrouter_api_key)
             elif provider == "vllm":
-                backend = _VLLMBackend(self._config, self.usage, api_key=self._vllm_api_key)
+                backend = _VLLMBackend(self._config, self.usage, tracer=self._tracer, api_key=self._vllm_api_key)
             else:
                 raise ValueError(f"unknown LLM provider {provider!r} (expected 'openrouter' or 'vllm')")
             self._backends[provider] = backend
@@ -953,13 +983,11 @@ class LLMClient:
 
     def call(
         self,
-        system: str,
         messages: list[dict],
         model: str | None = None,
         temperature: float = 0.0,
         effort: Effort = "off",
         disable_reasoning: bool = False,
-        ctx: ExecutionContext | None = None,
         call_site: str = "llm",
         provider_order: list[str] | None = None,
         max_output_tokens: int | None = None,
@@ -967,9 +995,9 @@ class LLMClient:
         usage_key: str = "default",
     ) -> LLMResponse:
         spec = CallSpec(
-            system=system, messages=list(messages),
+            messages=list(messages),
             temperature=temperature, effort=effort, disable_reasoning=disable_reasoning,
-            ctx=ctx, call_site=call_site,
+            call_site=call_site,
             model=model or self._config.llm_model, usage_key=usage_key,
             provider_order=provider_order, max_output_tokens=max_output_tokens,
             timeout_s=timeout_s,
@@ -978,13 +1006,11 @@ class LLMClient:
 
     async def acall(
         self,
-        system: str,
         messages: list[dict],
         model: str | None = None,
         temperature: float = 0.0,
         effort: Effort = "off",
         disable_reasoning: bool = False,
-        ctx: ExecutionContext | None = None,
         call_site: str = "llm",
         provider_order: list[str] | None = None,
         max_output_tokens: int | None = None,
@@ -993,9 +1019,9 @@ class LLMClient:
     ) -> LLMResponse:
         """Async twin of `call` for the request path."""
         spec = CallSpec(
-            system=system, messages=list(messages),
+            messages=list(messages),
             temperature=temperature, effort=effort, disable_reasoning=disable_reasoning,
-            ctx=ctx, call_site=call_site,
+            call_site=call_site,
             model=model or self._config.llm_model, usage_key=usage_key,
             provider_order=provider_order, max_output_tokens=max_output_tokens,
             timeout_s=timeout_s,
@@ -1008,7 +1034,6 @@ class LLMClient:
         *,
         model: str | None = None,
         provider: str | None = None,
-        ctx: ExecutionContext | None = None,
         usage_key: str = "default",
     ) -> list[float]:
         """Embed a single query string for vector search (see `_LLMBackend.embed_query`
@@ -1020,4 +1045,4 @@ class LLMClient:
             from `config.vllm_base_urls[model]`, same map as generation."""
         model = model or self._config.emb_model_id
         provider = provider or self._config.emb_provider
-        return self._backend(provider).embed_query(text, model=model, usage_key=usage_key, ctx=ctx)
+        return self._backend(provider).embed_query(text, model=model, usage_key=usage_key)

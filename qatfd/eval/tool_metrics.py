@@ -15,37 +15,40 @@ Counts include every *attempted* tool call, including errored / hallucinated one
 (a step where the agent invokes a tool it doesn't actually have raises "Forbidden
 function evaluation"). This is intentional: a nonzero count for such a tool is a
 useful signal of a prompting bug (e.g. a sem-only configuration attempting
-``search_corpus`` on QAMPARI).
-Because errored calls return in ~0s, they pull that tool's latency average toward 0.
-Latency is wall-clock (``observation.t - tool_code.t``) under the runner's concurrent
-execution, so it reflects real per-call wall time (including shared ChromaDB /
-thread-pool contention), not isolated tool CPU time.
+``search_corpus`` on QAMPARI). Errored calls return in ~0s, so they pull that
+tool's latency average toward 0.
+Latency is wall-clock under the runner's concurrent execution, so it reflects real
+per-call wall time (including shared ChromaDB / thread-pool contention), not
+isolated tool CPU time.
 
 Where the numbers come from
 ---------------------------
 The runner writes one structured event stream per question at
-``<run>/traces/<qid>.jsonl`` (the same streams the trace viewer renders). Each
-event has ``kind`` (system/user/call/assistant/note/observation/...), a float
-``t`` (seconds since the question started), a ``message``, and optional
-``data``. We reconstruct, per question, exactly what the viewer shows:
+``<run>/traces/<qid>.jsonl`` (``skunk.trace.TraceEvent`` lines). Each event has an
+``id`` (the emitting call site), a ``kind`` (system/user/call/assistant/tool_call/
+observation/lifecycle/...), a float ``t`` (seconds since the question started), and
+a structured ``data`` payload. Per question:
 
-* **Stage split** — the answer stage begins at the *second* ``system`` event
-  (mirrors the viewer's ``answerStartIdx``); everything before it is the
-  retrieval stage, which is all this table cares about.
-* **Turns/steps** — the retrieval stage is grouped into turns (an ``assistant``
-  reply, the LLM ``call``\\ s that preceded it, the ``tool_code`` note it emitted,
-  and the resulting ``observation``\\ s), mirroring the viewer's ``groupAgentTurns``.
-* **Which tool a step ran** — the first non-comment line's ``funcname(`` in the
-  emitted code (mirrors ``actionLabel``); this ignores tool names that appear
-  only in the model's ``# comments``. A step is additionally counted as
-  ``semantic_filter`` if it produced a structured ``semantic_filter n_in=...``
-  observation (emitted by ``skunk.search_agent.search_tools.filter_docs``).
-* **Tool-execution latency** — ``observation.t - tool_code.t`` for that step,
-  i.e. pure tool time with the LLM reasoning of the step excluded.
-* **RAG-LLM** has no agent loop: its retrieval is a single ``search_corpus`` under
-  an ``op == "retrieve"`` step (one embed ``call`` + a ``retrieved`` observation),
-  so it contributes exactly one vector-search call, and latency = embed latency +
-  the Chroma query time.
+* **Stage split** — the answer stage begins at the *second* ``system`` event (the
+  compute agent's system prompt); everything before it is the retrieval stage,
+  which is all this table cares about.
+* **Steps** — each executed agent step closes with an ``agent_step`` event
+  (``kind="assistant"``) whose ``data`` carries the step's parsed tool ``code``,
+  ``is_final`` flag, and any ``error``. Steps with code that is not a final answer
+  are counted (see ``_iter_agent_steps``).
+* **Which tool a step ran** — the ``data.tool`` of the step's ``kind="tool_call"``
+  result event when the call executed (authoritative — e.g. ``semantic_filter``);
+  for errored / hallucinated calls, the first non-comment line's ``funcname(`` in
+  ``data.code``, so attempted calls are still counted.
+* **Tool-execution latency** — the ``agent_step`` event's ``data.tool_latency_s``,
+  measured by the agent around the sandboxed tool execution (LLM reasoning
+  excluded); errored calls are timed too, since the sandbox captures their
+  exception.
+* **RAG-LLM** has no agent loop: its retrieval is a single direct vector search
+  that emits an ``embed`` ``call`` event and a ``retrieved`` observation, so it
+  contributes exactly one vector-search call, and latency = the ``retrieved``
+  event's ``data.latency_s`` (falling back, on traces predating that field, to
+  embed latency + the embed-to-``retrieved`` event gap).
 
 Usage
 -----
@@ -93,7 +96,7 @@ TOOL_HEADER: dict[str, str] = {
 
 
 # --------------------------------------------------------------------------- #
-# per-question trace parsing (mirrors skunk/eval/trace_viewer/app.html)
+# per-question trace parsing (structured skunk.trace.TraceEvent streams)
 # --------------------------------------------------------------------------- #
 
 
@@ -116,20 +119,17 @@ def _iter_question_events(traces_dir: Path) -> dict[str, list[dict]]:
 
 
 def _answer_start_idx(events: list[dict]) -> int:
-    """Index where the answer stage begins: the first ``system`` event at i>=1
-    (the answer prompt). Retrieval stage == events[:idx]."""
-    for i in range(1, len(events)):
-        if events[i].get("kind") == "system":
-            return i
+    """Index where the answer stage begins: the SECOND ``system`` event (the compute
+    agent's system prompt) — by count, not position, because prelude events (the
+    related-working-sets fetch) precede the retrieval agent's own system prompt.
+    Retrieval stage == events[:idx]."""
+    seen = 0
+    for i, e in enumerate(events):
+        if e.get("kind") == "system":
+            seen += 1
+            if seen == 2:
+                return i
     return len(events)
-
-
-def _tool_code_str(message: str) -> str:
-    """ "tool_code '<python repr>'" -> readable code (strip key + one quote layer)."""
-    s = re.sub(r"^tool_code\s+", "", message or "")
-    s = re.sub(r"^'([\s\S]*)'$", r"\1", s)
-    s = re.sub(r'^"([\s\S]*)"$', r"\1", s)
-    return s.replace("\\n", "\n").replace("\\t", "\t").replace("\\'", "'").replace('\\"', '"').replace("\\\\", "\\")
 
 
 def _action_name(code: str) -> str:
@@ -143,32 +143,52 @@ def _action_name(code: str) -> str:
 
 
 @dataclass
-class _Turn:
-    lead: list[dict] = field(default_factory=list)
-    tool_code: dict | None = None
-    results: list[dict] = field(default_factory=list)
+class AgentStep:
+    """One executed agent step reconstructed from the structured event stream: the
+    closing ``agent_step`` event's payload plus the step's tool result event
+    (``kind="tool_call"``), matched positionally within the step's window (the
+    events since the previous ``agent_step``)."""
+
+    step: int | None
+    turn: int | None
+    code: str | None          # the step's parsed tool code (None on a misfire)
+    is_final: bool
+    error: str | None
+    tool: str | None          # authoritative tool name, from the tool_call event
+    tool_kwargs: dict | None  # structured kwargs, from the tool_call event
+    latency: float | None     # data.tool_latency_s: sandboxed tool execution wall time
+    step_latency_s: float | None  # data.step_latency_s: full step wall time (LLM gen included)
 
 
-def _group_turns(events: list[dict]) -> list[_Turn]:
-    """Reconstruct agent turns from a flat retrieval-stage event stream."""
-    turns: list[_Turn] = []
-    pending: list[dict] = []
-    cur: _Turn | None = None
+def _iter_agent_steps(events: list[dict]) -> list[AgentStep]:
+    """Group a flat (retrieval-stage) event stream into executed agent steps.
+
+    Each step closes with an ``agent_step`` event whose ``data`` carries the timing
+    measured by the agent itself: ``tool_latency_s`` (around the sandboxed tool
+    execution — present for errored / hallucinated calls too, since the sandbox
+    captures their exceptions) and ``step_latency_s`` (the whole step). The step's
+    ``kind="tool_call"`` result event, emitted iff the tool executed, supplies the
+    authoritative tool name and structured kwargs. ``tool_latency_s`` is None on
+    traces predating the field (then no latency sample is recorded) and on steps
+    whose code never reached the sandbox (misfires, hard-context-limit rejections)."""
+    steps: list[AgentStep] = []
+    tool_event: dict | None = None
     for e in events:
         k = e.get("kind")
-        msg = e.get("message") or ""
-        if k == "assistant":
-            cur = _Turn(lead=pending)
-            pending = []
-            turns.append(cur)
-        elif k == "call":
-            (cur.lead if (cur and not cur.results) else pending).append(e)
-        elif k in ("observation", "error"):
-            (cur.results if cur else pending).append(e)
-        elif k == "note":
-            if cur and not cur.results and msg.startswith("tool_code"):
-                cur.tool_code = e
-    return turns
+        if k == "tool_call":
+            if tool_event is None:
+                tool_event = e
+        elif k == "assistant":
+            d = e.get("data") or {}
+            td = (tool_event or {}).get("data") or {}
+            steps.append(AgentStep(
+                step=e.get("step"), turn=e.get("turn"),
+                code=d.get("code"), is_final=bool(d.get("is_final")), error=d.get("error"),
+                tool=td.get("tool"), tool_kwargs=td.get("tool_kwargs"),
+                latency=d.get("tool_latency_s"), step_latency_s=d.get("step_latency_s"),
+            ))
+            tool_event = None
+    return steps
 
 
 @dataclass
@@ -183,45 +203,54 @@ class QuestionToolMetrics:
 def _parse_search_agent(events: list[dict]) -> QuestionToolMetrics:
     retrieval = events[: _answer_start_idx(events)]
     m = QuestionToolMetrics()
-    for turn in _group_turns(retrieval):
-        if turn.tool_code is None:
+    for s in _iter_agent_steps(retrieval):
+        if s.is_final or not s.code:
             continue
         m.n_steps += 1
-        name = _action_name(_tool_code_str(turn.tool_code.get("message", "")))
-        # Structured semantic_filter observation is authoritative when present.
-        if any((r.get("message") or "").startswith("semantic_filter") for r in turn.results):
-            name = "semantic_filter"
+        # The tool_call event's tool name is authoritative when the call executed (it also
+        # settles semantic_filter). For errored / hallucinated calls there is no tool_call
+        # event, so fall back to parsing the emitted code — every ATTEMPTED call is counted.
+        # This is deliberate: a nonzero count for a tool the configuration doesn't actually
+        # include (which raises "Forbidden function evaluation") is a useful signal of a
+        # prompting bug — the system prompt still references `search_corpus` in its
+        # grep/prune tool docs even when the tool is off, and QAMPARI's entity questions
+        # make the agent take the bait. Errored calls DO carry a tool_latency_s sample
+        # (the sandbox captures their exception); they return in ~0s, pulling that tool's
+        # latency average toward zero.
+        name = s.tool or _action_name(s.code)
         if name not in TOOL_KEYS:
             continue
-        # Count every ATTEMPTED tool call, including errored / hallucinated ones. This is
-        # deliberate: a nonzero count for a tool the configuration doesn't actually include
-        # (which raises "Forbidden function evaluation") is a useful signal of a prompting
-        # bug — the system prompt still references `search_corpus` in its grep/prune tool
-        # docs even when the tool is off, and QAMPARI's entity questions make the agent take
-        # the bait. Errored calls return in ~0s, so they pull the latency average toward 0.
         m.counts[name] += 1
-        # Latency is to the tool's OWN result — the first observation/error after the
-        # tool_code — NOT max(results.t): _group_turns also attaches trailing error events
-        # (e.g. a later "no fenced block" model misfire) to this turn, and those would
-        # otherwise inflate the latency by tens of seconds.
-        first_t = next((r["t"] for r in turn.results if r.get("t") is not None), None)
-        if first_t is not None and turn.tool_code.get("t") is not None:
-            m.latencies[name].append(max(0.0, first_t - turn.tool_code["t"]))
+        if s.latency is not None:
+            m.latencies[name].append(s.latency)
     return m
 
 
 def _parse_rag_llm(events: list[dict]) -> QuestionToolMetrics:
-    """RAG-LLM: exactly one vector search under an ``op == 'retrieve'`` step."""
+    """RAG-LLM: one direct vector search — an ``embed`` ``call`` event followed by
+    the ``retrieved`` observation. Latency = the ``retrieved`` event's measured
+    ``latency_s`` when present, else embed latency + the embed-to-event gap."""
     m = QuestionToolMetrics(n_steps=1)
-    retrieve = [e for e in events if e.get("op") == "retrieve"]
-    obs = [e for e in retrieve if e.get("kind") == "observation" and e.get("t") is not None]
-    calls = [e for e in retrieve if e.get("kind") == "call" and e.get("t") is not None]
     m.counts["search_corpus"] = 1
-    if obs and calls:
-        lm = re.search(r"latency_s=([\d.]+)", calls[0].get("message") or "")
-        embed_lat = float(lm.group(1)) if lm else 0.0
-        query_time = max(0.0, max(o["t"] for o in obs) - calls[0]["t"])
-        m.latencies["search_corpus"].append(embed_lat + query_time)
+    retrieved = next(
+        (e for e in events if e.get("kind") == "observation" and e.get("id") == "retrieved" and e.get("t") is not None),
+        None,
+    )
+    if retrieved is None:
+        return m
+    measured = (retrieved.get("data") or {}).get("latency_s")
+    if measured is not None:
+        m.latencies["search_corpus"].append(float(measured))
+        return m
+    embeds = [
+        e for e in events
+        if e.get("kind") == "call" and (e.get("data") or {}).get("call_site") == "embed"
+        and e.get("t") is not None and e["t"] <= retrieved["t"]
+    ]
+    if embeds:
+        embed = embeds[-1]
+        embed_lat = float((embed.get("data") or {}).get("latency_s") or 0.0)
+        m.latencies["search_corpus"].append(embed_lat + max(0.0, retrieved["t"] - embed["t"]))
     return m
 
 
@@ -312,7 +341,7 @@ def _run_dirs_by_variant(
 
     Walks all system dirs rather than one per row: the SearchAgent variants share the
     ``search_agent`` dir, so the tool set has to come from each run's config. The judge model
-    is part of the key so two semantic-filter runs that differ only in `semantic_filter_model`
+    is part of the key so two semantic-filter runs that differ only in `semantic_filter_llm_model`
     stay separate rows.
     """
     base = results_root / benchmark
@@ -430,7 +459,7 @@ def render_tool_table(
         r"attempted call, so a nonzero count for a tool the agent lacks (e.g.\ a sem-only "
         r"configuration hallucinating \texttt{search\_corpus} on QAMPARI) signals a prompting bug; such "
         r"errored calls return in ${\sim}0$s and pull that tool's latency toward zero. "
-        r"Latency is wall-clock time between the tool call and its result under concurrent "
+        r"Latency is measured around the sandboxed tool execution, under concurrent "
         r"execution, so it includes shared-index and thread-pool contention, not just the "
         r"tool's own CPU time. Values are averaged across repeated runs of each configuration.}"
     )

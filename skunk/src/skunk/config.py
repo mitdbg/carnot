@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import yaml
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -13,16 +14,13 @@ if TYPE_CHECKING:
 @dataclass
 class InferenceConfig:
     """Singleton configuration object which configures global inference state."""
-    # generation provider for every LLM call whose model has no `vllm_base_urls` entry
-    # (routing is per call — see `vllm_base_urls` below)
+    # generation provider for every llm call whose model has no `vllm_base_urls` entry (routing is per call — see `vllm_base_urls` below)
     llm_provider: Literal["openrouter", "vllm"]
-    # default model for every LLM call — one-shot prompted calls AND agent loops alike.
-    # A call resolves its model as `model_overrides.get(call_site_name, llm_model)`; only a
-    # per-call-site entry in `model_overrides` (below) overrides it.
+    # default model for every llm call
     llm_model: str
     # the client to use for computing embeddings ("vllm" resolves the server URL from `vllm_base_urls[emb_model_id]`)
     emb_provider: Literal["openrouter", "vllm"]
-    # the model to use for computing embeddings
+    # default model for computing embeddings
     emb_model_id: str
     # per-call retry on transient faults only (429 / 5xx / transport blips); the delay doubles each attempt.
     llm_max_retries: int
@@ -41,17 +39,13 @@ class InferenceConfig:
     # a candidate document so the judge request fits the judge model's window; a model with no match is
     # treated as having no known limit (no truncation).
     llm_context_limits: dict[str, int]
+    # default effort for llm calls
+    effort: Effort = "medium"
     # Optional OpenRouter provider pin (ignored on the vllm path): an ordered list of provider
     # slugs (e.g. ["parasail"]). When set, generation is routed only to these providers with no
     # fallback, so a specific provider's prompt-cache / pricing is used deterministically. null =
     # let OpenRouter pick. Resolve slugs from the model's Providers tab (e.g. io.net => "io-net").
     llm_provider_order: list[str] | None = None
-    # Per-call-site overrides keyed by `PromptedCall.name`, read by skunk's agent loop
-    # (prompted_call._resolve_effort / _resolve_model). Empty = every call site uses its
-    # own default effort and `llm_model`. The qatfd harness doesn't tune per-call-site,
-    # so these default empty — but the agent code path requires the attributes to exist.
-    effort_overrides: dict[str, "Effort"] = field(default_factory=dict)
-    model_overrides: dict[str, str] = field(default_factory=dict)
     # Per-model vLLM routing: model id -> OpenAI-compatible base URL of the vLLM server that
     # serves it (e.g. {"Qwen/Qwen3-32B": "http://gpu-box:8100/v1"}). Any generation call whose
     # resolved model appears here (exact match — keys must equal the server's
@@ -80,16 +74,49 @@ class StorageConfig:
 @dataclass
 class AgentConfig:
     """Configuration for an agent """
-    # the name of the agent
+    # the agent's human-readable name; used in logging to identify which lines belong to this agent
     name: str
+    # unique id used to attribute this agent's token/cost usage on the shared LLMClient's UsageTracker
+    # If None, each agent instance will generate a fresh uuid4
+    agent_id: str | None = None
+    # model for the agent to use; if None, falls back to InferenceConfig.llm_model
+    llm_model: str | None = None
+    # maximum number of steps taken by the agent
+    max_steps: int = 20
+    # maximum number of step failures across the agent trajectory; failures do not count
+    # against the step budget, but once we reach this limit we terminate to prevent the
+    # agent from failing repeatedly
+    max_misfires: int = 5
+    # the number steps before the max_steps boundary at which we issue a warning to the agent
+    warn_steps_remaining: int = 3
+    # Per-step sampling temperature, threaded to `LLMClient.acall()`.
+    # 1.0 per Gemini 3.x guidance: thinking-enabled calls below 1.0 can trap the
+    # model in a degenerate reasoning loop that burns the whole output budget (https://ai.google.dev/gemini-api/docs/gemini-3)
+    temperature: float = 1.0
+    # reasoning effort for the agent's model; if None, falls back to InferenceConfig.effort
+    effort: Effort | None = None
+    # Per-step generation caps, threaded to `LLMClient.acall()`.
+    # Both None → provider defaults (uncapped output, no wall-clock timeout),
+    # preserving behaviour for every agent that doesn't opt in. `SearchAgent` sets
+    # these to bound runaway generations and to cap genuinely hung requests.
+    max_output_tokens: int | None = None
+    request_timeout_s: float | None = None
+    # Extra imports authorized inside the per-step code sandbox. Default: none
+    # (tool calls only). Compute-oriented agents (e.g. the task solver) widen
+    # this to allow numpy / scipy / statistics / ... in their python steps.
+    # A tuple (not a list): class-level mutable defaults are shared across every
+    # instance, so an in-place append would leak between agents.
+    authorized_imports: Sequence[str] = ()
     # cost budget in dollars for the agent; None means no budget limit (default)
     cost_budget: float | None = None
     # latency budget in seconds for the agent; None means no latency limit (default)
     latency_budget: float | None = None
-    # stable id used to attribute this agent's token/cost usage on the shared UsageTracker
-    # (see UsageTracker.key_to_usage). None => the agent mints a fresh uuid4 per instance; set
-    # it to pin a deterministic key (e.g. to aggregate a system's usage across questions).
-    agent_id: str | None = None
+    # fraction of the context limit above which the agent is restricted from making
+    # tool calls which do not reclaim context
+    context_hard_safety_frac: float = 0.8
+    # fraction of the context limit above which the agent is warned that it should begin
+    # reclaiming context if possible or return a final answer
+    context_soft_safety_frac: float = 0.6
 
     @classmethod
     def from_yaml(cls, path: str) -> AgentConfig:
@@ -97,93 +124,87 @@ class AgentConfig:
             data = yaml.safe_load(f)
         return cls(**data)
 
+    # TODO: move into AgentConfig to enforce this on construction; also check that safety fractions make sense
+    # # sanity check config inputs
+    # assert config.cost_budget is None or config.cost_budget > 0.0
+    # assert config.latency_budget is None or config.latency_budget > 0.0
 
 @dataclass
 class LookupAgentConfig(AgentConfig):
-    """Additional configuration for the LookupAgent"""
-    # Step cap for the lookup_external agent (terminates earlier via its final-answer JSON block).
-    # (env: SKUNK_LOOKUP_MAX_STEPS)
-    lookup_max_steps: int = 4
-    # Active lookup tools by name (see `lookup_tools._REGISTRY`); None → all tools.
-    # (env: SKUNK_LOOKUP_TOOLS — comma-separated, e.g. "fetch_fred,tavily_search")
+    """Additional configuration and default overrides for the LookupAgent."""
+    name: str = "lookup_agent"
+    # specify set of active lookup tools by name (see `lookup_tools._REGISTRY`); None → all tools.
     lookup_tools: list[str] | None = None
-
-    # Per-LLM-call caps for the external-lookup agent's turns. Mirrors the search
-    # agent: without a combined thinking+visible cap, Flash thrashed to ~63K thinking
-    # tokens / ~285s per step and emitted no parseable tool call (parse-retry death
-    # spiral). (env: SKUNK_LOOKUP_AGENT_MAX_OUTPUT_TOKENS, SKUNK_LOOKUP_AGENT_TIMEOUT_S)
-    lookup_agent_max_output_tokens: int = 8192
-    lookup_agent_request_timeout_s: float = 150.0
+    # override default max steps for the LookupAgent
+    max_steps: int = 4
+    # override default warn steps remaining
+    warn_steps_remaining: int = 1
+    # override per-llm call generation caps for the LookupAgent
+    max_output_tokens: int | None = 8192
+    request_timeout_s: float | None = 150.0
+    # default set of authorized imports for the LookupAgent
+    authorized_imports: Sequence[str] = field(default_factory=lambda: ["math", "statistics", "numpy", "pandas", "json"])
 
 
 @dataclass
 class SearchAgentConfig(AgentConfig):
-    # the agent will answer the question directly if agent_mode == "answer", otherwise a separate
-    # LLM computes an answer given the SearchAgent's retrieved documents
-    agent_mode: str = "retrieve"
-
-    # maximum number of tokens and seconds the agent can take togenerate a repsonse
-    search_agent_max_output_tokens: int = 4096
-    search_agent_request_timeout_s: float = 120.0
-
+    """Additional configuration and default overrides for the SearchAgent."""
+    name: str = "search_agent"
     # boolean switches determining which tools the SearchAgent has access to
     include_search_corpus: bool = True
     include_grep_corpus: bool = True
     include_semantic_filter: bool = False
-
+    # the number of chunks to print headers for when the agent fetches data into the WorkingSet
+    chunks_per_summary: int = 10
+    # the number of workers to use to process semantic filter tool calls in parallel
+    semantic_filter_max_workers: int = 16
+    # the maximum number of documents that can be processed by a single semantic filter tool call
+    semantic_filter_max_candidate_docs: int = 1000
+    # the fraction of the semantic filter model's context window that can be used to fit document text
+    semantic_filter_context_safety_frac: float = 0.9
     # maximum output tokens for each semantic_filter judge call. The reply is a single TRUE/FALSE
     # token and judge reasoning is disabled (`semantic_filter_disable_reasoning`), so a tiny cap
     # suffices. If reasoning is re-enabled, raise this too — a reasoning judge that hits the cap
     # returns finish_reason=length with empty content, which retries+backs-off and destroys
     # throughput. Threaded into `SemanticFilterTool`.
     semantic_filter_max_output_tokens: int = 4
-
     # Disable reasoning/thinking on the semantic_filter judge calls (OpenRouter
     # `reasoning={"enabled": false}`): the verdict is one token, so thinking is pure cost.
     # Set False for judge models that mandate reasoning (they 400 on disabled reasoning) —
     # and then raise `semantic_filter_max_output_tokens` to give the judge headroom.
     semantic_filter_disable_reasoning: bool = True
-
     # Model for the semantic_filter's per-candidate judge calls; None => `llm_model` (the agent
     # model). Set it to a cheaper model to run the (token-heavy) candidate filtering on the cheap
     # model while the search agent itself stays on `llm_model` — the filtered-out candidates never
     # enter the agent model's context, so this drives cost down without touching the agent's reasoning.
-    semantic_filter_model: str | None = None
-
+    semantic_filter_llm_model: str | None = None
     # OpenRouter provider order (no fallback) for the semantic_filter judge calls only. None => use
     # the client-wide `llm_provider_order`. Lets the judge model route to specific providers (e.g.
     # [akashml, parasail]) while the agent model (which may be a different family, e.g. a Google
     # model that those providers don't serve) stays unpinned.
     semantic_filter_provider_order: list[str] | None = None
-
-    # maximum number of steps the agent can take in a single conversation
-    agent_max_steps: int = 20
-
-    # maximum number of failed agent steps before aborting
-    agent_max_misfires: int = 5
-
     # extra steps the agent may take, after its main run, to correct any returned doc_ids that
     # do not name a real document (e.g. a bare filing name missing its page suffix). Kept separate
-    # from `agent_max_steps` so a citation fix never eats into the agent's search budget.
+    # from `max_steps` so a citation fix never eats into the agent's search budget.
     doc_id_correction_steps: int = 3
-
     # turn off the intermediate collection used by each Working Set (ablation flag)
     working_set_collection_off: bool = False
-
     # turn off Working Set id tracking for inclusion / exclusion filters (ablation flag)
     id_tracking_off: bool = False
-
     # retrieve related working sets before running the agent
     fetch_related_working_sets: bool = False
+    # override per-llm call generation caps number for the SearchAgent
+    max_output_tokens: int | None = 4096
+    request_timeout_s: float | None = 120.0
 
 
 # --------------------------------------------------------------------------------
-# Orchestrator configuration.
+# Skunk configuration.
 # --------------------------------------------------------------------------------
 
 
 @dataclass
-class OrchestratorConfig:
+class SkunkConfig:
     # config for the retrieval operator (search agent)
     search: SearchAgentConfig
     # config for the lookup operator (lookup agent)
@@ -192,71 +213,3 @@ class OrchestratorConfig:
     inference: InferenceConfig
     # config for global storage
     storage: StorageConfig
-
-    # compute operator configuration for maximum number of attempts to answer question
-    compute_max_attempts: int = 3
-    # Best-of-N: run this many independent codegen→exec trials per compute call (in
-    # parallel) and commit the most frequent outcome. All `NeedsMore` trials pool into a
-    # single missing-data candidate; a tie NEVER breaks in favor of missing-data (see
-    # `ComputeOp._vote`). 1 = single-trial.
-    compute_best_of_n: int = 5
-
-    # Replan-on-MissingData loop. Total compute invocations ≤ recovery_max_rounds + 1.
-    recovery_max_rounds: int = 2
-
-
-def parse_effort_overrides(raw: str) -> dict[str, "Effort"]:
-    """Parse `SKUNK_EFFORT_OVERRIDES` ("name=tier,...") into a dict. Raises ValueError
-    on malformed entries / unknown tiers so config typos fail loudly at startup."""
-    from skunk.common import EFFORT_VALUES  # local to avoid import cycle
-
-    out: dict[str, Effort] = {}
-    for entry in raw.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        if "=" not in entry:
-            raise ValueError(
-                f"SKUNK_EFFORT_OVERRIDES entry {entry!r} missing '=' "
-                f"(expected `name=tier`)"
-            )
-        name, _, tier = entry.partition("=")
-        name = name.strip()
-        tier = tier.strip()
-        if tier not in EFFORT_VALUES:
-            raise ValueError(
-                f"SKUNK_EFFORT_OVERRIDES tier {tier!r} not in {EFFORT_VALUES}"
-            )
-        out[name] = tier  # type: ignore[assignment]
-    return out
-
-
-def parse_model_overrides(raw: str) -> dict[str, str]:
-    """Parse `SKUNK_MODEL_OVERRIDES` ("name=model,...") into a dict keyed by
-    `PromptedCall.name`. Model ids are free-form (no enum to validate against);
-    an unknown id surfaces as an API error at the call site. Raises ValueError on
-    a missing '=' so config typos fail loudly at startup."""
-    out: dict[str, str] = {}
-    for entry in raw.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        if "=" not in entry:
-            raise ValueError(
-                f"SKUNK_MODEL_OVERRIDES entry {entry!r} missing '=' "
-                f"(expected `name=model`)"
-            )
-        name, _, model = entry.partition("=")
-        name = name.strip()
-        model = model.strip()
-        if not model:
-            raise ValueError(f"SKUNK_MODEL_OVERRIDES entry {entry!r} has empty model")
-        out[name] = model
-    return out
-
-
-def parse_csv(raw: str) -> list[str] | None:
-    """Parse a comma-separated env var into a list of trimmed entries, or None when
-    unset/empty (so the field falls back to its default)."""
-    items = [s.strip() for s in raw.split(",") if s.strip()]
-    return items or None

@@ -56,7 +56,7 @@ def parse_codegen_reply(raw: str, *, expectation: str) -> str:
 
     s = strip_code_fences(raw).strip()
     if not s or s.startswith("{"):
-        raise ParseError(raw=raw, detail=expectation)
+        raise ParseError(detail=expectation)
     return s
 
 

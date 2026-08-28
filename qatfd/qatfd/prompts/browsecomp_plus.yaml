@@ -1,0 +1,33 @@
+
+corpus_details: |-
+  The corpus consists of 100,195 web pages scraped from URLs relevant to 830 complex, multi-hop fact-seeking questions.
+
+  #### Identifier formats
+  - `doc_id`: a numeric string identifying each scraped web page (e.g. `"4217"`).
+  - `chunk_id`: `"{doc_id}_{element_id}"` (e.g. `"4217_3"` = the 4th element, 0-indexed, of document 4217).
+  - In your final answer, the `doc_ids` list holds `doc_id`s in the format above.
+
+  #### Available metadata fields (for use with `metadata_filter`)
+  Every chunk has the following metadata you can filter on:
+  - `doc_id`: string, the numeric web-page identifier (see above).
+  - `chunk_id`: string, `"{doc_id}_{element_id}"`.
+  - `url`: string, the exact source URL of the web page (equality/set-membership only — ChromaDB does not support substring or prefix matching).
+  - `element_id`: integer, 0-based index of the chunk within its document.
+
+  #### Example `metadata_filter` clauses
+  ```python
+  # all chunks from a single document
+  {"doc_id": "4217"}
+
+  # only the first two elements of a document (often page title + intro)
+  {"$and": [{"doc_id": "4217"}, {"element_id": {"$in": [0, 1]}}]}
+
+  # all chunks from a known set of relevant documents
+  {"doc_id": {"$in": ["4217", "8031", "12500"]}}
+
+  # only the first element of every document (useful for a title-level scan)
+  {"element_id": 0}
+
+  # all chunks from an exact known URL
+  {"url": "https://example.com/some-article"}
+  ```

@@ -65,7 +65,7 @@ for entry in "${CONFIGS[@]}"; do
   fi
   provider_ovr=()
   [ -n "$PROVIDER" ] && provider_ovr+=( "inference.llm_provider_order=[${PROVIDER}]" )
-  [ -n "$JUDGE_MODEL" ] && provider_ovr+=( "systems.semantic_filter_model=${JUDGE_MODEL}" )
+  [ -n "$JUDGE_MODEL" ] && provider_ovr+=( "systems.semantic_filter_llm_model=${JUDGE_MODEL}" )
   [ -n "$JUDGE_PROVIDERS" ] && provider_ovr+=( "systems.semantic_filter_provider_order=[${JUDGE_PROVIDERS}]" )
   run_name="$label"
   if [ "$WORKING_SET_OFF" = "true" ]; then

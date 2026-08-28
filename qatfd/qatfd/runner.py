@@ -11,9 +11,6 @@ one asyncio.run per worker, a timestamped run directory, per-question JSONL even
 traces, and a pre-allocated results list that preserves input order.
 """
 
-# ruff: noqa: E402 — qatfd.env.load_env() MUST run before any `import skunk` (it
-# populates the API keys / config skunk reads at import), so the skunk + qatfd
-# imports below deliberately follow the load_env() call rather than sitting at the top.
 from __future__ import annotations
 
 import asyncio
@@ -56,15 +53,13 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 from skunk.common import ExecutionContext
-from skunk.config import InferenceConfig, LookupAgentConfig, OrchestratorConfig, SearchAgentConfig
-from skunk.errors import MissingData, StepFailed
-from skunk.llm_client import LLMClient
+from skunk.config import InferenceConfig, LookupAgentConfig, SkunkConfig, SearchAgentConfig
+from skunk.trace import Tracer
 
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources
 from qatfd.config import ExperimentConfig, benchmark_config_factory, system_config_factory
 from qatfd.registry import build_benchmark, build_system
 from qatfd.systems.base import System
-from qatfd.trace_util import dump_trace
 from qatfd.types import Question, Result, report_columns, result_to_row
 
 # keys to ignore when resuming an experiment from a previous run; these fields may naturally change
@@ -81,7 +76,7 @@ class _RunCtx:
     benchmark: Benchmark
     system: System
     resources: BenchmarkResources
-    trace_dir: Path | None
+    trace_dir: Path
     model: str
     verbose: bool
 
@@ -245,22 +240,24 @@ def _load_finished_qids(results_path: Path) -> dict[str, Result]:
 # ---------------------------------------------------------------------------
 
 async def _run_one(q: Question, rc: _RunCtx) -> Result:
-    llm_client = LLMClient(rc.system.inference_cfg)
-    tracker = llm_client.usage
-    log_path = str(rc.trace_dir / f"{q.qid}.jsonl") if rc.trace_dir else None
-    search_config = rc.system.config if isinstance(rc.system.config, SearchAgentConfig) else SearchAgentConfig(name="search")
-    ctx = ExecutionContext(
-        question=q.text, uid=q.qid,
-        config=OrchestratorConfig(
+    search_config = (
+        rc.system.retrieve_config
+        if isinstance(rc.system.retrieve_config, SearchAgentConfig)
+        else SearchAgentConfig(name="search")
+    )
+    ctx = ExecutionContext.build(
+        config=SkunkConfig(
             inference=rc.system.inference_cfg,
             storage=rc.benchmark.config.storage,
             search=search_config,
-            lookup=LookupAgentConfig(name="lookup"),   # unused
+            lookup=LookupAgentConfig(name="lookup"),  # unused
         ),
-        llm_client=llm_client,
         document_map=rc.resources.document_map,
-        log_path=log_path, verbose=rc.verbose,
-        prompt_overrides=rc.resources.prompt_overrides,
+        chroma_collection=rc.resources.chroma_collection,
+        tracer=Tracer(
+            log_path=str(rc.trace_dir / f"{q.qid}.jsonl"),
+            verbose=rc.verbose,
+        ),
     )
 
     predicted, failed, reason, retrieved = "", False, "", None
@@ -275,8 +272,6 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
         retrieved = out.retrieved_doc_ids
         terminate_state = out.terminate_state
         retrieve_wall_s, compute_wall_s = out.retrieve_wall_s, out.compute_wall_s
-    except (StepFailed, MissingData) as e:
-        failed, reason = True, f"{type(e).__name__}: {e}"
     except Exception as e:  # noqa: BLE001 — record any failure as a row, never crash the run
         failed, reason = True, f"{type(e).__name__}: {e}"
     wall_s = time.monotonic() - t0
@@ -295,6 +290,7 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
     # its stable per-phase keys ({agent_id}_retrieve / _compute), so we can attribute the retrieval
     # method's cost apart from the shared compute answerer. `system_cost` is their sum. Without a
     # configured agent_id the agents mint their own keys and we can't isolate them, so report 0.
+    tracker = ctx.llm_client.usage
     retrieve_key, compute_key = rc.system.retrieve_usage_key, rc.system.compute_usage_key
     retrieve_cost = tracker.cost(key=retrieve_key) if retrieve_key else 0.0
     compute_cost = tracker.cost(key=compute_key) if compute_key else 0.0
@@ -322,18 +318,7 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
             reason = f"scoring_failed: {type(e).__name__}: {e}"
 
     recall_metrics = rc.benchmark.recall_metrics(retrieved, q)
-
-    if rc.trace_dir:
-        try:
-            dump_trace(
-                str(rc.trace_dir / f"{q.qid}.txt"),
-                qid=q.qid, benchmark=rc.benchmark.name, system=rc.system.name,
-                question=q.text, predicted=predicted, gold=q.gold, score=score,
-                failed=failed, reason=reason, events=list(ctx.events), model=rc.model,
-            )
-        except Exception:  # noqa: BLE001 — a trace-dump failure must not lose the row
-            pass
-    ctx.close()
+    ctx.tracer.close()
 
     return Result(
         benchmark=rc.benchmark.name, system=rc.system.name, qid=q.qid, question=q.text,
@@ -347,8 +332,102 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
     )
 
 
+# TODO: rc.system.answer() is the entrypoint for answering each question
 async def _run_all(qs: list[Question], rc: _RunCtx) -> list[Result]:
-    return []
+    search_config = (
+        rc.system.retrieve_config
+        if isinstance(rc.system.retrieve_config, SearchAgentConfig)
+        else SearchAgentConfig(name="search")
+    )
+    ctx = ExecutionContext.build(
+        config=SkunkConfig(
+            inference=rc.system.inference_cfg,
+            storage=rc.benchmark.config.storage,
+            search=search_config,
+            lookup=LookupAgentConfig(name="lookup"),  # unused
+        ),
+        document_map=rc.resources.document_map,
+        chroma_collection=rc.resources.chroma_collection,
+        tracer=Tracer(
+            log_path=str(rc.trace_dir / "all.jsonl"),
+            verbose=rc.verbose,
+        ),
+    )
+
+    predicted, failed, reason, retrieved = "", False, "", None
+    # Defaults for the failure path: if answer() raises we get no AnswerOutput, so the phase
+    # splits stay 0 and the terminate flags stay False (the StepFailed text lands in `reason`).
+    terminate_state: str | None = None
+    t0 = time.monotonic()
+    try:
+        # TODO: rc.system.answer_all(qs, rc.resources, ctx)
+        out = await rc.system.answer(qs[0], rc.resources, ctx)
+        predicted = out.answer
+        retrieved = out.retrieved_doc_ids
+        terminate_state = out.terminate_state
+    except Exception as e:  # noqa: BLE001 — record any failure as a row, never crash the run
+        failed, reason = True, f"{type(e).__name__}: {e}"
+    wall_s = time.monotonic() - t0
+
+    # A budgeted agent stamps terminate_state as a `|`-joined subset of these tokens (else
+    # "finished"/None); split it into one boolean column per reason for easy filtering.
+    ts = terminate_state or ""
+    out_of_steps = "out_of_steps" in ts
+    over_cost_budget = "over_cost_budget" in ts
+    over_latency_budget = "over_latency_budget" in ts
+
+    # TODO: no separate retrieve vs. compute key here
+    # Snapshot system usage BEFORE scoring so the judge's tokens are not counted.
+    # `cost` is the all-in total (generation + embeddings); embed_* break out the
+    # query-embedding portion (tokens are exact on OpenRouter, char/4-estimated local).
+    # `cost` is the all-in total across every caller; the system's own spend is split by phase via
+    # its stable per-phase keys ({agent_id}_retrieve / _compute), so we can attribute the retrieval
+    # method's cost apart from the shared compute answerer. `system_cost` is their sum. Without a
+    # configured agent_id the agents mint their own keys and we can't isolate them, so report 0.
+    tracker = ctx.llm_client.usage
+    retrieve_key, compute_key = rc.system.retrieve_usage_key, rc.system.compute_usage_key
+    retrieve_cost = tracker.cost(key=retrieve_key) if retrieve_key else 0.0
+    compute_cost = tracker.cost(key=compute_key) if compute_key else 0.0
+    usage = {
+        "total_input_tokens": tracker.total_input_tokens,
+        "total_output_tokens": tracker.total_output_tokens,
+        "total_cache_input_tokens": tracker.total_cached_tokens,
+        "cost": tracker.cost(),
+        "system_cost": retrieve_cost + compute_cost,
+        "retrieve_cost": retrieve_cost,
+        "compute_cost": compute_cost,
+        "embed_tokens": tracker.total_embed_tokens,
+        "embed_calls": tracker.total_embed_calls,
+        "embed_cost": tracker.embed_cost(),
+    }
+
+    # TODO: output needs to produce a list of predicted values to score against qs
+    score, scorer, judge_rationale = 0.0, "", ""
+    if not failed:
+        try:
+            sc = await rc.benchmark.score(qs[0], predicted, ctx)
+            score = float(sc.get("score", 0.0))
+            scorer = sc.get("scorer", "")
+            judge_rationale = sc.get("judge_rationale", "")
+        except Exception as e:  # noqa: BLE001
+            reason = f"scoring_failed: {type(e).__name__}: {e}"
+
+    recall_metrics = rc.benchmark.recall_metrics(retrieved, qs[0])
+    ctx.tracer.close()
+
+    # TODO: return list[Result]
+    retrieve_wall_s = 0.0
+    compute_wall_s = 0.0
+    return [Result(
+        benchmark=rc.benchmark.name, system=rc.system.name, qid=qs[0].qid, question=qs[0].text,
+        predicted=predicted, gold=qs[0].gold, score=score, scorer=scorer,
+        recall_metrics=recall_metrics, retrieved_docs=json.dumps(retrieved or []),
+        gold_docs=json.dumps(qs[0].gold_docs), failed=failed, reason=reason,
+        judge_rationale=judge_rationale, wall_s=round(wall_s, 3),
+        retrieve_wall_s=round(retrieve_wall_s, 3), compute_wall_s=round(compute_wall_s, 3),
+        out_of_steps=out_of_steps, over_cost_budget=over_cost_budget,
+        over_latency_budget=over_latency_budget, **usage,
+    )]
 
 # ---------------------------------------------------------------------------
 # Question Execution Strategies (parallel | sequential | all)
@@ -479,11 +558,19 @@ def main(cfg: DictConfig) -> None:
     exp_cfg = ExperimentConfig(**cast(dict, OmegaConf.to_container(cfg.experiments, resolve=True)))
     inference_cfg = InferenceConfig(**cast(dict, OmegaConf.to_container(cfg.inference, resolve=True)))
     bench_cfg = benchmark_config_factory(cfg)
-    system_cfg = system_config_factory(cfg)
+
+    # NOTE: for now, ComputeAgent is simple enough that it suffices to copy the
+    # RAGLLMConfig / SearchAgentConfig config twice and adjust the few variables
+    # that need tweaking within the System class; if we ever have more elaborate
+    # compute we should create a new hydra doc to store the base compute agent config
+    retrieve_system_cfg = system_config_factory(cfg)
+    compute_system_cfg = system_config_factory(cfg)
+    retrieve_system_cfg.agent_id = f"{retrieve_system_cfg.agent_id}-retrieve"
+    compute_system_cfg.agent_id = f"{compute_system_cfg.agent_id}-compute"
 
     # build benchmark and system
     benchmark = build_benchmark(bench_cfg)
-    system = build_system(system_cfg, inference_cfg)
+    system = build_system(retrieve_system_cfg, compute_system_cfg, inference_cfg)
 
     if not cfg.dry_run:
         run(benchmark, system, exp_cfg, cfg, overrides=overrides)

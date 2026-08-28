@@ -187,16 +187,14 @@ class TrecBiogenBenchmark(Benchmark):
 
     # TREC-Biogen is evaluated on nugget recall instead of exact-answer correctness.
     compute_objective = (
-        "The final answer to this question will be graded on nugget recall — the fraction of the "
-        "reference answer's key facts that it covers."
+        "the final answer to this question will be graded on nugget recall — the fraction of the "
+        "reference answer's key facts that the final answer covers."
     )
 
     def __init__(self, config: TrecBiogenConfig) -> None:
         # all benchmark data (questions, nuggets, prompts) resolves under qatfd/benchmarks/.
         config.task_a_path = str(resolve_under_benchmarks(config.task_a_path))
         config.nuggets_path = str(resolve_under_benchmarks(config.nuggets_path))
-        if config.prompts_path:
-            config.prompts_path = str(resolve_under_benchmarks(config.prompts_path))
         super().__init__(config)
 
     # ---- questions + nuggets --------------------------------------------------
@@ -288,6 +286,8 @@ class TrecBiogenBenchmark(Benchmark):
             # fiction stays local here and consumers keep treating chroma_collection as a Collection.
             chroma_collection=cast(Collection, collection),
             document_map=_ChromaDocMap(collection),
+            answer_format_hint=self.answer_format_hint,
+            compute_objective=self.compute_objective,
         )
 
     # ---- scoring + metrics ----------------------------------------------------
