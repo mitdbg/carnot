@@ -11,3 +11,6 @@ splits_path: officeqa/officeqa_splits.json
 csv_path: officeqa/officeqa_pro.csv
 clean_page_map_path: officeqa/treasury_bulletins_cleaned/clean_page_map.json
 pdf_dir: officeqa/treasury_bulletin_pdfs
+codex_home: officeqa/codex/
+codex_scratch_dir: officeqa/codex-scratch/
+codex_answer_schema_file: officeqa/answer_schema.json

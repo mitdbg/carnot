@@ -210,6 +210,7 @@ class QampariBenchmark(Benchmark):
         # lazily + cached from the chroma `documents` column (only the chunks a question actually reads
         # get materialized). The systems only do keyed lookups, so the lazy mapping is a drop-in.
         return BenchmarkResources(
+            name=self.name,
             chroma_collection=collection,
             document_map=_ChromaDocMap(collection),
             answer_format_hint=self.answer_format_hint,

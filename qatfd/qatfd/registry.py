@@ -15,6 +15,7 @@ from qatfd.benchmarks.qampari import QampariBenchmark
 from qatfd.benchmarks.trec_biogen import TrecBiogenBenchmark
 from qatfd.config import BenchmarkConfig
 from qatfd.systems.base import System
+from qatfd.systems.codex import CodexSystem
 from qatfd.systems.rag_llm import RAGLLMSystem
 from qatfd.systems.search_agent import SearchAgentSystem
 
@@ -30,10 +31,7 @@ BENCHMARKS: dict[str, type[Benchmark]] = {
     FreshstackBenchmark.name: FreshstackBenchmark,
 }
 
-SYSTEMS: dict[str, type[System]] = {
-    RAGLLMSystem.name: RAGLLMSystem,
-    SearchAgentSystem.name: SearchAgentSystem,
-}
+SYSTEMS: list[type[System]] = [RAGLLMSystem, SearchAgentSystem, CodexSystem]
 
 
 def build_benchmark(config: BenchmarkConfig) -> Benchmark:
@@ -43,9 +41,21 @@ def build_benchmark(config: BenchmarkConfig) -> Benchmark:
     return BENCHMARKS[name](config)
 
 
-def build_system(retrieve_config: AgentConfig, compute_config: AgentConfig, inference: InferenceConfig) -> System:
-    name = retrieve_config.name
-    if name not in SYSTEMS:
-        raise KeyError(f"unknown system {name!r}; available: {sorted(SYSTEMS)}")
+def build_system(
+    inference: InferenceConfig,
+    retrieve_config: AgentConfig | None = None,
+    compute_config: AgentConfig | None = None,
+    codex_config: AgentConfig | None = None,
+) -> System:
+    if codex_config is not None:
+        return CodexSystem(codex_config, inference)
 
-    return SYSTEMS[name](retrieve_config, compute_config, inference)
+    assert retrieve_config is not None and compute_config is not None
+    name = retrieve_config.name
+    if name == RAGLLMSystem.name:
+        return RAGLLMSystem(retrieve_config, compute_config, inference)
+    elif name == SearchAgentSystem.name:
+        return SearchAgentSystem(retrieve_config, compute_config, inference)
+    else:
+        available = [system.name for system in SYSTEMS]
+        raise KeyError(f"unknown system {name!r}; available: {available}")

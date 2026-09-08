@@ -1,0 +1,9 @@
+retrieve:
+  name: ${systems.name}
+  # stable usage-attribution key for the system's retrieval agent (skunk MultiTurnAgent.agent_id)
+  agent_id: ${systems.name}-retrieve
+
+compute:
+  name: ${systems.name}
+  # stable usage-attribution key for the system's compute agent (skunk MultiTurnAgent.agent_id)
+  agent_id: ${systems.name}-compute

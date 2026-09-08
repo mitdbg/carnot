@@ -11,3 +11,6 @@ splits_path: browsecomp-plus/browsecomp_plus_splits.json
 bcp_questions: browsecomp-plus/browsecomp_plus_decrypted.jsonl
 bcp_metadata_glob: browsecomp-plus/browsecomp-plus-element-embeddings/metadata_rank*.json
 judge_model: null
+codex_home: browsecomp-plus/codex/
+codex_scratch_dir: browsecomp-plus/codex-scratch/
+codex_answer_schema_file: browsecomp-plus/answer_schema.json

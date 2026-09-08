@@ -78,7 +78,7 @@ class AgentConfig:
     name: str
     # unique id used to attribute this agent's token/cost usage on the shared LLMClient's UsageTracker
     # If None, each agent instance will generate a fresh uuid4
-    agent_id: str | None = None
+    agent_id: str = field(kw_only=True)
     # model for the agent to use; if None, falls back to InferenceConfig.llm_model
     llm_model: str | None = None
     # maximum number of steps taken by the agent

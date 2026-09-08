@@ -11,3 +11,11 @@ chroma_server_port: 8001
 pdf_dir: null
 # dev/test split JSON (under qatfd/benchmarks/): {"dev": [qids], "test": [qids]}. null => dev=all, test=empty.
 splits_path: null
+# (for CodexSystem) where the config.toml, sessions, and state live (relative to qatfd/benchmarks/)
+codex_home: null
+# (for CodexSystem) where the scratch directory for its work lives (relative to qatfd/benchmarks/)
+codex_scratch_dir: null
+# (for CodexSystem) where the example answer schema file lives (relative to qatfd/benchmarks/)
+codex_answer_schema_file: null
+# (for CodexSystem) the URL for the MCP server which is serving the benchmark via tools
+mcp_url: "http://127.0.0.1:8765/mcp"

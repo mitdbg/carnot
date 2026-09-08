@@ -12,3 +12,6 @@ name: officeqa_synth
 qa_pairs_path: officeqa/synth_dev_qa_pairs.json
 # no dev/test split: `experiments.split=dev` (the default) runs all questions
 splits_path: null
+codex_home: officeqa/codex/
+codex_scratch_dir: officeqa/codex-scratch/
+codex_answer_schema_file: officeqa/answer_schema.json

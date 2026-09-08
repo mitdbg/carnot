@@ -53,3 +53,6 @@ dev_questions_path: qampari/dev_data_sample50.jsonl
 partial_credit: 0.0
 # llm used by the nugget-completion judge (set on the CLI, e.g. google/gemini-2.5-flash)
 judge_model: null
+codex_home: qampari/codex/
+codex_scratch_dir: qampari/codex-scratch/
+codex_answer_schema_file: qampari/answer_schema.json

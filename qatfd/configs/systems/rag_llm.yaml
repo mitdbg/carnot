@@ -1,7 +1,11 @@
-# base config for rag_llm system
+# rag llm system inherits from retrieve_compute base config
 defaults:
-  - base
+  - retrieve_compute
   - _self_
 
 name: rag_llm
-top_k: null
+retrieve:
+  top_k: null
+
+compute:
+  max_steps: 5

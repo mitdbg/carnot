@@ -1,6 +1,6 @@
-# base config for search agent system
+# search agent system inherits from retrieve_compute base config
 defaults:
-  - base
+  - retrieve_compute
   - _self_
 
 name: search_agent

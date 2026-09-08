@@ -336,3 +336,6 @@ qatfd/benchmarks/**
 !qatfd/benchmarks/**/prompts.yaml
 !qatfd/benchmarks/**/README.md
 !qatfd/benchmarks/**/exclusions.txt
+# codex home dirs: only the config is source; everything else is runtime state
+qatfd/benchmarks/*/codex/**
+!qatfd/benchmarks/*/codex/config.toml

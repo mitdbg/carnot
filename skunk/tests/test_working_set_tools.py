@@ -207,7 +207,7 @@ def test_grep_read_truncation_marks_only_rendered_read():
 
 def _agent() -> SearchAgent:
     return SearchAgent(
-        config=SearchAgentConfig(name="t"), document_map={},
+        config=SearchAgentConfig(name="t", agent_id="t"), document_map={},
         chroma_collection=FakeChroma([]), llm_client=FakeLLMClient(),
     )
 

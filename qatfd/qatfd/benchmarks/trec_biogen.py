@@ -282,6 +282,7 @@ class TrecBiogenBenchmark(Benchmark):
         # question actually reads get materialized. (The systems only do keyed lookups on the doc
         # map; BioGen never iterates it, so the lazy mapping is a drop-in for the dict.)
         return BenchmarkResources(
+            name=self.name,
             # MergedCollection is a duck-typed Collection stand-in (query/get/count); cast so the
             # fiction stays local here and consumers keep treating chroma_collection as a Collection.
             chroma_collection=cast(Collection, collection),

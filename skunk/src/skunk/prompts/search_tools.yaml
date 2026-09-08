@@ -1,3 +1,4 @@
+# NOTE: if you modify this string; update the docstring in `qatfd/scripts/codex_mcp_server.py` to match.
 search_corpus: |-
   ### search_corpus(query: str, top_k: int, read: bool = False, fetch: bool = False, metadata_filter: dict | None = None)
   This tool performs a vector search over the corpus by embedding the input `query` and returning the `top_k` most relevant chunks, each labelled with its `chunk_id` and `doc_id`. You can optionally restrict the search to a subset of the corpus by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata.
@@ -51,6 +52,7 @@ search_corpus: |-
   ```
   {% endif %}
 
+# NOTE: if you modify this string; update the docstring in `qatfd/scripts/codex_mcp_server.py` to match.
 grep_corpus: |-
   ### grep_corpus(pattern: str, read: bool = False, fetch: bool = False, metadata_filter: dict | None = None, limit: int | None = None, max_output_tokens: int | None = None)
   This tool performs a regex search over the corpus and returns the matching chunks grouped by their `doc_id`. Each hit includes its `chunk_id` so you can later refer to it or prune it. The output is unlimited by default (`limit=None` and `max_output_tokens=None`). This is useful for exhaustive queries -- "find every doc that mentions X" -- but you should pass `limit=N` or `max_output_tokens=M` for narrower exploratory searches. If the matches exceed the `max_output_tokens` cap, the result is truncated with a note telling you how many hits were omitted. You can optionally restrict the search to a subset of the corpus by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata.
@@ -111,6 +113,7 @@ grep_corpus: |-
   ```
   {% endif %}
 
+# NOTE: if you modify this string; update the docstring in `qatfd/scripts/codex_mcp_server.py` to match.
 read_document: |-
   ### read_document(doc_id: str | list[str], start_char_idx: int | None | list[int | None] = None, end_char_idx: int | None | list[int | None] = None)
   This tool returns the cleaned text of one or more documents, given their `doc_id`(s). You can optionally specify `start_char_idx` and `end_char_idx` to fetch only a substring of each document. If you pass a list for `doc_id`, `start_char_idx` and `end_char_idx` must be lists of the same length or `None`, and each index pair will be applied to the corresponding document. If `end_char_idx` exceeds the document length, the document will be truncated to its actual length. If `start_char_idx` is negative, it counts from the end of the document. If `end_char_idx` is negative, it counts from the end of the document.
@@ -130,6 +133,7 @@ read_document: |-
   read_document(["doc_id_4", "doc_id_5"], start_char_idx=[-1000, None])
   ```
 
+# NOTE: if you modify this string; update the docstring in `qatfd/scripts/codex_mcp_server.py` to match.
 view_figure: |-
   ### view_figure(doc_id: str)
   When you read a document and see a `<figure id=N>` placeholder (a chart/figure that is NOT in the searchable text), call this tool to actually *see* it. It returns an image of the **entire page** — so you see every figure on the page in context — appended to your messages, just like reading the page's text. Use it to judge whether a page whose answer may live in a chart is relevant. Pass the `doc_id` of the page you read.
@@ -155,6 +159,7 @@ prune: |-
 sem_filter_judge: |-
   Determine whether a document satisfies a filter condition. You are given a filter condition and a document. Output TRUE if the document satisfies the condition, and FALSE otherwise. Your reply must be exactly TRUE or FALSE — a single word, with no explanation, reasoning, or any other text.
 
+# NOTE: if you modify this string; update the docstring in `qatfd/scripts/codex_mcp_server.py` to match.
 sem_filter_tool: |-
   ### semantic_filter(predicate: str, read: bool = False, fetch: bool = False, metadata_filter: dict | None = None, top_k: int | None = None, search_str: str | None = None, pattern: str | None = None, limit: int | None = None)
   Keep only the documents whose FULL text satisfies a natural-language `predicate`: candidates are selected from the corpus, each is judged independently by an LLM (TRUE/FALSE), and the survivors are returned. Ideally, your candidate selection should limit the number of LLM invocations to <= 1000. To perform candidate selection, this tool accepts a `metadata_filter` (a ChromaDB-style where clause over chunk metadata).

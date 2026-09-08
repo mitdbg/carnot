@@ -38,13 +38,20 @@ class AnswerOutput:
     `terminate_state` surfaces the retrieval agent's stop reason to the runner (see
     `Retrieved.terminate_state`), which parses it into the out_of_steps/over_cost_budget/
     over_latency_budget columns. `retrieve_wall_s`/`compute_wall_s` split the answer wall time
-    across the two phases (the runner also records the end-to-end `wall_s`)."""
+    across the two phases (the runner also records the end-to-end `wall_s`).
+    
+    `session_id` which is a provider-side id for systems whose spend is metered externally.
+    In particular, the CodexSystem forwards its thread id to OpenRouter as `session_id`, so
+    the runner can query this question's cost/tokens from the analytics API; subagent traffic
+    is billed under the parent's id).
+    """
 
     answer: str
     retrieved_doc_ids: list[str] | None = None
     terminate_state: str | None = None
     retrieve_wall_s: float = 0.0
     compute_wall_s: float = 0.0
+    session_id: str | None = None
 
 
 @dataclass
@@ -70,11 +77,8 @@ class Result:
     retrieve_wall_s: float = 0.0
     compute_wall_s: float = 0.0
     # all-in cost across every caller this question (generation + embeddings), then the system's
-    # own spend broken out by phase: system_cost is the sum of the retrieve slice (the retrieval
-    # agent, keyed `{agent_id}_retrieve`) and the compute slice (the shared answerer, keyed
-    # `{agent_id}_compute`). Lets a run compare a retrieval method's cost against compute and total.
+    # own spend broken out by phase. Lets a run compare a retrieval method's cost against compute and total.
     cost: float = 0.0
-    system_cost: float = 0.0
     retrieve_cost: float = 0.0
     compute_cost: float = 0.0
     total_cache_input_tokens: int = 0
@@ -110,7 +114,6 @@ REPORT_FIELDS = [
     "retrieve_wall_s",
     "compute_wall_s",
     "cost",
-    "system_cost",
     "retrieve_cost",
     "compute_cost",
     "total_cache_input_tokens",

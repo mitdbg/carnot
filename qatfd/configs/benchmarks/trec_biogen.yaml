@@ -29,3 +29,6 @@ nuggets_path: trec-biogen/baseline_labels.json
 partial_credit: 0.0
 # llm used by the nugget-completion judge
 judge_model: null
+codex_home: trec-biogen/codex/
+codex_scratch_dir: trec-biogen/codex-scratch/
+codex_answer_schema_file: trec-biogen/answer_schema.json

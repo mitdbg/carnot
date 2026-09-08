@@ -37,6 +37,7 @@ class BenchmarkResources:
     across all per-question workers. Mirrors skunk RetrieveOp's
     (collection, document_map) pair, named so systems read fields explicitly."""
 
+    name: str  # the name of the benchmark
     chroma_collection: Collection  # chromadb Collection (vector index over chunks)
     document_map: DocumentMap  # doc_id -> full text (for read_document / answer step)
     answer_format_hint: str = ""  # guidance on the format of the final answer (for the compute agent)

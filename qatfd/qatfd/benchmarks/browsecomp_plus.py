@@ -96,6 +96,7 @@ class BrowseCompPlusBenchmark(Benchmark):
         collection = self._open_chroma_collection()
         document_map = self._build_document_map()
         return BenchmarkResources(
+            name=self.name,
             chroma_collection=collection,
             document_map=document_map,
             answer_format_hint=self.answer_format_hint,

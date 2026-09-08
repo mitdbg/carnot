@@ -173,6 +173,7 @@ class FreshstackBenchmark(Benchmark):
     def _build_resources(self) -> BenchmarkResources:
         collection = self._open_chroma_collection()
         return BenchmarkResources(
+            name=self.name,
             chroma_collection=collection,
             document_map=self._build_document_map(),
             answer_format_hint=self.answer_format_hint,

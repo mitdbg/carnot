@@ -133,11 +133,6 @@ class SearchAgent(MultiTurnAgent):
         # override the default agent_id if one is provided
         config.agent_id = config.agent_id if agent_id is None else agent_id
 
-        # NOTE: temporary enforcement; if config.agent_id is None here, then _build_tools()
-        # will assign a (None) agent_id to the tools, and super().__init__() will create a
-        # different agent_id with uuid.uuid4()
-        assert config.agent_id is not None, "Must supply agent_id for SearchAgent"
-
         # set variables
         self.document_map = document_map
         self.chroma_collection = chroma_collection
@@ -419,7 +414,7 @@ class SearchAgent(MultiTurnAgent):
                 self.chroma_collection,
                 self._llm_client,
                 self._working_set,
-                usage_key=str(config.agent_id),
+                usage_key=config.agent_id,
                 working_set_collection_off=config.working_set_collection_off,
                 id_tracking_off=config.id_tracking_off,
             ))
@@ -440,7 +435,7 @@ class SearchAgent(MultiTurnAgent):
                 self._working_set,
                 config,
                 self._resolve_semantic_filter_llm_model(),
-                usage_key=str(config.agent_id),
+                usage_key=config.agent_id,
                 working_set_collection_off=config.working_set_collection_off,
                 id_tracking_off=config.id_tracking_off,
             ))

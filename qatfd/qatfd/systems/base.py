@@ -85,24 +85,11 @@ class CodeAnswerAgent(MultiTurnAgent):
 
 class System(ABC):
     name: str  # set to the registry key on the instance by build_system
-
-    def __init__(self, retrieve_config: AgentConfig, compute_config: AgentConfig, inference_cfg: InferenceConfig) -> None:
-        self.retrieve_config = retrieve_config
-        self.compute_config = compute_config
-        self.inference_cfg = inference_cfg
-
-        # enforce that retrieve and compute have agent ids which are distinct so that we can
-        # separate out the cost of retrieval from the cost of computing the final answer
-        assert self.retrieve_config.agent_id and self.compute_config.agent_id and self.retrieve_config.agent_id != self.compute_config.agent_id
-
-    # stable per-phase usage-attribution keys
-    @property
-    def retrieve_usage_key(self) -> str | None:
-        return self.retrieve_config.agent_id
+    inference_cfg: InferenceConfig
 
     @property
-    def compute_usage_key(self) -> str | None:
-        return self.compute_config.agent_id
+    def system_usage_key(self) -> str:
+        ...
 
     @abstractmethod
     async def answer(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext) -> AnswerOutput:
@@ -117,6 +104,24 @@ class RetrieveComputeSystem(System):
     # step budget for the code-execution answer agent; we use a fixed value across all systems
     # so that compute is identical and only retrieval varies
     ANSWER_MAX_STEPS: int = 5
+
+    def __init__(self, retrieve_config: AgentConfig, compute_config: AgentConfig, inference_cfg: InferenceConfig) -> None:
+        self.retrieve_config = retrieve_config
+        self.compute_config = compute_config
+        self.inference_cfg = inference_cfg
+
+        # enforce that retrieve and compute have agent ids which are distinct so that we can
+        # separate out the cost of retrieval from the cost of computing the final answer
+        assert self.retrieve_config.agent_id and self.compute_config.agent_id and self.retrieve_config.agent_id != self.compute_config.agent_id
+
+    # stable per-phase usage-attribution keys
+    @property
+    def retrieve_usage_key(self) -> str:
+        return self.retrieve_config.agent_id
+
+    @property
+    def compute_usage_key(self) -> str:
+        return self.compute_config.agent_id
 
     @abstractmethod
     async def retrieve(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext) -> Retrieved:

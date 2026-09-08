@@ -208,7 +208,7 @@ class MultiTurnAgent(ABC):
         parse: Callable[[str], StepOutput],
     ) -> None:
         self.config = config
-        self.agent_id = config.agent_id or str(uuid.uuid4())
+        self.agent_id = config.agent_id
         self._tools = tools
         self._system_prompt = system_prompt
         self._terminal_prompt = terminal_prompt
@@ -366,7 +366,7 @@ class MultiTurnAgent(ABC):
 
     def _cost_budget_left(self, ctx: ExecutionContext) -> bool:
         """True iff the agent has not exceeded its cost budget."""
-        return self.config.cost_budget is None or ctx.llm_client.usage.cost(key=str(self.agent_id)) < self.config.cost_budget
+        return self.config.cost_budget is None or ctx.llm_client.usage.cost(key=self.agent_id) < self.config.cost_budget
 
     def _latency_budget_left(self) -> bool:
         """True iff the agent has not exceeded its latency budget."""
@@ -486,7 +486,7 @@ class MultiTurnAgent(ABC):
         ))
         cost_usage, latency_usage = None, None
         if self.config.cost_budget is not None:
-            cost_usage = ctx.llm_client.usage.cost(key=str(self.agent_id))
+            cost_usage = ctx.llm_client.usage.cost(key=self.agent_id)
             obs_blocks.append(TextBlock(f"[Cost usage: ${cost_usage:.2f}/${self.config.cost_budget} ({(cost_usage / self.config.cost_budget * 100):.1f}%)]"))
         if self.config.latency_budget is not None:
             assert self._agent_start_time is not None

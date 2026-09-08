@@ -308,7 +308,7 @@ def test_trace_event_records_mode_and_inputs():
 
 
 def _agent(**kwargs) -> SearchAgent:
-    config = SearchAgentConfig(name="t")
+    config = SearchAgentConfig(name="t", agent_id="t")
     return SearchAgent(
         config=config, document_map={}, chroma_collection=FakeChroma([]),
         llm_client=FakeLLMClient(), **kwargs,

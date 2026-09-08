@@ -29,3 +29,6 @@ fb_metadata_glob: financebench/financebench-element-embeddings/metadata_rank*.js
 judge_model: null
 # pdf_dir is the SearchAgent view_figure source; page keys don't map 1:1 to a figure tool yet, so null.
 pdf_dir: null
+codex_home: financebench/codex/
+codex_scratch_dir: financebench/codex-scratch/
+codex_answer_schema_file: financebench/answer_schema.json

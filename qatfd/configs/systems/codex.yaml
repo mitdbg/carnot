@@ -1,0 +1,24 @@
+# codex system inherits from base config
+defaults:
+  - base
+  - _self_
+
+name: codex
+agent_id: ${systems.name}
+# path to the config.toml, sessions, and state for Codex (resolved relative to qatfd benchmarks directory)
+codex_home: ${benchmarks.codex_home}
+# path to the scratch work directory for the codex agent
+codex_scratch_dir: ${benchmarks.codex_scratch_dir}
+# path to the example answer schema json file
+codex_answer_schema_file: ${benchmarks.codex_answer_schema_file}
+# list of tools the Codex agent may use
+enabled_tools:
+  - read_document
+  - search_corpus
+  - grep_corpus
+# URL of the MCP server
+mcp_url: ${benchmarks.mcp_url}
+# # overrides on the hydra configuration
+# extra_overrides: dict
+# mode in which we run the CodexSystem ("isolated" or "sequential")
+mode: "isolated"

@@ -18,7 +18,9 @@ import csv
 import datetime
 import json
 import logging
+import os
 import random
+import requests
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -59,8 +61,17 @@ from skunk.trace import Tracer
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources
 from qatfd.config import ExperimentConfig, benchmark_config_factory, system_config_factory
 from qatfd.registry import build_benchmark, build_system
-from qatfd.systems.base import System
+from qatfd.systems.base import RetrieveComputeSystem, System
 from qatfd.types import Question, Result, report_columns, result_to_row
+
+# analytics API constants;
+# - metrics are returned for a session; token metrics arrive as strings (or ints)
+# - analytics ingestion lags the request by up to ~1 min, so we poll until the row is stable
+OPENROUTER_ANALYTICS_API = "https://openrouter.ai/api/v1/analytics/query"
+_OPENROUTER_SESSION_METRICS = ["request_count", "total_usage", "tokens_prompt", "tokens_completion", "reasoning_tokens", "cached_tokens"]
+OPENROUTER_ANALYTICS_FIRST_WAIT_S = 20.0
+OPENROUTER_ANALYTICS_POLL_S = 10.0
+OPENROUTER_ANALYTICS_MAX_WAIT_S = 120.0
 
 # keys to ignore when resuming an experiment from a previous run; these fields may naturally change
 _RESUME_IGNORED_KEYS = {"experiments.resume_dir", "experiments.run_name", "results_root", "dry_run"}
@@ -239,18 +250,95 @@ def _load_finished_qids(results_path: Path) -> dict[str, Result]:
 # Per-question execution
 # ---------------------------------------------------------------------------
 
+def _openrouter_session_usage(
+    session_id: str, started_at: datetime.datetime, finished_at: datetime.datetime
+) -> dict[str, int | float] | None:
+    """Per-question spend for one OpenRouter `session_id`. Codex forwards its thread id as the
+    session id on every request via the analytics API. Requires a management key to be set as
+    OPENROUTER_MGMT_API_KEY. The session filter filters `time_range` is mandatory but is only
+    honored at day granularity when no `granularity` is given, so it is widened to whole UTC
+    days around the question. Ingestion lags the request by up to about a minute, so the query
+    is polled until two consecutive reads agree (or a cap is hit) — the last read is returned
+    either way.
+
+    Returns:
+      A dictionary with:
+      {
+        "requests", "input_tokens", "output_tokens",
+        "reasoning_tokens", "cached_tokens", "cost"
+      }
+      or None if there's a missing key / API error / no rows.
+    """
+    # check to see management key is set
+    mgmt_key = os.environ.get("OPENROUTER_MGMT_API_KEY")
+    if not mgmt_key:
+        print("[qatfd] OPENROUTER_MGMT_API_KEY not set; codex spend not metered", file=sys.stderr)
+        return None
+
+    # prepare query for session data
+    day = datetime.timedelta(days=1)
+    payload = {
+        "metrics": _OPENROUTER_SESSION_METRICS,
+        "time_range": {
+            "start": (started_at - day).strftime("%Y-%m-%dT00:00:00Z"),
+            "end": (finished_at + day).strftime("%Y-%m-%dT00:00:00Z"),
+        },
+        "filters": [{"field": "session_id", "operator": "eq", "value": session_id}],
+    }
+    headers = {"Authorization": f"Bearer {mgmt_key}", "Content-Type": "application/json"}
+
+    # helper function to fire the query and return the response (or None on bad code / data)
+    def _query() -> dict[str, int | float] | None:
+        resp = requests.post(OPENROUTER_ANALYTICS_API, json=payload, headers=headers, timeout=30)
+        if resp.status_code != 200:
+            print(f"[qatfd] openrouter analytics {resp.status_code}: {resp.text[:200]}", file=sys.stderr)
+            return None
+        rows = resp.json().get("data", {}).get("data", [])
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "requests": int(row.get("request_count") or 0),
+            "input_tokens": int(row.get("tokens_prompt") or 0),
+            "output_tokens": int(row.get("tokens_completion") or 0),
+            "reasoning_tokens": int(row.get("reasoning_tokens") or 0),
+            "cached_tokens": int(row.get("cached_tokens") or 0),
+            "cost": float(row.get("total_usage") or 0.0),
+        }
+
+    # return once we have stable response on usage from OpenRouter
+    deadline = time.monotonic() + OPENROUTER_ANALYTICS_MAX_WAIT_S
+    time.sleep(OPENROUTER_ANALYTICS_FIRST_WAIT_S)
+    last: dict[str, int | float] | None = None
+    while True:
+        try:
+            cur = _query()
+        except (requests.RequestException, ValueError) as e:
+            print(f"[qatfd] openrouter analytics request failed: {e}", file=sys.stderr)
+            cur = None
+        if cur is not None and cur == last:
+            return cur
+        last = cur
+        if time.monotonic() >= deadline:
+            if last is None:
+                print(f"[qatfd] openrouter analytics: no rows for session {session_id} after {OPENROUTER_ANALYTICS_MAX_WAIT_S:.0f}s", file=sys.stderr)
+            return last
+        time.sleep(OPENROUTER_ANALYTICS_POLL_S)
+
+
 async def _run_one(q: Question, rc: _RunCtx) -> Result:
     search_config = (
         rc.system.retrieve_config
-        if isinstance(rc.system.retrieve_config, SearchAgentConfig)
-        else SearchAgentConfig(name="search")
+        if isinstance(rc.system, RetrieveComputeSystem)
+        else SearchAgentConfig(name="search", agent_id="search")
     )
+    assert isinstance(search_config, SearchAgentConfig)
     ctx = ExecutionContext.build(
         config=SkunkConfig(
             inference=rc.system.inference_cfg,
             storage=rc.benchmark.config.storage,
             search=search_config,
-            lookup=LookupAgentConfig(name="lookup"),  # unused
+            lookup=LookupAgentConfig(name="lookup", agent_id="lookup"),
         ),
         document_map=rc.resources.document_map,
         chroma_collection=rc.resources.chroma_collection,
@@ -260,52 +348,73 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
         ),
     )
 
+    # run the question and parse the output
     predicted, failed, reason, retrieved = "", False, "", None
-    # Defaults for the failure path: if answer() raises we get no AnswerOutput, so the phase
-    # splits stay 0 and the terminate flags stay False (the StepFailed text lands in `reason`).
     terminate_state: str | None = None
     retrieve_wall_s = compute_wall_s = 0.0
+    session_id: str | None = None
     t0 = time.monotonic()
+    started_at = datetime.datetime.now(datetime.timezone.utc)
     try:
         out = await rc.system.answer(q, rc.resources, ctx)
         predicted = out.answer
         retrieved = out.retrieved_doc_ids
         terminate_state = out.terminate_state
         retrieve_wall_s, compute_wall_s = out.retrieve_wall_s, out.compute_wall_s
+        session_id = out.session_id
     except Exception as e:  # noqa: BLE001 — record any failure as a row, never crash the run
         failed, reason = True, f"{type(e).__name__}: {e}"
     wall_s = time.monotonic() - t0
+    finished_at = datetime.datetime.now(datetime.timezone.utc)
 
-    # A budgeted agent stamps terminate_state as a `|`-joined subset of these tokens (else
-    # "finished"/None); split it into one boolean column per reason for easy filtering.
-    ts = terminate_state or ""
-    out_of_steps = "out_of_steps" in ts
-    over_cost_budget = "over_cost_budget" in ts
-    over_latency_budget = "over_latency_budget" in ts
+    # determine whether agent terminated early for an expected reason
+    out_of_steps = "out_of_steps" in (terminate_state or "")
+    over_cost_budget = "over_cost_budget" in (terminate_state or "")
+    over_latency_budget = "over_latency_budget" in (terminate_state or "")
 
     # Snapshot system usage BEFORE scoring so the judge's tokens are not counted.
-    # `cost` is the all-in total (generation + embeddings); embed_* break out the
-    # query-embedding portion (tokens are exact on OpenRouter, char/4-estimated local).
     # `cost` is the all-in total across every caller; the system's own spend is split by phase via
     # its stable per-phase keys ({agent_id}_retrieve / _compute), so we can attribute the retrieval
-    # method's cost apart from the shared compute answerer. `system_cost` is their sum. Without a
-    # configured agent_id the agents mint their own keys and we can't isolate them, so report 0.
-    tracker = ctx.llm_client.usage
-    retrieve_key, compute_key = rc.system.retrieve_usage_key, rc.system.compute_usage_key
-    retrieve_cost = tracker.cost(key=retrieve_key) if retrieve_key else 0.0
-    compute_cost = tracker.cost(key=compute_key) if compute_key else 0.0
+    # method's cost apart from the shared compute answerer. Without a configured agent_id the
+    # agents mint their own keys and we can't isolate them, so report 0.
     usage = {
-        "total_input_tokens": tracker.total_input_tokens,
-        "total_output_tokens": tracker.total_output_tokens,
-        "total_cache_input_tokens": tracker.total_cached_tokens,
-        "cost": tracker.cost(),
-        "system_cost": retrieve_cost + compute_cost,
-        "retrieve_cost": retrieve_cost,
-        "compute_cost": compute_cost,
-        "embed_tokens": tracker.total_embed_tokens,
-        "embed_calls": tracker.total_embed_calls,
-        "embed_cost": tracker.embed_cost(),
+        "total_input_tokens": 0, "total_output_tokens": 0, "total_cache_input_tokens": 0,
+        "cost": 0.0, "retrieve_cost": 0.0, "compute_cost": 0.0,
+        "embed_tokens": 0.0, "embed_calls": 0.0, "embed_cost": 0.0,
     }
+    if isinstance(rc.system, RetrieveComputeSystem):
+        tracker = ctx.llm_client.usage
+        retrieve_key, compute_key = rc.system.retrieve_usage_key, rc.system.compute_usage_key
+        usage = {
+            "total_input_tokens": tracker.total_input_tokens,
+            "total_output_tokens": tracker.total_output_tokens,
+            "total_cache_input_tokens": tracker.total_cached_tokens,
+            "cost": tracker.cost(),
+            "retrieve_cost": tracker.cost(key=retrieve_key) if retrieve_key else 0.0,
+            "compute_cost": tracker.cost(key=compute_key) if compute_key else 0.0,
+            "embed_tokens": tracker.total_embed_tokens,
+            "embed_calls": tracker.total_embed_calls,
+            "embed_cost": tracker.embed_cost(),
+        }
+    else:
+        # CodexSystem: the model calls are made by the codex subprocess (and any subagents it spawns)
+        # against OpenRouter directly, so nothing lands in our tracker. Codex forwards its thread id
+        # as OpenRouter's `session_id`, and subagent traffic is billed under the parent thread's id,
+        # so one analytics query scoped to that session is this question's exact spend.
+        if session_id is not None:
+            external_usage = _openrouter_session_usage(session_id, started_at, finished_at)
+            if external_usage is not None:
+                usage = {
+                    "total_input_tokens": external_usage["input_tokens"],
+                    "total_output_tokens": external_usage["output_tokens"],
+                    "total_cache_input_tokens": external_usage["cached_tokens"],
+                    "cost": external_usage["cost"],
+                    "retrieve_cost": 0.0,
+                    "compute_cost": 0.0,
+                    "embed_tokens": 0.0,
+                    "embed_calls": 0.0,
+                    "embed_cost": 0.0,
+                }
 
     score, scorer, judge_rationale = 0.0, "", ""
     if not failed:
@@ -332,103 +441,6 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
     )
 
 
-# TODO: rc.system.answer() is the entrypoint for answering each question
-async def _run_all(qs: list[Question], rc: _RunCtx) -> list[Result]:
-    search_config = (
-        rc.system.retrieve_config
-        if isinstance(rc.system.retrieve_config, SearchAgentConfig)
-        else SearchAgentConfig(name="search")
-    )
-    ctx = ExecutionContext.build(
-        config=SkunkConfig(
-            inference=rc.system.inference_cfg,
-            storage=rc.benchmark.config.storage,
-            search=search_config,
-            lookup=LookupAgentConfig(name="lookup"),  # unused
-        ),
-        document_map=rc.resources.document_map,
-        chroma_collection=rc.resources.chroma_collection,
-        tracer=Tracer(
-            log_path=str(rc.trace_dir / "all.jsonl"),
-            verbose=rc.verbose,
-        ),
-    )
-
-    predicted, failed, reason, retrieved = "", False, "", None
-    # Defaults for the failure path: if answer() raises we get no AnswerOutput, so the phase
-    # splits stay 0 and the terminate flags stay False (the StepFailed text lands in `reason`).
-    terminate_state: str | None = None
-    t0 = time.monotonic()
-    try:
-        # TODO: rc.system.answer_all(qs, rc.resources, ctx)
-        out = await rc.system.answer(qs[0], rc.resources, ctx)
-        predicted = out.answer
-        retrieved = out.retrieved_doc_ids
-        terminate_state = out.terminate_state
-    except Exception as e:  # noqa: BLE001 — record any failure as a row, never crash the run
-        failed, reason = True, f"{type(e).__name__}: {e}"
-    wall_s = time.monotonic() - t0
-
-    # A budgeted agent stamps terminate_state as a `|`-joined subset of these tokens (else
-    # "finished"/None); split it into one boolean column per reason for easy filtering.
-    ts = terminate_state or ""
-    out_of_steps = "out_of_steps" in ts
-    over_cost_budget = "over_cost_budget" in ts
-    over_latency_budget = "over_latency_budget" in ts
-
-    # TODO: no separate retrieve vs. compute key here
-    # Snapshot system usage BEFORE scoring so the judge's tokens are not counted.
-    # `cost` is the all-in total (generation + embeddings); embed_* break out the
-    # query-embedding portion (tokens are exact on OpenRouter, char/4-estimated local).
-    # `cost` is the all-in total across every caller; the system's own spend is split by phase via
-    # its stable per-phase keys ({agent_id}_retrieve / _compute), so we can attribute the retrieval
-    # method's cost apart from the shared compute answerer. `system_cost` is their sum. Without a
-    # configured agent_id the agents mint their own keys and we can't isolate them, so report 0.
-    tracker = ctx.llm_client.usage
-    retrieve_key, compute_key = rc.system.retrieve_usage_key, rc.system.compute_usage_key
-    retrieve_cost = tracker.cost(key=retrieve_key) if retrieve_key else 0.0
-    compute_cost = tracker.cost(key=compute_key) if compute_key else 0.0
-    usage = {
-        "total_input_tokens": tracker.total_input_tokens,
-        "total_output_tokens": tracker.total_output_tokens,
-        "total_cache_input_tokens": tracker.total_cached_tokens,
-        "cost": tracker.cost(),
-        "system_cost": retrieve_cost + compute_cost,
-        "retrieve_cost": retrieve_cost,
-        "compute_cost": compute_cost,
-        "embed_tokens": tracker.total_embed_tokens,
-        "embed_calls": tracker.total_embed_calls,
-        "embed_cost": tracker.embed_cost(),
-    }
-
-    # TODO: output needs to produce a list of predicted values to score against qs
-    score, scorer, judge_rationale = 0.0, "", ""
-    if not failed:
-        try:
-            sc = await rc.benchmark.score(qs[0], predicted, ctx)
-            score = float(sc.get("score", 0.0))
-            scorer = sc.get("scorer", "")
-            judge_rationale = sc.get("judge_rationale", "")
-        except Exception as e:  # noqa: BLE001
-            reason = f"scoring_failed: {type(e).__name__}: {e}"
-
-    recall_metrics = rc.benchmark.recall_metrics(retrieved, qs[0])
-    ctx.tracer.close()
-
-    # TODO: return list[Result]
-    retrieve_wall_s = 0.0
-    compute_wall_s = 0.0
-    return [Result(
-        benchmark=rc.benchmark.name, system=rc.system.name, qid=qs[0].qid, question=qs[0].text,
-        predicted=predicted, gold=qs[0].gold, score=score, scorer=scorer,
-        recall_metrics=recall_metrics, retrieved_docs=json.dumps(retrieved or []),
-        gold_docs=json.dumps(qs[0].gold_docs), failed=failed, reason=reason,
-        judge_rationale=judge_rationale, wall_s=round(wall_s, 3),
-        retrieve_wall_s=round(retrieve_wall_s, 3), compute_wall_s=round(compute_wall_s, 3),
-        out_of_steps=out_of_steps, over_cost_budget=over_cost_budget,
-        over_latency_budget=over_latency_budget, **usage,
-    )]
-
 # ---------------------------------------------------------------------------
 # Question Execution Strategies (parallel | sequential | all)
 # ---------------------------------------------------------------------------
@@ -453,14 +465,15 @@ def _execute_sequential(rc: _RunCtx, qid_to_result: dict[str, Result], todo: lis
             rf.flush()
             qid_to_result[r.qid] = r
 
-def _execute_all(rc: _RunCtx, qid_to_result: dict[str, Result], todo: list[Question], results_path: Path, exp_config: ExperimentConfig) -> None:
-    """Run the benchmark questions in sequence; good for experiments where state is shared / reused across questions."""
-    results = asyncio.run(_run_all(todo, rc))
-    with results_path.open("a", encoding="utf-8") as rf:
-        for r in results:
-            rf.write(json.dumps(asdict(r)) + "\n")
-            rf.flush()
-            qid_to_result[r.qid] = r
+# TODO
+# def _execute_all(rc: _RunCtx, qid_to_result: dict[str, Result], todo: list[Question], results_path: Path, exp_config: ExperimentConfig) -> None:
+#     """Run the benchmark questions in sequence; good for experiments where state is shared / reused across questions."""
+#     results = asyncio.run(_run_all(todo, rc))
+#     with results_path.open("a", encoding="utf-8") as rf:
+#         for r in results:
+#             rf.write(json.dumps(asdict(r)) + "\n")
+#             rf.flush()
+#             qid_to_result[r.qid] = r
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -520,8 +533,9 @@ def run(
         _execute_parallel(rc, qid_to_result, todo, results_path, exp_config)
     elif RunMode(exp_config.run_mode) == RunMode.SEQUENTIAL:
         _execute_sequential(rc, qid_to_result, todo, results_path, exp_config)
-    elif RunMode(exp_config.run_mode) == RunMode.ALL:
-        _execute_all(rc, qid_to_result, todo, results_path, exp_config)
+    # TODO
+    # elif RunMode(exp_config.run_mode) == RunMode.ALL:
+    #     _execute_all(rc, qid_to_result, todo, results_path, exp_config)
     else:
         raise Exception(f"Unsupported run_mode: {exp_config.run_mode}")
 
@@ -558,19 +572,16 @@ def main(cfg: DictConfig) -> None:
     exp_cfg = ExperimentConfig(**cast(dict, OmegaConf.to_container(cfg.experiments, resolve=True)))
     inference_cfg = InferenceConfig(**cast(dict, OmegaConf.to_container(cfg.inference, resolve=True)))
     bench_cfg = benchmark_config_factory(cfg)
-
-    # NOTE: for now, ComputeAgent is simple enough that it suffices to copy the
-    # RAGLLMConfig / SearchAgentConfig config twice and adjust the few variables
-    # that need tweaking within the System class; if we ever have more elaborate
-    # compute we should create a new hydra doc to store the base compute agent config
-    retrieve_system_cfg = system_config_factory(cfg)
-    compute_system_cfg = system_config_factory(cfg)
-    retrieve_system_cfg.agent_id = f"{retrieve_system_cfg.agent_id}-retrieve"
-    compute_system_cfg.agent_id = f"{compute_system_cfg.agent_id}-compute"
+    retrieve_system_cfg, compute_system_cfg, codex_system_cfg = system_config_factory(cfg)
 
     # build benchmark and system
     benchmark = build_benchmark(bench_cfg)
-    system = build_system(retrieve_system_cfg, compute_system_cfg, inference_cfg)
+    system = build_system(
+        inference_cfg,
+        retrieve_config=retrieve_system_cfg,
+        compute_config=compute_system_cfg,
+        codex_config=codex_system_cfg,
+    )
 
     if not cfg.dry_run:
         run(benchmark, system, exp_cfg, cfg, overrides=overrides)
