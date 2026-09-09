@@ -60,8 +60,10 @@ from skunk.trace import Tracer
 
 from qatfd.benchmarks.base import Benchmark, BenchmarkResources
 from qatfd.config import ExperimentConfig, benchmark_config_factory, system_config_factory
+from qatfd.mcp import build_mcp_server, start_mcp_server
 from qatfd.registry import build_benchmark, build_system
 from qatfd.systems.base import RetrieveComputeSystem, System
+from qatfd.systems.codex import CodexSystem
 from qatfd.types import Question, Result, report_columns, result_to_row
 
 # analytics API constants;
@@ -87,6 +89,7 @@ class _RunCtx:
     benchmark: Benchmark
     system: System
     resources: BenchmarkResources
+    session_id: str
     trace_dir: Path
     model: str
     verbose: bool
@@ -349,19 +352,18 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
     )
 
     # run the question and parse the output
+    q_session_id = f"{q.qid}-{rc.session_id}"
     predicted, failed, reason, retrieved = "", False, "", None
     terminate_state: str | None = None
     retrieve_wall_s = compute_wall_s = 0.0
-    session_id: str | None = None
     t0 = time.monotonic()
     started_at = datetime.datetime.now(datetime.timezone.utc)
     try:
-        out = await rc.system.answer(q, rc.resources, ctx)
+        out = await rc.system.answer(q, rc.resources, ctx, q_session_id)
         predicted = out.answer
         retrieved = out.retrieved_doc_ids
         terminate_state = out.terminate_state
         retrieve_wall_s, compute_wall_s = out.retrieve_wall_s, out.compute_wall_s
-        session_id = out.session_id
     except Exception as e:  # noqa: BLE001 — record any failure as a row, never crash the run
         failed, reason = True, f"{type(e).__name__}: {e}"
     wall_s = time.monotonic() - t0
@@ -399,22 +401,21 @@ async def _run_one(q: Question, rc: _RunCtx) -> Result:
     else:
         # CodexSystem: the model calls are made by the codex subprocess (and any subagents it spawns)
         # against OpenRouter directly, so nothing lands in our tracker. Codex forwards its thread id
-        # as OpenRouter's `session_id`, and subagent traffic is billed under the parent thread's id,
+        # as OpenRouter's `q_session_id`, and subagent traffic is billed under the parent thread's id,
         # so one analytics query scoped to that session is this question's exact spend.
-        if session_id is not None:
-            external_usage = _openrouter_session_usage(session_id, started_at, finished_at)
-            if external_usage is not None:
-                usage = {
-                    "total_input_tokens": external_usage["input_tokens"],
-                    "total_output_tokens": external_usage["output_tokens"],
-                    "total_cache_input_tokens": external_usage["cached_tokens"],
-                    "cost": external_usage["cost"],
-                    "retrieve_cost": 0.0,
-                    "compute_cost": 0.0,
-                    "embed_tokens": 0.0,
-                    "embed_calls": 0.0,
-                    "embed_cost": 0.0,
-                }
+        external_usage = _openrouter_session_usage(q_session_id, started_at, finished_at)
+        if external_usage is not None:
+            usage = {
+                "total_input_tokens": external_usage["input_tokens"],
+                "total_output_tokens": external_usage["output_tokens"],
+                "total_cache_input_tokens": external_usage["cached_tokens"],
+                "cost": external_usage["cost"],
+                "retrieve_cost": 0.0,
+                "compute_cost": 0.0,
+                "embed_tokens": 0.0,
+                "embed_calls": 0.0,
+                "embed_cost": 0.0,
+            }
 
     score, scorer, judge_rationale = 0.0, "", ""
     if not failed:
@@ -524,9 +525,14 @@ def run(
     resources = benchmark.get_resources()
     model = system.inference_cfg.llm_model
     rc = _RunCtx(
-        benchmark=benchmark, system=system, resources=resources,
+        benchmark=benchmark, system=system, resources=resources, session_id=exp_config.session_id,
         trace_dir=trace_dir, model=model, verbose=exp_config.console,
     )
+
+    # codex: serve the corpus tools over MCP from this process (avoids duplicate document map)
+    if isinstance(system, CodexSystem):
+        mcp = build_mcp_server(resources, system.inference_cfg)
+        start_mcp_server(mcp, system.codex_config.mcp_url)
 
     # execute each question and immediately persist its result to results.jsonl
     if RunMode(exp_config.run_mode) == RunMode.PARALLEL:

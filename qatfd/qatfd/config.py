@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import uuid
 import yaml
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import cast, Literal
 from omegaconf import DictConfig, OmegaConf
 from qatfd.constants import BROWSECOMP_PLUS, FINANCE_BENCH, FRESHSTACK, OFFICE_QA, OFFICE_QA_SYNTH, QAMPARI, TREC_BIOGEN
@@ -71,6 +72,8 @@ class ExperimentConfig:
     resume_dir: str | None = None
     # the mode to run the experiment questions in (parallel|sequential|all)
     run_mode: Literal["parallel", "sequential", "all"] = "parallel"
+    # the session_id (for Codex to use for experiment tracking)
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     @classmethod
     def from_yaml(cls, path: str) -> ExperimentConfig:

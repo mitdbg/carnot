@@ -1,18 +1,27 @@
-import os, shlex
-from qatfd.env import load_env
-load_env()
-from hydra import compose, initialize_config_dir
-from qatfd.config import benchmark_config_factory
-from qatfd.registry import build_benchmark
-from skunk.llm_client import LLMClient
-from skunk.agents.search_agent.search_tools import (
-    SearchCorpusTool, GrepCorpusTool, ReadDocumentTool,
-)
-from skunk.search_state.working_set import WorkingSet
+import asyncio
+import os
+import socket
+import threading
+import time
+
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers
+from urllib.parse import urlsplit
+
+from skunk.agents.search_agent.search_tools import (
+    GrepCorpusTool,
+    ReadDocumentTool,
+    SearchCorpusTool,
+)
+from skunk.config import InferenceConfig
+from skunk.llm_client import LLMClient
+from skunk.search_state.working_set import WorkingSet
+
+from qatfd.benchmarks.base import BenchmarkResources
 
 SERVER_NAME = "CorpusSearchServer"
 SERVER_INSTRUCTIONS = "This server provides access to a corpus of documents for search, grep, and read operations. Use the provided tools to interact with the corpus."
+SESSION_HEADER = "x-session-id"
 
 SEARCH_CORPUS_DESC = """This tool performs a vector search over the corpus by embedding the input `query` and returning the `top_k` most relevant chunks, each labelled with its `chunk_id` and `doc_id`. You can optionally restrict the search to a subset of the corpus by passing a `metadata_filter`, which is a ChromaDB-style where clause over chunk metadata.
 
@@ -117,40 +126,102 @@ Returns:
   - "text": the text of the document
 """
 
-config_dir = os.environ.get("QATFD_CONFIG_DIR")
-if config_dir is None:
-    raise Exception("Need to set QATFD_CONFIG_DIR in env")
-overrides = shlex.split(os.environ.get("QATFD_OVERRIDES", "benchmarks=officeqa"))
-with initialize_config_dir(config_dir=config_dir, version_base=None):
-    cfg = compose(config_name="config", overrides=overrides)
-bench = build_benchmark(benchmark_config_factory(cfg))
-res = bench.get_resources()
-llm = LLMClient(cfg.inference, openrouter_api_key=os.environ["OPENROUTER_CODEX_API_KEY"])
-ws = WorkingSet(collection=res.chroma_collection)
 
-# construct the skunk tools to be placed in the MCP server
-search = SearchCorpusTool(res.chroma_collection, llm, ws, working_set_collection_off=True, id_tracking_off=True)
-grep = GrepCorpusTool(res.chroma_collection, ws, working_set_collection_off=True, id_tracking_off=True)
-read = ReadDocumentTool(res.document_map, ws, id_tracking_off=True)
+class _SessionAwareSearchCorpusTool(SearchCorpusTool):
+    """Forward the caller's x-session-id (Codex sends it on every MCP request) to the
+    OpenRouter embeddings call, so embedding usage is attributed to the same session
+    as the codex agent's own model calls."""
 
-# construct the MCP server; wrap the tools to hide WorkingSet interface details
-mcp = FastMCP(SERVER_NAME, instructions=SERVER_INSTRUCTIONS)
+    def _embed_query(self, query: str) -> list[float]:
+        # get_http_headers() never raises; returns {} outside a request. Keys are lowercased.
+        sid = get_http_headers().get(SESSION_HEADER)
+        headers = {SESSION_HEADER: sid} if sid else None
+        return self._llm_client.embed_query(query, usage_key=self._usage_key, http_headers=headers)
 
-@mcp.tool(name="search_corpus", description=SEARCH_CORPUS_DESC, annotations={"readOnlyHint": True})
-def search_corpus(query: str, top_k: int, metadata_filter: dict | None = None) -> dict:
-    result_dict = search(query=query, top_k=top_k, metadata_filter=metadata_filter)
-    return {"chunks": result_dict["read_chunks"], "error": result_dict.get("error", None)}
 
-@mcp.tool(name="grep_corpus", description=GREP_CORPUS_DESC, annotations={"readOnlyHint": True})
-def grep_corpus(pattern: str, metadata_filter: dict | None = None, limit: int | None = None, max_output_tokens: int | None = None) -> dict:
-    result_dict = grep(pattern=pattern, metadata_filter=metadata_filter, limit=limit, max_output_tokens=max_output_tokens)
-    final_chunks = []
-    for group in result_dict["read_groups"]:
-        for chunk in group["chunks"]:
-            final_chunks.append({"chunk_id": chunk["chunk_id"], "doc_id": chunk["doc_id"], "text": chunk["text"]})
-    return {"chunks": final_chunks, "error": result_dict.get("error", None), "truncation_note": result_dict.get("truncation_note", None)}
+# TODO: if we decide to experiment with Codex + WS; this will be configured here
+def _build_base_tools(res: BenchmarkResources, inference: InferenceConfig) -> tuple[SearchCorpusTool, GrepCorpusTool, ReadDocumentTool]:
+    # construct LLM client for MCP server
+    llm = LLMClient(inference, openrouter_api_key=os.environ["OPENROUTER_CODEX_API_KEY"])
 
-@mcp.tool(name="read_document", description=READ_DOCUMENT_DESC, annotations={"readOnlyHint": True})
-def read_document(doc_id: str | list[str], start_char_idx: int | None | list[int | None] = None, end_char_idx: int | None | list[int | None] = None) -> dict:
-    result_dict = read(doc_id=doc_id, start_char_idx=start_char_idx, end_char_idx=end_char_idx)
-    return {"docs": result_dict["docs"]}
+    # create dummy working set (id tracking and working set collection will be off)
+    ws = WorkingSet(collection=res.chroma_collection)
+
+    # construct the skunk tools to be placed in the MCP server
+    search = _SessionAwareSearchCorpusTool(res.chroma_collection, llm, ws, working_set_collection_off=True, id_tracking_off=True)
+    grep = GrepCorpusTool(res.chroma_collection, ws, working_set_collection_off=True, id_tracking_off=True)
+    read = ReadDocumentTool(res.document_map, ws, id_tracking_off=True)
+
+    return search, grep, read
+
+
+def build_mcp_server(res: BenchmarkResources, inference: InferenceConfig) -> FastMCP:
+    # build the tools for the mcp server
+    search, grep, read = _build_base_tools(res, inference)
+
+    # construct the MCP server; wrap the tools to hide WorkingSet interface details
+    mcp = FastMCP(SERVER_NAME, instructions=SERVER_INSTRUCTIONS)
+
+    @mcp.tool(name="search_corpus", description=SEARCH_CORPUS_DESC, annotations={"readOnlyHint": True})
+    def search_corpus(query: str, top_k: int, metadata_filter: dict | None = None) -> dict:
+        result_dict = search(query=query, top_k=top_k, metadata_filter=metadata_filter)
+        return {"chunks": result_dict["read_chunks"], "error": result_dict.get("error", None)}
+
+    @mcp.tool(name="grep_corpus", description=GREP_CORPUS_DESC, annotations={"readOnlyHint": True})
+    def grep_corpus(pattern: str, metadata_filter: dict | None = None, limit: int | None = None, max_output_tokens: int | None = None) -> dict:
+        result_dict = grep(pattern=pattern, metadata_filter=metadata_filter, limit=limit, max_output_tokens=max_output_tokens)
+        final_chunks = []
+        for group in result_dict["read_groups"]:
+            for chunk in group["chunks"]:
+                final_chunks.append({"chunk_id": chunk["chunk_id"], "doc_id": chunk["doc_id"], "text": chunk["text"]})
+        return {"chunks": final_chunks, "error": result_dict.get("error", None), "truncation_note": result_dict.get("truncation_note", None)}
+
+    @mcp.tool(name="read_document", description=READ_DOCUMENT_DESC, annotations={"readOnlyHint": True})
+    def read_document(doc_id: str | list[str], start_char_idx: int | None | list[int | None] = None, end_char_idx: int | None | list[int | None] = None) -> dict:
+        result_dict = read(doc_id=doc_id, start_char_idx=start_char_idx, end_char_idx=end_char_idx)
+        return {"docs": result_dict["docs"]}
+
+    return mcp
+
+
+def start_mcp_server(mcp: FastMCP, url: str, ready_timeout_s: float = 30.0) -> threading.Thread:
+    """Serve `mcp` over streamable-HTTP at `url` on a daemon thread with its own event loop,
+    blocking until the port accepts connections. The thread dies with the process, so no
+    explicit shutdown is needed; codex subprocesses connect to it over localhost."""
+    parts = urlsplit(url)
+    host, port, path = parts.hostname, parts.port, parts.path
+
+    # refuse to silently reuse a stale server (e.g. a leftover scripts/codex_mcp_server.py)
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            raise RuntimeError(f"[qatfd] ABORT: something is already listening on {host}:{port}; stop it or change mcp_url")
+    except OSError:
+        pass
+
+    failure: list[BaseException] = []
+    def _serve() -> None:
+        try:
+            # own event loop: the worker threads each asyncio.run() their own loop, so there is no
+            # shared loop to attach to. uvicorn only installs signal handlers on the main thread.
+            asyncio.run(mcp.run_http_async(
+                transport="http", host=host, port=port, path=path,
+                show_banner=False, log_level="warning",
+            ))
+        except BaseException as e:  # noqa: BLE001 — uvicorn exits via SystemExit on bind failure
+            failure.append(e)
+
+    t = threading.Thread(target=_serve, name="qatfd-mcp-server", daemon=True)
+    t.start()
+
+    deadline = time.monotonic() + ready_timeout_s
+    while time.monotonic() < deadline:
+        if failure:
+            raise RuntimeError(f"[qatfd] MCP server failed to start on {url}") from failure[0]
+        try:
+            with socket.create_connection((host, port), timeout=0.5):
+                print(f"[qatfd] MCP server {mcp.name!r} serving at {url}")
+                return t
+        except OSError:
+            time.sleep(0.2)
+
+    raise RuntimeError(f"[qatfd] MCP server did not become ready at {url} within {ready_timeout_s:.0f}s")

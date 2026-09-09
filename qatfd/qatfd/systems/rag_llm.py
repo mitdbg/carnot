@@ -52,7 +52,7 @@ class RAGLLMSystem(RetrieveComputeSystem):
                 doc_ids.append(d)
 
         ctx.tracer.emit(
-            f"retrieved",
+            "retrieved",
             kind="observation",
             data={
                 "query": q.text,

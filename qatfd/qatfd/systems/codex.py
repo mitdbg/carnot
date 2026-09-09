@@ -48,7 +48,7 @@ class CodexSystem(System):
     def system_usage_key(self) -> str:
         return self.codex_config.agent_id
 
-    async def answer(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext) -> AnswerOutput:
+    async def answer(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext, session_id: str) -> AnswerOutput:
         # clear and create subdirectory for this question
         work_dir = Path(self.scratch_dir) / q.qid
         if work_dir.exists():
@@ -76,6 +76,8 @@ class CodexSystem(System):
             "-C", str(work_dir),
             "-c", f"mcp_servers.corpus.url={json.dumps(self.codex_config.mcp_url)}",
             "-c", f"mcp_servers.corpus.enabled_tools={json.dumps(self.codex_config.enabled_tools)}",
+            "-c", f'model_providers.openrouter.http_headers={{"x-session-id"="{session_id}"}}',
+            "-c", f'mcp_servers.corpus.http_headers={{"x-session-id"="{session_id}"}}',
             "--output-schema", schema_file, "-o", result_file, prompt,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
         )
@@ -84,17 +86,6 @@ class CodexSystem(System):
         terminate_state = "finished" if process.returncode == 0 else "error"
         (work_dir / f"{q.qid}.codex.jsonl").write_bytes(stdout)
 
-        # the codex thread id is forwarded to OpenRouter as `session_id` on every request (parent and
-        # spawned subagents alike), so the runner can meter this question's spend exactly
-        session_id: str | None = None
-        for line in stdout.decode(errors="replace").splitlines():
-            try:
-                ev = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if ev.get("type") == "thread.started":
-                session_id = ev.get("thread_id")
-                break
         # for line in stdout.decode().splitlines():
         #     ev = json.loads(line)
         #     if ev.get("type") == "turn.completed":
@@ -118,5 +109,4 @@ class CodexSystem(System):
             retrieved_doc_ids=answer["doc_ids"],
             terminate_state=terminate_state,
             compute_wall_s=wall_s,
-            session_id=session_id,
         )

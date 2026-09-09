@@ -92,7 +92,7 @@ class System(ABC):
         ...
 
     @abstractmethod
-    async def answer(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext) -> AnswerOutput:
+    async def answer(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext, session_id: str) -> AnswerOutput:
         ...
 
 
@@ -140,7 +140,7 @@ class RetrieveComputeSystem(System):
 
         return ""
 
-    async def answer(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext) -> AnswerOutput:
+    async def answer(self, q: Question, resources: BenchmarkResources, ctx: ExecutionContext, session_id: str) -> AnswerOutput:
         t0 = time.monotonic()
         r = await self.retrieve(q, resources, ctx)
         t1 = time.monotonic()
