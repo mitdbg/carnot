@@ -1,0 +1,6 @@
+apiVersion: v2
+name: experiments
+description: One release = one qatfd experiment sweep, run as a Kubernetes Indexed Job (one pod per cell, each with its own Chroma sidecar over a pristine store copy on node NVMe).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

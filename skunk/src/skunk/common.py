@@ -1,8 +1,8 @@
 """Shared runtime: the process-wide rate limiters plus the `ExecutionContext`.
 
-The LLM client itself lives in `skunk.llm_client`; this module owns the external
-rate-limit infrastructure it (and the data-source tools) pace against — the
-process-wide token-bucket limiters (see `_RATE_LIMITS` / `get_rate_limiter`)."""
+The rate limiters (`_RATE_LIMITS` / `get_rate_limiter`) pace the lookup agent's external data
+APIs (FRED, BLS, World Bank, Tavily), some of which ban a key outright when their cap is tripped.
+LLM calls are NOT paced here: `skunk.llm_client` relies on retry with backoff instead."""
 
 from __future__ import annotations
 
@@ -96,10 +96,6 @@ class _RateLimiter:
 # and call `get_rate_limiter("<name>")` at the call site.
 _RATE_LIMITS: dict[str, tuple[str, float]] = {
     # name          (env override,            default rpm)  # rationale
-    "embed": (
-        "SKUNK_EMBED_RPM",
-        600.0,
-    ),  # Gemini embeddings (search_agent.vector_search)
     "fred": ("SKUNK_FRED_RPM", 60.0),  # hard 120/min per API key; stay well under —
     # FRED escalates to an extended key-wide ban
     # (persistent 429s) once the cap is tripped.
@@ -117,8 +113,7 @@ _LIMITERS: dict[str, _RateLimiter] = {}
 
 def _resolve_rate_per_sec(name: str, rate_per_min: float | None) -> float:
     """Rate (req/sec) for a limiter bucket. A known service in `_RATE_LIMITS`
-    reads its env override (once); any other name (e.g. a per-model `llm:<model>`
-    bucket) requires an explicit `rate_per_min`."""
+    reads its env override (once); any other name requires an explicit `rate_per_min`."""
     if name in _RATE_LIMITS:
         env_var, default = _RATE_LIMITS[name]
         return float(os.environ.get(env_var, default)) / 60.0
@@ -131,8 +126,8 @@ def get_rate_limiter(name: str, rate_per_min: float | None = None) -> _RateLimit
     """Process-wide token-bucket limiter for service `name`, paced at its rpm — read ONCE at
     first use, then frozen for the run. ONE bucket per name, serving BOTH sync `acquire()` and
     async `acquire_async()` callers (so the cap holds across sync+async use). Known services
-    key off `_RATE_LIMITS` (env override); dynamic buckets (per-model `llm:<model>`) pass an
-    explicit `rate_per_min`. All threads in this process share the named bucket.
+    key off `_RATE_LIMITS` (env override); other names pass an explicit `rate_per_min`. All
+    threads in this process share the named bucket.
 
     Scope is per process, NOT per API key: separate processes get independent
     buckets and do not coordinate, so a multi-process deployment would not be
@@ -142,81 +137,6 @@ def get_rate_limiter(name: str, rate_per_min: float | None = None) -> _RateLimit
         if lim is None:
             lim = _RateLimiter(rate_per_sec=_resolve_rate_per_sec(name, rate_per_min))
             _LIMITERS[name] = lim
-        return lim
-
-
-# ---------------------------------------------------------------------------
-# Tokens-per-minute (TPM) throttle — async; per-model caps come from the
-# InferenceConfig (`llm_model_tpm`, falling back to `llm_default_tpm`).
-#
-# The RPM limiter alone can't bound token throughput: one request can carry tens
-# of thousands of tokens, so a request-paced run still blows a TPM quota (the
-# full-text page-index filter pushed ~36M tok/min and 429-stormed). This bucket
-# meters estimated *input* tokens per call. Mirrors `_RateLimiter.acquire_async`'s
-# cross-loop safety (threading.Lock around refill+deduct, sleep outside the lock).
-# Inert for any model whose effective TPM is falsy (None/0) — paced by RPM alone.
-# Housed here so BOTH process-wide pacing registries (RPM above, TPM below) live
-# in one module with one idiom.
-# ---------------------------------------------------------------------------
-
-
-class AsyncTokenBudget:
-    """Like `_RateLimiter.acquire_async` but `acquire(amount)` deducts a variable token
-    count (the call's estimated input tokens). `capacity` allows a short burst
-    and must exceed the largest single request, or `acquire` would cap-clamp it."""
-
-    def __init__(self, rate_per_sec: float, capacity: float) -> None:
-        if rate_per_sec <= 0:
-            raise ValueError(f"rate_per_sec must be > 0 (got {rate_per_sec})")
-        self._rate = rate_per_sec
-        self._capacity = max(capacity, rate_per_sec)
-        self._tokens = self._capacity
-        self._last_refill = time.monotonic()
-        self._lock = threading.Lock()
-
-    def _refill_locked(self) -> None:
-        now = time.monotonic()
-        elapsed = now - self._last_refill
-        if elapsed > 0:
-            self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
-            self._last_refill = now
-
-    async def acquire(self, amount: float) -> None:
-        amount = max(0.0, min(float(amount), self._capacity))
-        while True:
-            with self._lock:
-                self._refill_locked()
-                if self._tokens >= amount:
-                    self._tokens -= amount
-                    return
-                wait_s = (amount - self._tokens) / self._rate
-            await asyncio.sleep(wait_s)
-
-    def settle(self, delta: float) -> None:
-        """Post-call correction: charge `delta` (actual minus estimated tokens)
-        without awaiting. May drive the balance negative so the next `acquire`
-        waits longer — this is what makes the throttle track ACTUAL token usage
-        even when the pre-call estimate is off. No-op for delta 0."""
-        if not delta:
-            return
-        with self._lock:
-            self._refill_locked()
-            self._tokens -= delta
-
-
-_ASYNC_TPM_LOCK = threading.Lock()
-_ASYNC_TPM_LIMITERS: dict[str, AsyncTokenBudget] = {}
-
-
-def get_async_tpm_limiter(model: str, tpm: float) -> AsyncTokenBudget:
-    """Process-wide TPM bucket for `model`, paced at `tpm` tokens/min. Capacity is
-    ~4s of budget so a few large concurrent requests can burst, then throttle."""
-    with _ASYNC_TPM_LOCK:
-        lim = _ASYNC_TPM_LIMITERS.get(model)
-        if lim is None:
-            rate_per_sec = tpm / 60.0
-            lim = AsyncTokenBudget(rate_per_sec, capacity=max(rate_per_sec * 4.0, 256_000.0))
-            _ASYNC_TPM_LIMITERS[model] = lim
         return lim
 
 

@@ -22,15 +22,12 @@ class InferenceConfig:
     emb_provider: Literal["openrouter", "vllm"]
     # default model for computing embeddings
     emb_model_id: str
-    # per-call retry on transient faults only (429 / 5xx / transport blips); the delay doubles each attempt.
+    # per-call retry on transient faults only (429 / 5xx / transport blips / empty completions): the delay
+    # doubles each attempt from `llm_retry_initial_delay_s`, capped at `llm_retry_max_delay_s` (below), with
+    # jitter, and a provider `Retry-After` is honoured. No client-side RPM/TPM pacing: it was per process and
+    # so bounded nothing across the processes / pods of a sweep; provider throttling is what the retry is for.
     llm_max_retries: int
     llm_retry_initial_delay_s: float
-    # per-model request pacing (requests/min); each model gets its own `llm:<model>` token bucket; a model absent from the map uses `llm_default_rpm`.
-    llm_model_rpm: dict[str, float]
-    llm_default_rpm: float
-    # per-model token pacing (tokens/min); a model absent from the map uses `llm_default_tpm`; a falsy effective value (null / 0) means unthrottled TPM.
-    llm_model_tpm: dict[str, float]
-    llm_default_tpm: float | None
     # USD price table for cost accounting; maps a model-substring -> {"in"/"out"/"cached": $/Mtok}.
     # Lookup is exact-first then substring, a model with no match costs 0.
     llm_prices: dict[str, dict[str, float]]
@@ -41,6 +38,8 @@ class InferenceConfig:
     llm_context_limits: dict[str, int]
     # default effort for llm calls
     effort: Effort = "medium"
+    # ceiling on one retry's backoff delay (seconds); see `llm_retry_initial_delay_s`
+    llm_retry_max_delay_s: float = 60.0
     # Optional OpenRouter provider pin (ignored on the vllm path): an ordered list of provider
     # slugs (e.g. ["parasail"]). When set, generation is routed only to these providers with no
     # fallback, so a specific provider's prompt-cache / pricing is used deterministically. null =

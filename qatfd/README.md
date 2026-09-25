@@ -230,8 +230,7 @@ python3 -m qatfd.runner systems=search_agent benchmarks=officeqa inference.llm_m
 ```
 
 Notes: models listed in `vllm_base_urls` are costed $0 regardless of `llm_prices` — a model
-priced for OpenRouter runs stays free when served locally; give served models a high `llm_model_rpm` entry so the default
-1000 RPM client-side bucket doesn't throttle them; `systems.vllm_extra_body` merges extra
+priced for OpenRouter runs stays free when served locally; `systems.vllm_extra_body` merges extra
 JSON into every vLLM chat request (e.g. `{chat_template_kwargs: {enable_thinking: false}}`
 to disable Qwen3-style thinking — skunk's `effort` tiers are OpenRouter-only and ignored on
 the vLLM path); `resume_dir` refuses runs recorded before these config keys existed (the

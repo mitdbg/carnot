@@ -1,0 +1,71 @@
+# Local smoke test of the experiment image: the same two-container shape a Kubernetes pod will
+# have (a chroma server over a store copy + a runner talking to it), without a cluster.
+#
+#   cd deploy_exp/docker
+#   CHROMA_STORE=/mnt/nvme/officeqa-slim OPENROUTER_API_KEY=... docker compose up --build --abort-on-container-exit
+#
+# CHROMA_STORE must be a COPY of a chroma store that no other server holds (a second process on
+# one store directory is the cross-process lock that hangs both; see skunk/scripts/run_chroma_server.sh).
+# BENCHMARKS_DIR defaults to the repo's qatfd/benchmarks; only the files the benchmark reads are
+# needed (for officeqa: officeqa_pro.csv, officeqa_splits.json, treasury_bulletins_cleaned/).
+# Results land in ./results/ next to this file.
+#
+# Knobs (env): IMAGE, CHROMA_STORE (required), COLLECTION, BENCHMARKS_DIR, OPENROUTER_API_KEY,
+# RUNNER_OVERRIDES (hydra overrides appended to `python -m qatfd.runner`; the default runs one dev
+# question of officeqa through the search agent against the v1 collection).
+
+services:
+  chroma:
+    image: ${IMAGE:-qatfd-experiments:local}
+    build:
+      context: ../..
+      dockerfile: deploy_exp/docker/Dockerfile
+    # warms the named collection after the server is up, exactly as on the dev box
+    command: ["/app/skunk/scripts/run_chroma_server.sh", "${COLLECTION:-officeqa-qwen-8b-v1}"]
+    environment:
+      SKUNK_CHROMADB_DIR: /data/chromadb
+      SKUNK_CHROMA_SERVER_HOST: 0.0.0.0
+      SKUNK_CHROMA_SERVER_PORT: "8001"
+      SKUNK_CHROMA_NOFILE: "65536"
+    volumes:
+      - ${CHROMA_STORE:?set CHROMA_STORE to a copy of a chroma store}:/data/chromadb
+    ulimits:
+      nofile: 65536
+    healthcheck:
+      # the heartbeat answers before the warm-up finishes; the first query then pays the HNSW load
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8001/api/v2/heartbeat"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 28g
+
+  runner:
+    image: ${IMAGE:-qatfd-experiments:local}
+    depends_on:
+      chroma:
+        condition: service_healthy
+    working_dir: /app/qatfd
+    command:
+      - bash
+      - -c
+      - >-
+        python -m qatfd.runner
+        benchmarks=officeqa benchmarks.collection_name=${COLLECTION:-officeqa-qwen-8b-v1}
+        benchmarks.chroma_server_host=chroma benchmarks.chroma_server_port=8001
+        systems=search_agent experiments.run_mode=sequential experiments.workers=1
+        experiments.run_name=compose_smoke results_root=/results
+        ${RUNNER_OVERRIDES:-experiments.qids=[UID0001]}
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:?set OPENROUTER_API_KEY}
+      QATFD_BENCHMARKS_DIR: /data/benchmarks
+    volumes:
+      - ${BENCHMARKS_DIR:-../../qatfd/benchmarks}:/data/benchmarks:ro
+      - ./results:/results
+    deploy:
+      resources:
+        limits:
+          memory: 16g

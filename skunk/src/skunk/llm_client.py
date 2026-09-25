@@ -5,18 +5,22 @@ All LLM traffic goes through OpenRouter (`provider=openrouter`, authenticated by
 (`provider=vllm`, addressed per model via `config.vllm_base_urls`). Routing is
 per call: a model listed in `vllm_base_urls` goes to the vLLM server that serves
 it, every other model uses `config.llm_provider` — so one run can keep e.g. its
-judge on OpenRouter while the agent runs on a local model. LLM calls are paced
-by the process-wide token-bucket limiters from `skunk.common` (the per-model
-`llm:<model>` bucket); only transient SDK exceptions (HTTP 429 + 5xx, network
-timeouts / connection resets — see `_is_retryable`) are retried with exponential
-backoff up to `llm_max_retries` times. The limiter paces traffic; the retry rides
-out throttling and blips the limiter can't prevent (provider-side 429, TPM quotas,
-multi-process fan-out)."""
+judge on OpenRouter while the agent runs on a local model. Only transient SDK
+exceptions (HTTP 429 + 5xx, network timeouts / connection resets, empty
+completions — see `_is_retryable`) are retried, up to `llm_max_retries` times,
+with capped exponential backoff plus jitter (`_backoff_s`) that honours the
+provider's `Retry-After` header when one is sent (`_retry_after_s`). There is
+deliberately no client-side request or token pacing: pacing was per process, so
+it bounded nothing once a sweep ran many processes or pods against one API key,
+while the 429 retry path is what actually rides out provider throttling."""
 
 from __future__ import annotations
 
 import asyncio
+import datetime
+import email.utils
 import os
+import random
 import sys
 import threading
 import time
@@ -28,14 +32,7 @@ from typing import TYPE_CHECKING, Any, TypeVar
 import httpx
 import requests
 
-from skunk.common import (
-    AsyncTokenBudget,
-    Effort,
-    estimate_tokens,
-    get_async_tpm_limiter,
-    get_rate_limiter,
-)
-from skunk.constants import IMAGE_TOKENS_EST
+from skunk.common import Effort
 from skunk.usage import UsageTracker
 
 if TYPE_CHECKING:
@@ -174,17 +171,49 @@ def _error_detail(e: BaseException) -> str:
     return ""
 
 
-# The TPM throttle (AsyncTokenBudget + its process-wide registry) lives in
-# `skunk.common`, next to the RPM registry — one home for all pacing state.
+# Longest a provider `Retry-After` is honoured for. A bogus or hostile header must not park a
+# worker for an hour; anything longer than this falls back to the capped backoff.
+_RETRY_AFTER_MAX_S = 300.0
 
-def _estimate_prompt_tokens(messages: list[dict]) -> float:
-    """Pre-call input-token estimate for the TPM bucket: `common.estimate_tokens` on each
-    message's `content` text (exact BPE count, chars/4 above its size cutoff) plus a flat
-    per-image charge. Approximate by design — it only paces throughput, it doesn't bill;
-    `_tpm_settle` corrects against real usage post-call."""
-    text_tokens = sum(estimate_tokens(m.get("content") or "") for m in messages)
-    n_images = sum(len(m.get("images") or ()) for m in messages)
-    return text_tokens + n_images * IMAGE_TOKENS_EST
+
+def _retry_after_s(e: BaseException) -> float | None:
+    """The provider's `Retry-After` on a throttled / unavailable response, in seconds, when the
+    exception carries the HTTP response (OpenRouter SDK errors expose it as `raw_response`, openai SDK
+    errors as `response`); None when absent or unparseable. Accepts both the delta-seconds and the
+    HTTP-date forms. Never raises."""
+    resp = getattr(e, "raw_response", None) or getattr(e, "response", None)
+    headers = getattr(resp, "headers", None)
+    if not headers:
+        return None
+    try:
+        value = headers.get("retry-after") or headers.get("Retry-After")
+    except Exception:  # noqa: BLE001 — a headers object we do not understand is the same as no header
+        return None
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(str(value))
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    return max(0.0, (when - datetime.datetime.now(datetime.timezone.utc)).total_seconds())
+
+
+def _backoff_s(attempt: int, base_s: float, max_s: float, retry_after_s: float | None = None) -> float:
+    """Seconds to sleep before retry number `attempt` (0-based): `base_s * 2**attempt` capped at
+    `max_s`, with "equal jitter" (half fixed, half uniform random) so the workers that failed together
+    on one throttling event do not all come back together. A provider `Retry-After` wins when it is
+    longer than the computed delay, bounded by `_RETRY_AFTER_MAX_S`."""
+    delay = min(max_s, base_s * (2 ** attempt))
+    delay = delay / 2 + random.uniform(0, delay / 2)
+    if retry_after_s is not None:
+        delay = max(delay, min(retry_after_s, _RETRY_AFTER_MAX_S))
+    return delay
 
 
 @dataclass
@@ -386,9 +415,7 @@ class _LLMBackend:
 
             return vector
 
-        # Embeddings share one process-wide "embed" rate bucket across all workers
-        # (separate from the per-model generation buckets).
-        return self._retry_call(attempt, self.provider, model, bucket="embed")
+        return self._retry_call(attempt, self.provider, model)
 
     # --- provider bodies (subclass responsibility) -------------------------------------
 
@@ -405,60 +432,22 @@ class _LLMBackend:
 
     # --- shared machinery ---------------------------------------------------------------
 
-    def _retry_call(
-        self,
-        attempt: Callable[[], R],
-        provider: str,
-        model: str,
-        bucket: str | None = None,
-    ) -> R:
-        """Drive `attempt()` with exponential-backoff retry, paced by a
-        rate-limiter bucket. Retries only transient faults (`_is_retryable`: 429 / 5xx /
-        transport blips); a non-429 4xx (bad request, auth, context overflow) raises
-        immediately. `attempt` owns the API call, timing, parsing, and the success emit;
-        `provider`/`model` are for the failure warning (routed onto `self._tracer`'s event
-        stream when present — see `_warn`). `bucket` overrides the limiter (a shared
-        process-wide bucket like `"embed"`); when None, the per-model `llm:<model>` bucket
-        is used at the configured RPM."""
+    def _retry_call(self, attempt: Callable[[], R], provider: str, model: str) -> R:
+        """Drive `attempt()` with capped, jittered exponential backoff (`_backoff_s`), honouring a
+        provider `Retry-After` when one is sent. Retries only transient faults (`_is_retryable`:
+        429 / 5xx / transport blips / empty completions); a non-429 4xx (bad request, auth, context
+        overflow) raises immediately. `attempt` owns the API call, timing, parsing, and the success
+        emit; `provider`/`model` are for the failure warning (routed onto `self._tracer`'s event
+        stream when present — see `_warn`)."""
         max_retries = self._config.llm_max_retries
-        delay = self._config.llm_retry_initial_delay_s
-        limiter = (
-            get_rate_limiter(bucket)
-            if bucket is not None
-            else get_rate_limiter(
-                f"llm:{model}",
-                rate_per_min=self._config.llm_model_rpm.get(model, self._config.llm_default_rpm),
-            )
-        )
-
         for i in range(max_retries + 1):
-            limiter.acquire()
             try:
                 return attempt()
             except Exception as e:
-                # Log EVERY failure with its message — including the final one
-                # before we re-raise — so a fatal error is never silent.
-                stop = i == max_retries or not _is_retryable(e)
-                _warn(
-                    self._tracer,
-                    id="llm_call_failed",
-                    msg=(
-                        f"llm_call_failed attempt={i + 1}/{max_retries + 1} provider={provider} "
-                        f"model={model} error={type(e).__name__}: {e}{_error_detail(e)}"
-                        f"{'' if stop else f'; retrying in {delay:.1f}s'}"
-                    ),
-                    data={
-                        "attempt": i + 1,
-                        "max_attempts": max_retries + 1,
-                        "provider": provider,
-                        "model": model,
-                        "error": f"{type(e).__name__}: {e}{_error_detail(e)}",
-                    }
-                )
-                if stop:
+                delay = self._on_failure(i, e, provider, model)
+                if delay is None:
                     raise
                 time.sleep(delay)
-                delay *= 2
         raise RuntimeError("unreachable: retry loop fell through")
 
     async def _aretry_call(
@@ -467,43 +456,45 @@ class _LLMBackend:
         provider: str,
         model: str,
     ) -> LLMResponse:
-        """Async twin of `_retry_call`: awaits the model's async rate limiter and the
-        coroutine `attempt()`, backing off via `asyncio.sleep` (never blocking the
-        event loop). `provider`/`model` are for the failure warning."""
+        """Async twin of `_retry_call`: backs off via `asyncio.sleep` (never blocking the event loop)."""
         max_retries = self._config.llm_max_retries
-        delay = self._config.llm_retry_initial_delay_s
-        limiter = get_rate_limiter(
-            f"llm:{model}",
-            rate_per_min=self._config.llm_model_rpm.get(model, self._config.llm_default_rpm),
-        )
-
         for i in range(max_retries + 1):
-            await limiter.acquire_async()
             try:
                 return await attempt()
             except Exception as e:
-                stop = i == max_retries or not _is_retryable(e)
-                _warn(
-                    self._tracer,
-                    id="llm_call_failed",
-                    msg=(
-                        f"llm_call_failed attempt={i + 1}/{max_retries + 1} provider={provider} "
-                        f"model={model} error={type(e).__name__}: {e}{_error_detail(e)}"
-                        f"{'' if stop else f'; retrying in {delay:.1f}s'}"
-                    ),
-                    data={
-                        "attempt": i + 1,
-                        "max_attempts": max_retries + 1,
-                        "provider": provider,
-                        "model": model,
-                        "error": f"{type(e).__name__}: {e}{_error_detail(e)}",
-                    }
-                )
-                if stop:
+                delay = self._on_failure(i, e, provider, model)
+                if delay is None:
                     raise
                 await asyncio.sleep(delay)
-                delay *= 2
         raise RuntimeError("unreachable: retry loop fell through")
+
+    def _on_failure(self, attempt: int, e: BaseException, provider: str, model: str) -> float | None:
+        """Shared tail of both retry loops: log EVERY failure with its message — including the final
+        one before the caller re-raises — so a fatal error is never silent. Returns the seconds to
+        sleep before the next attempt, or None when the caller must re-raise (retry budget exhausted
+        or a permanent error)."""
+        max_retries = self._config.llm_max_retries
+        stop = attempt == max_retries or not _is_retryable(e)
+        delay = None if stop else _backoff_s(
+            attempt, self._config.llm_retry_initial_delay_s, self._config.llm_retry_max_delay_s, _retry_after_s(e),
+        )
+        _warn(
+            self._tracer,
+            id="llm_call_failed",
+            msg=(
+                f"llm_call_failed attempt={attempt + 1}/{max_retries + 1} provider={provider} "
+                f"model={model} error={type(e).__name__}: {e}{_error_detail(e)}"
+                f"{'' if delay is None else f'; retrying in {delay:.1f}s'}"
+            ),
+            data={
+                "attempt": attempt + 1,
+                "max_attempts": max_retries + 1,
+                "provider": provider,
+                "model": model,
+                "error": f"{type(e).__name__}: {e}{_error_detail(e)}",
+            }
+        )
+        return delay
 
     def _build_response(
         self,
@@ -556,29 +547,6 @@ class _LLMBackend:
         )
         self.usage.add(resp, model, usage_key)
         return resp
-
-    async def _tpm_acquire(
-        self, model: str, messages: list[dict],
-    ) -> tuple[AsyncTokenBudget | None, float]:
-        """Acquire the per-model token budget (`config.llm_model_tpm`, falling back to
-        `llm_default_tpm`) before a call, charging an up-front input-token estimate.
-        Returns (limiter, estimate) so the caller can `_tpm_settle` the actual-vs-estimate
-        delta afterward; (None, 0.0) when the model is unthrottled (paced by RPM alone)."""
-        tpm = self._config.llm_model_tpm.get(model, self._config.llm_default_tpm)
-        if not tpm:
-            return None, 0.0
-        est = _estimate_prompt_tokens(messages)
-        lim = get_async_tpm_limiter(model, tpm)
-        await lim.acquire(est)
-        return lim, est
-
-    @staticmethod
-    def _tpm_settle(lim: AsyncTokenBudget | None, est: float, input_tokens: int | None) -> None:
-        """Post-call correction: charge the actual-minus-estimated input tokens so the
-        bucket tracks REAL usage (the pre-call estimate uses o200k_base, not the provider's
-        tokenizer, and flat-estimates images and message overhead)."""
-        if lim is not None:
-            lim.settle((input_tokens or 0) - est)
 
     def _finish(
         self, spec: CallSpec, text: str, toks: dict, latency_s: float, model_id: str
@@ -780,12 +748,6 @@ class _OpenRouterBackend(_OpenAIChatBackend):
         client = self._get_client()
         messages = self._chat_messages(spec.messages)
         reasoning = {"effort": "none"} if spec.disable_reasoning else self._effort_to_reasoning(spec.effort)
-        # TPM throttle (opt-in via SKUNK_MODEL_TPM): meter input tokens so throughput
-        # stays under quota, separate from the RPM limiter. Per attempt (the retry loop
-        # re-invokes this body), so each retry re-charges. `_tpm_settle` corrects the
-        # estimate post-call. Estimated from the spec-format messages (`content` text +
-        # `images`), the wire-format `messages` local hides images inside content-parts lists.
-        tpm_lim, est = await self._tpm_acquire(spec.model, spec.messages)
         extra = (
             {"max_tokens": spec.max_output_tokens}
             if spec.max_output_tokens is not None
@@ -803,7 +765,6 @@ class _OpenRouterBackend(_OpenAIChatBackend):
         latency_s = time.monotonic() - t0
         output_text = self._checked_text(resp, spec)
         toks = self._usage_tokens_chat(getattr(resp, "usage", None))
-        self._tpm_settle(tpm_lim, est, toks["input_tokens"])
         return self._finish(spec, output_text, toks, latency_s, spec.model)
 
     def _embed_once(self, model: str, text: str, http_headers: dict[str, str] | None = None, timeout_s: float | None = None) -> tuple[list[float], int]:
@@ -886,8 +847,6 @@ class _VLLMBackend(_OpenAIChatBackend):
         """Async twin of `_gen_call`."""
         _, aclient = self._clients_for(spec.model)
         messages = self._chat_messages(spec.messages)
-        # TPM throttle (opt-in via SKUNK_MODEL_TPM) — identical to the OpenRouter path.
-        tpm_lim, est = await self._tpm_acquire(spec.model, spec.messages)
         t0 = time.monotonic()
         coro = aclient.chat.completions.create(
             model=spec.model, messages=messages, temperature=spec.temperature, # type: ignore[arg-type]
@@ -899,7 +858,6 @@ class _VLLMBackend(_OpenAIChatBackend):
         latency_s = time.monotonic() - t0
         output_text = self._checked_text(resp, spec)
         toks = self._usage_tokens_chat(getattr(resp, "usage", None))
-        self._tpm_settle(tpm_lim, est, toks["input_tokens"])
         return self._finish(spec, output_text, toks, latency_s, spec.model)
 
     def _embed_once(self, model: str, text: str, http_headers: dict[str, str] | None = None, timeout_s: float | None = None) -> tuple[list[float], int]:

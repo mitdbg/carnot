@@ -1,0 +1,27 @@
+# Build context for deploy_exp/docker/Dockerfile is the repo root; keep everything that is not
+# skunk/ or qatfd/ source out of it (the benchmark stores alone are ~700 GB).
+# (deploy/compose builds from deploy/compose/ as its own context, so this file does not affect it.)
+*
+!skunk/
+!qatfd/
+!deploy_exp/docker/requirements.lock
+!deploy_exp/docker/requirements-extra.txt
+
+# inside skunk/ and qatfd/: data, results, virtualenvs, caches
+**/venv/
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+qatfd/benchmarks/
+qatfd/results/
+qatfd/*_results/
+qatfd/logs/
+qatfd/latency_bench/
+qatfd/*.out
+skunk/results/
+skunk/.env
+skunk/data/

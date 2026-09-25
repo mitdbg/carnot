@@ -1,0 +1,3 @@
+# Packages the image needs beyond the dev venv freeze (requirements.lock).
+# boto3: the in-pod entrypoint's S3 sync + Secrets Manager read (the aws cli is also installed).
+boto3

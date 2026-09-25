@@ -83,7 +83,12 @@ _RESUME_IGNORED_KEYS = {
     "experiments.resume_dir", "experiments.run_name", "results_root", "dry_run",
     # wall-clock cap on the judge request: operational, changes how long a hung call waits, not what is measured
     "benchmarks.judge_timeout_s",
+    # retry pacing: operational, never changes what is measured
+    "inference.llm_max_retries", "inference.llm_retry_initial_delay_s", "inference.llm_retry_max_delay_s",
 }
+# key PREFIXES ignored on resume: the client-side RPM/TPM pacing config that runs before 2026-09-26 persisted
+# (removed since; an old run dir must still resume)
+_RESUME_IGNORED_PREFIXES = ("inference.llm_model_rpm", "inference.llm_default_rpm", "inference.llm_model_tpm", "inference.llm_default_tpm")
 
 # modes for running benchmark questions
 class RunMode(Enum):
@@ -390,7 +395,7 @@ def _check_resume_config(run_dir: Path, cfg: DictConfig) -> None:
     diffs = [
         f"  {key}: persisted={persisted.get(key, '<missing>')!r} current={current.get(key, '<missing>')!r}"
         for key in sorted(set(persisted) | set(current))
-        if key not in _RESUME_IGNORED_KEYS and persisted.get(key) != current.get(key)
+        if key not in _RESUME_IGNORED_KEYS and not key.startswith(_RESUME_IGNORED_PREFIXES) and persisted.get(key) != current.get(key)
     ]
     if diffs:
         raise Exception(

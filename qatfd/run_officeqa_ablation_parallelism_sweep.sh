@@ -96,7 +96,6 @@ for w in $WORKERS; do
       inference.llm_model="$CHAT_MODEL" \
       inference.emb_provider=vllm \
       inference.emb_model_id="$EMB_MODEL" \
-      inference.llm_default_rpm=100000 \
       "++inference.vllm_base_urls=${VLLM_URLS}" \
       systems.include_search_corpus="$vec" \
       systems.include_grep_corpus="$grep" \

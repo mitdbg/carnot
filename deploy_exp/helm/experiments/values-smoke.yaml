@@ -1,0 +1,31 @@
+# Smoke test: one officeqa dev question through the stock runner, sequential, base+v1 store, no PDFs.
+#   helm upgrade --install smoke deploy_exp/helm/experiments -n experiments --create-namespace \
+#       -f deploy_exp/helm/experiments/values-smoke.yaml \
+#       --set serviceAccount.roleArn=$(cd deploy_exp/terraform && terraform output -raw runner_role_arn) \
+#       --set image.tag=<git sha>
+benchmark: officeqa
+job:
+  parallelism: 1
+  activeDeadlineSeconds: 7200
+cells:
+  - label: smoke_x1
+    benchmark: officeqa
+    collection: officeqa-qwen-8b-v1
+    store_prefix: officeqa/chromadb
+    data:
+      - officeqa/officeqa_pro.csv
+      - officeqa/officeqa_splits.json
+      - officeqa/treasury_bulletins_cleaned/
+    expected_rows: 1
+    argv:
+      - python
+      - -m
+      - qatfd.runner
+      - benchmarks=officeqa
+      - benchmarks.collection_name=officeqa-qwen-8b-v1
+      - benchmarks.pdf_dir=null
+      - systems=search_agent
+      - experiments.run_mode=sequential
+      - experiments.workers=1
+      - experiments.run_name=smoke_x1
+      - experiments.qids=[UID0001]

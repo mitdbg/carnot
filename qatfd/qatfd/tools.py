@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import inspect
 import json
 import re
@@ -43,6 +44,15 @@ _ITER_BATCH_SIZE = 256
 # batch size for copying chunks between collections: chroma 1.x rejects requests over 40 MB (413), and a
 # 4096-dim float embedding is ~40 KB as JSON, so keep each get/upsert to a few hundred chunks
 _COPY_BATCH_SIZE = 256
+# pages (get / upsert round-trips) between forced `gc.collect()` calls in the batched chroma loops (`_grep_one`,
+# `_iter_get`, `_CollectionToolBase._copy`). chromadb's HttpClient is httpx, and in httpx 0.28 a finished
+# `Response` and its `BoundSyncStream` point at each other, so a response (and the multi-MB JSON body cached on
+# it) is only ever freed by the cyclic collector, never by reference counting. `bytes` do not count toward the
+# collector's allocation threshold, so on the runner's large long-lived heap a full collection almost never
+# fires on its own and the bodies pile up: ~20 MB per 256-chunk copy batch, measured as +8.8 GB of RSS on one
+# 40k-chunk copy vs +0.9 GB with periodic collects. A full collection costs ~60 ms on that heap, so every 32
+# pages bounds the retained bodies to well under 1 GB per tool call at negligible cost.
+_GC_EVERY_PAGES = 32
 # default cap on the number of chunks one create/add/copy/merge may move (guards against a loose
 # `metadata_filter` over the base collection); the tools take an explicit `max_copy_chunks` to override
 _DEFAULT_MAX_COPY_CHUNKS = 100_000
@@ -126,7 +136,7 @@ def _grep_one(chroma_client: ClientAPI, name: str, get_kwargs: dict, include: li
     ids = list(c.get(include=[], **scan_kwargs)["ids"])  # type: ignore
     out: dict = {"ids": [], **{key: [] for key in include}}
     batch = _GREP_ROW_BATCH_WITH_EMBEDDINGS if "embeddings" in include else _GREP_ROW_BATCH_TEXT_ONLY
-    for i in range(0, len(ids), batch):
+    for page, i in enumerate(range(0, len(ids), batch), start=1):
         wanted = ids[i : i + batch]
         got = c.get(ids=wanted, include=include)  # type: ignore
         pos = {chunk_id: j for j, chunk_id in enumerate(got["ids"])}
@@ -135,13 +145,17 @@ def _grep_one(chroma_client: ClientAPI, name: str, get_kwargs: dict, include: li
         for key in include:
             rows = got.get(key)
             out[key].extend(rows[j] for j in order) if rows is not None else out[key].extend([None] * len(order))
+        if page % _GC_EVERY_PAGES == 0:
+            gc.collect()
     return name, out
 
 def _iter_get(collection: Collection, include: list[str], batch_size: int = _ITER_BATCH_SIZE) -> Iterator[dict]:
     """Yield collection.get() pages of at most batch_size rows. Pages by id, not offset."""
     ids = collection.get(include=[])["ids"]
-    for i in range(0, len(ids), batch_size):
+    for page, i in enumerate(range(0, len(ids), batch_size), start=1):
         yield collection.get(ids=ids[i : i + batch_size], include=include) # type: ignore
+        if page % _GC_EVERY_PAGES == 0:
+            gc.collect()
 
 def _format_search_results(collection_to_results: dict, is_query: bool, include_embeddings: bool) -> dict[str, list[SearchResult]]:
     # format return results as dict of collection-->list[SearchResult]
@@ -1044,7 +1058,7 @@ class SemanticMapTool(Tool):
                         page_out = []
                         for chunk_id, meta in zip(page["ids"], page["metadatas"], strict=True):
                             doc_id = meta["doc_id"]
-                            text = self._document_map[doc_id]
+                            text = self._document_map.get(doc_id)
                             fields, error = doc_cache[doc_id]
                             page_out.append((chunk_id, doc_id, text, fields, error))
 
@@ -1139,7 +1153,7 @@ class MapTool(Tool):
                         page_out = []
                         for chunk_id, meta in zip(page["ids"], page["metadatas"], strict=True):
                             doc_id = meta["doc_id"]
-                            text = self._document_map[doc_id]
+                            text = self._document_map.get(doc_id)
                             output_fields, error = doc_cache[doc_id]
                             page_out.append((chunk_id, doc_id, text, output_fields, error))
 
@@ -1334,13 +1348,17 @@ class _CollectionToolBase(Tool):
                 return len(found) - len(existing), len(existing), len(batch) - len(found), batch_docs
 
             n_copied = 0
+            # `buffersize` keeps only max_workers batches in flight (a plain map submits every batch up front)
             with ThreadPoolExecutor(max_workers=min(self._max_workers, max(1, len(batches)))) as pool:
-                for n_new, n_existing, n_missing, batch_docs in pool.map(copy_batch, batches):
+                results = pool.map(copy_batch, batches, buffersize=self._max_workers)
+                for page, (n_new, n_existing, n_missing, batch_docs) in enumerate(results, start=1):
                     stats.n_new += n_new
                     stats.n_existing += n_existing
                     stats.n_missing += n_missing
                     n_copied += n_new + n_existing
                     docs |= batch_docs
+                    if page % _GC_EVERY_PAGES == 0:
+                        gc.collect()
             assert stats.sources is not None
             stats.sources[src_name] = stats.sources.get(src_name, 0) + n_copied
             fields.append((src.metadata or {}).get("fields"))

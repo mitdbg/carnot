@@ -1,0 +1,12 @@
+# The sweep's cell list, one JSON document mounted at /manifest/cells.json in every pod; each pod picks
+# cells[JOB_COMPLETION_INDEX]. A ConfigMap holds up to 1 MiB, i.e. thousands of cells.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-cells
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "experiments.labels" . | nindent 4 }}
+data:
+  cells.json: |-
+    {{- toPrettyJson .Values.cells | nindent 4 }}

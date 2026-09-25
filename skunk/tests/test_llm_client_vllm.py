@@ -32,8 +32,7 @@ def _config(**overrides) -> InferenceConfig:
     base = dict(
         emb_provider="openrouter", emb_model_id="emb", llm_provider="openrouter",
         llm_model="loc/m", llm_max_retries=0, llm_retry_initial_delay_s=0.0,
-        llm_model_rpm={}, llm_default_rpm=1e9, llm_model_tpm={}, llm_default_tpm=None, llm_prices={},
-        llm_context_limits={},
+        llm_prices={}, llm_context_limits={},
     )
     base.update(overrides)
     return InferenceConfig(**base)
@@ -241,3 +240,61 @@ def test_is_retryable_openai_errors():
     assert not _is_retryable(_status_error(400))
     req = httpx.Request("POST", "http://127.0.0.1:1/v1/chat/completions")
     assert _is_retryable(APIConnectionError(request=req))
+
+
+# ---- retry backoff ------------------------------------------------------------------------
+
+
+def test_backoff_is_capped_and_jittered():
+    from skunk.llm_client import _backoff_s
+    # attempt 0 at base 1s: equal jitter keeps it in [0.5, 1.0]
+    assert all(0.5 <= _backoff_s(0, 1.0, 60.0) <= 1.0 for _ in range(50))
+    # attempt 10 at base 1s would be 1024s; the cap bounds it to [30, 60]
+    assert all(30.0 <= _backoff_s(10, 1.0, 60.0) <= 60.0 for _ in range(50))
+    # a provider Retry-After longer than the computed delay wins, up to the sanity ceiling
+    assert _backoff_s(0, 1.0, 60.0, retry_after_s=20.0) == 20.0
+    assert _backoff_s(0, 1.0, 60.0, retry_after_s=99999.0) == 300.0
+    # a shorter Retry-After does not shrink the jittered delay
+    assert _backoff_s(10, 1.0, 60.0, retry_after_s=1.0) >= 30.0
+    # base 0 (the tests' config) never sleeps
+    assert _backoff_s(3, 0.0, 60.0) == 0.0
+
+
+def test_retry_after_header_parsing():
+    import datetime
+    import email.utils
+
+    from skunk.llm_client import _retry_after_s
+
+    assert _retry_after_s(RuntimeError("no response attached")) is None
+    assert _retry_after_s(_status_error(429)) is None  # no Retry-After header on the stub response
+    e = _status_error(429)
+    e.response.headers["Retry-After"] = "7"
+    assert _retry_after_s(e) == 7.0
+    e.response.headers["Retry-After"] = "not a number"
+    assert _retry_after_s(e) is None
+    soon = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=30)
+    e.response.headers["Retry-After"] = email.utils.format_datetime(soon, usegmt=True)
+    assert 25.0 <= _retry_after_s(e) <= 30.0
+
+
+def test_retry_loop_sleeps_the_retry_after(monkeypatch, stub_server):
+    """A 429 carrying Retry-After: the loop sleeps at least that long before the (successful) retry."""
+    import skunk.llm_client as lc
+
+    slept: list[float] = []
+    monkeypatch.setattr(lc.time, "sleep", lambda s: slept.append(s))
+    client = _stub_client(stub_server, llm_max_retries=1)
+    backend = client._backend_for_model("loc/m")
+    calls = {"n": 0}
+
+    def attempt():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            e = _status_error(429)
+            e.response.headers["Retry-After"] = "5"
+            raise e
+        return "ok"
+
+    assert backend._retry_call(attempt, "vllm", "loc/m") == "ok"
+    assert calls["n"] == 2 and slept == [5.0]

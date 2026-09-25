@@ -882,10 +882,6 @@ def _run_question(
         emb_model_id=SOLVER_DUMMY_EMB_MODEL_ID,
         llm_max_retries=5,
         llm_retry_initial_delay_s=1.0,
-        llm_model_rpm={},
-        llm_default_rpm=1000,
-        llm_model_tpm={},
-        llm_default_tpm=None,
         llm_prices=LLM_PRICES,
         llm_context_limits=LLM_CONTEXT_LIMITS,
     )
@@ -1014,10 +1010,6 @@ def main() -> None:
         emb_model_id=args.emb_model_id,
         llm_max_retries=5,
         llm_retry_initial_delay_s=1.0,
-        llm_model_rpm={},
-        llm_default_rpm=1000,
-        llm_model_tpm={},
-        llm_default_tpm=None,
         llm_prices=LLM_PRICES,
         llm_context_limits=LLM_CONTEXT_LIMITS,
     )

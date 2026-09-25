@@ -1,0 +1,173 @@
+# Values for one experiment sweep. `helm install <sweep-name> deploy_exp/helm/experiments -f my-sweep.yaml`
+# renders a ConfigMap holding the cell list and an Indexed Job with one pod per cell. The release name is
+# the sweep name: it names the Job, the ConfigMap, and the status prefix in the results bucket.
+#
+# Pod anatomy (see templates/job.yaml):
+#   init   fetch-data   pulls the cell's chroma store + benchmark files from the data bucket into /data (NVMe emptyDir)
+#   init   chroma       native sidecar: skunk/scripts/run_chroma_server.sh over /data/chromadb on 127.0.0.1:8001
+#   main   runner       waits for chroma, runs the cell's argv from /app/qatfd, syncs /results to the results bucket
+
+image:
+  repository: 422297141788.dkr.ecr.us-east-1.amazonaws.com/qatfd-experiments   # terraform output ecr_repository_url
+  tag: latest
+  pullPolicy: Always
+
+# Everything the terraform stack decided; change here only if you changed it there.
+cluster:
+  # experiment node group label + taint (terraform output experiment_node_selector)
+  nodeLabelKey: qatfd.io/workload
+  nodeLabelValue: experiments
+
+serviceAccount:
+  # create the ServiceAccount in this release (one release per namespace should own it; others set false)
+  create: true
+  name: experiment-runner                    # terraform var runner_service_account
+  # terraform output runner_role_arn; the SA is created by this chart and bound to the role by this annotation
+  roleArn: ""
+
+s3:
+  region: us-east-1
+  dataBucket: carnot-research                # source of truth for benchmark data (read-only)
+  resultsBucket: qatfd-research-experiments # terraform output results_bucket (read-write)
+  # /results in the pod (results_root) is mirrored to s3://<resultsBucket>/<resultsPrefix>/, i.e. the same
+  # <benchmark>/<system>/<label>_<ts>/ tree the local runner writes, so deploy_exp/scripts/pull_results.sh
+  # can sync it straight into qatfd/results/.
+  resultsPrefix: results
+  # per-cell status json lands at s3://<resultsBucket>/<jobsPrefix>/<release>/<index>_<label>.json
+  jobsPrefix: jobs
+  syncIntervalSeconds: 60
+
+secrets:
+  # Kubernetes Secret (in the release namespace) holding OPENROUTER_API_KEY; create it by hand:
+  #   kubectl -n experiments create secret generic llm-keys --from-literal=OPENROUTER_API_KEY=sk-or-...
+  # Leave empty to skip the env injection (e.g. once the runner reads Secrets Manager itself; the IRSA role
+  # already allows secretsmanager:GetSecretValue on qatfd/experiments/*).
+  llmSecretName: llm-keys
+
+# A sweep runs one benchmark; this selects the sizing profile under `benchmarks:` below.
+benchmark: officeqa
+
+job:
+  # how many cells run at once (capped at the number of cells). null = the benchmark profile's value.
+  parallelism: null
+  # retries per cell (a fresh pod, fresh store pull) before that index is marked failed
+  backoffLimitPerIndex: 1
+  # a cell that has not finished after this many seconds is killed (the whole Job's clock, so size it for
+  # the longest cell times the number of waves: cells / parallelism)
+  activeDeadlineSeconds: 172800   # 48h
+  # finished Jobs (and their pods/logs) are garbage-collected after this
+  ttlSecondsAfterFinished: 259200 # 3 days
+
+runner:
+  # hydra overrides appended to EVERY cell's argv (last override wins in hydra, so these pin the pod layout
+  # regardless of what the sweep generator emitted)
+  extraOverrides:
+    - results_root=/results
+    - benchmarks.chroma_server_host=127.0.0.1
+    - benchmarks.chroma_server_port=8001
+
+chroma:
+  port: 8001
+  # seconds to wait for the server to answer a heartbeat before the pod is considered failed
+  startupTimeoutSeconds: 600
+
+fetch:
+  resources:
+    requests:
+      cpu: "1"
+      memory: 1Gi
+    limits:
+      memory: 2Gi
+  # parallel S3 requests for the pull (the cleaned-pages tree is ~85k small objects)
+  maxConcurrentRequests: 64
+
+pod:
+  terminationGracePeriodSeconds: 120
+
+# Per-benchmark sizing. Selected by `benchmark:` above. Memory is the axis that matters: chroma holds the
+# corpus HNSW index in RAM (v1 collections: officeqa 9 GB, browsecomp 15 GB, financebench 1.5 GB, freshstack
+# 0.2 GB) plus every collection a cell creates, and it never frees a deleted collection's index, so a
+# bootstrap/enrich cell at X=10 can run chroma to 2-3x the corpus index. The runner's heap is the document
+# map plus whatever the httpx retention issue leaks between gc passes. A node is 384 GiB / 48 vCPU / 2.8 TB.
+#   chroma.limits.memory + runner.limits.memory ~= what one cell can take; parallelism / 4 nodes ~= cells per node
+benchmarks:
+  officeqa:
+    parallelism: 16                       # 4 cells per node at these limits
+    chroma:
+      requests: { cpu: "1", memory: 40Gi }
+      limits: { memory: 56Gi }
+    runner:
+      requests: { cpu: "3", memory: 12Gi }
+      limits: { memory: 24Gi }            # ~48Gi if running without the gc backstop in qatfd/tools.py
+    ephemeralStorage: 60Gi                # 26 GB store + 0.7 GB pages + collections + results
+    dataSizeLimit: 80Gi
+  browsecomp_plus:
+    parallelism: 8                        # 2 cells per node
+    chroma:
+      requests: { cpu: "1", memory: 64Gi }
+      limits: { memory: 96Gi }
+    runner:
+      requests: { cpu: "3", memory: 16Gi }
+      limits: { memory: 32Gi }
+    ephemeralStorage: 120Gi               # 67 GB store
+    dataSizeLimit: 160Gi
+  financebench:
+    parallelism: 16
+    chroma:
+      requests: { cpu: "1", memory: 8Gi }
+      limits: { memory: 16Gi }
+    runner:
+      requests: { cpu: "3", memory: 8Gi }
+      limits: { memory: 16Gi }
+    ephemeralStorage: 30Gi                # 5.5 GB store + pdfs
+    dataSizeLimit: 40Gi
+  freshstack:
+    parallelism: 16
+    chroma:
+      requests: { cpu: "1", memory: 4Gi }
+      limits: { memory: 8Gi }
+    runner:
+      requests: { cpu: "3", memory: 8Gi }
+      limits: { memory: 16Gi }
+    ephemeralStorage: 20Gi
+    dataSizeLimit: 30Gi
+  # qampari (25.9M x 1024-dim, ~106 GB HNSW, 212 GB store) fits one cell per node at best; trec_biogen is
+  # four shards behind four servers (qatfd.merged_chroma) and needs a multi-sidecar pod this chart does not
+  # render yet. Add profiles when those sweeps move here.
+
+# The cells. One pod per entry, in order (JOB_COMPLETION_INDEX == position in this list). Every field is
+# read by files/*.sh inside the pod; sweep generators (qatfd/qatfd/k8s/sweeps/*) emit this list.
+#   label          run label; also the results dir prefix the runner uses (experiments.run_name / +ub.label)
+#   benchmark      qatfd benchmark name (informational)
+#   collection     chroma collection the sidecar warms and the runner queries
+#   store_prefix   s3://<dataBucket>/<store_prefix>/  -> /data/chromadb
+#   data           files/dirs to pull under /data/benchmarks: a string "officeqa/officeqa_pro.csv" (same path on
+#                  both sides; trailing "/" = whole prefix) or {src, dest?, include?, exclude?}: `dest` when the
+#                  local layout differs from S3 (biogen/ -> trec-biogen/), `include` / `exclude` as aws s3 sync
+#                  globs on a prefix (e.g. include: "metadata_rank*.json" next to GBs of embedding shards)
+#   expected_rows  results.jsonl rows a complete run has (used by submit.py to skip done cells; informational here)
+#   argv           the command, run from /app/qatfd with runner.extraOverrides appended
+cells: []
+# Example (one dev question through the stock runner; also in values-smoke.yaml):
+# cells:
+#   - label: smoke_x1
+#     benchmark: officeqa
+#     collection: officeqa-qwen-8b-v1
+#     store_prefix: officeqa/chromadb
+#     data:
+#       - officeqa/officeqa_pro.csv
+#       - officeqa/officeqa_splits.json
+#       - officeqa/treasury_bulletins_cleaned/
+#     expected_rows: 1
+#     argv:
+#       - python
+#       - -m
+#       - qatfd.runner
+#       - benchmarks=officeqa
+#       - benchmarks.collection_name=officeqa-qwen-8b-v1
+#       - benchmarks.pdf_dir=null
+#       - systems=search_agent
+#       - experiments.run_mode=sequential
+#       - experiments.workers=1
+#       - experiments.run_name=smoke_x1
+#       - experiments.qids=[UID0001]

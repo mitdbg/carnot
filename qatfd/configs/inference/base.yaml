@@ -10,24 +10,13 @@ emb_model_id: Qwen/Qwen3-Embedding-8B
 llm_provider: openrouter
 # default model for every LLM call (one-shot calls and agent loops alike); full OpenRouter id
 llm_model: google/gemini-3.5-flash
-# per-call retry on transient faults only; the delay doubles each attempt
+# per-call retry on transient faults only (429 / 5xx / transport blips / empty completions): the delay
+# doubles each attempt from the initial value, is capped at the max, gets jitter, and a provider
+# Retry-After header is honoured. There is no client-side RPM/TPM pacing (it was per process, so it
+# bounded nothing across a sweep's processes / pods); provider throttling is what the retry rides out.
 llm_max_retries: 5
 llm_retry_initial_delay_s: 1.0
-# per-model request pacing (requests/min); a model not listed uses llm_default_rpm
-llm_model_rpm:
-  gemini-3.5-flash: 4000
-  gemini-3-flash-preview: 4000      # fine-grained filter scan model; same RPM as 3.5-flash
-  gemini-3.1-flash-lite: 4000
-  gemini-3.1-pro-preview: 2000
-llm_default_rpm: 1000
-# per-model token pacing (tokens/min); a model not listed uses llm_default_tpm.
-# null/0 disables the TPM throttle for that model (paced by RPM alone).
-llm_model_tpm:
-  gemini-3.5-flash: 10000000
-  gemini-3-flash-preview: 10000000  # same TPM as 3.5-flash
-  gemini-3.1-flash-lite: 25000000
-  gemini-3.1-pro-preview: 8000000
-llm_default_tpm: null
+llm_retry_max_delay_s: 60.0
 # USD price table for cost accounting; maps a model-substring -> {in/out/cached: $ per 1M tokens}
 # lookup is exact-first then substring, and an unmatched model costs 0.
 llm_prices:

@@ -289,10 +289,6 @@ def build_config(args) -> InferenceConfig:
         llm_model=args.extract_model,
         llm_max_retries=args.max_retries,
         llm_retry_initial_delay_s=1.0,
-        llm_model_rpm={},
-        llm_default_rpm=args.rpm,
-        llm_model_tpm={},
-        llm_default_tpm=None,
         llm_prices={},
         llm_context_limits={},
     )
@@ -518,7 +514,6 @@ def main() -> None:
     parser.add_argument("--dpi", type=int, default=200, help="Page render DPI for the vision calls")
     parser.add_argument("--render-procs", type=int, default=os.cpu_count() or 4, help="Phase-1 render processes (CPU-bound)")
     parser.add_argument("--concurrency", type=int, default=32, help="Phase-2/3 threads (I/O-bound LLM + S3)")
-    parser.add_argument("--rpm", type=float, default=600.0, help="Per-model requests/min pacing (LLMClient token bucket)")
     parser.add_argument("--max-retries", type=int, default=4, help="Per-call transient-fault retries (429/5xx/transport)")
     parser.add_argument("--target-element-tokens", type=int, default=DEFAULT_TARGET_ELEMENT_TOKENS, help="Target token size for merged text elements")
     parser.add_argument("--sample", type=int, default=None, help="Process only the first N (post-filter) docs")

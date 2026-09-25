@@ -1,0 +1,146 @@
+{{- $n := len .Values.cells -}}
+{{- if eq $n 0 }}{{ fail "values.cells is empty: nothing to run (see values.yaml for the cell schema)" }}{{ end -}}
+{{- $bp := index .Values.benchmarks .Values.benchmark | required (printf "no sizing profile benchmarks.%s in values (benchmark: %q)" .Values.benchmark .Values.benchmark) -}}
+{{- $par := .Values.job.parallelism | default $bp.parallelism | int -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "experiments.labels" . | nindent 4 }}
+spec:
+  # one pod per cell; each pod learns which cell it is from batch.kubernetes.io/job-completion-index
+  completionMode: Indexed
+  completions: {{ $n }}
+  parallelism: {{ min $par $n }}
+  # per-cell retry budget: a failed cell is re-run in a NEW pod (fresh store pull) up to this many times,
+  # independently of the other cells; the Job only fails once every index has exhausted its budget
+  backoffLimitPerIndex: {{ .Values.job.backoffLimitPerIndex }}
+  maxFailedIndexes: {{ $n }}
+  activeDeadlineSeconds: {{ .Values.job.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ .Values.job.ttlSecondsAfterFinished }}
+  podFailurePolicy:
+    rules:
+      # node drained / spot reclaimed / preempted: not the cell's fault, do not burn its retry budget
+      - action: Ignore
+        onPodConditions:
+          - type: DisruptionTarget
+      # anything else the runner exits non-zero with (incl. 137 = OOM-killed) counts against backoffLimitPerIndex
+      - action: Count
+        onExitCodes:
+          containerName: runner
+          operator: NotIn
+          values: [0]
+  template:
+    metadata:
+      labels:
+        {{- include "experiments.labels" . | nindent 8 }}
+      annotations:
+        # never let the cluster-autoscaler evict a running cell to compact a half-empty node
+        cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      terminationGracePeriodSeconds: {{ .Values.pod.terminationGracePeriodSeconds }}
+      nodeSelector:
+        {{ .Values.cluster.nodeLabelKey }}: {{ .Values.cluster.nodeLabelValue | quote }}
+      tolerations:
+        - key: {{ .Values.cluster.nodeLabelKey | quote }}
+          operator: Equal
+          value: {{ .Values.cluster.nodeLabelValue | quote }}
+          effect: NoSchedule
+      volumes:
+        # NVMe-backed (the node's kubelet dir is on the instance-store RAID0): the store copy + benchmark files
+        - name: data
+          emptyDir:
+            sizeLimit: {{ $bp.dataSizeLimit }}
+        - name: results
+          emptyDir: {}
+        - name: manifest
+          configMap:
+            name: {{ .Release.Name }}-cells
+        - name: scripts
+          configMap:
+            name: {{ .Release.Name }}-scripts
+            defaultMode: 0755
+      initContainers:
+        # 1. pull the store + benchmark files (runs to completion before anything else starts)
+        - name: fetch-data
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["bash", "/scripts/fetch.sh"]
+          env:
+            {{- include "experiments.commonEnv" . | nindent 12 }}
+            - name: MAX_CONCURRENT_REQUESTS
+              value: {{ .Values.fetch.maxConcurrentRequests | quote }}
+          resources:
+            {{- toYaml .Values.fetch.resources | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: manifest, mountPath: /manifest, readOnly: true }
+            - { name: scripts, mountPath: /scripts, readOnly: true }
+        # 2. the chroma server, as a NATIVE SIDECAR (restartPolicy: Always on an init container): it starts
+        #    after fetch-data, the runner starts once its startupProbe passes, and it is torn down when the
+        #    runner finishes, so the pod completes on the runner's exit code alone. Its own memory limit.
+        - name: chroma
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          restartPolicy: Always
+          command: ["bash", "/scripts/chroma.sh"]
+          env:
+            {{- include "experiments.commonEnv" . | nindent 12 }}
+            - name: SKUNK_CHROMA_NOFILE
+              value: "65536"
+          ports:
+            - name: chroma
+              containerPort: {{ .Values.chroma.port }}
+          startupProbe:
+            httpGet:
+              path: /api/v2/heartbeat
+              port: chroma
+            periodSeconds: 5
+            failureThreshold: {{ div (add (int .Values.chroma.startupTimeoutSeconds) 4) 5 }}
+          livenessProbe:
+            httpGet:
+              path: /api/v2/heartbeat
+              port: chroma
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            {{- toYaml $bp.chroma | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: manifest, mountPath: /manifest, readOnly: true }
+            - { name: scripts, mountPath: /scripts, readOnly: true }
+      containers:
+        # 3. the cell itself
+        - name: runner
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["bash", "/scripts/run.sh"]
+          env:
+            {{- include "experiments.commonEnv" . | nindent 12 }}
+            - name: SYNC_INTERVAL
+              value: {{ .Values.s3.syncIntervalSeconds | quote }}
+            - name: EXTRA_OVERRIDES
+              value: {{ join "\n" .Values.runner.extraOverrides | quote }}
+            {{- if .Values.secrets.llmSecretName }}
+            - name: OPENROUTER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secrets.llmSecretName }}
+                  key: OPENROUTER_API_KEY
+            {{- end }}
+          resources:
+            requests:
+              {{- toYaml $bp.runner.requests | nindent 14 }}
+              ephemeral-storage: {{ $bp.ephemeralStorage }}
+            limits:
+              {{- toYaml $bp.runner.limits | nindent 14 }}
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: results, mountPath: /results }
+            - { name: manifest, mountPath: /manifest, readOnly: true }
+            - { name: scripts, mountPath: /scripts, readOnly: true }
